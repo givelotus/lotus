@@ -85,16 +85,52 @@ Patches applied in order on top of a clean eCash tag:
 06-block-header.patch           ← larger nonce, extended metadata field
 07-txhash-txid-split.patch
 08-merkle-fix.patch
-09-intmath-opcodes.patch        ← int log (deterministic), int sqrt, POW opcodes
-10-bitwise-fixes.patch          ← Tobias's fixes
-11-nng-interface.patch
+09-util-intmath-log2.patch      ← Log2FixedPoint for subsidy calc (Logos Foundation)
+10-opcodes-bitwise.patch        ← Tobias's variable-length AND/OR/XOR fix
+11-opcodes-bitshift.patch       ← OP_RAWLEFTBITSHIFT (bidirectional via sign)
+12-opcodes-new.patch            ← OP_LOG, OP_SQRT (to be written for new chain)
+13-nng-interface.patch
 ```
+
+**Opcode notes:**
+- `OP_RAWLEFTBITSHIFT` (0x98): one opcode, positive operand = left shift, negative = right
+- `OP_AND/OR/XOR`: byte-level ops on variable-length operands; longer operand modified in place
+- `OP_LOG`, `OP_SQRT`: not yet implemented, needed for new chain from genesis
 
 ### Daemon Strategy
 - Track eCash upstream via git rebase on a clean eCash tag
 - Lotus-specific changes kept as clean atomic commits
 - Pull upstream security fixes selectively
 - Redenomination conflicts isolated to chain config layer
+
+### Future Work / Design Notes
+
+These are not decided but should not be forgotten:
+
+**OP_LOG opcode**
+- `Log2FixedPoint` exists in `util/intmath.cpp` as a utility for subsidy calculation
+- Exposing this as a script opcode (`OP_LOG`) would be useful for on-chain math
+- Turner algorithm (IEEE 2010), deterministic, fixed-point
+- Worth adding as a Lotus opcode from genesis
+
+**Integer sqrt opcode (OP_SQRT)**
+- Needed for reward issuance formula
+- Also useful as a general script opcode
+- Not yet implemented — needs to be written for the new chain
+- Should be deterministic integer sqrt (floor), not floating point
+
+**Transaction format redesign**
+- Many projects have discussed better tx formats but can't hardfork it in
+- Starting a new chain is the only clean opportunity to get this right
+- Worth designing a better format from genesis rather than inheriting Bitcoin's
+- Near-impossible to change later — if we're going to do it, it must be at launch
+- **Decision needed before genesis block is finalized**
+
+**Coin framework (logosd vision)**
+- If logosd becomes a general PoW chain framework, others could build chains on it
+- Similar to how L2s work on Ethereum but at the L1 daemon level
+- Chain identity lives entirely in config + CMake flags
+- This has implications for how we structure chain params, opcodes, and tx format
 
 ### Archive Patches
 Existing lotusd patches saved to `daemon/patches/archive/` for reference:
