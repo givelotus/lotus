@@ -5,7 +5,7 @@ import 'package:hex/hex.dart';
 import 'package:pool/pool.dart';
 import 'package:vase/chronik-client/client.dart';
 import 'package:vase/chronik-client/client.types.dart';
-import 'package:vase/lotus/lotus.dart';
+import 'package:lotus_dart/lotus.dart';
 import 'package:vase/wallet/vault.dart';
 
 import '../config/constants.dart';

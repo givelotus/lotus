@@ -4,7 +4,7 @@ import 'dart:typed_data';
 import 'package:collection/collection.dart';
 import 'package:pointycastle/digests/sha256.dart';
 
-import 'package:vase/lotus/lotus.dart';
+import 'package:lotus_dart/lotus.dart';
 import 'package:vase/config/constants.dart' as constants;
 
 Uint8List calculateScriptHash(Address? address) {
