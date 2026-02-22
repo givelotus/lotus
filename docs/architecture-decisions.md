@@ -71,8 +71,11 @@ sdk/cashweb-ts/          — extracted from stamp/src/cashweb/ into its own npm 
                            Depends on sdk/typescript/ for Lotus primitives
                            Published independently to npm
 
-sdk/dart/                — Dart equivalents (needed for Vase mobile wallet)
-                           Currently empty; mirrors sdk/typescript/ API where possible
+sdk/dart/                — extracted from wallets/vase/vase-client/lib/lotus/
+                           Currently embedded in Vase; same pattern as cashweb-ts in Stamp
+                           Contains: BIP39, crypto, encoding, script, transaction, block
+                           Referenced from Vase via pubspec path dependency (monorepo-native)
+                           Evaluate pc-dart (schancel/pc-dart, PointyCastle fork) vs upstream
 ```
 
 #### Decisions
@@ -81,6 +84,9 @@ sdk/dart/                — Dart equivalents (needed for Vase mobile wallet)
   depends on bn.js which has cross-environment bignum issues (required webpack inject
   hacks and local_modules workaround in Stamp to function in browser + Node); do not
   invest further; rewrite xpi-ts from scratch in native TypeScript using native BigInt instead
+- **Mitra support is a separate milestone** — rewrite xpi-ts cleanly first; add Mitra
+  tx format support after the format is finalized and format discussion is complete;
+  monorepo makes the cross-library update tractable when ready
 - **cashweb-ts extraction is a prerequisite for Mitra** — Mitra changes tx serialization,
   signing, and script evaluation; all three layers must be updated; easier to do with
   clean package boundaries than with cashweb embedded in Stamp
@@ -100,11 +106,12 @@ wallets/vase/    (depends on sdk/dart/)
 ```
 
 #### Open Issues
-- [ ] Extract `stamp/src/cashweb/` → `sdk/cashweb-ts/` as standalone npm package
-- [ ] Rewrite `sdk/typescript/` (xpi-ts) from scratch in native TypeScript
-- [ ] Implement Mitra tx format in new `sdk/typescript/`
-- [ ] Write Dart SDK in `sdk/dart/` mirroring TypeScript API
+- [ ] #1 — Extract `stamp/src/cashweb/` → `sdk/cashweb-ts/` as standalone npm package
+- [ ] #2 — Rewrite `sdk/typescript/` (xpi-ts) from scratch in native TypeScript (no bitcore, no bn.js)
+- [ ] #4 — Extract `wallets/vase/lib/lotus/` → `sdk/dart/` as standalone Dart package
+- [ ] (future) — Add Mitra tx format to sdk/typescript/ and sdk/dart/ after format is finalized
 - [ ] Update Stamp to depend on published `sdk/cashweb-ts/` package
+- [ ] Update Vase to reference `sdk/dart/` via pubspec path dependency
 
 ### Monorepo
 - Single `lotus` monorepo at github.com/givelotus/lotus
