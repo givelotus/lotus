@@ -27,15 +27,15 @@ CMAKE_ARGS=(
     -DBUILD_BITCOIN_ZMQ=OFF
     -DENABLE_UPNP=OFF
     -DENABLE_NATPMP=OFF
-    "${@}"
+    ${@+"$@"}
 )
 
 echo "Configuring with cmake..."
 cmake .. "${CMAKE_ARGS[@]}"
 
 echo "Building..."
-ninja -j"$(nproc 2>/dev/null || sysctl -n hw.logicalcpu)" bitcoind bitcoin-cli
+ninja -j"$(nproc 2>/dev/null || sysctl -n hw.logicalcpu)" lotusd lotus-cli
 
 echo ""
 echo "Build complete. Binaries:"
-ls -lh "$BUILD_DIR/src/bitcoind" "$BUILD_DIR/src/bitcoin-cli" 2>/dev/null || true
+ls -lh "$BUILD_DIR/src/lotusd" "$BUILD_DIR/src/lotus-cli" 2>/dev/null || true
