@@ -119,12 +119,22 @@ These are not decided but should not be forgotten:
 - Not yet implemented — needs to be written for the new chain
 - Should be deterministic integer sqrt (floor), not floating point
 
-**Transaction format redesign**
-- Many projects have discussed better tx formats but can't hardfork it in
-- Starting a new chain is the only clean opportunity to get this right
-- Worth designing a better format from genesis rather than inheriting Bitcoin's
-- Near-impossible to change later — if we're going to do it, it must be at launch
-- **Decision needed before genesis block is finalized**
+**Transaction format: Mitra (chosen)**
+- Designed by Tobias Ruck; implemented as PR #273 in the givelotus.github.io repo (branch `mitra-specification`)
+- Activates via `TX_VERSION_MITRA` (version flag in tx nVersion field)
+- Key features:
+  - **Preamble scripts**: each input has a `scriptPreamble` that runs before the main scriptSig/scriptPubKey evaluation; enables pre-computation and shared state across inputs
+  - **Carryover field**: data passed between input evaluations within a single tx; enables stateful cross-input logic without touching the UTXO set
+  - **Full introspection opcodes**: inputs can read tx fields (amounts, outputs, other inputs) at script level — no covenant workarounds needed
+  - **Native token support**: first-class tokens in the tx format, not OP_RETURN encoding
+  - **OP_LOOP / OP_ENDLOOP**: bounded iteration in script (replaces recursive covenant patterns)
+- Why Mitra over plain Bitcoin tx format:
+  - Bitcoin tx format is 15+ years of accumulated constraints; a new chain is the only window to fix it
+  - Introspection + preamble unlock DeFi primitives (AMMs, lending, etc.) without a separate VM
+  - Native tokens avoid the fragmentation of protocol-level vs OP_RETURN tokens
+  - Near-impossible to change after genesis — commit at launch or not at all
+- **Status: chosen; needs TS/Dart SDK work to support new format in client libraries**
+- Spec branch: `mitra-specification` in givelotus/givelotus.github.io
 
 **Coin framework (logosd vision)**
 - If logosd becomes a general PoW chain framework, others could build chains on it
@@ -144,7 +154,7 @@ Existing lotusd patches saved to `daemon/patches/archive/` for reference:
 - `addresses.patch` — address handling
 - `activation.patch` — fork activation logic
 - `nng-interface.patch` — NNG pub/sub interface
-- `iguana.patch` — unknown, needs investigation (45K)
+- `iguana.patch` — eCash-only addition (45K); not in lotusd at all, skip
 - `minerfund.patch` — miner fund addresses
 - `currencyunit.patch` — denomination
 - `amount.patch` — file move (Amount class preserved from original)
