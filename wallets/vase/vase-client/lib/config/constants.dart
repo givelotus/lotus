@@ -1,5 +1,5 @@
 import 'package:flutter/material.dart';
-import 'package:vase/lotus/networks.dart';
+import 'package:lotus_dart/networks.dart';
 
 const network = NetworkType.MAIN;
 

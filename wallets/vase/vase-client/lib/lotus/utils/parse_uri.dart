@@ -1,4 +1,4 @@
-import 'package:vase/lotus/address.dart';
+import 'package:lotus_dart/address.dart';
 
 class ParseURIResult {
   String address;

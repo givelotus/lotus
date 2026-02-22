@@ -12,8 +12,8 @@ import 'package:vase/features/numpad/numpad_view.dart';
 import 'package:vase/features/send/qr_view.dart';
 import 'package:vase/features/send/send_model.dart';
 import 'package:vase/features/wallet/wallet_model.dart';
-import 'package:vase/lotus/lotus.dart';
-import 'package:vase/lotus/utils/parse_uri.dart';
+import 'package:lotus_dart/lotus.dart';
+import 'package:lotus_dart/utils/parse_uri.dart';
 import 'package:vase/utils/currency.dart';
 
 import '../numpad/numpad_model.dart';
