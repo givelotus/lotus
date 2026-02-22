@@ -6,26 +6,27 @@ Goal: minimize operational complexity so community members can actually run node
 
 ```
 logosd      — chain-agnostic PoW daemon (eCash fork + Lotus patches); replaces lotusd
-cashwebd    — unified messaging daemon (keyserver + relay + broadcast merged)
-postgres    — persistent structured data
-redis(?)    — ephemeral high-throughput data (message queues, routing state)
+cashwebd    — unified messaging daemon (already consolidated: registry + relay + p2p)
+             uses embedded RocksDB — no separate database server required
 ```
 
 ## Open Questions
 
 ### Data Layer for cashwebd
-- Postgres handles persistent structured data (keys, metadata, accounts)
-- High-throughput ephemeral data (message queues, routing state) needs a separate store
-- Redis is operationally simple but not good for non-ephemeral data
-- ScyllaDB and MongoDB are options but may be overkill at current scale
-- **Decision deferred:** Need to inspect existing Rust daemon code to understand actual
-  storage patterns before committing to a data layer
+- Current: embedded RocksDB — column families: `metadata`, `pkh_by_time`, `topic_messages`,
+  `message_payloads`, `topic_burn_txs`
+- RocksDB is embedded so only one cashwebd instance can run against the data at a time;
+  no HA, no replication, corruption = outage
+- **Decision: migrate to ScyllaDB** (Cassandra-compatible, Rust driver available, built-in
+  replication, wide-column maps cleanly to existing column families)
+- Implement a storage trait abstraction first so the backend is swappable
+- See issue #3
 
 ### cashwebd Consolidation
-- Current state: separate keyserver, relay, and broadcast daemons (unfinished contractor work)
-- Target: single `cashwebd` binary with one config, one database connection
-- Shared connection pool, shared auth, shared crypto primitives across all three functions
-- **Decision deferred:** Need to audit existing Rust code before merging
+- **Resolved:** cashweb is already a single unified binary (`cashwebd-exe`)
+- Combines: HTTP API (axum), P2P peer sync, key registry, topic messaging
+- Connects to logosd via JSON-RPC for tx broadcasting
+- Source: `cashweb/` in the monorepo (pulled from LotusiaStewardship/cashweb)
 
 ### Indexer
 - Chronik was paid for ($20K) and then pulled into eCash daemon dropping Lotus support
@@ -38,6 +39,72 @@ redis(?)    — ephemeral high-throughput data (message queues, routing state)
 - **Decision deferred:** Settle before renaming patch is written
 
 ## Decided
+
+### SDK Architecture
+
+#### Current State (inherited, needs restructuring)
+
+Three TypeScript/JavaScript layers currently exist, tangled across repos:
+
+```
+bitcore-lib-xpi          — JS crypto primitives (forked from Bitcore); in stamp/local_modules/
+                           JavaScript + bolted-on TypeScript definitions; considered legacy
+xpi-ts                   — Lotus wallet SDK (TS); wraps bitcore-lib-xpi; in sdk/typescript/
+stamp/src/cashweb/       — cashweb protocol layer (your original work); embedded in the app
+                           registry client, relay client, wallet, BIP70, stealth, types
+```
+
+The cashweb TypeScript module was written inline with Stamp and never extracted as a
+standalone package. It is the most valuable piece and needs to be first-class.
+
+#### Target Structure
+
+```
+sdk/typescript/          — xpi-ts: rewritten as native TypeScript from scratch
+                           NO dependency on bitcore-lib-xpi
+                           Covers: addresses, tx construction, signing, script, PSBT
+                           Must support Mitra tx format natively
+
+sdk/cashweb-ts/          — extracted from stamp/src/cashweb/ into its own npm package
+                           Covers: registry client, relay client, wallet, BIP70, stealth,
+                           signed payloads, protobuf types
+                           Depends on sdk/typescript/ for Lotus primitives
+                           Published independently to npm
+
+sdk/dart/                — Dart equivalents (needed for Vase mobile wallet)
+                           Currently empty; mirrors sdk/typescript/ API where possible
+```
+
+#### Decisions
+
+- **bitcore-lib-xpi is deprecated** — JavaScript + type definitions, not native TS;
+  depends on bn.js which has cross-environment bignum issues (required webpack inject
+  hacks and local_modules workaround in Stamp to function in browser + Node); do not
+  invest further; rewrite xpi-ts from scratch in native TypeScript using native BigInt instead
+- **cashweb-ts extraction is a prerequisite for Mitra** — Mitra changes tx serialization,
+  signing, and script evaluation; all three layers must be updated; easier to do with
+  clean package boundaries than with cashweb embedded in Stamp
+- **Publish to npm independently** — sdk/typescript/ and sdk/cashweb-ts/ should be
+  separately versioned npm packages; Stamp and any other client depend on them normally
+- **Mitra support must be in sdk/typescript/ first** — everything above it follows
+
+#### Dependency Chain (target)
+
+```
+sdk/typescript/  (native TS, no legacy deps)
+      ↑
+sdk/cashweb-ts/  (depends on sdk/typescript/)
+      ↑
+wallets/stamp/   (depends on sdk/cashweb-ts/)
+wallets/vase/    (depends on sdk/dart/)
+```
+
+#### Open Issues
+- [ ] Extract `stamp/src/cashweb/` → `sdk/cashweb-ts/` as standalone npm package
+- [ ] Rewrite `sdk/typescript/` (xpi-ts) from scratch in native TypeScript
+- [ ] Implement Mitra tx format in new `sdk/typescript/`
+- [ ] Write Dart SDK in `sdk/dart/` mirroring TypeScript API
+- [ ] Update Stamp to depend on published `sdk/cashweb-ts/` package
 
 ### Monorepo
 - Single `lotus` monorepo at github.com/givelotus/lotus
