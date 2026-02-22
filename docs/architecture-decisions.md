@@ -114,12 +114,31 @@ These are not decided but should not be forgotten:
 - Worth adding as a Lotus opcode from genesis
 
 **Integer sqrt opcode (OP_SQRT)**
-- Needed for reward issuance formula
-- Also useful as a general script opcode
+- Useful as a general script opcode (on-chain geometry, etc.)
+- Not required for issuance — issuance uses Log2FixedPoint
 - Not yet implemented — needs to be written for the new chain
 - Should be deterministic integer sqrt (floor), not floating point
 
-**Transaction format: Mitra (chosen)**
+**Issuance curve: Log2-based (decided)**
+- Subsidy calculated using `Log2FixedPoint` (Logos Foundation, Turner algorithm)
+- Log2 gives diminishing early supply — large initial reward that decays quickly,
+  then levels off; encourages early mining without infinite tail inflation
+- This is V2 Lotus: the curve is the core economic fix vs V1
+- OP_LOG exposes the same primitive to script for on-chain math
+- OP_SQRT is separate and optional — not needed for the issuance formula
+
+**Coin distribution (decided)**
+- Clean PoW launch from genesis — no UTXO snapshot from old chain
+- Free riders (people who received coins without contributing) do not get new coins
+  automatically; they mine like everyone else
+- Small deliberate early-contributor allocation in genesis block for people who
+  demonstrably supported Lotus: funded development, bought and held, did real work
+  (not tip-bot recipients, not zero-contribution early miners)
+- Allocation recipients to be determined explicitly — not automatic
+- PoW is the fair distributor; the genesis allocation is a narrow exception for
+  people who are owed something concrete
+
+**Transaction format: Mitra (chosen, exclusive)**
 - Designed by Tobias Ruck; implemented as PR #273 in the givelotus.github.io repo (branch `mitra-specification`)
 - Activates via `TX_VERSION_MITRA` (version flag in tx nVersion field)
 - Key features:
