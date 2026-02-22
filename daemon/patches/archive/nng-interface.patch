@@ -1,0 +1,1942 @@
+diff --git a/src/interfaces/chain.cpp b/src/interfaces/chain.cpp
+new file mode 100644
+index 000000000..75cbb40cd
+--- /dev/null
++++ b/src/interfaces/chain.cpp
+@@ -0,0 +1,499 @@
++// Copyright (c) 2018-2019 The Bitcoin Core developers
++// Distributed under the MIT software license, see the accompanying
++// file COPYING or http://www.opensource.org/licenses/mit-license.php.
++
++#include <interfaces/chain.h>
++
++#include <blockdb.h>
++#include <chain.h>
++#include <chainparams.h>
++#include <interfaces/handler.h>
++#include <interfaces/wallet.h>
++#include <net.h>
++#include <net_processing.h>
++#include <node/coin.h>
++#include <node/context.h>
++#include <node/transaction.h>
++#include <node/ui_interface.h>
++#include <policy/mempool.h>
++#include <policy/policy.h>
++#include <policy/settings.h>
++#include <primitives/block.h>
++#include <primitives/blockhash.h>
++#include <rpc/protocol.h>
++#include <rpc/server.h>
++#include <shutdown.h>
++#include <sync.h>
++#include <timedata.h>
++#include <txmempool.h>
++#include <univalue.h>
++#include <util/system.h>
++#include <validation.h>
++#include <validationinterface.h>
++
++#include <utility>
++
++namespace interfaces {
++namespace {
++
++    bool FillBlock(const CBlockIndex *index, const FoundBlock &block,
++                   UniqueLock<RecursiveMutex> &lock) {
++        if (!index) {
++            return false;
++        }
++        if (block.m_hash) {
++            *block.m_hash = index->GetBlockHash();
++        }
++        if (block.m_height) {
++            *block.m_height = index->nHeight;
++        }
++        if (block.m_time) {
++            *block.m_time = index->GetBlockTime();
++        }
++        if (block.m_max_time) {
++            *block.m_max_time = index->GetBlockTimeMax();
++        }
++        if (block.m_mtp_time) {
++            *block.m_mtp_time = index->GetMedianTimePast();
++        }
++        if (block.m_data) {
++            REVERSE_LOCK(lock);
++            if (!ReadBlockFromDisk(*block.m_data, index,
++                                   Params().GetConsensus())) {
++                block.m_data->SetNull();
++            }
++        }
++        return true;
++    }
++
++    class NotificationsProxy : public CValidationInterface {
++    public:
++        explicit NotificationsProxy(
++            std::shared_ptr<Chain::Notifications> notifications)
++            : m_notifications(std::move(notifications)) {}
++        virtual ~NotificationsProxy() = default;
++        void TransactionAddedToMempool(
++            const CTransactionRef &tx,
++            const std::vector<Coin> &spent_coins,
++            uint64_t mempool_sequence) override {
++            m_notifications->transactionAddedToMempool(tx, mempool_sequence);
++        }
++        void TransactionRemovedFromMempool(const CTransactionRef &tx,
++                                           MemPoolRemovalReason reason,
++                                           uint64_t mempool_sequence) override {
++            m_notifications->transactionRemovedFromMempool(tx, reason,
++                                                           mempool_sequence);
++        }
++        void BlockConnected(const std::shared_ptr<const CBlock> &block,
++                            const CBlockIndex *index) override {
++            m_notifications->blockConnected(*block, index->nHeight);
++        }
++        void BlockDisconnected(const std::shared_ptr<const CBlock> &block,
++                               const CBlockIndex *index) override {
++            m_notifications->blockDisconnected(*block, index->nHeight);
++        }
++        void UpdatedBlockTip(const CBlockIndex *index,
++                             const CBlockIndex *fork_index,
++                             bool is_ibd) override {
++            m_notifications->updatedBlockTip();
++        }
++        void ChainStateFlushed(const CBlockLocator &locator) override {
++            m_notifications->chainStateFlushed(locator);
++        }
++        std::shared_ptr<Chain::Notifications> m_notifications;
++    };
++
++    class NotificationsHandlerImpl : public Handler {
++    public:
++        explicit NotificationsHandlerImpl(
++            std::shared_ptr<Chain::Notifications> notifications)
++            : m_proxy(std::make_shared<NotificationsProxy>(
++                  std::move(notifications))) {
++            RegisterSharedValidationInterface(m_proxy);
++        }
++        ~NotificationsHandlerImpl() override { disconnect(); }
++        void disconnect() override {
++            if (m_proxy) {
++                UnregisterSharedValidationInterface(m_proxy);
++                m_proxy.reset();
++            }
++        }
++        std::shared_ptr<NotificationsProxy> m_proxy;
++    };
++
++    class RpcHandlerImpl : public Handler {
++    public:
++        explicit RpcHandlerImpl(const CRPCCommand &command)
++            : m_command(command), m_wrapped_command(&command) {
++            m_command.actor = [this](const Config &config,
++                                     const JSONRPCRequest &request,
++                                     UniValue &result, bool last_handler) {
++                if (!m_wrapped_command) {
++                    return false;
++                }
++                try {
++                    return m_wrapped_command->actor(config, request, result,
++                                                    last_handler);
++                } catch (const UniValue &e) {
++                    // If this is not the last handler and a wallet not found
++                    // exception was thrown, return false so the next handler
++                    // can try to handle the request. Otherwise, reraise the
++                    // exception.
++                    if (!last_handler) {
++                        const UniValue &code = e["code"];
++                        if (code.isNum() &&
++                            code.get_int() == RPC_WALLET_NOT_FOUND) {
++                            return false;
++                        }
++                    }
++                    throw;
++                }
++            };
++            ::tableRPC.appendCommand(m_command.name, &m_command);
++        }
++
++        void disconnect() final {
++            if (m_wrapped_command) {
++                m_wrapped_command = nullptr;
++                ::tableRPC.removeCommand(m_command.name, &m_command);
++            }
++        }
++
++        ~RpcHandlerImpl() override { disconnect(); }
++
++        CRPCCommand m_command;
++        const CRPCCommand *m_wrapped_command;
++    };
++
++    class ChainImpl : public Chain {
++    public:
++        explicit ChainImpl(NodeContext &node, const CChainParams &params)
++            : m_node(node), m_params(params) {}
++        std::optional<int> getHeight() override {
++            LOCK(::cs_main);
++            int height = ::ChainActive().Height();
++            if (height >= 0) {
++                return height;
++            }
++            return std::nullopt;
++        }
++        std::optional<int> getBlockHeight(const BlockHash &hash) override {
++            LOCK(::cs_main);
++            CBlockIndex *block = LookupBlockIndex(hash);
++            if (block && ::ChainActive().Contains(block)) {
++                return block->nHeight;
++            }
++            return std::nullopt;
++        }
++        BlockHash getBlockHash(int height) override {
++            LOCK(::cs_main);
++            CBlockIndex *block = ::ChainActive()[height];
++            assert(block);
++            return block->GetBlockHash();
++        }
++        bool haveBlockOnDisk(int height) override {
++            LOCK(cs_main);
++            CBlockIndex *block = ::ChainActive()[height];
++            return block && (block->nStatus.hasData() != 0) && block->nTx > 0;
++        }
++        std::optional<int>
++        findFirstBlockWithTimeAndHeight(int64_t time, int height,
++                                        BlockHash *hash) override {
++            LOCK(cs_main);
++            CBlockIndex *block =
++                ::ChainActive().FindEarliestAtLeast(time, height);
++            if (block) {
++                if (hash) {
++                    *hash = block->GetBlockHash();
++                }
++                return block->nHeight;
++            }
++            return std::nullopt;
++        }
++        CBlockLocator getTipLocator() override {
++            LOCK(cs_main);
++            return ::ChainActive().GetLocator();
++        }
++        bool contextualCheckTransactionForCurrentBlock(
++            const CTransaction &tx, TxValidationState &state) override {
++            LOCK(cs_main);
++            return ContextualCheckTransactionForCurrentBlock(
++                m_params.GetConsensus(), tx, state);
++        }
++        std::optional<int>
++        findLocatorFork(const CBlockLocator &locator) override {
++            LOCK(cs_main);
++            if (CBlockIndex *fork =
++                    FindForkInGlobalIndex(::ChainActive(), locator)) {
++                return fork->nHeight;
++            }
++            return std::nullopt;
++        }
++        bool findBlock(const BlockHash &hash,
++                       const FoundBlock &block) override {
++            WAIT_LOCK(cs_main, lock);
++            return FillBlock(LookupBlockIndex(hash), block, lock);
++        }
++        bool findFirstBlockWithTimeAndHeight(int64_t min_time, int min_height,
++                                             const FoundBlock &block) override {
++            WAIT_LOCK(cs_main, lock);
++            return FillBlock(
++                ChainActive().FindEarliestAtLeast(min_time, min_height), block,
++                lock);
++        }
++        bool findNextBlock(const BlockHash &block_hash, int block_height,
++                           const FoundBlock &next, bool *reorg) override {
++            WAIT_LOCK(cs_main, lock);
++            CBlockIndex *block = ChainActive()[block_height];
++            if (block && block->GetBlockHash() != block_hash) {
++                block = nullptr;
++            }
++            if (reorg) {
++                *reorg = !block;
++            }
++            return FillBlock(block ? ChainActive()[block_height + 1] : nullptr,
++                             next, lock);
++        }
++        bool findAncestorByHeight(const BlockHash &block_hash,
++                                  int ancestor_height,
++                                  const FoundBlock &ancestor_out) override {
++            WAIT_LOCK(cs_main, lock);
++            if (const CBlockIndex *block = LookupBlockIndex(block_hash)) {
++                if (const CBlockIndex *ancestor =
++                        block->GetAncestor(ancestor_height)) {
++                    return FillBlock(ancestor, ancestor_out, lock);
++                }
++            }
++            return FillBlock(nullptr, ancestor_out, lock);
++        }
++        bool findAncestorByHash(const BlockHash &block_hash,
++                                const BlockHash &ancestor_hash,
++                                const FoundBlock &ancestor_out) override {
++            WAIT_LOCK(cs_main, lock);
++            const CBlockIndex *block = LookupBlockIndex(block_hash);
++            const CBlockIndex *ancestor = LookupBlockIndex(ancestor_hash);
++            if (block && ancestor &&
++                block->GetAncestor(ancestor->nHeight) != ancestor) {
++                ancestor = nullptr;
++            }
++            return FillBlock(ancestor, ancestor_out, lock);
++        }
++        bool findCommonAncestor(const BlockHash &block_hash1,
++                                const BlockHash &block_hash2,
++                                const FoundBlock &ancestor_out,
++                                const FoundBlock &block1_out,
++                                const FoundBlock &block2_out) override {
++            WAIT_LOCK(cs_main, lock);
++            const CBlockIndex *block1 = LookupBlockIndex(block_hash1);
++            const CBlockIndex *block2 = LookupBlockIndex(block_hash2);
++            const CBlockIndex *ancestor =
++                block1 && block2 ? LastCommonAncestor(block1, block2) : nullptr;
++            // Using & instead of && below to avoid short circuiting and leaving
++            // output uninitialized. Cast bool to int to avoid
++            // -Wbitwise-instead-of-logical compiler warnings.
++            return int{FillBlock(ancestor, ancestor_out, lock)} &
++                   int{FillBlock(block1, block1_out, lock)} &
++                   int{FillBlock(block2, block2_out, lock)};
++        }
++        void findCoins(std::map<COutPoint, Coin> &coins) override {
++            return FindCoins(m_node, coins);
++        }
++        double guessVerificationProgress(const BlockHash &block_hash) override {
++            LOCK(cs_main);
++            return GuessVerificationProgress(Params().TxData(),
++                                             LookupBlockIndex(block_hash));
++        }
++        bool hasBlocks(const BlockHash &block_hash, int min_height,
++                       std::optional<int> max_height) override {
++            // hasBlocks returns true if all ancestors of block_hash in
++            // specified range have block data (are not pruned), false if any
++            // ancestors in specified range are missing data.
++            //
++            // For simplicity and robustness, min_height and max_height are only
++            // used to limit the range, and passing min_height that's too low or
++            // max_height that's too high will not crash or change the result.
++            LOCK(::cs_main);
++            if (CBlockIndex *block = LookupBlockIndex(block_hash)) {
++                if (max_height && block->nHeight >= *max_height) {
++                    block = block->GetAncestor(*max_height);
++                }
++                for (; block->nStatus.hasData(); block = block->pprev) {
++                    // Check pprev to not segfault if min_height is too low
++                    if (block->nHeight <= min_height || !block->pprev) {
++                        return true;
++                    }
++                }
++            }
++            return false;
++        }
++        bool hasDescendantsInMempool(const TxId &txid) override {
++            if (!m_node.mempool) {
++                return false;
++            }
++            LOCK(m_node.mempool->cs);
++            auto it = m_node.mempool->GetIter(txid);
++            return it && (*it)->GetCountWithDescendants() > 1;
++        }
++        bool broadcastTransaction(const Config &config,
++                                  const CTransactionRef &tx,
++                                  const Amount &max_tx_fee, bool relay,
++                                  std::string &err_string) override {
++            const TransactionError err = BroadcastTransaction(
++                m_node, config, tx, err_string, max_tx_fee, relay,
++                /*wait_callback*/ false);
++            // Chain clients only care about failures to accept the tx to the
++            // mempool. Disregard non-mempool related failures. Note: this will
++            // need to be updated if BroadcastTransactions() is updated to
++            // return other non-mempool failures that Chain clients do not need
++            // to know about.
++            return err == TransactionError::OK;
++        }
++        void getTransactionAncestry(const TxId &txid, size_t &ancestors,
++                                    size_t &descendants) override {
++            ancestors = descendants = 0;
++            if (!m_node.mempool) {
++                return;
++            }
++            m_node.mempool->GetTransactionAncestry(txid, ancestors,
++                                                   descendants);
++        }
++        void getPackageLimits(size_t &limit_ancestor_count,
++                              size_t &limit_descendant_count) override {
++            limit_ancestor_count = size_t(
++                std::max<int64_t>(1, gArgs.GetArg("-limitancestorcount",
++                                                  DEFAULT_ANCESTOR_LIMIT)));
++            limit_descendant_count = size_t(
++                std::max<int64_t>(1, gArgs.GetArg("-limitdescendantcount",
++                                                  DEFAULT_DESCENDANT_LIMIT)));
++        }
++        bool checkChainLimits(const CTransactionRef &tx) override {
++            if (!m_node.mempool) {
++                return true;
++            }
++            LockPoints lp;
++            CTxMemPoolEntry entry(tx, Amount(), 0, 0, false, 0, lp);
++            CTxMemPool::setEntries ancestors;
++            auto limit_ancestor_count =
++                gArgs.GetArg("-limitancestorcount", DEFAULT_ANCESTOR_LIMIT);
++            auto limit_ancestor_size =
++                gArgs.GetArg("-limitancestorsize",
++                             DEFAULT_ANCESTOR_SIZE_LIMIT) *
++                1000;
++            auto limit_descendant_count =
++                gArgs.GetArg("-limitdescendantcount", DEFAULT_DESCENDANT_LIMIT);
++            auto limit_descendant_size =
++                gArgs.GetArg("-limitdescendantsize",
++                             DEFAULT_DESCENDANT_SIZE_LIMIT) *
++                1000;
++            std::string unused_error_string;
++            LOCK(m_node.mempool->cs);
++            return m_node.mempool->CalculateMemPoolAncestors(
++                entry, ancestors, limit_ancestor_count, limit_ancestor_size,
++                limit_descendant_count, limit_descendant_size,
++                unused_error_string);
++        }
++        CFeeRate estimateFee() const override {
++            if (!m_node.mempool) {
++                return {};
++            }
++            return m_node.mempool->estimateFee();
++        }
++        CFeeRate relayMinFee() override { return ::minRelayTxFee; }
++        CFeeRate relayDustFee() override { return ::dustRelayFee; }
++        bool havePruned() override {
++            LOCK(cs_main);
++            return ::fHavePruned;
++        }
++        bool isReadyToBroadcast() override {
++            return !::fImporting && !::fReindex && !isInitialBlockDownload();
++        }
++        bool isInitialBlockDownload() override {
++            return ::ChainstateActive().IsInitialBlockDownload();
++        }
++        bool shutdownRequested() override { return ShutdownRequested(); }
++        int64_t getAdjustedTime() override { return GetAdjustedTime(); }
++        void initMessage(const std::string &message) override {
++            ::uiInterface.InitMessage(message);
++        }
++        void initWarning(const bilingual_str &message) override {
++            InitWarning(message);
++        }
++        void initError(const bilingual_str &message) override {
++            InitError(message);
++        }
++        void showProgress(const std::string &title, int progress,
++                          bool resume_possible) override {
++            ::uiInterface.ShowProgress(title, progress, resume_possible);
++        }
++        std::unique_ptr<Handler> handleNotifications(
++            std::shared_ptr<Notifications> notifications) override {
++            return std::make_unique<NotificationsHandlerImpl>(
++                std::move(notifications));
++        }
++        void
++        waitForNotificationsIfTipChanged(const BlockHash &old_tip) override {
++            if (!old_tip.IsNull()) {
++                LOCK(::cs_main);
++                if (old_tip == ::ChainActive().Tip()->GetBlockHash()) {
++                    return;
++                }
++            }
++            SyncWithValidationInterfaceQueue();
++        }
++
++        std::unique_ptr<Handler>
++        handleRpc(const CRPCCommand &command) override {
++            return std::make_unique<RpcHandlerImpl>(command);
++        }
++        bool rpcEnableDeprecated(const std::string &method) override {
++            return IsDeprecatedRPCEnabled(gArgs, method);
++        }
++        void rpcRunLater(const std::string &name, std::function<void()> fn,
++                         int64_t seconds) override {
++            RPCRunLater(name, std::move(fn), seconds);
++        }
++        int rpcSerializationFlags() override { return RPCSerializationFlags(); }
++        util::SettingsValue getRwSetting(const std::string &name) override {
++            util::SettingsValue result;
++            gArgs.LockSettings([&](const util::Settings &settings) {
++                if (const util::SettingsValue *value =
++                        util::FindKey(settings.rw_settings, name)) {
++                    result = *value;
++                }
++            });
++            return result;
++        }
++        bool updateRwSetting(const std::string &name,
++                             const util::SettingsValue &value) override {
++            gArgs.LockSettings([&](util::Settings &settings) {
++                if (value.isNull()) {
++                    settings.rw_settings.erase(name);
++                } else {
++                    settings.rw_settings[name] = value;
++                }
++            });
++            return gArgs.WriteSettingsFile();
++        }
++        void requestMempoolTransactions(Notifications &notifications) override {
++            if (!m_node.mempool) {
++                return;
++            }
++            LOCK2(::cs_main, m_node.mempool->cs);
++            for (const CTxMemPoolEntry &entry : m_node.mempool->mapTx) {
++                notifications.transactionAddedToMempool(
++                    entry.GetSharedTx(), 0 /* mempool_sequence */);
++            }
++        }
++        const CChainParams &params() const override { return m_params; }
++        NodeContext &m_node;
++        const CChainParams &m_params;
++    };
++
++} // namespace
++
++std::unique_ptr<Chain> MakeChain(NodeContext &node,
++                                 const CChainParams &params) {
++    return std::make_unique<ChainImpl>(node, params);
++}
++
++} // namespace interfaces
+diff --git a/src/interfaces/chain.h b/src/interfaces/chain.h
+index af4ae0a41..1c0056bec 100644
+--- a/src/interfaces/chain.h
++++ b/src/interfaces/chain.h
+@@ -5,7 +5,6 @@
+ #ifndef BITCOIN_INTERFACES_CHAIN_H
+ #define BITCOIN_INTERFACES_CHAIN_H
+ 
+-#include <primitives/blockhash.h>
+ #include <primitives/transaction.h>
+ #include <primitives/txid.h>
+ #include <util/settings.h> // For util::SettingsValue
+@@ -28,13 +27,11 @@ class CScheduler;
+ class TxValidationState;
+ 
+ enum class MemPoolRemovalReason;
+-enum class ChainstateRole;
+ 
++struct BlockHash;
+ struct bilingual_str;
+ struct CBlockLocator;
+-namespace node {
+ struct NodeContext;
+-} // namespace node
+ 
+ namespace Consensus {
+ struct Params;
+@@ -45,12 +42,6 @@ namespace interfaces {
+ class Handler;
+ class Wallet;
+ 
+-//! Hash/height pair to help track and identify blocks.
+-struct BlockKey {
+-    BlockHash hash;
+-    int height = -1;
+-};
+-
+ //! Helper for findBlock to selectively return pieces of block data.
+ class FoundBlock {
+ public:
+@@ -74,22 +65,6 @@ public:
+         m_mtp_time = &mtp_time;
+         return *this;
+     }
+-    //! Return whether block is in the active (most-work) chain.
+-    FoundBlock &inActiveChain(bool &in_active_chain) {
+-        m_in_active_chain = &in_active_chain;
+-        return *this;
+-    }
+-    //! Return locator if block is in the active chain.
+-    FoundBlock &locator(CBlockLocator &locator) {
+-        m_locator = &locator;
+-        return *this;
+-    }
+-    //! Return next block in the active chain if current block is in the active
+-    //! chain.
+-    FoundBlock &nextBlock(const FoundBlock &next_block) {
+-        m_next_block = &next_block;
+-        return *this;
+-    }
+     //! Read block data from disk. If the block exists but doesn't have data
+     //! (for example due to pruning), the CBlock variable will be set to null.
+     FoundBlock &data(CBlock &data) {
+@@ -102,9 +77,6 @@ public:
+     int64_t *m_time = nullptr;
+     int64_t *m_max_time = nullptr;
+     int64_t *m_mtp_time = nullptr;
+-    bool *m_in_active_chain = nullptr;
+-    CBlockLocator *m_locator = nullptr;
+-    const FoundBlock *m_next_block = nullptr;
+     CBlock *m_data = nullptr;
+ };
+ 
+@@ -130,9 +102,9 @@ public:
+ //!   wallet cache it, fee estimation being driven by node mempool, wallet
+ //!   should be the consumer.
+ //!
+-//! * `guessVerificationProgress` and similar methods can go away if rescan
+-//!   logic moves out of the wallet, and the wallet just requests scans from the
+-//!   node (https://github.com/bitcoin/bitcoin/issues/11756)
++//! * The `guessVerificationProgress`, `getBlockHeight`, `getBlockHash`, etc
++//!   methods can go away if rescan logic is moved on the node side, and wallet
++//!   only register rescan request.
+ class Chain {
+ public:
+     virtual ~Chain() {}
+@@ -142,6 +114,11 @@ public:
+     //! contain any blocks)
+     virtual std::optional<int> getHeight() = 0;
+ 
++    //! Get block height above genesis block. Returns 0 for genesis block,
++    //! 1 for following block, and so on. Returns std::nullopt for a block not
++    //! included in the current chain.
++    virtual std::optional<int> getBlockHeight(const BlockHash &hash) = 0;
++
+     //! Get block hash. Height must be valid or this function will abort.
+     virtual BlockHash getBlockHash(int height) = 0;
+ 
+@@ -149,6 +126,16 @@ public:
+     //! pruned), and contains transactions.
+     virtual bool haveBlockOnDisk(int height) = 0;
+ 
++    //! Return height of the first block in the chain with timestamp equal
++    //! or greater than the given time and height equal or greater than the
++    //! given height, or std::nullopt if there is no block with a high enough
++    //! timestamp and height. Also return the block hash as an optional output
++    //! parameter (to avoid the cost of a second lookup in case this information
++    //! is needed.)
++    virtual std::optional<int>
++    findFirstBlockWithTimeAndHeight(int64_t time, int height,
++                                    BlockHash *hash) = 0;
++
+     //! Get locator for the current chain tip.
+     virtual CBlockLocator getTipLocator() = 0;
+ 
+@@ -158,6 +145,11 @@ public:
+     virtual std::optional<int>
+     findLocatorFork(const CBlockLocator &locator) = 0;
+ 
++    //! Check if transaction will be final given chain height current time.
++    virtual bool
++    contextualCheckTransactionForCurrentBlock(const CTransaction &tx,
++                                              TxValidationState &state) = 0;
++
+     //! Return whether node has the block and optionally return block metadata
+     //! or contents.
+     virtual bool findBlock(const BlockHash &hash,
+@@ -171,6 +163,13 @@ public:
+     findFirstBlockWithTimeAndHeight(int64_t min_time, int min_height,
+                                     const FoundBlock &block = {}) = 0;
+ 
++    //! Find next block if block is part of current chain. Also flag if
++    //! there was a reorg and the specified block hash is no longer in the
++    //! current chain, and optionally return block information.
++    virtual bool findNextBlock(const BlockHash &block_hash, int block_height,
++                               const FoundBlock &next = {},
++                               bool *reorg = nullptr) = 0;
++
+     //! Find ancestor of block at specified height and optionally return
+     //! ancestor information.
+     virtual bool findAncestorByHeight(const BlockHash &block_hash,
+@@ -206,6 +205,9 @@ public:
+     virtual bool hasBlocks(const BlockHash &block_hash, int min_height = 0,
+                            std::optional<int> max_height = {}) = 0;
+ 
++    //! Check if transaction has descendants in mempool.
++    virtual bool hasDescendantsInMempool(const TxId &txid) = 0;
++
+     //! Transaction is added to memory pool, if the transaction fee is below the
+     //! amount specified by max_tx_fee, and broadcast to all peers if relay is
+     //! set to true. Return false if the transaction could not be added due to
+@@ -215,6 +217,20 @@ public:
+                                       const Amount &max_tx_fee, bool relay,
+                                       std::string &err_string) = 0;
+ 
++    //! Calculate mempool ancestor and descendant counts for the given
++    //! transaction.
++    virtual void getTransactionAncestry(const TxId &txid, size_t &ancestors,
++                                        size_t &descendants) = 0;
++
++    //! Get the node's package limits.
++    //! Currently only returns the ancestor and descendant count limits, but
++    //! could be enhanced to return more policy settings.
++    virtual void getPackageLimits(size_t &limit_ancestor_count,
++                                  size_t &limit_descendant_count) = 0;
++
++    //! Check if transaction will pass the mempool's chain limits.
++    virtual bool checkChainLimits(const CTransactionRef &tx) = 0;
++
+     //! Estimate fee
+     virtual CFeeRate estimateFee() const = 0;
+ 
+@@ -228,9 +244,6 @@ public:
+     //! Check if any block has been pruned.
+     virtual bool havePruned() = 0;
+ 
+-    //! Get the current prune height.
+-    virtual std::optional<int> getPruneHeight() = 0;
+-
+     //! Check if the node is ready to broadcast transactions.
+     virtual bool isReadyToBroadcast() = 0;
+ 
+@@ -240,6 +253,9 @@ public:
+     //! Check if shutdown requested.
+     virtual bool shutdownRequested() = 0;
+ 
++    //! Get adjusted time.
++    virtual int64_t getAdjustedTime() = 0;
++
+     //! Send init message.
+     virtual void initMessage(const std::string &message) = 0;
+ 
+@@ -262,12 +278,10 @@ public:
+         virtual void transactionRemovedFromMempool(const CTransactionRef &ptx,
+                                                    MemPoolRemovalReason reason,
+                                                    uint64_t mempool_sequence) {}
+-        virtual void blockConnected(ChainstateRole role, const CBlock &block,
+-                                    int height) {}
++        virtual void blockConnected(const CBlock &block, int height) {}
+         virtual void blockDisconnected(const CBlock &block, int height) {}
+         virtual void updatedBlockTip() {}
+-        virtual void chainStateFlushed(ChainstateRole role,
+-                                       const CBlockLocator &locator) {}
++        virtual void chainStateFlushed(const CBlockLocator &locator) {}
+     };
+ 
+     //! Register handler for notifications.
+@@ -290,21 +304,15 @@ public:
+     virtual void rpcRunLater(const std::string &name, std::function<void()> fn,
+                              int64_t seconds) = 0;
+ 
+-    //! Get settings value.
+-    virtual util::SettingsValue getSetting(const std::string &arg) = 0;
+-
+-    //! Get list of settings values.
+-    virtual std::vector<util::SettingsValue>
+-    getSettingsList(const std::string &arg) = 0;
++    //! Current RPC serialization flags.
++    virtual int rpcSerializationFlags() = 0;
+ 
+     //! Return <datadir>/settings.json setting value.
+     virtual util::SettingsValue getRwSetting(const std::string &name) = 0;
+ 
+-    //! Write a setting to <datadir>/settings.json. Optionally just update the
+-    //! setting in memory and do not write the file.
++    //! Write a setting to <datadir>/settings.json.
+     virtual bool updateRwSetting(const std::string &name,
+-                                 const util::SettingsValue &value,
+-                                 bool write = true) = 0;
++                                 const util::SettingsValue &value) = 0;
+ 
+     //! Synchronously send transactionAddedToMempool notifications about all
+     //! current mempool transactions to the specified handler and return after
+@@ -316,13 +324,6 @@ public:
+     //! removed transactions and already added new transactions.
+     virtual void requestMempoolTransactions(Notifications &notifications) = 0;
+ 
+-    //! Return true if an assumed-valid chain is in use.
+-    virtual bool hasAssumedValidChain() = 0;
+-
+-    //! Get internal node context. Useful for testing, but not
+-    //! accessible across processes.
+-    virtual node::NodeContext *context() { return nullptr; }
+-
+     //! This Chain's parameters
+     virtual const CChainParams &params() const = 0;
+ };
+@@ -356,8 +357,7 @@ public:
+ };
+ 
+ //! Return implementation of Chain interface.
+-std::unique_ptr<Chain> MakeChain(node::NodeContext &node,
+-                                 const CChainParams &params);
++std::unique_ptr<Chain> MakeChain(NodeContext &node, const CChainParams &params);
+ 
+ } // namespace interfaces
+ 
+diff --git a/src/interfaces/handler.cpp b/src/interfaces/handler.cpp
+index 378818121..e1c0f8d7f 100644
+--- a/src/interfaces/handler.cpp
++++ b/src/interfaces/handler.cpp
+@@ -4,7 +4,7 @@
+ 
+ #include <interfaces/handler.h>
+ 
+-#include <common/system.h>
++#include <util/system.h>
+ 
+ #include <boost/signals2/connection.hpp>
+ #include <utility>
+diff --git a/src/interfaces/node.cpp b/src/interfaces/node.cpp
+new file mode 100644
+index 000000000..67a972c26
+--- /dev/null
++++ b/src/interfaces/node.cpp
+@@ -0,0 +1,325 @@
++// Copyright (c) 2018 The Bitcoin Core developers
++// Distributed under the MIT software license, see the accompanying
++// file COPYING or http://www.opensource.org/licenses/mit-license.php.
++
++#include <interfaces/node.h>
++
++#include <addrdb.h>
++#include <banman.h>
++#include <chain.h>
++#include <chainparams.h>
++#include <config.h>
++#include <init.h>
++#include <interfaces/chain.h>
++#include <interfaces/handler.h>
++#include <interfaces/wallet.h>
++#include <net.h>
++#include <net_processing.h>
++#include <netaddress.h>
++#include <netbase.h>
++#include <node/context.h>
++#include <node/ui_interface.h>
++#include <policy/fees.h>
++#include <policy/settings.h>
++#include <primitives/block.h>
++#include <rpc/server.h>
++#include <shutdown.h>
++#include <support/allocators/secure.h>
++#include <sync.h>
++#include <txmempool.h>
++#include <util/check.h>
++#include <util/ref.h>
++#include <util/system.h>
++#include <util/translation.h>
++#include <validation.h>
++#include <warnings.h>
++
++#if defined(HAVE_CONFIG_H)
++#include <config/bitcoin-config.h>
++#endif
++
++#include <univalue.h>
++
++#include <boost/signals2/signal.hpp>
++
++class HTTPRPCRequestProcessor;
++namespace interfaces {
++namespace {
++
++    class NodeImpl : public Node {
++    public:
++        NodeImpl(NodeContext *context) { setContext(context); }
++        void initLogging() override { InitLogging(*Assert(m_context->args)); }
++        void initParameterInteraction() override {
++            InitParameterInteraction(*Assert(m_context->args));
++        }
++        bilingual_str getWarnings() override { return GetWarnings(true); }
++        bool baseInitialize(Config &config) override {
++            return AppInitBasicSetup(gArgs) &&
++                   AppInitParameterInteraction(config, gArgs) &&
++                   AppInitSanityChecks() && AppInitLockDataDirectory() &&
++                   AppInitInterfaces(*m_context);
++        }
++        bool appInitMain(Config &config, RPCServer &rpcServer,
++                         HTTPRPCRequestProcessor &httpRPCRequestProcessor,
++                         interfaces::BlockAndHeaderTipInfo *tip_info) override {
++            return AppInitMain(config, rpcServer, httpRPCRequestProcessor,
++                               *m_context, tip_info);
++        }
++        void appShutdown() override {
++            Interrupt(*m_context);
++            Shutdown(*m_context);
++        }
++        void startShutdown() override {
++            StartShutdown();
++            // Stop RPC for clean shutdown if any of waitfor* commands is
++            // executed.
++            if (gArgs.GetBoolArg("-server", false)) {
++                InterruptRPC();
++                StopRPC();
++            }
++        }
++        bool shutdownRequested() override { return ShutdownRequested(); }
++        void mapPort(bool use_upnp) override {
++            if (use_upnp) {
++                StartMapPort();
++            } else {
++                InterruptMapPort();
++                StopMapPort();
++            }
++        }
++        bool getProxy(Network net, proxyType &proxy_info) override {
++            return GetProxy(net, proxy_info);
++        }
++        size_t getNodeCount(CConnman::NumConnections flags) override {
++            return m_context->connman ? m_context->connman->GetNodeCount(flags)
++                                      : 0;
++        }
++        bool getNodesStats(NodesStats &stats) override {
++            stats.clear();
++
++            if (m_context->connman) {
++                std::vector<CNodeStats> stats_temp;
++                m_context->connman->GetNodeStats(stats_temp);
++
++                stats.reserve(stats_temp.size());
++                for (auto &node_stats_temp : stats_temp) {
++                    stats.emplace_back(std::move(node_stats_temp), false,
++                                       CNodeStateStats());
++                }
++
++                // Try to retrieve the CNodeStateStats for each node.
++                if (m_context->peerman) {
++                    TRY_LOCK(::cs_main, lockMain);
++                    if (lockMain) {
++                        for (auto &node_stats : stats) {
++                            std::get<1>(node_stats) =
++                                m_context->peerman->GetNodeStateStats(
++                                    std::get<0>(node_stats).nodeid,
++                                    std::get<2>(node_stats));
++                        }
++                    }
++                }
++                return true;
++            }
++            return false;
++        }
++        bool getBanned(banmap_t &banmap) override {
++            if (m_context->banman) {
++                m_context->banman->GetBanned(banmap);
++                return true;
++            }
++            return false;
++        }
++        bool ban(const CNetAddr &net_addr, int64_t ban_time_offset) override {
++            if (m_context->banman) {
++                m_context->banman->Ban(net_addr, ban_time_offset);
++                return true;
++            }
++            return false;
++        }
++        bool unban(const CSubNet &ip) override {
++            if (m_context->banman) {
++                m_context->banman->Unban(ip);
++                return true;
++            }
++            return false;
++        }
++        bool disconnectByAddress(const CNetAddr &net_addr) override {
++            if (m_context->connman) {
++                return m_context->connman->DisconnectNode(net_addr);
++            }
++            return false;
++        }
++        bool disconnectById(NodeId id) override {
++            if (m_context->connman) {
++                return m_context->connman->DisconnectNode(id);
++            }
++            return false;
++        }
++        int64_t getTotalBytesRecv() override {
++            return m_context->connman ? m_context->connman->GetTotalBytesRecv()
++                                      : 0;
++        }
++        int64_t getTotalBytesSent() override {
++            return m_context->connman ? m_context->connman->GetTotalBytesSent()
++                                      : 0;
++        }
++        size_t getMempoolSize() override {
++            return m_context->mempool ? m_context->mempool->size() : 0;
++        }
++        size_t getMempoolDynamicUsage() override {
++            return m_context->mempool ? m_context->mempool->DynamicMemoryUsage()
++                                      : 0;
++        }
++        bool getHeaderTip(int &height, int64_t &block_time) override {
++            LOCK(::cs_main);
++            if (::pindexBestHeader) {
++                height = ::pindexBestHeader->nHeight;
++                block_time = ::pindexBestHeader->GetBlockTime();
++                return true;
++            }
++            return false;
++        }
++        int getNumBlocks() override {
++            LOCK(::cs_main);
++            return ::ChainActive().Height();
++        }
++        BlockHash getBestBlockHash() override {
++            const CBlockIndex *tip =
++                WITH_LOCK(::cs_main, return ::ChainActive().Tip());
++            return tip ? tip->GetBlockHash()
++                       : Params().GenesisBlock().GetHash();
++        }
++        int64_t getLastBlockTime() override {
++            LOCK(::cs_main);
++            if (::ChainActive().Tip()) {
++                return ::ChainActive().Tip()->GetBlockTime();
++            }
++            // Genesis block's time of current network
++            return Params().GenesisBlock().GetBlockTime();
++        }
++        double getVerificationProgress() override {
++            const CBlockIndex *tip;
++            {
++                LOCK(::cs_main);
++                tip = ::ChainActive().Tip();
++            }
++            return GuessVerificationProgress(Params().TxData(), tip);
++        }
++        bool isInitialBlockDownload() override {
++            return ::ChainstateActive().IsInitialBlockDownload();
++        }
++        bool getReindex() override { return ::fReindex; }
++        bool getImporting() override { return ::fImporting; }
++        void setNetworkActive(bool active) override {
++            if (m_context->connman) {
++                m_context->connman->SetNetworkActive(active);
++            }
++        }
++        bool getNetworkActive() override {
++            return m_context->connman && m_context->connman->GetNetworkActive();
++        }
++        CFeeRate estimateSmartFee() override {
++            return m_context->mempool ? m_context->mempool->estimateFee()
++                                      : CFeeRate();
++        }
++        CFeeRate getDustRelayFee() override { return ::dustRelayFee; }
++        UniValue executeRpc(Config &config, const std::string &command,
++                            const UniValue &params,
++                            const std::string &uri) override {
++            JSONRPCRequest req(m_context_ref);
++            req.params = params;
++            req.strMethod = command;
++            req.URI = uri;
++            return ::tableRPC.execute(config, req);
++        }
++        std::vector<std::string> listRpcCommands() override {
++            return ::tableRPC.listCommands();
++        }
++        void rpcSetTimerInterfaceIfUnset(RPCTimerInterface *iface) override {
++            RPCSetTimerInterfaceIfUnset(iface);
++        }
++        void rpcUnsetTimerInterface(RPCTimerInterface *iface) override {
++            RPCUnsetTimerInterface(iface);
++        }
++        bool getUnspentOutput(const COutPoint &output, Coin &coin) override {
++            LOCK(::cs_main);
++            return ::ChainstateActive().CoinsTip().GetCoin(output, coin);
++        }
++        WalletClient &walletClient() override {
++            return *Assert(m_context->wallet_client);
++        }
++        std::unique_ptr<Handler> handleInitMessage(InitMessageFn fn) override {
++            return MakeHandler(::uiInterface.InitMessage_connect(fn));
++        }
++        std::unique_ptr<Handler> handleMessageBox(MessageBoxFn fn) override {
++            return MakeHandler(::uiInterface.ThreadSafeMessageBox_connect(fn));
++        }
++        std::unique_ptr<Handler> handleQuestion(QuestionFn fn) override {
++            return MakeHandler(::uiInterface.ThreadSafeQuestion_connect(fn));
++        }
++        std::unique_ptr<Handler>
++        handleShowProgress(ShowProgressFn fn) override {
++            return MakeHandler(::uiInterface.ShowProgress_connect(fn));
++        }
++        std::unique_ptr<Handler> handleNotifyNumConnectionsChanged(
++            NotifyNumConnectionsChangedFn fn) override {
++            return MakeHandler(
++                ::uiInterface.NotifyNumConnectionsChanged_connect(fn));
++        }
++        std::unique_ptr<Handler> handleNotifyNetworkActiveChanged(
++            NotifyNetworkActiveChangedFn fn) override {
++            return MakeHandler(
++                ::uiInterface.NotifyNetworkActiveChanged_connect(fn));
++        }
++        std::unique_ptr<Handler>
++        handleNotifyAlertChanged(NotifyAlertChangedFn fn) override {
++            return MakeHandler(::uiInterface.NotifyAlertChanged_connect(fn));
++        }
++        std::unique_ptr<Handler>
++        handleBannedListChanged(BannedListChangedFn fn) override {
++            return MakeHandler(::uiInterface.BannedListChanged_connect(fn));
++        }
++        std::unique_ptr<Handler>
++        handleNotifyBlockTip(NotifyBlockTipFn fn) override {
++            return MakeHandler(::uiInterface.NotifyBlockTip_connect(
++                [fn](SynchronizationState sync_state,
++                     const CBlockIndex *block) {
++                    fn(sync_state,
++                       BlockTip{block->nHeight, block->GetBlockTime(),
++                                block->GetBlockHash()},
++                       GuessVerificationProgress(Params().TxData(), block));
++                }));
++        }
++        std::unique_ptr<Handler>
++        handleNotifyHeaderTip(NotifyHeaderTipFn fn) override {
++            /* verification progress is unused when a header was received */
++            return MakeHandler(::uiInterface.NotifyHeaderTip_connect(
++                [fn](SynchronizationState sync_state,
++                     const CBlockIndex *block) {
++                    fn(sync_state,
++                       BlockTip{block->nHeight, block->GetBlockTime(),
++                                block->GetBlockHash()},
++                       0);
++                }));
++        }
++        NodeContext *context() override { return m_context; }
++        void setContext(NodeContext *context) override {
++            m_context = context;
++            if (context) {
++                m_context_ref.Set(*context);
++            } else {
++                m_context_ref.Clear();
++            }
++        }
++        NodeContext *m_context{nullptr};
++        util::Ref m_context_ref{m_context};
++    };
++} // namespace
++
++std::unique_ptr<Node> MakeNode(NodeContext *context) {
++    return std::make_unique<NodeImpl>(context);
++}
++
++} // namespace interfaces
+diff --git a/src/interfaces/node.h b/src/interfaces/node.h
+index 8a82e14eb..eccb5c9d4 100644
+--- a/src/interfaces/node.h
++++ b/src/interfaces/node.h
+@@ -5,14 +5,12 @@
+ #ifndef BITCOIN_INTERFACES_NODE_H
+ #define BITCOIN_INTERFACES_NODE_H
+ 
+-#include <consensus/amount.h>
+-#include <net.h>        // For NodeId
++#include <amount.h>     // For Amount
++#include <net.h>        // For CConnman::NumConnections
+ #include <net_types.h>  // For banmap_t
+ #include <netaddress.h> // For Network
+-#include <netbase.h>    // For ConnectionDirection
+ 
+ #include <support/allocators/secure.h> // For SecureString
+-#include <util/settings.h>             // For util::SettingsValue
+ #include <util/translation.h>
+ 
+ #include <cstddef>
+@@ -31,15 +29,13 @@ struct CNodeStats;
+ class Coin;
+ class Config;
+ class HTTPRPCRequestProcessor;
++struct NodeContext;
+ class proxyType;
+ class RPCServer;
+ class RPCTimerInterface;
+ enum class SynchronizationState;
+ class UniValue;
+ struct bilingual_str;
+-namespace node {
+-struct NodeContext;
+-} // namespace node
+ 
+ namespace interfaces {
+ class Handler;
+@@ -55,7 +51,7 @@ struct BlockAndHeaderTipInfo {
+     double verification_progress;
+ };
+ 
+-//! Top-level interface for a bitcoin node (bitcoind process).
++//! Top-level interface for a bitcoin node (lotusd process).
+ class Node {
+ public:
+     virtual ~Node() {}
+@@ -69,9 +65,6 @@ public:
+     //! Get warnings.
+     virtual bilingual_str getWarnings() = 0;
+ 
+-    //! Get exit status.
+-    virtual int getExitStatus() = 0;
+-
+     //! Initialize app dependencies.
+     virtual bool baseInitialize(Config &config) = 0;
+ 
+@@ -90,35 +83,14 @@ public:
+     //! Return whether shutdown was requested.
+     virtual bool shutdownRequested() = 0;
+ 
+-    //! Return whether a particular setting in <datadir>/settings.json
+-    //! would be ignored because it is also specified in the command line.
+-    virtual bool isPersistentSettingIgnored(const std::string &name) = 0;
+-
+-    //! Return setting value from <datadir>/settings.json or bitcoin.conf.
+-    virtual util::SettingsValue
+-    getPersistentSetting(const std::string &name) = 0;
+-
+-    //! Update a setting in <datadir>/settings.json.
+-    virtual void updateRwSetting(const std::string &name,
+-                                 const util::SettingsValue &value) = 0;
+-
+-    //! Force a setting value to be applied, overriding any other configuration
+-    //! source, but not being persisted.
+-    virtual void forceSetting(const std::string &name,
+-                              const util::SettingsValue &value) = 0;
+-
+-    //! Clear all settings in <datadir>/settings.json and store a backup of
+-    //! previous settings in <datadir>/settings.json.bak.
+-    virtual void resetSettings() = 0;
+-
+     //! Map port.
+-    virtual void mapPort(bool use_upnp, bool use_natpmp) = 0;
++    virtual void mapPort(bool use_upnp) = 0;
+ 
+     //! Get proxy.
+     virtual bool getProxy(Network net, proxyType &proxy_info) = 0;
+ 
+     //! Get number of connections.
+-    virtual size_t getNodeCount(ConnectionDirection flags) = 0;
++    virtual size_t getNodeCount(CConnman::NumConnections flags) = 0;
+ 
+     //! Get stats for connected nodes.
+     using NodesStats =
+@@ -170,8 +142,11 @@ public:
+     //! Is initial block download.
+     virtual bool isInitialBlockDownload() = 0;
+ 
+-    //! Is loading blocks.
+-    virtual bool isLoadingBlocks() = 0;
++    //! Get reindex.
++    virtual bool getReindex() = 0;
++
++    //! Get importing.
++    virtual bool getImporting() = 0;
+ 
+     //! Set network active.
+     virtual void setNetworkActive(bool active) = 0;
+@@ -179,12 +154,14 @@ public:
+     //! Get network active.
+     virtual bool getNetworkActive() = 0;
+ 
++    //! Estimate smart fee.
++    virtual CFeeRate estimateSmartFee() = 0;
++
+     //! Get dust relay fee.
+     virtual CFeeRate getDustRelayFee() = 0;
+ 
+     //! Execute rpc command.
+-    virtual UniValue executeRpc(const Config &config,
+-                                const std::string &command,
++    virtual UniValue executeRpc(Config &config, const std::string &command,
+                                 const UniValue &params,
+                                 const std::string &uri) = 0;
+ 
+@@ -255,19 +232,20 @@ public:
+     handleNotifyBlockTip(NotifyBlockTipFn fn) = 0;
+ 
+     //! Register handler for header tip messages.
+-    using NotifyHeaderTipFn = std::function<void(
+-        SynchronizationState, interfaces::BlockTip tip, bool presync)>;
++    using NotifyHeaderTipFn =
++        std::function<void(SynchronizationState, interfaces::BlockTip tip,
++                           double verification_progress)>;
+     virtual std::unique_ptr<Handler>
+     handleNotifyHeaderTip(NotifyHeaderTipFn fn) = 0;
+ 
+     //! Get and set internal node context. Useful for testing, but not
+     //! accessible across processes.
+-    virtual node::NodeContext *context() { return nullptr; }
+-    virtual void setContext(node::NodeContext *context) {}
++    virtual NodeContext *context() { return nullptr; }
++    virtual void setContext(NodeContext *context) {}
+ };
+ 
+ //! Return implementation of Node interface.
+-std::unique_ptr<Node> MakeNode(node::NodeContext *context);
++std::unique_ptr<Node> MakeNode(NodeContext *context = nullptr);
+ 
+ //! Block tip (could be a header or not, depends on the subscribed signal).
+ struct BlockTip {
+diff --git a/src/interfaces/wallet.cpp b/src/interfaces/wallet.cpp
+new file mode 100644
+index 000000000..16875ea03
+--- /dev/null
++++ b/src/interfaces/wallet.cpp
+@@ -0,0 +1,569 @@
++// Copyright (c) 2018 The Bitcoin Core developers
++// Distributed under the MIT software license, see the accompanying
++// file COPYING or http://www.opensource.org/licenses/mit-license.php.
++
++#include <interfaces/wallet.h>
++
++#include <amount.h>
++#include <chainparams.h>
++#include <config.h>
++#include <consensus/validation.h>
++#include <interfaces/chain.h>
++#include <interfaces/handler.h>
++#include <policy/fees.h>
++#include <primitives/transaction.h>
++#include <rpc/server.h>
++#include <script/standard.h>
++#include <support/allocators/secure.h>
++#include <sync.h>
++#include <util/check.h>
++#include <util/ref.h>
++#include <util/system.h>
++#include <util/ui_change_type.h>
++#include <wallet/context.h>
++#include <wallet/fees.h>
++#include <wallet/ismine.h>
++#include <wallet/load.h>
++#include <wallet/rpcdump.h>
++#include <wallet/wallet.h>
++
++namespace interfaces {
++namespace {
++
++    //! Construct wallet tx struct.
++    WalletTx MakeWalletTx(CWallet &wallet, const CWalletTx &wtx) {
++        LOCK(wallet.cs_wallet);
++        WalletTx result;
++        result.tx = wtx.tx;
++        result.txin_is_mine.reserve(wtx.tx->vin.size());
++        for (const auto &txin : wtx.tx->vin) {
++            result.txin_is_mine.emplace_back(wallet.IsMine(txin));
++        }
++        result.txout_is_mine.reserve(wtx.tx->vout.size());
++        result.txout_address.reserve(wtx.tx->vout.size());
++        result.txout_address_is_mine.reserve(wtx.tx->vout.size());
++        for (const auto &txout : wtx.tx->vout) {
++            result.txout_is_mine.emplace_back(wallet.IsMine(txout));
++            result.txout_address.emplace_back();
++            result.txout_address_is_mine.emplace_back(
++                ExtractDestination(txout.scriptPubKey,
++                                   result.txout_address.back())
++                    ? wallet.IsMine(result.txout_address.back())
++                    : ISMINE_NO);
++        }
++        result.credit = wtx.GetCredit(ISMINE_ALL);
++        result.debit = wtx.GetDebit(ISMINE_ALL);
++        result.change = wtx.GetChange();
++        result.time = wtx.GetTxTime();
++        result.value_map = wtx.mapValue;
++        result.is_coinbase = wtx.IsCoinBase();
++        return result;
++    }
++
++    //! Construct wallet tx status struct.
++    WalletTxStatus MakeWalletTxStatus(CWallet &wallet, const CWalletTx &wtx) {
++        WalletTxStatus result;
++        result.block_height = wtx.m_confirm.block_height > 0
++                                  ? wtx.m_confirm.block_height
++                                  : std::numeric_limits<int>::max();
++        result.blocks_to_maturity = wtx.GetBlocksToMaturity();
++        result.depth_in_main_chain = wtx.GetDepthInMainChain();
++        result.time_received = wtx.nTimeReceived;
++        result.lock_time = wtx.tx->nLockTime;
++        TxValidationState state;
++        result.is_final =
++            wallet.chain().contextualCheckTransactionForCurrentBlock(*wtx.tx,
++                                                                     state);
++        result.is_trusted = wtx.IsTrusted();
++        result.is_abandoned = wtx.isAbandoned();
++        result.is_coinbase = wtx.IsCoinBase();
++        result.is_in_main_chain = wtx.IsInMainChain();
++        return result;
++    }
++
++    //! Construct wallet TxOut struct.
++    WalletTxOut MakeWalletTxOut(CWallet &wallet, const CWalletTx &wtx, int n,
++                                int depth)
++        EXCLUSIVE_LOCKS_REQUIRED(wallet.cs_wallet) {
++        WalletTxOut result;
++        result.txout = wtx.tx->vout[n];
++        result.time = wtx.GetTxTime();
++        result.depth_in_main_chain = depth;
++        result.is_spent = wallet.IsSpent(COutPoint(wtx.GetId(), n));
++        return result;
++    }
++
++    class WalletImpl : public Wallet {
++    public:
++        explicit WalletImpl(const std::shared_ptr<CWallet> &wallet)
++            : m_wallet(wallet) {}
++
++        bool encryptWallet(const SecureString &wallet_passphrase) override {
++            return m_wallet->EncryptWallet(wallet_passphrase);
++        }
++        bool isCrypted() override { return m_wallet->IsCrypted(); }
++        bool lock() override { return m_wallet->Lock(); }
++        bool unlock(const SecureString &wallet_passphrase) override {
++            return m_wallet->Unlock(wallet_passphrase);
++        }
++        bool isLocked() override { return m_wallet->IsLocked(); }
++        bool changeWalletPassphrase(
++            const SecureString &old_wallet_passphrase,
++            const SecureString &new_wallet_passphrase) override {
++            return m_wallet->ChangeWalletPassphrase(old_wallet_passphrase,
++                                                    new_wallet_passphrase);
++        }
++        void abortRescan() override { m_wallet->AbortRescan(); }
++        bool backupWallet(const std::string &filename) override {
++            return m_wallet->BackupWallet(filename);
++        }
++        std::string getWalletName() override { return m_wallet->GetName(); }
++        std::set<CTxDestination>
++        getLabelAddresses(const std::string &label) override {
++            return m_wallet->GetLabelAddresses(label);
++        };
++        bool getNewDestination(const OutputType type, const std::string label,
++                               CTxDestination &dest) override {
++            LOCK(m_wallet->cs_wallet);
++            std::string error;
++            return m_wallet->GetNewDestination(type, label, dest, error);
++        }
++        const CChainParams &getChainParams() override {
++            return m_wallet->GetChainParams();
++        }
++        bool getPubKey(const CScript &script, const CKeyID &address,
++                       CPubKey &pub_key) override {
++            std::unique_ptr<SigningProvider> provider =
++                m_wallet->GetSolvingProvider(script);
++            if (provider) {
++                return provider->GetPubKey(address, pub_key);
++            }
++            return false;
++        }
++        SigningResult signMessage(const std::string &message,
++                                  const PKHash &pkhash,
++                                  std::string &str_sig) override {
++            return m_wallet->SignMessage(message, pkhash, str_sig);
++        }
++        bool isSpendable(const CTxDestination &dest) override {
++            LOCK(m_wallet->cs_wallet);
++            return m_wallet->IsMine(dest) & ISMINE_SPENDABLE;
++        }
++        bool haveWatchOnly() override {
++            auto spk_man = m_wallet->GetLegacyScriptPubKeyMan();
++            if (spk_man) {
++                return spk_man->HaveWatchOnly();
++            }
++            return false;
++        };
++        bool setAddressBook(const CTxDestination &dest, const std::string &name,
++                            const std::string &purpose) override {
++            return m_wallet->SetAddressBook(dest, name, purpose);
++        }
++        bool delAddressBook(const CTxDestination &dest) override {
++            return m_wallet->DelAddressBook(dest);
++        }
++        bool getAddress(const CTxDestination &dest, std::string *name,
++                        isminetype *is_mine, std::string *purpose) override {
++            LOCK(m_wallet->cs_wallet);
++            auto it = m_wallet->m_address_book.find(dest);
++            if (it == m_wallet->m_address_book.end() || it->second.IsChange()) {
++                return false;
++            }
++            if (name) {
++                *name = it->second.GetLabel();
++            }
++            if (is_mine) {
++                *is_mine = m_wallet->IsMine(dest);
++            }
++            if (purpose) {
++                *purpose = it->second.purpose;
++            }
++            return true;
++        }
++        std::vector<WalletAddress> getAddresses() override {
++            LOCK(m_wallet->cs_wallet);
++            std::vector<WalletAddress> result;
++            for (const auto &item : m_wallet->m_address_book) {
++                if (item.second.IsChange()) {
++                    continue;
++                }
++                result.emplace_back(item.first, m_wallet->IsMine(item.first),
++                                    item.second.GetLabel(),
++                                    item.second.purpose);
++            }
++            return result;
++        }
++        bool addDestData(const CTxDestination &dest, const std::string &key,
++                         const std::string &value) override {
++            LOCK(m_wallet->cs_wallet);
++            WalletBatch batch{m_wallet->GetDatabase()};
++            return m_wallet->AddDestData(batch, dest, key, value);
++        }
++        bool eraseDestData(const CTxDestination &dest,
++                           const std::string &key) override {
++            LOCK(m_wallet->cs_wallet);
++            WalletBatch batch{m_wallet->GetDatabase()};
++            return m_wallet->EraseDestData(batch, dest, key);
++        }
++        std::vector<std::string>
++        getDestValues(const std::string &prefix) override {
++            LOCK(m_wallet->cs_wallet);
++            return m_wallet->GetDestValues(prefix);
++        }
++        void lockCoin(const COutPoint &output) override {
++            LOCK(m_wallet->cs_wallet);
++            return m_wallet->LockCoin(output);
++        }
++        void unlockCoin(const COutPoint &output) override {
++            LOCK(m_wallet->cs_wallet);
++            return m_wallet->UnlockCoin(output);
++        }
++        bool isLockedCoin(const COutPoint &output) override {
++            LOCK(m_wallet->cs_wallet);
++            return m_wallet->IsLockedCoin(output);
++        }
++        void listLockedCoins(std::vector<COutPoint> &outputs) override {
++            LOCK(m_wallet->cs_wallet);
++            return m_wallet->ListLockedCoins(outputs);
++        }
++        CTransactionRef
++        createTransaction(const std::vector<CRecipient> &recipients,
++                          const CCoinControl &coin_control, bool sign,
++                          int &change_pos, Amount &fee,
++                          bilingual_str &fail_reason) override {
++            LOCK(m_wallet->cs_wallet);
++            CTransactionRef tx;
++            if (!m_wallet->CreateTransaction(recipients, tx, fee, change_pos,
++                                             fail_reason, coin_control, sign)) {
++                return {};
++            }
++            return tx;
++        }
++        void commitTransaction(CTransactionRef tx, WalletValueMap value_map,
++                               WalletOrderForm order_form) override {
++            LOCK(m_wallet->cs_wallet);
++            m_wallet->CommitTransaction(std::move(tx), std::move(value_map),
++                                        std::move(order_form));
++        }
++        bool transactionCanBeAbandoned(const TxId &txid) override {
++            return m_wallet->TransactionCanBeAbandoned(txid);
++        }
++        bool abandonTransaction(const TxId &txid) override {
++            LOCK(m_wallet->cs_wallet);
++            return m_wallet->AbandonTransaction(txid);
++        }
++        CTransactionRef getTx(const TxId &txid) override {
++            LOCK(m_wallet->cs_wallet);
++            auto mi = m_wallet->mapWallet.find(txid);
++            if (mi != m_wallet->mapWallet.end()) {
++                return mi->second.tx;
++            }
++            return {};
++        }
++        WalletTx getWalletTx(const TxId &txid) override {
++            LOCK(m_wallet->cs_wallet);
++            auto mi = m_wallet->mapWallet.find(txid);
++            if (mi != m_wallet->mapWallet.end()) {
++                return MakeWalletTx(*m_wallet, mi->second);
++            }
++            return {};
++        }
++        std::vector<WalletTx> getWalletTxs() override {
++            LOCK(m_wallet->cs_wallet);
++            std::vector<WalletTx> result;
++            result.reserve(m_wallet->mapWallet.size());
++            for (const auto &entry : m_wallet->mapWallet) {
++                result.emplace_back(MakeWalletTx(*m_wallet, entry.second));
++            }
++            return result;
++        }
++        bool tryGetTxStatus(const TxId &txid,
++                            interfaces::WalletTxStatus &tx_status,
++                            int &num_blocks, int64_t &block_time) override {
++            TRY_LOCK(m_wallet->cs_wallet, locked_wallet);
++            if (!locked_wallet) {
++                return false;
++            }
++            auto mi = m_wallet->mapWallet.find(txid);
++            if (mi == m_wallet->mapWallet.end()) {
++                return false;
++            }
++            num_blocks = m_wallet->GetLastBlockHeight();
++            block_time = -1;
++            CHECK_NONFATAL(m_wallet->chain().findBlock(
++                m_wallet->GetLastBlockHash(), FoundBlock().time(block_time)));
++            tx_status = MakeWalletTxStatus(*m_wallet, mi->second);
++            return true;
++        }
++        WalletTx getWalletTxDetails(const TxId &txid, WalletTxStatus &tx_status,
++                                    WalletOrderForm &order_form,
++                                    bool &in_mempool,
++                                    int &num_blocks) override {
++            LOCK(m_wallet->cs_wallet);
++            auto mi = m_wallet->mapWallet.find(txid);
++            if (mi != m_wallet->mapWallet.end()) {
++                num_blocks = m_wallet->GetLastBlockHeight();
++                in_mempool = mi->second.InMempool();
++                order_form = mi->second.vOrderForm;
++                tx_status = MakeWalletTxStatus(*m_wallet, mi->second);
++                return MakeWalletTx(*m_wallet, mi->second);
++            }
++            return {};
++        }
++        TransactionError fillPSBT(SigHashType sighash_type, bool sign,
++                                  bool bip32derivs,
++                                  PartiallySignedTransaction &psbtx,
++                                  bool &complete) const override {
++            return m_wallet->FillPSBT(psbtx, complete, sighash_type, sign,
++                                      bip32derivs);
++        }
++        WalletBalances getBalances() override {
++            const auto bal = m_wallet->GetBalance();
++            WalletBalances result;
++            result.balance = bal.m_mine_trusted;
++            result.unconfirmed_balance = bal.m_mine_untrusted_pending;
++            result.immature_balance = bal.m_mine_immature;
++            result.have_watch_only = haveWatchOnly();
++            if (result.have_watch_only) {
++                result.watch_only_balance = bal.m_watchonly_trusted;
++                result.unconfirmed_watch_only_balance =
++                    bal.m_watchonly_untrusted_pending;
++                result.immature_watch_only_balance = bal.m_watchonly_immature;
++            }
++            return result;
++        }
++        bool tryGetBalances(WalletBalances &balances,
++                            BlockHash &block_hash) override {
++            TRY_LOCK(m_wallet->cs_wallet, locked_wallet);
++            if (!locked_wallet) {
++                return false;
++            }
++            block_hash = m_wallet->GetLastBlockHash();
++            balances = getBalances();
++            return true;
++        }
++        Amount getBalance() override {
++            return m_wallet->GetBalance().m_mine_trusted;
++        }
++        Amount getAvailableBalance(const CCoinControl &coin_control) override {
++            return m_wallet->GetAvailableBalance(&coin_control);
++        }
++        isminetype txinIsMine(const CTxIn &txin) override {
++            LOCK(m_wallet->cs_wallet);
++            return m_wallet->IsMine(txin);
++        }
++        isminetype txoutIsMine(const CTxOut &txout) override {
++            LOCK(m_wallet->cs_wallet);
++            return m_wallet->IsMine(txout);
++        }
++        Amount getDebit(const CTxIn &txin, isminefilter filter) override {
++            LOCK(m_wallet->cs_wallet);
++            return m_wallet->GetDebit(txin, filter);
++        }
++        Amount getCredit(const CTxOut &txout, isminefilter filter) override {
++            LOCK(m_wallet->cs_wallet);
++            return m_wallet->GetCredit(txout, filter);
++        }
++        CoinsList listCoins() override {
++            LOCK(m_wallet->cs_wallet);
++            CoinsList result;
++            for (const auto &entry : m_wallet->ListCoins()) {
++                auto &group = result[entry.first];
++                for (const auto &coin : entry.second) {
++                    group.emplace_back(COutPoint(coin.tx->GetId(), coin.i),
++                                       MakeWalletTxOut(*m_wallet, *coin.tx,
++                                                       coin.i, coin.nDepth));
++                }
++            }
++            return result;
++        }
++        std::vector<WalletTxOut>
++        getCoins(const std::vector<COutPoint> &outputs) override {
++            LOCK(m_wallet->cs_wallet);
++            std::vector<WalletTxOut> result;
++            result.reserve(outputs.size());
++            for (const auto &output : outputs) {
++                result.emplace_back();
++                auto it = m_wallet->mapWallet.find(output.GetTxId());
++                if (it != m_wallet->mapWallet.end()) {
++                    int depth = it->second.GetDepthInMainChain();
++                    if (depth >= 0) {
++                        result.back() = MakeWalletTxOut(*m_wallet, it->second,
++                                                        output.GetN(), depth);
++                    }
++                }
++            }
++            return result;
++        }
++        bool hdEnabled() override { return m_wallet->IsHDEnabled(); }
++        OutputType getDefaultAddressType() override {
++            return m_wallet->m_default_address_type;
++        }
++        bool canGetAddresses() const override {
++            return m_wallet->CanGetAddresses();
++        }
++        bool privateKeysDisabled() override {
++            return m_wallet->IsWalletFlagSet(WALLET_FLAG_DISABLE_PRIVATE_KEYS);
++        }
++        Amount getDefaultMaxTxFee() override {
++            return m_wallet->m_default_max_tx_fee;
++        }
++        void remove() override {
++            RemoveWallet(m_wallet, false /* load_on_start */);
++        }
++        bool isLegacy() override { return m_wallet->IsLegacy(); }
++        std::unique_ptr<Handler> handleUnload(UnloadFn fn) override {
++            return MakeHandler(m_wallet->NotifyUnload.connect(fn));
++        }
++        std::unique_ptr<Handler>
++        handleShowProgress(ShowProgressFn fn) override {
++            return MakeHandler(m_wallet->ShowProgress.connect(fn));
++        }
++        std::unique_ptr<Handler>
++        handleStatusChanged(StatusChangedFn fn) override {
++            return MakeHandler(m_wallet->NotifyStatusChanged.connect(
++                [fn](CWallet *) { fn(); }));
++        }
++        std::unique_ptr<Handler>
++        handleAddressBookChanged(AddressBookChangedFn fn) override {
++            return MakeHandler(m_wallet->NotifyAddressBookChanged.connect(
++                [fn](CWallet *, const CTxDestination &address,
++                     const std::string &label, bool is_mine,
++                     const std::string &purpose, ChangeType status) {
++                    fn(address, label, is_mine, purpose, status);
++                }));
++        }
++        std::unique_ptr<Handler>
++        handleTransactionChanged(TransactionChangedFn fn) override {
++            return MakeHandler(m_wallet->NotifyTransactionChanged.connect(
++                [fn](CWallet *, const TxId &txid, ChangeType status) {
++                    fn(txid, status);
++                }));
++        }
++        std::unique_ptr<Handler>
++        handleWatchOnlyChanged(WatchOnlyChangedFn fn) override {
++            return MakeHandler(m_wallet->NotifyWatchonlyChanged.connect(fn));
++        }
++        std::unique_ptr<Handler>
++        handleCanGetAddressesChanged(CanGetAddressesChangedFn fn) override {
++            return MakeHandler(
++                m_wallet->NotifyCanGetAddressesChanged.connect(fn));
++        }
++        Amount getRequiredFee(unsigned int tx_bytes) override {
++            return GetRequiredFee(*m_wallet, tx_bytes);
++        }
++        Amount getMinimumFee(unsigned int tx_bytes,
++                             const CCoinControl &coin_control) override {
++            return GetMinimumFee(*m_wallet, tx_bytes, coin_control);
++        }
++        CWallet *wallet() override { return m_wallet.get(); }
++
++        std::shared_ptr<CWallet> m_wallet;
++    };
++
++    class WalletClientImpl : public WalletClient {
++    public:
++        WalletClientImpl(Chain &chain, ArgsManager &args) {
++            m_context.chain = &chain;
++            m_context.args = &args;
++        }
++        ~WalletClientImpl() override { UnloadWallets(); }
++
++        //! ChainClient methods
++        void registerRpcs(const Span<const CRPCCommand> &commands) {
++            for (const CRPCCommand &command : commands) {
++                m_rpc_commands.emplace_back(
++                    command.category, command.name,
++                    [this, &command](const Config &config,
++                                     const JSONRPCRequest &request,
++                                     UniValue &result, bool last_handler) {
++                        return command.actor(config, {request, m_context},
++                                             result, last_handler);
++                    },
++                    command.argNames, command.unique_id);
++                m_rpc_handlers.emplace_back(
++                    m_context.chain->handleRpc(m_rpc_commands.back()));
++            }
++        }
++
++        void registerRpcs() override {
++            registerRpcs(GetWalletRPCCommands());
++            registerRpcs(GetWalletDumpRPCCommands());
++        }
++        bool verify() override { return VerifyWallets(*m_context.chain); }
++        bool load() override { return LoadWallets(*m_context.chain); }
++        void start(CScheduler &scheduler) override {
++            return StartWallets(scheduler, *Assert(m_context.args));
++        }
++        void flush() override { return FlushWallets(); }
++        void stop() override { return StopWallets(); }
++        void setMockTime(int64_t time) override { return SetMockTime(time); }
++
++        //! WalletClient methods
++        std::unique_ptr<Wallet>
++        createWallet(const std::string &name, const SecureString &passphrase,
++                     uint64_t wallet_creation_flags, bilingual_str &error,
++                     std::vector<bilingual_str> &warnings) override {
++            std::shared_ptr<CWallet> wallet;
++            DatabaseOptions options;
++            DatabaseStatus status;
++            options.require_create = true;
++            options.create_flags = wallet_creation_flags;
++            options.create_passphrase = passphrase;
++
++            return MakeWallet(CreateWallet(*m_context.chain, name,
++                                           true /* load_on_start */, options,
++                                           status, error, warnings));
++        }
++        std::unique_ptr<Wallet>
++        loadWallet(const std::string &name, bilingual_str &error,
++                   std::vector<bilingual_str> &warnings) override {
++            DatabaseOptions options;
++            DatabaseStatus status;
++            options.require_existing = true;
++            return MakeWallet(LoadWallet(*m_context.chain, name,
++                                         true /* load_on_start */, options,
++                                         status, error, warnings));
++        }
++        std::string getWalletDir() override {
++            return fs::PathToString(GetWalletDir());
++        }
++        std::vector<std::string> listWalletDir() override {
++            std::vector<std::string> paths;
++            for (auto &path : ListWalletDir()) {
++                paths.push_back(fs::PathToString(path));
++            }
++            return paths;
++        }
++
++        std::vector<std::unique_ptr<Wallet>> getWallets() override {
++            std::vector<std::unique_ptr<Wallet>> wallets;
++            for (const auto &wallet : GetWallets()) {
++                wallets.emplace_back(MakeWallet(wallet));
++            }
++            return wallets;
++        }
++
++        std::unique_ptr<Handler> handleLoadWallet(LoadWalletFn fn) override {
++            return HandleLoadWallet(std::move(fn));
++        }
++
++        WalletContext m_context;
++        const std::vector<std::string> m_wallet_filenames;
++        std::vector<std::unique_ptr<Handler>> m_rpc_handlers;
++        std::list<CRPCCommand> m_rpc_commands;
++    };
++
++} // namespace
++
++std::unique_ptr<Wallet> MakeWallet(const std::shared_ptr<CWallet> &wallet) {
++    return wallet ? std::make_unique<WalletImpl>(wallet) : nullptr;
++}
++
++std::unique_ptr<WalletClient> MakeWalletClient(Chain &chain,
++                                               ArgsManager &args) {
++    return std::make_unique<WalletClientImpl>(chain, args);
++}
++
++} // namespace interfaces
+diff --git a/src/interfaces/wallet.h b/src/interfaces/wallet.h
+index 27c0ac2dd..12da2698b 100644
+--- a/src/interfaces/wallet.h
++++ b/src/interfaces/wallet.h
+@@ -5,7 +5,7 @@
+ #ifndef BITCOIN_INTERFACES_WALLET_H
+ #define BITCOIN_INTERFACES_WALLET_H
+ 
+-#include <consensus/amount.h>
++#include <amount.h>           // For Amount
+ #include <interfaces/chain.h> // For ChainClient
+ #include <primitives/blockhash.h>
+ #include <primitives/transaction.h> // For CTxOut
+@@ -14,7 +14,6 @@
+ #include <script/standard.h>           // For CTxDestination
+ #include <support/allocators/secure.h> // For SecureString
+ #include <util/message.h>
+-#include <util/result.h>
+ #include <util/ui_change_type.h>
+ 
+ #include <cstdint>
+@@ -93,9 +92,14 @@ public:
+     //! Get chainparams.
+     virtual const CChainParams &getChainParams() = 0;
+ 
++    //! Get set of addresses corresponding to a given label.
++    virtual std::set<CTxDestination>
++    getLabelAddresses(const std::string &label) = 0;
++
+     // Get a new address.
+-    virtual util::Result<CTxDestination>
+-    getNewDestination(const OutputType type, const std::string &label) = 0;
++    virtual bool getNewDestination(const OutputType type,
++                                   const std::string label,
++                                   CTxDestination &dest) = 0;
+ 
+     //! Get public key.
+     virtual bool getPubKey(const CScript &script, const CKeyID &address,
+@@ -152,10 +156,11 @@ public:
+     virtual void listLockedCoins(std::vector<COutPoint> &outputs) = 0;
+ 
+     //! Create transaction.
+-    virtual util::Result<CTransactionRef>
++    virtual CTransactionRef
+     createTransaction(const std::vector<CRecipient> &recipients,
+                       const CCoinControl &coin_control, bool sign,
+-                      int &change_pos, Amount &fee) = 0;
++                      int &change_pos, Amount &fee,
++                      bilingual_str &fail_reason) = 0;
+ 
+     //! Commit transaction.
+     virtual void commitTransaction(CTransactionRef tx, WalletValueMap value_map,
+@@ -303,24 +308,19 @@ public:
+ class WalletClient : public ChainClient {
+ public:
+     //! Create new wallet.
+-    virtual util::Result<std::unique_ptr<Wallet>>
++    virtual std::unique_ptr<Wallet>
+     createWallet(const std::string &name, const SecureString &passphrase,
+-                 uint64_t wallet_creation_flags,
++                 uint64_t wallet_creation_flags, bilingual_str &error,
+                  std::vector<bilingual_str> &warnings) = 0;
+ 
+     //! Load existing wallet.
+-    virtual util::Result<std::unique_ptr<Wallet>>
+-    loadWallet(const std::string &name,
++    virtual std::unique_ptr<Wallet>
++    loadWallet(const std::string &name, bilingual_str &error,
+                std::vector<bilingual_str> &warnings) = 0;
+ 
+     //! Return default wallet directory.
+     virtual std::string getWalletDir() = 0;
+ 
+-    //! Restore backup wallet
+-    virtual util::Result<std::unique_ptr<Wallet>>
+-    restoreWallet(const fs::path &backup_file, const std::string &wallet_name,
+-                  std::vector<bilingual_str> &warnings) = 0;
+-
+     //! Return available wallets in wallet directory.
+     virtual std::vector<std::string> listWalletDir() = 0;
+ 
+@@ -332,9 +332,6 @@ public:
+     //! loaded at startup or by RPC.
+     using LoadWalletFn = std::function<void(std::unique_ptr<Wallet> wallet)>;
+     virtual std::unique_ptr<Handler> handleLoadWallet(LoadWalletFn fn) = 0;
+-
+-    //! Return pointer to internal context, useful for testing.
+-    virtual WalletContext *context() { return nullptr; }
+ };
+ 
+ //! Information about one wallet address.
+@@ -393,6 +390,7 @@ struct WalletTxStatus {
+     int depth_in_main_chain;
+     unsigned int time_received;
+     uint32_t lock_time;
++    bool is_final;
+     bool is_trusted;
+     bool is_abandoned;
+     bool is_coinbase;
+@@ -409,8 +407,7 @@ struct WalletTxOut {
+ 
+ //! Return implementation of Wallet interface. This function is defined in
+ //! dummywallet.cpp and throws if the wallet component is not compiled.
+-std::unique_ptr<Wallet> MakeWallet(WalletContext &context,
+-                                   const std::shared_ptr<CWallet> &wallet);
++std::unique_ptr<Wallet> MakeWallet(const std::shared_ptr<CWallet> &wallet);
+ 
+ //! Return implementation of ChainClient interface for a wallet client. This
+ //! function will be undefined in builds where ENABLE_WALLET is false.
