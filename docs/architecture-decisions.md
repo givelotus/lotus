@@ -5,10 +5,26 @@
 Goal: minimize operational complexity so community members can actually run nodes.
 
 ```
-logosd      — chain-agnostic PoW daemon (eCash fork + Lotus patches); replaces lotusd
-cashwebd    — unified messaging daemon (already consolidated: registry + relay + p2p)
-             uses embedded RocksDB — no separate database server required
+logosd        — chain-agnostic PoW daemon (eCash fork + Lotus patches)
+cashwebd      — unified messaging daemon (registry + relay + p2p); embedded RocksDB → ScyllaDB
+vase-server   — Go HTTP server: push notification registration, faucet, location (Gin + GORM)
+               does NOT need Lotus primitives; addresses stored as strings; Go is fine here
 ```
+
+### Language Matrix
+
+| Component | Language | Notes |
+|---|---|---|
+| logosd | C++ | eCash fork + Lotus patches |
+| cashwebd | Rust | bitcoinsuite-core for primitives |
+| vase-server | Go | no Lotus lib needed; Gin + GORM; keep as Go |
+| sdk/typescript | TypeScript | reference primitive implementation |
+| sdk/dart | Dart | mobile (Flutter/Vase); port from TypeScript + shared test vectors |
+| sdk/cashweb-ts | TypeScript | cashweb protocol layer (extracted from Stamp) |
+
+With AI assistance, maintaining Dart and TypeScript SDK parity is tractable: write
+clean TypeScript with comprehensive test vectors, port to Dart with AI, verify against
+the same vectors. The key is good test coverage at the protocol level.
 
 ## Open Questions
 
