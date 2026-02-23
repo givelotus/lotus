@@ -47,48 +47,49 @@ the same vectors. The key is good test coverage at the protocol level.
 ### Indexer (Chronik)
 
 **History:**
-- Chronik was funded by the Lotus project (~$20K) and originally built with NNG as its
-  event transport — it ran as a separate service that subscribed to block/tx events from
-  lotusd via the NNG pub/sub interface
-- eCash subsequently paid to pull Chronik in-process into their daemon and remove the NNG
-  dependency, making it eCash-specific and breaking Lotus support
-- Our eCash base (v0.24.11) predates Chronik's in-process integration — there is no Chronik
-  in the current V2 workspace at all
-- The NNG interface (patch 06) is present in V2 and still emits block/tx events; nothing
-  consumes them right now
+- Chronik was funded by the Lotus project (~$20K) and originally built with NNG as
+  its transport — it ran as a separate out-of-process service; NNG+flatbuffers let
+  the indexer live on a separate machine from the node, which was the point (indexers
+  are read-heavy; nodes are write-heavy; splitting lets you scale them independently)
+- The Chronik protobuf API was the query/notification interface; NNG was the **remoting
+  layer** that made that API reachable from another box
+- eCash subsequently pulled Chronik in-process and stripped NNG, making it eCash-specific
+  and removing the ability to run the indexer remotely
+- Timeline confirmed by `git log`:
+  - eCash v0.24.11: **January 2022** (our V2 base) — no in-process Chronik
+  - `chronik-bridge` FFI split: **September 2022** — first in-process integration
+  - IGUANA added to eCash master: **September 2024**
+  - doged base: **eCash v0.30.5** (2025) — fully integrated Chronik + IGUANA
+- Our V2 base (v0.24.11) predates both Chronik in-process AND IGUANA — neither is
+  present in the V2 workspace
 
 **Current state:**
-- `cashwebd` (Rust, in monorepo) connects to logosd via JSON-RPC — this is a different
-  service and not a full transaction indexer
-- doged has production Chronik (Tobias, EyeOfPython, worked on it) but NNG is stripped
-- No patch exists to restore Chronik to V2
+- No Chronik in V2 at all — predates it
+- NNG patch (06) emits block/tx events but nothing currently consumes them
+- doged (eCash v0.30.5) has production in-process Chronik, NNG stripped
+- IGUANA in V2 (patch 05) may conflict with or be redundant against eCash v0.30.x
+  where IGUANA is already upstream — verify when upgrading base
+- `cashwebd` connects via JSON-RPC only — not a full tx indexer
 
-**Why NNG matters beyond Chronik:**
-NNG was chosen because it serves as an **ecosystem event bus**, not just a Chronik
-transport. cashwebd subscribes to NNG for real-time block/tx notifications. Future
-services (monitoring, alerting, custom indexers) can subscribe without the daemon
-knowing about them. The daemon emits once; any number of consumers listen. Pulling
-Chronik in-process breaks this model by making Chronik a special citizen — but it
-does NOT mean NNG should be removed. The two are not mutually exclusive.
+**Why restore NNG:**
+NNG enabled remote indexer deployment (indexer on a different box than the node)
+via NNG+flatbuffers. cashwebd also uses NNG for real-time block/tx notifications.
+Restoring it alongside in-process Chronik gives the best of both worlds: fast
+in-process queries AND the ability to run an indexer remotely if needed.
 
 **Target architecture for V2:**
 - Daemon has in-process Chronik for fast indexed queries (single binary, no IPC for
   the hot query path)
-- Daemon also emits on NNG pub/sub for all block/tx events (cashwebd, monitoring,
-  future subscribers)
-- Chronik internally can also publish summary events to NNG if consumers want them
+- Daemon also emits on NNG so cashwebd and any remote indexer can subscribe
 - This is strictly better than the eCash approach (in-process only, NNG stripped)
 
 **Path to get there:**
-1. Study doged's Chronik: how it hooks into the daemon's block connection / tx
-   acceptance path, what internal events it subscribes to
-2. Our NNG patch (06) already handles the emission side; the integration point is
-   wiring Chronik's indexer to the same internal events NNG uses
-3. Likely requires upgrading eCash base past v0.24.11 to a version that has Chronik,
-   then applying our NNG patch on top
+1. Upgrade V2 eCash base from v0.24.11 → v0.30.x (where Chronik is already in-process)
+2. Reapply our patches; patch 05-merkle may now be redundant (IGUANA already upstream)
+3. Restore NNG patch on the new base
+4. Wire NNG emission to the same internal hooks Chronik already uses
 
-**Decision: deferred.** Examine `workspace-doged/src/` after `make setup SERIES=doged`
-to understand the Chronik ↔ daemon integration point, then write the plan.
+**Decision: deferred.** Base upgrade is prerequisite; do after V2 chain launches.
 
 ### logosd vs logond
 - Both names are viable; `logosd` feels more natural to say and type
@@ -265,9 +266,11 @@ Local experiments saved to `daemon/patches/v1/`.
 
 **SERIES=doged — Tobias's Dogecoin ABC**
 Direct clone of `doged-io/doged` at pinned commit.
-Reference for Chronik improvements, Avalanche consensus code, and any
-opcode/interpreter work Tobias may have added. eCash fork point unknown —
-determine by inspecting `git log` in the cloned workspace.
+Full eCash ABC monorepo (Cashtab, Electrum, Chronik, etc.) with only 17
+doged-specific commits on top. Based on **eCash v0.30.5** (much newer than our
+v0.24.11 base). Dogecoin support via `DEFAULT_USE_DOGE_UNIT = true` + Avalanche
+param tuning. IGUANA is already in eCash master here. Reference for: in-process
+Chronik integration, IGUANA upstream state, and any opcode work Tobias added.
 Local experiments saved to `daemon/patches/doged/`.
 
 **Opcode notes:**
