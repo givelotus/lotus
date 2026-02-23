@@ -44,11 +44,45 @@ the same vectors. The key is good test coverage at the protocol level.
 - Connects to logosd via JSON-RPC for tx broadcasting
 - Source: `cashweb/` in the monorepo (pulled from LotusiaStewardship/cashweb)
 
-### Indexer
-- Chronik was paid for ($20K) and then pulled into eCash daemon dropping Lotus support
-- Options: fork Chronik back out, extend Fulcrum, or build new indexer on bitcoinsuite
-- Preference: embed indexer in logosd to reduce daemon count
-- **Decision deferred:** Depends on daemon codebase analysis
+### Indexer (Chronik)
+
+**History:**
+- Chronik was funded by the Lotus project (~$20K) and originally built with NNG as its
+  event transport — it ran as a separate service that subscribed to block/tx events from
+  lotusd via the NNG pub/sub interface
+- eCash subsequently paid to pull Chronik in-process into their daemon and remove the NNG
+  dependency, making it eCash-specific and breaking Lotus support
+- Our eCash base (v0.24.11) predates Chronik's in-process integration — there is no Chronik
+  in the current V2 workspace at all
+- The NNG interface (patch 06) is present in V2 and still emits block/tx events; nothing
+  consumes them right now
+
+**Current state:**
+- `cashwebd` (Rust, in monorepo) connects to logosd via JSON-RPC — this is a different
+  service and not a full transaction indexer
+- doged has production Chronik (Tobias, EyeOfPython, worked on it) but NNG is stripped
+- No patch exists to restore Chronik to V2
+
+**Path forward (two options):**
+
+*Option A — Find and revive the NNG-based Chronik:*
+- The original out-of-process Chronik that consumed NNG events is likely in old commits
+  of `bitcoinsuite-chronik` or `LotusiaStewardship/lotusd` history
+- This preserves the clean separation: lotusd emits via NNG, Chronik consumes via NNG
+- Requires finding the last NNG-compatible Chronik commit and porting to work with V2
+
+*Option B — Upgrade eCash base and restore NNG in in-process Chronik:*
+- Upgrade from v0.24.11 to a newer eCash version that has in-process Chronik
+- Apply a patch that re-adds NNG as a notification channel within Chronik
+- More work but results in a single binary with embedded indexer
+
+*Option C — Study doged's Chronik, extract NNG integration as a patch:*
+- Clone workspace-doged, examine how Chronik integrates with the daemon internals
+- Write a patch that adds NNG back as a Chronik subscriber transport
+- This is effectively Option B but using Tobias's production Chronik as the starting point
+
+**Decision: deferred.** Need to examine doged's Chronik code and find the original
+NNG-Chronik integration point before committing to an approach.
 
 ### logosd vs logond
 - Both names are viable; `logosd` feels more natural to say and type

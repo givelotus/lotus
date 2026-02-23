@@ -36,11 +36,17 @@ with Maff's fork, not the spec.
 
 ### doged Notes
 
-doged is Tobias Ruck's (EyeOfPython) Bitcoin ABC-derived Dogecoin node. He also designed
-the Mitra transaction format. The eCash base commit it was forked from is unknown — determine
-by cloning and examining `git log`. Key things to study: Chronik improvements (useful for
-V2 indexer story), Avalanche consensus code (reference), any opcode or interpreter work
-Tobias may have added that isn't visible in recent commits.
+doged is a Bitcoin ABC-derived Dogecoin node; EyeOfPython (likely Tobias Ruck, who designed
+Mitra) is a contributor. The eCash base commit it was forked from is unknown — determine
+by cloning and examining `git log` in `workspace-doged/`.
+
+Key things to study:
+- **Chronik implementation**: doged has production Chronik. The Lotus project funded the
+  original Chronik development; eCash then paid to pull it in-process and strip NNG out.
+  doged's Chronik is the most accessible production reference for re-integrating Chronik
+  into V2 with NNG restored. See `architecture-decisions.md` for the three options.
+- **Avalanche consensus**: reference code for a consensus layer addition
+- **Opcode/interpreter history**: check `git log src/script/` for any changes Tobias made
 
 ---
 
@@ -349,7 +355,8 @@ removed by upcoming `24-ifp-removal.patch`). `08-issuance.patch` will be dropped
 | Stamp wallet | `wallets/stamp/` | Functional (Electron/Vue) | cashweb SDK embedded, needs extraction |
 | Vase wallet | `wallets/vase/` | Functional (Flutter) | Dart SDK embedded |
 | GPU miner | `miner/` | Functional (OpenCL) | Works with current daemon |
-| Indexer | `indexer/` | Functional (Fulcrum) | Electrum-compatible |
+| Indexer (Chronik) | n/a in V2 yet | Missing | Funded by Lotus project; eCash pulled it in-process and stripped NNG; needs restoration — see architecture-decisions.md |
+| Indexer (Fulcrum) | `indexer/` | Functional | Electrum-compatible; fallback until Chronik is restored |
 
 ### SDK Refactor (separate from chain work)
 
