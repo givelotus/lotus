@@ -134,17 +134,32 @@ wallets/vase/    (depends on sdk/dart/)
 - All components live here: daemon, SDKs, wallets, cashweb daemons, specs, docs
 - Reduces fragmentation across givelotus, StampChat, and LotusiaStewardship orgs
 
-### Daemon is Chain-Agnostic (logosd vision)
-- The daemon binary is not Lotus-specific — it is a PoW chain framework
-- Chain identity lives in config, not in the binary
-- Lotus, eCash-compatible, and future chains (Doge-style etc.) are just chain configs
-- This makes the project useful beyond Lotus and potentially upstreamable to eCash
-- CMake build flags control which chain configs are compiled in:
-  ```
-  cmake -DLOGOSD_CHAIN=lotus     # Lotus chain
-  cmake -DLOGOSD_CHAIN=ecash     # eCash-compatible (for testing)
-  cmake -DLOGOSD_CHAINS=all      # all configured chains
-  ```
+### Daemon is Chain-Agnostic (logond vision)
+
+The long-term goal is a **logond** framework: a PoW chain daemon where chain identity
+lives entirely in config, not in the binary. The three patchsets (V1 Lotus, V2 Lotus,
+doged) are all Bitcoin ABC derivatives and share substantial infrastructure. Studying them
+in parallel reveals what the common base looks like and what the per-chain layers are.
+
+- Lotus V1 and V2 share: XAddress, NNG, IGUANA merkle, Log2FixedPoint, issuance curve logic
+- doged adds: Avalanche consensus layer, production Chronik indexer, Electrum protocol
+- All three share: cmake build, eCash P2P layer, script interpreter, UTXO set, mempool
+
+Framework direction:
+- Chain identity (magic bytes, ports, address prefix, genesis) → per-chain config
+- Protocol features (opcodes, tx format, Mitra) → CMake build flags
+- Consensus rules (issuance, IFP, epoch activations) → per-chain config
+- Infrastructure (Chronik, NNG, Avalanche) → optional CMake modules
+
+```
+cmake -DLOGOND_CHAIN=lotus-v2     # V2 new chain
+cmake -DLOGOND_CHAIN=lotus-v1     # V1 mainnet-compatible
+cmake -DLOGOND_CHAIN=dogecoin     # Dogecoin-compatible (doged-style)
+cmake -DLOGOND_CHAIN=ecash        # eCash (for testing against upstream)
+```
+
+This is Phase N work — the V2 chain needs to launch first. But every patch we write
+should be designed with clean separation between chain-specific and chain-agnostic code.
 
 ### Two-Tier Flag System for Testing
 - **Build flags (CMake):** define what protocol features the binary has
@@ -165,22 +180,55 @@ wallets/vase/    (depends on sdk/dart/)
 - Makes the daemon a proper chain framework, not a Bitcoin ABC derivative
 
 ### Patchset Organization
-Patches applied in order on top of a clean eCash tag:
+
+Three parallel build targets in `daemon/`. All share the same `Makefile` and `scripts/`;
+the `SERIES` variable selects which workspace and version pin to use:
+
 ```
-01-rename-to-logosd.patch
-02-genesis-block.patch
-03-coin-issuance.patch          ← runtime -chain flag controls this
-04-address-format.patch         ← runtime -chain flag controls this
-05-remove-activations.patch     ← replace with per-chain config
-06-block-header.patch           ← larger nonce, extended metadata field
-07-txhash-txid-split.patch
-08-merkle-fix.patch
-09-util-intmath-log2.patch      ← Log2FixedPoint for subsidy calc (Logos Foundation)
-10-opcodes-bitwise.patch        ← Tobias's variable-length AND/OR/XOR fix
-11-opcodes-bitshift.patch       ← OP_RAWLEFTBITSHIFT (bidirectional via sign)
-12-opcodes-new.patch            ← OP_LOG, OP_SQRT (to be written for new chain)
-13-nng-interface.patch
+make setup [SERIES=v2|v1|doged]   # clone + apply
+make build [SERIES=v2|v1|doged]   # compile
+make run   [SERIES=v2|v1|doged]   # run daemon
 ```
+
+**SERIES=v2 (default) — V2 new chain**
+Patches applied in order on top of eCash v0.24.11 (`daemon/patches/series`):
+```
+01-chain-identity        # rename, network magic, port
+02-currency-unit         # XPI denomination
+03-xaddress              # Lotus address encoding
+04-daa-cleanup           # aserti3-2d only; remove Grasberg/EDA/DAA
+05-merkle                # IGUANA interleaved merkle tree
+06-nng-interface         # NNG pub/sub replacing ZeroMQ
+07-intmath-log2          # Log2FixedPoint (Turner algorithm)
+08-issuance              # OLD log2-difficulty formula (superseded by 22+23)
+10-script-opcodes        # OP_MULPOW2, OP_RAWLEFTBITSHIFT, etc.
+11-taproot               # Taproot
+12-chain-params          # REPLACE: remove epoch times
+13-genesis               # REPLACE: new genesis
+14-checkpoints           # CLEAR
+15-fixed-seeds           # REPLACE: project seeds
+16-seeder                # seeder tool
+17-consensus-activation  # REMOVE: epoch activation system
+18-src-build             # CMakeLists
+19-misc                  # rpc, wallet, net, tests
+20-qt-gui                # Qt GUI (off by default)
+21-build-compat          # CMake 4.x + Boost 1.90 fixes
+22-boot-subsidy          # height-based step-halvings (10M→260 XPI)
+23-tail-subsidy          # sqrt-adaptive stateful tail emission
+24-ifp-removal           # IFP disabled; no addresses; mechanism preserved
+TODO: 25-op-log, 26-op-sqrt, replace 12/13/14, XX-mitra-tx
+```
+
+**SERIES=v1 — mainnet-compatible**
+Direct clone of `LotusiaStewardship/lotusd` at pinned tag.
+Local experiments saved to `daemon/patches/v1/`.
+
+**SERIES=doged — Tobias's Dogecoin ABC**
+Direct clone of `doged-io/doged` at pinned commit.
+Reference for Chronik improvements, Avalanche consensus code, and any
+opcode/interpreter work Tobias may have added. eCash fork point unknown —
+determine by inspecting `git log` in the cloned workspace.
+Local experiments saved to `daemon/patches/doged/`.
 
 **Opcode notes:**
 - `OP_RAWLEFTBITSHIFT` (0x98): one opcode, positive operand = left shift, negative = right

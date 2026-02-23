@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # mkpatch.sh — Save current workspace changes as a named patch.
-# Use this after editing files in the workspace to capture changes
-# back into the patch series.
+#
+# SERIES=v2 (default): saves to patches/<name>.patch from workspace/
+# SERIES=v1:           saves to patches/v1/<name>.patch from workspace-v1/
 #
 # Usage: ./scripts/mkpatch.sh <patch-name>
 #   e.g. ./scripts/mkpatch.sh 06-block-header
@@ -10,8 +11,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DAEMON_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
-WORKSPACE="$DAEMON_DIR/workspace"
-PATCHES_DIR="$DAEMON_DIR/patches"
+SERIES="${SERIES:-v2}"
 
 if [[ $# -lt 1 ]]; then
     echo "Usage: $0 <patch-name>"
@@ -21,16 +21,29 @@ fi
 
 NAME="$1"
 [[ "$NAME" == *.patch ]] || NAME="${NAME}.patch"
+
+if [[ "$SERIES" == "v1" ]]; then
+    WORKSPACE="$DAEMON_DIR/workspace-v1"
+    PATCHES_DIR="$DAEMON_DIR/patches/v1"
+    mkdir -p "$PATCHES_DIR"
+elif [[ "$SERIES" == "doged" ]]; then
+    WORKSPACE="$DAEMON_DIR/workspace-doged"
+    PATCHES_DIR="$DAEMON_DIR/patches/doged"
+    mkdir -p "$PATCHES_DIR"
+else
+    WORKSPACE="$DAEMON_DIR/workspace"
+    PATCHES_DIR="$DAEMON_DIR/patches"
+fi
+
 OUTPUT="$PATCHES_DIR/$NAME"
 
 if [[ ! -d "$WORKSPACE" ]]; then
-    echo "Workspace not found. Run: make setup"
+    echo "Workspace not found. Run: make setup SERIES=$SERIES"
     exit 1
 fi
 
 cd "$WORKSPACE"
 
-# Diff against HEAD (staged + unstaged changes)
 DIFF=$(git diff HEAD)
 if [[ -z "$DIFF" ]]; then
     DIFF=$(git diff --cached HEAD)

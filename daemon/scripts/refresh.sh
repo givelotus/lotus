@@ -1,43 +1,75 @@
 #!/usr/bin/env bash
-# refresh.sh — Rebase the patch series onto a new eCash base commit.
-# Updates ecash-version, resets workspace to the new base, and attempts
-# to re-apply all patches. Reports conflicts for manual resolution.
+# refresh.sh — Update to a new base version.
 #
-# Usage: ./scripts/refresh.sh <new-ecash-commit> [tag-description]
-#   e.g. ./scripts/refresh.sh abc123def456 "eCash v0.27.0"
+# SERIES=v2: rebase eCash patch series onto a new eCash commit
+# SERIES=v1: advance LotusiaStewardship/lotusd to a new tag or commit
+#
+# Usage: ./scripts/refresh.sh <new-commit-or-tag> [description]
+#   V2: ./scripts/refresh.sh abc123def456 "eCash v0.27.0"
+#   V1: ./scripts/refresh.sh v10.4.11 "LotusiaStewardship v10.4.11"
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DAEMON_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+SERIES="${SERIES:-v2}"
+
+if [[ $# -lt 1 ]]; then
+    echo "Usage: $0 <new-commit-or-tag> [description]"
+    exit 1
+fi
+
+NEW_REF="$1"
+DESCRIPTION="${2:-update}"
+
+# ─── helper: advance a direct-clone workspace ────────────────────────────────
+advance_clone() {
+    local series="$1" version_file="$2" workspace="$3" branch="$4"
+    local old_ref new_ref="$NEW_REF" desc="$DESCRIPTION"
+    old_ref=$(grep -v '^#' "$version_file" | grep -v '^$' | head -1)
+    echo "Updating $series base: $old_ref → $new_ref ($desc)"
+    { echo "$new_ref"; echo "# $desc"; echo "# Previous: $old_ref"; } > "$version_file"
+    if [[ -d "$workspace" ]]; then
+        cd "$workspace"
+        git fetch origin
+        git checkout -B "$branch" "$new_ref"
+        echo "Workspace updated to $new_ref"
+    else
+        echo "Workspace not found — run: make setup SERIES=$series"
+    fi
+    echo "Refresh complete. Rebuild with: make build SERIES=$series"
+    exit 0
+}
+
+# ─── V1: advance lotusd version ───────────────────────────────────────────────
+if [[ "$SERIES" == "v1" ]]; then
+    advance_clone v1 "$DAEMON_DIR/lotusd-version" "$DAEMON_DIR/workspace-v1" lotusd-work
+fi
+
+# ─── doged: advance doged version ────────────────────────────────────────────
+if [[ "$SERIES" == "doged" ]]; then
+    advance_clone doged "$DAEMON_DIR/doged-version" "$DAEMON_DIR/workspace-doged" doged-work
+fi
+
+# ─── V2: rebase eCash patch series ────────────────────────────────────────────
 WORKSPACE="$DAEMON_DIR/workspace"
 ECASH_VERSION_FILE="$DAEMON_DIR/ecash-version"
 SERIES_FILE="$DAEMON_DIR/patches/series"
 PATCHES_DIR="$DAEMON_DIR/patches"
 
-if [[ $# -lt 1 ]]; then
-    echo "Usage: $0 <new-ecash-commit> [description]"
-    exit 1
-fi
-
-NEW_COMMIT="$1"
-DESCRIPTION="${2:-eCash update}"
-
 OLD_COMMIT=$(grep -v '^#' "$ECASH_VERSION_FILE" | grep -v '^$' | head -1)
-echo "Updating eCash base: $OLD_COMMIT → $NEW_COMMIT ($DESCRIPTION)"
+echo "Updating V2 base: $OLD_COMMIT → $NEW_REF ($DESCRIPTION)"
 
-# Update the version file
 {
-    echo "$NEW_COMMIT"
+    echo "$NEW_REF"
     echo "# $DESCRIPTION"
     echo "# Previous: $OLD_COMMIT"
 } > "$ECASH_VERSION_FILE"
 
-# Reset workspace
 echo "Resetting workspace to new base..."
 cd "$WORKSPACE"
 git fetch origin
-git checkout -B lotus-work "$NEW_COMMIT"
+git checkout -B lotus-work "$NEW_REF"
 
 echo "Re-applying patch series..."
 FAILED=0
@@ -57,7 +89,6 @@ while IFS= read -r line; do
     else
         echo "CONFLICT — manual resolution needed"
         echo "    Patch: $PATCH"
-        echo "    Workspace: $WORKSPACE"
         FAILED=1
     fi
 done < "$SERIES_FILE"

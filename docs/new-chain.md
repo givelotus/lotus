@@ -6,6 +6,44 @@ be built and why.
 
 ---
 
+## Three Patchsets
+
+Three parallel build targets are maintained in `daemon/`:
+
+| | V1 — Mainnet | V2 — New Chain | doged |
+|---|---|---|---|
+| Purpose | Sync to Maff's chain | Visionary new chain; paper-correct issuance, Mitra, OP_LOG/SQRT | Tobias's Dogecoin ABC; Chronik + Avalanche reference |
+| Base | LotusiaStewardship/lotusd | eCash v0.24.11 (fa7a44f731) + patches | doged-io/doged (eCash fork, version TBD) |
+| Workspace | `daemon/workspace-v1/` | `daemon/workspace/` | `daemon/workspace-doged/` |
+| Version pin | `daemon/lotusd-version` | `daemon/ecash-version` | `daemon/doged-version` |
+| Patches | `daemon/patches/v1/` (experiments on top) | `daemon/patches/series` | `daemon/patches/doged/` (experiments on top) |
+| Build | `make setup SERIES=v1 && make build SERIES=v1` | `make setup && make build` | `make setup SERIES=doged && make build SERIES=doged` |
+| Chain state | ~1.2M blocks; buggy Ruth/IFP fork; Taproot active | Not launched; genesis TBD | Dogecoin mainnet |
+
+The longer-term goal is to extract a common **logond** framework from the convergent
+technical decisions across these three ABC-derived codebases. See `docs/architecture-decisions.md`
+for the multi-chain framework design.
+
+### V1 Chain State
+
+The canonical *correct* Lotus chain stalled at block 927,381 (Dec 21, 2024) after
+the Ruth epoch upgrade shipped with two consensus bugs: missing replay protection and
+the Ruth IFP validation check falling through to the Judges epoch check. Maff released
+a hotfix (v8.3.3-hotfix) but subsequent 9.x/10.x releases were built on top of the
+diverged fork. The ~1.2M block chain is self-consistent within its own ruleset but
+no correctly-validating Ruth node would accept it. V1 compatibility means compatibility
+with Maff's fork, not the spec.
+
+### doged Notes
+
+doged is Tobias Ruck's (EyeOfPython) Bitcoin ABC-derived Dogecoin node. He also designed
+the Mitra transaction format. The eCash base commit it was forked from is unknown — determine
+by cloning and examining `git log`. Key things to study: Chronik improvements (useful for
+V2 indexer story), Avalanche consensus code (reference), any opcode or interpreter work
+Tobias may have added that isn't visible in recent commits.
+
+---
+
 ## Design Goals
 
 1. **Remove the developer reward (IFP).** The minerfund mechanism routing 50% of block
