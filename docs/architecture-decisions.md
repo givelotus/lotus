@@ -63,26 +63,32 @@ the same vectors. The key is good test coverage at the protocol level.
 - doged has production Chronik (Tobias, EyeOfPython, worked on it) but NNG is stripped
 - No patch exists to restore Chronik to V2
 
-**Path forward (two options):**
+**Why NNG matters beyond Chronik:**
+NNG was chosen because it serves as an **ecosystem event bus**, not just a Chronik
+transport. cashwebd subscribes to NNG for real-time block/tx notifications. Future
+services (monitoring, alerting, custom indexers) can subscribe without the daemon
+knowing about them. The daemon emits once; any number of consumers listen. Pulling
+Chronik in-process breaks this model by making Chronik a special citizen — but it
+does NOT mean NNG should be removed. The two are not mutually exclusive.
 
-*Option A — Find and revive the NNG-based Chronik:*
-- The original out-of-process Chronik that consumed NNG events is likely in old commits
-  of `bitcoinsuite-chronik` or `LotusiaStewardship/lotusd` history
-- This preserves the clean separation: lotusd emits via NNG, Chronik consumes via NNG
-- Requires finding the last NNG-compatible Chronik commit and porting to work with V2
+**Target architecture for V2:**
+- Daemon has in-process Chronik for fast indexed queries (single binary, no IPC for
+  the hot query path)
+- Daemon also emits on NNG pub/sub for all block/tx events (cashwebd, monitoring,
+  future subscribers)
+- Chronik internally can also publish summary events to NNG if consumers want them
+- This is strictly better than the eCash approach (in-process only, NNG stripped)
 
-*Option B — Upgrade eCash base and restore NNG in in-process Chronik:*
-- Upgrade from v0.24.11 to a newer eCash version that has in-process Chronik
-- Apply a patch that re-adds NNG as a notification channel within Chronik
-- More work but results in a single binary with embedded indexer
+**Path to get there:**
+1. Study doged's Chronik: how it hooks into the daemon's block connection / tx
+   acceptance path, what internal events it subscribes to
+2. Our NNG patch (06) already handles the emission side; the integration point is
+   wiring Chronik's indexer to the same internal events NNG uses
+3. Likely requires upgrading eCash base past v0.24.11 to a version that has Chronik,
+   then applying our NNG patch on top
 
-*Option C — Study doged's Chronik, extract NNG integration as a patch:*
-- Clone workspace-doged, examine how Chronik integrates with the daemon internals
-- Write a patch that adds NNG back as a Chronik subscriber transport
-- This is effectively Option B but using Tobias's production Chronik as the starting point
-
-**Decision: deferred.** Need to examine doged's Chronik code and find the original
-NNG-Chronik integration point before committing to an approach.
+**Decision: deferred.** Examine `workspace-doged/src/` after `make setup SERIES=doged`
+to understand the Chronik ↔ daemon integration point, then write the plan.
 
 ### logosd vs logond
 - Both names are viable; `logosd` feels more natural to say and type
