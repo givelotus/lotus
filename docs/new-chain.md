@@ -122,8 +122,8 @@ tight integration of the POP mechanism with the chain's issuance accounting.
 
 | Feature | Paper Specifies | Current Daemon | Gap |
 |---|---|---|---|
-| Boot subsidy | `R_0 * exp(-λn)` height-based decay | log2(difficulty) formula | Different approach; current formula is work-coupled not height-coupled |
-| Tail emission | Stateful `R_n^tail`, ratio update each block | Not implemented | **Must implement** |
+| Boot subsidy | `R_0 * exp(-λn)` height-based decay | Step-halvings: R_0=10M XPI, half-life=52,560 blocks (~73 days), floor=260 XPI — patch 22 | Approximation of exp decay via halvings; paper uses continuous decay |
+| Tail emission | Stateful `R_n^tail`, ratio update each block | Implemented: `nTailSubsidy` in CBlockIndex, sqrt-adaptive update from nBits log2 delta — patch 23 | None; matches paper spec |
 | Fee burn | β fraction burned | 50% burn (β=0.5) implemented | None |
 | Burn-to-speak sink | CashWeb OP_RETURN burns counted | Not integrated at daemon level | Needs chain-level burn accounting |
 | Developer reward | Not specified | 50% of blockReward to IFP addresses | **Must remove** |
@@ -254,35 +254,48 @@ Phase 1 of the new chain can omit burn-counting and add it as a soft upgrade.
 
 ## Patch Plan (New Chain)
 
-Starting from eCash v0.24.11 at commit `fa7a44f731`, the new series:
+Starting from eCash v0.24.11 at commit `fa7a44f731`. Old mainnet patches archived in
+`daemon/patches/archive/mainnet/`. Current active series in `daemon/patches/series`:
 
 ```
-01-chain-identity.patch          # rename to logosd, network magic, port, name
-02-cmake4-boost190-compat.patch  # macOS build fixes (keep as-is)
-03-xaddress.patch                # XAddress format (keep as-is)
-04-daa-cleanup.patch             # DAA parameter cleanup (keep as-is)
-05-merkle.patch                  # IGUANA merkle tree (keep as-is)
-06-nng-interface.patch           # NNG pub/sub (keep as-is)
-07-intmath-log2.patch            # Log2FixedPoint utility (keep as-is)
-08-issuance.patch                # REPLACE: two-loop adaptive issuance
-                                 # - Remove minerfund entirely
-                                 # - Add R_n^tail chainstate variable
-                                 # - GetBlockSubsidy → R_n^boot + R_n^tail
-                                 # - Remove bad-cb-minerfund validation
-09-script-opcodes.patch          # OP_RAWLEFTBITSHIFT etc. (keep as-is)
-10-op-log.patch                  # NEW: OP_LOG opcode (expose Log2FixedPoint)
-11-op-sqrt.patch                 # NEW: OP_SQRT opcode (integer floor-sqrt)
+# ── Carried from mainnet (reviewed, keep as-is) ──────────────────────────────
+01-chain-identity.patch          # binary names, version strings, cmake packaging
+02-currency-unit.patch           # XPI denomination and amount formatting
+03-xaddress.patch                # Lotus address encoding (XAddress, replaces CashAddr)
+04-daa-cleanup.patch             # remove Grasberg/EDA/DAA; keep aserti3-2d only
+05-merkle.patch                  # IGUANA interleaved merkle tree
+06-nng-interface.patch           # NNG pub/sub replacing ZeroMQ
+07-intmath-log2.patch            # Log2FixedPoint (Turner algorithm)
+08-issuance.patch                # OLD log2-difficulty formula — superseded by 22+23
+10-script-opcodes.patch          # OP_MULPOW2, OP_RAWLEFTBITSHIFT, etc.
+11-taproot.patch                 # Taproot — REVIEW: may simplify or keep as-is
 12-chain-params.patch            # REPLACE: remove epoch times, remove CoinbaseAddresses
-13-genesis.patch                 # REPLACE: new genesis block, new seeds
-14-taproot.patch                 # keep (consensus completeness)
-15-build-compat.patch            # macOS/Linux build fixes (keep as-is)
---- (future) ---
-XX-mitra-tx.patch                # Mitra transaction format (large, separate milestone)
+13-genesis.patch                 # REPLACE: new genesis block
+14-checkpoints.patch             # CLEAR for new chain
+15-fixed-seeds.patch             # REPLACE: project-controlled seed nodes
+16-seeder.patch                  # seeder tool
+17-consensus-activation.patch    # REMOVE: epoch activation system (no IFP → no epochs)
+18-src-build.patch               # src/CMakeLists.txt and sub-build-systems
+19-misc.patch                    # RPC, wallet, net, tests, util, policy, primitives
+20-qt-gui.patch                  # Qt GUI (BUILD_BITCOIN_QT=OFF by default)
+21-build-compat.patch            # CMake 4.x + Boost 1.90 fixes (macOS arm64)
+
+# ── New chain issuance ────────────────────────────────────────────────────────
+22-boot-subsidy.patch            # DONE: step-halvings boot component (10M→260 XPI)
+23-tail-subsidy.patch            # DONE: nTailSubsidy chainstate var, sqrt-adaptive tail
+
+# ── TODO ─────────────────────────────────────────────────────────────────────
+# 24-ifp-removal.patch           # gut minerfund.cpp, remove CoinbaseAddresses from params,
+#                                #   remove bad-cb-minerfund validation in ConnectBlock
+# 25-op-log.patch                # OP_LOG opcode (expose Log2FixedPoint as script opcode)
+# 26-op-sqrt.patch               # OP_SQRT opcode (expose Sqrt64 as script opcode)
+# (renumber/replace 12, 13, 14, 15, 17 for new chain identity)
+# XX-mitra-tx.patch              # Mitra transaction format (large milestone)
 ```
 
-Patches to drop entirely: `09-minerfund.patch`, all epoch activation patches
-(03-judges, 05-ruth, 06-nng, 19-first-samuel, 30-second-samuel and their fixes),
-all version-bump patches.
+Note: `09-minerfund.patch` dropped from series (left in `patches/` for reference; IFP
+removed by upcoming `24-ifp-removal.patch`). `08-issuance.patch` will be dropped once
+`22-boot-subsidy` and `23-tail-subsidy` are confirmed correct and `24-ifp-removal` is done.
 
 ---
 
