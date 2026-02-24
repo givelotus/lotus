@@ -57,7 +57,7 @@ a much larger effort than rebasing our existing patches.
 | 01 | `01-nlogn-block-construction.patch` | DONE | O(n log n) `addTxs`: snapshot → package-stat accumulation → sort → DFS |
 | 02 | `02-remove-chaintx-limit.patch` | DONE | Drop ancestor/descendant chain-tx limits from mempool |
 | 03 | `03-mempool-cleanup.patch` | NO-OP | CTxMemPoolEntry accounting fields already removed upstream in 252182e9 |
-| 04 | `04-issuance-compat.patch` | NEEDS-WRITE | Runtime `-issuance=ecash` flag; Lotus issuance is default; eCash/Bitcoin halving when flag set; allows eCash test suite to run unmodified without changing coinbase amount checks |
+| 04 | `04-issuance-compat.patch` | NEEDS-WRITE | Runtime `-issuance=ecash` flag; Lotus issuance is default; eCash/Bitcoin halving when flag set; allows eCash test suite to run unmodified without changing coinbase amount checks. Placeholder exists. |
 | 05 | `05-chain-identity.patch` | NEEDS-REBASE | Binary names (lotusd/lotus-cli), version strings, CMake project name |
 | 06 | `06-currency-unit.patch` | NEEDS-REBASE | XPI denomination; 1 XPI = 10^4 satoshis; amount formatting throughout |
 | 07 | `07-xaddress.patch` | NEEDS-REBASE | XAddress encoding/decoding; replaces CashAddr; v2 prefix = `xpi` (v1 used `lotus`) |
@@ -66,7 +66,7 @@ a much larger effort than rebasing our existing patches.
 | 08c | `08c-blocktime.patch` | NEEDS-EXTRACT | Set `nPowTargetSpacing = 2 * 60` (2 minutes). **The commit already exists in the v1 lotusd repo — extract it.** Find the commit with `git log --all --oneline -- src/chainparams.cpp` in workspace-v1 and isolate the `nPowTargetSpacing` change. V2 uses the same value; apply the same extracted patch. **Downstream effects:** (1) boot subsidy step heights in patch 26 must be 5× larger to hit the same wall-clock half-life (720 blocks/day at 2 min vs 144 at 10 min). |
 | 09 | `09-merkle.patch` | NEEDS-REBASE | IGUANA interleaved merkle tree; fixes the CVE-2012-2459 variant merkle tree vulnerability; implements MerklixHash (bitwise trie + SHA256 overlay) per the 2018 Vermorel/Séchet/Chancellor/Cox paper |
 | 10 | `10-nng-interface.patch` | NEEDS-REBASE | NNG pub/sub replacing ZeroMQ; adds `src/nng_interface/`; Chronik stays separate |
-| 11 | `11-remove-zeromq.patch` | NEEDS-WRITE | Delete `src/zmq/`, ZeroMQ CMake option, ZeroMQ functional + unit tests; was never removed |
+| 10b | `10b-remove-zeromq.patch` | NEEDS-WRITE | Delete `src/zmq/`, ZeroMQ CMake option, ZeroMQ tests; was never removed. **Numbered 10b in v2 because slot 11 is occupied by intmath-log2.** In ecash/bchn this is at slot 11. Placeholder exists. |
 | 12 | `12-issuance-OLD.patch` | DEFERRED | Old log2 issuance curve — **superseded by 26+27; remove from series once those confirmed stable** |
 | 13 | *(minerfund — not applied)* | N/A | Archived for reference only |
 | 14 | `14-script-opcodes.patch` | NEEDS-REBASE | OP_MULPOW2 (0xb2), OP_RAWLEFTBITSHIFT (0xb3) and related new opcodes |
@@ -76,7 +76,7 @@ a much larger effort than rebasing our existing patches.
 | 18 | `18-checkpoints.patch` | NEEDS-FIX | Checkpoints — currently has v1 values; must be cleared for new chain |
 | 19 | `19-fixed-seeds.patch` | NEEDS-WRITE | Seed node IPs for new chain (v1 IPs currently; need new seed nodes) |
 | 20 | `20-seeder.patch` | NEEDS-REBASE | DNS seeder tool |
-| 21 | `21-consensus-activation.patch` | NEEDS-REVIEW | V1 named upgrade epochs (Exodus through 1st Kings). **V2 activates everything at block 0 — no epoch infrastructure needed.** This patch likely should be dropped from v2 entirely or replaced with a single "all features active at genesis" config. Keep in v1 series only. |
+| 21 | `21-consensus-activation.patch` | DROP | V1 named upgrade epochs (Exodus through 1st Kings). **V2 activates everything at block 0 — this patch is dropped from v2.** Now commented out in v2/series. Keep in v1 series only. |
 | 22 | `22-src-build.patch` | NEEDS-REBASE | src/CMakeLists.txt and sub-build-systems |
 | 23 | `23-misc.patch` | NEEDS-REBASE+EXTRACT | RPC, wallet, net, tests, util, policy, primitives. **Contains several things that need their own patches — see below** |
 | 24 | `24-qt-gui.patch` | NEEDS-REBASE | Qt GUI (BUILD_BITCOIN_QT=OFF by default) |
@@ -87,8 +87,8 @@ a much larger effort than rebasing our existing patches.
 | 29 | `29-op-log-op-sqrt.patch` | NEEDS-REBASE | OP_LOG (0xbd) and OP_SQRT (0xbe) with full test suite |
 | 30 | `30-op-mul.patch` | NEEDS-REBASE | OP_MUL (0x95) re-enabled; 63-bit signed multiply with overflow detection |
 | 31 | `31-bigint-ops.patch` | NEEDS-REBASE | Big-integer opcodes (0xbf–0xc4): BIGADD/BIGSUB/BIGMUL/BIGMOD/BIGDIVMOD/BIGMULMOD |
-| 32 | `32-chronik-adapt.patch` | NEEDS-WRITE | Adapt Chronik API output to XAddress (xpi prefix) + XPI denomination |
-| 33 | `33-mitra-tx.patch` | SKELETON | Mitra tx format; see `daemon/docs/mitra-spec.md`; blocked on opcode slot resolution |
+| 32 | `32-chronik-adapt.patch` | NEEDS-WRITE | Adapt Chronik API output to XAddress (xpi prefix) + XPI denomination. Placeholder exists. |
+| 33 | `33-mitra-tx.patch` | SKELETON | Mitra tx format; see `daemon/docs/mitra-spec.md`; blocked on opcode slot resolution. Placeholder exists (renamed from 32-mitra-tx.patch). |
 
 ### Things currently buried in `23-misc.patch` that need extraction
 
@@ -148,19 +148,22 @@ There is a real distinction between hard consensus and soft coordination:
 
 ### V1 Patch Manifest
 
+V1 is a **mainnet archive** (live since June 2021) — the historical series is frozen.
+Mining improvements exist at their historical positions; do not restructure slot numbering.
+
 | Slot | File | Status | What it does |
 |------|------|--------|--------------|
-| 01 | `01-nlogn-block-construction.patch` | NEEDS-WRITE | Port mining patch to eCash v0.24.11 API (`addPackageTxs`, old `CTxMemPool::txiter`) |
-| 02 | `02-remove-chaintx-limit.patch` | NEEDS-WRITE | Port to v0.24.11 API |
-| 03 | `03-mempool-cleanup.patch` | NEEDS-WRITE | Port to v0.24.11 API (accounting fields still present at this base) |
-| 04 | `04-issuance-compat.patch` | NEEDS-WRITE | Runtime `-issuance=ecash` flag (same concept as v2; log2 Lotus issuance is default) |
-| 05+ | `05-lotus-mainnet.patch` (was 01) | DONE | Monolithic origin diff: full Bitcoin ABC → Lotus including all v1 features |
-| … | `06-cmake4-boost190-compat.patch` … `46-version-10.4.10.patch` | DONE | Incremental version bumps and named upgrade epochs (Exodus through 1st Kings). **Most of these contain no new features** — they were housekeeping: version strings, activation heights, build fixes. The feature content is almost entirely in the original monolithic `05-lotus-mainnet.patch`. |
-| 08c | `08c-blocktime.patch` | NEEDS-EXTRACT | 2-minute blocks. **Extract from v1 lotusd git log** — this commit exists; find it in `LotusiaStewardship/lotusd` and isolate the `nPowTargetSpacing` change. |
-| 47 | `47-remove-zeromq.patch` | NEEDS-WRITE | ZeroMQ present but only disabled (BUILD_BITCOIN_ZMQ=OFF); remove `src/zmq/`, tests |
-| — | `chronik-backport.patch` | DEFERRED | V1 predates Chronik; large effort; low priority — v1 is live and running, chronik backport is not needed for it to function |
-
-*Note: v1 slot 05+ uses renumbered names to accommodate 01-04 being added at the front.*
+| 01 | `01-lotus-mainnet.patch` | DONE | Monolithic origin diff (~52K lines, 371 files): full eCash v0.24.11 → Lotus. Contains blocktime, NNG, XAddress, issuance curve, genesis, opcodes, all v1 features. |
+| 02 | `02-cmake4-boost190-compat.patch` | DONE | CMake 4.x + Boost 1.90 build compatibility |
+| 03–27 | `03-judges-upgrade` … `27-version-9.4.3` | DONE | Epoch activations and version bumps. **Most contain no new features.** |
+| 10 | `10-mining-improvements.patch` | DONE | **Misnamed** — touches `activation.cpp` + `minerfund.cpp`; epoch activation, not mining algorithm |
+| 28 | `28-mining-improvements-2.patch` | DONE | **Misnamed** — touches `activation.cpp` only; another epoch patch |
+| 29 | `29-version-9.4.4.patch` | DONE | Version bump (active in series) |
+| 29* | `29-nlogn-block-construction.patch` | DONE (inactive) | **The actual O(n log n) mining patch** for v0.24.11 API. Touches `miner.cpp`, `miner.h`, `miner_tests.cpp`, `txmempool.h`. Commented out (slot conflict with 29-version-9.4.4). |
+| 30–42 | `30-second-samuel` … `42-version-10.4.10` | DONE | Epoch activations, taproot stages, version bumps |
+| 43 | `43-remove-zeromq.patch` | NEEDS-WRITE | ZeroMQ only disabled (BUILD_BITCOIN_ZMQ=OFF), never deleted. Placeholder exists. |
+| 00* | `00-issuance-compat.patch` | NEEDS-WRITE | `-issuance=ecash` flag; useful for eCash test suite. Not part of mainnet history. Placeholder exists. |
+| — | `chronik-backport.patch` | DEFERRED | V1 predates Chronik; large effort; mainnet runs without it |
 
 ---
 
@@ -173,8 +176,8 @@ There is a real distinction between hard consensus and soft coordination:
 | 01 | `01-nlogn-block-construction.patch` | DONE | O(n log n) `addTxs` for `src/node/miner.cpp` |
 | 02 | `02-remove-chaintx-limit.patch` | DONE | Drop chain-tx ancestor limits |
 | 03 | `03-mempool-cleanup.patch` | NO-OP | Already merged upstream |
-| 10 | `10-nng-interface.patch` | NEEDS-WRITE | Port NNG interface from v2; upstream PR to replace ZeroMQ in eCash |
-| 11 | `11-remove-zeromq.patch` | NEEDS-WRITE | Port ZeroMQ removal from v2; pairs with 10 as a single upstream PR |
+| 10 | `10-nng-interface.patch` | NEEDS-WRITE | Port NNG interface from v2. Independently reviewable. Placeholder exists. |
+| 11 | `11-remove-zeromq.patch` | NEEDS-WRITE | Remove ZeroMQ. Independently reviewable; applies after slot 10. Placeholder exists. |
 
 ---
 
@@ -187,8 +190,8 @@ There is a real distinction between hard consensus and soft coordination:
 | 01 | `01-nlogn-block-construction.patch` | DONE | O(n log n) `addTxs` for BCHN `src/miner.cpp` (value semantics, `addTxs(int64_t)`) |
 | 02 | `02-remove-chaintx-limit.patch` | DONE | Drop chain-tx ancestor limits |
 | 03 | `03-mempool-cleanup.patch` | NO-OP | Already merged upstream |
-| 10 | `10-nng-interface.patch` | NEEDS-WRITE | Port NNG interface to BCHN API |
-| 11 | `11-remove-zeromq.patch` | NEEDS-WRITE | Port ZeroMQ removal to BCHN |
+| 10 | `10-nng-interface.patch` | NEEDS-WRITE | Port NNG interface to BCHN API. Independently reviewable. Placeholder exists. |
+| 11 | `11-remove-zeromq.patch` | NEEDS-WRITE | Remove ZeroMQ from BCHN. Independently reviewable; applies after slot 10. Placeholder exists. |
 
 ---
 
@@ -228,8 +231,8 @@ Until this decomposition is done, workspace-doged remains a direct clone.
 | 3 | Port NNG + ZeroMQ removal to bchn (slots 10-11) | v2 patch 10+11 |
 | 4 | Write `47-remove-zeromq.patch` for v1 (against eCash v0.24.11) | nothing |
 | 5 | Write `04-issuance-compat.patch` for v2 and v1 | nothing |
-| 6 | Extract `08c-blocktime.patch` for v1 and v2 from v1 lotusd git log | workspace-v1 (needs fetch lotusd) |
-| 7 | Extract doged blocktime patch + scrape doged git log for all patch topics | workspace-doged |
+| 6 | Write `08c-blocktime.patch` for v2 (2-line chainparams.cpp change; blocktime buried in monolithic v1 patch, write fresh) | bitcoin-abc 252182e9 base |
+| 7 | Scrape doged git log for blocktime commit + all patch topics; document in doged series | workspace-doged |
 | 8 | Write `08b-decouple-avalanche.patch` for v2 | Avalanche decision (done) |
 | 9 | Rebase v2 patches 05–31 onto 252182e9 | nothing blocking |
 | 10 | Extract block-header, dual-txid, 64-bit fix from 23-misc during rebase | step 9 |
