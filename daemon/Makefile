@@ -1,18 +1,23 @@
 # daemon/Makefile — Lotus daemon build management
 #
-# Three build targets are supported:
+# All Lotus-family series (v1, v2, doged) use bitcoin-abc as their base.
+# See daemon/bitcoin-abc-version for the shared base commit.
+# BCHN uses its own pinned base (see bchn-version).
+#
+# Four build targets are supported:
 #   SERIES=v2 (default) — new chain: adaptive issuance, no IFP, OP_LOG/SQRT, Mitra
-#   SERIES=v1           — mainnet-compatible: tracks LotusiaStewardship/lotusd
-#   SERIES=doged        — Tobias's Dogecoin ABC: reference for Chronik, framework design
+#   SERIES=v1           — mainnet-compatible: bitcoin-abc + v1 patch series
+#   SERIES=doged        — Dogecoin ABC: bitcoin-abc + doged patch series
+#   SERIES=bchn         — Bitcoin Cash Node: chain-tx improvements (29–31) as upstream PR candidates
 #
 # Targets:
 #   make setup              — apply patch series into workspace (V2 default)
-#   make setup SERIES=v1    — clone LotusiaStewardship/lotusd into workspace-v1/
+#   make setup SERIES=v1    — clone bitcoin-abc + apply v1 patches into workspace-v1/
 #   make setup RESET=1      — wipe and recreate workspace from scratch
 #   make build              — compile lotusd + lotus-cli
 #   make run ARGS="..."     — run lotusd with ulimit -n 65536 pre-set
 #   make mkpatch NAME=<n>   — save current workspace changes as patches/<n>.patch
-#   make refresh COMMIT=<c> — rebase onto new base (eCash commit for V2, tag for V1)
+#   make refresh COMMIT=<c> — rebase onto new base (bitcoin-abc commit for v1/v2/doged)
 
 SCRIPTS := $(dir $(abspath $(lastword $(MAKEFILE_LIST))))scripts
 SERIES  ?= v2
@@ -28,9 +33,10 @@ help:
 	@echo "  make mkpatch NAME=<n>          Save workspace changes as patches/<n>.patch"
 	@echo "  make refresh COMMIT=<c>        Rebase onto new base commit or tag"
 	@echo ""
-	@echo "  SERIES=v2 (default): new chain  — workspace/"
-	@echo "  SERIES=v1:           mainnet    — workspace-v1/"
-	@echo "  SERIES=doged:        doged ref  — workspace-doged/"
+	@echo "  SERIES=v2 (default): new chain  — workspace/        (bitcoin-abc base)"
+	@echo "  SERIES=v1:           mainnet    — workspace-v1/     (bitcoin-abc base)"
+	@echo "  SERIES=doged:        doged      — workspace-doged/  (bitcoin-abc base)"
+	@echo "  SERIES=bchn:         BCHN       — workspace-bchn/   (bchn-version base)"
 
 setup:
 ifdef RESET
@@ -62,4 +68,4 @@ else
 endif
 
 clean:
-	rm -rf workspace/build workspace-v1/build workspace-doged/build
+	rm -rf workspace/build workspace-v1/build workspace-doged/build workspace-bchn/build

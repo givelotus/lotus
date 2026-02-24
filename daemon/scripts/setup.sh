@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 # setup.sh — Create or reset a daemon build workspace.
 #
-# SERIES=v2 (default): clone eCash at pinned commit, apply V2 patch series
-# SERIES=v1:           clone LotusiaStewardship/lotusd at pinned tag/commit
-# SERIES=doged:        clone doged-io/doged at pinned commit
+# SERIES=v2 (default): clone bitcoin-abc at latest, apply V2 patch series
+# SERIES=v1:           clone bitcoin-abc at latest, apply V1 patch series
+# SERIES=doged:        clone bitcoin-abc at latest, apply doged patch series
+# SERIES=bchn:         clone bitcoin-cash-node at pinned tag, apply patches 29-31
 #
 # Usage: ./scripts/setup.sh [--reset]
 #   --reset  wipe existing workspace and start fresh
@@ -33,72 +34,89 @@ clone_and_checkout() {
     echo "$label workspace ready at: $workspace"
 }
 
-# ─── V1: LotusiaStewardship/lotusd (mainnet-compatible) ──────────────────────
+# ─── helper: apply-patch-series ──────────────────────────────────────────────
+apply_patch_series() {
+    local series_file="$1" patches_dir="$2"
+    echo "Applying patch series..."
+    while IFS= read -r line; do
+        [[ "$line" =~ ^#.*$ || -z "$line" ]] && continue
+        local patch="$patches_dir/$line"
+        [[ ! -f "$patch" ]] && echo "ERROR: patch not found: $patch" && exit 1
+        echo "  applying $line..."
+        git apply --whitespace=nowarn "$patch"
+        git add -A
+        git commit -m "Apply patch: $line" --no-verify 2>/dev/null || true
+    done < "$series_file"
+}
+
+# ─── V1: bitcoin-abc base + Lotus mainnet patch series ───────────────────────
 if [[ "$SERIES" == "v1" ]]; then
     WORKSPACE="$DAEMON_DIR/workspace-v1"
-    VERSION_FILE="$DAEMON_DIR/lotusd-version"
-    REMOTE="https://github.com/LotusiaStewardship/lotusd.git"
+    VERSION_FILE="$DAEMON_DIR/bitcoin-abc-version"
+    SERIES_FILE="$DAEMON_DIR/patches/v1/series"
+    PATCHES_DIR="$DAEMON_DIR/patches/v1"
+    REMOTE="git@github.com:Bitcoin-ABC/bitcoin-abc.git"
     REF=$(grep -v '^#' "$VERSION_FILE" | grep -v '^$' | head -1)
-    echo "LotusiaStewardship/lotusd ref: $REF"
-    clone_and_checkout "$WORKSPACE" "$REMOTE" "$REF" "lotusd-work" "V1 (mainnet)"
+    echo "bitcoin-abc ref: $REF"
+    clone_and_checkout "$WORKSPACE" "$REMOTE" "$REF" "lotus-v1-work" "V1 (Lotus mainnet)"
+    apply_patch_series "$SERIES_FILE" "$PATCHES_DIR"
+    echo ""
+    echo "V1 workspace ready at: $WORKSPACE"
     echo "Build with: make build SERIES=v1"
     exit 0
 fi
 
-# ─── doged: Tobias's Dogecoin ABC implementation ─────────────────────────────
+# ─── doged: bitcoin-abc base + doged patch series ────────────────────────────
 if [[ "$SERIES" == "doged" ]]; then
     WORKSPACE="$DAEMON_DIR/workspace-doged"
-    VERSION_FILE="$DAEMON_DIR/doged-version"
-    REMOTE="https://github.com/doged-io/doged.git"
+    VERSION_FILE="$DAEMON_DIR/bitcoin-abc-version"
+    SERIES_FILE="$DAEMON_DIR/patches/doged/series"
+    PATCHES_DIR="$DAEMON_DIR/patches/doged"
+    REMOTE="git@github.com:Bitcoin-ABC/bitcoin-abc.git"
     REF=$(grep -v '^#' "$VERSION_FILE" | grep -v '^$' | head -1)
-    echo "doged-io/doged ref: $REF"
+    echo "bitcoin-abc ref (doged base): $REF"
     clone_and_checkout "$WORKSPACE" "$REMOTE" "$REF" "doged-work" "doged"
-    echo "Build with: make build SERIES=doged"
+    apply_patch_series "$SERIES_FILE" "$PATCHES_DIR"
     echo ""
-    echo "NOTE: eCash fork point unknown. After cloning, run:"
-    echo "  cd workspace-doged && git log --oneline | head -20"
-    echo "  to find where this diverged from Bitcoin ABC."
+    echo "doged workspace ready at: $WORKSPACE"
+    echo "Build with: make build SERIES=doged"
     exit 0
 fi
 
-# ─── V2: eCash base + Lotus patch series (new chain) ─────────────────────────
+# ─── bchn: Bitcoin Cash Node upstream PR candidates ──────────────────────────
+if [[ "$SERIES" == "bchn" ]]; then
+    WORKSPACE="$DAEMON_DIR/workspace-bchn"
+    VERSION_FILE="$DAEMON_DIR/bchn-version"
+    SERIES_FILE="$DAEMON_DIR/patches/bchn/series"
+    PATCHES_DIR="$DAEMON_DIR/patches/bchn"
+    REMOTE="https://gitlab.com/bitcoin-cash-node/bitcoin-cash-node.git"
+    REF=$(grep -v '^#' "$VERSION_FILE" | grep -v '^$' | head -1)
+    echo "bitcoin-cash-node ref: $REF"
+    clone_and_checkout "$WORKSPACE" "$REMOTE" "$REF" "bchn-work" "BCHN"
+    apply_patch_series "$SERIES_FILE" "$PATCHES_DIR"
+    echo ""
+    echo "BCHN workspace ready at: $WORKSPACE"
+    echo "Build with: make build SERIES=bchn"
+    echo ""
+    echo "NOTE: Patches 29-31 were written against eCash v0.24.11 and may need context"
+    echo "  adjustments to apply cleanly against BCHN. If git apply fails, port manually:"
+    echo "  cd workspace-bchn && <apply hunks by hand>"
+    echo "  make mkpatch SERIES=bchn NAME=<patch-name>"
+    exit 0
+fi
+
+# ─── V2: bitcoin-abc base + Lotus patch series (new chain) ───────────────────
 WORKSPACE="$DAEMON_DIR/workspace"
-ECASH_VERSION_FILE="$DAEMON_DIR/ecash-version"
+VERSION_FILE="$DAEMON_DIR/bitcoin-abc-version"
 SERIES_FILE="$DAEMON_DIR/patches/v2/series"
 PATCHES_DIR="$DAEMON_DIR/patches/v2"
-ECASH_REMOTE="git@github.com:Bitcoin-ABC/bitcoin-abc.git"
+REMOTE="git@github.com:Bitcoin-ABC/bitcoin-abc.git"
 
-ECASH_COMMIT=$(grep -v '^#' "$ECASH_VERSION_FILE" | grep -v '^$' | head -1)
-echo "eCash base commit: $ECASH_COMMIT"
+REF=$(grep -v '^#' "$VERSION_FILE" | grep -v '^$' | head -1)
+echo "bitcoin-abc ref: $REF"
 
-if [[ "${1:-}" == "--reset" ]]; then
-    echo "Resetting V2 workspace..."
-    rm -rf "$WORKSPACE"
-fi
-
-if [[ ! -d "$WORKSPACE" ]]; then
-    echo "Cloning eCash into workspace/..."
-    git clone "$ECASH_REMOTE" "$WORKSPACE"
-fi
-
-echo "Checking out pinned commit $ECASH_COMMIT..."
-cd "$WORKSPACE"
-git fetch origin
-git checkout -B lotus-work "$ECASH_COMMIT"
-
-echo "Applying patch series..."
-while IFS= read -r line; do
-    [[ "$line" =~ ^#.*$ || -z "$line" ]] && continue
-    PATCH="$PATCHES_DIR/$line"
-    if [[ ! -f "$PATCH" ]]; then
-        echo "ERROR: patch not found: $PATCH"
-        exit 1
-    fi
-    echo "  applying $line..."
-    git apply --whitespace=nowarn "$PATCH"
-    git add -A
-    git commit -m "Apply patch: $line" --no-verify 2>/dev/null || true
-done < "$SERIES_FILE"
+clone_and_checkout "$WORKSPACE" "$REMOTE" "$REF" "lotus-work" "V2 (Lotus new chain)"
+apply_patch_series "$SERIES_FILE" "$PATCHES_DIR"
 
 echo ""
 echo "V2 workspace ready at: $WORKSPACE"
