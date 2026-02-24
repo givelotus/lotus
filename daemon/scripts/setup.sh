@@ -15,6 +15,11 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DAEMON_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 SERIES="${SERIES:-v2}"
 
+# Export RESET from script argv so clone_and_checkout can see it
+if [[ "${1:-}" == "--reset" ]]; then
+    RESET="--reset"
+fi
+
 # ─── helper: clone-and-checkout ──────────────────────────────────────────────
 clone_and_checkout() {
     local workspace="$1" remote="$2" ref="$3" branch="$4" label="$5"
