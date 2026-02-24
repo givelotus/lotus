@@ -141,29 +141,85 @@ There is a real distinction between hard consensus and soft coordination:
 
 ---
 
-## V1 — Lotus Mainnet Archive
+## V1 — Lotus Mainnet (rebasing to latest bitcoin-abc)
 
-**Base:** eCash v0.24.11 `fa7a44f731a2dfe1587e572d9eb0e4bb7c73d79c` (static)
-**Goal:** Build lotusd v10.4.10; sync the Lotus mainnet.
+**Current base:** eCash v0.24.11 `fa7a44f731a2dfe1587e572d9eb0e4bb7c73d79c` (extraction anchor)
+**Target base:** bitcoin-abc `252182e957120652960c1f88ec96515c448b1204` (same as v2)
+**Goal:** Working lotusd on latest bitcoin-abc with Chronik. Lotus mainnet has been
+live since June 2021. We extracted the full commit history from both source repos and
+are now rebasing it onto modern bitcoin-abc so we can use Chronik and ship a supported build.
 
-### V1 Patch Manifest
+### Where We Are
 
-V1 is a **mainnet archive** (live since June 2021) — the historical series is frozen.
-Mining improvements exist at their historical positions; do not restructure slot numbering.
+We have extracted **245 individual commits** as patch files:
+
+| Range | Source | Count | Notes |
+|-------|--------|-------|-------|
+| `001` | (written fresh) | 1 | O(n log n) block construction (eCash v0.24.11 API) |
+| `002` | (written fresh) | 1 | Remove ancestor/descendant chain-tx limits |
+| `003` | (written fresh) | 1 | Mempool cleanup (DEFERRED — no-op after rebase to 252182e9) |
+| `004–199` | `givelotus/lotusd` | 196 | All non-merge commits, fork point `fa7a44f73..master` |
+| `200–245` | `LotusiaStewardship/lotusd` | 46 | Commits beyond givelotus: Ruth, Samuel, Taproot, v10.4.10 |
+
+**The patches currently target the eCash v0.24.11 base.** Many will conflict when applied
+to bitcoin-abc 252182e9. The next phase is to go through each one, apply it, run tests,
+fix conflicts, and move on. By the end we have a working Lotus daemon on current bitcoin-abc
+with Chronik fully functional.
+
+### Process — patch-by-patch rebase
+
+For each patch in order (001 → 245):
+1. `git apply --check patches/v1/<patch>` against a clean 252182e9 workspace
+2. If it fails: resolve conflicts manually, keeping Lotus-specific changes
+3. `git apply --whitespace=nowarn` to apply
+4. Run the relevant test suite (`make check` or the affected test file)
+5. Fix any test failures
+6. `make mkpatch SERIES=v1 NAME=<patch>` to re-emit the updated patch
+7. Move to the next patch
+
+Many early patches (004–100) will conflict because bitcoin-abc reorganized files between
+v0.24.11 and 252182e9. Key known conflicts:
+- `src/miner.cpp` → `src/node/miner.cpp` (affects patches touching mining)
+- `src/chainparams.cpp` → `src/kernel/chainparams.cpp` (affects every epoch patch)
+- Avalanche machinery added throughout `src/net_processing.cpp`
+- Chronik added as a new subsystem (patches touching it are additive, low conflict)
+- `src/init.cpp` reorganized substantially
+
+### Key landmark patches to watch for
+
+| Patch | What it is | Rebase note |
+|-------|------------|-------------|
+| `044` | Change blocktime to 2 minutes | `nPowTargetSpacing` change; file moved to kernel/ |
+| `043` | Remove ZeroMQ | Placeholder — write during rebase |
+| `087` | Add log2 fixed-point math | Low conflict; likely applies cleanly |
+| `095` | Log2 issuance curve | Medium conflict; touches chainparams + validation |
+| `158` | Add NNG interface | Likely applies with path adjustment |
+| `199` | Judges epoch activation | High conflict — epoch infrastructure differs |
+| `203` | Ruth epoch | High conflict |
+| `218` | 1st Samuel epoch | High conflict |
+| `230` | 2nd Samuel + Taproot | High conflict |
+| `240` | Taproot address RPC | Medium conflict |
+
+### Additional patches needed on top of the historical series
+
+These are not in the historical lotusd commits — write them after the series applies cleanly:
 
 | Slot | File | Status | What it does |
 |------|------|--------|--------------|
-| 01 | `01-lotus-mainnet.patch` | DONE | Monolithic origin diff (~52K lines, 371 files): full eCash v0.24.11 → Lotus. Contains blocktime, NNG, XAddress, issuance curve, genesis, opcodes, all v1 features. |
-| 02 | `02-cmake4-boost190-compat.patch` | DONE | CMake 4.x + Boost 1.90 build compatibility |
-| 03–27 | `03-judges-upgrade` … `27-version-9.4.3` | DONE | Epoch activations and version bumps. **Most contain no new features.** |
-| 10 | `10-mining-improvements.patch` | DONE | **Misnamed** — touches `activation.cpp` + `minerfund.cpp`; epoch activation, not mining algorithm |
-| 28 | `28-mining-improvements-2.patch` | DONE | **Misnamed** — touches `activation.cpp` only; another epoch patch |
-| 29 | `29-version-9.4.4.patch` | DONE | Version bump (active in series) |
-| 29* | `29-nlogn-block-construction.patch` | DONE (inactive) | **The actual O(n log n) mining patch** for v0.24.11 API. Touches `miner.cpp`, `miner.h`, `miner_tests.cpp`, `txmempool.h`. Commented out (slot conflict with 29-version-9.4.4). |
-| 30–42 | `30-second-samuel` … `42-version-10.4.10` | DONE | Epoch activations, taproot stages, version bumps |
-| 43 | `43-remove-zeromq.patch` | NEEDS-WRITE | ZeroMQ only disabled (BUILD_BITCOIN_ZMQ=OFF), never deleted. Placeholder exists. |
-| 00* | `00-issuance-compat.patch` | NEEDS-WRITE | `-issuance=ecash` flag; useful for eCash test suite. Not part of mainnet history. Placeholder exists. |
-| — | `chronik-backport.patch` | DEFERRED | V1 predates Chronik; large effort; mainnet runs without it |
+| A | `08b-decouple-avalanche.patch` | NEEDS-WRITE | Remove Avalanche from chain-tip finalization; keep for soft voting |
+| B | `32-chronik-adapt.patch` | NEEDS-WRITE | Adapt Chronik output to `lotus` prefix + Lotus denomination |
+| C | `04-issuance-compat.patch` | NEEDS-WRITE | `-issuance=ecash` flag for running eCash test suite |
+
+### V1 Patch Manifest (summary)
+
+The individual patches are listed in `daemon/patches/v1/series`. There are 245 of them.
+Rather than repeat all 245 here, the key categories are:
+
+- **001–003**: Mining improvements (nlogn, remove chain limits, cleanup)
+- **004–046**: Core Lotus protocol changes (genesis, ASERT, blocktime, issuance, NNG, opcodes)
+- **047–100**: Address format, XAddress, chain params, Chronik stubs
+- **101–199**: Epoch activations (Numbers through Judges) + version bumps
+- **200–245**: LotusiaStewardship additions (Ruth, Samuel epochs, Taproot, v10.4.10)
 
 ---
 
@@ -224,23 +280,59 @@ Until this decomposition is done, workspace-doged remains a direct clone.
 
 ## Work Sequencing
 
-| Priority | Work Item | Depends on |
-|----------|-----------|------------|
-| 1 | Write `11-remove-zeromq.patch` for v2 (directly against 252182e9) | nothing |
-| 2 | Port NNG + ZeroMQ removal to ecash (slots 10-11) | v2 patch 10+11 |
-| 3 | Port NNG + ZeroMQ removal to bchn (slots 10-11) | v2 patch 10+11 |
-| 4 | Write `47-remove-zeromq.patch` for v1 (against eCash v0.24.11) | nothing |
-| 5 | Write `04-issuance-compat.patch` for v2 and v1 | nothing |
-| 6 | Write `08c-blocktime.patch` for v2 (2-line chainparams.cpp change; blocktime buried in monolithic v1 patch, write fresh) | bitcoin-abc 252182e9 base |
-| 7 | Scrape doged git log for blocktime commit + all patch topics; document in doged series | workspace-doged |
-| 8 | Write `08b-decouple-avalanche.patch` for v2 | Avalanche decision (done) |
-| 9 | Rebase v2 patches 05–31 onto 252182e9 | nothing blocking |
-| 10 | Extract block-header, dual-txid, 64-bit fix from 23-misc during rebase | step 9 |
-| 11 | Write `32-chronik-adapt.patch` for v2 | `07-xaddress` rebased, xpi prefix confirmed |
-| 12 | Decompose doged patches | time / priority |
-| 13 | Port mining patches 01-03 to v1 (eCash v0.24.11 API) | time |
-| 14 | Mine genesis, update patches 16/17/18 | launch readiness |
-| 15 | Implement Mitra (patch 33) | opcode slot decision, dual-txid patch |
+### Primary goal (current): Rebase V1 onto bitcoin-abc 252182e9
+
+The immediate focus is getting all 245 v1 patches applying cleanly to the latest
+bitcoin-abc. Once that's done we have a working Lotus daemon with Chronik.
+
+**Process:** For each patch in `patches/v1/series` (001 → 245):
+```
+git apply --check patches/v1/<patch>     # see what fails
+# fix conflicts, keeping Lotus logic, accepting upstream reorganization
+git apply --whitespace=nowarn patches/v1/<patch>
+make check                                # or run specific test
+# fix test failures
+make mkpatch SERIES=v1 NAME=<patch>      # re-emit updated patch
+```
+
+| Priority | Work Item | Status |
+|----------|-----------|--------|
+| **1** | **Rebase v1 patches 001–245 onto bitcoin-abc 252182e9** | **IN PROGRESS** |
+| 1a | Patches 001–050: core protocol, genesis, blocktime, NNG, opcodes | not started |
+| 1b | Patches 051–100: XAddress, chainparams, issuance, DAA | not started |
+| 1c | Patches 101–199: epoch activations (Numbers → Judges) | not started |
+| 1d | Patches 200–245: Ruth → 2nd Samuel, Taproot, v10.4.10 | not started |
+| 1e | Write `08b-decouple-avalanche.patch` on top of rebased series | not started |
+| 1f | Write `32-chronik-adapt.patch` (lotus prefix + denomination) | not started |
+| 2 | Verify Chronik works end-to-end against Lotus mainnet | after 1f |
+| 3 | Rebase v2 patches 05–31 onto 252182e9 (derive from v1 rebase) | after step 1 |
+| 4 | Extract block-header / dual-txid / 64-bit fix from 23-misc | during step 3 |
+| 5 | Write v2-specific patches (new genesis, issuance params, xpi prefix) | after step 3 |
+| 6 | Decompose doged patches | lower priority |
+| 7 | Port NNG + ZeroMQ patches to ecash / bchn (slots 10-11) | lower priority |
+| 8 | Mine v2 genesis, update patches 16/17/18 | launch readiness |
+| 9 | Implement Mitra (patch 33) | opcode slot decision, dual-txid |
+
+### Notes on the rebase
+
+**File moves to expect** (bitcoin-abc moved files between v0.24.11 and 252182e9):
+- `src/chainparams.cpp` → `src/kernel/chainparams.cpp`
+- `src/miner.cpp` → `src/node/miner.cpp`
+- Many `src/*.cpp` split into `src/node/*.cpp` and `src/kernel/*.cpp`
+
+**Epoch activation patches (101–245)** will conflict heavily because bitcoin-abc removed
+the `gArgs.GetArg("-xxxactivationtime", ...)` pattern. Strategy: accept the upstream
+removal of that plumbing and keep only the Lotus-specific activation logic and addresses.
+
+**Avalanche** is woven throughout `src/net_processing.cpp` and `src/validation.cpp` in
+252182e9 in ways that didn't exist in v0.24.11. Patches touching those files will conflict.
+Accept bitcoin-abc's Avalanche additions (we keep the code), just make sure Lotus's own
+changes layer on top cleanly. The `08b-decouple-avalanche.patch` applied last removes the
+consensus-critical Avalanche hooks.
+
+**Chronik** is additive in 252182e9 — it's a new subsystem not present in v0.24.11.
+Lotus patches don't touch Chronik, so those patches should apply cleanly. The
+`32-chronik-adapt.patch` at the end adjusts Chronik output for Lotus specifics.
 
 ---
 
