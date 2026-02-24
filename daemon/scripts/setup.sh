@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # setup.sh — Create or reset a daemon build workspace.
 #
-# SERIES=v2 (default): clone bitcoin-abc at latest, apply V2 patch series
-# SERIES=v1:           clone bitcoin-abc at latest, apply V1 patch series
-# SERIES=doged:        clone bitcoin-abc at latest, apply doged patch series
+# SERIES=v2 (default): clone bitcoin-abc at 252182e9, apply V2 patch series
+# SERIES=v1:           clone bitcoin-abc at eCash v0.24.11, apply V1 patch series (42 patches)
+# SERIES=doged:        clone doged-io/doged directly at doged-version tag/branch
 # SERIES=bchn:         clone bitcoin-cash-node at pinned tag, apply patches 29-31
 #
 # Usage: ./scripts/setup.sh [--reset]
@@ -49,15 +49,15 @@ apply_patch_series() {
     done < "$series_file"
 }
 
-# ─── V1: bitcoin-abc base + Lotus mainnet patch series ───────────────────────
+# ─── V1: eCash v0.24.11 base + Lotus mainnet patch series (42 patches) ───────
 if [[ "$SERIES" == "v1" ]]; then
     WORKSPACE="$DAEMON_DIR/workspace-v1"
-    VERSION_FILE="$DAEMON_DIR/bitcoin-abc-version"
+    VERSION_FILE="$DAEMON_DIR/ecash-version"
     SERIES_FILE="$DAEMON_DIR/patches/v1/series"
     PATCHES_DIR="$DAEMON_DIR/patches/v1"
     REMOTE="git@github.com:Bitcoin-ABC/bitcoin-abc.git"
     REF=$(grep -v '^#' "$VERSION_FILE" | grep -v '^$' | head -1)
-    echo "bitcoin-abc ref: $REF"
+    echo "eCash v0.24.11 ref: $REF"
     clone_and_checkout "$WORKSPACE" "$REMOTE" "$REF" "lotus-v1-work" "V1 (Lotus mainnet)"
     apply_patch_series "$SERIES_FILE" "$PATCHES_DIR"
     echo ""
@@ -66,20 +66,18 @@ if [[ "$SERIES" == "v1" ]]; then
     exit 0
 fi
 
-# ─── doged: bitcoin-abc base + doged patch series ────────────────────────────
+# ─── doged: direct clone of doged-io/doged at pinned version ─────────────────
 if [[ "$SERIES" == "doged" ]]; then
     WORKSPACE="$DAEMON_DIR/workspace-doged"
-    VERSION_FILE="$DAEMON_DIR/bitcoin-abc-version"
-    SERIES_FILE="$DAEMON_DIR/patches/doged/series"
-    PATCHES_DIR="$DAEMON_DIR/patches/doged"
-    REMOTE="git@github.com:Bitcoin-ABC/bitcoin-abc.git"
+    VERSION_FILE="$DAEMON_DIR/doged-version"
+    REMOTE="git@github.com:doged-io/doged.git"
     REF=$(grep -v '^#' "$VERSION_FILE" | grep -v '^$' | head -1)
-    echo "bitcoin-abc ref (doged base): $REF"
+    echo "doged ref: $REF"
     clone_and_checkout "$WORKSPACE" "$REMOTE" "$REF" "doged-work" "doged"
-    apply_patch_series "$SERIES_FILE" "$PATCHES_DIR"
     echo ""
     echo "doged workspace ready at: $WORKSPACE"
     echo "Build with: make build SERIES=doged"
+    echo "NOTE: doged is a direct clone — no patches applied (it is its own patchset)."
     exit 0
 fi
 

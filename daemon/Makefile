@@ -1,13 +1,15 @@
 # daemon/Makefile — Lotus daemon build management
 #
-# All Lotus-family series (v1, v2, doged) use bitcoin-abc as their base.
-# See daemon/bitcoin-abc-version for the shared base commit.
-# BCHN uses its own pinned base (see bchn-version).
+# Each series has its own base:
+#   SERIES=v2    — bitcoin-abc HEAD (252182e9)       see bitcoin-abc-version
+#   SERIES=v1    — eCash v0.24.11  (fa7a44f73)       see ecash-version
+#   SERIES=doged — doged-io/doged  (direct clone)    see doged-version
+#   SERIES=bchn  — BCHN v28.0.0                      see bchn-version
 #
 # Four build targets are supported:
 #   SERIES=v2 (default) — new chain: adaptive issuance, no IFP, OP_LOG/SQRT, Mitra
-#   SERIES=v1           — mainnet-compatible: bitcoin-abc + v1 patch series
-#   SERIES=doged        — Dogecoin ABC: bitcoin-abc + doged patch series
+#   SERIES=v1           — mainnet-compatible: eCash v0.24.11 + 42-patch Lotus series
+#   SERIES=doged        — Dogecoin ABC: direct clone of doged-io/doged
 #   SERIES=bchn         — Bitcoin Cash Node: chain-tx improvements (29–31) as upstream PR candidates
 #
 # Targets:
@@ -33,10 +35,10 @@ help:
 	@echo "  make mkpatch NAME=<n>          Save workspace changes as patches/<n>.patch"
 	@echo "  make refresh COMMIT=<c>        Rebase onto new base commit or tag"
 	@echo ""
-	@echo "  SERIES=v2 (default): new chain  — workspace/        (bitcoin-abc base)"
-	@echo "  SERIES=v1:           mainnet    — workspace-v1/     (bitcoin-abc base)"
-	@echo "  SERIES=doged:        doged      — workspace-doged/  (bitcoin-abc base)"
-	@echo "  SERIES=bchn:         BCHN       — workspace-bchn/   (bchn-version base)"
+	@echo "  SERIES=v2 (default): new chain  — workspace/        (bitcoin-abc 252182e9)"
+	@echo "  SERIES=v1:           mainnet    — workspace-v1/     (eCash v0.24.11 fa7a44f73)"
+	@echo "  SERIES=doged:        doged      — workspace-doged/  (direct clone doged-io/doged)"
+	@echo "  SERIES=bchn:         BCHN       — workspace-bchn/   (BCHN v28.0.0)"
 
 setup:
 ifdef RESET
