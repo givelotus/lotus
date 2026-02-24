@@ -49,15 +49,15 @@ apply_patch_series() {
     done < "$series_file"
 }
 
-# ─── V1: eCash v0.24.11 base + Lotus mainnet patch series (42 patches) ───────
+# ─── V1: bitcoin-abc 252182e9 base + Lotus mainnet patch series ───────────────
 if [[ "$SERIES" == "v1" ]]; then
     WORKSPACE="$DAEMON_DIR/workspace-v1"
-    VERSION_FILE="$DAEMON_DIR/ecash-version"
+    VERSION_FILE="$DAEMON_DIR/bitcoin-abc-version"
     SERIES_FILE="$DAEMON_DIR/patches/v1/series"
     PATCHES_DIR="$DAEMON_DIR/patches/v1"
     REMOTE="git@github.com:Bitcoin-ABC/bitcoin-abc.git"
     REF=$(grep -v '^#' "$VERSION_FILE" | grep -v '^$' | head -1)
-    echo "eCash v0.24.11 ref: $REF"
+    echo "bitcoin-abc ref: $REF"
     clone_and_checkout "$WORKSPACE" "$REMOTE" "$REF" "lotus-v1-work" "V1 (Lotus mainnet)"
     apply_patch_series "$SERIES_FILE" "$PATCHES_DIR"
     echo ""
