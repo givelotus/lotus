@@ -132,12 +132,15 @@ There is a real distinction between hard consensus and soft coordination:
 
 **Action:**
 - Add `08b-decouple-avalanche.patch` after `08-daa-cleanup` in v2 series (NEEDS-WRITE)
-- Remove Avalanche from: chain-tip finalization hooks in `src/net_processing.cpp`,
-  block validity checks that require Avalanche quorum
-- **Keep:** `src/avalanche/` directory, CMake option, init startup — Avalanche remains
-  functional as a gossip/voting protocol for soft parameter coordination (fee preferences,
-  mempool policy, network parameter governance)
-- Avalanche votes have no authority over which block is valid or which chain tip wins
+- Same patch at slot `000` in v1 series (applied first, before mining patches)
+- **Remove from** `src/net_processing.cpp` and `src/validation.cpp`:
+  the call sites where Avalanche quorum gates block acceptance or chain-tip finalization.
+  A valid PoW block is valid, full stop — Avalanche cannot veto it.
+- **Keep everything in** `src/avalanche/`: the gossip protocol, voting rounds, quorum
+  tracking, and all the parameter-voting machinery. Nodes can still run Avalanche rounds
+  to reach soft consensus on fee preferences, mempool policy knobs, and other network
+  parameters. None of that touches block or transaction validity.
+- Net result: Avalanche is still running and useful, just not in the consensus path.
 
 ---
 
@@ -166,10 +169,39 @@ to bitcoin-abc 252182e9. The next phase is to go through each one, apply it, run
 fix conflicts, and move on. By the end we have a working Lotus daemon on current bitcoin-abc
 with Chronik fully functional.
 
+### Patch ordering on the rebased 252182e9 base
+
+**Slot 000 comes before everything else — decouple Avalanche from block/tx consensus first.**
+
+At bitcoin-abc 252182e9, Avalanche is woven into `net_processing.cpp` and `validation.cpp`
+at dozens of call sites. Specifically: chain-tip finalization hooks, quorum checks used as
+block validity criteria, and tx-acceptance gates. Stripping *those specific hooks* first
+means every subsequent Lotus patch that touches those files lands on cleaner context.
+
+**What stays vs what goes in 000-decouple-avalanche:**
+
+- **Keep:** `src/avalanche/` directory entirely. We want Avalanche for soft parameter
+  voting — nodes gossip and reach quorum on things like preferred fee rates, mempool policy
+  knobs, and other network parameters. None of that touches block or transaction validity.
+- **Remove:** The call sites where Avalanche quorum is required to *accept a block* or
+  *finalize a chain tip*. Lotus is a pure PoW chain; a valid PoW block is valid, full stop.
+  Avalanche cannot veto it.
+- **Leave alone:** Everything in `src/avalanche/` that handles gossip, voting rounds,
+  quorum tracking — that's the part we want. Just disconnect it from the block/tx validity
+  gates in `net_processing.cpp` and `validation.cpp`.
+
+```
+000-decouple-avalanche   ← remove block/tx finalization hooks; keep gossip/voting
+001-nlogn-block          ← mining (uses 252182e9 API: src/node/miner.cpp + addTxs)
+002-remove-chaintx       ← chain-tx limits
+003-mempool-cleanup      ← no-op at this base
+004 → 245                ← Lotus historical commits, conflict-resolved one at a time
+```
+
 ### Process — patch-by-patch rebase
 
-For each patch in order (001 → 245):
-1. `git apply --check patches/v1/<patch>` against a clean 252182e9 workspace
+For each patch in order (000 → 245):
+1. `git apply --check patches/v1/<patch>` against the workspace
 2. If it fails: resolve conflicts manually, keeping Lotus-specific changes
 3. `git apply --whitespace=nowarn` to apply
 4. Run the relevant test suite (`make check` or the affected test file)
@@ -177,12 +209,11 @@ For each patch in order (001 → 245):
 6. `make mkpatch SERIES=v1 NAME=<patch>` to re-emit the updated patch
 7. Move to the next patch
 
-Many early patches (004–100) will conflict because bitcoin-abc reorganized files between
+Many patches (004–100) will conflict because bitcoin-abc reorganized files between
 v0.24.11 and 252182e9. Key known conflicts:
 - `src/miner.cpp` → `src/node/miner.cpp` (affects patches touching mining)
 - `src/chainparams.cpp` → `src/kernel/chainparams.cpp` (affects every epoch patch)
-- Avalanche machinery added throughout `src/net_processing.cpp`
-- Chronik added as a new subsystem (patches touching it are additive, low conflict)
+- Chronik is a new subsystem (Lotus patches don't touch it; additive, low conflict)
 - `src/init.cpp` reorganized substantially
 
 ### Key landmark patches to watch for
