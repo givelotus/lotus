@@ -104,7 +104,7 @@ if [[ "$SERIES" == "bchn" ]]; then
 fi
 
 # ─── V2: bitcoin-abc base + Lotus patch series (new chain) ───────────────────
-WORKSPACE="$DAEMON_DIR/workspace"
+WORKSPACE="$DAEMON_DIR/workspace-v2"
 VERSION_FILE="$DAEMON_DIR/bitcoin-abc-version"
 SERIES_FILE="$DAEMON_DIR/patches/v2/series"
 PATCHES_DIR="$DAEMON_DIR/patches/v2"

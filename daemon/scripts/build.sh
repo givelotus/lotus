@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # build.sh — Build lotusd from a workspace.
 #
-# SERIES=v2 (default): build from workspace/
+# SERIES=v2 (default): build from workspace-v2/
 # SERIES=v1:           build from workspace-v1/
 #
 # Usage: ./scripts/build.sh [cmake-args...]
@@ -20,7 +20,7 @@ elif [[ "$SERIES" == "doged" ]]; then
     WORKSPACE="$DAEMON_DIR/workspace-doged"
     LABEL="doged (Tobias/Dogecoin ABC)"
 else
-    WORKSPACE="$DAEMON_DIR/workspace"
+    WORKSPACE="$DAEMON_DIR/workspace-v2"
     LABEL="V2 (new chain)"
 fi
 

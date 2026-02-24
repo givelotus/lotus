@@ -5,6 +5,36 @@
 Single source of truth for all patches across all series. Tracks status, ordering,
 what each patch does, which series it applies to, and what work remains.
 
+---
+
+## Patch Quality Standard
+
+**These patches run a live network. Bugs mean lost funds, forks, or downtime.**
+
+Every patch — whether written from scratch or rebased from history — must be
+reviewed before it goes into a series. Sloppy context lines, half-applied hunks,
+or logic errors that happen to compile are the failure mode. The goal is not "it
+applies cleanly"; the goal is "it is correct."
+
+### IMPCPD review
+
+Every patch must pass IMPCPD review before being marked `DONE`.
+See **`daemon/docs/impcpd-methodology.md`** for the full checklist and scoring guide.
+
+Summary of the personas applied to every patch:
+- **Regression** — does it break existing behavior?
+- **Consensus Correctness** — is every branch of the state machine handled?
+- **Security** — does it add a new attack surface?
+- **Edge Cases** — genesis, empty mempool, reorg, disabled Avalanche?
+- **Completeness** — all three networks updated? series file correct? `git apply --check` passes?
+- **Tests & Docs** — test that fails before and passes after?
+- **Minimality** — does it do exactly one thing?
+
+A patch that fails Minimality (does more than it claims) must be split before
+the other personas are even applied.
+
+---
+
 **Status legend:**
 - `DONE` — applies cleanly, correct, no further work needed
 - `NEEDS-REBASE` — logically correct but context lines outdated; re-express against current base

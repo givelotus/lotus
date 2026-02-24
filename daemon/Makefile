@@ -7,10 +7,11 @@
 #   SERIES=bchn  — BCHN v28.0.0                      see bchn-version
 #
 # Four build targets are supported:
-#   SERIES=v2 (default) — new chain: adaptive issuance, no IFP, OP_LOG/SQRT, Mitra
-#   SERIES=v1           — mainnet-compatible: eCash v0.24.11 + 42-patch Lotus series
-#   SERIES=doged        — Dogecoin ABC: direct clone of doged-io/doged
-#   SERIES=bchn         — Bitcoin Cash Node: chain-tx improvements (29–31) as upstream PR candidates
+#   SERIES=v2 (default) — new chain (workspace-v2/):   bitcoin-abc 252182e9 + Lotus v2 patches
+#   SERIES=v1           — mainnet   (workspace-v1/):   lotusd history rebased onto bitcoin-abc
+#   SERIES=ecash        — eCash PRs (workspace-v2/):   mining + NNG patches for upstream
+#   SERIES=doged        — doged     (workspace-doged/): doged-io/doged direct clone
+#   SERIES=bchn         — BCHN      (workspace-bchn/):  BCHN v28.0.0 + mining patches
 #
 # Targets:
 #   make setup              — apply patch series into workspace (V2 default)
@@ -35,7 +36,7 @@ help:
 	@echo "  make mkpatch NAME=<n>          Save workspace changes as patches/<n>.patch"
 	@echo "  make refresh COMMIT=<c>        Rebase onto new base commit or tag"
 	@echo ""
-	@echo "  SERIES=v2 (default): new chain  — workspace/        (bitcoin-abc 252182e9)"
+	@echo "  SERIES=v2 (default): new chain  — workspace-v2/     (bitcoin-abc 252182e9)"
 	@echo "  SERIES=v1:           mainnet    — workspace-v1/     (eCash v0.24.11 fa7a44f73)"
 	@echo "  SERIES=doged:        doged      — workspace-doged/  (direct clone doged-io/doged)"
 	@echo "  SERIES=bchn:         BCHN       — workspace-bchn/   (BCHN v28.0.0)"
@@ -70,4 +71,4 @@ else
 endif
 
 clean:
-	rm -rf workspace/build workspace-v1/build workspace-doged/build workspace-bchn/build
+	rm -rf workspace-v2/build workspace-v1/build workspace-doged/build workspace-bchn/build

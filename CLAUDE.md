@@ -33,8 +33,9 @@ Four patch series are maintained. Each uses a different upstream base:
 
 | SERIES | Base | Version file | Workspace | Purpose |
 |--------|------|-------------|-----------|---------|
-| `v2` (default) | bitcoin-abc `252182e9` | `bitcoin-abc-version` | `workspace/` | New Lotus chain (adaptive issuance, OP_LOG/SQRT, Mitra) |
-| `v1` | eCash v0.24.11 `fa7a44f73` | `ecash-version` | `workspace-v1/` | Lotus mainnet compatibility (42 patches → lotusd v10.4.10) |
+| `v2` (default) | bitcoin-abc `252182e9` | `bitcoin-abc-version` | `workspace-v2/` | New Lotus chain (adaptive issuance, OP_LOG/SQRT, Mitra) |
+| `v1` | target: bitcoin-abc `252182e9` | `bitcoin-abc-version` | `workspace-v1/` | Lotus mainnet (245 patches extracted from lotusd history, being rebased) |
+| `ecash` | bitcoin-abc `252182e9` | `bitcoin-abc-version` | `workspace-v2/` | Upstream PR candidates for eCash (mining + NNG patches) |
 | `doged` | direct clone of doged-io/doged | `doged-version` | `workspace-doged/` | Dogecoin ABC (Tobias Ruck; Mitra author; reference) |
 | `bchn` | BCHN v28.0.0 | `bchn-version` | `workspace-bchn/` | Bitcoin Cash Node upstream PR candidates |
 
@@ -44,46 +45,51 @@ Workspaces are **not tracked** in this repo (listed in `daemon/.gitignore`). Rec
 
 ```bash
 cd daemon/
-make setup               # v2 (new chain) — bitcoin-abc 252182e9 + v2 patch series
-make setup SERIES=v1     # Lotus mainnet — eCash v0.24.11 + 42 patches
-make setup SERIES=doged  # direct clone of doged-io/doged
-make setup SERIES=bchn   # BCHN v28.0.0 + patches 29-31
+make setup               # v2 (new chain) — bitcoin-abc 252182e9 + v2 patch series → workspace-v2/
+make setup SERIES=v1     # Lotus mainnet — 245 patches being rebased to bitcoin-abc 252182e9 → workspace-v1/
+make setup SERIES=doged  # direct clone of doged-io/doged → workspace-doged/
+make setup SERIES=bchn   # BCHN v28.0.0 + patches 29-31 → workspace-bchn/
 make build               # cmake + ninja → lotusd + lotus-cli
 ```
 
 ### Patch workflow
 
 ```bash
-# Edit files in daemon/workspace/, then save as a patch:
+# Edit files in daemon/workspace-v2/, then save as a patch:
 make mkpatch NAME=25-my-feature        # saves to patches/v2/25-my-feature.patch
 # Add the name to patches/v2/series (in order), then commit.
 
+# Edit files in daemon/workspace-v1/, then save as a v1 patch:
+make mkpatch SERIES=v1 NAME=044-blocktime  # saves to patches/v1/044-blocktime.patch
+
 # Rebase v2 onto a newer bitcoin-abc commit:
 make refresh SERIES=v2 COMMIT=<hash> DESC="bitcoin-abc 2026-03-01"
-
-# Add a newer lotusd release to the v1 series:
-make refresh SERIES=v1 COMMIT=v10.4.11 DESC="lotusd v10.4.11"
-
-# Advance doged to a newer release:
-make refresh SERIES=doged COMMIT=v0.5.0 DESC="doged v0.5.0"
 ```
 
 ### Key files
 
-- `daemon/bitcoin-abc-version` — pinned bitcoin-abc commit for v2 (`252182e9`)
-- `daemon/ecash-version` — pinned eCash v0.24.11 base for v1 (`fa7a44f73`, static)
+- `daemon/bitcoin-abc-version` — pinned bitcoin-abc commit for v1+v2 (`252182e9`)
 - `daemon/doged-version` — doged branch/tag (`master`, ~Oct 2025 / v0.4.0)
 - `daemon/bchn-version` — BCHN tag (`v28.0.0` / `0bc23ac4`)
-- `daemon/lotusd-version` — current lotusd release tracked in v1 (`v10.4.10`)
-- `daemon/patches/v2/series` — ordered patch list for new chain (patches 01–31 active; 01–28 need rebase to 252182e9)
-- `daemon/patches/v1/series` — 42 patches, all apply cleanly to eCash v0.24.11
-- `daemon/patches/ecash/` — ecash-specific versions of patches 29-31 (same base as v2)
-- `daemon/patches/bchn/` — BCHN-adapted patches 29-31
+- `daemon/patches/v2/series` — ordered patch list for new chain (patches 01–31; need rebase)
+- `daemon/patches/v1/series` — 245 patches extracted from lotusd history (being rebased to 252182e9)
+- `daemon/patches/ecash/` — ecash upstream PR candidates (mining + NNG)
+- `daemon/patches/bchn/` — BCHN-adapted mining patches
+- `daemon/docs/patch-strategy.md` — full patch manifest, status, and work sequencing
+- `daemon/docs/impcpd-methodology.md` — patch review methodology (IMPCPD)
 
-### v2 patch status
+### Patch review standard
 
-- **Patches 01–28**: written against eCash v0.24.11 — still need rebase onto bitcoin-abc 252182e9
-- **Patches 29–31**: ported to bitcoin-abc 252182e9 API (`src/node/miner.cpp`, `addTxs(const CTxMemPool&)`)
+All patches must pass IMPCPD review before being marked DONE.
+See `daemon/docs/impcpd-methodology.md`. Consensus-touching patches are held to the
+highest standard — bugs mean forks, downtime, or fund loss on a live network.
+
+### v1 patch status (current primary goal)
+
+245 patches extracted from `givelotus/lotusd` (004–199) and `LotusiaStewardship/lotusd`
+(200–245). Plus mining patches 001–003 and Avalanche decouple at slot 000.
+Currently targeting eCash v0.24.11; being rebased patch-by-patch to bitcoin-abc 252182e9
+so we can run Chronik. See `daemon/docs/patch-strategy.md` for the process.
 
 ### macOS build dependencies
 

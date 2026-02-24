@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # run.sh — Launch lotusd with adequate file descriptor limits.
 #
-# SERIES=v2 (default): run from workspace/
+# SERIES=v2 (default): run from workspace-v2/
 # SERIES=v1:           run from workspace-v1/
 #
 # Usage: ./scripts/run.sh [lotusd-args...]
@@ -18,7 +18,7 @@ if [[ "$SERIES" == "v1" ]]; then
 elif [[ "$SERIES" == "doged" ]]; then
     LOTUSD="$DAEMON_DIR/workspace-doged/build/src/doged"
 else
-    LOTUSD="$DAEMON_DIR/workspace/build/src/lotusd"
+    LOTUSD="$DAEMON_DIR/workspace-v2/build/src/lotusd"
 fi
 
 if [[ ! -x "$LOTUSD" ]]; then
