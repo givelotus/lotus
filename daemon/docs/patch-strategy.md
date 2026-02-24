@@ -54,7 +54,8 @@ a much larger effort than rebasing our existing patches.
 | 06 | `06-currency-unit.patch` | NEEDS-REBASE | XPI denomination; 1 XPI = 10^4 satoshis; amount formatting throughout |
 | 07 | `07-xaddress.patch` | NEEDS-REBASE | XAddress encoding/decoding; replaces CashAddr; v2 prefix = `xpi` (v1 used `lotus`) |
 | 08 | `08-daa-cleanup.patch` | NEEDS-REBASE | Remove Grasberg/EDA; keep only aserti3-2d DAA |
-| 09 | `09-merkle.patch` | NEEDS-REBASE | IGUANA interleaved merkle tree; fixes the CVE-2012-2459 variant merkle tree vulnerability |
+| 08b | `08b-remove-avalanche.patch` | NEEDS-WRITE | Remove Avalanche from consensus path: `src/avalanche/`, net_processing hooks, init startup, CMake option. Avalanche is a competing finalization layer incompatible with the σₜ security model. Soft advisory coordination (fees etc.) is a separate future patch. |
+| 09 | `09-merkle.patch` | NEEDS-REBASE | IGUANA interleaved merkle tree; fixes the CVE-2012-2459 variant merkle tree vulnerability; implements MerklixHash (bitwise trie + SHA256 overlay) per the 2018 Vermorel/Séchet/Chancellor/Cox paper |
 | 10 | `10-nng-interface.patch` | NEEDS-REBASE | NNG pub/sub replacing ZeroMQ; adds `src/nng_interface/`; Chronik stays separate |
 | 11 | `11-remove-zeromq.patch` | NEEDS-WRITE | Delete `src/zmq/`, ZeroMQ CMake option, ZeroMQ functional + unit tests; was never removed |
 | 12 | `12-issuance-OLD.patch` | DEFERRED | Old log2 issuance curve — **superseded by 26+27; remove from series once those confirmed stable** |
@@ -66,7 +67,7 @@ a much larger effort than rebasing our existing patches.
 | 18 | `18-checkpoints.patch` | NEEDS-FIX | Checkpoints — currently has v1 values; must be cleared for new chain |
 | 19 | `19-fixed-seeds.patch` | NEEDS-WRITE | Seed node IPs for new chain (v1 IPs currently; need new seed nodes) |
 | 20 | `20-seeder.patch` | NEEDS-REBASE | DNS seeder tool |
-| 21 | `21-consensus-activation.patch` | NEEDS-REBASE | Named upgrade epochs (Exodus through 1st Kings) with activation times |
+| 21 | `21-consensus-activation.patch` | NEEDS-REVIEW | V1 named upgrade epochs (Exodus through 1st Kings). **V2 activates everything at block 0 — no epoch infrastructure needed.** This patch likely should be dropped from v2 entirely or replaced with a single "all features active at genesis" config. Keep in v1 series only. |
 | 22 | `22-src-build.patch` | NEEDS-REBASE | src/CMakeLists.txt and sub-build-systems |
 | 23 | `23-misc.patch` | NEEDS-REBASE+EXTRACT | RPC, wallet, net, tests, util, policy, primitives. **Contains several things that need their own patches — see below** |
 | 24 | `24-qt-gui.patch` | NEEDS-REBASE | Qt GUI (BUILD_BITCOIN_QT=OFF by default) |
@@ -96,32 +97,39 @@ Each needs to be extracted as its own named patch during the rebase:
 | Decision | Status | Notes |
 |----------|--------|-------|
 | XAddress prefix | **DECIDED** — `xpi` | V1 uses `lotus`; v2 uses `xpi` to prevent address reuse across chains |
+| Avalanche in v2 | **DECIDED** — remove from consensus | See below; soft coordination (fees etc.) is a separate future patch |
+| V2 epoch activation | **DECIDED** — drop patch 21 | V2 activates everything at block 0; no epoch infrastructure needed; keep 21 in v1 only |
 | Taproot in v2 | OPEN | Needs review before patch 15 is rebased; may or may not belong in v2 |
-| Avalanche in v2 | OPEN | Comes free with 252182e9 base; discuss vs Lotus economics papers (see below) |
 | Mine genesis nNonce | BLOCKED on launch readiness | Patches 16/17 have placeholder nNonce=0 |
 | Remove patch 12 | PENDING | Remove `12-issuance-OLD.patch` once 26+27 confirmed stable |
 | Mitra opcode slots | OPEN | Patch 31 uses 0xbf–0xc4; Mitra needs adjacent slots; resolve before implementing 33 |
 
-### Avalanche discussion
+### Avalanche — DECIDED: remove from consensus, advisory use TBD
 
-bitcoin-abc 252182e9 includes Avalanche consensus (Post-Consensus finalization).
-When we rebase v2 patches onto this base, Avalanche comes along unless explicitly removed.
+**The core problem with Avalanche as a consensus mechanism:**
+Two consensus mechanisms with no defined tie-breaker. PoW miners can build a valid chain
+that Avalanche validators reject. eCash's answer is "Avalanche wins" — which means it's
+no longer a PoW chain in any meaningful sense. The σₜ security signal from Paper 1 breaks
+immediately: security expenditure is now split between hashwork (visible) and stake
+(opaque), and the adaptive issuance math in Paper 2 assumes σₜ is the sole signal.
 
-**Arguments for keeping it:**
-- Zero extra implementation cost — it's already there
-- Avalanche provides fast finality (transactions confirmed in ~1-2s vs 10 min)
-- doged (Tobias's implementation) ships it and it works in production
+**What Avalanche is actually good for (soft coordination):**
+There is a real distinction between hard consensus and soft coordination:
+- **Hard consensus** — block validity, chain tip selection, finality. PoW wins unconditionally.
+- **Soft coordination** — advisory signals like preferred minimum fee rates, mempool policy
+  preferences, or node-level chain tip preference votes. No PoW implication; nodes can
+  ignore it and remain fully valid.
 
-**Arguments for removing or disabling it:**
-- Lotus published papers on economics of PoW + tail emission; Avalanche adds a
-  validator layer with different economic incentives (staking-adjacent)
-- Avalanche nodes require connectivity and stake — changes the node operator profile
-- The Lotus thesis is about pure PoW + log2/sqrt issuance; Avalanche complicates that story
-- Can always add it later; removing it after launch is harder
+A lightweight gossip/voting protocol could serve the soft coordination role without
+touching consensus. This doesn't need to be Avalanche specifically — it doesn't need
+stake, it doesn't need finalization authority. It's just nodes signaling preferences.
 
-**Recommendation:** Decide before the rebase. If removing, add a dedicated patch
-`08b-remove-avalanche.patch` right after daa-cleanup (08). If keeping, document the
-economic rationale in the whitepaper context.
+**Action:**
+- Add `08b-remove-avalanche.patch` after `08-daa-cleanup` in v2 series (NEEDS-WRITE)
+- Remove Avalanche from: `src/avalanche/`, `src/net_processing.cpp` Avalanche hooks,
+  `src/init.cpp` Avalanche startup, CMake build option
+- If soft fee coordination is wanted later, that is a new independent patch with a
+  lightweight advisory protocol — explicitly not a consensus mechanism
 
 ---
 
