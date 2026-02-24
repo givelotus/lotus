@@ -29,49 +29,67 @@ lotus/
 
 ## Daemon Build (daemon/)
 
-The daemon is maintained as a patch series on top of an eCash (Bitcoin ABC) base commit.
-The workspace (`daemon/workspace/`) is a local git clone — **not tracked in this repo**.
+Four patch series are maintained. Each uses a different upstream base:
+
+| SERIES | Base | Version file | Workspace | Purpose |
+|--------|------|-------------|-----------|---------|
+| `v2` (default) | bitcoin-abc `252182e9` | `bitcoin-abc-version` | `workspace/` | New Lotus chain (adaptive issuance, OP_LOG/SQRT, Mitra) |
+| `v1` | eCash v0.24.11 `fa7a44f73` | `ecash-version` | `workspace-v1/` | Lotus mainnet compatibility (42 patches → lotusd v10.4.10) |
+| `doged` | direct clone of doged-io/doged | `doged-version` | `workspace-doged/` | Dogecoin ABC (Tobias Ruck; Mitra author; reference) |
+| `bchn` | BCHN v28.0.0 | `bchn-version` | `workspace-bchn/` | Bitcoin Cash Node upstream PR candidates |
+
+Workspaces are **not tracked** in this repo (listed in `daemon/.gitignore`). Recreate with `make setup`.
 
 ### Quick start
 
 ```bash
 cd daemon/
-make setup        # clone eCash at pinned commit, apply all patches
-make build        # cmake + ninja → builds lotusd + lotus-cli
+make setup               # v2 (new chain) — bitcoin-abc 252182e9 + v2 patch series
+make setup SERIES=v1     # Lotus mainnet — eCash v0.24.11 + 42 patches
+make setup SERIES=doged  # direct clone of doged-io/doged
+make setup SERIES=bchn   # BCHN v28.0.0 + patches 29-31
+make build               # cmake + ninja → lotusd + lotus-cli
 ```
 
 ### Patch workflow
 
 ```bash
-# Edit files in daemon/workspace/, then save changes as a patch:
-make mkpatch NAME=03-my-feature
+# Edit files in daemon/workspace/, then save as a patch:
+make mkpatch NAME=25-my-feature        # saves to patches/v2/25-my-feature.patch
+# Add the name to patches/v2/series (in order), then commit.
 
-# Add the new patch name to daemon/patches/series (in order), then commit.
+# Rebase v2 onto a newer bitcoin-abc commit:
+make refresh SERIES=v2 COMMIT=<hash> DESC="bitcoin-abc 2026-03-01"
 
-# To rebase onto a newer eCash commit:
-make refresh COMMIT=<new-hash> DESC="eCash v0.27.0"
+# Add a newer lotusd release to the v1 series:
+make refresh SERIES=v1 COMMIT=v10.4.11 DESC="lotusd v10.4.11"
+
+# Advance doged to a newer release:
+make refresh SERIES=doged COMMIT=v0.5.0 DESC="doged v0.5.0"
 ```
 
 ### Key files
 
-- `daemon/ecash-version` — pinned eCash base commit (currently `fa7a44f731`, eCash v0.24.11)
-- `daemon/patches/series` — ordered list of patches to apply
-- `daemon/patches/01-lotus-mainnet.patch` — cumulative Lotus diff vs eCash v0.24.11 (~52K lines)
-- `daemon/patches/02-cmake4-boost190-compat.patch` — fixes for CMake 4.x + Boost 1.90 on macOS
+- `daemon/bitcoin-abc-version` — pinned bitcoin-abc commit for v2 (`252182e9`)
+- `daemon/ecash-version` — pinned eCash v0.24.11 base for v1 (`fa7a44f73`, static)
+- `daemon/doged-version` — doged branch/tag (`master`, ~Oct 2025 / v0.4.0)
+- `daemon/bchn-version` — BCHN tag (`v28.0.0` / `0bc23ac4`)
+- `daemon/lotusd-version` — current lotusd release tracked in v1 (`v10.4.10`)
+- `daemon/patches/v2/series` — ordered patch list for new chain (patches 01–31 active; 01–28 need rebase to 252182e9)
+- `daemon/patches/v1/series` — 42 patches, all apply cleanly to eCash v0.24.11
+- `daemon/patches/ecash/` — ecash-specific versions of patches 29-31 (same base as v2)
+- `daemon/patches/bchn/` — BCHN-adapted patches 29-31
+
+### v2 patch status
+
+- **Patches 01–28**: written against eCash v0.24.11 — still need rebase onto bitcoin-abc 252182e9
+- **Patches 29–31**: ported to bitcoin-abc 252182e9 API (`src/node/miner.cpp`, `addTxs(const CTxMemPool&)`)
 
 ### macOS build dependencies
 
 ```bash
 brew install berkeley-db boost cmake flatbuffers jemalloc libevent nng ninja openssl protobuf
 ```
-
-### eCash compatibility notes
-
-The current patch base is eCash v0.24.11. Newer eCash versions (v0.27+) added:
-- **Avalanche** consensus (eCash-specific, will NOT be in Lotus)
-- **Chronik** — integrated into the daemon as linked Rust code (Lotus uses NNG instead)
-
-When rebasing to newer eCash, cherry-pick security/consensus fixes only; skip Avalanche and Chronik.
 
 ## SDK Architecture
 
