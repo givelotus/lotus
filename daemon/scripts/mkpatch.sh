@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
 # mkpatch.sh — Save current workspace changes as a named patch.
 #
-# SERIES=v2 (default): saves to patches/<name>.patch from workspace/
-# SERIES=v1:           saves to patches/v1/<name>.patch from workspace-v1/
+# SERIES=v2 (default): saves to patches/v2/<name>.patch    from workspace/
+# SERIES=v1:           saves to patches/v1/<name>.patch    from workspace-v1/
+# SERIES=doged:        saves to patches/doged/<name>.patch from workspace-doged/
+# SERIES=ecash:        saves to patches/ecash/<name>.patch from workspace-ecash/
 #
 # Usage: ./scripts/mkpatch.sh <patch-name>
 #   e.g. ./scripts/mkpatch.sh 06-block-header
@@ -30,9 +32,13 @@ elif [[ "$SERIES" == "doged" ]]; then
     WORKSPACE="$DAEMON_DIR/workspace-doged"
     PATCHES_DIR="$DAEMON_DIR/patches/doged"
     mkdir -p "$PATCHES_DIR"
+elif [[ "$SERIES" == "ecash" ]]; then
+    WORKSPACE="$DAEMON_DIR/workspace-ecash"
+    PATCHES_DIR="$DAEMON_DIR/patches/ecash"
+    mkdir -p "$PATCHES_DIR"
 else
     WORKSPACE="$DAEMON_DIR/workspace"
-    PATCHES_DIR="$DAEMON_DIR/patches"
+    PATCHES_DIR="$DAEMON_DIR/patches/v2"
 fi
 
 OUTPUT="$PATCHES_DIR/$NAME"

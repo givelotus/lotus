@@ -64,8 +64,8 @@ fi
 # ─── V2: eCash base + Lotus patch series (new chain) ─────────────────────────
 WORKSPACE="$DAEMON_DIR/workspace"
 ECASH_VERSION_FILE="$DAEMON_DIR/ecash-version"
-SERIES_FILE="$DAEMON_DIR/patches/series"
-PATCHES_DIR="$DAEMON_DIR/patches"
+SERIES_FILE="$DAEMON_DIR/patches/v2/series"
+PATCHES_DIR="$DAEMON_DIR/patches/v2"
 ECASH_REMOTE="git@github.com:Bitcoin-ABC/bitcoin-abc.git"
 
 ECASH_COMMIT=$(grep -v '^#' "$ECASH_VERSION_FILE" | grep -v '^$' | head -1)
