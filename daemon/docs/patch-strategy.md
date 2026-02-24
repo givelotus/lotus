@@ -38,6 +38,14 @@ This makes it easy to see at a glance which improvements have been ported where.
 issuance, expanded opcode set, dual-txid, Mitra transaction format, O(n log n) mining.
 No UTXO snapshot — clean PoW start from genesis.
 
+**Design principle — no future hardforks:**
+V2 is designed to be published once and work forever, like Bitcoin does. All features
+are active from block 0. There are no named upgrade epochs, no mandatory activation
+heights, no "coming in the next fork" promises. Users and developers can count on the
+protocol being stable. The v1 upgrade patches (Exodus, Ruth, Samuel, Kings, etc.) were
+largely housekeeping increments with no real feature additions — that whole machinery
+is dropped in v2. Everything ships complete at genesis.
+
 **Why this bitcoin-abc base:** Chronik is production-ready here. Chronik is the indexer
 we need (Electrum-compatible API, Rust-based). Without it we'd have to backport it —
 a much larger effort than rebasing our existing patches.
@@ -54,7 +62,8 @@ a much larger effort than rebasing our existing patches.
 | 06 | `06-currency-unit.patch` | NEEDS-REBASE | XPI denomination; 1 XPI = 10^4 satoshis; amount formatting throughout |
 | 07 | `07-xaddress.patch` | NEEDS-REBASE | XAddress encoding/decoding; replaces CashAddr; v2 prefix = `xpi` (v1 used `lotus`) |
 | 08 | `08-daa-cleanup.patch` | NEEDS-REBASE | Remove Grasberg/EDA; keep only aserti3-2d DAA |
-| 08b | `08b-remove-avalanche.patch` | NEEDS-WRITE | Remove Avalanche from consensus path: `src/avalanche/`, net_processing hooks, init startup, CMake option. Avalanche is a competing finalization layer incompatible with the σₜ security model. Soft advisory coordination (fees etc.) is a separate future patch. |
+| 08b | `08b-decouple-avalanche.patch` | NEEDS-WRITE | Decouple Avalanche from block consensus: remove chain-tip finalization hooks in `src/net_processing.cpp`, remove Avalanche from block validity checks. **Do NOT remove the Avalanche code itself.** It stays in the codebase for soft parameter voting (fee preferences, mempool policy, network parameter governance). Avalanche as a finalization layer is incompatible with the σₜ security model; as a gossip/voting layer it's fine. |
+| 08c | `08c-blocktime.patch` | NEEDS-EXTRACT | Set `nPowTargetSpacing = 2 * 60` (2 minutes). **The commit already exists in the v1 lotusd repo — extract it.** Find the commit with `git log --all --oneline -- src/chainparams.cpp` in workspace-v1 and isolate the `nPowTargetSpacing` change. V2 uses the same value; apply the same extracted patch. **Downstream effects:** (1) boot subsidy step heights in patch 26 must be 5× larger to hit the same wall-clock half-life (720 blocks/day at 2 min vs 144 at 10 min). |
 | 09 | `09-merkle.patch` | NEEDS-REBASE | IGUANA interleaved merkle tree; fixes the CVE-2012-2459 variant merkle tree vulnerability; implements MerklixHash (bitwise trie + SHA256 overlay) per the 2018 Vermorel/Séchet/Chancellor/Cox paper |
 | 10 | `10-nng-interface.patch` | NEEDS-REBASE | NNG pub/sub replacing ZeroMQ; adds `src/nng_interface/`; Chronik stays separate |
 | 11 | `11-remove-zeromq.patch` | NEEDS-WRITE | Delete `src/zmq/`, ZeroMQ CMake option, ZeroMQ functional + unit tests; was never removed |
@@ -97,39 +106,38 @@ Each needs to be extracted as its own named patch during the rebase:
 | Decision | Status | Notes |
 |----------|--------|-------|
 | XAddress prefix | **DECIDED** — `xpi` | V1 uses `lotus`; v2 uses `xpi` to prevent address reuse across chains |
-| Avalanche in v2 | **DECIDED** — remove from consensus | See below; soft coordination (fees etc.) is a separate future patch |
+| Avalanche in v2 | **DECIDED** — decouple from consensus; keep for soft voting | See below; Avalanche stays in codebase for fee/parameter governance |
 | V2 epoch activation | **DECIDED** — drop patch 21 | V2 activates everything at block 0; no epoch infrastructure needed; keep 21 in v1 only |
 | Taproot in v2 | OPEN | Needs review before patch 15 is rebased; may or may not belong in v2 |
 | Mine genesis nNonce | BLOCKED on launch readiness | Patches 16/17 have placeholder nNonce=0 |
 | Remove patch 12 | PENDING | Remove `12-issuance-OLD.patch` once 26+27 confirmed stable |
 | Mitra opcode slots | OPEN | Patch 31 uses 0xbf–0xc4; Mitra needs adjacent slots; resolve before implementing 33 |
 
-### Avalanche — DECIDED: remove from consensus, advisory use TBD
+### Avalanche — DECIDED: decouple from consensus, keep for soft voting
 
 **The core problem with Avalanche as a consensus mechanism:**
 Two consensus mechanisms with no defined tie-breaker. PoW miners can build a valid chain
 that Avalanche validators reject. eCash's answer is "Avalanche wins" — which means it's
-no longer a PoW chain in any meaningful sense. The σₜ security signal from Paper 1 breaks
-immediately: security expenditure is now split between hashwork (visible) and stake
-(opaque), and the adaptive issuance math in Paper 2 assumes σₜ is the sole signal.
+no longer a PoW chain in any meaningful sense. The σₜ security signal from the issuance
+papers breaks immediately: security expenditure is now split between hashwork (visible)
+and stake (opaque), and the adaptive issuance math assumes σₜ is the sole signal.
 
 **What Avalanche is actually good for (soft coordination):**
 There is a real distinction between hard consensus and soft coordination:
 - **Hard consensus** — block validity, chain tip selection, finality. PoW wins unconditionally.
 - **Soft coordination** — advisory signals like preferred minimum fee rates, mempool policy
-  preferences, or node-level chain tip preference votes. No PoW implication; nodes can
-  ignore it and remain fully valid.
-
-A lightweight gossip/voting protocol could serve the soft coordination role without
-touching consensus. This doesn't need to be Avalanche specifically — it doesn't need
-stake, it doesn't need finalization authority. It's just nodes signaling preferences.
+  preferences, or network parameter votes. No PoW implication; nodes can ignore it and
+  remain fully valid. No need to reimplement a new gossip protocol when Avalanche already
+  exists in the codebase.
 
 **Action:**
-- Add `08b-remove-avalanche.patch` after `08-daa-cleanup` in v2 series (NEEDS-WRITE)
-- Remove Avalanche from: `src/avalanche/`, `src/net_processing.cpp` Avalanche hooks,
-  `src/init.cpp` Avalanche startup, CMake build option
-- If soft fee coordination is wanted later, that is a new independent patch with a
-  lightweight advisory protocol — explicitly not a consensus mechanism
+- Add `08b-decouple-avalanche.patch` after `08-daa-cleanup` in v2 series (NEEDS-WRITE)
+- Remove Avalanche from: chain-tip finalization hooks in `src/net_processing.cpp`,
+  block validity checks that require Avalanche quorum
+- **Keep:** `src/avalanche/` directory, CMake option, init startup — Avalanche remains
+  functional as a gossip/voting protocol for soft parameter coordination (fee preferences,
+  mempool policy, network parameter governance)
+- Avalanche votes have no authority over which block is valid or which chain tip wins
 
 ---
 
@@ -147,9 +155,10 @@ stake, it doesn't need finalization authority. It's just nodes signaling prefere
 | 03 | `03-mempool-cleanup.patch` | NEEDS-WRITE | Port to v0.24.11 API (accounting fields still present at this base) |
 | 04 | `04-issuance-compat.patch` | NEEDS-WRITE | Runtime `-issuance=ecash` flag (same concept as v2; log2 Lotus issuance is default) |
 | 05+ | `05-lotus-mainnet.patch` (was 01) | DONE | Monolithic origin diff: full Bitcoin ABC → Lotus including all v1 features |
-| … | `06-cmake4-boost190-compat.patch` … `46-version-10.4.10.patch` | DONE | Incremental version bumps and upgrade epochs |
+| … | `06-cmake4-boost190-compat.patch` … `46-version-10.4.10.patch` | DONE | Incremental version bumps and named upgrade epochs (Exodus through 1st Kings). **Most of these contain no new features** — they were housekeeping: version strings, activation heights, build fixes. The feature content is almost entirely in the original monolithic `05-lotus-mainnet.patch`. |
+| 08c | `08c-blocktime.patch` | NEEDS-EXTRACT | 2-minute blocks. **Extract from v1 lotusd git log** — this commit exists; find it in `LotusiaStewardship/lotusd` and isolate the `nPowTargetSpacing` change. |
 | 47 | `47-remove-zeromq.patch` | NEEDS-WRITE | ZeroMQ present but only disabled (BUILD_BITCOIN_ZMQ=OFF); remove `src/zmq/`, tests |
-| — | `chronik-backport.patch` | DEFERRED | V1 predates Chronik; large effort; low priority given mainnet is stalled |
+| — | `chronik-backport.patch` | DEFERRED | V1 predates Chronik; large effort; low priority — v1 is live and running, chronik backport is not needed for it to function |
 
 *Note: v1 slot 05+ uses renumbered names to accommodate 01-04 being added at the front.*
 
@@ -190,15 +199,21 @@ stake, it doesn't need finalization authority. It's just nodes signaling prefere
 **Why:** Tobias Ruck (doged author) designed Mitra. Understanding which changes he made
 to adapt bitcoin-abc for Dogecoin is valuable for Lotus v2.
 
-**Approach:** Compute symmetric diff between doged HEAD and bitcoin-abc at their fork
+**Approach:** Scrape the doged git log and diff against bitcoin-abc at their fork
 point (`5c6880edbc`, June 2024). Identify changes by Tobias and collaborators. Organize
 as individual patches covering:
 - Chain identity (Dogecoin chain params, magic bytes, ports)
+- Block time (`nPowTargetSpacing`): Dogecoin uses 1-minute blocks; doged likely patches this
 - Dogecoin DAA (DigiShield + ASERT hybrid)
 - Auxpow / merged mining (if present)
 - Avalanche parameter tuning for Dogecoin
 - Chronik adaptations for DOGE addresses/denomination
 - Build / misc
+
+**Note on block time:** Doged uses `nPowTargetSpacing = 60` (1-minute blocks), confirmed
+in `src/kernel/chainparams.cpp`. The commit that sets this **already exists in the doged
+git log** — extract it when decomposing doged patches. It maps to a `08c-blocktime.patch`
+slot in the doged series.
 
 Until this decomposition is done, workspace-doged remains a direct clone.
 
@@ -213,14 +228,16 @@ Until this decomposition is done, workspace-doged remains a direct clone.
 | 3 | Port NNG + ZeroMQ removal to bchn (slots 10-11) | v2 patch 10+11 |
 | 4 | Write `47-remove-zeromq.patch` for v1 (against eCash v0.24.11) | nothing |
 | 5 | Write `04-issuance-compat.patch` for v2 and v1 | nothing |
-| 6 | Decide on Avalanche in v2 | whitepaper discussion |
-| 7 | Rebase v2 patches 05–31 onto 252182e9 | Avalanche decision |
-| 8 | Extract block-header, dual-txid, 64-bit fix from 23-misc during rebase | step 7 |
-| 9 | Write `32-chronik-adapt.patch` for v2 | `07-xaddress` rebased, xpi prefix confirmed |
-| 10 | Decompose doged patches | time / priority |
-| 11 | Port mining patches 01-03 to v1 (eCash v0.24.11 API) | time |
-| 12 | Mine genesis, update patches 16/17/18 | launch readiness |
-| 13 | Implement Mitra (patch 33) | opcode slot decision, dual-txid patch |
+| 6 | Extract `08c-blocktime.patch` for v1 and v2 from v1 lotusd git log | workspace-v1 (needs fetch lotusd) |
+| 7 | Extract doged blocktime patch + scrape doged git log for all patch topics | workspace-doged |
+| 8 | Write `08b-decouple-avalanche.patch` for v2 | Avalanche decision (done) |
+| 9 | Rebase v2 patches 05–31 onto 252182e9 | nothing blocking |
+| 10 | Extract block-header, dual-txid, 64-bit fix from 23-misc during rebase | step 9 |
+| 11 | Write `32-chronik-adapt.patch` for v2 | `07-xaddress` rebased, xpi prefix confirmed |
+| 12 | Decompose doged patches | time / priority |
+| 13 | Port mining patches 01-03 to v1 (eCash v0.24.11 API) | time |
+| 14 | Mine genesis, update patches 16/17/18 | launch readiness |
+| 15 | Implement Mitra (patch 33) | opcode slot decision, dual-txid patch |
 
 ---
 
