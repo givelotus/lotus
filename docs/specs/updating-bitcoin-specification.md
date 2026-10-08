@@ -31,6 +31,12 @@
    - [5.2. Chain-Agnostic Upstream Candidates (Bitcoin ABC / BCHN)](#52-chain-agnostic-upstream-candidates-bitcoin-abc--bchn)
 6. [The Complete 35-Patch Rebase Sequence (`daemon/patches/v2/`)](#6-the-complete-35-patch-rebase-sequence-daemonpatchesv2)
 7. [Verification, Test Harness & Genesis Launch Checklist](#7-verification-test-harness--genesis-launch-checklist)
+8. [Post-Genesis Evolution: Zero-Hardfork Enhancements](#8-post-genesis-evolution-zero-hardfork-enhancements)
+   - [8.1. QUIC P2P Transport Layer](#81-quic-p2p-transport-layer-rfc-9000--http3-over-udp)
+   - [8.2. Stateless Snap-Sync RPCs & P2P Merklix Chunk Streaming](#82-stateless-snap-sync-rpcs--p2p-merklix-chunk-streaming)
+   - [8.3. Chronik Indexer API Adaptations & Real-Time WebSockets](#83-chronik-indexer-api-adaptations--real-time-websockets)
+   - [8.4. Partially Signed Lotus Transactions (PSLT / BIP-0370)](#84-partially-signed-lotus-transactions-pslt--bip-0370-standard)
+   - [8.5. Architectural Exclusion of Double-Spend Proofs (BUIP135)](#85-architectural-exclusion-of-double-spend-proofs-buip135)
 
 ---
 
@@ -351,28 +357,46 @@ Unlike Taproot (where a spend path satisfies $L_1 \lor L_2 \lor L_3$), `P2MNOR` 
 
 ### 3.6. The 128-Bit Forth Stack Machine (`int128_t`)
 
-All numerical values on the evaluation stack are **native 128-bit signed two's-complement integers (`int128_t`, 16 bytes)**:
-* **Elimination of `CScriptNum`**: Zero sign-magnitude quirks, zero negative-zero (`0x80`) malleability bugs, zero arbitrary byte-length conversions.
-* **Direct Hardware Mapping**: `OP_ADD`, `OP_SUB`, `OP_MUL`, `OP_DIV`, and `OP_MOD` map directly to native 64-bit CPU instructions with carry/overflow registers (`mulq`/`adcq`).
-* **High-Precision Financial Math**: 128-bit integers support calculations up to $3.4 \times 10^{38}$, allowing multi-asset AMM liquidity pools and compound interest math without rounding overflow.
+All numerical values on the evaluation stack are **native 128-bit signed two's-complement integers (`int128_t` / `__int128_t`, 16 bytes)**:
+* **Elimination of `CScriptNum`**:
+  * Legacy Bitcoin stored integers as variable-length sign-magnitude byte arrays (1 to 4 bytes, later expanded to 8 bytes with quirky rules). This introduced sign-magnitude ambiguity, negative-zero (`0x80`) malleability bugs, and endianness mismatch.
+  * In Lotus v2, numbers on the stack are fixed 16-byte signed two's-complement integers. Zero sign-magnitude quirks, zero negative-zero bugs, zero variable-byte allocations.
+* **Direct Hardware Instruction Mapping**:
+  * On modern 64-bit architectures (x86-64 and ARM64), operations on `int128_t` map directly to pairs of native CPU instructions using carry/overflow flags (`adcq`, `sbbq`, `mulq`, `umulh`).
+  * `OP_ADD`, `OP_SUB`, `OP_MUL`, `OP_DIV`, `OP_MOD`, `OP_NEGATE`, `OP_ABS` execute in nanoseconds without arbitrary-precision heap overhead.
+* **High-Precision Financial Math & Scale**:
+  * 128-bit signed integers support values up to $\pm 1.7 \times 10^{38}$ ($\pm 2^{127}-1$).
+  * Fully accommodates multi-asset automated market makers (AMMs), constant-product formulas ($x \cdot y = k$), loan collateralization ratios, and high-frequency compound interest without intermediate truncation or integer overflow.
 
 ---
 
-### 3.7. Multi-Precision & Cryptographic Primitives
+### 3.7. Multi-Precision Math & Cryptographic Primitives
 
-To guarantee that developers can implement arbitrary zero-knowledge proofs and cryptographic curves without network hardforks:
-* **Curve Arithmetic Opcodes**:
-  * `OP_ADDCARRY`: Pops $(a, b, c_{in})$, pushes $(sum, c_{out})$.
-  * `OP_SUBCARRY`: Pops $(a, b, b_{in})$, pushes $(diff, b_{out})$.
-  * `OP_MUL128_WIDE`: Pops two 128-bit ints, pushes the 256-bit product as $(prod_{high}, prod_{low})$.
-  * Allows chaining 128-bit limbs to execute 256-bit (secp256k1, Ed25519) and 384-bit (BLS12-381) curve arithmetic directly in user-space Script.
-* **Cryptographic Hashing & Verification**:
-  * `OP_BLAKE3`: Single BLAKE3 hash ($\approx 12\text{ ns}$).
-  * `OP_SHA256`: Single SHA-256 hash.
-  * `OP_HASH256` (`OP_SHA256D`): Double SHA-256 for cross-chain Bitcoin/eCash header verification.
-  * `OP_CHECKSIG`: Verifies 64-byte Schnorr (default) or 64-byte compact Low-S ECDSA.
-  * `OP_CHECKDATASIG`: Verifies an arbitrary data hash against a public key.
-  * `OP_MERKLEVERIFY`: Verifies Merklix inclusion/exclusion proofs on stack against a state root.
+To empower smart contracts to compute arbitrary zero-knowledge proofs and cryptographic curves without requiring network hardforks:
+
+#### 3.7.1. Integer & Curve Arithmetic Opcodes
+* `OP_MUL` (`0x95`): 128-bit signed multiplication with explicit overflow checking.
+* `OP_MULPOW2` (`0xb2`): Computes $x \cdot 2^k$ via hardware bitshift.
+* `OP_RAWLEFTBITSHIFT` (`0xb3`): Low-level 128-bit logical left bitshift.
+* `OP_ADDCARRY` (`0xb4`): Multi-precision add with carry. Pops $(a, b, c_{in})$, pushes $(sum, c_{out})$ where $c_{out} \in \{0, 1\}$.
+* `OP_SUBCARRY` (`0xb5`): Multi-precision subtract with borrow. Pops $(a, b, b_{in})$, pushes $(diff, b_{out})$ where $b_{out} \in \{0, 1\}$.
+* `OP_MUL128_WIDE` (`0xb6`): Full 128-bit $\times$ 128-bit $\to$ 256-bit unsigned wide multiply. Pops $(a, b)$, pushes $(prod_{high}, prod_{low})$.
+* `OP_LOG` (`0xbd`): Fixed-point base-2 logarithm using the Turner algorithm.
+* `OP_SQRT` (`0xbe`): Integer square root ($\lfloor\sqrt{x}\rfloor$).
+
+By chaining `OP_ADDCARRY`, `OP_SUBCARRY`, and `OP_MUL128_WIDE`, user-space contracts can implement 256-bit (secp256k1, secp256r1, Ed25519) and 384-bit (BLS12-381) field arithmetic directly in Script.
+
+#### 3.7.2. Cryptographic Hashing & Signature Verification
+* `OP_BLAKE3` (`0xcd`): Single-pass BLAKE3 hash ($\approx 12\text{ ns}$).
+* `OP_SHA256` (`0xaa`): Single SHA-256 hash.
+* `OP_HASH256` (`0xaa` / `OP_SHA256D`): Double SHA-256 for Bitcoin cross-chain header verification.
+* `OP_CHECKSIG` (`0xac`): Evaluates 64-byte Schnorr signatures (BIP340) by default, or 64-byte compact Low-S ECDSA.
+* `OP_CHECKDATASIG` (`0xba`): Verifies an arbitrary message hash against a public key.
+  - **Multi-Curve Algorithm Parameter**: Evaluates a curve parameter byte on stack:
+    - `0x00`: **secp256k1** (standard Bitcoin/Lotus curve)
+    - `0x01`: **secp256r1 (NIST P-256)** — Native support for **Apple Secure Enclave (FaceID / TouchID)**, **Google Titan M**, and **WebAuthn / FIDO2 Passkeys**! Allows non-custodial mobile spending without seed phrases.
+    - `0x02`: **Ed25519** — Fast Edwards-curve signatures for cross-ecosystem attestation.
+* `OP_MERKLEVERIFY` (`0xbb`): Verifies Merklix branch inclusion/exclusion proofs on stack against a state root.
 
 ---
 
@@ -383,22 +407,22 @@ Introspection opcodes allow an input script to inspect its spending transaction 
 | Opcode | Hex | Description |
 | :--- | :--- | :--- |
 | `OP_TXID` | `0xbf` | Pushes the 32-byte Single-BLAKE3 Merklix TXID of current transaction. |
-| `OP_TXHASH` | `0xc0` | Pushes the 32-byte witness-inclusive serialization hash. |
-| `OP_TXVERSION` | `0xc1` | Pushes the 32-bit transaction version. |
-| `OP_TXLOCKTIME` | `0xc2` | Pushes the 32-bit transaction locktime. |
-| `OP_INPUTINDEX` | `0xc3` | Pushes the 32-bit index of the executing input. |
-| `OP_INPUTCOUNT` | `0xc4` | Pushes the total number of inputs in the transaction. |
-| `OP_OUTPOINT` | `0xc5` | Pops input index $i$, pushes 36-byte outpoint `(txid || vout)`. |
+| `OP_TXVERSION` | `0xc0` | Pushes the 32-bit transaction version. |
+| `OP_TXLOCKTIME` | `0xc1` | Pushes the 32-bit transaction locktime. |
+| `OP_INPUTCOUNT` | `0xc2` | Pushes the total number of inputs in the transaction. |
+| `OP_OUTPUTCOUNT` | `0xc3` | Pushes the total number of outputs in the transaction. |
+| `OP_INPUTINDEX` | `0xc4` | Pushes the 32-bit index of the executing input. |
+| `OP_OUTPOINT` | `0xc5` | Pops input index $i$, pushes 36-byte outpoint `(txid \|\| vout)`. |
 | `OP_UTXOVALUE` | `0xc6` | Pops input index $i$, pushes 128-bit satoshi amount. |
-| `OP_UTXOTYPE` | `0xc7` | Pops input index $i$, pushes 1-byte output type. |
+| `OP_UTXOTYPE` | `0xc7` | Pops input index $i$, pushes 1-byte output type (0x01, 0x02, 0x03, 0x04). |
 | `OP_UTXOMETADATA` | `0xc8` | Pops input index $i$, pushes 32-byte metadata (Token/Covenant state). |
-| `OP_OUTPUTCOUNT` | `0xc9` | Pushes the total number of outputs in the transaction. |
+| `OP_UTXODESTINATION`| `0xc9`| Pops input index $i$, pushes 32-byte destination (PubKey Hash or Merkle Root). |
 | `OP_OUTPUTVALUE` | `0xca` | Pops output index $j$, pushes 128-bit satoshi amount. |
-| `OP_OUTPUTTYPE` | `0xcb` | Pops output index $j$, pushes 1-byte output type. |
+| `OP_OUTPUTTYPE` | `0xcb` | Pops output index $j$, pushes 1-byte output type (0x01, 0x02, 0x03, 0x04). |
 | `OP_OUTPUTMETADATA` | `0xcc` | Pops output index $j$, pushes 32-byte metadata. |
-| `OP_OUTPUTBYTECODE` | `0xcd` | Pops output index $j$, pushes destination locking bytecode. |
-| `OP_TOTALINPUTVALUE`| `0xce` | Pushes sum of all input amounts in 1 CPU cycle. |
-| `OP_TOTALOUTPUTVALUE`|`0xcf` | Pushes sum of all output amounts in 1 CPU cycle. |
+| `OP_OUTPUTDESTINATION`|`0xcd`| Pops output index $j$, pushes 32-byte destination. |
+| `OP_FOREACH_INPUT` | `0xce` | Starts an enumerable bounded loop over all inputs (depth $\le 2$). |
+| `OP_FOREACH_OUTPUT`| `0xcf` | Starts an enumerable bounded loop over all outputs (depth $\le 2$). |
 
 ---
 
@@ -618,3 +642,32 @@ The full rebase sequence in `lotus/daemon/patches/v2/series` onto `bitcoin-abc 2
    Spin up a fresh node from block headers + Merklix chunk stream; verify full operational readiness in $< 3 \text{ minutes}$.
 5. **Genesis Block Mining**:
    Mine the definitive Genesis Block committing to locked Block 0 invariants, hardcoded seed nodes, and zero future hardfork flags.
+
+---
+
+## 8. Post-Genesis Evolution: Zero-Hardfork Enhancements
+
+Because all consensus invariants (Header format, 80B POD Outputs, BLAKE3, 128-bit VM, Introspection, P2MNOR, Tail Subsidy) are permanently locked at Block 0, future protocol optimizations remain **strictly internal node implementations and network transport upgrades** that require **ZERO hardforks**:
+
+### 8.1. QUIC P2P Transport Layer (RFC 9000 / HTTP/3 over UDP)
+* **Deep Packet Inspection (DPI) Invisibility**: Transports P2P messages inside standard TLS 1.3 encrypted UDP datagrams. To ISPs, enterprise firewalls, and state censors, Lotus P2P traffic looks indistinguishable from standard HTTP/3 web browsing (Cloudflare, Google, YouTube).
+* **Elimination of Head-of-Line Blocking**: In TCP, a dropped packet on a 32 MB block stalls all concurrent transaction relay. In QUIC, independent streams (blocks, mempool transactions, peer discovery, heartbeats) multiplex over a single connection without blocking.
+* **Connection Migration for Mobile Nodes**: QUIC connections bind to 64-bit Connection IDs rather than `IP:Port` tuples. Mobile wallets and node operators can transition seamlessly from Wi-Fi to 5G cellular without dropping peer connections or restarting handshakes.
+* **Zero-Hardfork Rollout**: Introduced via standard P2P feature negotiation (`NODE_QUIC` service bit) in `src/net`. Nodes that support QUIC upgrade immediately; older or constrained nodes remain on TCP.
+
+### 8.2. Stateless Snap-Sync RPCs & P2P Merklix Chunk Streaming
+* Rapid node synchronization utilizing authenticated Crit-Bit Radix Trie snapshots.
+* New nodes sync to the tip in $< 3 \text{ minutes}$ by streaming the Radix Trie leaves validated against the header's `hashUtxoMerklixRoot`.
+
+### 8.3. Chronik Indexer API Adaptations & Real-Time WebSockets
+* Native streaming of L1 token balances (`uint128_t amount || uint128_t token_id`), XAddress (`xpi` prefix), and 32-byte output metadata.
+* Enables Web3 applications and mobile wallets to query balances and state channels in $O(1)$ time without running an L1 script evaluator.
+
+### 8.4. Partially Signed Lotus Transactions (PSLT / BIP-0370 Standard)
+* Standardized binary exchange format for air-gapped hardware wallets, multisig coordinators, and mobile signers.
+* Incorporates native fields for 80-byte POD outputs, 32-byte metadata, and Merklix proofs.
+
+### 8.5. Architectural Exclusion of Double-Spend Proofs (BUIP135)
+* **The Asymmetric DoS Vulnerability**: Double-Spend Proofs (DSPs) introduce an un-fee'd signature verification cascade. An attacker splitting 1 XPI into 100,000 dust outputs can broadcast 100,000 conflicting transactions, forcing every full node on the network to perform 200,000 cryptographic signature checks and gossip the proofs across the P2P topology without paying a single satoshi in fees.
+* **Script & Covenant Incompatibility**: DSPs break down on stateful smart contracts and `P2MNOR` guardrails, requiring complex whitelist heuristics that compromise protocol simplicity.
+* **The Sound Alternative**: Lotus v2 adheres to pure Nakamoto first-seen policy: conflicting mempool spends are rejected in a single $O(1)$ hash table check ($<5\text{ ns}$ CPU cost, zero bandwidth, zero state bloat).

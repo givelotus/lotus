@@ -144,8 +144,11 @@ a much larger effort than rebasing our existing patches.
 | Output representation | **DECIDED** — 80-Byte POD | Flat array, 32B metadata, fast-path script bypass (~30 ns P2PKH validation). |
 | Native tokens | **DECIDED** — Outpoint Invariant | $\text{TokenID} = \text{BLAKE3}(\text{vin}[0].\text{prevout})$; double-spend immunity; zero lineage proofs. |
 | Introspection opcodes | **DECIDED** — 128-bit VM | Native `int128_t` stack eliminates `BIGADD/SUB`, freeing `0xbf–0xcf` for clean introspection. |
+| Passkey / WebAuthn | **DECIDED** — `secp256r1` in `OP_CHECKDATASIG` | Native curve support for Apple Secure Enclave & Android Titan biometric signatures. |
 | Script loops | **DECIDED** — Enumerable ($N \le 2$) | Bounded over `input_count`/`output_count`; static precomputed execution budget. |
 | State persistence | **DECIDED** — RAM Trie + RocksDB WAL | In-memory Crit-Bit Trie for $<5\text{ ms}$ rehash; RocksDB block state commitments for sub-second crash recovery. |
+| P2P Transport (QUIC) | **DECIDED** — Post-Genesis Upgrade | RFC 9000 TLS 1.3 over UDP; looks like HTTP/3; 0 hardforks needed (`NODE_QUIC` service bit). |
+| Double-Spend Proofs | **REJECTED** — Asymmetric DoS Vector | Un-fee'd signature verification cascade and covenant incompatibility; stick to clean $O(1)$ first-seen drop. |
 
 ### Avalanche — DECIDED: decouple from consensus, keep for soft voting
 
@@ -175,6 +178,26 @@ There is a real distinction between hard consensus and soft coordination:
   to reach soft consensus on fee preferences, mempool policy knobs, and other network
   parameters. None of that touches block or transaction validity.
 - Net result: Avalanche is still running and useful, just not in the consensus path.
+
+### Post-Genesis Roadmap (Zero-Hardfork Enhancements)
+
+Because all consensus invariants (Header format, 80B POD Outputs, BLAKE3, 128-bit VM, Introspection, P2MNOR, Tail Subsidy) are permanently locked at Block 0, future protocol optimizations remain **strictly internal node implementations and network transport upgrades** that require **ZERO hardforks**:
+
+1. **QUIC P2P Transport Layer (RFC 9000 / HTTP/3 over UDP)**:
+   - Deep Packet Inspection (DPI) resistance: Transports P2P messages inside standard TLS 1.3 encrypted UDP datagrams, indistinguishable from HTTP/3 web browsing.
+   - Eliminates TCP head-of-line blocking across independent block, transaction, and heartbeat streams.
+   - Seamless connection migration for mobile nodes across Wi-Fi $\leftrightarrow$ 5G handovers via 64-bit Connection IDs.
+   - Rollout: Standard P2P feature negotiation via `NODE_QUIC` service bit in `src/net`.
+2. **Stateless Snap-Sync RPCs & P2P Merklix Chunk Streaming**:
+   - Fast node synchronization utilizing authenticated Crit-Bit Radix Trie snapshots.
+3. **Chronik Real-Time WebSockets & Token Streaming**:
+   - Native streaming of L1 token balances (`amount || token_id`) and 32B output metadata.
+4. **Partially Signed Lotus Transactions (PSLT / BIP-0370)**:
+   - Standardized hardware wallet multisig coordinator formats.
+5. **Architectural Exclusion of Double-Spend Proofs (BUIP135)**:
+   - DSPs introduce an un-fee'd signature verification cascade (100,000 dust outputs force 200,000 signature checks on every node globally).
+   - Incompatible with stateful smart contracts and `P2MNOR` guardrails.
+   - Lotus v2 retains pure Nakamoto first-seen policy: conflicting mempool spends are rejected in an $O(1)$ hash table check ($<5\text{ ns}$, zero bandwidth, zero state bloat).
 
 ---
 
