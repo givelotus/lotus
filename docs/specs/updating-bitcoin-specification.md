@@ -376,8 +376,8 @@ To empower smart contracts to compute arbitrary zero-knowledge proofs and crypto
 
 #### 3.7.1. Integer & Curve Arithmetic Opcodes
 * `OP_MUL` (`0x95`): 128-bit signed multiplication with explicit overflow checking.
-* `OP_MULPOW2` (`0xb2`): Computes $x \cdot 2^k$ via hardware bitshift.
-* `OP_RAWLEFTBITSHIFT` (`0xb3`): Low-level 128-bit logical left bitshift.
+* `OP_RAWLEFTBITSHIFT` (`0x98`): Raw bitshift on byte vectors. A positive shift count shifts left; a negative shift count shifts right!
+* `OP_MULPOW2` (`0x99`): Computes arithmetic power-of-two scaling ($x \cdot 2^k$ for $k > 0$, or $x / 2^{|k|}$ for $k < 0$).
 * `OP_ADDCARRY` (`0xb4`): Multi-precision add with carry. Pops $(a, b, c_{in})$, pushes $(sum, c_{out})$ where $c_{out} \in \{0, 1\}$.
 * `OP_SUBCARRY` (`0xb5`): Multi-precision subtract with borrow. Pops $(a, b, b_{in})$, pushes $(diff, b_{out})$ where $b_{out} \in \{0, 1\}$.
 * `OP_MUL128_WIDE` (`0xb6`): Full 128-bit $\times$ 128-bit $\to$ 256-bit unsigned wide multiply. Pops $(a, b)$, pushes $(prod_{high}, prod_{low})$.
@@ -388,7 +388,7 @@ By chaining `OP_ADDCARRY`, `OP_SUBCARRY`, and `OP_MUL128_WIDE`, user-space contr
 
 #### 3.7.2. Cryptographic Hashing & Signature Verification
 * `OP_BLAKE3` (`0xcd`): Single-pass BLAKE3 hash ($\approx 12\text{ ns}$).
-* `OP_SHA256` (`0xaa`): Single SHA-256 hash.
+* `OP_SHA256` (`0xa8`): Single SHA-256 hash.
 * `OP_HASH256` (`0xaa` / `OP_SHA256D`): Double SHA-256 for Bitcoin cross-chain header verification.
 * `OP_CHECKSIG` (`0xac`): Evaluates 64-byte Schnorr signatures (BIP340) by default, or 64-byte compact Low-S ECDSA.
 * `OP_CHECKDATASIG` (`0xba`): Verifies an arbitrary message hash against a public key.
@@ -400,29 +400,31 @@ By chaining `OP_ADDCARRY`, `OP_SUBCARRY`, and `OP_MUL128_WIDE`, user-space contr
 
 ---
 
-### 3.8. Native Introspection Opcodes (`0xbf–0xcf`)
+### 3.8. Native Introspection Opcodes (`0xc0–0xd2`) — BCH Ecosystem Aligned
 
-Introspection opcodes allow an input script to inspect its spending transaction and parent UTXO state directly in memory without quadratic hashing or preambles:
+To maximize tooling interoperability with CashScript, Libauth, and existing smart contract compilers, Lotus v2 aligns its native introspection opcodes directly with the **Bitcoin Cash (BCH) May 2022 specification**, while augmenting them with Lotus v2's 80-byte POD metadata and bounded loop primitives:
 
-| Opcode | Hex | Description |
-| :--- | :--- | :--- |
-| `OP_TXID` | `0xbf` | Pushes the 32-byte Single-BLAKE3 Merklix TXID of current transaction. |
-| `OP_TXVERSION` | `0xc0` | Pushes the 32-bit transaction version. |
-| `OP_TXLOCKTIME` | `0xc1` | Pushes the 32-bit transaction locktime. |
-| `OP_INPUTCOUNT` | `0xc2` | Pushes the total number of inputs in the transaction. |
-| `OP_OUTPUTCOUNT` | `0xc3` | Pushes the total number of outputs in the transaction. |
-| `OP_INPUTINDEX` | `0xc4` | Pushes the 32-bit index of the executing input. |
-| `OP_OUTPOINT` | `0xc5` | Pops input index $i$, pushes 36-byte outpoint `(txid \|\| vout)`. |
-| `OP_UTXOVALUE` | `0xc6` | Pops input index $i$, pushes 128-bit satoshi amount. |
-| `OP_UTXOTYPE` | `0xc7` | Pops input index $i$, pushes 1-byte output type (0x01, 0x02, 0x03, 0x04). |
-| `OP_UTXOMETADATA` | `0xc8` | Pops input index $i$, pushes 32-byte metadata (Token/Covenant state). |
-| `OP_UTXODESTINATION`| `0xc9`| Pops input index $i$, pushes 32-byte destination (PubKey Hash or Merkle Root). |
-| `OP_OUTPUTVALUE` | `0xca` | Pops output index $j$, pushes 128-bit satoshi amount. |
-| `OP_OUTPUTTYPE` | `0xcb` | Pops output index $j$, pushes 1-byte output type (0x01, 0x02, 0x03, 0x04). |
-| `OP_OUTPUTMETADATA` | `0xcc` | Pops output index $j$, pushes 32-byte metadata. |
-| `OP_OUTPUTDESTINATION`|`0xcd`| Pops output index $j$, pushes 32-byte destination. |
-| `OP_FOREACH_INPUT` | `0xce` | Starts an enumerable bounded loop over all inputs (depth $\le 2$). |
-| `OP_FOREACH_OUTPUT`| `0xcf` | Starts an enumerable bounded loop over all outputs (depth $\le 2$). |
+| Opcode | Hex | Stack In $\to$ Out | Alignment | Description |
+| :--- | :--- | :--- | :--- | :--- |
+| `OP_INPUTINDEX` | `0xc0` | `-> index` | **BCH Identical** | Pushes the 32-bit index of the executing input. |
+| `OP_ACTIVEBYTECODE`| `0xc1` | `-> bytecode` | **BCH Identical** | Pushes currently executing script bytecode. |
+| `OP_TXVERSION` | `0xc2` | `-> ver` | **BCH Identical** | Pushes the 32-bit transaction version. |
+| `OP_TXINPUTCOUNT` | `0xc3` | `-> count` | **BCH Identical** | Pushes the total number of inputs. |
+| `OP_TXOUTPUTCOUNT`| `0xc4` | `-> count` | **BCH Identical** | Pushes the total number of outputs. |
+| `OP_TXLOCKTIME` | `0xc5` | `-> locktime` | **BCH Identical** | Pushes the 32-bit transaction locktime. |
+| `OP_UTXOVALUE` | `0xc6` | `i -> amount` | **BCH Identical** | Pops input index $i$, pushes 128-bit satoshi amount. |
+| `OP_UTXOBYTECODE` | `0xc7` | `i -> dest` | **BCH Identical** | Pops input index $i$, pushes 32-byte destination (pubkey hash or Merkle root). |
+| `OP_OUTPOINTTXHASH`|`0xc8` | `i -> txid` | **BCH Identical** | Pops input index $i$, pushes 32-byte spent outpoint TXID. |
+| `OP_OUTPOINTINDEX` | `0xc9` | `i -> vout` | **BCH Identical** | Pops input index $i$, pushes 32-bit spent outpoint index. |
+| `OP_UTXOMETADATA` | `0xca` | `i -> metadata`| **Lotus v2 Native** | Pops input index $i$, pushes 32-byte metadata (Token/Covenant state). |
+| `OP_UTXOTYPE` | `0xcb` | `i -> type` | **Lotus v2 Native** | Pops input index $i$, pushes 1-byte output type (`0x01`–`0x04`). |
+| `OP_OUTPUTVALUE` | `0xcc` | `j -> amount` | **BCH Identical** | Pops output index $j$, pushes 128-bit satoshi amount. |
+| `OP_OUTPUTBYTECODE`|`0xcd` | `j -> dest` | **BCH Identical** | Pops output index $j$, pushes 32-byte destination (pubkey hash or Merkle root). |
+| `OP_OUTPUTMETADATA`|`0xce` | `j -> metadata`| **Lotus v2 Native** | Pops output index $j$, pushes 32-byte metadata (Token/Covenant state). |
+| `OP_OUTPUTTYPE` | `0xcf` | `j -> type` | **Lotus v2 Native** | Pops output index $j$, pushes 1-byte output type (`0x01`–`0x04`). |
+| `OP_TXID` | `0xd0` | `-> txid` | **Lotus v2 Native** | Pushes the 32-byte Single-BLAKE3 Merklix TXID of current transaction. |
+| `OP_FOREACH_INPUT` | `0xd1` | `... OP_ENDFOR` | **Lotus v2 Native** | Starts an enumerable bounded loop over all inputs (depth $\le 2$). |
+| `OP_FOREACH_OUTPUT`| `0xd2` | `... OP_ENDFOR` | **Lotus v2 Native** | Starts an enumerable bounded loop over all outputs (depth $\le 2$). |
 
 ---
 
