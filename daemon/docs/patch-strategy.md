@@ -65,7 +65,7 @@ This makes it easy to see at a glance which improvements have been ported where.
 
 **Base:** bitcoin-abc `252182e957120652960c1f88ec96515c448b1204`
 **Goal:** Launch a new Lotus chain from genesis: Chronik indexer, NNG pub/sub, adaptive
-issuance, expanded opcode set, dual-txid, Mitra transaction format, O(n log n) mining.
+issuance, expanded opcode set, dual-txid, Modernized BUIP037 transaction format, O(n log n) mining.
 No UTXO snapshot — clean PoW start from genesis.
 
 **Design principle — no future hardforks:**
@@ -84,64 +84,68 @@ a much larger effort than rebasing our existing patches.
 
 | Slot | File | Status | What it does |
 |------|------|--------|--------------|
+| 00 | `00-decouple-avalanche.patch` | NEEDS-WRITE | Decouple Avalanche from block consensus: remove chain-tip finalization hooks in `src/net_processing.cpp` and `src/validation.cpp`. Keep `src/avalanche/` for soft parameter voting. |
 | 01 | `01-nlogn-block-construction.patch` | DONE | O(n log n) `addTxs`: snapshot → package-stat accumulation → sort → DFS |
-| 02 | `02-remove-chaintx-limit.patch` | DONE | Drop ancestor/descendant chain-tx limits from mempool |
+| 02 | `02-remove-chaintx-limit.patch` | DONE | Drop ancestor/descendant chain-tx limits from mempool (O(1) ingestion) |
 | 03 | `03-mempool-cleanup.patch` | NO-OP | CTxMemPoolEntry accounting fields already removed upstream in 252182e9 |
-| 04 | `04-issuance-compat.patch` | NEEDS-WRITE | Runtime `-issuance=ecash` flag; Lotus issuance is default; eCash/Bitcoin halving when flag set; allows eCash test suite to run unmodified without changing coinbase amount checks. Placeholder exists. |
+| 04 | `04-issuance-compat.patch` | NEEDS-WRITE | Runtime `-issuance=ecash` flag; Lotus issuance is default; eCash/Bitcoin halving when flag set. |
 | 05 | `05-chain-identity.patch` | NEEDS-REBASE | Binary names (lotusd/lotus-cli), version strings, CMake project name |
-| 06 | `06-currency-unit.patch` | NEEDS-REBASE | XPI denomination; 1 XPI = 10^4 satoshis; amount formatting throughout |
-| 07 | `07-xaddress.patch` | NEEDS-REBASE | XAddress encoding/decoding; replaces CashAddr; v2 prefix = `xpi` (v1 used `lotus`) |
+| 06 | `06-currency-unit.patch` | NEEDS-REBASE | XPI denomination; 1 XPI = 10^6 atomic satoshis/atoms |
+| 07 | `07-xaddress.patch` | NEEDS-REBASE | XAddress encoding/decoding; v2 prefix = `xpi` |
 | 08 | `08-daa-cleanup.patch` | NEEDS-REBASE | Remove Grasberg/EDA; keep only aserti3-2d DAA |
-| 08b | `08b-decouple-avalanche.patch` | NEEDS-WRITE | Decouple Avalanche from block consensus: remove chain-tip finalization hooks in `src/net_processing.cpp`, remove Avalanche from block validity checks. **Do NOT remove the Avalanche code itself.** It stays in the codebase for soft parameter voting (fee preferences, mempool policy, network parameter governance). Avalanche as a finalization layer is incompatible with the σₜ security model; as a gossip/voting layer it's fine. |
-| 08c | `08c-blocktime.patch` | NEEDS-EXTRACT | Set `nPowTargetSpacing = 2 * 60` (2 minutes). **The commit already exists in the v1 lotusd repo — extract it.** Find the commit with `git log --all --oneline -- src/chainparams.cpp` in workspace-v1 and isolate the `nPowTargetSpacing` change. V2 uses the same value; apply the same extracted patch. **Downstream effects:** (1) boot subsidy step heights in patch 26 must be 5× larger to hit the same wall-clock half-life (720 blocks/day at 2 min vs 144 at 10 min). |
-| 09 | `09-merkle.patch` | NEEDS-REBASE | IGUANA interleaved merkle tree; fixes the CVE-2012-2459 variant merkle tree vulnerability; implements MerklixHash (bitwise trie + SHA256 overlay) per the 2018 Vermorel/Séchet/Chancellor/Cox paper |
-| 10 | `10-nng-interface.patch` | NEEDS-REBASE | NNG pub/sub replacing ZeroMQ; adds `src/nng_interface/`; Chronik stays separate |
-| 10b | `10b-remove-zeromq.patch` | NEEDS-WRITE | Delete `src/zmq/`, ZeroMQ CMake option, ZeroMQ tests; was never removed. **Numbered 10b in v2 because slot 11 is occupied by intmath-log2.** In ecash/bchn this is at slot 11. Placeholder exists. |
-| 12 | `12-issuance-OLD.patch` | DEFERRED | Old log2 issuance curve — **superseded by 26+27; remove from series once those confirmed stable** |
-| 13 | *(minerfund — not applied)* | N/A | Archived for reference only |
-| 14 | `14-script-opcodes.patch` | NEEDS-REBASE | OP_MULPOW2 (0xb2), OP_RAWLEFTBITSHIFT (0xb3) and related new opcodes |
-| 15 | `15-taproot.patch` | NEEDS-REBASE | Taproot — **open question: does v2 want taproot? review before rebasing** |
-| 16 | `16-chain-params.patch` | NEEDS-FIX | Network magic, ports, primitives; genesis nNonce=0 placeholder; epoch times need updating |
-| 17 | `17-genesis.patch` | NEEDS-FIX | Assume-valid constants — placeholder with v1 mainnet values; replace after genesis is mined |
-| 18 | `18-checkpoints.patch` | NEEDS-FIX | Checkpoints — currently has v1 values; must be cleared for new chain |
-| 19 | `19-fixed-seeds.patch` | NEEDS-WRITE | Seed node IPs for new chain (v1 IPs currently; need new seed nodes) |
-| 20 | `20-seeder.patch` | NEEDS-REBASE | DNS seeder tool |
-| 21 | `21-consensus-activation.patch` | DROP | V1 named upgrade epochs (Exodus through 1st Kings). **V2 activates everything at block 0 — this patch is dropped from v2.** Now commented out in v2/series. Keep in v1 series only. |
-| 22 | `22-src-build.patch` | NEEDS-REBASE | src/CMakeLists.txt and sub-build-systems |
-| 23 | `23-misc.patch` | NEEDS-REBASE+EXTRACT | RPC, wallet, net, tests, util, policy, primitives. **Contains several things that need their own patches — see below** |
-| 24 | `24-qt-gui.patch` | NEEDS-REBASE | Qt GUI (BUILD_BITCOIN_QT=OFF by default) |
-| 25 | `25-build-compat.patch` | NEEDS-REBASE | CMake 4.x + Boost 1.90 fixes for macOS arm64 |
-| 26 | `26-boot-subsidy.patch` | NEEDS-REBASE | Boot subsidy: height-based step-halvings (10M XPI → 260 XPI floor, ~73-day half-life) |
-| 27 | `27-tail-subsidy.patch` | NEEDS-REBASE | Tail emission: sqrt-adaptive stateful emission via nTailSubsidy consensus variable |
-| 28 | `28-ifp-removal.patch` | NEEDS-REBASE | Disable IFP: enableMinerFund=false, coinbasePayoutAddresses cleared |
-| 29 | `29-op-log-op-sqrt.patch` | NEEDS-REBASE | OP_LOG (0xbd) and OP_SQRT (0xbe) with full test suite |
-| 30 | `30-op-mul.patch` | NEEDS-REBASE | OP_MUL (0x95) re-enabled; 63-bit signed multiply with overflow detection |
-| 31 | `31-bigint-ops.patch` | NEEDS-REBASE | Big-integer opcodes (0xbf–0xc4): BIGADD/BIGSUB/BIGMUL/BIGMOD/BIGDIVMOD/BIGMULMOD |
-| 32 | `32-chronik-adapt.patch` | NEEDS-WRITE | Adapt Chronik API output to XAddress (xpi prefix) + XPI denomination. Placeholder exists. |
-| 33 | `33-mitra-tx.patch` | SKELETON | Mitra tx format; see `daemon/docs/mitra-spec.md`; blocked on opcode slot resolution. Placeholder exists (renamed from 32-mitra-tx.patch). |
+| 08c | `08c-blocktime.patch` | NEEDS-EXTRACT | Set `nPowTargetSpacing = 2 * 60` (120s / 2 minutes) in `src/kernel/chainparams.cpp`. |
+| 09 | `09-merkle.patch` | NEEDS-REBASE | Single BLAKE3 domain-separated segmented Merkle tree; CVE-2012-2459 fix. |
+| 09b | `09b-block-header.patch` | NEEDS-EXTRACT | 116-byte fixed 64-bit aligned `LotusHeader` committing to `hashUtxoMerklixRoot` and `hashTxMerklixRoot`. |
+| 09c | `09c-compact-outputs.patch` | NEEDS-EXTRACT | 80-byte POD `LotusOutput` with 32B metadata, destination, type, and flags. Script-bypass fast lane (~30 ns). |
+| 10 | `10-nng-interface.patch` | NEEDS-REBASE | NNG pub/sub replacing ZeroMQ; adds `src/nng_interface/` |
+| 10b | `10b-remove-zeromq.patch` | NEEDS-WRITE | Delete `src/zmq/`, ZeroMQ CMake option, ZeroMQ tests. |
+| 11 | `11-intmath-log2.patch` | NEEDS-REBASE | Turner algorithm fixed-point log2 integer math. |
+| 12 | `12-issuance-OLD.patch` | DEFERRED | Old log2 issuance curve — supersede by 26+27. |
+| 13 | *(minerfund — not applied)* | N/A | Archived for reference only. |
+| 14 | `14-script-opcodes.patch` | NEEDS-REBASE | OP_MULPOW2 (0xb2), OP_RAWLEFTBITSHIFT (0xb3), etc. |
+| 15 | `15-taproot.patch` | NEEDS-REBASE | 64-byte compact Schnorr signatures and Taproot tree evaluation. |
+| 16 | `16-chain-params.patch` | NEEDS-FIX | Network magic, ports, primitives; genesis nNonce=0 placeholder. |
+| 17 | `17-genesis.patch` | NEEDS-FIX | Assume-valid constants — placeholder; replace after genesis mined. |
+| 18 | `18-checkpoints.patch` | NEEDS-FIX | Clear checkpoints for new chain. |
+| 19 | `19-fixed-seeds.patch` | NEEDS-WRITE | Hardcoded seed node IPs for new chain. |
+| 20 | `20-seeder.patch` | NEEDS-REBASE | DNS seeder tool. |
+| 21 | `21-consensus-activation.patch` | DROP | V2 activates all rules at block 0 — dropped from v2 series. |
+| 22 | `22-src-build.patch` | NEEDS-REBASE | src/CMakeLists.txt and sub-build-systems. |
+| 23 | `23-misc.patch` | NEEDS-REBASE | RPC, wallet, net, tests, util (header, outputs, txid extracted). |
+| 24 | `24-qt-gui.patch` | NEEDS-REBASE | Qt GUI (BUILD_BITCOIN_QT=OFF by default). |
+| 25 | `25-build-compat.patch` | NEEDS-REBASE | CMake 4.x + Boost 1.90 fixes for macOS arm64. |
+| 26 | `26-boot-subsidy.patch` | NEEDS-REBASE | Boot subsidy step-halvings calibrated for 720 blocks/day (2-minute spacing). |
+| 27 | `27-tail-subsidy.patch` | NEEDS-REBASE | Tail emission: sqrt-adaptive stateful emission ($R = K \sqrt{D}$). |
+| 28 | `28-ifp-removal.patch` | NEEDS-REBASE | Disable IFP: enableMinerFund=false, zero coinbase tax. |
+| 29 | `29-op-log-op-sqrt.patch` | NEEDS-REBASE | OP_LOG (0xbd) and OP_SQRT (0xbe) with full test suite. |
+| 30 | `30-op-mul.patch` | NEEDS-REBASE | OP_MUL (0x95) re-enabled; 63-bit signed multiply with overflow detection. |
+| 31 | `31-int128-stack.patch` | NEEDS-WRITE | Native `int128_t` two's-complement stack (kills `CScriptNum`); `OP_ADDCARRY`, `OP_SUBCARRY`, `OP_MUL128_WIDE`. |
+| 32 | `32-chronik-adapt.patch` | NEEDS-WRITE | Adapt Chronik API output to XAddress (`xpi` prefix) + XPI denomination. |
+| 33 | `33-introspection-loops.patch` | NEEDS-WRITE | Clean introspection opcodes (`0xbf–0xcf`), `OP_FOREACH_INPUT/OUTPUT` (depth ≤ 2), static precomputed budget. |
+| 34 | `34-utxo-merklix-rocksdb.patch`| NEEDS-WRITE | In-memory Crit-Bit Radix Trie + RocksDB asynchronous write-behind with block state commitments. |
+| 35 | `35-rpc-merklix-proofs.patch` | NEEDS-WRITE | `getutxoproof`, `verifymerklixproof`, PCT validation, P2P stateless snap-sync (`GETMERKLIX`/`MERKLIXCHUNK`). |
 
-### Things currently buried in `23-misc.patch` that need extraction
+### Extractions from `23-misc.patch`
 
-These were originally separate patches in v1 but got merged into the misc catch-all.
-Each needs to be extracted as its own named patch during the rebase:
+| Extracted Slot | File | Purpose |
+|----------------|------|---------|
+| Slot 09b | `09b-block-header.patch` | 116-byte fixed aligned `LotusHeader` committing to `hashUtxoMerklixRoot` and `hashTxMerklixRoot`. |
+| Slot 09c | `09c-compact-outputs.patch` | 80-byte POD `LotusOutput` with 32B metadata, destination, type, flags. |
+| Slot 31 | `31-int128-stack.patch` | Native 128-bit stack replacing `CScriptNum` and ad-hoc 64-bit shims. |
 
-| Future slot | What it is | Notes |
-|-------------|------------|-------|
-| Between 09 and 10 | **Block header format changes** | Changes to `CBlockHeader` struct; related to IGUANA; may overlap with patch 09 |
-| After 07 | **Dual TXID / merklix input tree** | `txid` = new hash via merklix tree over inputs/outputs; `txhash` = legacy serialization; block merkle commits to both; enables covenants; Mitra builds on top |
-| After 14 | **64-bit script fix** | 64-bit integer support in OP_DIV and other arithmetic ops; bitwise operator fixes; was a dedicated patch originally, may have been rolled into the monolithic v1 patch |
-
-### V2 Open Decisions
+### V2 Open Decisions — All Core Invariants Resolved
 
 | Decision | Status | Notes |
 |----------|--------|-------|
-| XAddress prefix | **DECIDED** — `xpi` | V1 uses `lotus`; v2 uses `xpi` to prevent address reuse across chains |
-| Avalanche in v2 | **DECIDED** — decouple from consensus; keep for soft voting | See below; Avalanche stays in codebase for fee/parameter governance |
-| V2 epoch activation | **DECIDED** — drop patch 21 | V2 activates everything at block 0; no epoch infrastructure needed; keep 21 in v1 only |
-| Taproot in v2 | OPEN | Needs review before patch 15 is rebased; may or may not belong in v2 |
-| Mine genesis nNonce | BLOCKED on launch readiness | Patches 16/17 have placeholder nNonce=0 |
-| Remove patch 12 | PENDING | Remove `12-issuance-OLD.patch` once 26+27 confirmed stable |
-| Mitra opcode slots | OPEN | Patch 31 uses 0xbf–0xc4; Mitra needs adjacent slots; resolve before implementing 33 |
+| XAddress prefix | **DECIDED** — `xpi` | V1 uses `lotus`; v2 uses `xpi` to prevent cross-chain address reuse. |
+| Avalanche in v2 | **DECIDED** — decouple from consensus; keep for soft voting | Hard PoW block/tx consensus; Avalanche kept for advisory fee/parameter voting. |
+| V2 epoch activation | **DECIDED** — drop patch 21 | All consensus rules active at block 0; zero hardfork epochs. |
+| Hashing engine | **DECIDED** — Single BLAKE3 | Double hashing (`BLAKE3d`) rejected; BLAKE3 domain flags prevent length extension. |
+| Output representation | **DECIDED** — 80-Byte POD | Flat array, 32B metadata, fast-path script bypass (~30 ns P2PKH validation). |
+| Native tokens | **DECIDED** — Outpoint Invariant | $\text{TokenID} = \text{BLAKE3}(\text{vin}[0].\text{prevout})$; double-spend immunity; zero lineage proofs. |
+| Introspection opcodes | **DECIDED** — 128-bit VM | Native `int128_t` stack eliminates `BIGADD/SUB`, freeing `0xbf–0xcf` for clean introspection. |
+| Script loops | **DECIDED** — Enumerable ($N \le 2$) | Bounded over `input_count`/`output_count`; static precomputed execution budget. |
+| State persistence | **DECIDED** — RAM Trie + RocksDB WAL | In-memory Crit-Bit Trie for $<5\text{ ms}$ rehash; RocksDB block state commitments for sub-second crash recovery. |
 
 ### Avalanche — DECIDED: decouple from consensus, keep for soft voting
 
@@ -372,7 +376,7 @@ make mkpatch SERIES=v1 NAME=<patch>      # re-emit updated patch
 | 6 | Decompose doged patches | lower priority |
 | 7 | Port NNG + ZeroMQ patches to ecash / bchn (slots 10-11) | lower priority |
 | 8 | Mine v2 genesis, update patches 16/17/18 | launch readiness |
-| 9 | Implement Mitra (patch 33) | opcode slot decision, dual-txid |
+| 9 | Implement Introspection & Loops (patch 33) | 0xbf–0xcf introspection, bounded loops |
 
 ### Notes on the rebase
 
@@ -410,5 +414,5 @@ Lotus patches don't touch Chronik, so those patches should apply cleanly. The
 | `daemon/patches/v1/series` | Ordered patch list for v1 |
 | `daemon/patches/ecash/` | eCash upstream PR patches |
 | `daemon/patches/bchn/` | BCHN upstream PR patches |
-| `daemon/docs/mitra-spec.md` | Mitra transaction format spec |
+| `daemon/docs/mitra-spec.md` | Mitra spec (Archived reference; superseded by Modernized BUIP037 + P2MNOR) |
 | `daemon/docs/patch-strategy.md` | This file |
