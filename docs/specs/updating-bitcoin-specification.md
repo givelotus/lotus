@@ -11,13 +11,13 @@
 3. [Immutable Consensus Specification (Locked at Block 0)](#3-immutable-consensus-specification-locked-at-block-0)
    - [3.1. The 116-Byte Header & 2-Minute Block Interval](#31-the-116-byte-header--2-minute-block-interval)
    - [3.2. Single BLAKE3 Domain-Separated Segmented Merklix Tree](#32-single-blake3-domain-separated-segmented-merklix-tree)
-   - [3.3. Zero-Copy Wire Format, Inline Witnesses & Multi-Branch Structured Outputs](#33-zero-copy-wire-format-inline-witnesses--multi-branch-structured-outputs)
-   - [3.4. Native Layer-1 Assets, Token Identity & Key Rotation](#34-native-layer-1-assets-token-identity--key-rotation)
-   - [3.5. Multi-Branch Architecture & Elimination of Opaque Roots](#35-multi-branch-architecture--elimination-of-opaque-roots)
+   - [3.3. Zero-Copy Wire Format, Inline Witnesses & Single-Asset Multi-Branch Outputs](#33-zero-copy-wire-format-inline-witnesses--single-asset-multi-branch-outputs)
+   - [3.4. Universal Asset Conservation & Minting Engine](#34-universal-asset-conservation--minting-engine)
+   - [3.5. Multi-Branch Architecture & Explicit Branch Witnesses](#35-multi-branch-architecture--explicit-branch-witnesses)
    - [3.6. The 128-Bit Forth Stack Machine (`int128_t`)](#36-the-128-bit-forth-stack-machine-int128_t)
    - [3.7. Multi-Precision & Cryptographic Primitives](#37-multi-precision--cryptographic-primitives)
-   - [3.8. Native Introspection Opcodes (`0xbf–0xcf`)](#38-native-introspection-opcodes-0xbf0xcf)
-   - [3.9. Enumerable Loops ($N \le 2$) & Static Precomputed Cost Budget](#39-enumerable-loops-n--2--static-precomputed-cost-budget)
+   - [3.8. Native Introspection Opcodes (`0xc0–0xd9`) — Multi-Branch & Single-Asset Aligned](#38-native-introspection-opcodes-0xc00xd9--multi-branch--single-asset-aligned)
+   - [3.9. Bounded Primitive Recursion (`OP_ENUMERATE`) & Static Precomputed Cost Budget](#39-bounded-primitive-recursion-op_enumerate--static-precomputed-cost-budget)
    - [3.10. Thermodynamic Monetary Issuance & Onboarding Faucet](#310-thermodynamic-monetary-issuance--onboarding-faucet)
 4. [Node Implementation & Performance Architecture (No Hardfork Required)](#4-node-implementation--performance-architecture-no-hardfork-required)
    - [4.1. Hybrid State Architecture: In-Memory Trie + RocksDB Write-Behind](#41-hybrid-state-architecture-in-memory-trie--rocksdb-write-behind)
@@ -60,12 +60,14 @@ To eliminate these bottlenecks while guaranteeing that the protocol **never need
 ├────────────────────────────────────────────────────────────────────────┤
 │  • 116-byte Block Header (Commits to UTXO Merklix Root)                │
 │  • Single BLAKE3 Domain-Separated Merklix Trees (txid & utxoroot)      │
-│  • Memory-Aligned Wire Format & 64-byte Compact Signatures             │
-│  • 80-byte Typed Compact Outputs with 32-byte Metadata Field           │
-│  • Genesis Outpoint Invariant: TokenID = BLAKE3(vin[0].prevout)        │
+│  • Memory-Aligned Wire Format & Inline Branch Witnesses                │
+│  • Single-Asset UTXO (42B Pure XPI fits in single 64B L1 Cache Line)   │
+│  • Universal Asset Conservation: ∑in[asset] ≥ ∑out[asset]              │
+│  • Token Identity: TokenID = BLAKE3(minting_script), Zero Batons       │
 │  • 128-bit Two's-Complement Stack VM Semantics (int128_t)              │
-│  • Native Introspection Opcodes (0xbf–0xcf) & Loop Opcodes (N ≤ 2)     │
-│  • Static Precomputed Execution Budget (1 Wire Byte = 1 Cost Unit)     │
+│  • Native Introspection Opcodes (0xc0–0xd9)                            │
+│  • Bounded Primitive Recursion (OP_ENUMERATE, Zero Nested Loops)       │
+│  • Static Precomputed Execution Budget (Zero Halting Problem)          │
 │  • Dynamic Sub-Linear Issuance: R = K · √(Difficulty)                  │
 │  • 50/50 Miner / Faucet Seigniorage Split with Auto-Burn Cap           │
 └────────────────────────────────────────────────────────────────────────┘
@@ -96,12 +98,12 @@ To eliminate these bottlenecks while guaranteeing that the protocol **never need
 | **Header State Commitments** | None (Tx merkle root only) | `hashEpochBlock` (32B) + `hashExtendedMetadata` (32B) | `hashTxMerklixRoot` (32B) + `hashUtxoMerklixRoot` (32B) | Enables stateless verification and sub-second crash recovery. |
 | **Block Cadence** | 600s (10 min) | 120s (2 min) | **120s (2 min)** | Near-zero orphan rate, $5\times$ faster DAA responsiveness. |
 | **Hashing Engine** | SHA256d everywhere | SHA256d + SHA256 overlay | **Single BLAKE3** (Consensus & Trees) | Native tree hashing, immune to length-extension, $12\text{ ns}$ execution. |
-| **Output Representation** | Dynamic `vector<uint8_t>` | Dynamic `vector<uint8_t>` | **80-Byte POD Struct** | Zero heap allocation, 32B metadata, fast-path script bypass. |
+| **Output Representation** | Dynamic `vector<uint8_t>` | Dynamic `vector<uint8_t>` | **Single-Asset Multi-Branch (42B/74B)** | 42B pure XPI fits in single 64B L1 CPU cache line; zero dust for tokens. |
 | **Script Stack Integers** | `CScriptNum` (32-bit signed) | `CScriptNum` + 64-bit hacks | **Native `int128_t` (128-bit)** | Eliminates sign-magnitude bugs, enables high-precision finance. |
 | **Multi-Precision Math** | None | Ad-hoc `BIGADD` | `OP_ADDCARRY`, `OP_SUBCARRY`, `OP_MUL128_WIDE` | Curve arithmetic (secp256k1, BLS12-381) directly in Script. |
-| **Covenant Introspection** | None | Ad-hoc sighash flags | **Native Opcodes (`0xbf–0xcf`)** | Inspects own inputs, outputs, outpoints, metadata in 1 CPU cycle. |
-| **Script Loops** | Disabled / Forbidden | Mitra loop proposal | **`OP_FOREACH_INPUT/OUTPUT` ($N \le 2$)** | Bounded, statically precomputed loops without Halting Problem. |
-| **Native L1 Tokens** | None (3rd party indexers) | None | **Consensus-enforced $\sum \text{in} \ge \sum \text{out}$** | Invariant $\text{TokenID} = \text{BLAKE3}(\text{vin}[0].\text{prevout})$. |
+| **Covenant Introspection** | None | Ad-hoc sighash flags | **Native Opcodes (`0xc0–0xd9`)** | Inspects inputs, outputs, outpoints, branches, state in 1 CPU cycle. |
+| **Script Loops** | Disabled / Forbidden | Mitra loop proposal | **`OP_ENUMERATE` Family** | Primitive recursion bounded by inputs/outputs or $N \le 256$; zero Halting Problem. |
+| **Native L1 Tokens** | None (3rd party indexers) | None | **Universal Conservation ($\sum \text{in} \ge \sum \text{out}$)** | $\text{TokenID} = \text{BLAKE3}(\text{minting\_script})$; zero consensus batons; zero dust. |
 | **Mempool Ingestion** | $O(n^2)$ CPFP DAG walk | $O(n^2)$ CPFP DAG walk | **$O(1)$ Ingestion Pipeline** | Eliminates chain limits, handles $50,000\text{ tx/s}$ ingress. |
 | **Block Construction** | $O(n^2)$ package selection | $O(n^2)$ package selection | **$O(n \log n)$ Pipeline** | Topological forward-walk and tier sorting. |
 | **UTXO Persistence** | LevelDB (Uncommitted) | LevelDB (Uncommitted) | **RAM Radix Trie + RocksDB WAL** | Cryptographic crash recovery; 0 reindexing from genesis. |
@@ -197,44 +199,60 @@ To prevent leaf duplication vulnerabilities where an unconfirmed transaction can
 
 ---
 
-### 3.3. Zero-Copy Wire Format, Inline Witnesses & Multi-Branch Structured Outputs
+#### 3.3. Zero-Copy Wire Format, Inline Witnesses & Single-Asset Multi-Branch Outputs
 
-Variable-length integers (`CompactSize` / `varint`) are eliminated from transaction headers and fixed records. Crucially, the BIP-141 soft-fork hack of a decoupled, trailing `witness` vector is completely discarded. In Lotus v2, **witnesses map 1-to-1 directly inside `vin` and `vout`**.
+Variable-length integers (`CompactSize` / `varint`) are eliminated from transaction headers and fixed records. Crucially, the BIP-141 soft-fork hack of a decoupled, trailing `witness` vector is completely discarded. In Lotus v2, **witnesses map 1-to-1 directly inside `vin`**, and **minting proofs are structured per-asset at the transaction level**.
 
 ```cpp
 // Transaction Wire Header (16 Bytes)
 struct LotusTxHeader {
     int32_t  nVersion;       // 4 bytes: Tx format version
-    uint32_t nLockTime;      // 4 bytes: Locktime
+    uint32_t nLockTime;      // 4 bytes: Block height or MTP locktime
     uint32_t nInputCount;    // 4 bytes: Fixed 32-bit integer
     uint32_t nOutputCount;   // 4 bytes: Fixed 32-bit integer
+    // Note: mint_count follows outputs if nVersion indicates minting/v2
 };
 
-// Branch Witness (Carried inside each input, one per active branch)
+// Branch Witness (Carried inside each input, exactly 1-to-1 per branch of spent coin)
 struct BranchWitness {
-    std::vector<uint8_t> script;              // Script preimage / covenant bytecode
-    std::vector<std::vector<uint8_t>> stack;  // Unlocking parameters / signatures
+    CScript script;                              // The UNHASHED script bytecode (Preimage of branch[k])
+    std::vector<std::vector<uint8_t>> args;      // Unlocking parameters / signatures passed to script
 };
 
 // Input Record (Inline Branch Witnesses)
 struct LotusInput {
-    COutPoint prevout;                         // 32B txid + 4B index
-    uint32_t  nSequence;                       // 4 bytes
-    uint16_t  n_branch_witnesses;              // 2 bytes: Number of branch witnesses
-    std::vector<BranchWitness> witnesses;      // Inline 1-to-1 branch witnesses
+    COutPoint prevout;                           // 32B txid + 4B index (36 bytes)
+    uint32_t  nSequence;                         // 4 bytes (RBF / Relative Locktime)
+    uint8_t   flags;                             // 1 byte:
+                                                 //   Bit 0 (0x01): FLAG_READ_ONLY_REFERENCE
+                                                 //   Bits 1-7: Reserved (must be 0)
+    uint16_t  n_branch_witnesses;                // 2 bytes: Number of branch witnesses (1-to-1 with coin.branches)
+    std::vector<BranchWitness> branch_witnesses; // Explicit branch witnesses
 };
 
-// Output Record (Inline Creation Witness & Optional Token Amount)
+// Output Record (Single-Asset Representation with Unified nValue)
 struct LotusOutput {
-    uint64_t  amount;                          // 8 bytes: Native XPI satoshis (carrier gas)
-    uint16_t  flags;                           // 2 bytes: Bitflags (FLAG_HAS_TOKEN, etc.)
-    uint16_t  n_branches;                      // 2 bytes: Count of branch hashes (typically 1 or 2)
-    uint128_t token_amount;                    // 16 bytes: ONLY serialized if (flags & FLAG_HAS_TOKEN)
-    std::vector<uint256> branches;             // Array of 32B branch hashes [Owner, Covenant, ...]
+    uint8_t  flags;                              // 1 byte:
+                                                 //   Bit 0 (0x01): FLAG_HAS_TOKEN
+                                                 //   Bit 1 (0x02): FLAG_HAS_STATE
+                                                 //   Bits 2-7: Reserved (must be 0)
+    Amount   nValue;                             // 8 bytes: Single unified amount (XPI satoshis OR Token units)
     
-    // Creation Witness: 0 bytes for standard transfers, populated ONLY when minting tokens
-    std::vector<uint8_t> creation_script;
-    std::vector<std::vector<uint8_t>> creation_args;
+    // Present ONLY if (flags & FLAG_HAS_TOKEN) is set:
+    uint256  token_id;                           // 32 bytes: TokenID = BLAKE3(minting_script)
+    
+    // Present ONLY if (flags & FLAG_HAS_STATE) is set:
+    CompactSize state_len;                       // Length of state payload
+    std::vector<uint8_t> state_commitment;       // Dynamic NFT / state machine data
+    
+    uint8_t  num_branches;                       // 1 byte: Count of branch hashes (typically 1 or 2)
+    std::vector<uint256> branches;               // Array of 32B branch hashes [BLAKE3(script_0), BLAKE3(script_1), ...]
+};
+
+// Transaction-Level Mint Witness (Present ONLY when expanding token supply: Delta > 0)
+struct TokenMintWitness {
+    CScript minting_script;                      // Preimage of TokenID: TokenID = BLAKE3(minting_script)
+    std::vector<std::vector<uint8_t>> stack_args;// Arguments (delegated certificates, signatures, proofs)
 };
 ```
 
@@ -242,127 +260,126 @@ struct LotusOutput {
 
 ```
 ┌────────────────────────────────────────────────────────────────────────────────────────┐
-│ PURE XPI STANDARD OUTPUT (44 Bytes - Fits in a SINGLE 64-Byte CPU Cache Line!)         │
+│ PURE XPI STANDARD OUTPUT (42 Bytes - Fits in a SINGLE 64-Byte CPU Cache Line!)         │
 ├────────────────────────────────────────────────────────────────────────────────────────┤
-│ [00..07] uint64_t amount              (8B: Native XPI satoshis)                        │
-│ [08..09] uint16_t flags               (2B: FLAG_HAS_TOKEN = 0)                         │
-│ [10..11] uint16_t n_branches          (2B: 0x0001 = 1 branch)                          │
-│ [12..43] uint256  branch[0]           (32B: Owner PubKeyHash / Destination)            │
+│ [00..00] uint8_t  flags               (1B: 0x00 = Pure Native XPI)                     │
+│ [01..08] uint64_t nValue              (8B: Native XPI satoshis)                        │
+│ [09..09] uint8_t  num_branches        (1B: 0x01 = 1 branch)                            │
+│ [10..41] uint256  branch[0]           (32B: Owner Script Hash: BLAKE3(OwnerScript))    │
 └────────────────────────────────────────────────────────────────────────────────────────┘
 
 ┌────────────────────────────────────────────────────────────────────────────────────────┐
-│ TOKEN / COVENANT OUTPUT (92 Bytes - Explicit Owner, Token Amount & Covenant)           │
+│ TOKEN / COVENANT OUTPUT (74 Bytes - Zero Dust, Pure Single-Asset UTXO)                 │
 ├────────────────────────────────────────────────────────────────────────────────────────┤
-│ [00..07] uint64_t  amount             (8B: Native XPI carrier fuel)                    │
-│ [08..09] uint16_t  flags              (2B: FLAG_HAS_TOKEN = 1)                         │
-│ [10..11] uint16_t  n_branches         (2B: 0x0002 = 2 branches)                        │
-│ [12..27] uint128_t token_amount       (16B: Native 128-bit token balance)              │
-│ [28..59] uint256   branch[0]          (32B: Owner PubKeyHash)                          │
-│ [60..91] uint256   branch[1]          (32B: Token Covenant / Policy Hash)              │
+│ [00..00] uint8_t  flags               (1B: 0x01 = FLAG_HAS_TOKEN)                      │
+│ [01..08] uint64_t nValue              (8B: Token units - NO native XPI dust!)          │
+│ [09..40] uint256  token_id            (32B: Asset ID = BLAKE3(minting_script))         │
+│ [41..41] uint8_t  num_branches        (1B: 0x01 = 1 branch, or 0x02 = 2 branches)      │
+│ [42..73] uint256  branch[0]           (32B: Owner Script Hash: BLAKE3(OwnerScript))    │
+│ [74..105]uint256  branch[1] (opt)     (32B: Covenant Script Hash: BLAKE3(Covenant))    │
 └────────────────────────────────────────────────────────────────────────────────────────┘
 ```
 
-#### Why Optional `token_amount` via Bitflag Beats Varints:
-1. **Zero Bytes for Pure XPI**:
-   For $>95\%$ of transactions (pure native XPI), `FLAG_HAS_TOKEN` is unset. `token_amount` is **omitted entirely from the wire (0 bytes)**. Standard outputs shrink to **44 bytes**, fitting inside a single 64-byte L1 CPU cache line.
-2. **Zero-Cycle CPU Cost**:
-   Instead of variable-length parsing branches, serialization uses a single bit-test:
-   ```cpp
-   if (__builtin_expect(flags & FLAG_HAS_TOKEN, 0)) {
-       stream >> token_amount;
-   } else {
-       token_amount = 0;
-   }
-   ```
-   The CPU branch predictor predicts pure XPI with $>99.9\%$ accuracy, executing in 0 clock cycles without CPU stalls. When tokens are present, 128-bit amounts load via a single 1-cycle SIMD instruction (`vmovdqu` / `ldr q0`).
+#### Why Re-Using `nValue` Eliminates the "Dust Nightmare":
+1. **Zero Dust Overhead**:
+   In legacy protocols (SLP, CashTokens), token outputs were mutant hybrids: they were forced to carry 546 satoshis of native crypto just to satisfy miner dust limits. In Lotus v2, **token outputs carry 0 XPI satoshis**.
+2. **Zero Accidental Burn Risk**:
+   Because token outputs have no native XPI in them, an un-upgraded wallet cannot mistake a token coin for a satoshi coin and accidentally spend it as miner fees.
 3. **Malleability Immunity by Construction**:
-   The **TXID** is defined as $\mathbf{BLAKE3}(\text{nVersion} \parallel \text{nLockTime} \parallel \text{inputs without witnesses} \parallel \text{outputs without creation\_witness})$. Third parties can never malleate the TXID.
+   The **TXID** is defined as:
+   $$\mathbf{TxID} = \mathbf{BLAKE3}\Big(\text{nVersion} \parallel \text{nLockTime} \parallel \text{vin\_stripped} \parallel \text{vout}\Big)$$
+   Where `vin_stripped` excludes all `branch_witnesses`, and `mint_witnesses` are excluded. Third parties can never malleate the TXID.
 
 ---
 
-### 3.4. Native Layer-1 Assets, Token Identity & Key Rotation
+### 3.4. Native Layer-1 Assets & Universal Conservation
 
-#### 3.4.1. The Immutable Identity Invariant
-To prevent configuration changes from altering the token identity, `TokenID` is **never** the hash of mutable admin keys or reserve addresses. `TokenID` is permanently anchored to the Genesis Outpoint:
-$$\mathbf{TokenID} = \mathbf{BLAKE3}(\text{tx.vin}[0].\text{prevout})$$
+#### 3.4.1. The Universal Conservation Law
+In Lotus v2, the consensus engine runs a single, universal accounting loop across all assets in a transaction:
 
-Because every outpoint `(txid:vout)` can only be spent once in the history of the ledger, `TokenID` is mathematically unique and immutable forever.
+For every unique `asset_id` (where `asset_id = 0` represents native XPI):
+$$\sum_{\text{in}} \text{nValue}[\text{asset}] \ge \sum_{\text{out}} \text{nValue}[\text{asset}]$$
 
-#### 3.4.2. Key Rotation Without TokenID Mutation
-In production, reserve addresses change, keys are compromised, and corporate officers rotate. Lotus v2 decouples immutable `TokenID` from mutable configuration:
+* **For Native XPI (`asset_id == 0`)**:
+  The difference is the **Miner Fee**:
+  $$\text{Miner Fee} = \sum_{\text{in}} \text{nValue}[\text{XPI}] - \sum_{\text{out}} \text{nValue}[\text{XPI}] \ge 0$$
+* **For Tokens (`asset_id != 0`)**:
+  The difference is an **Opt-in Burn**.
+* **Sub-Microsecond Validation**:
+  For 99.9% of transactions (standard peer-to-peer transfers), token validation requires **zero script interpretation**. It is a single SIMD 128-bit comparison (`sum_in >= sum_out`). Nodes validate over 100,000 token transfers per second per CPU core.
 
-1. **The Admin Baton (On-Chain Governance Coin)**:
-   The token creator maintains an Admin Baton UTXO governed by an $m$-of-$n$ corporate multisig (e.g. 3-of-5).
-   - **Key Rotation**: When an employee leaves, the remaining officers spend the Admin Baton to a new Baton UTXO containing the updated key set and new reserve address. `TokenID` never changes.
-   - **Contention-Free Ingestion**: Depositors include the Admin Baton as a **Read-Only Reference Input** (`FLAG_READ_ONLY_REFERENCE = 0x01` in `LotusInput`). Because depositors only *read* the baton rather than spending it, **10,000 users can read the Admin Baton simultaneously in the same block with zero double-spend collisions**.
+#### 3.4.2. Token Scarcity & The Minting Engine ($\Delta > 0$)
+When a transaction outputs more tokens than it inputs:
+$$\Delta[\text{TokenID}] = \sum_{\text{out}} \text{nValue}[\text{TokenID}] - \sum_{\text{in}} \text{nValue}[\text{TokenID}] > 0$$
 
-2. **Immunity of Circulating Tokens During Baton Rotations**:
-   When the Admin Baton is spent and moved to a new outpoint:
-   - **Existing circulating tokens are 100% unaffected.**
-   - Standard peer-to-peer transfers (Alice sending USDC to Bob) **never touch, read, or reference the Admin Baton.**
-   - Transfers only enforce local asset conservation ($\sum \text{in}[TokenID] \ge \sum \text{out}[TokenID]$) and recipient covenant preservation.
-   - Because `TokenID` is pinned to the Genesis Outpoint, old tokens and newly minted tokens have the exact same `TokenID` and remain **100% fungible**.
+Consensus strictly requires an entry in `tx.mint_witnesses` where:
+$$\mathbf{TokenID} = \mathbf{BLAKE3}(\text{mint\_witness}.\text{minting\_script})$$
 
-3. **Context-Aware Governance via `OP_ISREFERENCEINPUT`**:
-   To avoid rigid, brittle branch-ordering rules in consensus (e.g. forcing "Slot 0 = Spend, Slot 1 = Reference"), the Forth VM provides the `OP_ISREFERENCEINPUT` (`0xd3`) introspection opcode.
-   A single governance script dynamically alters its behavior based on runtime context:
-   ```forth
-   OP_ISREFERENCEINPUT
-   OP_IF
-       # ─── MODE A: REFERENCED (User Deposit / Minting) ───
-       # Verify deposit went to the authorized reserve address:
-       <Reserve_Address> 0 OP_OUTPUTBYTECODE OP_EQUALVERIFY
-   OP_ELSE
-       # ─── MODE B: SPENT (Admin Key Rotation / Migration) ───
-       # Coin is physically being consumed to rotate keys:
-       3 <PK1> <PK2> <PK3> <PK4> <PK5> 5 OP_CHECKMULTISIG
-   OP_ENDIF
-   ```
-   Consensus enforces zero magic slot semantics: the coin’s script governs its own execution path.
+The node executes `minting_script` with `mint_witness.stack_args`. If the script returns `true`, the expansion of supply is approved. If missing or false, the transaction is immediately rejected as counterfeit (`bad-txns-unauthorized-mint`).
 
-4. **Epoch Delegation Certificates (`OP_CHECKDATASIG`)**:
-   Alternatively, the $m$-of-$n$ admin keys sign an off-chain delegation certificate committing to the authorized reserve address for epoch $[H..H+\Delta]$. The depositor attaches this certificate to their witness, and the token script validates it via `OP_CHECKDATASIG`. Zero on-chain state contention.
+#### 3.4.3. The Three Minting & Governance Architectures (Zero Batons in Consensus)
+Tracking physical "baton coins" in consensus creates massive codebase fragility (LevelDB capability flags, undo log bloat, accidental burn risks). Lotus v2 eliminates consensus batons entirely in favor of three clean architectures:
 
-#### 3.4.3. The Parallel Deposit Invariant (Zero State-UTXO Collisions)
-To deposit into a token or staking contract (e.g. USDC $\rightarrow$ sUSDC), users **never spend a shared contract coin**. The deposit is an atomic local transaction invariant:
-- **Inputs**: Alice's 500 USDC.
-- **Outputs**:
-  - `Vout[0]`: 500 USDC sent to `sUSDC_Reserve_Address`.
-  - `Vout[1]`: 480 sUSDC minted to `Alice_Address` (with `creation_witness` proving the deposit).
-- **Zero Lock Contention**: Alice only spends her own coins. 10,000 users can deposit in parallel across the exact same block with zero lock contention. Reserves are held in chunked UTXOs, enabling parallel withdrawals.
+1. **Pattern 1: The Treasury Vault Pattern (Zero Minting Scripts After Genesis)**:
+   * At Genesis, total authorized supply (e.g. 10 Billion USDC) is minted into a **Treasury Vault UTXO** governed by an $m$-of-$n$ multisig. Circulating market supply is $0$.
+   * **Issuance**: When reserves arrive, the company spends from the Treasury UTXO: $50,000$ to the buyer, and $9,999,950,000$ change back to the Treasury.
+   * **Key Rotation**: The officers spend the Treasury coin to their **new multisig address**.
+   * **Consensus**: $\sum \text{in} \ge \sum \text{out}$ holds 100% of the time. The consensus engine never executes a minting script after Genesis.
+2. **Pattern 2: Dynamic Delegated Minting (`OP_CHECKDATASIG`)**:
+   * For elastic tokens: `MintingScript` hardcodes a **Cold Root Public Key** (`Root_PK`).
+   * The cold key signs an off-chain **Delegation Certificate**:
+     $$\text{Cert} = \text{Sign}_{\text{Root\_PK}}(\text{Epoch: 2}, \text{ Authorized: Frank}, \text{ Expiry: Block 600,000})$$
+   * When minting, `mint_witnesses` provides `stack_args = [Frank_Sig, Cert_Bytes, Root_Sig]`.
+   * `MintingScript` verifies the certificate via `OP_CHECKDATASIGVERIFY`, extracts Frank's key, and verifies Frank's transaction signature with `OP_CHECKSIG`.
+   * **Key Rotation**: Cold Root signs a new certificate. `TokenID` never changes. Consensus tracks zero batons.
+3. **Pattern 3: One-Time Hard-Capped Genesis (e.g. 21 Million Max Supply)**:
+   * Anchored to a unique Genesis outpoint (`prevout = 0x1234...:0`):
+     ```forth
+     OP_0 OP_PICKINPUTOUTPOINT <0x1234...:0> OP_EQUALVERIFY
+     OP_0 OP_ENUMERATE_OUTPUTS OP_PICKOUTPUTVALUE OP_ADD OP_ENDENUMERATE
+     2100000000000000 OP_LESSTHANOREQUAL
+     ```
+   * Because `prevout` can only be spent once in blockchain history, the script can only succeed once. Double-minting is mathematically prevented by UTXO double-spend rules.
+
+#### 3.4.4. Read-Only Reference Inputs (`FLAG_READ_ONLY_REFERENCE`)
+To inspect on-chain vault or oracle state without double-spend contention:
+* Set `FLAG_READ_ONLY_REFERENCE = 0x01` on `LotusInput`.
+* The coin is **read, not spent**. It remains in the UTXO set.
+* Enables 10,000 users to read and validate against a central vault in the exact same block with **zero lock collisions**.
 
 ---
 
 ### 3.5. Multi-Branch Architecture & Elimination of Opaque Roots
 
-#### 3.5.1. Why Opaque Merkle Roots Were Abandoned
-Early covenant proposals (including Taproot MAST and single-root `P2MNOR`) hashed all spend conditions and recipient public keys into a single 32-byte opaque Merkle root. This created severe operational failures:
-1. **The Blind Indexer Problem**: Chronik could not identify what token or contract an output belonged to until the coin was spent.
-2. **The Blind Light-Wallet Problem**: Because the recipient's public key was hashed together with the covenant, Bob's address was blinded. Bob's wallet could not find his own coins without out-of-band communication or exhaustive witness graph tracing.
-
-#### 3.5.2. Multi-Branch Direct Hashes
-Lotus v2 replaces single opaque roots with an **explicit array of branch hashes** in the output struct:
+#### 3.5.1. Multi-Branch Direct Hashes
+Lotus v2 replaces single opaque roots (Taproot / P2MNOR) with an **explicit array of branch hashes** on the wire:
 $$\text{branches} = [ \mathbf{hash}_0, \mathbf{hash}_1, \dots \mathbf{hash}_{n-1} ]$$
+where each branch is the single BLAKE3 hash of an unhashed script:
+$$\mathbf{hash}_k = \mathbf{BLAKE3}(\mathbf{script}_k)$$
 
-- **`hash_0` (Owner)**: `BLAKE3(Bob_PubKey)`. Bob's wallet and Chronik index the recipient in $O(1)$ directly from the unspent output.
-- **`hash_1` (Covenant / Token Policy)**: `BLAKE3(TokenCovenantScript)`. Chronik indexes the asset type and rules in $O(1)$ directly from the unspent output.
-- **`hash_2` (Optional Guardrail / Emergency Recovery)**: E.g., timelock or recovery key.
+* **`branch[0]` (Owner)**: `BLAKE3(OwnerScript)`. Chronik and light wallets find the recipient in $O(1)$ directly from the unspent output.
+* **`branch[1]` (Covenant / Policy)**: `BLAKE3(CovenantScript)`. Chronik indexes the asset type and rules in $O(1)$ directly from the unspent output.
 
-#### 3.5.3. Multi-Branch Execution & The NOR-Tree
-When spending an output with $n$ branches, the input provides an array of branch witnesses: `vin[i].witnesses[k]`.
-Consensus verifies:
-1. $\mathbf{BLAKE3}(\text{witnesses}[k].\text{script}) == \text{branches}[k]$ for all active branches.
-2. Executes each branch script in an **isolated evaluation stack frame** (executed in parallel across CPU cores).
-3. Evaluates branch results across a deterministic **NOR-Tree**:
-   $$\text{Root} = (n_0 \bar{\lor} n_1) \;\bar{\lor}\; (n_2 \bar{\lor} n_3)$$
-   Using static scripts (`OP_TRUE` / `OP_FALSE`) in branch slots, arbitrary boolean logic like $(\text{Owner} \land \text{Covenant}) \lor \text{Recovery}$ is expressed directly on the wire with zero hidden Merkle trees.
-
-#### 3.5.4. Composable Asset Invariants
-Covenants must never hardcode output indices (e.g. "Output 0 must be my change"). Instead, composable covenants enforce **Asset Invariants**:
-- The `USDC_Covenant` only asserts that the subset of inputs carrying USDC balances equals the subset of outputs carrying USDC balances ($\sum \text{in}[USDC] == \sum \text{out}[USDC]$), and all USDC outputs preserve `USDC_Covenant`.
-- It ignores unrelated inputs and outputs (such as XPI or sUSDC), allowing multiple covenants, AMMs, and staking vaults to compose seamlessly in the exact same transaction.
-
----
+#### 3.5.2. Explicit Branch Witnesses (`BranchWitness`)
+When spending an output, `vin[i].branch_witnesses` provides a clean 1-to-1 mapping with `coin.branches`:
+```cpp
+for (size_t k = 0; k < coin.branches.size(); k++) {
+    const BranchWitness &bw = input.branch_witnesses[k];
+    
+    // 1. Verify unhashed script matches the branch hash on the coin:
+    if (BLAKE3(bw.script) != coin.branches[k]) {
+        return state.Invalid("bad-txns-branch-hash-mismatch");
+    }
+    
+    // 2. Execute bw.script initialized with bw.args:
+    if (!VerifyScript(bw.args, bw.script, ...)) {
+        return state.Invalid("bad-txns-branch-script-failed");
+    }
+}
+```
+* **No Buried Scripts**: The unhashed script is explicitly provided in `bw.script`.
+* **No Argument Confusion**: Arguments and signatures live cleanly in `bw.args`.
+* **Zero Hidden Merkle Trees**: All rules are explicit and independently verifiable.
 
 ### 3.6. The 128-Bit Forth Stack Machine (`int128_t`)
 
@@ -396,7 +413,7 @@ To empower smart contracts to compute arbitrary zero-knowledge proofs and crypto
 By chaining `OP_ADDCARRY`, `OP_SUBCARRY`, and `OP_MUL128_WIDE`, user-space contracts can implement 256-bit (secp256k1, secp256r1, Ed25519) and 384-bit (BLS12-381) field arithmetic directly in Script.
 
 #### 3.7.2. Cryptographic Hashing & Signature Verification
-* `OP_BLAKE3` (`0xcd`): Single-pass BLAKE3 hash ($\approx 12\text{ ns}$).
+* `OP_BLAKE3` (`0xbf`): Single-pass BLAKE3 hash ($\approx 12\text{ ns}$).
 * `OP_SHA256` (`0xa8`): Single SHA-256 hash.
 * `OP_HASH256` (`0xaa` / `OP_SHA256D`): Double SHA-256 for Bitcoin cross-chain header verification.
 * `OP_CHECKSIG` (`0xac`): Evaluates 64-byte Schnorr signatures (BIP340) by default, or 64-byte compact Low-S ECDSA.
@@ -409,47 +426,83 @@ By chaining `OP_ADDCARRY`, `OP_SUBCARRY`, and `OP_MUL128_WIDE`, user-space contr
 
 ---
 
-### 3.8. Native Introspection Opcodes (`0xc0–0xd2`) — BCH Ecosystem Aligned
+### 3.8. Native Introspection Opcodes (`0xc0–0xd9`) — Multi-Branch & Single-Asset Aligned
 
-To maximize tooling interoperability with CashScript, Libauth, and existing smart contract compilers, Lotus v2 aligns its native introspection opcodes directly with the **Bitcoin Cash (BCH) May 2022 specification**, while augmenting them with Lotus v2's 80-byte POD metadata and bounded loop primitives:
+To maximize tooling interoperability with CashScript, Libauth, and smart contract compilers, Lotus v2 aligns its native introspection opcodes with the Bitcoin Cash (BCH) May 2022 specification while upgrading them to support Lotus v2's single-asset outputs, multi-branch architecture, state commitments, and reference inputs:
 
-| Opcode | Hex | Stack In $\to$ Out | Alignment | Description |
-| :--- | :--- | :--- | :--- | :--- |
-| `OP_INPUTINDEX` | `0xc0` | `-> index` | **BCH Identical** | Pushes the 32-bit index of the executing input. |
-| `OP_ACTIVEBYTECODE`| `0xc1` | `-> bytecode` | **BCH Identical** | Pushes currently executing script bytecode. |
-| `OP_TXVERSION` | `0xc2` | `-> ver` | **BCH Identical** | Pushes the 32-bit transaction version. |
-| `OP_TXINPUTCOUNT` | `0xc3` | `-> count` | **BCH Identical** | Pushes the total number of inputs. |
-| `OP_TXOUTPUTCOUNT`| `0xc4` | `-> count` | **BCH Identical** | Pushes the total number of outputs. |
-| `OP_TXLOCKTIME` | `0xc5` | `-> locktime` | **BCH Identical** | Pushes the 32-bit transaction locktime. |
-| `OP_UTXOVALUE` | `0xc6` | `i -> amount` | **BCH Identical** | Pops input index $i$, pushes 128-bit satoshi amount. |
-| `OP_UTXOBYTECODE` | `0xc7` | `i -> dest` | **BCH Identical** | Pops input index $i$, pushes 32-byte destination (pubkey hash or Merkle root). |
-| `OP_OUTPOINTTXHASH`|`0xc8` | `i -> txid` | **BCH Identical** | Pops input index $i$, pushes 32-byte spent outpoint TXID. |
-| `OP_OUTPOINTINDEX` | `0xc9` | `i -> vout` | **BCH Identical** | Pops input index $i$, pushes 32-bit spent outpoint index. |
-| `OP_UTXOMETADATA` | `0xca` | `i -> metadata`| **Lotus v2 Native** | Pops input index $i$, pushes 32-byte metadata (Token/Covenant state). |
-| `OP_UTXOTYPE` | `0xcb` | `i -> type` | **Lotus v2 Native** | Pops input index $i$, pushes 1-byte output type (`0x01`–`0x04`). |
-| `OP_OUTPUTVALUE` | `0xcc` | `j -> amount` | **BCH Identical** | Pops output index $j$, pushes 128-bit satoshi amount. |
-| `OP_OUTPUTBYTECODE`|`0xcd` | `j -> dest` | **BCH Identical** | Pops output index $j$, pushes 32-byte destination (pubkey hash or Merkle root). |
-| `OP_OUTPUTMETADATA`|`0xce` | `j -> metadata`| **Lotus v2 Native** | Pops output index $j$, pushes 32-byte metadata (Token/Covenant state). |
-| `OP_OUTPUTTYPE` | `0xcf` | `j -> type` | **Lotus v2 Native** | Pops output index $j$, pushes 1-byte output type (`0x01`–`0x04`). |
-| `OP_TXID` | `0xd0` | `-> txid` | **Lotus v2 Native** | Pushes the 32-byte Single-BLAKE3 Merklix TXID of current transaction. |
-| `OP_FOREACH_INPUT` | `0xd1` | `... OP_ENDFOR` | **Lotus v2 Native** | Starts an enumerable bounded loop over all inputs (depth $\le 2$). |
-| `OP_FOREACH_OUTPUT`| `0xd2` | `... OP_ENDFOR` | **Lotus v2 Native** | Starts an enumerable bounded loop over all outputs (depth $\le 2$). |
-| `OP_ISREFERENCEINPUT`| `0xd3`| `-> bool` | **Lotus v2 Native** | Pushes 1 if the current input is a read-only reference input, else 0. |
+| Opcode | Hex | Stack In $\to$ Out | Description |
+| :--- | :--- | :--- | :--- |
+| `OP_INPUTINDEX` | `0xc0` | `-> index` | Pushes the 32-bit index of the executing input. |
+| `OP_ACTIVEBYTECODE`| `0xc1` | `-> bytecode` | Pushes the currently executing branch script bytecode. |
+| `OP_TXVERSION` | `0xc2` | `-> ver` | Pushes the 32-bit transaction version. |
+| `OP_TXINPUTCOUNT` | `0xc3` | `-> count` | Pushes the total number of inputs. |
+| `OP_TXOUTPUTCOUNT`| `0xc4` | `-> count` | Pushes the total number of outputs. |
+| `OP_TXLOCKTIME` | `0xc5` | `-> locktime` | Pushes the 32-bit transaction locktime. |
+| `OP_UTXOVALUE` | `0xc6` | `i -> nValue` | Pops input index $i$, pushes 128-bit integer value (XPI satoshis or token units). Alias: `OP_PICKINPUTVALUE`. |
+| `OP_UTXOBRANCH` | `0xc7` | `i k -> branch_hash` | Pops input index $i$ and branch index $k$, pushes the 32-byte `branch[k]` hash of the spent coin. |
+| `OP_OUTPOINTTXHASH`| `0xc8` | `i -> txid` | Pops input index $i$, pushes 32-byte spent outpoint TXID. |
+| `OP_OUTPOINTINDEX` | `0xc9` | `i -> vout` | Pops input index $i$, pushes 32-bit spent outpoint index. |
+| `OP_UTXOTOKENID` | `0xca` | `i -> token_id` | Pops input index $i$, pushes 32-byte `token_id` (or 32 zero bytes if native XPI). |
+| `OP_UTXOSTATE` | `0xcb` | `i -> state` | Pops input index $i$, pushes state commitment byte vector (empty vector if none). |
+| `OP_OUTPUTVALUE` | `0xcc` | `j -> nValue` | Pops output index $j$, pushes 128-bit integer value (XPI satoshis or token units). Alias: `OP_PICKOUTPUTVALUE`. |
+| `OP_OUTPUTBRANCH`| `0xcd` | `j k -> branch_hash` | Pops output index $j$ and branch index $k$, pushes the 32-byte `branch[k]` hash. |
+| `OP_OUTPUTTOKENID`| `0xce` | `j -> token_id` | Pops output index $j$, pushes 32-byte `token_id` (or 32 zero bytes if native XPI). |
+| `OP_OUTPUTSTATE` | `0xcf` | `j -> state` | Pops output index $j$, pushes state commitment byte vector (empty vector if none). |
+| `OP_TXID` | `0xd0` | `-> txid` | Pushes the 32-byte Single-BLAKE3 Merklix TXID of current transaction. |
+| `OP_ENUMERATE_INPUTS`| `0xd1`| `... OP_ENDENUMERATE` | Bounded loop over all inputs ($0 \dots \text{nInputs}-1$). Auto-pushes current index $i$ on each iteration. |
+| `OP_ENUMERATE_OUTPUTS`| `0xd2`| `... OP_ENDENUMERATE` | Bounded loop over all outputs ($0 \dots \text{nOutputs}-1$). Auto-pushes current index $j$ on each iteration. |
+| `OP_ISREFERENCEINPUT`| `0xd3`| `i -> bool` | Pops input index $i$, pushes 1 if `FLAG_READ_ONLY_REFERENCE` is set, else 0. |
+| `OP_TXMINTCOUNT` | `0xd4` | `-> count` | Pushes the total number of TokenMintWitness entries in the transaction. |
+| `OP_INPUTSEQUENCENUMBER`| `0xd5`| `i -> nSequence` | Pops input index $i$, pushes its 32-bit sequence number. |
+| `OP_INPUTFLAGS` | `0xd6` | `i -> flags` | Pops input index $i$, pushes its 1-byte flags. |
+| `OP_UTXOBRANCHCOUNT`| `0xd7`| `i -> count` | Pops input index $i$, pushes the number of branches on the spent coin. |
+| `OP_OUTPUTBRANCHCOUNT`| `0xd8`| `j -> count` | Pops output index $j$, pushes the number of branches on the output. |
+| `OP_OUTPUTFLAGS`| `0xd9` | `j -> flags` | Pops output index $j$, pushes its 1-byte flags (`FLAG_HAS_TOKEN`, `FLAG_HAS_STATE`). |
+| `OP_ENUMERATE` | `0xda` | `N ... OP_ENDENUMERATE` | Generic bounded enumeration loop ($0 \le N \le 256$). Pops $N$, auto-pushes loop counter $k \in [0, N-1]$. |
+| `OP_ENDENUMERATE`| `0xdb`| `->` | Terminates loop body and steps to next iteration or exits. |
+| `OP_BREAK` | `0xdc` | `->` | Immediately terminates the active enumeration loop and jumps past `OP_ENDENUMERATE`. |
 
 ---
 
-### 3.9. Enumerable Loops ($N \le 2$) & Static Precomputed Cost Budget
+### 3.9. Bounded Primitive Recursion (`OP_ENUMERATE`) & Static Precomputed Cost Budget
 
-To support expressive smart contracts without dynamic runtime gas meters or the Halting Problem:
-* **The Loop Opcodes**: `OP_FOREACH_INPUT ... OP_ENDFOR` and `OP_FOREACH_OUTPUT ... OP_ENDFOR`.
-* **Static Bounded Multiples**:
-  Because `nInputCount` and `nOutputCount` are fixed integers in the transaction header, the engine precomputes the exact worst-case execution cost upfront:
-  * Single Loop: $\text{Count} \times \text{Cost}(\text{Body}) + \text{Overhead}$
-  * Nested Loop ($N = 2$ Max):
-    $$\text{LoopCost} = (\mathbf{nInputCount} \times \mathbf{nOutputCount} \times \text{Cost}(\text{InnerBody})) + \text{Overhead}$$
-* **Strict Total Budget**:
-  $$\mathbf{TotalCost} = \mathbf{WireBytes} + \sum \mathbf{PrecomputedScriptCosts} \le \mathbf{MAX\_TX\_COST}$$
-  If $\mathbf{TotalCost} > \mathbf{MAX\_TX\_COST}$, the transaction is rejected at mempool admission without executing a single instruction.
+#### 3.9.1. The DDoS Flaw in Generic `OP_LOOP`
+In early smart contract designs (including Tobias Ruck's initial Mitra experiments), unbounded `OP_LOOP` or generic while-loops were explored. However, unbounded loops present a critical mempool denial-of-service vulnerability:
+* An attacker crafts an invalid or low-fee transaction containing an infinite or near-infinite loop.
+* Because execution length cannot be determined without running the script (the Halting Problem), nodes are forced to burn CPU cycles interpreting instructions until hitting an opcode or gas limit.
+* Attackers can flood the mempool with free or low-fee transactions that exhaust node CPU resources without paying fees.
+
+#### 3.9.2. Primitive Recursion via `OP_ENUMERATE`
+Lotus v2 solves this completely by restricting control flow to **Primitive Recursion** through the `OP_ENUMERATE` opcode family:
+* **Strict Physical Bounds**: Loops can only iterate over physically bound quantities:
+  - `OP_ENUMERATE_INPUTS`: Strictly bounded by `tx.vin.size()`.
+  - `OP_ENUMERATE_OUTPUTS`: Strictly bounded by `tx.vout.size()`.
+  - `OP_ENUMERATE`: Strictly bounded by integer $N \in [0, 256]$ popped from the stack.
+* **Auto-Pushing Loop Index**:
+  On each iteration, the interpreter automatically pushes the current zero-based loop index ($i = 0, 1, \dots, \text{bound}-1$) onto the evaluation stack. In 95% of covenant loops, the body immediately consumes this index (e.g. `OP_OUTPUTVALUE` or `OP_UTXOVALUE`), eliminating index arithmetic overhead. If the index is not needed, the body opens with `OP_DROP` (1 byte).
+* **Zero Nested Loops & Flat C++ Call Frame**:
+  To prevent combinatorial $O(N^2)$ execution bombs, **nested enumeration loops are strictly forbidden in consensus** (`SCRIPT_ERR_NESTED_LOOPS_PROHIBITED`). Sequential loops (e.g., looping over all inputs, then looping over all outputs) are fully permitted.
+  Because nesting is prohibited, the node interpreter maintains loop state in a single flat struct on the C++ stack:
+  ```cpp
+  struct LoopFrame {
+      uint32_t index;
+      uint32_t bound;
+      const uint8_t *pc_start;
+  };
+  ```
+  Zero dynamic heap allocations (`std::vector`), zero recursive stack calls, and zero garbage collection overhead.
+* **Early Exit (`OP_BREAK`)**:
+  `OP_BREAK` immediately jumps to the instruction following `OP_ENDENUMERATE` and clears the active loop frame, enabling early termination when a matching condition is found.
+
+#### 3.9.3. Static Precomputed Cost Budget (Zero Halting Problem)
+Because every loop bound is either known from the transaction wire header (`nInputCount`, `nOutputCount`) or statically limited ($N \le 256$), the node computes the exact worst-case execution cost **statically in $O(\text{script\_size})$ before running a single opcode**:
+
+$$\text{WorstCaseCost} = \sum_{\text{loops}} \left(\text{bound}_k \times \text{cost}(\text{body}_k)\right) + \text{cost}(\text{linear\_code})$$
+
+Consensus enforces the universal budget rule:
+$$\mathbf{TotalCost} = \mathbf{WireBytes} + \sum_{\text{witnesses}} \mathbf{PrecomputedScriptCost} \le \mathbf{MAX\_TX\_COST}$$
+
+If $\mathbf{TotalCost} > \mathbf{MAX\_TX\_COST}$, the transaction is discarded at the P2P network boundary without executing any script bytecode. Mempool DDoS is mathematically impossible.
 
 ---
 
@@ -614,7 +667,7 @@ The full rebase sequence in `lotus/daemon/patches/v2/series` onto `bitcoin-abc 2
 | **08c**| `08c-blocktime.patch` | **NEEDS-EXTRACT** | Set `nPowTargetSpacing = 120` (2 minutes) in `src/kernel/chainparams.cpp`. |
 | **09** | `09-merkle.patch` | **NEEDS-REBASE** | Single BLAKE3 domain-separated segmented Merkle tree; CVE-2012-2459 fix. |
 | **09b**| `09b-block-header.patch` | **NEEDS-EXTRACT** | 116-byte fixed aligned `LotusHeader` struct with `hashUtxoMerklixRoot` in `src/primitives/block.h`. |
-| **09c**| `09c-compact-outputs.patch` | **NEEDS-EXTRACT** | 80-byte POD `LotusOutput` struct with 32B metadata in `src/primitives/transaction.h`. |
+| **09c**| `09c-compact-outputs.patch` | **NEEDS-EXTRACT** | Single-asset multi-branch outputs (42B/74B), explicit `BranchWitness` and `TokenMintWitness` in `src/primitives/transaction.h`. |
 | **10** | `10-nng-interface.patch` | **NEEDS-REBASE** | NNG pub/sub interface replacing ZeroMQ in `src/nng_interface/`. |
 | **10b**| `10b-remove-zeromq.patch` | **NEEDS-WRITE** | Purge `src/zmq/`, CMake options, and ZeroMQ tests. |
 | **11** | `11-intmath-log2.patch` | **NEEDS-REBASE** | Turner fixed-point log2 integer arithmetic. |
@@ -636,7 +689,7 @@ The full rebase sequence in `lotus/daemon/patches/v2/series` onto `bitcoin-abc 2
 | **30** | `30-op-mul.patch` | **NEEDS-REBASE** | `OP_MUL` (0x95) re-enabled with overflow protection. |
 | **31** | `31-int128-stack.patch` | **NEEDS-WRITE** | Native `int128_t` stack VM; `OP_ADDCARRY`, `OP_SUBCARRY`, `OP_MUL128_WIDE`. |
 | **32** | `32-chronik-adapt.patch` | **NEEDS-WRITE** | Adapt Chronik Rust indexer to `xpi` prefix and XPI units. |
-| **33** | `33-introspection-loops.patch` | **NEEDS-WRITE** | Introspection opcodes `0xbf–0xcf`, `OP_FOREACH_INPUT/OUTPUT`, static precomputed budget. |
+| **33** | `33-introspection-loops.patch` | **NEEDS-WRITE** | Introspection opcodes `0xc0–0xd9`, `OP_ENUMERATE` family, static precomputed budget. |
 | **34** | `34-utxo-merklix-rocksdb.patch`| **NEEDS-WRITE** | In-memory Radix Trie + RocksDB write-behind with block state commitments. |
 | **35** | `35-rpc-merklix-proofs.patch` | **NEEDS-WRITE** | `getutxoproof`, `verifymerklixproof`, PCT validation, snap sync. |
 
