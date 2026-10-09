@@ -35,7 +35,7 @@ Avoid dual transaction/VM validity engines selected by a production runtime flag
 - **State queries/snapshots:** freeze the root algorithm in consensus. Separately define proof RPC schemas, snapshot completeness, root/chain selection trust, resource bounds, resumable import and atomic activation. State authentication does not replace historical validation.
 - **Caching/batch signatures:** prove C20 equivalence; charge scalar costs even on hits. Any batch failure falls back to a deterministic scalar verdict. No architecture-specific CPU instruction is required by consensus.
 - **Mempool/mining:** model spent and referenced dependencies; revalidate when references disappear or context changes. Bound vertices, edges, bytes and expensive work. Preserve valid topological ordering and assess fee selection quality separately from speed.
-- **Indexer/SDK:** expose core TxID and WitnessID distinctly, native versus token values, references, path policies and state. Connect/disconnect notifications and wallet signing must follow exact consensus identities.
+- **Indexer/SDK:** expose core TxID and TxHash distinctly, native versus token values, references, path policies and state. Connect/disconnect notifications and wallet signing must follow exact consensus identities.
 - **Transport/advisory voting:** feature negotiation, QUIC or advisory voting cannot change block validity, accepted target/work or resource limits. Existing protocols remain usable during implementation-only rollout.
 
 ## Genesis gate

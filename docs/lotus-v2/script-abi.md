@@ -9,7 +9,7 @@ Status: review draft, derived from [consensus C04–C25](consensus.md). P01 and 
 | Script selection | Spending input selects one committed path; witnesses correspond exactly to its branch indices |
 | Method selection | Revealed script plus unordered membership proof selects a leaf; no numeric method index in consensus |
 | Arguments | Count followed by length-prefixed byte strings; wire order is bottom-to-top, last argument on top |
-| Initial machine | Fresh main stack, empty alternate stack, no shared mutable branch state |
+| Initial machine | Fresh main stack, empty alternate stack, no shared mutable branch state. In a mint, the node pushes the token ID and then the mint delta above the arguments |
 | Numeric operand | Exactly 16 bytes, signed two's complement, little-endian; no implicit Bitcoin ScriptNum conversion |
 | Boolean | Exactly int128 zero or one; Boolean consumers reject other values in this draft |
 | Bytes | Remain bytes until an explicit opcode interprets them; hashes, keys and signatures are not int128 values |
@@ -21,13 +21,13 @@ Status: review draft, derived from [consensus C04–C25](consensus.md). P01 and 
 
 ## Introspection and context
 
-P03 defines field and complete-output/path reads, active invocation kind, mint ID/delta and spend-only operations. References expose recorded coin fields while accounting excludes their values. Out-of-range or undefined-context reads reject. Candidate height and parent median time support expiration checks; context changes require mempool/cache revalidation. SIGHASH exposes the full invocation digest for application signature policies. Other invocations' successful execution and WitnessID remain unavailable; the proposed field accessors do not establish the old Master/Companion optimization.
+P03 defines field and complete-output/path reads, active invocation kind and spend-only operations; a mint's token ID and delta arrive as node-pushed stack items above the arguments. References expose recorded coin fields while accounting excludes their values. Out-of-range or undefined-context reads reject. Candidate height and parent median time support expiration checks; context changes require mempool/cache revalidation. SIGHASH takes a signing mode and exposes that mode's invocation digest for application signature policies. Other invocations' successful execution and TxHash remain unavailable; the proposed field accessors do not establish the old Master/Companion optimization.
 
 ## Signing and addresses
 
 The signing API returns the exact digest and a decoded display of the committed intent: chain, inputs and resolved assets, paths, outputs, native fee, positive mint deltas and invocation. Hardware wallets must refuse unsupported context, not silently sign a hash they display as an ordinary native payment. [P01](decisions/encoding-and-signatures.md) now defines the preimage bytes; signing fixtures become executable only when generated and independently checked against that proposal.
 
-An address identifies a network and a construction template or a complete output policy. A branch root alone does not identify a multi-branch path policy. Address encoding/checksum, script template, parameter widths and policy reconstruction must be specified together. Roots change when policies change. The `xpi` prefix is a historical proposal, not a complete address standard.
+An address identifies a network and a construction template or a complete output policy. A branch root alone does not identify a multi-branch path policy. Address encoding/checksum, script template, parameter widths and policy reconstruction must be specified together. Roots change when policies change. The `xpi` prefix is a historical proposal, not a complete address standard. Direction from the maintainer (2026-10-09): a cashaddr-style encoding whose checksum covers the prefix, with no `:` separator because it breaks copy and paste; wallets accept an address with the prefix omitted and recover it by trying the known prefixes against the checksum. The payload must distinguish a single-branch, single-path policy (one 32-byte root) from a full serialized branch-and-path policy.
 
 Application state uses a documented versioned schema with explicit lengths and units. A covenant must verify successor asset identity, value constraints, state and authorization paths. A balance equality check alone does not preserve a vault's restrictions.
 
@@ -35,4 +35,4 @@ Application state uses a documented versioned schema with explicit lengths and u
 
 The small language in [examples](examples/README.md) is explanatory pseudocode with explicit transaction and invocation access. Its assembly uses symbolic opcode names. A subsequent reference assembler must emit exact bytes, source maps and a static-cost report, then execute those bytes in the scalar evaluator. Freeze consensus opcode semantics; permit compiler syntax and optimizations to evolve while preserving those semantics.
 
-Each generated artifact records compiler/evaluator revisions, consensus/parameter digests, argument order, selected policy, leaf/proof bytes, core/complete transaction bytes, TxID/WitnessID, signature digest, final stack, resulting state and static charges. A pretty source listing is not a conformance vector.
+Each generated artifact records compiler/evaluator revisions, consensus/parameter digests, argument order, selected policy, leaf/proof bytes, core/complete transaction bytes, TxID/TxHash, signature digest, final stack, resulting state and static charges. A pretty source listing is not a conformance vector.

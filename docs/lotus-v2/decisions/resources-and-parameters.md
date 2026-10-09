@@ -40,12 +40,12 @@ The sorted/hashed algorithm chosen for asset accumulation must have a bounded wo
 
 | Family | Required named parameters / constraints |
 | --- | --- |
-| Wire | MAX_TX_BYTES, MAX_BLOCK_BYTES, MAX_INPUTS, MAX_OUTPUTS, MAX_BLOCK_TXS, MAX_MINTS, MAX_EXTRA_NONCE_BYTES |
+| Wire | MAX_TX_BYTES, MAX_BLOCK_BYTES, MAX_INPUTS, MAX_OUTPUTS, MAX_BLOCK_TXS, MAX_MINTS |
 | Output/authorization | MAX_OUTPUT_BYTES, MAX_STATE_BYTES, MAX_BRANCHES, MAX_PATHS, MAX_PATH_BRANCHES, MAX_BRANCH_PROOF_DEPTH |
 | VM | MAX_SCRIPT_BYTES, MAX_ARGUMENTS, MAX_ELEMENT_BYTES, MAX_STACK_ITEMS, MAX_ALTSTACK_ITEMS, MAX_VM_BYTES, MAX_AST_DEPTH; loop depth=2 and generic bound=256 |
 | Work | MAX_INVOCATION_COST, MAX_TX_COST, MAX_BLOCK_COST and every primitive/structural coefficient |
 | Time/chain | COINBASE_MATURITY, POW_LIMIT, ASERT anchor and half-life, timestamp/future-eligibility rules |
-| Money | Tail initialization/floor/cap/precision, bootstrap initialization/clock/decay, fee-burn ratio, allocation and faucet state parameters |
+| Money | Tail initialization/floor/cap/precision, bootstrap initialization/clock/decay, fee-burn ratio, DUST_LIMIT and the token-output burn multiple (C14a), allocation and faucet state parameters |
 | Identity | ChainID, header/transaction versions, exact genesis bytes/hash, network/address/seed/directory configuration |
 
 Represent constants in a versioned machine-readable manifest, not scattered daemon defaults. Its byte grammar and digest must be fixed before freezing; a JSON file with unspecified number/string canonicalization is not yet a consensus hash preimage. An outer release manifest can hash the exact canonical parameter-file bytes without making its own digest part of those bytes.

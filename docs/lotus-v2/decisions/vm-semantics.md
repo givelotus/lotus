@@ -82,7 +82,7 @@ All bytes not listed here reject; none is a future-success placeholder. Each lis
 | a5 | WITHIN | N(x) N(lo) N(hi) → Boolean(lo≤x<hi) |
 | a8 | SHA256 | bytes → SHA256(bytes) |
 | aa | HASH256 | bytes → SHA256(SHA256(bytes)) |
-| ac | CHECKSIG | signature public_key → Boolean, P01 transaction message |
+| ac | CHECKSIG | signature public_key → Boolean, P01 transaction message; 64-byte signature = mode 00, 65-byte = explicit partial mode |
 | ad | CHECKSIGVERIFY | CHECKSIG then VERIFY |
 | b1 | CHECKLOCKTIMEVERIFY | N(kind) N(bound) → empty, absolute transaction lock check |
 | b2 | CHECKSEQUENCEVERIFY | N(kind) N(bound) → empty, current consuming input's relative lock check |
@@ -120,7 +120,7 @@ Indices/results are N values; hashes/outpoints/state/scripts remain bytes. Missi
 | c2 | TXVERSION | push transaction version |
 | c3 | TXINPUTCOUNT | push input count |
 | c4 | TXOUTPUTCOUNT | push output count |
-| c5 | TXLOCKTIME | push u64 lock_value as N |
+| c5 | TXLOCKTIME | push 56-bit lock_value as N |
 | c6 | UTXOVALUE | i → resolved coin value |
 | c7 | UTXOBRANCH | i k → resolved branch[k] |
 | c8 | OUTPOINTTXHASH | i → prev_txid |
@@ -135,7 +135,7 @@ Indices/results are N values; hashes/outpoints/state/scripts remain bytes. Missi
 | d1 | ENUMERATE_INPUTS | structured loop with fixed input_count bound |
 | d2 | ENUMERATE_OUTPUTS | structured loop with fixed output_count bound |
 | d3 | ISREFERENCEINPUT | i → Boolean reference flag |
-| d4 | TXMINTCOUNT | push mint_count |
+| d4 | TXMINTCOUNT | push the number of mint inputs (flags `02`) |
 | d5 | INPUTSEQUENCENUMBER | i → sequence |
 | d6 | INPUTFLAGS | i → flags |
 | d7 | UTXOBRANCHCOUNT | i → resolved branch count |
@@ -148,8 +148,6 @@ Indices/results are N values; hashes/outpoints/state/scripts remain bytes. Missi
 | de | OUTPUTPATHCOUNT | j → output path count |
 | e0 | TXLOCKKIND | push absolute lock_kind |
 | e1 | INVOCATIONKIND | push 0 for spend, 1 for mint |
-| e2 | MINTTOKENID | push active mint asset; spend context errors |
-| e3 | MINTDELTA | push positive mint delta as N; see delta bound below |
 | e4 | INPUTPATHINDEX | i → selected path; reference input errors |
 | e5 | UTXOPATH | i p → canonical Vec(CS(branch_index)) bytes |
 | e6 | OUTPUTPATH | j p → canonical Vec(CS(branch_index)) bytes |
@@ -158,11 +156,11 @@ Indices/results are N values; hashes/outpoints/state/scripts remain bytes. Missi
 | e9 | BLOCKHEIGHT | push candidate block's derived height |
 | ea | BLOCKMEDIANTIME | push MTP(parent), as defined in P01 |
 | eb | CHAINID | push the immutable 32-byte chain identifier |
-| ec | SIGHASH | push P01's 32-byte FULL message for this invocation |
+| ec | SIGHASH | N(mode) → P01's 32-byte message for this invocation in that signing mode (0, 1 or 2) |
 
-With u64 amounts and at most 2^32−1 outputs, positive token delta is below 2^96, so MINTDELTA fits N. Returned serialized outputs/paths and active bytecode must fit the element limit; using such an opcode on a larger object errors. This does not make the underlying output invalid by itself. Length-aware costs charge bounded serialization/copy work. There is no introspection of other invocations' successful execution, mutable VM state, signature arguments or WitnessID; P01's PlanHash binding is not such an opcode.
+A mint invocation receives its context on the stack instead of through context-only opcodes: after the witness arguments are pushed, the node pushes the 32-byte token ID and then the positive mint delta as N, so the delta is on top. Bytes e2 and e3 are unassigned and reject. With u64 amounts and at most 2^16−1 outputs, positive token delta is below 2^80, so it fits N. A mint script must consume both values; a script not written for minting therefore normally fails in a mint invocation, although safety must not rely on that alone. Returned serialized outputs/paths and active bytecode must fit the element limit; using such an opcode on a larger object errors. This does not make the underlying output invalid by itself. Length-aware costs charge bounded serialization/copy work. There is no introspection of other invocations' successful execution, mutable VM state, signature arguments or TxHash; P01's PlanHash binding is not such an opcode.
 
-BLOCKHEIGHT/BLOCKMEDIANTIME permit upper-bound expiry checks as well as minimum locks. Absolute transaction locktime alone cannot enforce a certificate's expiration. Both opcodes work in spend and mint contexts; they expose parent-derived context available before current-block execution, not local clock time or the containing block's hash/timestamp. Transactions using them may cease to be valid as the candidate context advances; mempool admission and caches must revalidate accordingly. SIGHASH lets a P-256/Ed25519 policy bind its application signature or WebAuthn challenge to the same full intent as CHECKSIG without attempting to reconstruct hidden witness-plan fields in Script.
+BLOCKHEIGHT/BLOCKMEDIANTIME permit upper-bound expiry checks as well as minimum locks. Absolute transaction locktime alone cannot enforce a certificate's expiration. Both opcodes work in spend and mint contexts; they expose parent-derived context available before current-block execution, not local clock time or the containing block's hash/timestamp. Transactions using them may cease to be valid as the candidate context advances; mempool admission and caches must revalidate accordingly. SIGHASH takes the signing mode as an operand and pushes P01's message for that mode: 0 everywhere, 1 or 2 only in a spend invocation; any other value, or a partial mode in a mint invocation, errors. A script may fix the mode with a constant or take it from a witness argument so the signer chooses. This lets an ECDSA or Ed25519 policy checked with CHECKDATASIG bind its signature to the same intent as CHECKSIG in any of the three modes, without one opcode per mode and without reconstructing hidden witness-plan fields in Script.
 
 CHECKLOCKTIMEVERIFY accepts kind 1 or 2 and nonnegative bound: require tx.lock_kind=kind and tx.lock_value≥bound. CHECKSEQUENCEVERIFY accepts kind 1 (height) or 2 (512-second units), bound 0..65535; require current spend's enabled relative lock of that kind and encoded delay≥bound. Both consume their operands. Global P01 lock checks enforce the actual candidate context. Mint context may use the absolute check but not the input-relative check.
 
@@ -181,6 +179,7 @@ Message operand is exactly 32 bytes for every profile. Stack signature, message,
 - **0:** BIP340, 32-byte x-only secp256k1 key, 64-byte signature, direct verification over message bytes.
 - **1:** ECDSA over P-256, SEC1 compressed 33-byte key, signature r||s as two unsigned big-endian 32-byte integers; 1≤r<n and 1≤s≤floor(n/2). The message is the already-computed 256-bit digest supplied to ECDSA, not hashed again. DER and high-S encodings are not accepted. P-256 point/domain parameters and ECDSA follow [SEC1](https://www.secg.org/sec1-v2.pdf) and [FIPS 186-5](https://csrc.nist.gov/pubs/fips/186-5/final).
 - **2:** Strict prime-subgroup Ed25519 profile: canonical 32-byte public-key/encoded-R points, 64-byte R||S signature, S<L; A and R must be nonidentity points in the prime-order subgroup. Verify the uncofactored equation `[S]B=R+[h]A`, using the pure-Ed25519 SHA512 challenge over R||A||message and canonical encodings. This intentionally specifies a narrower acceptance profile than some Ed25519 libraries; do not substitute their default verifier. [RFC 8032](https://www.rfc-editor.org/rfc/rfc8032) supplies curve/encoding/hash definitions. The message is 32 application bytes, not Ed25519ph mode.
+- **3:** ECDSA over secp256k1, SEC1 compressed 33-byte key, signature r||s as two unsigned big-endian 32-byte integers; 1≤r<n and 1≤s≤floor(n/2). The message is the already-computed 256-bit digest supplied to ECDSA, not hashed again. DER and high-S encodings are not accepted. This is the same curve as profile 0 with the older signature scheme, included because many signing cards, secure elements and HSMs implement secp256k1 ECDSA but not BIP340. A device that hashes its input with SHA256 before signing is accommodated by applying the SHA256 opcode to the message in script. Profile 0 remains preferred where the device supports it.
 
 These profiles are proposals needing independent library/edge-vector review and costs; they are not an assertion that existing Lotus libraries accept exactly this set. Dedicated key types and explicit algorithm selection prevent a 64-byte signature from ambiguously selecting two algorithms. An on-device WebAuthn assertion additionally requires the application's challenge/origin/authenticator policy and cannot be reduced to the existence of P-256 verification.
 

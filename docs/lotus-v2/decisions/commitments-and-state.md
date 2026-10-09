@@ -10,11 +10,11 @@ Decision packet P02, October 9, 2026. **Recommended candidate**, not frozen or i
 | --- | --- |
 | branch | `Lotus/v2/branch` |
 | txid | `Lotus/v2/txid` |
-| witnessid | `Lotus/v2/witnessid` |
-| token | `Lotus/v2/token` |
+| txhash | `Lotus/v2/txhash` |
 | sighash | `Lotus/v2/sighash` |
 | authplan | `Lotus/v2/authplan` |
 | spentoutputs | `Lotus/v2/spentoutputs` |
+| outputs | `Lotus/v2/outputs` |
 | txroot | `Lotus/v2/txroot` |
 | outpointkey | `Lotus/v2/outpointkey` |
 | utxo | `Lotus/v2/utxo` |
@@ -36,7 +36,7 @@ For reproducible wallet construction, recommend: sort distinct leaf hashes lexic
 
 ## Block transaction vector: ordered, count-bound tree
 
-Let transaction i have WitnessID `w_i`, including the first coinbase. Define `T(xs)`:
+Let transaction i, including the first coinbase, have the 64-byte leaf value `w_i = TxHash_i || TxID_i`. Define `T(xs)`:
 
 ```text
 T([])  = H_txroot(02)
@@ -47,9 +47,9 @@ T(xs), n>1:
 TxRoot(xs) = H_txroot(03 || u32(n) || T(xs))
 ```
 
-Children are ordered; no sorting, duplication or zero-padding occurs. Empty vector has a defined commitment for tools, but a block with no coinbase is invalid. Count is bounded before construction. This split strategy follows the ordered-tree principle in [RFC 6962 §2.1](https://www.rfc-editor.org/rfc/rfc6962#section-2.1); Lotus adds its own context and count wrapper and uses BLAKE3.
+Each leaf commits to both identities of its transaction, TxHash first, as Lotus v1's block tree does. The TxHash fixes the complete bytes, witnesses included; the TxID lets a proof show that a transaction ID, and therefore its outpoints, is in a block by supplying the two 32-byte hashes, without the transaction or its witnesses. Children are ordered; no sorting, duplication or zero-padding occurs. Empty vector has a defined commitment for tools, but a block with no coinbase is invalid. Count is bounded before construction. This split strategy follows the ordered-tree principle in [RFC 6962 §2.1](https://www.rfc-editor.org/rfc/rfc6962#section-2.1); Lotus adds its own context and count wrapper and uses BLAKE3.
 
-A transaction inclusion proof is `count:u32 || index:u32 || Vec(h32 siblings)` plus the transaction bytes or WitnessID being proved. Require `0 <= index < count`, count within the consensus block-transaction limit, and exact sibling consumption. Reconstruct recursively: for n=1 use the leaf; otherwise compute k, recurse into the child containing index, consume the next sibling from the bottom-up proof, and combine left/right according to index<k. Finally apply the count wrapper. No direction mask is serialized; count and index determine every direction. A proof API must clearly distinguish committed transaction membership from complete transaction/block validity.
+A transaction inclusion proof is `count:u32 || index:u32 || Vec(h32 siblings)` plus the transaction bytes, or the TxHash and TxID pair, being proved. A verifier given only the pair learns that the TxID is committed, not that the TxHash it was given corresponds to any particular witness bytes. Require `0 <= index < count`, count within the consensus block-transaction limit, and exact sibling consumption. Reconstruct recursively: for n=1 use the leaf; otherwise compute k, recurse into the child containing index, consume the next sibling from the bottom-up proof, and combine left/right according to index<k. Finally apply the count wrapper. No direction mask is serialized; count and index determine every direction. A proof API must clearly distinguish committed transaction membership from complete transaction/block validity.
 
 ## UTXO map: fixed-depth sparse binary tree
 
@@ -99,7 +99,7 @@ Header ancestry supplies validated time/target context; a standalone UTXO snapsh
 
 ## Coinbase and root dependency order
 
-Choose ChainID and genesis parameters → construct coinbase using parent ID/height → derive TxID/WitnessID → evaluate transitions and full state envelope → compute transaction/state roots → construct header → compute BlockID/PoW. The containing header hash is never embedded in its own coin records. In a non-genesis block, the parent's hash is already available. Genesis uses zero parent and an explicitly initialized monetary record.
+Choose ChainID and genesis parameters → construct coinbase using parent ID/height → derive TxID/TxHash → evaluate transitions and full state envelope → compute transaction/state roots → construct header → compute BlockID/PoW. The containing header hash is never embedded in its own coin records. In a non-genesis block, the parent's hash is already available. Genesis uses zero parent and an explicitly initialized monetary record.
 
 ## Acceptance obligations
 

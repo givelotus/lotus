@@ -28,7 +28,7 @@ Expected result: each selected path requires exactly its listed witness(es). The
 
 ## 3. Token lifecycle
 
-Under the proposed program-derived identity, a mint entry authorizes a positive delta of 1000 units into a recipient policy. Native inputs separately cover fees. A later transaction consuming 1000 units and producing 700 + 250 units burns 50 token units; it has no mint entry. Every consumed token coin still executes its selected authorization path. A minted token output does not automatically acquire the issuer's transfer restrictions.
+Under the proposed program-derived identity, a mint input authorizes a positive delta of 1000 units into a recipient policy. Native inputs separately cover fees. A later transaction consuming 1000 units and producing 700 + 250 units burns 50 token units; it has no mint input. Every consumed token coin still executes its selected authorization path. A minted token output does not automatically acquire the issuer's transfer restrictions.
 
 A one-time mint policy requires a specified anchor outpoint to be consumed, checks its asset and authorization context, and bounds exactly the selected token's positive delta. Mere presence as a read-only reference is insufficient. A replacement delegation certificate does not revoke an earlier certificate without an explicit validity interval or authenticated revocation state.
 
