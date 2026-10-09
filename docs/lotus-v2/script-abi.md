@@ -9,7 +9,7 @@ Status: review draft, derived from [consensus C04–C25](consensus.md). P01 and 
 | Script selection | Spending input selects one committed path; witnesses correspond exactly to its branch indices |
 | Method selection | Revealed script plus unordered membership proof selects a leaf; no numeric method index in consensus |
 | Arguments | Count followed by length-prefixed byte strings; wire order is bottom-to-top, last argument on top |
-| Initial machine | Fresh main stack, empty alternate stack, no shared mutable branch state. In a mint, the node pushes the token ID and then the mint delta above the arguments |
+| Initial machine | Fresh main stack, empty alternate stack, no shared mutable branch state. In a mint, the node pushes the mint delta above the arguments |
 | Numeric operand | Exactly 16 bytes, signed two's complement, little-endian; no implicit Bitcoin ScriptNum conversion |
 | Boolean | Exactly int128 zero or one; Boolean consumers reject other values in this draft |
 | Bytes | Remain bytes until an explicit opcode interprets them; hashes, keys and signatures are not int128 values |
@@ -21,7 +21,7 @@ Status: review draft, derived from [consensus C04–C25](consensus.md). P01 and 
 
 ## Introspection and context
 
-P03 defines field and complete-output/path reads, active invocation kind and spend-only operations; a mint's token ID and delta arrive as node-pushed stack items above the arguments. References expose recorded coin fields while accounting excludes their values. Out-of-range or undefined-context reads reject. Candidate height and parent median time support expiration checks; context changes require mempool/cache revalidation. SIGHASH takes a signing mode and exposes that mode's invocation digest for application signature policies. Other invocations' successful execution and TxHash remain unavailable; the proposed field accessors do not establish the old Master/Companion optimization.
+P03 defines field and complete-output/path reads, active invocation kind and spend-only operations; a mint's delta arrives as a node-pushed stack item above the arguments, and its token ID is read with BRANCHROOT. References expose recorded coin fields while accounting excludes their values. Out-of-range or undefined-context reads reject. Candidate height and parent median time support expiration checks; context changes require mempool/cache revalidation. SIGHASH takes a signing mode and exposes that mode's invocation digest for application signature policies. Other invocations' successful execution and TxHash remain unavailable; the proposed field accessors do not establish the old Master/Companion optimization.
 
 ## Signing and addresses
 

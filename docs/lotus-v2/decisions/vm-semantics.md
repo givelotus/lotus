@@ -19,7 +19,7 @@ All bytes not listed here reject; none is a future-success placeholder. Each lis
 | 4c | PUSHDATA | push Bytes payload; only length 0 or ≥76 |
 | 4f | NEGATIVE_ONE | push N(−1) |
 | 51–60 | ONE through SIXTEEN | push corresponding N |
-| 61 | NOP | no effect; permanently no effect |
+| 61 | NOP | no effect; permanently no effect (not an extension point) |
 | 63 | IF | pop Boolean; execute selected arm |
 | 64 | NOTIF | IF with inverted Boolean |
 | 67 | ELSE | structural alternate arm delimiter |
@@ -148,19 +148,23 @@ Indices/results are N values; hashes/outpoints/state/scripts remain bytes. Missi
 | de | OUTPUTPATHCOUNT | j → output path count |
 | e0 | TXLOCKKIND | push absolute lock_kind |
 | e1 | INVOCATIONKIND | push 0 for spend, 1 for mint |
+| df | UTXOREQUIRESBRANCH | i root → Boolean: every path of resolved coin i includes a branch equal to root |
+| e2 | BRANCHROOT | push the 32-byte root the active script was proven against: the branch root in a spend, the token ID in a mint |
+| e3 | OUTPUTREQUIRESBRANCH | j root → Boolean: every path of output j includes a branch equal to root |
 | e4 | INPUTPATHINDEX | i → selected path; reference input errors |
 | e5 | UTXOPATH | i p → canonical Vec(CS(branch_index)) bytes |
 | e6 | OUTPUTPATH | j p → canonical Vec(CS(branch_index)) bytes |
 | e7 | UTXOOUTPUT | i → complete serialized Output bytes |
 | e8 | OUTPUTRECORD | j → complete serialized Output bytes |
-| e9 | BLOCKHEIGHT | push candidate block's derived height |
-| ea | BLOCKMEDIANTIME | push MTP(parent), as defined in P01 |
 | eb | CHAINID | push the immutable 32-byte chain identifier |
 | ec | SIGHASH | N(mode) → P01's 32-byte message for this invocation in that signing mode (0, 1 or 2) |
+| f0–f7 | EXTENSION0 through EXTENSION7 | no effect on either stack; reserved extension points, see below |
 
-A mint invocation receives its context on the stack instead of through context-only opcodes: after the witness arguments are pushed, the node pushes the 32-byte token ID and then the positive mint delta as N, so the delta is on top. Bytes e2 and e3 are unassigned and reject. With u64 amounts and at most 2^16−1 outputs, positive token delta is below 2^80, so it fits N. A mint script must consume both values; a script not written for minting therefore normally fails in a mint invocation, although safety must not rely on that alone. Returned serialized outputs/paths and active bytecode must fit the element limit; using such an opcode on a larger object errors. This does not make the underlying output invalid by itself. Length-aware costs charge bounded serialization/copy work. There is no introspection of other invocations' successful execution, mutable VM state, signature arguments or TxHash; P01's PlanHash binding is not such an opcode.
+A mint invocation receives its context on the stack instead of through context-only opcodes: after the witness arguments are pushed, the node pushes the positive mint delta as N, so it is on top. The token ID is not pushed: in a mint it is the root the script was proven against, which BRANCHROOT returns in any invocation. Bytes e2 and e3 no longer carry mint context and are reassigned below. With u64 amounts and at most 2^16−1 outputs, positive token delta is below 2^80, so it fits N. A mint script must consume the delta. This stack shape is not a security boundary between mint and spend scripts; P02 requires them to be kept in separate trees. Returned serialized outputs/paths and active bytecode must fit the element limit; using such an opcode on a larger object errors. This does not make the underlying output invalid by itself. Length-aware costs charge bounded serialization/copy work. There is no introspection of other invocations' successful execution, mutable VM state, signature arguments or TxHash; P01's PlanHash binding is not such an opcode.
 
-BLOCKHEIGHT/BLOCKMEDIANTIME permit upper-bound expiry checks as well as minimum locks. Absolute transaction locktime alone cannot enforce a certificate's expiration. Both opcodes work in spend and mint contexts; they expose parent-derived context available before current-block execution, not local clock time or the containing block's hash/timestamp. Transactions using them may cease to be valid as the candidate context advances; mempool admission and caches must revalidate accordingly. SIGHASH takes the signing mode as an operand and pushes P01's message for that mode: 0 everywhere, 1 or 2 only in a spend invocation; any other value, or a partial mode in a mint invocation, errors. A script may fix the mode with a constant or take it from a witness argument so the signer chooses. This lets an ECDSA or Ed25519 policy checked with CHECKDATASIG bind its signature to the same intent as CHECKSIG in any of the three modes, without one opcode per mode and without reconstructing hidden witness-plan fields in Script.
+BRANCHROOT lets a script name the tree it belongs to without containing its own hash. UTXOREQUIRESBRANCH and OUTPUTREQUIRESBRANCH answer, in one operation, whether a policy makes a given tree mandatory: true iff the root operand is exactly 32 bytes and every path contains at least one branch index whose root equals it. Because C09 makes branch roots distinct within an output, at most one index k has that root, and the result equals: k exists and bit k is set in the intersection of all path index sets. Together they let a covenant require that a successor output stays under its own rules for any policy shape, using a single loop over outputs. Walking paths and their entries in script would need three nested loops, which C22 forbids. Their cost is charged at the maximum permitted paths times path length. A mint, coinbase or out-of-range index errors for the UTXO form.
+
+No opcode exposes the height, time or hash of the block being built or of any ancestor; bytes e9 and ea, which earlier drafts assigned to BLOCKHEIGHT and BLOCKMEDIANTIME, are unassigned and reject. This keeps validity monotone (C22a): a script's result depends only on the transaction, its resolved coins and ChainID, so it cannot change as blocks arrive. A script can require that a height or time has been reached by constraining TXLOCKTIME or the input's sequence, which the node enforces as minimum locks. A script cannot require that a height or time has not yet passed. A certificate or quote that must stop working is instead tied to a coin and ends when that coin is spent, which is an ordinary input conflict. SIGHASH takes the signing mode as an operand and pushes P01's message for that mode: 0 everywhere, 1 or 2 only in a spend invocation; any other value, or a partial mode in a mint invocation, errors. A script may fix the mode with a constant or take it from a witness argument so the signer chooses. This lets an ECDSA or Ed25519 policy checked with CHECKDATASIG bind its signature to the same intent as CHECKSIG in any of the three modes, without one opcode per mode and without reconstructing hidden witness-plan fields in Script.
 
 CHECKLOCKTIMEVERIFY accepts kind 1 or 2 and nonnegative bound: require tx.lock_kind=kind and tx.lock_value≥bound. CHECKSEQUENCEVERIFY accepts kind 1 (height) or 2 (512-second units), bound 0..65535; require current spend's enabled relative lock of that kind and encoded delay≥bound. Both consume their operands. Global P01 lock checks enforce the actual candidate context. Mint context may use the absolute check but not the input-relative check.
 
@@ -172,9 +176,24 @@ A loop captures its bound once on entry. Each iteration pushes N(index), evaluat
 
 Define evaluation results `Continue`, `ExitLoops(d)`, or `Error`. BREAK with `1≤d≤active_loop_depth` produces ExitLoops(d). Sequence/conditional nodes immediately propagate it. A loop receiving ExitLoops(1) terminates and returns Continue; receiving ExitLoops(d>1) terminates and returns ExitLoops(d−1). This specifies conditional-frame unwinding without byte-offset guesses. All existing stack effects persist. No BREAK signal may escape the top-level sequence.
 
+## Extension points
+
+Two sets of values are reserved so that a later feature can be added by tightening validity, without invalidating anything old nodes accept. They follow the idea of [BUIP039](https://github.com/HaleyX/BUIP/blob/master/039.md): the points are named in advance, so every node knows that a use of one is a use of a feature it may not understand.
+
+- **EXTENSION0–EXTENSION7 (f0–f7).** Until assigned, each does nothing and succeeds. An assignment may only make the opcode fail under stated conditions, reading stack items without removing or adding any, as CHECKLOCKTIMEVERIFY does. It may never change either stack, so the size pass and every stack-shape property of existing scripts are unaffected.
+- **CHECKDATASIG algorithms 4–15.** Until assigned, the opcode consumes its four operands and pushes N(1), whatever the sizes of signature, message and public key, up to MAX_ELEMENT_BYTES. The size rules of the defined profiles do not apply, because a future algorithm's sizes are not known now. An assignment defines sizes and a verification rule for one number.
+
+Everything else stays closed: other opcode bytes, algorithm numbers outside 0..15, versions, flags, lock kinds and signing modes reject (C02). These are the only values with a defined pass-until-assigned meaning.
+
+Until a point is assigned, a coin whose script relies on it has no protection from it. A script consisting of `EXTENSION0` and a true value can be spent by anyone. Relay policy (consensus §8) therefore refuses transactions that use an unassigned point, and wallets must never build them. Assignment is a network upgrade that old nodes follow without rejecting blocks; how it is signalled and when it takes effect is outside this packet. At assignment, mempool transactions using the point are re-checked once, the single exception to C22a.
+
+A new operation that can be expressed with existing opcodes needs none of this: it is a compiler function that expands to a sequence. Extension points are for work the VM cannot do at an acceptable cost, in practice new cryptography or proof verification.
+
+Charges: an unassigned EXTENSION opcode has a fixed charge. CHECKDATASIG with a number that is not a constant, or with a reserved number, is charged as the most expensive defined profile plus hashing of its operands at their size bounds. An assignment may raise a charge, which is also a tightening.
+
 ## CHECKDATASIG profile proposal
 
-Message operand is exactly 32 bytes for every profile. Stack signature, message, public_key, N(algorithm) are consumed. Unknown algorithm, wrong size, or malformed/noncanonical public key errors. Any correctly sized signature that fails the selected profile, including scalar/point canonicality, subgroup or verification checks, produces false. Application protocols must domain-separate their message construction.
+Message operand is exactly 32 bytes for every defined profile (0..3). Stack signature, message, public_key, N(algorithm) are consumed. An algorithm outside 0..15 errors. Algorithms 4..15 are reserved extension points and succeed as described above. For algorithms 0..3, a wrong size or a malformed/noncanonical public key errors. Any correctly sized signature that fails the selected profile, including scalar/point canonicality, subgroup or verification checks, produces false. Application protocols must domain-separate their message construction.
 
 - **0:** BIP340, 32-byte x-only secp256k1 key, 64-byte signature, direct verification over message bytes.
 - **1:** ECDSA over P-256, SEC1 compressed 33-byte key, signature r||s as two unsigned big-endian 32-byte integers; 1≤r<n and 1≤s≤floor(n/2). The message is the already-computed 256-bit digest supplied to ECDSA, not hashed again. DER and high-S encodings are not accepted. P-256 point/domain parameters and ECDSA follow [SEC1](https://www.secg.org/sec1-v2.pdf) and [FIPS 186-5](https://csrc.nist.gov/pubs/fips/186-5/final).
@@ -185,4 +204,4 @@ These profiles are proposals needing independent library/edge-vector review and 
 
 ## Cost proof obligations
 
-Costs use decoded syntax and maximum permitted operands, never interpreter execution to estimate a bound. Account for pushes/copies, control frames, stack memory, proof hashing and each crypto profile. A bounded algorithm can still be too expensive; no numerical cost schedule is frozen here. Test skipped invalid opcodes, nested condition/loop exits, boundary arithmetic and both stack caps with the reference evaluator before adopting this allocation. Adding any unlisted opcode after genesis would change validity.
+Costs use decoded syntax and per-operand size bounds from P05's size pass (the maximum permitted operand where it has none), never interpreter execution to estimate a bound. Account for pushes/copies, control frames, stack memory, proof hashing and each crypto profile. A bounded algorithm can still be too expensive; no numerical cost schedule is frozen here. Test skipped invalid opcodes, nested condition/loop exits, boundary arithmetic and both stack caps with the reference evaluator before adopting this allocation. Adding any unlisted opcode after genesis would change validity.

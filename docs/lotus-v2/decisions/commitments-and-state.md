@@ -30,7 +30,7 @@ Leaf(script) = H_branch(00 || Bytes(script))
 BranchNode(a,b) = H_branch(01 || min(a,b) || max(a,b))
 ```
 
-Consume siblings bottom-up, hashing once per sibling. Empty sibling vector means root=Leaf(script). A proof only asserts membership; it has no direction bits, method index, hidden leaf-count claim or hidden uniqueness claim. Consensus limits proof depth; no unverified tree metadata enlarges that bound.
+Spend and mint invocations use the same leaf function. Consensus therefore does not distinguish a mint script from a spend script: any leaf of a tree can be proven in either kind of invocation. A design that needs both must keep them in **separate trees**. A token's mint scripts form the tree whose root is the token ID; rules that must run on every spend form a second tree that appears on outputs as a branch, and the mint scripts name that second root as a constant. A mint script placed in a tree that outputs use as a required branch could be offered to satisfy that branch. Consume siblings bottom-up, hashing once per sibling. Empty sibling vector means root=Leaf(script). A proof only asserts membership; it has no direction bits, method index, hidden leaf-count claim or hidden uniqueness claim. Consensus limits proof depth; no unverified tree metadata enlarges that bound.
 
 For reproducible wallet construction, recommend: sort distinct leaf hashes lexicographically; split a list of n>1 at the greatest power of two less than n; recursively build and sort each child pair at hashing. This construction is a wallet convention, not a property enforceable from a single proof. An owner may commit another finite binary tree. Duplicated leaves or alternative shapes provide no independent authorization and receive no accounting discount.
 
@@ -83,6 +83,24 @@ Presence is exactly 0 or 1. Bitmap bit j, indexed least-significant-bit first wi
 Start at the occupied leaf hash for presence=1 or Empty[256] for absence. At step j combine at depth `d=255-j` using key bit d for left/right direction and the indicated sibling. After exactly 256 steps compare the expected map root. Present Coin must match the queried Outpoint. Truncated or extra sibling bytes reject. Absence proves that this key is empty at this root, under the hash assumptions; it does not prove an outpoint was never created or spent at another root.
 
 This defines a bounded single-key proof (maximum 8192 sibling bytes plus framing/Coin), not an efficient multiproof. Multiproofs and snapshot range proofs may be designed later as transport/RPC encodings reproducing the same root. Their parsers still need independent resource bounds. Do not require these proofs in transaction witnesses unless a separate transaction-format decision explicitly does so.
+
+### Candidate input-proof relay package (not consensus)
+
+A wallet may relay a transaction together with its coins and their membership proofs, so that a node holding recent headers and recent block deltas can validate it without a database lookup. The package is transport only: none of it enters TxID, TxHash, the signature message or a block, so it can change without a consensus change.
+
+```text
+ProvenTx  = Tx || anchor:h32 || UtxoRoot:h32 || Bytes(MonetaryState)
+            || Vec(CoinProof)
+CoinProof = Bytes(Coin) || bitmap:32bytes || siblings
+```
+
+`CoinProof` is the membership proof above with presence fixed at 1 and its byte omitted. There is exactly one per spend or reference input, in input order; mint and coinbase inputs have none. `anchor` is a BlockID. The envelope fields are those of the full state root below, with height taken from the anchor header.
+
+A node accepts the package only if: the anchor is on its best chain and at most `PROOF_WINDOW` blocks behind the tip (a node policy value, not chosen here); the envelope reproduces the anchor header's state_root; each Coin's Outpoint equals its input's outpoint and its proof reconstructs UtxoRoot; and no proved outpoint is spent by a block after the anchor or by a conflicting mempool transaction. The node must therefore retain, in memory, the outpoints spent and coins created by the last `PROOF_WINDOW` blocks. An input whose coin was created after the anchor, or by an unconfirmed transaction, is resolved from that retained data and its CoinProof slot is replaced by a zero-length marker to be specified with the encoding. Ordinary validation then runs on the supplied coins; `creation_height`, `creation_parent_mtp` and `coinbase` come from the proved Coin.
+
+A TxID-based proof is not a substitute: a TxID with its transaction-tree path shows that an output was created, not that it is unspent, and since TxID is a flat hash it would require the whole creating transaction.
+
+Limits of this candidate. Proof size is about one sibling per doubling of the coin set (about 27 siblings, near 1 KB per input, at 10^8 coins). A proof expires when its anchor leaves the window; any state-holding node can reissue it and need not be trusted. Checking a block's new state_root without state additionally needs the paths of every key the block inserts; because keys are hashes of outpoints these are scattered, so a block-level multiproof from the producer is required and is not designed here. Block producers need the coin set or a complete set of proofs.
 
 ## Full state root
 

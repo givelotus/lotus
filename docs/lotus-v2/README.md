@@ -6,7 +6,7 @@ Start with the [review handoff](review-notes.md) for the current recommendations
 
 The first deliverable is an updated Lotus v1 node that synchronizes the running network from genesis without an unofficial binary or manual intervention. That validated source becomes the foundation for Lotus v2: a separate proof-of-work chain with composable UTXO authorization, native assets, bounded covenants, and authenticated state.
 
-V2's engineering constraint is **zero hardforks after genesis**. Design the complete validity function before launch; improve its implementation afterward. This is a launch discipline, not a proof that cryptography, economic incentives, or software can never fail. A bug fix that changes which blocks are accepted is a consensus change regardless of what the release calls it.
+V2's engineering goal is that **hard forks should not be needed after genesis**. Design the complete validity function before launch, leave named room for what cannot be foreseen (P03's extension points, limits sized for future signature schemes), and improve the implementation afterward. A hard fork remains possible; the design aims to make one unnecessary. This is a launch discipline, not a proof that cryptography, economic incentives, or software can never fail. A bug fix that changes which blocks are accepted is a consensus change regardless of what the release calls it.
 
 ## Read and build in this order
 

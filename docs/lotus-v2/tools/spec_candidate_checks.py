@@ -330,7 +330,7 @@ def make_vectors() -> dict:
             'signing_message_mode_01': msg_all_outputs.hex(), 'signing_message_mode_02': msg_one_output.hex(),
             'note': 'No signature or full VM/block validation is asserted.'},
         'mint_input_fixture': {
-            'mint_root': root.hex(), 'token_id': token_id.hex(),
+            'mint_root': token_id.hex(), 'token_id': token_id.hex(),
             'input_core': mint_core.hex(), 'input_wire': mint_wire.hex(),
             'note': 'One-leaf OP_ONE mint policy; framing and token ID only.'},
         'ordered_transaction_roots': transaction_trees,

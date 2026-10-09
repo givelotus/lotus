@@ -4,7 +4,7 @@ Decision packet P05, October 9, 2026. Candidate rules for D08; **numeric mainnet
 
 ## Static cost algebra
 
-Assign every primitive a positive integer upper-bound charge covering its maximum permitted operands and memory behavior. Let `cost(node)` be:
+Assign every primitive a positive integer upper-bound charge covering its operands and memory behavior. A charge that grows with operand size is a nondecreasing function of a per-operand size bound; the bound comes from the size pass below, and is MAX_ELEMENT_BYTES wherever that pass has no better answer. Let `cost(node)` be:
 
 ```text
 ordinary instruction: scheduled upper bound
@@ -13,11 +13,42 @@ conditional: condition/control charge + max(cost(then),cost(else))
 loop(bound,body): setup + bound*(iteration_control + cost(body))
 ```
 
-Generic enumeration bound is always 256 for static charging; input/output bounds are validated counts I/O. Charge BREAK as an instruction but ignore its early termination when calculating the bound. Includes unexecuted arms and the complete loop syntax; no symbolic execution is needed. Use checked unsigned 128-bit cost arithmetic; overflow/exceeding the enclosing cap rejects before execution. The schedule must make all intermediate charge calculations well-defined before a narrowing conversion.
+Generic enumeration bound is always 256 for static charging; input/output bounds are validated counts I/O. Charge BREAK as an instruction but ignore its early termination when calculating the bound. Includes unexecuted arms and the complete loop syntax; no path-by-path symbolic execution is needed; the size pass below is a single traversal that merges paths. Use checked unsigned 128-bit cost arithmetic; overflow/exceeding the enclosing cap rejects before execution. The schedule must make all intermediate charge calculations well-defined before a narrowing conversion.
 
 With nonnegative charges, structural induction proves monotonicity in bounds: sums, max, and multiplication by nonnegative bounds are monotone. An ordinary instruction's charged work is bounded by its schedule. A selected conditional arm is bounded by max; a loop executes no more than its captured bound and BREAK only removes work. Induction therefore establishes `actual abstract charge <= static charge`, **conditional on correct primitive upper bounds and control semantics**. It does not prove a nanosecond bound or a hardware-independent memory-latency bound.
 
 Decode/charge syntax once per invocation, not once per expanded iteration. Nested I×O loops remain legal; I identical invocations still charge I²O inner work. No optimization discounts. Runtime memory/stack/range checks remain necessary even when static cost fits.
+
+## Size-bounded charging
+
+MAX_ELEMENT_BYTES has a working value of 8192, chosen so that a post-quantum signature or key (for example SLH-DSA at about 7.9 KB) fits in one stack item. A large limit must not raise the price of scripts that only handle small items, so size-dependent charges use a bound computed per operand, before execution, by one traversal of the decoded script.
+
+The pass **never rejects a script and adds no validity rule**. It only chooses charges. Where it cannot follow the stack it falls back to the maximum, which is the rule this packet had before.
+
+**State.** Either `Known(main, alt)`, two lists holding one byte-size bound per stack item, or `Unknown`. In `Unknown` every operand is charged at MAX_ELEMENT_BYTES. The initial state is `Known`: the witness arguments at their actual lengths in wire order, then N-sized (16) for the mint delta in a mint invocation; `alt` is empty.
+
+**Transfer rules.** An instruction that needs more items than a `Known` state holds moves the pass to `Unknown` (it would error if executed, but it may sit in an arm that never runs).
+
+| Instruction | Bound of each result |
+| --- | --- |
+| PUSH_n, PUSHDATA | exact data length |
+| constants, arithmetic, comparisons, DEPTH, SIZE, counts, indices, values | 16 |
+| hashes, TXID, CHAINID, SIGHASH, BRANCHROOT, token IDs, branch roots | 32 |
+| CAT | sum of both operand bounds, capped at MAX_ELEMENT_BYTES |
+| SPLIT | each piece takes the source's bound |
+| NUM2BIN | the width, if it is a constant pushed by the immediately preceding instruction; otherwise MAX_ELEMENT_BYTES |
+| INVERT, AND, OR, XOR | the larger operand bound |
+| DUP, OVER, SWAP, ROT, TUCK, NIP, DROP, alt-stack moves and the other fixed stack shuffles | bounds move with their items |
+| PICK, ROLL | with an index pushed as a constant by the immediately preceding instruction, the exact slot. Otherwise PICK yields the maximum bound on `main`, and ROLL sets every `main` slot to that maximum |
+| ACTIVEBYTECODE | length of the running script |
+| state, path, complete-output and other transaction or coin reads | with a constant index, that field's actual length in this transaction or its resolved coin; otherwise the maximum of that field over all inputs or outputs |
+| EXTENSION0–7 and NOP | no change |
+
+**Conditional.** Pop the condition, analyze both arms from the same state. If both results are `Known` with equal `main` and `alt` heights, the result is the slot-by-slot maximum; otherwise `Unknown`. A missing ELSE is an empty arm.
+
+**Loop.** Let `S0` be the state at loop entry, plus the 16-byte index the loop pushes for each iteration. Analyze the body once to get `S1`. If `S1` is `Known` with the same heights as `S0` before its index, set to MAX_ELEMENT_BYTES every slot whose bound grew, and analyze the body a second time from that widened state; if any slot still grows, or the heights differ, or either result is `Unknown`, the body is charged in `Unknown` and the state after the loop is `Unknown`. Otherwise the body's charges are those of the second analysis and the state after the loop is the slot-by-slot maximum of `S0` and the second result. A BREAK reached at a `main` or `alt` height different from the loop's exit height makes the state after the loop `Unknown`. Each body is analyzed at most twice, so with nesting depth two the pass visits any instruction at most four times.
+
+**Soundness obligation.** For every execution and every instruction reached, each operand's actual size is at most the bound the pass assigned at that instruction. With charges nondecreasing in the bound, `actual abstract charge <= static charge` continues to hold. `Unknown` reproduces the maximum-operand rule, so the pass can only lower a charge where it has a proof. Runtime element, count and total-byte checks are unchanged and still required; the pass is not a memory proof. Vectors must cover unequal conditional arms, computed PICK/ROLL indices, accumulating and non-accumulating loops, BREAK at unequal heights, and underflow inside an unexecuted arm.
 
 ## Transaction and block charge domains
 
@@ -42,7 +73,7 @@ The sorted/hashed algorithm chosen for asset accumulation must have a bounded wo
 | --- | --- |
 | Wire | MAX_TX_BYTES, MAX_BLOCK_BYTES, MAX_INPUTS, MAX_OUTPUTS, MAX_BLOCK_TXS, MAX_MINTS |
 | Output/authorization | MAX_OUTPUT_BYTES, MAX_STATE_BYTES, MAX_BRANCHES, MAX_PATHS, MAX_PATH_BRANCHES, MAX_BRANCH_PROOF_DEPTH |
-| VM | MAX_SCRIPT_BYTES, MAX_ARGUMENTS, MAX_ELEMENT_BYTES, MAX_STACK_ITEMS, MAX_ALTSTACK_ITEMS, MAX_VM_BYTES, MAX_AST_DEPTH; loop depth=2 and generic bound=256 |
+| VM | MAX_SCRIPT_BYTES, MAX_ARGUMENTS, MAX_ELEMENT_BYTES (working value 8192), MAX_STACK_ITEMS, MAX_ALTSTACK_ITEMS, MAX_VM_BYTES, MAX_AST_DEPTH; loop depth=2 and generic bound=256 |
 | Work | MAX_INVOCATION_COST, MAX_TX_COST, MAX_BLOCK_COST and every primitive/structural coefficient |
 | Time/chain | COINBASE_MATURITY, POW_LIMIT, ASERT anchor and half-life, timestamp/future-eligibility rules |
 | Money | Tail initialization/floor/cap/precision, bootstrap initialization/clock/decay, fee-burn ratio, DUST_LIMIT and the token-output burn multiple (C14a), allocation and faucet state parameters |

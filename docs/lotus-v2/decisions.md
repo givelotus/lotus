@@ -18,7 +18,7 @@ Status: review draft. Decision owner: project maintainer; technical reviewers an
 | D12 Header, PoW and time | RECOMMENDED / eligibility and values OPEN | [P04](decisions/header-and-mining.md): revised 134-byte recursive header, state commitment, v1's 64-bit nonce and 48-bit timestamp, median-time-past timestamp rule, two-day ASERT half-life as working value | Width/hash selection, independent target/ASERT vectors, time-eligibility semantics, header/mining measurements |
 | D13 State and coinbase | CANDIDATE / monetary record OPEN | P01/P02: parent/height coinbase identity, full state envelope including coin metadata and monetary state | MonetaryState grammar, genesis/undo vectors, snapshot trust contract |
 | D14 Genesis/network identity | PARTIAL CANDIDATE / values OPEN | P01: independently selected ChainID; P04: explicit header/genesis framing | Parameter/launch manifest, addresses, magic, ports, seeds and source/build reproduction |
-| D15 Extension policy | CANDIDATE | Reject unknown consensus data; listed NOP is permanently a NOP; no unannounced future activation | Review capacity, crypto longevity and all post-genesis claims |
+| D15 Extension policy | CANDIDATE; maintainer chose named extension points 2026-10-09 | Reject unknown consensus data except eight reserved EXTENSION opcodes and CHECKDATASIG algorithm numbers 4–15, which pass until assigned and may only be tightened; NOP is permanently a NOP; hard forks are to be made unnecessary where practical, not declared impossible | Review capacity, crypto longevity and all post-genesis claims |
 
 ## Decisions that can proceed now
 
