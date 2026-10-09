@@ -98,10 +98,10 @@ To eliminate these bottlenecks while guaranteeing that the protocol **never need
 | **Header State Commitments** | None (Tx merkle root only) | `hashEpochBlock` (32B) + `hashExtendedMetadata` (32B) | `hashTxMerklixRoot` (32B) + `hashUtxoMerklixRoot` (32B) | Enables stateless verification and sub-second crash recovery. |
 | **Block Cadence** | 600s (10 min) | 120s (2 min) | **120s (2 min)** | Near-zero orphan rate, $5\times$ faster DAA responsiveness. |
 | **Hashing Engine** | SHA256d everywhere | SHA256d + SHA256 overlay | **Single BLAKE3** (Consensus & Trees) | Native tree hashing, immune to length-extension, $12\text{ ns}$ execution. |
-| **Output Representation** | Dynamic `vector<uint8_t>` | Dynamic `vector<uint8_t>` | **Single-Asset Multi-Branch (43B/75B)** | 43B pure XPI fits in single 64B L1 CPU cache line; zero dust for tokens; 1-byte NAND tree wiring matrix. |
+| **Output Representation** | Dynamic `vector<uint8_t>` | Dynamic `vector<uint8_t>` | **Single-Asset Multi-Branch (45B/77B)** | 45B pure XPI fits in single 64B L1 CPU cache line; zero dust for tokens; Variadic spending paths & branch MASTs. |
 | **Script Stack Integers** | `CScriptNum` (32-bit signed) | `CScriptNum` + 64-bit hacks | **Native `int128_t` (128-bit)** | Eliminates sign-magnitude bugs, enables high-precision finance. |
 | **Multi-Precision Math** | None | Ad-hoc `BIGADD` | `OP_ADDCARRY`, `OP_SUBCARRY`, `OP_MUL128_WIDE` | Curve arithmetic (secp256k1, BLS12-381) directly in Script. |
-| **Covenant Introspection** | None | Ad-hoc sighash flags | **Native Opcodes (`0xc0–0xde`)** | Inspects inputs, outputs, outpoints, branches, state, wiring in 1 CPU cycle. |
+| **Covenant Introspection** | None | Ad-hoc sighash flags | **Native Opcodes (`0xc0–0xde`)** | Inspects inputs, outputs, outpoints, branches, state, paths in 1 CPU cycle. |
 | **Script Loops** | Disabled / Forbidden | Mitra loop proposal | **`OP_ENUMERATE` Family** | Primitive recursion bounded by inputs/outputs or $N \le 256$; zero Halting Problem. |
 | **Native L1 Tokens** | None (3rd party indexers) | None | **Universal Conservation ($\sum \text{in} \ge \sum \text{out}$)** | $\text{TokenID} = \text{BLAKE3}(\text{minting\_script})$; zero consensus batons; zero dust. |
 | **Mempool Ingestion** | $O(n^2)$ CPFP DAG walk | $O(n^2)$ CPFP DAG walk | **$O(1)$ Ingestion Pipeline** | Eliminates chain limits, handles $50,000\text{ tx/s}$ ingress. |
@@ -213,25 +213,25 @@ struct LotusTxHeader {
     // Note: mint_count follows outputs if nVersion indicates minting/v2
 };
 
-// Branch Witness (Carried inside each input, mapping to an active branch index of spent coin)
+// Branch Witness (Carried inside each input, positionally mapped to required branches)
 struct BranchWitness {
-    uint8_t branch_index;                        // 1 byte: Index in spent coin's branches array (0..3)
-    CScript script;                              // The UNHASHED script bytecode (Preimage of coin.branches[branch_index])
+    CScript script;                              // The UNHASHED leaf script bytecode (Preimage)
+    std::vector<uint256> merkle_proof;           // Merklix audit path (empty if 1-leaf single script)
     std::vector<std::vector<uint8_t>> args;      // Unlocking parameters / signatures passed to script
 };
 
-// Input Record (Inline Branch Witnesses)
+// Input Record (Inline Branch Witnesses with Positional Witness Binding)
 struct LotusInput {
     COutPoint prevout;                           // 32B txid + 4B index (36 bytes)
     uint32_t  nSequence;                         // 4 bytes (RBF / Relative Locktime)
     uint8_t   flags;                             // 1 byte:
                                                  //   Bit 0 (0x01): FLAG_READ_ONLY_REFERENCE
                                                  //   Bits 1-7: Reserved (must be 0)
-    uint16_t  n_branch_witnesses;                // 2 bytes: Number of provided branch witnesses
-    std::vector<BranchWitness> branch_witnesses; // Explicit branch witnesses for active paths
+    CompactSize path_index;                      // Index into spent coin's paths array (coin.paths[path_index])
+    std::vector<BranchWitness> branch_witnesses; // Positionally maps 1-to-1 to required branches in chosen path
 };
 
-// Output Record (Single-Asset Representation with Unified nValue & NAND Wiring Matrix)
+// Output Record (Single-Asset Representation with Unified nValue & Variadic Spending Paths)
 struct LotusOutput {
     uint8_t  flags;                              // 1 byte:
                                                  //   Bit 0 (0x01): FLAG_HAS_TOKEN
@@ -246,9 +246,11 @@ struct LotusOutput {
     CompactSize state_len;                       // Length of state payload
     std::vector<uint8_t> state_commitment;       // Dynamic NFT / state machine data
     
-    uint8_t  wiring;                             // 1 byte: 4-Leaf NAND Tree Wiring Matrix (2 bits per leaf)
-    uint8_t  num_branches;                       // 1 byte: Count of branch hashes (1 to 4)
-    std::vector<uint256> branches;               // Array of 32B branch hashes [BLAKE3(script_0), BLAKE3(script_1), ...]
+    CompactSize num_branches;                    // Count of branch Merklix roots (1 to 65,535)
+    std::vector<uint256> branches;               // Array of 32B Merklix Roots
+    
+    CompactSize num_paths;                       // Count of valid spending paths (1 to 65,535)
+    std::vector<std::vector<CompactSize>> paths; // Each path is a sorted vector of branch indices required
 };
 
 // Transaction-Level Mint Witness (Present ONLY when expanding token supply: Delta > 0)
@@ -262,25 +264,27 @@ struct TokenMintWitness {
 
 ```
 ┌────────────────────────────────────────────────────────────────────────────────────────┐
-│ PURE XPI STANDARD OUTPUT (43 Bytes - Fits in a SINGLE 64-Byte CPU Cache Line!)         │
+│ PURE XPI STANDARD OUTPUT (45 Bytes - Fits in a SINGLE 64-Byte CPU Cache Line!)         │
 ├────────────────────────────────────────────────────────────────────────────────────────┤
-│ [00..00] uint8_t  flags               (1B: 0x00 = Pure Native XPI)                     │
-│ [01..08] uint64_t nValue              (8B: Native XPI satoshis)                        │
-│ [09..09] uint8_t  wiring              (1B: 4-leaf NAND wiring matrix, 0x00 = standard) │
-│ [10..10] uint8_t  num_branches        (1B: 0x01 = 1 branch)                            │
-│ [11..42] uint256  branch[0]           (32B: Owner Script Hash: BLAKE3(OwnerScript))    │
+│ [00..00] uint8_t     flags            (1B: 0x00 = Pure Native XPI)                     │
+│ [01..08] uint64_t    nValue           (8B: Native XPI satoshis)                        │
+│ [09..09] CompactSize num_branches     (1B: 0x01 = 1 branch root)                       │
+│ [10..41] uint256     branch[0]        (32B: Merklix Root: BLAKE3(OwnerScript))         │
+│ [42..42] CompactSize num_paths        (1B: 0x01 = 1 spending path)                     │
+│ [43..43] CompactSize path[0].len      (1B: 0x01 = 1 required branch)                   │
+│ [44..44] CompactSize path[0][0]       (1B: 0x00 = requires branch 0)                   │
 └────────────────────────────────────────────────────────────────────────────────────────┘
 
 ┌────────────────────────────────────────────────────────────────────────────────────────┐
-│ TOKEN / COVENANT OUTPUT (75 Bytes - Zero Dust, Pure Single-Asset UTXO)                 │
+│ TOKEN / COVENANT OUTPUT (77 Bytes - Zero Dust, Pure Single-Asset UTXO)                 │
 ├────────────────────────────────────────────────────────────────────────────────────────┤
-│ [00..00] uint8_t  flags               (1B: 0x01 = FLAG_HAS_TOKEN)                      │
-│ [01..08] uint64_t nValue              (8B: Token units - NO native XPI dust!)          │
-│ [09..40] uint256  token_id            (32B: Asset ID = BLAKE3(minting_script))         │
-│ [41..41] uint8_t  wiring              (1B: 4-leaf NAND wiring matrix)                  │
-│ [42..42] uint8_t  num_branches        (1B: 0x01 = 1 branch, or 0x02 = 2 branches)      │
-│ [43..74] uint256  branch[0]           (32B: Owner Script Hash: BLAKE3(OwnerScript))    │
-│ [75..106]uint256  branch[1] (opt)     (32B: Covenant Script Hash: BLAKE3(Covenant))    │
+│ [00..00] uint8_t     flags            (1B: 0x01 = FLAG_HAS_TOKEN)                      │
+│ [01..08] uint64_t    nValue           (8B: Token units - NO native XPI dust!)          │
+│ [09..40] uint256     token_id         (32B: Asset ID = BLAKE3(minting_script))         │
+│ [41..41] CompactSize num_branches     (1B: 0x01 = 1 branch, or 0x02 = 2 branches)      │
+│ [42..73] uint256     branch[0]        (32B: Merklix Root: BLAKE3(OwnerScript))         │
+│ [74..105]uint256     branch[1] (opt)  (32B: Merklix Root: BLAKE3(CovenantScript))      │
+│ [106..]  Spending Paths...            (CompactSize num_paths & required branch lists)  │
 └────────────────────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -355,85 +359,86 @@ To inspect on-chain vault or oracle state without double-spend contention:
 
 ---
 
-### 3.5. Multi-Branch Architecture, The Balanced 4-Leaf NAND Tree & Universal Script Indexing
+### 3.5. Variadic Spending Paths, Branch Merklix Trees (MAST) & Intra-Transaction Validation Caching
 
-#### 3.5.1. Multi-Branch Direct Hashes: Elimination of Opaque Roots
-Legacy Bitcoin attempts to handle complex spending conditions through buried Merkle trees (Taproot / BIP-341 / MAST). However, opaque Merkle trees introduce severe indexer blindness: light wallets and block explorers (e.g. Chronik) cannot determine whether an output belongs to an address or covenant until an inclusion proof is revealed at spend time.
+#### 3.5.1. The Variadic Spending Paths Architecture (Option B Positional Witnesses)
+In smart contract and transaction design, spending authorization naturally resolves into two orthogonal dimensions:
+1. **Horizontal Role Composition (Branches & Paths)**: *"WHICH participants, covenants, or guardians must approve this spend?"*
+2. **Vertical Specialization (The MAST within each Branch)**: *"WHICH specific method or execution path is that role running?"*
 
-Lotus v2 replaces single opaque roots with an **explicit catalog of branch hashes** on the wire:
-$$\text{branches} = [ \mathbf{hash}_0, \mathbf{hash}_1, \dots, \mathbf{hash}_{n-1} ] \quad (1 \le n \le 4)$$
-where each branch is the single BLAKE3 hash of an unhashed script:
-$$\mathbf{hash}_k = \mathbf{BLAKE3}(\mathbf{script}_k)$$
+##### Elimination of Fixed-Depth Tree Bottlenecks
+Early iterations evaluated spending conditions using fixed boolean topologies (such as 4-leaf NAND trees). However, fixed-depth structures introduce severe limitations:
+* They artificially restrict an output to at most 4 leaves and 2 spending paths.
+* They cannot express simple, common structures like $A \lor B \lor C$ (three independent alternative spenders) or $A \land B \land C$ (three co-signers) without nested inlining acrobatics.
+* Forcing multi-spender and multi-method logic into a single fixed tree causes combinatorial inlining bloat: 3 co-signers and 3 contract methods would require duplicating code across $\binom{3}{2} \times 3 = 9$ separate leaves.
 
-* **`branch[0]` (Owner Script Hash)**: `BLAKE3(OwnerScript)`. Chronik, indexers, and mobile wallets detect and index incoming payments in $O(1)$ directly from the unspent output on the wire.
-* **`branch[1]` (Covenant / Policy Hash)**: `BLAKE3(CovenantScript)`. Protocols, liquidity pools, and vaults index active smart contract rules in $O(1)$ without inspecting script preimages.
+Lotus v2 replaces fixed wiring topologies with the **Variadic Spending Paths Architecture**:
+$$\text{branches} = [ \mathbf{root}_0, \mathbf{root}_1, \dots, \mathbf{root}_{N-1} ] \quad (1 \le N \le 65,535)$$
+$$\text{paths} = [ \mathbf{path}_0, \mathbf{path}_1, \dots, \mathbf{path}_{M-1} ] \quad (1 \le M \le 65,535)$$
+
+* **Branches**: An explicit array of 32-byte Merklix Roots, each representing an autonomous role or policy (e.g. Owner, Co-Signer, Covenant, Protocol Fee Controller).
+* **Paths**: A list of valid spending paths. Each path is a canonical, strictly sorted vector of branch indices required:
+  $$\mathbf{path}_p = [ b_{p,0}, b_{p,1}, \dots, b_{p,k-1} ] \quad \text{where } b_{p,0} < b_{p,1} < \dots < b_{p,k-1}$$
+* **Expressiveness**:
+  * **Standard Single-Key / P2SH**: `branches = [A]`, `paths = [[0]]`
+  * **2-of-2 Covenant (Owner + Vault)**: `branches = [Owner, Vault]`, `paths = [[0, 1]]`
+  * **1-of-2 Recovery (Owner OR Backup Key)**: `branches = [Owner, Backup]`, `paths = [[0], [1]]`
+  * **Quorum / Guarded Spending**: `branches = [Alice, Bob, Charlie, Vault]`, `paths = [[0, 1, 3], [0, 2, 3], [1, 2, 3]]` (Any 2 owners AND the vault).
+
+##### Option B: Positional Witness Mapping
+When spending an output, the transaction input chooses exactly which spending path to activate via `input.path_index`:
+$$\mathbf{active\_path} = \text{coin.paths}[\text{input.path\_index}]$$
+
+To eliminate all redundant wire overhead, dummy witnesses, and placeholder padding:
+* The transaction input supplies an array of branch witnesses: `input.branch_witnesses`.
+* **Positional Binding Invariant**: The number of witnesses provided MUST exactly equal the number of required branches in the selected path:
+  $$\mathbf{input.branch\_witnesses.size}() == \mathbf{active\_path.size}()$$
+* Witness element $i$ positionally binds to branch index $\mathbf{active\_path}[i]$:
+  $$\mathbf{input.branch\_witnesses}[i] \iff \mathbf{coin.branches}[\mathbf{active\_path}[i]]$$
+* There is **zero branch index byte** within the witness, **zero empty dummy witnesses**, and **zero unspent branch leakage**. If the spending path requires branches `[0, 2]`, `branch_witnesses` has length 2: `witness[0]` validates against `branch[0]`, and `witness[1]` validates against `branch[2]`.
 
 ---
 
-#### 3.5.2. The Balanced 4-Leaf NAND Tree & Disjunctive Normal Form (DNF)
-Rather than executing all branches sequentially with rigid AND semantics, Lotus v2 evaluates spending authorization through a **2-layer, 4-leaf balanced NAND Tree**:
+#### 3.5.2. Every Branch is a 32-Byte Merklix Root (MAST)
+Every entry in `coin.branches` is uniformly a **32-byte Merklix Root**. A branch can be either a single atomic script or an entire Merklized Alternative Script Tree (MAST):
 
 ```
-                       [ ROOT ]
-                     NAND( N0, N1 )
-                   = (L0 ∧ L1) ∨ (L2 ∧ L3)
-                         /    \
-                        /      \
-                       /        \
-                   [ N0 ]      [ N1 ]
-                 NAND(L0, L1) NAND(L2, L3)
-                   /    \       /    \
-                  /      \     /      \
-                [L0]    [L1] [L2]    [L3]
+┌────────────────────────────────────────────────────────────────────────────────────────┐
+│ 1. HORIZONTAL COMPOSITION (Branches & Paths on Output Wire)                            │
+│    • Output defines: branches[0..N] and paths[0..M]                                    │
+│    • e.g. Path 0: [Alice, Bob, LendingVault]                                          │
+├────────────────────────────────────────────────────────────────────────────────────────┤
+│ 2. VERTICAL SPECIALIZATION (MAST within each Branch Root)                              │
+│    • Each branch root expands into its own Merklix tree of leaf methods                │
+│    • Spender reveals ONLY the active leaf script + Merkle audit path                   │
+│    • Unused methods remain completely private 32-byte hashes                           │
+└────────────────────────────────────────────────────────────────────────────────────────┘
 ```
 
-By De Morgan's Law, two layers of NAND gates evaluate directly to **Disjunctive Normal Form (Sum-of-Products)**:
-$$\mathbf{Root} = \text{NAND}\big(\text{NAND}(L_0, L_1), \text{NAND}(L_2, L_3)\big) = \mathbf{(L_0 \land L_1) \lor (L_2 \land L_3)}$$
-
-This maps 1-to-1 to the universal structure of smart contract authorization:
-$$\mathbf{Root} = \mathbf{Path_1} \lor \mathbf{Path_2} \quad \text{where} \quad \mathbf{Path_1} = (L_0 \land L_1), \quad \mathbf{Path_2} = (L_2 \land L_3)$$
-
-##### Why NAND Mathematically Beats NOR:
-1. **Direct Sum-of-Products**: Real-world authorization is naturally disjunctive: *"Either execute standard operation (Path 1), OR execute emergency recovery (Path 2)"*. NAND evaluates this directly.
-2. **Zero Variable Duplication**: A NOR tree computes Conjunctive Normal Form (Product-of-Sums: $(L_0 \lor L_1) \land (L_2 \lor L_3)$). To express $(A \land B) \lor C$ in NOR requires boolean distribution: $(A \lor C) \land (B \lor C)$, forcing recovery term $C$ to appear in multiple clauses and requiring both sides to be evaluated simultaneously. NAND computes $(A \land B) \lor (C \land C) = (A \land B) \lor C$ with zero distribution acrobatics.
-3. **Natural Positive-Boolean Stack Alignment**: In Forth/Bitcoin Script, valid conditions leave non-zero values (`TRUE` / `1`) on the stack. The NAND tree directly consumes these positive booleans:
-   $$\text{bool root} = (L_0 \ \&\&\ L_1)\ ||\ (L_2 \ \&\&\ L_3);$$
-4. **Zero-Knowledge Path Privacy for Unused Branches**: Any branch omitted from the transaction's `branch_witnesses` naturally evaluates to **`0` (`FALSE`)**. If the spender satisfies Path 1 ($L_0 = 1, L_1 = 1$), Path 2 automatically evaluates to $0 \land 0 = 0$. The root evaluates to $1 \lor 0 = 1$ (`TRUE`). **The spender never reveals the script preimage, public keys, or signatures for unspent alternative paths!**
-
----
-
-#### 3.5.3. The 1-Byte Wiring Matrix (`uint8_t wiring`)
-To map the 4 physical leaves ($L_0, L_1, L_2, L_3$) to the coin's catalog of branch hashes (`branches[0..3]`), each output carries a single byte: `uint8_t wiring`.
-
-Because there are 4 leaves and up to 4 catalog entries, each leaf index is encoded in exactly 2 bits ($\log_2 4 = 2$):
-$$\text{wiring} = (k_3 \ll 6) \mid (k_2 \ll 4) \mid (k_1 \ll 2) \mid k_0$$
-where $k_m \in \{0, 1, 2, 3\}$ designates which catalog branch `branches[k_m]` feeds leaf $L_m$.
-
-Because boolean conjunction is idempotent ($X \land X = X$), no constant `TRUE` or `FALSE` hardware inputs are required. The 5 canonical authorization templates map directly:
-
-| Template | Logical Formula | Leaf Wiring $[L_0, L_1, L_2, L_3]$ | `wiring` Hex | Wire Description |
-| :--- | :--- | :--- | :--- | :--- |
-| **Standard Single-Key / P2SH** | $A$ | $[0, 0, 0, 0]$ | `0x00` | $(A \land A) \lor (A \land A) = A$ |
-| **Standard Covenant / 2-FA** | $A \land B$ | $[0, 1, 0, 1]$ | `0x44` | $(A \land B) \lor (A \land B) = A \land B$ |
-| **Alternative Keys / 1-of-2 OR** | $A \lor B$ | $[0, 0, 1, 1]$ | `0x50` | $(A \land A) \lor (B \land B) = A \lor B$ |
-| **Guarded Recovery** | $(A \land B) \lor C$ | $[0, 1, 2, 2]$ | `0xa4` | $(A \land B) \lor (C \land C) = (A \land B) \lor C$ |
-| **Dual Covenant Switch** | $(A \land B) \lor (C \land D)$ | $[0, 1, 2, 3]$ | `0xe4` | $(A \land B) \lor (C \land D)$ |
+##### 1-Leaf Fast Path vs Multi-Leaf Merklix Tree
+When validating `input.branch_witnesses[i]` against branch root $\mathbf{R} = \text{coin.branches}[\mathbf{active\_path}[i]]$:
+1. **1-Leaf Tree Fast Path (`merkle_proof.empty()`)**:
+   For standard single-key payments, basic multisig, or single-method scripts, the branch root is simply the BLAKE3 hash of the leaf script:
+   $$\mathbf{BLAKE3}(\text{bw.script}) == \mathbf{R}$$
+   If `bw.script` is a standard public-key script (`<PubKey> OP_CHECKSIG`), the interpreter skips bytecode parsing and dispatches directly to AVX-512 batch Schnorr verification ($\approx 30\text{ ns}$).
+2. **Multi-Leaf Tree (`!merkle_proof.empty()`)**:
+   For smart contracts with multiple methods (e.g. `deposit`, `borrow`, `liquidate`, `repay`):
+   * Each method is an unhashed leaf in a BLAKE3 domain-separated Merklix tree:
+     $$\mathbf{leaf\_hash} = \mathbf{BLAKE3}(\text{DOMAIN\_LEAF} \parallel \text{bw.script})$$
+   * The node verifies that `leaf_hash` is cryptographically included in $\mathbf{R}$ using `bw.merkle_proof`:
+     $$\mathbf{VerifyMerklixProof}(\mathbf{leaf\_hash}, \text{bw.merkle\_proof}, \mathbf{R}) == \mathbf{true}$$
+   * The spender reveals only the active method script and its Merkle path. All other methods remain cryptographically unrevealed and zero-knowledge.
 
 ---
 
-#### 3.5.4. Wire-Level P2PKH Obsolescence: Universal Script Hashing & Address Resolution
-In legacy Bitcoin (2008), the consensus protocol maintained distinct serialized wire formats for different output types:
-* **P2PK**: Serialized the full 35-byte raw public key script (`<PubKey> OP_CHECKSIG`) directly in `scriptPubKey`.
-* **P2PKH**: Serialized the 25-byte script (`OP_DUP OP_HASH160 <20B Hash> OP_EQUALVERIFY OP_CHECKSIG`) in `scriptPubKey`.
-* **P2SH**: Serialized the 23-byte script (`OP_HASH160 <20B Hash> OP_EQUAL`) in `scriptPubKey`.
+#### 3.5.3. Wire-Level P2PKH Obsolescence: Universal Script Hashing & Address Resolution
+In legacy Bitcoin (2008), the consensus protocol maintained distinct serialized wire formats for different output types (`scriptPubKey` bytecodes for P2PK, P2PKH, P2SH). This forced full nodes to inspect and branch on arbitrary, variable-length script bytecodes during UTXO database serialization and mempool validation.
 
-This forced full nodes to inspect and branch on arbitrary, variable-length script bytecodes during UTXO database serialization and mempool validation.
+##### Wire-Level Unification (All Outputs Are Branch Roots)
+In Lotus v2, **the distinct wire-level "P2PKH output" is obsolete**. The consensus wire format recognizes only one unified output representation: an explicit array of 32-byte BLAKE3 branch roots evaluated through variadic spending paths:
+$$\mathbf{branch}[k] = \mathbf{BLAKE3}(\mathbf{script}_k) \quad \text{or} \quad \mathbf{branch}[k] = \mathbf{MerklixRoot}(\{\mathbf{script}_{k,m}\})$$
 
-##### Wire-Level Unification (All Outputs Are Branch Hashes)
-In Lotus v2, **the distinct wire-level "P2PKH output" is obsolete**. The consensus wire format recognizes only one unified output representation: an explicit array of 32-byte BLAKE3 branch hashes:
-$$\mathbf{branch}[k] = \mathbf{BLAKE3}(\mathbf{script}_k)$$
-
-Every output in Lotus v2 is structurally a Pay-to-Script-Hash (P2SH). Consensus does not know or care whether an output is a single-key payment, an address hash, a multisig vault, or an AMM covenant—they all exist as uniform 32-byte hashes evaluated through the NAND tree.
+Every output in Lotus v2 is structurally a Pay-to-Script-Hash (P2SH) / Pay-to-MAST. Consensus does not know or care whether an output is a single-key payment, an address hash, a multisig vault, or an AMM covenant—they all exist as uniform 32-byte hashes.
 
 ##### Sending to a Hashed PubKey Address (`pubkeyhash`)
 When a user shares an address, they provide a compact hashed public key (`pubkeyhash`):
@@ -446,79 +451,149 @@ Hashing the public key inside the script is therefore essential for address-base
    The sender's wallet constructs the canonical address-resolution script from `PubKeyHash`:
    $$\mathbf{script} = \mathbf{OP\_DUP} \;\; \mathbf{OP\_BLAKE3} \;\; \langle\mathbf{PubKeyHash}\rangle \;\; \mathbf{OP\_EQUALVERIFY} \;\; \mathbf{OP\_CHECKSIG}$$
 2. **Commitment on the Wire**:
-   The sender computes the 32-byte branch hash:
+   The sender computes the 32-byte branch root:
    $$\mathbf{branch}[0] = \mathbf{BLAKE3}(\mathbf{script})$$
-   and serializes it into the 43-byte output record. The sender never needs the recipient's public key.
+   and serializes it into the 45-byte output record with `paths = [[0]]`. The sender never needs the recipient's public key.
 3. **Sub-Microsecond Wallet Indexing**:
    The recipient's wallet knows its own `PubKeyHash`. The wallet precomputes:
    $$\mathbf{expected\_branch} = \mathbf{BLAKE3}\Big(\mathbf{OP\_DUP} \parallel \mathbf{OP\_BLAKE3} \parallel \mathbf{PubKeyHash} \parallel \mathbf{OP\_EQUALVERIFY} \parallel \mathbf{OP\_CHECKSIG}\Big)$$
    The wallet registers `expected_branch` with Chronik. When a transaction is received, Chronik indexes the output by `branch[0]` in $O(1)$ time—enabling instantaneous payment discovery without scanning raw scripts.
 4. **Execution at Spend Time**:
-   When spending the coin, the recipient's `BranchWitness` supplies:
-   * `bw.branch_index = 0`
-   * `bw.script = OP_DUP OP_BLAKE3 <PubKeyHash> OP_EQUALVERIFY OP_CHECKSIG`
-   * `bw.args = [ <64B Schnorr Sig>, <33B PubKey> ]`
-   The node verifies `BLAKE3(bw.script) == coin.branches[0]`, then executes the script: `PubKey` is duplicated, hashed with BLAKE3, verified equal to `PubKeyHash`, and the Schnorr signature is verified against `PubKey`. The script leaves `TRUE` ($1$) on the stack, satisfying the NAND tree.
+   When spending the coin, the recipient's input supplies:
+   * `input.path_index = 0`
+   * `input.branch_witnesses[0].script = OP_DUP OP_BLAKE3 <PubKeyHash> OP_EQUALVERIFY OP_CHECKSIG`
+   * `input.branch_witnesses[0].merkle_proof = []`
+   * `input.branch_witnesses[0].args = [ <64B Schnorr Sig>, <33B PubKey> ]`
+   The node verifies `BLAKE3(script) == coin.branches[0]`, then executes the script: `PubKey` is duplicated, hashed with BLAKE3, verified equal to `PubKeyHash`, and the Schnorr signature is verified against `PubKey`.
 
 ##### Direct Public-Key Scripts (`<PubKey> OP_CHECKSIG`)
-When the recipient's public key is known in advance (or when an interactive channel / payment invoice conveys the public key or the 32-byte branch hash directly), the sender can skip the inner pubkey hash check:
+When the recipient's public key is known in advance (e.g. interactive payment channels, deterministic key exchanges, or Nostr/WebLN invoices), the sender skips the inner pubkey hash check:
 $$\mathbf{script} = \langle\text{33-byte PubKey}\rangle \;\; \mathbf{OP\_CHECKSIG} \quad (34\text{ bytes})$$
 $$\mathbf{branch}[0] = \mathbf{BLAKE3}(\text{PubKey} \parallel \text{OP\_CHECKSIG})$$
-At spend time, the witness provides only `bw.args = [ <64B Schnorr Sig> ]` (saving 33 bytes on the wire), and node validators route directly to the AVX-512 batch Schnorr fast-path ($\approx 30\text{ ns}$). Both paradigms coexist seamlessly under the universal multi-branch NAND tree.
+At spend time, the witness provides only `args = [ <64B Schnorr Sig> ]` (saving 33 bytes on the wire), and node validators route directly to the AVX-512 batch Schnorr fast-path ($\approx 30\text{ ns}$).
 
 ---
 
-#### 3.5.5. Explicit Branch Witnesses & Validation Execution Semantics
-When spending a coin, the input carries `branch_witnesses` only for the branch(es) required to satisfy active paths:
+#### 3.5.4. Multi-Covenant Token Governance & The Linear Resource Model (Move Comparison)
+In Ethereum, token balances and covenant states are stored in isolated, siloed smart contract storage tables (`mapping(address => uint256)`). This forces tokens to be manipulated through dynamic cross-contract calls (`transferFrom`), introducing reentrancy vulnerabilities and severe execution bottlenecks.
 
+Lotus v2 adopts the **Linear Resource Model** (analogous to the Move language):
+1. **Assets are Resources, Not Storage Mappings**:
+   An asset is a physical UTXO record. It has an explicit asset identity (`token_id`), cannot be cloned, cannot be silently destroyed, and obeys the immutable universal conservation law:
+   $$\sum_{\text{in}} \text{nValue}[\text{asset}] \ge \sum_{\text{out}} \text{nValue}[\text{asset}]$$
+2. **Orthogonal Separation: Asset Type vs. Owner vs. Covenant Logic**:
+   * **Asset Type (`token_id`)**: Distinguishes native XPI (miner fees) from specific tokens, enabling $O(1)$ SIMD conservation checks ($3\text{ ns}$) without executing any script.
+   * **Owner (`branch[0]`)**: Authorizes the asset holder to approve transfers or reallocations.
+   * **Covenant Rules (`branch[1]`, etc.)**: Governs operational rules (liquidity pools, collateral vaults, vesting locks).
+3. **Decoupled Composability**:
+   Because `token_id` is an explicit orthogonal field, a token can enter a lending vault, transition into an AMM pool, or be deposited into an escrow contract **without mutating its underlying asset identity**. The covenant simply occupies a branch on the coin, leaving the asset type immutable.
+
+---
+
+#### 3.5.5. Intra-Transaction Validation Caching & Static Purity Analysis (`OP_INPUTINDEX`)
+In complex transactions (such as vault consolidations, batch withdrawals, or multi-input swaps), multiple transaction inputs often execute identical covenant branch scripts. If every input naively re-executes the same covenant script from scratch, validation time scales linearly with input count ($O(K \cdot \text{ops})$).
+
+##### The Reflected Data Hazard: Why Naive Caching Breaks
+A naive node implementation might attempt to cache script execution results across companion inputs by script hash alone: $\mathbf{CacheKey} = \mathbf{BLAKE3}(\text{TxID} \parallel \text{ScriptHash})$.
+However, if a covenant uses **reflected input data**—specifically `OP_INPUTINDEX` (`0xc0`) or input-dependent introspection:
+* On `vin[0]`, `OP_INPUTINDEX` pushes `0`.
+* On `vin[1]`, `OP_INPUTINDEX` pushes `1`.
+* If `vin[0]` executes `OP_INPUTINDEX OP_UTXOVALUE` and sees $10,000\text{ XPI}$, but `vin[1]` only provides $1\text{ XPI}$, blindly reusing `vin[0]`'s cached `TRUE` result on `vin[1]` would allow an attacker to bypass all balance checks and drain the vault!
+
+##### Solution 1: Static Purity Analysis (Node-Level Caching)
+Before executing a branch script, the node validator performs a single $O(\text{script\_size})$ scan over the script bytecode:
+$$\mathbf{IsPureTxPredicate} = (\text{script does NOT contain } \mathbf{OP\_INPUTINDEX})$$
+
+* **Pure Transaction Predicates (`IsPureTxPredicate == true`)**:
+  The script only inspects global transaction invariants (`tx.outputs`, `tx.locktime`, `tx.version`, or literal inputs via `0 OP_UTXOVALUE`). The script is a mathematically pure function of the transaction:
+  $$f(\text{Tx}) \to \{\mathbf{TRUE}, \mathbf{FALSE}\}$$
+  Its result is 100% invariant across all inputs in the transaction. The node safely caches the result using:
+  $$\mathbf{CacheKey} = \mathbf{BLAKE3}(\text{TxID} \parallel \text{ScriptHash})$$
+  The script executes exactly **once** for the first companion input; all subsequent companion inputs resolve the cache in $< 5\text{ nanoseconds}$.
+* **Input-Dependent Predicates (`IsPureTxPredicate == false`)**:
+  The script's outcome depends on which input is currently executing. The cache key commits to the executing input index:
+  $$\mathbf{CacheKey} = \mathbf{BLAKE3}(\text{TxID} \parallel \text{ScriptHash} \parallel \mathbf{input\_index})$$
+  The script evaluates independently for each input, guaranteeing absolute consensus soundness.
+
+##### Solution 2: The Master/Companion Script Pattern (Compiler-Level)
+High-performance covenant compilers (such as the Lotus Contract Compiler) optimize multi-input covenants using the **Master/Companion Pattern**:
+* The covenant script checks whether it is running on the primary ("master") vault input:
+  $$\mathbf{is\_master} = (\mathbf{OP\_INPUTINDEX} == \mathbf{master\_input\_index})$$
+* **On the Master Input**: The contract executes the comprehensive aggregation loop: iterating over all inputs, computing total vault balances, and verifying reserve constraints.
+* **On Companion Inputs**: The contract executes a **3-opcode fast-path**:
+  ```forth
+  <master_input_index> OP_UTXOBRANCH <branch_k> OP_ACTIVEBYTECODE OP_BLAKE3 OP_EQUALVERIFY
+  ```
+  It simply asserts that the Master Input is present in this same transaction and executing the identical covenant.
+* **Result**: In a 5-input consolidation, 1 input executes the loop, and 4 inputs execute in 3 CPU instructions. Total execution cost drops by $> 75\%$.
+
+---
+
+#### 3.5.6. Complete Output Authorization Validation Algorithm
 ```cpp
-bool VerifyLotusOutputAuthorization(const LotusOutput &coin, const LotusInput &input) {
-    // 1. Initialize all 4 branch results to false (omitted branches default to 0)
-    bool branch_results[4] = {false, false, false, false};
+bool VerifyLotusOutputAuthorization(const LotusOutput &coin, const LotusInput &input, size_t input_index, const CTransaction &tx) {
+    // 1. Path Index Bounds Check
+    if (input.path_index >= coin.paths.size()) {
+        return false; // SCRIPT_ERR_INVALID_PATH_INDEX
+    }
+    const std::vector<CompactSize> &required_branches = coin.paths[input.path_index];
     
-    // 2. Validate and execute supplied branch witnesses
-    for (const BranchWitness &bw : input.branch_witnesses) {
-        if (bw.branch_index >= coin.num_branches) {
-            return false; // Out of bounds branch index
+    // 2. Option B Positional Mapping Invariant
+    if (input.branch_witnesses.size() != required_branches.size()) {
+        return false; // SCRIPT_ERR_WITNESS_COUNT_MISMATCH
+    }
+    
+    // 3. Execute Required Branch Witnesses Positionally
+    for (size_t i = 0; i < required_branches.size(); ++i) {
+        CompactSize branch_k = required_branches[i];
+        if (branch_k >= coin.branches.size()) {
+            return false; // SCRIPT_ERR_BRANCH_INDEX_OUT_OF_BOUNDS
         }
+        const uint256 &expected_branch_root = coin.branches[branch_k];
+        const BranchWitness &bw = input.branch_witnesses[i];
         
-        // Cryptographic preimage check: BLAKE3(script) == coin.branches[k]
-        if (BLAKE3(bw.script) != coin.branches[bw.branch_index]) {
-            return false; // Preimage mismatch
-        }
-        
-        // Execute script with provided args
-        if (bw.script.IsP2PKFastPath()) {
-            // Direct AVX-512 batch Schnorr (~30ns)
-            branch_results[bw.branch_index] = VerifySchnorrFastPath(bw);
+        // 4. Branch Root Cryptographic Verification
+        if (bw.merkle_proof.empty()) {
+            // 1-Leaf Tree Fast-Path: Preimage check
+            if (BLAKE3(bw.script) != expected_branch_root) {
+                return false; // SCRIPT_ERR_SCRIPT_HASH_MISMATCH
+            }
         } else {
-            // General 128-bit Forth VM evaluation
-            branch_results[bw.branch_index] = ExecuteScriptVM(bw.args, bw.script);
+            // Multi-Leaf Merklix Tree Proof
+            uint256 leaf_hash = BLAKE3(DOMAIN_LEAF, bw.script);
+            if (!VerifyMerklixProof(leaf_hash, bw.merkle_proof, expected_branch_root)) {
+                return false; // SCRIPT_ERR_MERKLE_PROOF_INVALID
+            }
         }
         
-        if (!branch_results[bw.branch_index]) {
-            return false; // Executed script returned FALSE
+        // 5. Script Execution with Intra-Transaction Caching
+        bool script_passed = false;
+        if (bw.script.IsP2PKFastPath()) {
+            // AVX-512 batch Schnorr fast-path (~30ns)
+            script_passed = VerifySchnorrFastPath(bw);
+        } else {
+            // Static Purity Analysis & Caching
+            bool is_pure = !ScriptContainsInputIndex(bw.script);
+            uint256 cache_key = is_pure 
+                ? BLAKE3(tx.GetId(), expected_branch_root)
+                : BLAKE3(tx.GetId(), expected_branch_root, static_cast<uint32_t>(input_index));
+            
+            if (tx_validation_cache.Lookup(cache_key, script_passed)) {
+                // Cache hit! Skip VM execution
+            } else {
+                script_passed = ExecuteScriptVM(bw.args, bw.script, input_index, tx);
+                tx_validation_cache.Insert(cache_key, script_passed);
+            }
+        }
+        
+        if (!script_passed) {
+            return false; // SCRIPT_ERR_EVAL_FALSE
         }
     }
     
-    // 3. Map branch results to the 4 leaves via the 1-byte wiring matrix
-    bool L[4];
-    for (size_t m = 0; m < 4; m++) {
-        uint8_t branch_k = (coin.wiring >> (2 * m)) & 0x03;
-        L[m] = branch_results[branch_k];
-    }
-    
-    // 4. Evaluate the 2-Layer Balanced NAND Tree: (L0 && L1) || (L2 && L3)
-    bool N0 = !(L[0] && L[1]);
-    bool N1 = !(L[2] && L[3]);
-    bool root = !(N0 && N1); // Equivalent to: (L[0] && L[1]) || (L[2] && L[3])
-    
-    return root;
+    return true; // All required branches in selected path satisfied!
 }
 ```
-
-* **Deterministic $O(1)$ Execution**: Tree evaluation consists of 3 bitwise instructions in modern CPU registers.
-* **Sub-Microsecond Pipeline**: Standard single-key transactions execute in $< 50\text{ nanoseconds}$, allowing a single CPU core to validate over 20,000 transaction inputs per second.
 
 ### 3.6. The 128-Bit Forth Stack Machine (`int128_t`)
 
@@ -600,8 +675,8 @@ To maximize tooling interoperability with CashScript, Libauth, and smart contrac
 | `OP_ENUMERATE` | `0xda` | `N ... OP_ENDENUMERATE` | Generic bounded enumeration loop ($0 \le N \le 256$). Pops $N$, auto-pushes loop counter $k \in [0, N-1]$. |
 | `OP_ENDENUMERATE`| `0xdb`| `->` | Terminates loop body and steps to next iteration or exits. |
 | `OP_BREAK` | `0xdc` | `depth -> ` | Pops integer `depth` ($1 \le \text{depth} \le 2$). Terminates `depth` nested active loops and jumps past target `OP_ENDENUMERATE`. |
-| `OP_UTXOWIRING` | `0xdd` | `i -> wiring` | Pops input index $i$, pushes 1-byte NAND tree wiring matrix of the spent coin. |
-| `OP_OUTPUTWIRING`| `0xde` | `j -> wiring` | Pops output index $j$, pushes 1-byte NAND tree wiring matrix of output $j$. |
+| `OP_UTXOPATHCOUNT` | `0xdd` | `i -> count` | Pops input index $i$, pushes the number of valid spending paths (`paths.size()`) of the spent coin. |
+| `OP_OUTPUTPATHCOUNT`| `0xde` | `j -> count` | Pops output index $j$, pushes the number of valid spending paths (`paths.size()`) of output $j$. |
 
 ---
 
@@ -860,7 +935,7 @@ The full rebase sequence in `lotus/daemon/patches/v2/series` onto `bitcoin-abc 2
 
 ## 8. Post-Genesis Evolution: Zero-Hardfork Enhancements
 
-Because all consensus invariants (Header format, 43B/75B Single-Asset Multi-Branch Outputs, 4-Leaf NAND Tree, BLAKE3, 128-bit VM, Introspection, Tail Subsidy) are permanently locked at Block 0, future protocol optimizations remain **strictly internal node implementations and network transport upgrades** that require **ZERO hardforks**:
+Because all consensus invariants (Header format, 45B/77B Single-Asset Multi-Branch Outputs, Variadic Spending Paths, BLAKE3, 128-bit VM, Introspection, Tail Subsidy) are permanently locked at Block 0, future protocol optimizations remain **strictly internal node implementations and network transport upgrades** that require **ZERO hardforks**:
 
 ### 8.1. QUIC P2P Transport Layer (RFC 9000 / HTTP/3 over UDP)
 * **Deep Packet Inspection (DPI) Invisibility**: Transports P2P messages inside standard TLS 1.3 encrypted UDP datagrams. To ISPs, enterprise firewalls, and state censors, Lotus P2P traffic looks indistinguishable from standard HTTP/3 web browsing (Cloudflare, Google, YouTube).
@@ -878,9 +953,9 @@ Because all consensus invariants (Header format, 43B/75B Single-Asset Multi-Bran
 
 ### 8.4. Partially Signed Lotus Transactions (PSLT / BIP-0370 Standard)
 * Standardized binary exchange format for air-gapped hardware wallets, multisig coordinators, and mobile signers.
-* Incorporates native fields for single-asset multi-branch outputs, 1-byte wiring matrix, and Merklix proofs.
+* Incorporates native fields for single-asset multi-branch outputs, variadic spending paths, and Merklix proofs.
 
 ### 8.5. Architectural Exclusion of Double-Spend Proofs (BUIP135)
 * **The Asymmetric DoS Vulnerability**: Double-Spend Proofs (DSPs) introduce an un-fee'd signature verification cascade. An attacker splitting 1 XPI into 100,000 dust outputs can broadcast 100,000 conflicting transactions, forcing every full node on the network to perform 200,000 cryptographic signature checks and gossip the proofs across the P2P topology without paying a single satoshi in fees.
-* **Script & Covenant Incompatibility**: DSPs break down on stateful smart contracts and multi-branch NAND tree guardrails, requiring complex whitelist heuristics that compromise protocol simplicity.
+* **Script & Covenant Incompatibility**: DSPs break down on stateful smart contracts and multi-branch guardrails, requiring complex whitelist heuristics that compromise protocol simplicity.
 * **The Sound Alternative**: Lotus v2 adheres to pure Nakamoto first-seen policy: conflicting mempool spends are rejected in a single $O(1)$ hash table check ($<5\text{ ns}$ CPU cost, zero bandwidth, zero state bloat).
