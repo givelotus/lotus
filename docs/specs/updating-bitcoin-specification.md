@@ -290,11 +290,37 @@ Because every outpoint `(txid:vout)` can only be spent once in the history of th
 
 #### 3.4.2. Key Rotation Without TokenID Mutation
 In production, reserve addresses change, keys are compromised, and corporate officers rotate. Lotus v2 decouples immutable `TokenID` from mutable configuration:
+
 1. **The Admin Baton (On-Chain Governance Coin)**:
    The token creator maintains an Admin Baton UTXO governed by an $m$-of-$n$ corporate multisig (e.g. 3-of-5).
    - **Key Rotation**: When an employee leaves, the remaining officers spend the Admin Baton to a new Baton UTXO containing the updated key set and new reserve address. `TokenID` never changes.
-   - **Contention-Free Ingestion**: Depositors include the Admin Baton as a **Read-Only Reference Input** (like Cardano CIP-31). Because depositors only *read* the baton rather than spending it, **10,000 users can read the Admin Baton simultaneously in the same block with zero double-spend collisions**.
-2. **Epoch Delegation Certificates (`OP_CHECKDATASIG`)**:
+   - **Contention-Free Ingestion**: Depositors include the Admin Baton as a **Read-Only Reference Input** (`FLAG_READ_ONLY_REFERENCE = 0x01` in `LotusInput`). Because depositors only *read* the baton rather than spending it, **10,000 users can read the Admin Baton simultaneously in the same block with zero double-spend collisions**.
+
+2. **Immunity of Circulating Tokens During Baton Rotations**:
+   When the Admin Baton is spent and moved to a new outpoint:
+   - **Existing circulating tokens are 100% unaffected.**
+   - Standard peer-to-peer transfers (Alice sending USDC to Bob) **never touch, read, or reference the Admin Baton.**
+   - Transfers only enforce local asset conservation ($\sum \text{in}[TokenID] \ge \sum \text{out}[TokenID]$) and recipient covenant preservation.
+   - Because `TokenID` is pinned to the Genesis Outpoint, old tokens and newly minted tokens have the exact same `TokenID` and remain **100% fungible**.
+
+3. **Context-Aware Governance via `OP_ISREFERENCEINPUT`**:
+   To avoid rigid, brittle branch-ordering rules in consensus (e.g. forcing "Slot 0 = Spend, Slot 1 = Reference"), the Forth VM provides the `OP_ISREFERENCEINPUT` (`0xd3`) introspection opcode.
+   A single governance script dynamically alters its behavior based on runtime context:
+   ```forth
+   OP_ISREFERENCEINPUT
+   OP_IF
+       # ─── MODE A: REFERENCED (User Deposit / Minting) ───
+       # Verify deposit went to the authorized reserve address:
+       <Reserve_Address> 0 OP_OUTPUTBYTECODE OP_EQUALVERIFY
+   OP_ELSE
+       # ─── MODE B: SPENT (Admin Key Rotation / Migration) ───
+       # Coin is physically being consumed to rotate keys:
+       3 <PK1> <PK2> <PK3> <PK4> <PK5> 5 OP_CHECKMULTISIG
+   OP_ENDIF
+   ```
+   Consensus enforces zero magic slot semantics: the coin’s script governs its own execution path.
+
+4. **Epoch Delegation Certificates (`OP_CHECKDATASIG`)**:
    Alternatively, the $m$-of-$n$ admin keys sign an off-chain delegation certificate committing to the authorized reserve address for epoch $[H..H+\Delta]$. The depositor attaches this certificate to their witness, and the token script validates it via `OP_CHECKDATASIG`. Zero on-chain state contention.
 
 #### 3.4.3. The Parallel Deposit Invariant (Zero State-UTXO Collisions)
@@ -408,6 +434,7 @@ To maximize tooling interoperability with CashScript, Libauth, and existing smar
 | `OP_TXID` | `0xd0` | `-> txid` | **Lotus v2 Native** | Pushes the 32-byte Single-BLAKE3 Merklix TXID of current transaction. |
 | `OP_FOREACH_INPUT` | `0xd1` | `... OP_ENDFOR` | **Lotus v2 Native** | Starts an enumerable bounded loop over all inputs (depth $\le 2$). |
 | `OP_FOREACH_OUTPUT`| `0xd2` | `... OP_ENDFOR` | **Lotus v2 Native** | Starts an enumerable bounded loop over all outputs (depth $\le 2$). |
+| `OP_ISREFERENCEINPUT`| `0xd3`| `-> bool` | **Lotus v2 Native** | Pushes 1 if the current input is a read-only reference input, else 0. |
 
 ---
 
