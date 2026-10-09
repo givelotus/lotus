@@ -199,7 +199,7 @@ To prevent leaf duplication vulnerabilities where an unconfirmed transaction can
 
 ---
 
-#### 3.3. Zero-Copy Wire Format, Inline Witnesses & Single-Asset Multi-Branch Outputs
+### 3.3. Zero-Copy Wire Format, Inline Witnesses & Single-Asset Multi-Branch Outputs
 
 Variable-length integers (`CompactSize` / `varint`) are eliminated from transaction headers and fixed records. Crucially, the BIP-141 soft-fork hack of a decoupled, trailing `witness` vector is completely discarded. In Lotus v2, **witnesses map 1-to-1 directly inside `vin`**, and **minting proofs are structured per-asset at the transaction level**.
 
