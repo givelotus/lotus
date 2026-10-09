@@ -96,7 +96,7 @@ a much larger effort than rebasing our existing patches.
 | 08c | `08c-blocktime.patch` | NEEDS-EXTRACT | Set `nPowTargetSpacing = 2 * 60` (120s / 2 minutes) in `src/kernel/chainparams.cpp`. |
 | 09 | `09-merkle.patch` | NEEDS-REBASE | Single BLAKE3 domain-separated segmented Merkle tree; CVE-2012-2459 fix. |
 | 09b | `09b-block-header.patch` | NEEDS-EXTRACT | 116-byte fixed 64-bit aligned `LotusHeader` committing to `hashUtxoMerklixRoot` and `hashTxMerklixRoot`. |
-| 09c | `09c-compact-outputs.patch` | NEEDS-EXTRACT | 80-byte POD `LotusOutput` with 32B metadata, destination, type, and flags. Script-bypass fast lane (~30 ns). |
+| 09c | `09c-compact-outputs.patch` | NEEDS-EXTRACT | Multi-branch structured `LotusOutput` (44B standard, 92B token) with inline witnesses and optional `token_amount`. |
 | 10 | `10-nng-interface.patch` | NEEDS-REBASE | NNG pub/sub replacing ZeroMQ; adds `src/nng_interface/` |
 | 10b | `10b-remove-zeromq.patch` | NEEDS-WRITE | Delete `src/zmq/`, ZeroMQ CMake option, ZeroMQ tests. |
 | 11 | `11-intmath-log2.patch` | NEEDS-REBASE | Turner algorithm fixed-point log2 integer math. |
@@ -130,7 +130,7 @@ a much larger effort than rebasing our existing patches.
 | Extracted Slot | File | Purpose |
 |----------------|------|---------|
 | Slot 09b | `09b-block-header.patch` | 116-byte fixed aligned `LotusHeader` committing to `hashUtxoMerklixRoot` and `hashTxMerklixRoot`. |
-| Slot 09c | `09c-compact-outputs.patch` | 80-byte POD `LotusOutput` with 32B metadata, destination, type, flags. |
+| Slot 09c | `09c-compact-outputs.patch` | Multi-branch structured `LotusOutput` (44B standard, 92B token) with inline witnesses and optional `token_amount`. |
 | Slot 31 | `31-int128-stack.patch` | Native 128-bit stack replacing `CScriptNum` and ad-hoc 64-bit shims. |
 
 ### V2 Open Decisions — All Core Invariants Resolved
@@ -141,7 +141,7 @@ a much larger effort than rebasing our existing patches.
 | Avalanche in v2 | **DECIDED** — decouple from consensus; keep for soft voting | Hard PoW block/tx consensus; Avalanche kept for advisory fee/parameter voting. |
 | V2 epoch activation | **DECIDED** — drop patch 21 | All consensus rules active at block 0; zero hardfork epochs. |
 | Hashing engine | **DECIDED** — Single BLAKE3 | Double hashing (`BLAKE3d`) rejected; BLAKE3 domain flags prevent length extension. |
-| Output representation | **DECIDED** — 80-Byte POD | Flat array, 32B metadata, fast-path script bypass (~30 ns P2PKH validation). |
+| Output representation | **DECIDED** — Multi-Branch Structured | Explicit `branches[]` (44B standard XPI, 92B token), optional `token_amount` bitflag, inline 1-to-1 witnesses in `vin`/`vout`. |
 | Native tokens | **DECIDED** — Outpoint Invariant | $\text{TokenID} = \text{BLAKE3}(\text{vin}[0].\text{prevout})$; double-spend immunity; zero lineage proofs. |
 | Introspection opcodes | **DECIDED** — 128-bit VM | Native `int128_t` stack eliminates `BIGADD/SUB`, freeing `0xbf–0xcf` for clean introspection. |
 | Passkey / WebAuthn | **DECIDED** — `secp256r1` in `OP_CHECKDATASIG` | Native curve support for Apple Secure Enclave & Android Titan biometric signatures. |
@@ -181,7 +181,7 @@ There is a real distinction between hard consensus and soft coordination:
 
 ### Post-Genesis Roadmap (Zero-Hardfork Enhancements)
 
-Because all consensus invariants (Header format, 80B POD Outputs, BLAKE3, 128-bit VM, Introspection, P2MNOR, Tail Subsidy) are permanently locked at Block 0, future protocol optimizations remain **strictly internal node implementations and network transport upgrades** that require **ZERO hardforks**:
+Because all consensus invariants (Header format, Multi-Branch Outputs with Inline Witnesses, BLAKE3, 128-bit VM, Introspection, NOR-Tree, Tail Subsidy) are permanently locked at Block 0, future protocol optimizations remain **strictly internal node implementations and network transport upgrades** that require **ZERO hardforks**:
 
 1. **QUIC P2P Transport Layer (RFC 9000 / HTTP/3 over UDP)**:
    - Deep Packet Inspection (DPI) resistance: Transports P2P messages inside standard TLS 1.3 encrypted UDP datagrams, indistinguishable from HTTP/3 web browsing.

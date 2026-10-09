@@ -197,12 +197,12 @@ To prevent leaf duplication vulnerabilities where an unconfirmed transaction can
 
 ---
 
-### 3.3. Zero-Copy Wire Format & 80-Byte Typed Compact Outputs (POD)
+### 3.3. Zero-Copy Wire Format, Inline Witnesses & Multi-Branch Structured Outputs
 
-Variable-length integers (`CompactSize` / `varint`) are banished from transaction headers and outputs. Transactions and outputs are structured as fixed-size Plain Old Data (POD) structs:
+Variable-length integers (`CompactSize` / `varint`) are eliminated from transaction headers and fixed records. Crucially, the BIP-141 soft-fork hack of a decoupled, trailing `witness` vector is completely discarded. In Lotus v2, **witnesses map 1-to-1 directly inside `vin` and `vout`**.
 
 ```cpp
-// Transaction Fixed Wire Header (16 Bytes)
+// Transaction Wire Header (16 Bytes)
 struct LotusTxHeader {
     int32_t  nVersion;       // 4 bytes: Tx format version
     uint32_t nLockTime;      // 4 bytes: Locktime
@@ -210,148 +210,131 @@ struct LotusTxHeader {
     uint32_t nOutputCount;   // 4 bytes: Fixed 32-bit integer
 };
 
-// Input Fixed Wire Record (48 Bytes + Witness Payloads)
-struct LotusInputRecord {
-    uint256  prevout_txid;        // 32 bytes: Spent Outpoint TXID
-    uint32_t prevout_index;       // 4 bytes: Spent Outpoint Index
-    uint32_t nSequence;           // 4 bytes: Sequence number
-    uint32_t script_sig_size;     // 4 bytes: Unlocking script size
-    uint32_t witness_size;        // 4 bytes: Witness stack size
-    // Payload bytes follow, padded to 8-byte alignment
+// Branch Witness (Carried inside each input, one per active branch)
+struct BranchWitness {
+    std::vector<uint8_t> script;              // Script preimage / covenant bytecode
+    std::vector<std::vector<uint8_t>> stack;  // Unlocking parameters / signatures
 };
 
-// Output Fixed Wire Record (80 Bytes - Plain Old Data POD)
-struct alignas(8) LotusOutput {
-    uint64_t amount;              // 8 bytes: Native XPI atomic units (satoshis)
-    uint8_t  output_type;         // 1 byte: 0x01=P2PKH, 0x02=P2SH32, 0x03=P2MNOR, 0x04=P2TR
-    uint8_t  flags;               // 1 byte: Metadata dispatch flags (Token, NFT, Covenant)
-    uint16_t custom_size;         // 2 bytes: Bytecode size if custom type, else 0
-    uint32_t reserved_alignment;  // 4 bytes: Padding to maintain 64-bit alignment
-    uint256  destination;         // 32 bytes: PubKey Hash, Script Hash, or Merkle Root
-    uint256  metadata;            // 32 bytes: Token Amount (16B) & TokenID (16B) / Covenant State (Chronik Indexable)
-}; // Total: Exactly 80 bytes
+// Input Record (Inline Branch Witnesses)
+struct LotusInput {
+    COutPoint prevout;                         // 32B txid + 4B index
+    uint32_t  nSequence;                       // 4 bytes
+    uint16_t  n_branch_witnesses;              // 2 bytes: Number of branch witnesses
+    std::vector<BranchWitness> witnesses;      // Inline 1-to-1 branch witnesses
+};
+
+// Output Record (Inline Creation Witness & Optional Token Amount)
+struct LotusOutput {
+    uint64_t  amount;                          // 8 bytes: Native XPI satoshis (carrier gas)
+    uint16_t  flags;                           // 2 bytes: Bitflags (FLAG_HAS_TOKEN, etc.)
+    uint16_t  n_branches;                      // 2 bytes: Count of branch hashes (typically 1 or 2)
+    uint128_t token_amount;                    // 16 bytes: ONLY serialized if (flags & FLAG_HAS_TOKEN)
+    std::vector<uint256> branches;             // Array of 32B branch hashes [Owner, Covenant, ...]
+    
+    // Creation Witness: 0 bytes for standard transfers, populated ONLY when minting tokens
+    std::vector<uint8_t> creation_script;
+    std::vector<std::vector<uint8_t>> creation_args;
+};
 ```
+
+#### Wire Layout & Cache-Line Efficiency:
 
 ```
 ┌────────────────────────────────────────────────────────────────────────────────────────┐
-│ LOTUS v2 TYPED COMPACT OUTPUT (80 Bytes - Fixed 64-Bit Aligned POD)                    │
+│ PURE XPI STANDARD OUTPUT (44 Bytes - Fits in a SINGLE 64-Byte CPU Cache Line!)         │
 ├────────────────────────────────────────────────────────────────────────────────────────┤
-│ [00..07] uint64_t amount              (8B: Native XPI satoshis / carrier gas)          │
-│ [08..08] uint8_t  output_type         (1B: P2PKH=0x01, P2SH32=0x02, P2MNOR=0x03, P2TR=0x04) │
-│ [09..09] uint8_t  flags               (1B: 0x00=XPI, 0x01=Token, 0x02=NFT, 0x03=Cov)   │
-│ [10..11] uint16_t custom_size         (2B: 0 for standard outputs)                     │
-│ [12..15] uint32_t reserved_alignment  (4B: Explicit 64-bit padding)                    │
-│ [16..47] uint256  destination         (32B: Destination PubKey Hash or Merkle Root)    │
-│ [48..79] uint256  metadata            (32B: 16B TokenAmount || 16B TokenID / Cov State)│
+│ [00..07] uint64_t amount              (8B: Native XPI satoshis)                        │
+│ [08..09] uint16_t flags               (2B: FLAG_HAS_TOKEN = 0)                         │
+│ [10..11] uint16_t n_branches          (2B: 0x0001 = 1 branch)                          │
+│ [12..43] uint256  branch[0]           (32B: Owner PubKeyHash / Destination)            │
+└────────────────────────────────────────────────────────────────────────────────────────┘
+
+┌────────────────────────────────────────────────────────────────────────────────────────┐
+│ TOKEN / COVENANT OUTPUT (92 Bytes - Explicit Owner, Token Amount & Covenant)           │
+├────────────────────────────────────────────────────────────────────────────────────────┤
+│ [00..07] uint64_t  amount             (8B: Native XPI carrier fuel)                    │
+│ [08..09] uint16_t  flags              (2B: FLAG_HAS_TOKEN = 1)                         │
+│ [10..11] uint16_t  n_branches         (2B: 0x0002 = 2 branches)                        │
+│ [12..27] uint128_t token_amount       (16B: Native 128-bit token balance)              │
+│ [28..59] uint256   branch[0]          (32B: Owner PubKeyHash)                          │
+│ [60..91] uint256   branch[1]          (32B: Token Covenant / Policy Hash)              │
 └────────────────────────────────────────────────────────────────────────────────────────┘
 ```
 
-#### Why Typed Compact Outputs Are a Scalability Breakthrough:
-1. **Elimination of Heap Allocations**:
-   In Bitcoin Core, every output contains a dynamic `std::vector<uint8_t> scriptPubKey`. In memory and on disk, 100,000,000 outputs trigger 100,000,000 separate dynamic heap allocations, fragmenting RAM and thrashing CPU cache. In Lotus v2, $>99.9\%$ of outputs are fixed 80-byte structs stored as a contiguous memory-mapped array with **zero pointer indirection**.
-2. **The Script-Bypass Fast Lane (~30 ns Validation)**:
-   When `output_type == 0x01` (`P2PKH`), the validation engine **bypasses the Forth script interpreter entirely**. It verifies `destination == BLAKE3(pubkey)` and passes the 64-byte signature to the AVX-512 batch Schnorr verification queue. Processing latency drops from microseconds to **$\approx 30 \text{ nanoseconds}$ per spend**.
-3. **The Metadata Dispatch Engine**:
-   The `flags` byte dictates how consensus validates `metadata`:
-   * **`0x00` (`FLAG_NONE`)**: Pure native XPI payment. Metadata is unused / zero.
-   * **`0x01` (`FLAG_FUNGIBLE_TOKEN`)**: Consensus validates native token math ($\sum \text{in} \ge \sum \text{out}$) for `amount[16B] || token_id[16B]`. Zero indexers needed.
-   * **`0x02` (`FLAG_NFT`)**: Consensus enforces 1-to-1 conservation of an indivisible asset.
-   * **`0x03` (`FLAG_COVENANT_STATE`)**: **100% General-Purpose State (Mitra Carryover)**. Consensus performs **no token arithmetic**. The 32 bytes are arbitrary data owned by the smart contract (Frank state channels, AMM reserves, rollup roots). The spending script inspects and transitions this state via `OP_UTXOMETADATA` and `OP_OUTPUTMETADATA`.
-4. **Carrier Gas & Covenant Refueling**:
-   * Every output carries `uint64_t amount` (native XPI satoshis) alongside `metadata`. A token or covenant UTXO always carries its own native fuel.
-   * Transaction fees ("gas") are paid via normal multi-input transaction balance:
-     $$\text{Fee} = \sum \text{Inputs.amount} - \sum \text{Outputs.amount} \ge \mathbf{TotalCost} \times \text{ComputeFeeRate}$$
-   * Autonomous covenants that maintain state across hundreds of transactions can be refueled by any external transaction depositing XPI into their output balance.
+#### Why Optional `token_amount` via Bitflag Beats Varints:
+1. **Zero Bytes for Pure XPI**:
+   For $>95\%$ of transactions (pure native XPI), `FLAG_HAS_TOKEN` is unset. `token_amount` is **omitted entirely from the wire (0 bytes)**. Standard outputs shrink to **44 bytes**, fitting inside a single 64-byte L1 CPU cache line.
+2. **Zero-Cycle CPU Cost**:
+   Instead of variable-length parsing branches, serialization uses a single bit-test:
+   ```cpp
+   if (__builtin_expect(flags & FLAG_HAS_TOKEN, 0)) {
+       stream >> token_amount;
+   } else {
+       token_amount = 0;
+   }
+   ```
+   The CPU branch predictor predicts pure XPI with $>99.9\%$ accuracy, executing in 0 clock cycles without CPU stalls. When tokens are present, 128-bit amounts load via a single 1-cycle SIMD instruction (`vmovdqu` / `ldr q0`).
+3. **Malleability Immunity by Construction**:
+   The **TXID** is defined as $\mathbf{BLAKE3}(\text{nVersion} \parallel \text{nLockTime} \parallel \text{inputs without witnesses} \parallel \text{outputs without creation\_witness})$. Third parties can never malleate the TXID.
 
 ---
 
-### 3.4. Native Layer-1 Assets & The Genesis Outpoint Invariant
+### 3.4. Native Layer-1 Assets, Token Identity & Key Rotation
 
-To mint a new token, an issuer spends any standard UTXO in their wallet as Input #0. The protocol consensus rule locks the unique token identifier:
+#### 3.4.1. The Immutable Identity Invariant
+To prevent configuration changes from altering the token identity, `TokenID` is **never** the hash of mutable admin keys or reserve addresses. `TokenID` is permanently anchored to the Genesis Outpoint:
 $$\mathbf{TokenID} = \mathbf{BLAKE3}(\text{tx.vin}[0].\text{prevout})$$
 
-```
-[ Issuer Wallet ] 
-Outpoint A: (txid: 0x4a3f..., vout: 0) ──► Spent as tx.vin[0]
-                                                │
-                                                ▼
-                                    Consensus Rule Enforces:
-                                    TokenID == BLAKE3(Outpoint A)
-                                                │
-                                                ▼
-                                    Outputs Created:
-                                    • 1,000,000 Tokens (metadata = amount || TokenID)
-```
+Because every outpoint `(txid:vout)` can only be spent once in the history of the ledger, `TokenID` is mathematically unique and immutable forever.
 
-* **Mathematical Uniqueness**:
-  Because every outpoint `(txid || vout)` in the blockchain is globally unique and can only be spent once in the history of the ledger, it is mathematically impossible for an attacker to ever create a colliding `TokenID`.
-* **Zero Lineage Overhead**:
-  Unlike early UTXO covenant tokens or SLP, a transaction **never needs to carry parent transaction preimages or ancestry proofs**. The consensus engine verifies minting in a single 12-nanosecond hash in C++.
-* **Subsequent Minting (Minting Batons)**:
-  For elastic-supply tokens (stablecoins or Frank relay stamps), the genesis transaction outputs a **Minting Baton** (`flags & FLAG_MINT_BATON`). Future minting is permitted if and only if the transaction consumes the unspent Minting Baton UTXO for that `TokenID`. When the issuer wishes to cap supply permanently, the baton is spent to `OP_RETURN` or burned.
+#### 3.4.2. Key Rotation Without TokenID Mutation
+In production, reserve addresses change, keys are compromised, and corporate officers rotate. Lotus v2 decouples immutable `TokenID` from mutable configuration:
+1. **The Admin Baton (On-Chain Governance Coin)**:
+   The token creator maintains an Admin Baton UTXO governed by an $m$-of-$n$ corporate multisig (e.g. 3-of-5).
+   - **Key Rotation**: When an employee leaves, the remaining officers spend the Admin Baton to a new Baton UTXO containing the updated key set and new reserve address. `TokenID` never changes.
+   - **Contention-Free Ingestion**: Depositors include the Admin Baton as a **Read-Only Reference Input** (like Cardano CIP-31). Because depositors only *read* the baton rather than spending it, **10,000 users can read the Admin Baton simultaneously in the same block with zero double-spend collisions**.
+2. **Epoch Delegation Certificates (`OP_CHECKDATASIG`)**:
+   Alternatively, the $m$-of-$n$ admin keys sign an off-chain delegation certificate committing to the authorized reserve address for epoch $[H..H+\Delta]$. The depositor attaches this certificate to their witness, and the token script validates it via `OP_CHECKDATASIG`. Zero on-chain state contention.
+
+#### 3.4.3. The Parallel Deposit Invariant (Zero State-UTXO Collisions)
+To deposit into a token or staking contract (e.g. USDC $\rightarrow$ sUSDC), users **never spend a shared contract coin**. The deposit is an atomic local transaction invariant:
+- **Inputs**: Alice's 500 USDC.
+- **Outputs**:
+  - `Vout[0]`: 500 USDC sent to `sUSDC_Reserve_Address`.
+  - `Vout[1]`: 480 sUSDC minted to `Alice_Address` (with `creation_witness` proving the deposit).
+- **Zero Lock Contention**: Alice only spends her own coins. 10,000 users can deposit in parallel across the exact same block with zero lock contention. Reserves are held in chunked UTXOs, enabling parallel withdrawals.
 
 ---
 
-### 3.5. Transaction Architecture: Modernized BUIP037 & Merklized NOR (`P2MNOR`)
+### 3.5. Multi-Branch Architecture & Elimination of Opaque Roots
 
-#### 3.5.1. Why Mitra Is Abandoned
-Tobias Ruck’s Mitra proposal (`daemon/docs/mitra-spec.md`) attempted to address transaction malleability, isolated validation, and smart contract tokens. However, its draft specification suffered from ongoing churn, shifting opcode allocations, and severe architectural bloat:
-1. **Free-Floating Preambles (`CTxPreamble[]`)**: Free-floating transaction-level scripts broke the UTXO spending model and created messy execution phases.
-2. **Duplicating Full `CTxOut` in `CTxIn`**: Copying the entire spent output on the wire bloated transaction data unnecessarily.
-3. **Wire-Serialized `loopCounts[]`**: Requiring transaction authors to encode loop counter arrays on the wire added serialization overhead and complex validation edge cases.
+#### 3.5.1. Why Opaque Merkle Roots Were Abandoned
+Early covenant proposals (including Taproot MAST and single-root `P2MNOR`) hashed all spend conditions and recipient public keys into a single 32-byte opaque Merkle root. This created severe operational failures:
+1. **The Blind Indexer Problem**: Chronik could not identify what token or contract an output belonged to until the coin was spent.
+2. **The Blind Light-Wallet Problem**: Because the recipient's public key was hashed together with the covenant, Bob's address was blinded. Bob's wallet could not find his own coins without out-of-band communication or exhaustive witness graph tracing.
 
-In contrast, Amaury Séchet’s **BUIP037 ("Hardfork SegWit")** and **BUIP045** (unified address format) laid down the true sound architectural principles in 2016:
-- Segregated witness (txid hashes inputs and outputs, excluding signatures, providing 100% malleability immunity).
-- Strictly typed outputs with compact hashes instead of arbitrary script bytecode in the UTXO set.
-- Shifting execution bytecode and proofs from the hot UTXO set to cold witness data.
+#### 3.5.2. Multi-Branch Direct Hashes
+Lotus v2 replaces single opaque roots with an **explicit array of branch hashes** in the output struct:
+$$\text{branches} = [ \mathbf{hash}_0, \mathbf{hash}_1, \dots \mathbf{hash}_{n-1} ]$$
 
-Lotus v2 modernizes BUIP037: replacing variable-length `varuint` with fixed 64-bit aligned POD structs, adopting single BLAKE3, and pairing it with **Merklized NOR (`P2MNOR`)** to deliver universal covenants without Schnorr key-tweaking overhead.
+- **`hash_0` (Owner)**: `BLAKE3(Bob_PubKey)`. Bob's wallet and Chronik index the recipient in $O(1)$ directly from the unspent output.
+- **`hash_1` (Covenant / Token Policy)**: `BLAKE3(TokenCovenantScript)`. Chronik indexes the asset type and rules in $O(1)$ directly from the unspent output.
+- **`hash_2` (Optional Guardrail / Emergency Recovery)**: E.g., timelock or recovery key.
 
-#### 3.5.2. The 4 Concrete Output Types
-Every UTXO in Lotus v2 is an 80-byte POD struct (`LotusOutput`) belonging to one of four canonical types:
+#### 3.5.3. Multi-Branch Execution & The NOR-Tree
+When spending an output with $n$ branches, the input provides an array of branch witnesses: `vin[i].witnesses[k]`.
+Consensus verifies:
+1. $\mathbf{BLAKE3}(\text{witnesses}[k].\text{script}) == \text{branches}[k]$ for all active branches.
+2. Executes each branch script in an **isolated evaluation stack frame** (executed in parallel across CPU cores).
+3. Evaluates branch results across a deterministic **NOR-Tree**:
+   $$\text{Root} = (n_0 \bar{\lor} n_1) \;\bar{\lor}\; (n_2 \bar{\lor} n_3)$$
+   Using static scripts (`OP_TRUE` / `OP_FALSE`) in branch slots, arbitrary boolean logic like $(\text{Owner} \land \text{Covenant}) \lor \text{Recovery}$ is expressed directly on the wire with zero hidden Merkle trees.
 
-| Type | Name | Destination (32B) | Verification Engine | Primary Use Case |
-|---|---|---|---|---|
-| `0x01` | **`P2PKH`** | `BLAKE3(pubkey)` | **VM Bypass**: AVX-512 batch Schnorr (~30 ns) | Simple payments, peer-to-peer transfers |
-| `0x02` | **`P2SH32`** | `BLAKE3(redeem_script)` | Forth VM linear script execution | Standard multisig, single linear contracts |
-| `0x03` | **`P2MNOR`** | `BLAKE3(Merkle Root)` | **Merklized Negative Guardrail Tree** | Universal covenants, Frank state channels, AMMs |
-| `0x04` | **`P2TR`** | BIP341 Taproot Key/Root | Schnorr Key-Path or MAST Script-Path | Bitcoin cross-chain atomic swaps |
-
-#### 3.5.3. Solving the Indexer Problem with Wire Metadata
-A fatal flaw of pure script-hash outputs (e.g. standard Taproot or P2SH) is that the coin's state is completely opaque until spent. If Alice sends Bob 500 USDL tokens, an indexer (such as Chronik) sees a transaction where token UTXOs were consumed as inputs, but cannot tell which output received the tokens or what the split amounts are without running complex external proofs.
-
-In Lotus v2, the 80-byte `LotusOutput` embeds a plaintext 32-byte `metadata` field on the wire:
-- For Fungible Tokens (`flags == 0x01`): `metadata` contains `uint128_t token_amount || uint128_t token_id`.
-- Chronik indexes token balances and transfers in **$O(1)$ time** immediately upon mempool ingress or block arrival.
-- Consensus validates token conservation ($\sum \text{in} \ge \sum \text{out}$) directly in C++ at transaction validation time.
-- For Covenants (`flags == 0x03`): `metadata` holds arbitrary state (e.g., channel balances, AMM reserves) inspected by script via `OP_UTXOMETADATA` and `OP_OUTPUTMETADATA`.
-
-#### 3.5.4. P2MNOR: Merklized Negative Guardrails & Execution Flow
-Unlike Taproot (where a spend path satisfies $L_1 \lor L_2 \lor L_3$), `P2MNOR` models covenants as **universal negative guardrails**: to spend the coin, none of the prohibited conditions must occur ($\neg L_1 \land \neg L_2 \dots$).
-
-1. **Zero Schnorr Curve Math Overhead**:
-   In Taproot, spending via script requires committing to an internal public key $P$ and computing an elliptic curve tweak $Q = P + H(P \parallel m)G$. This requires an expensive point multiplication (~50 µs). In `P2MNOR`, the destination is directly the 32-byte BLAKE3 Merkle root. Verifying it is a **12-nanosecond hash check** with zero elliptic curve operations.
-2. **Witness Format**:
-   An input spending a `P2MNOR` output provides a list of leaves and proofs:
-   ```
-   [leaf_0_arg_0 ... leaf_0_arg_{k-1}] [k (num_args)] [leaf_0_code] [merkle_proof_0]
-   [leaf_1_arg_0 ... leaf_1_arg_{m-1}] [m (num_args)] [leaf_1_code] [merkle_proof_1]
-   [num_leaves]
-   ```
-3. **Isolated Stack Execution & Cleanstack by Construction**:
-   To prevent brittle inter-leaf stack passing, consensus executes each leaf in total isolation:
-   - For each active leaf $i$:
-     a. Asserts `merkle_proof_i` proves `leaf_i_code` is in `destination` root via BLAKE3.
-     b. **Wipes the evaluation stack completely**.
-     c. Pushes the declared $k$ witness arguments onto the stack.
-     d. Executes `leaf_i_code`.
-     e. Asserts the top stack item is truthy (non-zero).
-     f. **Wipes the evaluation stack before the next leaf executes**.
-   - Because the consensus engine wipes the stack between frames, leaf scripts cannot corrupt each other's execution, and enforcing cleanstack inside a leaf is unnecessary.
-4. **Covenants Across Recipient Transfers**:
-   When tokens are sent to a new recipient with a different destination script, the covenant does **not** assert `Output.Root == Input.Root`. Instead, the covenant leaf uses `OP_MERKLEVERIFY` with sibling hashes provided in the witness to assert:
-   $$\mathbf{TokenPolicyLeaf} \in \mathbf{Output.Root}$$
-   This allows recipient destinations to be arbitrary multisigs or contracts while mathematically locking token conservation.
+#### 3.5.4. Composable Asset Invariants
+Covenants must never hardcode output indices (e.g. "Output 0 must be my change"). Instead, composable covenants enforce **Asset Invariants**:
+- The `USDC_Covenant` only asserts that the subset of inputs carrying USDC balances equals the subset of outputs carrying USDC balances ($\sum \text{in}[USDC] == \sum \text{out}[USDC]$), and all USDC outputs preserve `USDC_Covenant`.
+- It ignores unrelated inputs and outputs (such as XPI or sUSDC), allowing multiple covenants, AMMs, and staking vaults to compose seamlessly in the exact same transaction.
 
 ---
 
