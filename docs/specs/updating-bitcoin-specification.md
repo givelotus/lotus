@@ -421,26 +421,50 @@ Because boolean conjunction is idempotent ($X \land X = X$), no constant `TRUE` 
 
 ---
 
-#### 3.5.4. Obsolescence of Legacy P2PKH: Universal P2SH & Pure Single-Key Scripts
-In legacy Bitcoin (2008), outputs stored raw `scriptPubKey` bytecode. Satoshi invented P2PKH (`OP_DUP OP_HASH160 <20B Hash> OP_EQUALVERIFY OP_CHECKSIG`) because exposing raw 65-byte uncompressed public keys in the unspent UTXO database wasted disk space and theoretically exposed keys to future quantum preimage discovery before spending.
+#### 3.5.4. Wire-Level P2PKH Obsolescence: Universal Script Hashing & Address Resolution
+In legacy Bitcoin (2008), the consensus protocol maintained distinct serialized wire formats for different output types:
+* **P2PK**: Serialized the full 35-byte raw public key script (`<PubKey> OP_CHECKSIG`) directly in `scriptPubKey`.
+* **P2PKH**: Serialized the 25-byte script (`OP_DUP OP_HASH160 <20B Hash> OP_EQUALVERIFY OP_CHECKSIG`) in `scriptPubKey`.
+* **P2SH**: Serialized the 23-byte script (`OP_HASH160 <20B Hash> OP_EQUAL`) in `scriptPubKey`.
 
-In Lotus v2, **every output on the wire stores exclusively 32-byte BLAKE3 hashes** (`branch[k] = BLAKE3(script_k)`). There is no raw `scriptPubKey` serialized on the wire. Consequently, **every output in Lotus v2 is inherently Pay-to-Script-Hash (P2SH)**.
+This forced full nodes to inspect and branch on arbitrary, variable-length script bytecodes during UTXO database serialization and mempool validation.
 
-Wrapping a single-key payment in `OP_DUP OP_HASH160 <pubkeyhash> OP_EQUALVERIFY OP_CHECKSIG` inside the script is completely obsolete and wasteful:
-1. **Zero Double-Hashing**: The public key is already cryptographically concealed behind 256 bits of BLAKE3 preimage resistance before the coin is spent!
-2. **Canonical Single-Key Script**: Standard single-key ownership in Lotus v2 is simply:
-   $$\mathbf{script} = \langle\text{33-byte PubKey}\rangle \;\; \mathbf{OP\_CHECKSIG} \quad (34\text{ bytes})$$
-   The coin's outpoint branch is:
-   $$\mathbf{branch}[0] = \mathbf{BLAKE3}(\text{PubKey} \parallel \text{OP\_CHECKSIG})$$
-3. **Wallet Indexing & Address Generation**:
-   * Address is the base-encoded representation of `BLAKE3(PubKey || OP_CHECKSIG)`.
-   * Wallets derive this hash in $< 20\text{ ns}$ directly from their public key and index all incoming payments in Chronik in $O(1)$.
-4. **Witness Bandwidth Savings**:
-   * Spending a single-key coin requires only `bw.args = [ <64B Schnorr Sig> ]` and `bw.script = <PubKey> OP_CHECKSIG` (34 bytes).
-   * Eliminates 25+ bytes of witness overhead and 4 legacy script opcodes on every transfer.
-5. **Hardware-Accelerated AVX-512 Fast-Path**:
-   * When `bw.script` matches the 34-byte pattern ending in `OP_CHECKSIG`, the node validator **bypasses the Forth VM interpreter entirely**.
-   * The validator extracts the 33-byte public key and 64-byte Schnorr signature directly, batching them into the AVX-512 SIMD batch Schnorr verification engine ($\approx 30\text{ ns}$ per signature).
+##### Wire-Level Unification (All Outputs Are Branch Hashes)
+In Lotus v2, **the distinct wire-level "P2PKH output" is obsolete**. The consensus wire format recognizes only one unified output representation: an explicit array of 32-byte BLAKE3 branch hashes:
+$$\mathbf{branch}[k] = \mathbf{BLAKE3}(\mathbf{script}_k)$$
+
+Every output in Lotus v2 is structurally a Pay-to-Script-Hash (P2SH). Consensus does not know or care whether an output is a single-key payment, an address hash, a multisig vault, or an AMM covenant—they all exist as uniform 32-byte hashes evaluated through the NAND tree.
+
+##### Sending to a Hashed PubKey Address (`pubkeyhash`)
+When a user shares an address, they provide a compact hashed public key (`pubkeyhash`):
+$$\mathbf{PubKeyHash} = \mathbf{BLAKE3}(\text{PubKey}) \quad \text{or} \quad \mathbf{RIPEMD160}(\mathbf{SHA256}(\text{PubKey}))$$
+
+The sender only knows `PubKeyHash`—the sender **does not know the recipient's raw public key**. 
+
+Hashing the public key inside the script is therefore essential for address-based payments:
+1. **Deterministic Script Construction by Sender**:
+   The sender's wallet constructs the canonical address-resolution script from `PubKeyHash`:
+   $$\mathbf{script} = \mathbf{OP\_DUP} \;\; \mathbf{OP\_BLAKE3} \;\; \langle\mathbf{PubKeyHash}\rangle \;\; \mathbf{OP\_EQUALVERIFY} \;\; \mathbf{OP\_CHECKSIG}$$
+2. **Commitment on the Wire**:
+   The sender computes the 32-byte branch hash:
+   $$\mathbf{branch}[0] = \mathbf{BLAKE3}(\mathbf{script})$$
+   and serializes it into the 43-byte output record. The sender never needs the recipient's public key.
+3. **Sub-Microsecond Wallet Indexing**:
+   The recipient's wallet knows its own `PubKeyHash`. The wallet precomputes:
+   $$\mathbf{expected\_branch} = \mathbf{BLAKE3}\Big(\mathbf{OP\_DUP} \parallel \mathbf{OP\_BLAKE3} \parallel \mathbf{PubKeyHash} \parallel \mathbf{OP\_EQUALVERIFY} \parallel \mathbf{OP\_CHECKSIG}\Big)$$
+   The wallet registers `expected_branch` with Chronik. When a transaction is received, Chronik indexes the output by `branch[0]` in $O(1)$ time—enabling instantaneous payment discovery without scanning raw scripts.
+4. **Execution at Spend Time**:
+   When spending the coin, the recipient's `BranchWitness` supplies:
+   * `bw.branch_index = 0`
+   * `bw.script = OP_DUP OP_BLAKE3 <PubKeyHash> OP_EQUALVERIFY OP_CHECKSIG`
+   * `bw.args = [ <64B Schnorr Sig>, <33B PubKey> ]`
+   The node verifies `BLAKE3(bw.script) == coin.branches[0]`, then executes the script: `PubKey` is duplicated, hashed with BLAKE3, verified equal to `PubKeyHash`, and the Schnorr signature is verified against `PubKey`. The script leaves `TRUE` ($1$) on the stack, satisfying the NAND tree.
+
+##### Direct Public-Key Scripts (`<PubKey> OP_CHECKSIG`)
+When the recipient's public key is known in advance (or when an interactive channel / payment invoice conveys the public key or the 32-byte branch hash directly), the sender can skip the inner pubkey hash check:
+$$\mathbf{script} = \langle\text{33-byte PubKey}\rangle \;\; \mathbf{OP\_CHECKSIG} \quad (34\text{ bytes})$$
+$$\mathbf{branch}[0] = \mathbf{BLAKE3}(\text{PubKey} \parallel \text{OP\_CHECKSIG})$$
+At spend time, the witness provides only `bw.args = [ <64B Schnorr Sig> ]` (saving 33 bytes on the wire), and node validators route directly to the AVX-512 batch Schnorr fast-path ($\approx 30\text{ ns}$). Both paradigms coexist seamlessly under the universal multi-branch NAND tree.
 
 ---
 
