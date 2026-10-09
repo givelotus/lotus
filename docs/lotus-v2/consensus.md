@@ -1,0 +1,107 @@
+# Lotus v2 consensus specification
+
+Status: **review draft; not launchable**. Requirement IDs below identify proposed rules for conformance work. MUST denotes an obligation within this draft, not a claim that the existing daemon implements it. [Open decisions](decisions.md) and missing parameter values block genesis. Historical v1 consensus is outside this document.
+
+## 1. Validity boundary
+
+**C01 — Scalar semantics.** Define block validity by deterministic parsing, contextual checks, script evaluation, accounting and state transition. Caches, batch signatures, threads, databases, indexing, mempool policy and transport MUST preserve this result. Consensus limits cannot depend on machine speed, cache warmth or local configuration.
+
+**C02 — Unknown data.** Unknown transaction/header versions, flags, opcode encodings and signature algorithms MUST reject. No success-on-unknown rule or miner vote implicitly enables future consensus behavior. Network feature negotiation does not change block validity.
+
+**C03 — State.** The validation state contains unspent coins with complete output bytes, creation height and coinbase status, plus any monetary or faucet state required by future blocks. The state commitment design MUST cover that state or define separately authenticated derivation. Header PoW is necessary but not sufficient for block validity.
+
+## 2. Encoding contract (D01)
+
+**C04 — Primitive proposal.** Fixed-width transaction integers use little-endian encoding. Hashes are 32 bytes in digest order; display reversal is not serialization. An unsigned amount is `u64` in `[0, 2^64-1]`, subject to the final narrower asset/supply limits. Aggregate arithmetic uses checked unsigned 128-bit or equivalently bounded mathematical integers. Never reinterpret token units as signed native amounts.
+
+`CS(n)` denotes shortest CompactSize: one byte for 0..252; `fd` plus u16 for 253..65535; `fe` plus u32 through 2^32−1; otherwise `ff` plus u64. Larger-than-needed encodings reject. `Bytes(x)=CS(len(x)) || x`; `Vec(xs)=CS(count(xs)) || encode(each item in order)`. Count and cumulative-byte limits MUST be checked before allocation, indexing, or multiplication. Truncation and trailing bytes reject. Actual limit values remain OPEN.
+
+**C05 — Output proposal.** Serialize `flags:u8 || value:u64 || token_id? || state? || branches || paths`:
+
+- Bits 0 and 1 mean HAS_TOKEN and HAS_STATE; other bits reject.
+- Token ID is exactly 32 bytes iff HAS_TOKEN. It MUST be nonzero; native XPI has no token-ID field. Zero is reserved exclusively for native identity in introspection/accounting.
+- State is `Bytes(state)` iff HAS_STATE. Present-empty and absent are distinct committed encodings, distinguishable by flags.
+- Branches are `Vec(hash32)`; paths are `Vec(Vec(CS(branch_index)))`. C09 gives their invariants.
+- There is no token-operation field. An object/API supplying a nonzero token operation without a token-bearing output is invalid input to the encoder, not a native transfer. Unexpected wire data rejects under the complete grammar.
+
+A one-branch, one-path native output with no state occupies 45 bytes under this proposal; the corresponding token output is 77 bytes. More branches, paths, larger lengths or state add bytes. Neither size guarantees cache-line alignment.
+
+**C06 — Transaction candidate.** [P01](decisions/encoding-and-signatures.md) owns the exact ordinary/coinbase grammar: version u32, explicit kind and lock_kind bytes, lock_value u64, fixed u32 input/output counts, kind-specific payload, inputs/outputs, and a final mint section. Its fixed prefix is 22 bytes. References have no spend path/witness and use disabled sequence; ordinary transactions require a consuming input but may have zero outputs. Coinbase has explicit height/parent/extra-nonce identity and no inputs or mints. Unknown kind/version/flags reject. Mint entries are unique, sorted and exactly cover positive deltas.
+
+**C07 — Identities.** P01 defines the core projection exactly. `TxID=H_txid(ChainID || Core(tx))`; `WitnessID=H_witnessid(ChainID || Tx(tx))`. The block commits to WitnessIDs in order using P02's count-bound ordered tree. Reject duplicate TxIDs within a block and any attempted overwrite of an existing outpoint. Signature mode FULL commits to the core, resolved output policies and selected leaf plan under C18. Witness arguments/proofs remain outside TxID and the signature message but inside WitnessID; no general claim of witness-byte immutability follows.
+
+## 3. Application hash domains and branch commitments
+
+**C08 — Hashes and trees.** [P02](decisions/commitments-and-state.md) owns the application domain registry and exact branch, ordered-transaction, sparse-UTXO and full-state-envelope algorithms. `H_name(x)=BLAKE3(ASCII(tag) || 00 || x)` with 32-byte output. Leaf/node type bytes are application-level inputs, independent of BLAKE3's internal flags. Header hash-group definitions and their additional domains are in [P04](decisions/header-and-mining.md). Do not reuse a branch-membership proof as an ordered-vector or keyed-map proof.
+
+**C09 — Output authorization structure.** Both branch and path counts MUST be positive and within their final limits. Every path MUST contain at least one in-range index. Indices in a path are strictly increasing. Paths are strictly lexicographically increasing integer vectors, with a proper prefix ordered first. Duplicate paths reject. Branch order is committed as supplied, not sorted by a validator; duplicate branch roots are permitted as distinct positions, do not imply independent identities, and receive separate authorization charges. Output well-formedness is checked on creation and on imported state, not deferred to its first spend.
+
+**C10 — Positional witnesses.** A consuming input MUST have `0 <= path_index < path_count` before dereferencing it. Its witness count MUST equal the selected path length. Witness `j` proves and executes branch `paths[path_index][j]`. No spare, missing, wildcard or automatically successful witnesses exist. Every required branch must succeed.
+
+**C11 — Branch inclusion.** Start with `r=Leaf(script)`; for each supplied sibling in bottom-up order set `r=Node(r,sibling)`; require `r == expected_branch_root`. Zero siblings is the one-leaf case using exactly the same leaf hash. Bound proof length and charge all supplied hashes. This is unordered membership: there is no leaf index, direction mask or claim about method position. A branch commits to an owner's binary tree, not a numbered method table. It does not prove leaf count or uniqueness of hidden leaves. Wallets may use a deterministic construction convention, but validators cannot enforce hidden-tree properties from one inclusion proof.
+
+Adding a method generally changes the branch root and address. Domain separation does not preserve addresses across contract refactors. Distinct tags remove structural ambiguity in hash inputs under the hash security assumptions; they do not make hash collisions mathematically impossible.
+
+Transaction order and state-key direction MUST NOT use this sorted-child operation. An ordered transaction vector and an authenticated key/value map have different proof obligations from branch membership.
+
+## 4. UTXO resolution and conservation
+
+**C12 — Resolution.** Evaluate transactions sequentially in their committed block order against an evolving UTXO view. Every input must resolve to a coin unspent immediately before that transaction. Reject repeated outpoints within a transaction, including repeated references or reference/spend aliases. A later transaction may reference a coin created earlier in the block, provided maturity/context rules permit; it cannot reference a coin already consumed. A later spend of a previously referenced coin is allowed. Each transaction evaluates against an immutable resolved context; no mid-script state changes.
+
+**C13 — References.** Reference coins remain unspent and contribute zero to value, fees, mint authority based on unique consumption, and consumed-state updates. They require no spending authorization: unspent on-chain data is public. A mint or covenant relying on unique use MUST check that its anchor is a consuming input, not merely present. P01 recommends the same maturity height check for coinbase references and spends; the maturity constant remains a parameter to freeze. Mempool dependency tracking must model reference invalidation, independently of block validity.
+
+**C14 — Accounting.** Let `I_a` be the sum of consuming-input values for asset `a`, and `O_a` the sum of output values. Exclude references. Compute with checked arithmetic. For native XPI, ordinary transactions require `I_native >= O_native`; `F=I_native-O_native`. Tokens never pay native fees. For each token, if `O_a <= I_a`, the difference is a burn; if `O_a > I_a`, C15 must authorize precisely the positive delta. Spending still requires every branch under C10, regardless of whether accounting balances.
+
+**C15 — Minting proposal, pending D05.** Token ID is `H_token(Bytes(mint_script))`; zero is forbidden. Execute exactly one matching mint entry for each positive delta in a dedicated mint context binding that asset and delta. No native mint entry exists. Program-derived identity allows the same policy to authorize later mints; it is not intrinsically unique issuance. One-time policies require a uniquely consumed anchor. Supply caps, revocation and circulating-supply claims need explicit authenticated state or conserved authority, not an assumption that an off-chain certificate disappears when replaced.
+
+**C16 — Native issuance.** Coinbase is the only native issuance exception. Let subsidy entitlement be `R`, total native fees `F`, mandatory fee burn `B`, actual coinbase output sum `C`, and underclaim `U=R+F-B-C >=0`, adjusted for any mandatory allocation rule. With no double-counted application burn, net native supply change is `C-F=R-B-U`. Exact faucet allocation, cap burn, rounding, entitlement, and application-burn representation remain OPEN under D10–D11. A 50/50 split needs a rule for the odd unit; truncating both halves silently burns one.
+
+**C17 — Atomicity.** Validate all required branches, mints, conservation and contextual rules before committing a transaction. Validate block roots and total budgets before committing a block. Failure leaves no consensus state changes. Disconnect MUST restore coins and all monetary/faucet metadata exactly. State import MUST reproduce the same rules and root; a matching root is not evidence that unverified history was executed.
+
+## 5. VM, signatures and optimization
+
+**C18 — Invocation.** Every execution has an immutable context: core transaction, complete witnesses if introspection exposes them, resolved coin records in input order, chain domain, block-context fields available to opcodes, invocation kind (spend/mint), input/path/branch indices or mint ID/delta, active leaf bytes/hash, and arguments. Undefined context reads reject. Mint execution cannot borrow an arbitrary spending input's OP_INPUTINDEX or CHECKSIG context.
+
+[P01](decisions/encoding-and-signatures.md) defines the exact FULL message: ChainID, mode, TxID, CoinsHash, PlanHash and a typed spend/mint selector. Resolved output policies and all selected leaves are committed; confirmation metadata, current block hash/time and signature bytes are excluded. Contextual locks/maturity still validate separately. BIP340 verification uses that message without replacing its internal hash algorithm.
+
+**C19 — Scalar execution.** Arguments initialize a fresh stack in wire order, last argument at top. The alternate stack starts empty. Branch invocations share no mutable VM state. The proposal uses byte strings with explicit exact-width signed int128 numerical operands and canonical booleans, as detailed in the ABI. Scripts finish with exactly one true value and empty alternate stack. Arithmetic overflow, invalid operand encoding, invalid index, stack underflow and unsupported opcode reject. [P03](decisions/vm-semantics.md) supplies a closed candidate opcode allocation, control/arithmetic semantics and explicitly selected crypto profiles. Independent vectors, review and costs remain required before D07 closes.
+
+**C20 — Cache equivalence.** Reference validation executes each invocation. An implementation may reuse a result only when all observable context and invocation inputs are equivalent and all proof/well-formedness checks still occur. At minimum include actual leaf identity, canonical argument vector, invocation context, resolved coins, rule set and all observable transaction/block data. Hashing concatenated arguments without lengths is not a unique vector encoding. Root alone does not identify an executed MAST leaf; TxID omits witnesses. Include unambiguous invocation-kind tags rather than overloading input index zero as a “pure” sentinel.
+
+The absence of OP_INPUTINDEX is not a purity proof: CHECKSIG, relative locks, implicit spent-coin fields, active script, mint context and future introspection may depend on the invocation. Conservatively disable cross-input result caching until a closed opcode dependency analysis proves equivalence. Cache identity and invalidation are daemon details, not a new consensus hash formula. Static charges never shrink on hits.
+
+**C21 — Covenant aggregation.** A companion must not treat another coin's branch commitment as proof that its invariant ran. A permitted optimization must establish a consuming designated master, its selected path and executed leaf, noncircular obligation to perform the invariant, and coverage of every companion and relevant output. With the currently proposed introspection surface, that proof is not specified; the Master/Companion shortcut is excluded from reference examples. Repeated independent checks remain valid. An output's covenant is preserved only if its spending program enforces the required successor policy; conservation alone does not preserve governance.
+
+## 6. Structured control flow and resources
+
+**C22 — Loops.** Only structurally matched enumeration loops are allowed, at lexical nesting depth at most two. All combinations, including inputs × outputs, are allowed. Input/output bounds are validated transaction counts; generic bounds are runtime integers 0..256. Each iteration pushes a fresh index from zero upward. Zero iterations execute no body. Code is decoded once, including skipped regions; pushed data is not decoded as instructions. No dynamic jumps, recursion, or script-generated executable code exists.
+
+`depth OP_BREAK` requires an integer in `[1, active_loop_depth]`. It exits the named enclosing loop and any inner loops, landing after its matching end; it does not roll back stack effects. Conditional/loop frames crossed by the jump must unwind consistently. P03 defines structured ExitLoops propagation, canonical Boolean conditions and decoding of unexecuted regions; those semantics must not be replaced by assumptions about C++ pointer arithmetic.
+
+**C23 — Static bound.** Compute a conservative deterministic upper bound from decoded syntax before execution. Sequence costs add. A conditional includes its condition/control cost and the maximum of both arms. A loop with bound `b` costs setup plus `b × (iteration_control + body_bound)`; generic loops use 256 even when runtime N is smaller. Input/output loops use I/O. Early termination, false predicates and BREAK do not lower the charge. Use checked arithmetic; overflow or excess budget rejects. The pass traverses syntax, not expanded iterations.
+
+**C24 — Aggregation.** Charge parsing, all proof verification, accounting, state operations and every branch/mint invocation. Sum at transaction and block scope. An I×O scan repeated by I spending invocations has I²O body work; depth two alone does not make it cheap. Fixed per-input limits cannot substitute for transaction/block limits. Charges are independent of caches, batch verification and execution ordering.
+
+**C25 — Bounded primitives.** Every operation requires a conservative charge covering maximum permitted operand size, signature/curve work, hashing, copies, concatenation and memory use. Independent limits bound total bytes, counts, proof depth, syntax depth, operand bytes, stack/altstack entries and total VM bytes. Define budget units as abstract integers, never CPU cycles. A structural O(script_bytes) cost pass is defensible only with bounded operands and a complete schedule. For each accepted execution, prove actual charged work ≤ static bound. Increasing allowed bounds must not decrease estimates. Local admission/rate limits protect repeated invalid submissions but cannot change block validity.
+
+## 7. Blocks, time and genesis blockers
+
+**C26 — Block transition.** [P04](decisions/header-and-mining.md) proposes a 144-byte recursive header and exact block framing, size/height checks and PoW digest. The validation order must cover parsing, parent/context, target/PoW, complete transaction/root checks, first-and-only coinbase, ordinary transitions in order, total cost and the post-state envelope. Commit only after all checks pass. P01's parent/height-derived coinbase identity and P02's dependency order avoid embedding the containing block hash in its own coin records. The specified ASERT candidate still needs independent vectors/acceptance; monetary/future-time details remain blockers, not inherited defaults.
+
+**C27 — Time and issuance.** Lotus v1 already uses a six-byte unsigned timestamp. The older v2 draft regressed to 32 bits; P04 compares retained 48-bit and proposed 64-bit time within a new-header design. Width does not determine truthful timestamps. P01 fixes proposed absolute/relative lock clocks and boundaries; P06 separates bootstrap clock choices and a precisely rounded tail candidate from economic incentive claims. Target/ASERT anchors, future-time eligibility and all monetary initialization must be frozen before launch. No timestamp-honesty theorem is adopted here.
+
+**C28 — Freeze.** Before genesis, fill every parameter and algorithm below, generate reference vectors, and obtain independent conformance/review evidence. Unknown values are blockers, not implementation defaults.
+
+| Required parameter or algorithm family | Status |
+| --- | --- |
+| Versions/byte grammar/ranges; count and size limits | P01 candidate; mainnet limits and vectors pending |
+| Opcode map, conversions, arithmetic, shifts, fixed-point math, crypto profiles | P03 candidate; independent vectors/review/costs pending |
+| Signature domain and sighash preimage | P01 exact candidate; independent vectors/acceptance pending |
+| Ordered transaction tree, state map, hash domains | P02/P04 candidates; vectors/acceptance pending |
+| Header/PoW/compact target and ASERT | P04 candidate; width/hash selection, ASERT vectors and future-time rule pending |
+| Cost budgets, primitive schedule and memory limits | P05 cost algebra; numerical calibration OPEN |
+| Locktime/sequence, references and coinbase | P01 candidate; maturity value and reward rules pending |
+| Issuance, fee burn, faucet, authenticated monetary state | P06 alternatives/exact tail candidate; product/economic decisions OPEN |
+| Genesis allocations, empty state, chain identity and launch manifest | OPEN |
+
+A complete genesis package must contain no OPEN rows and no dependence on unspecified behavior inherited from Bitcoin ABC.

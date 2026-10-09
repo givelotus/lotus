@@ -1,5 +1,7 @@
 # Architecture Decisions & Open Questions
 
+> Historical and cross-product architecture notes. For current Lotus v1/v2 protocol and daemon decisions, use the [development plan](plans/lotus-v2-artifacts-plan.md). These notes do not override its compatibility, genesis or validation gates.
+
 ## Target Deployment Stack
 
 Goal: minimize operational complexity so community members can actually run nodes.
