@@ -102,7 +102,7 @@ for depth in range(255, -1, -1):
 
 
 def bit(key: bytes, depth: int) -> int:
-    return (key[depth // 8] >> (7 - depth % 8)) & 1
+    return (key[depth // 8] >> (depth % 8)) & 1  # little-endian bit order
 
 
 def smt(entries: dict[bytes, bytes], depth: int = 0) -> bytes:
