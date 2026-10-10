@@ -27,7 +27,7 @@ V1 hashes three groups using SHA256: body fields → work fields plus body hash 
 
 Remove the epoch/lucky-block pointer. Replace the old metadata commitment with the full state commitment described by P02. Retain explicit target, timestamp, height, size and the 64-bit nonce because each has a concrete validation/mining role. Do not retain unused reserved bytes as an implied post-genesis extension mechanism.
 
-For the candidate, keep v1's six-byte timestamp (u48, unsigned little-endian seconds) and its 64-bit nonce, and use ordinary widths elsewhere: version u32, height/size u64. Forty-eight bits spans roughly 8.9 million years, so a wider timestamp buys nothing. A 64-bit nonce gives 2^64 attempts per template per timestamp second. No single mining device approaches that rate, so a pool that hands each worker its own template (for example a per-worker tag in a coinbase output's state, the role extranonce1 plays in Bitcoin pools) never exhausts it; a pool sharing one template among all workers would need more than about 18 EH/s in aggregate to do so. A wider nonce is therefore not needed. Neither format can prevent a miner choosing to mutate coinbase or timestamp for other reasons.
+For the candidate, keep v1's six-byte timestamp (u48, unsigned little-endian seconds) and its 64-bit nonce, and use ordinary widths elsewhere: version u32, height/size u64. Forty-eight bits spans roughly 8.9 million years, so a wider timestamp buys nothing. A 64-bit nonce gives 2^64 attempts per template per timestamp second. No single mining device approaches that rate, so a pool that hands each worker its own template (for example a per-worker tag placed in a coinbase output as an extra branch root that no path uses, the role extranonce1 plays in Bitcoin pools) never exhausts it; a pool sharing one template among all workers would need more than about 18 EH/s in aggregate to do so. A wider nonce is therefore not needed. Neither format can prevent a miner choosing to mutate coinbase or timestamp for other reasons.
 
 Recommend **recursive field groups**, not a Merkle leaf per header field. This preserves short ancestry/work disclosures. Mainnet selection still requires reference vectors and mining/tooling cost measurements; no deployed-ASIC compatibility constrains that selection.
 
@@ -69,9 +69,9 @@ The first two cases preserve the reason for v1's recursion. The layout does not 
 | --- | ---: | --- | --- |
 | Flat `H_blockid(ChainID || Header)` | 134 | Supply header (134 bytes) and parse fixed offsets | Least hash-structure complexity; fixed prefixes can be precomputed when nonce is last |
 | Recommended recursive groups | 134 | 64-byte linkage or 82-byte work disclosure | Preserves useful script/light-client boundary; more hash layers |
-| Fully field-Merkleized template plus nonce | 134 | Four siblings for nine template fields padded to sixteen | General field proofs often exceed the complete header; useful only with demonstrated composability/reuse benefits |
+| Fully field-Merkleized template plus nonce | 134 | Three siblings for the eight template fields | General field proofs often exceed the complete header; useful only with demonstrated composability/reuse benefits |
 
-For the Merkle alternative, a 32-byte field plus four 32-byte siblings plus the 8-byte nonce is already **168 bytes**, before its selector/framing. A compact header and a large transaction/state tree do not have the same proof economics. Do not select the Merkle alternative merely because state commitments themselves use a tree.
+For the Merkle alternative, a 32-byte field plus three 32-byte siblings plus the 8-byte nonce is already **136 bytes**, more than the whole 134-byte header, before its selector/framing. A compact header and a large transaction/state tree do not have the same proof economics. Do not select the Merkle alternative merely because state commitments themselves use a tree.
 
 Nonce changes do not require recomputing body/transaction/state commitments in the recursive design. Flat hashing also permits prefix caching; recursive hashing has no assumed mining-speed advantage. Count compression work and benchmark actual implementations rather than comparing only the number of top-level hash calls. Separately measure timestamp changes, new transaction templates, pool job turnover, light-client/script verification and hardware implementation complexity.
 
@@ -116,4 +116,4 @@ A selected future-time rule must be shared by the economic/network model and nod
 
 ## Acceptance
 
-Before closure: recompute v1 source layout/hashes and carry forward its timestamp fixtures; generate independent v2 full/partial hash vectors; choose time/nonce widths; measure hashing/pool/script costs; independently check the specified target/ASERT candidate; freeze time eligibility and genesis values. The 134-byte candidate is an explicit proposal for review, not a new silently assumed constant in daemon code.
+Before closure: recompute v1 source layout/hashes and carry forward its timestamp fixtures; generate independent v2 full/partial hash vectors; measure hashing/pool/script costs; independently check the specified target/ASERT candidate; freeze time eligibility and genesis values. The 134-byte candidate is an explicit proposal for review, not a new silently assumed constant in daemon code.

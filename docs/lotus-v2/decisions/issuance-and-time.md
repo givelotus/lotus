@@ -1,12 +1,12 @@
 # Issuance, clocks and faucet: decision-ready questions
 
-Decision packet P06, October 9, 2026. D05/D10/D11 economic/state choices remain **open**. This packet does not amend the monetary paper. It defines candidate mechanics and the evidence needed to accept them.
+Decision packet P06, October 9, 2026. D10/D11 economic/state choices remain **open**. D05's identity model, a token ID equal to the root of its mint scripts, was chosen by the maintainer on 2026-10-09; the lifecycle requirements below still need acceptance. This packet does not amend the monetary paper. It defines candidate mechanics and the evidence needed to accept them.
 
 ## Token identity recommendation
 
 Use program-derived identity as in C15/P01: `TokenID=mint_root`, nonzero, where mint_root is a branch root over the token's mint scripts. This identifies an immutable mint policy, not a unique invocation or organization. Two issuers wanting different assets with otherwise identical code must include distinct committed constants in their programs. A script constructor should make that discriminator explicit. Holder authorization and transfer-policy preservation remain separate obligations.
 
-A supply cap requires an authenticated cumulative state or an exclusively consumed initial allocation/authority; a stateless repeated signature check does not remember past issuance. A one-time mint requires consumption of its unique anchor, checks the asset-specific delta, and cannot accept a reference as that anchor. New certificates do not revoke old ones. Accept this identity model only after reviewing these lifecycle requirements; the historical outpoint-derived design must then be marked superseded rather than left as another valid interpretation.
+A supply cap requires an authenticated cumulative state or an exclusively consumed initial allocation/authority; a stateless repeated signature check does not remember past issuance. A one-time mint requires consumption of its unique anchor, and checks the asset-specific delta. New certificates do not revoke old ones. Accept this identity model only after reviewing these lifecycle requirements; the historical outpoint-derived design must then be marked superseded rather than left as another valid interpretation.
 
 ## Tail recurrence candidate with exact integer meaning
 
@@ -54,4 +54,4 @@ Neither is adopted here. If the desired 50/50 split remains, specify miner entit
 
 ## Decisions to accept before genesis
 
-Choose token lifecycle/identity; bootstrap clock and exact integer function; tail precision/initialization/lag/clipping; native fee burn; faucet mechanism/policy/cap; underclaim rules; and every initial parameter. Then complete the canonical MonetaryState record and genesis vectors. Reference infrastructure and v1 work can start while these choices are analyzed; a production monetary implementation must not guess them.
+Choose token lifecycle/identity; bootstrap clock and exact integer function; tail precision/initialization/lag/clipping; faucet mechanism/policy/cap; underclaim rules; and every initial parameter. Then complete the canonical MonetaryState record and genesis vectors. Reference infrastructure and v1 work can start while these choices are analyzed; a production monetary implementation must not guess them.

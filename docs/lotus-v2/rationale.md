@@ -4,7 +4,7 @@ Status: explanatory, not normative. [Consensus](consensus.md) owns rules; [decis
 
 ## Authorization and assets
 
-Alternative paths express OR; the required branches within one path express AND. Branch MASTs select methods within a role. Asset accounting is a separate obligation: conserving token units does not prove the owner approved, and owner approval does not authorize additional supply. Program-derived token identity supports continuing mint authority; outpoint-derived identity offers a different genesis model. D05 must close that tradeoff, including which historical code is reusable.
+Alternative paths express OR; the required branches within one path express AND. Branch MASTs select methods within a role. Asset accounting is a separate obligation: conserving token units does not prove the owner approved, and owner approval does not authorize additional supply. Program-derived token identity supports continuing mint authority and is the chosen model (D05): a token ID is the root of its mint scripts. The earlier outpoint-derived design is superseded; which of its historical code is reusable remains to be settled.
 
 A branch tree needs membership, while a transaction tree needs order and a state map needs key position and nonmembership. Calling all three “Merklix” obscured their different contracts. The proposed branch proof uses sorted children; it must not be silently reused to authenticate transaction order.
 
@@ -16,7 +16,7 @@ Memory layout, RAM trie representation, RocksDB/LevelDB selection, write-behind,
 
 A matching state root detects a mismatch; it does not reconstruct lost state. Crash recovery needs a durable atomic boundary linking block index, coins, undo and monetary state, plus a replay policy. Likewise, fixed-width fields do not automatically align a packed wire record. Two-minute spacing does not eliminate stale blocks. Removal of ancestor bookkeeping does not make parsing, signatures or dependency processing O(1).
 
-The scope of post-genesis improvements must be reviewed. New wallet languages and optimized validation can preserve semantics. New accepted opcodes, different hashes, changed resource ceilings, transaction versions or monetary parameters change consensus unless their behavior was already completely defined at genesis. No advisory voting layer can authorize such changes within the zero-hardfork objective.
+The scope of post-genesis improvements must be reviewed. New wallet languages and optimized validation can preserve semantics. Different hashes, changed resource ceilings, transaction versions or monetary parameters change consensus unless their behavior was already completely defined at genesis. New operations fit without a hard fork only through P03's named extension points, whose assignment can narrow validity but never widen it. No advisory voting layer can authorize anything beyond that; such a change is a hard fork, which the design aims to make unnecessary.
 
 ## Monetary research
 

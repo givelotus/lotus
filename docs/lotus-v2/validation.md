@@ -8,7 +8,7 @@ The [candidate structural checks](tools/README.md) now run against saved [fixtur
 
 Build a small scalar evaluator independent of optimized daemon code. Its public boundary is `evaluate(parameter_set, prior_state, block_bytes) -> accepted(post_state, receipts, undo) | rejected(stage, reason)`. Test transaction validation with an explicit candidate block context; do not hide context in process globals. The evaluator must parse canonical bytes itself. Sharing the daemon's parser, sighash builder and state-update routines would weaken differential evidence at those boundaries.
 
-The evaluator is a specification tool, not a network service. The first version needs ordinary payments, deterministic commitments and disconnect/reconnect. Add mint/reference/loop behavior only against accepted rules. Use locally constructed benign conformance fixtures; no current-network exploitation workflow is required.
+The evaluator is a specification tool, not a network service. The first version needs ordinary payments, deterministic commitments and disconnect/reconnect. Add mint/loop behavior only against accepted rules. Use locally constructed benign conformance fixtures; no current-network exploitation workflow is required.
 
 ## Vector record contract
 
@@ -34,18 +34,18 @@ A versioned machine-readable schema and runner are deliverables of V2-01. A pros
 | --- | --- |
 | C01–C07 | Encoding uniqueness, bounded allocation, exact flags/counts/lengths, core versus witness identity and commitments |
 | C08–C11 | Uniform one-leaf hashing; typed domain registry; positional mapping; empty/out-of-range path rejection; multi-leaf membership and ordered-tree distinction |
-| C12–C17 | Authorization independent of conservation; asset-separated sums; zero token-ID rule; reference ordering; exact mint coverage; atomic state and undo |
+| C12–C17 | Authorization independent of conservation; asset-separated sums; zero token-ID rule; rejection of read-only inputs; token-output burn (C14a) and the half-fee burn; exact mint coverage; atomic state and undo |
 | C18–C21 | Explicit signing/mint contexts; argument framing; actual leaf binding; independent invocation; cached/uncached equality |
-| C22–C25 | Syntax/control-flow termination; depth checks; BREAK frame restoration; memory/primitive caps; monotonic checked bounds; transaction/block aggregation |
+| C22–C25 | Monotone validity (C22a): no opcode reads advancing chain state, and a mempool transaction is invalidated only by a spent input; syntax/control-flow termination; depth checks; BREAK frame restoration; memory/primitive caps; monotonic checked bounds; transaction/block aggregation |
 | C26–C28 | Coinbase uniqueness without cycles; root/state coverage; target/work/time boundaries; exact reward and reorg state; complete frozen parameters |
 
-Formal obligations are conditional statements, not labels: unique decoding; every consumed coin authorized; no native creation outside coinbase; token growth only under the corresponding mint authority; no reference value credit; bounded execution/memory; static upper-bound soundness; optimized/scalar equivalence; reversible accepted transitions. State assumptions about collision resistance and signature unforgeability explicitly. They do not prove economic incentive compatibility.
+Formal obligations are conditional statements, not labels: unique decoding; every consumed coin authorized; no native creation outside coinbase; token growth only under the corresponding mint authority; bounded execution/memory; static upper-bound soundness; optimized/scalar equivalence; reversible accepted transitions. State assumptions about collision resistance and signature unforgeability explicitly. They do not prove economic incentive compatibility.
 
 ## Gate sequence
 
 1. **Specification closure:** accepted definitions and all numerical parameters; no unresolved normative references, code-default semantics, or conflicting decision statuses.
 2. **Reference slice:** ordinary payment from bytes through block acceptance and undo; independently checked identities and signature preimages.
-3. **Complete conformance:** every requirement mapped to vectors/proof obligations; assets, references, loops and monetary state included.
+3. **Complete conformance:** every requirement mapped to vectors/proof obligations; assets, loops and monetary state included.
 4. **Daemon agreement:** reference and scalar daemon agree; then each optimization agrees on the same corpus, including rejection and cost results.
 5. **Operational qualification:** reorg/restart/import/indexer/persistence tests; fault-injected interrupted commits never advertise a state beyond a durable recoverable boundary.
 6. **Capacity qualification:** weakest supported hardware and worst permitted operand sizes; bytes, dependency edges, proofs, signatures and VM memory measured separately. Define thresholds before measurement.

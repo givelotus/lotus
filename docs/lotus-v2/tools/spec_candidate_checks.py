@@ -41,7 +41,8 @@ def leaf(script: bytes) -> bytes:
 
 
 def branch(a: bytes, b: bytes) -> bytes:
-    return h('branch', b'\1' + min(a, b) + max(a, b))
+    lo, hi = sorted((a, b), key=lambda x: x[::-1])  # unsigned little-endian order
+    return h('branch', b'\1' + lo + hi)
 
 
 def split(n: int) -> int:
@@ -225,26 +226,26 @@ def make_vectors() -> dict:
     prev_output = b'\0' + u(2000, 8) + b'\1' + root + b'\1\1\0'
     outpoint = b'\x11' * 32 + u(0, 4)
     prefix = u(7, 4) + u(0, 8) + u(1, 2) + u(1, 2)
-    inp = outpoint + b'\xff' * 4 + b'\0\0'
+    inp = outpoint + b'\xff' * 4 + b'\1\0'  # flags 01 spend, path_index 0
     witness = b'\1' + blob(script) + b'\0\0'
     core = prefix + inp + output
     wire = prefix + inp + witness + output
     assert (len(prefix), len(output), len(core), len(wire)) == (16, 45, 103, 108)
     txid, wid = h('txid', CHAIN + core), h('txhash', CHAIN + wire)
-    plan = u(1, 2) + b'\0\0\1\0' + root
+    plan = u(1, 2) + b'\1\0\1\0' + root
     coins = u(1, 2) + blob(prev_output)
-    selector = b'\0' + root
+    selector = b'\1' + root
     preimage = CHAIN + b'\0' + txid + h('spentoutputs', coins) + h('authplan', plan) + selector
     assert len(preimage) == 162
     # Partial signing modes: own input plus all outputs (01) or the same-index output (02).
-    own_input = inp + blob(prev_output) + b'\0\0\1\0' + root
+    own_input = inp + blob(prev_output) + b'\1\0\1\0' + root
     partial_head = u(7, 4) + u(0, 8) + own_input
     msg_all_outputs = h('sighash', CHAIN + b'\1' + partial_head + h('outputs', u(1, 2) + output) + selector)
     msg_one_output = h('sighash', CHAIN + b'\2' + partial_head + blob(output) + selector)
     assert len(own_input) == 42 + 46 + 36
     # Mint input: token ID is the one-leaf mint root itself; witness is one BranchWitness.
     token_id = root
-    mint_core = token_id + u(0, 4) + b'\xff' * 4 + b'\2'
+    mint_core = token_id + u(0, 4) + b'\xff' * 4 + b'\3'
     mint_wire = mint_core + blob(script) + b'\0\0'
     assert (len(mint_core), len(mint_wire)) == (41, 45)
 

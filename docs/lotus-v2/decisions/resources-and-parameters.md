@@ -13,7 +13,7 @@ conditional: condition/control charge + max(cost(then),cost(else))
 loop(bound,body): setup + bound*(iteration_control + cost(body))
 ```
 
-Generic enumeration bound is always 256 for static charging; input/output bounds are validated counts I/O. Charge BREAK as an instruction but ignore its early termination when calculating the bound. Includes unexecuted arms and the complete loop syntax; no path-by-path symbolic execution is needed; the size pass below is a single traversal that merges paths. Use checked unsigned 128-bit cost arithmetic; overflow/exceeding the enclosing cap rejects before execution. The schedule must make all intermediate charge calculations well-defined before a narrowing conversion.
+Generic enumeration bound is always 256 for static charging; input/output bounds are validated counts I/O. Charge BREAK as an instruction but ignore its early termination when calculating the bound. The bound includes unexecuted arms and the complete loop syntax. No path-by-path symbolic execution is needed: the size pass below is a single traversal that merges paths. Use checked unsigned 128-bit cost arithmetic; overflow/exceeding the enclosing cap rejects before execution. The schedule must make all intermediate charge calculations well-defined before a narrowing conversion.
 
 With nonnegative charges, structural induction proves monotonicity in bounds: sums, max, and multiplication by nonnegative bounds are monotone. An ordinary instruction's charged work is bounded by its schedule. A selected conditional arm is bounded by max; a loop executes no more than its captured bound and BREAK only removes work. Induction therefore establishes `actual abstract charge <= static charge`, **conditional on correct primitive upper bounds and control semantics**. It does not prove a nanosecond bound or a hardware-independent memory-latency bound.
 
@@ -32,16 +32,18 @@ The pass **never rejects a script and adds no validity rule**. It only chooses c
 | Instruction | Bound of each result |
 | --- | --- |
 | PUSH_n, PUSHDATA | exact data length |
-| constants, arithmetic, comparisons, DEPTH, SIZE, counts, indices, values | 16 |
-| hashes, TXID, CHAINID, SIGHASH, BRANCHROOT, token IDs, branch roots | 32 |
+| constants, arithmetic on N values, comparisons and every other Boolean result, BIN2NUM, DEPTH, SIZE, counts, indices, values | 16 |
+| RAWLEFTBITSHIFT | the shifted operand's bound |
+| hashes, LEAFHASH, NODEHASH, TXID, CHAINID, SIGHASH, BRANCHROOT, token IDs, branch roots | 32 |
 | CAT | sum of both operand bounds, capped at MAX_ELEMENT_BYTES |
 | SPLIT | each piece takes the source's bound |
 | NUM2BIN | the width, if it is a constant pushed by the immediately preceding instruction; otherwise MAX_ELEMENT_BYTES |
 | INVERT, AND, OR, XOR | the larger operand bound |
+| LESSSWAP | both results take the larger of the two operand bounds |
 | DUP, OVER, SWAP, ROT, TUCK, NIP, DROP, alt-stack moves and the other fixed stack shuffles | bounds move with their items |
 | PICK, ROLL | with an index pushed as a constant by the immediately preceding instruction, the exact slot. Otherwise PICK yields the maximum bound on `main`, and ROLL sets every `main` slot to that maximum |
 | ACTIVEBYTECODE | length of the running script |
-| state, path, complete-output and other transaction or coin reads | with a constant index, that field's actual length in this transaction or its resolved coin; otherwise the maximum of that field over all inputs or outputs |
+| path, complete-output and other transaction or coin reads | with a constant index, that field's actual length in this transaction or its resolved coin; otherwise the maximum of that field over all inputs or outputs |
 | EXTENSION0–7 and NOP | no change |
 
 **Conditional.** Pop the condition, analyze both arms from the same state. If both results are `Known` with equal `main` and `alt` heights, the result is the slot-by-slot maximum; otherwise `Unknown`. A missing ELSE is an empty arm.
@@ -55,7 +57,7 @@ The pass **never rejects a script and adds no validity rule**. It only chooses c
 A complete schedule must separately cover:
 
 1. Wire parsing and canonicalization by bytes/counts; all script structural scans.
-2. Coin resolution, referenced output bytes and metadata; path/witness matching.
+2. Coin resolution, resolved output bytes and metadata; path/witness matching.
 3. Script/mint commitment hashing and every supplied membership sibling.
 4. Core/Coins/AuthPlan construction and hashing, charged by their bytes even if cached.
 5. Every spend and mint invocation, including signatures, data hashing, byte copies, introspection serialization and state-proof opcodes.
@@ -63,7 +65,7 @@ A complete schedule must separately cover:
 7. State updates and root calculation: a conservative charge for each consumed/created key's leaf/value hashing and 256 sparse-tree levels, without relying on shared-path or cache savings.
 8. Block parsing/header/transaction-tree/monetary/undo work and all transaction charges.
 
-A reference to a large output is not cheap just because its input wire record is small. Max output bytes, reference count and coin-resolution charges must cover it. A transaction-level cost cap alone cannot bound a block full of individually acceptable expensive transactions. Conversely, a block cap does not replace bounds on rejected transaction parsing and mempool admission.
+Spending a large output is not cheap just because its input wire record is small. Max output bytes and coin-resolution charges must cover it. A transaction-level cost cap alone cannot bound a block full of individually acceptable expensive transactions. Conversely, a block cap does not replace bounds on rejected transaction parsing and mempool admission.
 
 The sorted/hashed algorithm chosen for asset accumulation must have a bounded worst-case schedule; expected O(1) hash-table lookup is not a worst-case consensus argument. Model at most I+O asset records with a deterministic sort or another explicitly bounded procedure. Storage I/O and peer submission limits remain operational obligations; consensus does not require the entire UTXO set in RAM.
 
@@ -72,11 +74,11 @@ The sorted/hashed algorithm chosen for asset accumulation must have a bounded wo
 | Family | Required named parameters / constraints |
 | --- | --- |
 | Wire | MAX_TX_BYTES, MAX_BLOCK_BYTES, MAX_INPUTS, MAX_OUTPUTS, MAX_BLOCK_TXS, MAX_MINTS |
-| Output/authorization | MAX_OUTPUT_BYTES, MAX_STATE_BYTES, MAX_BRANCHES, MAX_PATHS, MAX_PATH_BRANCHES, MAX_BRANCH_PROOF_DEPTH |
+| Output/authorization | MAX_OUTPUT_BYTES, MAX_BRANCHES, MAX_PATHS, MAX_PATH_BRANCHES, MAX_BRANCH_PROOF_DEPTH |
 | VM | MAX_SCRIPT_BYTES, MAX_ARGUMENTS, MAX_ELEMENT_BYTES (working value 8192), MAX_STACK_ITEMS, MAX_ALTSTACK_ITEMS, MAX_VM_BYTES, MAX_AST_DEPTH; loop depth=2 and generic bound=256 |
 | Work | MAX_INVOCATION_COST, MAX_TX_COST, MAX_BLOCK_COST and every primitive/structural coefficient |
 | Time/chain | COINBASE_MATURITY, POW_LIMIT, ASERT anchor and half-life, timestamp/future-eligibility rules |
-| Money | Tail initialization/floor/cap/precision, bootstrap initialization/clock/decay, fee-burn ratio, DUST_LIMIT and the token-output burn multiple (C14a), allocation and faucet state parameters |
+| Money | Tail initialization/floor/cap/precision, bootstrap initialization/clock/decay, DUST_LIMIT and the token-output burn multiple (C14a), allocation and faucet state parameters |
 | Identity | ChainID, header/transaction versions, exact genesis bytes/hash, network/address/seed/directory configuration |
 
 Represent constants in a versioned machine-readable manifest, not scattered daemon defaults. Its byte grammar and digest must be fixed before freezing; a JSON file with unspecified number/string canonicalization is not yet a consensus hash preimage. An outer release manifest can hash the exact canonical parameter-file bytes without making its own digest part of those bytes.
@@ -85,7 +87,7 @@ Feasibility constraints matter as much as maxima: a standard payment must fit al
 
 ## Calibration procedure
 
-Before selecting numerical mainnet values, define supported hardware and a target full-block verification/recovery envelope. Measure scalar worst permitted operands, including each crypto algorithm, wide math, LOG's fixed 64 rounds, hashing, copying, proof handling, sparse-tree updates, large referenced coins and asset aggregation. Measure cold and warm state and rejected submissions. Fit conservative integer coefficients with documented margin, then verify complete workloads against both per-transaction and block caps.
+Before selecting numerical mainnet values, define supported hardware and a target full-block verification/recovery envelope. Measure scalar worst permitted operands, including each crypto algorithm, wide math, LOG's fixed 64 rounds, hashing, copying, proof handling, sparse-tree updates, large spent coins and asset aggregation. Measure cold and warm state and rejected submissions. Fit conservative integer coefficients with documented margin, then verify complete workloads against both per-transaction and block caps.
 
 A separate named development profile may choose smaller values for fixtures. Its name and ChainID must differ from production, and passing it must not be represented as mainnet capacity qualification. No development value is adopted by this packet merely to make the checklist green.
 

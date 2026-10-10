@@ -12,7 +12,7 @@ Deliver a modern Lotus v1 release that syncs the running network unattended, the
 | Modern v1 foundation | [V1 plan](../../daemon/docs/lotus-v1-implementation-plan.md) | Historical compatibility, integrated sync fix, clean sync and supported stalled-state recovery |
 | V1 release | V1-06 | Reproducible supported release and immutable validated-v1 commit |
 | V2 reference and daemon slice | [V2 plan](../../daemon/docs/lotus-v2-implementation-plan.md), V2-00–V2-02 | Exact payment bytes, reference/daemon agreement, block/root/undo |
-| Complete v2 behavior | V2-03–V2-05 | Assets, references, VM/costs and monetary/state transitions fully specified and validated |
+| Complete v2 behavior | V2-03–V2-05 | Assets, VM/costs and monetary/state transitions fully specified and validated |
 | Optimization and launch | V2-06–V2-07 | Independent review and reproduction; every genesis decision closed |
 | Upstream contributions | [Upstream plan](../../daemon/docs/lotus-upstream-plan.md) | Independent problem/test/benchmark packets, accepted submission scope |
 

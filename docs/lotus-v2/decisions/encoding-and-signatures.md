@@ -1,10 +1,10 @@
 # Encoding, transaction identity and signatures
 
-Decision packet P01, October 9, 2026. **Recommended candidate**, not frozen or implemented. Refines D01/D03/D04/D06 and the serialization portions of D12–D14. This packet owns the detailed candidate grammar; the consensus overview links here. Production parameter values and independent vectors remain prerequisites for acceptance.
+Decision packet P01, October 9, 2026. **Recommended candidate**, not frozen or implemented. Refines D01/D03/D04 and the serialization portions of D12–D14. This packet owns the detailed candidate grammar; the consensus overview links here. Production parameter values and independent vectors remain prerequisites for acceptance.
 
 ## Choice and tradeoffs
 
-Use a single canonical byte grammar with fixed-width outer counts, shortest CompactSize for nested collections, one input layout whose flags select spend, reference, mint or coinbase, an explicit lock clock, and separate core/witness identities. By default sign every input/output policy and every selected leaf in one full-transaction mode; two explicit partial modes let a signer commit to only their own input plus all outputs or one paired output. Exclude mutable confirmation metadata from signatures so a benign reorg need not require resigning; contextual validity still checks that metadata.
+Use a single canonical byte grammar with fixed-width outer counts, shortest CompactSize for nested collections, one input layout whose flags select spend, mint or coinbase, an explicit lock clock, and separate core/witness identities. By default sign every input/output policy and every selected leaf in one full-transaction mode; two explicit partial modes let a signer commit to only their own input plus all outputs or one paired output. Exclude mutable confirmation metadata from signatures so a benign reorg need not require resigning; contextual validity still checks that metadata.
 
 Use a 32-byte ChainID chosen independently before genesis construction. It is an immutable network parameter, not the genesis hash and not a hash of a manifest containing itself. A published release manifest later binds ChainID, final parameters and the mined genesis. Different production/test networks must select different IDs. This breaks the would-be genesis/signature/UTXO-root circular dependency.
 
@@ -29,23 +29,24 @@ lock_value = lock >> 8                (bits 8..63, 56 bits)
 
 Input = prev_txid:h32 || prev_index:u32 || sequence:u32 || flags:u8
         || authorization(flags)
-authorization(00 spend)     = CS(path_index) || Vec(BranchWitness)
-authorization(01 reference) = empty
-authorization(02 mint)      = BranchWitness
-authorization(03 coinbase)  = empty
+authorization(01 spend)    = CS(path_index) || Vec(BranchWitness)
+authorization(02 coinbase) = empty
+authorization(03 mint)     = BranchWitness
 BranchWitness = Bytes(script) || Vec(h32 sibling) || Vec(Bytes(arg))
 
-Output = flags:u8 || value:u64 || token_id? || state?
+Output = flags:u8 || value:u64 || token_id?
          || Vec(h32 branch_root) || Vec(Vec(CS(branch_index)))
 ```
 
+An output has no state field. Flags bit 1, which earlier drafts used for HAS_STATE, is unassigned and rejects. A contract that keeps data between spends commits to it inside its own branch tree, using the data-leaf convention in P02; consensus sees only the branch root.
+
 The fixed transaction prefix is **16 bytes** (4+8+2+2); nothing follows the outputs. On the wire the first lock byte is lock_kind and the next seven bytes are lock_value, little-endian. Lock_kind values 3..255 are unassigned and reject; they are not an extension mechanism. There is no transaction-kind field: a coinbase is recognized by its input. Version is 7, chosen so that no parser for Bitcoin-family or Lotus v1 transactions (versions 1 and 2) mistakes a v2 transaction for one of its own; any other version rejects. Input and output counts are at most 65,535 by construction; a larger payment set is expressed as chained transactions. Lower production limits remain D08 parameters. Output grammar/flags are C05. Unknown version/flags reject. No token-operation byte, scriptSig, annex, hidden per-input signature-mode byte, separate mint section, or optional trailing section exists.
 
-An ordinary transaction is one with no coinbase input. Ordinary transactions require at least one consuming input. Zero outputs are permitted: a native imbalance becomes fees and a token imbalance becomes a token burn under accounting rules. Every serialized output, even a zero-valued one, must have a valid nonempty authorization policy. Zero amounts do not bypass resource charges. Inputs may not repeat a `(prev_txid, prev_index)` pair, whatever their flags. Reference inputs carry sequence `ffffffff` and no authorization bytes.
+An ordinary transaction is one with no coinbase input. Ordinary transactions require at least one consuming input. Zero outputs are permitted: a native imbalance becomes fees and a token imbalance becomes a token burn under accounting rules. Every serialized output, even a zero-valued one, must have a valid nonempty authorization policy. Zero amounts do not bypass resource charges. Inputs may not repeat a `(prev_txid, prev_index)` pair, whatever their flags. Input flags are `01` spend, `02` coinbase and `03` mint; `00` and every other value reject. The same numbering, 1 spend, 2 coinbase, 3 mint, is used wherever the kind of an input or invocation is tagged: in AuthPlan, in the signing selectors and by P03's INVOCATIONKIND. Earlier drafts had a read-only reference input kind, which has been removed (C13).
 
-A coinbase is a transaction whose only input has flags `03`. That input carries `prev_txid` = the parent BlockID (zero at genesis), `prev_index` = the derived block height as u32, `sequence` = `ffffffff`, and no authorization bytes. It resolves no coin. A coinbase therefore has exactly one input and no spends, references or mints; it requires at least one output, lock zero, and only native outputs. The first transaction of a block MUST be a coinbase and no later transaction may contain a flags-`03` input. The u32 height field bounds chain height at 2^32−1. Parent ID and height in the input make every coinbase TxID unique without a separate payload or transaction-kind field. There is no extra-nonce field: P04's 64-bit header nonce supplies the search space per template, and a pool gives each worker its own template by placing a tag in a coinbase output's state. Genesis allocations and reward entitlement remain D10–D14 choices. The coinbase contains no current-block ID or current-state root. Coinbase core thus depends only on already available parent/height/template data. Coinbase output identity is unique across heights without introducing a post-state-root cycle.
+A coinbase is a transaction whose only input has flags `02`. That input carries `prev_txid` = the parent BlockID (zero at genesis), `prev_index` = the derived block height as u32, `sequence` = `ffffffff`, and no authorization bytes. It resolves no coin. A coinbase therefore has exactly one input and no spends or mints; it requires at least one output, lock zero, and only native outputs. The first transaction of a block MUST be a coinbase and no later transaction may contain a flags-`02` input. The u32 height field bounds chain height at 2^32−1. Parent ID and height in the input make every coinbase TxID unique without a separate payload or transaction-kind field. There is no extra-nonce field: P04's 64-bit header nonce supplies the search space per template, and a pool gives each worker its own template by placing a 32-byte tag in a coinbase output as an extra branch root that no path uses. Genesis allocations and reward entitlement remain D10–D14 choices. The coinbase contains no current-block ID or current-state root. Coinbase core thus depends only on already available parent/height/template data. Coinbase output identity is unique across heights without introducing a post-state-root cycle.
 
-A mint is an input with flags `02`. It resolves no coin and is not a consuming input. Its authorization is one BranchWitness. Compute `mint_root` from `Leaf(script)` and the supplied siblings exactly as C11 computes a branch root; the `prev_txid` field holds the token ID, which MUST be nonzero and equal `mint_root` itself (C15's proposed program-derived identity). The root is already a domain-tagged BLAKE3 commitment, so it is not hashed again. `prev_index` MUST be zero and `sequence` MUST be `ffffffff`. A token's mint policy is thus a script tree like any branch: several mint methods may be committed and only the one used is revealed; a single-script policy is the zero-sibling case. The token ID sits in the core while the script, proof and arguments are witness data, as with a branch root and its revealed leaf. A token ID and a branch root are the same kind of value. The consequence is that every script tree names a token whose ID is its root. Leaves are not typed, so a contract keeps its mint scripts and its spend scripts in separate trees (P02): the token ID is the root of the mint scripts alone, and they name the root of any rules tree that outputs must carry. The spend/mint tag in the signature selector keeps a signature for one use from authorizing the other. No separate mint count or mint section exists: `input_count` counts mint inputs, and a transaction that mints nothing carries no mint bytes.
+A mint is an input with flags `03`. It resolves no coin and is not a consuming input. Its authorization is one BranchWitness. Compute `mint_root` from `Leaf(script)` and the supplied siblings exactly as C11 computes a branch root; the `prev_txid` field holds the token ID, which MUST be nonzero and equal `mint_root` itself (C15's proposed program-derived identity). The root is already a domain-tagged BLAKE3 commitment, so it is not hashed again. `prev_index` MUST be zero and `sequence` MUST be `ffffffff`. A token's mint policy is thus a script tree like any branch: several mint methods may be committed and only the one used is revealed; a single-script policy is the zero-sibling case. The token ID sits in the core while the script, proof and arguments are witness data, as with a branch root and its revealed leaf. A token ID and a branch root are the same kind of value. The consequence is that every script tree names a token whose ID is its root. Leaves are not typed, so a contract keeps its mint scripts and its spend scripts in separate trees (P02): the token ID is the root of the mint scripts alone, and they name the root of any rules tree that outputs must carry. The spend/mint tag in the signature selector keeps a signature for one use from authorizing the other. No separate mint count or mint section exists: `input_count` counts mint inputs, and a transaction that mints nothing carries no mint bytes.
 
 Mint inputs may appear at any input position and are committed in wire order. The no-repeat rule above permits at most one mint input per token ID. Mint inputs MUST exactly cover positive token deltas: one for every token whose output sum exceeds its consuming-input sum, and none for any other token. A mint input contributes no amount of its own; the positive delta is computed by accounting and bound into its invocation. Several mint inputs in one transaction mint several tokens. A real outpoint and a mint pseudo-outpoint use different hash domains (`H_txid`, `H_branch`) and different flags.
 
@@ -70,7 +71,7 @@ For consuming inputs, `sequence=ffffffff` disables relative locking. Otherwise o
 
 `creation_parent_mtp` is the parent's MTP at the block that created the coin, stored in its authenticated coin record. Coinbase creation uses the same metadata. Maturity is a separate height check. Same-block ordinary outputs have creation_height equal to the candidate height and creation_parent_mtp equal to current parent MTP, so only zero relative delay can pass. Overflow rejects rather than wraps. Relative-lock encoding is independent of local replacement policy.
 
-Recommend that coinbase maturity apply to both consumption and references: `height >= creation_height + COINBASE_MATURITY`. Ordinary coins have no maturity delay. This avoids immediate dependence on newly issued, immature state while leaving same-block references to ordinary outputs available. The maturity value is at least one and remains uncalibrated. A reference never receives spendable-value credit.
+Coinbase maturity applies to consumption: `height >= creation_height + COINBASE_MATURITY`. Ordinary coins have no maturity delay and may be spent in the block that creates them. The maturity value is at least one and remains uncalibrated.
 
 ## Core and complete identities
 
@@ -89,13 +90,12 @@ Signers should authorize the method choices, not just the resulting outputs. A c
 
 ```text
 AuthPlan = input_count:u16 || InputPlan[input_count]
-InputPlan(spend) = 00 || CS(selected_path_index)
+InputPlan(spend) = 01 || CS(selected_path_index)
                    || Vec(CS(branch_index) || Leaf(script))
-InputPlan(reference) = 01
-InputPlan(mint) = 02 || Leaf(mint_script)
+InputPlan(mint) = 03 || Leaf(mint_script)
 
 Coins = input_count:u16 || CoinEntry[input_count]
-CoinEntry(spend or reference) = Bytes(Output(resolved_coin))
+CoinEntry(spend) = Bytes(Output(resolved_coin))
 CoinEntry(mint) = Bytes(empty)
 PlanHash  = H_authplan(AuthPlan)
 CoinsHash = H_spentoutputs(Coins)
@@ -103,17 +103,17 @@ CoinsHash = H_spentoutputs(Coins)
 
 InputPlan branches occur in selected path order, exactly one per required branch. Scripts and their proofs are checked against the resolved coin's roots before treating this plan as authorized. A leaf in the plan is a commitment to the actual script, not a branch root or witness position. Mint leaves use the same leaf function as spend leaves and are distinguished by their InputPlan tag and the selector's invocation tag; the token ID itself is already in the core at that input.
 
-Coins includes complete outputs for consuming and reference inputs in wire order; outpoints, flags and sequences are already in Core. A mint input resolves no coin, so its entry is the single byte `00` (zero-length Bytes), which keeps entries aligned with input indices and cannot be confused with a serialized output. It excludes confirmation height, creation MTP and coinbase status. Those fields remain authenticated contextual inputs for locks/maturity; they do not affect the signing digest. Moving the same ordinary coin to a different block can change contextual validity without changing the signature's intent.
+Coins includes complete outputs for spend inputs in wire order; outpoints, flags and sequences are already in Core. A mint input resolves no coin, so its entry is the single byte `00` (zero-length Bytes), which keeps entries aligned with input indices and cannot be confused with a serialized output. It excludes confirmation height, creation MTP and coinbase status. Those fields remain authenticated contextual inputs for locks/maturity; they do not affect the signing digest. Moving the same ordinary coin to a different block can change contextual validity without changing the signature's intent.
 
 AuthPlan excludes membership proofs and argument vectors. Those remain committed by TxHash and are validated at execution. This avoids signature self-reference and allows independent signature production. A method that needs authenticated application arguments must explicitly verify them or bind their effect to committed transaction fields. There is no general claim that all witness bytes are signer-immutable. There is no TxHash introspection opcode in this proposal.
 
 ## Exact CHECKSIG message
 
-Three signing modes are proposed. The mode is always part of the message. A 64-byte signature selects mode `00`; a 65-byte signature is 64 signature bytes followed by one mode byte, which MUST be `01` or `02`. Any other length or trailing byte, including an explicit `00`, is a script error. Because modes cannot be added after genesis, this set is meant to be complete: there is no NONE, no all-inputs-one-output mode, no CODESEPARATOR, signature deletion, or legacy fallback. More unusual commitments are built in script from introspection and CHECKDATASIG.
+Three signing modes are proposed. The mode is always part of the message. A 64-byte signature selects mode `00`; a 65-byte signature is 64 signature bytes followed by one mode byte, which MUST be `01` or `02`. Any other length or trailing byte, including an explicit `00`, is a script error. Because adding a mode later would take a hard fork, this set is meant to be complete: there is no NONE, no all-inputs-one-output mode, no CODESEPARATOR, signature deletion, or legacy fallback. More unusual commitments are built in script from introspection and CHECKDATASIG.
 
 ```text
-SpendSelector = 00 || Leaf(script)
-MintSelector  = 01 || token_id:h32 || positive_delta:u128 || Leaf(mint_script)
+SpendSelector = 01 || Leaf(script)
+MintSelector  = 03 || token_id:h32 || positive_delta:u128 || Leaf(mint_script)
 
 InputCore(i) = input i exactly as it appears in Core(tx)
 OwnInput(i)  = InputCore(i) || Bytes(Output(resolved_coin_i)) || InputPlan(i)
@@ -129,9 +129,9 @@ mode 02 OWN_INPUT_ONE_OUTPUT
                          || OwnInput(i) || Bytes(Output[i]) || Selector)
 ```
 
-Modes 01 and 02 correspond to Bitcoin's ALL|ANYONECANPAY and SINGLE|ANYONECANPAY. `i` is the index of the input whose script is executing. Both are defined only for spend invocations; a 65-byte signature in a mint invocation is a script error. In mode 02 the paired output is the one at the same index as the input; `i >= output_count` is a script error, never a signature over a placeholder. Neither message contains the index itself, so a signed input (and in mode 02 its paired output) may be placed at any position, provided the pair stays aligned. Same-index pairing is what stops one output from satisfying two different signed inputs. Extend P02's registry with `outputs = Lotus/v2/outputs`.
+Modes 01 and 02 correspond to Bitcoin's ALL|ANYONECANPAY and SINGLE|ANYONECANPAY. `i` is the index of the input whose script is executing. Both are defined only for spend invocations; a 65-byte signature in a mint invocation is a script error. In mode 02 the paired output is the one at the same index as the input; `i >= output_count` is a script error, never a signature over a placeholder. Neither message contains the index itself, so a signed input (and in mode 02 its paired output) may be placed at any position, provided the pair stays aligned. Same-index pairing is what stops one output from satisfying two different signed inputs. P02's registry holds the tag `outputs = Lotus/v2/outputs`.
 
-A partial-mode signature covers the transaction version and lock, the signer's own outpoint, sequence, path choice, resolved coin and selected scripts, and the stated outputs. It does not cover any other input, any other input's coin, or in mode 02 any other output; anyone may add those. It is bound to one coin through the outpoint, so it is never shared across inputs, and it remains usable in any transaction that satisfies it until that coin is spent. The absolute lock is a not-before bound, not an expiry; an offer that must expire needs a script condition. Wallets and signing devices must display the mode and must not treat a partial-mode request as an ordinary payment.
+A partial-mode signature covers the transaction version and lock, the signer's own outpoint, sequence, path choice, resolved coin and selected scripts, and the stated outputs. It does not cover any other input, any other input's coin, or in mode 02 any other output; anyone may add those. It is bound to one coin through the outpoint, so it is never shared across inputs, and it remains usable in any transaction that satisfies it until that coin is spent. The absolute lock is a not-before bound, not an expiry. No script condition can express an expiry either (C22a): a signed offer stays usable until one of its inputs is spent, so withdrawing it means spending that coin. Wallets and signing devices must display the mode and must not treat a partial-mode request as an ordinary payment.
 
 In mode 00 the selector deliberately omits the input, path and branch indices. TxID, CoinsHash and PlanHash already commit to every input, every resolved coin and the script selected at every position, so no input can be added or re-planned under an existing signature. One mode-00 signature therefore authorizes every spend invocation of the same script in the same transaction: a consolidation of many coins held by one policy needs one signing operation, and a `(message, public key, signature)` verification result may be reused wherever that triple recurs, including across inputs. This is signature-result reuse, not the script-result caching restricted by C20, and static charges are unchanged. A signature still cannot move to another script, another transaction, or between spend and mint. Wallets must treat one signature as approval of every input in the transaction that runs that script.
 

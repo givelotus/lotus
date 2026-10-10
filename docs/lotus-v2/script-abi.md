@@ -15,13 +15,13 @@ Status: review draft, derived from [consensus C04–C25](consensus.md). P01 and 
 | Bytes | Remain bytes until an explicit opcode interprets them; hashes, keys and signatures are not int128 values |
 | Success | Exactly one Boolean true on main stack, empty alternate stack |
 | Failure | Invalid encoding/type/range/index, overflow, division by zero, unmatched structure, resource excess, or false result rejects |
-| State | Optional application-owned bytes; a program validates schema/version before interpreting them |
+| State | Not an output field. A contract commits to its data as a leaf of its own branch tree (P02's data-leaf convention); the spender supplies the data and the methods-subtree hash as witness arguments and the program checks them against BRANCHROOT |
 
 [P03](decisions/vm-semantics.md) owns exact opcode bytes, stack effects, integer/limb conversions, shifts, LOG/SQRT algorithms, structured control flow and crypto profiles. CHECKSIG is BIP340 over P01's exact transaction message; CHECKDATASIG has explicit candidate algorithm selectors. Do not infer 33-byte keys for BIP340 or silently substitute a library's Ed25519 acceptance rules. Opcode/cost conformance remains unproven until independent vectors pass.
 
 ## Introspection and context
 
-P03 defines field and complete-output/path reads, active invocation kind and spend-only operations; a mint's delta arrives as a node-pushed stack item above the arguments, and its token ID is read with BRANCHROOT. References expose recorded coin fields while accounting excludes their values. Out-of-range or undefined-context reads reject. Candidate height and parent median time support expiration checks; context changes require mempool/cache revalidation. SIGHASH takes a signing mode and exposes that mode's invocation digest for application signature policies. Other invocations' successful execution and TxHash remain unavailable; the proposed field accessors do not establish the old Master/Companion optimization.
+P03 defines field and complete-output/path reads, active invocation kind and spend-only operations; a mint's delta arrives as a node-pushed stack item above the arguments, and its token ID is read with BRANCHROOT. Every coin a script reads is one the transaction spends. Out-of-range or undefined-context reads reject. No operation reads block height or time, so a script's result does not change as blocks arrive. SIGHASH takes a signing mode and exposes that mode's invocation digest for application signature policies. Other invocations' successful execution and TxHash remain unavailable; the proposed field accessors do not establish the old Master/Companion optimization.
 
 ## Signing and addresses
 
@@ -29,7 +29,7 @@ The signing API returns the exact digest and a decoded display of the committed 
 
 An address identifies a network and a construction template or a complete output policy. A branch root alone does not identify a multi-branch path policy. Address encoding/checksum, script template, parameter widths and policy reconstruction must be specified together. Roots change when policies change. The `xpi` prefix is a historical proposal, not a complete address standard. Direction from the maintainer (2026-10-09): a cashaddr-style encoding whose checksum covers the prefix, with no `:` separator because it breaks copy and paste; wallets accept an address with the prefix omitted and recover it by trying the known prefixes against the checksum. The payload must distinguish a single-branch, single-path policy (one 32-byte root) from a full serialized branch-and-path policy.
 
-Application state uses a documented versioned schema with explicit lengths and units. A covenant must verify successor asset identity, value constraints, state and authorization paths. A balance equality check alone does not preserve a vault's restrictions.
+Application state is committed in a data leaf with a documented, versioned layout with explicit lengths and units. A covenant must verify successor asset identity, value constraints, state and authorization paths. A balance equality check alone does not preserve a vault's restrictions.
 
 ## Language boundary
 
