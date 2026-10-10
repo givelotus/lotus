@@ -79,7 +79,7 @@ The absence of OP_INPUTINDEX is not a purity proof: CHECKSIG, relative locks, im
 
 `depth OP_BREAK` requires an integer in `[1, active_loop_depth]`. It exits the named enclosing loop and any inner loops, landing after its matching end; it does not roll back stack effects. Conditional/loop frames crossed by the jump must unwind consistently. P03 defines structured ExitLoops propagation, canonical Boolean conditions and decoding of unexecuted regions; those semantics must not be replaced by assumptions about C++ pointer arithmetic.
 
-**C22a — Monotone validity.** Once a transaction is valid against a chain tip, it remains valid on every extension of that chain until one of its inputs is spent by another transaction. Minimum locks, relative locks and coinbase maturity only ever become satisfied. No script operation reads block height, block time, block hashes or any other state that advances with the chain. A reorganization that removes an input's creating block is the only other cause of invalidation. A node therefore never re-executes scripts for mempool transactions when a block arrives; it only removes those whose inputs the block consumed. The assignment of an extension point (C02) is the one event that requires a re-check.
+**C22a — Monotone validity.** Once a transaction is valid against a chain tip, it remains valid on every extension of that chain until one of its inputs is spent by another transaction. Minimum locks, relative locks and coinbase maturity only ever become satisfied. No script operation reads block height, block time, block hashes or any other state that advances with the chain. A reorganization that removes an input's creating block is the only other cause of invalidation. A node therefore never re-executes scripts for mempool transactions when a block arrives; it only removes those whose inputs the block consumed. The assignment of an extension point (C02) is the one event that requires a re-check. A design that would relax this rule is recorded in §9; it is not adopted.
 
 **C23 — Static bound.** Compute a conservative deterministic upper bound from decoded syntax before execution. Sequence costs add. A conditional includes its condition/control cost and the maximum of both arms. A loop with bound `b` costs setup plus `b × (iteration_control + body_bound)`; generic loops use 256 even when runtime N is smaller. Input/output loops use I/O. Early termination, false predicates and BREAK do not lower the charge. Use checked arithmetic; overflow or excess budget rejects. The pass traverses syntax, not expanded iterations. Size-dependent charges use the per-operand bounds of P05's size pass, which tracks an upper bound on each stack item's size through the same traversal and falls back to MAX_ELEMENT_BYTES (working value 8192) wherever the stack's shape is not determined by the syntax. That pass selects charges only; it rejects nothing.
 
@@ -118,3 +118,40 @@ Mechanics not described here are inherited from the Bitcoin ABC base: peer-to-pe
 - **Fee floor by cost.** The minimum relay fee is priced on P05's static cost units and bytes, not bytes alone. Its value is a node setting.
 - **Accept by TxID, reject by TxHash.** Witness arguments are outside TxID, so one TxID can circulate with different TxHashes, and anyone can produce an invalid variant of a valid transaction by altering its witness. The mempool holds at most one transaction per TxID and treats a second TxHash for a held TxID as a duplicate, not a conflict. A rejection is remembered by TxHash only, never by TxID, so an invalid variant cannot block the valid one that follows; the exception is a failure that does not depend on the witness, such as a missing input or a value imbalance, which may be remembered by TxID. Announcements and requests between peers identify transactions by TxHash.
 - **No revalidation on new blocks.** By C22a, a block removes only the mempool transactions whose inputs it consumed.
+
+## 9. Under consideration: block-dependent transactions (speculative, not adopted)
+
+Nothing in this section is in force. C22a and §8 stand as written, and no opcode in P03 reads block data. This section records a design being weighed so that its costs can be compared with other ways of solving the same problems.
+
+**What it would allow.** Three things that monotone validity (C22a) rules out:
+
+- A signature, offer, certificate or quote that stops working after a time. Today the only way to withdraw one is to spend a coin it is tied to.
+- Randomness taken from a block hash.
+- A transaction bound to one chain history.
+
+**Readable values.** A script could read values from the parent of the block that includes the transaction: its hash, its height and its MTP-11. Other header fields, or the whole parent header, are candidates. Every value comes from the parent, so block validation stays deterministic and transactions in a block can still be checked in any order. The parent's own time is a poor candidate on its own: it can move backwards from one block to the next, so a comparison against it can turn true, false and true again, where MTP-11 only moves forward.
+
+**Flag.** A transaction is block-dependent if any script it executes reads one of these values. The node learns this during validation; nothing in the encoding declares it. An unconfirmed transaction that spends an output of a block-dependent transaction inherits the flag.
+
+**Mempool handling.** This is relay behaviour, not consensus.
+
+- A block-dependent transaction is evaluated against the current tip as its parent.
+- When a block arrives or the chain reorganizes, every block-dependent transaction and its unconfirmed descendants move to a pending pool and are revalidated against the new tip before they are admitted again.
+- One that fails against the node's tip is rejected without a ban score. The sender may be one block ahead or behind, as with a transaction whose lock is not yet satisfied.
+- The signing message does not include block data, so cached signature checks remain valid across revalidation. A CHECKDATASIG over data derived from a block value is checked again. Any cache of whole-script results, and the reject-by-TxHash memory of §8, is keyed by tip for these transactions or not used.
+- A node may keep a reduced form of each script to make revalidation cheap. During the P05 charging pass it marks block values and everything computed from them, runs the rest once and stores the results, and keeps only the marked part to run again. For a script that compares MTP-11 with a deadline, the part kept is that comparison. A script written so that a block value feeds everything keeps its whole body.
+- The pending pool is capped by the total cost of the parts that must be run again, so the work a new block triggers is bounded.
+- A block template is checked by full execution before mining, so a fault in the reduced form cannot put an invalid transaction in a block.
+
+**Consequences.**
+
+- A reorganization can invalidate a confirmed transaction with no one double-spending, and everything built on its outputs goes with it. The exposure depends on the condition: "MTP-11 is at or after T" only ever becomes true and is safe; "MTP-11 is before T" fails if the new chain includes the transaction after T; a condition on the parent hash fails on any reorganization at that depth.
+- Nodes spend validation work on transactions that expire unmined. This already happens when a transaction is relayed and later evicted; what is added is the repeated work per block, which the cap bounds.
+- Randomness from the parent hash is usable only when the block is fixed in advance. A script that reads whichever parent it happens to get lets the spender see the outcome and wait for a better block. A contract therefore commits first and requires settlement at one exact height, which needs the parent height to be readable. A miner who would lose can still discard a block at the cost of its reward, so the stake must stay well below the reward, and the contract needs a path for a settlement that misses its block. All transactions in a block read the same value; a contract that needs a value per coin hashes it with its own outpoint.
+- If the parent's state commitment were readable, a script would have a trustworthy root to check a UTXO proof against, which UTXOPROOFVERIFY lacks today.
+
+**Open questions.**
+
+- Whether the cost of revalidation is worth it, compared with other ways of making a signature stop working after a time.
+- Which header fields to expose, and whether to expose the whole header.
+- Whether outputs of a block-dependent transaction need any protection against the reorganization case above.
