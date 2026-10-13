@@ -41,6 +41,10 @@ A versioned machine-readable schema and runner are deliverables of V2-01. A pros
 
 Formal obligations are conditional statements, not labels: unique decoding; every consumed coin authorized; no native creation outside coinbase; token growth only under the corresponding mint authority; bounded execution/memory; static upper-bound soundness; optimized/scalar equivalence; reversible accepted transitions. State assumptions about collision resistance and signature unforgeability explicitly. They do not prove economic incentive compatibility.
 
+## Generic success-opcode cases
+
+Require vectors for every currently unassigned byte at an instruction boundary; success in skipped arms and after RETURN; ignored malformed suffixes; truncated/noncanonical pushes before success; success bytes inside fixed and length-prefixed push payloads; and ordinary full decoding when no success byte is found. Separately verify that successful invocation does not bypass membership proofs, witness/count/byte limits, other required branches, mint/accounting/lock rules or transaction/block budgets. Unknown CHECKDATASIG selectors, including 4..15, must error in ordinary execution. Compare a mock assigned instruction against the old success rule to establish valid-set inclusion, including changed stack effects and cost floors. Relay refusal must use the same instruction-boundary scan. These are required independent conformance cases, not claims that the structural scanner alone validates transactions.
+
 ## Gate sequence
 
 1. **Specification closure:** accepted definitions and all numerical parameters; no unresolved normative references, code-default semantics, or conflicting decision statuses.

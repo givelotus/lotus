@@ -4,6 +4,8 @@ Decision packet P05, October 9, 2026. Candidate rules for D08; **numeric mainnet
 
 ## Static cost algebra
 
+Apply P03's bounded instruction-boundary success scan first. An invocation containing an unassigned OP_SUCCESS_N pays a structural charge covering its complete script bytes and scan, plus all outer witness/proof/transaction charges; its suffix need not form an AST and no ordinary VM instructions run. The algebra and size pass below apply only when the scan finds no unassigned success opcode. Future assignments must preserve the old structural-charge floor and the transaction/block validity-subset requirement.
+
 Assign every primitive a positive integer upper-bound charge covering its operands and memory behavior. A charge that grows with operand size is a nondecreasing function of a per-operand size bound; the bound comes from the size pass below, and is MAX_ELEMENT_BYTES wherever that pass has no better answer. Let `cost(node)` be:
 
 ```text
@@ -32,25 +34,25 @@ The pass **never rejects a script and adds no validity rule**. It only chooses c
 | Instruction | Bound of each result |
 | --- | --- |
 | PUSH_n, PUSHDATA | exact data length |
-| constants, arithmetic on N values, comparisons and every other Boolean result, BIN2NUM, DEPTH, SIZE, counts, indices, values | 16 |
+| constants, arithmetic on N or U values, comparisons and every other Boolean result, BIN2NUM, DEPTH, SIZE, counts, indices, values | 16 |
 | RAWLEFTBITSHIFT | the shifted operand's bound |
-| hashes, LEAFHASH, NODEHASH, TXID, CHAINID, SIGHASH, BRANCHROOT, token IDs, branch roots | 32 |
+| hashes, LEAFHASH, NODEHASH, TXID, OUTPOINTTXID, CHAINID, SIGHASH, BRANCHROOT, token IDs, branch roots | 32 |
 | CAT | sum of both operand bounds, capped at MAX_ELEMENT_BYTES |
 | SPLIT | each piece takes the source's bound |
-| NUM2BIN | the width, if it is a constant pushed by the immediately preceding instruction; otherwise MAX_ELEMENT_BYTES |
+| NUM2BIN | the width, if it is a constant in 0..MAX_ELEMENT_BYTES pushed by the immediately preceding instruction; otherwise MAX_ELEMENT_BYTES |
 | INVERT, AND, OR, XOR | the larger operand bound |
 | LESSSWAP | both results take the larger of the two operand bounds |
 | DUP, OVER, SWAP, ROT, TUCK, NIP, DROP, alt-stack moves and the other fixed stack shuffles | bounds move with their items |
-| PICK, ROLL | with an index pushed as a constant by the immediately preceding instruction, the exact slot. Otherwise PICK yields the maximum bound on `main`, and ROLL sets every `main` slot to that maximum |
+| PICK, ROLL | with an in-range index pushed as a constant by the immediately preceding instruction, the exact slot. Otherwise PICK yields the maximum bound on `main`, and ROLL sets every `main` slot to that maximum |
 | ACTIVEBYTECODE | length of the running script |
 | path, complete-output and other transaction or coin reads | with a constant index, that field's actual length in this transaction or its resolved coin; otherwise the maximum of that field over all inputs or outputs |
-| EXTENSION0–7 and NOP | no change |
+| NOP | no change |
 
 **Conditional.** Pop the condition, analyze both arms from the same state. If both results are `Known` with equal `main` and `alt` heights, the result is the slot-by-slot maximum; otherwise `Unknown`. A missing ELSE is an empty arm.
 
-**Loop.** Let `S0` be the state at loop entry, plus the 16-byte index the loop pushes for each iteration. Analyze the body once to get `S1`. If `S1` is `Known` with the same heights as `S0` before its index, set to MAX_ELEMENT_BYTES every slot whose bound grew, and analyze the body a second time from that widened state; if any slot still grows, or the heights differ, or either result is `Unknown`, the body is charged in `Unknown` and the state after the loop is `Unknown`. Otherwise the body's charges are those of the second analysis and the state after the loop is the slot-by-slot maximum of `S0` and the second result. A BREAK reached at a `main` or `alt` height different from the loop's exit height makes the state after the loop `Unknown`. Each body is analyzed at most twice, so with nesting depth two the pass visits any instruction at most four times.
+**Loop.** Let `S0` be the state at loop entry, plus the 16-byte index the loop pushes for each iteration. Analyze the body once to get `S1`. Every `BREAK` reached in the body pops its depth operand; for each enclosing loop that the `BREAK` may exit (only the inner loop if the depth is a constant 1 pushed by the immediately preceding instruction, otherwise every active enclosing loop), if the state at `BREAK` after popping is `Unknown` or differs in `main` or `alt` height from that loop's entry state before its index, the state after that loop is `Unknown`; otherwise merge that `BREAK` state slot-by-slot into `S1` and into the exited loop's post-loop state. If `S1` is `Known` with the same heights as `S0` before its index, set to MAX_ELEMENT_BYTES every slot whose bound grew, and analyze the body a second time from that widened state; if any slot still grows, or the heights differ, or either result is `Unknown`, the body is charged in `Unknown` and the state after the loop is `Unknown`. Otherwise the body's charges are those of the second analysis and the state after the loop is the slot-by-slot maximum of `S0`, the second result and any `BREAK` states that exit that loop. Each body is analyzed at most twice, so with nesting depth two the pass visits any instruction at most four times.
 
-**Soundness obligation.** For every execution and every instruction reached, each operand's actual size is at most the bound the pass assigned at that instruction. With charges nondecreasing in the bound, `actual abstract charge <= static charge` continues to hold. `Unknown` reproduces the maximum-operand rule, so the pass can only lower a charge where it has a proof. Runtime element, count and total-byte checks are unchanged and still required; the pass is not a memory proof. Vectors must cover unequal conditional arms, computed PICK/ROLL indices, accumulating and non-accumulating loops, BREAK at unequal heights, and underflow inside an unexecuted arm.
+**Soundness obligation.** For every execution and every instruction reached, each operand's actual size is at most the bound the pass assigned at that instruction. With charges nondecreasing in the bound, `actual abstract charge <= static charge` continues to hold. `Unknown` reproduces the maximum-operand rule, so the pass can only lower a charge where it has a proof. Runtime element, count and total-byte checks are unchanged and still required; the pass is not a memory proof. Vectors must cover unequal conditional arms, computed PICK/ROLL indices, accumulating and non-accumulating loops, BREAK at equal and unequal heights, and underflow inside an unexecuted arm.
 
 ## Transaction and block charge domains
 
@@ -59,7 +61,7 @@ A complete schedule must separately cover:
 1. Wire parsing and canonicalization by bytes/counts; all script structural scans.
 2. Coin resolution, resolved output bytes and metadata; path/witness matching.
 3. Script/mint commitment hashing and every supplied membership sibling.
-4. Core/Coins/AuthPlan construction and hashing, charged by their bytes even if cached.
+4. Core and Coins construction and hashing, charged by their bytes even if cached.
 5. Every spend and mint invocation, including signatures, data hashing, byte copies, introspection serialization and state-proof opcodes.
 6. Native/token aggregation and mint lookup, with a deterministic bounded algorithm/model.
 7. State updates and root calculation: a conservative charge for each consumed/created key's leaf/value hashing and 256 sparse-tree levels, without relying on shared-path or cache savings.

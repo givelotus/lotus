@@ -12,7 +12,6 @@ Decision packet P02, October 9, 2026. **Recommended candidate**, not frozen or i
 | txid | `Lotus/v2/txid` |
 | txhash | `Lotus/v2/txhash` |
 | sighash | `Lotus/v2/sighash` |
-| authplan | `Lotus/v2/authplan` |
 | spentoutputs | `Lotus/v2/spentoutputs` |
 | outputs | `Lotus/v2/outputs` |
 | txroot | `Lotus/v2/txroot` |

@@ -7,7 +7,7 @@ This file records executed evidence, not planned acceptance. Updated October 9, 
 | DOC-01 | Local source inventory and separation of current/historical docs | Patch bytes/series inspected; CSV contains digests | No patch application, daemon build or chain validation |
 | DOC-02 | Current documentation integrity | PASS: local file links across 20 current documents; unique C01–C28/D01–D15; all 299 inventory rows checked against local files; archived spec content hash verified; `git diff --check` | Mechanical document checks only; no proof of protocol correctness |
 | DOC-03 | Expanded candidate documentation integrity | PASS: local file links across 29 documents; unique C01–C28/D01–D15; 299 patch digests and archived spec digest; 213 distinct allocated opcode bytes without overlap; staged current-file whitespace check (historical archive excluded) | Link/allocation checks do not validate opcode semantics |
-| MODEL-01 | Candidate structural model | PASS: framing/signing inputs; 153 ordered-tree paths; sparse membership/absence/insertion order; 144/92/64-byte recursive header views; LOG power/monotonic samples; tail integer rounding; ASERT/compact-target boundaries | One construction model; no signature verification, full VM, valid block, economic simulation or independent conformance |
+| MODEL-01 | Candidate structural model | PASS: framing/signing inputs (with witnesses minus arguments in Core); 43 success opcodes and push-boundary scan cases; 153 ordered-tree paths; sparse membership/absence/insertion order; 134/82/64-byte recursive header views; LOG power/monotonic samples; tail integer rounding; ASERT/compact-target boundaries | One construction model; no signature verification, full VM, valid block, economic simulation or independent conformance |
 | FACTORY-01 | Software Factory import | Source `e3221c55427328071d046485dc5a648996662b8e`; import provenance in `.agents/software-factory-import.json` | Workflow tests do not validate Lotus consensus |
 | V1-BASE | Compatible reference release and target chain | NOT_RUN / not pinned | Release-name and historical-height leads only |
 | V1-SYNC | Full clean live-network sync and stalled-state recovery | NOT_RUN | Requires faster hardware and incident evidence |
@@ -19,10 +19,10 @@ This file records executed evidence, not planned acceptance. Updated October 9, 
 
 ## MODEL-01 reproduction
 
-Run the default command in [the model instructions](../../docs/lotus-v2/tools/README.md). Executed locally on October 9, 2026 with Python 3.14.6 and `blake3==1.0.11`, against uncommitted candidate documents. The saved fixture manifest records each of the six packet digests and the generator digest; these content identities identify this run independently of a later commit.
+Run the default command in [the model instructions](../../docs/lotus-v2/tools/README.md). Executed locally with `blake3==1.0.11` against the candidate documents. The saved fixture manifest records each of the six packet digests and the generator digest; these content identities identify this run independently of a later commit.
 
-- Generator SHA256: `aaf3ad5ba298a73a999e72bcb1ace7ffe26ffe82b217447e8a76cd739e4fc121`.
-- Fixture SHA256: `f9ccbb0010120f73da8b61454e84c99f9cf55e253bb5ddc564b34c2ae0499369`.
+- Generator SHA256: `c3025fdf02a6cc75d4ac18202be5f6f2a7926518219e1982ff1ae473b564d440`.
+- Fixture SHA256: `08439bc69f62d33a058273cb0d45bd170d16e446392466acb12ebc8814f792eb`.
 - Result: all model assertions passed; a subsequent default run matched the saved fixture and packet digests exactly. Expectations were constructed by the same model, so this is not independent verification.
 
 ## Result record template

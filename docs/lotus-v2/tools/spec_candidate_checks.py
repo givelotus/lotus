@@ -218,6 +218,102 @@ def asert(target: int, drift: int, half_life: int, limit: int) -> int:
     return min(limit, max(1, raw))
 
 
+# Explicit P03 allocation, independent of the scanner's control flow.
+ASSIGNED_OPCODES = set(range(1, 76)) | set(bytes.fromhex('''
+00 4c 4f 51 52 53 54 55 56 57 58 59 5a 5b 5c 5d 5e 5f 60
+61 63 64 67 68 69 6a 6b 6c 6d 6e 6f 70 71 72 74 75 76 77
+78 79 7a 7b 7c 7d 7e 7f 80 81 82 83 84 85 86 87 88 8b 8c
+8f 90 91 92 93 94 95 96 97 98 99 9a 9b 9c 9d 9e 9f a0 a1
+a2 a3 a4 a5 a8 aa ac ad b1 b2 b4 b5 b6 ba bb bd be bf c0 c1
+c2 c3 c4 c5 c6 c7 c8 c9 ca cb cc cd ce d0 d1 d2 d4 d5 d6 d7
+d8 d9 da db dc dd de df e0 e1 e2 e3 e4 e5 e6 e7 e8 e9 ea eb ec ed
+'''))
+SUCCESS_OPCODES = set(range(256)) - ASSIGNED_OPCODES
+
+
+def success_scan(script: bytes, max_element_bytes: int = 8192) -> bool:
+    """P03 structural scan only; False still requires ordinary decode/evaluation.
+
+    The caller must validate framing, outer limits and membership first.
+    This helper is not a VM, transaction validator or relay implementation.
+    """
+    offset = 0
+    while offset < len(script):
+        op = script[offset]
+        offset += 1
+        if op in SUCCESS_OPCODES:
+            return True
+        if 1 <= op <= 75:
+            size = op
+        elif op == 0x4c:
+            if offset == len(script):
+                raise ValueError('missing push length')
+            first = script[offset]
+            offset += 1
+            if first < 253:
+                size = first
+            else:
+                width = {253: 2, 254: 4, 255: 8}[first]
+                if width > len(script) - offset:
+                    raise ValueError('truncated push length')
+                size = int.from_bytes(script[offset:offset + width], 'little')
+                offset += width
+                if size < {253: 253, 254: 65536, 255: 2**32}[first]:
+                    raise ValueError('nonminimal push length')
+            if 1 <= size <= 75:
+                raise ValueError('noncanonical PUSHDATA form')
+        else:
+            continue
+        if size > max_element_bytes or size > len(script) - offset:
+            raise ValueError('oversized or truncated push')
+        offset += size
+    return False
+
+
+def success_scan_vectors() -> dict:
+    assert len(ASSIGNED_OPCODES) == 213 and len(SUCCESS_OPCODES) == 43
+    # Bind the explicit model allocation to the instruction rows, excluding
+    # summary rows whose ranges also contain otherwise unassigned bytes.
+    import re
+    documented = set()
+    packet = (ROOT / 'decisions' / 'vm-semantics.md').read_text()
+    for token, name in re.findall(r'^\| ([0-9a-f]+(?:–[0-9a-f]+)?) \| ([^|]+) \|', packet, re.M):
+        if 'allocation' in name or 'Invocation introspection' in name:
+            continue
+        bounds = token.split('–')
+        documented.update(range(int(bounds[0], 16), int(bounds[-1], 16) + 1))
+    assert documented == ASSIGNED_OPCODES
+
+    rows = []
+    cases = [(f'success_{op}', bytes([op]), True) for op in sorted(SUCCESS_OPCODES)]
+    cases += [
+        ('after_return', b'\x6a\xf0', True),
+        ('skipped_arm', b'\x00\x63\xf0\x68', True),
+        ('unmatched_conditional', b'\x63\xf0', True),
+        ('ignored_truncated_suffix', b'\xf0\x01', True),
+        ('fixed_push_payload', b'\x01\xf0', False),
+        ('long_push_payload', b'\x4c\x4c' + b'\xf0' * 76, False),
+        ('after_long_push', b'\x4c\x4c' + b'\xf0' * 76 + b'\xff', True),
+        ('empty_push', b'\x4c\x00', False),
+        ('ordinary_one', b'\x51', False),
+        ('ordinary_return_needs_vm', b'\x6a', False),
+        ('truncated_push_before_success', b'\x02\xf0', 'error'),
+        ('noncanonical_push_before_success', b'\x4c\x01\xf0', 'error'),
+        ('nonminimal_length_before_success', b'\x4c\xfd\x01\x00\xf0', 'error'),
+        ('truncated_length_before_success', b'\x4c\xfe\xf0', 'error'),
+        ('oversized_push_before_success', b'\x4c\xfd\x01\x20\xf0', 'error'),
+    ]
+    for name, script, expected in cases:
+        try:
+            result = success_scan(script)
+        except ValueError:
+            result = 'error'
+        assert result == expected, (name, result, expected)
+        rows.append({'id': name, 'script': script.hex(), 'scan_result': result})
+    return {'note': 'Instruction-boundary scanning only; outer validation and ordinary VM execution are not modeled.',
+            'success_bytes': bytes(sorted(SUCCESS_OPCODES)).hex(), 'cases': rows}
+
+
 def make_vectors() -> dict:
     # Ordinary fixture uses OP_ONE, not a signature placeholder or payment claim.
     script = b'\x51'
@@ -226,28 +322,34 @@ def make_vectors() -> dict:
     prev_output = b'\0' + u(2000, 8) + b'\1' + root + b'\1\1\0'
     outpoint = b'\x11' * 32 + u(0, 4)
     prefix = u(7, 4) + u(0, 8) + u(1, 2) + u(1, 2)
-    inp = outpoint + b'\xff' * 4 + b'\1\0'  # flags 01 spend, path_index 0
-    witness = b'\1' + blob(script) + b'\0\0'
-    core = prefix + inp + output
-    wire = prefix + inp + witness + output
-    assert (len(prefix), len(output), len(core), len(wire)) == (16, 45, 103, 108)
+    core_witness = blob(script) + b'\0'  # Bytes(script) || Vec(h32 sibling)
+    inp_core = outpoint + b'\xff' * 4 + b'\1\0\1' + core_witness  # flags 01 spend, path_index 0, 1 CoreWitness
+    inp_wire = inp_core + b'\0'  # empty Vec(Bytes(arg))
+    core = prefix + inp_core + output
+    wire = prefix + inp_wire + output
+    assert (len(prefix), len(output), len(core), len(wire)) == (16, 45, 107, 108)
     txid, wid = h('txid', CHAIN + core), h('txhash', CHAIN + wire)
-    plan = u(1, 2) + b'\1\0\1\0' + root
+    # Changing witness arguments changes TxHash only; changing script or proof changes Core and TxID.
+    wire_with_arg = prefix + inp_core + b'\1' + blob(b'\xaa' * 64) + output
+    assert h('txhash', CHAIN + wire_with_arg) != wid
+    alt_core = prefix + outpoint + b'\xff' * 4 + b'\1\0\1' + blob(b'\x52') + b'\0' + output
+    sibling_core = prefix + outpoint + b'\xff' * 4 + b'\1\0\1' + blob(script) + b'\1' + b'\x99' * 32 + output
+    assert h('txid', CHAIN + alt_core) != txid and h('txid', CHAIN + sibling_core) != txid
     coins = u(1, 2) + blob(prev_output)
     selector = b'\1' + root
-    preimage = CHAIN + b'\0' + txid + h('spentoutputs', coins) + h('authplan', plan) + selector
-    assert len(preimage) == 162
+    preimage = CHAIN + b'\0' + txid + h('spentoutputs', coins) + selector
+    assert len(preimage) == 130
     # Partial signing modes: own input plus all outputs (01) or the same-index output (02).
-    own_input = inp + blob(prev_output) + b'\1\0\1\0' + root
+    own_input = inp_core + blob(prev_output)
     partial_head = u(7, 4) + u(0, 8) + own_input
     msg_all_outputs = h('sighash', CHAIN + b'\1' + partial_head + h('outputs', u(1, 2) + output) + selector)
     msg_one_output = h('sighash', CHAIN + b'\2' + partial_head + blob(output) + selector)
-    assert len(own_input) == 42 + 46 + 36
-    # Mint input: token ID is the one-leaf mint root itself; witness is one BranchWitness.
+    assert len(own_input) == 46 + 46
+    # Mint input: token ID is the one-leaf mint root itself; Core retains CoreWitness and omits Vec(Bytes(arg)).
     token_id = root
-    mint_core = token_id + u(0, 4) + b'\xff' * 4 + b'\3'
-    mint_wire = mint_core + blob(script) + b'\0\0'
-    assert (len(mint_core), len(mint_wire)) == (41, 45)
+    mint_core = token_id + u(0, 4) + b'\xff' * 4 + b'\3' + core_witness
+    mint_wire = mint_core + b'\0'
+    assert (len(mint_core), len(mint_wire)) == (44, 45)
 
     transaction_trees = []
     for count in range(18):
@@ -322,11 +424,12 @@ def make_vectors() -> dict:
         'status': 'single-model structural fixtures; not independently verified conformance',
         'generator_sha256': hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
         'packet_sha256': {p.name: hashlib.sha256(p.read_bytes()).hexdigest() for p in packets},
+        'success_scan': success_scan_vectors(),
         'chain_id_fixture_only': CHAIN.hex(),
         'ordinary_op_one_fixture': {
             'output': output.hex(), 'core': core.hex(), 'wire': wire.hex(),
             'txid': txid.hex(), 'txhash': wid.hex(), 'branch_leaf': root.hex(),
-            'coins': coins.hex(), 'auth_plan': plan.hex(), 'selector': selector.hex(),
+            'coins': coins.hex(), 'selector': selector.hex(),
             'signing_preimage': preimage.hex(), 'signing_message': h('sighash', preimage).hex(),
             'signing_message_mode_01': msg_all_outputs.hex(), 'signing_message_mode_02': msg_one_output.hex(),
             'note': 'No signature or full VM/block validation is asserted.'},
@@ -360,7 +463,7 @@ def main() -> None:
         path.write_text(json.dumps(actual, indent=2) + '\n')
     else:
         assert json.loads(path.read_text()) == actual, 'Fixtures or packet digests changed; review before regenerating.'
-    print('PASS: framing/signing inputs; 153 ordered-tree paths; sparse-map membership/absence/order; 134/82/64-byte header views; LOG power/monotonic checks; exact tail rounding; ASERT boundaries and compact targets.')
+    print('PASS: framing/signing inputs; 43 success opcodes and push-boundary scan cases; 153 ordered-tree paths; sparse-map membership/absence/order; 134/82/64-byte header views; LOG power/monotonic checks; exact tail rounding; ASERT boundaries and compact targets.')
 
 
 if __name__ == '__main__':

@@ -13,11 +13,11 @@ Status: review draft, derived from [consensus C04–C25](consensus.md). P01 and 
 | Numeric operand | Exactly 16 bytes, signed two's complement, little-endian; no implicit Bitcoin ScriptNum conversion |
 | Boolean | Exactly int128 zero or one; Boolean consumers reject other values in this draft |
 | Bytes | Remain bytes until an explicit opcode interprets them; hashes, keys and signatures are not int128 values |
-| Success | Exactly one Boolean true on main stack, empty alternate stack |
-| Failure | Invalid encoding/type/range/index, overflow, division by zero, unmatched structure, resource excess, or false result rejects |
+| Success | Ordinary execution: exactly one Boolean true on main stack, empty alternate stack. An unassigned OP_SUCCESS_N instead succeeds for the whole invocation during P03's scan, after outer witness/proof checks |
+| Failure | Invalid encoding/type/range/index, overflow, division by zero, unmatched structure, resource excess, or false result rejects under ordinary execution; P03 defines the success-scan exception |
 | State | Not an output field. A contract commits to its data as a leaf of its own branch tree (P02's data-leaf convention); the spender supplies the data and the methods-subtree hash as witness arguments and the program checks them against BRANCHROOT |
 
-[P03](decisions/vm-semantics.md) owns exact opcode bytes, stack effects, integer/limb conversions, shifts, LOG/SQRT algorithms, structured control flow and crypto profiles. CHECKSIG is BIP340 over P01's exact transaction message; CHECKDATASIG has explicit candidate algorithm selectors. Do not infer 33-byte keys for BIP340 or silently substitute a library's Ed25519 acceptance rules. Opcode/cost conformance remains unproven until independent vectors pass.
+[P03](decisions/vm-semantics.md) owns exact opcode bytes, stack effects, integer/limb conversions, shifts, LOG/SQRT algorithms, structured control flow and crypto profiles. CHECKSIG is BIP340 over P01's exact transaction message; CHECKDATASIG has only selectors 0..3; unknown selectors error. Every otherwise unassigned opcode byte is a generic OP_SUCCESS_N, not an algorithm-specific fallback. Do not infer 33-byte keys for BIP340 or silently substitute a library's Ed25519 acceptance rules. Opcode/cost conformance remains unproven until independent vectors pass.
 
 ## Introspection and context
 
