@@ -98,30 +98,83 @@ def node(depth: int, left: bytes, right: bytes) -> bytes:
 EMPTY_ROOT = h('utxo', b'\2')
 
 
+EMPTY_INDEXED_ROOT = h('merkleidx', b'\2')
+ZERO32 = b'\0' * 32
+
+
 def bit(key: bytes, depth: int) -> int:
     return (key[depth // 8] >> (depth % 8)) & 1  # little-endian bit order
 
 
-def merkle_sorted(leaf_hash: bytes, proof_bytes: bytes) -> bytes:
-    assert len(leaf_hash) == 32 and len(proof_bytes) % 32 == 0
+def indexed_tree_root(leaves: list[bytes]) -> bytes:
+    if not leaves:
+        return EMPTY_INDEXED_ROOT
+    if len(leaves) == 1:
+        assert len(leaves[0]) == 32
+        return leaves[0]
+    cur = list(leaves)
+    s = 0
+    while len(cur) > 1:
+        if len(cur) % 2 == 1:
+            cur.append(ZERO32)
+        cur = [h('merkleidx', b'\1' + u(s, 2) + cur[2 * j] + cur[2 * j + 1]) for j in range(len(cur) // 2)]
+        s += 1
+    return cur[0]
+
+
+def indexed_tree_proof(leaves: list[bytes], index: int) -> bytes:
+    assert 0 <= index < len(leaves)
+    if len(leaves) == 1:
+        return b''
+    cur = list(leaves)
+    idx = index
+    s = 0
+    siblings = []
+    while len(cur) > 1:
+        if len(cur) % 2 == 1:
+            cur.append(ZERO32)
+        siblings.append(cur[idx ^ 1])
+        cur = [h('merkleidx', b'\1' + u(s, 2) + cur[2 * j] + cur[2 * j + 1]) for j in range(len(cur) // 2)]
+        idx >>= 1
+        s += 1
+    return b''.join(siblings)
+
+
+def merkle_sorted(leaf_hash: bytes, proof_bytes: bytes, hash_alg: int = 0) -> bytes:
+    assert len(leaf_hash) == 32 and len(proof_bytes) % 32 == 0 and hash_alg in (0, 1, 2, 3)
     k = len(proof_bytes) // 32
     assert 0 <= k <= 64
     acc = leaf_hash
-    for i in range(k):
-        acc = branch(acc, proof_bytes[32 * i:32 * (i + 1)])
+    for s in range(k):
+        sib = proof_bytes[32 * s:32 * (s + 1)]
+        lo, hi = sorted((acc, sib), key=lambda x: x[::-1])
+        if hash_alg == 0:
+            acc = h('branch', b'\1' + lo + hi)
+        elif hash_alg == 1:
+            acc = blake3(lo + hi).digest()
+        elif hash_alg == 2:
+            acc = hashlib.sha256(lo + hi).digest()
+        else:
+            acc = hashlib.sha256(hashlib.sha256(lo + hi).digest()).digest()
     return acc
 
 
-def merkle_indexed(leaf_hash: bytes, key_bytes: bytes, proof_bytes: bytes) -> bytes:
-    assert len(leaf_hash) == 32 and 1 <= len(key_bytes) <= 32 and len(proof_bytes) % 32 == 0
+def merkle_indexed(leaf_hash: bytes, key_bytes: bytes, proof_bytes: bytes, hash_alg: int = 0) -> bytes:
+    assert len(leaf_hash) == 32 and 1 <= len(key_bytes) <= 32 and len(proof_bytes) % 32 == 0 and hash_alg in (0, 1, 2, 3)
     k = len(proof_bytes) // 32
     assert 0 <= k <= 8 * len(key_bytes)
     acc = leaf_hash
-    for i in range(k):
-        d = (k - 1) - i
-        sib = proof_bytes[32 * i:32 * (i + 1)]
-        left, right = (sib, acc) if bit(key_bytes, d) else (acc, sib)
-        acc = h('merkleidx', b'\1' + u(d, 2) + left + right)
+    for s in range(k):
+        sib = proof_bytes[32 * s:32 * (s + 1)]
+        left, right = (sib, acc) if bit(key_bytes, s) else (acc, sib)
+        if hash_alg == 0:
+            acc = h('merkleidx', b'\1' + u(s, 2) + left + right)
+        elif hash_alg == 1:
+            acc = blake3(left + right).digest()
+        elif hash_alg == 2:
+            acc = hashlib.sha256(left + right).digest()
+        else:
+            acc = hashlib.sha256(hashlib.sha256(left + right).digest()).digest()
     return acc
 
 
@@ -357,27 +410,42 @@ def make_vectors() -> dict:
     core = prefix + inp_core + output
     wire = prefix + inp_wire + output
     assert (len(prefix), len(output), len(core), len(wire)) == (16, 45, 107, 108)
-    txid, wid = h('txid', CHAIN + core), h('txhash', CHAIN + wire)
-    # Changing witness arguments changes TxHash only; changing script or proof changes Core and TxID.
-    wire_with_arg = prefix + inp_core + b'\1' + blob(b'\xaa' * 64) + output
-    assert h('txhash', CHAIN + wire_with_arg) != wid
-    alt_core = prefix + outpoint + b'\xff' * 4 + b'\1\0\1' + blob(b'\x52') + b'\0' + output
-    sibling_core = prefix + outpoint + b'\xff' * 4 + b'\1\0\1' + blob(script) + b'\1' + b'\x99' * 32 + output
-    assert h('txid', CHAIN + alt_core) != txid and h('txid', CHAIN + sibling_core) != txid
-    coins = u(1, 2) + blob(prev_output)
+    input_core_leaf = h('inputcore', inp_core)
+    input_full_leaf = h('inputfull', inp_wire)
+    output_leaf = h('output', blob(output))
+    inputs_root = indexed_tree_root([input_core_leaf])
+    full_inputs_root = indexed_tree_root([input_full_leaf])
+    outputs_root = indexed_tree_root([output_leaf])
+    assert (inputs_root, full_inputs_root, outputs_root) == (input_core_leaf, input_full_leaf, output_leaf)
+    txid_preimage = CHAIN + prefix + inputs_root + outputs_root
+    txhash_preimage = CHAIN + prefix + full_inputs_root + outputs_root
+    assert len(txid_preimage) == 112 and len(txhash_preimage) == 112
+    txid, wid = h('txid', txid_preimage), h('txhash', txhash_preimage)
+    # C08 domain-tagged hashes are unkeyed BLAKE3 over ASCII(tag) || 0x00 || data, computable directly in script.
+    assert blake3(b'Lotus/v2/txid\0' + txid_preimage).digest() == txid
+    assert blake3(b'Lotus/v2/inputcore\0' + inp_core).digest() == input_core_leaf
+    assert blake3(b'Lotus/v2/output\0' + blob(output)).digest() == output_leaf
+    # Changing witness arguments changes TxHash only; changing script or proof changes InputCoreLeaf and TxID.
+    inp_wire_with_arg = inp_core + b'\1' + blob(b'\xaa' * 64)
+    assert h('txhash', CHAIN + prefix + indexed_tree_root([h('inputfull', inp_wire_with_arg)]) + outputs_root) != wid
+    alt_inp_core = outpoint + b'\xff' * 4 + b'\1\0\1' + blob(b'\x52') + b'\0'
+    sibling_inp_core = outpoint + b'\xff' * 4 + b'\1\0\1' + blob(script) + b'\1' + b'\x99' * 32
+    assert h('txid', CHAIN + prefix + indexed_tree_root([h('inputcore', alt_inp_core)]) + outputs_root) != txid
+    assert h('txid', CHAIN + prefix + indexed_tree_root([h('inputcore', sibling_inp_core)]) + outputs_root) != txid
+    coin_leaf = h('coinentry', blob(prev_output))
+    coins_root = indexed_tree_root([coin_leaf])
+    assert coins_root == coin_leaf
     selector = b'\1' + u(0, 4) + u(0, 4) + root  # 01 || input_index:u32 || branch_index:u32 || Leaf(script)
     assert len(selector) == 41
-    preimage = CHAIN + b'\0' + txid + h('spentoutputs', coins) + selector
+    preimage = CHAIN + b'\0' + txid + coins_root + selector
     assert len(preimage) == 138
-    # Partial signing modes use O(1) 32-byte digests: OwnInputHash(i) and OutputsHash (01) or OutputHash(i) (02).
+    # Partial signing modes use O(1) 32-byte digests: OwnInputHash(i) and OutputsRoot (01) or OutputLeaf(i) (02).
     own_input = inp_core + blob(prev_output)
     assert len(own_input) == 46 + 46
     own_input_hash = h('owninput', own_input)
-    outputs_hash = h('outputs', u(1, 2) + output)
-    output_hash = h('output', blob(output))
     partial_head = u(7, 4) + u(0, 8) + own_input_hash
-    preimage_mode_01 = CHAIN + b'\1' + partial_head + outputs_hash + selector
-    preimage_mode_02 = CHAIN + b'\2' + partial_head + output_hash + selector
+    preimage_mode_01 = CHAIN + b'\1' + partial_head + outputs_root + selector
+    preimage_mode_02 = CHAIN + b'\2' + partial_head + output_leaf + selector
     assert len(preimage_mode_01) == 150 and len(preimage_mode_02) == 150
     msg_all_outputs = h('sighash', preimage_mode_01)
     msg_one_output = h('sighash', preimage_mode_02)
@@ -390,15 +458,34 @@ def make_vectors() -> dict:
     burn_output = b'\2' + u(500, 8) + b'\1' + root + b'\0'
     assert len(burn_output) == 43
 
-    # MERKLEROOT_SORTED (0xee) and MERKLEROOT_INDEXED (0xef) fixtures.
+    # MERKLEROOT_SORTED (0xee) and MERKLEROOT_INDEXED (0xef) fixtures across hash_alg in 0..3 and IndexedTreeRoot.
+    assert indexed_tree_root([]) == EMPTY_INDEXED_ROOT
+    for n in range(1, 10):
+        leaves = [h('output', u(j, 4)) for j in range(n)]
+        expected_root = indexed_tree_root(leaves)
+        for j in range(n):
+            proof = indexed_tree_proof(leaves, j)
+            assert merkle_indexed(leaves[j], u(j, 2), proof, 0) == expected_root
+    # Parent transaction O(log N) input/output proof verification (3 inputs, 3 outputs).
+    parent_in_leaves = [input_core_leaf, h('inputcore', alt_inp_core), h('inputcore', sibling_inp_core)]
+    parent_out_leaves = [output_leaf, h('output', blob(prev_output)), h('output', blob(burn_output))]
+    parent_header = u(7, 4) + u(0, 8) + u(3, 2) + u(3, 2)
+    parent_in_root = indexed_tree_root(parent_in_leaves)
+    parent_out_root = indexed_tree_root(parent_out_leaves)
+    parent_txid = h('txid', CHAIN + parent_header + parent_in_root + parent_out_root)
+    reconstructed_in_root = merkle_indexed(parent_in_leaves[2], u(2, 2), indexed_tree_proof(parent_in_leaves, 2), 0)
+    reconstructed_out_root = merkle_indexed(parent_out_leaves[1], u(1, 2), indexed_tree_proof(parent_out_leaves, 1), 0)
+    assert blake3(b'Lotus/v2/txid\0' + CHAIN + parent_header + reconstructed_in_root + reconstructed_out_root).digest() == parent_txid
+
     sib0, sib1 = leaf(b'\x52'), leaf(b'\x53')
-    sorted_root = merkle_sorted(root, sib0 + sib1)
-    assert sorted_root == branch(branch(root, sib0), sib1)
-    assert merkle_sorted(root, b'') == root
-    idx_key = b'\x05'  # bits: d=0 -> 1, d=1 -> 0
-    idx_old_root = merkle_indexed(root, idx_key, sib0 + sib1)
-    idx_new_root = merkle_indexed(leaf(b'\x54'), idx_key, sib0 + sib1)
-    assert idx_old_root != idx_new_root and merkle_indexed(root, idx_key, b'') == root
+    sorted_roots = {str(alg): merkle_sorted(root, sib0 + sib1, alg).hex() for alg in range(4)}
+    assert bytes.fromhex(sorted_roots['0']) == branch(branch(root, sib0), sib1)
+    idx_key = b'\x05'  # bits: s=0 -> 1, s=1 -> 0
+    indexed_old_roots = {str(alg): merkle_indexed(root, idx_key, sib0 + sib1, alg).hex() for alg in range(4)}
+    indexed_new_roots = {str(alg): merkle_indexed(leaf(b'\x54'), idx_key, sib0 + sib1, alg).hex() for alg in range(4)}
+    for alg in range(4):
+        assert merkle_sorted(root, b'', alg) == root and merkle_indexed(root, idx_key, b'', alg) == root
+        assert indexed_old_roots[str(alg)] != indexed_new_roots[str(alg)]
 
     transaction_trees = []
     for count in range(18):
@@ -486,10 +573,11 @@ def make_vectors() -> dict:
         'ordinary_op_one_fixture': {
             'output': output.hex(), 'burn_output': burn_output.hex(),
             'core': core.hex(), 'wire': wire.hex(),
+            'inputs_root': inputs_root.hex(), 'full_inputs_root': full_inputs_root.hex(),
+            'outputs_root': outputs_root.hex(), 'coins_root': coins_root.hex(),
             'txid': txid.hex(), 'txhash': wid.hex(), 'branch_leaf': root.hex(),
-            'coins': coins.hex(), 'selector': selector.hex(),
-            'own_input_hash': own_input_hash.hex(), 'outputs_hash': outputs_hash.hex(),
-            'output_hash': output_hash.hex(),
+            'selector': selector.hex(),
+            'own_input_hash': own_input_hash.hex(), 'output_leaf': output_leaf.hex(),
             'signing_preimage': preimage.hex(), 'signing_message': h('sighash', preimage).hex(),
             'signing_message_mode_01': msg_all_outputs.hex(), 'signing_message_mode_02': msg_one_output.hex(),
             'note': 'No signature or full VM/block validation is asserted.'},
@@ -498,10 +586,12 @@ def make_vectors() -> dict:
             'input_core': mint_core.hex(), 'input_wire': mint_wire.hex(),
             'note': 'One-leaf OP_ONE mint policy; framing and token ID only.'},
         'merkle_opcode_fixtures': {
-            'sorted_root': sorted_root.hex(),
+            'empty_indexed_root': EMPTY_INDEXED_ROOT.hex(),
+            'parent_txid_3x3': parent_txid.hex(),
+            'sorted_roots': sorted_roots,
             'indexed_key': idx_key.hex(),
-            'indexed_old_root': idx_old_root.hex(),
-            'indexed_new_root': idx_new_root.hex()},
+            'indexed_old_roots': indexed_old_roots,
+            'indexed_new_roots': indexed_new_roots},
         'ordered_transaction_roots': transaction_trees,
         'state': {'empty_root': EMPTY_ROOT.hex(), 'single_coin_root': single_root.hex(),
                   'two_coin_root': state_root.hex(),

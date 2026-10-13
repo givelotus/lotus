@@ -284,13 +284,13 @@ These checks cover every step but not the start: no script runs when a coin is c
 
 **Why `OUTPUTCONTINUESBRANCH` (`0xcf`) is used for continuation (`OUTPUTEXCLUSIVEBRANCH` `0xcb` for fresh payouts):** `OUTPUTCONTINUESBRANCH` verifies in one $O(1)$ check that output `j` has the exact same `paths` array and the exact same `branches` array as the spent coin (`INPUTINDEX`), except that the active invocation's `BRANCHROOT` at its branch index `k` is replaced by `R'`. Consequently, `Counter.increment()` works identically whether the coin is a single-branch native XPI coin (`branches=[Counter]`, `paths=[[0]]`) **or** a multi-branch token coin carrying a mandatory token rules contract (`branches=[Counter, MyTokenRules]`, `paths=[[0, 1]]`). By contrast, `OUTPUTEXCLUSIVEBRANCH` (`0xcb`) is used when a contract creates a fresh payout output to another party's single-branch root (`pay_to` in `LimitOrder.fill()`), where the spent coin's own branches are intentionally not continued.
 
-**Key-value maps and sets in contract state (`MERKLEROOT_INDEXED` `0xef`, `MERKLEROOT_SORTED` `0xee`):** When a contract stores a large key-value map or allowlist inside its state leaf (a 32-byte `map_root` instead of a single scalar `n`), a method verifies the old entry `old_leaf` at `key` and computes the updated `map_root'` for `new_leaf` using the same `proof` witness argument:
+**Key-value maps and sets in contract state (`MERKLEROOT_INDEXED` `0xef`, `MERKLEROOT_SORTED` `0xee`):** When a contract stores a large key-value map or allowlist inside its state leaf (a 32-byte `map_root` instead of a single scalar `n`), a method verifies the old entry `old_leaf` at `key` and computes the updated `map_root'` for `new_leaf` using the same `proof` witness argument and `hash_alg = 0` (Lotus Tagged BLAKE3; `1` = Raw BLAKE3, `2` = SHA256, `3` = HASH256):
 
 ```text
-; verify old_leaf at key against current map_root
-<old_leaf> <key> <proof> MERKLEROOT_INDEXED <map_root> EQUALVERIFY
+; verify old_leaf at key against current map_root (hash_alg = 0)
+<old_leaf> <key> <proof> <0> MERKLEROOT_INDEXED <map_root> EQUALVERIFY
 ; compute updated map_root' for new_leaf at the same key and proof
-<new_leaf> <key> <proof> MERKLEROOT_INDEXED
+<new_leaf> <key> <proof> <0> MERKLEROOT_INDEXED
 ; wrap map_root' in the data leaf and enforce continuation with OUTPUTCONTINUESBRANCH
 ```
 
@@ -298,6 +298,34 @@ These checks cover every step but not the start: no script runs when a coin is c
 1. **Data leaf inside the executing branch tree (`BranchNode(DataLeaf, M)`):** Shown in `Counter` above; keeps a single-branch coin (`branches=[Counter]`, `paths=[[0]]`) while updating state via `OUTPUTCONTINUESBRANCH` (`0xcf`).
 2. **Dedicated unexecuted data branch on a spendable coin (`branches=[CodeRoot, StateMerkleRoot]`, `paths=[[0]]`):** Branch `0` holds the immutable method tree (`CodeRoot`) and is the only branch referenced by `paths`; branch `1` holds a 32-byte state hash or Merkle root directly. The script in branch `0` reads its current state via `INPUTINDEX <1> UTXOBRANCH` (`0xd5`), folds a witness proof via `MERKLEROOT_INDEXED` (`0xef`) or `MERKLEROOT_SORTED` (`0xee`), and checks `OUTPUTBRANCH(j, 1) == new_state_root` alongside `OUTPUTBRANCH(j, 0) == BRANCHROOT`.
 3. **Pruneable burn / `OP_RETURN` commitment output (`Output.flags` bit 1 `IS_BURN`, `0x02` native / `0x03` token):** Has `paths = []` (`path_count == 0`) and `1..16` 32-byte commitment words or Merkle roots in `branches` (up to 512 bytes), is never inserted into `UtxoRoot` (C17), permanently burns its `value`, and is introspected in the same transaction via `OUTPUTFLAGS` (`0xd9`), `OUTPUTBRANCHCOUNT` (`0xd8`), and `OUTPUTBRANCH` (`0xd6`).
+
+### Proving inputs or outputs of a parent / injected transaction (`OUTPOINTTXID`)
+
+Because `TxID = H_txid(ChainID || TxHeaderCore || InputsRoot || OutputsRoot)` commits to the bottom-up indexed binary Merkle roots (`IndexedTreeRoot` in P02) of `InputCoreLeaf(m) = H_inputcore(InputCore(m))` and `OutputLeaf(k) = H_output(Bytes(Output[k]))`, and because every `H_name(x)` domain tag (`C08`) is ordinary unkeyed `BLAKE3` (`0xbf`) over the ASCII prefix `tag || 0x00 || x`, a script can prove any input `InputCore(m)` or output `Output[k]` of a parent transaction (`INPUTINDEX OUTPOINTTXID`) in $O(\log N)$ space without pushing the entire parent transaction onto the stack:
+
+```text
+; Witness arguments:
+;   parent_header_16B  (version:u32 || lock:u64 || input_count:u16 || output_count:u16)
+;   parent_outputs_root (32B, or proven from a sibling output via MERKLEROOT_INDEXED)
+;   input_core_bytes   (serialized InputCore(m) of the parent transaction)
+;   input_idx_u16      (2-byte little-endian index m, checked < input_count)
+;   input_merkle_proof (32 * ceil(log2(input_count)) sibling bytes)
+
+; 1. Compute InputCoreLeaf(m) = H_inputcore(InputCore(m)) via C08 prefix + BLAKE3 (0xbf):
+<"Lotus/v2/inputcore\x00"> <input_core_bytes> CAT BLAKE3
+
+; 2. Reconstruct InputsRoot in one instruction via MERKLEROOT_INDEXED (0xef, hash_alg = 0):
+<input_idx_u16> <input_merkle_proof> <0> MERKLEROOT_INDEXED
+
+; 3. Reconstruct parent TxID = H_txid(ChainID || TxHeaderCore || InputsRoot || OutputsRoot):
+<"Lotus/v2/txid\x00"> CHAINID CAT <parent_header_16B> CAT
+SWAP CAT <parent_outputs_root> CAT BLAKE3
+
+; 4. Verify against the spent coin's creating transaction ID:
+INPUTINDEX OUTPOINTTXID EQUALVERIFY
+```
+
+The exact same pattern proves any sibling output `Output[k]` of the parent transaction via `OutputLeaf(k) = <"Lotus/v2/output\x00"> <Bytes(Output[k])> CAT BLAKE3` and `<OutputLeaf(k)> <u16(k)> <output_merkle_proof> <0> MERKLEROOT_INDEXED`.
 
 ### Merging two coins
 

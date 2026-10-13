@@ -12,9 +12,10 @@ Decision packet P02, October 9, 2026. **Recommended candidate**, not frozen or i
 | txid | `Lotus/v2/txid` |
 | txhash | `Lotus/v2/txhash` |
 | sighash | `Lotus/v2/sighash` |
-| spentoutputs | `Lotus/v2/spentoutputs` |
+| inputcore | `Lotus/v2/inputcore` |
+| inputfull | `Lotus/v2/inputfull` |
+| coinentry | `Lotus/v2/coinentry` |
 | owninput | `Lotus/v2/owninput` |
-| outputs | `Lotus/v2/outputs` |
 | output | `Lotus/v2/output` |
 | txroot | `Lotus/v2/txroot` |
 | outpointkey | `Lotus/v2/outpointkey` |
@@ -23,7 +24,7 @@ Decision packet P02, October 9, 2026. **Recommended candidate**, not frozen or i
 | blockid | `Lotus/v2/blockid` |
 | merkleidx | `Lotus/v2/merkleidx` |
 
-The BLAKE3 primitive follows its [specification](https://github.com/BLAKE3-team/BLAKE3-specs/blob/master/blake3.pdf); application tags and tree rules are Lotus choices. [P04](header-and-mining.md) specifies a recursive BlockID/PoW candidate and its additional headerbody/headerwork domains; final choice remains D12. Hash collision resistance is an assumption, not a theorem about these tags.
+The BLAKE3 primitive follows its [specification](https://github.com/BLAKE3-team/BLAKE3-specs/blob/master/blake3.pdf); application tags and tree rules are Lotus choices. Because `H_name(x)` is ordinary unkeyed `BLAKE3` (`0xbf`) over the ASCII prefix `tag || 0x00 || x` (`C08`), any script can compute and verify any domain-tagged hash (`H_txid`, `H_inputcore`, `H_output`, `H_coinentry`, `H_merkleidx`, etc.) in three instructions (`<"Lotus/v2/...\x00"> SWAP CAT BLAKE3`) without needing a dedicated opcode per domain tag. [P04](header-and-mining.md) specifies a recursive BlockID/PoW candidate and its additional headerbody/headerwork domains; final choice remains D12. Hash collision resistance is an assumption, not a theorem about these tags.
 
 ## Branch MAST: unordered membership
 
@@ -58,6 +59,27 @@ Outputs carry no separate state field. Contracts and protocols commit data or Me
    - `M` never changes; `root` changes whenever `values` do. The data script ends in `RETURN` (`0x6a`) so that it can never be run as a method. The spender supplies the current `values` and `M` as witness arguments, and the method checks `BranchNode(Leaf(data_script(values)), M) == BRANCHROOT` using `LEAFHASH` and `NODEHASH`, then requires `BranchNode(Leaf(data_script(new_values)), M)` on the successor output with `OUTPUTCONTINUESBRANCH` (`0xcf`) or `OUTPUTEXCLUSIVEBRANCH` (`0xcb`). The cost is two leaf hashes and two node hashes per spend, whatever the number of methods, and a method's membership proof is one sibling longer than it would be without state.
 
 Patterns 2 and 3 are compiler/application conventions recorded in the contract's ABI; pattern 1 (`IS_BURN` `0x02`/`0x03`) has consensus-enforced `path_count == 0` and UTXO pruning (`C05`, `C09`, `C17`).
+
+## Indexed binary Merkle tree: transaction inputs, outputs, and coins (`IndexedTreeRoot`)
+
+Following Lotus v1's Malfix design (`101-implement-malfix.patch`), transaction inputs, outputs, and resolved coins are committed via a canonical bottom-up indexed binary Merkle tree (`IndexedTreeRoot`) so that smart contracts can prove any individual input or output of a parent/injected transaction (`OUTPOINTTXID(i)`) in $O(\log N)$ space using `MERKLEROOT_INDEXED` (`0xef`, `hash_alg = 0`) without pushing the entire parent transaction onto the stack.
+
+For a vector of $n \ge 0$ 32-byte leaf hashes `L[0 .. n - 1]`:
+
+```text
+EmptyIndexedRoot         = H_merkleidx(02)
+IndexedNode(s, l, r)     = H_merkleidx(01 || u16(s) || l || r)
+Zero32                   = 00^32
+```
+
+- **Empty vector ($n == 0$):** `IndexedTreeRoot([]) = EmptyIndexedRoot`.
+- **Single-element vector ($n == 1$):** `IndexedTreeRoot([L[0]]) = L[0]` directly (depth $k = 0$, zero siblings; a 1-input or 1-output vector performs zero interior tree node hashes beyond the leaf hash itself).
+- **Multi-element vector ($n > 1$):** Build bottom-up by layer $s = 0, 1, \dots, \lceil \log_2(n) \rceil - 1$, starting from `cur = L[0 .. n - 1]`:
+  1. At layer $s$, let $m = \text{len}(\text{cur})$. If $m$ is odd, append `Zero32 = 0x00^32` as the right sibling of the last element (`cur[m] = Zero32`, matching Lotus v1's CVE-2012-2459 mitigation rather than Bitcoin's vulnerable self-duplication).
+  2. Set `next[j] = IndexedNode(s, cur[2j], cur[2j + 1])` for $0 \le j < \lceil m / 2 \rceil$, and advance `cur = next`.
+  3. After $k = \lceil \log_2(n) \rceil$ layers, return the single remaining 32-byte root `cur[0]`.
+
+Because layer index $s$ runs bottom-up from $0$ (leaves) to $k - 1$ (root), for any leaf index `idx in 0 .. n - 1`, at step $s = 0 \dots k - 1$, bit $s$ of `idx` (`(idx >> s) & 1`) is `0` when the node is the left child (`cur[2j]`) and `1` when the node is the right child (`cur[2j + 1]`). Consequently, `MERKLEROOT_INDEXED` (`0xef`, `hash_alg = 0`) verifies any leaf `L[idx]` against `IndexedTreeRoot(L)` in a single instruction (`<L[idx]> <u16(idx)> <proof_bytes> <0> MERKLEROOT_INDEXED`), while the outer transaction header in `TxID` (`input_count:u16` and `output_count:u16` in [P01](encoding-and-signatures.md)) binds the exact vector lengths.
 
 ## Block transaction vector: ordered, count-bound tree
 
