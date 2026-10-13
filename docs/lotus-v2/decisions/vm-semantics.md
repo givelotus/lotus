@@ -90,15 +90,14 @@ Every byte not assigned an instruction in these tables is OP_SUCCESS_N, where N 
 | b5 | SUBCARRY | U(a) U(b) N(c) → U((a−b−c) mod 2^128) N(borrow) |
 | b6 | MUL128_WIDE | U(a) U(b) → U(high128(a*b)) U(low128(a*b)) |
 | ba | CHECKDATASIG | signature message public_key N(algorithm) → Boolean, profile below |
-| bb | UTXOPROOFVERIFY | outpoint proof map_root → Boolean, P02 single-key proof |
 | bd | LOG | N(x) → N(LOG2_Q64(x)), algorithm below |
 | be | SQRT | N(x) → N(floor(sqrt(x))); x≥0 |
 | bf | BLAKE3 | bytes → unkeyed 32-byte BLAKE3(bytes), no application tag |
-| c0–df | Introspection and loop allocation | Explicit table below; cf and d3 are OP_SUCCESS_207 and OP_SUCCESS_211 |
-| e0–ed | Invocation introspection, branch checks, ordering and tree hashes | Explicit table below |
+| c0–df | Introspection, branch continuation and loop allocation | Explicit table below; d3 is OP_SUCCESS_211 |
+| e0–ef | Invocation introspection, branch checks, ordering, tree hashes and Merkle roots | Explicit table below |
 | all otherwise unassigned bytes | OP_SUCCESS_N | Unconditional invocation success during the scan below |
 
-Existing template spellings may prefix `OP_`; that does not alter bytes. OP_MERKLEVERIFY is replaced by a specifically typed UTXOPROOFVERIFY name at bb: it verifies P02's map proof, not any arbitrarily named Merklix structure. A proof succeeds only if its reconstructed map root equals the 32-byte operand; malformed proof framing errors reject. A well-formed mismatching proof pushes false. The proof's presence flag is part of its bytes; a contract must inspect/require the intended presence and Coin content when relying on the claim. This opcode does not authenticate a map root to a block header by itself.
+Existing template spellings may prefix `OP_`; that does not alter bytes. Earlier drafts assigned `UTXOPROOFVERIFY` at byte `bb`; in-script global UTXO proofs are rejected because proving against a moving global `UtxoRoot` inside script creates TOCTOU race conditions and violates C22a monotone validity (see [rationale](../rationale.md#2-op_utxoproofverify-in-script-global-utxo-state-proofs)). Byte `bb` is therefore unassigned (`OP_SUCCESS_187`), P02's compact `UtxoRoot` proofs remain strictly for RPCs, snapshots and optional `ProvenTx` relay packages, and contracts authenticate their own internal sets and key-value maps in script with `MERKLEROOT_SORTED` (`ee`) and `MERKLEROOT_INDEXED` (`ef`).
 
 ## Arithmetic edge semantics
 
@@ -127,9 +126,11 @@ Indices/results are N values; hashes/outpoints/scripts remain bytes. Token ID re
 | c8 | OUTPOINTTXID | i → prev_txid |
 | c9 | OUTPOINTINDEX | i → prev_index |
 | ca | UTXOTOKENID | i → resolved asset ID |
+| cb | OUTPUTEXCLUSIVEBRANCH | j root → Boolean: output j has a path consisting of that branch alone, and every other path of output j also includes it |
 | cc | OUTPUTVALUE | j → output value |
 | cd | OUTPUTBRANCH | j k → output branch[k] |
 | ce | OUTPUTTOKENID | j → output asset ID |
+| cf | OUTPUTCONTINUESBRANCH | j new_root → Boolean: spend-only; output j has the exact same paths and branches as the spent coin (INPUTINDEX), except the active invocation's BRANCHROOT is replaced by new_root (preserving C09 distinct branches) |
 | d0 | TXID | push ChainID-bound core TxID |
 | d1 | ENUMERATE_INPUTS | structured loop with fixed input_count bound |
 | d2 | ENUMERATE_OUTPUTS | structured loop with fixed output_count bound |
@@ -144,12 +145,11 @@ Indices/results are N values; hashes/outpoints/scripts remain bytes. Token ID re
 | dc | BREAK | pop N(depth); exit that many enclosing active loops |
 | dd | UTXOPATHCOUNT | i → resolved path count |
 | de | OUTPUTPATHCOUNT | j → output path count |
+| df | UTXOREQUIRESBRANCH | i root → Boolean: every path of resolved coin i includes a branch equal to root |
 | e0 | TXLOCKKIND | push absolute lock_kind |
 | e1 | INVOCATIONKIND | push 1 for spend, 3 for mint, the same numbers as input flags |
-| df | UTXOREQUIRESBRANCH | i root → Boolean: every path of resolved coin i includes a branch equal to root |
 | e2 | BRANCHROOT | push the 32-byte root the active script was proven against: the branch root in a spend, the token ID in a mint |
 | e3 | OUTPUTREQUIRESBRANCH | j root → Boolean: every path of output j includes a branch equal to root |
-| cb | OUTPUTEXCLUSIVEBRANCH | j root → Boolean: output j has a path consisting of that branch alone, and every other path of output j also includes it |
 | e4 | INPUTPATHINDEX | i → selected path of spend input i |
 | e5 | UTXOPATH | i p → canonical Vec(CS(branch_index)) bytes |
 | e6 | OUTPUTPATH | j p → canonical Vec(CS(branch_index)) bytes |
@@ -158,15 +158,17 @@ Indices/results are N values; hashes/outpoints/scripts remain bytes. Token ID re
 | e9 | LESSSWAP | a b → the same two items with the smaller one deeper and the larger on top, compared as unsigned little-endian integers |
 | ea | LEAFHASH | script_bytes → P02 `Leaf(script_bytes)`, 32 bytes |
 | eb | CHAINID | push the immutable 32-byte chain identifier |
-| ec | SIGHASH | N(mode) → P01's 32-byte message for this invocation in that signing mode (0, 1 or 2) |
+| ec | SIGHASH | N(mode) → P01's 32-byte message for this invocation in that signing mode (0, 1 or 2); mode 2 errors when INPUTINDEX ≥ TXOUTPUTCOUNT |
 | ed | NODEHASH | a b → P02 `BranchNode(a,b)`, 32 bytes; a and b must each be exactly 32 bytes |
+| ee | MERKLEROOT_SORTED | leaf_hash proof_bytes → root_hash: bottom-up sorted-pair Merkle root via P02 `BranchNode`, 0≤k≤64 siblings |
+| ef | MERKLEROOT_INDEXED | leaf_hash key_bytes proof_bytes → root_hash: bottom-up key-bit-indexed Merkle root via `H_merkleidx`, 1≤len(key_bytes)≤32, 0≤k≤8*len(key_bytes) siblings |
 | all otherwise unassigned bytes | OP_SUCCESS_N | Unconditional invocation success during the scan below |
 
 A mint is an input (flags `03`), so a mint script has an input position like any other and INPUTINDEX returns it. A mint input resolves no coin: UTXO-prefixed reads at a mint input's index error, and a script that scans inputs tests INPUTFLAGS first. A mint invocation receives the rest of its context on the stack instead of through context-only opcodes: after the witness arguments are pushed, the node pushes the positive mint delta as N, so it is on top. The token ID is not pushed: in a mint it is the root the script was proven against, which BRANCHROOT returns in any invocation. With u64 amounts and at most 2^16−1 outputs, positive token delta is below 2^80, so it fits N. A mint script must consume the delta. This stack shape is not a security boundary between mint and spend scripts; P02 requires them to be kept in separate trees. Returned serialized outputs/paths and active bytecode must fit the element limit; using such an opcode on a larger object errors. This does not make the underlying output invalid by itself. Length-aware costs charge bounded serialization/copy work. There is no introspection of other invocations' successful execution, mutable VM state, signature arguments or TxHash; P01's core witness binding is not such an opcode.
 
-BRANCHROOT lets a script name the tree it belongs to without containing its own hash. UTXOREQUIRESBRANCH and OUTPUTREQUIRESBRANCH answer, in one operation, whether a policy makes a given tree mandatory: true iff the root operand is exactly 32 bytes and every path contains at least one branch index whose root equals it. Because C09 makes branch roots distinct within an output, at most one index k has that root, and the result equals: k exists and bit k is set in the intersection of all path index sets. Together they let a covenant require that a successor output stays under its own rules for any policy shape, using a single loop over outputs. Walking paths and their entries in script would need three nested loops, which C22 forbids. Their cost is charged at the maximum permitted paths times path length. A mint, coinbase or out-of-range index errors for the UTXO form.
+BRANCHROOT lets a script name the tree it belongs to without containing its own hash. UTXOREQUIRESBRANCH and OUTPUTREQUIRESBRANCH answer, in one operation, whether a policy makes a given tree mandatory: true iff the root operand is exactly 32 bytes, the coin/output is spendable (`path_count >= 1`, i.e. `(flags & 0x02) == 0`), and every path contains at least one branch index whose root equals it. Because C09 makes branch roots distinct within an output, at most one index k has that root, and the result equals: k exists and bit k is set in the intersection of all path index sets. Together they let a covenant require that a successor output stays under its own rules for any policy shape, using a single loop over outputs. Walking paths and their entries in script would need three nested loops, which C22 forbids. With C09's hard caps (`MAX_OUTPUT_BRANCHES = 16`, `MAX_OUTPUT_PATHS = 16`), each path is a 16-bit mask and these checks are pure $O(1)$ bitmask operations. For a pruneable burn/commitment output (`(flags & 0x02) != 0`), `OUTPUTFLAGS` returns `0x02` (native) or `0x03` (token), `OUTPUTPATHCOUNT` returns `0`, `OUTPUTBRANCHCOUNT` returns `1..16`, `OUTPUTBRANCH(j, k)` returns the $k$-th 32-byte commitment word or Merkle root, `OUTPUTPATH` errors (out of range), and `OUTPUTREQUIRESBRANCH`, `OUTPUTEXCLUSIVEBRANCH`, and `OUTPUTCONTINUESBRANCH` return `false` (`N(0)`) because the output has no spend paths (`path_count == 0`). A mint, coinbase or out-of-range index errors for the UTXO form.
 
-No opcode exposes the height, time or hash of the block being built or of any ancestor; earlier drafts had BLOCKHEIGHT and BLOCKMEDIANTIME at bytes e9 and ea; they now hold LESSSWAP and LEAFHASH. This keeps validity monotone (C22a): a script's result depends only on the transaction, its resolved coins and ChainID, so it cannot change as blocks arrive. A script can require that a height or time has been reached by constraining TXLOCKTIME or the input's sequence, which the node enforces as minimum locks. A script cannot require that a height or time has not yet passed. A certificate or quote that must stop working is instead tied to a coin and ends when that coin is spent, which is an ordinary input conflict. SIGHASH takes the signing mode as an operand and pushes P01's message for that mode: 0 everywhere, 1 or 2 only in a spend invocation; any other value, or a partial mode in a mint invocation, errors. A script may fix the mode with a constant or take it from a witness argument so the signer chooses. This lets an ECDSA or Ed25519 policy checked with CHECKDATASIG bind its signature to the same intent as CHECKSIG in any of the three modes, without one opcode per mode and without reconstructing hidden witness-plan fields in Script.
+No opcode exposes the height, time or hash of the block being built or of any ancestor; earlier drafts had BLOCKHEIGHT and BLOCKMEDIANTIME at bytes e9 and ea; they now hold LESSSWAP and LEAFHASH. This keeps validity monotone (C22a): a script's result depends only on the transaction, its resolved coins and ChainID, so it cannot change as blocks arrive. A script can require that a height or time has been reached by constraining TXLOCKTIME or the input's sequence, which the node enforces as minimum locks (enabling Dutch auctions and linear vesting curves over `TXLOCKTIME`; see [rationale](../rationale.md#1-op_blockheight-op_blocktime-op_blockhash-and-block-dependent-transactions)). A script cannot require that a height or time has not yet passed; a certificate or quote that must stop working is instead tied to a coin and ends when that coin is spent, which is an ordinary input conflict. SIGHASH takes the signing mode as an operand and pushes P01's message for that mode: 0 everywhere, 1 or 2 only in a spend invocation; any other value, a partial mode in a mint invocation, or mode 2 when `INPUTINDEX >= TXOUTPUTCOUNT` errors. A script may fix the mode with a constant or take it from a witness argument so the signer chooses. This lets an ECDSA or Ed25519 policy checked with CHECKDATASIG bind its signature to the same intent as CHECKSIG in any of the three modes, without one opcode per mode and without reconstructing hidden witness-plan fields in Script.
 
 CHECKLOCKTIMEVERIFY accepts kind 1 or 2 and nonnegative bound: require tx.lock_kind=kind and tx.lock_value≥bound. CHECKSEQUENCEVERIFY accepts kind 1 (height) or 2 (512-second units), bound 0..65535; require current spend's enabled relative lock of that kind and encoded delay≥bound. Both consume their operands. Global P01 lock checks enforce the actual candidate context. Mint context may use the absolute check but not the input-relative check.
 
@@ -178,33 +180,62 @@ A loop captures its bound once on entry. Each iteration pushes N(index), evaluat
 
 Define evaluation results `Continue`, `ExitLoops(d)`, or `Error`. BREAK with `1≤d≤active_loop_depth` produces ExitLoops(d). Sequence/conditional nodes immediately propagate it. A loop receiving ExitLoops(1) terminates and returns Continue; receiving ExitLoops(d>1) terminates and returns ExitLoops(d−1). This specifies conditional-frame unwinding without byte-offset guesses. All existing stack effects persist. No BREAK signal may escape the top-level sequence.
 
-## Exclusive branch check
+## Exclusive branch and branch-continuation checks
 
 OUTPUTREQUIRESBRANCH proves that a root is present on every path of an output and says nothing about what else is there. That is right when the holder is meant to add branches of their own, as with a token's rules. It is not enough when a script creates a coin for someone else or continues a contract: a spender could satisfy it and still require a further branch on every path, one only they can satisfy or one nobody can, leaving the coin held hostage or burned.
 
-OUTPUTEXCLUSIVEBRANCH closes that with one more condition. It is true exactly when both hold for output j:
+OUTPUTEXCLUSIVEBRANCH (`cb`) closes that for single-branch continuation. It is true exactly when both hold for output j:
 
 1. Some path consists of the single branch whose root equals `root`. The coin can therefore always be spent by satisfying that branch alone.
 2. Every other path also includes that branch. No path lets anyone spend without it.
 
-Other paths that pass are only stricter versions of the first and add no way to spend. The root operand must be exactly 32 bytes. The node answers from the output's own branches and paths, at the same charge as OUTPUTREQUIRESBRANCH.
+Other paths that pass are only stricter versions of the first and add no way to spend. The root operand must be exactly 32 bytes.
 
-## Tree-hash opcodes and LESSSWAP
+When a coin carries multiple branches that must all be preserved across a state transition—for example, a token coin carrying both the token's mandatory rules branch and a stateful limit-order, auction or vault branch, or an output combining an owner branch with a rate-limiting covenant branch—`OUTPUTEXCLUSIVEBRANCH` does not apply because the continuing path intentionally requires multiple branches (`AND` composition), and verifying that every other branch and path is unchanged would otherwise require loops in Script.
+
+`OUTPUTCONTINUESBRANCH` (`cf`) handles both single-branch and multi-branch state transitions in one operation:
+
+- It is defined only in spend invocations (`INVOCATIONKIND == 1`); executing it in a mint invocation (`INVOCATIONKIND == 3`) is a script error.
+- It pops `new_root` (which MUST be exactly 32 bytes, else error) and output index `j` (which MUST satisfy `0 <= j < TXOUTPUTCOUNT`, else error).
+- Let `coin` be the resolved coin of the current spend input (`INPUTINDEX`), and let `k = paths[path_index][witness_index]` be the unique branch index in `coin.branches` of the active invocation's `BRANCHROOT`.
+- It pushes `N(1)` (`true`) iff:
+  1. `output[j].paths == coin.paths` (the output has the exact same path count and the exact same branch-index vectors in every path as `coin`), and
+  2. `len(output[j].branches) == len(coin.branches)`, `output[j].branches[k] == new_root`, and for every `m != k` (`0 <= m < len(coin.branches)`), `output[j].branches[m] == coin.branches[m]` (which by C09's distinct-branch invariant is already guaranteed not to collide with `new_root` on any valid output).
+- Otherwise it pushes `N(0)` (`false`). Passing `BRANCHROOT` as `new_root` checks that output `j` has the exact same branches and paths as the spent coin without modification. With `MAX_OUTPUT_BRANCHES = 16` and `MAX_OUTPUT_PATHS = 16`, the node evaluates `OUTPUTCONTINUESBRANCH` in $O(1)$ by comparing the 32-byte `uint16_t paths[16]` bitmask array and at most 16 32-byte branch roots.
+
+## Tree-hash opcodes, general Merkle root verification and LESSSWAP
 
 LEAFHASH and NODEHASH compute P02's branch-tree leaf and node hashes exactly as consensus does when it checks a membership proof: the domain tag, the leaf or node marker, the length framing of a leaf, and the ordering of a node's two children are all applied by the opcode. A script supplies only the script bytes, or the two child hashes. Everyone who computes these hashes, wallet, node and script alike, uses the same tagged functions; there is no untagged form. LEAFHASH does not parse its operand as a script; any byte string up to MAX_ELEMENT_BYTES is accepted. Each is charged as one hash over its operands at their size bounds.
 
-With them a script can build the root of a branch tree from its parts and compare it with BRANCHROOT, or require it on an output through OUTPUTREQUIRESBRANCH or OUTPUTEXCLUSIVEBRANCH. Their main use is P02's data-leaf convention, by which a contract keeps state inside its own tree and consensus needs no state field. They also let a script check an arbitrary membership proof against any branch root.
+With them a script can build the root of a branch tree from its parts and compare it with BRANCHROOT, or require it on an output through OUTPUTREQUIRESBRANCH, OUTPUTEXCLUSIVEBRANCH or OUTPUTCONTINUESBRANCH. As detailed in P02, contracts and protocols can store data or Merkle roots in `branches` in three complementary ways: (1) inside the executing branch tree itself via `BranchNode(DataLeaf, M)`, (2) in a dedicated unexecuted data branch on a spendable coin (`branches = [CodeRoot, StateMerkleRoot]`, `paths = [[0]]`) read directly with `UTXOBRANCH`/`OUTPUTBRANCH` and folded with `MERKLEROOT_SORTED`/`MERKLEROOT_INDEXED`, or (3) on a pruneable `IS_BURN` (`0x02`/`0x03`) output with `paths = []` and up to 16 32-byte commitment words/roots.
 
-LESSSWAP is a general ordering operation on byte strings. It reads each operand as an unsigned little-endian integer, so the last byte is the most significant, which is the byte order of every integer in this specification and the order P02 uses for branch-tree nodes. Operands may be any length up to MAX_ELEMENT_BYTES; a shorter one is treated as zero-extended, and if the two are then numerically equal the shorter is the smaller. It leaves the smaller deeper and the larger on top, so a following CAT yields `smaller || larger`. Identical operands are left as they are. NODEHASH orders its operands itself and does not need it; LESSSWAP is for contracts that keep sorted structures of their own. The numeric comparisons apply only to N values.
+For contracts that maintain large internal sets, allowlists, or key-value maps inside their data leaf, two dedicated opcodes fold a multi-level Merkle path in one instruction without unrolling `NODEHASH` in a script loop:
+
+- **`MERKLEROOT_SORTED` (`ee`):** Stack `leaf_hash proof_bytes → root_hash`.
+  - Require `len(leaf_hash) == 32` and `len(proof_bytes) == 32 * k` for an integer `0 <= k <= 64`; any other operand length is a script error.
+  - Initialize `acc = leaf_hash`. For `i = 0 .. k - 1`, let `sib = proof_bytes[32*i : 32*(i+1)]` and set `acc = BranchNode(acc, sib)` (`H_branch(01 || min(acc, sib) || max(acc, sib))` from P02). Push the 32-byte `acc`.
+  - When `k == 0` (`proof_bytes` is empty), returns `leaf_hash` unchanged. Static cost is charged from P05's size bound `ceil(bound(proof_bytes) / 32)` capped at 64 hashes.
+- **`MERKLEROOT_INDEXED` (`ef`):** Stack `leaf_hash key_bytes proof_bytes → root_hash`.
+  - Require `len(leaf_hash) == 32`, `1 <= len(key_bytes) <= 32`, and `len(proof_bytes) == 32 * k` for an integer `0 <= k <= 8 * len(key_bytes)`; any other operand length is a script error.
+  - Initialize `acc = leaf_hash`. For step `i = 0 .. k - 1` (bottom-up from depth `d = (k - 1) - i` up to the root at `d = 0`), let `d = (k - 1) - i`, `bit = (key_bytes[d // 8] >> (d % 8)) & 1` (least-significant-bit first, matching P02), and `sib = proof_bytes[32*i : 32*(i+1)]`. Set:
+    ```text
+    IndexedNode(d, l, r) = H_merkleidx(01 || u16(d) || l || r)
+    acc = IndexedNode(d, acc, sib)  if bit == 0
+    acc = IndexedNode(d, sib, acc)  if bit == 1
+    ```
+  - Push the 32-byte `acc`. When `k == 0`, returns `leaf_hash` unchanged. `merkleidx = Lotus/v2/merkleidx` is registered in P02.
+  - Because `MERKLEROOT_INDEXED` returns the computed root rather than asserting equality, a single `proof_bytes` witness argument supports both **membership/non-membership checks** and **atomic in-place updates**: the contract calls `MERKLEROOT_INDEXED` with `(old_leaf_hash, key_bytes, proof_bytes)` to verify against the current map root in its data leaf, and calls `MERKLEROOT_INDEXED` with `(new_leaf_hash, key_bytes, proof_bytes)` to compute the updated map root for `OUTPUTCONTINUESBRANCH` (`cf`).
+
+LESSSWAP is a general ordering operation on byte strings. It reads each operand as an unsigned little-endian integer, so the last byte is the most significant, which is the byte order of every integer in this specification and the order P02 uses for branch-tree nodes. Operands may be any length up to MAX_ELEMENT_BYTES; a shorter one is treated as zero-extended, and if the two are then numerically equal the shorter is the smaller. It leaves the smaller deeper and the larger on top, so a following CAT yields `smaller || larger`. Identical operands are left as they are. NODEHASH and MERKLEROOT_SORTED order their operands themselves and do not need it; LESSSWAP is for contracts that keep sorted structures of their own. The numeric comparisons apply only to N values.
 
 ## Extension points
 
-Maintainer direction, October 11, 2026: every otherwise unassigned opcode byte is a generic OP_SUCCESS_N extension point. This replaces the eight no-op EXTENSION instructions and the reserved CHECKDATASIG algorithm selectors. The current tables assign 213 bytes and leave 43 success bytes:
+Maintainer direction, October 11, 2026: every otherwise unassigned opcode byte is a generic OP_SUCCESS_N extension point. This replaces the eight no-op EXTENSION instructions and the reserved CHECKDATASIG algorithm selectors. The current tables assign 215 bytes and leave 41 success bytes:
 
 ```text
 4d 4e 50 62 65 66 73 89 8a 8d 8e a6 a7 a9 ab ae af
-b0 b3 b7 b8 b9 bc cf d3 ee ef f0 f1 f2 f3 f4 f5 f6 f7
-f8 f9 fa fb fc fd fe ff
+b0 b3 b7 b8 b9 bb bc d3 f0 f1 f2 f3 f4 f5 f6 f7 f8
+f9 fa fb fc fd fe ff
 ```
 
 The suffix N is decimal: byte 50 is OP_SUCCESS_80 and byte ff is OP_SUCCESS_255. Success is for the complete script invocation, not just a Boolean result or a no-op. This follows the unconditional-success principle in [BIP342](https://bips.dev/342/#specification). It leaves a spend path rather than permanently stranding a coin behind an undefined instruction. Wallets and relay policy must nevertheless refuse unassigned success instructions: before activation they provide no authorization protection.

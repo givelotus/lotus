@@ -13,12 +13,15 @@ Decision packet P02, October 9, 2026. **Recommended candidate**, not frozen or i
 | txhash | `Lotus/v2/txhash` |
 | sighash | `Lotus/v2/sighash` |
 | spentoutputs | `Lotus/v2/spentoutputs` |
+| owninput | `Lotus/v2/owninput` |
 | outputs | `Lotus/v2/outputs` |
+| output | `Lotus/v2/output` |
 | txroot | `Lotus/v2/txroot` |
 | outpointkey | `Lotus/v2/outpointkey` |
 | utxo | `Lotus/v2/utxo` |
 | state | `Lotus/v2/state` |
 | blockid | `Lotus/v2/blockid` |
+| merkleidx | `Lotus/v2/merkleidx` |
 
 The BLAKE3 primitive follows its [specification](https://github.com/BLAKE3-team/BLAKE3-specs/blob/master/blake3.pdf); application tags and tree rules are Lotus choices. [P04](header-and-mining.md) specifies a recursive BlockID/PoW candidate and its additional headerbody/headerwork domains; final choice remains D12. Hash collision resistance is an assumption, not a theorem about these tags.
 
@@ -35,20 +38,26 @@ Spend and mint invocations use the same leaf function. Consensus therefore does 
 
 For reproducible wallet construction, recommend: sort distinct leaf hashes as unsigned little-endian integers, ascending; split a list of n>1 at the greatest power of two less than n; recursively build and sort each child pair at hashing. This construction is a wallet convention, not a property enforceable from a single proof. An owner may commit another finite binary tree. Duplicated leaves or alternative shapes provide no independent authorization and receive no accounting discount.
 
-### Contract state: the data-leaf convention (not consensus)
+### Storing data and Merkle roots in branches: three patterns
 
-Outputs carry no state field. A contract that keeps data between spends places it in its own branch tree, as one leaf beside the subtree of its methods:
+Outputs carry no separate state field. Contracts and protocols commit data or Merkle roots in `branches` and verify Merkle proofs against them (`MERKLEROOT_SORTED` `0xee`, `MERKLEROOT_INDEXED` `0xef`, `LEAFHASH` `0xea`, `NODEHASH` `0xed`) in three complementary ways:
 
-```text
-DataLeaf(values) = Leaf(data_script(values))      # pushes of the values, then RETURN
-root             = BranchNode(DataLeaf(values), M)   # M = root of the methods subtree
-```
+1. **On a pruneable burn / `OP_RETURN` output (`flags = 0x02` native or `0x03` token, `paths = []`):**
+   - Setting bit 1 (`0x02` `IS_BURN`) requires `path_count == 0` (`paths = []`) and `1 <= branch_count <= 16` pairwise distinct 32-byte entries in `branches` (up to 512 bytes of commitment hashes, Merkle roots, or topic/data words).
+   - 100% of `value` on an `IS_BURN` output is permanently burned (included in `O_a`, never claimable by miners as fees; `value = 0` is also valid), and validators **never insert `IS_BURN` outputs into `UtxoRoot`** (`C17`), so they consume zero UTXO memory forever.
+   - Scripts in the creating transaction can inspect an `IS_BURN` output `j` via `OUTPUTFLAGS(j)`, `OUTPUTVALUE(j)`, `OUTPUTTOKENID(j)`, `OUTPUTBRANCHCOUNT(j)`, and `OUTPUTBRANCH(j, k)`—and can verify Merkle proofs against `OUTPUTBRANCH(j, k)` using `MERKLEROOT_SORTED` or `MERKLEROOT_INDEXED`—making `IS_BURN` outputs ideal for Frank/Stamp topic broadcasts, burn-weighted votes, and verified on-chain data commitments.
+2. **As a dedicated unexecuted data branch on a spendable coin (`branches = [CodeRoot, StateMerkleRoot]`, `paths = [[0]]`):**
+   - Because `paths = [[0]]` requires only `branch[0]` (`CodeRoot`), `branch[1]` (`StateMerkleRoot`) is never executed as a script—it acts as a direct 32-byte state or Merkle-root register on the coin (or up to 15 registers `branch[1..15]`).
+   - Methods in `CodeRoot` read the current root in $O(1)$ via `INPUTINDEX <1> UTXOBRANCH`, verify or update leaves using `MERKLEROOT_INDEXED` (`0xef`) or `MERKLEROOT_SORTED` (`0xee`), and require the successor output `j` to carry the updated root at `OUTPUTBRANCH(j, 1)` while `branch[0]` (`CodeRoot`) never changes.
+3. **Inside the executing branch tree itself (`BranchNode(DataLeaf, M)`, the data-leaf convention):**
+   - For the most compact 1-branch coin (45 bytes native / 77 bytes token, `branches = [root]`, `paths = [[0]]`), a contract places its state as one leaf beside the subtree `M` of its methods:
+     ```text
+     DataLeaf(values) = Leaf(data_script(values))      # pushes of the values, then RETURN
+     root             = BranchNode(DataLeaf(values), M)   # M = root of the methods subtree
+     ```
+   - `M` never changes; `root` changes whenever `values` do. The data script ends in `RETURN` (`0x6a`) so that it can never be run as a method. The spender supplies the current `values` and `M` as witness arguments, and the method checks `BranchNode(Leaf(data_script(values)), M) == BRANCHROOT` using `LEAFHASH` and `NODEHASH`, then requires `BranchNode(Leaf(data_script(new_values)), M)` on the successor output with `OUTPUTCONTINUESBRANCH` (`0xcf`) or `OUTPUTEXCLUSIVEBRANCH` (`0xcb`). The cost is two leaf hashes and two node hashes per spend, whatever the number of methods, and a method's membership proof is one sibling longer than it would be without state.
 
-`M` never changes; the root changes whenever the values do. The data script ends in RETURN so that it can never be run as a method, since any leaf of a tree can be revealed and executed. A contract with no state has no data leaf and its root is `M`, fixed.
-
-A method cannot contain `M`, which is built from the method's own hash. The spender supplies the current values and `M` as witness arguments, and the method checks `BranchNode(Leaf(data_script(values)), M) == BRANCHROOT` using P03's LEAFHASH and NODEHASH. Because a root is the hash of exactly one unordered pair, and leaves and nodes are hashed under different prefixes, only the true values and the true `M` satisfy it. The successor's required root is the same expression with the new values, and the method requires it on the successor with P03's OUTPUTEXCLUSIVEBRANCH, so that a spender can neither drop the contract nor attach conditions of their own. The cost is two leaf hashes and two node hashes per spend, whatever the number of methods, and a method's membership proof is one sibling longer than it would be without state.
-
-Consensus enforces none of this. It is a compiler convention, recorded in the contract's ABI so that wallets know to supply the two extra arguments and to rebuild the membership proof from the current values.
+Patterns 2 and 3 are compiler/application conventions recorded in the contract's ABI; pattern 1 (`IS_BURN` `0x02`/`0x03`) has consensus-enforced `path_count == 0` and UTXO pruning (`C05`, `C09`, `C17`).
 
 ## Block transaction vector: ordered, count-bound tree
 
@@ -67,9 +76,9 @@ Each leaf commits to both identities of its transaction, TxHash first, as Lotus 
 
 A transaction inclusion proof is `count:u32 || index:u32 || Vec(h32 siblings)` plus the transaction bytes, or the TxHash and TxID pair, being proved. A verifier given only the pair learns that the TxID is committed, not that the TxHash it was given corresponds to any particular witness bytes. Require `0 <= index < count`, count within the consensus block-transaction limit, and exact sibling consumption. Reconstruct recursively: for n=1 use the leaf; otherwise compute k, recurse into the child containing index, consume the next sibling from the bottom-up proof, and combine left/right according to index<k. Finally apply the count wrapper. No direction mask is serialized; count and index determine every direction. A proof API must clearly distinguish committed transaction membership from complete transaction/block validity.
 
-## UTXO map: fixed-depth sparse binary tree
+## UTXO map: compact single-leaf-collapsed sparse binary tree
 
-Recommend a 256-bit keyed sparse tree as the initial normative root algorithm. This is deliberately independent of whether a daemon stores it in a compressed trie, database or cache. A Crit-Bit tree is not automatically interchangeable with this root algorithm. The cost is up to 256 node hashes per changed key before shared-path optimization, which must be benchmarked under D08 before adopting the design.
+Use a 256-bit keyed sparse binary tree with single-leaf subtree collapsing as the normative `UtxoRoot` algorithm. Collapsing every single-leaf subtree to its leaf hash eliminates the 220+ redundant hashes between a leaf's deepest split (~depth 27 at $10^8$ coins) and depth 256: updating or proving a key hashes only `k` interior nodes where `k` is the depth of the deepest split with another occupied key (~27 BLAKE3 hashes instead of 256, an ~9.5× reduction). This commitment is strictly for block headers, RPC queries, snapshot verification, and optional transport-layer `ProvenTx` relay packages—never a VM opcode (`OP_UTXOPROOFVERIFY` is rejected; see [rationale](../rationale.md#2-op_utxoproofverify-in-script-global-utxo-state-proofs)).
 
 ```text
 Outpoint = txid:h32 || output_index:u32
@@ -78,27 +87,42 @@ Coin = Outpoint || Bytes(Output) || creation_height:u64
        || creation_parent_mtp:u64 || coinbase:u8
 UtxoLeaf(key,coin) = H_utxo(00 || key || Bytes(Coin))
 UtxoNode(d,l,r) = H_utxo(01 || u16(d) || l || r)       # d=0..255
-Empty[256] = H_utxo(02 || u16(256))
-Empty[d] = UtxoNode(d,Empty[d+1],Empty[d+1])           # descending d
+EmptyRoot = H_utxo(02)
 ```
 
-Key bit d is `(key[d//8] >> (d%8)) & 1`: bit d of the key read as an unsigned little-endian 256-bit integer, least significant bit first, in keeping with the byte-order convention used everywhere else. At depth 256 an occupied key stores exactly one Coin. Depth d has left child for bit zero and right for one. Root is at depth zero. Coin's outpoint must derive its key, coinbase must be 0 or 1, flags must be valid, and its output must satisfy ordinary output well-formedness. Height/time and coinbase flag are consensus metadata, not database hints. Inserting a different outpoint at an occupied hash key rejects; never overwrite or merge such entries.
+Key bit `d` is `bit(key, d) = (key[d//8] >> (d%8)) & 1`: bit `d` of the key read as an unsigned little-endian 256-bit integer, least significant bit first, in keeping with the byte-order convention used everywhere else. For a set of distinct `(key, coin)` entries inside the subtree at depth `d` (`0 <= d <= 256`), the subtree root `smt(entries, d)` is:
 
-Map root is independent of insertion order. Deletion replaces the leaf with Empty[256]. Updates recompute ancestor nodes; implementations may compress storage but must reproduce all implied hashes. Duplicate-key snapshot entries reject even when identical. Pre/post roots alone do not establish that the intervening transaction set was valid.
+- **Empty subtree (`|entries| == 0`):** `EmptyRoot`.
+- **Single-leaf subtree (`|entries| == 1`):** `UtxoLeaf(key, coin)` directly, regardless of depth `d` (all single-child levels from `d` to `256` are collapsed).
+- **Multi-entry subtree (`|entries| >= 2`, `0 <= d < 256`):** Partition `entries` by `bit(key, d)` into `left` (bit `0`) and `right` (bit `1`), and return `UtxoNode(d, smt(left, d + 1), smt(right, d + 1))`.
+
+`UtxoRoot` is `smt(all_entries, 0)`. Only spendable outputs (`(flags & 0x02) == 0`) are inserted into `UtxoRoot`; burn/commitment outputs (`(flags & 0x02) != 0`, which have `path_count == 0`) are pruned at transaction application and never enter `UtxoRoot` (`C17`). Coin's outpoint must derive its key, coinbase must be `0` or `1`, flags must be `0x00` or `0x01`, and its output must satisfy spendable output well-formedness (including `MAX_OUTPUT_BRANCHES = 16` and `MAX_OUTPUT_PATHS = 16`, which bounds every `Coin` record to $\le 867\text{ bytes}$). Height/time and coinbase flag are consensus metadata, not database hints. Inserting a different outpoint at an occupied hash key rejects; never overwrite or merge such entries.
+
+The map root is independent of insertion order. Deletion removes the entry, which automatically collapses any ancestor node whose remaining subtree drops to a single entry. Duplicate-key snapshot entries reject even when identical. Pre/post roots alone do not establish that the intervening transaction set was valid.
 
 ### Canonical membership and absence proof
 
-For a queried Outpoint, encode:
+For a queried `Outpoint` with `query_key = H_outpointkey(Outpoint)`, encode:
 
 ```text
-presence:u8 || [Bytes(Coin) if presence=1] || bitmap:32bytes || siblings
+presence:u8 || [Bytes(Coin) if presence in (1, 2)] || bitmap:32bytes || siblings
 ```
 
-Presence is exactly 0 or 1. Bitmap bit j, indexed least-significant-bit first within byte `j//8`, describes the sibling j steps above the leaf (j=0..255). If zero use `Empty[256-j]`; if one consume one h32 from `siblings` in increasing j order. Siblings has exactly `popcount(bitmap)` entries and no separate count. An explicitly supplied default sibling is noncanonical and rejects.
+In a single-leaf-collapsed tree, following `bit(query_key, d)` from `d = 0` terminates at the shallowest depth `k` (`0 <= k <= 256`) whose subtree has at most one entry. Because the parent at depth `k - 1` (when `k > 0`) had at least two entries while the queried child at depth `k` has at most one, the sibling at depth `k - 1` is guaranteed to be non-empty (`!= EmptyRoot`). Therefore:
 
-Start at the occupied leaf hash for presence=1 or Empty[256] for absence. At step j combine at depth `d=255-j` using key bit d for left/right direction and the indicated sibling. After exactly 256 steps compare the expected map root. Present Coin must match the queried Outpoint. Truncated or extra sibling bytes reject. Absence proves that this key is empty at this root, under the hash assumptions; it does not prove an outpoint was never created or spent at another root.
+- Bit `d` of `bitmap` (`0 <= d <= 255`, indexed least-significant-bit first within byte `d//8`) is `1` iff `d < k` and the sibling at depth `d` is non-empty (`!= EmptyRoot`). All bits `d >= k` MUST be `0`, and when `k > 0` bit `k - 1` is `1`.
+- The terminal depth `k` is uniquely determined by `bitmap`: `k = 0` if `bitmap` is all zeros (which occurs only when the entire UTXO map has `0` or `1` entry), and `k = max_set_bit(bitmap) + 1` otherwise.
+- `siblings` contains exactly `popcount(bitmap)` 32-byte hashes ordered from depth `d = k - 1` down to `0` (bottom-up from the terminal subtree to the root). An explicitly supplied `EmptyRoot` in `siblings`, or any trailing/truncated bytes, is noncanonical and rejects.
 
-This defines a bounded single-key proof (maximum 8192 sibling bytes plus framing/Coin), not an efficient multiproof. That maximum is theoretical. A proof has a real sibling only at a depth where another key shares the path that far, and keys are hashes: with N coins that is about log2(N) levels, and forcing one more at depth d costs about 2^d hash evaluations. A proof of all 256 siblings is therefore unreachable, and realistic proofs are about 1 KB. P05's working MAX_ELEMENT_BYTES of 8192 is slightly below the theoretical maximum, which matters only if a script-visible proof limit is set; a practical sibling cap can be chosen with the other limits. Multiproofs and snapshot range proofs may be designed later as transport/RPC encodings reproducing the same root. Their parsers still need independent resource bounds. Do not require these proofs in transaction witnesses unless a separate transaction-format decision explicitly does so.
+`presence` is `0`, `1`, or `2`, determining the terminal hash `acc` at depth `k`:
+
+- **`presence = 1` (membership):** `Coin.Outpoint` MUST equal the queried `Outpoint`, and `acc = UtxoLeaf(query_key, Coin)`.
+- **`presence = 0` (absence at an empty branch):** No `Coin` is serialized, and `acc = EmptyRoot`. (When `k > 0`, the sibling at depth `k - 1` must be an interior node rather than a single leaf, because a parent with `EmptyRoot` on one side and a single leaf on the other would have collapsed to that single leaf; implementations may additionally reject a single-leaf sibling if tagged, and root comparison binds `UtxoNode(k - 1, ...)` against `UtxoRoot`.)
+- **`presence = 2` (absence by prefix collision with another single leaf):** `Coin.Outpoint` MUST differ from the queried `Outpoint`, `other_key = H_outpointkey(Coin.Outpoint)` MUST agree with `query_key` on all bits `0 .. k - 1` (`bit(other_key, d) == bit(query_key, d)` for every `0 <= d < k`), and `acc = UtxoLeaf(other_key, Coin)`.
+
+For each depth `d = k - 1` down to `0`, let `sib = EmptyRoot` if bit `d` of `bitmap` is `0`, or consume the next 32-byte hash from `siblings` if bit `d` is `1` (rejecting if `sib == EmptyRoot`). Set `acc = UtxoNode(d, acc, sib)` when `bit(query_key, d) == 0`, or `UtxoNode(d, sib, acc)` when `bit(query_key, d) == 1`. After `k` steps (`d = 0`), require `acc == UtxoRoot`.
+
+Verification performs only `k` node hashes (plus 1 leaf hash when `presence in (1, 2)`), which is about 27 hashes at $10^8$ coins (~1 KB proof). Absence (`presence = 0` or `2`) proves that `query_key` is unpopulated at `UtxoRoot` under the hash assumptions; it does not prove an outpoint was never created or spent at another root. Multiproofs and snapshot range proofs may be designed later as transport/RPC encodings reproducing the same root.
 
 ### Candidate input-proof relay package (not consensus)
 
@@ -127,7 +151,7 @@ StateRoot = H_state(00 || ChainID || height:u64
                     || UtxoRoot:h32 || Bytes(MonetaryState))
 ```
 
-`MonetaryState` is a canonical record to be frozen with D10/D11: it must contain every recurrence/faucet value not uniquely derivable from authenticated headers/UTXOs. This packet does not choose opaque daemon bytes as its encoding. The header's former `hashUtxoMerklixRoot` is therefore renamed **state_root**. RPCs must expose both the envelope and UTXO proofs so clients can connect a coin proof to the header root. Height must match the validated block context.
+`MonetaryState` is a canonical record to be frozen with D10: it must contain every work-responsive reward recurrence value not uniquely derivable from authenticated headers/UTXOs (D11's protocol faucet is rejected, so no faucet state exists). This packet does not choose opaque daemon bytes as its encoding. The header's former `hashUtxoMerklixRoot` is therefore renamed **state_root**. RPCs must expose both the envelope and UTXO proofs so clients can connect a coin proof to the header root. Height must match the validated block context.
 
 Header ancestry supplies validated time/target context; a standalone UTXO snapshot does not. Snapshot admission must check envelope, unique entries, canonical Coin encodings, root reconstruction, monetary record and selected chain context, and clearly state which historical transitions were actually verified. Retained undo must restore every field of the prior envelope.
 
@@ -137,4 +161,4 @@ Choose ChainID and genesis parameters → construct coinbase using parent ID/hei
 
 ## Acceptance obligations
 
-Pin test vectors for empty/one/two/odd transaction trees, every proof direction, empty/occupied/deleted state maps, same map built in different orders, coin metadata changes and envelope restoration. Check both scalar and compressed implementations against the same vectors. Calibrate the 256-level map cost before freezing it; choose an alternative before genesis if the measured budget is unacceptable. This packet closes a candidate algorithm, not its performance or MonetaryState dependencies.
+Pin test vectors for empty/one/two/odd transaction trees, every proof direction, empty/single-leaf/multi-leaf/deleted compact state maps, all three proof presence modes (`0`, `1`, `2`), same map built in different orders, coin metadata changes and envelope restoration. Check both scalar and incremental implementations against the same vectors. This packet closes a candidate algorithm, not its MonetaryState dependencies.

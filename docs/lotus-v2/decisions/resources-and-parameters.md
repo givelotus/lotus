@@ -34,9 +34,9 @@ The pass **never rejects a script and adds no validity rule**. It only chooses c
 | Instruction | Bound of each result |
 | --- | --- |
 | PUSH_n, PUSHDATA | exact data length |
-| constants, arithmetic on N or U values, comparisons and every other Boolean result, BIN2NUM, DEPTH, SIZE, counts, indices, values | 16 |
+| constants, arithmetic on N or U values, comparisons, OUTPUTCONTINUESBRANCH and every other Boolean result, BIN2NUM, DEPTH, SIZE, counts, indices, values | 16 |
 | RAWLEFTBITSHIFT | the shifted operand's bound |
-| hashes, LEAFHASH, NODEHASH, TXID, OUTPOINTTXID, CHAINID, SIGHASH, BRANCHROOT, token IDs, branch roots | 32 |
+| hashes, LEAFHASH, NODEHASH, MERKLEROOT_SORTED, MERKLEROOT_INDEXED, TXID, OUTPOINTTXID, CHAINID, SIGHASH, BRANCHROOT, token IDs, branch roots | 32 |
 | CAT | sum of both operand bounds, capped at MAX_ELEMENT_BYTES |
 | SPLIT | each piece takes the source's bound |
 | NUM2BIN | the width, if it is a constant in 0..MAX_ELEMENT_BYTES pushed by the immediately preceding instruction; otherwise MAX_ELEMENT_BYTES |
@@ -61,13 +61,13 @@ A complete schedule must separately cover:
 1. Wire parsing and canonicalization by bytes/counts; all script structural scans.
 2. Coin resolution, resolved output bytes and metadata; path/witness matching.
 3. Script/mint commitment hashing and every supplied membership sibling.
-4. Core and Coins construction and hashing, charged by their bytes even if cached.
-5. Every spend and mint invocation, including signatures, data hashing, byte copies, introspection serialization and state-proof opcodes.
+4. `Core(tx)`, `CoinsHash`, `OutputsHash`, `OwnInputHash(i)` and `OutputHash(j)` construction and hashing, charged linearly in $O(\text{tx bytes} + \text{resolved coin bytes})$ even if lazily cached. Every `CHECKSIG` or `SIGHASH` execution in any mode (`00`, `01`, `02`) then hashes a fixed-size preimage of 138, 150 or 178 bytes ($\le 3$ BLAKE3 64-byte compression blocks) in $O(1)$ time, preventing quadratic sighash hashing.
+5. Every spend and mint invocation, including signatures, data hashing, byte copies, introspection serialization and Merkle-root opcodes (`MERKLEROOT_SORTED`, `MERKLEROOT_INDEXED`).
 6. Native/token aggregation and mint lookup, with a deterministic bounded algorithm/model.
-7. State updates and root calculation: a conservative charge for each consumed/created key's leaf/value hashing and 256 sparse-tree levels, without relying on shared-path or cache savings.
+7. State updates and root calculation: each consumed/created key's leaf/value hashing and interior-node updates in P02's compact single-leaf-collapsed sparse tree (~27 hashes per key at $10^8$ coins, bounded by a conservative per-key cap).
 8. Block parsing/header/transaction-tree/monetary/undo work and all transaction charges.
 
-Spending a large output is not cheap just because its input wire record is small. Max output bytes and coin-resolution charges must cover it. A transaction-level cost cap alone cannot bound a block full of individually acceptable expensive transactions. Conversely, a block cap does not replace bounds on rejected transaction parsing and mempool admission.
+Input resolution never loads parent transactions into memory, and outputs carry no inline scripts or state blobs. With the hard consensus caps `MAX_OUTPUT_BRANCHES = 16` and `MAX_OUTPUT_PATHS = 16` ([P01](encoding-and-signatures.md)), every serialized `Output` is at most **812 bytes** (45B native / 77B token for single-branch outputs) and every UTXO `Coin` record is at most **867 bytes** (865 bytes without the outer `CS` length). Spending 256 or 1,000 inputs from the largest transactions in history therefore requires $< 225\text{ KB}$ or $< 870\text{ KB}$ of `Coin` memory, eliminating Bitcoin's PrevTx and oversized-UTXO out-of-memory vectors by construction. Furthermore, each path is a subset of `0..15` stored in RAM as a single `uint16_t` bitmask (`uint16_t paths[16]`, 32 bytes per coin), making `UTXOREQUIRESBRANCH`, `OUTPUTREQUIRESBRANCH`, `OUTPUTEXCLUSIVEBRANCH` and `OUTPUTCONTINUESBRANCH` $O(1)$ bitmask operations. A transaction-level cost cap alone cannot bound a block full of individually acceptable expensive transactions; conversely, a block cap does not replace bounds on rejected transaction parsing and mempool admission.
 
 The sorted/hashed algorithm chosen for asset accumulation must have a bounded worst-case schedule; expected O(1) hash-table lookup is not a worst-case consensus argument. Model at most I+O asset records with a deterministic sort or another explicitly bounded procedure. Storage I/O and peer submission limits remain operational obligations; consensus does not require the entire UTXO set in RAM.
 
@@ -76,16 +76,16 @@ The sorted/hashed algorithm chosen for asset accumulation must have a bounded wo
 | Family | Required named parameters / constraints |
 | --- | --- |
 | Wire | MAX_TX_BYTES, MAX_BLOCK_BYTES, MAX_INPUTS, MAX_OUTPUTS, MAX_BLOCK_TXS, MAX_MINTS |
-| Output/authorization | MAX_OUTPUT_BYTES, MAX_BRANCHES, MAX_PATHS, MAX_PATH_BRANCHES, MAX_BRANCH_PROOF_DEPTH |
+| Output/authorization | `MAX_OUTPUT_BRANCHES = 16`, `MAX_OUTPUT_PATHS = 16` (implied `MAX_PATH_BRANCHES = 16`, `MAX_OUTPUT_BYTES = 812`, `MAX_COIN_BYTES = 867`), MAX_BRANCH_PROOF_DEPTH |
 | VM | MAX_SCRIPT_BYTES, MAX_ARGUMENTS, MAX_ELEMENT_BYTES (working value 8192), MAX_STACK_ITEMS, MAX_ALTSTACK_ITEMS, MAX_VM_BYTES, MAX_AST_DEPTH; loop depth=2 and generic bound=256 |
 | Work | MAX_INVOCATION_COST, MAX_TX_COST, MAX_BLOCK_COST and every primitive/structural coefficient |
 | Time/chain | COINBASE_MATURITY, POW_LIMIT, ASERT anchor and half-life, timestamp/future-eligibility rules |
-| Money | Tail initialization/floor/cap/precision, bootstrap initialization/clock/decay, DUST_LIMIT and the token-output burn multiple (C14a), allocation and faucet state parameters |
+| Money | Tail initialization/floor/cap/precision, bootstrap initialization/clock/decay, DUST_LIMIT and the token-output burn multiple (C14a), genesis allocations (protocol faucet rejected under D11) |
 | Identity | ChainID, header/transaction versions, exact genesis bytes/hash, network/address/seed/directory configuration |
 
 Represent constants in a versioned machine-readable manifest, not scattered daemon defaults. Its byte grammar and digest must be fixed before freezing; a JSON file with unspecified number/string canonicalization is not yet a consensus hash preimage. An outer release manifest can hash the exact canonical parameter-file bytes without making its own digest part of those bytes.
 
-Feasibility constraints matter as much as maxima: a standard payment must fit all caps; a useful two-level covenant must fit its transaction budget; configured state-proof payloads and any intended full-output introspection must fit MAX_ELEMENT_BYTES; total stack memory must cover legal individual elements; the maximum block's declared byte/count fields must be representable. An output too large for full-output introspection must still be usable through field accessors, or its construction limit should be lowered. Document which capabilities are intentionally bounded out.
+Feasibility constraints matter as much as maxima: a standard payment must fit all caps; a useful two-level covenant must fit its transaction budget; every valid `Output` ($\le 812\text{ bytes}$) fits well inside `MAX_ELEMENT_BYTES` (8192) for `UTXOOUTPUT` / `OUTPUTRECORD` introspection; total stack memory must cover legal individual elements; the maximum block's declared byte/count fields must be representable. Document which capabilities are intentionally bounded out.
 
 ## Calibration procedure
 

@@ -220,6 +220,12 @@ The terms are template parameters, so each order has its own root and an order c
 
 Pairing: with two order coins from one maker at inputs 0 and 1, each requires its own payment at outputs 0 and 1. Without pairing both could be satisfied by one payment.
 
+**Partial fills, Dutch auctions and expiring offers (preserving C22a):**
+
+- **Partial fills:** A partially fillable limit order checks that output `2*i` pays the maker `(this.coin.value - remaining) * price` (`OUTPUTEXCLUSIVEBRANCH` to `pay_to`) and that output `2*i + 1` returns `remaining` units of the offered token to the exact same order covenant via `BRANCHROOT OUTPUTCONTINUESBRANCH` (`0xcf`), which preserves both the `LimitOrder` branch, the `MakerWallet` cancel branch, and any `MyTokenRules` branch on the remainder coin.
+- **Dutch auctions and linear vesting:** Because `TXLOCKTIME` (`0xc5`) and `TXLOCKKIND` (`0xe0`) expose the transaction's deterministic lower-bound lock (`height >= lock_value` or `MTP(parent) >= lock_value`), a Dutch auction computes `price(t) = max(floor_price, start_price - rate * max(0, TXLOCKTIME - start_time))` in script without any block-header opcode (`OP_BLOCKHEIGHT` / `OP_BLOCKTIME` are rejected; see [rationale](../rationale.md#1-op_blockheight-op_blocktime-op_blockhash-and-block-dependent-transactions)). A rational buyer sets `lock` to the current block height or parent MTP to obtain the lowest valid price, while the signed transaction remains monotonically valid at all later blocks (`C22a`).
+- **Expiring offers:** Add a refund/sweep method to the maker branch gated by `CHECKLOCKTIMEVERIFY` (`0xb1`) or `CHECKSEQUENCEVERIFY` (`0xb2`) so the maker (or a keeper) can sweep the coin once the deadline passes, revoking the offer by consuming its UTXO.
+
 ## 5. Contract state
 
 Outputs have no state field. A contract with `state` is laid out as one data leaf beside the subtree of its methods (P02):
@@ -267,16 +273,31 @@ SWAP 1ADD                            ; M n'      n' = n + 1
 <10> SWAP CAT <6a> CAT LEAFHASH      ; M D'
 NODEHASH                             ; R'        R' = Node(D', M)
 
-; 4. Require it on the output at this input's position.
+; 4. Require the output at this input's position to continue with R'.
 INPUTINDEX SWAP                      ; i R'
-OUTPUTEXCLUSIVEBRANCH                ; spendable with R' alone, never without it
+OUTPUTCONTINUESBRANCH                ; preserves all paths and companion branches, replacing BRANCHROOT with R'
 ```
 
 A method's membership proof ends with the data leaf's hash, so the wallet rebuilds the proof from the current values on every spend. The data script ends in RETURN so that it can never be run as a method. Numbers in state are kept at the VM's 16-byte width, so no conversion is needed.
 
 These checks cover every step but not the start: no script runs when a coin is created, so anyone can make a coin whose root is a `Counter` holding any `n`. Where the history matters, a mint script requires the first coin to carry the contract's root for the starting values, and the contract's methods require the token to move to the successor.
 
-Scope of the exclusive check. OUTPUTEXCLUSIVEBRANCH names one root, so it applies to an output that needs no other mandatory branch: a contract's own successor, or a payment in XPI or in a token without a rules contract. That covers the uses here, where a method pays out a different asset from the one it guards. It cannot be applied to an output that itself holds a token with a rules contract, because the rules require their root on every path of that output.
+**Why `OUTPUTCONTINUESBRANCH` (`0xcf`) is used for continuation (`OUTPUTEXCLUSIVEBRANCH` `0xcb` for fresh payouts):** `OUTPUTCONTINUESBRANCH` verifies in one $O(1)$ check that output `j` has the exact same `paths` array and the exact same `branches` array as the spent coin (`INPUTINDEX`), except that the active invocation's `BRANCHROOT` at its branch index `k` is replaced by `R'`. Consequently, `Counter.increment()` works identically whether the coin is a single-branch native XPI coin (`branches=[Counter]`, `paths=[[0]]`) **or** a multi-branch token coin carrying a mandatory token rules contract (`branches=[Counter, MyTokenRules]`, `paths=[[0, 1]]`). By contrast, `OUTPUTEXCLUSIVEBRANCH` (`0xcb`) is used when a contract creates a fresh payout output to another party's single-branch root (`pay_to` in `LimitOrder.fill()`), where the spent coin's own branches are intentionally not continued.
+
+**Key-value maps and sets in contract state (`MERKLEROOT_INDEXED` `0xef`, `MERKLEROOT_SORTED` `0xee`):** When a contract stores a large key-value map or allowlist inside its state leaf (a 32-byte `map_root` instead of a single scalar `n`), a method verifies the old entry `old_leaf` at `key` and computes the updated `map_root'` for `new_leaf` using the same `proof` witness argument:
+
+```text
+; verify old_leaf at key against current map_root
+<old_leaf> <key> <proof> MERKLEROOT_INDEXED <map_root> EQUALVERIFY
+; compute updated map_root' for new_leaf at the same key and proof
+<new_leaf> <key> <proof> MERKLEROOT_INDEXED
+; wrap map_root' in the data leaf and enforce continuation with OUTPUTCONTINUESBRANCH
+```
+
+**Three ways to store data or Merkle roots in `branches` (P02):**
+1. **Data leaf inside the executing branch tree (`BranchNode(DataLeaf, M)`):** Shown in `Counter` above; keeps a single-branch coin (`branches=[Counter]`, `paths=[[0]]`) while updating state via `OUTPUTCONTINUESBRANCH` (`0xcf`).
+2. **Dedicated unexecuted data branch on a spendable coin (`branches=[CodeRoot, StateMerkleRoot]`, `paths=[[0]]`):** Branch `0` holds the immutable method tree (`CodeRoot`) and is the only branch referenced by `paths`; branch `1` holds a 32-byte state hash or Merkle root directly. The script in branch `0` reads its current state via `INPUTINDEX <1> UTXOBRANCH` (`0xd5`), folds a witness proof via `MERKLEROOT_INDEXED` (`0xef`) or `MERKLEROOT_SORTED` (`0xee`), and checks `OUTPUTBRANCH(j, 1) == new_state_root` alongside `OUTPUTBRANCH(j, 0) == BRANCHROOT`.
+3. **Pruneable burn / `OP_RETURN` commitment output (`Output.flags` bit 1 `IS_BURN`, `0x02` native / `0x03` token):** Has `paths = []` (`path_count == 0`) and `1..16` 32-byte commitment words or Merkle roots in `branches` (up to 512 bytes), is never inserted into `UtxoRoot` (C17), permanently burns its `value`, and is introspected in the same transaction via `OUTPUTFLAGS` (`0xd9`), `OUTPUTBRANCHCOUNT` (`0xd8`), and `OUTPUTBRANCH` (`0xd6`).
 
 ### Merging two coins
 

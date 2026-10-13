@@ -95,64 +95,81 @@ def node(depth: int, left: bytes, right: bytes) -> bytes:
     return h('utxo', b'\1' + u(depth, 2) + left + right)
 
 
-EMPTY = [b''] * 257
-EMPTY[256] = h('utxo', b'\2' + u(256, 2))
-for depth in range(255, -1, -1):
-    EMPTY[depth] = node(depth, EMPTY[depth + 1], EMPTY[depth + 1])
+EMPTY_ROOT = h('utxo', b'\2')
 
 
 def bit(key: bytes, depth: int) -> int:
     return (key[depth // 8] >> (depth % 8)) & 1  # little-endian bit order
 
 
+def merkle_sorted(leaf_hash: bytes, proof_bytes: bytes) -> bytes:
+    assert len(leaf_hash) == 32 and len(proof_bytes) % 32 == 0
+    k = len(proof_bytes) // 32
+    assert 0 <= k <= 64
+    acc = leaf_hash
+    for i in range(k):
+        acc = branch(acc, proof_bytes[32 * i:32 * (i + 1)])
+    return acc
+
+
+def merkle_indexed(leaf_hash: bytes, key_bytes: bytes, proof_bytes: bytes) -> bytes:
+    assert len(leaf_hash) == 32 and 1 <= len(key_bytes) <= 32 and len(proof_bytes) % 32 == 0
+    k = len(proof_bytes) // 32
+    assert 0 <= k <= 8 * len(key_bytes)
+    acc = leaf_hash
+    for i in range(k):
+        d = (k - 1) - i
+        sib = proof_bytes[32 * i:32 * (i + 1)]
+        left, right = (sib, acc) if bit(key_bytes, d) else (acc, sib)
+        acc = h('merkleidx', b'\1' + u(d, 2) + left + right)
+    return acc
+
+
 def smt(entries: dict[bytes, bytes], depth: int = 0) -> bytes:
     if not entries:
-        return EMPTY[depth]
-    if depth == 256:
-        assert len(entries) == 1
+        return EMPTY_ROOT
+    if len(entries) == 1:
         key, coin = next(iter(entries.items()))
         return h('utxo', b'\0' + key + blob(coin))
+    assert depth < 256
     left = {k: v for k, v in entries.items() if bit(k, depth) == 0}
     right = {k: v for k, v in entries.items() if bit(k, depth) == 1}
     return node(depth, smt(left, depth + 1), smt(right, depth + 1))
 
 
-def state_path(entries: dict[bytes, bytes], key: bytes, depth: int = 0) -> list[bytes]:
-    if depth == 256:
-        return []
+def state_path(entries: dict[bytes, bytes], key: bytes, depth: int = 0) -> tuple[dict[bytes, bytes], list[tuple[int, bytes]]]:
+    if len(entries) <= 1:
+        return entries, []
+    assert depth < 256
     selected = {k: v for k, v in entries.items() if bit(k, depth) == bit(key, depth)}
     other = {k: v for k, v in entries.items() if bit(k, depth) != bit(key, depth)}
-    return state_path(selected, key, depth + 1) + [smt(other, depth + 1)]
+    terminal, path = state_path(selected, key, depth + 1)
+    return terminal, path + [(depth, smt(other, depth + 1))]
 
 
 def state_proof(entries: dict[bytes, bytes], key: bytes) -> bytes:
-    coin = entries.get(key)
-    start = b'\0' if coin is None else b'\1' + blob(coin)
+    terminal, path = state_path(entries, key)
+    if not terminal:
+        start = b'\0'
+    else:
+        term_key, term_coin = next(iter(terminal.items()))
+        start = (b'\1' if term_key == key else b'\2') + blob(term_coin)
     bitmap = bytearray(32)
     nondefault = []
-    for j, sibling in enumerate(state_path(entries, key)):
-        if sibling != EMPTY[256 - j]:
-            bitmap[j // 8] |= 1 << (j % 8)
+    for depth, sibling in path:
+        if sibling != EMPTY_ROOT:
+            bitmap[depth // 8] |= 1 << (depth % 8)
             nondefault.append(sibling)
     return start + bytes(bitmap) + b''.join(nondefault)
-
-
-def recover_state(key: bytes, coin: bytes | None, path: list[bytes]) -> bytes:
-    root = EMPTY[256] if coin is None else h('utxo', b'\0' + key + blob(coin))
-    assert len(path) == 256
-    for j, sibling in enumerate(path):
-        depth = 255 - j
-        left, right = (sibling, root) if bit(key, depth) else (root, sibling)
-        root = node(depth, left, right)
-    return root
 
 
 def recover_compact(outpoint: bytes, proof: bytes) -> bytes:
     """Decode the generated P02 fixtures; this is not a hardened input parser."""
     key = h('outpointkey', outpoint)
-    assert proof[0] in (0, 1)
+    presence = proof[0]
+    assert presence in (0, 1, 2)
     offset, coin = 1, None
-    if proof[0]:
+    if presence in (1, 2):
         first = proof[offset]
         offset += 1
         if first < 253:
@@ -162,22 +179,34 @@ def recover_compact(outpoint: bytes, proof: bytes) -> bytes:
             size = int.from_bytes(proof[offset:offset + width], 'little')
             offset += width
         coin = proof[offset:offset + size]
-        assert len(coin) == size and coin[:36] == outpoint
+        assert len(coin) == size
         assert proof[1:offset + size] == blob(coin)
         offset += size
     bitmap = proof[offset:offset + 32]
     assert len(bitmap) == 32
     offset += 32
-    path = []
-    for j in range(256):
-        sibling = EMPTY[256 - j]
-        if bitmap[j // 8] & (1 << (j % 8)):
+    set_bits = [d for d in range(256) if bitmap[d // 8] & (1 << (d % 8))]
+    k = 0 if not set_bits else max(set_bits) + 1
+    if presence == 0:
+        root = EMPTY_ROOT
+    elif presence == 1:
+        assert coin is not None and coin[:36] == outpoint
+        root = h('utxo', b'\0' + key + blob(coin))
+    else:
+        assert coin is not None and coin[:36] != outpoint
+        other_key = h('outpointkey', coin[:36])
+        assert all(bit(other_key, d) == bit(key, d) for d in range(k))
+        root = h('utxo', b'\0' + other_key + blob(coin))
+    for depth in range(k - 1, -1, -1):
+        sibling = EMPTY_ROOT
+        if bitmap[depth // 8] & (1 << (depth % 8)):
             sibling = proof[offset:offset + 32]
-            assert len(sibling) == 32 and sibling != EMPTY[256 - j]
+            assert len(sibling) == 32 and sibling != EMPTY_ROOT
             offset += 32
-        path.append(sibling)
+        left, right = (sibling, root) if bit(key, depth) else (root, sibling)
+        root = node(depth, left, right)
     assert offset == len(proof)
-    return recover_state(key, coin, path)
+    return root
 
 
 def log_q64(x: int) -> int:
@@ -224,9 +253,9 @@ ASSIGNED_OPCODES = set(range(1, 76)) | set(bytes.fromhex('''
 61 63 64 67 68 69 6a 6b 6c 6d 6e 6f 70 71 72 74 75 76 77
 78 79 7a 7b 7c 7d 7e 7f 80 81 82 83 84 85 86 87 88 8b 8c
 8f 90 91 92 93 94 95 96 97 98 99 9a 9b 9c 9d 9e 9f a0 a1
-a2 a3 a4 a5 a8 aa ac ad b1 b2 b4 b5 b6 ba bb bd be bf c0 c1
-c2 c3 c4 c5 c6 c7 c8 c9 ca cb cc cd ce d0 d1 d2 d4 d5 d6 d7
-d8 d9 da db dc dd de df e0 e1 e2 e3 e4 e5 e6 e7 e8 e9 ea eb ec ed
+a2 a3 a4 a5 a8 aa ac ad b1 b2 b4 b5 b6 ba bd be bf c0 c1
+c2 c3 c4 c5 c6 c7 c8 c9 ca cb cc cd ce cf d0 d1 d2 d4 d5 d6 d7
+d8 d9 da db dc dd de df e0 e1 e2 e3 e4 e5 e6 e7 e8 e9 ea eb ec ed ee ef
 '''))
 SUCCESS_OPCODES = set(range(256)) - ASSIGNED_OPCODES
 
@@ -271,7 +300,7 @@ def success_scan(script: bytes, max_element_bytes: int = 8192) -> bool:
 
 
 def success_scan_vectors() -> dict:
-    assert len(ASSIGNED_OPCODES) == 213 and len(SUCCESS_OPCODES) == 43
+    assert len(ASSIGNED_OPCODES) == 215 and len(SUCCESS_OPCODES) == 41
     # Bind the explicit model allocation to the instruction rows, excluding
     # summary rows whose ranges also contain otherwise unassigned bytes.
     import re
@@ -336,20 +365,40 @@ def make_vectors() -> dict:
     sibling_core = prefix + outpoint + b'\xff' * 4 + b'\1\0\1' + blob(script) + b'\1' + b'\x99' * 32 + output
     assert h('txid', CHAIN + alt_core) != txid and h('txid', CHAIN + sibling_core) != txid
     coins = u(1, 2) + blob(prev_output)
-    selector = b'\1' + root
+    selector = b'\1' + u(0, 4) + u(0, 4) + root  # 01 || input_index:u32 || branch_index:u32 || Leaf(script)
+    assert len(selector) == 41
     preimage = CHAIN + b'\0' + txid + h('spentoutputs', coins) + selector
-    assert len(preimage) == 130
-    # Partial signing modes: own input plus all outputs (01) or the same-index output (02).
+    assert len(preimage) == 138
+    # Partial signing modes use O(1) 32-byte digests: OwnInputHash(i) and OutputsHash (01) or OutputHash(i) (02).
     own_input = inp_core + blob(prev_output)
-    partial_head = u(7, 4) + u(0, 8) + own_input
-    msg_all_outputs = h('sighash', CHAIN + b'\1' + partial_head + h('outputs', u(1, 2) + output) + selector)
-    msg_one_output = h('sighash', CHAIN + b'\2' + partial_head + blob(output) + selector)
     assert len(own_input) == 46 + 46
+    own_input_hash = h('owninput', own_input)
+    outputs_hash = h('outputs', u(1, 2) + output)
+    output_hash = h('output', blob(output))
+    partial_head = u(7, 4) + u(0, 8) + own_input_hash
+    preimage_mode_01 = CHAIN + b'\1' + partial_head + outputs_hash + selector
+    preimage_mode_02 = CHAIN + b'\2' + partial_head + output_hash + selector
+    assert len(preimage_mode_01) == 150 and len(preimage_mode_02) == 150
+    msg_all_outputs = h('sighash', preimage_mode_01)
+    msg_one_output = h('sighash', preimage_mode_02)
     # Mint input: token ID is the one-leaf mint root itself; Core retains CoreWitness and omits Vec(Bytes(arg)).
     token_id = root
     mint_core = token_id + u(0, 4) + b'\xff' * 4 + b'\3' + core_witness
     mint_wire = mint_core + b'\0'
     assert (len(mint_core), len(mint_wire)) == (44, 45)
+    # Pruneable burn/commitment output (flags=0x02 IS_BURN): 1..16 branch roots and path_count == 0 (never enters UtxoRoot).
+    burn_output = b'\2' + u(500, 8) + b'\1' + root + b'\0'
+    assert len(burn_output) == 43
+
+    # MERKLEROOT_SORTED (0xee) and MERKLEROOT_INDEXED (0xef) fixtures.
+    sib0, sib1 = leaf(b'\x52'), leaf(b'\x53')
+    sorted_root = merkle_sorted(root, sib0 + sib1)
+    assert sorted_root == branch(branch(root, sib0), sib1)
+    assert merkle_sorted(root, b'') == root
+    idx_key = b'\x05'  # bits: d=0 -> 1, d=1 -> 0
+    idx_old_root = merkle_indexed(root, idx_key, sib0 + sib1)
+    idx_new_root = merkle_indexed(leaf(b'\x54'), idx_key, sib0 + sib1)
+    assert idx_old_root != idx_new_root and merkle_indexed(root, idx_key, b'') == root
 
     transaction_trees = []
     for count in range(18):
@@ -369,13 +418,21 @@ def make_vectors() -> dict:
     entries = {key: coin, other_key: other_coin}
     state_root = smt(entries)
     assert state_root == smt(dict(reversed(list(entries.items()))))
-    for query in (key, other_key, absent_key):
-        assert recover_state(query, entries.get(query), state_path(entries, query)) == state_root
     for query_outpoint in (outpoint, other_outpoint, absent_outpoint):
         query = h('outpointkey', query_outpoint)
         assert recover_compact(query_outpoint, state_proof(entries, query)) == state_root
-    assert smt({}) == EMPTY[0]
-    assert smt({key: coin}) != state_root
+    # Single-leaf map: root is UtxoLeaf directly (0 interior node hashes), and absence uses presence=2 at k=0.
+    single_map = {key: coin}
+    single_root = smt(single_map)
+    assert single_root == h('utxo', b'\0' + key + blob(coin))
+    assert recover_compact(outpoint, state_proof(single_map, key)) == single_root
+    single_absence = state_proof(single_map, absent_key)
+    assert single_absence[0] == 2 and recover_compact(absent_outpoint, single_absence) == single_root
+    # Empty map: root is EMPTY_ROOT, and absence uses presence=0 at k=0.
+    assert smt({}) == EMPTY_ROOT
+    empty_absence = state_proof({}, absent_key)
+    assert empty_absence == b'\0' + b'\0' * 32 and recover_compact(absent_outpoint, empty_absence) == EMPTY_ROOT
+    assert single_root != state_root
 
     # Arbitrary root bytes below are header-hashing fixtures, not a valid mined block.
     body = u(2, 4) + u(1000, 8) + u(101, 8) + txroot([wid + txid]) + b'\x44' * 32
@@ -427,9 +484,12 @@ def make_vectors() -> dict:
         'success_scan': success_scan_vectors(),
         'chain_id_fixture_only': CHAIN.hex(),
         'ordinary_op_one_fixture': {
-            'output': output.hex(), 'core': core.hex(), 'wire': wire.hex(),
+            'output': output.hex(), 'burn_output': burn_output.hex(),
+            'core': core.hex(), 'wire': wire.hex(),
             'txid': txid.hex(), 'txhash': wid.hex(), 'branch_leaf': root.hex(),
             'coins': coins.hex(), 'selector': selector.hex(),
+            'own_input_hash': own_input_hash.hex(), 'outputs_hash': outputs_hash.hex(),
+            'output_hash': output_hash.hex(),
             'signing_preimage': preimage.hex(), 'signing_message': h('sighash', preimage).hex(),
             'signing_message_mode_01': msg_all_outputs.hex(), 'signing_message_mode_02': msg_one_output.hex(),
             'note': 'No signature or full VM/block validation is asserted.'},
@@ -437,10 +497,17 @@ def make_vectors() -> dict:
             'mint_root': token_id.hex(), 'token_id': token_id.hex(),
             'input_core': mint_core.hex(), 'input_wire': mint_wire.hex(),
             'note': 'One-leaf OP_ONE mint policy; framing and token ID only.'},
+        'merkle_opcode_fixtures': {
+            'sorted_root': sorted_root.hex(),
+            'indexed_key': idx_key.hex(),
+            'indexed_old_root': idx_old_root.hex(),
+            'indexed_new_root': idx_new_root.hex()},
         'ordered_transaction_roots': transaction_trees,
-        'state': {'empty_root': EMPTY[0].hex(), 'two_coin_root': state_root.hex(),
-                  'present_outpoint': outpoint.hex(), 'membership_proof': state_proof(entries,key).hex(),
-                  'absent_outpoint': absent_outpoint.hex(), 'absence_proof': state_proof(entries,absent_key).hex()},
+        'state': {'empty_root': EMPTY_ROOT.hex(), 'single_coin_root': single_root.hex(),
+                  'two_coin_root': state_root.hex(),
+                  'present_outpoint': outpoint.hex(), 'membership_proof': state_proof(entries, key).hex(),
+                  'absent_outpoint': absent_outpoint.hex(), 'absence_proof': state_proof(entries, absent_key).hex(),
+                  'empty_absence_proof': empty_absence.hex()},
         'header_hash_fixture': {'wire': header.hex(), 'body_hash': body_hash.hex(),
                                 'work_hash': work_hash.hex(), 'block_id': block_id.hex(),
                                 'note': 'Size/state/transaction fields are hash inputs only; not a valid block.'},
@@ -463,7 +530,7 @@ def main() -> None:
         path.write_text(json.dumps(actual, indent=2) + '\n')
     else:
         assert json.loads(path.read_text()) == actual, 'Fixtures or packet digests changed; review before regenerating.'
-    print('PASS: framing/signing inputs; 43 success opcodes and push-boundary scan cases; 153 ordered-tree paths; sparse-map membership/absence/order; 134/82/64-byte header views; LOG power/monotonic checks; exact tail rounding; ASERT boundaries and compact targets.')
+    print('PASS: framing/signing inputs; 41 success opcodes and push-boundary scan cases; Merkle opcodes; 153 ordered-tree paths; compact sparse-map membership/absence/order; 134/82/64-byte header views; LOG power/monotonic checks; exact tail rounding; ASERT boundaries and compact targets.')
 
 
 if __name__ == '__main__':

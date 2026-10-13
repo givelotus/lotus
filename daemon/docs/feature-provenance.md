@@ -22,7 +22,7 @@ The active no-diff entries are `03-mempool-cleanup.patch` in v2/eCash/BCHN. Dete
 | --- | --- | --- | --- |
 | Two-minute timing and ASERT | v1 patches 004, 044 and later chainparams history | Preserve observed activated behavior | Reuse arithmetic only after exact target/time rules selected |
 | Extended headers/transaction identities | v1 094 (`fb997e62174368720901d4af7a8b312f5970f68f`): 48-bit time, 64-bit nonce, height/size and recursive SHA256 groups; v2 09/23 | Match live-network bytes/hashes, including existing >32-bit timestamp cases | P04 proposes revised recursive groups and a state commitment; widths/hash/ASERT still need acceptance |
-| Issuance and minerfund | v1 087/095, epoch series, 206; v2 11/12/26/27 | Preserve historical rewards and activation behavior | Reconcile paper and D10–D11; legacy and proposed schedules cannot both be active |
+| Issuance and minerfund | v1 087/095, epoch series, 206; v2 11/12/26/27/28 (`28-ifp-removal.patch`) | Preserve historical rewards and activation behavior | Reconcile paper and D10 (D11 protocol faucet/IFP rejected); legacy and proposed schedules cannot both be active |
 | Script/signature changes | v1 053, 060–079, 185, 230/232/240/242; v2 14/15 | Preserve historical enable/disable transitions | Inventory each opcode/flag; do not assume old Taproot fits new branch MAST ABI |
 | XAddress and denomination | v1 address history; v2 06/07 | Existing addresses/RPC units compatible | New-chain address/signing policy and asset-aware amounts |
 | NNG and indexer integration | v1 155/158/175; v2 10 | Verify current consumers and reconnect/replay | Port where useful; compare direct Chronik integration and IPC requirements |

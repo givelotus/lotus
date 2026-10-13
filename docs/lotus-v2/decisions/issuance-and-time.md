@@ -1,6 +1,6 @@
-# Issuance, clocks and faucet: decision-ready questions
+# Issuance, clocks and rejected protocol faucet: decision-ready questions
 
-Decision packet P06, October 9, 2026. D10/D11 economic/state choices remain **open**. D05's identity model, a token ID equal to the root of its mint scripts, was chosen by the maintainer on 2026-10-09; the lifecycle requirements below still need acceptance. This packet does not amend the monetary paper. It defines candidate mechanics and the evidence needed to accept them.
+Decision packet P06, October 9, 2026 (updated October 13, 2026). D10 economic/state choices remain **open**. D05's identity model, a token ID equal to the root of its mint scripts, was chosen by the maintainer on 2026-10-09; the lifecycle requirements below still need acceptance. D11 (protocol-level onboarding faucet and 50/50 block-subsidy split) was **rejected and removed by the maintainer on 2026-10-13**. This packet does not amend the monetary paper. It defines candidate mechanics and the evidence needed to accept them.
 
 ## Token identity recommendation
 
@@ -19,7 +19,7 @@ S_(n+1) = min(S_max, max(S_min, isqrt(Q)))
 
 This floors the unscaled recurrence once before clipping; `isqrt(floor(x))=floor(sqrt(x))` for nonnegative x. Compute the mathematical product before division with bounded sufficiently wide integers, not modular multiplication. With S≤u64 and W≤2^256, the numerator is below 2^384; intermediate width and target conventions must be reflected in the implementation contract. If sub-unit precision is desired, define a fixed-point state separately; it changes rounding behavior and needs different vectors.
 
-Genesis must specify S_0 and W_(-1)>0 (or an explicit first-step rule). The monetary state envelope can carry next_tail and previous_work plus any bootstrap/faucet state. Reward lag is deliberate: current entitlement is established from prior accepted state; current work adjusts the next entitlement. Clipping and rounding make this state path-dependent and must be restored on reorg. This candidate is not identical to a direct `K*sqrt(W_n)` rule and may have rounding dead zones; analyze those before adopting it.
+Genesis must specify S_0 and W_(-1)>0 (or an explicit first-step rule). The monetary state envelope carries next_tail and previous_work plus any bootstrap state (no faucet state exists under D11's rejection). Reward lag is deliberate: current entitlement is established from prior accepted state; current work adjusts the next entitlement. Clipping and rounding make this state path-dependent and must be restored on reorg. This candidate is not identical to a direct `K*sqrt(W_n)` rule and may have rounding dead zones; analyze those before adopting it.
 
 ## Bootstrap clock alternatives
 
@@ -41,17 +41,14 @@ Do not optimize reward/work over arbitrary independent difficulties. Difficulty 
 
 The analysis deliverable is: model/assumptions, feasible controls, honest baseline, best-response computation or a proved bound, sensitivity across miner share/discount/cost/fee regimes, and a narrowly stated conclusion. Candidate rules remain open if the model cannot support a freshness claim. Simulations must use the same integer DAA/reward semantics as the proposed consensus, not a continuous approximation substituted at the last step.
 
-## Faucet allocation is a state-machine decision
+## Rejected protocol faucet and 50/50 subsidy split (D11)
 
-A coinbase output paying a faucet policy is a concrete mechanism. “Credit the faucet” and “burn excess runway” are not sufficient rules. Identify which outputs count as reserve, how donations affect it, who authorizes spending, what constitutes valid onboarding and what happens on recipient/policy rotation. An off-chain relay's claim does not become an objective consensus fact without a specified authenticated policy.
+Earlier drafts proposed diverting 50% of block subsidy into a protocol-level onboarding faucet with a consensus-tracked reserve cap. On 2026-10-13 the maintainer rejected D11 and removed all protocol-level faucet rules from Lotus v2:
 
-Two possible implementations have different obligations:
-
-- **Fixed allocation only:** require a portion of subsidy in a specified faucet policy; a covenant governs its spending. A global automatic reserve cap is not claimed. Application-controlled burns are separate spends.
-- **Consensus-accounted reserve cap:** maintain an authenticated reserve accumulator tied to an exact class of faucet outputs; update it on creation/spend, specify donation behavior and cap units, and derive the required coinbase allocation/burn from that state. This adds consensus state and policy-classification rules; ordinary covenant introspection alone does not scan the global UTXO set.
-
-Neither is adopted here. If the desired 50/50 split remains, specify miner entitlement as R−floor(R/2) and faucet allocation as floor(R/2), or explicitly choose another odd-unit rule. Specify separately how fee burn, underclaim and capped-away allocation affect spendable supply. Do not use “months of runway” as an integer threshold until the clock and expense definition exist.
+- **Consensus simplicity and provenance:** Protocol-enforced subsidy splits require either a hardcoded coinbase policy or a consensus-accounted reserve accumulator in `StateRoot` with output-classification rules. Lotus v1 explicitly removed the Infrastructure Funding Plan (`28-ifp-removal.patch`); Lotus v2 likewise keeps base-layer issuance free of mandatory non-miner diversions.
+- **Miner entitlement (`C16`):** Miners may claim up to `100%` of the block subsidy `R` (`S(h)`) plus `floor((F - T) / 2)` of remaining transaction fees after the mandatory token-output burn `T` (`C14a`), with the other half of remaining fees `G - floor(G / 2)` (`G = F - T`) burned.
+- **User-space faucet covenants:** Any donor, application, or miner can deploy a voluntary onboarding faucet in user space as an ordinary covenant coin using `OUTPUTCONTINUESBRANCH` (`0xcf`), per-claim drip limits (`OUTPUTVALUE`), relative timelock rate-limiting (`CHECKSEQUENCEVERIFY`), and voucher signatures (`CHECKDATASIG`); see [rationale](../rationale.md#5-protocol-level-onboarding-faucet-and-50-50-subsidy-splits-d11).
 
 ## Decisions to accept before genesis
 
-Choose token lifecycle/identity; bootstrap clock and exact integer function; tail precision/initialization/lag/clipping; faucet mechanism/policy/cap; underclaim rules; and every initial parameter. Then complete the canonical MonetaryState record and genesis vectors. Reference infrastructure and v1 work can start while these choices are analyzed; a production monetary implementation must not guess them.
+Choose token lifecycle/identity; bootstrap clock and exact integer function; tail precision/initialization/lag/clipping; underclaim rules; and every initial parameter. Then complete the canonical MonetaryState record and genesis vectors. Reference infrastructure and v1 work can start while these choices are analyzed; a production monetary implementation must not guess them.

@@ -30,7 +30,7 @@ The first two units can start independently. The third is an evidence investigat
 
 **Stage B:** implement decoded structured syntax, fixed-width stack semantics, parameterized cost algebra and a minimal payment opcode slice. Preserve the full closed opcode table as the intended target; unimplemented instructions cause an explicit tool error, never accepted consensus success. Generate the complete signed payment using a maintained BIP340 library/reference, including public key, digest, signature, bytes, stack and accounting. Then implement remaining opcode groups as separate testable increments against P03. A partial evaluator cannot label arbitrary v2 transactions valid.
 
-**Stage C:** add ordinary consuming/reference resolution, mint-context separation, checked asset conservation and atomic undo against in-memory fixture state. Do not pretend a test subsidy/faucet stub validates production coinbase entitlement. Export which features and parameter profile each result actually covers.
+**Stage C:** add ordinary consuming resolution, mint-context separation, checked asset conservation and atomic undo against in-memory fixture state. Do not pretend a test subsidy stub validates production coinbase entitlement (protocol faucet is rejected under D11). Export which features and parameter profile each result actually covers.
 
 **Proof:** independent byte/message/tree vectors; exact arithmetic and structured BREAK behavior; complete payment acceptance and focused rejection cases; state/undo equality; parameterized cost upper bounds independent of cache state. Crypto profiles require independent acceptance-set vectors; do not rely solely on the same underlying library in two wrappers. A second implementation is still required before genesis.
 
@@ -44,4 +44,4 @@ Execute the [incident contract](tickets/v1-sync-obstruction.md) on consistent co
 
 ## What is still not ready
 
-Production v2 monetary/faucet code, final header/PoW selection, future-time eligibility, mainnet resource constants and launch identity need explicit acceptance/evidence. Heavy daemon port/sync/benchmark work remains on the faster machine. These are visible dependencies; they no longer prevent implementation of isolated tooling and candidate reference semantics.
+Production v2 monetary code (D10; protocol faucet D11 is rejected), final header/PoW selection, future-time eligibility, mainnet resource constants and launch identity need explicit acceptance/evidence. Heavy daemon port/sync/benchmark work remains on the faster machine. These are visible dependencies; they no longer prevent implementation of isolated tooling and candidate reference semantics.

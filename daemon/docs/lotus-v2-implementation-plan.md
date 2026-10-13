@@ -17,7 +17,7 @@ Specification work and an independent reference evaluator may proceed before V1-
 | V2-02 | New-chain daemon payment slice | V1-06, V2-01, minimum D12–D14 test-chain parameters | Fresh regtest genesis, signed payment, block/root agreement and disconnect restoration |
 | V2-03 | Native assets and minting | D05 closed; V2-02 | Conservation/authorization, explicit mint contexts, asset-aware wallet/RPC |
 | V2-04 | Complete VM/ABI and bounded covenant examples | D07–D08 closed; V2-03 | Every opcode specified/tested/costed, nested-loop cost bounds and input × output vault transition |
-| V2-05 | Exact monetary/faucet transition and authenticated state | D10–D13 closed; V2-02 | Integer issuance/target/state vectors, replay/reorg restoration, complete state-root/snapshot contract |
+| V2-05 | Exact monetary transition and authenticated state | D10, D12–D13 closed (D11 faucet rejected); V2-02 | Integer issuance/target/state vectors, replay/reorg restoration, complete state-root/snapshot contract |
 | V2-06 | Storage, cache, signature and mining optimization | Relevant scalar features and D09 equivalence obligations | Scalar equivalence, fault/restart tests, measured resource and performance evidence |
 | V2-07 | Network, SDK, wallet/indexer and launch qualification | V2-03–V2-06; D14–D15 closed | Cross-component conformance, independent review, reproducible genesis/release, all launch blockers closed |
 
