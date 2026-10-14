@@ -69,13 +69,13 @@ The isolated checkout is `/tmp/lotus-doged-lineage-source`; original `daemon/wor
 
 The unmodified pin builds `doged` and `doge-cli`, but C++ tests initially fail to compile on Apple arm64: two large unsuffixed decimal literals have type `long`, causing ambiguous multiplication overloads with `Amount`. The compilation patch casts those literals explicitly to `int64_t`, preserving their numeric values and all consensus source. With that patch, the daemon, CLI and C++ unit binary build successfully. Both local mailbox patches replay cleanly onto the exact doged pin with `git am`; their final tree matches the tested checkout (`03ef6997701bc25b9b6a8e9712c20870995c6d9c`).
 
-- All **740 C++ test cases / 34,638,071 assertions pass**, including Dogecoin subsidy, AuxPoW, header serialization and inherited coordination unit tests. A printed assumeutxo failure is an intentional negative test; the process exits zero.
+- All **740 `test_bitcoin` cases / 34,638,071 assertions pass**, including Dogecoin subsidy, AuxPoW, header serialization and inherited chain-finalization integration tests. A printed assumeutxo failure is an intentional negative test; the process exits zero.
 - Separate focused runs passed 24 Dogecoin/AuxPoW/compression cases and 11 validation/subsidy cases. AuxPoW fixtures include historical mainnet heights 700,000, 800,000, 3,000,000 and 5,462,519.
 - Isolated regtest functional tests `dogecoin_auxpow.py`, `feature_legacy_script_flags.py` and `feature_legacy_script_rules.py` pass.
 - **Chronik `chronik_block.py`, `chronik_block_header.py` and the new `chronik_dogecoin_auxpow.py` pass** on isolated regtest. The independent AuxPoW test reruns acceptance/rejection scenarios with Avalanche disabled, then compares full variable-length headers, transaction IDs and raw disk-read transaction bytes against decoded RPC blocks at heights 1 and 2 with different Merkle branch shapes. This verifies generated AuxPoW indexing but does not verify indexing historical mainnet AuxPoW blocks. Its functional harness needs generated `protobuf-chronik`, `PYTHONPATH=<build>/test`, Python `protobuf` matching the installed `protoc` (7.36.2 here), and `websocket-client`; these are installed only in `/tmp/lotus-doged-python-20261014`.
-- **Mainnet synchronization is not tested.** No Dogecoin chain-data import or unbounded chain download occurs. Historical fixtures and regtest acceptance do not establish complete mainnet consensus compatibility.
+- **Full mainnet synchronization is not tested.** A later bounded follow-up verifies peer download and acceptance through height 100 (details below); no chain-data import or unbounded chain download occurs. These checks do not establish complete mainnet consensus compatibility.
 - **Avalanche network behavior is not tested.** Passing inherited unit tests does not prove a deployed Dogecoin quorum or finalization.
-- The current-ABC rebase remains blocked at patch 2; the passing build/tests above apply to pinned doged plus the two-line compatibility patch and independent test addition, not to that incomplete rebase.
+- The initial automated current-ABC rebase stops at patch 2; the follow-up below advances an adapted initial segment and records the next conflict. The passing build/tests above apply to pinned doged plus the two-line compatibility patch and independent test addition, not to that incomplete rebase.
 
 Local logs: `/tmp/lotus-doged-configure-20261014.log`, `/tmp/lotus-doged-build-20261014.log` (initial compilation failure), `/tmp/lotus-doged-build-fixed-20261014.log`, `/tmp/lotus-doged-full-unit-20261014.log`, `/tmp/lotus-doged-functional-20261014.log` (three consensus tests pass; first Chronik attempts lacked test dependencies), `/tmp/lotus-doged-chronik-verified-20261014.log`, `/tmp/lotus-doged-chronik-auxpow-20261014.log`, `/tmp/lotus-doged-all-functional-20261014.log`, `/tmp/lotus-doged-candidate-tool-20261014/report.json`. Logs and clones remain outside the repository.
 
@@ -91,3 +91,52 @@ PYTHONPATH=/tmp/doged-source/build/test /path/to/isolated-python \
   dogecoin_auxpow.py feature_legacy_script_flags.py feature_legacy_script_rules.py \
   chronik_block.py chronik_block_header.py chronik_dogecoin_auxpow.py
 ```
+
+## Follow-up: bounded mainnet synchronization
+
+A separate node at `/tmp/lotus-doged-bounded-mainnet-20261014` connected to one peer resolved through `seed.multidoge.org`, downloaded and accepted real Dogecoin mainnet blocks **0 through 100**, and automatically stopped at `-stopatheight=100` after **6.5 seconds**. The last live sample recorded 1,156,243 received bytes; the final saved header height was 16,000. Height 100 is `48d8b2a0ea39518a288f739d10c13fb9e4ef713198fc2b7c81d0be2646ebd8d2`.
+
+The experiment imposed a 60-second deadline and sampled a 20-MiB receive threshold; it used isolated RPC `22604`, Chronik `28331`, no listening socket, `-avalanche=0`, `-assumevalid=0`, and **`-minimumchainwork=0` solely to permit bounded early-block synchronization**. These settings are not deployment recommendations. The node still reports `initialblockdownload=true`; this establishes early-chain peer interoperability and local block acceptance, not synchronization to the present mainnet tip or validation across every consensus era.
+
+An offline restart of that same disposable datadir (`-connect=0 -dnsseed=0`) returned **`verifychain 4 0 = true`** and zero peer connections. Chronik raw headers, transaction IDs and raw transaction bytes matched independently decoded RPC blocks at heights **0, 1, 16, 50, 96 and 100**. These early blocks contain no AuxPoW; the separate generated regtest AuxPoW fixture supplies the indexer coverage for that serialization. Both disposable processes shut down cleanly. No pre-existing Doged process or default Dogecoin datadir was found, and no existing workspace or node data was changed.
+
+Checked-in evidence: [`evidence/doged-reference-20261014.json`](evidence/doged-reference-20261014.json). Local evidence: `/tmp/lotus-doged-bounded-mainnet-20261014/report.json`, `console.log`, `offline-check.json`, and `/tmp/lotus-doged-bounded-offline-check-20261014.log`.
+
+## Follow-up: reviewed categories and initial port
+
+The checked-in [`doged-lineage-classification.tsv`](doged-lineage-classification.tsv) covers all 414 unmatched original commits, with paths, an initial review category, suggested disposition and exact ABC same-subject counterpart where present. Reproduce it using `daemon/scripts/doged-classify-lineage.py` and the candidate export report. Categories are deliberately a **heuristic review inventory**, not a claim of fully audited semantic equivalence and not an automatic exclusion list.
+
+| Initial review category | Commits |
+| --- | ---: |
+| Dogecoin consensus / serialization | 44 |
+| Chronik | 52 |
+| Network / identity | 32 |
+| Wallet / SDK | 24 |
+| Avalanche / policy | 53 |
+| Build / tests / upstream infrastructure | 169 |
+| Applications / documentation | 40 |
+
+**273** entries have exact subject matches in current ABC despite non-equivalent patch IDs. Such entries require reviewing the Dogecoin-specific delta against the counterpart already present; replaying the entire old change would often restore obsolete APIs. Exact subjects are not proof that a patch is upstream-only. Forty application/documentation changes are separated from the minimal daemon-port review. Five historical version bumps should be consolidated into the eventual Doged version. The temporary test skip `3e443c33fb` is superseded by the following fixture addition `e29a68fb43`; checkpoint-only formatting `e43f0aea5c` is superseded by the adapted checkpoint representation.
+
+The isolated port now progresses beyond the first conflict: **23 adapted commits** are retained on local branch `lotus-doged-on-abc-initial-20261014`, HEAD `daf09a9ec28c316e25a80bec8bbd7a88cb3b82b6`, tree `bf971ab0f83cf34656bb6671e8078463099d9ee0`. They export as mailbox patches under `/tmp/lotus-doged-current-abc-initial-20261014`; replay on exact ABC `8c67fe1e85` reproduces that tree. This is still an **incomplete, unbuilt port**, not the validated Doged reference above.
+
+Resolved adaptations preserve current ABC APIs while applying the original Dogecoin intent:
+
+- Port-number conflicts keep current pointer-based address-manager tests and `ToStringAddrPort`; the obsolete deleted Electrum Docker fixture stays deleted.
+- Dogecoin checkpoints retain the original hashes while using current `BlockHash::FromHex` / `ChainType` APIs; seed lists remain Dogecoin lists.
+- The old checkpoint formatting-only patch is skipped, with that decision recorded here.
+- Scrypt test registration keeps current Script interpreter tests. `CBaseBlockHeader` takes over ordinary header hashing as intended; the duplicate old `CBlockHeader::GetHash` is removed.
+- Python Scrypt is added without reverting current compact-size serialization. Removed eCash-only DAA algorithms lose their corresponding tests, while current retained algorithms/tests stay present.
+- Height-dependent maturity keeps current benchmark transaction padding and Script test fixtures, adds `IsDigishieldEnabled`, and avoids resurrecting the removed unrelated `IsAugustoEnabled` declaration. The wallet-link repair adds only consensus activation, preserving upstream's removal of the old string-encoding translation unit.
+
+The next conflict is original `a06e1c4c831a6f0bbd9b1e3983a0c6b8d4c4594a` (“Unbreak avalanche tests”): a 14-file proof-score-width change intersects current upstream overflow protection and changed proof/test APIs. Resolving this by choosing old code would introduce a demonstrated arithmetic error (below). The maintainable next step is to port safe numeric-width handling into its own optional coordination layer, then continue with the historical Dogecoin DAA/subsidy, legacy Script and full AuxPoW layers before compiling the complete port. Successful mailbox replay of this initial segment alone does not establish any behavioral property of the eventual port.
+
+## Follow-up: optional Avalanche score defect
+
+The pinned Doged source multiplies satoshis by 100 in `uint64_t` before dividing by satoshis per coin. Dogecoin's 10-billion-coin `MAX_MONEY` exceeds the safe intermediate range. A 2-billion-DOGE input scores `15532559262` rather than `200000000000`; `MAX_MONEY` scores `77662796314` rather than `1000000000000`. The existing test repeats an overflowing expected-value expression, so its passing result conceals the defect.
+
+An independent regression using constants, sum scaling and rounding boundaries fails **all five assertions before repair**. The optional mailbox candidate in [`daemon/candidates/doged-avalanche-proof-score`](../candidates/doged-avalanche-proof-score/README.md) divides by the exact satoshis per hundredth coin, preserving clamping and rounding without overflow. It applies independently to the exact Doged pin and is **outside the default Doged series**: Chronik and ordinary synchronization do not depend on this optional proof-scoring change.
+
+After repair, all **139 separate `test-avalanche` cases / 17,717,287 assertions pass**, including the nine proof cases. Separate **`check-pow` passes**, including the Dogecoin DAA suite. The earlier count of 740 cases refers specifically to the entire `test_bitcoin` binary; it did not cover every separately built CMake test suite. Passing these unit tests still establishes neither an operational Avalanche quorum nor Dogecoin network finalization.
+
+Evidence: `/tmp/lotus-doged-avalanche-before-20261014.log`, `/tmp/lotus-doged-avalanche-proof-fixed-20261014.log`, `/tmp/lotus-doged-avalanche-all-fixed-20261014.log`, `/tmp/lotus-doged-pow-tests-20261014.log`.
