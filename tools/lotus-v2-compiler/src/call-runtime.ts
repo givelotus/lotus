@@ -6,7 +6,7 @@ export type ContractArtifact = {
   schema: 'lotus-v2/contract-artifact/2'; target: 'P01-P02-P03-candidate-2026-10-14'; contract: string;
   kind?: 'contract' | 'token';
   constructor: { name: string; type: string }[]; bindings: { name: string; type: string; value: string | boolean }[];
-  methods: { name: string; invocation?: 'spend' | 'mint'; args: { name: string; type: string }[]; scriptHex: string; leaf: string; proof: string[]; root: string }[];
+  methods: { name: string; invocation?: 'spend' | 'mint'; mintAmountParam?: string; args: { name: string; type: string }[]; scriptHex: string; leaf: string; proof: string[]; root: string }[];
   policy: { branches: string[]; paths: number[][]; root: string; treeRecipe: string };
 };
 export type CallContext = { chainId: string; prevTxid: string; prevIndex: number; sequence: number; coin: PaymentOutput; outputs: PaymentOutput[]; lock?: bigint; profile: 'P01-P02-P03-candidate-2026-10-14' };
@@ -57,6 +57,9 @@ export function assertContractArtifact(a: ContractArtifact): void {
   const leaves: Uint8Array[] = [];
   for (const m of a.methods) {
     if (!validName(m.name) || (m.invocation !== undefined && m.invocation !== 'spend' && m.invocation !== 'mint') || !Array.isArray(m.args) || new Set(m.args.map(x => x.name)).size !== m.args.length || m.args.some(x => !validName(x.name) || !validType(x.type))) throw new Error('invalid method arguments');
+    if (a.kind === 'token') {
+      if (m.invocation !== 'mint' || !validName(m.mintAmountParam!) || m.args.some(x => x.name === m.mintAmountParam)) throw new Error('invalid mint amount metadata');
+    } else if (m.invocation === 'mint' || m.mintAmountParam !== undefined) throw new Error('mint metadata on spend artifact');
     const script = unhex(m.scriptHex);
     if (!script.length || script.length > 8192) throw new Error('script width');
     const leaf = tagged('branch', concat(Uint8Array.of(0), bytes(script)));

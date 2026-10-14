@@ -23,11 +23,15 @@ const rules = compileContract(
   { contract: "Rules", bindings: {} },
 );
 const issuer = compileContract(
-  "contract Issuer<owner: PublicKey> { function issue(signature: Signature) { require(checksig(signature, owner)); } }",
+  "token Issuer<owner: PublicKey> { function issue(amount: Amount, signature: Signature) { require(amount > 0); require(checksig(signature, owner)); } }",
   { contract: "Issuer", bindings: { Issuer: { owner: owner4 } } },
 );
-issuer.kind = "token";
-issuer.methods[0].invocation = "mint";
+assert.equal(issuer.kind, "token");
+assert.equal(issuer.methods[0].mintAmountParam, "amount");
+assert.deepEqual(
+  issuer.methods[0].args.map((x) => x.name),
+  ["signature"],
+);
 const tokenId = issuer.policy.root,
   walletRoot = wallet.policy.root,
   rulesRoot = rules.policy.root;
@@ -188,6 +192,68 @@ test("transfer requires both positional branches and records implicit token burn
 });
 
 test("wrong artifact kind, malformed mint and insufficient fee reject", () => {
+  const mintWith = (artifact) =>
+    prepareTransactionCall({
+      ...intent,
+      inputs: [
+        intent.inputs[0],
+        {
+          kind: "mint",
+          artifact,
+          methodName: "issue",
+          args: { signature: null },
+        },
+      ],
+    });
+  assert.throws(
+    () =>
+      mintWith({
+        ...issuer,
+        methods: [{ ...issuer.methods[0], mintAmountParam: undefined }],
+      }),
+    /invalid mint amount metadata/,
+  );
+  assert.throws(
+    () =>
+      mintWith({
+        ...issuer,
+        methods: [{ ...issuer.methods[0], mintAmountParam: "signature" }],
+      }),
+    /invalid mint amount metadata/,
+  );
+  assert.throws(
+    () =>
+      mintWith({
+        ...issuer,
+        methods: [{ ...issuer.methods[0], invocation: "spend" }],
+      }),
+    /invalid mint amount metadata/,
+  );
+  assert.throws(
+    () =>
+      prepareTransactionCall({
+        ...intent,
+        inputs: [
+          {
+            ...intent.inputs[0],
+            witnesses: [
+              w(
+                {
+                  ...wallet,
+                  methods: [
+                    { ...wallet.methods[0], mintAmountParam: "amount" },
+                  ],
+                },
+                "spend",
+                { signature: null },
+              ),
+            ],
+          },
+          intent.inputs[1],
+        ],
+      }),
+    /mint metadata on spend artifact/,
+  );
   assert.throws(
     () => prepareContractCall(issuer, "issue", {}, { signature: null }),
     /mint artifact requires transaction runtime/,
@@ -248,29 +314,93 @@ test("wrong artifact kind, malformed mint and insufficient fee reject", () => {
   );
 });
 
-test('Python planner matches signed mint and transfer bytes and selectors', t => {
-  const python = process.env.LOTUS_V2_PYTHON ?? 'python3';
-  const probe = spawnSync(python, ['-c', 'import blake3'], { encoding: 'utf8' });
-  if (probe.status !== 0) { t.skip('install python/requirements.txt and set LOTUS_V2_PYTHON'); return; }
+test("Python planner matches signed mint and transfer bytes and selectors", (t) => {
+  const python = process.env.LOTUS_V2_PYTHON ?? "python3";
+  const probe = spawnSync(python, ["-c", "import blake3"], {
+    encoding: "utf8",
+  });
+  if (probe.status !== 0) {
+    t.skip("install python/requirements.txt and set LOTUS_V2_PYTHON");
+    return;
+  }
+  const malformed = {
+    ...issuer,
+    methods: [{ ...issuer.methods[0], mintAmountParam: "signature" }],
+  };
+  const reject = spawnSync(
+    python,
+    [
+      "-c",
+      "import json,sys;sys.path.insert(0,'python');from lotus_v2_call_runtime import selected;selected(json.load(sys.stdin),'issue',allow_mint=True)",
+    ],
+    { input: JSON.stringify(malformed), encoding: "utf8" },
+  );
+  assert.notEqual(reject.status, 0);
+  assert.match(reject.stderr, /invalid mint amount metadata/);
   const mintPlan = prepareTransactionCall(intent);
-  const transfer = { ...intent, inputs: [
-    { kind: 'spend', prevTxid: mintPlan.txid, prevIndex: 0, sequence: 0xffffffff,
-      coin: token(1000n), pathIndex: 0, witnesses: [w(wallet, 'spend', { signature: null }), w(rules, 'enforce', {})] },
-    nativeSpend(mintPlan.txid, 1, native(7000n))],
-    outputs: [token(700n), token(250n), native(4000n)] };
+  const transfer = {
+    ...intent,
+    inputs: [
+      {
+        kind: "spend",
+        prevTxid: mintPlan.txid,
+        prevIndex: 0,
+        sequence: 0xffffffff,
+        coin: token(1000n),
+        pathIndex: 0,
+        witnesses: [
+          w(wallet, "spend", { signature: null }),
+          w(rules, "enforce", {}),
+        ],
+      },
+      nativeSpend(mintPlan.txid, 1, native(7000n)),
+    ],
+    outputs: [token(700n), token(250n), native(4000n)],
+  };
   for (const selectedIntent of [intent, transfer]) {
     const plan = prepareTransactionCall(selectedIntent);
     const signatures = sign(plan);
     const result = finalizeTransactionCall(plan, signatures);
-    const payload = { intent: selectedIntent, signatures: Object.fromEntries(Object.entries(signatures).map(([key, value]) => [key, hex(value)])) };
-    const input = JSON.stringify(payload, (_, value) => typeof value === 'bigint' ? value.toString() : value);
-    const run = spawnSync(python, ['test/python-transaction-run.py'], { input, encoding: 'utf8' });
+    const payload = {
+      intent: selectedIntent,
+      signatures: Object.fromEntries(
+        Object.entries(signatures).map(([key, value]) => [key, hex(value)]),
+      ),
+    };
+    const input = JSON.stringify(payload, (_, value) =>
+      typeof value === "bigint" ? value.toString() : value,
+    );
+    const run = spawnSync(python, ["test/python-transaction-run.py"], {
+      input,
+      encoding: "utf8",
+    });
     assert.equal(run.status, 0, run.stderr);
-    assert.deepEqual(JSON.parse(run.stdout), { wire: hex(result.wire), txid: result.txid, txhash: result.txhash,
-      feeAtoms: plan.feeAtoms.toString(), minimumFeeAtoms: plan.minimumFeeAtoms.toString(),
-      tokenDeltas: Object.fromEntries(Object.entries(plan.tokenDeltas).map(([key, value]) => [key, value.toString()])),
-      tokenBurns: Object.fromEntries(Object.entries(plan.tokenBurns).map(([key, value]) => [key, value.toString()])),
-      requests: plan.requests.map(r => ({ key: r.key, digest: r.digest, leaf: r.leaf, branchIndex: r.branchIndex ?? null,
-        tokenId: r.tokenId ?? null, positiveDelta: r.positiveDelta?.toString() ?? null })) });
+    assert.deepEqual(JSON.parse(run.stdout), {
+      wire: hex(result.wire),
+      txid: result.txid,
+      txhash: result.txhash,
+      feeAtoms: plan.feeAtoms.toString(),
+      minimumFeeAtoms: plan.minimumFeeAtoms.toString(),
+      tokenDeltas: Object.fromEntries(
+        Object.entries(plan.tokenDeltas).map(([key, value]) => [
+          key,
+          value.toString(),
+        ]),
+      ),
+      tokenBurns: Object.fromEntries(
+        Object.entries(plan.tokenBurns).map(([key, value]) => [
+          key,
+          value.toString(),
+        ]),
+      ),
+      requests: plan.requests.map((r) => ({
+        key: r.key,
+        digest: r.digest,
+        leaf: r.leaf,
+        branchIndex: r.branchIndex ?? null,
+        tokenId: r.tokenId ?? null,
+        positiveDelta: r.positiveDelta?.toString() ?? null,
+      })),
+    });
   }
 });

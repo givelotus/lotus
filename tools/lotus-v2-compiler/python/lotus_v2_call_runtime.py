@@ -113,6 +113,7 @@ def indexed_root(leaves: list[bytes]) -> bytes:
 
 def selected(artifact: dict, method_name: str, *, allow_mint: bool = False) -> dict:
     if artifact.get('schema') != 'lotus-v2/contract-artifact/2' or artifact.get('target') != TARGET: raise ValueError('unsupported artifact')
+    if artifact.get('kind', 'contract') not in ('contract', 'token'): raise ValueError('unsupported artifact kind')
     policy = artifact['policy']
     if policy.get('treeRecipe') != 'sorted-leaves-largest-power-split-v1' or policy['branches'] != [policy['root']] or policy['paths'] != [[0]]:
         raise ValueError('unsupported policy')
@@ -142,8 +143,14 @@ def selected(artifact: dict, method_name: str, *, allow_mint: bool = False) -> d
     if not 1 <= len(methods) <= 16 or len({m['name'] for m in methods}) != len(methods): raise ValueError('invalid methods')
     leaves = []
     for entry in methods:
-        if not re.fullmatch(r'[A-Za-z_][A-Za-z_0-9]*', entry['name']) or len({x['name'] for x in entry['args']}) != len(entry['args']) or any(not re.fullmatch(r'[A-Za-z_][A-Za-z_0-9]*', x['name']) or not valid_type(x['type']) for x in entry['args']):
+        if not re.fullmatch(r'[A-Za-z_][A-Za-z_0-9]*', entry['name']) or entry.get('invocation', 'spend') not in ('spend', 'mint') or len({x['name'] for x in entry['args']}) != len(entry['args']) or any(not re.fullmatch(r'[A-Za-z_][A-Za-z_0-9]*', x['name']) or not valid_type(x['type']) for x in entry['args']):
             raise ValueError('invalid method arguments')
+        if artifact.get('kind') == 'token':
+            amount_param = entry.get('mintAmountParam')
+            if entry.get('invocation') != 'mint' or not isinstance(amount_param, str) or not re.fullmatch(r'[A-Za-z_][A-Za-z_0-9]*', amount_param) or amount_param in {x['name'] for x in entry['args']}:
+                raise ValueError('invalid mint amount metadata')
+        elif entry.get('invocation') == 'mint' or 'mintAmountParam' in entry:
+            raise ValueError('mint metadata on spend artifact')
         script = hx(entry['scriptHex'])
         if not 1 <= len(script) <= 8192: raise ValueError('script width')
         leaf = tagged('branch', b'\x00' + sized(script))
