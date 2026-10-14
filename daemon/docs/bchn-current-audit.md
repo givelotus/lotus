@@ -136,3 +136,5 @@ after this cleanup. The maintained mailbox hashes and combination proofs above
 remain scoped to their original exports; they are not claims of byte-identical
 submission trees. Neither MR includes NNG or ZeroMQ changes. GitLab CI and
 maintainer review remain separate from the local validation.
+
+Initial fork pipelines [2948111374](https://gitlab.com/schancel/bitcoin-cash-node/-/pipelines/2948111374) and [2948111630](https://gitlab.com/schancel/bitcoin-cash-node/-/pipelines/2948111630) failed before creating any jobs. GitLab GraphQL reports: "The pipeline failed due to the user not being verified." This is account verification, not a compiled/test failure; upstream CI remains unvalidated until account verification and a rerun. Do not disable CI or alter the patches to hide this status.
