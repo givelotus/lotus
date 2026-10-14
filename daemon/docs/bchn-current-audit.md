@@ -27,14 +27,14 @@ ancestor-package feerates does not match the implementation: below-minimum-fee
 parents prevent inclusion of their paying children. Existing tests explicitly
 require this policy. It must not be silently replaced with CPFP.
 
-## Scoped improvements under review
+## Scoped improvements
 
 A ready heap is useful to prioritize newly eligible siblings by modified feerate
 under limited block capacity, rather than arbitrary FIFO child iteration order.
 That is a fee-selection behavior improvement, not proof of a speedup over BCHN's
 already nonquadratic scheduler. Preserve BCHN ABLA resource limits, virtual-size
 fee comparison, topology tie breaks, time budget, finality and termination
-heuristics. Native before/after reproduction is required before exporting it.
+heuristics. The native before/after reproduction below validates this change.
 
 Separate workers are examining the optional NNG transport and diagnostic
 mempool-check traversal. ZeroMQ is already independently disableable using
@@ -62,3 +62,24 @@ for provenance and is no longer selected. No wall-clock comparison, mainnet
 synchronization or reproducible binary claim is made. See
 [evidence](evidence/bchn-current-20261014.json) for patch hash and log paths.
 Production nodes/data and published releases are untouched.
+
+## Review application
+
+The feature planner reports patch files and dependencies; `make build` does not
+apply experimental patches. Use a new checkout and the pinned SHA, then apply
+only the independently selected mailboxes with `git am`:
+
+```sh
+git clone https://gitlab.com/bitcoin-cash-node/bitcoin-cash-node.git /tmp/bchn-review
+git -C /tmp/bchn-review checkout --detach abd433abe04f74780744b9eac06731f3690ce68a
+git -C /tmp/bchn-review am "$PWD/daemon/patches/bchn/01-prioritize-ready-transactions.patch"
+cmake -S /tmp/bchn-review -B /tmp/bchn-review-build -GNinja \
+  -DBUILD_BITCOIN_QT=OFF -DBUILD_BITCOIN_ZMQ=OFF -DENABLE_MAN=OFF \
+  -DENABLE_UPNP=OFF -DENABLE_NATPMP=OFF
+ninja -C /tmp/bchn-review-build bitcoind bitcoin-cli test_bitcoin check-bitcoin
+```
+
+These commands assume the current directory is the Lotus monorepo. Use fresh
+paths rather than resetting an existing node workspace. The feature planner's
+`--check-workspace` mode verifies clean application using a temporary index,
+without applying patches to the source checkout.
