@@ -43,3 +43,27 @@ This checker runs native framing, identities, signing message and BIP340 verific
 The artifact schema is `lotus-v2/payment-artifact/1`; its target is `P01-P02-P03-candidate-2026-10-14`. JSON hashes and bytecode are lowercase hex; user-facing native amounts must be decimal atom strings and parsed to checked `bigint`. The runtime accepts no implicit network and rejects an artifact whose policy root does not match its script. Generated clients must pin this schema and supply a separately reviewed signer; they must not assume that a valid signature alone makes a transaction valid.
 
 Current source mapping records UTF-16 offsets (JavaScript string offsets) and byte intervals in the emitted script. A future compiler profile should define UTF-8 source byte offsets for cross-language editor interoperability. This is a schema issue before broader language support.
+
+## Bounded template and method frontend (artifact schema 2)
+
+`compileContract(source, { contract, bindings })` in `@lotus/v2-payment-compiler/generic` compiles one selected contract from a source that may contain multiple contracts and free pure helpers. Every constructor value for every referenced contract must be supplied explicitly. It emits `lotus-v2/contract-artifact/2` with ordered method arguments, each method's script, leaf, bottom-up membership proof, source map and static size/stack report. The policy is one P02 branch root with path `[[0]]`. The deterministic wallet tree sorts distinct method leaves as unsigned little-endian hashes, splits at the greatest power of two below the leaf count, and uses P02's sorted-child node hash. Method names select an ABI entry; consensus sees the revealed script and proof, with no numeric method index.
+
+```text
+function digest(x: Bytes32): Bytes32 { return sha256(x); }
+contract Vault<owner: PublicKey, target: Bytes32> {
+    function spend(sig: Signature) { require(checksig(sig, owner)); }
+    function reveal(data: Bytes32) { require(digest(data) == target); }
+}
+```
+
+Supported constructor and method types are `PublicKey` (validated BIP340 x-only point), `Signature`, `Bytes32`, `Bytes(N)` (up to N bytes, N in 1..8192), signed 128-bit `Int`, `Bool`, and distinct `MethodLeafHash` / `ContractRootHash` values. Constructor byte values are lowercase hex, Int values canonical decimal strings or `bigint`, and Bool values booleans. Methods take ordered wire arguments. Expressions include `checksig`, `sha256`, `hash256`, `blake3`, equality, limited checked integer arithmetic/comparison, Boolean operators and unary `!`/`-`. Statements are `require(expr);` and bounded `if (expr) { ... } else { ... }`. A method finishes with exactly one true value after its requirements pass. Free helpers have a single typed return expression; they inline at calls with scoped parameters and source origin spans. There are no mutable locals, loops, external effects, general macros or arbitrary opcodes.
+
+`leaf_hash(Other.method)` yields a `MethodLeafHash` of a fully bound compiled method. `contract_root(Other)` yields a `ContractRootHash` of a fully bound contract. Their types are distinct from plain `Bytes32`. A self or mutual dependency through these builtins is rejected, as are recursive helpers. Source spans in schema 2 are **UTF-8 byte offsets**; schema 1 Payment artifacts retain their historical UTF-16 code-unit offsets. Schema 2 limits source to 65536 UTF-8 bytes, methods to 16, scripts to 8192 bytes, opcodes to 4096, helper expansions to 256, and expression/control nesting to 64/16. Normal compilation emits only assigned P03 opcodes and rejects unsupported syntax, including an `OP_SUCCESS_N` spelling.
+
+The v2 CLI reads source plus an options JSON object, then writes `artifact.json` and a generated TypeScript call wrapper:
+
+```sh
+node dist/generic-cli.js vault.lotus options.json /tmp/vault-artifact
+```
+
+For the example, `options.json` is `{"contract":"Vault","bindings":{"Vault":{"owner":"<32-byte lowercase hex>","target":"<32-byte lowercase hex>"}}}`. The schema is [artifact-v2.schema.json](artifact-v2.schema.json). Schema 1 artifacts are not reinterpreted as schema 2; its signed fixture remains an independent historical vector. The generated TypeScript wrapper calls the maintained `@lotus/v2-payment-compiler/call-runtime` interface once that separate runtime is integrated. Compilation has no RPC, wallet, filesystem import, or signing side effect; the CLI only reads its declared source/options and writes requested artifact files.

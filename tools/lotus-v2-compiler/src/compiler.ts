@@ -1,4 +1,5 @@
 import { blake3 } from '@noble/hashes/blake3';
+import { schnorr } from '@noble/curves/secp256k1';
 
 export type Span = { start: number; end: number };
 type Token = { text: string; span: Span };
@@ -60,11 +61,15 @@ export function parsePayment(source: string): PaymentAst {
   take('}'); const end = take('}').span.end;
   if (i !== t.length) throw new Error(`unsupported syntax at offset ${t[i]!.span.start}`);
   if (sigUse.text !== signature.text || ownerUse.text !== owner.text) throw new Error(`typed name mismatch at offset ${sigUse.span.start}`);
+  const reserved = new Set('class default function return import export constructor if else true false public private protected static self def None pass'.split(' '));
+  if ([name.text,owner.text,signature.text].some(x => reserved.has(x))) throw new Error('reserved binding name');
+  if (owner.text === signature.text) throw new Error('method parameter shadows constructor');
   return { kind: 'Payment', name: name.text, ownerName: owner.text, signatureName: signature.text, span: { start, end }, ownerSpan: ownerUse.span, checkSpan: { start: checkStart, end: t[i - 3]!.span.end } };
 }
 export function lowerPayment(ast: PaymentAst): PaymentIr { return { kind: 'checksig', signature: 'Signature', publicKey: 'PublicKey', stackBefore: ['Signature'], stackAfter: ['Boolean'], span: ast.checkSpan }; }
 export function compilePayment(source: string, ownerHex: string): PaymentArtifact {
   const ast = parsePayment(source); lowerPayment(ast); const owner = unhex(ownerHex, 32);
+  try { schnorr.utils.lift_x(BigInt(`0x${ownerHex}`)); } catch { throw new Error('PublicKey is not a BIP340 x-only curve point'); }
   // P03 PUSH_32 (0x20), then CHECKSIG (0xbb). P02 one-leaf branch root.
   const script = concat(Uint8Array.of(0x20), owner, Uint8Array.of(0xbb));
   const leaf = tagged('branch', concat(Uint8Array.of(0), bytes(script)));

@@ -35,7 +35,7 @@ test('generated payment call matches independent signed reference byte-for-byte'
 test('changed owner, output and chain reject an old signature at cryptographic layer', () => {
   const plan = preparePayment(artifact, context);
   const signature = unhex(reference.signature_00);
-  const alteredOwner = compilePayment(PAYMENT_SOURCE, '00'.repeat(31) + '01');
+  const alteredOwner = compilePayment(PAYMENT_SOURCE, 'e493dbf1c10d80f3581e4904930b1404cc6c13900ee0758474fa94abe8c4cd13');
   const ownerContext = { ...context, coin: { ...context.coin, branches: alteredOwner.policy.branches } };
   assert.throws(() => finalizePayment(preparePayment(alteredOwner, ownerContext), signature), /signature verification failed/);
   assert.throws(() => finalizePayment(preparePayment(artifact, { ...context, outputs: [{ ...output, value: 999n }] }), signature), /signature verification failed/);
