@@ -71,3 +71,13 @@ source; required GitLab lint job 17185211785 passes in pipeline 2948599926.
 The fresh sanitizer job 17185211816 remains running with the three-hour budget.
 The maintained optional export and exact-tree/order evidence are documented
 in `bchn-nng-publisher.md`; no C++ publisher behavior changed for this lint fix.
+
+## NNG scope correction
+
+The user rejected the raw-payload publisher as a scope change: BCHN NNG must
+preserve the existing Lotus/Tobias FlatBuffers and RPC interfaces, including
+mining. A separate compatibility worker owns that replacement. The publisher's
+lint/CI records above are historical evidence only; do not promote its raw
+protocol mailbox/export candidate or infer consumer compatibility from those
+checks. No further update or external discussion of MR 2176 is authorized by
+this followthrough work. Mining/mempool sanitizer monitoring continues separately.
