@@ -10,7 +10,7 @@ from hashlib import sha256
 from types import MappingProxyType
 from typing import Callable, Mapping
 
-from .encoding import DecodeError, Reader
+from .encoding import DecodeError, Reader, encode_compact_size
 
 
 class VMError(ValueError):
@@ -87,6 +87,85 @@ class VMResult:
     automatic: bool
     charged_cost: int
     stack: tuple[bytes, ...] | None
+
+
+def branch_leaf_hash(script: bytes) -> bytes:
+    """P02 Leaf(script), for explicit invocation-selector cross-checks."""
+    if not isinstance(script, bytes):
+        raise TypeError("script must be bytes")
+    try:
+        from blake3 import blake3
+    except ImportError as exc:
+        raise UnsupportedFeature("blake3 dependency is required for branch leaves") from exc
+    preimage = b"Lotus/v2/branch\x00\x00" + encode_compact_size(len(script)) + script
+    return blake3(preimage).digest()
+
+
+@dataclass(frozen=True)
+class SigningContext:
+    """Externally prepared P01 messages for one selected script invocation.
+
+    A transaction validator must independently construct and authenticate
+    these messages and the branch membership proof. This object only checks
+    that the claimed selected leaf matches the script passed to the VM.
+    """
+
+    selected_leaf_hash: bytes
+    messages: Mapping[int, bytes]
+    invocation_kind: str
+    input_index: int
+    output_count: int
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.selected_leaf_hash, bytes) or len(self.selected_leaf_hash) != 32:
+            raise ValueError("selected leaf hash must be h32")
+        if self.invocation_kind not in ("spend", "mint"):
+            raise ValueError("invocation kind must be spend or mint")
+        if type(self.input_index) is not int or not 0 <= self.input_index <= 65535:
+            raise ValueError("input index out of range")
+        if type(self.output_count) is not int or not 0 <= self.output_count <= 65535:
+            raise ValueError("output count out of range")
+        if any(type(mode) is not int or mode not in (0, 1, 2) or
+               not isinstance(message, bytes) or len(message) != 32
+               for mode, message in self.messages.items()):
+            raise ValueError("messages must map defined modes to 32-byte digests")
+        object.__setattr__(self, "messages", MappingProxyType(dict(self.messages)))
+
+
+def _verify_checksig(signature: bytes, public_key: bytes,
+                     context: SigningContext | None) -> bool:
+    if len(signature) == 64:
+        mode = 0
+    elif len(signature) == 65 and signature[-1] in (1, 2):
+        mode = signature[-1]
+    else:
+        raise VMError("invalid CHECKSIG signature length or mode encoding")
+    if len(public_key) != 32:
+        raise VMError("CHECKSIG key must be 32-byte x-only encoding")
+    if context is None:
+        raise UnsupportedFeature("CHECKSIG requires an authenticated signing context")
+    if mode and context.invocation_kind != "spend":
+        raise VMError("partial CHECKSIG mode is spend-only")
+    if mode == 2 and context.input_index >= context.output_count:
+        raise VMError("mode 02 has no paired output")
+    try:
+        message = context.messages[mode]
+    except KeyError as exc:
+        raise UnsupportedFeature(f"signing message for mode {mode:02x} is unavailable") from exc
+    try:
+        from coincurve import PublicKeyXOnly
+    except ImportError as exc:
+        raise UnsupportedFeature("coincurve 21 dependency is required for CHECKSIG") from exc
+    try:
+        key = PublicKeyXOnly(public_key)
+    except ValueError as exc:
+        raise VMError("malformed CHECKSIG x-only key") from exc
+    try:
+        return key.verify(signature[:64], message)
+    except ValueError:
+        # Once framing and key parsing have succeeded, BIP340 scalar/point
+        # noncanonicality belongs to the false-signature result.
+        return False
 
 
 def number(value: int) -> bytes:
@@ -211,10 +290,13 @@ def static_cost(ast: tuple[Node, ...], profile: VMProfile, *, input_count: int,
                             output_count=output_count, field_sizes=field_sizes).cost
 
 
-def evaluate(script: bytes, args: tuple[bytes, ...], profile: VMProfile, *,
-             input_count: int = 0, output_count: int = 0,
-             field_sizes: Mapping[int, tuple[int, ...]] | None = None) -> VMResult:
-    """Evaluate one invocation; caller handles witness, membership and outer checks."""
+def validate_invocation_inputs(script: bytes, args: tuple[bytes, ...],
+                               profile: VMProfile, *, input_count: int,
+                               output_count: int,
+                               signing: SigningContext | None = None) -> None:
+    """Check bounded invocation inputs before the instruction-boundary scan."""
+    if not isinstance(script, bytes) or len(script) > profile.max_script_bytes:
+        raise VMError("script exceeds explicit bound")
     if type(input_count) is not int or type(output_count) is not int or not (0 <= input_count <= 65535 and 0 <= output_count <= 65535):
         raise VMError("invalid transaction counts")
     if not isinstance(args, tuple) or len(args) > profile.max_arguments or any(
@@ -223,6 +305,20 @@ def evaluate(script: bytes, args: tuple[bytes, ...], profile: VMProfile, *,
         raise VMError("argument framing exceeds bounds")
     if len(args) > profile.max_stack_items or sum(map(len, args)) > profile.max_vm_bytes:
         raise VMError("initial stack exceeds bounds")
+    if signing is not None and (signing.output_count != output_count or
+                                signing.input_index >= input_count):
+        raise VMError("signing context indices disagree with invocation counts")
+    if signing is not None and branch_leaf_hash(script) != signing.selected_leaf_hash:
+        raise VMError("selected leaf does not match script")
+
+
+def evaluate(script: bytes, args: tuple[bytes, ...], profile: VMProfile, *,
+             input_count: int = 0, output_count: int = 0,
+             field_sizes: Mapping[int, tuple[int, ...]] | None = None,
+             signing: SigningContext | None = None) -> VMResult:
+    """Evaluate one invocation; caller handles witness, membership and outer checks."""
+    validate_invocation_inputs(script, args, profile, input_count=input_count,
+                               output_count=output_count, signing=signing)
     if success_scan(script, profile):
         charge = _checked_cost(len(script) * profile.structural_byte_cost, profile.max_invocation_cost)
         return VMResult(True, True, charge, None)
@@ -425,6 +521,14 @@ def evaluate(script: bytes, args: tuple[bytes, ...], profile: VMProfile, *,
                 data = pop()
                 digest = sha256(data).digest()
                 push(digest if op == 0xb8 else sha256(digest).digest())
+            elif op in (0xbb, 0xbc):
+                public_key, signature = pop(), pop()
+                verified = _verify_checksig(signature, public_key, signing)
+                if op == 0xbc:
+                    if not verified:
+                        raise VMError("CHECKSIGVERIFY failed")
+                else:
+                    push(number(int(verified)))
             else:
                 raise UnsupportedFeature(f"assigned opcode {op:02x} is outside this VM slice")
         return 0

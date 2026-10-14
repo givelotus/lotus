@@ -78,7 +78,7 @@ class VMTests(unittest.TestCase):
                 512, 8, 128, 16, 8, 256, 8, 1, 1,
                 {op: 1 for op in ASSIGNED}))
         with self.assertRaises(UnsupportedFeature):
-            evaluate(bytes.fromhex("bb"), (), PROFILE)
+            evaluate(bytes.fromhex("bd"), (), PROFILE)
         with self.assertRaises(UnsupportedFeature):
             evaluate(bytes.fromhex("4e"), (), VMProfile(
                 512, 8, 128, 16, 8, 256, 8, 100000, 1, {}))
