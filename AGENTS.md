@@ -52,7 +52,7 @@ Workspaces (`daemon/workspace-*`) are **gitignored** local clones created by `ma
 | `v1` | `bitcoin-abc` `8c67fe1e85` | `bitcoin-abc-v1-version` | `workspace-v1/` | **Lotus V1 mainnet (`v11.6.0`)** — 153 patches (`000`–`247`) + in-process Chronik (`-DBUILD_CHRONIK=ON`) |
 | `ecash` | `bitcoin-abc` `1fb7db17` | `bitcoin-abc-version` | `workspace-ecash/` | Upstream reference patches |
 | `doged` | `doged-io/doged` | `doged-version` | `workspace-doged/` | Dogecoin ABC reference |
-| `bchn` | BCHN `v28.0.0` | `bchn-version` | `workspace-bchn/` | Bitcoin Cash Node upstream PR candidates |
+| `bchn` | BCHN `abd433abe0` (29.2.1) | `bchn-version` | `workspace-bchn/` | Current-tip Bitcoin Cash Node upstream candidates |
 
 ### Commands
 
