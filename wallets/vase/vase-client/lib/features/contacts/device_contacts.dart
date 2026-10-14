@@ -8,6 +8,12 @@ class DeviceContactLink {
   final String? address;
 }
 
+class DeviceContactsSnapshot {
+  const DeviceContactsSnapshot(this.status, this.contacts);
+  final PermissionStatus status;
+  final List<DeviceContactLink> contacts;
+}
+
 class DeviceContacts {
   const DeviceContacts();
   bool get supported =>
@@ -15,9 +21,42 @@ class DeviceContacts {
       (defaultTargetPlatform == TargetPlatform.iOS ||
           defaultTargetPlatform == TargetPlatform.android);
 
+  Stream<void> get changes => FlutterContacts.onDatabaseChange;
+  Future<void> openSettings() => FlutterContacts.permissions.openSettings();
+
+  Future<DeviceContactsSnapshot> read({bool requestPermission = false}) async {
+    var status = await FlutterContacts.permissions.check(PermissionType.read);
+    if (requestPermission && status == PermissionStatus.notDetermined) {
+      status = await FlutterContacts.permissions.request(PermissionType.read);
+    }
+    if (status != PermissionStatus.granted &&
+        status != PermissionStatus.limited) {
+      return DeviceContactsSnapshot(status, const []);
+    }
+    final contacts = await FlutterContacts.getAll(
+      properties: {ContactProperty.website},
+    );
+    final result = <DeviceContactLink>[];
+    for (final contact in contacts) {
+      if (contact.id == null) continue;
+      String? address;
+      for (final website in contact.websites) {
+        try {
+          address = contactAddress(website.url);
+          break;
+        } catch (_) {
+          /* Other websites are not payment destinations. */
+        }
+      }
+      result.add(
+        DeviceContactLink(contact.id!, contact.displayName ?? '', address),
+      );
+    }
+    return DeviceContactsSnapshot(status, result);
+  }
+
   Future<DeviceContactLink?> pick() async {
-    // Native picker returns only the selected identity; never enumerate/upload
-    // the user's address book or request permission when opening Contacts.
+    // Keep the picker for explicitly linking a saved Vase contact.
     final chosen = await FlutterContacts.native.showPicker();
     if (chosen?.id == null) return null;
     String? address;

@@ -21,6 +21,14 @@ class SettingsPage extends HookWidget {
 
   @override
   Widget build(BuildContext context) {
+    final scrollController = useScrollController();
+    final swipeStart = useRef<Offset?>(null);
+    void dismiss() => onBack != null
+        ? onBack!()
+        : context.canPop()
+        ? context.pop()
+        : context.go('/');
+
     final showSeedTextController = useTextEditingController();
     final showPasswordTextController = useTextEditingController();
     final newSeedController = useTextEditingController();
@@ -37,9 +45,7 @@ class SettingsPage extends HookWidget {
           return Stack(
             children: [
               const IgnorePointer(
-                child: Scaffold(
-                  backgroundColor: Colors.transparent,
-                ),
+                child: Scaffold(backgroundColor: Colors.transparent),
               ),
               AlertDialog(
                 title: showSeedTextController.text.isNotEmpty
@@ -87,23 +93,24 @@ class SettingsPage extends HookWidget {
                         ],
                       ),
                       const Padding(
-                          padding: EdgeInsets.fromLTRB(0, 12, 0, 12),
-                          child: Text(
-                            'Password (Optional)',
-                          )),
-                      Row(children: [
-                        Expanded(
-                          child: TextField(
-                            maxLines: null,
-                            minLines: 2,
-                            controller: showPasswordTextController,
-                            readOnly: true,
-                            decoration: const InputDecoration(
-                              border: OutlineInputBorder(),
+                        padding: EdgeInsets.fromLTRB(0, 12, 0, 12),
+                        child: Text('Password (Optional)'),
+                      ),
+                      Row(
+                        children: [
+                          Expanded(
+                            child: TextField(
+                              maxLines: null,
+                              minLines: 2,
+                              controller: showPasswordTextController,
+                              readOnly: true,
+                              decoration: const InputDecoration(
+                                border: OutlineInputBorder(),
+                              ),
                             ),
                           ),
-                        )
-                      ])
+                        ],
+                      ),
                     ],
                   ],
                 ),
@@ -145,10 +152,9 @@ class SettingsPage extends HookWidget {
                   ],
                 ),
                 const Padding(
-                    padding: EdgeInsets.fromLTRB(0, 12, 0, 12),
-                    child: Text(
-                      'Password (Optional)',
-                    )),
+                  padding: EdgeInsets.fromLTRB(0, 12, 0, 12),
+                  child: Text('Password (Optional)'),
+                ),
                 Row(
                   children: [
                     Expanded(
@@ -172,8 +178,9 @@ class SettingsPage extends HookWidget {
               onPressed: () {
                 final mnemonicGenerator = Mnemonic();
                 final enteredSeed = newSeedController.text.trim().toLowerCase();
-                final enteredPassword =
-                    newPasswordController.text.trim().toLowerCase();
+                final enteredPassword = newPasswordController.text
+                    .trim()
+                    .toLowerCase();
 
                 if (!mnemonicGenerator.validateMnemonic(enteredSeed)) {
                   ScaffoldMessenger.of(context).showSnackBar(
@@ -198,101 +205,114 @@ class SettingsPage extends HookWidget {
     }
 
     Future<void> Function() _launchUrl(String url) => () async {
-          final uri = Uri.tryParse(url);
-          if (uri == null) {
-            Sentry.captureMessage('Invalid URL: $url');
-            return;
-          }
+      final uri = Uri.tryParse(url);
+      if (uri == null) {
+        Sentry.captureMessage('Invalid URL: $url');
+        return;
+      }
 
-          if (!await canLaunchUrl(uri)) {
-            Sentry.captureMessage('Could not launch $url');
-            return;
-          }
+      if (!await canLaunchUrl(uri)) {
+        Sentry.captureMessage('Could not launch $url');
+        return;
+      }
 
-          await launchUrl(uri);
-        };
+      await launchUrl(uri);
+    };
 
-    return Scaffold(
-      appBar: AppBar(
-        backgroundColor: Colors.transparent,
-        elevation: 0,
-        leading: IconButton(
-          splashRadius: AppTheme.splashRadius,
-          onPressed: onBack ?? () => context.pop(),
-          icon: const Icon(Icons.navigate_before),
-        ),
-        title: const Text(
-          'Settings',
-          style: TextStyle(
-            fontSize: 20,
+    return Listener(
+      // Observe without stealing the ListView's drag recognizer. Only a new
+      // upward swipe at the bottom dismisses; scrolling to the bottom does not.
+      onPointerDown: (event) {
+        swipeStart.value =
+            ModalRoute.of(context)?.isCurrent == true &&
+                scrollController.hasClients &&
+                scrollController.position.extentAfter <= 1
+            ? event.position
+            : null;
+      },
+      onPointerCancel: (_) => swipeStart.value = null,
+      onPointerUp: (event) {
+        final start = swipeStart.value;
+        swipeStart.value = null;
+        if (start == null || ModalRoute.of(context)?.isCurrent != true) return;
+        final delta = event.position - start;
+        if (delta.dy <= -64 && -delta.dy > delta.dx.abs() * 1.5) dismiss();
+      },
+      child: Scaffold(
+        appBar: AppBar(
+          backgroundColor: Colors.transparent,
+          elevation: 0,
+          leading: IconButton(
+            splashRadius: AppTheme.splashRadius,
+            onPressed: dismiss,
+            icon: const Icon(Icons.navigate_before),
           ),
+          title: const Text('Settings', style: TextStyle(fontSize: 20)),
+          centerTitle: true,
         ),
-        centerTitle: true,
-      ),
-      body: ListView(
-        children: [
-          const ListTile(
-            title: Text(
-              'Wallet',
-              style: TextStyle(
-                fontSize: 16,
-                fontWeight: FontWeight.bold,
+        body: ListView(
+          controller: scrollController,
+          children: [
+            const ListTile(
+              title: Text(
+                'Wallet',
+                style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold),
               ),
             ),
-          ),
-          ListTile(
-            title: const Text('Seed Phrase'),
-            leading: const Icon(Icons.nature),
-            trailing: const Icon(Icons.keyboard_arrow_right),
-            onTap: () => showSeedDialog(),
-          ),
-          ListTile(
-            title: const Text('Import Seed Phrase'),
-            leading: const Icon(Icons.upload),
-            trailing: const Icon(Icons.keyboard_arrow_right),
-            onTap: () => showEnterSeedDialog(),
-          ),
-          const Divider(),
-          const ListTile(
-            title: Text(
-              'More',
-              style: TextStyle(
-                fontSize: 16,
-                fontWeight: FontWeight.bold,
+            ListTile(
+              title: const Text('Seed Phrase'),
+              leading: const Icon(Icons.nature),
+              trailing: const Icon(Icons.keyboard_arrow_right),
+              onTap: () => showSeedDialog(),
+            ),
+            ListTile(
+              title: const Text('Import Seed Phrase'),
+              leading: const Icon(Icons.upload),
+              trailing: const Icon(Icons.keyboard_arrow_right),
+              onTap: () => showEnterSeedDialog(),
+            ),
+            const Divider(),
+            const ListTile(
+              title: Text(
+                'More',
+                style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold),
               ),
             ),
-          ),
-          ListTile(
-            title: const Text('Help'),
-            leading: const Icon(Icons.help),
-            trailing: const Icon(Icons.keyboard_arrow_right),
-            onTap: _launchUrl('https://t.me/cashewwallet'),
-          ),
-          ListTile(
+            ListTile(
+              title: const Text('Help'),
+              leading: const Icon(Icons.help),
+              trailing: const Icon(Icons.keyboard_arrow_right),
+              enabled: false,
+              subtitle: const Text('Temporarily unavailable'),
+            ),
+            ListTile(
               title: const Text('Website'),
               leading: const Icon(Icons.web),
               trailing: const Icon(Icons.keyboard_arrow_right),
-              onTap: _launchUrl('https://givelotus.org')),
-          ListTile(
-            title: const Text('Community'),
-            leading: const Icon(Icons.group),
-            trailing: const Icon(Icons.keyboard_arrow_right),
-            onTap: _launchUrl('https://t.me/givelotus'),
-          ),
-          ListTile(
-            title: const Text('Version'),
-            subtitle: FutureBuilder<PackageInfo>(
-              future: packageInfoFuture,
-              builder: (context, snapshot) {
-                if (snapshot.hasData) {
-                  return Text('${snapshot.data?.version}');
-                }
-                return const SizedBox.shrink();
-              },
+              enabled: false,
+              subtitle: const Text('Temporarily unavailable'),
             ),
-            leading: const Icon(Icons.info),
-          ),
-        ],
+            ListTile(
+              title: const Text('Community'),
+              leading: const Icon(Icons.group),
+              trailing: const Icon(Icons.keyboard_arrow_right),
+              onTap: _launchUrl('https://t.me/TheLotusNetwork'),
+            ),
+            ListTile(
+              title: const Text('Version'),
+              subtitle: FutureBuilder<PackageInfo>(
+                future: packageInfoFuture,
+                builder: (context, snapshot) {
+                  if (snapshot.hasData) {
+                    return Text('${snapshot.data?.version}');
+                  }
+                  return const SizedBox.shrink();
+                },
+              ),
+              leading: const Icon(Icons.info),
+            ),
+          ],
+        ),
       ),
     );
   }

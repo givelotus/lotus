@@ -9,10 +9,16 @@ import 'package:vase/config/theme.dart';
 import 'package:vase/features/home/wallet_pager.dart';
 import 'package:vase/features/contacts/contacts_model.dart';
 import 'package:vase/features/contacts/contacts_page.dart';
+import 'package:vase/features/contacts/device_contacts.dart';
 import 'secure_storage_test.dart' show MemoryStorage;
 import 'package:vase/features/send/send_model.dart';
 import 'package:vase/features/wallet/wallet_model.dart';
 import 'package:vase/wallet/wallet.dart';
+
+class _NoPhoneContacts extends DeviceContacts {
+  @override
+  bool get supported => false;
+}
 
 class _FixtureWallet implements Wallet {
   @override
@@ -50,8 +56,11 @@ void main() {
       initialLocation: location,
       routes: [
         ...walletPageRoutes(
-          contactsBuilder: (back) =>
-              ContactsPage(onBack: back, model: contacts),
+          contactsBuilder: (back) => ContactsPage(
+            onBack: back,
+            model: contacts,
+            deviceContacts: _NoPhoneContacts(),
+          ),
           scannerBuilder: (onScan) {
             scan = onScan;
             return const ColoredBox(
@@ -227,6 +236,53 @@ void main() {
       await tester.pumpAndSettle();
       expect(location(), '/');
       expect(find.byKey(const ValueKey('scanner')), findsOneWidget);
+    },
+  );
+
+  for (final direct in [false, true]) {
+    testWidgets('swipe up dismisses Settings (direct link: $direct)', (
+      tester,
+    ) async {
+      tester.view.physicalSize = const Size(390, 844);
+      tester.view.devicePixelRatio = 1;
+      addTearDown(tester.view.resetPhysicalSize);
+      addTearDown(tester.view.resetDevicePixelRatio);
+      await launch(tester, location: direct ? '/settings' : '/');
+      if (!direct) {
+        await tester.drag(
+          find.byKey(const ValueKey('scanner')),
+          const Offset(0, 180),
+        );
+        await tester.pumpAndSettle();
+      }
+      await tester.drag(find.byType(ListView), const Offset(0, -180));
+      await tester.pumpAndSettle();
+      expect(location(), '/');
+      expect(find.byKey(const ValueKey('scanner')), findsOneWidget);
+    });
+  }
+
+  testWidgets(
+    'Settings scrolls before dismissing on a compact screen and links are disabled',
+    (tester) async {
+      tester.view.physicalSize = const Size(390, 480);
+      tester.view.devicePixelRatio = 1;
+      addTearDown(tester.view.resetPhysicalSize);
+      addTearDown(tester.view.resetDevicePixelRatio);
+      await launch(tester, location: '/settings');
+      for (final title in ['Website', 'Help']) {
+        final tile = tester.widget<ListTile>(
+          find.widgetWithText(ListTile, title),
+        );
+        expect(tile.enabled, isFalse);
+        expect(tile.onTap, isNull);
+      }
+      await tester.drag(find.byType(ListView), const Offset(0, -350));
+      await tester.pumpAndSettle();
+      expect(location(), '/settings');
+      await tester.drag(find.byType(ListView), const Offset(0, -180));
+      await tester.pumpAndSettle();
+      expect(location(), '/');
     },
   );
 

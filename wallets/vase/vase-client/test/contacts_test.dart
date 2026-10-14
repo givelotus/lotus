@@ -1,4 +1,6 @@
 import 'dart:convert';
+import 'dart:async';
+import 'package:flutter_contacts/flutter_contacts.dart' show PermissionStatus;
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
@@ -37,6 +39,26 @@ class _Storage extends MemoryStorage {
 class _DeviceContacts extends DeviceContacts {
   @override
   bool get supported => false;
+}
+
+class _SyncDeviceContacts extends DeviceContacts {
+  final events = StreamController<void>.broadcast();
+  DeviceContactsSnapshot snapshot = const DeviceContactsSnapshot(
+    PermissionStatus.granted,
+    [DeviceContactLink('phone-a', 'Phone Alice', null)],
+  );
+  final requests = <bool>[];
+  bool fail = false;
+  @override
+  bool get supported => true;
+  @override
+  Stream<void> get changes => events.stream;
+  @override
+  Future<DeviceContactsSnapshot> read({bool requestPermission = false}) async {
+    requests.add(requestPermission);
+    if (fail) throw StateError('test read failed');
+    return snapshot;
+  }
 }
 
 void main() {
@@ -140,6 +162,138 @@ void main() {
         );
       }
       expect(storage.writes, isEmpty);
+    },
+  );
+
+  testWidgets(
+    'phone access starts on visibility and refreshes changes, resume and revocation',
+    (tester) async {
+      final phone = _SyncDeviceContacts();
+      addTearDown(phone.events.close);
+      Future<void> render(bool active) async {
+        await tester.pumpWidget(
+          MaterialApp(
+            home: ContactsPage(
+              model: model,
+              deviceContacts: phone,
+              active: active,
+            ),
+          ),
+        );
+        await tester.pumpAndSettle();
+      }
+
+      await render(false);
+      expect(phone.requests, isEmpty);
+      await render(true);
+      expect(phone.requests, [true]);
+      expect(find.text('Phone Alice'), findsOneWidget);
+      expect(find.text('Add Lotus address'), findsOneWidget);
+      expect(storage.writes, isEmpty);
+      phone.snapshot = DeviceContactsSnapshot(PermissionStatus.limited, [
+        DeviceContactLink('phone-a', 'Alice renamed', address),
+      ]);
+      phone.events.add(null);
+      await tester.pumpAndSettle();
+      expect(find.text('Phone Alice'), findsNothing);
+      expect(find.text('Alice renamed'), findsOneWidget);
+      expect(find.text('Showing selected phone contacts'), findsOneWidget);
+      phone.fail = true;
+      phone.events.add(null);
+      await tester.pumpAndSettle();
+      expect(find.text('Phone contacts could not refresh.'), findsOneWidget);
+      expect(find.text('Alice renamed'), findsOneWidget);
+      phone.fail = false;
+      phone.snapshot = const DeviceContactsSnapshot(
+        PermissionStatus.permanentlyDenied,
+        [],
+      );
+      tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.resumed);
+      await tester.pumpAndSettle();
+      expect(find.text('Alice renamed'), findsNothing);
+      expect(phone.requests.skip(1).every((request) => !request), isTrue);
+      expect(storage.writes, isEmpty);
+      await tester.pumpWidget(const SizedBox());
+      expect(phone.events.hasListener, isFalse);
+    },
+  );
+
+  testWidgets(
+    'linked names refresh without changing saved destinations or deleting local contacts',
+    (tester) async {
+      await model.load();
+      await model.save(
+        name: 'Saved Alice',
+        address: address,
+        deviceContactId: 'phone-a',
+      );
+      final saved = storage.values[contactsStorageKey];
+      final identity = model.contacts.single.id;
+      final phone = _SyncDeviceContacts();
+      addTearDown(phone.events.close);
+      await tester.pumpWidget(
+        MaterialApp(
+          home: ContactsPage(model: model, deviceContacts: phone),
+        ),
+      );
+      await tester.pumpAndSettle();
+      expect(find.text('Phone Alice'), findsOneWidget);
+      expect(find.text('Saved Alice'), findsOneWidget);
+      expect(find.text(address), findsNWidgets(2));
+      phone.snapshot = const DeviceContactsSnapshot(
+        PermissionStatus.granted,
+        [],
+      );
+      phone.events.add(null);
+      await tester.pumpAndSettle();
+      expect(find.text('Saved Alice'), findsOneWidget);
+      expect(model.contacts.single.id, identity);
+      expect(storage.values[contactsStorageKey], saved);
+      await tester.pumpWidget(const SizedBox());
+    },
+  );
+
+  testWidgets(
+    'compact editor keeps focused input visible above keyboard and Next moves focus',
+    (tester) async {
+      tester.view.physicalSize = const Size(390, 640);
+      tester.view.devicePixelRatio = 1;
+      addTearDown(tester.view.resetPhysicalSize);
+      addTearDown(tester.view.resetDevicePixelRatio);
+      await tester.pumpWidget(
+        MaterialApp(
+          theme: AppTheme.lotusTheme,
+          home: ContactsPage(model: model, deviceContacts: _DeviceContacts()),
+        ),
+      );
+      await tester.pumpAndSettle();
+      await tester.tap(find.byTooltip('Add contact'));
+      await tester.pumpAndSettle();
+      expect(tester.testTextInput.isVisible, isTrue);
+      await tester.enterText(
+        find.widgetWithText(TextField, 'Name'),
+        'Keyboard Alice',
+      );
+      await tester.testTextInput.receiveAction(TextInputAction.next);
+      await tester.pumpAndSettle();
+      tester.testTextInput.enterText(address);
+      await tester.pump();
+      expect(
+        tester
+            .widget<TextField>(find.widgetWithText(TextField, 'Lotus address'))
+            .controller!
+            .text,
+        address,
+      );
+      tester.view.viewInsets = const FakeViewPadding(bottom: 290);
+      addTearDown(tester.view.resetViewInsets);
+      await tester.pumpAndSettle();
+      expect(tester.takeException(), isNull);
+      await tester.ensureVisible(find.widgetWithText(TextButton, 'Save'));
+      await tester.tap(find.widgetWithText(TextButton, 'Save'));
+      await tester.pumpAndSettle();
+      expect(model.contacts.single.name, 'Keyboard Alice');
+      expect(model.contacts.single.address, address);
     },
   );
 

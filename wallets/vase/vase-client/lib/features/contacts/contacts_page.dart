@@ -1,3 +1,5 @@
+import 'dart:async';
+import 'package:flutter_contacts/flutter_contacts.dart' show PermissionStatus;
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:go_router/go_router.dart';
@@ -10,9 +12,11 @@ class ContactsPage extends StatefulWidget {
   const ContactsPage({
     super.key,
     this.onBack,
+    this.active = true,
     this.model,
     this.deviceContacts = const DeviceContacts(),
   });
+  final bool active;
   final VoidCallback? onBack;
   final ContactsModel? model;
   final DeviceContacts deviceContacts;
@@ -20,18 +24,81 @@ class ContactsPage extends StatefulWidget {
   State<ContactsPage> createState() => _ContactsPageState();
 }
 
-class _ContactsPageState extends State<ContactsPage> {
+class _ContactsPageState extends State<ContactsPage>
+    with WidgetsBindingObserver {
   late final ContactsModel _model = widget.model ?? ContactsModel();
   String _query = '';
   bool _deviceBusy = false;
+  List<DeviceContactLink> _phoneContacts = [];
+  PermissionStatus? _permission;
+  String? _syncError;
+  bool _syncing = false, _syncAgain = false, _permissionAttempted = false;
+  StreamSubscription<void>? _changes;
+
+  Future<void> _sync() async {
+    if (!mounted || !widget.active || !widget.deviceContacts.supported) return;
+    if (_syncing) {
+      _syncAgain = true;
+      return;
+    }
+    setState(() => _syncing = true);
+    try {
+      do {
+        _syncAgain = false;
+        final request = !_permissionAttempted;
+        _permissionAttempted = true;
+        final snapshot = await widget.deviceContacts.read(
+          requestPermission: request,
+        );
+        if (!mounted) return;
+        setState(() {
+          _permission = snapshot.status;
+          _phoneContacts = snapshot.contacts;
+          _syncError = null;
+        });
+      } while (_syncAgain && widget.active);
+    } catch (_) {
+      if (mounted) {
+        setState(() => _syncError = 'Phone contacts could not refresh.');
+      }
+    } finally {
+      if (mounted) setState(() => _syncing = false);
+    }
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.resumed) _sync();
+  }
+
+  @override
+  void didUpdateWidget(ContactsPage oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (widget.active && !oldWidget.active) _sync();
+  }
+
   @override
   void initState() {
     super.initState();
     _model.load();
+    WidgetsBinding.instance.addObserver(this);
+    if (widget.deviceContacts.supported) {
+      _changes = widget.deviceContacts.changes.listen(
+        (_) => _sync(),
+        onError: (Object _) {
+          if (mounted) {
+            setState(() => _syncError = 'Phone contacts could not refresh.');
+          }
+        },
+      );
+      WidgetsBinding.instance.addPostFrameCallback((_) => _sync());
+    }
   }
 
   @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
+    _changes?.cancel();
     if (widget.model == null) _model.dispose();
     super.dispose();
   }
@@ -128,6 +195,24 @@ class _ContactsPageState extends State<ContactsPage> {
   Widget build(BuildContext context) => AnimatedBuilder(
     animation: _model,
     builder: (context, _) {
+      final savedByPhone = <String, WalletContact>{};
+      for (final contact in _model.contacts) {
+        if (contact.deviceContactId != null) {
+          savedByPhone.putIfAbsent(contact.deviceContactId!, () => contact);
+        }
+      }
+      final phoneRecords =
+          _phoneContacts
+              .where(
+                (c) =>
+                    c.name.toLowerCase().contains(_query.toLowerCase()) ||
+                    (c.address?.contains(_query) ?? false) ||
+                    (savedByPhone[c.id]?.address.contains(_query) ?? false),
+              )
+              .toList()
+            ..sort(
+              (a, b) => a.name.toLowerCase().compareTo(b.name.toLowerCase()),
+            );
       final records = _model.contacts
           .where(
             (c) =>
@@ -177,6 +262,53 @@ class _ContactsPageState extends State<ContactsPage> {
             ? const Center(child: CircularProgressIndicator())
             : Column(
                 children: [
+                  if (widget.deviceContacts.supported)
+                    ListTile(
+                      dense: true,
+                      title: Text(
+                        _syncError ??
+                            (_permission == PermissionStatus.limited
+                                ? 'Showing selected phone contacts'
+                                : _permission == PermissionStatus.granted
+                                ? 'Phone contacts synced'
+                                : _syncing
+                                ? 'Loading phone contacts…'
+                                : 'Allow Contacts access in Settings to sync your phone contacts'),
+                      ),
+                      trailing: _syncing
+                          ? const SizedBox(
+                              width: 20,
+                              height: 20,
+                              child: CircularProgressIndicator(strokeWidth: 2),
+                            )
+                          : IconButton(
+                              tooltip:
+                                  _syncError != null ||
+                                      _permission == PermissionStatus.granted
+                                  ? 'Refresh phone contacts'
+                                  : 'Manage contacts access',
+                              icon: Icon(
+                                _syncError != null ||
+                                        _permission == PermissionStatus.granted
+                                    ? Icons.refresh
+                                    : Icons.settings,
+                              ),
+                              onPressed: () async {
+                                if (_syncError != null ||
+                                    _permission == PermissionStatus.granted) {
+                                  await _sync();
+                                } else {
+                                  try {
+                                    await widget.deviceContacts.openSettings();
+                                  } catch (_) {
+                                    _message(
+                                      'Unable to open contacts settings',
+                                    );
+                                  }
+                                }
+                              },
+                            ),
+                    ),
                   Padding(
                     padding: const EdgeInsets.all(16),
                     child: TextField(
@@ -188,7 +320,7 @@ class _ContactsPageState extends State<ContactsPage> {
                     ),
                   ),
                   Expanded(
-                    child: records.isEmpty
+                    child: records.isEmpty && phoneRecords.isEmpty
                         ? Center(
                             child: Text(
                               _query.isEmpty
@@ -197,8 +329,74 @@ class _ContactsPageState extends State<ContactsPage> {
                             ),
                           )
                         : ListView.builder(
-                            itemCount: records.length,
+                            itemCount:
+                                records.length +
+                                phoneRecords.length +
+                                (records.isEmpty ? 0 : 1) +
+                                (phoneRecords.isEmpty ? 0 : 1),
                             itemBuilder: (context, index) {
+                              if (records.isNotEmpty) {
+                                if (index == 0)
+                                  return const ListTile(
+                                    dense: true,
+                                    title: Text('Saved in Vase'),
+                                  );
+                                index--;
+                              }
+                              if (index >= records.length) {
+                                final phoneIndex = index - records.length;
+                                if (phoneIndex == 0)
+                                  return const ListTile(
+                                    dense: true,
+                                    title: Text('Phone contacts'),
+                                  );
+                                final phone = phoneRecords[phoneIndex - 1];
+                                final saved = savedByPhone[phone.id];
+                                final address = phone.address ?? saved?.address;
+                                return ListTile(
+                                  leading: const CircleAvatar(
+                                    child: Icon(Icons.person_outline),
+                                  ),
+                                  title: Text(
+                                    phone.name.isEmpty
+                                        ? 'Unnamed contact'
+                                        : phone.name,
+                                  ),
+                                  subtitle: Text(
+                                    address ?? 'Add Lotus address',
+                                    maxLines: 1,
+                                    overflow: TextOverflow.ellipsis,
+                                  ),
+                                  onTap: enabled
+                                      ? () async {
+                                          if (address == null) {
+                                            await _edit(
+                                              contact: saved,
+                                              link: phone,
+                                            );
+                                          } else {
+                                            context
+                                                .read<SendModel>()
+                                                .setPayment(
+                                                  address,
+                                                  BigInt.zero,
+                                                );
+                                            await context.push('/send');
+                                          }
+                                        }
+                                      : null,
+                                  trailing: IconButton(
+                                    tooltip: saved == null
+                                        ? 'Save in Vase'
+                                        : 'Edit saved contact',
+                                    icon: const Icon(Icons.person_add_alt),
+                                    onPressed: enabled
+                                        ? () =>
+                                              _edit(contact: saved, link: phone)
+                                        : null,
+                                  ),
+                                );
+                              }
                               final contact = records[index];
                               return ListTile(
                                 title: Text(contact.name),
@@ -294,12 +492,14 @@ class _ContactEditorState extends State<_ContactEditor> {
   late final _address = TextEditingController(
     text: widget.contact?.address ?? widget.link?.address,
   );
+  final _addressFocus = FocusNode();
   bool _saving = false;
   String? _error;
   @override
   void dispose() {
     _name.dispose();
     _address.dispose();
+    _addressFocus.dispose();
     super.dispose();
   }
 
@@ -346,19 +546,34 @@ class _ContactEditorState extends State<_ContactEditor> {
           TextField(
             controller: _name,
             enabled: !_saving,
+            autofocus: true,
             maxLength: 120,
+            textInputAction: TextInputAction.next,
+            onSubmitted: (_) => _addressFocus.requestFocus(),
             textCapitalization: TextCapitalization.words,
-            decoration: const InputDecoration(labelText: 'Name'),
+            decoration: const InputDecoration(
+              labelText: 'Name',
+              border: OutlineInputBorder(),
+              counterText: '',
+              isDense: true,
+            ),
           ),
+          const SizedBox(height: 20),
           TextField(
             controller: _address,
+            focusNode: _addressFocus,
             enabled: !_saving,
-            maxLines: 3,
+            maxLines: 1,
+            keyboardType: TextInputType.url,
+            textInputAction: TextInputAction.done,
+            onSubmitted: (_) => _save(),
             autocorrect: false,
             enableSuggestions: false,
             decoration: const InputDecoration(
               labelText: 'Lotus address',
               hintText: 'lotus_…',
+              border: OutlineInputBorder(),
+              isDense: true,
             ),
           ),
           if (widget.link != null || widget.contact?.deviceContactId != null)

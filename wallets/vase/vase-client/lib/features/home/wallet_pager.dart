@@ -122,7 +122,10 @@ class _WalletPagerState extends State<WalletPager> {
         _KeptPage(
           child:
               widget.contactsBuilder?.call(() => context.go('/')) ??
-              ContactsPage(onBack: () => context.go('/')),
+              ContactsPage(
+                active: _index == 0 && widget.location == '/contacts',
+                onBack: () => context.go('/'),
+              ),
         ),
         HomePage(
           active: _index == 1,
