@@ -9,22 +9,55 @@ The initial rebase workspace HEAD was `a055e77a25`; its tree was
 ordered series entry. Applying all exported patches to a temporary Git index
 initialized from the new base reproduces that tree exactly.
 
-The subsequent mining audit found incorrect ancestor resource/fee accounting in
-the experimental assembler. The explicit repair is folded into patch 246,
-retaining all 153 entries and their metadata. Current workspace HEAD is
-`6590d92300ba588325628ab7c1a166e392947cff`; its source tree is
-`e0d4f9c0219739b6774864858c582a8144a443d9`. Every intermediate tree and metadata
-digest replays successfully. See [the mining audit](ecash-block-assembly-review.md)
-for the before/after regression evidence.
+## Current corrected custom scheduler candidate
 
-The repaired source also passes the normal Chronik-enabled `lotusd`, `lotus-cli`,
-`test_lotus`, `check-crates`, and all 156 `check-bitcoin` targets. Restarting only
-the isolated test node with that binary retained height 1,400,955 and
-`initialblockdownload=false`. Chronik/RPC parity passed again at 11 sampled blocks
-and 15 transactions; `verifychain 4 1000` returned true. Production was untouched.
-Logs: `/tmp/lotus-v1-mining-repair-chronik-build-20261014.log`,
-`/tmp/lotus-v1-mining-repair-chronik-cpp-20261014.log`, and
-`/tmp/lotus-v1-mining-repair-chronik-parity-20261014.log`.
+The custom snapshot-based mining algorithm is corrected in patch **001**, with
+its generic native tests. Patch 077 has context adaptation only; patch 246 keeps
+Lotus fixture/API and Chronik compatibility work and no longer reverses the
+custom scheduler. The prior upstream restoration in 246 was a temporary mistake
+and was revoked by the user. Its tree `e0d4f9c0219739b6774864858c582a8144a443d9`
+and older validation results are historical, not the current candidate.
+
+Current source HEAD is `0b7939e926b8353ad09d8edc47f355ddacc30502`; source tree
+is `73e9db8356d5f9e617f40d4d9228209e117b08f0`. Exactly 153 commits replay with
+plain `git am`, and every intermediate tree and author/date/message digest
+matches recorded provenance. See [the mining audit](ecash-block-assembly-review.md)
+for the custom design and independent operation counts.
+
+The same final native fixtures fail eight assertions with the historical broken
+accumulator and pass with the corrected custom dependency snapshot/ready-fee
+heap. Coverage includes exact byte/sigcheck boundaries, layered diamonds,
+repeated-parent inputs, scarce-capacity sibling priority, nonfinal parents and
+fee-delta/free-descendant policy. Normal Chronik-enabled daemon/CLI/test builds,
+Rust tests/Clippy, and all 156 C++ check targets pass.
+
+A **fresh** isolated node replayed mainnet from copied block files through
+**1,401,052**, reached `initialblockdownload=false`, and accepted fresh blocks.
+Chronik/RPC parity passes at 11 sampled heights and 15 coinbase/non-coinbase
+transactions, checking exact 160-byte headers, merkleized TxIds, raw disk bytes
+and transaction sizes. `verifychain 4 1000` returns true; `getchaintips` has only
+the active tip. Read-only `getblocktemplate` succeeds at height 1,401,053 with an
+empty mempool; native fixtures supply dependent-transaction behavior evidence.
+
+Source/build is `/tmp/lotus-v1-custom-assembly`; isolated data is
+`/tmp/lotus-v1-custom-assembly-mainnet-20261014` (RPC 12604, Chronik 19331,
+listening disabled). Only APFS copy-on-write `blk*.dat` copies were taken.
+Existing nodes, original workspaces/databases, tags and published releases were
+not stopped or modified. Publication remains a separate candidate/artifact
+review step; prior CI artifacts do not contain this newly corrected source.
+
+Evidence logs:
+
+- `/tmp/lotus-v1-custom-assembly-miner-tests-before.log`
+- `/tmp/lotus-v1-custom-assembly-build-final.log`
+- `/tmp/lotus-v1-custom-assembly-cpp-checks.log`
+- `/tmp/lotus-v1-custom-series-verify-final.log`
+- `/tmp/lotus-v1-custom-series-operations.log`
+- `/tmp/lotus-v1-custom-assembly-chronik-parity.log`
+- `/tmp/lotus-v1-custom-assembly-verifychain.log`
+
+The remaining sections retain the original rebase procedure and historical
+release context; source identity and current evidence are recorded above.
 
 ## Build and tests
 

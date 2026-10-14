@@ -241,8 +241,22 @@ Logs are `/tmp/lotus-v1-custom-assembly-miner-tests-before.log`,
 `/tmp/lotus-v1-custom-series-verify.log`, and
 `/tmp/lotus-v1-custom-series-operations.log`.
 
-New corrected-tree mainnet replay is still in progress in a fresh isolated
-datadir at `/tmp/lotus-v1-custom-assembly-mainnet-20261014` (RPC 12604, Chronik
-19331). This candidate is not ready to publish until corrected-tree mainnet
-parity is recorded. Existing working nodes, original workspaces, chain data,
-tags, and published releases remain untouched.
+A fresh corrected-tree node replayed mainnet to **1,401,052** with
+`initialblockdownload=false`, then accepted fresh blocks beyond the copied block
+files. It uses `/tmp/lotus-v1-custom-assembly-mainnet-20261014` (RPC 12604,
+Chronik 19331). Chronik/RPC parity passes at **11 sampled heights and 15
+coinbase/non-coinbase transactions**: exact 160-byte headers, merkleized TxIds,
+raw disk bytes and transaction sizes. `verifychain 4 1000` returns true;
+`getchaintips` has only the active tip, with no parked branch. Read-only
+`getblocktemplate` succeeds for height 1,401,053. Its live mempool was empty;
+dependent-transaction selection is covered by the separate native fixtures.
+
+Mainnet evidence is in `/tmp/lotus-v1-custom-assembly-chronik-parity.log`,
+`/tmp/lotus-v1-custom-assembly-verifychain.log`,
+`/tmp/lotus-v1-custom-assembly-chaininfo.json`,
+`/tmp/lotus-v1-custom-assembly-chaintips.json`, and
+`/tmp/lotus-v1-custom-assembly-blocktemplate.json`.
+
+Existing working nodes, original workspaces, original chain data, tags, and
+published releases remain untouched. These source checks support review;
+publication still follows the normal candidate/artifact verification path.
