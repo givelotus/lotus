@@ -46,15 +46,36 @@ direct Hashlock example, showing that the helper is copied into its caller.
 | `recovery.lotus` | Two independently committed owner and guardian methods, each with its own leaf and proof. The guardian method has no delay. |
 | `helper.lotus` | A typed free helper whose operations are inlined into a method. |
 | `linked.lotus` | A fully bound contract root and method leaf copied as compile-time constants into a second contract. This shows byte commitments; it does not enforce execution of the referenced contract. |
+| `fungible-token.lotus` | Separate wallet, mandatory transfer-rules and issuer-mint trees for a fungible token. |
+
+The fungible token gallery can also be generated on its own:
+
+```sh
+node examples/gallery/run-fungible-token.mjs /tmp/lotus-v2-token-gallery
+```
+
+`FungibleToken` is a mint-only tree. Its root is the token ID. `FungibleRules`
+is a separate spend tree that checks every output carrying that token ID; its
+root must appear on **every path** of those outputs. A holder output has
+`branches=[TokenWallet,FungibleRules]` and `paths=[[0,1]]`, so spending it
+requires both the wallet and rules witnesses. `paths=[[0],[0,1]]` is a valid
+policy shape but violates the token rule, because the first path bypasses it.
+
+The example mints 1,000 units, then transfers 700 and 250 while implicitly
+burning 50. A token `IS_BURN` output has no paths, so the rules script rejects
+it; the burn is the difference between consumed and created token amounts.
+The issuer can mint again under the same token ID. There is no supply cap or
+allowance state in this example.
 
 `summary.json` reports compile, proof, transaction framing, signature, VM,
 accounting and block stages separately. The generic Payment method has its own
 public signed fixture. The runner reconstructs its transaction wire, TxID,
 TxHash and signing message, checks its Schnorr signature, and asks the VM to
 execute correct and altered signatures. The other examples are compiler
-artifacts, with VM checks only for hashlock, helper and linked. The current compiler/runtime does not
-implement a stateful counter, mint policy, relative recovery delay, full coin
-context, fee accounting or block connection. Those examples remain in the
+artifacts, with VM checks only for hashlock, helper and linked in the base
+runner. The separate fungible-token runner reports its own stages. The current
+compiler/runtime does not implement a stateful counter, allowance state,
+relative recovery delay, full coin context or block connection. Those examples remain in the
 semantic specification at `docs/lotus-v2/examples/README.md`. No node,
 network, wallet or private key is needed to run this gallery.
 
