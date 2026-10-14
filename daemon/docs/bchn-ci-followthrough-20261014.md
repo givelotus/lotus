@@ -13,8 +13,11 @@ with `job_execution_timeout`. The fork's project-level `build_timeout` was
 3,600 seconds. Those jobs inherit `allow_failure: true` from upstream's
 `.sanitizer-common`: a green pipeline does not establish sanitizer success.
 
-Retained traces contain no explicit `runtime error:`/UndefinedBehaviorSanitizer
-diagnostic. Four contain no completed functional-test failure. The mining
+All five original jobs completed the full C++ unit binary under UBSan with
+`*** No errors detected`, and reported Qt/seeder suite passes. That is real
+component-level sanitizer evidence, even though the complete integration job
+did not finish. Retained traces contain no explicit
+`runtime error:`/UndefinedBehaviorSanitizer diagnostic. Four contain no completed functional-test failure. The mining
 trace also reports a real `p2p_compactblocks.py` failure waiting 30 seconds for
 an end-to-end block announcement. Its root cause remains unproven.
 The hard-timeout job did not retain its configured failure-artifact archive,
