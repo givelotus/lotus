@@ -35,5 +35,4 @@ nTailSubsidy, lotusd, etc.).
 
 ## See Also
 
-- `patches/v2/` — same patches as part of the full Lotus v2 series (v2/29-31 still target old API; refresh pending)
 - `patches/bchn/` — same patches ported to Bitcoin Cash Node

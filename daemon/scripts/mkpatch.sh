@@ -1,10 +1,9 @@
 #!/usr/bin/env bash
 # mkpatch.sh — Save current workspace changes as a named patch.
 #
-# SERIES=v2 (default): saves to patches/v2/<name>.patch    from workspace-v2/
-# SERIES=v1:           saves to patches/v1/<name>.patch    from workspace-v1/
+# SERIES=v1 (default):           saves to patches/v1/<name>.patch    from workspace-v1/
 # SERIES=doged:        saves to patches/doged/<name>.patch from workspace-doged/
-# SERIES=ecash:        saves to patches/ecash/<name>.patch from workspace-v2/ (same base)
+# SERIES=ecash:        saves to patches/ecash/<name>.patch from workspace-ecash/
 #
 # Usage: ./scripts/mkpatch.sh <patch-name>
 #   e.g. ./scripts/mkpatch.sh 06-block-header
@@ -13,7 +12,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DAEMON_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
-SERIES="${SERIES:-v2}"
+SERIES="${SERIES:-v1}"
 
 if [[ $# -lt 1 ]]; then
     echo "Usage: $0 <patch-name>"
@@ -33,7 +32,7 @@ elif [[ "$SERIES" == "doged" ]]; then
     PATCHES_DIR="$DAEMON_DIR/patches/doged"
     mkdir -p "$PATCHES_DIR"
 elif [[ "$SERIES" == "ecash" ]]; then
-    WORKSPACE="$DAEMON_DIR/workspace-v2"
+    WORKSPACE="$DAEMON_DIR/workspace-ecash"
     PATCHES_DIR="$DAEMON_DIR/patches/ecash"
     mkdir -p "$PATCHES_DIR"
 elif [[ "$SERIES" == "bchn" ]]; then
@@ -41,8 +40,8 @@ elif [[ "$SERIES" == "bchn" ]]; then
     PATCHES_DIR="$DAEMON_DIR/patches/bchn"
     mkdir -p "$PATCHES_DIR"
 else
-    WORKSPACE="$DAEMON_DIR/workspace-v2"
-    PATCHES_DIR="$DAEMON_DIR/patches/v2"
+    echo "Unsupported series: $SERIES (choose v1, ecash, doged, or bchn)" >&2
+    exit 1
 fi
 
 OUTPUT="$PATCHES_DIR/$NAME"

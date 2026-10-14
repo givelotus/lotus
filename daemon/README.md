@@ -74,7 +74,7 @@ make setup SERIES=v1
 
 **What this command does for you:**
 1. Clones `https://github.com/Bitcoin-ABC/bitcoin-abc.git` into `workspace-v1/`.
-2. Checks out the exact pinned base commit from [`bitcoin-abc-v1-version`](bitcoin-abc-v1-version) for V1 (V2 uses `bitcoin-abc-version`).
+2. Checks out the exact pinned base commit from [`bitcoin-abc-v1-version`](bitcoin-abc-v1-version) for V1.
 3. Reads [`patches/v1/series`](patches/v1/series) from top to bottom and applies all 153 Lotus patches (`000` through `247`) in order, committing each one cleanly into `workspace-v1/`.
 
 *(Need to wipe `workspace-v1/` and re-apply all patches cleanly from scratch? Run `make setup SERIES=v1 RESET=1`.)*
@@ -152,4 +152,8 @@ curl -s http://127.0.0.1:8331/blockchain-info | xxd
   ```bash
   make mkpatch SERIES=v1 NAME=248-my-new-patch
   ```
-- **Rebase onto a newer Bitcoin ABC commit**: do this in an isolated workspace, update `bitcoin-abc-v1-version`, and export one patch per entry in `patches/v1/series`. Verify replay and protocol compatibility before replacing release artifacts. The existing V1 `refresh` helper handles historical Lotus version tags; it does not perform this ABC rebase.
+- **Rebase onto a newer Bitcoin ABC commit**: use an isolated workspace, then run:
+  ```bash
+  make refresh SERIES=v1 COMMIT=UPSTREAM_COMMIT_SHA
+  ```
+  The helper updates `bitcoin-abc-v1-version` and reapplies the mainnet series. Resolve conflicts, export one patch per series entry, and verify replay and protocol compatibility before replacing release artifacts.

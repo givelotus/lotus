@@ -1,8 +1,7 @@
 #!/usr/bin/env bash
 # setup.sh — Create or reset a daemon build workspace.
 #
-# SERIES=v2 (default): clone bitcoin-abc at 252182e9, apply V2 patch series
-# SERIES=v1:           clone bitcoin-abc at bitcoin-abc-v1-version, apply V1 patch series (153 patches)
+# SERIES=v1 (default):           clone bitcoin-abc at bitcoin-abc-v1-version, apply V1 patch series (153 patches)
 # SERIES=doged:        clone doged-io/doged directly at doged-version tag/branch
 # SERIES=bchn:         clone bitcoin-cash-node at pinned tag, apply patches 29-31
 #
@@ -13,7 +12,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DAEMON_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
-SERIES="${SERIES:-v2}"
+SERIES="${SERIES:-v1}"
 
 # Export RESET from script argv so clone_and_checkout can see it
 if [[ "${1:-}" == "--reset" ]]; then
@@ -108,19 +107,20 @@ if [[ "$SERIES" == "bchn" ]]; then
     exit 0
 fi
 
-# ─── V2: bitcoin-abc base + Lotus patch series (new chain) ───────────────────
-WORKSPACE="$DAEMON_DIR/workspace-v2"
-VERSION_FILE="$DAEMON_DIR/bitcoin-abc-version"
-SERIES_FILE="$DAEMON_DIR/patches/v2/series"
-PATCHES_DIR="$DAEMON_DIR/patches/v2"
-REMOTE="${BITCOIN_ABC_REMOTE:-https://github.com/Bitcoin-ABC/bitcoin-abc.git}"
+# ─── eCash: pinned bitcoin-abc base + upstream candidate patches ────────────
+if [[ "$SERIES" == "ecash" ]]; then
+    WORKSPACE="$DAEMON_DIR/workspace-ecash"
+    VERSION_FILE="$DAEMON_DIR/bitcoin-abc-version"
+    SERIES_FILE="$DAEMON_DIR/patches/ecash/series"
+    PATCHES_DIR="$DAEMON_DIR/patches/ecash"
+    REMOTE="${BITCOIN_ABC_REMOTE:-https://github.com/Bitcoin-ABC/bitcoin-abc.git}"
+    REF=$(grep -v '^#' "$VERSION_FILE" | grep -v '^$' | head -1)
+    echo "bitcoin-abc ref: $REF"
+    clone_and_checkout "$WORKSPACE" "$REMOTE" "$REF" "ecash-work" "eCash candidates"
+    apply_patch_series "$SERIES_FILE" "$PATCHES_DIR"
+    echo "Build with: make build SERIES=ecash"
+    exit 0
+fi
 
-REF=$(grep -v '^#' "$VERSION_FILE" | grep -v '^$' | head -1)
-echo "bitcoin-abc ref: $REF"
-
-clone_and_checkout "$WORKSPACE" "$REMOTE" "$REF" "lotus-work" "V2 (Lotus new chain)"
-apply_patch_series "$SERIES_FILE" "$PATCHES_DIR"
-
-echo ""
-echo "V2 workspace ready at: $WORKSPACE"
-echo "Build with: make build"
+echo "Unsupported series: $SERIES (choose v1, ecash, doged, or bchn)" >&2
+exit 1

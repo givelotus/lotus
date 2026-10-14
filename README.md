@@ -2,7 +2,7 @@
 
 Lotus is a trust-minimized peer-to-peer monetary protocol. Monetary policy is governed by proof-of-work mining difficulty as a live, adversarially-revealed signal — no committees, no oracles, no central bank.
 
-This monorepo contains the Lotus V1 node daemon, patch series, historical specifications, mining software, and SDKs. Lotus V2 is unfinished development on the separate `lotus-v2` branch.
+This monorepo contains the Lotus V1 node daemon, patch series, historical specifications, mining software, and SDKs.
 
 Release validation currently covers the V1 daemon and its in-process Chronik indexer. The standalone SDKs, wallet, and miner are inherited components with separate build and test requirements. See the [validation report](daemon/docs/v1-8c67fe1e85-validation.md) for the checks performed.
 
@@ -11,7 +11,6 @@ Release validation currently covers the V1 daemon and its in-process Chronik ind
 ```
 daemon/         — Lotus node daemon (`lotusd` & `lotus-cli` built on Bitcoin ABC + Lotus patch series, with in-process Chronik & NNG)
   patches/v1/   — Lotus V1 mainnet patch series (`000`–`247`, rebased onto modern Bitcoin ABC 8c67fe1e85)
-  patches/v2/   — Historical V2 patch plan; current development is on branch lotus-v2
 sdk/
   dart/         — Dart SDK for mobile wallet development
   rust/         — Rust libraries (bitcoinsuite / chronik-client)
@@ -88,8 +87,6 @@ This runs CMake + Ninja inside `daemon/workspace-v1/build/` with `-DBUILD_CHRONI
 ## Research
 
 The theoretical foundation for Lotus is published at [givelotus.github.io](https://givelotus.github.io). Three preprints cover proof-of-work as monetary signal, adaptive monetary policy via feedback control, and spam prevention via burn-to-speak messaging.
-
-The next-generation **Lotus V2** candidate specification is on the separate [`lotus-v2` branch](https://github.com/givelotus/lotus/tree/lotus-v2/docs/lotus-v2). It is unfinished and is not the protocol implemented by the V1 mainnet daemon.
 
 ## Support
 

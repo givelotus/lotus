@@ -10,11 +10,10 @@ Lotus (`XPI`) is a trust-minimized peer-to-peer Proof-of-Work monetary protocol 
 - Merkleized transaction IDs (`GetId()` / `TxId`) alongside raw-serialization `GetHash()` (`TxHash`)
 - 160-byte block headers (`CBlockHeader`) and block-level `vMetadata`
 - Taproot (`P2TR` with optional 32-byte state parameter) and `SIGHASH_LOTUS`
-- XAddress format (`lotus_` prefix on V1 mainnet; `xpi_` planned for V2)
+- XAddress format (`lotus_` prefix on mainnet)
 - Both an **in-process Rust/C++ Chronik indexer** (`-chronik=1`, HTTP/WS on port `8331`) and an **NNG pub/sub interface** (`src/nng_interface/`)
 
-**Phase 1 (V1 mainnet):** Current release source rebases `v11.6.0` onto `bitcoin-abc` `8c67fe1e85a602204a2ce65aa3b643469c2c3a1d`. All 153 patches replay cleanly, C++/Rust checks pass, and an isolated node has replayed mainnet through height 1,400,898 with Chronik. The production node still runs the previous `252182e957` build until deployment is explicitly undertaken.
-**Phase 2 (unfinished, on the separate `lotus-v2` development branch; specifications there are under `docs/lotus-v2/`):** Lotus V2 protocol featuring stripped-witness `CoreTxId` commitments, deterministic UTXO state tree, v1/v2 Script ABI (`OP_SUCCESS_N` upgrade hooks, big-integer arithmetic), and optional Avalanche soft coordination.
+**Mainnet validation:** Current release source rebases `v11.6.0` onto `bitcoin-abc` `8c67fe1e85a602204a2ce65aa3b643469c2c3a1d`. All 153 patches replay cleanly, C++/Rust checks pass, and an isolated node has replayed mainnet through height 1,400,898 with Chronik. The production node still runs the previous `252182e957` build until deployment is explicitly undertaken.
 
 Trademark: "Lotus" is owned by Shammah Chancellor. All repos under `givelotus/` use it with permission.
 
@@ -24,12 +23,11 @@ Trademark: "Lotus" is owned by Shammah Chancellor. All repos under `givelotus/` 
 
 ```
 lotus/
-├── daemon/              # lotusd build system & patch series (v1 mainnet, v2 new chain, ecash, bchn, doged)
-│   ├── bitcoin-abc-version
+├── daemon/              # lotusd build system & patch series (mainnet, ecash, bchn, doged)
+│   ├── bitcoin-abc-v1-version
 │   ├── Makefile
 │   ├── scripts/         # setup.sh, build.sh, run.sh, mkpatch.sh, refresh.sh
 │   ├── patches/v1/      # 153 verified patches (000–247) for Lotus V1 mainnet (v11.6.0)
-│   ├── patches/v2/      # Lotus V2 new-chain patches
 │   └── docs/            # patch-strategy.md, impcpd-methodology.md, v1-8c67fe1e85-validation.md
 ├── sdk/
 │   ├── dart/            # Dart SDK (extracted from wallets/vase)
@@ -52,8 +50,7 @@ Workspaces (`daemon/workspace-*`) are **gitignored** local clones created by `ma
 | SERIES | Base | Version file | Workspace | Purpose |
 |--------|------|-------------|-----------|---------|
 | `v1` | `bitcoin-abc` `8c67fe1e85` | `bitcoin-abc-v1-version` | `workspace-v1/` | **Lotus V1 mainnet (`v11.6.0`)** — 153 patches (`000`–`247`) + in-process Chronik (`-DBUILD_CHRONIK=ON`) |
-| `v2` (default) | `bitcoin-abc` `252182e9` | `bitcoin-abc-version` | `workspace-v2/` | **Lotus V2 new chain** (see `docs/lotus-v2/`) |
-| `ecash` | `bitcoin-abc` `252182e9` | `bitcoin-abc-version` | `workspace-v2/` | Upstream PR candidates for eCash ($O(n \log n)$ mining, $O(1)$ mempool, NNG) |
+| `ecash` | `bitcoin-abc` `252182e9` | `bitcoin-abc-version` | `workspace-ecash/` | Upstream reference patches |
 | `doged` | `doged-io/doged` | `doged-version` | `workspace-doged/` | Dogecoin ABC reference |
 | `bchn` | BCHN `v28.0.0` | `bchn-version` | `workspace-bchn/` | Bitcoin Cash Node upstream PR candidates |
 
@@ -83,7 +80,7 @@ Default mainnet ports:
 - **Hard Consensus vs. Soft Parking**: In `bitcoin-abc` `252182e9`, `Chainstate::ConnectTip` (`src/validation.cpp`) runs a `ParkingPolicy` loop after connecting a block when `!IsInitialBlockDownload()`.
 - Upstream eCash registers `MinerFundPolicy` inside `ConnectTip`, which computes the expected miner fund from `blockFees + subsidy` (eCash's formula).
 - However, Lotus burns 50% of fees (`GetBlockValue = nFees / 2 + nSubsidy`), and Lotus **already enforces its miner fund as a hard consensus rule** inside `ContextualCheckBlock` (`bad-cb-minerfund`). Leaving `MinerFundPolicy` in `ConnectTip` caused `lotusd` to falsely park valid Lotus blocks (`policy-invalid-miner-fund`) the moment `IsInitialBlockDownload()` latched to `false`!
-- Therefore, `000-decouple-avalanche.patch` removes both `MinerFundPolicy` and `StakingRewardsPolicy` from `ConnectTip` while preserving the `ParkingPolicy`, `src/avalanche/`, `StakeContenderCache`, and `StakingRewardsPolicy` classes in the codebase (documented inline in `src/validation.cpp`) so they can be used for soft coordination or automated faucet/staking payouts in V2.
+- Therefore, `000-decouple-avalanche.patch` removes both `MinerFundPolicy` and `StakingRewardsPolicy` from `ConnectTip` while preserving the `ParkingPolicy`, `src/avalanche/`, `StakeContenderCache`, and `StakingRewardsPolicy` classes in the codebase (documented inline in `src/validation.cpp`) for optional coordination code.
 
 ### 2. Porting In-Process Chronik & RTT to Lotus V1 (`246-port-chronik-and-rtt-for-lotus.patch`)
 Upstream Bitcoin ABC's in-process Chronik (`chronik/`) assumes standard 80-byte Bitcoin headers, linear `CBlockHeader + vtx` disk offsets, and double-SHA256 `txid`. Patch `246` adapts Chronik and RTT for Lotus V1 across 5 critical areas:
@@ -104,15 +101,9 @@ Upstream Bitcoin ABC's in-process Chronik (`chronik/`) assumes standard 80-byte 
 - In `src/kernel/chainparams.cpp` (from `245-bump-version-to-10.4.10.patch`), `consensus.secondKingsActivationTime = 1797886200` (**2026-12-21T20:50:00Z**).
 - `IsReplayProtectionEnabled` in `src/validation.cpp` defaults to activating at `secondKingsActivationTime`. Before December 21, 2026, a network upgrade patch must either advance/remove the replay-protection timebomb or coordinate the solstice upgrade with active miners.
 
-### 4. Lotus V2 Specification (`docs/lotus-v2/`)
-- Always run `python3 docs/lotus-v2/tools/spec_candidate_checks.py` after modifying any file under `docs/lotus-v2/`.
-- **CoreTxId Witness Commitment**: `CoreTxId` (`txid`) commits to the structural witness fields (`WitnessStripped`, excluding runtime/signature `vMethodArgs`) to prevent code/branch substitution attacks while keeping `txid` non-malleable and supporting presigned transactions.
-- **Avalanche Stake Weighting (`issuance-and-time.md` & `rationale.md`)**: Both reward weight $R(x)$ and voting weight $V(x)$ must remain strictly linear ($f(x_1 + x_2) = f(x_1) + f(x_2)$) with a bounded Top-$K$ active proof table (`AVALANCHE_MAX_ACTIVE_PROOFS`). Pairing superlinear $R(x)$ with sublinear $V(x) = \sqrt{x}$ is vulnerable to stock-vs.-flow 51% quorum Sybil splits and penalizes solo multi-UTXO `avalanche::Proof` construction.
-
-
 ## V1 Rebase Validation (2026-10-14)
 
-- V1 now has its own base pin, `daemon/bitcoin-abc-v1-version`, at `8c67fe1e85a602204a2ce65aa3b643469c2c3a1d`. The shared V2/eCash pin stays at `252182e957`; advancing it would invalidate those existing patch series. The separate V2 worktrees and their completed patches 000–004 are preserved.
+- Mainnet uses `daemon/bitcoin-abc-v1-version`, pinned at `8c67fe1e85a602204a2ce65aa3b643469c2c3a1d`.
 - `/tmp/rebase-latest-abc` contains exactly 153 commits matching `daemon/patches/v1/series`. Export patches from each commit's parent-to-commit diff; verify replay using a temporary Git index and compare the final tree with HEAD. Never run setup/reset against the live `daemon/workspace-v1` during this work.
 - Fold leftover eCash activation removal and build compatibility repairs into patch 246, near the end of the series, preserving the 153-entry mapping. Lotus historical activation times and `secondKingsActivationTime` remain unchanged.
 - The C++ test binary/target is `test_lotus`, not `test_bitcoin`. The upstream CMake Git reflog lookup assumes `.git` is a directory; patch 246 uses `git rev-parse --path-format=absolute --git-path logs/HEAD` to support linked worktrees.
@@ -125,8 +116,12 @@ Upstream Bitcoin ABC's in-process Chronik (`chronik/`) assumes standard 80-byte 
 - Isolated mainnet replay uses `/tmp/lotus-v1-mainnet-8c67fe1e85`, RPC 11604, P2P 11605 (listening disabled), Chronik 18331. Block files were copied with APFS copy-on-write; original live data is untouched. `daemon/scripts/check-v1-chronik.py` compares headers, TxIds, and raw transaction disk bytes with RPC. Previous release assets and tag are backed up in `/tmp/lotus-v11.6.0-before-8c67fe1e85` before republishing.
 
 - Full isolated mainnet replay on `8c67fe1e85` reached height 1,400,898 with `initialblockdownload=false`; `verifychain 4 1000` returned true. The node accepted fresh blocks after replay. Chronik/RPC comparisons passed at 11 sampled heights (including 15 coinbase/non-coinbase transactions), with exact 160-byte headers and raw disk bytes. The original production node/workspace remains running on the previous base.
-- Final V1 patch chain HEAD: `daf2ae4d06` (153 commits), tree `624fe49cbd017b43935e7bb3159d0e445eaf712e`; the monorepo daemon rebase was introduced in `d2ef5908`. Tag `v11.6.0` also includes subsequent public-facing cleanup. Initial tag workflow `38570812943` was cancelled to add missing `COPYING` packaging; earlier dispatch run `38570352993` was cancelled to avoid duplicating release builds. Local original tag is retained as `lotus-release-backup/v11.6.0-abc252182e9-20261014`.
-- V2 progress is isolated on branch `lotus-v2` in `/private/tmp/lotus-v2-repo`: commits `a043243d` (refresh two stale spec packet hashes, semantic vectors unchanged) and `efb4d95f` (track implementation patches 000–005 and dedicated V2 pin). V2 workspace HEAD is `560acd2500`; identity patch build/RPC check/spec checker/replay pass. Both commits are pushed to `origin/lotus-v2`. This branch has not been merged into main; V2 genesis and remaining protocol implementation are unfinished.
+- Final V1 patch chain HEAD: `a055e77a25` (153 commits), tree `a8d838de8fb5887170d6f32e86fed19f8e82c124`; the monorepo daemon rebase was introduced in `d2ef5908`. Tag `v11.6.0` also includes subsequent public-facing cleanup. Initial tag workflow `38570812943` was cancelled to add missing `COPYING` packaging; earlier dispatch run `38570352993` was cancelled to avoid duplicating release builds. Local original tag is retained as `lotus-release-backup/v11.6.0-abc252182e9-20261014`.
 
 - Public-facing cleanup preserves imported component licenses and Git history. Generated Vase server/iOS artifacts and the localhost development `.env` are removed from the current Git index while local files remain available; use `.env.example` for development setup. No live credential or recognizable access token/private key was identified in the tracked-text audit. Historical build files remain in the subtree import; do not rewrite that history as an incidental cleanup.
-- The first tag release build was cancelled after a packaging audit found missing upstream `COPYING`. Packaging now includes that file. Public README/build documentation must distinguish tested V1 release behavior from unfinished V2 work and inherited wallet/SDK/miner components; old design notes are marked historical.
+- The first tag release build was cancelled after a packaging audit found missing upstream `COPYING`. Packaging now includes that file. Public README/build documentation must distinguish tested mainnet daemon behavior from inherited wallet/SDK/miner components.
+
+- Main contains the mainnet implementation and its operational documentation only. Exploratory protocol work is kept on separate branches. Preserve those branch contents when removing unrelated plans from this checkout; do not rewrite history.
+
+- `main` contains the V1 mainnet implementation and its supporting tools only. Exploratory protocol specifications and implementation belong on separate development branches; do not add their files, roadmap, or links to this branch.
+- Release CI pins Rust 1.93.0 (`dtolnay/rust-toolchain@1.93.0`, CMake `Rust_TOOLCHAIN=1.93.0`), matching passing local checks. Floating stable selected 1.99.0 and Clippy reported `clone_on_copy` in CXX-generated bridge derives. Pinning the validated toolchain avoids changing bridge ABI/source to satisfy generated-code lint diagnostics.

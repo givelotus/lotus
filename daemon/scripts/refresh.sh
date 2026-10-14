@@ -1,12 +1,10 @@
 #!/usr/bin/env bash
 # refresh.sh — Advance a series to a new upstream version.
 #
-# SERIES=v2   — rebase Lotus new-chain patches onto a new bitcoin-abc commit
-#   Usage: SERIES=v2 ./scripts/refresh.sh <bitcoin-abc-commit> [description]
 #
-# SERIES=v1   — add a new lotusd version as an incremental patch
-#   Usage: SERIES=v1 ./scripts/refresh.sh <lotusd-tag> [description]
-#   Example: SERIES=v1 ./scripts/refresh.sh v10.4.11 "lotusd v10.4.11"
+# SERIES=v1 (default) — reapply Lotus patches onto a new bitcoin-abc commit
+#   Usage: SERIES=v1 ./scripts/refresh.sh <bitcoin-abc-commit> [description]
+# SERIES=ecash / SERIES=bchn — refresh the corresponding reference patch series
 #
 # SERIES=doged — update workspace-doged to a newer doged commit/tag
 #   Usage: SERIES=doged ./scripts/refresh.sh <doged-commit-or-tag> [description]
@@ -16,7 +14,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DAEMON_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
-SERIES="${SERIES:-v2}"
+SERIES="${SERIES:-v1}"
 
 if [[ $# -lt 1 ]]; then
     echo "Usage: SERIES=<series> $0 <new-ref> [description]"
@@ -84,62 +82,9 @@ rebase_patchset() {
     echo "Refresh complete. Rebuild with: make build SERIES=$series"
 }
 
-# ─── V1: add new lotusd version as an incremental patch ──────────────────────
+# ─── Lotus mainnet: reapply patches on a new pinned bitcoin-abc base ─────────
 if [[ "$SERIES" == "v1" ]]; then
-    WORKSPACE="$DAEMON_DIR/workspace-v1"
-    LOTUSD_VERSION_FILE="$DAEMON_DIR/lotusd-version"
-
-    if [[ ! -d "$WORKSPACE" ]]; then
-        echo "workspace-v1 not found — run: make setup SERIES=v1 first"
-        exit 1
-    fi
-
-    OLD_REF=$(grep -v '^#' "$LOTUSD_VERSION_FILE" | grep -v '^$' | head -1)
-    echo "Advancing v1: $OLD_REF → $NEW_REF ($DESCRIPTION)"
-
-    cd "$WORKSPACE"
-
-    # Ensure lotusd remote exists
-    if ! git remote get-url lotusd &>/dev/null; then
-        git remote add lotusd https://github.com/LotusiaStewardship/lotusd.git
-    fi
-    git fetch lotusd --tags
-
-    # Compute diff from current state to new lotusd ref
-    DIFF_FILE="/tmp/v1-upgrade-${NEW_REF//\//-}.diff"
-    git diff HEAD "lotusd/$NEW_REF" > "$DIFF_FILE" 2>/dev/null \
-        || git diff HEAD "$NEW_REF" > "$DIFF_FILE"
-    LINES=$(wc -l < "$DIFF_FILE")
-    echo "Diff: $DIFF_FILE ($LINES lines)"
-
-    if [[ $LINES -eq 0 ]]; then
-        echo "No changes between current HEAD and $NEW_REF — nothing to do."
-        exit 0
-    fi
-
-    # Apply and commit
-    git apply --whitespace=nowarn "$DIFF_FILE"
-    git add -A
-    git commit -m "lotusd $NEW_REF: $DESCRIPTION" --no-verify
-
-    # Update lotusd-version
-    {
-        echo "$NEW_REF"
-        echo "# $DESCRIPTION"
-        echo "# Previous: $OLD_REF"
-    } > "$LOTUSD_VERSION_FILE"
-
-    # Determine next patch number
-    LAST_NUM=$(grep -v '^#' "$DAEMON_DIR/patches/v1/series" | grep -v '^$' \
-        | grep -oP '^\d+' | sort -n | tail -1)
-    NEXT_NUM=$(printf "%02d" $((10#$LAST_NUM + 1)))
-    PATCH_NAME="${NEXT_NUM}-version-${NEW_REF#v}.patch"
-
-    echo ""
-    echo "Next steps:"
-    echo "  make mkpatch SERIES=v1 NAME=$PATCH_NAME"
-    echo "  Add '$PATCH_NAME' to patches/v1/series"
-    echo "  Update lotusd-version comments"
+    rebase_patchset v1 "$DAEMON_DIR/workspace-v1" "$DAEMON_DIR/bitcoin-abc-v1-version"
     exit 0
 fi
 
@@ -172,5 +117,14 @@ if [[ "$SERIES" == "doged" ]]; then
     exit 0
 fi
 
-# ─── V2: rebase Lotus new-chain patches onto new bitcoin-abc commit ───────────
-rebase_patchset v2 "$DAEMON_DIR/workspace" "$DAEMON_DIR/bitcoin-abc-version"
+if [[ "$SERIES" == "ecash" ]]; then
+    rebase_patchset ecash "$DAEMON_DIR/workspace-ecash" "$DAEMON_DIR/bitcoin-abc-version"
+    exit 0
+fi
+if [[ "$SERIES" == "bchn" ]]; then
+    rebase_patchset bchn "$DAEMON_DIR/workspace-bchn" "$DAEMON_DIR/bchn-version"
+    exit 0
+fi
+
+echo "Unsupported series: $SERIES (choose v1, ecash, doged, or bchn)" >&2
+exit 1

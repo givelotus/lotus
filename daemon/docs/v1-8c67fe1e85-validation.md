@@ -2,10 +2,10 @@
 
 The 153-patch V1 series now targets Bitcoin ABC
 `8c67fe1e85a602204a2ce65aa3b643469c2c3a1d`, pinned separately in
-`daemon/bitcoin-abc-v1-version`. V2/eCash's existing shared pin is unchanged.
+`daemon/bitcoin-abc-v1-version`.
 
-The final workspace HEAD is `daf2ae4d06`; its tree is
-`624fe49cbd017b43935e7bb3159d0e445eaf712e`. Every commit subject matches its
+The final workspace HEAD is `a055e77a25`; its tree is
+`a8d838de8fb5887170d6f32e86fed19f8e82c124`. Every commit subject matches its
 ordered series entry. Applying all exported patches to a temporary Git index
 initialized from the new base reproduces that tree exactly.
 
@@ -19,14 +19,14 @@ PyO3 0.23 bindings reject Python 3.14:
 cmake -S /tmp/rebase-latest-abc -B /tmp/rebase-latest-abc/build -GNinja \
   -DBUILD_BITCOIN_QT=OFF -DBUILD_BITCOIN_ZMQ=OFF \
   -DENABLE_UPNP=OFF -DENABLE_NATPMP=OFF -DBUILD_CHRONIK=ON \
-  -DPython_EXECUTABLE=/opt/homebrew/bin/python3.13
+  -DPython_EXECUTABLE=/opt/homebrew/bin/python3.13 -DRust_TOOLCHAIN=1.93.0
 PYO3_PYTHON=/opt/homebrew/bin/python3.13 \
   ninja -C /tmp/rebase-latest-abc/build -j16 \
     lotusd lotus-cli test_lotus check-crates
 ninja -C /tmp/rebase-latest-abc/build -j8 check-bitcoin
 ```
 
-Both commands pass. The C++ suite includes 150 test suites and 156 Ninja
+Both commands pass with Rust 1.93.0. Release CI pins that version; floating stable 1.99.0 raises Clippy diagnostics in generated CXX bridge code. Install the validated toolchain with `rustup toolchain install 1.93.0` when reproducing these checks. The C++ suite includes 150 test suites and 156 Ninja
 targets. `test_lotus` is the correct binary/target name in the V1 series.
 `check-crates` includes Rust tests, documentation tests, and Clippy checks.
 
@@ -74,8 +74,9 @@ Local evidence is retained in `/tmp/lotus-v1-build-final-20261014.log`,
 
 The daemon rebase was introduced in monorepo commit `d2ef5908`.
 Tag `v11.6.0` also includes subsequent documentation, tracked-artifact, and
-license-packaging cleanup. The initial release run was cancelled so the
-archives could include upstream `COPYING`; the final run is recorded below.
+license-packaging cleanup. Earlier release runs were stopped to include upstream `COPYING` and to pin
+the locally validated Rust toolchain after generated-code Clippy diagnostics
+on floating stable. The final run is recorded below.
 It builds Linux x86_64 and macOS arm64, checks C++ and Rust before packaging,
 and publishes archives with SHA256SUMS after both builds succeed.
 

@@ -1,8 +1,7 @@
 #!/usr/bin/env bash
 # build.sh — Build lotusd from a workspace.
 #
-# SERIES=v2 (default): build from workspace-v2/
-# SERIES=v1:           build from workspace-v1/
+# SERIES=v1 (default):           build from workspace-v1/
 #
 # Usage: ./scripts/build.sh [cmake-args...]
 #   e.g. ./scripts/build.sh -DBUILD_BITCOIN_QT=OFF
@@ -11,18 +10,15 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DAEMON_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
-SERIES="${SERIES:-v2}"
+SERIES="${SERIES:-v1}"
 
-if [[ "$SERIES" == "v1" ]]; then
-    WORKSPACE="$DAEMON_DIR/workspace-v1"
-    LABEL="V1 (mainnet)"
-elif [[ "$SERIES" == "doged" ]]; then
-    WORKSPACE="$DAEMON_DIR/workspace-doged"
-    LABEL="doged (Tobias/Dogecoin ABC)"
-else
-    WORKSPACE="$DAEMON_DIR/workspace-v2"
-    LABEL="V2 (new chain)"
-fi
+case "$SERIES" in
+    v1) WORKSPACE="$DAEMON_DIR/workspace-v1"; LABEL="V1 (mainnet)"; TARGETS=(lotusd lotus-cli) ;;
+    ecash) WORKSPACE="$DAEMON_DIR/workspace-ecash"; LABEL="eCash candidates"; TARGETS=(bitcoind bitcoin-cli) ;;
+    doged) WORKSPACE="$DAEMON_DIR/workspace-doged"; LABEL="doged reference"; TARGETS=(doged doge-cli) ;;
+    bchn) WORKSPACE="$DAEMON_DIR/workspace-bchn"; LABEL="BCHN candidates"; TARGETS=(bitcoind bitcoin-cli) ;;
+    *) echo "Unsupported series: $SERIES (choose v1, ecash, doged, or bchn)" >&2; exit 1 ;;
+esac
 
 BUILD_DIR="$WORKSPACE/build"
 
@@ -52,8 +48,10 @@ echo "Configuring $LABEL with cmake..."
 cmake .. "${CMAKE_ARGS[@]}"
 
 echo "Building..."
-ninja -j"$(nproc 2>/dev/null || sysctl -n hw.logicalcpu)" lotusd lotus-cli
+ninja -j"$(nproc 2>/dev/null || sysctl -n hw.logicalcpu)" "${TARGETS[@]}"
 
 echo ""
 echo "Build complete ($LABEL). Binaries:"
-ls -lh "$BUILD_DIR/src/lotusd" "$BUILD_DIR/src/lotus-cli" 2>/dev/null || true
+for target in "${TARGETS[@]}"; do
+    ls -lh "$BUILD_DIR/src/$target"
+done

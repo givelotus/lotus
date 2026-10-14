@@ -1,8 +1,7 @@
 #!/usr/bin/env bash
 # run.sh — Launch lotusd with adequate file descriptor limits.
 #
-# SERIES=v2 (default): run from workspace-v2/
-# SERIES=v1:           run from workspace-v1/
+# SERIES=v1 (default):           run from workspace-v1/
 #
 # Usage: ./scripts/run.sh [lotusd-args...]
 #   e.g. ./scripts/run.sh -regtest -datadir=/tmp/lotus-regtest -daemon
@@ -11,15 +10,15 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DAEMON_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
-SERIES="${SERIES:-v2}"
+SERIES="${SERIES:-v1}"
 
-if [[ "$SERIES" == "v1" ]]; then
-    LOTUSD="$DAEMON_DIR/workspace-v1/build/src/lotusd"
-elif [[ "$SERIES" == "doged" ]]; then
-    LOTUSD="$DAEMON_DIR/workspace-doged/build/src/doged"
-else
-    LOTUSD="$DAEMON_DIR/workspace-v2/build/src/lotusd"
-fi
+case "$SERIES" in
+    v1) LOTUSD="$DAEMON_DIR/workspace-v1/build/src/lotusd" ;;
+    ecash) LOTUSD="$DAEMON_DIR/workspace-ecash/build/src/bitcoind" ;;
+    doged) LOTUSD="$DAEMON_DIR/workspace-doged/build/src/doged" ;;
+    bchn) LOTUSD="$DAEMON_DIR/workspace-bchn/build/src/bitcoind" ;;
+    *) echo "Unsupported series: $SERIES (choose v1, ecash, doged, or bchn)" >&2; exit 1 ;;
+esac
 
 if [[ ! -x "$LOTUSD" ]]; then
     echo "lotusd not found. Run: make build SERIES=$SERIES"
