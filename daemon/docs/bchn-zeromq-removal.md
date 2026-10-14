@@ -105,3 +105,10 @@ python3 daemon/tests/check-bchn-patch-combinations.py --upstream /tmp/bchn-no-zm
 See [ordering evidence](evidence/bchn-zmq-removal-orders-20261014.json) and
 [native/runtime evidence](evidence/bchn-zmq-removal-validation-20261014.json)
 for exact patches, trees, modes, log hashes and remaining validation boundaries.
+
+## Upstream submissions
+
+- [MR 2177](https://gitlab.com/bitcoin-cash-node/bitcoin-cash-node/-/merge_requests/2177): default-disable only, commit `19b1d245742c949087f03f063721770816c150ec`.
+- [MR 2178](https://gitlab.com/bitcoin-cash-node/bitcoin-cash-node/-/merge_requests/2178): complete source/interface removal, commit `c3fde6e531223eea0a0249414913cdd65cb403fc`, depending on MR 2177. Its branch contains the prerequisite followed by the removal commit; both target upstream master, and the description asks to merge the prerequisite first.
+
+Both submitted source trees exactly match the independently tested exports. Neither includes NNG or mining/mempool changes. Public API removal is explicitly documented. See [submission identities](evidence/bchn-interface-submissions-20261014.json). Initial fork CI remains subject to GitLab account verification; local evidence is separate from upstream CI and maintainer acceptance.

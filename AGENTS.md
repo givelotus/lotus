@@ -260,3 +260,5 @@ Upstream Bitcoin ABC's in-process Chronik (`chronik/`) assumes standard 80-byte 
 - User-authorized BCHN submissions are open as upstream GitLab MR 2174 (mining ready-child fee priority) and MR 2175 (optional topological mempool diagnostic), independent single commits on `abd433abe0`. See `daemon/docs/bchn-current-audit.md` for exact source commits and submission cleanup. NNG/ZeroMQ are not included; submitted does not mean merged or upstream-CI validated.
 
 - Initial BCHN fork pipelines fail before any jobs because GitLab reports the user is not verified. Account verification must be completed by the user before rerunning CI; do not claim upstream tests ran or bypass the verification requirement.
+
+- User-authorized interface submissions are open as BCHN GitLab MR 2176 (independent default-OFF raw NNG publisher), MR 2177 (ZeroMQ default-OFF), and MR 2178 (complete ZeroMQ source/public API removal; depends on 2177). Submitted source trees exactly match tested exports; see `daemon/docs/evidence/bchn-interface-submissions-20261014.json`. No legacy NNG query protocol or complete Chronik port is implied.

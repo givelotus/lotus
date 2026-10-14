@@ -59,3 +59,7 @@ ZeroMQ subscriber data flow, mempool-removal/conflict and persisted-tip payloads
 load behavior and client recovery remain unverified. No wall-clock speedup or
 reliable-delivery claim is made. Detailed local logs, hashes and exact source
 identity are recorded in `bchn-nng-publisher-evidence.json`.
+
+## Upstream submission
+
+[MR 2176](https://gitlab.com/bitcoin-cash-node/bitcoin-cash-node/-/merge_requests/2176) submits this publisher independently as commit `c595a3cf29dccf9f5d1d0be5065b9d234c1f810e` directly on the acceptance base. Its source tree exactly matches the tested export above. The MR explicitly identifies the new raw-payload protocol and incomplete legacy/query/Chronik compatibility. Submitted does not mean merged or upstream-CI validated.
