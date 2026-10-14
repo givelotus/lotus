@@ -226,3 +226,8 @@ Upstream Bitcoin ABC's in-process Chronik (`chronik/`) assumes standard 80-byte 
 
 - User selected latest BCHN tip, resolved to GitLab master `abd433abe04f74780744b9eac06731f3690ce68a` (29.2.1). Use a full immutable pin; v28 validation is historical. Isolated source/build lives under `/tmp/lotus-bchn-tip-*`; never reset the original workspace.
 - Current BCHN already removed transitive mempool entry updates/chain limits in 2021 and its direct-parent-count block scheduler visits O(n + m) graph elements, with O(n log n + m) selection work including ordered mapLinks lookups, before CTOR sorting. Do not label either path quadratic without evidence. Ready-heap changes must be justified by fee selection behavior, with no unsupported speedup or CPFP claim. See `daemon/docs/bchn-current-audit.md`.
+
+## BCHN independent NNG candidate (2026-10-14)
+
+- `daemon/patches/bchn/10-nng-interface.patch` now implements an independent default-OFF NNG publisher at BCHN `abd433abe04f74780744b9eac06731f3690ce68a`, outside the default manifest. It preserves ZeroMQ and has no mining/mempool-policy/Chronik dependencies. Native NNG ON/OFF and both-NNG/ZeroMQ-ON daemon/CLI builds pass; real regtest subscriber bytes, sequence, admitted transaction/mining, invalidation and failed-bind restart pass.
+- This is explicitly a new BCHN raw-payload protocol, not Lotus FlatBuffers/RPC compatibility. The full legacy interface needs separate storage/spent-coin/undo/RPC-bound work; do not silently present the focused publisher as that complete port. See `daemon/docs/bchn-nng-publisher.md` for exact scope and remaining unverified behavior. Production workspaces, nodes, data and releases remain untouched.
