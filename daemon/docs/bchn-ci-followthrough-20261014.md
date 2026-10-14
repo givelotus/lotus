@@ -45,7 +45,12 @@ After the user's report, root changed only the fork project's timeout from
 | 2175 | 17182330966 | 17184743711 |
 
 Both retries started on 2026-10-14 at approximately 22:14 UTC. Their full
-results remain pending. No timeout or P2P source change was made to these MRs.
+results remain pending. Both retries have completed all 708 C++ cases under
+Linux UBSan with no errors. The full compact-block functional test also passes
+in both retries: mining MR 2174 in 47 seconds at 23:00:34 UTC and diagnostic
+MR 2175 in 41 seconds at 22:59:47 UTC. Thus the original announcement timeout
+did not recur on the unchanged submitted mining source; its cause is still
+unproven. See [retained progress evidence](evidence/bchn-ubsan-retry-progress-20261014.json). No timeout or P2P source change was made to these MRs.
 The sanitizer job makes a fresh build with ccache disabled, runs native unit
 checks, then Qt/seeder/util and the full functional suite; a larger job budget
 is an infrastructure adjustment, not a patch-specific fix.
@@ -58,10 +63,11 @@ are retained separately as `/tmp/bchn-ci-job-<job-id>.log`.
 
 NNG MR 2176 has a genuine required-job failure in `static-run-linters`: the
 raw substring `strerror` also matches the independent `nng_strerror` API.
-Candidate commit `63e495c3c1696204b568360a6a3c463b38f6ecc9` changes only the
-lint regular expression and its explanatory comment. Actual lint and shell
-syntax checks pass; temporary tracked C++ probes confirm ordinary `strerror`,
-`std::strerror` and `strerror_r` remain rejected, while `nng_strerror` is accepted.
-Those probes were removed. The candidate also composes with the two ZeroMQ
-patches in both orders, yielding the same tree. It awaits root review/push;
-this record does not claim the upstream lint job has been fixed yet.
+Reviewed follow-up `69462d0ec7ec651165249fed78b938c09b1cc861` preserves the
+unsafe C/Windows strerror-family ban while allowing independent identifiers.
+An executable permanent regression runs through the existing CMake lint suite
+and tests the actual linter in a disposable repository. Root pushed the reviewed
+source; required GitLab lint job 17185211785 passes in pipeline 2948599926.
+The fresh sanitizer job 17185211816 remains running with the three-hour budget.
+The maintained optional export and exact-tree/order evidence are documented
+in `bchn-nng-publisher.md`; no C++ publisher behavior changed for this lint fix.
