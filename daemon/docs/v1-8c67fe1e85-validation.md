@@ -4,10 +4,27 @@ The 153-patch V1 series now targets Bitcoin ABC
 `8c67fe1e85a602204a2ce65aa3b643469c2c3a1d`, pinned separately in
 `daemon/bitcoin-abc-v1-version`.
 
-The final workspace HEAD is `a055e77a25`; its tree is
+The initial rebase workspace HEAD was `a055e77a25`; its tree was
 `a8d838de8fb5887170d6f32e86fed19f8e82c124`. Every commit subject matches its
 ordered series entry. Applying all exported patches to a temporary Git index
 initialized from the new base reproduces that tree exactly.
+
+The subsequent mining audit found incorrect ancestor resource/fee accounting in
+the experimental assembler. The explicit repair is folded into patch 246,
+retaining all 153 entries and their metadata. Current workspace HEAD is
+`6590d92300ba588325628ab7c1a166e392947cff`; its source tree is
+`e0d4f9c0219739b6774864858c582a8144a443d9`. Every intermediate tree and metadata
+digest replays successfully. See [the mining audit](ecash-block-assembly-review.md)
+for the before/after regression evidence.
+
+The repaired source also passes the normal Chronik-enabled `lotusd`, `lotus-cli`,
+`test_lotus`, `check-crates`, and all 156 `check-bitcoin` targets. Restarting only
+the isolated test node with that binary retained height 1,400,955 and
+`initialblockdownload=false`. Chronik/RPC parity passed again at 11 sampled blocks
+and 15 transactions; `verifychain 4 1000` returned true. Production was untouched.
+Logs: `/tmp/lotus-v1-mining-repair-chronik-build-20261014.log`,
+`/tmp/lotus-v1-mining-repair-chronik-cpp-20261014.log`, and
+`/tmp/lotus-v1-mining-repair-chronik-parity-20261014.log`.
 
 ## Build and tests
 
