@@ -1,4 +1,5 @@
 #include "signing.h"
+#include "commitment.h"
 
 #include <algorithm>
 #include <iostream>
@@ -41,6 +42,18 @@ int main(int argc, char **argv) {
         Output coin;
         std::string error;
         if (!DecodeTransaction(wire, profile, tx, error) || !DecodeOutput(coin_wire, coin, error)) throw std::runtime_error(error);
+        const auto &input = tx.inputs.at(0);
+        if (input.flags != 1 || input.path_index >= coin.paths.size() || coin.paths[input.path_index].size() != 1 || input.witnesses.size() != 1)
+            throw std::runtime_error("unsupported path");
+        const auto &witness = input.witnesses.at(0);
+        const Hash leaf = BranchLeaf(witness.script);
+        const Hash root = BranchProofRoot(leaf, witness.siblings);
+        const Hash expected_root = coin.branches.at(coin.paths[input.path_index].at(0));
+        if (std::string(argv[8]) == "invalid-proof") {
+            if (root == expected_root) throw std::runtime_error("proof unexpectedly valid");
+            return 0;
+        }
+        if (root != expected_root) throw std::runtime_error("branch proof mismatch");
         const ResolvedCoins resolved{coin};
         IdentityDigests ids;
         if (!ComputeIdentities(tx, profile, chain, ids, error)) throw std::runtime_error(error);
