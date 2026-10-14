@@ -178,7 +178,7 @@ Upstream Bitcoin ABC's in-process Chronik (`chronik/`) assumes standard 80-byte 
 
 ## Independent eCash verification (2026-10-14)
 
-- Check each candidate independently and combinations separately; the eCash directory is not a passing series. Historical 01 failed native mining assertions and is superseded by the corrected custom implementation below. Patch 02 still calls the nonexistent `SigOpCount` helper while bypassing admission policy. Files 03/10/11 have no diff hunks.
+- Check each candidate independently and combinations separately. Historical 01 failed native mining assertions and historical 02 called a nonexistent `SigOpCount` helper; both are superseded by the separately validated corrections below. Current implemented 01/02/04 pass combined checks at the selected pin; files 03/10/11 still have no diff hunks and are not executable patches.
 - Candidate 04 applies to declared ABC base `8c67fe1e85` and audit-start current master `1fb7db17c176cdea8a2c60d887891589382ee4e3`, but not the wrapper's older eCash pin `252182e957`. It has no dependency on mining/policy candidates or Chronik. Ordering 02 before 04 conflicts in appended test context; reversing the order applies but does not repair 02 compilation.
 - Keep independent partial-diamond finalization coverage as a separate test-only mailbox fixture under `daemon/candidates/ecash-finalized-pruning-verification/`; do not silently alter the submitted 04 payload. Report application, native unit checks, isolated regtest behavior and unmeasured performance separately in `daemon/docs/ecash-independent-verification.md`. Production workspaces, data and releases remain untouched.
 
