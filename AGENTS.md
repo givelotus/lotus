@@ -178,7 +178,7 @@ Upstream Bitcoin ABC's in-process Chronik (`chronik/`) assumes standard 80-byte 
 
 ## Independent eCash verification (2026-10-14)
 
-- Check each candidate independently and combinations separately; the eCash directory is not a passing series. Payloads 01/02 remain unchanged and quarantined: native mining assertions fail for 01, and 02 calls the nonexistent `SigOpCount` helper while bypassing admission policy. Files 03/10/11 have no diff hunks.
+- Check each candidate independently and combinations separately; the eCash directory is not a passing series. Historical 01 failed native mining assertions and is superseded by the corrected custom implementation below. Patch 02 still calls the nonexistent `SigOpCount` helper while bypassing admission policy. Files 03/10/11 have no diff hunks.
 - Candidate 04 applies to declared ABC base `8c67fe1e85` and audit-start current master `1fb7db17c176cdea8a2c60d887891589382ee4e3`, but not the wrapper's older eCash pin `252182e957`. It has no dependency on mining/policy candidates or Chronik. Ordering 02 before 04 conflicts in appended test context; reversing the order applies but does not repair 02 compilation.
 - Keep independent partial-diamond finalization coverage as a separate test-only mailbox fixture under `daemon/candidates/ecash-finalized-pruning-verification/`; do not silently alter the submitted 04 payload. Report application, native unit checks, isolated regtest behavior and unmeasured performance separately in `daemon/docs/ecash-independent-verification.md`. Production workspaces, data and releases remain untouched.
 
@@ -198,6 +198,7 @@ Upstream Bitcoin ABC's in-process Chronik (`chronik/`) assumes standard 80-byte 
 - Preserve the new custom assembler in eCash 01; do not replace it with upstream code or a tests-only diff. The corrected implementation uses a flat direct-parent snapshot and highest-feerate ready heap, live per-transaction size/sigchecks, individual modified fees and release-on-success dependencies. Expected bound is O(n + m + n log n), not a measured speedup over modern ABC.
 - Keep this eCash correction separate from Lotus's own series. Update each chain's patch independently and retain its protocol fixtures. The eCash submission is one mailbox diff including algorithm and native regression tests; the previous failure payload/tree/metadata stays in provenance history.
 - Existing old-assembler failure harness is explicitly historical and reads commit `f67257e2`, with `--patch-file` for shallow clones. It must not pretend to test the corrected current assembler. See `daemon/docs/ecash01-corrected-snapshot-assembler.md` for exact before/after scope.
+- Main now retains the corrected custom assembler in Lotus 001 and eCash 01 separately. Feature planning reports V1 block construction as integrated, without adding duplicate patches. Rebuild the native release candidate from this corrected series; prior candidate CI and assets do not validate the newly retained implementation.
 
 ## Corrected custom mining scheduler (supersedes temporary upstream restoration)
 

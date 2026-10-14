@@ -29,9 +29,16 @@ class FeatureSelectionTests(unittest.TestCase):
     def test_unimplemented_ports_and_policy_are_rejected(self):
         for target, name in (("bitcoin", "chronik"), ("bchn", "nng"),
                              ("ecash", "tx-chain-limit"), ("v1", "tx-chain-limit"),
-                             ("v1", "block-construction"), ("doged", "zeromq-remove")):
+                             ("doged", "zeromq-remove")):
             with self.assertRaises(ValueError):
                 planner.resolve(target, [name], True)
+
+    def test_v1_custom_assembler_is_integrated(self):
+        plan = planner.resolve("v1", ["block-construction"], False)
+        self.assertEqual(plan["patches"], [])
+        self.assertEqual(plan["cmake_args"], [])
+        self.assertEqual(plan["features"][0]["kind"], "integrated-custom-assembler")
+        self.assertEqual(plan["features"][0]["requires"], ["complete-v1-series"])
 
     def test_experimental_selection_requires_opt_in(self):
         with self.assertRaises(ValueError):

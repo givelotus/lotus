@@ -39,7 +39,9 @@ def resolve(target, names, allow_experimental):
         elif name == 'zeromq-remove':
             raise ValueError('ZeroMQ source-removal patches are placeholders; use zeromq-off')
         elif name == 'block-construction' and target == 'v1':
-            raise ValueError('V1 uses restored upstream selection; historical patch 001 is reverted by 246, not a supported optional optimization')
+            evidence.append({'feature': name, 'kind': 'integrated-custom-assembler',
+                             'requires': ['complete-v1-series'],
+                             'warning': 'Corrected snapshot/ready-heap implementation in patch 001; no measured speedup over modern ABC'})
         elif name == 'long-chain-container-test' and target == 'v1':
             evidence.append({'feature': name, 'kind': 'integrated-test-only',
                              'requires': ['complete-v1-series']})
