@@ -97,7 +97,7 @@ Native macOS release builds remain the current path.
 The initial tooling runs use source tree
 `e0d4f9c0219739b6774864858c582a8144a443d9`, which temporarily restored the
 upstream block assembler. That source has been superseded by work to repair and
-retain Lotus's custom assembler. These running jobs remain useful for Guix
+retain Lotus's custom assembler. Those completed jobs remain useful for Guix
 toolchain/build diagnosis. They use wallet-OFF; final builds retain the native
 release's wallet-ON setting. They cannot validate or publish the final custom
 assembler. Final binary comparisons must replay the corrected V1 series and
@@ -133,12 +133,11 @@ promoting this path into a release workflow.
 These attempts use the superseded source and wallet-OFF configuration described
 above. They are build-tooling evidence, not release readiness evidence.
 
-The next isolated attempt uses the independently verified corrected custom
-assembler from review commits `236f6870` and `48a85cda`: all153 patches replay
+Run [38613625044](https://github.com/givelotus/lotus/actions/runs/38613625044)
+uses the independently verified corrected custom assembler: all153 patches replay
 to source `0b7939e926b8353ad09d8edc47f355ddacc30502`, tree
-`73e9db8356d5f9e617f40d4d9228209e117b08f0`. This source is copied only to the
-Guix candidate branch; its main-branch promotion remains separate. The next
-attempt also upgrades the actual daemon/helper, retains wallet support, and
+`73e9db8356d5f9e617f40d4d9228209e117b08f0`. This is also the corrected source now maintained on main. The
+Guix attempt upgrades the actual daemon/helper, retains wallet support, and
 disables unused plugin/CPython builds. Binary validation remains pending.
 
 Bootstrap upgrade attempt `38609545611` authenticated and installed the pinned
@@ -146,3 +145,5 @@ Bootstrap upgrade attempt `38609545611` authenticated and installed the pinned
 group spelling (`_guixbuild`, not the shell installer's `guixbuild`); the service
 override now preserves that existing distro group. No Lotus source compilation
 was reached on that failed worker.
+
+- Guix run `38613625044` replica b completed pinned compiler/environment provisioning, then failed compiling the inherited FlatBuffers 2.0.0 span assignment with GCC 14.3. Backport upstream `google/flatbuffers` commit `20aad0c41e1252b04c72111c3eb221280a9c2009` into both native and target depends recipes, retaining archive hashes/version. A fast GCC 14 dependency preflight now runs before the cold Guix builds. No Guix Lotus binary validation is claimed from that failed run.
