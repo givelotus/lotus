@@ -60,6 +60,10 @@ NODE_ARGS=("-datadir=$CANDIDATE/smoke-data" -rpcport=18432 -listen=0 -connect=0 
 "$BIN/lotusd" "${NODE_ARGS[@]}"
 "${CLI[@]}" -rpcwait -rpcwaittimeout=60 getblockchaininfo
 "${CLI[@]}" verifychain 4 0
+# An empty watch-only wallet confirms packaged wallet RPC support without keys.
+"${CLI[@]}" createwallet guix-smoke true true
+"${CLI[@]}" getwalletinfo
+"${CLI[@]}" unloadwallet guix-smoke
 if [[ "$LOTUS_CHRONIK" == ON ]]; then
     python3 "$SCRIPT_DIR/check-v1-chronik.py" --cli "$BIN/lotus-cli" --datadir "$CANDIDATE/smoke-data" --rpcport 18432 --chronik-url http://127.0.0.1:18431 --heights 0
 fi
