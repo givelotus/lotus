@@ -16,7 +16,7 @@ TARGETS = {
     'bitcoin': {'zmq': 'WITH_ZMQ'},
 }
 FEATURES = ('chronik', 'chronik-off', 'nng', 'nng-off', 'zeromq-on', 'zeromq-off', 'zeromq-remove',
-            'block-construction', 'tx-chain-limit', 'long-chain-container-test')
+            'block-construction', 'tx-chain-limit', 'long-chain-container-test', 'mempool-check')
 
 
 def resolve(target, names, allow_experimental):
@@ -52,6 +52,14 @@ def resolve(target, names, allow_experimental):
         elif name == 'long-chain-container-test' and target == 'v1':
             evidence.append({'feature': name, 'kind': 'integrated-test-only',
                              'requires': ['complete-v1-series']})
+        elif name == 'mempool-check':
+            if target != 'bchn':
+                raise ValueError(f'{target}: no topological consistency-check candidate is implemented')
+            if not allow_experimental:
+                raise ValueError('BCHN consistency-check candidate requires --allow-experimental')
+            patches.append(str(DAEMON / 'patches' / 'bchn' / '04-topological-mempool-check.patch'))
+            evidence.append({'feature': name, 'kind': 'experimental-diagnostic-optimization', 'requires': [],
+                             'warning': 'Optimizes optional consistency checking; no admission-policy change'})
         elif name == 'tx-chain-limit':
             raise ValueError('No standalone admission-policy change is implemented; patch 02 only calls addUnchecked')
         else:

@@ -56,6 +56,15 @@ class FeatureSelectionTests(unittest.TestCase):
         self.assertEqual(plan["features"][0]["requires"], [])
         self.assertIn("not Lotus", plan["features"][0]["warning"])
 
+    def test_bchn_diagnostic_check_is_independent_from_mining(self):
+        plan = planner.resolve("bchn", ["mempool-check"], True)
+        self.assertEqual([Path(p).name for p in plan["patches"]],
+                         ["04-topological-mempool-check.patch"])
+        self.assertEqual(plan["cmake_args"], [])
+        self.assertEqual(plan["features"][0]["requires"], [])
+        with self.assertRaises(ValueError):
+            planner.resolve("ecash", ["mempool-check"], True)
+
     def test_experimental_selection_requires_opt_in(self):
         with self.assertRaises(ValueError):
             planner.resolve("ecash", ["block-construction"], False)
