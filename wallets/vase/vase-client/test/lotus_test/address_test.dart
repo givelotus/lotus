@@ -1,6 +1,6 @@
 import 'package:hex/hex.dart';
 import 'package:test/test.dart';
-import 'package:vase/lotus/address.dart';
+import 'package:lotus_dart/address.dart';
 
 void main() {
   test('can decode and encode an address', () async {

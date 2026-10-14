@@ -19,7 +19,24 @@ class VaultUtxo {
 
 /// The vault stores utxo outputs - that is, outputs together with
 /// information required to spend them.
-class Vault extends SplayTreeMap<BigInt, List<VaultUtxo>> {
+class Vault extends MapBase<BigInt, List<VaultUtxo>> {
+  final _utxos = SplayTreeMap<BigInt, List<VaultUtxo>>();
+
+  @override
+  List<VaultUtxo>? operator [](Object? key) => _utxos[key];
+
+  @override
+  void operator []=(BigInt key, List<VaultUtxo> value) => _utxos[key] = value;
+
+  @override
+  void clear() => _utxos.clear();
+
+  @override
+  Iterable<BigInt> get keys => _utxos.keys;
+
+  @override
+  List<VaultUtxo>? remove(Object? key) => _utxos.remove(key);
+
   Vault(Iterable<VaultUtxo> utxos) : super() {
     addAllUtxos(utxos);
   }
@@ -61,7 +78,7 @@ class Vault extends SplayTreeMap<BigInt, List<VaultUtxo>> {
   /// Remove a utxo output at a given amount.
   VaultUtxo? popAt(BigInt amount) {
     final List<VaultUtxo>? utxos = remove(amount);
-    if (utxos != null) {
+    if (utxos != null && utxos.isNotEmpty) {
       final popped = utxos.removeLast();
       if (utxos.isNotEmpty) {
         this[amount] = utxos;

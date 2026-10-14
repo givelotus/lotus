@@ -1,8 +1,8 @@
 import 'package:test/test.dart';
 
-import 'package:vase/lotus/hdprivatekey.dart';
-import 'package:vase/lotus/bip39/bip39.dart';
-import 'package:vase/lotus/networks.dart';
+import 'package:lotus_dart/hdprivatekey.dart';
+import 'package:lotus_dart/bip39/bip39.dart';
+import 'package:lotus_dart/networks.dart';
 
 const testSeed =
     'festival shrimp feel before tackle pyramid immense banner fire wash steel fiscal';

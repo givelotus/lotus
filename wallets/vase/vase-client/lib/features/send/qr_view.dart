@@ -11,7 +11,10 @@ class QRView extends HookWidget {
 
   @override
   Widget build(BuildContext context) {
-    final throttledOnScanResult = throttle(onScanResult, 1000);
+    final throttledOnScanResult = useMemoized(
+      () => throttle(onScanResult, 1000),
+      [onScanResult],
+    );
     return MobileScanner(
       fit: BoxFit.cover,
       onDetect: (capture) {

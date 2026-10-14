@@ -1,6 +1,6 @@
 import 'package:test/test.dart';
-import 'package:vase/lotus/address.dart';
-import 'package:vase/lotus/cashaddress.dart';
+import 'package:lotus_dart/address.dart';
+import 'package:lotus_dart/cashaddress.dart';
 
 void main() {
   test('can decode and encode to base58', () async {

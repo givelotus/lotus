@@ -10,13 +10,13 @@ class AppTheme {
     ),
     scaffoldBackgroundColor: AppColors.lotusPurple4,
     textTheme: const TextTheme(
-      bodyText1: TextStyle(
+      bodyLarge: TextStyle(
         color: Colors.white,
       ),
-      bodyText2: TextStyle(
+      bodyMedium: TextStyle(
         color: Colors.white,
       ),
-      button: TextStyle(
+      labelLarge: TextStyle(
         color: Colors.white,
       ),
     ),

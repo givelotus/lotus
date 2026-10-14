@@ -1,7 +1,7 @@
 import 'dart:typed_data';
 
 import 'package:buffer/buffer.dart';
-import 'package:vase/lotus/lotus.dart';
+import 'package:lotus_dart/lotus.dart';
 import 'package:test/test.dart';
 
 void main() {

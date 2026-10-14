@@ -85,7 +85,7 @@ class NumpadView extends HookWidget {
                         shape: RoundedRectangleBorder(
                           borderRadius: BorderRadius.circular(40),
                         ),
-                        primary: Colors.white,
+                        foregroundColor: Colors.white,
                         backgroundColor: AppColors.lotusPurple1,
                         padding: const EdgeInsets.symmetric(
                           vertical: 8,

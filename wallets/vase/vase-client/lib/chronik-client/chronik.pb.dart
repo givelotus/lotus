@@ -1,6 +1,8 @@
 ///
 //  Generated code. Do not modify.
 //  source: chronik.proto
+// Legacy binding retained for unused historical APIs. Obsolete createRepeated
+// factories were removed for protobuf 6; wallet wire paths use lotus_dart's schema.
 //
 // @dart = 2.12
 // ignore_for_file: annotate_overrides,camel_case_types,constant_identifier_names,directives_ordering,library_prefixes,non_constant_identifier_names,prefer_final_fields,return_of_invalid_type,unnecessary_const,unnecessary_import,unnecessary_this,unused_import,unused_shown_name
@@ -46,7 +48,6 @@ class ValidateUtxoRequest extends $pb.GeneratedMessage {
   @$core.pragma('dart2js:noInline')
   static ValidateUtxoRequest create() => ValidateUtxoRequest._();
   ValidateUtxoRequest createEmptyInstance() => create();
-  static $pb.PbList<ValidateUtxoRequest> createRepeated() => $pb.PbList<ValidateUtxoRequest>();
   @$core.pragma('dart2js:noInline')
   static ValidateUtxoRequest getDefault() => _defaultInstance ??= $pb.GeneratedMessage.$_defaultFor<ValidateUtxoRequest>(create);
   static ValidateUtxoRequest? _defaultInstance;
@@ -87,7 +88,6 @@ class ValidateUtxoResponse extends $pb.GeneratedMessage {
   @$core.pragma('dart2js:noInline')
   static ValidateUtxoResponse create() => ValidateUtxoResponse._();
   ValidateUtxoResponse createEmptyInstance() => create();
-  static $pb.PbList<ValidateUtxoResponse> createRepeated() => $pb.PbList<ValidateUtxoResponse>();
   @$core.pragma('dart2js:noInline')
   static ValidateUtxoResponse getDefault() => _defaultInstance ??= $pb.GeneratedMessage.$_defaultFor<ValidateUtxoResponse>(create);
   static ValidateUtxoResponse? _defaultInstance;
@@ -133,7 +133,6 @@ class BroadcastTxRequest extends $pb.GeneratedMessage {
   @$core.pragma('dart2js:noInline')
   static BroadcastTxRequest create() => BroadcastTxRequest._();
   BroadcastTxRequest createEmptyInstance() => create();
-  static $pb.PbList<BroadcastTxRequest> createRepeated() => $pb.PbList<BroadcastTxRequest>();
   @$core.pragma('dart2js:noInline')
   static BroadcastTxRequest getDefault() => _defaultInstance ??= $pb.GeneratedMessage.$_defaultFor<BroadcastTxRequest>(create);
   static BroadcastTxRequest? _defaultInstance;
@@ -189,7 +188,6 @@ class BroadcastTxResponse extends $pb.GeneratedMessage {
   @$core.pragma('dart2js:noInline')
   static BroadcastTxResponse create() => BroadcastTxResponse._();
   BroadcastTxResponse createEmptyInstance() => create();
-  static $pb.PbList<BroadcastTxResponse> createRepeated() => $pb.PbList<BroadcastTxResponse>();
   @$core.pragma('dart2js:noInline')
   static BroadcastTxResponse getDefault() => _defaultInstance ??= $pb.GeneratedMessage.$_defaultFor<BroadcastTxResponse>(create);
   static BroadcastTxResponse? _defaultInstance;
@@ -241,7 +239,6 @@ class BroadcastTxsRequest extends $pb.GeneratedMessage {
   @$core.pragma('dart2js:noInline')
   static BroadcastTxsRequest create() => BroadcastTxsRequest._();
   BroadcastTxsRequest createEmptyInstance() => create();
-  static $pb.PbList<BroadcastTxsRequest> createRepeated() => $pb.PbList<BroadcastTxsRequest>();
   @$core.pragma('dart2js:noInline')
   static BroadcastTxsRequest getDefault() => _defaultInstance ??= $pb.GeneratedMessage.$_defaultFor<BroadcastTxsRequest>(create);
   static BroadcastTxsRequest? _defaultInstance;
@@ -291,7 +288,6 @@ class BroadcastTxsResponse extends $pb.GeneratedMessage {
   @$core.pragma('dart2js:noInline')
   static BroadcastTxsResponse create() => BroadcastTxsResponse._();
   BroadcastTxsResponse createEmptyInstance() => create();
-  static $pb.PbList<BroadcastTxsResponse> createRepeated() => $pb.PbList<BroadcastTxsResponse>();
   @$core.pragma('dart2js:noInline')
   static BroadcastTxsResponse getDefault() => _defaultInstance ??= $pb.GeneratedMessage.$_defaultFor<BroadcastTxsResponse>(create);
   static BroadcastTxsResponse? _defaultInstance;
@@ -337,7 +333,6 @@ class BlockchainInfo extends $pb.GeneratedMessage {
   @$core.pragma('dart2js:noInline')
   static BlockchainInfo create() => BlockchainInfo._();
   BlockchainInfo createEmptyInstance() => create();
-  static $pb.PbList<BlockchainInfo> createRepeated() => $pb.PbList<BlockchainInfo>();
   @$core.pragma('dart2js:noInline')
   static BlockchainInfo getDefault() => _defaultInstance ??= $pb.GeneratedMessage.$_defaultFor<BlockchainInfo>(create);
   static BlockchainInfo? _defaultInstance;
@@ -448,7 +443,6 @@ class Tx extends $pb.GeneratedMessage {
   @$core.pragma('dart2js:noInline')
   static Tx create() => Tx._();
   Tx createEmptyInstance() => create();
-  static $pb.PbList<Tx> createRepeated() => $pb.PbList<Tx>();
   @$core.pragma('dart2js:noInline')
   static Tx getDefault() => _defaultInstance ??= $pb.GeneratedMessage.$_defaultFor<Tx>(create);
   static Tx? _defaultInstance;
@@ -616,7 +610,6 @@ class Utxo extends $pb.GeneratedMessage {
   @$core.pragma('dart2js:noInline')
   static Utxo create() => Utxo._();
   Utxo createEmptyInstance() => create();
-  static $pb.PbList<Utxo> createRepeated() => $pb.PbList<Utxo>();
   @$core.pragma('dart2js:noInline')
   static Utxo getDefault() => _defaultInstance ??= $pb.GeneratedMessage.$_defaultFor<Utxo>(create);
   static Utxo? _defaultInstance;
@@ -753,7 +746,6 @@ class Token extends $pb.GeneratedMessage {
   @$core.pragma('dart2js:noInline')
   static Token create() => Token._();
   Token createEmptyInstance() => create();
-  static $pb.PbList<Token> createRepeated() => $pb.PbList<Token>();
   @$core.pragma('dart2js:noInline')
   static Token getDefault() => _defaultInstance ??= $pb.GeneratedMessage.$_defaultFor<Token>(create);
   static Token? _defaultInstance;
@@ -920,7 +912,6 @@ class BlockInfo extends $pb.GeneratedMessage {
   @$core.pragma('dart2js:noInline')
   static BlockInfo create() => BlockInfo._();
   BlockInfo createEmptyInstance() => create();
-  static $pb.PbList<BlockInfo> createRepeated() => $pb.PbList<BlockInfo>();
   @$core.pragma('dart2js:noInline')
   static BlockInfo getDefault() => _defaultInstance ??= $pb.GeneratedMessage.$_defaultFor<BlockInfo>(create);
   static BlockInfo? _defaultInstance;
@@ -1090,7 +1081,6 @@ class BlockDetails extends $pb.GeneratedMessage {
   @$core.pragma('dart2js:noInline')
   static BlockDetails create() => BlockDetails._();
   BlockDetails createEmptyInstance() => create();
-  static $pb.PbList<BlockDetails> createRepeated() => $pb.PbList<BlockDetails>();
   @$core.pragma('dart2js:noInline')
   static BlockDetails getDefault() => _defaultInstance ??= $pb.GeneratedMessage.$_defaultFor<BlockDetails>(create);
   static BlockDetails? _defaultInstance;
@@ -1179,7 +1169,6 @@ class Block extends $pb.GeneratedMessage {
   @$core.pragma('dart2js:noInline')
   static Block create() => Block._();
   Block createEmptyInstance() => create();
-  static $pb.PbList<Block> createRepeated() => $pb.PbList<Block>();
   @$core.pragma('dart2js:noInline')
   static Block getDefault() => _defaultInstance ??= $pb.GeneratedMessage.$_defaultFor<Block>(create);
   static Block? _defaultInstance;
@@ -1256,7 +1245,6 @@ class ScriptUtxos extends $pb.GeneratedMessage {
   @$core.pragma('dart2js:noInline')
   static ScriptUtxos create() => ScriptUtxos._();
   ScriptUtxos createEmptyInstance() => create();
-  static $pb.PbList<ScriptUtxos> createRepeated() => $pb.PbList<ScriptUtxos>();
   @$core.pragma('dart2js:noInline')
   static ScriptUtxos getDefault() => _defaultInstance ??= $pb.GeneratedMessage.$_defaultFor<ScriptUtxos>(create);
   static ScriptUtxos? _defaultInstance;
@@ -1311,7 +1299,6 @@ class TxHistoryPage extends $pb.GeneratedMessage {
   @$core.pragma('dart2js:noInline')
   static TxHistoryPage create() => TxHistoryPage._();
   TxHistoryPage createEmptyInstance() => create();
-  static $pb.PbList<TxHistoryPage> createRepeated() => $pb.PbList<TxHistoryPage>();
   @$core.pragma('dart2js:noInline')
   static TxHistoryPage getDefault() => _defaultInstance ??= $pb.GeneratedMessage.$_defaultFor<TxHistoryPage>(create);
   static TxHistoryPage? _defaultInstance;
@@ -1361,7 +1348,6 @@ class Utxos extends $pb.GeneratedMessage {
   @$core.pragma('dart2js:noInline')
   static Utxos create() => Utxos._();
   Utxos createEmptyInstance() => create();
-  static $pb.PbList<Utxos> createRepeated() => $pb.PbList<Utxos>();
   @$core.pragma('dart2js:noInline')
   static Utxos getDefault() => _defaultInstance ??= $pb.GeneratedMessage.$_defaultFor<Utxos>(create);
   static Utxos? _defaultInstance;
@@ -1402,7 +1388,6 @@ class Blocks extends $pb.GeneratedMessage {
   @$core.pragma('dart2js:noInline')
   static Blocks create() => Blocks._();
   Blocks createEmptyInstance() => create();
-  static $pb.PbList<Blocks> createRepeated() => $pb.PbList<Blocks>();
   @$core.pragma('dart2js:noInline')
   static Blocks getDefault() => _defaultInstance ??= $pb.GeneratedMessage.$_defaultFor<Blocks>(create);
   static Blocks? _defaultInstance;
@@ -1448,7 +1433,6 @@ class SlpTxData extends $pb.GeneratedMessage {
   @$core.pragma('dart2js:noInline')
   static SlpTxData create() => SlpTxData._();
   SlpTxData createEmptyInstance() => create();
-  static $pb.PbList<SlpTxData> createRepeated() => $pb.PbList<SlpTxData>();
   @$core.pragma('dart2js:noInline')
   static SlpTxData getDefault() => _defaultInstance ??= $pb.GeneratedMessage.$_defaultFor<SlpTxData>(create);
   static SlpTxData? _defaultInstance;
@@ -1523,7 +1507,6 @@ class SlpMeta extends $pb.GeneratedMessage {
   @$core.pragma('dart2js:noInline')
   static SlpMeta create() => SlpMeta._();
   SlpMeta createEmptyInstance() => create();
-  static $pb.PbList<SlpMeta> createRepeated() => $pb.PbList<SlpMeta>();
   @$core.pragma('dart2js:noInline')
   static SlpMeta getDefault() => _defaultInstance ??= $pb.GeneratedMessage.$_defaultFor<SlpMeta>(create);
   static SlpMeta? _defaultInstance;
@@ -1602,7 +1585,6 @@ class TokenStats extends $pb.GeneratedMessage {
   @$core.pragma('dart2js:noInline')
   static TokenStats create() => TokenStats._();
   TokenStats createEmptyInstance() => create();
-  static $pb.PbList<TokenStats> createRepeated() => $pb.PbList<TokenStats>();
   @$core.pragma('dart2js:noInline')
   static TokenStats getDefault() => _defaultInstance ??= $pb.GeneratedMessage.$_defaultFor<TokenStats>(create);
   static TokenStats? _defaultInstance;
@@ -1688,7 +1670,6 @@ class TxInput extends $pb.GeneratedMessage {
   @$core.pragma('dart2js:noInline')
   static TxInput create() => TxInput._();
   TxInput createEmptyInstance() => create();
-  static $pb.PbList<TxInput> createRepeated() => $pb.PbList<TxInput>();
   @$core.pragma('dart2js:noInline')
   static TxInput getDefault() => _defaultInstance ??= $pb.GeneratedMessage.$_defaultFor<TxInput>(create);
   static TxInput? _defaultInstance;
@@ -1810,7 +1791,6 @@ class TxOutput extends $pb.GeneratedMessage {
   @$core.pragma('dart2js:noInline')
   static TxOutput create() => TxOutput._();
   TxOutput createEmptyInstance() => create();
-  static $pb.PbList<TxOutput> createRepeated() => $pb.PbList<TxOutput>();
   @$core.pragma('dart2js:noInline')
   static TxOutput getDefault() => _defaultInstance ??= $pb.GeneratedMessage.$_defaultFor<TxOutput>(create);
   static TxOutput? _defaultInstance;
@@ -1898,7 +1878,6 @@ class BlockMetadata extends $pb.GeneratedMessage {
   @$core.pragma('dart2js:noInline')
   static BlockMetadata create() => BlockMetadata._();
   BlockMetadata createEmptyInstance() => create();
-  static $pb.PbList<BlockMetadata> createRepeated() => $pb.PbList<BlockMetadata>();
   @$core.pragma('dart2js:noInline')
   static BlockMetadata getDefault() => _defaultInstance ??= $pb.GeneratedMessage.$_defaultFor<BlockMetadata>(create);
   static BlockMetadata? _defaultInstance;
@@ -1968,7 +1947,6 @@ class OutPoint extends $pb.GeneratedMessage {
   @$core.pragma('dart2js:noInline')
   static OutPoint create() => OutPoint._();
   OutPoint createEmptyInstance() => create();
-  static $pb.PbList<OutPoint> createRepeated() => $pb.PbList<OutPoint>();
   @$core.pragma('dart2js:noInline')
   static OutPoint getDefault() => _defaultInstance ??= $pb.GeneratedMessage.$_defaultFor<OutPoint>(create);
   static OutPoint? _defaultInstance;
@@ -2029,7 +2007,6 @@ class SlpToken extends $pb.GeneratedMessage {
   @$core.pragma('dart2js:noInline')
   static SlpToken create() => SlpToken._();
   SlpToken createEmptyInstance() => create();
-  static $pb.PbList<SlpToken> createRepeated() => $pb.PbList<SlpToken>();
   @$core.pragma('dart2js:noInline')
   static SlpToken getDefault() => _defaultInstance ??= $pb.GeneratedMessage.$_defaultFor<SlpToken>(create);
   static SlpToken? _defaultInstance;
@@ -2090,7 +2067,6 @@ class SlpBurn extends $pb.GeneratedMessage {
   @$core.pragma('dart2js:noInline')
   static SlpBurn create() => SlpBurn._();
   SlpBurn createEmptyInstance() => create();
-  static $pb.PbList<SlpBurn> createRepeated() => $pb.PbList<SlpBurn>();
   @$core.pragma('dart2js:noInline')
   static SlpBurn getDefault() => _defaultInstance ??= $pb.GeneratedMessage.$_defaultFor<SlpBurn>(create);
   static SlpBurn? _defaultInstance;
@@ -2168,7 +2144,6 @@ class SlpGenesisInfo extends $pb.GeneratedMessage {
   @$core.pragma('dart2js:noInline')
   static SlpGenesisInfo create() => SlpGenesisInfo._();
   SlpGenesisInfo createEmptyInstance() => create();
-  static $pb.PbList<SlpGenesisInfo> createRepeated() => $pb.PbList<SlpGenesisInfo>();
   @$core.pragma('dart2js:noInline')
   static SlpGenesisInfo getDefault() => _defaultInstance ??= $pb.GeneratedMessage.$_defaultFor<SlpGenesisInfo>(create);
   static SlpGenesisInfo? _defaultInstance;
@@ -2261,7 +2236,6 @@ class UtxoState extends $pb.GeneratedMessage {
   @$core.pragma('dart2js:noInline')
   static UtxoState create() => UtxoState._();
   UtxoState createEmptyInstance() => create();
-  static $pb.PbList<UtxoState> createRepeated() => $pb.PbList<UtxoState>();
   @$core.pragma('dart2js:noInline')
   static UtxoState getDefault() => _defaultInstance ??= $pb.GeneratedMessage.$_defaultFor<UtxoState>(create);
   static UtxoState? _defaultInstance;
@@ -2336,7 +2310,6 @@ class Subscription extends $pb.GeneratedMessage {
   @$core.pragma('dart2js:noInline')
   static Subscription create() => Subscription._();
   Subscription createEmptyInstance() => create();
-  static $pb.PbList<Subscription> createRepeated() => $pb.PbList<Subscription>();
   @$core.pragma('dart2js:noInline')
   static Subscription getDefault() => _defaultInstance ??= $pb.GeneratedMessage.$_defaultFor<Subscription>(create);
   static Subscription? _defaultInstance;
@@ -2453,7 +2426,6 @@ class SubscribeMsg extends $pb.GeneratedMessage {
   @$core.pragma('dart2js:noInline')
   static SubscribeMsg create() => SubscribeMsg._();
   SubscribeMsg createEmptyInstance() => create();
-  static $pb.PbList<SubscribeMsg> createRepeated() => $pb.PbList<SubscribeMsg>();
   @$core.pragma('dart2js:noInline')
   static SubscribeMsg getDefault() => _defaultInstance ??= $pb.GeneratedMessage.$_defaultFor<SubscribeMsg>(create);
   static SubscribeMsg? _defaultInstance;
@@ -2571,7 +2543,6 @@ class MsgAddedToMempool extends $pb.GeneratedMessage {
   @$core.pragma('dart2js:noInline')
   static MsgAddedToMempool create() => MsgAddedToMempool._();
   MsgAddedToMempool createEmptyInstance() => create();
-  static $pb.PbList<MsgAddedToMempool> createRepeated() => $pb.PbList<MsgAddedToMempool>();
   @$core.pragma('dart2js:noInline')
   static MsgAddedToMempool getDefault() => _defaultInstance ??= $pb.GeneratedMessage.$_defaultFor<MsgAddedToMempool>(create);
   static MsgAddedToMempool? _defaultInstance;
@@ -2618,7 +2589,6 @@ class MsgRemovedFromMempool extends $pb.GeneratedMessage {
   @$core.pragma('dart2js:noInline')
   static MsgRemovedFromMempool create() => MsgRemovedFromMempool._();
   MsgRemovedFromMempool createEmptyInstance() => create();
-  static $pb.PbList<MsgRemovedFromMempool> createRepeated() => $pb.PbList<MsgRemovedFromMempool>();
   @$core.pragma('dart2js:noInline')
   static MsgRemovedFromMempool getDefault() => _defaultInstance ??= $pb.GeneratedMessage.$_defaultFor<MsgRemovedFromMempool>(create);
   static MsgRemovedFromMempool? _defaultInstance;
@@ -2665,7 +2635,6 @@ class MsgConfirmed extends $pb.GeneratedMessage {
   @$core.pragma('dart2js:noInline')
   static MsgConfirmed create() => MsgConfirmed._();
   MsgConfirmed createEmptyInstance() => create();
-  static $pb.PbList<MsgConfirmed> createRepeated() => $pb.PbList<MsgConfirmed>();
   @$core.pragma('dart2js:noInline')
   static MsgConfirmed getDefault() => _defaultInstance ??= $pb.GeneratedMessage.$_defaultFor<MsgConfirmed>(create);
   static MsgConfirmed? _defaultInstance;
@@ -2712,7 +2681,6 @@ class MsgReorg extends $pb.GeneratedMessage {
   @$core.pragma('dart2js:noInline')
   static MsgReorg create() => MsgReorg._();
   MsgReorg createEmptyInstance() => create();
-  static $pb.PbList<MsgReorg> createRepeated() => $pb.PbList<MsgReorg>();
   @$core.pragma('dart2js:noInline')
   static MsgReorg getDefault() => _defaultInstance ??= $pb.GeneratedMessage.$_defaultFor<MsgReorg>(create);
   static MsgReorg? _defaultInstance;
@@ -2759,7 +2727,6 @@ class MsgBlockConnected extends $pb.GeneratedMessage {
   @$core.pragma('dart2js:noInline')
   static MsgBlockConnected create() => MsgBlockConnected._();
   MsgBlockConnected createEmptyInstance() => create();
-  static $pb.PbList<MsgBlockConnected> createRepeated() => $pb.PbList<MsgBlockConnected>();
   @$core.pragma('dart2js:noInline')
   static MsgBlockConnected getDefault() => _defaultInstance ??= $pb.GeneratedMessage.$_defaultFor<MsgBlockConnected>(create);
   static MsgBlockConnected? _defaultInstance;
@@ -2806,7 +2773,6 @@ class MsgBlockDisconnected extends $pb.GeneratedMessage {
   @$core.pragma('dart2js:noInline')
   static MsgBlockDisconnected create() => MsgBlockDisconnected._();
   MsgBlockDisconnected createEmptyInstance() => create();
-  static $pb.PbList<MsgBlockDisconnected> createRepeated() => $pb.PbList<MsgBlockDisconnected>();
   @$core.pragma('dart2js:noInline')
   static MsgBlockDisconnected getDefault() => _defaultInstance ??= $pb.GeneratedMessage.$_defaultFor<MsgBlockDisconnected>(create);
   static MsgBlockDisconnected? _defaultInstance;
@@ -2863,7 +2829,6 @@ class Error extends $pb.GeneratedMessage {
   @$core.pragma('dart2js:noInline')
   static Error create() => Error._();
   Error createEmptyInstance() => create();
-  static $pb.PbList<Error> createRepeated() => $pb.PbList<Error>();
   @$core.pragma('dart2js:noInline')
   static Error getDefault() => _defaultInstance ??= $pb.GeneratedMessage.$_defaultFor<Error>(create);
   static Error? _defaultInstance;

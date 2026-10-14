@@ -30,7 +30,7 @@ class KeyWidget extends StatelessWidget {
       child: Text(
         label,
         style: TextStyle(
-          color: Theme.of(context).textTheme.button?.color,
+          color: Theme.of(context).textTheme.labelLarge?.color,
           fontSize: 40,
           fontWeight: FontWeight.w700,
         ),

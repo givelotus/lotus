@@ -1,33 +1,22 @@
-import 'dart:math';
-
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_hooks/flutter_hooks.dart';
 import 'package:go_router/go_router.dart';
+import 'package:hex/hex.dart';
 import 'package:provider/provider.dart';
 import 'package:slide_to_confirm/slide_to_confirm.dart';
 import 'package:vase/config/colors.dart';
 import 'package:vase/config/theme.dart';
 import 'package:vase/features/numpad/numpad_view.dart';
-import 'package:vase/features/send/qr_view.dart';
 import 'package:vase/features/send/send_model.dart';
 import 'package:vase/features/wallet/wallet_model.dart';
 import 'package:lotus_dart/lotus.dart';
-import 'package:lotus_dart/utils/parse_uri.dart';
 import 'package:vase/utils/currency.dart';
 
 import '../numpad/numpad_model.dart';
 
-final qrKey = GlobalKey(debugLabel: 'QR');
-
 class SendPage extends HookWidget {
   const SendPage({Key? key}) : super(key: key);
-
-  void _showSnackBar(BuildContext context, String message) {
-    ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(content: Text(message)),
-    );
-  }
 
   @override
   Widget build(BuildContext context) {
@@ -57,30 +46,6 @@ class SendPage extends HookWidget {
         child: Column(
           children: [
             Expanded(
-              child: QRView(
-                onScanResult: (String? result) {
-                  if (result == null) {
-                    return;
-                  }
-
-                  final parseResult = parseSendURI(result);
-                  final address = parseResult.address;
-                  final amount = parseResult.amount;
-
-                  if (address.isEmpty) {
-                    _showSnackBar(context, 'Unable to parse QR code');
-                    return;
-                  }
-
-                  sendModel.setAddress(address);
-
-                  if (sendModel.amount == BigInt.zero) {
-                    sendModel.setAmount(amount);
-                  }
-                },
-              ),
-            ),
-            Expanded(
               child: Padding(
                 padding: const EdgeInsets.all(16),
                 child: Column(
@@ -94,9 +59,7 @@ class SendPage extends HookWidget {
                           isScrollControlled: true,
                           context: context,
                           builder: (ctx) => ConstrainedBox(
-                            constraints: const BoxConstraints(
-                              maxHeight: 600,
-                            ),
+                            constraints: const BoxConstraints(maxHeight: 600),
                             child: NumpadView(
                               onDoneTap: () {
                                 Navigator.of(ctx).pop();
@@ -118,8 +81,9 @@ class SendPage extends HookWidget {
                                   floatingLabelBehavior:
                                       FloatingLabelBehavior.always,
                                   hintText: 'Enter or scan qr code',
-                                  labelStyle:
-                                      TextStyle(color: AppColors.lotusPink),
+                                  labelStyle: TextStyle(
+                                    color: AppColors.lotusPink,
+                                  ),
                                   border: InputBorder.none,
                                 ),
                                 controller: amountCtrl,
@@ -136,7 +100,7 @@ class SendPage extends HookWidget {
                               onPressed: () {
                                 sendModel.setAmount(BigInt.zero);
                               },
-                            )
+                            ),
                         ],
                       ),
                     ),
@@ -153,8 +117,9 @@ class SendPage extends HookWidget {
                               floatingLabelBehavior:
                                   FloatingLabelBehavior.always,
                               hintText: 'Paste or scan qr code',
-                              labelStyle:
-                                  const TextStyle(color: AppColors.lotusPink),
+                              labelStyle: const TextStyle(
+                                color: AppColors.lotusPink,
+                              ),
                               border: InputBorder.none,
                               suffixIcon: addressCtrl.text.isNotEmpty
                                   ? IconButton(
@@ -185,6 +150,7 @@ class SendPage extends HookWidget {
                           ),
                           onPressed: () async {
                             final data = await Clipboard.getData('text/plain');
+                            if (!context.mounted) return;
                             sendModel.setAddress(data?.text ?? '');
                             ScaffoldMessenger.of(context).showSnackBar(
                               const SnackBar(
@@ -193,10 +159,7 @@ class SendPage extends HookWidget {
                               ),
                             );
                           },
-                          child: const Icon(
-                            Icons.paste,
-                            color: Colors.white,
-                          ),
+                          child: const Icon(Icons.paste, color: Colors.white),
                         ),
                       ],
                     ),
@@ -208,10 +171,7 @@ class SendPage extends HookWidget {
         ),
       ),
       floatingActionButton: FloatingActionButton(
-        child: const Icon(
-          Icons.check,
-          color: Colors.white,
-        ),
+        child: const Icon(Icons.check, color: Colors.white),
         backgroundColor: sendEnabled ? AppColors.lotusPink : Colors.grey,
         elevation: sendEnabled ? 1 : 0,
         onPressed: sendEnabled
@@ -230,20 +190,23 @@ class SendPage extends HookWidget {
 }
 
 class TransactionModal extends HookWidget {
-  const TransactionModal({
-    Key? key,
-  }) : super(key: key);
+  const TransactionModal({Key? key}) : super(key: key);
 
   Future<Transaction?> _sendTransaction(
-      BuildContext context, String address, BigInt amount) async {
+    BuildContext context,
+    String address,
+    BigInt amount,
+  ) async {
     try {
       final walletModel = context.read<WalletModel>();
-      return await walletModel.wallet
-          ?.sendTransaction(Address(address), amount);
+      return await walletModel.wallet?.sendTransaction(
+        Address(address),
+        amount,
+      );
     } on AppException catch (e) {
-      _showSnackBar(context, e.message);
+      if (context.mounted) _showSnackBar(context, e.message);
     } catch (error) {
-      _showSnackBar(context, error.toString());
+      if (context.mounted) _showSnackBar(context, error.toString());
     }
     return null;
   }
@@ -284,10 +247,7 @@ class TransactionModal extends HookWidget {
                               color: Colors.green,
                               shape: CircleBorder(),
                             ),
-                            child: const Icon(
-                              Icons.check,
-                              size: 56,
-                            ),
+                            child: const Icon(Icons.check, size: 56),
                           ),
                           const SizedBox(height: 16),
                           const Text('Transaction sent!'),
@@ -300,8 +260,9 @@ class TransactionModal extends HookWidget {
                                   readOnly: true,
                                   decoration: const InputDecoration(
                                     labelText: 'TxId',
-                                    labelStyle:
-                                        TextStyle(color: AppColors.lotusPink),
+                                    labelStyle: TextStyle(
+                                      color: AppColors.lotusPink,
+                                    ),
                                     border: InputBorder.none,
                                   ),
                                   controller: txIdCtrl,
@@ -316,9 +277,7 @@ class TransactionModal extends HookWidget {
                                 ),
                                 onPressed: () {
                                   Clipboard.setData(
-                                    ClipboardData(
-                                      text: txIdCtrl.text,
-                                    ),
+                                    ClipboardData(text: txIdCtrl.text),
                                   );
                                   _showSnackBar(
                                     context,
@@ -331,7 +290,7 @@ class TransactionModal extends HookWidget {
                                 ),
                               ),
                             ],
-                          )
+                          ),
                         ] else ...[
                           if (error.value) ...[
                             const Text(
@@ -356,8 +315,11 @@ class TransactionModal extends HookWidget {
                                 amount,
                               );
 
+                              if (!context.mounted) return;
                               if (transaction != null) {
-                                txIdCtrl.text = transaction.id ?? '';
+                                txIdCtrl.text = lotusTxId(
+                                  HEX.decode(transaction.serialize()),
+                                );
                                 success.value = true;
                               } else {
                                 error.value = true;
@@ -365,15 +327,13 @@ class TransactionModal extends HookWidget {
                               loading.value = false;
                             },
                           ),
-                        ]
+                        ],
                       ],
                     ),
             ),
           ),
           const IgnorePointer(
-            child: Scaffold(
-              backgroundColor: Colors.transparent,
-            ),
+            child: Scaffold(backgroundColor: Colors.transparent),
           ),
         ],
       ),

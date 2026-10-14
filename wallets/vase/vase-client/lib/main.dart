@@ -17,24 +17,32 @@ import 'package:vase/features/wallet/wallet_model.dart';
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
-  await SentryFlutter.init((options) {
-    options.dsn =
-        'https://c6a61e7ac13b413d8bb529c3c05b0ab1@o1111989.ingest.sentry.io/6141317';
-    options.tracesSampleRate = kReleaseMode ? 1.0 : 0.0;
-    options.environment = kReleaseMode ? 'production' : 'development';
-  }, appRunner: () async {
-    final chronik = ChronikClient("https://chronik.be.cash/xpi");
-    return runApp(
-      MultiProvider(
-        providers: [
-          ChangeNotifierProvider(create: (_) => WalletModel(chronik)),
-          ChangeNotifierProvider(create: (_) => SendModel()),
-          ChangeNotifierProvider(create: (_) => NumpadModel()),
-        ],
-        child: VaseApp(),
-      ),
-    );
-  });
+  await SentryFlutter.init(
+    (options) {
+      options.dsn =
+          'https://c6a61e7ac13b413d8bb529c3c05b0ab1@o1111989.ingest.sentry.io/6141317';
+      options.tracesSampleRate = kReleaseMode ? 1.0 : 0.0;
+      options.environment = kReleaseMode ? 'production' : 'development';
+    },
+    appRunner: () async {
+      final chronik = ChronikClient(
+        const String.fromEnvironment(
+          'CHRONIK_URL',
+          defaultValue: 'https://chronik.be.cash/xpi',
+        ),
+      );
+      return runApp(
+        MultiProvider(
+          providers: [
+            ChangeNotifierProvider(create: (_) => WalletModel(chronik)),
+            ChangeNotifierProvider(create: (_) => SendModel()),
+            ChangeNotifierProvider(create: (_) => NumpadModel()),
+          ],
+          child: VaseApp(),
+        ),
+      );
+    },
+  );
 }
 
 class VaseApp extends StatelessWidget {
@@ -42,10 +50,7 @@ class VaseApp extends StatelessWidget {
 
   final router = GoRouter(
     routes: [
-      GoRoute(
-        path: '/',
-        builder: (ctx, state) => const HomePage(),
-      ),
+      GoRoute(path: '/', builder: (ctx, state) => const HomePage()),
       GoRoute(path: '/settings', builder: (ctx, state) => const SettingsPage()),
       GoRoute(path: '/request', builder: (ctx, state) => const RequestPage()),
       GoRoute(path: '/send', builder: (ctx, state) => const SendPage()),
@@ -63,8 +68,7 @@ class VaseApp extends StatelessWidget {
         title: 'Vase',
         debugShowCheckedModeBanner: false,
         theme: AppTheme.lotusTheme,
-        routeInformationParser: router.routeInformationParser,
-        routerDelegate: router.routerDelegate,
+        routerConfig: router,
       ),
     );
   }

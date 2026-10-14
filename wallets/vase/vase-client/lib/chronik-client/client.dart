@@ -1,8 +1,10 @@
+import 'dart:async';
 import 'dart:convert';
+import 'dart:typed_data';
 
 import 'package:http/http.dart' as http;
-import 'package:flutter/foundation.dart';
-import 'package:universal_html/html.dart';
+import 'package:hex/hex.dart';
+import 'package:lotus_dart/chronik.dart' as current;
 import 'package:web_socket_channel/web_socket_channel.dart';
 
 import 'chronik.pb.dart' as proto;
@@ -20,13 +22,14 @@ class ChronikClient {
   /// @param url Url of a Chronik instance, with schema and without trailing
   /// slash. E.g. https://chronik.be.cash/xec.
   ChronikClient(String url)
-      : _url = url,
-        _wsUrl = url.startsWith('https://')
-            ? 'wss://${url.substring('https://'.length)}'
-            : (url.startsWith('http://')
+    : _url = url,
+      _wsUrl = url.startsWith('https://')
+          ? 'wss://${url.substring('https://'.length)}'
+          : (url.startsWith('http://')
                 ? 'ws://${url.substring('http://'.length)}'
                 : throw Exception(
-                    "url must start with 'https://' or 'http://', got: $url")) {
+                    "url must start with 'https://' or 'http://', got: $url",
+                  )) {
     if (url.endsWith('/')) {
       throw Exception("url cannot end with '/', got: $url");
     }
@@ -39,13 +42,16 @@ class ChronikClient {
     dynamic rawTx,
     skipSlpCheck = false,
   }) async {
-    final request = proto.BroadcastTxRequest.fromJson(jsonEncode({
-      'rawTx': rawTx is String ? fromHex(rawTx) : rawTx,
-      'skipSlpCheck': skipSlpCheck,
-    }));
+    final request = current.BroadcastTxRequest(
+      rawTx: rawTx is String ? HEX.decode(rawTx) : rawTx as List<int>,
+      skipTokenChecks: skipSlpCheck,
+    );
     final data = await _post(
-        url: _url, path: "/broadcast-tx", data: request.writeToBuffer());
-    final broadcastResponse = proto.BroadcastTxResponse.fromBuffer(data);
+      url: _url,
+      path: "/broadcast-tx",
+      data: request.writeToBuffer(),
+    );
+    final broadcastResponse = current.BroadcastTxResponse.fromBuffer(data);
     return BroadcastTxResponse(txid: toHexRev(broadcastResponse.txid));
   }
 
@@ -56,17 +62,25 @@ class ChronikClient {
     dynamic rawTxs,
     skipSlpCheck = false,
   }) async {
-    final request = proto.BroadcastTxsRequest.fromJson(jsonEncode({
-      'rawTxs': (rawTxs as List)
-          .map((rawTx) => rawTx is String ? fromHex(rawTx) : rawTx)
-          .toList() as Uint8List,
-      'skipSlpCheck': skipSlpCheck,
-    }));
+    final request = proto.BroadcastTxsRequest.fromJson(
+      jsonEncode({
+        'rawTxs':
+            (rawTxs as List)
+                    .map((rawTx) => rawTx is String ? fromHex(rawTx) : rawTx)
+                    .toList()
+                as Uint8List,
+        'skipSlpCheck': skipSlpCheck,
+      }),
+    );
     final data = await _post(
-        url: _url, path: "/broadcast-txs", data: request.writeToBuffer());
+      url: _url,
+      path: "/broadcast-txs",
+      data: request.writeToBuffer(),
+    );
     final broadcastResponse = proto.BroadcastTxsResponse.fromBuffer(data);
     return BroadcastTxsResponse(
-        txids: broadcastResponse.txids.map(toHexRev).toList());
+      txids: broadcastResponse.txids.map(toHexRev).toList(),
+    );
   }
 
   /// Fetch current info of the blockchain, such as tip hash and height. */
@@ -112,9 +126,13 @@ class ChronikClient {
   /// never existed. */
   Future<List<UtxoState>> validateUtxos(List<proto.OutPoint> outpoints) async {
     final request = proto.ValidateUtxoRequest.fromJson(
-        jsonEncode({'outpoints': outpoints.map(convertToOutPoint).toList()}));
+      jsonEncode({'outpoints': outpoints.map(convertToOutPoint).toList()}),
+    );
     final data = await _post(
-        url: _url, path: "/validate-utxos", data: request.writeToBuffer());
+      url: _url,
+      path: "/validate-utxos",
+      data: request.writeToBuffer(),
+    );
     final validationStates = proto.ValidateUtxoResponse.fromBuffer(data);
     return validationStates.utxoStates.map(convertToUxtoState).toList();
   }
@@ -122,7 +140,10 @@ class ChronikClient {
   /// Create object that allows fetching script history or UTXOs. */
   ScriptEndpoint script(String scriptType, String scriptPayload) {
     return ScriptEndpoint(
-        url: _url, scriptType: scriptType, scriptPayload: scriptPayload);
+      url: _url,
+      scriptType: scriptType,
+      scriptPayload: scriptPayload,
+    );
   }
 
   /// Open a WebSocket connection to listen for updates. */
@@ -148,17 +169,14 @@ class ScriptEndpoint {
   /// by the indexer before, it's ordered by the block timestamp.
   /// @param page Page index of the tx history.
   /// @param pageSize Number of txs per page.
-  Future<TxHistoryPage> history({
-    int? page,
-    int? pageSize,
-  }) async {
+  Future<TxHistoryPage> history({int? page, int? pageSize}) async {
     final query = page != null && pageSize != null
         ? '?page=$page&page_size=$pageSize'
         : page != null
-            ? '?page=$page'
-            : pageSize != null
-                ? '?page_size=$pageSize'
-                : "";
+        ? '?page=$page'
+        : pageSize != null
+        ? '?page_size=$pageSize'
+        : "";
     final data = await _get(
       url,
       '/script/$scriptType/$scriptPayload/history$query',
@@ -174,37 +192,57 @@ class ScriptEndpoint {
   /// It is grouped by output script, in case a script type can match multiple
   /// different output scripts (e.g. Taproot on Lotus). */
   Future<List<ScriptUtxos>> utxos() async {
-    final data = await _get(
-      url,
-      '/script/$scriptType/$scriptPayload/utxos',
-    );
-    final utxos = proto.Utxos.fromBuffer(data);
-    return utxos.scriptUtxos.map(convertToScriptUtxos).toList();
+    final data = await _get(url, '/script/$scriptType/$scriptPayload/utxos');
+    final result = current.ScriptUtxos.fromBuffer(data);
+    return [
+      ScriptUtxos(
+        outputScript: toHex(result.script),
+        // This wallet cannot preserve token commitments when constructing a spend.
+        // Leave all token-bearing outputs untouched rather than burning tokens.
+        utxos: result.utxos
+            .where((utxo) => !utxo.hasToken())
+            .map(
+              (utxo) => Utxo(
+                outpoint: OutPoint(
+                  txid: toHexRev(utxo.outpoint.txid),
+                  outIdx: utxo.outpoint.outIdx,
+                ),
+                blockHeight: utxo.blockHeight,
+                isCoinbase: utxo.isCoinbase,
+                value: utxo.sats.toString(),
+                slpMeta: null,
+                network: Network.XPI,
+              ),
+            )
+            .toList(),
+      ),
+    ];
   }
 }
 
 /// Config for a WebSocket connection to Chronik.
 class WsConfig {
-  const WsConfig(
-      {this.onMessage,
-      this.onConnect,
-      this.onReconnect,
-      this.onError,
-      this.onEnd,
-      this.autoReconnect});
+  const WsConfig({
+    this.onMessage,
+    this.onConnect,
+    this.onReconnect,
+    this.onError,
+    this.onEnd,
+    this.autoReconnect,
+  });
 
   /// Fired when a message is sent from the WebSocket.
   final void Function(SubscribeMsg)? onMessage;
 
   /// Fired when a connection has been (re)established.
-  final void Function(MessageEvent)? onConnect;
+  final void Function()? onConnect;
 
   /// Fired after a connection has been unexpectedly closed, and before a
   /// reconnection attempt is made. Only fired if `autoReconnect` is true.
   final void Function()? onReconnect;
 
   /// Fired when an error with the WebSocket occurs.
-  final void Function(MessageEvent)? onError;
+  final void Function(Object)? onError;
 
   /// Fired after a connection has been manually closed, or if `autoReconnect`
   /// is false, if the WebSocket disconnects for any reason.
@@ -216,156 +254,167 @@ class WsConfig {
 
 /// WebSocket connection to Chronik.
 class WsEndpoint {
-  /// Fired when a message is sent from the WebSocket.
   void Function(SubscribeMsg)? onMessage;
-
-  /// Fired when a connection has been (re)established.
-  void Function(MessageEvent)? onConnect;
-
-  /// Fired after a connection has been unexpectedly closed, and before a
-  /// reconnection attempt is made. Only fired if `autoReconnect` is true.
+  void Function()? onConnect;
   void Function()? onReconnect;
-
-  /// Fired when an error with the WebSocket occurs.
-  void Function(ErrorEvent)? onError;
-
-  /// Fired after a connection has been manually closed, or if `autoReconnect`
-  /// is false, if the WebSocket disconnects for any reason.
+  void Function(Object)? onError;
   void Function()? onEnd;
-
-  /// Whether to automatically reconnect on disconnect, default true.
-  bool autoReconnect = false;
+  bool autoReconnect;
 
   WebSocketChannel? _ws;
-  String _wsUrl = "";
+  final String _wsUrl;
   bool _manuallyClosed = false;
-  List<Subscription> _subs = [];
+  bool _connected = false;
+  Timer? _reconnectTimer;
+  final List<Subscription> _subs = [];
 
-  WsEndpoint({required wsUrl, required WsConfig config}) {
+  WsEndpoint({required String wsUrl, required WsConfig config})
+    : _wsUrl = wsUrl,
+      autoReconnect = config.autoReconnect ?? true {
     onMessage = config.onMessage;
     onConnect = config.onConnect;
     onReconnect = config.onReconnect;
+    onError = config.onError;
     onEnd = config.onEnd;
-    autoReconnect = config.autoReconnect ?? true;
-    _subs = [];
-    _wsUrl = wsUrl;
-    _manuallyClosed = false;
     _connect();
   }
 
-  /// Wait for the WebSocket to be connected.
-  waitForOpen() async {
-    await _ws?.ready;
-  }
+  Future<void> waitForOpen() async => await _ws?.ready;
 
-  /// Subscribe to the given script type and payload.
-  /// For "p2pkh", `scriptPayload` is the 20 byte key hash. */
-  subscribe(String scriptType, String scriptPayload) {
+  /// Subscribe with a 20-byte key hash for p2pkh. Repeated calls are idempotent.
+  void subscribe(String scriptType, String scriptPayload) {
+    if (_subs.any(
+      (sub) =>
+          sub.scriptType == scriptType && sub.scriptPayload == scriptPayload,
+    )) {
+      return;
+    }
     _subs.add(
-        Subscription(scriptType: scriptType, scriptPayload: scriptPayload));
-    if (_ws != null) {
+      Subscription(scriptType: scriptType, scriptPayload: scriptPayload),
+    );
+    if (_connected) {
       _subUnsub(
-          isSubscribe: true,
-          scriptType: scriptType,
-          scriptPayload: scriptPayload);
+        isSubscribe: true,
+        scriptType: scriptType,
+        scriptPayload: scriptPayload,
+      );
     }
   }
 
-  /// Unsubscribe from the given script type and payload. */
-  unsubscribe(String scriptType, String scriptPayload) {
-    _subs = _subs
-        .where(
-          (sub) =>
-              sub.scriptType != scriptType ||
-              sub.scriptPayload != scriptPayload,
-        )
-        .toList();
-    if (_ws != null) {
+  void unsubscribe(String scriptType, String scriptPayload) {
+    _subs.removeWhere(
+      (sub) =>
+          sub.scriptType == scriptType && sub.scriptPayload == scriptPayload,
+    );
+    if (_connected) {
       _subUnsub(
-          isSubscribe: false,
-          scriptType: scriptType,
-          scriptPayload: scriptPayload);
+        isSubscribe: false,
+        scriptType: scriptType,
+        scriptPayload: scriptPayload,
+      );
     }
   }
 
-  /// Close the WebSocket connection and prevent future any reconnection
-  /// attempts. */
-  close() {
+  Future<void> close() async {
     _manuallyClosed = true;
-    _ws?.sink.close();
+    _connected = false;
+    _reconnectTimer?.cancel();
+    await _ws?.sink.close();
   }
 
-  _connect() {
-    _ws = WebSocketChannel.connect(Uri.parse(_wsUrl));
-    _ws?.stream.listen((e) => _handleMsg(e),
-        onError: (e) => onError?.call(e),
-        onDone: () {
-          // End if manually closed or no auto-reconnect
-          if (_manuallyClosed || !autoReconnect) {
-            if (onEnd != null) {
-              onEnd?.call();
-            }
-            return;
-          }
-          if (onReconnect != null) {
-            onReconnect?.call();
-          }
-          _connect();
-        });
+  Future<void> _connect() async {
+    if (_manuallyClosed) return;
+    final channel = WebSocketChannel.connect(Uri.parse(_wsUrl));
+    _ws = channel;
+    channel.stream.listen(
+      (data) {
+        try {
+          _handleMsg(data as List<int>);
+        } catch (error) {
+          onError?.call(error);
+        }
+      },
+      onError: (Object error) => onError?.call(error),
+      onDone: () => _disconnected(channel),
+    );
+    try {
+      await channel.ready;
+      if (_manuallyClosed || _ws != channel) {
+        await channel.sink.close();
+        return;
+      }
+      _connected = true;
+      for (final sub in _subs) {
+        _subUnsub(
+          isSubscribe: true,
+          scriptType: sub.scriptType,
+          scriptPayload: sub.scriptPayload,
+        );
+      }
+      onConnect?.call();
+    } catch (error) {
+      onError?.call(error);
+      _disconnected(channel);
+    }
   }
 
-  _subUnsub({
+  void _disconnected(WebSocketChannel channel) {
+    if (_ws != channel) return;
+    _ws = null;
+    _connected = false;
+    if (_manuallyClosed || !autoReconnect) {
+      onEnd?.call();
+      return;
+    }
+    // A failed endpoint must not trigger an immediate reconnect loop.
+    _reconnectTimer = Timer(const Duration(seconds: 2), () {
+      onReconnect?.call();
+      _connect();
+    });
+  }
+
+  void _subUnsub({
     required bool isSubscribe,
     required String scriptType,
     required String scriptPayload,
   }) {
-    final encodedSubscription = proto.Subscription.fromJson(jsonEncode({
-      'scriptType': scriptType,
-      'payload': fromHex(scriptPayload),
-      'isSubscribe': isSubscribe,
-    }));
-    if (_ws == null) {
-      throw Exception("Invalid state; _ws is null");
-    }
-    _ws?.sink.add(encodedSubscription);
+    final message = current.WsSub(
+      isUnsub: !isSubscribe,
+      script: current.WsSubScript(
+        scriptType: scriptType,
+        payload: HEX.decode(scriptPayload),
+      ),
+    );
+    _ws?.sink.add(message.writeToBuffer());
   }
 
-  _handleMsg(Uint8List data) async {
-    final msg = proto.SubscribeMsg.fromBuffer(data);
-    print('Message received $msg');
-    if (msg.hasError()) {
-      onMessage?.call(MsgError(
-        errorCode: msg.error.errorCode,
-        msg: msg.error.msg,
-        isUserError: msg.error.isUserError,
-      ));
-    } else if (msg.hasAddedToMempool()) {
-      onMessage?.call(MsgAddedToMempool(
-        txid: toHexRev(msg.addedToMempool.txid),
-      ));
-    } else if (msg.hasRemovedFromMempool()) {
-      onMessage?.call(MsgRemovedFromMempool(
-        txid: toHexRev(msg.removedFromMempool.txid),
-      ));
-    } else if (msg.hasConfirmed()) {
-      onMessage?.call(MsgConfirmed(
-        txid: toHexRev(msg.confirmed.txid),
-      ));
-    } else if (msg.hasReorg()) {
-      onMessage?.call(MsgReorg(
-        txid: toHexRev(msg.reorg.txid),
-      ));
-    } else if (msg.hasBlockConnected()) {
-      onMessage?.call(MsgBlockConnected(
-        blockHash: toHexRev(msg.blockConnected.blockHash),
-      ));
-    } else if (msg.hasBlockDisconnected()) {
-      onMessage?.call(MsgBlockDisconnected(
-        blockHash: toHexRev(msg.blockDisconnected.blockHash),
-      ));
-    } else {
-      if (kDebugMode) {
-        print("Silently ignored unknown Chronik message: $msg");
+  void _handleMsg(List<int> data) {
+    final message = current.WsMsg.fromBuffer(data);
+    if (message.hasError()) {
+      onMessage?.call(
+        MsgError(errorCode: '', msg: message.error.msg, isUserError: true),
+      );
+    } else if (message.hasTx()) {
+      final txid = toHexRev(message.tx.txid);
+      final type = message.tx.msgType;
+      if (type == current.TxMsgType.TX_ADDED_TO_MEMPOOL) {
+        onMessage?.call(MsgAddedToMempool(txid: txid));
+      } else if (type == current.TxMsgType.TX_REMOVED_FROM_MEMPOOL) {
+        onMessage?.call(MsgRemovedFromMempool(txid: txid));
+      } else if (type == current.TxMsgType.TX_CONFIRMED ||
+          type == current.TxMsgType.TX_FINALIZED) {
+        onMessage?.call(MsgConfirmed(txid: txid));
+      } else if (type == current.TxMsgType.TX_INVALIDATED) {
+        onMessage?.call(MsgReorg(txid: txid));
+      }
+    } else if (message.hasBlock()) {
+      final hash = toHexRev(message.block.blockHash);
+      if (message.block.msgType == current.BlockMsgType.BLK_CONNECTED) {
+        onMessage?.call(MsgBlockConnected(blockHash: hash));
+      } else if (message.block.msgType ==
+              current.BlockMsgType.BLK_DISCONNECTED ||
+          message.block.msgType == current.BlockMsgType.BLK_INVALIDATED) {
+        onMessage?.call(MsgBlockDisconnected(blockHash: hash));
       }
     }
   }
@@ -382,17 +431,26 @@ Future<Uint8List> _post({
   required String path,
   required Uint8List data,
 }) async {
-  final response =
-      await http.post(Uri.parse('$url$path'), body: data, headers: {
-    "Content-Type": "application/x-protobuf",
-  });
+  final response = await http.post(
+    Uri.parse('$url$path'),
+    body: data,
+    headers: {"Content-Type": "application/x-protobuf"},
+  );
   ensureResponseErrorThrown(response, path);
   return response.bodyBytes;
 }
 
-ensureResponseErrorThrown(http.Response response, String path) {
-  if (response.statusCode != 200) {
-    final error = proto.Error.fromBuffer(response.bodyBytes);
-    throw Exception('Failed getting $path (${error.errorCode}): ${error.msg}');
+void ensureResponseErrorThrown(http.Response response, String path) {
+  if (response.statusCode < 200 || response.statusCode >= 300) {
+    String message;
+    try {
+      message = current.Error.fromBuffer(response.bodyBytes).msg;
+    } catch (_) {
+      message = 'Invalid error response';
+    }
+    throw current.ChronikException(
+      response.statusCode,
+      'Failed getting $path: $message',
+    );
   }
 }
