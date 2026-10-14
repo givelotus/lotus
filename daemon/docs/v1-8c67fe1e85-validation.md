@@ -56,6 +56,26 @@ Evidence logs:
 - `/tmp/lotus-v1-custom-assembly-chronik-parity.log`
 - `/tmp/lotus-v1-custom-assembly-verifychain.log`
 
+## Corrected release artifact verification
+
+Candidate `a4e6b837` prepares version 11.6.1 from the corrected custom scheduler,
+with source tree `2f67d96795f6c3e6236fbb189838bc28e420a97e`.
+[Native release CI](https://github.com/givelotus/lotus/actions/runs/38621180299)
+passes both macOS arm64 and Linux x86_64 builds, C++/Rust checks and packaging;
+the Linux container check also passes. Publication was skipped.
+
+Downloaded archive checksums, licenses and both source manifests pass. The CI
+source archive is byte-identical to the locally reviewed source archive. All
+eight packaged macOS Mach-O files pass signature verification and reference only
+bundled or system dependency paths. The packaged daemon and CLI report
+`v11.6.1-1ea997e0b2c4`. A fresh disconnected regtest node passes wallet creation,
+inspection/unloading, `verifychain 4 0`, and Chronik genesis parity for the
+160-byte header, merkleized TxId and raw transaction disk bytes; it was stopped
+afterward. Existing nodes/data and published releases remain untouched.
+
+These are verified native candidate artifacts, not published assets or a Guix
+binary reproducibility result. See [artifact hashes and checks](evidence/v1-release-native-20261014.json).
+
 The remaining sections retain the original rebase procedure and historical
 release context; source identity and current evidence are recorded above.
 
