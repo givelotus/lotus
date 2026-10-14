@@ -60,14 +60,14 @@ def encode_value(kind: str, value: Any) -> bytes:
     if kind == 'Signature':
         if type(value) is not bytes or len(value) != 64: raise ValueError('FULL signature must be 64 bytes')
         return value
-    if kind == 'Int':
+    if kind in ('Int', 'Amount'):
         if type(value) is not int or not -(1 << 127) <= value < (1 << 127): raise ValueError('int128 range')
         return value.to_bytes(16, 'little', signed=True)
     if kind == 'Bool':
         if type(value) is not bool: raise ValueError('Bool required')
         return ui(int(value), 16)
     if type(value) is not bytes: raise ValueError('byte value required')
-    if kind in ('PublicKey', 'Bytes32', 'MethodLeafHash', 'ContractRootHash'): expected, bound = 32, None
+    if kind in ('PublicKey', 'Bytes32', 'TokenId', 'MethodLeafHash', 'ContractRootHash'): expected, bound = 32, None
     elif kind.startswith('Bytes(') and kind.endswith(')') and kind[6:-1].isdigit(): expected, bound = None, int(kind[6:-1])
     elif kind == 'Bytes': expected, bound = None, None
     else: raise ValueError('unsupported argument type')
@@ -78,7 +78,7 @@ def encode_value(kind: str, value: Any) -> bytes:
 
 
 def valid_type(kind: str) -> bool:
-    if kind in ('PublicKey', 'Signature', 'Bytes32', 'Int', 'Bool', 'MethodLeafHash', 'ContractRootHash'):
+    if kind in ('PublicKey', 'Signature', 'Bytes32', 'TokenId', 'Int', 'Amount', 'Bool', 'MethodLeafHash', 'ContractRootHash'):
         return True
     match = re.fullmatch(r'Bytes\(([1-9][0-9]*)\)', kind)
     return match is not None and int(match.group(1)) <= 8192
@@ -111,7 +111,7 @@ def indexed_root(leaves: list[bytes]) -> bytes:
     return nodes[0]
 
 
-def selected(artifact: dict, method_name: str) -> dict:
+def selected(artifact: dict, method_name: str, *, allow_mint: bool = False) -> dict:
     if artifact.get('schema') != 'lotus-v2/contract-artifact/2' or artifact.get('target') != TARGET: raise ValueError('unsupported artifact')
     policy = artifact['policy']
     if policy.get('treeRecipe') != 'sorted-leaves-largest-power-split-v1' or policy['branches'] != [policy['root']] or policy['paths'] != [[0]]:
@@ -125,7 +125,7 @@ def selected(artifact: dict, method_name: str) -> dict:
         kind, value = val['type'], val['value']
         if kind == 'Bool':
             if type(value) is not bool: raise ValueError('noncanonical Bool binding')
-        elif kind == 'Int':
+        elif kind in ('Int', 'Amount'):
             if type(value) is not str or not re.fullmatch(r'0|-[1-9][0-9]*|[1-9][0-9]*', value): raise ValueError('noncanonical Int binding')
             encode_value(kind, int(value))
         elif kind == 'Signature':
@@ -160,6 +160,8 @@ def selected(artifact: dict, method_name: str) -> dict:
     if tree(ordered).hex() != policy['root']: raise ValueError('method tree recipe mismatch')
     method = next((m for m in methods if m['name'] == method_name), None)
     if method is None: raise ValueError('unknown method')
+    if not allow_mint and (artifact.get('kind') == 'token' or method.get('invocation') == 'mint'):
+        raise ValueError('mint artifact requires transaction runtime')
     leaf = tagged('branch', b'\x00' + sized(hx(method['scriptHex']))).hex()
     if method['leaf'] != leaf or method_root(method['scriptHex'], method['proof']) != method['root'] or method['root'] != policy['root']:
         raise ValueError('method proof or root mismatch')

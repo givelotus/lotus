@@ -4,8 +4,9 @@ import { encodeOutput, type PaymentOutput } from './runtime.js';
 
 export type ContractArtifact = {
   schema: 'lotus-v2/contract-artifact/2'; target: 'P01-P02-P03-candidate-2026-10-14'; contract: string;
+  kind?: 'contract' | 'token';
   constructor: { name: string; type: string }[]; bindings: { name: string; type: string; value: string | boolean }[];
-  methods: { name: string; args: { name: string; type: string }[]; scriptHex: string; leaf: string; proof: string[]; root: string }[];
+  methods: { name: string; invocation?: 'spend' | 'mint'; args: { name: string; type: string }[]; scriptHex: string; leaf: string; proof: string[]; root: string }[];
   policy: { branches: string[]; paths: number[][]; root: string; treeRecipe: string };
 };
 export type CallContext = { chainId: string; prevTxid: string; prevIndex: number; sequence: number; coin: PaymentOutput; outputs: PaymentOutput[]; lock?: bigint; profile: 'P01-P02-P03-candidate-2026-10-14' };
@@ -17,7 +18,7 @@ export type CallFinal = { wire: Uint8Array; txid: string; txhash: string; stages
 function u32(n: number): Uint8Array { if (!Number.isInteger(n) || n < 0 || n > 0xffffffff) throw new Error('u32 range'); return uint(BigInt(n), 4); }
 function equal(a: unknown, b: unknown): boolean { return JSON.stringify(a) === JSON.stringify(b); }
 function validName(value: string): boolean { return typeof value === 'string' && /^[A-Za-z_][A-Za-z_0-9]*$/.test(value); }
-function validType(type: string): boolean { return ['PublicKey', 'Signature', 'Bytes32', 'Int', 'Bool', 'MethodLeafHash', 'ContractRootHash'].includes(type) || /^Bytes\(([1-9][0-9]*)\)$/.test(type) && Number(type.slice(6, -1)) <= 8192; }
+function validType(type: string): boolean { return ['PublicKey', 'Signature', 'Bytes32', 'TokenId', 'Int', 'Amount', 'Bool', 'MethodLeafHash', 'ContractRootHash'].includes(type) || /^Bytes\(([1-9][0-9]*)\)$/.test(type) && Number(type.slice(6, -1)) <= 8192; }
 function node(a: Uint8Array, b: Uint8Array): Uint8Array {
   let cmp = 0;
   for (let i = 31; i >= 0; i--) if (a[i] !== b[i]) { cmp = a[i]! - b[i]!; break; }
@@ -31,6 +32,7 @@ export function methodRoot(scriptHex: string, proof: string[]): string {
 }
 export function assertContractArtifact(a: ContractArtifact): void {
   if (a.schema !== 'lotus-v2/contract-artifact/2' || a.target !== 'P01-P02-P03-candidate-2026-10-14' || !validName(a.contract)) throw new Error('unsupported artifact');
+  if (a.kind !== undefined && a.kind !== 'contract' && a.kind !== 'token') throw new Error('unsupported artifact kind');
   if (a.policy.treeRecipe !== 'sorted-leaves-largest-power-split-v1' || a.policy.branches.length !== 1 || a.policy.branches[0] !== a.policy.root || !equal(a.policy.paths, [[0]])) throw new Error('unsupported policy');
   unhex(a.policy.root, 32);
   if (!Array.isArray(a.constructor) || !Array.isArray(a.bindings) || a.constructor.length !== a.bindings.length) throw new Error('constructor/binding mismatch');
@@ -39,7 +41,7 @@ export function assertContractArtifact(a: ContractArtifact): void {
     const declaration = a.constructor[i]!, binding = a.bindings[i]!;
     if (!validName(declaration.name) || !validType(declaration.type) || binding.name !== declaration.name || binding.type !== declaration.type) throw new Error('constructor/binding mismatch');
     if (binding.type === 'Bool') { if (typeof binding.value !== 'boolean') throw new Error('noncanonical Bool binding'); }
-    else if (binding.type === 'Int') {
+    else if (binding.type === 'Int' || binding.type === 'Amount') {
       if (typeof binding.value !== 'string' || !/^(0|-?[1-9][0-9]*)$/.test(binding.value)) throw new Error('noncanonical Int binding');
       encodeCallValue('Int', BigInt(binding.value));
     } else {
@@ -54,7 +56,7 @@ export function assertContractArtifact(a: ContractArtifact): void {
   if (!Array.isArray(a.methods) || !a.methods.length || a.methods.length > 16 || new Set(a.methods.map(m => m.name)).size !== a.methods.length) throw new Error('invalid methods');
   const leaves: Uint8Array[] = [];
   for (const m of a.methods) {
-    if (!validName(m.name) || !Array.isArray(m.args) || new Set(m.args.map(x => x.name)).size !== m.args.length || m.args.some(x => !validName(x.name) || !validType(x.type))) throw new Error('invalid method arguments');
+    if (!validName(m.name) || (m.invocation !== undefined && m.invocation !== 'spend' && m.invocation !== 'mint') || !Array.isArray(m.args) || new Set(m.args.map(x => x.name)).size !== m.args.length || m.args.some(x => !validName(x.name) || !validType(x.type))) throw new Error('invalid method arguments');
     const script = unhex(m.scriptHex);
     if (!script.length || script.length > 8192) throw new Error('script width');
     const leaf = tagged('branch', concat(Uint8Array.of(0), bytes(script)));
@@ -74,6 +76,7 @@ function methodOf(a: ContractArtifact, name: string): ContractArtifact['methods'
   assertContractArtifact(a);
   const m = a.methods.find(x => x.name === name);
   if (!m) throw new Error('unknown method');
+  if (a.kind === 'token' || m.invocation === 'mint') throw new Error('mint artifact requires transaction runtime');
   const leaf = hex(tagged('branch', concat(Uint8Array.of(0), bytes(unhex(m.scriptHex)))));
   if (m.leaf !== leaf || methodRoot(m.scriptHex, m.proof) !== m.root || m.root !== a.policy.root) throw new Error('method proof or root mismatch');
   if (new Set(m.args.map(x => x.name)).size !== m.args.length) throw new Error('duplicate argument names');
@@ -88,12 +91,12 @@ export function encodeCallValue(type: string, value: CallValue): Uint8Array {
     if (!(value instanceof Uint8Array) || value.length !== 64) throw new Error('FULL signature must be 64 bytes');
     return Uint8Array.from(value);
   }
-  if (type === 'Int') return int128(value as bigint);
+  if (type === 'Int' || type === 'Amount') return int128(value as bigint);
   if (type === 'Bool') {
     if (typeof value !== 'boolean') throw new Error('Bool required');
     return int128(value ? 1n : 0n);
   }
-  const fixed = ['PublicKey', 'Bytes32', 'MethodLeafHash', 'ContractRootHash'].includes(type) ? 32 : undefined;
+  const fixed = ['PublicKey', 'Bytes32', 'TokenId', 'MethodLeafHash', 'ContractRootHash'].includes(type) ? 32 : undefined;
   const bounded = /^Bytes\(([0-9]+)\)$/.exec(type)?.[1];
   if (!(value instanceof Uint8Array)) throw new Error('byte value required');
   if (fixed !== undefined && value.length !== Number(fixed)) throw new Error(`${type} length`);
