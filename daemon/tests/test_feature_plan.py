@@ -63,8 +63,19 @@ class FeatureSelectionTests(unittest.TestCase):
                          ["04-topological-mempool-check.patch"])
         self.assertEqual(plan["cmake_args"], [])
         self.assertEqual(plan["features"][0]["requires"], [])
+
+    def test_abc_derived_diagnostics_are_optional_independent_candidates(self):
+        for target in ("v1", "ecash", "doged"):
+            with self.assertRaises(ValueError):
+                planner.resolve(target, ["mempool-check"], False)
+            plan = planner.resolve(target, ["mempool-check", "chronik"], True)
+            self.assertEqual(len(plan["patches"]), 1)
+            self.assertIn("candidates/mempool-diagnostics/" + target,
+                          plan["patches"][0])
+            self.assertEqual(plan["features"][0]["requires"], [])
+            self.assertEqual(plan["cmake_args"], ["-DBUILD_CHRONIK=ON"])
         with self.assertRaises(ValueError):
-            planner.resolve("ecash", ["mempool-check"], True)
+            planner.resolve("bitcoin", ["mempool-check"], True)
 
     def test_bchn_disable_then_remove_has_only_its_explicit_dependency(self):
         default = planner.resolve("bchn", ["zeromq-default-off"], True)

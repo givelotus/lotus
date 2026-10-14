@@ -67,11 +67,16 @@ def resolve(target, names, allow_experimental):
             evidence.append({'feature': name, 'kind': 'integrated-test-only',
                              'requires': ['complete-v1-series']})
         elif name == 'mempool-check':
-            if target != 'bchn':
+            if target not in ('bchn', 'v1', 'ecash', 'doged'):
                 raise ValueError(f'{target}: no topological consistency-check candidate is implemented')
             if not allow_experimental:
-                raise ValueError('BCHN consistency-check candidate requires --allow-experimental')
-            patches.append(str(DAEMON / 'patches' / 'bchn' / '04-topological-mempool-check.patch'))
+                raise ValueError('Consistency-check candidate requires --allow-experimental')
+            if target == 'bchn':
+                patch = DAEMON / 'patches' / 'bchn' / '04-topological-mempool-check.patch'
+            else:
+                patch = (DAEMON / 'candidates' / 'mempool-diagnostics' / target /
+                         '0001-avoid-redundant-ancestor-check.patch')
+            patches.append(str(patch))
             evidence.append({'feature': name, 'kind': 'experimental-diagnostic-optimization', 'requires': [],
                              'warning': 'Optimizes optional consistency checking; no admission-policy change'})
         elif name == 'long-chain-container-test' and target == 'bchn':
