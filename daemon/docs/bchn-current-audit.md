@@ -120,3 +120,19 @@ Historical 01/02 are not selectable at the current pin. Optional ZeroMQ source r
 deletes the interface, source and dependency plumbing. Neither depends on NNG,
 mining or mempool changes. This is a deliberate interface/dependency choice,
 not a performance claim. See [the removal audit](bchn-zeromq-removal.md).
+
+## Upstream submissions
+
+Two independent merge requests target the audited master revision:
+
+- [MR 2174: ready-child fee priority](https://gitlab.com/bitcoin-cash-node/bitcoin-cash-node/-/merge_requests/2174), source commit `640b8bd1c8e88107421a201828eaaf2b46802b28`.
+- [MR 2175: topological consistency checking](https://gitlab.com/bitcoin-cash-node/bitcoin-cash-node/-/merge_requests/2175), source commit `cdc388c7f0ecf3562865143bb85ff03e14d31703`.
+
+Each is one commit directly on `abd433abe04f74780744b9eac06731f3690ce68a`.
+Submission exports preserve the implementation and add formatting of new hunks,
+wrapped rationale and explicit test plans; mining also explicitly includes
+`<algorithm>` in its test file. The focused native mining/mempool suites pass
+after this cleanup. The maintained mailbox hashes and combination proofs above
+remain scoped to their original exports; they are not claims of byte-identical
+submission trees. Neither MR includes NNG or ZeroMQ changes. GitLab CI and
+maintainer review remain separate from the local validation.
