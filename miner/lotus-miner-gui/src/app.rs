@@ -8,12 +8,14 @@ use eframe::{
     },
     epi,
 };
-use lotus_miner_lib::{settings, ConfigSettings, LogEntry, Miner, Server, ServerRef};
+use lotus_miner_lib::{settings, ConfigSettings, LogEntry, Miner, Protocol, Server, ServerRef};
 use serde::{Deserialize, Serialize};
 use tokio::runtime::Runtime;
 
 #[derive(Deserialize, Serialize, Debug, Clone, Default)]
 pub struct UserSettings {
+    #[serde(default)]
+    protocol: Protocol,
     mine_to_address: String,
     intensity: i32,
     bitcoind_url: String,
@@ -44,6 +46,7 @@ impl MinerApp {
     pub fn load() -> Self {
         let user_settings = match ConfigSettings::load(false) {
             Ok(config_settings) => UserSettings {
+                protocol: config_settings.protocol,
                 mine_to_address: config_settings.mine_to_address,
                 intensity: config_settings.kernel_size.try_into().unwrap(),
                 bitcoind_url: config_settings.rpc_url,
@@ -55,6 +58,7 @@ impl MinerApp {
             Err(err) => {
                 eprintln!("Failed to load config, falling back to defaults: {}", err);
                 UserSettings {
+                    protocol: Protocol::V1,
                     mine_to_address: String::new(),
                     intensity: settings::DEFAULT_KERNEL_SIZE.try_into().unwrap(),
                     bitcoind_url: settings::DEFAULT_URL.to_string(),
@@ -66,6 +70,7 @@ impl MinerApp {
             }
         };
         let config = ConfigSettings {
+            protocol: user_settings.protocol,
             rpc_url: user_settings.bitcoind_url.clone(),
             rpc_user: user_settings.bitcoind_user.clone(),
             rpc_password: user_settings.bitcoind_password.clone(),
@@ -76,7 +81,10 @@ impl MinerApp {
         };
         MinerApp {
             user_settings,
-            server: Arc::new(Server::from_config(config, Duration::from_millis(300))),
+            server: Arc::new(
+                Server::from_config(config, Duration::from_millis(300))
+                    .unwrap_or_else(|err| panic!("{}", err)),
+            ),
             device_names: Miner::list_device_names(),
             rt: tokio::runtime::Runtime::new().unwrap(),
             logs: Vec::new(),
@@ -107,6 +115,9 @@ impl epi::App for MinerApp {
                 }
             }
             None => println!("No storage"),
+        }
+        if self.user_settings.protocol == Protocol::V2 {
+            panic!("V2 mining is unavailable: the daemon V2 job API and tagged-BLAKE3 OpenCL kernel are not integrated");
         }
         std::thread::spawn({
             let server = Arc::clone(&self.server);

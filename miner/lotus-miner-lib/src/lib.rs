@@ -2,10 +2,11 @@ mod block;
 mod miner;
 pub mod settings;
 mod sha256;
+pub mod v2_header;
 
 use eyre::Result;
 pub use miner::Miner;
-pub use settings::ConfigSettings;
+pub use settings::{ConfigSettings, Protocol};
 
 use std::{
     convert::TryInto,
@@ -78,7 +79,12 @@ struct BlockState {
 pub type ServerRef = Arc<Server>;
 
 impl Server {
-    pub fn from_config(config: ConfigSettings, report_hashrate_interval: Duration) -> Self {
+    pub fn from_config(config: ConfigSettings, report_hashrate_interval: Duration) -> Result<Self> {
+        if config.protocol == Protocol::V2 {
+            return Err(eyre::eyre!(
+                "V2 mining is unavailable: the daemon V2 job API and tagged-BLAKE3 OpenCL kernel are not integrated"
+            ));
+        }
         let mining_settings = MiningSettings {
             local_work_size: 256,
             inner_iter_size: 16,
@@ -88,7 +94,7 @@ impl Server {
             gpu_indices: vec![config.gpu_index as usize],
         };
         let miner = Miner::setup(mining_settings.clone()).unwrap();
-        Server {
+        Ok(Server {
             miner: std::sync::Mutex::new(miner),
             client: reqwest::Client::new(),
             node_settings: Mutex::new(NodeSettings {
@@ -109,7 +115,7 @@ impl Server {
             metrics_nonces: AtomicU64::new(0),
             log: Log::new(),
             report_hashrate_interval,
-        }
+        })
     }
 
     pub async fn run(self: ServerRef) -> Result<(), Box<dyn std::error::Error>> {
@@ -424,5 +430,28 @@ impl Display for HashrateEntry {
             self.timestamp.to_rfc3339(),
             self.hashrate / 1_000_000.0
         )
+    }
+}
+
+#[cfg(test)]
+mod protocol_tests {
+    use super::*;
+
+    #[test]
+    fn v2_selection_fails_before_gpu_or_rpc() {
+        let config = ConfigSettings {
+            protocol: Protocol::V2,
+            rpc_url: "http://127.0.0.1:1".into(),
+            rpc_user: "".into(),
+            rpc_password: "".into(),
+            rpc_poll_interval: 3,
+            mine_to_address: "".into(),
+            kernel_size: 21,
+            gpu_index: -1,
+        };
+        let err = Server::from_config(config, Duration::from_secs(1))
+            .err()
+            .unwrap();
+        assert!(err.to_string().contains("V2 mining is unavailable"));
     }
 }

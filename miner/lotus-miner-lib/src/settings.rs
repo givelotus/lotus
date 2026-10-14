@@ -2,7 +2,7 @@ use std::io::Write;
 
 use clap::{crate_description, crate_version, load_yaml, App};
 use config::{Config, ConfigError, File};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 pub const DEFAULT_URL: &str = "http://127.0.0.1:10604";
 pub const DEFAULT_USER: &str = "lotus";
@@ -12,8 +12,17 @@ pub const FOLDER_DIR: &str = ".lotus-miner";
 pub const DEFAULT_KERNEL_SIZE: i64 = 21;
 pub const DEFAULT_GPU_INDEX: i64 = 0;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum Protocol {
+    #[default]
+    V1,
+    V2,
+}
+
 #[derive(Debug, Deserialize)]
 pub struct ConfigSettings {
+    pub protocol: Protocol,
     pub rpc_url: String,
     pub rpc_user: String,
     pub rpc_password: String,
@@ -24,6 +33,7 @@ pub struct ConfigSettings {
 }
 
 const DEFAULT_CONFIG_FILE_CONTENT: &str = r#"mine_to_address = ""
+protocol = "v1"
 rpc_url = "http://127.0.0.1:10604"
 rpc_poll_interval = 3
 rpc_user = "lotus"
@@ -53,6 +63,8 @@ impl ConfigSettings {
         s.set_default("rpc_password", DEFAULT_PASSWORD)?;
         s.set_default("kernel_size", DEFAULT_KERNEL_SIZE)?;
         s.set_default("gpu_index", DEFAULT_GPU_INDEX)?;
+        s.set_default("protocol", "v1")?;
+        s.set_default("mine_to_address", "")?;
 
         // Load config from file
         let default_config = home_dir;
@@ -144,6 +156,10 @@ impl ConfigSettings {
         // Set the GPU index
         if let Some(gpu_index) = matches.value_of("gpu_index") {
             s.set("gpu_index", gpu_index.parse::<i64>().unwrap())?;
+        }
+
+        if let Some(protocol) = matches.value_of("protocol") {
+            s.set("protocol", protocol)?;
         }
 
         s.try_into()

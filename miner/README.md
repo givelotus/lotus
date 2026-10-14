@@ -4,6 +4,11 @@ A solo miner for Lotus (XPI) using OpenCL and a local `lotusd` JSON-RPC server.
 The CLI and optional desktop GUI share the same mining library. They use Lotus's
 160-byte block headers and `getrawunsolvedblock`/`submitblock` RPCs.
 
+The CLI accepts `--protocol=v1|v2`, with V1 as the default. V2 selection exits
+with an unsupported error before mining because its daemon job API and OpenCL
+kernel are pending. The candidate V2 CPU header hash and full integration gates
+are described in [V2-MINING.md](V2-MINING.md).
+
 ## Build
 
 Install [Rust with rustup](https://rustup.rs/) and your platform's native C/C++
