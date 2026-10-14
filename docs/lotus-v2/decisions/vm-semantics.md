@@ -6,98 +6,206 @@ Decision packet P03, October 9, 2026. **Recommended candidate**, not frozen. Res
 
 Stacks contain bounded byte strings. `N(x)` is exactly sixteen-byte signed little-endian int128. `U(x)` interprets exactly sixteen bytes as an unsigned limb; its output is also sixteen raw bytes. Boolean consumers accept only N(0)/N(1). Comparisons and signatures produce those canonical booleans. For ordinary execution, main and alternate stacks start as described in the ABI; finish requires main=[N(1)], alternate=[]. The success-scan exception below initializes neither stack. Every push, duplicate, move and concatenation must satisfy element/count/total-byte limits before mutation.
 
-First perform the bounded OP_SUCCESS_N scan specified below. If it finds no unassigned success opcode, decode the entire script to structured syntax before execution, including unreachable regions; malformed pushes and unmatched structures reject even in skipped code. Push data bytes are never opcodes. Canonical push framing is one-byte fixed length for 1..75 bytes, or opcode 4c followed by shortest `Bytes(data)` for empty data or lengths ≥76. Bytes 4d and 4e have no legacy PUSHDATA meaning: they are unassigned OP_SUCCESS_N opcodes. Constant opcodes push N values. A fixed-length push of sixteen bytes is allowed even if a constant opcode could produce the same stack item: different programs have different commitments; canonical parsing does not imply a unique program for each computation.
+First perform the bounded OP_SUCCESS_N scan specified below. If it finds no unassigned success opcode, decode the entire script to structured syntax before execution, including unreachable regions; malformed pushes and unmatched structures reject even in skipped code. Push data bytes are never opcodes. Canonical push framing is one-byte fixed length for 1..75 bytes, or opcode 4c followed by shortest `Bytes(data)` for empty data or lengths ≥76. Bytes 4d and 4e mean NEGATIVE_ONE and ONE; they have no legacy PUSHDATA meaning. Constant opcodes push N values. A fixed-length push of sixteen bytes is allowed even if a constant opcode could produce the same stack item: different programs have different commitments; canonical parsing does not imply a unique program for each computation.
 
 ## Closed candidate allocation
 
 Every byte not assigned an instruction in these tables is OP_SUCCESS_N, where N is its unsigned decimal byte value. An unassigned success opcode unconditionally succeeds for the entire invocation under the scan below; it does not push true and continue. Each assigned byte has the semantics below or in the referenced packet. This table is an allocation proposal requiring byte-for-byte vectors before D07 closes. Historical Bitcoin, Mitra and BIGINT assignments are not aliases. NOP remains permanently a NOP.
+
+The [machine-readable opcode registry](../tools/opcodes.json) owns byte assignments. These tables use the same names and bytes; the structural checker verifies their agreement. This pre-genesis allocation groups literals, control, stack, bytes, arithmetic, cryptography, transaction/input/output introspection, and invocation/locks. It is deliberately incompatible with Bitcoin Script and earlier V2 draft bytecode; regenerate scripts, branch roots, token IDs, transaction IDs and signatures together. Unassigned gaps remain success extension points, not aliases for old instructions.
+
+### Literals (`00`–`5d`)
 
 | Hex | Instruction | Stack effect / meaning (rightmost is top) |
 | --- | --- | --- |
 | 00 | ZERO | push N(0) |
 | 01–4b | PUSH_n | push next n bytes, 1≤n≤75 |
 | 4c | PUSHDATA | push Bytes payload; only length 0 or ≥76 |
-| 4f | NEGATIVE_ONE | push N(−1) |
-| 51–60 | ONE through SIXTEEN | push corresponding N |
-| 61 | NOP | no effect; permanently no effect (not an extension point) |
-| 63 | IF | pop Boolean; execute selected arm |
-| 64 | NOTIF | IF with inverted Boolean |
-| 67 | ELSE | structural alternate arm delimiter |
-| 68 | ENDIF | structural conditional end |
-| 69 | VERIFY | pop Boolean; false rejects |
-| 6a | RETURN | reject when executed |
-| 6b | TOALTSTACK | main top moves to alternate top |
-| 6c | FROMALTSTACK | alternate top moves to main top |
-| 6d | 2DROP | a b → empty |
-| 6e | 2DUP | a b → a b a b |
-| 6f | 3DUP | a b c → a b c a b c |
-| 70 | 2OVER | a b c d → a b c d a b |
-| 71 | 2ROT | a b c d e f → c d e f a b |
-| 72 | 2SWAP | a b c d → c d a b |
-| 74 | DEPTH | push N(main item count before push) |
-| 75 | DROP | x → empty |
-| 76 | DUP | x → x x |
-| 77 | NIP | a b → b |
-| 78 | OVER | a b → a b a |
-| 79 | PICK | pop numeric n; copy nth remaining item from top, top=0 |
-| 7a | ROLL | pop numeric n; move nth remaining item to top |
-| 7b | ROT | a b c → b c a |
-| 7c | SWAP | a b → b a |
-| 7d | TUCK | a b → b a b |
-| 7e | CAT | a b → a concatenated with b |
-| 7f | SPLIT | bytes N(i) → bytes[0:i] bytes[i:] |
-| 80 | NUM2BIN | N(x) N(width) → signed LE encoding of x at exact width |
-| 81 | BIN2NUM | 0..16 bytes interpreted signed LE → N(x); empty → N(0) |
-| 82 | SIZE | bytes → bytes N(byte length) |
-| 83 | INVERT | bytes → bitwise complement of every byte |
-| 84 | AND | equal-length a b → bytewise a AND b |
-| 85 | OR | equal-length a b → bytewise a OR b |
-| 86 | XOR | equal-length a b → bytewise a XOR b |
-| 87 | EQUAL | a b → Boolean byte equality |
-| 88 | EQUALVERIFY | EQUAL then VERIFY |
-| 8b | 1ADD | N(a) → N(a+1), checked |
-| 8c | 1SUB | N(a) → N(a−1), checked |
-| 8f | NEGATE | N(a) → N(−a), checked |
-| 90 | ABS | N(a) → N(abs(a)), checked |
-| 91 | NOT | Boolean → inverted Boolean |
-| 92 | 0NOTEQUAL | N(a) → Boolean(a≠0) |
-| 93 | ADD | N(a) N(b) → N(a+b), checked |
-| 94 | SUB | N(a) N(b) → N(a−b), checked |
-| 95 | MUL | N(a) N(b) → N(a*b), checked |
-| 96 | DIV | N(a) N(b) → N(trunc_toward_zero(a/b)) |
-| 97 | MOD | N(a) N(b) → N(a−trunc_toward_zero(a/b)*b) |
-| 98 | RAWLEFTBITSHIFT | bytes N(k) → fixed-width logical shift defined below |
-| 99 | MULPOW2 | N(a) N(k) → checked a*2^k or truncating division |
-| 9a | BOOLAND | Boolean a b → Boolean(a AND b) |
-| 9b | BOOLOR | Boolean a b → Boolean(a OR b) |
-| 9c | NUMEQUAL | N(a) N(b) → Boolean(a=b) |
-| 9d | NUMEQUALVERIFY | NUMEQUAL then VERIFY |
-| 9e | NUMNOTEQUAL | N(a) N(b) → Boolean(a≠b) |
-| 9f | LESSTHAN | N(a) N(b) → Boolean(a<b) |
-| a0 | GREATERTHAN | N(a) N(b) → Boolean(a>b) |
-| a1 | LESSTHANOREQUAL | N(a) N(b) → Boolean(a≤b) |
-| a2 | GREATERTHANOREQUAL | N(a) N(b) → Boolean(a≥b) |
-| a3 | MIN | N(a) N(b) → N(min(a,b)) |
-| a4 | MAX | N(a) N(b) → N(max(a,b)) |
-| a5 | WITHIN | N(x) N(lo) N(hi) → Boolean(lo≤x<hi) |
-| a8 | SHA256 | bytes → SHA256(bytes) |
-| aa | HASH256 | bytes → SHA256(SHA256(bytes)) |
-| ac | CHECKSIG | signature public_key → Boolean, P01 transaction message; 64-byte signature = mode 00, 65-byte = explicit partial mode |
-| ad | CHECKSIGVERIFY | CHECKSIG then VERIFY |
-| b1 | CHECKLOCKTIMEVERIFY | N(kind) N(bound) → empty, absolute transaction lock check |
-| b2 | CHECKSEQUENCEVERIFY | N(kind) N(bound) → empty, current consuming input's relative lock check |
-| b4 | ADDCARRY | U(a) U(b) N(c) → U(low128(a+b+c)) N(carry) |
-| b5 | SUBCARRY | U(a) U(b) N(c) → U((a−b−c) mod 2^128) N(borrow) |
-| b6 | MUL128_WIDE | U(a) U(b) → U(high128(a*b)) U(low128(a*b)) |
-| ba | CHECKDATASIG | signature message public_key N(algorithm) → Boolean, profile below |
-| bd | LOG | N(x) → N(LOG2_Q64(x)), algorithm below |
-| be | SQRT | N(x) → N(floor(sqrt(x))); x≥0 |
-| bf | BLAKE3 | bytes → unkeyed 32-byte BLAKE3(bytes), no application tag |
-| c0–df | Introspection, branch continuation and loop allocation | Explicit table below; d3 is OP_SUCCESS_211 |
-| e0–ef | Invocation introspection, branch checks, ordering, tree hashes and Merkle roots | Explicit table below |
-| all otherwise unassigned bytes | OP_SUCCESS_N | Unconditional invocation success during the scan below |
+| 4d | NEGATIVE_ONE | push N(−1) |
+| 4e | ONE | push N(1) |
+| 4f | TWO | push N(2) |
+| 50 | THREE | push N(3) |
+| 51 | FOUR | push N(4) |
+| 52 | FIVE | push N(5) |
+| 53 | SIX | push N(6) |
+| 54 | SEVEN | push N(7) |
+| 55 | EIGHT | push N(8) |
+| 56 | NINE | push N(9) |
+| 57 | TEN | push N(10) |
+| 58 | ELEVEN | push N(11) |
+| 59 | TWELVE | push N(12) |
+| 5a | THIRTEEN | push N(13) |
+| 5b | FOURTEEN | push N(14) |
+| 5c | FIFTEEN | push N(15) |
+| 5d | SIXTEEN | push N(16) |
 
-Existing template spellings may prefix `OP_`; that does not alter bytes. Earlier drafts assigned `UTXOPROOFVERIFY` at byte `bb`; in-script global UTXO proofs are rejected because proving against a moving global `UtxoRoot` inside script creates TOCTOU race conditions and violates C22a monotone validity (see [rationale](../rationale.md#2-op_utxoproofverify-in-script-global-utxo-state-proofs)). Byte `bb` is therefore unassigned (`OP_SUCCESS_187`), P02's compact `UtxoRoot` proofs remain strictly for RPCs, snapshots and optional `ProvenTx` relay packages, and contracts authenticate their own internal sets and key-value maps in script with `MERKLEROOT_SORTED` (`ee`) and `MERKLEROOT_INDEXED` (`ef`).
+### Control (`60`–`6b`)
+
+| Hex | Instruction | Stack effect / meaning (rightmost is top) |
+| --- | --- | --- |
+| 60 | NOP | no effect; permanently no effect (not an extension point) |
+| 61 | IF | pop Boolean; execute selected arm |
+| 62 | NOTIF | IF with inverted Boolean |
+| 63 | ELSE | structural alternate arm delimiter |
+| 64 | ENDIF | structural conditional end |
+| 65 | VERIFY | pop Boolean; false rejects |
+| 66 | RETURN | reject when executed |
+| 67 | ENUMERATE_INPUTS | structured loop with fixed input_count bound |
+| 68 | ENUMERATE_OUTPUTS | structured loop with fixed output_count bound |
+| 69 | ENUMERATE | pop N in 0..256; structured loop |
+| 6a | ENDENUMERATE | structural loop end |
+| 6b | BREAK | pop N(depth); exit that many enclosing active loops |
+
+### Stack (`70`–`81`)
+
+| Hex | Instruction | Stack effect / meaning (rightmost is top) |
+| --- | --- | --- |
+| 70 | TOALTSTACK | main top moves to alternate top |
+| 71 | FROMALTSTACK | alternate top moves to main top |
+| 72 | 2DROP | a b → empty |
+| 73 | 2DUP | a b → a b a b |
+| 74 | 3DUP | a b c → a b c a b c |
+| 75 | 2OVER | a b c d → a b c d a b |
+| 76 | 2ROT | a b c d e f → c d e f a b |
+| 77 | 2SWAP | a b c d → c d a b |
+| 78 | DEPTH | push N(main item count before push) |
+| 79 | DROP | x → empty |
+| 7a | DUP | x → x x |
+| 7b | NIP | a b → b |
+| 7c | OVER | a b → a b a |
+| 7d | PICK | pop numeric n; copy nth remaining item from top, top=0 |
+| 7e | ROLL | pop numeric n; move nth remaining item to top |
+| 7f | ROT | a b c → b c a |
+| 80 | SWAP | a b → b a |
+| 81 | TUCK | a b → b a b |
+
+### Bytes (`88`–`94`)
+
+| Hex | Instruction | Stack effect / meaning (rightmost is top) |
+| --- | --- | --- |
+| 88 | CAT | a b → a concatenated with b |
+| 89 | SPLIT | bytes N(i) → bytes[0:i] bytes[i:] |
+| 8a | NUM2BIN | N(x) N(width) → signed LE encoding of x at exact width |
+| 8b | BIN2NUM | 0..16 bytes interpreted signed LE → N(x); empty → N(0) |
+| 8c | SIZE | bytes → bytes N(byte length) |
+| 8d | INVERT | bytes → bitwise complement of every byte |
+| 8e | AND | equal-length a b → bytewise a AND b |
+| 8f | OR | equal-length a b → bytewise a OR b |
+| 90 | XOR | equal-length a b → bytewise a XOR b |
+| 91 | EQUAL | a b → Boolean byte equality |
+| 92 | EQUALVERIFY | EQUAL then VERIFY |
+| 93 | LESSSWAP | a b → the same two items with the smaller one deeper and the larger on top, compared as unsigned little-endian integers |
+| 94 | RAWLEFTBITSHIFT | bytes N(k) → fixed-width logical shift defined below |
+
+### Arithmetic (`98`–`b4`)
+
+| Hex | Instruction | Stack effect / meaning (rightmost is top) |
+| --- | --- | --- |
+| 98 | 1ADD | N(a) → N(a+1), checked |
+| 99 | 1SUB | N(a) → N(a−1), checked |
+| 9a | NEGATE | N(a) → N(−a), checked |
+| 9b | ABS | N(a) → N(abs(a)), checked |
+| 9c | NOT | Boolean → inverted Boolean |
+| 9d | 0NOTEQUAL | N(a) → Boolean(a≠0) |
+| 9e | ADD | N(a) N(b) → N(a+b), checked |
+| 9f | SUB | N(a) N(b) → N(a−b), checked |
+| a0 | MUL | N(a) N(b) → N(a*b), checked |
+| a1 | DIV | N(a) N(b) → N(trunc_toward_zero(a/b)) |
+| a2 | MOD | N(a) N(b) → N(a−trunc_toward_zero(a/b)*b) |
+| a3 | MULPOW2 | N(a) N(k) → checked a*2^k or truncating division |
+| a4 | BOOLAND | Boolean a b → Boolean(a AND b) |
+| a5 | BOOLOR | Boolean a b → Boolean(a OR b) |
+| a6 | NUMEQUAL | N(a) N(b) → Boolean(a=b) |
+| a7 | NUMEQUALVERIFY | NUMEQUAL then VERIFY |
+| a8 | NUMNOTEQUAL | N(a) N(b) → Boolean(a≠b) |
+| a9 | LESSTHAN | N(a) N(b) → Boolean(a<b) |
+| aa | GREATERTHAN | N(a) N(b) → Boolean(a>b) |
+| ab | LESSTHANOREQUAL | N(a) N(b) → Boolean(a≤b) |
+| ac | GREATERTHANOREQUAL | N(a) N(b) → Boolean(a≥b) |
+| ad | MIN | N(a) N(b) → N(min(a,b)) |
+| ae | MAX | N(a) N(b) → N(max(a,b)) |
+| af | WITHIN | N(x) N(lo) N(hi) → Boolean(lo≤x<hi) |
+| b0 | ADDCARRY | U(a) U(b) N(c) → U(low128(a+b+c)) N(carry) |
+| b1 | SUBCARRY | U(a) U(b) N(c) → U((a−b−c) mod 2^128) N(borrow) |
+| b2 | MUL128_WIDE | U(a) U(b) → U(high128(a*b)) U(low128(a*b)) |
+| b3 | LOG | N(x) → N(LOG2_Q64(x)), algorithm below |
+| b4 | SQRT | N(x) → N(floor(sqrt(x))); x≥0 |
+
+### Cryptography (`b8`–`c2`)
+
+| Hex | Instruction | Stack effect / meaning (rightmost is top) |
+| --- | --- | --- |
+| b8 | SHA256 | bytes → SHA256(bytes) |
+| b9 | HASH256 | bytes → SHA256(SHA256(bytes)) |
+| ba | BLAKE3 | bytes → unkeyed 32-byte BLAKE3(bytes), no application tag |
+| bb | CHECKSIG | signature public_key → Boolean, P01 transaction message; 64-byte signature = mode 00, 65-byte = explicit partial mode |
+| bc | CHECKSIGVERIFY | CHECKSIG then VERIFY |
+| bd | CHECKDATASIG | signature message public_key N(algorithm) → Boolean, profile below |
+| be | LEAFHASH | script_bytes → P02 `Leaf(script_bytes)`, 32 bytes |
+| bf | NODEHASH | a b → P02 `BranchNode(a,b)`, 32 bytes; a and b must each be exactly 32 bytes |
+| c0 | MERKLEROOT_SORTED | leaf_hash proof_bytes N(hash_alg) → root_hash: bottom-up sorted-pair Merkle root, hash_alg in 0..3, 0≤k≤64 siblings |
+| c1 | MERKLEROOT_INDEXED | leaf_hash key_bytes proof_bytes N(hash_alg) → root_hash: bottom-up key-bit-indexed Merkle root, hash_alg in 0..3, 1≤len(key_bytes)≤32, 0≤k≤8*len(key_bytes) siblings |
+| c2 | SIGHASH | N(mode) → P01's 32-byte message for this invocation in that signing mode (0, 1 or 2); mode 2 errors when INPUTINDEX ≥ TXOUTPUTCOUNT |
+
+### Transaction (`c8`–`cf`)
+
+| Hex | Instruction | Stack effect / meaning (rightmost is top) |
+| --- | --- | --- |
+| c8 | TXVERSION | push transaction version |
+| c9 | TXINPUTCOUNT | push input count |
+| ca | TXOUTPUTCOUNT | push output count |
+| cb | TXMINTCOUNT | push the number of mint inputs (flags `03`) |
+| cc | TXLOCKTIME | push 56-bit lock_value as N |
+| cd | TXLOCKKIND | push absolute lock_kind |
+| ce | TXID | push ChainID-bound core TxID |
+| cf | CHAINID | push the immutable 32-byte chain identifier |
+
+### Input (`d0`–`dd`)
+
+| Hex | Instruction | Stack effect / meaning (rightmost is top) |
+| --- | --- | --- |
+| d0 | INPUTINDEX | push the index of the input this script is running for: the spend input in a spend, the mint input in a mint |
+| d1 | INPUTFLAGS | i → flags |
+| d2 | OUTPOINTTXID | i → prev_txid |
+| d3 | OUTPOINTINDEX | i → prev_index |
+| d4 | INPUTSEQUENCENUMBER | i → sequence |
+| d5 | INPUTPATHINDEX | i → selected path of spend input i |
+| d6 | UTXOVALUE | i → resolved coin value |
+| d7 | UTXOTOKENID | i → resolved asset ID |
+| d8 | UTXOBRANCHCOUNT | i → resolved branch count |
+| d9 | UTXOBRANCH | i k → resolved branch[k] |
+| da | UTXOPATHCOUNT | i → resolved path count |
+| db | UTXOPATH | i p → canonical Vec(CS(branch_index)) bytes |
+| dc | UTXOOUTPUT | i → complete serialized Output bytes |
+| dd | UTXOREQUIRESBRANCH | i root → Boolean: every path of resolved coin i includes a branch equal to root |
+
+### Output (`e0`–`ea`)
+
+| Hex | Instruction | Stack effect / meaning (rightmost is top) |
+| --- | --- | --- |
+| e0 | OUTPUTFLAGS | j → output flags |
+| e1 | OUTPUTVALUE | j → output value |
+| e2 | OUTPUTTOKENID | j → output asset ID |
+| e3 | OUTPUTBRANCHCOUNT | j → output branch count |
+| e4 | OUTPUTBRANCH | j k → output branch[k] |
+| e5 | OUTPUTPATHCOUNT | j → output path count |
+| e6 | OUTPUTPATH | j p → canonical Vec(CS(branch_index)) bytes |
+| e7 | OUTPUTRECORD | j → complete serialized Output bytes |
+| e8 | OUTPUTREQUIRESBRANCH | j root → Boolean: every path of output j includes a branch equal to root |
+| e9 | OUTPUTEXCLUSIVEBRANCH | j root → Boolean: output j has a path consisting of that branch alone, and every other path of output j also includes it |
+| ea | OUTPUTCONTINUESBRANCH | j new_root → Boolean: spend-only; output j has the exact same paths and branches as the spent coin (INPUTINDEX), except the active invocation's BRANCHROOT is replaced by new_root (preserving C09 distinct branches) |
+
+### Invocation And Locks (`f0`–`f4`)
+
+| Hex | Instruction | Stack effect / meaning (rightmost is top) |
+| --- | --- | --- |
+| f0 | ACTIVEBYTECODE | push exact active script bytes |
+| f1 | INVOCATIONKIND | push 1 for spend, 3 for mint, the same numbers as input flags |
+| f2 | BRANCHROOT | push the 32-byte root the active script was proven against: the branch root in a spend, the token ID in a mint |
+| f3 | CHECKLOCKTIMEVERIFY | N(kind) N(bound) → empty, absolute transaction lock check |
+| f4 | CHECKSEQUENCEVERIFY | N(kind) N(bound) → empty, current consuming input's relative lock check |
+
+Existing template spellings may prefix `OP_`; that does not alter bytes. In-script global UTXO proofs are rejected because proving against a moving global `UtxoRoot` inside script creates TOCTOU race conditions and violates C22a monotone validity (see [rationale](../rationale.md#2-op_utxoproofverify-in-script-global-utxo-state-proofs)). P02's compact `UtxoRoot` proofs remain strictly for RPCs, snapshots and optional `ProvenTx` relay packages, and contracts authenticate their own internal sets and key-value maps in script with `MERKLEROOT_SORTED` (`0xc0`) and `MERKLEROOT_INDEXED` (`0xc1`).
 
 ## Arithmetic edge semantics
 
@@ -113,62 +221,11 @@ LOG returns the following fixed algorithm, **not a claim of exact real logarithm
 
 Indices/results are N values; hashes/outpoints/scripts remain bytes. Token ID reads zero only for native coins. Every index and integer result must be representable and checked before access.
 
-| Hex | Name | Effect |
-| --- | --- | --- |
-| c0 | INPUTINDEX | push the index of the input this script is running for: the spend input in a spend, the mint input in a mint |
-| c1 | ACTIVEBYTECODE | push exact active script bytes |
-| c2 | TXVERSION | push transaction version |
-| c3 | TXINPUTCOUNT | push input count |
-| c4 | TXOUTPUTCOUNT | push output count |
-| c5 | TXLOCKTIME | push 56-bit lock_value as N |
-| c6 | UTXOVALUE | i → resolved coin value |
-| c7 | UTXOBRANCH | i k → resolved branch[k] |
-| c8 | OUTPOINTTXID | i → prev_txid |
-| c9 | OUTPOINTINDEX | i → prev_index |
-| ca | UTXOTOKENID | i → resolved asset ID |
-| cb | OUTPUTEXCLUSIVEBRANCH | j root → Boolean: output j has a path consisting of that branch alone, and every other path of output j also includes it |
-| cc | OUTPUTVALUE | j → output value |
-| cd | OUTPUTBRANCH | j k → output branch[k] |
-| ce | OUTPUTTOKENID | j → output asset ID |
-| cf | OUTPUTCONTINUESBRANCH | j new_root → Boolean: spend-only; output j has the exact same paths and branches as the spent coin (INPUTINDEX), except the active invocation's BRANCHROOT is replaced by new_root (preserving C09 distinct branches) |
-| d0 | TXID | push ChainID-bound core TxID |
-| d1 | ENUMERATE_INPUTS | structured loop with fixed input_count bound |
-| d2 | ENUMERATE_OUTPUTS | structured loop with fixed output_count bound |
-| d4 | TXMINTCOUNT | push the number of mint inputs (flags `03`) |
-| d5 | INPUTSEQUENCENUMBER | i → sequence |
-| d6 | INPUTFLAGS | i → flags |
-| d7 | UTXOBRANCHCOUNT | i → resolved branch count |
-| d8 | OUTPUTBRANCHCOUNT | j → output branch count |
-| d9 | OUTPUTFLAGS | j → output flags |
-| da | ENUMERATE | pop N in 0..256; structured loop |
-| db | ENDENUMERATE | structural loop end |
-| dc | BREAK | pop N(depth); exit that many enclosing active loops |
-| dd | UTXOPATHCOUNT | i → resolved path count |
-| de | OUTPUTPATHCOUNT | j → output path count |
-| df | UTXOREQUIRESBRANCH | i root → Boolean: every path of resolved coin i includes a branch equal to root |
-| e0 | TXLOCKKIND | push absolute lock_kind |
-| e1 | INVOCATIONKIND | push 1 for spend, 3 for mint, the same numbers as input flags |
-| e2 | BRANCHROOT | push the 32-byte root the active script was proven against: the branch root in a spend, the token ID in a mint |
-| e3 | OUTPUTREQUIRESBRANCH | j root → Boolean: every path of output j includes a branch equal to root |
-| e4 | INPUTPATHINDEX | i → selected path of spend input i |
-| e5 | UTXOPATH | i p → canonical Vec(CS(branch_index)) bytes |
-| e6 | OUTPUTPATH | j p → canonical Vec(CS(branch_index)) bytes |
-| e7 | UTXOOUTPUT | i → complete serialized Output bytes |
-| e8 | OUTPUTRECORD | j → complete serialized Output bytes |
-| e9 | LESSSWAP | a b → the same two items with the smaller one deeper and the larger on top, compared as unsigned little-endian integers |
-| ea | LEAFHASH | script_bytes → P02 `Leaf(script_bytes)`, 32 bytes |
-| eb | CHAINID | push the immutable 32-byte chain identifier |
-| ec | SIGHASH | N(mode) → P01's 32-byte message for this invocation in that signing mode (0, 1 or 2); mode 2 errors when INPUTINDEX ≥ TXOUTPUTCOUNT |
-| ed | NODEHASH | a b → P02 `BranchNode(a,b)`, 32 bytes; a and b must each be exactly 32 bytes |
-| ee | MERKLEROOT_SORTED | leaf_hash proof_bytes N(hash_alg) → root_hash: bottom-up sorted-pair Merkle root, hash_alg in 0..3, 0≤k≤64 siblings |
-| ef | MERKLEROOT_INDEXED | leaf_hash key_bytes proof_bytes N(hash_alg) → root_hash: bottom-up key-bit-indexed Merkle root, hash_alg in 0..3, 1≤len(key_bytes)≤32, 0≤k≤8*len(key_bytes) siblings |
-| all otherwise unassigned bytes | OP_SUCCESS_N | Unconditional invocation success during the scan below |
-
 A mint is an input (flags `03`), so a mint script has an input position like any other and INPUTINDEX returns it. A mint input resolves no coin: UTXO-prefixed reads at a mint input's index error, and a script that scans inputs tests INPUTFLAGS first. A mint invocation receives the rest of its context on the stack instead of through context-only opcodes: after the witness arguments are pushed, the node pushes the positive mint delta as N, so it is on top. The token ID is not pushed: in a mint it is the root the script was proven against, which BRANCHROOT returns in any invocation. With u64 amounts and at most 2^16−1 outputs, positive token delta is below 2^80, so it fits N. A mint script must consume the delta. This stack shape is not a security boundary between mint and spend scripts; P02 requires them to be kept in separate trees. Returned serialized outputs/paths and active bytecode must fit the element limit; using such an opcode on a larger object errors. This does not make the underlying output invalid by itself. Length-aware costs charge bounded serialization/copy work. There is no introspection of other invocations' successful execution, mutable VM state, signature arguments or TxHash; P01's core witness binding is not such an opcode.
 
 BRANCHROOT lets a script name the tree it belongs to without containing its own hash. UTXOREQUIRESBRANCH and OUTPUTREQUIRESBRANCH answer, in one operation, whether a policy makes a given tree mandatory: true iff the root operand is exactly 32 bytes, the coin/output is spendable (`path_count >= 1`, i.e. `(flags & 0x02) == 0`), and every path contains at least one branch index whose root equals it. Because C09 makes branch roots distinct within an output, at most one index k has that root, and the result equals: k exists and bit k is set in the intersection of all path index sets. Together they let a covenant require that a successor output stays under its own rules for any policy shape, using a single loop over outputs. Walking paths and their entries in script would need three nested loops, which C22 forbids. With C09's hard caps (`MAX_OUTPUT_BRANCHES = 16`, `MAX_OUTPUT_PATHS = 16`), each path is a 16-bit mask and these checks are pure $O(1)$ bitmask operations. For a pruneable burn/commitment output (`(flags & 0x02) != 0`), `OUTPUTFLAGS` returns `0x02` (native) or `0x03` (token), `OUTPUTPATHCOUNT` returns `0`, `OUTPUTBRANCHCOUNT` returns `1..16`, `OUTPUTBRANCH(j, k)` returns the $k$-th 32-byte commitment word or Merkle root, `OUTPUTPATH` errors (out of range), and `OUTPUTREQUIRESBRANCH`, `OUTPUTEXCLUSIVEBRANCH`, and `OUTPUTCONTINUESBRANCH` return `false` (`N(0)`) because the output has no spend paths (`path_count == 0`). A mint, coinbase or out-of-range index errors for the UTXO form.
 
-No opcode exposes the height, time or hash of the block being built or of any ancestor; earlier drafts had BLOCKHEIGHT and BLOCKMEDIANTIME at bytes e9 and ea; they now hold LESSSWAP and LEAFHASH. This keeps validity monotone (C22a): a script's result depends only on the transaction, its resolved coins and ChainID, so it cannot change as blocks arrive. A script can require that a height or time has been reached by constraining TXLOCKTIME or the input's sequence, which the node enforces as minimum locks (enabling Dutch auctions and linear vesting curves over `TXLOCKTIME`; see [rationale](../rationale.md#1-op_blockheight-op_blocktime-op_blockhash-and-block-dependent-transactions)). A script cannot require that a height or time has not yet passed; a certificate or quote that must stop working is instead tied to a coin and ends when that coin is spent, which is an ordinary input conflict. SIGHASH takes the signing mode as an operand and pushes P01's message for that mode: 0 everywhere, 1 or 2 only in a spend invocation; any other value, a partial mode in a mint invocation, or mode 2 when `INPUTINDEX >= TXOUTPUTCOUNT` errors. A script may fix the mode with a constant or take it from a witness argument so the signer chooses. This lets an ECDSA or Ed25519 policy checked with CHECKDATASIG bind its signature to the same intent as CHECKSIG in any of the three modes, without one opcode per mode and without reconstructing hidden witness-plan fields in Script.
+No opcode exposes the height, time or hash of the block being built or of any ancestor. This keeps validity monotone (C22a): a script's result depends only on the transaction, its resolved coins and ChainID, so it cannot change as blocks arrive. A script can require that a height or time has been reached by constraining TXLOCKTIME or the input's sequence, which the node enforces as minimum locks (enabling Dutch auctions and linear vesting curves over `TXLOCKTIME`; see [rationale](../rationale.md#1-op_blockheight-op_blocktime-op_blockhash-and-block-dependent-transactions)). A script cannot require that a height or time has not yet passed; a certificate or quote that must stop working is instead tied to a coin and ends when that coin is spent, which is an ordinary input conflict. SIGHASH takes the signing mode as an operand and pushes P01's message for that mode: 0 everywhere, 1 or 2 only in a spend invocation; any other value, a partial mode in a mint invocation, or mode 2 when `INPUTINDEX >= TXOUTPUTCOUNT` errors. A script may fix the mode with a constant or take it from a witness argument so the signer chooses. This lets an ECDSA or Ed25519 policy checked with CHECKDATASIG bind its signature to the same intent as CHECKSIG in any of the three modes, without one opcode per mode and without reconstructing hidden witness-plan fields in Script.
 
 CHECKLOCKTIMEVERIFY accepts kind 1 or 2 and nonnegative bound: require tx.lock_kind=kind and tx.lock_value≥bound. CHECKSEQUENCEVERIFY accepts kind 1 (height) or 2 (512-second units), bound 0..65535; require current spend's enabled relative lock of that kind and encoded delay≥bound. Both consume their operands. Global P01 lock checks enforce the actual candidate context. Mint context may use the absolute check but not the input-relative check.
 
@@ -184,7 +241,7 @@ Define evaluation results `Continue`, `ExitLoops(d)`, or `Error`. BREAK with `1�
 
 OUTPUTREQUIRESBRANCH proves that a root is present on every path of an output and says nothing about what else is there. That is right when the holder is meant to add branches of their own, as with a token's rules. It is not enough when a script creates a coin for someone else or continues a contract: a spender could satisfy it and still require a further branch on every path, one only they can satisfy or one nobody can, leaving the coin held hostage or burned.
 
-OUTPUTEXCLUSIVEBRANCH (`cb`) closes that for single-branch continuation. It is true exactly when both hold for output j:
+OUTPUTEXCLUSIVEBRANCH (`0xe9`) closes that for single-branch continuation. It is true exactly when both hold for output j:
 
 1. Some path consists of the single branch whose root equals `root`. The coin can therefore always be spent by satisfying that branch alone.
 2. Every other path also includes that branch. No path lets anyone spend without it.
@@ -207,11 +264,11 @@ When a coin carries multiple branches that must all be preserved across a state 
 
 LEAFHASH and NODEHASH compute P02's branch-tree leaf and node hashes exactly as consensus does when it checks a membership proof: the domain tag, the leaf or node marker, the length framing of a leaf, and the ordering of a node's two children are all applied by the opcode. A script supplies only the script bytes, or the two child hashes. Everyone who computes these hashes, wallet, node and script alike, uses the same tagged functions; there is no untagged form. LEAFHASH does not parse its operand as a script; any byte string up to MAX_ELEMENT_BYTES is accepted. Each is charged as one hash over its operands at their size bounds.
 
-With them a script can build the root of a branch tree from its parts and compare it with BRANCHROOT, or require it on an output through OUTPUTREQUIRESBRANCH, OUTPUTEXCLUSIVEBRANCH or OUTPUTCONTINUESBRANCH. Furthermore, because `H_name(x) = BLAKE3(ASCII(tag) || 00 || x)` (`C08`) uses a plain ASCII prefix before unkeyed `BLAKE3` (`0xbf`), any script can compute any domain-tagged hash in P02's registry (`H_txid`, `H_inputcore`, `H_output`, `H_coinentry`, `H_merkleidx`, etc.) in three instructions (`<"Lotus/v2/...\x00"> SWAP CAT BLAKE3`) without a separate opcode per domain tag. As detailed in P02, contracts and protocols can store data or Merkle roots in `branches` in three complementary ways: (1) inside the executing branch tree itself via `BranchNode(DataLeaf, M)`, (2) in a dedicated unexecuted data branch on a spendable coin (`branches = [CodeRoot, StateMerkleRoot]`, `paths = [[0]]`) read directly with `UTXOBRANCH`/`OUTPUTBRANCH` and folded with `MERKLEROOT_SORTED`/`MERKLEROOT_INDEXED`, or (3) on a pruneable `IS_BURN` (`0x02`/`0x03`) output with `paths = []` and up to 16 32-byte commitment words/roots.
+With them a script can build the root of a branch tree from its parts and compare it with BRANCHROOT, or require it on an output through OUTPUTREQUIRESBRANCH, OUTPUTEXCLUSIVEBRANCH or OUTPUTCONTINUESBRANCH. Furthermore, because `H_name(x) = BLAKE3(ASCII(tag) || 00 || x)` (`C08`) uses a plain ASCII prefix before unkeyed `BLAKE3`, any script can compute any domain-tagged hash in P02's registry (`H_txid`, `H_inputcore`, `H_output`, `H_coinentry`, `H_merkleidx`, etc.) in three instructions (`<"Lotus/v2/...\x00"> SWAP CAT BLAKE3`) without a separate opcode per domain tag. As detailed in P02, contracts and protocols can store data or Merkle roots in `branches` in three complementary ways: (1) inside the executing branch tree itself via `BranchNode(DataLeaf, M)`, (2) in a dedicated unexecuted data branch on a spendable coin (`branches = [CodeRoot, StateMerkleRoot]`, `paths = [[0]]`) read directly with `UTXOBRANCH`/`OUTPUTBRANCH` and folded with `MERKLEROOT_SORTED`/`MERKLEROOT_INDEXED`, or (3) on a pruneable `IS_BURN` (`0x02`/`0x03`) output with `paths = []` and up to 16 32-byte commitment words/roots.
 
 For contracts that maintain large internal sets, allowlists, or key-value maps, prove inputs or outputs of parent/injected transactions (`OUTPOINTTXID(i)`), or verify cross-chain SPV proofs, two dedicated opcodes fold a multi-level Merkle path in one instruction with an explicit `N(hash_alg)` selector (`0..3`, matching `CHECKDATASIG`'s selector convention):
 
-- **`MERKLEROOT_SORTED` (`ee`):** Stack `leaf_hash proof_bytes N(hash_alg) → root_hash`.
+- **`MERKLEROOT_SORTED` (`0xc0`):** Stack `leaf_hash proof_bytes N(hash_alg) → root_hash`.
   - Require `len(leaf_hash) == 32`, `len(proof_bytes) == 32 * k` for an integer `0 <= k <= 64`, and `hash_alg in 0..3`; any other operand length or selector value is a script error.
   - Initialize `acc = leaf_hash`. For step `s = 0 .. k - 1`, let `sib = proof_bytes[32*s : 32*(s+1)]`, and let `(lo, hi) = (acc, sib)` if `acc <= sib` (unsigned little-endian 256-bit comparison, as in P02 `BranchNode` and `LESSSWAP`) else `(sib, acc)`:
     - `hash_alg == 0` (Lotus Tagged BLAKE3): `acc = H_branch(01 || lo || hi)` (P02 `BranchNode(acc, sib)`)
@@ -219,7 +276,7 @@ For contracts that maintain large internal sets, allowlists, or key-value maps, 
     - `hash_alg == 2` (SHA256): `acc = SHA256(lo || hi)`
     - `hash_alg == 3` (HASH256 / Double-SHA256): `acc = SHA256(SHA256(lo || hi))`
   - Push the 32-byte `acc`. When `k == 0` (`proof_bytes` is empty), returns `leaf_hash` unchanged. Static cost is charged from P05's size bound `floor(bound(proof_bytes) / 32)` capped at 64 hashes and the hash cost of `hash_alg` (or `max(C_blake3, C_hash256)` when `hash_alg` is non-constant).
-- **`MERKLEROOT_INDEXED` (`ef`):** Stack `leaf_hash key_bytes proof_bytes N(hash_alg) → root_hash`.
+- **`MERKLEROOT_INDEXED` (`0xc1`):** Stack `leaf_hash key_bytes proof_bytes N(hash_alg) → root_hash`.
   - Require `len(leaf_hash) == 32`, `1 <= len(key_bytes) <= 32`, `len(proof_bytes) == 32 * k` for an integer `0 <= k <= 8 * len(key_bytes)`, and `hash_alg in 0..3`; any other operand length or selector value is a script error.
   - Initialize `acc = leaf_hash`. For step `s = 0 .. k - 1` (from the leaf bottom-up toward the root):
     - Let `bit = (key_bytes[s // 8] >> (s % 8)) & 1` (least-significant-bit first, matching P02) and `sib = proof_bytes[32*s : 32*(s+1)]`.
@@ -239,12 +296,12 @@ LESSSWAP is a general ordering operation on byte strings. It reads each operand 
 Maintainer direction, October 11, 2026: every otherwise unassigned opcode byte is a generic OP_SUCCESS_N extension point. This replaces the eight no-op EXTENSION instructions and the reserved CHECKDATASIG algorithm selectors. The current tables assign 215 bytes and leave 41 success bytes:
 
 ```text
-4d 4e 50 62 65 66 73 89 8a 8d 8e a6 a7 a9 ab ae af
-b0 b3 b7 b8 b9 bb bc d3 f0 f1 f2 f3 f4 f5 f6 f7 f8
-f9 fa fb fc fd fe ff
+5e 5f 6c 6d 6e 6f 82 83 84 85 86 87 95 96 97 b5
+b6 b7 c3 c4 c5 c6 c7 de df eb ec ed ee ef f5 f6
+f7 f8 f9 fa fb fc fd fe ff
 ```
 
-The suffix N is decimal: byte 50 is OP_SUCCESS_80 and byte ff is OP_SUCCESS_255. Success is for the complete script invocation, not just a Boolean result or a no-op. This follows the unconditional-success principle in [BIP342](https://bips.dev/342/#specification). It leaves a spend path rather than permanently stranding a coin behind an undefined instruction. Wallets and relay policy must nevertheless refuse unassigned success instructions: before activation they provide no authorization protection.
+The suffix N is decimal: byte 5e is OP_SUCCESS_94 and byte ff is OP_SUCCESS_255. Success is for the complete script invocation, not just a Boolean result or a no-op. This follows the unconditional-success principle in [BIP342](https://bips.dev/342/#specification). It leaves a spend path rather than permanently stranding a coin behind an undefined instruction. Wallets and relay policy must nevertheless refuse unassigned success instructions: before activation they provide no authorization protection.
 
 **Validation order and scan.** First enforce transaction/witness framing, script and argument byte/count limits, path/witness matching, and the script's membership proof. These are outside the VM and cannot be bypassed. Then scan the script from byte zero, at instruction boundaries, before executing any instruction or checking structured control flow:
 
@@ -254,11 +311,11 @@ The suffix N is decimal: byte 50 is OP_SUCCESS_80 and byte ff is OP_SUCCESS_255.
 
 Only this invocation succeeds automatically. Every other branch on the selected path, every other input/mint, conservation, locks, block commitments and enclosing resource budgets still require validation. A sole-branch policy whose revealed script contains an unassigned success opcode is effectively anyone-can-spend; a separate required owner branch remains enforced.
 
-**Soft-fork contract.** Assigning a success byte may define new operations, stack effects or suffix syntax, because old nodes accepted the whole invocation without interpreting those effects. The new valid transaction/block set MUST be a subset of the old valid set, including outer framing, limits and aggregate charges. Freeze activation and costs before assignment. No existing assigned opcode, push framing, CHECKDATASIG algorithm selector, version, flags, lock kind or signing mode gains implicit success behavior. CHECKDATASIG recognizes only algorithms 0..3; every other selector errors. Future cryptography can use a generic success byte instead of reopening that closed selector set.
+**Soft-fork contract.** Assigning a success byte may define new operations, stack effects or suffix syntax, because old nodes accepted the whole invocation without interpreting those effects. The new valid transaction/block set MUST be a subset of the old valid set, including outer framing, limits and aggregate charges. Freeze activation and enforcement costs before assignment. The monetary accounting schedule and accounting success-byte set stay fixed at genesis (P05), so old and upgraded validators derive identical post-state roots for every newly valid block. No existing assigned opcode, push framing, CHECKDATASIG algorithm selector, version, flags, lock kind or signing mode gains implicit success behavior. CHECKDATASIG recognizes only algorithms 0..3; every other selector errors. Future cryptography can use a generic success byte instead of reopening that closed selector set.
 
 Relay/mining policy refuses a transaction if the scan finds an unassigned success opcode in any revealed script, including skipped arms. Output roots do not reveal hidden scripts, so this policy is not a creation-time inspection guarantee. At activation, recheck affected mempool entries and caches. Activation/signalling remains a separate network-upgrade decision.
 
-**Charges.** An automatically successful invocation pays a deterministic structural charge for its complete script bytes and the success scan, plus ordinary witness parsing, argument bytes, proof and transaction/block overhead. It executes no VM instructions and has no ordinary AST/size-pass charge. This charge is computable even when the ignored suffix is malformed. The assigned implementation's charge must be at least this baseline and cover its additional work. CHECKDATASIG with a nonconstant selector is charged at the most expensive defined profile plus hashing at operand bounds; unknown selectors error. A new operation expressible with existing instructions remains a compiler function and needs no assignment.
+**Charges.** An automatically successful invocation pays a deterministic structural charge for its complete script bytes and the success scan, plus ordinary witness parsing, argument bytes, proof and transaction/block overhead. It executes no VM instructions and has no ordinary AST/size-pass charge. This charge is computable even when the ignored suffix is malformed. After assignment, the frozen accounting view keeps this exact baseline; the separate enforcement view must cover all additional execution work. Only frozen accounting costs update the monetary EMA (P05). CHECKDATASIG with a nonconstant selector is charged at the most expensive defined profile plus hashing at operand bounds; unknown selectors error. A new operation expressible with existing instructions remains a compiler function and needs no assignment.
 
 ## CHECKDATASIG profile proposal
 

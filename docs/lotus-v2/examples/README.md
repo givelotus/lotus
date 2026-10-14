@@ -27,7 +27,7 @@ contract Payment<owner: PublicKey> {
 
 Symbolic assembly: `<owner> CHECKSIG`. Arguments bottom-to-top: `[signature]`; pushing owner leaves signature below the key. CHECKSIG pops key then signature and pushes an int128 Boolean. Selected policy: one branch `Leaf(script)`, `paths=[[0]]`; path index zero, exactly one witness, empty membership proof.
 
-Pre-state: one mature native coin with value 100000 and the payment policy. Transaction: consume it and create native outputs of 60000 and 39000 to two fully specified recipient policies, with no mint input. Expected native fee: 1000, of which the block's coinbase may collect at most half (C16). With valid authorization, the final stack is `[true]`, the input is removed and both outputs are inserted. Changing a committed output changes core identity and the signing message.
+Pre-state: one mature native coin with value 100000 and the payment policy. Transaction: consume it and create native outputs of 60000 and 39000 to two fully specified recipient policies, with no mint input. Expected native fee: 1000 atoms; the complete transaction must be at most 1000 bytes to meet C14b, and P05's block burn floor must also hold. At most half of net fees enters the coinbase entitlement before its resource deduction (C16). With valid authorization, the final stack is `[true]`, the input is removed and both outputs are inserted. Changing a committed output changes core identity and the signing message.
 
 Cost report must include parsing, coin resolution, root verification, push/CHECKSIG and accounting; it cannot assume a signature-cache hit.
 
@@ -222,9 +222,9 @@ Pairing: with two order coins from one maker at inputs 0 and 1, each requires it
 
 **Partial fills, Dutch auctions and expiring offers (preserving C22a):**
 
-- **Partial fills:** A partially fillable limit order checks that output `2*i` pays the maker `(this.coin.value - remaining) * price` (`OUTPUTEXCLUSIVEBRANCH` to `pay_to`) and that output `2*i + 1` returns `remaining` units of the offered token to the exact same order covenant via `BRANCHROOT OUTPUTCONTINUESBRANCH` (`0xcf`), which preserves both the `LimitOrder` branch, the `MakerWallet` cancel branch, and any `MyTokenRules` branch on the remainder coin.
-- **Dutch auctions and linear vesting:** Because `TXLOCKTIME` (`0xc5`) and `TXLOCKKIND` (`0xe0`) expose the transaction's deterministic lower-bound lock (`height >= lock_value` or `MTP(parent) >= lock_value`), a Dutch auction computes `price(t) = max(floor_price, start_price - rate * max(0, TXLOCKTIME - start_time))` in script without any block-header opcode (`OP_BLOCKHEIGHT` / `OP_BLOCKTIME` are rejected; see [rationale](../rationale.md#1-op_blockheight-op_blocktime-op_blockhash-and-block-dependent-transactions)). A rational buyer sets `lock` to the current block height or parent MTP to obtain the lowest valid price, while the signed transaction remains monotonically valid at all later blocks (`C22a`).
-- **Expiring offers:** Add a refund/sweep method to the maker branch gated by `CHECKLOCKTIMEVERIFY` (`0xb1`) or `CHECKSEQUENCEVERIFY` (`0xb2`) so the maker (or a keeper) can sweep the coin once the deadline passes, revoking the offer by consuming its UTXO.
+- **Partial fills:** A partially fillable limit order checks that output `2*i` pays the maker `(this.coin.value - remaining) * price` (`OUTPUTEXCLUSIVEBRANCH` to `pay_to`) and that output `2*i + 1` returns `remaining` units of the offered token to the exact same order covenant via `BRANCHROOT OUTPUTCONTINUESBRANCH` (`0xea`), which preserves both the `LimitOrder` branch, the `MakerWallet` cancel branch, and any `MyTokenRules` branch on the remainder coin.
+- **Dutch auctions and linear vesting:** Because `TXLOCKTIME` and `TXLOCKKIND` expose the transaction's deterministic lower-bound lock (`height >= lock_value` or `MTP(parent) >= lock_value`), a Dutch auction computes `price(t) = max(floor_price, start_price - rate * max(0, TXLOCKTIME - start_time))` in script without any block-header opcode (`OP_BLOCKHEIGHT` / `OP_BLOCKTIME` are rejected; see [rationale](../rationale.md#1-op_blockheight-op_blocktime-op_blockhash-and-block-dependent-transactions)). A rational buyer sets `lock` to the current block height or parent MTP to obtain the lowest valid price, while the signed transaction remains monotonically valid at all later blocks (`C22a`).
+- **Expiring offers:** Add a refund/sweep method to the maker branch gated by `CHECKLOCKTIMEVERIFY` or `CHECKSEQUENCEVERIFY` so the maker (or a keeper) can sweep the coin once the deadline passes, revoking the offer by consuming its UTXO.
 
 ## 5. Contract state
 
@@ -261,7 +261,7 @@ The wallet supplies the current value and `M` as two hidden leading arguments. `
 ; witness args: n (a 16-byte number), M (32 bytes)
 
 ; 1. Check the state the wallet supplied.
-OVER <10> SWAP CAT <6a> CAT          ; n M ds    ds = data script: push n, RETURN
+OVER <10> SWAP CAT <66> CAT          ; n M ds    ds = data script: push n, RETURN
 LEAFHASH                             ; n M D     D  = data leaf holding n
 OVER NODEHASH                        ; n M R     R  = Node(D, M)
 BRANCHROOT EQUALVERIFY               ; n M       n and M are genuine
@@ -270,7 +270,7 @@ BRANCHROOT EQUALVERIFY               ; n M       n and M are genuine
 SWAP 1ADD                            ; M n'      n' = n + 1
 
 ; 3. Compute the root the successor must have.
-<10> SWAP CAT <6a> CAT LEAFHASH      ; M D'
+<10> SWAP CAT <66> CAT LEAFHASH      ; M D'
 NODEHASH                             ; R'        R' = Node(D', M)
 
 ; 4. Require the output at this input's position to continue with R'.
@@ -282,9 +282,9 @@ A method's membership proof ends with the data leaf's hash, so the wallet rebuil
 
 These checks cover every step but not the start: no script runs when a coin is created, so anyone can make a coin whose root is a `Counter` holding any `n`. Where the history matters, a mint script requires the first coin to carry the contract's root for the starting values, and the contract's methods require the token to move to the successor.
 
-**Why `OUTPUTCONTINUESBRANCH` (`0xcf`) is used for continuation (`OUTPUTEXCLUSIVEBRANCH` `0xcb` for fresh payouts):** `OUTPUTCONTINUESBRANCH` verifies in one $O(1)$ check that output `j` has the exact same `paths` array and the exact same `branches` array as the spent coin (`INPUTINDEX`), except that the active invocation's `BRANCHROOT` at its branch index `k` is replaced by `R'`. Consequently, `Counter.increment()` works identically whether the coin is a single-branch native XPI coin (`branches=[Counter]`, `paths=[[0]]`) **or** a multi-branch token coin carrying a mandatory token rules contract (`branches=[Counter, MyTokenRules]`, `paths=[[0, 1]]`). By contrast, `OUTPUTEXCLUSIVEBRANCH` (`0xcb`) is used when a contract creates a fresh payout output to another party's single-branch root (`pay_to` in `LimitOrder.fill()`), where the spent coin's own branches are intentionally not continued.
+**Why `OUTPUTCONTINUESBRANCH` is used for continuation (`OUTPUTEXCLUSIVEBRANCH` for fresh payouts):** `OUTPUTCONTINUESBRANCH` verifies in one $O(1)$ check that output `j` has the exact same `paths` array and the exact same `branches` array as the spent coin (`INPUTINDEX`), except that the active invocation's `BRANCHROOT` at its branch index `k` is replaced by `R'`. Consequently, `Counter.increment()` works identically whether the coin is a single-branch native XPI coin (`branches=[Counter]`, `paths=[[0]]`) **or** a multi-branch token coin carrying a mandatory token rules contract (`branches=[Counter, MyTokenRules]`, `paths=[[0, 1]]`). By contrast, `OUTPUTEXCLUSIVEBRANCH` is used when a contract creates a fresh payout output to another party's single-branch root (`pay_to` in `LimitOrder.fill()`), where the spent coin's own branches are intentionally not continued.
 
-**Key-value maps and sets in contract state (`MERKLEROOT_INDEXED` `0xef`, `MERKLEROOT_SORTED` `0xee`):** When a contract stores a large key-value map or allowlist inside its state leaf (a 32-byte `map_root` instead of a single scalar `n`), a method verifies the old entry `old_leaf` at `key` and computes the updated `map_root'` for `new_leaf` using the same `proof` witness argument and `hash_alg = 0` (Lotus Tagged BLAKE3; `1` = Raw BLAKE3, `2` = SHA256, `3` = HASH256):
+**Key-value maps and sets in contract state (`MERKLEROOT_INDEXED`, `MERKLEROOT_SORTED`):** When a contract stores a large key-value map or allowlist inside its state leaf (a 32-byte `map_root` instead of a single scalar `n`), a method verifies the old entry `old_leaf` at `key` and computes the updated `map_root'` for `new_leaf` using the same `proof` witness argument and `hash_alg = 0` (Lotus Tagged BLAKE3; `1` = Raw BLAKE3, `2` = SHA256, `3` = HASH256):
 
 ```text
 ; verify old_leaf at key against current map_root (hash_alg = 0)
@@ -295,13 +295,13 @@ These checks cover every step but not the start: no script runs when a coin is c
 ```
 
 **Three ways to store data or Merkle roots in `branches` (P02):**
-1. **Data leaf inside the executing branch tree (`BranchNode(DataLeaf, M)`):** Shown in `Counter` above; keeps a single-branch coin (`branches=[Counter]`, `paths=[[0]]`) while updating state via `OUTPUTCONTINUESBRANCH` (`0xcf`).
-2. **Dedicated unexecuted data branch on a spendable coin (`branches=[CodeRoot, StateMerkleRoot]`, `paths=[[0]]`):** Branch `0` holds the immutable method tree (`CodeRoot`) and is the only branch referenced by `paths`; branch `1` holds a 32-byte state hash or Merkle root directly. The script in branch `0` reads its current state via `INPUTINDEX <1> UTXOBRANCH` (`0xd5`), folds a witness proof via `MERKLEROOT_INDEXED` (`0xef`) or `MERKLEROOT_SORTED` (`0xee`), and checks `OUTPUTBRANCH(j, 1) == new_state_root` alongside `OUTPUTBRANCH(j, 0) == BRANCHROOT`.
-3. **Pruneable burn / `OP_RETURN` commitment output (`Output.flags` bit 1 `IS_BURN`, `0x02` native / `0x03` token):** Has `paths = []` (`path_count == 0`) and `1..16` 32-byte commitment words or Merkle roots in `branches` (up to 512 bytes), is never inserted into `UtxoRoot` (C17), permanently burns its `value`, and is introspected in the same transaction via `OUTPUTFLAGS` (`0xd9`), `OUTPUTBRANCHCOUNT` (`0xd8`), and `OUTPUTBRANCH` (`0xd6`).
+1. **Data leaf inside the executing branch tree (`BranchNode(DataLeaf, M)`):** Shown in `Counter` above; keeps a single-branch coin (`branches=[Counter]`, `paths=[[0]]`) while updating state via `OUTPUTCONTINUESBRANCH`.
+2. **Dedicated unexecuted data branch on a spendable coin (`branches=[CodeRoot, StateMerkleRoot]`, `paths=[[0]]`):** Branch `0` holds the immutable method tree (`CodeRoot`) and is the only branch referenced by `paths`; branch `1` holds a 32-byte state hash or Merkle root directly. The script in branch `0` reads its current state via `INPUTINDEX <1> UTXOBRANCH` (`0xd9`), folds a witness proof via `MERKLEROOT_INDEXED` or `MERKLEROOT_SORTED`, and checks `OUTPUTBRANCH(j, 1) == new_state_root` alongside `OUTPUTBRANCH(j, 0) == BRANCHROOT`.
+3. **Pruneable burn / `OP_RETURN` commitment output (`Output.flags` bit 1 `IS_BURN`, `0x02` native / `0x03` token):** Has `paths = []` (`path_count == 0`) and `1..16` 32-byte commitment words or Merkle roots in `branches` (up to 512 bytes), is never inserted into `UtxoRoot` (C17), permanently burns its `value`, and is introspected in the same transaction via `OUTPUTFLAGS`, `OUTPUTBRANCHCOUNT`, and `OUTPUTBRANCH`.
 
 ### Proving inputs or outputs of a parent / injected transaction (`OUTPOINTTXID`)
 
-Because `TxID = H_txid(ChainID || TxHeaderCore || InputsRoot || OutputsRoot)` commits to the bottom-up indexed binary Merkle roots (`IndexedTreeRoot` in P02) of `InputCoreLeaf(m) = H_inputcore(InputCore(m))` and `OutputLeaf(k) = H_output(Bytes(Output[k]))`, and because every `H_name(x)` domain tag (`C08`) is ordinary unkeyed `BLAKE3` (`0xbf`) over the ASCII prefix `tag || 0x00 || x`, a script can prove any input `InputCore(m)` or output `Output[k]` of a parent transaction (`INPUTINDEX OUTPOINTTXID`) in $O(\log N)$ space without pushing the entire parent transaction onto the stack:
+Because `TxID = H_txid(ChainID || TxHeaderCore || InputsRoot || OutputsRoot)` commits to the bottom-up indexed binary Merkle roots (`IndexedTreeRoot` in P02) of `InputCoreLeaf(m) = H_inputcore(InputCore(m))` and `OutputLeaf(k) = H_output(Bytes(Output[k]))`, and because every `H_name(x)` domain tag (`C08`) is ordinary unkeyed `BLAKE3` over the ASCII prefix `tag || 0x00 || x`, a script can prove any input `InputCore(m)` or output `Output[k]` of a parent transaction (`INPUTINDEX OUTPOINTTXID`) in $O(\log N)$ space without pushing the entire parent transaction onto the stack:
 
 ```text
 ; Witness arguments:
@@ -311,10 +311,10 @@ Because `TxID = H_txid(ChainID || TxHeaderCore || InputsRoot || OutputsRoot)` co
 ;   input_idx_u16      (2-byte little-endian index m, checked < input_count)
 ;   input_merkle_proof (32 * ceil(log2(input_count)) sibling bytes)
 
-; 1. Compute InputCoreLeaf(m) = H_inputcore(InputCore(m)) via C08 prefix + BLAKE3 (0xbf):
+; 1. Compute InputCoreLeaf(m) = H_inputcore(InputCore(m)) via C08 prefix + BLAKE3 (0xba):
 <"Lotus/v2/inputcore\x00"> <input_core_bytes> CAT BLAKE3
 
-; 2. Reconstruct InputsRoot in one instruction via MERKLEROOT_INDEXED (0xef, hash_alg = 0):
+; 2. Reconstruct InputsRoot in one instruction via MERKLEROOT_INDEXED (0xc1, hash_alg = 0):
 <input_idx_u16> <input_merkle_proof> <0> MERKLEROOT_INDEXED
 
 ; 3. Reconstruct parent TxID = H_txid(ChainID || TxHeaderCore || InputsRoot || OutputsRoot):

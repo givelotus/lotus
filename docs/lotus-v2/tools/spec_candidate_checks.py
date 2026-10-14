@@ -32,6 +32,63 @@ def blob(data: bytes) -> bytes:
     return cs(len(data)) + data
 
 
+def coinbase_data(data: bytes | None) -> bytes:
+    """Construct P01's one optional opaque item, not a script witness."""
+    if data is None:
+        return b'\0'
+    if not 1 <= len(data) <= 8192:
+        raise ValueError('coinbase data length')
+    return b'\1' + blob(data)
+
+
+def parse_coinbase_data(encoded: bytes) -> bytes | None:
+    """Check this field's framing only; no transaction or VM parsing."""
+    def length(offset: int) -> tuple[int, int]:
+        if offset >= len(encoded):
+            raise ValueError('truncated CompactSize')
+        marker = encoded[offset]
+        offset += 1
+        width = {253: 2, 254: 4, 255: 8}.get(marker, 0)
+        if not width:
+            return marker, offset
+        if len(encoded) - offset < width:
+            raise ValueError('truncated CompactSize')
+        value = int.from_bytes(encoded[offset:offset + width], 'little')
+        if value < (253 if width == 2 else 65536 if width == 4 else 2**32):
+            raise ValueError('non-shortest CompactSize')
+        return value, offset + width
+
+    count, offset = length(0)
+    if count == 0:
+        if offset != len(encoded):
+            raise ValueError('trailing coinbase data')
+        return None
+    if count != 1:
+        raise ValueError('coinbase data count')
+    size, offset = length(offset)
+    if not 1 <= size <= 8192:
+        raise ValueError('coinbase data length')
+    if len(encoded) - offset != size:
+        raise ValueError('truncated or trailing coinbase data')
+    return encoded[offset:]
+
+
+def coinbase_input(parent_id: bytes, height: int, data: bytes | None) -> bytes:
+    if len(parent_id) != 32 or not 0 <= height <= 2**32 - 1:
+        raise ValueError('coinbase parent or height')
+    return parent_id + u(height, 4) + b'\xff' * 4 + b'\2' + coinbase_data(data)
+
+
+def check_coinbase_context(inp: bytes, parent_id: bytes, derived_height: int) -> None:
+    """Model the parent/height comparison after a block supplies context."""
+    if len(parent_id) != 32 or not 0 <= derived_height <= 2**32 - 1:
+        raise ValueError('coinbase context overflow')
+    if derived_height == 0 and parent_id != ZERO32:
+        raise ValueError('genesis parent')
+    if inp[:32] != parent_id or inp[32:36] != u(derived_height, 4):
+        raise ValueError('coinbase parent or height mismatch')
+
+
 def h(name: str, data: bytes) -> bytes:
     return blake3(('Lotus/v2/' + name).encode('ascii') + b'\0' + data).digest()
 
@@ -337,17 +394,108 @@ def required_block_burn_floor(block_cu: int, ema_cu: int, ema_min: int, s_linear
     return ((block_cu * max(ema_cu, ema_min)) >> s_linear) + ((block_cu * block_cu) >> s_quad)
 
 
-# Explicit P03 allocation, independent of the scanner's control flow.
-ASSIGNED_OPCODES = set(range(1, 76)) | set(bytes.fromhex('''
-00 4c 4f 51 52 53 54 55 56 57 58 59 5a 5b 5c 5d 5e 5f 60
-61 63 64 67 68 69 6a 6b 6c 6d 6e 6f 70 71 72 74 75 76 77
-78 79 7a 7b 7c 7d 7e 7f 80 81 82 83 84 85 86 87 88 8b 8c
-8f 90 91 92 93 94 95 96 97 98 99 9a 9b 9c 9d 9e 9f a0 a1
-a2 a3 a4 a5 a8 aa ac ad b1 b2 b4 b5 b6 ba bd be bf c0 c1
-c2 c3 c4 c5 c6 c7 c8 c9 ca cb cc cd ce cf d0 d1 d2 d4 d5 d6 d7
-d8 d9 da db dc dd de df e0 e1 e2 e3 e4 e5 e6 e7 e8 e9 ea eb ec ed ee ef
-'''))
+def minimum_byte_fee(size: int) -> int:
+    assert size >= 0
+    return (1000 * size + 999) // 1000
+
+
+def coinbase_claim_limit(subsidy: int, fees: int, token_burn: int,
+                         coinbase_bytes: int, envelope_bytes: int,
+                         required_burn: int) -> tuple[int, int]:
+    assert min(subsidy, fees, token_burn, coinbase_bytes, envelope_bytes, required_burn) >= 0
+    assert fees >= token_burn
+    net_fees = fees - token_burn
+    fee_burn = net_fees - net_fees // 2
+    deduction = max(minimum_byte_fee(coinbase_bytes + envelope_bytes),
+                    max(0, required_burn - fee_burn))
+    entitlement = subsidy + net_fees // 2
+    if deduction > entitlement:
+        raise ValueError('insufficient reward for resource charge')
+    return entitlement - deduction, deduction
+
+
+def review_regression_vectors() -> dict:
+    # Literal boundary expectations independently exercise rounding and units.
+    assert [minimum_byte_fee(n) for n in (0, 1, 999, 1000, 1001)] == [0, 1, 999, 1000, 1001]
+    fee_rows = []
+    for label, args, expected in (
+        ('coinbase_only', (10000, 0, 0, 100, 139, 0), (9761, 239)),
+        ('extra_coinbase_output', (10000, 0, 0, 623, 139, 0), (9238, 762)),
+        ('parabolic_dominates', (10000, 0, 0, 100, 139, 1000), (9000, 1000)),
+        ('token_and_odd_fee', (10000, 1001, 100, 100, 139, 1000), (9901, 549)),
+        ('fee_burn_covers_curve', (10000, 2000, 0, 100, 139, 1000), (10761, 239)),
+    ):
+        claim, deduction = coinbase_claim_limit(*args)
+        assert (claim, deduction) == expected
+        subsidy, fees, token_burn, cb_bytes, envelope, floor = args
+        net_fees = fees - token_burn
+        for candidate, valid in ((claim, True), (claim + 1, False)):
+            underclaim = subsidy + net_fees // 2 - candidate
+            assert ((underclaim >= minimum_byte_fee(cb_bytes + envelope)) and
+                    (net_fees - net_fees // 2 + underclaim >= floor)) == valid
+        fee_rows.append(dict(case=label, inputs=list(args), max_claim=claim, required_underclaim=deduction))
+    try:
+        coinbase_claim_limit(238, 0, 0, 100, 139, 0)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError('negative claim was allowed')
+    # An output with zero value still adds full serialized output bytes.
+    assert len(cs(252)) == 1 and len(cs(253)) == 3
+    assert minimum_byte_fee(134 + 4 + len(cs(253)) + 253) == 394
+
+    # Mock extension: old and new enforce different floors but commit the SAME
+    # accounting EMA. Actual assigned-opcode execution requires the future VM.
+    account = parabolic_tx_cost(1024)
+    enforce = parabolic_tx_cost(2048)
+    ema = update_ema_block_cost(1024, account)
+    assert (account, enforce, ema) == (1032, 2080, 1024)
+    incorrect_ema = update_ema_block_cost(1024, enforce)
+    assert incorrect_ema == 1025
+    state = monetary_state_record(100000, 100, 1, ema)
+    old_root = state_root_envelope(1, EMPTY_ROOT, state)
+    new_root = state_root_envelope(1, EMPTY_ROOT, state)
+    wrong_root = state_root_envelope(1, EMPTY_ROOT, monetary_state_record(100000, 100, 1, incorrect_ema))
+    assert old_root == new_root and old_root != wrong_root
+    old_floor = required_block_burn_floor(account, 1024, 1, 10, 10)
+    new_floor = required_block_burn_floor(enforce, 1024, 1, 10, 10)
+    old_claim, _ = coinbase_claim_limit(10000, 0, 0, 100, 139, old_floor)
+    new_claim, _ = coinbase_claim_limit(10000, 0, 0, 100, 139, new_floor)
+    assert new_claim < old_claim
+    # Every new valid claim is also old-valid; old maximum is new-invalid.
+    assert all((claim <= old_claim) for claim in range(new_claim + 1))
+
+    # Genesis initialization is not step 0. Keep a small, hand-checkable profile.
+    genesis = monetary_state_record(64, 10, 1, 1024)
+    b0, r1 = bootstrap_step(64, 6)
+    b1, r2 = bootstrap_step(r1, 6)
+    assert (b0, r1, b1, r2) == (1, 63, 1, 62)
+    height1 = monetary_state_record(r1, 10, 1, update_ema_block_cost(1024, account))
+    height2 = monetary_state_record(r2, 10, 1, update_ema_block_cost(1024, account))
+    assert [int.from_bytes(record[:8], 'little') for record in (genesis, height1, height2)] == [64, 63, 62]
+    # Domain bytes count toward BLAKE3 compression blocks.
+    assert len(b'Lotus/v2/sighash\0') == 17
+    assert [(n + 17 + 63) // 64 for n in (138, 150, 178)] == [3, 3, 4]
+    return {'fee_and_reward_cases': fee_rows,
+            'extension': {'account_cost': account, 'enforce_cost': enforce,
+                          'account_ema': ema, 'old_floor': old_floor, 'new_floor': new_floor,
+                          'shared_root': old_root.hex(), 'incorrect_root': wrong_root.hex()},
+            'genesis_indexing': {'genesis': genesis.hex(), 'height_1': height1.hex(), 'height_2': height2.hex(),
+                                 'height_1_gross_subsidy': b0 + 10, 'height_2_gross_subsidy': b1 + 10},
+            'scope': 'Arithmetic and commitments only; not a block validator, assigned-opcode VM, or Avalanche test.'}
+
+
+# Byte allocation has one machine-readable source; semantics stay in P03.
+OPCODE_PATH = ROOT / 'tools' / 'opcodes.json'
+OPCODE_ROWS = json.loads(OPCODE_PATH.read_text())['opcodes']
+OPCODES = {row['name']: int(row['byte'], 16) for row in OPCODE_ROWS}
+assert len(OPCODES) == len(OPCODE_ROWS) == len(set(OPCODES.values())) == 215
+ASSIGNED_OPCODES = set(OPCODES.values())
 SUCCESS_OPCODES = set(range(256)) - ASSIGNED_OPCODES
+
+
+def op(name: str) -> bytes:
+    return bytes([OPCODES[name]])
 
 
 def success_scan(script: bytes, max_element_bytes: int = 8192) -> bool:
@@ -391,36 +539,43 @@ def success_scan(script: bytes, max_element_bytes: int = 8192) -> bool:
 
 def success_scan_vectors() -> dict:
     assert len(ASSIGNED_OPCODES) == 215 and len(SUCCESS_OPCODES) == 41
-    # Bind the explicit model allocation to the instruction rows, excluding
-    # summary rows whose ranges also contain otherwise unassigned bytes.
+    # Cross-check every documented name, not just the set of occupied bytes.
     import re
-    documented = set()
+    documented = {}
     packet = (ROOT / 'decisions' / 'vm-semantics.md').read_text()
-    for token, name in re.findall(r'^\| ([0-9a-f]+(?:–[0-9a-f]+)?) \| ([^|]+) \|', packet, re.M):
-        if 'allocation' in name or 'Invocation introspection' in name:
-            continue
-        bounds = token.split('–')
-        documented.update(range(int(bounds[0], 16), int(bounds[-1], 16) + 1))
-    assert documented == ASSIGNED_OPCODES
+    for byte, name in re.findall(r'^\| ([0-9a-f]{2}) \| ([A-Z0-9_]+) \|', packet, re.M):
+        assert name not in documented
+        documented[name] = int(byte, 16)
+    documented.update({f'PUSH_{i}': i for i in range(1, 76)})
+    assert documented == OPCODES
+    assert [OPCODES[n] for n in ('ZERO', 'PUSHDATA', 'ONE', 'RETURN', 'BLAKE3', 'TXID', 'CHECKSEQUENCEVERIFY')] == [0, 0x4c, 0x4e, 0x66, 0xba, 0xce, 0xf4]
+    assert all(OPCODES[n] == 0x4e + i for i, n in enumerate(('ONE TWO THREE FOUR FIVE SIX SEVEN EIGHT NINE TEN ELEVEN TWELVE THIRTEEN FOURTEEN FIFTEEN SIXTEEN').split()))
+
+    success_listing = packet.split('## Extension points', 1)[1].split('```text', 1)[1].split('```', 1)[0]
+    assert set(bytes.fromhex(success_listing)) == SUCCESS_OPCODES
+    for path in ROOT.rglob('*.md'):
+        for name, byte in re.findall(r'\b([A-Z][A-Z0-9_]+)`?\s*\(\s*`?0x([0-9a-f]{2})', path.read_text()):
+            if name in OPCODES:
+                assert OPCODES[name] == int(byte, 16), (path, name, byte)
 
     rows = []
     cases = [(f'success_{op}', bytes([op]), True) for op in sorted(SUCCESS_OPCODES)]
     cases += [
-        ('after_return', b'\x6a\xf0', True),
-        ('skipped_arm', b'\x00\x63\xf0\x68', True),
-        ('unmatched_conditional', b'\x63\xf0', True),
-        ('ignored_truncated_suffix', b'\xf0\x01', True),
-        ('fixed_push_payload', b'\x01\xf0', False),
-        ('long_push_payload', b'\x4c\x4c' + b'\xf0' * 76, False),
-        ('after_long_push', b'\x4c\x4c' + b'\xf0' * 76 + b'\xff', True),
+        ('after_return', op('RETURN') + b'\xff', True),
+        ('skipped_arm', op('ZERO') + op('IF') + b'\xff' + op('ENDIF'), True),
+        ('unmatched_conditional', op('IF') + b'\xff', True),
+        ('ignored_truncated_suffix', b'\xff\x01', True),
+        ('fixed_push_payload', b'\x01\xff', False),
+        ('long_push_payload', b'\x4c\x4c' + b'\xff' * 76, False),
+        ('after_long_push', b'\x4c\x4c' + b'\xff' * 76 + b'\xff', True),
         ('empty_push', b'\x4c\x00', False),
-        ('ordinary_one', b'\x51', False),
-        ('ordinary_return_needs_vm', b'\x6a', False),
-        ('truncated_push_before_success', b'\x02\xf0', 'error'),
-        ('noncanonical_push_before_success', b'\x4c\x01\xf0', 'error'),
-        ('nonminimal_length_before_success', b'\x4c\xfd\x01\x00\xf0', 'error'),
-        ('truncated_length_before_success', b'\x4c\xfe\xf0', 'error'),
-        ('oversized_push_before_success', b'\x4c\xfd\x01\x20\xf0', 'error'),
+        ('ordinary_one', op('ONE'), False),
+        ('ordinary_return_needs_vm', op('RETURN'), False),
+        ('truncated_push_before_success', b'\x02\xff', 'error'),
+        ('noncanonical_push_before_success', b'\x4c\x01\xff', 'error'),
+        ('nonminimal_length_before_success', b'\x4c\xfd\x01\x00\xff', 'error'),
+        ('truncated_length_before_success', b'\x4c\xfe\xff', 'error'),
+        ('oversized_push_before_success', b'\x4c\xfd\x01\x20\xff', 'error'),
     ]
     for name, script, expected in cases:
         try:
@@ -433,9 +588,80 @@ def success_scan_vectors() -> dict:
             'success_bytes': bytes(sorted(SUCCESS_OPCODES)).hex(), 'cases': rows}
 
 
+def coinbase_identity_vectors(output: bytes) -> dict:
+    """Construct P01 coinbase identities and check field/context boundaries."""
+    parent = b'\x55' * 32
+    height = 7
+    header = u(7, 4) + u(0, 8) + u(1, 2) + u(1, 2)
+    outputs_root = indexed_tree_root([h('output', blob(output))])
+
+    def identities(inp: bytes) -> tuple[bytes, bytes]:
+        # Coinbase has no BranchWitness, so InputCore is byte-for-byte InputFull.
+        core = inp
+        full = inp
+        assert core == full
+        txid = h('txid', CHAIN + header + indexed_tree_root([h('inputcore', core)]) + outputs_root)
+        txhash = h('txhash', CHAIN + header + indexed_tree_root([h('inputfull', full)]) + outputs_root)
+        return txid, txhash
+
+    absent = coinbase_input(parent, height, None)
+    original = coinbase_input(parent, height, b'pool-1')
+    changed_data = coinbase_input(parent, height, b'pool-2')
+    changed_parent = coinbase_input(b'\x56' * 32, height, b'pool-1')
+    changed_height = coinbase_input(parent, height + 1, b'pool-1')
+    assert len(absent) == 42 and len(original) == 49
+    assert absent[41:] == b'\0' and original[41:] == b'\1\x06pool-1'
+    assert parse_coinbase_data(absent[41:]) is None
+    assert parse_coinbase_data(original[41:]) == b'pool-1'
+    assert parse_coinbase_data(coinbase_data(b'\xff\x66')) == b'\xff\x66'
+    assert parse_coinbase_data(coinbase_data(b'\xaa' * 8192)) == b'\xaa' * 8192
+    check_coinbase_context(original, parent, height)
+    check_coinbase_context(coinbase_input(ZERO32, 0, None), ZERO32, 0)
+    original_ids = identities(original)
+    assert identities(coinbase_input(parent, height, b'pool-1')) == original_ids  # sibling template
+    for inp in (absent, changed_data, changed_parent, changed_height):
+        assert all(a != b for a, b in zip(identities(inp), original_ids))
+    assert txroot([original_ids[1] + original_ids[0]]) != txroot([identities(changed_data)[1] + identities(changed_data)[0]])
+
+    for malformed in (b'', b'\x02', b'\x01\0', b'\x01' + blob(b'\xaa' * 8193),
+                      b'\xfd\x01\0', b'\x01\xfd\x01\0x', b'\x01\xfd',
+                      b'\x01\x02x', b'\0x'):
+        try:
+            parse_coinbase_data(malformed)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f'accepted malformed coinbase data: {malformed[:8].hex()}')
+    for bad in (b'', b'\xaa' * 8193):
+        try:
+            coinbase_data(bad)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError('accepted invalid constructed coinbase data')
+    for inp, expected_parent, expected_height in (
+        (original, b'\x56' * 32, height), (original, parent, height + 1),
+        (original, parent, 2**32)):
+        try:
+            check_coinbase_context(inp, expected_parent, expected_height)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError('accepted wrong coinbase context')
+    try:
+        coinbase_input(parent, 2**32, None)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError('encoded overflowing coinbase height')
+    return {'absent_input': absent.hex(), 'present_input': original.hex(),
+            'txid': original_ids[0].hex(), 'txhash': original_ids[1].hex(),
+            'scope': 'Constructed field and context model only; not a transaction parser or block validator.'}
+
+
 def make_vectors() -> dict:
     # Ordinary fixture uses OP_ONE, not a signature placeholder or payment claim.
-    script = b'\x51'
+    script = op('ONE')
     root = leaf(script)
     output = b'\0' + u(1000, 8) + b'\1' + root + b'\1\1\0'
     prev_output = b'\0' + u(2000, 8) + b'\1' + root + b'\1\1\0'
@@ -656,9 +882,11 @@ def make_vectors() -> dict:
     return {
         'schema': 'lotus/spec-candidate-smoke/v1',
         'status': 'single-model structural fixtures; not independently verified conformance',
+        'opcode_registry_sha256': hashlib.sha256(OPCODE_PATH.read_bytes()).hexdigest(),
         'generator_sha256': hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
         'packet_sha256': {p.name: hashlib.sha256(p.read_bytes()).hexdigest() for p in packets},
         'success_scan': success_scan_vectors(),
+        'review_regressions': review_regression_vectors(),
         'chain_id_fixture_only': CHAIN.hex(),
         'ordinary_op_one_fixture': {
             'output': output.hex(), 'burn_output': burn_output.hex(),
@@ -671,6 +899,7 @@ def make_vectors() -> dict:
             'signing_preimage': preimage.hex(), 'signing_message': h('sighash', preimage).hex(),
             'signing_message_mode_01': msg_all_outputs.hex(), 'signing_message_mode_02': msg_one_output.hex(),
             'note': 'No signature or full VM/block validation is asserted.'},
+        'coinbase_identity_fixture': coinbase_identity_vectors(output),
         'mint_input_fixture': {
             'mint_root': token_id.hex(), 'token_id': token_id.hex(),
             'input_core': mint_core.hex(), 'input_wire': mint_wire.hex(),
@@ -727,7 +956,7 @@ def main() -> None:
         path.write_text(json.dumps(actual, indent=2) + '\n')
     else:
         assert json.loads(path.read_text()) == actual, 'Fixtures or packet digests changed; review before regenerating.'
-    print('PASS: framing/signing inputs; 41 success opcodes and push-boundary scan cases; Merkle opcodes; 153 ordered-tree paths; compact sparse-map membership/absence/order; 56B MonetaryState/StateRoot, telescoping bootstrap & parabolic cost curves; 134/82/64-byte header views; LOG power/monotonic checks; exact tail rounding; ASERT boundaries and compact targets.')
+    print('PASS: framing/signing inputs and coinbase identity/context; 41 success opcodes and push-boundary scan cases; Merkle opcodes; 153 ordered-tree paths; compact sparse-map membership/absence/order; 56B MonetaryState/StateRoot, telescoping bootstrap & parabolic cost curves; 134/82/64-byte header views; LOG power/monotonic checks; exact tail rounding; ASERT boundaries and compact targets; byte fees, coinbase deductions, extension accounting and genesis indexing.')
 
 
 if __name__ == '__main__':

@@ -1,10 +1,10 @@
 # Lotus: a compatible v1 release, then a new v2 chain
 
-Status: review draft, October 9, 2026. No v2 genesis specification is frozen.
+Status: review draft, updated October 14, 2026. No v2 genesis specification is frozen.
 
 Start with the [review handoff](review-notes.md) for the current recommendations, executed checks and implementation entry points.
 
-The first deliverable is an updated Lotus v1 node that synchronizes the running network from genesis without an unofficial binary or manual intervention. That validated source becomes the foundation for Lotus v2: a separate proof-of-work chain with composable UTXO authorization, native assets, bounded covenants, and authenticated state.
+The first deliverable is an updated Lotus v1 node that synchronizes the running network from genesis without an unofficial binary or manual intervention. Verified V1 behavior is selectively carried into a dedicated ABC-based V2 series: a separate proof-of-work chain with composable UTXO authorization, native assets, bounded covenants, and authenticated state.
 
 V2's engineering goal is that **hard forks should not be needed after genesis**. Design the complete validity function before launch, leave named room for what cannot be foreseen (P03's extension points, limits sized for future signature schemes), and improve the implementation afterward. A hard fork remains possible; the design aims to make one unnecessary. This is a launch discipline, not a proof that cryptography, economic incentives, or software can never fail. A bug fix that changes which blocks are accepted is a consensus change regardless of what the release calls it.
 
@@ -19,7 +19,7 @@ V2's engineering goal is that **hard forks should not be needed after genesis**.
 | How do wallets and contracts interact? | [Script ABI](script-abi.md), [worked examples](examples/README.md) |
 | Which choices are now concrete? | [Six technical decision packets](decisions.md), [implementation entry contracts](../plans/implementation-entry.md) |
 | How do we establish correctness? | [Validation contract](validation.md), [recorded results](../../daemon/docs/lotus-validation-results.md) |
-| How do we implement v2? | [V2 implementation plan](../../daemon/docs/lotus-v2-implementation-plan.md) |
+| How do we implement v2, update the miner and create genesis? | [V2 implementation and launch plan](../../daemon/docs/lotus-v2-implementation-plan.md), including V1 patch reuse and V2-00–V2-07 acceptance gates |
 | What can be contributed upstream? | [Upstream plan](../../daemon/docs/lotus-upstream-plan.md) |
 | What is ready to investigate? | [Local work packets](../plans/tickets/README.md), [machine handoff](../plans/faster-machine-handoff.md) |
 | Why these choices? | [Rationale](rationale.md) |
@@ -40,4 +40,4 @@ The consensus draft owns proposed validity rules. The ABI owns developer-facing 
 
 The [former combined specification](../archive/updating-bitcoin-design-2026-10-08.md) and [former patch roadmap](../../daemon/docs/archive/patch-strategy-2026-10-08.md) are historical design evidence. Their performance claims, “DECIDED” labels, and code snippets are not current authority. Existing historical v1 specifications remain evidence for compatibility investigation, not v2 rules.
 
-Builds, rebases, live-network sync, monetary simulations, and benchmarks remain scheduled for the faster machine. This documentation pass does not claim those gates passed.
+V1 has separate validation evidence, summarized with exact source identities in the implementation plan. V2 daemon, miner, economic-simulation and launch gates still require their own evidence; this documentation review does not claim they passed.

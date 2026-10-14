@@ -1,10 +1,12 @@
 # Resource soundness and parameter selection
 
-Decision packet P05, October 9, 2026 (updated October 13, 2026). **Candidate cost algebra and parabolic fee-burn curves specified for D08** (unified Cost Units `cu`, parabolic transaction cost $C_{\text{tx}}$, rolling integer `ema_block_cost` $E_n$, and parabolic block burn floor, eliminating hard step-function walls `MAX_TX_BYTES` and `MAX_BLOCK_BYTES`); **primitive `cu` coefficients and shift constants ($S_{\text{tx\_knee}}, w, E_{\min}, S_{\text{linear}}, S_{\text{quad}}$) remain to be confirmed by hardware benchmark and economic simulation before genesis freeze**. A resource rule is consensus, even when its motivation is protection of a daemon. No post-genesis vote or hardware benchmark may change it implicitly.
+Decision packet P05, October 9, 2026 (updated October 14, 2026). **Candidate cost algebra and parabolic fee-burn curves specified for D08** (unified Cost Units `cu`, parabolic transaction cost $C_{\text{tx}}$, rolling integer `ema_block_cost` $E_n$, and parabolic block burn floor, eliminating hard step-function walls `MAX_TX_BYTES` and `MAX_BLOCK_BYTES`); **primitive `cu` coefficients and shift constants ($S_{\text{tx\_knee}}, w, E_{\min}, S_{\text{linear}}, S_{\text{quad}}$) remain to be confirmed by hardware benchmark and economic simulation before genesis freeze**. A resource rule is consensus, even when its motivation is protection of a daemon. No post-genesis vote or hardware benchmark may change it implicitly.
+
+Monetary index convention: issuance step `n >= 0` means block height `n + 1`; genesis commits the initial state without advancing any recurrence. See P02's genesis/indexing rule.
 
 ## Static cost algebra
 
-Apply P03's bounded instruction-boundary success scan first. An invocation containing an unassigned OP_SUCCESS_N pays a structural charge covering its complete script bytes and scan, plus all outer witness/proof/transaction charges; its suffix need not form an AST and no ordinary VM instructions run. The algebra and size pass below apply only when the scan finds no unassigned success opcode. Future assignments must preserve the old structural-charge floor and the transaction/block validity-subset requirement.
+Apply P03's bounded instruction-boundary success scan first. An invocation containing an unassigned OP_SUCCESS_N pays a structural charge covering its complete script bytes and scan, plus all outer witness/proof/transaction charges; its suffix need not form an AST and no ordinary VM instructions run. The algebra and size pass below apply only when the scan finds no unassigned success opcode. Future assignments preserve the frozen accounting view and add execution restrictions as specified below.
 
 Assign every primitive a positive integer upper-bound charge in **Cost Units (`cu`)** (normalized so **1 wire byte = 1 `cu`**) covering its operands and memory behavior. A charge that grows with operand size is a nondecreasing function of a per-operand size bound; the bound comes from the size pass below, and is MAX_ELEMENT_BYTES wherever that pass has no better answer. Let `cost(node)` be:
 
@@ -20,6 +22,14 @@ Generic enumeration bound is always 256 for static charging; input/output bounds
 With nonnegative charges, structural induction proves monotonicity in bounds: sums, max, and multiplication by nonnegative bounds are monotone. An ordinary instruction's charged work is bounded by its schedule. A selected conditional arm is bounded by max; a loop executes no more than its captured bound and BREAK only removes work. Induction therefore establishes `actual abstract charge <= static charge`, **conditional on correct primitive upper bounds and control semantics**. It does not prove a nanosecond bound or a hardware-independent memory-latency bound.
 
 Decode/charge syntax once per invocation, not once per expanded iteration. Nested I×O loops remain legal; I identical invocations still charge I²O inner work. No optimization discounts. Runtime memory/stack/range checks remain necessary even when static cost fits.
+
+## Extension-safe accounting and enforcement
+
+Freeze two views at genesis. `C_account` is the monetary accounting cost: evaluate the genesis opcode allocation, instruction-boundary success scan and cost schedule forever, even after assigning a success byte. An invocation that encounters a genesis-success byte keeps its genesis structural accounting charge for its complete script and outer work. This immutable view defines `L`, `C_tx`, `C_block` and the EMA committed in `MonetaryState`.
+
+`C_enforce` is the current validation charge. Initially it equals `C_account`. After an extension activates, statically charge its actual execution under the activated rules, at least the genesis accounting charge for that invocation; retain all outer charges and apply the same parabolic aggregation. Enforce invocation limits and the block burn floor using `C_enforce >= C_account`, but **update the EMA only from `C_account`**. Thus in the deduction formula use `R = RequiredBlockBurnFloor(C_enforce, E_n)`; genesis-rule nodes compute the weaker floor using `C_account` and accept the same coinbase underclaim and state root. New checks may reject more blocks; they must not change state transitions for blocks they accept. Each later activation must preserve all previous restrictions and must not lower the prior enforcement charge for an accepted invocation; comparison only to the genesis baseline is insufficient across multiple upgrades.
+
+The genesis scan used for accounting is distinct from the activated execution scan: newly assigned instructions may execute, but remain success bytes in the immutable accounting view. Prefix/suffix execution costs, proof/wire work, the fixed size-pass algorithm and block-overhead costs must be covered. Future assignments cannot reinterpret transaction bytes, monetary recurrence inputs or output/state effects. Differential upgrade vectors must compare whole-block acceptance and exact post-state roots, not only script success. Increased enforcement cost is a restriction, never a new monetary-state value.
 
 ## Size-bounded charging
 
@@ -56,12 +66,12 @@ The pass **never rejects a script and adds no validity rule**. It only chooses c
 
 ## Unified Cost Units (`cu`) and transaction linear base cost $L(\text{tx})$
 
-All wire bytes, BLAKE3/SHA256 hashing, signature verifications, state-tree updates, and static VM opcode charges are unified into a single integer unit: **Cost Units (`cu`)**, where **1 wire byte = 1 `cu`** and every cryptographic, commitment, state, and VM operation has a deterministic static `cu` charge. Each non-coinbase transaction's linear base cost $L(\text{tx})$ (`u64`) is the checked sum of:
+All wire bytes, BLAKE3/SHA256 hashing, signature verifications, state-tree updates, and static VM opcode charges are unified into a single integer unit: **Cost Units (`cu`)**, where **1 wire byte = 1 `cu`** and every cryptographic, commitment, state, and VM operation has a deterministic static `cu` charge. Each transaction's linear base cost $L(\text{tx})$ (`u64`) is the checked sum of:
 
-1. Wire parsing and canonicalization by bytes/counts (1 `cu` per serialized wire byte) and all script structural scans.
+1. Wire parsing and canonicalization by bytes/counts (1 `cu` per serialized wire byte) and all script structural scans. For coinbase, the zero-cost absence of witnesses does not exempt its bytes or outputs.
 2. Coin resolution, resolved output bytes and metadata; path/witness matching.
 3. Script/mint commitment hashing and every supplied membership sibling.
-4. `InputCoreLeaf(i)`, `InputsRoot`, `InputFullLeaf(i)`, `FullInputsRoot`, `OutputLeaf(j)`, `OutputsRoot`, `CoinLeaf(i)`, `CoinsRoot`, `TxID`, `TxHash`, and `OwnInputHash(i)` construction and hashing, charged linearly in $O(\text{tx bytes} + \text{resolved coin bytes})$ even if lazily cached. Both `TxID` and `TxHash` top-level digests hash a fixed 112-byte preimage, and every `CHECKSIG` or `SIGHASH` execution in any mode (`00`, `01`, `02`) hashes a fixed-size preimage of 138, 150 or 178 bytes ($\le 3$ BLAKE3 64-byte compression blocks) in $O(1)$ time, preventing quadratic sighash hashing.
+4. `InputCoreLeaf(i)`, `InputsRoot`, `InputFullLeaf(i)`, `FullInputsRoot`, `OutputLeaf(j)`, `OutputsRoot`, `CoinLeaf(i)`, `CoinsRoot`, `TxID`, `TxHash`, and `OwnInputHash(i)` construction and hashing, charged linearly in $O(\text{tx bytes} + \text{resolved coin bytes})$ even if lazily cached. Both `TxID` and `TxHash` top-level digests hash a fixed 112-byte preimage, and every `CHECKSIG` or `SIGHASH` execution in any mode (`00`, `01`, `02`) hashes a fixed-size preimage of 138, 150 or 178 bytes ($\le 4$ BLAKE3 64-byte compression blocks including the domain prefix) in $O(1)$ time, preventing quadratic sighash hashing.
 5. Every spend and mint invocation, including signatures, data hashing, byte copies, introspection serialization and Merkle-root opcodes (`MERKLEROOT_SORTED` and `MERKLEROOT_INDEXED`, charged at `k <= floor(size_bound(proof_bytes) / 32)` times the step cost of `hash_alg`, or `max(C_blake3, C_hash256)` when `hash_alg` is non-constant).
 6. Native/token aggregation and mint lookup, with a deterministic bounded algorithm/model.
 7. State updates and root calculation: each consumed/created key's leaf/value hashing and interior-node updates in P02's compact single-leaf-collapsed sparse tree (~27 hashes per key at $10^8$ coins, bounded by a conservative per-key `cu` charge).
@@ -70,13 +80,31 @@ Input resolution never loads parent transactions into memory, and outputs carry 
 
 The sorted/hashed algorithm chosen for asset accumulation must have a bounded worst-case schedule; expected O(1) hash-table lookup is not a worst-case consensus argument. Model at most I+O asset records with a deterministic sort or another explicitly bounded procedure. Storage I/O and peer submission limits remain operational obligations; consensus does not require the entire UTXO set in RAM.
 
+## Minimum byte fees and coinbase reward deduction
+
+`MIN_FEE_PER_KB = 1000` native atoms per **1,000 bytes** (decimal kB). Here a “sat” means one native atom, `10^-6 XPI`; it does not mean `10^-8 XPI`. For `b` bytes define `ByteFee(b) = ceil(1000*b/1000) = b` atoms using checked integer arithmetic. This is a consensus floor, not merely the upstream default relay policy. Relay may require more.
+
+Every ordinary transaction requires `F_tx >= ByteFee(len(Tx))`, counting its complete serialized bytes, including scripts and witness arguments. C14a's token-output burn remains a separate lower bound on the same fee, so both must hold; this does not add the two minima together. The parabolic block requirement below is additional and can require more burn than the byte floor.
+
+Coinbase has no fee-paying inputs. Its byte charge is deducted from the reward. Define `overhead_bytes = 134 + 4 + sum(len(CS(len(Tx))))` for the header, transaction count and all transaction-frame prefixes. Set `K = ByteFee(len(coinbase) + overhead_bytes)`. No bytes are exempt and ordinary transaction payload bytes are not counted twice. Coinbase hashing, output validation and state insertion are included in `L(coinbase)`; only nonexistent script execution, coin resolution and signing work are omitted. `C_envelope` charges envelope bytes, block transaction-tree hashing and other block-only work under the frozen schedule; per-transaction work is not charged twice.
+
+Let `R = RequiredBlockBurnFloor(C_block, E_n)` be the parabolic expression below. With `G = F - T_tok`, `BurnedFees = ceil(G/2)`, and actual coinbase output sum `C`, require:
+
+```text
+U_required = max(K, max(0, R - BurnedFees))
+C <= S + floor(G/2) - U_required
+U = S + floor(G/2) - C
+```
+
+If the available entitlement is less than `U_required`, the block is invalid; subtraction never wraps. Equivalently require `U >= K` and `BurnedFees + U >= R`. The unclaimed amount is burned, including when paid from subsidy in a coinbase-only block. Explicit burn outputs do not count as this underclaim. Coinbase payout distribution, including Avalanche-selected payouts, occurs **after** the required deduction. Genesis is a fixed manifest block with zero native issuance and is exempt from recurring fee/EMA rules; P02 defines that initialization boundary.
+
 ## Parabolic transaction and block cost curves (replacing `MAX_TX_BYTES` and `MAX_BLOCK_BYTES`)
 
 Arbitrary hard step-function byte walls (`MAX_TX_BYTES` and `MAX_BLOCK_BYTES`) are **removed** from consensus. Structural framing bounds (`u16` input/output counts, `MAX_OUTPUT_BRANCHES = 16`, `MAX_OUTPUT_PATHS = 16`, `MAX_ELEMENT_BYTES = 8192`, `MAX_SCRIPT_BYTES`, `MAX_ARGUMENTS`, `MAX_STACK_ITEMS`, etc.) remain enforced before allocation so parsers never allocate unbounded buffers, while aggregate transaction and block capacity are governed by smooth **parabolic integer cost curves** enforced through `C16`'s mandatory 50% native fee burn.
 
 ### 1. Parabolic transaction effective cost $C_{\text{tx}}$
 
-Given an ordinary transaction's linear base cost $L = L(\text{tx})$ (`u64` Cost Units), its **parabolic effective cost** $C_{\text{tx}}$ (`u64`, computed with checked `u128` intermediates) is:
+Given a transaction's linear base cost $L = L(\text{tx})$ (`u64` Cost Units), its **parabolic effective cost** $C_{\text{tx}}$ (`u64`, computed with checked `u128` intermediates) is:
 
 $$C_{\text{tx}} = L(\text{tx}) + \big((L(\text{tx}) \cdot L(\text{tx})) \gg S_{\text{tx\_knee}}\big)$$
 
@@ -87,21 +115,21 @@ with candidate knee shift $S_{\text{tx\_knee}} = 17$ ($2^{17} = 131{,}072\text{ 
 
 ### 2. Rolling integer `ema_block_cost` ($E_n$) and parabolic block burn floor
 
-Let $C_{\text{block}}$ be the sum of $C_{\text{tx}}$ over all ordinary (non-coinbase) transactions in block $n$, accumulated in checked `u128` arithmetic:
+Let $C_{\text{block}}$ be the sum of $C_{\text{tx}}$ over **all transactions, including coinbase**, plus deterministic block-envelope work at post-genesis step $n$, accumulated in checked `u128` arithmetic:
 
-$$C_{\text{block}} = \sum_{\text{tx} \in \text{block}} C_{\text{tx}}$$
+$$C_{\text{block}} = C_{\text{envelope}} + \sum_{\text{tx} \in \text{block}} C_{\text{tx}}$$
 
-The canonical 56-byte `MonetaryState` record ([P02](commitments-and-state.md)) maintains a rolling integer exponential moving average $E_n$ (`ema_block_cost:u64`) of block cost units with candidate smoothing shift $w = 10$ ($2^{10} = 1024\text{ blocks} \approx 34.1\text{ hours}$ at 2-minute blocks), updated after accepting block $n$:
+The canonical 56-byte `MonetaryState` record ([P02](commitments-and-state.md)) maintains a rolling integer exponential moving average $E_n$ (`ema_block_cost:u64`) of block cost units with candidate smoothing shift $w = 10$ ($2^{10} = 1024\text{ blocks} \approx 34.1\text{ hours}$ at 2-minute blocks), updated after accepting issuance step $n$:
 
 $$E_{n+1} = E_n - (E_n \gg 10) + (C_{\text{block}} \gg 10)$$
 
-Let $F_n$ be total native transaction fees of block $n$'s ordinary transactions, $T_{\text{tok},n}$ the mandatory token-output burn (`C14a`), $G_n = F_n - T_{\text{tok},n}$ the remaining native fees, and $\text{BurnedFees}_n = G_n - \lfloor G_n / 2 \rfloor = \lceil G_n / 2 \rceil$ the mandatory 50% burned share of remaining native fees under `C16`. Consensus requires $\text{BurnedFees}_n$ to be at least the **Required Block Burn Floor**:
+Let $F_n$ be total native transaction fees of issuance step $n$'s ordinary transactions, $T_{\text{tok},n}$ the mandatory token-output burn (`C14a`), $G_n = F_n - T_{\text{tok},n}$ the remaining native fees, and $\text{BurnedFees}_n = G_n - \lfloor G_n / 2 \rfloor = \lceil G_n / 2 \rceil$ the mandatory 50% burned share of remaining native fees under `C16`. Consensus requires $\text{BurnedFees}_n + U$ to be at least the **Required Block Burn Floor**:
 
-$$\text{BurnedFees}_n \ge \left(\big(C_{\text{block}} \cdot \max(E_n,\, E_{\min})\big) \gg S_{\text{linear}}\right) + \left(\big(C_{\text{block}} \cdot C_{\text{block}}\big) \gg S_{\text{quad}}\right)$$
+$$\text{BurnedFees}_n + U \ge \left(\big(C_{\text{block}} \cdot \max(E_n,\, E_{\min})\big) \gg S_{\text{linear}}\right) + \left(\big(C_{\text{block}} \cdot C_{\text{block}}\big) \gg S_{\text{quad}}\right)$$
 
 Why this synergy with `C16`'s 50% fee burn replaces `MAX_BLOCK_BYTES`:
 
-- **Miner self-dealing immunity:** In a chain where miners keep 100% of transaction fees, a fee floor does not constrain block size because a miner can include their own dummy transactions paying high fees to themselves at zero net cost. Because `C16` permanently burns $\text{BurnedFees}_n = G_n - \lfloor G_n / 2 \rfloor$, **not even a miner mining their own transactions can stuff a block for free**: every additional `cu` of block cost increases the irrevocable native XPI burn required for the block to be consensus-valid.
+- **Miner self-dealing immunity:** In a chain where miners keep 100% of transaction fees, a fee floor does not constrain block size because a miner can include their own dummy transactions paying high fees to themselves at zero net cost. Because `C16` permanently burns $\text{BurnedFees}_n = G_n - \lfloor G_n / 2 \rfloor$, **not even a miner mining their own transactions can stuff a block for free**: the byte floor and parabolic resource floor apply to ordinary transactions and reward-funded coinbase work. Integer rounding can leave adjacent cost values at the same parabolic floor; the byte charge remains exact.
 - **Sustained-load congestion pricing (`ema_block_cost` linear term):** When sustained demand (whether byte-heavy or VM/crypto-heavy, since all opcodes and hashes bill into $L(\text{tx})$) pushes $E_n$ above $E_{\min}$, the linear term $\big(C_{\text{block}} \cdot \max(E_n, E_{\min})\big) \gg S_{\text{linear}}$ automatically raises the marginal burn required per `cu` across subsequent blocks.
 - **Single-block spike protection (quadratic term):** The quadratic surcharge $(C_{\text{block}} \cdot C_{\text{block}}) \gg S_{\text{quad}}$ makes sudden single-block stuffing spikes quadratically expensive in burned XPI even when $E_n$ is low, while allowing elastic burst capacity during genuine demand spikes without a hard `MAX_BLOCK_BYTES` ceiling.
 
@@ -112,9 +140,9 @@ Why this synergy with `C16`'s 50% fee burn replaces `MAX_BLOCK_BYTES`:
 | Wire framing | `u16` input/output counts (`MAX_INPUTS`, `MAX_OUTPUTS`), `MAX_BLOCK_TXS`, `MAX_MINTS` (`MAX_TX_BYTES` and `MAX_BLOCK_BYTES` removed in favor of parabolic $C_{\text{tx}}$ and block burn floor) |
 | Output/authorization | `MAX_OUTPUT_BRANCHES = 16`, `MAX_OUTPUT_PATHS = 16` (implied `MAX_PATH_BRANCHES = 16`, `MAX_OUTPUT_BYTES = 812`, `MAX_COIN_BYTES = 867`), `MAX_BRANCH_PROOF_DEPTH = 64` |
 | VM | `MAX_SCRIPT_BYTES`, `MAX_ARGUMENTS`, `MAX_ELEMENT_BYTES` (working value 8192), `MAX_STACK_ITEMS`, `MAX_ALTSTACK_ITEMS`, `MAX_VM_BYTES`, `MAX_AST_DEPTH`; loop depth=2 and generic bound=256 |
-| Cost & parabolic curves | Primitive/structural `cu` schedule (1 wire byte = 1 `cu`), `MAX_INVOCATION_COST`, candidate shift parameters ($S_{\text{tx\_knee}} = 17$, $w = 10$, $E_{\min}$, $S_{\text{linear}}$, $S_{\text{quad}}$) and initial $E_0$ |
+| Cost & parabolic curves | Frozen accounting schedule and extension enforcement schedule (1 wire byte = 1 `cu`), `MIN_FEE_PER_KB = 1000` atoms per 1000 bytes, `MAX_INVOCATION_COST`, candidate shift parameters ($S_{\text{tx\_knee}} = 17$, $w = 10$, $E_{\min}$, $S_{\text{linear}}$, $S_{\text{quad}}$) and initial $E_0$ |
 | Time/chain | `COINBASE_MATURITY`, `POW_LIMIT`, ASERT anchor and half-life (working value 172800 s), timestamp/future-eligibility rules |
-| Money | 56-byte `MonetaryState` initial values ($R_0 = M_{\text{boot}}$, $T_0$, $W_{-1}$, $E_0$), bootstrap shift ($k_{\text{boot}} = 20$), tail bounds ($T_{\min}, T_{\max}$), `DUST_LIMIT` and the token-output burn multiple (`C14a`), genesis allocations (protocol faucet rejected under `D11`) |
+| Money | 56-byte `MonetaryState` initial values ($R_0 = M_{\text{boot}}$, $T_0$, $W_{-1}$, $E_0$), bootstrap shift ($k_{\text{boot}} = 20$), tail bounds ($T_{\min}, T_{\max}$), `DUST_LIMIT` and the token-output burn multiple (`C14a`), zero genesis issuance; Avalanche payout profile (P06) |
 | Identity | `ChainID`, header/transaction versions, exact genesis bytes/hash, network/address/seed/directory configuration |
 
 Represent constants in a versioned machine-readable manifest, not scattered daemon defaults. Its byte grammar and digest must be fixed before freezing; a JSON file with unspecified number/string canonicalization is not yet a consensus hash preimage. An outer release manifest can hash the exact canonical parameter-file bytes without making its own digest part of those bytes.
@@ -128,3 +156,5 @@ Before freezing the numerical mainnet shift constants ($S_{\text{tx\_knee}}, w, 
 A separate named development profile may choose smaller values for fixtures. Its name and ChainID must differ from production, and passing it must not be represented as mainnet capacity qualification. No development value is adopted by this packet merely to make the checklist green.
 
 Implementation can begin on the parameterized parser/evaluator, unified `cu` cost algebra, and parabolic fee-burn checks before final constant calibration. Mainnet readiness cannot. This separates a real implementation dependency from a launch dependency without pretending either is complete.
+
+A minimally populated block, including its coinbase byte charge and envelope work, must remain affordable at the selected tail minimum and reachable EMA values. Test that liveness condition during calibration; underclaim may consume subsidy but cannot make a negative payout valid. Coinbase output amounts use fixed-width encoding, so reducing the claim does not change its serialized length; constructors finalize output count/policies before computing the deduction.

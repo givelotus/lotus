@@ -1,6 +1,6 @@
 # Implementation entry contracts
 
-October 9, 2026. These direct-request contracts make the **candidate** implementable without claiming mainnet design approval. The maintainer has authorized autonomous preparation; no worker has been dispatched and no live-network operation is authorized here. Use an isolated checkout at the reviewed documentation candidate revision and record that exact commit before starting. Candidate packet digests are in the structural fixture manifest.
+October 9, 2026; source routing updated October 14. These direct-request contracts make the **candidate** implementable without claiming mainnet design approval. The maintainer has authorized autonomous preparation; no worker has been dispatched and no live-network operation is authorized here. Use an isolated checkout at the reviewed documentation candidate revision and record that exact commit before starting. Candidate packet digests are in the structural fixture manifest.
 
 The first two units can start independently. The third is an evidence investigation whose inputs still need to be collected. All three require a strong implementation lane because they touch persistence, protocol bytes or compatibility; the actual harness/model is selected and recorded at dispatch. Review before integration, not merely after tests turn green.
 
@@ -8,11 +8,11 @@ The first two units can start independently. The third is an evidence investigat
 
 **Outcome:** a developer can prepare separate reference-v1, candidate-v1, candidate-v2 and upstream workspaces with explicit source pins, without overwriting existing work or suppressing patch failures.
 
-**Evidence:** setup reads the modern ABC pin for v1 while comments describe the extraction anchor; upstream/v2 share a directory; reset/branch checkout can affect valuable work; commit failures are suppressed. See [V1-01 draft](tickets/workspace-provenance.md).
+**Historical evidence:** the original October 9 investigation reported ambiguous pins/shared workspaces and suppressed failures. Recheck each condition against current tooling before treating it as an open bug. The dedicated V2 pin and six-patch manifest now exist; the [current implementation plan](../../daemon/docs/lotus-v2-implementation-plan.md) owns source routing and acceptance.
 
 **Boundary:** `daemon/scripts`, Makefile, pin-role metadata, patch-series validation and their disposable-repository tests. Preserve existing workspaces and all data directories. Do not apply the full history, change network consensus or launch a node.
 
-**Implementation contract:** model extraction base, compatible reference, modern candidate and validated-v1 as distinct inputs. Fail before mutation for unknown series, unavailable pin, conflicting workspace, dirty destructive transition, missing/empty/no-diff active patch or unsupported resume state. Handle documented no-ops by explicit disposition, not swallowed errors. Derive all per-series checkout/build/output paths explicitly. A future v2 setup must require an actual validated-v1 commit; absence is a clear error, never fallback to ABC.
+**Implementation contract:** model extraction base, compatible reference, modern candidate and validated-v1 as distinct inputs. Fail before mutation for unknown series, unavailable pin, conflicting workspace, dirty destructive transition, missing/empty/no-diff active patch or unsupported resume state. Handle documented no-ops by explicit disposition, not swallowed errors. Derive all per-series checkout/build/output paths explicitly. V2 setup must use its explicit ABC base and separate V2 series, never an implicit fallback or a second application over the entire V1 stack. Promotion of a daemon candidate additionally requires a recorded validated-V1 reference and selective-port regression evidence; a missing reference blocks promotion, not isolated reference development.
 
 **Proof:** isolated Git fixtures demonstrate preserved dirty files, separate paths, deterministic resume, exact pin checkout, failure propagation and no false success. Snapshot input fixture state before/after rejection. Test reset only on disposable owned fixtures with explicit authorization. Publish tested commands and rollback instructions. New tooling must not retroactively mutate historical patch provenance.
 
