@@ -15,6 +15,8 @@ import 'package:vase/features/wallet/wallet_model.dart';
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
+  // All app routes have direct-linkable paths, including pushed detail pages.
+  GoRouter.optionURLReflectsImperativeAPIs = true;
   await SentryFlutter.init(
     (options) {
       options.dsn =

@@ -304,3 +304,8 @@ Upstream Bitcoin ABC's in-process Chronik (`chronik/`) assumes standard 80-byte 
 ## Vase routed swipe restoration (2026-10-14)
 
 - User requested the historical PageView structure and desktop/web routes together. Restore Settings/scanner/Receive horizontal pages with URL synchronization, scanner suspension, state-owned controller lifecycle, and existing payment confirmation routes; details are in wallets/vase/AGENTS.md. Keep speculative contacts navigation separate from this historical restoration.
+
+## Vase contacts and feedback candidate (2026-10-14)
+
+- User reports missing Contacts swipe and calculator validation layout bounce. The candidate uses the earlier requested layout: right drag from scanner opens app-owned Contacts, left opens Receive, downward pull opens Settings; buttons and direct routes remain. Do not describe the historical Settings-left pager as the completed Contacts design.
+- Contacts have independent local IDs, strict XPI-mainnet addresses, an optional phone-contact link, and their own versioned storage record. Saving/editing contacts must not write wallet keys or overwrite unreadable contact data. Phone contact selection/write-back is optional and explicit; it neither enumerates/uploads the address book nor silently modifies phone records. Native phone permission/provider behavior still needs device validation.

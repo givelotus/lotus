@@ -1,14 +1,18 @@
 import 'package:flutter/material.dart';
 import 'package:go_router/go_router.dart';
 import 'package:vase/features/home/home_page.dart';
+import 'package:vase/features/contacts/contacts_page.dart';
 import 'package:vase/features/request/request_page.dart';
 import 'package:vase/features/settings/settings_page.dart';
 
-const _paths = ['/settings', '/', '/request'];
+const _paths = ['/contacts', '/', '/request'];
 
 /// These mutually exclusive routes share a page key so URL changes preserve the
 /// pager, its controller, and the state of the wallet's adjacent screens.
-List<RouteBase> walletPageRoutes({ScannerBuilder? scannerBuilder}) => [
+List<RouteBase> walletPageRoutes({
+  ScannerBuilder? scannerBuilder,
+  Widget Function(VoidCallback)? contactsBuilder,
+}) => [
   for (final path in _paths)
     GoRoute(
       path: path,
@@ -17,12 +21,29 @@ List<RouteBase> walletPageRoutes({ScannerBuilder? scannerBuilder}) => [
         child: WalletPager(
           location: state.uri.path,
           scannerBuilder: scannerBuilder,
+          contactsBuilder: contactsBuilder,
           initialRequestAmount: state.extra is BigInt
               ? state.extra as BigInt
               : null,
         ),
       ),
     ),
+  GoRoute(
+    path: '/settings',
+    pageBuilder: (context, state) => CustomTransitionPage<void>(
+      key: state.pageKey,
+      child: SettingsPage(
+        onBack: () => context.canPop() ? context.pop() : context.go('/'),
+      ),
+      transitionsBuilder: (_, animation, _, child) => SlideTransition(
+        position: Tween(
+          begin: const Offset(0, -1),
+          end: Offset.zero,
+        ).animate(CurvedAnimation(parent: animation, curve: Curves.easeInOut)),
+        child: child,
+      ),
+    ),
+  ),
 ];
 
 class WalletPager extends StatefulWidget {
@@ -30,11 +51,13 @@ class WalletPager extends StatefulWidget {
     super.key,
     required this.location,
     this.scannerBuilder,
+    this.contactsBuilder,
     this.initialRequestAmount,
   });
 
   final String location;
   final ScannerBuilder? scannerBuilder;
+  final Widget Function(VoidCallback)? contactsBuilder;
   final BigInt? initialRequestAmount;
 
   @override
@@ -96,11 +119,15 @@ class _WalletPagerState extends State<WalletPager> {
       controller: _controller,
       onPageChanged: _pageChanged,
       children: [
-        _KeptPage(child: SettingsPage(onBack: () => context.go('/'))),
+        _KeptPage(
+          child:
+              widget.contactsBuilder?.call(() => context.go('/')) ??
+              ContactsPage(onBack: () => context.go('/')),
+        ),
         HomePage(
           active: _index == 1,
           scannerBuilder: widget.scannerBuilder,
-          onSettings: () => context.go('/settings'),
+          onContacts: () => context.go('/contacts'),
           onReceive: () => context.go('/request'),
         ),
         _KeptPage(
