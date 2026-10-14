@@ -58,7 +58,7 @@ trap cleanup EXIT
 NODE_ARGS=("-datadir=$CANDIDATE/smoke-data" -rpcport=18432 -listen=0 -connect=0 -dnsseed=0 -discover=0 -assumevalid=0 -daemon)
 [[ "$LOTUS_CHRONIK" != ON ]] || NODE_ARGS+=(-chronik=1 -chronikbind=127.0.0.1:18431)
 "$BIN/lotusd" "${NODE_ARGS[@]}"
-"${CLI[@]}" -rpcwait -rpcwaittimeout=60 getblockchaininfo
+timeout 60 "${CLI[@]}" -rpcwait getblockchaininfo
 "${CLI[@]}" verifychain 4 0
 # An empty watch-only wallet confirms packaged wallet RPC support without keys.
 "${CLI[@]}" createwallet guix-smoke true true
