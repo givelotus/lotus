@@ -172,7 +172,7 @@ fn display_hash(hash: &[u8]) -> String {
 
 async fn update_next_block(server: &Server) -> Result<(), Box<dyn std::error::Error>> {
     let log = server.log();
-    let response = init_request(&server)
+    let response = init_request(server)
         .await
         .body(format!(
             r#"{{"method":"getrawunsolvedblock","params":["{}"]}}"#,
@@ -202,23 +202,26 @@ async fn update_next_block(server: &Server) -> Result<(), Box<dyn std::error::Er
         None => {
             log.error(format!(
                 "getrawunsolvedblock failed: {}",
-                response.error.unwrap_or("unknown error".to_string())
+                response
+                    .error
+                    .map(|error| error.to_string())
+                    .unwrap_or_else(|| "unknown error".to_string())
             ));
             return Ok(());
         }
     };
-    let block = create_block(&unsolved_block);
+    let block = create_block(&unsolved_block)?;
     if let Some(current_block) = &block_state.current_block {
         if current_block.prev_hash() != block.prev_hash() {
             log.info(format!(
                 "Switched to new chain tip: {}",
-                display_hash(&block.prev_hash())
+                display_hash(block.prev_hash())
             ));
         }
     } else {
         log.info(format!(
             "Started mining on chain tip: {}",
-            display_hash(&block.prev_hash())
+            display_hash(block.prev_hash())
         ));
     }
     block_state.extra_nonce += 1;
@@ -246,10 +249,11 @@ async fn mine_some_nonces(server: ServerRef) -> Result<()> {
             let log = server.log();
             let mut miner = server.miner.lock().unwrap();
             if !miner.has_nonces_left(&work) {
-                log.error(format!(
+                log.error(
                     "Error: Exhaustively searched nonces. This could be fixed by lowering \
                            rpc_poll_interval."
-                ));
+                        .to_string(),
+                );
                 return Ok((None, 0));
             }
             miner
@@ -391,6 +395,12 @@ impl Log {
 
     pub fn hashrates<'a>(&'a self) -> std::sync::RwLockReadGuard<'a, Vec<HashrateEntry>> {
         self.hashrates.read().unwrap()
+    }
+}
+
+impl Default for Log {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
