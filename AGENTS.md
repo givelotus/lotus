@@ -50,7 +50,7 @@ Workspaces (`daemon/workspace-*`) are **gitignored** local clones created by `ma
 | SERIES | Base | Version file | Workspace | Purpose |
 |--------|------|-------------|-----------|---------|
 | `v1` | `bitcoin-abc` `8c67fe1e85` | `bitcoin-abc-v1-version` | `workspace-v1/` | **Lotus V1 mainnet (`v11.6.0`)** — 153 patches (`000`–`247`) + in-process Chronik (`-DBUILD_CHRONIK=ON`) |
-| `ecash` | `bitcoin-abc` `252182e9` | `bitcoin-abc-version` | `workspace-ecash/` | Upstream reference patches |
+| `ecash` | `bitcoin-abc` `1fb7db17` | `bitcoin-abc-version` | `workspace-ecash/` | Upstream reference patches |
 | `doged` | `doged-io/doged` | `doged-version` | `workspace-doged/` | Dogecoin ABC reference |
 | `bchn` | BCHN `v28.0.0` | `bchn-version` | `workspace-bchn/` | Bitcoin Cash Node upstream PR candidates |
 
@@ -199,6 +199,7 @@ Upstream Bitcoin ABC's in-process Chronik (`chronik/`) assumes standard 80-byte 
 - Keep this eCash correction separate from Lotus's own series. Update each chain's patch independently and retain its protocol fixtures. The eCash submission is one mailbox diff including algorithm and native regression tests; the previous failure payload/tree/metadata stays in provenance history.
 - Existing old-assembler failure harness is explicitly historical and reads commit `f67257e2`, with `--patch-file` for shallow clones. It must not pretend to test the corrected current assembler. See `daemon/docs/ecash01-corrected-snapshot-assembler.md` for exact before/after scope.
 - Main now retains the corrected custom assembler in Lotus 001 and eCash 01 separately. Feature planning reports V1 block construction as integrated, without adding duplicate patches. Rebuild the native release candidate from this corrected series; prior candidate CI and assets do not validate the newly retained implementation.
+- The user selected `1fb7db17c176cdea8a2c60d887891589382ee4e3` as the sole eCash acceptance pin. `daemon/bitcoin-abc-version` now selects it; stop spending work on older-base compatibility and retain those results only as historical evidence. Verify individual candidates and their combinations at this exact revision. Lotus keeps its independently validated V1 pin.
 
 ## Corrected custom mining scheduler (supersedes temporary upstream restoration)
 

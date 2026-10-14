@@ -36,7 +36,7 @@ help:
 	@echo "  Network input schema: daemon/NETWORK-RELEASE.md"
 	@echo ""
 	@echo "  SERIES=v1 (default): mainnet    — workspace-v1/     (bitcoin-abc 8c67fe1e85 + Chronik)"
-	@echo "  SERIES=ecash:        upstream   — workspace-ecash/  (bitcoin-abc 252182e9)"
+	@echo "  SERIES=ecash:        upstream   — workspace-ecash/  (bitcoin-abc 1fb7db17)"
 	@echo "  SERIES=doged:        doged      — workspace-doged/  (direct clone doged-io/doged)"
 	@echo "  SERIES=bchn:         BCHN       — workspace-bchn/   (BCHN v28.0.0)"
 	@echo "  eCash/BCHN defaults apply no candidates; experimental/placeholder patches are not validated features."
