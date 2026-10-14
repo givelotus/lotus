@@ -14,7 +14,7 @@ CANDIDATE="$2"
 [[ -z "$(git -C "$SOURCE" status --porcelain --untracked-files=no)" ]] || { echo 'Source has tracked modifications.' >&2; exit 1; }
 command -v guix >/dev/null
 SOURCE_COMMIT="$(git -C "$SOURCE" rev-parse HEAD)"
-SOURCE_TREE="$(git -C "$SOURCE" rev-parse HEAD^{tree})"
+SOURCE_TREE="$(git -C "$SOURCE" rev-parse 'HEAD^{tree}')"
 SOURCE_EPOCH="$(git -C "$SOURCE" show -s --format=%at HEAD)"
 mkdir -p "$CANDIDATE"
 CANDIDATE="$(cd "$CANDIDATE" && pwd)"
@@ -23,10 +23,11 @@ git -C "$CANDIDATE/source" checkout --detach "$SOURCE_COMMIT"
 git -C "$CANDIDATE/source" -c user.name='Lotus Guix candidate' -c user.email='builds@givelotus.org' am --committer-date-is-author-date --keep-non-patch "$DAEMON_DIR/candidates/guix/000-lotus-guix-linux.patch"
 cd "$CANDIDATE/source"
 printf 'source_commit=%s\nsource_tree=%s\nadapted_commit=%s\nadapted_tree=%s\nsource_date_epoch=%s\n' \
-    "$SOURCE_COMMIT" "$SOURCE_TREE" "$(git rev-parse HEAD)" "$(git rev-parse HEAD^{tree})" "$SOURCE_EPOCH" > "$CANDIDATE/inputs.txt"
+    "$SOURCE_COMMIT" "$SOURCE_TREE" "$(git rev-parse HEAD)" "$(git rev-parse 'HEAD^{tree}')" "$SOURCE_EPOCH" > "$CANDIDATE/inputs.txt"
 export HOSTS=x86_64-linux-gnu JOBS="${JOBS:-2}"
 export SOURCE_DATE_EPOCH="$SOURCE_EPOCH" FORCE_SOURCE_DATE_EPOCH=1
-export FORCE_VERSION="$(cat "$DAEMON_DIR/release-version")"
+FORCE_VERSION="$(cat "$DAEMON_DIR/release-version")"
+export FORCE_VERSION
 export DISTNAME="lotus-${FORCE_VERSION}" OUTDIR_BASE="$CANDIDATE/output"
 ./contrib/guix/guix-build
 cp "$CANDIDATE/inputs.txt" "$CANDIDATE/output/inputs.txt"
