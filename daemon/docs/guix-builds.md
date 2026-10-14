@@ -85,7 +85,11 @@ record its new source provenance.
 
 Initial CI proved Ubuntu's packaged Guix installs and its daemon is reachable,
 and exposed the inherited depends parser failure and obsolete Savannah channel
-URL (HTTP 500 after all depends source hashes passed). Subsequent candidate runs
+URL (HTTP 500 after all depends source hashes passed). The next attempt built pinned Guix and the custom Linux toolchain, then a
+substitute subprocess failed with a TLS write/push error during final environment
+creation. CI now provisions the same FHS container environment in a separate
+step with three bounded attempts, preserving its store between transient
+failures. Subsequent candidate runs
 are still pending; there is no successful Guix Lotus binary or reproducibility
 claim yet. Record exact successful run IDs and artifact hashes here before
 promoting this path into a release workflow.
