@@ -30,6 +30,9 @@ database/index, generates metadata, verifies the result again, and promotes the
 entire candidate with one directory rename. Failed preparation leaves no partial
 candidate. Do not point the destination at an existing checkout or datadir.
 Uncommitted *untracked* feature files must be tracked before preparing a candidate.
+The candidate preserves the original checkout's origin fetch and push URLs;
+it never retains the local clone source as an implicit publication destination.
+If the source has no origin, the candidate has none.
 
 No mode flag means a read-only drift report. `--check` fails on drift. `--write`
 updates an already isolated candidate with staged writes and rollback on ordinary
@@ -126,7 +129,10 @@ python3 daemon/scripts/prepare-release.py --upstream /path/to/isolated/abc \
 ```
 
 This rechecks generated metadata, clean checkout, exact remote main, and CI
-identity/success. It creates and pushes a **new** annotated tag; tag CI rebuilds,
+identity/success. Both origin fetch and push URLs must each resolve to exactly
+one canonical `givelotus/lotus` GitHub HTTPS or SSH URL. Local paths, other
+repositories, multiple destinations, and noncanonical URLs are rejected before
+network access or tag creation. It creates and pushes a **new** annotated tag; tag CI rebuilds,
 checks, and publishes assets. Existing local or remote tags are refused, so this
 operation cannot republish `v11.6.0`. Do not delete a tag to bypass this check.
 A transport error may leave a local tag: reconcile the remote before retrying.

@@ -129,9 +129,15 @@ class ReleaseTests(unittest.TestCase):
             subprocess.run(["git", "-C", str(self.root), "-c", "user.name=Test", "-c", "user.email=test@example.invalid", *args], check=True, stdout=subprocess.PIPE)
         git("add", "daemon")
         git("commit", "-qm", "Candidate fixture")
+        git("remote", "add", "origin", "https://github.com/givelotus/lotus.git")
+        git("remote", "set-url", "--push", "origin", "ssh://git@github.com/givelotus/lotus.git")
         destination = self.root / "review"
         release.candidate(self.root, self.upstream, "12.0.0", destination)
         self.assertEqual((destination / "daemon/release-version").read_text(), "12.0.0\n")
+        for options in ([], ["--push"]):
+            expected = subprocess.check_output(["git", "-C", str(self.root), "remote", "get-url", *options, "origin"]).decode().strip()
+            actual = subprocess.check_output(["git", "-C", str(destination), "remote", "get-url", *options, "origin"]).decode().strip()
+            self.assertEqual(actual, expected)
         self.assertEqual((self.root / "daemon/release-version").read_text(), "11.6.0\n")
         self.assertEqual(release.prepare(destination, self.upstream, "12.0.0", check=True)["changed"], [])
         with self.assertRaisesRegex(ValueError, "already exists"):
@@ -141,6 +147,10 @@ class ReleaseTests(unittest.TestCase):
             release.candidate(self.root, self.upstream, "bad", failed)
         self.assertFalse(failed.exists())
         self.assertFalse(list(self.root.glob(".lotus-candidate-*")))
+        git("remote", "remove", "origin")
+        no_origin = self.root / "without-origin"
+        release.candidate(self.root, self.upstream, "12.0.0", no_origin)
+        self.assertEqual(subprocess.check_output(["git", "-C", str(no_origin), "remote"]), b"")
 
     def test_publish_exact_reviewed_commit_once_and_reject_dirty_checkout(self):
         self.prepare(write=True)
@@ -160,22 +170,36 @@ class ReleaseTests(unittest.TestCase):
         git("config", "user.email", "test@example.invalid")
         with self.assertRaisesRegex(ValueError, "HEAD differs"):
             release.publish(self.root, "11.6.0", "0" * 40)
+        # Local origins and a distinct noncanonical push destination fail before
+        # any network access or tag creation.
+        with self.assertRaisesRegex(ValueError, "canonical"):
+            release.publish(self.root, "11.6.0", commit, "123")
+        git("remote", "set-url", "origin", "https://github.com/givelotus/lotus.git")
+        git("remote", "set-url", "--push", "origin", str(remote))
+        with self.assertRaisesRegex(ValueError, "canonical"):
+            release.publish(self.root, "11.6.0", commit, "123")
+        self.assertEqual(git("tag", "--list"), "")
+        git("remote", "set-url", "--push", "origin", "git@github.com:givelotus/lotus.git")
         real_run = release.run
+        def fixture_transport(args, **kwargs):
+            if args[0] == "git" and "origin" in args and ("ls-remote" in args or "push" in args):
+                args = [str(remote) if arg == "origin" else arg for arg in args]
+            return real_run(args, **kwargs)
         def checked_run(args, **kwargs):
             if args[0] == "gh":
                 return json.dumps({"headSha": commit, "conclusion": "success", "event": "workflow_dispatch", "workflowName": "Build & Release Lotus Daemon (with Chronik)"}).encode()
-            return real_run(args, **kwargs)
+            return fixture_transport(args, **kwargs)
         def failed_validation(args, **kwargs):
             if args[0] == "gh":
                 return json.dumps({"headSha": commit, "conclusion": "failure", "event": "workflow_dispatch", "workflowName": "Build & Release Lotus Daemon (with Chronik)"}).encode()
-            return real_run(args, **kwargs)
+            return fixture_transport(args, **kwargs)
         with patch.object(release, "run", side_effect=failed_validation):
             with self.assertRaisesRegex(ValueError, "Validation run"):
                 release.publish(self.root, "11.6.0", commit, "123")
         self.assertEqual(git("tag", "--list"), "")
         with patch.object(release, "run", side_effect=checked_run):
             self.assertEqual(release.publish(self.root, "11.6.0", commit, "123"), "v11.6.0")
-        self.assertIn("refs/tags/v11.6.0", git("ls-remote", "origin", "refs/tags/v11.6.0"))
+        self.assertIn("refs/tags/v11.6.0", git("ls-remote", str(remote), "refs/tags/v11.6.0"))
         with patch.object(release, "run", side_effect=checked_run):
             with self.assertRaisesRegex(ValueError, "already exists"):
                 release.publish(self.root, "11.6.0", commit, "123")

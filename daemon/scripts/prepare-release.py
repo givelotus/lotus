@@ -184,6 +184,11 @@ def publish(root, version, reviewed_commit, validation_run=None):
         raise ValueError("Publish requires a clean reviewed checkout")
     if git("rev-parse", "HEAD") != reviewed_commit:
         raise ValueError("HEAD differs from --reviewed-commit")
+    canonical = re.compile(r"(?:https://github\.com/givelotus/lotus(?:\.git)?|git@github\.com:givelotus/lotus(?:\.git)?|ssh://git@github\.com/givelotus/lotus(?:\.git)?)\Z")
+    for option in ((), ("--push",)):
+        urls = git("remote", "get-url", *option, "--all", "origin").splitlines()
+        if len(urls) != 1 or not canonical.fullmatch(urls[0]):
+            raise ValueError("Publish requires exactly one canonical givelotus/lotus GitHub origin fetch URL and push URL")
     remote_main = git("ls-remote", "origin", "refs/heads/main").split()
     if not remote_main or remote_main[0] != reviewed_commit:
         raise ValueError("Publish requires the exact reviewed commit on origin/main")
@@ -294,6 +299,18 @@ def candidate(root, upstream, version, destination, network=None, allow_network_
     with tempfile.TemporaryDirectory(prefix=".lotus-candidate-", dir=destination.parent) as temporary:
         checkout = Path(temporary) / "candidate"
         run(["git", "clone", "--quiet", "--no-hardlinks", "--no-local", str(root), str(checkout)])
+        # Cloning a local object source must not make it a publication target.
+        # Preserve the source checkout's fetch/push destinations independently.
+        source_remotes = run(["git", "-C", str(root), "remote"]).decode().splitlines()
+        run(["git", "-C", str(checkout), "remote", "remove", "origin"])
+        if "origin" in source_remotes:
+            fetch_urls = run(["git", "-C", str(root), "remote", "get-url", "--all", "origin"]).decode().splitlines()
+            push_urls = run(["git", "-C", str(root), "remote", "get-url", "--push", "--all", "origin"]).decode().splitlines()
+            run(["git", "-C", str(checkout), "remote", "add", "origin", fetch_urls[0]])
+            for url in fetch_urls[1:]:
+                run(["git", "-C", str(checkout), "config", "--add", "remote.origin.url", url])
+            for url in push_urls:
+                run(["git", "-C", str(checkout), "config", "--add", "remote.origin.pushurl", url])
         # A worktree HEAD may differ from a clone's default branch.
         head = run(["git", "-C", str(root), "rev-parse", "HEAD"]).decode().strip()
         run(["git", "-C", str(checkout), "checkout", "--quiet", "--detach", head])
