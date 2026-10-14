@@ -26,7 +26,7 @@ done
 export LOTUS_CHRONIK LOTUS_NNG
 mkdir -p "$CANDIDATE"
 CANDIDATE="$(cd "$CANDIDATE" && pwd)"
-git clone --no-hardlinks "$SOURCE" "$CANDIDATE/source"
+git clone --no-hardlinks --dissociate "$SOURCE" "$CANDIDATE/source"
 git -C "$CANDIDATE/source" checkout --detach "$SOURCE_COMMIT"
 python3 "$SCRIPT_DIR/patch-series.py" "$CANDIDATE/source" "$DAEMON_DIR/candidates/guix/series" --base "$SOURCE_COMMIT"
 cd "$CANDIDATE/source"
