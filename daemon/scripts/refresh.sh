@@ -44,9 +44,9 @@ rebase_patchset() {
     git -C "$workspace" fetch origin
     local resolved
     resolved=$(git -C "$workspace" rev-parse --verify "$NEW_REF^{commit}")
-    local extra=()
+    local extra=(--base "$resolved")
     [[ "$series" == v1 ]] || extra+=(--allow-empty)
-    python3 "$SCRIPT_DIR/patch-series.py" "$workspace" "$series_file" --base "$resolved" "${extra[@]}"
+    python3 "$SCRIPT_DIR/patch-series.py" "$workspace" "$series_file" "${extra[@]}"
     # Publish the pin only after the entire series succeeds.
     local pin_temp
     pin_temp=$(mktemp "$version_file.XXXXXX")

@@ -91,3 +91,7 @@ before repair failed five assertions, including the strict-size case expecting
 three selected transactions but receiving two. These results validate the C++
 repair, not a new Chronik build, live synchronization, or released binary. Those
 checks remain separate requirements before publication or deployment.
+
+Follow-up integration also passes the normal Chronik-enabled build, Rust checks,
+all 156 C++ check targets, and isolated mainnet Chronik parity. See
+[v1 validation](v1-8c67fe1e85-validation.md) for the exact source and evidence.

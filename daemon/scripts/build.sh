@@ -32,13 +32,14 @@ fi
 mkdir -p "$BUILD_DIR"
 cd "$BUILD_DIR"
 
-CMAKE_ARGS=(
-    -GNinja
-    -DBUILD_BITCOIN_QT=OFF
-    -DBUILD_BITCOIN_ZMQ=OFF
-    -DENABLE_UPNP=OFF
-    -DENABLE_NATPMP=OFF
-)
+CMAKE_ARGS=(-GNinja)
+if [[ "$SERIES" == bchn ]]; then
+    CMAKE_ARGS+=(-DBUILD_BITCOIN_QT=OFF -DBUILD_BITCOIN_ZMQ=OFF
+                 -DENABLE_UPNP=OFF -DENABLE_NATPMP=OFF -DENABLE_MAN=OFF)
+else
+    # Current ABC and Doged use these names; UPnP/NAT-PMP were removed upstream.
+    CMAKE_ARGS+=(-DBUILD_QT=OFF -DBUILD_ZMQ=OFF)
+fi
 
 if [[ "$SERIES" == "v1" ]]; then
     CMAKE_ARGS+=(-DBUILD_CHRONIK=ON)

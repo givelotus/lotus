@@ -97,6 +97,20 @@ class PatchMetadataTests(unittest.TestCase):
         self.assertNotEqual(refused.returncode, 0)
         self.assertEqual(sentinel.read_text(), 'preserve\n')
 
+    def test_setup_v1_works_with_system_bash(self):
+        daemon = self.root / 'daemon-v1'
+        (daemon / 'scripts').mkdir(parents=True)
+        for name in ('setup.sh', 'patch-series.py'):
+            shutil.copy2(SCRIPTS / name, daemon / 'scripts' / name)
+        (daemon / 'patches').mkdir()
+        shutil.copytree(self.patches, daemon / 'patches/v1')
+        (daemon / 'bitcoin-abc-v1-version').write_text(self.base + '\n')
+        env = dict(os.environ, SERIES='v1', BITCOIN_ABC_REMOTE=str(self.repo))
+        subprocess.run(['/bin/bash', str(daemon / 'scripts/setup.sh')], env=env,
+                       check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        self.assertEqual(git(daemon / 'workspace-v1', 'rev-parse', 'HEAD^{tree}'),
+                         git(self.repo, 'rev-parse', 'HEAD^{tree}'))
+
     def test_late_conflict_does_not_leave_first_commit_or_am_state(self):
         patch = self.patches / self.names[1]
         patch.write_bytes(patch.read_bytes().replace(b'-change 0', b'-wrong base'))

@@ -43,9 +43,9 @@ clone_and_checkout() {
 # ─── helper: apply-patch-series ──────────────────────────────────────────────
 apply_patch_series() {
     local series_file="$1" patches_dir="$2"
-    local extra=()
+    local extra=(--base "$REF")
     [[ "${3:-}" != base-only ]] || extra+=(--allow-empty)
-    python3 "$SCRIPT_DIR/patch-series.py" "$PWD" "$series_file" --base "$REF" "${extra[@]}"
+    python3 "$SCRIPT_DIR/patch-series.py" "$PWD" "$series_file" "${extra[@]}"
 }
 
 # ─── V1: independently pinned bitcoin-abc base + Lotus mainnet patch series ───────────────
