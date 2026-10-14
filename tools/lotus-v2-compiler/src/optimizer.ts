@@ -157,7 +157,7 @@ function symbolicRegion(entries: readonly Instruction[], state: State, budget: {
       bodyState.stack.push(fresh('iterator'));
       const body = symbolicRegion(entries.slice(i + 1, end), bodyState, budget);
       out.push(entry, ...body, entries[end]!);
-      state.stack = state.stack.map(cell => cell.id.startsWith('arg:') ? unknown(cell.id) : fresh('loopResult'));
+      state.stack = state.stack.map(() => fresh('loopResult'));
       state.facts.clear(); i = end; continue;
     }
     if (op === 'ELSE' || op === 'ENDIF' || op === 'ENDENUMERATE') throw new Error(`unexpected ${op} in optimizer`);
