@@ -85,7 +85,9 @@ and Rust checks, packages binaries plus COPYING and source, signs/rechecks macOS
 bundled binaries, and checks packaged version output. With a manifest it verifies
 reproducibility before compilation. Historical baseline builds without a
 manifest export their actual replayed source and do not claim generated Arch or
-container validation. All artifact-only dispatches leave releases unchanged.
+container validation. Publication requires a prepared manifest, even though
+historical artifact-only builds remain supported. All artifact-only dispatches
+leave releases unchanged.
 
 Run local tooling checks with:
 

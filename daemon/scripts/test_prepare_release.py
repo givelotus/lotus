@@ -165,6 +165,14 @@ class ReleaseTests(unittest.TestCase):
             if args[0] == "gh":
                 return json.dumps({"headSha": commit, "conclusion": "success", "event": "workflow_dispatch", "workflowName": "Build & Release Lotus Daemon (with Chronik)"}).encode()
             return real_run(args, **kwargs)
+        def failed_validation(args, **kwargs):
+            if args[0] == "gh":
+                return json.dumps({"headSha": commit, "conclusion": "failure", "event": "workflow_dispatch", "workflowName": "Build & Release Lotus Daemon (with Chronik)"}).encode()
+            return real_run(args, **kwargs)
+        with patch.object(release, "run", side_effect=failed_validation):
+            with self.assertRaisesRegex(ValueError, "Validation run"):
+                release.publish(self.root, "11.6.0", commit, "123")
+        self.assertEqual(git("tag", "--list"), "")
         with patch.object(release, "run", side_effect=checked_run):
             self.assertEqual(release.publish(self.root, "11.6.0", commit, "123"), "v11.6.0")
         self.assertIn("refs/tags/v11.6.0", git("ls-remote", "origin", "refs/tags/v11.6.0"))
