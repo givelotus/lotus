@@ -53,10 +53,10 @@ the other personas are even applied.
 | Range | Source / Purpose | Status | Notes |
 |-------|------------------|--------|-------|
 | `000` | `000-decouple-avalanche.patch` | `DONE` | Decouples Avalanche finalization & `MinerFundPolicy` / `StakingRewardsPolicy` from `ConnectTip` while preserving `src/avalanche/` and `ParkingPolicy` for optional coordination |
-| `001–002` | Mining & Mempool | `DONE` | $O(n \log n)$ `addTxs` block template construction and $O(1)$ mempool long-chain acceptance |
+| `001–002` | Historical mining candidates | `AUDITED` | 001 experimental selection is reverted by 246 after native regression failures; 002 tests unchecked container insertion, not admission-policy changes. No speedup or O(1) admission claim. |
 | `004–199` | `givelotus/lotusd` | `DONE` | Core Lotus protocol, 2-min blocks, ASERT, $\log_2$ issuance, 50% fee burn, Merkleized txid, 160-byte header + `vMetadata`, XAddress, NNG interface, epochs through Judges |
 | `203–245` | `LotusiaStewardship/lotusd` | `DONE` | Ruth, 1st/2nd Samuel, 1st/2nd Kings epochs, Taproot (`P2TR`), `SIGHASH_LOTUS` |
-| `246` | `246-port-chronik-and-rtt-for-lotus.patch` | `DONE` | Ports in-process Rust/C++ Chronik (`-DBUILD_CHRONIK=ON`: 160B headers, `vMetadata` disk offset, Merkleized `TxId::from_tx`, `P2TR` script indexing) and 120s `RTTPolicy` target spacing |
+| `246` | `246-port-chronik-and-rtt-for-lotus.patch` | `DONE` | Ports in-process Rust/C++ Chronik (`-DBUILD_CHRONIK=ON`: 160B headers, `vMetadata` disk offset, Merkleized `TxId::from_tx`, `P2TR` script indexing) and 120s `RTTPolicy` target spacing; restores upstream mining selection with boundary regressions |
 | `247` | `247-bump-version-to-11.6.0.patch` | `DONE` | Bumps client version to `v11.6.0` and updates repository URLs to `givelotus/lotus` |
 
 ---

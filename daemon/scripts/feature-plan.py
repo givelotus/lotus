@@ -38,8 +38,10 @@ def resolve(target, names, allow_experimental):
             evidence.append({'feature': name, 'kind': 'existing-build-option', 'requires': []})
         elif name == 'zeromq-remove':
             raise ValueError('ZeroMQ source-removal patches are placeholders; use zeromq-off')
-        elif name in ('block-construction', 'tx-chain-limit') and target == 'v1':
-            evidence.append({'feature': name, 'kind': 'integrated-mainnet-series',
+        elif name == 'block-construction' and target == 'v1':
+            raise ValueError('V1 uses restored upstream selection; historical patch 001 is reverted by 246, not a supported optional optimization')
+        elif name == 'long-chain-container-test' and target == 'v1':
+            evidence.append({'feature': name, 'kind': 'integrated-test-only',
                              'requires': ['complete-v1-series']})
         elif name == 'tx-chain-limit':
             raise ValueError('No standalone admission-policy change is implemented; patch 02 only calls addUnchecked')

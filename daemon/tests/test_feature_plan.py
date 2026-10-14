@@ -28,7 +28,8 @@ class FeatureSelectionTests(unittest.TestCase):
 
     def test_unimplemented_ports_and_policy_are_rejected(self):
         for target, name in (("bitcoin", "chronik"), ("bchn", "nng"),
-                             ("ecash", "tx-chain-limit"), ("doged", "zeromq-remove")):
+                             ("ecash", "tx-chain-limit"), ("v1", "tx-chain-limit"),
+                             ("v1", "block-construction"), ("doged", "zeromq-remove")):
             with self.assertRaises(ValueError):
                 planner.resolve(target, [name], True)
 
