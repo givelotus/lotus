@@ -140,3 +140,9 @@ to source `0b7939e926b8353ad09d8edc47f355ddacc30502`, tree
 Guix candidate branch; its main-branch promotion remains separate. The next
 attempt also upgrades the actual daemon/helper, retains wallet support, and
 disables unused plugin/CPython builds. Binary validation remains pending.
+
+Bootstrap upgrade attempt `38609545611` authenticated and installed the pinned
+`d7dde9c1` client and daemon. Its first readiness check caught Ubuntu's builder
+group spelling (`_guixbuild`, not the shell installer's `guixbuild`); the service
+override now preserves that existing distro group. No Lotus source compilation
+was reached on that failed worker.
