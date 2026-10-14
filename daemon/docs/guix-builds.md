@@ -19,7 +19,8 @@ recipes supply Python 3.12.7, NNG 1.5.2 and Flatbuffers 2.0.0.
 The separate mailbox patch in `daemon/candidates/guix` repairs an inherited
 missing `endif` in `depends/Makefile`, explicitly passes the depends toolchain
 to NNG/Flatbuffers, selects the validated Rust 1.93.0 instead of upstream
-1.87.0, and builds headless Lotus daemon and CLI. C++ suites, security checks,
+1.87.0, and builds headless Lotus daemon and CLI while retaining built-in wallet RPC
+support through the existing Berkeley DB and SQLite depends recipes. C++ suites, security checks,
 and symbol checks precede packaging. Archives contain upstream COPYING.
 
 Chronik and NNG use separate ON/OFF switches and do not select mining or policy
@@ -74,7 +75,8 @@ The initial tooling runs use source tree
 `e0d4f9c0219739b6774864858c582a8144a443d9`, which temporarily restored the
 upstream block assembler. That source has been superseded by work to repair and
 retain Lotus's custom assembler. These running jobs remain useful for Guix
-toolchain/build diagnosis, but cannot validate or publish the final custom
+toolchain/build diagnosis. They use wallet-OFF; final builds retain the native
+release's wallet-ON setting. They cannot validate or publish the final custom
 assembler. Final binary comparisons must replay the corrected V1 series and
 record its new source provenance.
 
