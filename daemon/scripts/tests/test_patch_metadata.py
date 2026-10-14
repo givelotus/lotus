@@ -5,6 +5,7 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import shutil
 import tempfile
 import unittest
 
@@ -71,8 +72,30 @@ class PatchMetadataTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             module.replay(self.workspace, self.manifest)
         self.assert_unchanged()
+
         module.replay(self.workspace, self.manifest, base=self.base, allow_empty=True)
         self.assert_unchanged()
+
+    def test_setup_base_only_uses_pin_and_refuses_reset(self):
+        daemon = self.root / 'daemon'
+        (daemon / 'scripts').mkdir(parents=True)
+        for name in ('setup.sh', 'patch-series.py'):
+            shutil.copy2(SCRIPTS / name, daemon / 'scripts' / name)
+        series = daemon / 'patches/ecash'
+        series.mkdir(parents=True)
+        (series / 'series').write_text('# No experimental patches enabled\n')
+        (daemon / 'bitcoin-abc-version').write_text(self.base + '\n')
+        env = dict(os.environ, SERIES='ecash', BITCOIN_ABC_REMOTE=str(self.repo))
+        subprocess.run(['bash', str(daemon / 'scripts/setup.sh')], env=env,
+                       check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        workspace = daemon / 'workspace-ecash'
+        self.assertEqual(git(workspace, 'rev-parse', 'HEAD').decode().strip(), self.base)
+        sentinel = workspace / 'operator-data'
+        sentinel.write_text('preserve\n')
+        refused = subprocess.run(['bash', str(daemon / 'scripts/setup.sh'), '--reset'],
+                                 env=env, capture_output=True)
+        self.assertNotEqual(refused.returncode, 0)
+        self.assertEqual(sentinel.read_text(), 'preserve\n')
 
     def test_late_conflict_does_not_leave_first_commit_or_am_state(self):
         patch = self.patches / self.names[1]
