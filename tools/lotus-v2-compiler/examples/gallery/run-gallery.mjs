@@ -94,7 +94,7 @@ if (vmPackage) {
   if (!existsSync(join(vmPackage, 'lotus_v2_reference', 'vm_runner.py'))) throw new Error('VM_REFERENCE_PACKAGE does not contain vm_runner.py');
   const assigned = [[0x00,0x5d],[0x60,0x6b],[0x70,0x81],[0x88,0x94],[0x98,0xb4],[0xb8,0xc2],[0xc8,0xdd],[0xe0,0xea],[0xf0,0xf4]];
   const opcodeCosts = {};
-  for (const [first,last] of assigned) for (let op = first; op <= last; op++) opcodeCosts[op.toString(16).padStart(2,'0')] = op === 0xbb ? 1000 : 1;
+  for (const [first,last] of assigned) for (let op = first; op <= last; op++) opcodeCosts[op.toString(16).padStart(2,'0')] = (op === 0xbb || op === 0xbc) ? 1000 : 1;
   const profile = { max_script_bytes: 8192, max_arguments: 16, max_element_bytes: 8192, max_stack_items: 128,
     max_altstack_items: 64, max_vm_bytes: 65536, max_ast_depth: 32, max_invocation_cost: 1000000,
     structural_byte_cost: 1, opcode_costs: opcodeCosts };
