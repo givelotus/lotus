@@ -59,8 +59,15 @@ execution evidence, not network mining or a measured hash rate. No V2 job API
 or accepted V2 block exists in this miner slice. No live network mining was
 performed.
 
+The V2-branch integration review adds a deterministic GPU corpus that changes
+ChainID, parent ID, bits, time, version, size, height, transaction root and state
+root independently. Batches of 1, 2, 7 and 16 nonces span u32 carry and the u64
+end. Every GPU digest matches the CPU implementation, and exact/lower targets
+are checked for each field variant on Apple M5 Max.
+
 ```sh
 cargo test --locked -p lotus-miner-lib gpu_cpu_parity_and_target_boundaries -- --ignored --nocapture
+cargo test --locked -p lotus-miner-lib gpu_diverse_header_and_batch_corpus -- --ignored --nocapture
 cargo test --locked --workspace
 cargo clippy --locked --workspace --all-targets -- -D warnings
 ```

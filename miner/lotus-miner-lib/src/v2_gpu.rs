@@ -225,5 +225,78 @@ mod tests {
             hex::encode(vector[1].block_id),
             "8a967f4522d06f683830cf003b9f456001e045f617bf4d4336754a91c75f5824"
         );
+        let last = gpu
+            .hash_nonces(&vector_header, &chain_id, &[0xff; 32], u64::MAX, 1)
+            .unwrap();
+        assert_eq!(
+            hex::encode(last[0].block_id),
+            "ce606e015b769cf60502917d0bac3597048e25668c7df323f817b53969aab371"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires an installed OpenCL runtime and device"]
+    fn gpu_diverse_header_and_batch_corpus() {
+        let gpu = V2GpuHasher::setup(0).unwrap();
+        let base_header: [u8; HEADER_LEN] = std::array::from_fn(|i| (i as u8).wrapping_mul(17));
+        let base_chain: [u8; 32] = std::array::from_fn(|i| (i as u8).wrapping_mul(13));
+        let mut cases = Vec::new();
+        cases.push((base_header, base_chain));
+        let mut chain = base_chain;
+        chain[31] ^= 0x80;
+        cases.push((base_header, chain));
+        for &offset in &[0, 32, 36, 50, 54, 62, 70, 102] {
+            let mut header = base_header;
+            header[offset] ^= 0x80;
+            cases.push((header, base_chain));
+        }
+
+        let mut baseline = None;
+        for (case_index, (header, chain_id)) in cases.into_iter().enumerate() {
+            let count = [1, 2, 7, 16][case_index % 4];
+            let start = if case_index % 2 == 0 {
+                0xffff_ffffu64 - 3
+            } else {
+                u64::MAX - (count as u64 - 1)
+            };
+            let results = gpu
+                .hash_nonces(&header, &chain_id, &[0xff; 32], start, count)
+                .unwrap();
+            for item in &results {
+                let mut cpu_header = header;
+                cpu_header[NONCE_OFFSET..NONCE_OFFSET + 8]
+                    .copy_from_slice(&item.nonce.to_le_bytes());
+                assert_eq!(item.block_id, hashes(&cpu_header, &chain_id).unwrap().2);
+                assert!(item.meets_target);
+            }
+            let fixed_nonce_id = gpu
+                .hash_nonces(&header, &chain_id, &[0xff; 32], 0, 1)
+                .unwrap()[0]
+                .block_id;
+            if case_index == 0 {
+                baseline = Some(fixed_nonce_id);
+            } else {
+                // Each case changes one independent header field or ChainID.
+                assert_ne!(fixed_nonce_id, baseline.unwrap());
+            }
+            let selected = results[0].block_id;
+            let equal = gpu
+                .hash_nonces(&header, &chain_id, &selected, start, 1)
+                .unwrap();
+            assert!(equal[0].meets_target);
+            let mut lower = selected;
+            for byte in &mut lower {
+                if *byte != 0 {
+                    *byte -= 1;
+                    break;
+                }
+                *byte = 0xff;
+            }
+            assert!(
+                !gpu.hash_nonces(&header, &chain_id, &lower, start, 1)
+                    .unwrap()[0]
+                    .meets_target
+            );
+        }
     }
 }
