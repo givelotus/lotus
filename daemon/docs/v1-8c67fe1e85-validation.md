@@ -85,4 +85,8 @@ The previous tag is retained locally as
 release metadata, and tag object ID are saved in
 `/tmp/lotus-v11.6.0-before-8c67fe1e85`.
 
-Publication and downloaded archive validation are pending completion of CI.
+The subsequent release-engineering audit requires preserving published assets.
+Tag-publishing run `38577910924` was cancelled before publication; artifact-only
+dispatch `38581523660` builds the candidate without replacing a release.
+The existing `v11.6.0` archives still contain the earlier `252182e957` build.
+Downloaded candidate archive validation is pending completion of CI.

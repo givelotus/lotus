@@ -125,3 +125,10 @@ Upstream Bitcoin ABC's in-process Chronik (`chronik/`) assumes standard 80-byte 
 
 - `main` contains the V1 mainnet implementation and its supporting tools only. Exploratory protocol specifications and implementation belong on separate development branches; do not add their files, roadmap, or links to this branch.
 - Release CI pins Rust 1.93.0 (`dtolnay/rust-toolchain@1.93.0`, CMake `Rust_TOOLCHAIN=1.93.0`), matching passing local checks. Floating stable selected 1.99.0 and Clippy reported `clone_on_copy` in CXX-generated bridge derives. Pinning the validated toolchain avoids changing bridge ABI/source to satisfy generated-code lint diagnostics.
+
+## Release engineering and component review (2026-10-14)
+
+- Preserve published releases while preparing the new release-engineering candidate. Pending tag-publishing run `38577910924` was cancelled before assets changed; artifact-only dispatch `38581523660` builds the same daemon source without publishing. Existing `v11.6.0` assets remain the earlier `252182e957` build. Do not describe candidate archives as published or overwrite existing releases during this audit.
+- Standalone Rust SDK imports `LotusiaStewardship/bitcoinsuite` `d425f277`, with Lotus address/signing/Chronik corrections checked against daemon fixtures and read-only mainnet queries. External-node integration tests still need their documented services/binaries; see `sdk/rust/AGENTS.md`.
+- Dart SDK has separate Chronik HTTP/protobuf and Electrum TCP/TLS libraries. DER/compact signature fixes, merkleized TxIds, and 160-byte headers pass 36 tests on isolated Dart 3.13.5; installed Dart/Flutter still use 3.13.3. Electrum validation uses mock servers; Taproot spending and SIGHASH_LOTUS remain absent. See `sdk/dart/AGENTS.md` for protocol boundaries.
+- Miner packages now contain an embedded OpenCL kernel and native CLI/desktop binaries. macOS arm64 builds, tests, strict Clippy, archive extraction and ad-hoc signatures pass; other platforms await dedicated CI. Its Rust 1.99.0 toolchain is scoped to `miner/`, preserving the daemon's Rust 1.93.0.
