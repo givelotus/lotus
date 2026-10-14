@@ -115,6 +115,8 @@ python3 daemon/scripts/feature-plan.py --target bchn \
 
 NNG explicitly requires protocol opt-in. All candidate dependencies are empty;
 none requires another candidate. The default BCHN series remains base-only.
-Historical 01/02 are not selectable at the current pin. Full ZeroMQ source
-removal remains deferred: `zeromq-off` already works, while deletion removes a
-public interface without providing a demonstrated mining or mempool benefit.
+Historical 01/02 are not selectable at the current pin. Optional ZeroMQ source removal is now available as two ordered review patches:
+11 changes the build default to OFF while retaining the implementation; 12 then
+deletes the interface, source and dependency plumbing. Neither depends on NNG,
+mining or mempool changes. This is a deliberate interface/dependency choice,
+not a performance claim. See [the removal audit](bchn-zeromq-removal.md).

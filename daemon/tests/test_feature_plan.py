@@ -66,6 +66,27 @@ class FeatureSelectionTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             planner.resolve("ecash", ["mempool-check"], True)
 
+    def test_bchn_disable_then_remove_has_only_its_explicit_dependency(self):
+        default = planner.resolve("bchn", ["zeromq-default-off"], True)
+        self.assertEqual([Path(p).name for p in default["patches"]], ["11-disable-zeromq.patch"])
+        self.assertEqual(default["features"][0]["requires"], [])
+        for names in (["zeromq-remove"], ["zeromq-default-off", "zeromq-remove"],
+                      ["zeromq-remove", "zeromq-default-off"]):
+            plan = planner.resolve("bchn", names, True)
+            self.assertEqual([Path(p).name for p in plan["patches"]],
+                             ["11-disable-zeromq.patch", "12-remove-zeromq.patch"])
+            self.assertEqual(plan["cmake_args"], [])
+        plan = planner.resolve("bchn", ["zeromq-remove"], True)
+        self.assertEqual(plan["features"][0]["requires"], ["zeromq-default-off"])
+        for names in (["zeromq-on", "zeromq-remove"], ["zeromq-remove", "zeromq-off"]):
+            with self.assertRaises(ValueError):
+                planner.resolve("bchn", names, True)
+        for target in ("ecash", "bitcoin", "doged", "v1"):
+            with self.assertRaises(ValueError):
+                planner.resolve(target, ["zeromq-remove"], True)
+        with self.assertRaises(ValueError):
+            planner.resolve("bchn", ["zeromq-remove"], False)
+
     def test_experimental_selection_requires_opt_in(self):
         with self.assertRaises(ValueError):
             planner.resolve("ecash", ["block-construction"], False)

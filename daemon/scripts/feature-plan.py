@@ -15,12 +15,14 @@ TARGETS = {
     'bchn': {'zmq': 'BUILD_BITCOIN_ZMQ'},
     'bitcoin': {'zmq': 'WITH_ZMQ'},
 }
-FEATURES = ('chronik', 'chronik-off', 'nng', 'nng-off', 'zeromq-on', 'zeromq-off', 'zeromq-remove',
+FEATURES = ('chronik', 'chronik-off', 'nng', 'nng-off', 'zeromq-on', 'zeromq-off', 'zeromq-default-off', 'zeromq-remove',
             'block-construction', 'tx-chain-limit', 'long-chain-container-test', 'mempool-check')
 
 
 def resolve(target, names, allow_experimental):
     flags, patches, evidence = [], [], []
+    if 'zeromq-remove' in names and {'zeromq-on', 'zeromq-off'}.intersection(names):
+        raise ValueError('ZeroMQ source removal cannot be combined with removed ZeroMQ build flags')
     for feature in ('chronik', 'nng', 'zeromq'):
         enabled = 'zeromq-on' if feature == 'zeromq' else feature
         if enabled in names and feature + '-off' in names:
@@ -43,8 +45,20 @@ def resolve(target, names, allow_experimental):
         elif name in ('zeromq-on', 'zeromq-off'):
             flags.append(f'-D{TARGETS[target]["zmq"]}=' + ('OFF' if name.endswith('-off') else 'ON'))
             evidence.append({'feature': name, 'kind': 'existing-build-option', 'requires': []})
-        elif name == 'zeromq-remove':
-            raise ValueError('ZeroMQ source-removal patches are placeholders; use zeromq-off')
+        elif name in ('zeromq-default-off', 'zeromq-remove'):
+            if target != 'bchn':
+                raise ValueError(f'{target}: no implemented ZeroMQ source-change candidate')
+            if not allow_experimental:
+                raise ValueError('BCHN ZeroMQ source changes require --allow-experimental')
+            patches.append(str(DAEMON / 'patches' / 'bchn' / '11-disable-zeromq.patch'))
+            requires = []
+            warning = 'Changes only the build default; implementation and explicit ON remain available'
+            if name == 'zeromq-remove':
+                patches.append(str(DAEMON / 'patches' / 'bchn' / '12-remove-zeromq.patch'))
+                requires = ['zeromq-default-off']
+                warning = 'Removes ZeroMQ source, dependencies and public API; does not require NNG'
+            evidence.append({'feature': name, 'kind': 'experimental-candidate',
+                             'requires': requires, 'warning': warning})
         elif name == 'block-construction' and target == 'v1':
             evidence.append({'feature': name, 'kind': 'integrated-custom-assembler',
                              'requires': ['complete-v1-series'],
@@ -83,7 +97,7 @@ def resolve(target, names, allow_experimental):
                            'traversal. Native regression evidence, no measured performance speedup')
             evidence.append({'feature': name, 'kind': 'experimental-candidate', 'requires': [],
                              'warning': warning})
-    return {'target': target, 'cmake_args': flags, 'patches': patches, 'features': evidence}
+    return {'target': target, 'cmake_args': flags, 'patches': list(dict.fromkeys(patches)), 'features': evidence}
 
 
 def check(plan, workspace):

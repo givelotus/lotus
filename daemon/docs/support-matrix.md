@@ -14,7 +14,7 @@ Checked 2026-10-14. “Applies” means patch application only. A successful bui
 
 `ecash-version` (`fa7a44f731a2dfe1587e572d9eb0e4bb7c73d79c`, old ABC v0.24.11) and `lotusd-version` (`v10.4.10`) are historical provenance references: setup/build/refresh do not read them. They do not define today's mainnet version. Their inherited comments about 42 patches, an archived V1, or a stalled/divergent mainnet were obsolete and have been corrected. Release preparation should identify the actual executable source pin and version rather than treating all six files as equivalent inputs.
 
-The original ecash/BCHN executable manifests included `03-mempool-cleanup.patch`, a comment-only no-op that `git apply` rejects. This audit removes all experimental entries from default execution, retaining their payloads for explicit review through the feature planner. The no-op file remains as historical explanation. Slots 10 (NNG) and 11 (ZeroMQ source deletion) are also comment-only placeholders and remain excluded. Manifest existence does not imply implemented or maintained support.
+The original ecash/BCHN executable manifests included `03-mempool-cleanup.patch`, a comment-only no-op that `git apply` rejects. This audit removes all experimental entries from default execution, retaining their payloads for explicit review through the feature planner. The no-op file remains as historical explanation. The eCash slots 10/11 remain comment-only placeholders. BCHN now has independent real NNG (10) and ordered ZeroMQ default-disable/source-removal (11/12) candidates, all excluded from default execution. Manifest existence does not imply implemented or maintained support.
 
 ## Historical upstream application evidence before eCash 01 correction
 
@@ -27,7 +27,7 @@ Remote default-branch revisions were checked directly with `git ls-remote <prima
 | [Bitcoin Core](https://github.com/bitcoin/bitcoin) | `f13ae519de94394314cd63a27924b0998ac65d45` | BCHN 01 expects nonexistent `src/miner.cpp`/`.h`; 02 fails its test context. No Core-specific candidates exist. |
 | [Doged](https://github.com/doged-io/doged) | `9690833b8b6709b7a7837bc397f0d04bf3b885d1` | ecash 01 and 02 apply, individually and together. This is not a build/sync result. |
 
-At the older pinned ABC `252182e957` and BCHN `0bc23ac4c`, 01 and 02 apply. All 03/10/11 files contain no valid patch hunks. Full check results are recorded in [application evidence](evidence/feature-apply-2026-10-14.json).
+At the older pinned ABC `252182e957` and BCHN `0bc23ac4c`, 01 and 02 apply. At that historical audit, all 03/10/11 files contained no valid patch hunks; current BCHN 10/11/12 implementations are validated separately. Full check results are recorded in [application evidence](evidence/feature-apply-2026-10-14.json).
 
 Checks used isolated `/tmp/lotus-upstream-feasibility-*` checkouts and disposable candidate worktrees. A standalone local-object clone was required for pinned ABC builds: upstream CMake assumes `.git` is a directory, so linked worktrees fail configuring `.git/logs/HEAD`. No source workaround was added to the candidate for the successful standalone configuration.
 
@@ -64,7 +64,7 @@ Local evidence logs: `/tmp/lotus-ecash-standalone-configure.log`, `/tmp/lotus-ec
 | Block construction | Corrected ecash 01 uses a custom snapshot/ready heap; native pinned/current checks pass, with no measured speedup claim | Original ecash 01 application was checked; corrected Dogecoin port is not validated here | Current-tip ready-backlog fee-priority fix has native and functional evidence; no speedup claim | Requires a new port/review of current mining interfaces |
 | Transaction chain limits | Existing ABC policy must be assessed as upstream behavior; candidate 02 changes no policy | 02 changes no policy | Limits already removed upstream in 2021; historical 02 changes no policy | No implemented policy change; current cluster/package policy must be evaluated independently |
 | Disable ZeroMQ | `BUILD_ZMQ=OFF` (legacy `BUILD_BITCOIN_ZMQ` alias) | `BUILD_ZMQ=OFF` | `BUILD_BITCOIN_ZMQ=OFF` | `WITH_ZMQ=OFF` |
-| Delete ZeroMQ source | Placeholder only | No patch | Placeholder only | No patch |
+| Delete ZeroMQ source | Placeholder only | No patch | Optional ordered 11-default-OFF then 12-source/API deletion, no NNG dependency; see [validation](bchn-zeromq-removal.md) | No patch |
 
 Chronik requires its own bridge/storage/serialization implementation and Rust dependencies. It does **not** require NNG, ZeroMQ deletion, mining algorithm replacement, chain-limit changes, or Avalanche policy changes. In Lotus V1 the whole mainnet patch series defines consensus; selecting `BUILD_CHRONIK` does not make arbitrary subsets of that historical series supported. NNG and Chronik have separate CMake guards.
 
