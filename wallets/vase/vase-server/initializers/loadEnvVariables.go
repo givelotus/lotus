@@ -1,13 +1,16 @@
 package initializers
 
-import(
-	"log"
+import (
+	"errors"
+	"os"
+
 	"github.com/joho/godotenv"
 )
 
-func LoadEnvVariables(){
-	err := godotenv.Load()
-	if err != nil {
-		log.Fatal("Error loading .env file")
+func LoadEnvVariables() error {
+	// Production can supply environment variables directly, without a .env file.
+	if err := godotenv.Load(); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return errors.New("failed to load environment configuration")
 	}
+	return nil
 }

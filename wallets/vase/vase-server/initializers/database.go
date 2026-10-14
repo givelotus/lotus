@@ -1,21 +1,26 @@
 package initializers
 
 import (
-	"log"
+	"context"
+	"errors"
 	"os"
 
-	"gorm.io/driver/postgres"
-	"gorm.io/gorm"
+	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-var DB *gorm.DB
-
-func ConnectToDB() *gorm.DB {
-	var err error
+func ConnectToDB(ctx context.Context) (*pgxpool.Pool, error) {
 	dsn := os.Getenv("DB_STRING")
-	DB, err := gorm.Open(postgres.Open(dsn), &gorm.Config{})
-	if err != nil {
-		log.Fatal("Failed to connect to database")
+	if dsn == "" {
+		return nil, errors.New("DB_STRING is required")
 	}
-	return DB
+	pool, err := pgxpool.New(ctx, dsn)
+	if err != nil {
+		return nil, errors.New("invalid database configuration")
+	}
+	if err := pool.Ping(ctx); err != nil {
+		pool.Close()
+		// Connection errors can contain credentials from a DSN; keep logs generic.
+		return nil, errors.New("failed to connect to database")
+	}
+	return pool, nil
 }
