@@ -25,8 +25,8 @@ class ReleaseTests(unittest.TestCase):
             "contrib/aur/common/lotus.service": "ExecStop=/usr/bin/lotusd stop\n",
             "contrib/aur/common/lotus-reindex.service": "ExecStop=/usr/bin/lotusd stop\n",
             "CMakeLists.txt": "project(lotus\n\tVERSION 11.5.1\n)\n",
-            "contrib/aur/lotus/PKGBUILD": "pkgver=1.0.0\npkgrel=3\nmakedepends=('cmake' 'ninja')\nsource=(https://github.com/LogosFoundation/lotusd/archive/v$pkgver.tar.gz)\ncd ${pkgname}-$pkgver\n",
-            "contrib/aur/lotus-qt/PKGBUILD": "pkgver=1.0.0\npkgrel=3\nmakedepends=('cmake' 'ninja')\nsource=(https://github.com/logosfoundation/lotusd/archive/v$pkgver.tar.gz)\ncd lotus-$pkgver\n",
+            "contrib/aur/lotus/PKGBUILD": "pkgver=1.0.0\npkgrel=3\nmakedepends=('cmake' 'ninja' 'python')\nsource=(https://github.com/LogosFoundation/lotusd/archive/v$pkgver.tar.gz)\ncd ${pkgname}-$pkgver\n",
+            "contrib/aur/lotus-qt/PKGBUILD": "pkgver=1.0.0\npkgrel=3\nmakedepends=('cmake' 'ninja' 'python')\nsource=(https://github.com/logosfoundation/lotusd/archive/v$pkgver.tar.gz)\ncd lotus-$pkgver\n",
             "contrib/docker/lotus/Dockerfile": "FROM debian:bookworm-slim\n",
             "contrib/docker/lotus/README.md": "old example\n",
         }
@@ -80,6 +80,7 @@ class ReleaseTests(unittest.TestCase):
             dependencies = next(line for line in recipe.splitlines() if line.startswith("makedepends="))
             self.assertIn("'protobuf'", dependencies)
             self.assertIn("'flatbuffers'", dependencies)
+            self.assertIn("'python313'", dependencies)
         config = changes["contrib/aur/common/lotus.conf"]
         install = changes["contrib/aur/common/lotus.install"]
         self.assertNotIn("rpcuser=", config + install)

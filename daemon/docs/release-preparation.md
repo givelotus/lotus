@@ -79,7 +79,7 @@ installed. Source tarballs are checked against release
 `SHA256SUMS` during Arch preparation; the PKGBUILD cannot embed its own containing
 archive's digest without a circular dependency. Copy the entire `contrib/aur`
 directory when building, including `common`. Python 3.13 at
-`/usr/bin/python3.13` and Rust 1.93.0 are required. Full Arch builds and Qt are
+`/usr/bin/python3.13` (the AUR `python313` dependency) and Rust 1.93.0 are required. Full Arch builds and Qt are
 **not validated** by the binary release matrix.
 
 Prepared containers consume the Ubuntu 24.04 Linux binary archive and use the
@@ -142,3 +142,12 @@ checks, and publishes assets. Existing local or remote tags are refused, so this
 operation cannot republish `v11.6.0`. Do not delete a tag to bypass this check.
 A transport error may leave a local tag: reconcile the remote before retrying.
 Publication is not deployment; replacing the production executable is separate.
+
+## Build reproducibility scope
+
+Current Lotus release CI builds natively with CMake/Ninja, Ubuntu packages and
+Homebrew. It runs neither Gitian nor Guix. The pinned ABC source includes
+`contrib/guix/` machinery with Chronik support, but that path has not been
+adapted and validated for Lotus, including the published arm64 macOS target.
+Deterministic patch replay and source archives are verified; bit-for-bit binary
+reproducibility is not established by the current workflow.
