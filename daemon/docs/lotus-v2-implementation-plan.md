@@ -108,6 +108,10 @@ The final manifest must contain exact serialized parameters, their digest and al
 6. Run a final multi-node rehearsal with these binaries/profiles: fresh datadirs, mining and payouts, wallet transfers/assets, indexer agreement, restart, fork/reorg and state recovery. Reproduce release packages and document operational recovery and V1/V2 separation. No automatic coin/database migration is implied.
 7. Record independent review, every acceptance result and the exact release commit/manifest/build hashes. Obtain the separate launch/publication instruction before publishing network artifacts or starting public services. A mined placeholder does not close a missing consensus decision.
 
+## Test migration
+
+The compiler plan also owns [V2-native fixture infrastructure](../../docs/plans/lotus-v2-compiler-abi.md#v2-native-test-fixture-infrastructure): deterministic basic-contract builders, offline JSON bundles for native/functional tests, and an inventory distinguishing reusable, migrated, retired and new tests. Preserve rejection intent and independently hand-encoded vectors. A compiler-generated signature-valid transaction is not a full-validity fixture until the relevant VM/accounting/block checks pass.
+
 ## Next bounded work
 
 The coinbase-data and Frank appendix changes are now specified. Reviewed foundations are being assembled as an isolated candidate on ABC master `1fb7db17c176cdea8a2c60d887891589382ee4e3`; the nine-patch foundation series has passed combined focused validation and root review. The independent output reference is integrated as `beebcbde`. Continue native transaction parsing, reference VM and monetary arithmetic, then signing/commitments and the development-chain transition. Continue with a disposable development genesis/payment/block/undo slice before broad optimization. Do not mark the complete plan implemented merely because documentation, patches or a genesis-search script exist.
