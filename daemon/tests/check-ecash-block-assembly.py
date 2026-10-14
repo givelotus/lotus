@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Characterize the known-broken ecash/01 candidate using its real C++ logic.
+"""Characterize historical, superseded ecash/01 using its real C++ logic.
 
 Exit zero means the documented failures were reproduced, NOT that the patch
 is safe. This is a dependency-free algorithm harness, not a node/miner test.
@@ -47,10 +47,22 @@ def main():
     parser.add_argument("--cxx", default=shutil.which("c++") or "c++")
     parser.add_argument("--source-tree", type=Path,
                         help="Also verify an existing source tree has the same assembly logic")
+    parser.add_argument("--patch-file", type=Path,
+                        help="Historical assembler patch (for shallow clones without the recorded commit)")
     args = parser.parse_args()
     daemon = Path(__file__).resolve().parents[1]
-    patch_path = daemon / "patches/ecash/01-nlogn-block-construction.patch"
-    patch_bytes = patch_path.read_bytes()
+    if args.patch_file:
+        patch_bytes = args.patch_file.read_bytes()
+    else:
+        # Current 01 uses the corrected heap. Keep the old failure reproducer tied
+        # to the historical payload instead of silently testing a replacement.
+        try:
+            patch_bytes = subprocess.check_output([
+                "git", "-C", str(daemon.parent), "show",
+                "f67257e2:daemon/patches/ecash/01-nlogn-block-construction.patch"],
+                stderr=subprocess.PIPE)
+        except subprocess.CalledProcessError:
+            parser.error("Historical source unavailable; supply --patch-file from commit f67257e2")
     patch = patch_bytes.decode()
     header = new_side(patch, "src/node/miner.h")
     # The hunk starts immediately after the unchanged tx field; restore just

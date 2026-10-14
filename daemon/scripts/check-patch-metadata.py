@@ -54,7 +54,7 @@ def audit(root):
         data = (root / row['patch']).read_bytes()
         payload = data[data.index(b'diff --git '):]
         if hashlib.sha256(payload).hexdigest() != row['payload_sha256']:
-            raise ValueError(f"{row['patch']}: source payload differs from metadata-only recovery")
+            raise ValueError(f"{row['patch']}: source payload differs from recorded provenance")
     return result
 
 

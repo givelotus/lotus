@@ -1,5 +1,7 @@
 # eCash block-construction candidate audit
 
+Historical evidence: this report's 01 failure results refer to the superseded static-package payload (raw SHA256 `556182643ff288998a6fc1c97238a73f40268de0d5fec5f2fba2dc0c8bf1dedf`). Current eCash 01 retains a corrected custom snapshot/ready-heap assembler; see [new source and native evidence](ecash01-corrected-snapshot-assembler.md). Other candidate results below retain their recorded revision scope.
+
 `patches/ecash/01-nlogn-block-construction.patch` is an unvalidated historical
 candidate, not a demonstrated optimization. It changes only `src/node/miner.cpp`
 and `src/node/miner.h`; it supplies no tests. Absence of test changes is not

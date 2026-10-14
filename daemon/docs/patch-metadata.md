@@ -111,7 +111,7 @@ whose recorded tip `c1bdbe00d29042af81e1846728088f32867c3498` has the original
 subject “WIP: Stupidly simple mining.” That 2019 source is historical lineage,
 not the adapted modern diff.
 
-The new messages explain actual behavior: 01 is a broken experimental static
+At the metadata-only backfill revision, the new messages explain actual behavior: 01 was a broken experimental static
 ancestor-package assembler; 02 inserts transactions with `addUnchecked` and
 does not establish admission-policy changes. Neither becomes supported through
 this metadata update. Both remain outside default executable manifests.
@@ -152,3 +152,7 @@ a meaningful subject and explanation for every source patch, validates envelope
 author/date fields, and recognizes only explicitly labelled non-patch placeholders.
 The reference payload hash guard intentionally fails after a source correction;
 update its evidence only alongside an independently reviewed source change.
+
+### Later intentional eCash 01 source correction
+
+The four raw-to-mail tree comparisons above are historical evidence for the metadata-only conversion. The later eCash 01 correction changes source deliberately: it retains the custom snapshot assembler, fixes dependency/fee/resource scheduling with a ready heap, and adds native regressions in one mailbox diff. It is not an upstream restoration. `reference-metadata-provenance.json` retains 01's prior payload/tree/metadata under `history` and records the replacement independently; the other three reference payloads remain unchanged. See [the corrected assembler evidence](ecash01-corrected-snapshot-assembler.md).

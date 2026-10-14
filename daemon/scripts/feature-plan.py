@@ -54,8 +54,12 @@ def resolve(target, names, allow_experimental):
             filename = ('01-nlogn-block-construction.patch' if name == 'block-construction'
                         else '02-remove-chaintx-limit.patch')
             patches.append(str(DAEMON / 'patches' / series / filename))
+            warning = 'Clean application does not establish successful builds or behavior'
+            if series == 'ecash' and name == 'block-construction':
+                warning = ('Corrected custom snapshot/ready-heap assembler with native regression evidence; '
+                           'expected O(n + m + n log n), no measured speedup over modern ABC')
             evidence.append({'feature': name, 'kind': 'experimental-candidate', 'requires': [],
-                             'warning': 'Clean application does not establish successful builds or behavior'})
+                             'warning': warning})
     return {'target': target, 'cmake_args': flags, 'patches': patches, 'features': evidence}
 
 

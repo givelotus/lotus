@@ -7,7 +7,7 @@ Checked 2026-10-14. “Applies” means patch application only. A successful bui
 | Selector | Source pin consumed by setup | Build targets | Actual support |
 |---|---|---|---|
 | `v1` (default) | `bitcoin-abc-v1-version`: `8c67fe1e85a602204a2ce65aa3b643469c2c3a1d` | `lotusd`, `lotus-cli` | Maintained 153-patch mainnet series; prior build, C++/Rust checks, isolated mainnet replay and sampled Chronik comparison passed. The newly identified mining-selection defect has been repaired by restoring retained upstream selection, with native C++ regression/suite evidence; corrected release CI remains required. See [mining repair](ecash-block-assembly-review.md). See [validation](v1-8c67fe1e85-validation.md). |
-| `ecash` | `bitcoin-abc-version`: `252182e957120652960c1f88ec96515c448b1204` | `bitcoind`, `bitcoin-cli` | Unmodified pinned upstream daemon/CLI build successfully. Experimental 01 builds but fails existing miner tests; 02 breaks test compilation. Neither candidate is established correct. |
+| `ecash` | `bitcoin-abc-version`: `252182e957120652960c1f88ec96515c448b1204` | `bitcoind`, `bitcoin-cli` | Unmodified pinned upstream daemon/CLI build successfully. Corrected custom 01 now passes native miner tests and full C++ checks at the pin and current master; historical static-package failures are preserved below. Candidate 02 still breaks test compilation. See [corrected assembler](ecash01-corrected-snapshot-assembler.md). |
 | `bchn` | `bchn-version`: `0bc23ac4c1365f34ed824e2b07e554ec06a5f5cd` (historical `v28.0.0`) | `bitcoind`, `bitcoin-cli` | Unmodified pinned upstream daemon/CLI build successfully with manpages disabled. Experimental 01/02 apply at the pin but are unvalidated; both fail application at current upstream. |
 | `doged` | `doged-version` | `doged`, `doge-cli` | Exact pin `9690833b8b6709b7a7837bc397f0d04bf3b885d1` plus two mailbox patches (Apple arm64 test compilation and an AuxPoW Chronik regression): Chronik-enabled daemon/CLI, 740 C++ cases and six isolated functional tests pass. Full mainnet synchronization and network Avalanche behavior remain untested. See [Dogecoin lineage](dogecoin-lineage.md). |
 | Bitcoin Core | No selector or pin | No configured target | Not supported by the existing wrapper. Copying BCHN or ABC patches is not a port. |
@@ -16,7 +16,7 @@ Checked 2026-10-14. “Applies” means patch application only. A successful bui
 
 The original ecash/BCHN executable manifests included `03-mempool-cleanup.patch`, a comment-only no-op that `git apply` rejects. This audit removes all experimental entries from default execution, retaining their payloads for explicit review through the feature planner. The no-op file remains as historical explanation. Slots 10 (NNG) and 11 (ZeroMQ source deletion) are also comment-only placeholders and remain excluded. Manifest existence does not imply implemented or maintained support.
 
-## Exact upstream application evidence
+## Historical upstream application evidence before eCash 01 correction
 
 Remote default-branch revisions were checked directly with `git ls-remote <primary repository> HEAD`; the isolated checkouts match those revisions:
 
@@ -47,7 +47,7 @@ ninja -C /tmp/lotus-bchn-base-build/build -j6 bitcoind bitcoin-cli
 
 Both base-only audits use Apple Clang 21.0.0 (`clang-2100.1.1.101`), CMake 4.4.4, Ninja 1.13.2, current installed dependencies, and disposable standalone clones. Logs and results are summarized in [base build evidence](evidence/upstream-base-build-2026-10-14.json).
 
-## Native pinned ABC build/test evidence
+## Historical pinned ABC candidate build/test evidence
 
 On macOS arm64, a standalone clone at `252182e957` with exact ecash 01 and 02 configured with Ninja, Qt/ZMQ/UPnP/NATPMP/Chronik disabled, Python 3.13. Daemon and CLI compiled. `test_bitcoin` failed compiling candidate 02: `TestMemPoolEntryHelper` has no `SigOpCount` member (`mempool_tests.cpp:786`). No silent compatibility fix was applied.
 
@@ -61,7 +61,7 @@ Local evidence logs: `/tmp/lotus-ecash-standalone-configure.log`, `/tmp/lotus-ec
 |---|---|---|---|---|
 | Chronik | Existing `BUILD_CHRONIK`; runtime `-chronik=1` | Existing `BUILD_CHRONIK`; Dogecoin consensus/indexing still requires its separate lineage validation | No implemented port here | No implemented port here |
 | NNG | Implemented in Lotus V1 with `BUILD_BITCOIN_NNG`; ecash slot 10 is a placeholder | No implemented local port | Slot 10 placeholder | No port |
-| Block construction | ecash 01 is experimental; integrated V1 implementation has separate mainnet checks | ecash 01 applies at exact current Doged, unvalidated | 01 applies only at old pin, unvalidated | Requires a new port/review of current mining interfaces |
+| Block construction | Corrected ecash 01 uses a custom snapshot/ready heap; native pinned/current checks pass, with no measured speedup claim | Original ecash 01 application was checked; corrected Dogecoin port is not validated here | 01 applies only at old pin, unvalidated | Requires a new port/review of current mining interfaces |
 | Transaction chain limits | Existing ABC policy must be assessed as upstream behavior; candidate 02 changes no policy | 02 changes no policy | 02 changes no policy | No implemented policy change; current cluster/package policy must be evaluated independently |
 | Disable ZeroMQ | `BUILD_ZMQ=OFF` (legacy `BUILD_BITCOIN_ZMQ` alias) | `BUILD_ZMQ=OFF` | `BUILD_BITCOIN_ZMQ=OFF` | `WITH_ZMQ=OFF` |
 | Delete ZeroMQ source | Placeholder only | No patch | Placeholder only | No patch |
@@ -88,7 +88,7 @@ python3 daemon/scripts/feature-plan.py --target ecash \
 
 No candidate depends on another candidate. `long-chain-container-test` deliberately names what patch 02 does; requesting a standalone `tx-chain-limit` policy change fails rather than silently substituting an unchecked insertion test. The planner reports application, build and behavior separately and never starts a node or mutates the checked tree/index.
 
-## Mining candidate review limits
+## Historical static-package candidate review limits
 
 Patch 01 adds no tests and changes transaction selection. A passing compilation would not establish its advertised O(n log n) bound or mining correctness:
 
@@ -104,3 +104,7 @@ Do not submit these candidates as ready upstream improvements or enable them in 
 ## Later independent eCash candidate verification
 
 ABC master advanced to `1fb7db17c176cdea8a2c60d887891589382ee4e3` during this session. Every eCash payload was checked again independently at that exact revision, original `8c67fe1e85`, and pinned `252182e957`. Newly added candidate 04 passes independent native builds, full `check-bitcoin`, processor tests and real isolated transaction-finalization regtest at both newer revisions, but fails application at the older default pin. Candidate 01/02 failures and no-op/placeholder classifications remain unchanged. See [the independent report](ecash-independent-verification.md) for combination conflicts, exact trees and test-only diamond coverage. This is not an all-patches-pass result.
+
+## Corrected custom eCash 01
+
+The static-package 01 described in historical sections above has been replaced by a corrected custom dependency snapshot and ready heap, retaining the intended independent implementation. One mailbox patch contains the algorithm and native regressions. It passes daemon/CLI/test builds, native miner tests and full `check-bitcoin` at pinned `252182e957` and current `1fb7db17c1`; it also applies cleanly at `8c67fe1e85`. The bound is expected O(n + m + n log n), with independent operation-count evidence and no claimed wall-clock speedup over already efficient modern ABC. See [current source and evidence](ecash01-corrected-snapshot-assembler.md). Candidate 02 and placeholders remain separately classified. Lotus maintains its own patch series and validation; this eCash diff changes no live daemon or release.
