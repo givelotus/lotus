@@ -521,6 +521,13 @@ def evaluate(script: bytes, args: tuple[bytes, ...], profile: VMProfile, *,
                 data = pop()
                 digest = sha256(data).digest()
                 push(digest if op == 0xb8 else sha256(digest).digest())
+            elif op == 0xba:
+                data = pop()
+                try:
+                    from blake3 import blake3
+                except ImportError as exc:
+                    raise UnsupportedFeature("blake3 dependency is required for BLAKE3") from exc
+                push(blake3(data).digest())
             elif op in (0xbb, 0xbc):
                 public_key, signature = pop(), pop()
                 verified = _verify_checksig(signature, public_key, signing)
