@@ -6,7 +6,9 @@ Updated October 14, 2026. Development plan; no genesis parameters are frozen and
 
 ## Source foundation and current status
 
-The current executable [V2 series](../patches/v2/series) contains six patches, `000`–`005`, on ABC `8c67fe1e85a602204a2ce65aa3b643469c2c3a1d`, selected by [bitcoin-abc-v2-version](../bitcoin-abc-v2-version). They address Avalanche decoupling, custom block assembly, chain-limit removal, activation cleanup, ASERT/block spacing and naming. This is an initial port, not an implemented V2 transaction format or a launch-ready chain. This planning review inspected files; it did not replay or build that series.
+The current executable [V2 series](../patches/v2/series) contains nine patches, `000`–`008`, on ABC master `1fb7db17c176cdea8a2c60d887891589382ee4e3`, selected by [bitcoin-abc-v2-version](../bitcoin-abc-v2-version). It retains the six overnight topics with the corrected custom scheduler folded into `001`, then adds a separate mining-fixture repair, isolated header/hash primitives and the output codec. The [foundation review packet](../candidates/v2-foundations-20261014/README.md) records every replay tree and exact validation. This is development infrastructure, not an implemented V2 transaction format or launch-ready chain.
+
+The root reviewer reran all six mining tests, native header checks and Release output codec tests on the combined candidate before promoting this series. The live chain and existing source workspaces were not changed. Whole-daemon V2 validity, all inherited unit/functional suites, Chronik and network integration remain separate gates.
 
 ### Preserved overnight implementation
 
@@ -104,4 +106,4 @@ The final manifest must contain exact serialized parameters, their digest and al
 
 ## Next bounded work
 
-The coinbase-data and Frank appendix changes are now specified. Reviewed foundations are being assembled as an isolated candidate on ABC master `1fb7db17c176cdea8a2c60d887891589382ee4e3`; canonical series promotion waits for combined validation and reviewer approval. The independent output reference is integrated as `beebcbde`. Continue native transaction parsing, reference VM and monetary arithmetic, then signing/commitments and the development-chain transition. Continue with a disposable development genesis/payment/block/undo slice before broad optimization. Do not mark the complete plan implemented merely because documentation, patches or a genesis-search script exist.
+The coinbase-data and Frank appendix changes are now specified. Reviewed foundations are being assembled as an isolated candidate on ABC master `1fb7db17c176cdea8a2c60d887891589382ee4e3`; the nine-patch foundation series has passed combined focused validation and root review. The independent output reference is integrated as `beebcbde`. Continue native transaction parsing, reference VM and monetary arithmetic, then signing/commitments and the development-chain transition. Continue with a disposable development genesis/payment/block/undo slice before broad optimization. Do not mark the complete plan implemented merely because documentation, patches or a genesis-search script exist.
