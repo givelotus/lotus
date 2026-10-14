@@ -147,3 +147,5 @@ override now preserves that existing distro group. No Lotus source compilation
 was reached on that failed worker.
 
 - Guix run `38613625044` replica b completed pinned compiler/environment provisioning, then failed compiling the inherited FlatBuffers 2.0.0 span assignment with GCC 14.3. Backport upstream `google/flatbuffers` commit `20aad0c41e1252b04c72111c3eb221280a9c2009` into both native and target depends recipes, retaining archive hashes/version. A fast GCC 14 dependency preflight now runs before the cold Guix builds. No Guix Lotus binary validation is claimed from that failed run.
+
+- Run `38626970793` replica b built every pinned depends package (including FlatBuffers with GCC 14.3 and NNG), then Lotus configuration exposed the missing CMake `BASEPREFIX` argument. Pass it explicitly; the fast Linux preflight now builds all headless depends and configures Lotus before cold Guix provisioning. This remains build/configuration evidence, not successful binary validation.
