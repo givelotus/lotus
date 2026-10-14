@@ -12,8 +12,7 @@ import 'package:vase/features/send/send_model.dart';
 import 'package:vase/features/wallet/wallet_model.dart';
 import 'package:lotus_dart/lotus.dart';
 import 'package:vase/utils/currency.dart';
-
-import '../numpad/numpad_model.dart';
+import 'package:lotus_dart/utils/parse_uri.dart';
 
 class SendPage extends HookWidget {
   const SendPage({Key? key}) : super(key: key);
@@ -51,22 +50,14 @@ class SendPage extends HookWidget {
                 child: Column(
                   children: [
                     InkWell(
-                      onTap: () {
-                        final sendModel = context.read<SendModel>();
-                        final numpadModel = context.read<NumpadModel>();
-                        numpadModel.setValue(satsToLotus(sendModel.amount));
-                        showModalBottomSheet(
-                          isScrollControlled: true,
-                          context: context,
-                          builder: (ctx) => ConstrainedBox(
-                            constraints: const BoxConstraints(maxHeight: 600),
-                            child: NumpadView(
-                              onDoneTap: () {
-                                Navigator.of(ctx).pop();
-                              },
-                            ),
-                          ),
+                      onTap: () async {
+                        final amount = await showAmountCalculator(
+                          context,
+                          initialAmount: sendModel.amount,
                         );
+                        if (context.mounted && amount != null) {
+                          sendModel.setAmount(amount);
+                        }
                       },
                       child: Row(
                         children: [
@@ -151,7 +142,26 @@ class SendPage extends HookWidget {
                           onPressed: () async {
                             final data = await Clipboard.getData('text/plain');
                             if (!context.mounted) return;
-                            sendModel.setAddress(data?.text ?? '');
+                            try {
+                              final payment = parseSendURI(data?.text ?? '');
+                              if (payment.address.isEmpty ||
+                                  payment.amount < BigInt.zero) {
+                                throw const FormatException('Invalid payment');
+                              }
+                              sendModel.setPayment(
+                                payment.address,
+                                payment.amount,
+                              );
+                            } catch (_) {
+                              ScaffoldMessenger.of(context).showSnackBar(
+                                const SnackBar(
+                                  content: Text(
+                                    'Unable to parse payment from clipboard',
+                                  ),
+                                ),
+                              );
+                              return;
+                            }
                             ScaffoldMessenger.of(context).showSnackBar(
                               const SnackBar(
                                 content: Text('Pasted address from clipboard'),
