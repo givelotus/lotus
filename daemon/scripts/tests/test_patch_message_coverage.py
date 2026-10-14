@@ -1,6 +1,7 @@
 """Patch message coverage must survive subsequent imports and refreshes."""
 import importlib.util
 from pathlib import Path
+import subprocess
 import unittest
 
 ROOT = Path(__file__).resolve().parents[3]
@@ -13,7 +14,23 @@ class MessageCoverage(unittest.TestCase):
     def test_all_tracked_patches_have_rationale_or_explicit_placeholder(self):
         counts = AUDIT.audit(ROOT)
         self.assertGreaterEqual(counts['mail'], 183)
-        self.assertEqual(counts['placeholder'], 6)
+        # Implementing an existing placeholder must not break release checks.
+        # New placeholders still require an explicit review of this allowlist.
+        allowed_placeholders = {
+            'daemon/patches/bchn/03-mempool-cleanup.patch',
+            'daemon/patches/ecash/03-mempool-cleanup.patch',
+            'daemon/patches/ecash/10-nng-interface.patch',
+            'daemon/patches/ecash/11-remove-zeromq.patch',
+        }
+        names = subprocess.check_output(
+            ['git', '-C', str(ROOT), 'ls-files', '-z', '*.patch', '*.diff']
+        ).decode().split('\0')
+        placeholders = {
+            name for name in filter(None, names)
+            if AUDIT.inspect_patch((ROOT / name).read_bytes()) == 'placeholder'
+        }
+        self.assertLessEqual(placeholders, allowed_placeholders)
+        self.assertEqual(counts['placeholder'], len(placeholders))
 
     def test_missing_rationale_rejected(self):
         data = (ROOT / 'daemon/patches/ecash/01-nlogn-block-construction.patch').read_bytes()
