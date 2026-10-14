@@ -38,8 +38,17 @@ already nonquadratic scheduler. Preserve BCHN ABLA resource limits, virtual-size
 fee comparison, topology tie breaks, time budget, finality and termination
 heuristics. The native before/after reproduction below validates this change.
 
-Separate workers are examining the optional NNG transport and diagnostic
-mempool-check traversal. ZeroMQ is already independently disableable using
+Independent `04-topological-mempool-check.patch` uses BCHN's existing
+entry-ID topology to avoid redundant ancestor walks and dependency retries in
+optional consistency checks. A 512-transaction native check visits 130,816
+ancestors before and zero afterward, while checking the same 512 entries.
+This does not accelerate normal admission: consistency checking is disabled
+by default. See [the detailed mempool audit](bchn-mempool-complexity-review.md).
+
+Independent default-OFF `10-nng-interface.patch` implements a new raw-payload
+publisher. Native NNG ON/OFF and ZeroMQ coexistence builds, and real subscriber
+regtests pass. It is not wire-compatible with Lotus's FlatBuffers/request-reply
+interface; see [NNG scope](bchn-nng-publisher.md). ZeroMQ is already independently disableable using
 `BUILD_BITCOIN_ZMQ=OFF`; source removal must remain a separate optional change.
 Chronik is not present in BCHN and would require a substantial independent port.
 ABC Avalanche-finalization pruning cannot be transplanted into a node without
@@ -52,7 +61,7 @@ builds pass with Qt, ZeroMQ, UPnP, NAT-PMP and manpages disabled. Both executabl
 version checks report BCHN 29.2.1. The final sibling regression fails two
 membership assertions against the unchanged upstream assembler and passes after
 the ready-backlog heap change. All native miner tests pass, and `check-bitcoin`
-passes 125 separately scheduled suites plus the final aggregate target (127
+passes 126 separately scheduled suites plus the final aggregate target (127
 Ninja steps). Isolated `mining_basic.py` and `mining_prioritisetransaction.py`
 regtests pass, covering template/submission and fee-delta behavior.
 
@@ -85,3 +94,27 @@ These commands assume the current directory is the Lotus monorepo. Use fresh
 paths rather than resetting an existing node workspace. The feature planner's
 `--check-workspace` mode verifies clean application using a temporary index,
 without applying patches to the source checkout.
+
+## Composition validation
+
+All 15 individual/ordered combinations of 01, 04 and 10 apply cleanly at the
+exact acceptance base. All six triple orders produce identical tree
+`bf50633c2575549a6b621cff8e70142df901b2f7`. Native builds of daemon, CLI and test
+binary with both NNG and ZeroMQ enabled pass, followed by all 126 C++ suites.
+Real `interface_nng.py` subscriber and `mining_prioritisetransaction.py` regtests
+pass on the combined tree. Application, builds and behavior are recorded
+separately in [combined evidence](evidence/bchn-combined-20261014.json).
+
+Select `block-construction`, `mempool-check` and/or `nng` independently through
+`feature-plan.py --target bchn --allow-experimental`. For example:
+
+```sh
+python3 daemon/scripts/feature-plan.py --target bchn \
+  --features block-construction,mempool-check,nng,zeromq-on --allow-experimental
+```
+
+NNG explicitly requires protocol opt-in. All candidate dependencies are empty;
+none requires another candidate. The default BCHN series remains base-only.
+Historical 01/02 are not selectable at the current pin. Full ZeroMQ source
+removal remains deferred: `zeromq-off` already works, while deletion removes a
+public interface without providing a demonstrated mining or mempool benefit.
