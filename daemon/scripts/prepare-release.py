@@ -63,7 +63,7 @@ def metadata(replay, version):
         # Replayed-source assets have one consistent top-level directory.
         text = text.replace("${pkgname}-$pkgver", "lotus-v$pkgver").replace("lotus-$pkgver", "lotus-v$pkgver")
         text = text.replace("arch=('i686' 'x86_64')", "arch=('x86_64')")
-        text = text.replace(" 'zeromq'", "").replace(" 'miniupnpc'", "").replace(" 'libnatpmp'", "")
+        text = text.replace(" 'zeromq'", " 'nng' 'utf8proc' 'sqlite'").replace(" 'miniupnpc'", "").replace(" 'libnatpmp'", "")
         text = text.replace("'cmake' 'ninja'", "'rustup' 'clang' 'curl' 'cmake' 'ninja'")
         text = text.replace("-DBUILD_QT=OFF", "-DBUILD_BITCOIN_QT=OFF").replace("    -DBUILD_IGUANA=OFF \\\n", "")
         text = text.replace("    -DENABLE_CLANG_TIDY=OFF", "    -DBUILD_CHRONIK=ON \\\n    -DRust_TOOLCHAIN=1.93.0 \\\n    -DPython_EXECUTABLE=/usr/bin/python3.13 \\\n    -DBUILD_BITCOIN_ZMQ=OFF \\\n    -DENABLE_UPNP=OFF \\\n    -DENABLE_NATPMP=OFF \\\n    -DENABLE_CLANG_TIDY=OFF")
