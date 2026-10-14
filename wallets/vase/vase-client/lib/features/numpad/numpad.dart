@@ -1,5 +1,5 @@
 import 'package:flutter/material.dart';
-import 'package:flutter_vibrate/flutter_vibrate.dart';
+import 'package:flutter/services.dart';
 import 'package:provider/provider.dart';
 import 'package:vase/features/numpad/key_widget.dart';
 import 'package:vase/features/numpad/numpad_model.dart';
@@ -83,9 +83,7 @@ class NumpadWidget extends StatelessWidget {
 
   void _vibrate() async {
     controller.forward(from: 0);
-    if (await Vibrate.canVibrate) {
-      Vibrate.feedback(FeedbackType.heavy);
-    }
+    await HapticFeedback.heavyImpact();
   }
 
   void Function() _handleClick(NumpadModel model, KeyValue value) => () {

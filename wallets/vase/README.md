@@ -96,3 +96,29 @@ show an error instead of silently rounding a payment.
 Closing the editor discards its draft. Done commits the amount once; reopening
 starts from that amount. Receive requests can exceed your current balance and
 remain separate from Send. QR codes and copied requests carry base-unit amounts.
+
+### iOS simulator development
+
+Use a dedicated simulator for wallet previews so existing app/keychain data stays
+separate. With full Xcode installed, scope its developer directory to each command
+instead of changing the system `xcode-select` setting:
+
+```sh
+cd wallets/vase/vase-client
+DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer tool/with_xcode.sh flutter pub get
+DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer tool/with_xcode.sh flutter build ios --simulator --debug --no-pub
+```
+
+Run `pub get` with the same developer directory: otherwise generated plugin
+metadata can incorrectly report Swift Package Manager unavailable. The wrapper
+also preserves that selection for Dart native build hooks, which filter ordinary
+environment variables but forward PATH. It creates a temporary `xcrun` wrapper
+and removes it after the command; it does not change system tool configuration.
+
+Current Sentry requires SwiftPM; the app enables it in its project configuration.
+All current iOS plugins support SwiftPM, and the old iOS CocoaPods integration
+has been removed. The first build fetches native framework dependencies and may
+take several minutes. Simulator builds do not need an Apple developer account;
+signing/distribution and physical-device checks are separate. Xcode 27 / iOS 27
+simulator builds pass; camera, push notifications and existing-wallet keychain
+migration still require separate device checks.
