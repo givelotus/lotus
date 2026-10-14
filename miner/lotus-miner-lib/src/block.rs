@@ -3,6 +3,7 @@ use std::convert::TryInto;
 use serde::Deserialize;
 
 pub struct Block {
+    pub chain: crate::settings::Chain,
     pub header: [u8; 160],
     pub body: Vec<u8>,
     pub target: [u8; 32],
@@ -20,27 +21,49 @@ pub struct RawUnsolvedBlockAndTarget {
     pub target: String,
 }
 
+#[cfg(test)]
 pub fn create_block(unsolved_block_and_target: &RawUnsolvedBlockAndTarget) -> eyre::Result<Block> {
+    create_block_for_chain(unsolved_block_and_target, crate::settings::Chain::Lotus)
+}
+
+pub fn create_block_for_chain(
+    unsolved_block_and_target: &RawUnsolvedBlockAndTarget,
+    chain: crate::settings::Chain,
+) -> eyre::Result<Block> {
+    let size = chain.header_len();
     let block = hex::decode(&unsolved_block_and_target.blockhex)?;
-    if block.len() < 160 {
+    if block.len() < size {
         return Err(eyre::eyre!(
-            "Mining block is shorter than the 160-byte Lotus header"
+            "Mining block is shorter than its configured chain header"
         ));
     }
     let mut target: [u8; 32] = hex::decode(&unsolved_block_and_target.target)?
         .try_into()
         .map_err(|_| eyre::eyre!("Mining target must be 32 bytes"))?;
     target.reverse();
+    let mut header = [0; 160];
+    header[..size].copy_from_slice(&block[..size]);
+    if chain == crate::settings::Chain::Dogecoin
+        && u32::from_le_bytes(header[..4].try_into().unwrap()) & 256 != 0
+    {
+        return Err(eyre::eyre!(
+            "AuxPoW jobs require a parent-chain miner; expected a direct Scrypt job"
+        ));
+    }
     Ok(Block {
-        header: block[0..160].try_into().unwrap(),
-        body: block[160..].to_vec(),
+        chain,
+        header,
+        body: block[size..].to_vec(),
         target,
     })
 }
 
 impl Block {
     pub fn prev_hash(&self) -> &[u8] {
-        &self.header[..32]
+        match self.chain {
+            crate::settings::Chain::Lotus => &self.header[..32],
+            crate::settings::Chain::Dogecoin => &self.header[4..36],
+        }
     }
 }
 
@@ -61,6 +84,33 @@ mod tests {
         assert_eq!(block.target[0], 1);
         assert_eq!(block.target[31], 0);
         assert_eq!(block.prev_hash(), &bytes[..32]);
+    }
+
+    #[test]
+    fn dogecoin_job_preserves_wire_body_and_target() {
+        let mut bytes: Vec<u8> = (0..192).map(|i| i as u8).collect();
+        bytes[..4].copy_from_slice(&0x620004u32.to_le_bytes());
+        let block = create_block_for_chain(
+            &RawUnsolvedBlockAndTarget {
+                blockhex: hex::encode(&bytes),
+                target: format!("01{}", "00".repeat(31)),
+            },
+            crate::settings::Chain::Dogecoin,
+        )
+        .unwrap();
+        assert_eq!(&block.header[..80], &bytes[..80]);
+        assert_eq!(block.body, bytes[80..]);
+        assert_eq!(block.prev_hash(), &bytes[4..36]);
+        assert_eq!(block.target[31], 1);
+        bytes[1] |= 1;
+        assert!(create_block_for_chain(
+            &RawUnsolvedBlockAndTarget {
+                blockhex: hex::encode(&bytes),
+                target: "ff".repeat(32)
+            },
+            crate::settings::Chain::Dogecoin
+        )
+        .is_err());
     }
 
     #[test]

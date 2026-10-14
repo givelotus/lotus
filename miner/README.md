@@ -109,3 +109,79 @@ macOS arm64 archive checks passed. Linux and macOS Intel builds await CI.
 Passing compilation and CPU tests alone does not establish GPU hashrate,
 successful live block submission, or
 support for every vendor driver. No live mining is performed by the tests.
+
+## Dogecoin direct Scrypt mining
+
+Select the chain explicitly with `--chain dogecoin` or `chain = "dogecoin"`
+in a separate configuration file. The default remains Lotus. Dogecoin uses
+an 80-byte header, a 32-bit little-endian nonce at byte 76, and
+Scrypt(N=1024,r=1,p=1); Lotus retains its 160-byte layered SHA-256 format.
+Both CLI and GUI use the selected backend; restart to change the chain.
+
+```toml
+chain = "dogecoin"
+rpc_url = "http://127.0.0.1:22555"
+rpc_user = "your-local-rpc-user"
+rpc_password = "your-local-rpc-password"
+rpc_poll_interval = 3
+mine_to_address = "YOUR_DOGECOIN_ADDRESS"
+gpu_index = 0
+scrypt_work_size = 1024
+```
+
+This requires the rebased Doged node's `getrawunsolvedblock(address)` RPC
+returning `{blockhex,target}` and `submitblock(blockhex)`. It is not a
+Stratum pool client. It mines ordinary direct Scrypt blocks, not parent-chain
+AuxPoW jobs or combined Litecoin/Dogecoin rewards. Payout validation and
+coinbase construction belong to the node; the miner preserves its entire
+serialized transaction body. AuxPoW-marked work is rejected rather than
+mistakenly treating its parent proof as direct work. No live financial mining
+is enabled by tests.
+
+The embedded OpenCL kernel uses 128 KiB scratch per nonce. `scrypt_work_size`
+is an independent power-of-two batch size from 256 to 4096 (32–512 MiB).
+The default is 1024 (128 MiB); Lotus's intensity slider and `kernel_size`
+never control this allocation. Device allocation failures are reported by
+OpenCL. Each candidate is rehashed with an independent CPU implementation
+before submission, including nonce zero and target equality. Identical
+polled jobs retain nonce progress; fresh work starts a new nonce space.
+After nonce exhaustion the miner waits for a different template from RPC.
+
+Verification commands (from `miner/`):
+
+```sh
+cargo test --workspace
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test -p lotus-miner-lib opencl_matches_cpu -- --ignored --nocapture
+cargo test -p lotus-miner-lib opencl_batch_benchmark -- --ignored --nocapture
+```
+
+The bounded RPC integration test requires `DOGE_REGTEST_RPC_URL`,
+`DOGE_REGTEST_RPC_USER`, `DOGE_REGTEST_RPC_PASSWORD`, and
+`DOGE_REGTEST_PAYOUT`, pointing at an isolated regtest node with the new RPC.
+It verifies the chain is regtest before requesting mining work:
+
+```sh
+cargo test -p lotus-miner-lib dogecoin_regtest_gpu_submit -- --ignored --nocapture
+```
+
+2026-10-14 validation on Apple M5 Max: all 256 GPU hashes matched the CPU
+reference, which also matched Python `hashlib.scrypt`; nonzero headers and
+near-maximum nonces are sampled at each supported benchmark batch size.
+The real GPU/node RPC round trip mined and submitted isolated regtest height
+22 after AuxPoW activation (height 21 before the test), accepted by the node.
+These checks establish direct mining correctness on this device, not pool
+compatibility, ASIC competitiveness, sustained profitability, or other GPUs.
+
+Bounded warmed OpenCL measurements on that M5 Max (1,024 batches each,
+including GPU buffer upload/readback, excluding compilation and CPU verification):
+
+| Nonces/batch | Scratch | Hashes | Elapsed | Hashes/second |
+| --- | --- | --- | --- | --- |
+| 256 | 32 MiB | 262,144 | 3.64046 s | 72,008.5 |
+| 1,024 | 128 MiB | 1,048,576 | 4.03905 s | 259,609.5 |
+| 4,096 | 512 MiB | 4,194,304 | 4.42599 s | 947,652.6 |
+
+These are short local measurements during concurrent development, not a
+long-duration thermal test or an estimate of mining income. The kernel is a
+correctness-first implementation; tuning for other devices remains unvalidated.

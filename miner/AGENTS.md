@@ -35,3 +35,15 @@
   dedication using the standard SPDX text and its complete published source.
   The full Linux dependency metadata audit found no other unsupported license
   fallback cases. Await rerun before claiming Linux archives passed.
+
+- Dogecoin mining is explicitly selected with `chain = "dogecoin"`/`--chain
+  dogecoin`; preserve Lotus defaults and its 160-byte header. Direct Dogecoin
+  jobs use Scrypt1024_1_1, 80-byte headers, nonce bytes76–79, and untouched body.
+  The new embedded OpenCL kernel is independently written under this project's
+  MIT license, with Rust CPU verification and Python hashlib test evidence.
+- Keep `scrypt_work_size` separate from Lotus intensity: power-of-two256–4096,
+  default1024, 128KiB scratch per item (32–512MiB). No Stratum pool or parent
+  AuxPoW mining implementation is claimed. Bounded M5 Max GPU tests include
+  digest parity, nonce0, uint32 boundary samples and actual regtest RPC mining:
+  getrawunsolvedblock/submitblock accepted height22 from height21 after AuxPoW
+  activation on the isolated current-ABC port. No mainnet mining was performed.
