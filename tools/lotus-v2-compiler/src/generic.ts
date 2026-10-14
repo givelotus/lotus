@@ -27,6 +27,7 @@ export type CompileOptions = { contract: string; bindings: Record<string, Record
 
 const MAX_SOURCE = 65536, MAX_SCRIPT = 8192, MAX_OPS = 4096, MAX_EXPANSIONS = 256, MAX_METHODS = 16;
 const MAX_INFERENCE_VISITS = 8192;
+const MAX_DEPENDENCY_VISITS = 8192;
 function symbol(name: string): void { assertPortableName(name); }
 function utf8Offset(source: string, utf16: number): number { return new TextEncoder().encode(source.slice(0, utf16)).length; }
 function lex(source: string): Token[] {
@@ -228,6 +229,8 @@ class Emitter {
 class Compiler {
   private scheduledJob?: string;
   private enforceScheduledJobs = false;
+  private dependencyVisits = 0;
+  private readonly helperDependencies = new Map<string, string[]>();
   private methodMemo = new Map<string, Compiled>();
   private methodActive = new Set<string>();
   private rootMemo = new Map<string, Tree>();
@@ -249,29 +252,40 @@ class Compiler {
   private findMethod(contract: string, method: string): Method { const m = this.contract(contract).methods.find(x => x.name === method); if (!m) throw new Error(`unknown method ${contract}.${method}`); return m; }
   private dependencies(method: Method): string[] {
     const found = new Set<string>();
-    const scan = (expr: Expr, helpers: string[]): void => {
+    const scan = (expr: Expr, target: Set<string>, helpers: string[]): void => {
+      if (++this.dependencyVisits > MAX_DEPENDENCY_VISITS) throw new Error('dependency scan visit budget exceeded');
       if (expr.kind === 'call') {
         const args = expr.args ?? [];
         if (expr.value === 'leaf_hash' && args.length === 1 && args[0]?.kind === 'name') {
           const path = args[0].value!.split('.');
           if (path.length === 2) {
-            found.add(`leaf:${path[0]}.${path[1]}`);
+            target.add(`leaf:${path[0]}.${path[1]}`);
           }
         } else if ((expr.value === 'contract_root' || expr.value === 'merkle_root') && args.length === 1 && args[0]?.kind === 'name' && !args[0].value!.includes('.')) {
-          found.add(`root:${args[0].value}`);
+          target.add(`root:${args[0].value}`);
         } else {
-          for (const arg of args) scan(arg, helpers);
+          for (const arg of args) scan(arg, target, helpers);
           const helper = this.program.helpers.get(expr.value!);
-          if (helper && !helpers.includes(helper.name)) scan(helper.body, [...helpers, helper.name]);
+          if (helper && !helpers.includes(helper.name)) {
+            let dependencies = this.helperDependencies.get(helper.name);
+            if (!dependencies) {
+              if (helpers.length >= 16) throw new Error('helper dependency depth exceeded');
+              const inner = new Set<string>();
+              scan(helper.body, inner, [...helpers, helper.name]);
+              dependencies = [...inner];
+              this.helperDependencies.set(helper.name, dependencies);
+            }
+            for (const dependency of dependencies) target.add(dependency);
+          }
         }
       } else {
-        if (expr.left) scan(expr.left, helpers);
-        if (expr.right) scan(expr.right, helpers);
+        if (expr.left) scan(expr.left, target, helpers);
+        if (expr.right) scan(expr.right, target, helpers);
       }
     };
     const statements = (body: Stmt[]): void => {
       for (const stmt of body) {
-        if (stmt.expr) scan(stmt.expr, []);
+        if (stmt.expr) scan(stmt.expr, found, []);
         if (stmt.then) statements(stmt.then);
         if (stmt.otherwise) statements(stmt.otherwise);
       }
@@ -292,10 +306,10 @@ class Compiler {
     for (const contract of this.program.contracts.values()) {
       for (const method of contract.methods) {
         const name = `leaf:${contract.name}.${method.name}`;
-        scheduler.register(name, this.dependencies(method), () => execute(name, () => { this.method(contract.name, method.name); }));
+        scheduler.register(name, () => this.dependencies(method), () => execute(name, () => { this.method(contract.name, method.name); }), method.span);
       }
       const name = `root:${contract.name}`;
-      scheduler.register(name, contract.methods.map(method => `leaf:${contract.name}.${method.name}`), () => execute(name, () => { this.root(contract.name); }));
+      scheduler.register(name, contract.methods.map(method => `leaf:${contract.name}.${method.name}`), () => execute(name, () => { this.root(contract.name); }), contract.span);
     }
     await scheduler.run(`root:${this.options.contract}`);
     this.enforceScheduledJobs = false;
