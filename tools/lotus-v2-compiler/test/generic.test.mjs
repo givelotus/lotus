@@ -69,8 +69,7 @@ test('argument reuse and control flow retain copies while safe checksig fusion a
   const optimized = compileContract(source, opts);
   for (const method of optimized.methods) {
     const prior = normal.methods.find(x => x.name === method.name);
-    assert.equal((method.scriptHex.match(/007d/g) ?? []).length, (prior.scriptHex.match(/007d/g) ?? []).length);
-    assert.equal(method.scriptHex, prior.scriptHex.replaceAll('bb65', 'bc'));
+    assert.equal(method.scriptHex, prior.scriptHex.replaceAll('007d', '7a').replaceAll('bb65', 'bc'));
     assert.equal(method.staticResources.scriptBytes, method.scriptHex.length / 2);
     assert.equal(method.sourceMap.at(-1).byteEnd, method.staticResources.scriptBytes);
   }

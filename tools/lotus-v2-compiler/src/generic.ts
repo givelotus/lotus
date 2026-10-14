@@ -2,6 +2,7 @@
 import { bytes, concat, cs, hex, tagged, unhex, uint, type Span } from './compiler.js';
 import { schnorr } from '@noble/curves/secp256k1';
 import { assertPortableName } from './names.js';
+import { optimizeInstructions, type Instruction } from './optimizer.js';
 
 export type ValueType = 'PublicKey' | 'Signature' | 'Bytes32' | `Bytes(${number})` | 'Int' | 'Bool' | 'MethodLeafHash' | 'ContractRootHash';
 export type BoundValue = string | boolean | bigint;
@@ -173,7 +174,6 @@ type Compiled = { script: Uint8Array; leaf: Uint8Array; map: MethodArtifact['sou
 const OPCODES = { VERIFY: 0x65, IF: 0x61, ELSE: 0x63, ENDIF: 0x64, DROP: 0x79, PICK: 0x7d,
   EQUAL: 0x91, NOT: 0x9c, ADD: 0x9e, SUB: 0x9f, MUL: 0xa0, BOOLAND: 0xa4, BOOLOR: 0xa5,
   LESSTHAN: 0xa9, GREATERTHAN: 0xaa, SHA256: 0xb8, HASH256: 0xb9, BLAKE3: 0xba, CHECKSIG: 0xbb, CHECKSIGVERIFY: 0xbc, NEGATE: 0x9a } as const;
-type Instruction = { wire: Uint8Array; map: MethodArtifact['sourceMap'][number]; delta: number };
 class Emitter {
   private instructions: Instruction[] = [];
   private length = 0;
@@ -202,32 +202,7 @@ class Emitter {
   op(name: keyof typeof OPCODES, span: Span, origin?: Span, delta = 0): void { this.append(Uint8Array.of(OPCODES[name]), name, span, origin, delta); if (name === 'CHECKSIG') this.signatureChecks++; }
   control(name: 'IF'|'ELSE'|'ENDIF', span: Span): void { this.op(name, span, undefined, name === 'IF' ? -1 : 0); }
   finish(optimize: boolean): { script: Uint8Array; map: MethodArtifact['sourceMap']; resources: Pick<MethodArtifact['staticResources'], 'scriptBytes'|'opcodes'|'maxStackItems'> } {
-    let entries = this.instructions;
-    if (optimize) {
-      // A lone argument copied at depth zero has exactly one use. Consume its
-      // original stack item, then omit the now-unnecessary final DROP. Control
-      // flow and repeated references retain the ordinary lowering.
-      const picks = entries.flatMap((entry, index) => entry.map.op === 'PICK' ? [index] : []);
-      const pick = picks[0];
-      if (this.args === 1 && picks.length === 1 && pick !== undefined && pick > 0 &&
-          entries[pick - 1]!.map.op === 'ZERO' &&
-          !entries.some(entry => ['IF','ELSE','ENDIF'].includes(entry.map.op)) &&
-          entries.at(-2)?.map.op === 'DROP' && entries.at(-1)?.map.op === 'N(1)') {
-        entries = entries.filter((_, index) => index !== pick - 1 && index !== pick && index !== this.instructions.length - 2);
-      }
-      const fused: Instruction[] = [];
-      for (let i = 0; i < entries.length; i++) {
-        const current = entries[i]!, next = entries[i + 1];
-        if (current.map.op === 'CHECKSIG' && next?.map.op === 'VERIFY') {
-          fused.push({ wire: Uint8Array.of(OPCODES.CHECKSIGVERIFY), delta: current.delta + next.delta,
-            map: { ...next.map, op: 'CHECKSIGVERIFY', optimizedFrom: [
-              { op: current.map.op, source: current.map.source, ...(current.map.expandedFrom ? { expandedFrom: current.map.expandedFrom } : {}) },
-              { op: next.map.op, source: next.map.source, ...(next.map.expandedFrom ? { expandedFrom: next.map.expandedFrom } : {}) }] } });
-          i++;
-        } else fused.push(current);
-      }
-      entries = fused;
-    }
+    const entries = optimize ? optimizeInstructions(this.instructions, this.args) : this.instructions;
     const map: MethodArtifact['sourceMap'] = [];
     let offset = 0, height = this.args, maxStackItems = height;
     for (const entry of entries) {
