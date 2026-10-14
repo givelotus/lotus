@@ -46,6 +46,11 @@ test('optimized and unoptimized scripts agree in independent P03 VM', { skip: !a
         ...(name === 'loop' ? { input_count: 2 } : {}) });
     }
   }
+  const loopMutation = 'contract C { function m(x: Int) { total = x; for o in tx.outputs { require(total == x); total += 1; } } }';
+  const loopBefore = compileContract(loopMutation, { contract: 'C', bindings: {}, optimize: false }).methods[0].scriptHex;
+  const loopAfter = compileContract(loopMutation, { contract: 'C', bindings: {} }).methods[0].scriptHex;
+  fixtures.push({ name: 'loop-carried local differs on second iteration', before: loopBefore, after: loopAfter,
+    args: ['00'.repeat(16)], output_count: 2, expected: 'error' });
   const constant = 'contract C { function m(x: Bool) { require((1 + 2) * (3 + 4) == 21); require(x); } }';
   const constantOptions = { contract: 'C', bindings: {} };
   const constantBefore = compileContract(constant, { ...constantOptions, optimize: false }).methods[0].scriptHex;

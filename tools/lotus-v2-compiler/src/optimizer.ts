@@ -150,9 +150,11 @@ function symbolicRegion(entries: readonly Instruction[], state: State, budget: {
       const end = matchingEnd(entries, i, op, 'ENDENUMERATE');
       if (end < 0) { out.push(entry); state.stack = state.stack.map(() => fresh('control')); continue; }
       const bodyState = copyState(state);
-      // A loop may replace locals before its next iteration. Arguments are
-      // immutable; every other incoming identity and fact is a fresh unknown.
-      bodyState.stack = bodyState.stack.map(cell => cell.id.startsWith('arg:') ? unknown(cell.id) : fresh('loopInput'));
+      // A local initialized from an argument shares its identity until the
+      // body mutates it. Repeated iterations must start with fresh identities
+      // for every slot, while repeated reads of one slot within an iteration
+      // can still be simplified.
+      bodyState.stack = bodyState.stack.map(() => fresh('loopInput'));
       bodyState.facts.clear();
       bodyState.stack.push(fresh('iterator'));
       const body = symbolicRegion(entries.slice(i + 1, end), bodyState, budget);
