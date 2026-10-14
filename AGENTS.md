@@ -262,3 +262,5 @@ Upstream Bitcoin ABC's in-process Chronik (`chronik/`) assumes standard 80-byte 
 - Initial BCHN fork pipelines fail before any jobs because GitLab reports the user is not verified. Account verification must be completed by the user before rerunning CI; do not claim upstream tests ran or bypass the verification requirement.
 
 - User-authorized interface submissions are open as BCHN GitLab MR 2176 (independent default-OFF raw NNG publisher), MR 2177 (ZeroMQ default-OFF), and MR 2178 (complete ZeroMQ source/public API removal; depends on 2177). Submitted source trees exactly match tested exports; see `daemon/docs/evidence/bchn-interface-submissions-20261014.json`. No legacy NNG query protocol or complete Chronik port is implied.
+
+- GitLab account verification is cleared after the user completed it. New MR pipelines were created through the MR-pipeline API: 2174→2948226388, 2175→2948226781, 2176→2948226956, 2177→2948227063, 2178→2948227193. Each now has 33 jobs; the first is running and the others queue behind shared-runner capacity. Earlier verification failures remain historical; current CI results are pending, not successful yet.
