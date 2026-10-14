@@ -20,6 +20,21 @@ SOURCE_VERSION="$(sed -nE 's/^[[:space:]]*VERSION ([0-9]+\.[0-9]+\.[0-9]+)$/\1/p
 [[ "$SOURCE_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "Source has no unique semantic project version." >&2; exit 1; }
 LOTUS_CHRONIK="${LOTUS_CHRONIK:-ON}"
 LOTUS_NNG="${LOTUS_NNG:-ON}"
+if [[ -n "${FEATURES:-}" ]]; then
+    PLAN="$(python3 "$SCRIPT_DIR/feature-plan.py" --target v1 --features "$FEATURES")"
+    SWITCHES="$(python3 -c '
+import json, sys
+plan = json.load(sys.stdin)
+if plan["patches"]:
+    raise SystemExit("Guix build options cannot apply policy patches")
+flags = dict(flag.removeprefix("-D").split("=", 1) for flag in plan["cmake_args"])
+if any(key not in ("BUILD_CHRONIK", "BUILD_BITCOIN_NNG", "BUILD_ZMQ") or
+       (key == "BUILD_ZMQ" and value != "OFF") for key, value in flags.items()):
+    raise SystemExit("This Guix candidate supports Chronik/NNG selection and ZeroMQ OFF only")
+print(flags.get("BUILD_CHRONIK", sys.argv[1]), flags.get("BUILD_BITCOIN_NNG", sys.argv[2]))
+' "$LOTUS_CHRONIK" "$LOTUS_NNG" <<< "$PLAN")"
+    read -r LOTUS_CHRONIK LOTUS_NNG <<< "$SWITCHES"
+fi
 for feature in "$LOTUS_CHRONIK" "$LOTUS_NNG"; do
     [[ "$feature" == ON || "$feature" == OFF ]] || { echo "Feature switches must be ON or OFF." >&2; exit 1; }
 done

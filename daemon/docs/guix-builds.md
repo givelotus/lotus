@@ -62,7 +62,10 @@ diff -u /new/build-a/output/SHA256SUMS /new/build-b/output/SHA256SUMS
 The build directory must not exist, and the input source must have no tracked
 modifications. The wrapper clones it, applies the mailbox with a deterministic
 committer date, and never changes the input checkout. Optional selectors:
-`LOTUS_CHRONIK=OFF` and `LOTUS_NNG=OFF`. Both default to ON.
+`FEATURES=chronik,nng-off` uses the same feature planner as native builds.
+The low-level `LOTUS_CHRONIK` and `LOTUS_NNG` ON/OFF switches also remain
+available; both default to ON and explicit FEATURES takes precedence. Policy
+patch selection and unsupported build options fail closed. ZeroMQ remains OFF.
 
 `guix-daemon.yml` uses two independent ephemeral Ubuntu runners and compares
 archive SHA256 hashes. It only uploads CI artifacts; it cannot publish a GitHub
