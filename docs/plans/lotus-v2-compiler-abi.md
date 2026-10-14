@@ -1,6 +1,10 @@
 # V2 compiler, ABI generator and contract test plan
 
-October 14, 2026. Proposed implementation scope, not an implemented compiler or frozen language. This complements [V2-01/V2-04/V2-07](../../daemon/docs/lotus-v2-implementation-plan.md), the [script ABI](../lotus-v2/script-abi.md), and the [worked contracts](../lotus-v2/examples/README.md). It is a tool for exercising the evolving protocol before genesis, not a reason to freeze the draft prematurely.
+October 14, 2026. Implementation roadmap with an initial working compiler; the language remains a draft. This complements [V2-01/V2-04/V2-07](../../daemon/docs/lotus-v2-implementation-plan.md), the [script ABI](../lotus-v2/script-abi.md), and the [worked contracts](../lotus-v2/examples/README.md). It is a tool for exercising the evolving protocol before genesis, not a reason to freeze the draft prematurely.
+
+## Integrated prototype
+
+The [compiler and gallery](../../tools/lotus-v2-compiler/examples/gallery/README.md) now provide bound typed templates, multiple methods, pure helper inlining, hash builtins and cross-contract method/root commitments. Both client runtimes construct canonical single-input calls, with a signed generic Payment fixture checked against native framing and signature code. The seven source examples compile and their method proofs are independently folded. Root verification passed 27 compiler/runtime tests and 34 reference tests, with gallery VM positive and negative cases. These checks cover the initial subset, not all milestone requirements below.
 
 ## First useful outcome
 
@@ -25,7 +29,7 @@ Start under `tools/lotus-v2-compiler/`, with a machine-readable schema and fixtu
 
 Keep Python as an independent test/reference implementation and as one generated client target. **Python and TypeScript are equal first-release binding targets**, each with a contract-specific API and a small maintained runtime library generated/maintained against the same versioned ABI. The compiler does not run during every client call. Python is required only for the Python client and optional reference checks, not the compiler or TypeScript client. Changes in `~/repos/frank` require a separate scoped revision; this plan makes no changes there.
 
-The first worker is dispatched on a narrow payment slice: real source parsing and type checks, bytecode/ABI emission, generated call construction, and an actual signed transaction under an explicit fixture profile. It must compare exact bytes and signing results with independent reference/native modules. Those modules currently cover framing/cryptography, so passing them does not claim full VM or block validity. The first slice does not close all CABI-00–03 requirements.
+The initial payment slice is implemented: real source parsing and type checks, bytecode/ABI emission, generated call construction, and an actual signed transaction under an explicit fixture profile. It must compare exact bytes and signing results with independent reference/native modules. Native modules cover framing/cryptography; the separate reference VM now also executes the gallery Payment, hashlock, helper and linked-commitment invocations. Neither establishes contextual or block validity. The first slice does not close all CABI-00–03 requirements.
 
 ## Finch specification influence and deliberately small scope
 

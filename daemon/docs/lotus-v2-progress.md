@@ -11,7 +11,8 @@ The [implementation plan](lotus-v2-implementation-plan.md) owns the full gates. 
 | Miner CPU/OpenCL | Isolated V2 integration `94e176f4`; worker executed V1 and expanded V2 GPU tests on Apple M5 Max. Root reran original V2 GPU parity. GUI unsupported-mode error handling remains a review blocker; daemon job integration absent. |
 | Transaction framing | Python `a95b9366`, native `b58c83fa`; worker reports Debug/Release and independent corpus passes; root review pending |
 | Commitment primitives | Native `de5f497f`; branch/indexed/ordered trees and transaction identity wrappers, independent vectors; root review pending |
-| VM reference | `0b195ff8`; partial interpreter and explicit unsupported-feature errors; root review pending, size-aware charging incomplete |
+| VM reference | Integrated bounded interpreter, size-aware static charging, BIP340 and raw BLAKE3; root ran 34 reference tests. Explicit profiles and unsupported-feature errors; no complete transaction validator. |
+| Compiler and ABI | Integrated TypeScript templates, helper inlining, multi-method P02 proofs, typed hash references, TS/Python call runtimes and seven-example gallery. Root ran 27 package tests, native signed generic Payment checks and positive/negative gallery VM cases. |
 
 Next work: review transaction/commitment interfaces, demonstrate an independently signed payment, complete VM/charging, implement sparse state and monetary/block transition, then connect mining jobs to full validation. Workers continue in isolated worktrees; candidates are not automatically accepted because tests pass. Unfrozen cost/monetary/network parameters must remain explicit development profiles.
 
