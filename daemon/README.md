@@ -178,5 +178,5 @@ make prepare-release UPSTREAM=/tmp/isolated-abc VERSION=11.6.1 \
 
 This prepares reviewable source, packaging and release metadata without
 publishing. Network changes require explicit verified inputs. See
-[release preparation](NETWORK-RELEASE.md) for validation and the separate
+[release preparation](docs/release-preparation.md) for validation and the separate
 publication command.
