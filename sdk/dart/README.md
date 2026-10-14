@@ -1,7 +1,7 @@
 # Lotus Dart SDK
 
 Keys, XAddresses, scripts and transactions for Lotus (XPI), plus separate Chronik
-HTTP/protobuf and Electrum TCP/TLS clients. Dart 3.7 or later is required.
+HTTP/protobuf and Electrum TCP/TLS clients. Dart 3.11 or later is required.
 
 ```sh
 dart pub get

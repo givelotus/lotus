@@ -23,3 +23,9 @@
   HD key fixes, and pass independent OpenSSL/libsecp256k1 interoperability checks.
   Exact recovered provenance and reproduction commands are in
   `docs/crypto-audit-20261014/README.md`.
+
+- Latest dependency constraints were reviewed against official pub.dev metadata
+  on 2026-10-14. Keep `unorm_dart` aligned with Vase (`^0.3.3`); BIP39 ASCII,
+  composed/decomposed accents and compatibility characters have independent seed
+  regression vectors. The Dart minimum is 3.11 because current test tooling
+  requires it; Flutter's installed Dart 3.13.3 satisfies that bound.
