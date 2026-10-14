@@ -77,6 +77,13 @@ def encode_value(kind: str, value: Any) -> bytes:
     return value
 
 
+def valid_type(kind: str) -> bool:
+    if kind in ('PublicKey', 'Signature', 'Bytes32', 'Int', 'Bool', 'MethodLeafHash', 'ContractRootHash'):
+        return True
+    match = re.fullmatch(r'Bytes\(([1-9][0-9]*)\)', kind)
+    return match is not None and int(match.group(1)) <= 8192
+
+
 def encode_output(output: dict) -> bytes:
     flags = output.get('flags', 0)
     if flags != 0: raise ValueError('only native spendable output supported')
@@ -113,7 +120,7 @@ def selected(artifact: dict, method_name: str) -> dict:
     declared, bound = artifact['constructor'], artifact['bindings']
     if len(declared) != len(bound) or len({x['name'] for x in declared}) != len(declared): raise ValueError('constructor/binding mismatch')
     for dec, val in zip(declared, bound):
-        if not re.fullmatch(r'[A-Za-z_][A-Za-z_0-9]*', dec['name']) or dec['name'] != val['name'] or dec['type'] != val['type']:
+        if not re.fullmatch(r'[A-Za-z_][A-Za-z_0-9]*', dec['name']) or not valid_type(dec['type']) or dec['name'] != val['name'] or dec['type'] != val['type']:
             raise ValueError('constructor/binding mismatch')
         kind, value = val['type'], val['value']
         if kind == 'Bool':
@@ -124,12 +131,19 @@ def selected(artifact: dict, method_name: str) -> dict:
         elif kind == 'Signature':
             raw = hx(value)
             if len(raw) != 64 and not (len(raw) == 65 and raw[-1] in (1, 2)): raise ValueError('noncanonical Signature binding')
-        else: encode_value(kind, hx(value))
+        else:
+            encode_value(kind, hx(value))
+            if kind == 'PublicKey':
+                x = int.from_bytes(hx(value), 'big')
+                p = (1 << 256) - (1 << 32) - 977
+                if x >= p or pow((x * x * x + 7) % p, (p - 1) // 2, p) != 1:
+                    raise ValueError('PublicKey is not a BIP340 x-only curve point')
     methods = artifact['methods']
     if not 1 <= len(methods) <= 16 or len({m['name'] for m in methods}) != len(methods): raise ValueError('invalid methods')
     leaves = []
     for entry in methods:
-        if not re.fullmatch(r'[A-Za-z_][A-Za-z_0-9]*', entry['name']) or len({x['name'] for x in entry['args']}) != len(entry['args']): raise ValueError('invalid method arguments')
+        if not re.fullmatch(r'[A-Za-z_][A-Za-z_0-9]*', entry['name']) or len({x['name'] for x in entry['args']}) != len(entry['args']) or any(not re.fullmatch(r'[A-Za-z_][A-Za-z_0-9]*', x['name']) or not valid_type(x['type']) for x in entry['args']):
+            raise ValueError('invalid method arguments')
         script = hx(entry['scriptHex'])
         if not 1 <= len(script) <= 8192: raise ValueError('script width')
         leaf = tagged('branch', b'\x00' + sized(script))
