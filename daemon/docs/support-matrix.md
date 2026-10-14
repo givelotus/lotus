@@ -6,13 +6,13 @@ Checked 2026-10-14. “Applies” means patch application only. A successful bui
 
 | Selector | Source pin consumed by setup | Build targets | Actual support |
 |---|---|---|---|
-| `v1` (default) | `bitcoin-abc-v1-version`: `8c67fe1e85a602204a2ce65aa3b643469c2c3a1d` | `lotusd`, `lotus-cli` | Maintained 153-patch mainnet series; prior build, C++/Rust checks, isolated mainnet replay and sampled Chronik comparison passed. A newly identified mining-selection defect in the shared candidate algorithm requires separate repair/validation before claiming mining readiness. See [validation](v1-8c67fe1e85-validation.md). |
-| `ecash` | `bitcoin-abc-version`: `252182e957120652960c1f88ec96515c448b1204` | `bitcoind`, `bitcoin-cli` | Experimental mining candidates. Exact 01 builds daemon/CLI/test binary but fails existing miner tests; 02 breaks test compilation. Neither is established correct. |
-| `bchn` | `bchn-version`: `v28.0.0`, commit `0bc23ac4c1365f34ed824e2b07e554ec06a5f5cd` | `bitcoind`, `bitcoin-cli` | Experimental candidates 01/02 apply at the pin. No build or behavior result from this audit. Both fail application at current upstream. |
-| `doged` | `doged-version` | `doged`, `doge-cli` | ABC-derived Dogecoin source with a separate compatibility patch series. Current upstream daemon/CLI build with Chronik; the lineage investigation adds an explicit integer-width fix for Apple arm64 test compilation. Chronik is present upstream, not provided by the Lotus mining candidates. See the separate Dogecoin lineage investigation for actual build/sync evidence. |
+| `v1` (default) | `bitcoin-abc-v1-version`: `8c67fe1e85a602204a2ce65aa3b643469c2c3a1d` | `lotusd`, `lotus-cli` | Maintained 153-patch mainnet series; prior build, C++/Rust checks, isolated mainnet replay and sampled Chronik comparison passed. The newly identified mining-selection defect has been repaired by restoring retained upstream selection, with native C++ regression/suite evidence; corrected release CI remains required. See [mining repair](ecash-block-assembly-review.md). See [validation](v1-8c67fe1e85-validation.md). |
+| `ecash` | `bitcoin-abc-version`: `252182e957120652960c1f88ec96515c448b1204` | `bitcoind`, `bitcoin-cli` | Unmodified pinned upstream daemon/CLI build successfully. Experimental 01 builds but fails existing miner tests; 02 breaks test compilation. Neither candidate is established correct. |
+| `bchn` | `bchn-version`: `v28.0.0`, commit `0bc23ac4c1365f34ed824e2b07e554ec06a5f5cd` | `bitcoind`, `bitcoin-cli` | Unmodified pinned upstream daemon/CLI build successfully with manpages disabled. Experimental 01/02 apply at the pin but are unvalidated; both fail application at current upstream. |
+| `doged` | `doged-version` | `doged`, `doge-cli` | Exact pin `9690833b8b6709b7a7837bc397f0d04bf3b885d1` plus two mailbox patches (Apple arm64 test compilation and an AuxPoW Chronik regression): Chronik-enabled daemon/CLI, 740 C++ cases and six isolated functional tests pass. Full mainnet synchronization and network Avalanche behavior remain untested. See [Dogecoin lineage](dogecoin-lineage.md). |
 | Bitcoin Core | No selector or pin | No configured target | Not supported by the existing wrapper. Copying BCHN or ABC patches is not a port. |
 
-`ecash-version` (`fa7a44f731a2dfe1587e572d9eb0e4bb7c73d79c`, old ABC v0.24.11) and `lotusd-version` (`v10.4.10`) are historical provenance references: setup/build/refresh do not read them. They do not define today's mainnet version. Their inherited comments about 42 patches, an archived V1, or a stalled/divergent mainnet are obsolete. Release preparation should identify the actual executable source pin and version rather than treating all six files as equivalent inputs.
+`ecash-version` (`fa7a44f731a2dfe1587e572d9eb0e4bb7c73d79c`, old ABC v0.24.11) and `lotusd-version` (`v10.4.10`) are historical provenance references: setup/build/refresh do not read them. They do not define today's mainnet version. Their inherited comments about 42 patches, an archived V1, or a stalled/divergent mainnet were obsolete and have been corrected. Release preparation should identify the actual executable source pin and version rather than treating all six files as equivalent inputs.
 
 The original ecash/BCHN executable manifests included `03-mempool-cleanup.patch`, a comment-only no-op that `git apply` rejects. This audit removes all experimental entries from default execution, retaining their payloads for explicit review through the feature planner. The no-op file remains as historical explanation. Slots 10 (NNG) and 11 (ZeroMQ source deletion) are also comment-only placeholders and remain excluded. Manifest existence does not imply implemented or maintained support.
 
@@ -30,6 +30,22 @@ Remote default-branch revisions were checked directly with `git ls-remote <prima
 At the older pinned ABC `252182e957` and BCHN `0bc23ac4c`, 01 and 02 apply. All 03/10/11 files contain no valid patch hunks. Full check results are recorded in [application evidence](evidence/feature-apply-2026-10-14.json).
 
 Checks used isolated `/tmp/lotus-upstream-feasibility-*` checkouts and disposable candidate worktrees. A standalone local-object clone was required for pinned ABC builds: upstream CMake assumes `.git` is a directory, so linked worktrees fail configuring `.git/logs/HEAD`. No source workaround was added to the candidate for the successful standalone configuration.
+
+## Unmodified upstream build evidence
+
+Pinned ABC `252182e957` was also compiled **without** experimental patches. Reversing candidate 01 after removing candidate 02 restored a clean tracked source tree; daemon/CLI rebuild passed. Regenerating cached build metadata produced `Bitcoin ABC version v0.32.8-252182e95712` without a dirty suffix. This records actual base-only compilation, not an inference from the changed miner build. No upstream-mainnet behavior or Chronik check was run for this base-only build.
+
+Pinned BCHN `v28.0.0` (`0bc23ac4c1365f34ed824e2b07e554ec06a5f5cd`) initially failed configuration because optional manpage generation requires unavailable `help2man`. Reconfiguration with `-DENABLE_MAN=OFF` succeeded, without a source patch. Building `bitcoind bitcoin-cli` passed all 228 Ninja steps. The clean-tree binaries report `v28.0.0-0bc23ac4c`; no experimental candidate was applied. BCHN unit, consensus, mainnet synchronization and current-tip builds were not run.
+
+```sh
+cmake -S /tmp/lotus-bchn-base-build -B /tmp/lotus-bchn-base-build/build -GNinja \
+  -DBUILD_BITCOIN_QT=OFF -DBUILD_BITCOIN_ZMQ=OFF \
+  -DENABLE_UPNP=OFF -DENABLE_NATPMP=OFF -DENABLE_MAN=OFF \
+  -DPython_EXECUTABLE=/opt/homebrew/bin/python3.13
+ninja -C /tmp/lotus-bchn-base-build/build -j6 bitcoind bitcoin-cli
+```
+
+Both base-only audits use Apple Clang 21.0.0 (`clang-2100.1.1.101`), CMake 4.4.4, Ninja 1.13.2, current installed dependencies, and disposable standalone clones. Logs and results are summarized in [base build evidence](evidence/upstream-base-build-2026-10-14.json).
 
 ## Native pinned ABC build/test evidence
 
