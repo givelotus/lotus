@@ -6,6 +6,15 @@ const baselineOnly = process.argv[3] === '--baseline-only';
 if (!executable || (process.argv[3] && !baselineOnly))
   throw new Error('usage: node test/run-native-token-fixtures.mjs NATIVE_CHECK_EXECUTABLE [--baseline-only]');
 
+function deltaHex(value) {
+  if (value == null) return '-';
+  if (typeof value === 'string' && /^[0-9a-f]{32}$/.test(value)) return value;
+  const amount = BigInt(value);
+  if (amount <= 0n || amount >= (1n << 128n)) throw new Error('positive delta out of u128 range');
+  return Array.from({ length: 16 }, (_, i) => Number((amount >> (8n * BigInt(i))) & 255n)
+    .toString(16).padStart(2, '0')).join('');
+}
+
 function run(testCase, expectedFailure) {
   const args = [testCase.wire, testCase.chainId, testCase.txid, testCase.txhash,
     String(testCase.coinWires.length), ...testCase.coinWires.map(coin => coin ?? '-'),
@@ -13,7 +22,7 @@ function run(testCase, expectedFailure) {
   for (const request of testCase.requests) {
     args.push(String(request.inputIndex), String(request.witnessIndex), String(request.argumentIndex ?? 0),
       request.publicKey, request.digest, request.branchIndex == null ? '-' : String(request.branchIndex),
-      request.positiveDelta ?? '-');
+      deltaHex(request.positiveDelta));
   }
   const result = spawnSync(executable, args, { encoding: 'utf8' });
   if (result.error) throw result.error;
@@ -53,12 +62,22 @@ if (existsSync(tokenFixture)) {
   const transactions = fixture.transactions ?? {};
   for (const [name, tx] of Object.entries(transactions)) {
     run(tx);
+    const proofScript = (name === 'mint' ? fixture.artifacts.FungibleToken : fixture.artifacts.FungibleRules).methods[0].scriptHex;
+    if (!tx.wire.includes(proofScript)) throw new Error(`${name}: proof script not found in wire`);
+    const modifiedScript = (proofScript[0] === 'f' ? 'e' : 'f') + proofScript.slice(1);
+    run({ ...tx, wire: tx.wire.replace(proofScript, modifiedScript), txid: '-', txhash: '-' },
+      name === 'mint' ? 'mint branch proof mismatch' : 'selected branch proof mismatch');
+    const spendRequest = tx.requests.find(request => request.branchIndex != null);
+    if (spendRequest) {
+      const requests = tx.requests.map(request => request === spendRequest ?
+        { ...request, branchIndex: request.branchIndex + 1 } : request);
+      run({ ...tx, requests }, 'spend selector branch index mismatch');
+    }
     if (tx.requests.some(request => request.positiveDelta)) {
       const requests = tx.requests.map(request => ({ ...request }));
       const request = requests.find(item => item.positiveDelta);
-      request.positiveDelta = '01' + request.positiveDelta.slice(2);
-      if (request.positiveDelta === tx.requests.find(item => item.positiveDelta).positiveDelta)
-        request.positiveDelta = '02' + request.positiveDelta.slice(2);
+      const original = deltaHex(request.positiveDelta);
+      request.positiveDelta = (original.slice(0, 2) === '01' ? '02' : '01') + original.slice(2);
       run({ ...tx, requests }, 'mint positive delta mismatch');
     }
     console.log(`${name}: native fixture verified`);
