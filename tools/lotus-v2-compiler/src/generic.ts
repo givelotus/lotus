@@ -3,6 +3,8 @@ import { bytes, concat, cs, hex, tagged, unhex, uint, type Span } from './compil
 import { schnorr } from '@noble/curves/secp256k1';
 import { assertPortableName } from './names.js';
 import { optimizeInstructions, type Instruction } from './optimizer.js';
+import { PromiseScheduler, type SchedulerEvent } from './scheduler.js';
+export type { SchedulerEvent } from './scheduler.js';
 
 export type ValueType = 'PublicKey' | 'Signature' | 'Bytes32' | `Bytes(${number})` | 'Int' | 'Amount' | 'TokenId' | 'Bool' | 'MethodLeafHash' | 'ContractRootHash' | 'InputIndex' | 'OutputIndex';
 export type BoundValue = string | boolean | bigint;
@@ -224,6 +226,8 @@ class Emitter {
 }
 
 class Compiler {
+  private scheduledJob?: string;
+  private enforceScheduledJobs = false;
   private methodMemo = new Map<string, Compiled>();
   private methodActive = new Set<string>();
   private rootMemo = new Map<string, Tree>();
@@ -243,8 +247,63 @@ class Compiler {
     this.bindingMemo.set(name,out); return out;
   }
   private findMethod(contract: string, method: string): Method { const m = this.contract(contract).methods.find(x => x.name === method); if (!m) throw new Error(`unknown method ${contract}.${method}`); return m; }
+  private dependencies(method: Method): string[] {
+    const found = new Set<string>();
+    const scan = (expr: Expr, helpers: string[]): void => {
+      if (expr.kind === 'call') {
+        const args = expr.args ?? [];
+        if (expr.value === 'leaf_hash' && args.length === 1 && args[0]?.kind === 'name') {
+          const path = args[0].value!.split('.');
+          if (path.length === 2) {
+            found.add(`leaf:${path[0]}.${path[1]}`);
+          }
+        } else if ((expr.value === 'contract_root' || expr.value === 'merkle_root') && args.length === 1 && args[0]?.kind === 'name' && !args[0].value!.includes('.')) {
+          found.add(`root:${args[0].value}`);
+        } else {
+          for (const arg of args) scan(arg, helpers);
+          const helper = this.program.helpers.get(expr.value!);
+          if (helper && !helpers.includes(helper.name)) scan(helper.body, [...helpers, helper.name]);
+        }
+      } else {
+        if (expr.left) scan(expr.left, helpers);
+        if (expr.right) scan(expr.right, helpers);
+      }
+    };
+    const statements = (body: Stmt[]): void => {
+      for (const stmt of body) {
+        if (stmt.expr) scan(stmt.expr, []);
+        if (stmt.then) statements(stmt.then);
+        if (stmt.otherwise) statements(stmt.otherwise);
+      }
+    };
+    statements(method.body);
+    return [...found];
+  }
+  async compileAsync(onEvent?: (event: SchedulerEvent) => void): Promise<ContractArtifact> {
+    this.contract(this.options.contract);
+    const scheduler = new PromiseScheduler<void>(onEvent);
+    this.enforceScheduledJobs = true;
+    const execute = (name: string, job: () => void): void => {
+      this.scheduledJob = name;
+      try { job(); } finally { this.scheduledJob = undefined; }
+    };
+    // Register all declarations from the single parsed program. Jobs compile
+    // only after their leaf/root dependencies have completed successfully.
+    for (const contract of this.program.contracts.values()) {
+      for (const method of contract.methods) {
+        const name = `leaf:${contract.name}.${method.name}`;
+        scheduler.register(name, this.dependencies(method), () => execute(name, () => { this.method(contract.name, method.name); }));
+      }
+      const name = `root:${contract.name}`;
+      scheduler.register(name, contract.methods.map(method => `leaf:${contract.name}.${method.name}`), () => execute(name, () => { this.root(contract.name); }));
+    }
+    await scheduler.run(`root:${this.options.contract}`);
+    this.enforceScheduledJobs = false;
+    return this.compile();
+  }
   private root(name: string): Tree {
     const old = this.rootMemo.get(name); if (old) return old;
+    if (this.enforceScheduledJobs && this.scheduledJob !== `root:${name}`) throw new Error(`unscheduled root dependency ${name}`);
     if (this.rootActive.has(name)) throw new Error(`contract-root dependency cycle at ${name}`);
     this.rootActive.add(name);
     try {
@@ -255,6 +314,7 @@ class Compiler {
   }
   private method(contractName: string, methodName: string): Compiled {
     const key = `${contractName}.${methodName}`; const old = this.methodMemo.get(key); if (old) return old;
+    if (this.enforceScheduledJobs && this.scheduledJob !== `leaf:${key}`) throw new Error(`unscheduled leaf dependency ${key}`);
     if (this.methodActive.has(key)) throw new Error(`method-leaf dependency cycle at ${key}`);
     this.methodActive.add(key);
     try {
@@ -517,6 +577,15 @@ class Compiler {
 export function compileContract(source: string, options: CompileOptions): ContractArtifact {
   if (typeof options?.contract !== 'string' || !options.bindings || typeof options.bindings !== 'object') throw new Error('compile options require contract and bindings');
   return new Compiler(new Parser(lex(source)).parse(), options).compile();
+}
+export async function compileContractAsync(source: string, options: CompileOptions, onEvent?: (event: SchedulerEvent) => void): Promise<ContractArtifact> {
+  if (typeof options?.contract !== 'string' || !options.bindings || typeof options.bindings !== 'object') throw new Error('compile options require contract and bindings');
+  return new Compiler(new Parser(lex(source)).parse(), options).compileAsync(onEvent);
+}
+export async function compileContractWithTrace(source: string, options: CompileOptions): Promise<{ artifact: ContractArtifact; trace: SchedulerEvent[] }> {
+  const trace: SchedulerEvent[] = [];
+  const artifact = await compileContractAsync(source, options, event => trace.push(event));
+  return { artifact, trace };
 }
 export function methodLeafHash(artifact: ContractArtifact, method: string): { kind: 'MethodLeafHash'; hex: string } {
   const m = artifact.methods.find(x => x.name === method); if (!m) throw new Error(`unknown method ${method}`);
