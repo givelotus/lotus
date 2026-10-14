@@ -249,3 +249,8 @@ Upstream Bitcoin ABC's in-process Chronik (`chronik/`) assumes standard 80-byte 
 
 - User requested two separate ordered review patches: `11-disable-zeromq.patch` changes only CMake's default to OFF, retaining source and explicit ON; `12-remove-zeromq.patch` follows 11 and removes the implementation, public CLI/RPC/logging interface, build discovery/linkage, dependency recipes, docs/examples/tests and CI installation requirements. Historical release notes and opaque keys/test vectors remain intact. Neither patch changes consensus or depends on NNG/mining/mempool candidates.
 - Keep upstream `zeromq-off` as the existing flag-only option; experimental `zeromq-default-off` selects 11, and `zeromq-remove` expands into ordered 11 then 12 with the explicit default-off dependency. Reject ON/OFF flags alongside source removal because that CMake option is deleted. Default BCHN setup stays base-only. See `daemon/docs/bchn-zeromq-removal.md` for exact source/tree/build/runtime evidence.
+
+## GitLab upstream submissions (2026-10-14)
+
+- GitLab CLI is authenticated as `schancel` using macOS Keychain. The existing local development SSH public key is registered with GitLab; the GitLab ED25519 host fingerprint was checked against official documentation before adding host trust. Never expose access tokens or private keys in logs or commits.
+- Use the fork `schancel/bitcoin-cash-node` for independent upstream submissions against `bitcoin-cash-node/bitcoin-cash-node` master. Keep mining fee priority and optional mempool diagnostic improvements separate; NNG and ZeroMQ interface changes require their own review. Public BCHN submissions do not authorize changing Lotus repository visibility or publishing a release.
