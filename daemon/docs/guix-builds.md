@@ -127,7 +127,16 @@ promoting this path into a release workflow.
   source branch commit `d4b7fd6d`: worker a built pinned Guix and the custom GCC
   14.3/glibc 2.31 toolchain, then its substitute subprocess failed with a TLS
   push/write error at 16:55 UTC. No Lotus compilation or binary archive passed
-  on that worker. Worker b is still running; its result remains unverified.
+  on that worker. Worker b likewise built the toolchain and then reported that the substitute
+  subprocess died. Both workers stopped before compiling Lotus.
 
 These attempts use the superseded source and wallet-OFF configuration described
 above. They are build-tooling evidence, not release readiness evidence.
+
+The next isolated attempt uses the independently verified corrected custom
+assembler from review commits `236f6870` and `48a85cda`: all153 patches replay
+to source `0b7939e926b8353ad09d8edc47f355ddacc30502`, tree
+`73e9db8356d5f9e617f40d4d9228209e117b08f0`. This source is copied only to the
+Guix candidate branch; its main-branch promotion remains separate. The next
+attempt also upgrades the actual daemon/helper, retains wallet support, and
+disables unused plugin/CPython builds. Binary validation remains pending.
