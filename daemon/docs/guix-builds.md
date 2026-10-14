@@ -8,6 +8,18 @@ Guix builds pass and their archives match. No Gitian installation is used here.
 
 Reuse the actual `contrib/guix` machinery in pinned Bitcoin ABC
 `8c67fe1e85a602204a2ce65aa3b643469c2c3a1d`, after the maintained V1 patches.
+The CI bootstrap manager and daemon are separately pinned by
+`daemon/guix-bootstrap-version` to authenticated canonical Guix commit
+`d7dde9c16032d3f6f970135c52d52120e7ba0e75` (2026-10-08). Ubuntu's packaged
+1.4.0 client/daemon is only the initial bootstrap. CI upgrades the root profile
+and explicitly points its ephemeral service at the new daemon, because merely
+running time-machine left `/usr/bin/guix substitute` active and both first
+workers failed after compiling the toolchain. GNU documents the foreign-distro
+root-profile upgrade and its July 2026 substitute/pull fixes in the
+[official advisory](https://guix.gnu.org/en/blog/2026/guix-substitute-pull-vulnerabilities/).
+The initial OS package and official substitutes remain trusted bootstrap
+inputs; this is not a source-only bootstrap claim.
+
 The underlying Guix time-machine revision is
 `c5eee3336cc1d10a3cc1c97fde2809c3451624d3`, fetched from the project's
 [canonical Codeberg repository](https://lists.gnu.org/r/guix-devel/2025-05/msg00279.html).
