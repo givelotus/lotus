@@ -323,5 +323,5 @@ Upstream Bitcoin ABC's in-process Chronik (`chronik/`) assumes standard 80-byte 
 
 ## BCHN sanitizer followthrough review (2026-10-14)
 
-- Preserve failed CI evidence and distinguish allowed failures from successful sanitizer runs. All five original UBSan jobs hit the fork's 3,600-second cap; no explicit sanitizer diagnostic is present in retained traces, but MR 2174 also has an unresolved 30-second compact-block announcement timeout. Its full native unsanitized functional test passes; that does not establish Linux UBSan safety or a runner-only cause.
+- Preserve failed CI evidence and distinguish allowed failures from successful sanitizer runs. All five original UBSan jobs hit the fork's 3,600-second cap; no explicit sanitizer diagnostic is present in retained traces, but MR 2174 also has an unresolved 30-second compact-block announcement timeout. Its full native unsanitized and isolated macOS UBSan functional tests pass; that does not establish full Linux UBSan integration or a runner-only cause.
 - Root increased only fork project 87642769's timeout to 10,800 seconds and retried MR 2174/2175 jobs as 17184742893/17184743711. Wait for full results before claiming sanitizer validation. Keep logs and status under the isolated review paths; do not edit frozen main during release preparation. See `daemon/docs/bchn-ci-followthrough-20261014.md`.

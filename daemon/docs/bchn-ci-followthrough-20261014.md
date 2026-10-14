@@ -26,8 +26,13 @@ so per-node debug logs needed to identify that event are unavailable.
 At that failing step, the test manually constructs and solves a block, then
 calls `submitblock`; it does not invoke the changed transaction selector.
 The full native unsanitized compact-block test passes on the mining candidate.
-That narrows the investigation but does not reproduce the Linux sanitizer
-runner or prove the CI failure harmless.
+A fresh standalone macOS arm64 Debug build of exact MR 2174 commit
+`640b8bd1c8e88107421a201828eaaf2b46802b28`, with undefined-behavior
+instrumentation, also passes the full compact-block test with
+`UBSAN_OPTIONS=print_stacktrace=1:halt_on_error=1:log_path=stdout`. Build
+commands and runtime symbols confirm instrumentation. That narrows the
+investigation but does not reproduce the Linux runner or prove the original
+CI failure harmless.
 
 ## Retry configuration and pending work
 
