@@ -55,7 +55,9 @@ fi
 CLI=("$BIN/lotus-cli" "-datadir=$CANDIDATE/smoke-data" -rpcport=18432)
 cleanup() { "${CLI[@]}" stop >/dev/null 2>&1 || true; }
 trap cleanup EXIT
-"$BIN/lotusd" "-datadir=$CANDIDATE/smoke-data" -rpcport=18432 -listen=0 -connect=0 -dnsseed=0 -discover=0 -assumevalid=0 -chronik="$([[ "$LOTUS_CHRONIK" == ON ]] && echo 1 || echo 0)" -chronikbind=127.0.0.1:18431 -daemon
+NODE_ARGS=("-datadir=$CANDIDATE/smoke-data" -rpcport=18432 -listen=0 -connect=0 -dnsseed=0 -discover=0 -assumevalid=0 -daemon)
+[[ "$LOTUS_CHRONIK" != ON ]] || NODE_ARGS+=(-chronik=1 -chronikbind=127.0.0.1:18431)
+"$BIN/lotusd" "${NODE_ARGS[@]}"
 "${CLI[@]}" -rpcwait -rpcwaittimeout=60 getblockchaininfo
 "${CLI[@]}" verifychain 4 0
 if [[ "$LOTUS_CHRONIK" == ON ]]; then
