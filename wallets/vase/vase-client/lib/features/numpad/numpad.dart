@@ -16,7 +16,7 @@ enum KeyValue {
   Eight,
   Nine,
   Period,
-  Back
+  Back,
 }
 
 extension KeyValueExts on KeyValue {
@@ -46,54 +46,15 @@ extension KeyValueExts on KeyValue {
         return '.';
       case KeyValue.Back:
         return '<';
-      default:
-        throw Exception();
     }
   }
 }
 
-final defaultOperation = (NumpadModel model, KeyValue value) {
-  model.addValue(value.value);
-};
-
-final defaultValidator = (NumpadModel model) => model.items.length < maxLength;
-
-final periodValidator = (NumpadModel model) =>
-    defaultValidator(model) &&
-    model.items.indexWhere((element) => element == KeyValue.Period.value) == -1;
-
-final backValidator = (NumpadModel model) =>
-    model.items.length > 1 ||
-    (model.items.length == 1 && model.items.first != '0');
-
-bool zeroValidator(NumpadModel model) =>
-    defaultValidator(model) && backValidator(model);
-
-final backOperation = (NumpadModel model) {
-  model.removeLast();
-};
-
 final List<List<KeyValue>> rows = [
-  [
-    KeyValue.One,
-    KeyValue.Two,
-    KeyValue.Three,
-  ],
-  [
-    KeyValue.Four,
-    KeyValue.Five,
-    KeyValue.Six,
-  ],
-  [
-    KeyValue.Seven,
-    KeyValue.Eight,
-    KeyValue.Nine,
-  ],
-  [
-    KeyValue.Period,
-    KeyValue.Zero,
-    KeyValue.Back,
-  ],
+  [KeyValue.One, KeyValue.Two, KeyValue.Three],
+  [KeyValue.Four, KeyValue.Five, KeyValue.Six],
+  [KeyValue.Seven, KeyValue.Eight, KeyValue.Nine],
+  [KeyValue.Period, KeyValue.Zero, KeyValue.Back],
 ];
 
 class NumpadWidget extends StatelessWidget {
@@ -109,47 +70,16 @@ class NumpadWidget extends StatelessWidget {
   }
 
   void Function() _handleClick(NumpadModel model, KeyValue value) => () {
-        switch (value) {
-          case KeyValue.Zero:
-            if (zeroValidator(model)) {
-              defaultOperation(model, value);
-            } else {
-              _vibrate();
-            }
-            break;
-          case KeyValue.One:
-          case KeyValue.Two:
-          case KeyValue.Three:
-          case KeyValue.Four:
-          case KeyValue.Five:
-          case KeyValue.Six:
-          case KeyValue.Seven:
-          case KeyValue.Eight:
-          case KeyValue.Nine:
-            if (defaultValidator(model)) {
-              defaultOperation(model, value);
-            } else {
-              _vibrate();
-            }
-            break;
-          case KeyValue.Period:
-            if (periodValidator(model)) {
-              defaultOperation(model, value);
-            } else {
-              _vibrate();
-            }
-            break;
-          case KeyValue.Back:
-            if (backValidator(model)) {
-              backOperation(model);
-            } else {
-              _vibrate();
-            }
-            break;
-          default:
-            throw Exception();
-        }
-      };
+    if (value == KeyValue.Back) {
+      if (model.value != '0') {
+        model.removeLast();
+      } else {
+        _vibrate();
+      }
+    } else if (!model.addValue(value.value)) {
+      _vibrate();
+    }
+  };
 
   @override
   Widget build(BuildContext context) {

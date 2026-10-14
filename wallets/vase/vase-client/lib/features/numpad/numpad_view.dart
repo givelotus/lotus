@@ -167,7 +167,7 @@ class NumpadView extends HookWidget {
                           final cb = onDoneTap;
                           if (cb != null) {
                             if (await isValid(context, controller)) {
-                              cb();
+                              if (context.mounted) cb();
                             }
                           }
                         },
@@ -217,7 +217,7 @@ class NumpadView extends HookWidget {
                               ),
                               onPressed: () async {
                                 if (await isValid(context, controller)) {
-                                  context.push('/send');
+                                  if (context.mounted) context.push('/send');
                                 }
                               },
                             ),
@@ -241,7 +241,7 @@ Future<bool> isValid(BuildContext ctx, AnimationController controller) async {
   final balance = walletModel.balance?.balance;
   final amount = lotusToSats(numpadModel.value);
 
-  if (balance == null || balance <= amount) {
+  if (amount <= BigInt.zero || balance == null || balance <= amount) {
     controller.forward(from: 0);
     if (await Vibrate.canVibrate) {
       Vibrate.feedback(FeedbackType.heavy);

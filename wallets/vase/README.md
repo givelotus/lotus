@@ -31,6 +31,23 @@ The preview uses a flat camera placeholder and a fixed example balance. It does 
 
 Native Android/iOS builds require the Android SDK or full Xcode/CocoaPods installations. Passing widget tests and a web compiler build does not establish native camera behavior or validate a live payment. Existing analyzer notices in inherited code remain visible.
 
+## Amount keypad correctness
+
+Amounts use exact integer base units (1 XPI = 1,000,000 units). Decimal editing and payment/request values use canonical ASCII text; grouping and decimal separators are applied only for display. Ambiguous pasted separators, signs, exponents, and nonzero fractions smaller than a base unit are rejected instead of becoming zero or a different amount. Empty editing text becomes `0`.
+
+| Input or operation | Previous behavior | Corrected behavior |
+|---|---|---|
+| Enter `1.000001` XPI | 1,000,000 base units | 1,000,001 base units |
+| Enter `0.000249` XPI | 248 base units | 249 base units |
+| Type `0.000001` on keypad | Last digit blocked by seven-character limit | One base unit can be entered |
+| Display `1.005` XPI with two decimals | `1 XPI` | `1.01 XPI` |
+| Edit 9,007,199,254,740,993 base units | Low digits lost through floating point | Exact `9007199254.740993` XPI |
+| Clear amount or paste malformed text | Empty state could crash; invalid text could become zero | Clear produces `0`; malformed text leaves the prior value intact |
+
+The keypad preserves all six fractional digits, trailing decimal/zero editing states, and up to 19 integer digits. Presentation rounds to the requested precision with ties away from zero; that rounded text is never used to construct a payment. The Done/Send path rejects zero amounts. Current mainnet wallet code contains no arithmetic-expression or fiat conversion engine; historical calculator operators are not reintroduced by these corrections.
+
+Validation: the initial unchanged-code regression run failed 10 of 11 tests. The corrected wallet passes 59 Flutter tests, including 15 amount/keypad regressions; 12 amount/model tests also pass in headless Chrome to cover JavaScript precision. The production web build passes. Tests use mock wallet/haptics and do not access a real wallet, camera, storage, or broadcast a transaction.
+
 ## Server development
 
 From `wallets/vase/vase-server`:

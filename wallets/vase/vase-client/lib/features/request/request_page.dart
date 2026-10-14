@@ -27,7 +27,7 @@ class RequestPage extends HookWidget {
   Widget build(BuildContext context) {
     final keys = context.watch<WalletModel>().wallet?.keys.keys?.sublist(0);
     final amount = context.watch<NumpadModel>().value;
-    final hideAmount = useState((double.tryParse(amount) ?? 0) == 0);
+    final hideAmount = useState(lotusToSats(amount) == BigInt.zero);
 
     final keyInfo = keys?.firstWhere((keyInfo) =>
         keyInfo.isChange == false && keyInfo.isDeprecated == false);
