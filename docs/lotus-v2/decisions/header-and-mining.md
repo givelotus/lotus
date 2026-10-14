@@ -1,6 +1,6 @@
 # Header design from Lotus v1's useful properties
 
-Decision packet P04, October 9, 2026. **Recommended candidate**, not frozen. Refines D12/D14. The maintainer clarified that v2 need not preserve a deployed ASIC interface, that the lucky-block pointer is not useful to the intended design, and that v1's recursive hashes were chosen to reveal useful header portions without Merkle-path overhead. Preserve that rationale while evaluating a new layout.
+Decision packet P04, October 9, 2026 (updated October 13, 2026). **Recommended candidate**, not frozen. Refines D12/D14. The maintainer clarified that v2 need not preserve a deployed ASIC interface, that the lucky-block pointer is not useful to the intended design, that v1's recursive hashes were chosen to reveal useful header portions without Merkle-path overhead, and that **pure tagged BLAKE3** (`H_headerbody`, `H_headerwork`, `H_blockid`) is the candidate consensus hash for both the 134-byte recursive header and Proof-of-Work (`BlockID`), keeping BLAKE3 as the single hash primitive across the entire Lotus v2 protocol.
 
 ## Verified v1 source evidence
 
@@ -45,7 +45,15 @@ WorkHash = H_headerwork(Work)
 BlockID = H_blockid(prev_id:h32 || WorkHash:h32)
 ```
 
-Extend P02's registry with `headerbody = Lotus/v2/header/body` and `headerwork = Lotus/v2/header/work`. BlockID is proposed as the PoW digest as well as chain identity. This is a new BLAKE3-based PoW candidate, not wire/hash compatibility with v1. Each layer uses the application hash definition; do not substitute raw, double, keyed or derive-key BLAKE3.
+Extend P02's registry with `headerbody = Lotus/v2/header/body` and `headerwork = Lotus/v2/header/work`. `BlockID` is the PoW digest as well as chain identity, using **pure tagged BLAKE3** (`H_headerbody`, `H_headerwork`, `H_blockid`) so that BLAKE3 is the single consensus hash primitive across the entire Lotus v2 protocol (headers, PoW, `TxID`, `TxHash`, `UtxoRoot`, `StateRoot`, and branch MASTs). Each layer uses the P02 application hash definition (`BLAKE3(ASCII(tag) || 0x00 || payload)`); do not substitute raw, double, keyed or derive-key BLAKE3.
+
+### Why pure BLAKE3 PoW was chosen over memory-hard / GPU-specific PoW algorithms
+
+Memory-hard and dynamic-program PoW algorithms (`ProgPoW`, `KawPoW`, `Ethash`, `RandomX`) were audited and explicitly rejected for `D12`:
+
+1. **Verification symmetry and header-sync DoS resistance:** Memory-hard PoW algorithms destroy the fundamental asymmetry of Proof-of-Work (expensive to find, instantaneous to verify). Requiring multi-megabyte or multi-gigabyte DAGs/scratchpads, random DRAM gathers, or runtime program compilation for every header check slows initial header synchronization by $10^3\times$–$10^5\times$, opens cheap header-spam DoS vectors against full nodes, and prevents ultra-light SPV, browser, and mobile clients from verifying header chains directly.
+2. **Illusory ASIC resistance and the defensive hardfork treadmill:** Empirically, complex or memory-hard PoW algorithms do not prevent specialized hardware—they merely shift advantage from commodity hardware to covert FPGAs and privately financed ASICs, forcing chains onto a perpetual emergency-hardfork treadmill while imposing permanent verification overhead on every node.
+3. **Native 32-bit ARX GPU parallelism with ~50 ns CPU verification:** Pure BLAKE3 is built entirely from 32-bit addition, rotation, and XOR (`ARX`) operations with zero lookup tables and zero S-boxes. Commodity GPUs execute 32-bit ARX natively across thousands of SIMD lanes at massive throughput, while CPUs verify a 134-byte header in ~50–100 ns (two tiny single-chunk tagged BLAKE3 evaluations for `WorkHash` and `BlockID` once `BodyHash` is computed, or a single final 64-byte compression block per nonce iteration during mining).
 
 Body is 84 bytes; explicit work fields are 18 bytes; previous ID is 32 bytes. A complete block is `Header || transaction_count:u32 || Bytes(Tx)[transaction_count]`. Every framed transaction must consume its frame exactly. Size is the exact encoded block length including header, counts and framing; height equals parent.height+1 (genesis zero); parent ID must match the selected parent; tx_root and state_root must match full validation. Validate all declared sizes against limits before allocating. Header-only size/root claims remain unverified until the body/state transition is checked.
 

@@ -160,27 +160,39 @@ CoinProof = Bytes(Coin) || bitmap:32bytes || siblings
 
 A node accepts the package only if: the anchor is on its best chain and at most `PROOF_WINDOW` blocks behind the tip (a node policy value, not chosen here); the envelope reproduces the anchor header's state_root; each Coin's Outpoint equals its input's outpoint and its proof reconstructs UtxoRoot; and no proved outpoint is spent by a block after the anchor or by a conflicting mempool transaction. The node must therefore retain, in memory, the outpoints spent and coins created by the last `PROOF_WINDOW` blocks. An input whose coin was created after the anchor, or by an unconfirmed transaction, is resolved from that retained data and its CoinProof slot is replaced by a zero-length marker to be specified with the encoding. Ordinary validation then runs on the supplied coins; `creation_height`, `creation_parent_mtp` and `coinbase` come from the proved Coin.
 
-A TxID-based proof is not a substitute: a TxID with its transaction-tree path shows that an output was created, not that it is unspent, and since TxID is a flat hash it would require the whole creating transaction.
+A TxID-based proof is not a substitute: a TxID with its transaction-tree path and output-tree path shows only that an output was created in some block, not that it remains unspent at the current tip.
 
 Limits of this candidate. Proof size is about one sibling per doubling of the coin set (about 27 siblings, near 1 KB per input, at 10^8 coins). A proof expires when its anchor leaves the window; any state-holding node can reissue it and need not be trusted. Checking a block's new state_root without state additionally needs the paths of every key the block inserts; because keys are hashes of outpoints these are scattered, so a block-level multiproof from the producer is required and is not designed here. Block producers need the coin set or a complete set of proofs.
 
-## Full state root
+## Full state root and canonical 56-byte `MonetaryState`
 
-A UTXO root alone omits the paper's stateful reward recurrence. Commit a versioned state envelope:
+A UTXO root alone omits the protocol's stateful issuance and dynamic fee-burn recurrences ([P05](resources-and-parameters.md), [P06](issuance-and-time.md)). Commit a versioned state envelope:
 
 ```text
-StateRoot = H_state(00 || ChainID || height:u64
-                    || UtxoRoot:h32 || Bytes(MonetaryState))
+MonetaryState = bootstrap_reserve:u64     # R_n (remaining unissued bootstrap atoms, P06)
+                || tail_subsidy:u64       # T_n (current adaptive tail subsidy atoms, P06)
+                || prev_work:u256         # W_{n-1} (32-byte little-endian unsigned per-block work, P04/P06)
+                || ema_block_cost:u64     # E_n (rolling integer EMA of block cost units, P05)
+
+StateRoot     = H_state(00 || ChainID || height:u64
+                        || UtxoRoot:h32 || Bytes(MonetaryState))
 ```
 
-`MonetaryState` is a canonical record to be frozen with D10: it must contain every work-responsive reward recurrence value not uniquely derivable from authenticated headers/UTXOs (D11's protocol faucet is rejected, so no faucet state exists). This packet does not choose opaque daemon bytes as its encoding. The header's former `hashUtxoMerklixRoot` is therefore renamed **state_root**. RPCs must expose both the envelope and UTXO proofs so clients can connect a coin proof to the header root. Height must match the validated block context.
+`MonetaryState` is a canonical fixed-width **56-byte** record (`8 + 8 + 32 + 8 = 56` bytes, serialized in `StateRoot` and `ProvenTx` via `Bytes(MonetaryState) = 0x38 || MonetaryState`, making the `StateRoot` preimage after the domain tag exactly `1 + 32 + 8 + 32 + 57 = 130` bytes). It contains every consensus recurrence value not uniquely derivable from a single header (`D11`'s protocol faucet is rejected, so no faucet state exists):
 
-Header ancestry supplies validated time/target context; a standalone UTXO snapshot does not. Snapshot admission must check envelope, unique entries, canonical Coin encodings, root reconstruction, monetary record and selected chain context, and clearly state which historical transitions were actually verified. Retained undo must restore every field of the prior envelope.
+1. `bootstrap_reserve:u64` ($R_n$): remaining unissued bootstrap reserve in native atoms; block $n$ emits $B_n = \max(1, R_n \gg k_{\text{boot}})$ when $R_n > 0$ (or $0$ when $R_n = 0$) and updates $R_{n+1} = R_n - B_n$ ([P06](issuance-and-time.md)).
+2. `tail_subsidy:u64` ($T_n$): block $n$'s adaptive tail subsidy in native atoms (total block $n$ subsidy entitlement is $S_n = B_n + T_n$); after accepting block $n$ with per-block work $W_n$, updates to $T_{n+1} = \min(T_{\max}, \max(T_{\min}, \text{isqrt}(\lfloor T_n^2 W_n / W_{n-1} \rfloor)))$ ([P06](issuance-and-time.md)).
+3. `prev_work:u256` ($W_{n-1}$): 32-byte unsigned little-endian per-block chainwork of the parent block (initialized at genesis to $W_{-1} > 0$ from the genesis target, updated to $W'_n = W_n$ after block $n$).
+4. `ema_block_cost:u64` ($E_n$): rolling integer exponential moving average of ordinary block cost units $C_{\text{block}}$, updated after block $n$ via $E_{n+1} = E_n - (E_n \gg w) + (C_{\text{block}} \gg w)$ and used to enforce block $n$'s required fee-burn floor ([P05](resources-and-parameters.md)).
+
+The header's former `hashUtxoMerklixRoot` is therefore renamed **state_root**. RPCs must expose both the 56-byte `MonetaryState` envelope and UTXO proofs so clients can connect a coin proof to the header's `state_root`. `height` must match the validated block context.
+
+Header ancestry supplies validated time/target context; a standalone UTXO snapshot does not. Snapshot admission must check the envelope, unique entries, canonical `Coin` encodings, root reconstruction, the 56-byte `MonetaryState` record and selected chain context, and clearly state which historical transitions were actually verified. Retained undo data must restore every field of the prior 56-byte `MonetaryState` envelope on disconnect.
 
 ## Coinbase and root dependency order
 
-Choose ChainID and genesis parameters → construct coinbase using parent ID/height → derive TxID/TxHash → evaluate transitions and full state envelope → compute transaction/state roots → construct header → compute BlockID/PoW. The containing header hash is never embedded in its own coin records. In a non-genesis block, the parent's hash is already available. Genesis uses zero parent and an explicitly initialized monetary record.
+Choose ChainID and genesis parameters → construct coinbase using parent ID/height and the parent's `MonetaryState` ($S_n = B_n + T_n$) → derive TxID/TxHash → evaluate transitions, block cost $C_{\text{block}}$, mandatory fee-burn floor against $E_n$, and the post-block 56-byte `MonetaryState` ($R_{n+1}, T_{n+1}, W_n, E_{n+1}$) → compute transaction/state roots → construct header → compute BlockID/PoW. The containing header hash is never embedded in its own coin records. In a non-genesis block, the parent's hash and `MonetaryState` are already available. Genesis uses zero parent and an explicitly initialized 56-byte `MonetaryState` ($R_0, T_0, W_{-1}, E_0$).
 
 ## Acceptance obligations
 
-Pin test vectors for empty/one/two/odd transaction trees, every proof direction, empty/single-leaf/multi-leaf/deleted compact state maps, all three proof presence modes (`0`, `1`, `2`), same map built in different orders, coin metadata changes and envelope restoration. Check both scalar and incremental implementations against the same vectors. This packet closes a candidate algorithm, not its MonetaryState dependencies.
+Pin test vectors for empty/one/two/odd transaction trees, every proof direction, empty/single-leaf/multi-leaf/deleted compact state maps, all three proof presence modes (`0`, `1`, `2`), same map built in different orders, coin metadata changes, 56-byte `MonetaryState` transitions and `StateRoot` envelope restoration. Check both scalar and incremental implementations against the same vectors. Initial genesis parameter values ($R_0, T_0, W_{-1}, E_0$) remain to be confirmed by simulation before genesis freeze.

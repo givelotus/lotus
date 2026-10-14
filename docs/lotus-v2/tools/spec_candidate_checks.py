@@ -300,6 +300,43 @@ def asert(target: int, drift: int, half_life: int, limit: int) -> int:
     return min(limit, max(1, raw))
 
 
+def monetary_state_record(bootstrap_reserve: int, tail_subsidy: int, prev_work: int, ema_block_cost: int) -> bytes:
+    record = u(bootstrap_reserve, 8) + u(tail_subsidy, 8) + u(prev_work, 32) + u(ema_block_cost, 8)
+    assert len(record) == 56
+    return record
+
+
+def state_root_envelope(height: int, utxo_root: bytes, monetary_state: bytes) -> bytes:
+    assert len(utxo_root) == 32 and len(monetary_state) == 56
+    preimage = b'\0' + CHAIN + u(height, 8) + utxo_root + blob(monetary_state)
+    assert len(preimage) == 130 and blob(monetary_state)[:1] == b'\x38'
+    return h('state', preimage)
+
+
+def bootstrap_step(reserve: int, k_boot: int = 20) -> tuple[int, int]:
+    assert reserve >= 0 and k_boot >= 0
+    if reserve == 0:
+        return 0, 0
+    b_n = max(1, reserve >> k_boot)
+    assert 1 <= b_n <= reserve
+    return b_n, reserve - b_n
+
+
+def parabolic_tx_cost(linear_cu: int, knee_shift: int = 17) -> int:
+    assert linear_cu >= 0 and knee_shift >= 0
+    return linear_cu + ((linear_cu * linear_cu) >> knee_shift)
+
+
+def update_ema_block_cost(ema_cu: int, block_cu: int, w: int = 10) -> int:
+    assert ema_cu >= 0 and block_cu >= 0 and w >= 0
+    return ema_cu - (ema_cu >> w) + (block_cu >> w)
+
+
+def required_block_burn_floor(block_cu: int, ema_cu: int, ema_min: int, s_linear: int, s_quad: int) -> int:
+    assert block_cu >= 0 and ema_cu >= 0 and ema_min >= 0
+    return ((block_cu * max(ema_cu, ema_min)) >> s_linear) + ((block_cu * block_cu) >> s_quad)
+
+
 # Explicit P03 allocation, independent of the scanner's control flow.
 ASSIGNED_OPCODES = set(range(1, 76)) | set(bytes.fromhex('''
 00 4c 4f 51 52 53 54 55 56 57 58 59 5a 5b 5c 5d 5e 5f 60
@@ -543,6 +580,59 @@ def make_vectors() -> dict:
         assert r*r*prior <= subsidy*subsidy*work < (r+1)*(r+1)*prior
         tails.append({'tail': str(subsidy), 'work': str(work), 'prior_work': str(prior), 'unclipped_next': str(r)})
 
+    # P02/P06 56-byte MonetaryState, StateRoot commitment, telescoping bootstrap reserve (k_boot = 20), and additive S_n = B_n + T_n.
+    atoms_per_xpi = 10**6
+    b0_atoms = 250_000 * atoms_per_xpi  # 250,000 XPI = 2.5e11 atoms
+    r0_atoms = (1 << 20) * b0_atoms     # 262,144,000,000 XPI = 2.62144e17 atoms (< 2^64 - 1)
+    t0_atoms = 250_000 * atoms_per_xpi  # 250,000 XPI = 2.5e11 atoms
+    assert r0_atoms < 2**64
+    b0_check, r1_atoms = bootstrap_step(r0_atoms, 20)
+    assert b0_check == b0_atoms and r1_atoms == r0_atoms - b0_atoms
+    s0_atoms = b0_check + t0_atoms
+    assert s0_atoms == 500_000 * atoms_per_xpi
+    # Exact telescoping conservation check: sum_{n>=0} B_n == R_0 to the exact atom, then permanently 0.
+    b_above, rem_after_above = bootstrap_step((2 << 20) + 37, 20)
+    assert b_above == 2 and rem_after_above == (2 << 20) + 35
+    rem, total_emitted, steps = 37, 0, 0
+    while rem > 0:
+        b_step, rem = bootstrap_step(rem, 20)
+        total_emitted += b_step
+        steps += 1
+    assert total_emitted == 37 and steps == 37 and bootstrap_step(rem, 20) == (0, 0)
+    # Also verify full multi-epoch telescoping conservation with k_boot = 6 on an arbitrary reserve.
+    rem6, emitted6 = 50_000, 0
+    while rem6 > 0:
+        b6, rem6 = bootstrap_step(rem6, 6)
+        emitted6 += b6
+    assert emitted6 == 50_000 and rem6 == 0
+    # Homomorphic scale invariance in the interior regime (R_n >= 2^20): scaling by lambda scales B_n and T_{n+1} by lambda.
+    for scale in (1, 10, 10**6):
+        b_scaled, _ = bootstrap_step(scale * (1 << 20) * 250_000, 20)
+        assert b_scaled == scale * 250_000
+        assert isqrt((scale * 250_000)**2 * (9 * 7) // (4 * 7)) == scale * 375_000
+
+    # P05 parabolic transaction cost C_tx, rolling integer ema_block_cost E_n, and required block fee-burn floor.
+    tx_cost_cases = []
+    for l_cu in (500, 32_000, 131_072, 262_144, 1_048_576):
+        c_tx = parabolic_tx_cost(l_cu, 17)
+        tx_cost_cases.append({'linear_cu': l_cu, 'effective_cu': c_tx})
+    assert [row['effective_cu'] for row in tx_cost_cases] == [501, 39_812, 262_144, 786_432, 9_437_184]
+    # Super-additivity above the quadratic threshold: splitting a mega-batch lowers total C_tx.
+    assert parabolic_tx_cost(262_144, 17) > 2 * parabolic_tx_cost(131_072, 17)
+    ema0 = 1_048_576
+    block_cu_sample = 2_097_152
+    ema1 = update_ema_block_cost(ema0, block_cu_sample, 10)
+    assert ema1 == 1_048_576 - 1024 + 2048 == 1_049_600
+    burn_floor_sample = required_block_burn_floor(block_cu_sample, ema0, 524_288, 30, 32)
+    assert burn_floor_sample == ((block_cu_sample * ema0) >> 30) + ((block_cu_sample * block_cu_sample) >> 32) == 2048 + 1024 == 3072
+
+    prev_work_0 = (1 << 256) // (compact_decode(0x1d00ffff) + 1)
+    ms0 = monetary_state_record(r0_atoms, t0_atoms, prev_work_0, ema0)
+    ms1 = monetary_state_record(r1_atoms, t0_atoms, prev_work_0, ema1)
+    sr0 = state_root_envelope(0, EMPTY_ROOT, ms0)
+    sr1 = state_root_envelope(1, state_root, ms1)
+    assert sr0 != sr1
+
     target, half_life, limit = 2**200, 172800, 2**224 - 1
     assert asert(target, 0, half_life, limit) == target
     assert asert(target, half_life, half_life, limit) == 2*target
@@ -598,6 +688,23 @@ def make_vectors() -> dict:
                   'present_outpoint': outpoint.hex(), 'membership_proof': state_proof(entries, key).hex(),
                   'absent_outpoint': absent_outpoint.hex(), 'absence_proof': state_proof(entries, absent_key).hex(),
                   'empty_absence_proof': empty_absence.hex()},
+        'monetary_state_and_cost_fixtures': {
+            'atoms_per_xpi': atoms_per_xpi,
+            'k_boot': 20,
+            'b0_atoms': str(b0_atoms),
+            'r0_atoms': str(r0_atoms),
+            'r1_atoms': str(r1_atoms),
+            't0_atoms': str(t0_atoms),
+            's0_atoms': str(s0_atoms),
+            'monetary_state_0': ms0.hex(),
+            'monetary_state_1': ms1.hex(),
+            'state_root_0': sr0.hex(),
+            'state_root_1': sr1.hex(),
+            'parabolic_tx_cost_examples': tx_cost_cases,
+            'ema_block_cost_0': ema0,
+            'block_cu_sample': block_cu_sample,
+            'ema_block_cost_1': ema1,
+            'burn_floor_sample': burn_floor_sample},
         'header_hash_fixture': {'wire': header.hex(), 'body_hash': body_hash.hex(),
                                 'work_hash': work_hash.hex(), 'block_id': block_id.hex(),
                                 'note': 'Size/state/transaction fields are hash inputs only; not a valid block.'},
@@ -620,7 +727,7 @@ def main() -> None:
         path.write_text(json.dumps(actual, indent=2) + '\n')
     else:
         assert json.loads(path.read_text()) == actual, 'Fixtures or packet digests changed; review before regenerating.'
-    print('PASS: framing/signing inputs; 41 success opcodes and push-boundary scan cases; Merkle opcodes; 153 ordered-tree paths; compact sparse-map membership/absence/order; 134/82/64-byte header views; LOG power/monotonic checks; exact tail rounding; ASERT boundaries and compact targets.')
+    print('PASS: framing/signing inputs; 41 success opcodes and push-boundary scan cases; Merkle opcodes; 153 ordered-tree paths; compact sparse-map membership/absence/order; 56B MonetaryState/StateRoot, telescoping bootstrap & parabolic cost curves; 134/82/64-byte header views; LOG power/monotonic checks; exact tail rounding; ASERT boundaries and compact targets.')
 
 
 if __name__ == '__main__':
