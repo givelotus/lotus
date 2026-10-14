@@ -24,7 +24,8 @@ python3 daemon/scripts/prepare-release.py \
 ```
 
 The destination must not exist. The tool snapshots tracked content, including
-local tracked edits, into a private Git clone; it excludes ignored daemon
+local tracked edits, staged deletions/renames, and working-tree deletions, into a
+private Git clone; it excludes ignored daemon
 workspaces and untracked files. It replays the exact series into a private object
 database/index, generates metadata, verifies the result again, and promotes the
 entire candidate with one directory rename. Failed preparation leaves no partial
@@ -70,7 +71,11 @@ The generated source archive is the replayed **daemon tree**, not a GitHub
 monorepo tag tarball. Its top directory is `lotus-vVERSION/`; Arch and Docker
 references use the same label. Arch recipes now use shared `contrib/aur/common`
 inputs and current CMake flags. Their install hook preserves the service account
-and blockchain on uninstall. Source tarballs are checked against release
+and blockchain on uninstall. Build dependencies include protobuf (`protoc`) for
+Chronik and flatbuffers (`flatc`) for NNG. Local RPC uses cookie authentication;
+run `sudo -u lotus /usr/bin/lotus-cli -conf=/etc/lotus/lotus.conf
+-datadir=/srv/lotus getmininginfo` as one command. No default RPC password is
+installed. Source tarballs are checked against release
 `SHA256SUMS` during Arch preparation; the PKGBUILD cannot embed its own containing
 archive's digest without a circular dependency. Copy the entire `contrib/aur`
 directory when building, including `common`. Python 3.13 at

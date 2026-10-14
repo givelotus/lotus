@@ -64,7 +64,7 @@ def metadata(replay, version):
         text = text.replace("${pkgname}-$pkgver", "lotus-v$pkgver").replace("lotus-$pkgver", "lotus-v$pkgver")
         text = text.replace("arch=('i686' 'x86_64')", "arch=('x86_64')")
         text = text.replace(" 'zeromq'", " 'nng' 'utf8proc' 'sqlite'").replace(" 'miniupnpc'", "").replace(" 'libnatpmp'", "")
-        text = text.replace("'cmake' 'ninja'", "'rustup' 'clang' 'curl' 'cmake' 'ninja'")
+        text = text.replace("'cmake' 'ninja'", "'protobuf' 'flatbuffers' 'rustup' 'clang' 'curl' 'cmake' 'ninja'")
         text = text.replace("-DBUILD_QT=OFF", "-DBUILD_BITCOIN_QT=OFF").replace("    -DBUILD_IGUANA=OFF \\\n", "")
         text = text.replace("    -DENABLE_CLANG_TIDY=OFF", "    -DBUILD_CHRONIK=ON \\\n    -DRust_TOOLCHAIN=1.93.0 \\\n    -DPython_EXECUTABLE=/usr/bin/python3.13 \\\n    -DBUILD_BITCOIN_ZMQ=OFF \\\n    -DENABLE_UPNP=OFF \\\n    -DENABLE_NATPMP=OFF \\\n    -DENABLE_CLANG_TIDY=OFF")
         text = text.replace('source=(https:', 'source=(https:')
@@ -85,7 +85,33 @@ def metadata(replay, version):
     # Package removal must never erase chain data or recursively delete homes.
     install = install.replace("  _rmuser\n  rm -rf /srv/lotus /run/lotus", "  : # Preserve the service account and chain data on uninstall")
     install = install.replace("userdel -rf", "userdel")
+    install = replace(install, r"(?s)read -d '' lotus <<'EOI'.*?\nEOI", """read -d '' lotus <<'EOI'
+
+Lotus
+_____
+
+To start Lotus:
+
+$ sudo systemctl start lotus
+
+RPC uses the daemon's automatically generated authentication cookie.
+Run the CLI as the service user with the same config and data directory:
+
+$ sudo -u lotus /usr/bin/lotus-cli -conf=/etc/lotus/lotus.conf -datadir=/srv/lotus getmininginfo
+
+Config:        /etc/lotus/lotus.conf
+Blockchain:    /srv/lotus
+Cookie:        /srv/lotus/.cookie (private to the service account)
+Documentation: /usr/share/doc/lotus
+EOI""")
     changes[path] = install
+    path = "contrib/aur/common/lotus.conf"
+    config = replay.read(path)
+    config = re.sub(r"(?m)^rpc(?:user|password)=.*\n?", "", config)
+    config = "# Local RPC uses /srv/lotus/.cookie; run lotus-cli as the lotus service user.\n" + config
+    if not re.search(r"(?m)^rpcbind=", config):
+        config += "rpcbind=127.0.0.1\n"
+    changes[path] = config
     for path in ("contrib/aur/common/lotus.service", "contrib/aur/common/lotus-reindex.service"):
         changes[path] = replay.read(path).replace("ExecStop=/usr/bin/lotusd stop", "ExecStop=/usr/bin/lotus-cli -conf=/etc/lotus/lotus.conf -datadir=/srv/lotus stop")
     path = "contrib/docker/lotus/README.md"
@@ -314,13 +340,21 @@ def candidate(root, upstream, version, destination, network=None, allow_network_
         # A worktree HEAD may differ from a clone's default branch.
         head = run(["git", "-C", str(root), "rev-parse", "HEAD"]).decode().strip()
         run(["git", "-C", str(checkout), "checkout", "--quiet", "--detach", head])
-        tracked = run(["git", "-C", str(root), "ls-files", "-z"]).decode().split("\0")
-        for name in filter(None, tracked):
+        indexed = set(filter(None, run(["git", "-C", str(root), "ls-files", "-z"]).decode().split("\0")))
+        committed = set(filter(None, run(["git", "-C", str(root), "ls-tree", "-r", "--name-only", "-z", head]).decode().split("\0")))
+        # HEAD contributes paths removed from the index, including old rename
+        # names. They must disappear even if an untracked local copy remains.
+        for name in sorted(committed - indexed, key=lambda path: path.count("/"), reverse=True):
+            (checkout / name).unlink(missing_ok=True)
+        for name in sorted(indexed):
             source, target = root / name, checkout / name
             if source.exists() or source.is_symlink():
-                target.parent.mkdir(parents=True, exist_ok=True)
+                # A staged rename may turn a former directory into a file.
+                if target.is_dir() and not target.is_symlink():
+                    shutil.rmtree(target)
                 if target.exists() or target.is_symlink():
                     target.unlink()
+                target.parent.mkdir(parents=True, exist_ok=True)
                 if source.is_symlink():
                     target.symlink_to(os.readlink(source))
                 else:

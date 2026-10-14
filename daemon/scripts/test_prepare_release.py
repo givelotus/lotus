@@ -20,12 +20,13 @@ class ReleaseTests(unittest.TestCase):
         self.upstream.mkdir()
         subprocess.run(["git", "init", "-q", str(self.upstream)], check=True)
         files = {
-            "contrib/aur/common/lotus.install": "post_remove() {\n  _rmuser\n  rm -rf /srv/lotus /run/lotus\n}\n",
+            "contrib/aur/common/lotus.install": "post_remove() {\n  _rmuser\n  rm -rf /srv/lotus /run/lotus\n}\nread -d '' lotus <<'EOI'\nrpcuser=lotus\nrpcpassword=secret\nEOI\n",
+            "contrib/aur/common/lotus.conf": "rpcport=10604\nrpcuser=bitcoin\nrpcpassword=secret\nserver=1\n",
             "contrib/aur/common/lotus.service": "ExecStop=/usr/bin/lotusd stop\n",
             "contrib/aur/common/lotus-reindex.service": "ExecStop=/usr/bin/lotusd stop\n",
             "CMakeLists.txt": "project(lotus\n\tVERSION 11.5.1\n)\n",
-            "contrib/aur/lotus/PKGBUILD": "pkgver=1.0.0\npkgrel=3\nsource=(https://github.com/LogosFoundation/lotusd/archive/v$pkgver.tar.gz)\ncd ${pkgname}-$pkgver\n",
-            "contrib/aur/lotus-qt/PKGBUILD": "pkgver=1.0.0\npkgrel=3\nsource=(https://github.com/logosfoundation/lotusd/archive/v$pkgver.tar.gz)\ncd lotus-$pkgver\n",
+            "contrib/aur/lotus/PKGBUILD": "pkgver=1.0.0\npkgrel=3\nmakedepends=('cmake' 'ninja')\nsource=(https://github.com/LogosFoundation/lotusd/archive/v$pkgver.tar.gz)\ncd ${pkgname}-$pkgver\n",
+            "contrib/aur/lotus-qt/PKGBUILD": "pkgver=1.0.0\npkgrel=3\nmakedepends=('cmake' 'ninja')\nsource=(https://github.com/logosfoundation/lotusd/archive/v$pkgver.tar.gz)\ncd lotus-$pkgver\n",
             "contrib/docker/lotus/Dockerfile": "FROM debian:bookworm-slim\n",
             "contrib/docker/lotus/README.md": "old example\n",
         }
@@ -68,6 +69,26 @@ class ReleaseTests(unittest.TestCase):
         self.assertIn("lotus-v12.0.1-x86_64-linux-gnu.tar.gz", data)
         self.assertIn("/releases/download/v$pkgver/lotus-v$pkgver-source.tar.gz", data)
         self.assertEqual(self.prepare("12.0.1", check=True)["changed"], [])
+
+    def test_arch_generators_and_cookie_auth_are_consistent(self):
+        with tempfile.TemporaryDirectory() as directory:
+            replay = release.Replay(self.upstream, directory)
+            replay.git("read-tree", self.git("rev-parse", "HEAD").decode().strip())
+            changes = release.metadata(replay, "11.6.0")
+        for name in ("lotus", "lotus-qt"):
+            recipe = changes[f"contrib/aur/{name}/PKGBUILD"]
+            dependencies = next(line for line in recipe.splitlines() if line.startswith("makedepends="))
+            self.assertIn("'protobuf'", dependencies)
+            self.assertIn("'flatbuffers'", dependencies)
+        config = changes["contrib/aur/common/lotus.conf"]
+        install = changes["contrib/aur/common/lotus.install"]
+        self.assertNotIn("rpcuser=", config + install)
+        self.assertNotIn("rpcpassword=", config + install)
+        self.assertNotIn("secret", config + install)
+        self.assertIn("rpcbind=127.0.0.1", config)
+        self.assertIn("sudo -u lotus /usr/bin/lotus-cli -conf=/etc/lotus/lotus.conf -datadir=/srv/lotus getmininginfo", install)
+        self.assertIn("/srv/lotus/.cookie", install)
+        self.assertNotIn("rm -rf /srv/lotus", install)
 
     def test_bad_versions_do_not_write(self):
         for version in ("v12.0.0", "01.2.3", "1.2", "1.2.3;touch x", "1.2.3-rc1"):
@@ -127,13 +148,28 @@ class ReleaseTests(unittest.TestCase):
         (self.root / ".git/info/exclude").write_text("upstream/\n")
         def git(*args):
             subprocess.run(["git", "-C", str(self.root), "-c", "user.name=Test", "-c", "user.email=test@example.invalid", *args], check=True, stdout=subprocess.PIPE)
-        git("add", "daemon")
+        for name in ("deleted", "untracked-copy", "renamed-old", "working-deleted"):
+            (self.root / name).write_text(name)
+        git("add", "daemon", "deleted", "untracked-copy", "renamed-old", "working-deleted")
         git("commit", "-qm", "Candidate fixture")
+        git("rm", "deleted")
+        git("rm", "--cached", "untracked-copy")
+        git("mv", "renamed-old", "renamed-new")
+        (self.root / "working-deleted").unlink()
+        before_status = subprocess.check_output(["git", "-C", str(self.root), "status", "--porcelain", "-z", "--untracked-files=no"])
+        before_index = (self.root / ".git/index").read_bytes()
         git("remote", "add", "origin", "https://github.com/givelotus/lotus.git")
         git("remote", "set-url", "--push", "origin", "ssh://git@github.com/givelotus/lotus.git")
         destination = self.root / "review"
         release.candidate(self.root, self.upstream, "12.0.0", destination)
         self.assertEqual((destination / "daemon/release-version").read_text(), "12.0.0\n")
+        for name in ("deleted", "untracked-copy", "renamed-old", "working-deleted"):
+            self.assertFalse((destination / name).exists(), name)
+        self.assertEqual((destination / "renamed-new").read_text(), "renamed-old")
+        self.assertEqual((self.root / "untracked-copy").read_text(), "untracked-copy")
+        self.assertEqual((self.root / ".git/index").read_bytes(), before_index)
+        after_status = subprocess.check_output(["git", "-C", str(self.root), "status", "--porcelain", "-z", "--untracked-files=no"])
+        self.assertEqual(after_status, before_status)
         for options in ([], ["--push"]):
             expected = subprocess.check_output(["git", "-C", str(self.root), "remote", "get-url", *options, "origin"]).decode().strip()
             actual = subprocess.check_output(["git", "-C", str(destination), "remote", "get-url", *options, "origin"]).decode().strip()
