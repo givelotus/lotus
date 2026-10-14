@@ -35,6 +35,8 @@ Application state is committed in a data leaf with a documented, versioned layou
 
 ## Language boundary
 
-The small language in [examples](examples/README.md) is explanatory pseudocode with explicit transaction and invocation access. Its assembly uses symbolic opcode names. A subsequent reference assembler must emit exact bytes, source maps and a static-cost report, then execute those bytes in the scalar evaluator. Freeze consensus opcode semantics; permit compiler syntax and optimizations to evolve while preserving those semantics.
+The small language in [examples](examples/README.md) is explanatory pseudocode with explicit transaction and invocation access. Its assembly uses symbolic opcode names. A subsequent reference assembler must emit exact bytes, source maps and a static-cost report, then execute those bytes in the scalar evaluator. Pin exact draft opcode semantics for each development artifact; compiler syntax and optimizations may evolve while preserving that target profile. Final consensus freeze remains a launch gate.
 
 Each generated artifact records compiler/evaluator revisions, consensus/parameter digests, argument order, selected policy, leaf/proof bytes, core/complete transaction bytes, TxID/TxHash, signature digest, final stack, resulting state and static charges. A pretty source listing is not a conformance vector.
+
+The [compiler and ABI implementation plan](../plans/lotus-v2-compiler-abi.md) defines staged assembler, typed language, artifact schema, binding generation and independent execution/stress-test gates. Development targets a versioned draft profile; final consensus freeze is required for launch, not for beginning tooling.

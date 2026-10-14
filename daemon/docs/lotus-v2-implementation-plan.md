@@ -84,6 +84,10 @@ Reuse ABC's Avalanche staking payout policy with an explicit V2 profile: fractio
 
 Calibrate P06 constants before freeze. Incorporate Frank's burn-to-speak demand: a fiat burn budget `A` at price `P` buys `A/P` XPI of burns, conditional on real adoption and budget persistence. Model changing adoption/budgets, mining response lag, hardware/energy costs, tail bounds, integer rounding, price/demand shocks and fee burns. A $1 reference price and eventual trillions of XPI are design scenarios, not a peg or a proven supply trajectory. At constant 250,000 XPI tail per 120-second block, annual issuance is 65.7 billion XPI (365 days), requiring equivalent aggregate annual burns for steady supply after bootstrap; this is not a launch demand assumption. P06/rationale now include this context and exact paper provenance. Simulations and D10 parameter closure remain pending.
 
+## Compiler and generated ABI tooling
+
+The [compiler/ABI plan](../../docs/plans/lotus-v2-compiler-abi.md) adds CABI-00–CABI-06: canonical assembler, typed contract compiler, versioned artifacts, generated TypeScript bindings, independent execution/stress harness and later optimization. Begin schema/assembler work alongside V2-01, then compile the worked contracts as V2-04 semantics land. A compiler-generated signed payment accepted by independent engines is an explicit integration gate; complete application/block tests wait for chain transitions. Compiler work does not require final genesis parameter freeze.
+
 ## SDK, wallet, indexer and node integration (V2-07)
 
 - Publish exact schemas and independent vectors for transactions, addresses, signing modes, blocks, proofs and amounts. Audit in-repository Rust/Dart SDKs plus the maintained Frank TypeScript/wallet integration in `~/repos/frank`; changes in that separate repository require their own revision/evidence records.

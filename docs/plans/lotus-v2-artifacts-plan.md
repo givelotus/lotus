@@ -16,6 +16,10 @@ V1 remains independently maintained. V2 is a separate chain with its own six-pat
 
 Development-chain genesis construction starts at V2-02. Final mainnet genesis follows parameter freeze and independent review. Spec/reference work does not require waiting for publication of a V1 release; promoting shared daemon changes requires their recorded regression evidence.
 
+## Compiler and dogfooding
+
+The [compiler and ABI plan](lotus-v2-compiler-abi.md) scopes CABI-00–CABI-06 alongside protocol implementation. It turns the worked contracts into reproducible bytecode, generated call bindings and independent execution/stress tests; the language and schema remain proposed.
+
 ## Artifact ownership
 
 - [Consensus](../lotus-v2/consensus.md) owns proposed validity requirements C01–C28.
