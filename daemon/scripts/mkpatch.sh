@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# mkpatch.sh — Save current workspace changes as a named patch.
+# mkpatch.sh — Export the current committed change with its complete metadata.
 #
 # SERIES=v1 (default):           saves to patches/v1/<name>.patch    from workspace-v1/
 # SERIES=doged:        saves to patches/doged/<name>.patch from workspace-doged/
@@ -53,16 +53,26 @@ fi
 
 cd "$WORKSPACE"
 
-DIFF=$(git diff HEAD)
-if [[ -z "$DIFF" ]]; then
-    DIFF=$(git diff --cached HEAD)
-fi
-
-if [[ -z "$DIFF" ]]; then
-    echo "No changes in workspace to save."
+# Commit first: this makes authorship, rationale and the exact change reviewable.
+if [[ -n "$(git status --porcelain)" ]]; then
+    echo "Commit your intended patch (including its rationale) first; workspace must be clean." >&2
     exit 1
 fi
-
-echo "$DIFF" > "$OUTPUT"
+if [[ "$NAME" == */* || "$NAME" == .* || -e "$OUTPUT" ]]; then
+    echo "Invalid patch name or patch already exists: $NAME" >&2
+    exit 1
+fi
+if [[ "$(git rev-list --parents -n 1 HEAD | wc -w)" -ne 2 ]]; then
+    echo "HEAD must be one non-merge patch commit." >&2
+    exit 1
+fi
+TEMP=$(mktemp "$PATCHES_DIR/.mkpatch.XXXXXX")
+trap 'rm -f "$TEMP"' EXIT
+git -c format.signature= format-patch --stdout --binary --full-index --no-stat -1 HEAD > "$TEMP"
+if ! grep -q '^diff --git ' "$TEMP"; then
+    echo "HEAD has no patch to export." >&2
+    exit 1
+fi
+mv "$TEMP" "$OUTPUT"
 echo "Saved: $OUTPUT"
-echo "Lines: $(wc -l < "$OUTPUT")"
+echo "Review it and add $NAME to $PATCHES_DIR/series in the intended order."

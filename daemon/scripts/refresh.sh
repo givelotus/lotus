@@ -33,50 +33,27 @@ rebase_patchset() {
     old_ref=$(grep -v '^#' "$version_file" | grep -v '^$' | head -1)
 
     echo "Updating $series base: $old_ref → $NEW_REF ($DESCRIPTION)"
+    if [[ ! -d "$workspace" ]]; then
+        echo "Workspace not found — run: make setup SERIES=$series" >&2
+        exit 1
+    fi
+    if [[ -n "$(git -C "$workspace" status --porcelain)" ]]; then
+        echo "Workspace has uncommitted changes; refusing refresh" >&2
+        exit 1
+    fi
+    git -C "$workspace" fetch origin
+    local resolved
+    resolved=$(git -C "$workspace" rev-parse --verify "$NEW_REF^{commit}")
+    python3 "$SCRIPT_DIR/patch-series.py" "$workspace" "$series_file" --base "$resolved"
+    # Publish the pin only after the entire series succeeds.
+    local pin_temp
+    pin_temp=$(mktemp "$version_file.XXXXXX")
     {
-        echo "$NEW_REF"
+        echo "$resolved"
         echo "# $DESCRIPTION"
         echo "# Previous: $old_ref"
-    } > "$version_file"
-
-    if [[ ! -d "$workspace" ]]; then
-        echo "Workspace not found — run: make setup SERIES=$series"
-        exit 1
-    fi
-
-    echo "Resetting workspace to new base..."
-    cd "$workspace"
-    git fetch origin
-    git checkout -B lotus-work "$NEW_REF"
-
-    echo "Re-applying $series patch series..."
-    local FAILED=0
-    while IFS= read -r line; do
-        [[ "$line" =~ ^#.*$ || -z "$line" ]] && continue
-        local patch="$patches_dir/$line"
-        if [[ ! -f "$patch" ]]; then
-            echo "  ERROR: patch not found: $patch"
-            FAILED=1
-            continue
-        fi
-        echo -n "  applying $line... "
-        if git apply --whitespace=nowarn "$patch" 2>/dev/null; then
-            git add -A
-            git commit -m "Apply patch: $line" --no-verify 2>/dev/null || true
-            echo "OK"
-        else
-            echo "CONFLICT — manual resolution needed"
-            echo "    Patch: $patch"
-            FAILED=1
-        fi
-    done < "$series_file"
-
-    if [[ $FAILED -eq 1 ]]; then
-        echo ""
-        echo "Some patches need manual resolution."
-        echo "Fix conflicts in $workspace, then run: make mkpatch SERIES=$series NAME=<patch-name>"
-        exit 1
-    fi
+    } > "$pin_temp"
+    mv "$pin_temp" "$version_file"
 
     echo ""
     echo "Refresh complete. Rebuild with: make build SERIES=$series"
@@ -102,14 +79,21 @@ if [[ "$SERIES" == "doged" ]]; then
     fi
 
     cd "$WORKSPACE"
+    if [[ -n "$(git status --porcelain)" ]]; then
+        echo "Workspace has uncommitted changes; refusing refresh" >&2
+        exit 1
+    fi
     git fetch origin --tags
-    git checkout -B doged-work "$NEW_REF"
+    RESOLVED=$(git rev-parse --verify "$NEW_REF^{commit}")
+    git checkout -B doged-work "$RESOLVED"
 
+    PIN_TEMP=$(mktemp "$VERSION_FILE.XXXXXX")
     {
-        echo "$NEW_REF"
+        echo "$RESOLVED"
         echo "# $DESCRIPTION"
         echo "# Previous: $OLD_REF"
-    } > "$VERSION_FILE"
+    } > "$PIN_TEMP"
+    mv "$PIN_TEMP" "$VERSION_FILE"
 
     echo ""
     echo "doged workspace now at: $NEW_REF"

@@ -1,12 +1,11 @@
 #!/usr/bin/env bash
-# setup.sh — Create or reset a daemon build workspace.
+# setup.sh — Create or replay a daemon build workspace.
 #
 # SERIES=v1 (default):           clone bitcoin-abc at bitcoin-abc-v1-version, apply V1 patch series (153 patches)
 # SERIES=doged:        clone doged-io/doged directly at doged-version tag/branch
 # SERIES=bchn:         clone bitcoin-cash-node at pinned tag, apply patches 29-31
 #
-# Usage: ./scripts/setup.sh [--reset]
-#   --reset  wipe existing workspace and start fresh
+# Usage: ./scripts/setup.sh
 
 set -euo pipefail
 
@@ -14,26 +13,29 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DAEMON_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 SERIES="${SERIES:-v1}"
 
-# Export RESET from script argv so clone_and_checkout can see it
-if [[ "${1:-}" == "--reset" ]]; then
-    RESET="--reset"
+if [[ $# -gt 0 || -n "${RESET:-}" ]]; then
+    echo "Setup no longer deletes workspaces. Preserve or move the old workspace, then rerun without --reset/RESET." >&2
+    exit 1
 fi
 
 # ─── helper: clone-and-checkout ──────────────────────────────────────────────
 clone_and_checkout() {
     local workspace="$1" remote="$2" ref="$3" branch="$4" label="$5"
-    if [[ "${RESET:-}" == "--reset" || "${1:-}" == "--reset" ]]; then
-        echo "Resetting $label workspace..."
-        rm -rf "$workspace"
-    fi
     if [[ ! -d "$workspace" ]]; then
         echo "Cloning $remote into $(basename "$workspace")/..."
         git clone "$remote" "$workspace"
     fi
+    if [[ -n "$(git -C "$workspace" status --porcelain)" ]]; then
+        echo "ERROR: workspace has uncommitted changes; preserve them before setup" >&2
+        exit 1
+    fi
     echo "Checking out $ref..."
     cd "$workspace"
     git fetch origin
-    git checkout -B "$branch" "$ref"
+    # Replay is promoted atomically; keep the existing HEAD intact on failure.
+    if ! git rev-parse --verify HEAD >/dev/null 2>&1; then
+        git checkout -b "$branch" "$ref"
+    fi
     echo ""
     echo "$label workspace ready at: $workspace"
 }
@@ -41,16 +43,7 @@ clone_and_checkout() {
 # ─── helper: apply-patch-series ──────────────────────────────────────────────
 apply_patch_series() {
     local series_file="$1" patches_dir="$2"
-    echo "Applying patch series..."
-    while IFS= read -r line; do
-        [[ "$line" =~ ^#.*$ || -z "$line" ]] && continue
-        local patch="$patches_dir/$line"
-        [[ ! -f "$patch" ]] && echo "ERROR: patch not found: $patch" && exit 1
-        echo "  applying $line..."
-        git apply --whitespace=nowarn "$patch"
-        git add -A
-        git -c user.name="Lotus Builder" -c user.email="build@givelotus.org" commit -m "Apply patch: $line" --no-verify 2>/dev/null || true
-    done < "$series_file"
+    python3 "$SCRIPT_DIR/patch-series.py" "$PWD" "$series_file" --base "$REF"
 }
 
 # ─── V1: independently pinned bitcoin-abc base + Lotus mainnet patch series ───────────────
@@ -78,6 +71,7 @@ if [[ "$SERIES" == "doged" ]]; then
     REF=$(grep -v '^#' "$VERSION_FILE" | grep -v '^$' | head -1)
     echo "doged ref: $REF"
     clone_and_checkout "$WORKSPACE" "$REMOTE" "$REF" "doged-work" "doged"
+    git checkout -B doged-work "$REF"
     echo ""
     echo "doged workspace ready at: $WORKSPACE"
     echo "Build with: make build SERIES=doged"
