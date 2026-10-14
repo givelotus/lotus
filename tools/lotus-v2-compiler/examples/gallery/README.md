@@ -1,6 +1,6 @@
 # Offline contract gallery
 
-This gallery turns seven small source programs into compiler artifacts with exact
+This gallery turns small source programs into compiler artifacts with exact
 script bytes, method leaves, membership proofs, policy roots, ABI arguments,
 source maps and static resource reports. The programs use the typed compiler
 grammar in this package. All template values are deterministic public examples.
@@ -10,10 +10,10 @@ cd tools/lotus-v2-compiler
 npm ci
 npm run build
 python3.13 -m venv /tmp/lotus-v2-gallery-venv
-/tmp/lotus-v2-gallery-venv/bin/python -m pip install -r ../../tools/lotus-v2-reference/requirements-vm.txt
+/tmp/lotus-v2-gallery-venv/bin/python -m pip install -r ../lotus-v2-reference/requirements-vm.txt -r test/requirements-vm.txt
 LOTUS_V2_PYTHON=/tmp/lotus-v2-gallery-venv/bin/python \
   node examples/gallery/run-gallery.mjs /tmp/lotus-v2-gallery
-npm test
+LOTUS_V2_PYTHON=/tmp/lotus-v2-gallery-venv/bin/python npm test
 ```
 
 When the reference VM package is present at `tools/lotus-v2-reference`, the
@@ -47,6 +47,7 @@ direct Hashlock example, showing that the helper is copied into its caller.
 | `helper.lotus` | A typed free helper whose operations are inlined into a method. |
 | `linked.lotus` | A fully bound contract root and method leaf copied as compile-time constants into a second contract. This shows byte commitments; it does not enforce execution of the referenced contract. |
 | `fungible-token.lotus` | Separate wallet, mandatory transfer-rules and issuer-mint trees for a fungible token. |
+| `token-upgrade.lotus` | Burn old tokens to mint a replacement asset; the compiler-to-VM test checks sufficient and insufficient burns, including guarded reads past a mint input. |
 
 The fungible token gallery can also be generated on its own:
 
@@ -55,11 +56,11 @@ cd tools/lotus-v2-compiler
 npm ci
 npm run build
 python3.13 -m venv .venv
-.venv/bin/python -m pip install -r ../lotus-v2-reference/requirements-vm.txt
+.venv/bin/python -m pip install -r ../lotus-v2-reference/requirements-vm.txt -r test/requirements-vm.txt
 node test/generate-fungible-token-fixture.mjs
 LOTUS_V2_PYTHON=.venv/bin/python \
   node examples/gallery/run-fungible-token.mjs /tmp/lotus-v2-token-gallery
-npm test
+LOTUS_V2_PYTHON=.venv/bin/python npm test
 ```
 
 The public-only fixture uses BIP340's published test scalar 3 in the local

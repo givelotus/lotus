@@ -5,37 +5,7 @@ import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { compileContract } from '../dist/generic.js';
 
-const source = `
-contract Rules {
-  function transfer() {
-    for output in tx.outputs {
-      if output.token_id == this.coin.token_id {
-        require(output.requires_branch(this.root));
-      }
-    }
-  }
-}
-token Token<old_token: TokenId> {
-  function upgrade(amount: Amount) {
-    burned = 0;
-    for input in tx.inputs {
-      if input.is_spend && input.coin.token_id == old_token {
-        burned += input.coin.value;
-      }
-    }
-    for output in tx.outputs {
-      if output.token_id == old_token {
-        burned -= output.value;
-      }
-    }
-    require(burned >= amount);
-    for output in tx.outputs {
-      if output.token_id == this.root {
-        require(output.requires_branch(contract_root(Rules)));
-      }
-    }
-  }
-}`;
+const source = readFileSync(new URL('../examples/gallery/token-upgrade.lotus', import.meta.url), 'utf8');
 const oldToken = '11'.repeat(32);
 const walletRoot = '22'.repeat(32);
 const bindings = { Token: { old_token: oldToken } };
