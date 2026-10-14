@@ -29,3 +29,9 @@
 - Keep the existing GUI API for this reversible toolchain/package repair.
   Upgrading its old eframe major version is separate work. The old `block`
   dependency emits a future-compatibility notice on Rust 1.99, but compiles.
+
+- Initial Linux CI compiled both executables and passed checks, then stopped at
+  the packaging license guard for `osmesa-sys` 0.1.2. Preserve its CC0-1.0
+  dedication using the standard SPDX text and its complete published source.
+  The full Linux dependency metadata audit found no other unsupported license
+  fallback cases. Await rerun before claiming Linux archives passed.

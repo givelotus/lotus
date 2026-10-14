@@ -89,7 +89,7 @@ with tempfile.TemporaryDirectory(prefix='lotus-miner-package-') as temporary:
         if not any(p.name.upper().startswith(('LICENSE', 'COPYING', 'LICENCE')) for p in license_paths):
             expression = package.get('license') or ''
             standard = {
-                'MIT': 'MIT', 'Apache-2.0': 'Apache-2.0',
+                'MIT': 'MIT', 'Apache-2.0': 'Apache-2.0', 'CC0-1.0': 'CC0-1.0',
                 'MIT OR Apache-2.0': 'Apache-2.0',
                 'Apache-2.0 OR MIT': 'Apache-2.0',
                 'MIT/Apache-2.0': 'Apache-2.0',
@@ -111,7 +111,7 @@ with tempfile.TemporaryDirectory(prefix='lotus-miner-package-') as temporary:
         'See DEPENDENCIES.json for names, authors, licenses and source locations.\n'
         'licenses/ preserves distributed license files and documented supplements.\n'
         'Where no dedicated license text was distributed, the selected standard\n'
-        'MIT or Apache-2.0 license is supplied and the complete published crate\n'
+        'MIT, Apache-2.0 or CC0-1.0 text is supplied and the complete published crate\n'
         'source is retained in license-sources/ to preserve original notices.\n')
     (stage / 'BUILD.txt').write_text(run('rustc', '-vV') + run('cargo', '-V') +
                                    'Native build; OpenCL GPU driver/runtime required.\n')

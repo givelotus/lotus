@@ -14,5 +14,8 @@ license supplements with their own `SOURCE.txt` provenance.
 
 The packaging script first preserves distributed license/notice files and
 supplements. Where upstream did not distribute license text, it includes the
-standard declared MIT or Apache-2.0 license plus the published crate source.
+standard declared MIT, Apache-2.0 or CC0-1.0 text plus the published crate
+source. `CC0-1.0.txt` comes from the SPDX license list:
+https://github.com/spdx/license-list-data/blob/main/text/CC0-1.0.txt
+The Linux GUI's `osmesa-sys` 0.1.2 dependency declares CC0-1.0 and omits its text.
 Do not silently fall back for unknown license expressions.
