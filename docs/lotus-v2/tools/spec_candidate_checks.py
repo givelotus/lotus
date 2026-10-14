@@ -660,6 +660,15 @@ def coinbase_identity_vectors(output: bytes) -> dict:
 
 
 def make_vectors() -> dict:
+    # Maximum output uses distinct paths: one of length16 and fifteen of length15.
+    max_paths = sorted([list(range(16))] + [[i for i in range(16) if i != skip] for skip in range(15)])
+    assert len({tuple(path) for path in max_paths}) == 16
+    max_output = (b'\1' + u(1, 8) + b'\1' * 32 + cs(16)
+                  + b''.join(u(i, 32) for i in range(16)) + cs(16)
+                  + b''.join(cs(len(path)) + bytes(path) for path in max_paths))
+    max_coin = bytes(36) + blob(max_output) + bytes(8 + 8 + 1)
+    assert len(max_output) == 812 and len(cs(len(max_output))) == 3
+    assert len(max_coin) == 868
     # Ordinary fixture uses OP_ONE, not a signature placeholder or payment claim.
     script = op('ONE')
     root = leaf(script)
