@@ -1,38 +1,13 @@
-# patches/ecash/ — Clean eCash Upstream Candidates
+# Experimental ecash candidates
 
-These patches contain no Lotus-specific code. They are intended as upstream PR candidates
-for https://github.com/Bitcoin-ABC/bitcoin-abc (eCash).
+Pinned base: Bitcoin ABC `252182e957120652960c1f88ec96515c448b1204`. Default setup applies no patches. These are opt-in review material, not a maintained release target. See [the support audit](../../docs/support-matrix.md).
 
-## Target Base
+| File | Actual change | Status |
+|---|---|---|
+| `01-nlogn-block-construction.patch` | Replaces mining transaction selection | Applies and builds at the pinned base, but existing miner tests fail three assertions; not established correct or O(n log n). Shared ancestors are counted repeatedly, DFS has no visited set, and static package statistics become stale as ancestors enter the block. No regression tests accompany this patch. |
+| `02-remove-chaintx-limit.patch` | Adds a 100-entry `addUnchecked` container test | Fails pinned-base test compilation (`SigOpCount` is not a helper method). Does not remove any policy check, exercise transaction admission, or establish relay/mining acceptance. Independent of 01. |
+| `03-mempool-cleanup.patch` | Comment-only historical no-op | Excluded from executable series; `git apply` rejects a file with no diff. |
+| `10-nng-interface.patch` | Comment-only placeholder | Unimplemented; not selectable. |
+| `11-remove-zeromq.patch` | Comment-only placeholder | Unimplemented source deletion; disabling the existing CMake feature is already possible. |
 
-bitcoin-abc `252182e957120652960c1f88ec96515c448b1204` (confirmed clean apply).
-
-Patches were ported from the old v0.24.11 target to the current bitcoin-abc HEAD API:
-- `src/miner.cpp` → `src/node/miner.cpp`
-- `addPackageTxs(int&, int&)` → `addTxs(const CTxMemPool &mempool)`
-- `sigOpCount` → `sigChecks`
-- `insertion_order` tag replaced by existing `entry_id` topological index
-- `AddToBlock` takes `CTxMemPoolEntryRef` not `txiter`
-
-## Patches
-
-| Patch | Description |
-|---|---|
-| `29-nlogn-block-construction.patch` | O(n log n) block construction replacing the upstream `addTxs`. Uses `entry_id` topological index for snapshot; `CBlockTemplateEntry` gains package-stat fields; legacy O(n²) renamed `accuratelyAddTxs`. Step 1 of 3. |
-| `30-remove-chaintx-limit.patch` | Adds regression test `long_chain_accepted`. The ancestor/descendant chain-length limits were already removed in upstream bitcoin-abc before 252182e9; this patch just documents that. Step 2 of 3. |
-| `31-mempool-cleanup.patch` | **NO-OP** against 252182e9. All `CTxMemPoolEntry` accounting fields and O(n²) maintenance were already removed upstream. File is a header comment only. Step 3 of 3. |
-
-## Submitting Upstream
-
-Only patch 29 has new content to submit. Patches 30 and 31 are pre-applied in
-bitcoin-abc as of 252182e9.
-
-Apply order: 29 → 30 → 31
-Verify: `git apply --check patches/ecash/29-nlogn-block-construction.patch`
-
-Patches have been verified clean of Lotus-specific identifiers (XPI, XAddress, OP_LOG,
-nTailSubsidy, lotusd, etc.).
-
-## See Also
-
-- `patches/bchn/` — same patches ported to Bitcoin Cash Node
+Apply/build/test results are separate evidence. Do not describe these candidates as upstream-ready until focused mining, policy, reorg, resource-limit, and performance checks pass. No candidate changes are required to enable upstream Chronik on an ABC-derived daemon.
