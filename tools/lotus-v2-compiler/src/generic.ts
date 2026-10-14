@@ -1,6 +1,7 @@
 /** Bounded, typed P03 contract frontend. No VM or consensus-validation code. */
 import { bytes, concat, cs, hex, tagged, unhex, uint, type Span } from './compiler.js';
 import { schnorr } from '@noble/curves/secp256k1';
+import { assertPortableName } from './names.js';
 
 export type ValueType = 'PublicKey' | 'Signature' | 'Bytes32' | `Bytes(${number})` | 'Int' | 'Bool' | 'MethodLeafHash' | 'ContractRootHash';
 export type BoundValue = string | boolean | bigint;
@@ -22,8 +23,8 @@ export type ContractArtifact = { schema: 'lotus-v2/contract-artifact/2'; target:
 export type CompileOptions = { contract: string; bindings: Record<string, Record<string, BoundValue>> };
 
 const MAX_SOURCE = 65536, MAX_SCRIPT = 8192, MAX_OPS = 4096, MAX_EXPANSIONS = 256, MAX_METHODS = 16;
-const RESERVED = new Set('as async await break case catch class const continue debugger default delete do else enum export extends false finally for from function if import in instanceof interface let new null of package private protected public return static super switch this throw true try type typeof var void while with yield and def elif except lambda nonlocal not or pass raise global is None self constructor'.split(' '));
-function symbol(name: string): void { if (RESERVED.has(name)) throw new Error(`reserved name ${name}`); }
+const MAX_INFERENCE_VISITS = 8192;
+function symbol(name: string): void { assertPortableName(name); }
 function utf8Offset(source: string, utf16: number): number { return new TextEncoder().encode(source.slice(0, utf16)).length; }
 function lex(source: string): Token[] {
   if (new TextEncoder().encode(source).length > MAX_SOURCE) throw new Error('source exceeds 65536 UTF-8 bytes');
@@ -111,7 +112,7 @@ class Parser {
         this.take('{'); const methods: Method[] = [];
         while (this.peek().text !== '}') {
           this.take('function'); const method = this.ident(); symbol(method.text); this.take('('); const args = this.params(')'); const body = this.statements();
-          if (!body.length || methods.some(x => x.name === method.text)) throw new Error(`empty or duplicate method ${method.text}`);
+          if (!body.length || methods.some(x => x.name.toLowerCase() === method.text.toLowerCase())) throw new Error(`empty or duplicate method ${method.text}`);
           methods.push({ name: method.text, params: args, body, span: { start: method.span.start, end: this.tokens[this.i - 1]!.span.end } });
           if (methods.length > MAX_METHODS) throw new Error('more than 16 methods');
         }
@@ -247,7 +248,9 @@ class Compiler {
       }
       const emitter = new Emitter(method.params.length);
       const helperStack: string[] = [];
+      let inferenceVisits = 0;
       const infer = (expr: Expr, scope: Env, active: string[] = []): ValueType => {
+        if (++inferenceVisits > MAX_INFERENCE_VISITS) throw new Error('type inference visit budget exceeded');
         if (expr.kind === 'number') { encodedInt(BigInt(expr.value!)); return 'Int'; }
         if (expr.kind === 'bool') return 'Bool';
         if (expr.kind === 'name') {
@@ -255,6 +258,7 @@ class Compiler {
           return v.kind === 'substitute' ? infer(v.expr,v.env,active) : v.type;
         }
         if (expr.kind === 'unary') {
+          if (expr.value === '-' && expr.right?.kind === 'number') { encodedInt(-BigInt(expr.right.value!)); return 'Int'; }
           const t = infer(expr.right!,scope,active);
           if ((expr.value === '!' && t === 'Bool') || (expr.value === '-' && t === 'Int')) return t;
           throw new Error(`invalid unary ${expr.value} on ${t}`);
@@ -303,6 +307,7 @@ class Compiler {
           return v.type;
         }
         if (expr.kind === 'unary') {
+          if (expr.value === '-' && expr.right?.kind === 'number') { emitter.number(-BigInt(expr.right.value!),expr.span,origin); return 'Int'; }
           const t = expression(expr.right!,scope,origin);
           if (expr.value === '!' && t === 'Bool') { emitter.op('NOT',expr.span,origin); return 'Bool'; }
           if (expr.value === '-' && t === 'Int') { emitter.op('NEGATE',expr.span,origin); return 'Int'; }

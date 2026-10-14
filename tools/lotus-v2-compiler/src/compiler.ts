@@ -1,5 +1,6 @@
 import { blake3 } from '@noble/hashes/blake3';
 import { schnorr } from '@noble/curves/secp256k1';
+import { assertPortableName } from './names.js';
 
 export type Span = { start: number; end: number };
 type Token = { text: string; span: Span };
@@ -61,8 +62,7 @@ export function parsePayment(source: string): PaymentAst {
   take('}'); const end = take('}').span.end;
   if (i !== t.length) throw new Error(`unsupported syntax at offset ${t[i]!.span.start}`);
   if (sigUse.text !== signature.text || ownerUse.text !== owner.text) throw new Error(`typed name mismatch at offset ${sigUse.span.start}`);
-  const reserved = new Set('class default function return import export constructor if else true false public private protected static self def None pass'.split(' '));
-  if ([name.text,owner.text,signature.text].some(x => reserved.has(x))) throw new Error('reserved binding name');
+  for (const value of [name.text,owner.text,signature.text]) assertPortableName(value);
   if (owner.text === signature.text) throw new Error('method parameter shadows constructor');
   return { kind: 'Payment', name: name.text, ownerName: owner.text, signatureName: signature.text, span: { start, end }, ownerSpan: ownerUse.span, checkSpan: { start: checkStart, end: t[i - 3]!.span.end } };
 }

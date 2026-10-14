@@ -2,8 +2,9 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { compileContract, methodLeafHash, contractRootHash } from '../dist/generic.js';
 import { unhex } from '../dist/compiler.js';
-import { generateContractTypeScript } from '../dist/bindings.js';
+import { generateContractPython, generateContractTypeScript } from '../dist/bindings.js';
 import { readFileSync } from 'node:fs';
+import { spawnSync } from 'node:child_process';
 
 const key3 = 'f9308a019258c31049344f85f89d5229b531c845836f99b08601f113bce036f9';
 const key4 = 'e493dbf1c10d80f3581e4904930b1404cc6c13900ee0758474fa94abe8c4cd13';
@@ -52,7 +53,7 @@ test('UTF-8 source spans, strict template types and reserved names', () => {
   assert(a.methods[0].sourceMap[0].source.start > make().methods[0].sourceMap[0].source.start + 8);
   assert.throws(() => compileContract(vault, { contract: 'Vault', bindings: { Vault: { owner: zero, expected: zero } } }), /x-only curve point/);
   assert.throws(() => compileContract(vault, { contract: 'Vault', bindings: { Vault: { owner: key3 } } }), /constructor arity/);
-  assert.throws(() => compileContract('contract class { function spend() { require(true); } }', { contract: 'class', bindings: {} }), /reserved name/);
+  assert.throws(() => compileContract('contract class { function spend() { require(true); } }', { contract: 'class', bindings: {} }), /reserved/);
   assert.throws(() => compileContract('contract A { function m(x: Int) { require(sha256(x) == x); } }', { contract: 'A', bindings: {} }), /expects byte/);
 });
 
@@ -106,4 +107,37 @@ test('helper expansion and parser expression bounds reject unbounded source', ()
   assert.throws(() => compileContract(source, { contract: 'C', bindings: {} }), /helper expansion budget/);
   const nested = '('.repeat(66) + 'true' + ')'.repeat(66);
   assert.throws(() => compileContract(`contract C { function m() { require(${nested}); } }`, { contract: 'C', bindings: {} }), /expression depth/);
+});
+
+test('type inference visits are bounded before substitution fanout', () => {
+  const helpers = ['function f0(x: Bool): Bool { return x; }'];
+  for (let i = 1; i <= 14; i++) helpers.push(`function f${i}(x: Bool): Bool { return f${i-1}(x) && f${i-1}(x); }`);
+  const source = `${helpers.join(' ')} contract C { function m() { require(f14(true)); } }`;
+  assert.throws(() => compileContract(source, { contract: 'C', bindings: {} }), /helper expansion budget/);
+  const balanced = n => n === 1 ? 'true' : `(${balanced(Math.floor(n / 2))} || ${balanced(Math.ceil(n / 2))})`;
+  const large = `function id(x: Bool): Bool { return x; } contract C { function m() { require(id(${balanced(4200)})); } }`;
+  assert.throws(() => compileContract(large, { contract: 'C', bindings: {} }), /type inference visit budget/);
+});
+
+test('signed Int minimum parses as one literal and out-of-range values reject', () => {
+  const min = -(1n << 127n);
+  const source = `contract C { function m() { require(${min} == ${min}); } }`;
+  const a = compileContract(source, { contract: 'C', bindings: {} });
+  assert(a.methods[0].scriptHex.includes('00'.repeat(15) + '80'));
+  const underflow = min - 1n;
+  assert.throws(() => compileContract(`contract C { function m() { require(${underflow} == 0); } }`, { contract: 'C', bindings: {} }), /signed 128-bit range/);
+  const overflow = 1n << 127n;
+  assert.throws(() => compileContract(`contract C { function m() { require(${overflow} == 0); } }`, { contract: 'C', bindings: {} }), /signed 128-bit range/);
+});
+
+test('portable identifiers and case-folded method entrypoints avoid generated binding collisions', () => {
+  for (const name of ['await','lambda','class']) {
+    assert.throws(() => compileContract(`contract ${name} { function spend() { require(true); } }`, { contract:name,bindings:{} }), /reserved/);
+  }
+  assert.throws(() => compileContract('contract C { function spend() { require(true); } function Spend() { require(false); } }', { contract:'C',bindings:{} }), /duplicate method/);
+  const a = make();
+  const python = generateContractPython(a);
+  const run = spawnSync('python3',['-c','import sys; compile(sys.stdin.read(), "generated.py", "exec")'],{input:python,encoding:'utf8'});
+  assert.equal(run.status,0,run.stderr);
+  assert.match(python,/def prepareSpend\(/);
 });
