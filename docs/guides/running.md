@@ -7,6 +7,9 @@ author: Shammah Chancellor ([@micropresident](https://twitter.com/micropresident
 position: 5.0
 ---
 
+> **Historical guide (2021).** The commands, downloads, dependencies, and network-size estimates below describe an earlier release. For the current V1 daemon, use the [validated build and run instructions](../../daemon/README.md) and [current release downloads](https://github.com/givelotus/lotus/releases). This page is retained as historical reference; it has not been validated against the current daemon.
+
+
 ## Build apps with Lotus Node
 
 Fastest way to start experimenting or building applications with Lotus:
@@ -63,7 +66,7 @@ Optional dependencies:
 | univalue    | Utility          | JSON parsing and encoding (bundled version will be used unless --with-system-univalue passed to configure) |
 | libzmq3     | ZMQ notification | Optional, allows generating ZMQ notifications (requires ZMQ version >= 4.1.5)                              |
 
-For the versions used, see [dependencies.md](dependencies.md)
+For the versions used, see [current dependency instructions](../../daemon/README.md#step-2-install-build-dependencies)
 
 ## Memory Requirements
 
@@ -105,7 +108,7 @@ Then update the package list and install `cmake`:
     sudo apt update
     sudo apt install cmake
 
-Now, you can either build from self-compiled [depends](/depends/README.md) or
+Now, you can either build from self-compiled the historical upstream `depends` system or
 install the required dependencies with the following instructions.
 
 Options when installing required Boost library files:
@@ -280,7 +283,7 @@ To build executables for ARM:
     cmake -GNinja .. -DCMAKE_TOOLCHAIN_FILE=../cmake/platforms/LinuxARM.cmake -DENABLE_GLIBC_BACK_COMPAT=ON -DENABLE_STATIC_LIBSTDCXX=ON
     ninja
 
-For further documentation on the depends system see [README.md](../depends/README.md) in the depends directory.
+For further documentation on the depends system see the upstream `depends/README.md` in the depends directory.
 
 ## Build using a Docker container
 

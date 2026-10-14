@@ -13,8 +13,8 @@ Lotus (`XPI`) is a trust-minimized peer-to-peer Proof-of-Work monetary protocol 
 - XAddress format (`lotus_` prefix on V1 mainnet; `xpi_` planned for V2)
 - Both an **in-process Rust/C++ Chronik indexer** (`-chronik=1`, HTTP/WS on port `8331`) and an **NNG pub/sub interface** (`src/nng_interface/`)
 
-**Phase 1 (Complete & Live):** Rebase Lotus V1 mainnet (`v11.6.0`) onto modern `bitcoin-abc` (`252182e957120652960c1f88ec96515c448b1204`) with in-process Chronik enabled and verified against the live mainnet tip (`1,400,645+`).
-**Phase 2 (Specified in `docs/lotus-v2/`):** Lotus V2 protocol featuring stripped-witness `CoreTxId` commitments, deterministic UTXO state tree, v1/v2 Script ABI (`OP_SUCCESS_N` upgrade hooks, big-integer arithmetic), and optional Avalanche soft coordination.
+**Phase 1 (V1 mainnet):** Current release source rebases `v11.6.0` onto `bitcoin-abc` `8c67fe1e85a602204a2ce65aa3b643469c2c3a1d`. All 153 patches replay cleanly, C++/Rust checks pass, and an isolated node has replayed mainnet through height 1,400,898 with Chronik. The production node still runs the previous `252182e957` build until deployment is explicitly undertaken.
+**Phase 2 (unfinished, on the separate `lotus-v2` development branch; specifications there are under `docs/lotus-v2/`):** Lotus V2 protocol featuring stripped-witness `CoreTxId` commitments, deterministic UTXO state tree, v1/v2 Script ABI (`OP_SUCCESS_N` upgrade hooks, big-integer arithmetic), and optional Avalanche soft coordination.
 
 Trademark: "Lotus" is owned by Shammah Chancellor. All repos under `givelotus/` use it with permission.
 
@@ -30,14 +30,14 @@ lotus/
 │   ├── scripts/         # setup.sh, build.sh, run.sh, mkpatch.sh, refresh.sh
 │   ├── patches/v1/      # 153 verified patches (000–247) for Lotus V1 mainnet (v11.6.0)
 │   ├── patches/v2/      # Lotus V2 new-chain patches
-│   └── docs/            # patch-strategy.md, impcpd-methodology.md, lotus-validation-results.md
+│   └── docs/            # patch-strategy.md, impcpd-methodology.md, v1-8c67fe1e85-validation.md
 ├── sdk/
 │   ├── dart/            # Dart SDK (extracted from wallets/vase)
 │   └── rust/            # Standalone Rust bitcoinsuite / chronik-client crates (see Issue #8)
 ├── wallets/
 │   └── vase/            # Flutter mobile wallet (vase-client Dart) + Go vase-server
 ├── miner/               # GPU miner (OpenCL)
-├── docs/                # Lotus V2 specification (docs/lotus-v2/), architecture decisions, and guides
+├── docs/                # V1 specifications, historical architecture decisions, and guides
 └── .github/workflows/   # CI/CD: release-daemon.yml builds & publishes lotusd + Chronik binaries on v* tags
 ```
 
@@ -123,3 +123,10 @@ Upstream Bitcoin ABC's in-process Chronik (`chronik/`) assumes standard 80-byte 
 - Preserve current upstream initialization/shutdown and node-owned `ValidationSignals`; apply only Lotus settings/NNG hooks to upstream `src/init.cpp`. Restore current optional `GetCoin`, static secp256k1 context, const network-magic lookup, and mempool options APIs in patch 246.
 - Mainnet/testnet eCash assumeutxo snapshots are removed; their commitments do not describe Lotus. Regtest keeps a regenerated deterministic Lotus snapshot at height 110, checked by snapshot loading/validation tests. Lotus fixtures use coinbase output 1, 160-byte headers plus serialized metadata, and block Merkle leaves committing to both TxHash and TxId. Tests must preserve V1 BIP143 out-of-range SINGLE behavior rather than importing an upstream consensus change.
 - Isolated mainnet replay uses `/tmp/lotus-v1-mainnet-8c67fe1e85`, RPC 11604, P2P 11605 (listening disabled), Chronik 18331. Block files were copied with APFS copy-on-write; original live data is untouched. `daemon/scripts/check-v1-chronik.py` compares headers, TxIds, and raw transaction disk bytes with RPC. Previous release assets and tag are backed up in `/tmp/lotus-v11.6.0-before-8c67fe1e85` before republishing.
+
+- Full isolated mainnet replay on `8c67fe1e85` reached height 1,400,898 with `initialblockdownload=false`; `verifychain 4 1000` returned true. The node accepted fresh blocks after replay. Chronik/RPC comparisons passed at 11 sampled heights (including 15 coinbase/non-coinbase transactions), with exact 160-byte headers and raw disk bytes. The original production node/workspace remains running on the previous base.
+- Final V1 patch chain HEAD: `daf2ae4d06` (153 commits), tree `624fe49cbd017b43935e7bb3159d0e445eaf712e`; the monorepo daemon rebase was introduced in `d2ef5908`. Tag `v11.6.0` also includes subsequent public-facing cleanup. Initial tag workflow `38570812943` was cancelled to add missing `COPYING` packaging; earlier dispatch run `38570352993` was cancelled to avoid duplicating release builds. Local original tag is retained as `lotus-release-backup/v11.6.0-abc252182e9-20261014`.
+- V2 progress is isolated on branch `lotus-v2` in `/private/tmp/lotus-v2-repo`: commits `a043243d` (refresh two stale spec packet hashes, semantic vectors unchanged) and `efb4d95f` (track implementation patches 000–005 and dedicated V2 pin). V2 workspace HEAD is `560acd2500`; identity patch build/RPC check/spec checker/replay pass. Both commits are pushed to `origin/lotus-v2`. This branch has not been merged into main; V2 genesis and remaining protocol implementation are unfinished.
+
+- Public-facing cleanup preserves imported component licenses and Git history. Generated Vase server/iOS artifacts and the localhost development `.env` are removed from the current Git index while local files remain available; use `.env.example` for development setup. No live credential or recognizable access token/private key was identified in the tracked-text audit. Historical build files remain in the subtree import; do not rewrite that history as an incidental cleanup.
+- The first tag release build was cancelled after a packaging audit found missing upstream `COPYING`. Packaging now includes that file. Public README/build documentation must distinguish tested V1 release behavior from unfinished V2 work and inherited wallet/SDK/miner components; old design notes are marked historical.

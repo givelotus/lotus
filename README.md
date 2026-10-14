@@ -2,21 +2,23 @@
 
 Lotus is a trust-minimized peer-to-peer monetary protocol. Monetary policy is governed by proof-of-work mining difficulty as a live, adversarially-revealed signal — no committees, no oracles, no central bank.
 
-This monorepo contains the core Lotus node daemon, patch series, specifications, mining software, and SDKs.
+This monorepo contains the Lotus V1 node daemon, patch series, historical specifications, mining software, and SDKs. Lotus V2 is unfinished development on the separate `lotus-v2` branch.
+
+Release validation currently covers the V1 daemon and its in-process Chronik indexer. The standalone SDKs, wallet, and miner are inherited components with separate build and test requirements. See the [validation report](daemon/docs/v1-8c67fe1e85-validation.md) for the checks performed.
 
 ## Structure
 
 ```
 daemon/         — Lotus node daemon (`lotusd` & `lotus-cli` built on Bitcoin ABC + Lotus patch series, with in-process Chronik & NNG)
   patches/v1/   — Lotus V1 mainnet patch series (`000`–`247`, rebased onto modern Bitcoin ABC 8c67fe1e85)
-  patches/v2/   — Lotus V2 next-generation chain patch series
+  patches/v2/   — Historical V2 patch plan; current development is on branch lotus-v2
 sdk/
   dart/         — Dart SDK for mobile wallet development
   rust/         — Rust libraries (bitcoinsuite / chronik-client)
 wallets/
   vase/         — Mobile reference wallet (Dart/Flutter + Go vase-server)
 miner/          — GPU mining software (OpenCL)
-docs/           — Documentation, legacy specs, and Lotus V2 specification (docs/lotus-v2/)
+docs/           — Documentation and historical protocol specifications
 ```
 
 ---
@@ -28,20 +30,20 @@ Prebuilt binaries for Linux (`x86_64`) and macOS (`arm64`) with the **in-process
 To start `lotusd` with Chronik enabled:
 
 ```bash
-./lotusd -chronik=1 -daemon
+./bin/lotusd -chronik=1 -daemon
 ```
 
 By default on mainnet:
 - **P2P port**: `10605`
 - **JSON-RPC port**: `10604`
 - **Chronik HTTP / WebSocket indexer**: `127.0.0.1:8331` (override with `-chronikbind=<ip:port>`)
-- **Chronik data directory**: `<datadir>/indexes/chronik/` (initial index sync from genesis takes ~2–5 minutes on NVMe SSD)
+- **Chronik data directory**: `<datadir>/indexes/chronik/` (sync time depends on hardware, chain size, and whether blocks are already available locally)
 
 Verify Chronik is serving live chain state:
 
 ```bash
 curl -s http://127.0.0.1:8331/blockchain-info | xxd
-./lotus-cli getblockchaininfo
+./bin/lotus-cli getblockchaininfo
 ```
 
 ---
@@ -52,22 +54,7 @@ Rather than maintaining a diverging fork of the entire C++/Rust tree, `daemon/` 
 
 ### 1. Install Dependencies
 
-**macOS (Homebrew):**
-```bash
-brew install berkeley-db@4 boost cmake flatbuffers jemalloc libevent miniupnpc libnatpmp nng ninja openssl protobuf python rocksdb rust sqlite zeroMQ
-```
-
-**Ubuntu / Debian (22.04 / 24.04):**
-```bash
-sudo apt-get update
-sudo apt-get install -y \
-  build-essential cmake ninja-build pkg-config git python3 \
-  libboost-all-dev libssl-dev libevent-dev libdb++-dev \
-  libsqlite3-dev libjemalloc-dev libnng-dev libflatbuffers-dev flatbuffers-compiler \
-  libprotobuf-dev protobuf-compiler librocksdb-dev libclang-dev curl
-# Install Rust toolchain (required for in-process Chronik):
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
-```
+Follow the [daemon dependency instructions](daemon/README.md#step-2-install-build-dependencies), including Python selection for Chronik. The release workflow builds on Ubuntu 24.04 and macOS arm64. Other components and platforms have separate validation requirements.
 
 ### 2. Clone `bitcoin-abc` and Apply the Lotus V1 Patch Series
 
@@ -87,7 +74,9 @@ What this does automatically (`daemon/scripts/setup.sh`):
 ### 3. Compile `lotusd` and `lotus-cli` (with In-Process Chronik)
 
 ```bash
-make -C daemon build SERIES=v1
+# Use the Python interpreter selected in the dependency instructions:
+PYO3_PYTHON="$LOTUS_BUILD_PYTHON" SERIES=v1 daemon/scripts/build.sh \
+  -DPython_EXECUTABLE="$LOTUS_BUILD_PYTHON"
 ```
 
 This runs CMake + Ninja inside `daemon/workspace-v1/build/` with `-DBUILD_CHRONIK=ON` enabled by default, producing:
@@ -100,8 +89,12 @@ This runs CMake + Ninja inside `daemon/workspace-v1/build/` with `-DBUILD_CHRONI
 
 The theoretical foundation for Lotus is published at [givelotus.github.io](https://givelotus.github.io). Three preprints cover proof-of-work as monetary signal, adaptive monetary policy via feedback control, and spam prevention via burn-to-speak messaging.
 
-The next-generation **Lotus V2** protocol specification is located in [`docs/lotus-v2/`](docs/lotus-v2/README.md).
+The next-generation **Lotus V2** candidate specification is on the separate [`lotus-v2` branch](https://github.com/givelotus/lotus/tree/lotus-v2/docs/lotus-v2). It is unfinished and is not the protocol implemented by the V1 mainnet daemon.
 
 ## Support
 
 Lotus is funded by its community. If you believe mathematics should govern money instead of committees, consider supporting development at [patreon.com/c/givelotus](https://www.patreon.com/c/givelotus).
+
+## Licenses
+
+Components retain their existing licenses and attribution. See the [component license map](LICENSES.md).

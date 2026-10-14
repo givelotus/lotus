@@ -6,6 +6,9 @@ linkTitle: "Mining Lotus"
 author: Shammah Chancellor ([@micropresident](https://twitter.com/micropresident))
 position: 5.0
 ---
+
+> **Historical guide (2021).** The commands, downloads, dependencies, and network-size estimates below describe an earlier release. For the current V1 daemon, use the [validated build and run instructions](../../daemon/README.md) and [current release downloads](https://github.com/givelotus/lotus/releases). This page is retained as historical reference; it has not been validated against the current daemon.
+
 ## Setup Lotus Node
 
 ### Windows

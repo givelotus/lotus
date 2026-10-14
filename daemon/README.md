@@ -1,6 +1,6 @@
 # Lotus Daemon (`lotusd` & `lotus-cli` with In-Process Chronik)
 
-This directory contains everything needed to pull upstream [`Bitcoin-ABC/bitcoin-abc`](https://github.com/Bitcoin-ABC/bitcoin-abc), automatically apply the Lotus patch series in order, and compile `lotusd` and `lotus-cli` with the **in-process Chronik indexer** (`-DBUILD_CHRONIK=ON`) enabled.
+This directory builds Lotus V1 mainnet on pinned Bitcoin ABC `8c67fe1e85`. It contains everything needed to pull upstream [`Bitcoin-ABC/bitcoin-abc`](https://github.com/Bitcoin-ABC/bitcoin-abc), automatically apply the Lotus patch series in order, and compile `lotusd` and `lotus-cli` with the **in-process Chronik indexer** (`-DBUILD_CHRONIK=ON`) enabled.
 
 > **Don't want to compile from source?**
 > Download prebuilt Linux (`x86_64`) and macOS (`arm64`) binaries directly from **[GitHub Releases](https://github.com/givelotus/lotus/releases)**.
@@ -26,20 +26,24 @@ Copy and paste:
 
 ```bash
 brew install berkeley-db boost cmake flatbuffers jemalloc libevent \
-  nng ninja openssl protobuf rust sqlite utf8proc
+  nng ninja openssl protobuf python@3.13 rust sqlite utf8proc
+export LOTUS_BUILD_PYTHON="$(brew --prefix python@3.13)/bin/python3.13"
 ```
 
-#### On Ubuntu / Debian (22.04 or 24.04)
+Chronik uses PyO3 bindings that support Python through 3.13. Select the same interpreter for CMake and Rust; the default Homebrew Python may be newer.
+
+#### On Ubuntu 24.04 (release build platform)
 
 Copy and paste:
 
 ```bash
 sudo apt-get update
 sudo apt-get install -y \
-  build-essential cmake ninja-build pkg-config git python3 \
+  build-essential cmake ninja-build pkg-config git python3 python3-dev \
   libboost-all-dev libssl-dev libevent-dev libdb++-dev \
   libsqlite3-dev libjemalloc-dev libflatbuffers-dev flatbuffers-compiler \
   libprotobuf-dev protobuf-compiler libclang-dev libutf8proc-dev curl
+export LOTUS_BUILD_PYTHON=/usr/bin/python3
 
 # Install the Rust compiler (required for the in-process Chronik indexer):
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
@@ -55,6 +59,8 @@ cmake -S /tmp/nng -B /tmp/nng/build -GNinja \
   -DCMAKE_POSITION_INDEPENDENT_CODE=ON
 sudo cmake --build /tmp/nng/build --target install
 ```
+
+Ubuntu 24.04's Python 3.12 is within Chronik's supported range. CI explicitly selects Python 3.13. On other distributions, select a Python 3.10–3.13 interpreter with development headers; those distributions are not covered by the release workflow.
 
 ---
 
@@ -80,7 +86,8 @@ make setup SERIES=v1
 From inside `lotus/daemon`, run:
 
 ```bash
-make build SERIES=v1
+PYO3_PYTHON="$LOTUS_BUILD_PYTHON" SERIES=v1 scripts/build.sh \
+  -DPython_EXECUTABLE="$LOTUS_BUILD_PYTHON"
 ```
 
 **What this command does for you:**
@@ -145,7 +152,4 @@ curl -s http://127.0.0.1:8331/blockchain-info | xxd
   ```bash
   make mkpatch SERIES=v1 NAME=248-my-new-patch
   ```
-- **Rebase the patch series onto a newer `bitcoin-abc` commit**:
-  ```bash
-  make refresh SERIES=v1 COMMIT=<new-bitcoin-abc-commit-sha>
-  ```
+- **Rebase onto a newer Bitcoin ABC commit**: do this in an isolated workspace, update `bitcoin-abc-v1-version`, and export one patch per entry in `patches/v1/series`. Verify replay and protocol compatibility before replacing release artifacts. The existing V1 `refresh` helper handles historical Lotus version tags; it does not perform this ABC rebase.

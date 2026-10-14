@@ -2,8 +2,9 @@
 
 ## Purpose
 
-Single source of truth for all patches across all series. Tracks status, ordering,
-what each patch does, which series it applies to, and what work remains.
+V1 patch reference and historical planning notes for the other series. The executable manifests in `daemon/patches/*/series` and their version pins define the source that setup applies.
+
+Current V1 mainnet uses Bitcoin ABC `8c67fe1e85` with 153 patches; see the [current build guide](../README.md). V2 development is unfinished on the separate `lotus-v2` branch. Its candidate specification and newer implementation work are not included in this checkout. V2 tables and sequencing below describe the older porting plan, not a completed or approved protocol.
 
 ---
 
@@ -61,7 +62,7 @@ This makes it easy to see at a glance which improvements have been ported where.
 
 ---
 
-## V2 — New Lotus Chain (primary goal)
+## V2 — Historical New-Chain Plan
 
 **Base:** bitcoin-abc `252182e957120652960c1f88ec96515c448b1204`
 **Goal:** Launch a new Lotus chain from genesis: Chronik indexer, NNG pub/sub, adaptive
@@ -77,7 +78,7 @@ largely housekeeping increments with no real feature additions — that whole ma
 is dropped in v2. Everything ships complete at genesis.
 
 **Why this bitcoin-abc base:** Chronik is production-ready here. Chronik is the indexer
-we need (Electrum-compatible API, Rust-based). Without it we'd have to backport it —
+we need (HTTP protobuf and WebSocket API, Rust-based). Without it we'd have to backport it —
 a much larger effort than rebasing our existing patches.
 
 ### V2 Patch Manifest
@@ -174,11 +175,11 @@ There is a real distinction between hard consensus and soft coordination:
 
 ---
 
-## V1 — Lotus Mainnet (rebased onto bitcoin-abc 252182e9 — COMPLETE & VERIFIED)
+## V1 — Lotus Mainnet
 
-**Base:** bitcoin-abc `252182e957120652960c1f88ec96515c448b1204` (same as v2)
+**Base:** bitcoin-abc `8c67fe1e85a602204a2ce65aa3b643469c2c3a1d` (`daemon/bitcoin-abc-v1-version`)
 **Release:** `v11.6.0`
-**Status:** **COMPLETE & VERIFIED** — All 153 rolled-up patches (`000`–`247`) apply cleanly onto `bitcoin-abc` `252182e9`, compile with in-process Chronik (`-DBUILD_CHRONIK=ON`), pass C++ and Rust (`check-crates`) test suites, and sync 100% from genesis to the live mainnet tip (`1,400,645+`).
+**Validation (2026-10-14):** All 153 patches replay onto the pinned base. Daemon/CLI, C++ tests, and Rust crate checks pass. Isolated mainnet replay reached height 1,400,898, `verifychain 4 1000` passed, and sampled Chronik headers and transactions matched RPC. This covers the V1 daemon; it does not establish validation of every monorepo component. The earlier `252182e9` rebase is historical.
 
 ### V1 Patch Manifest Summary (`daemon/patches/v1/series`)
 
@@ -248,11 +249,11 @@ Until this decomposition is done, workspace-doged remains a direct clone.
 
 ---
 
-## Work Sequencing
+## Historical Work Sequencing
 
 | Priority | Work Item | Status |
 |----------|-----------|--------|
-| **1** | **Rebase v1 patches 000–247 onto bitcoin-abc 252182e9** | **DONE (`v11.6.0`)** |
+| **1** | **Rebase v1 patches 000–247 onto bitcoin-abc 252182e9** | **Historical; V1 now uses `8c67fe1e85`** |
 | 1a | Patches 000–050: Avalanche/MinerFundPolicy decouple, core protocol, genesis, blocktime, opcodes | `DONE` |
 | 1b | Patches 051–100: XAddress, chainparams, $\log_2$ issuance, ASERT DAA, NNG | `DONE` |
 | 1c | Patches 101–199: epoch activations (Numbers → Judges) | `DONE` |

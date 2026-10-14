@@ -1,4 +1,9 @@
-# Architecture Decisions & Open Questions
+# Historical Architecture Planning
+
+
+> **Superseded planning record.** The proposals below describe an earlier repository layout and unimplemented design options. They are retained for context, not as current build instructions or accepted V2 consensus rules.
+
+The current repository contains `daemon/` (`lotusd`, `lotus-cli`, in-process Chronik, and NNG), `sdk/dart/`, `sdk/rust/`, `wallets/vase/`, and `miner/`. V1 uses the pinned Bitcoin ABC base and patch series described in the [daemon guide](../daemon/README.md). The TypeScript SDK, cashweb, and modern wallet live in the separate Frank repository; their old paths below no longer exist here. V2 candidate specifications and implementation work are on the separate `lotus-v2` branch and remain unfinished. The historical `logosd` flags, SDK restructuring tasks, issuance proposals, and allocation ideas below are not descriptions of the current V1 daemon.
 
 ## Target Deployment Stack
 

@@ -1,13 +1,9 @@
----
-title: Introduction
-description: 'This is the home of the Lotus technical documentation'
-position: 1
-category: 'Introduction'
----
+# Lotus Documentation
 
-<img src="/preview.png" class="light-img" width="1280" height="640" alt=""/>
-<img src="/preview-dark.png" class="dark-img" width="1280" height="640" alt=""/>
+For the current V1 mainnet daemon, start with the [build and run guide](../daemon/README.md). The repository [README](../README.md) describes its components and release downloads.
 
-This is the home of the Lotus technical documentation
+The files under `specs/` and the 2021 running/mining guides are historical protocol and operational references. Use current daemon instructions when running a node.
 
-<p class="flex items-center">Enjoy light and dark mode:&nbsp;<app-color-switcher class="inline-flex ml-2"></app-color-switcher></p>
+Lotus V2 candidate specifications and implementation work live on the separate `lotus-v2` branch. V2 remains unfinished and is not the protocol implemented by the V1 mainnet daemon.
+
+[Historical architecture planning](architecture-decisions.md) records earlier proposals and identifies the current component layout.
