@@ -49,27 +49,50 @@ Therefore a plain `add_subdirectory(external/chronik)` is insufficient. BCHN has
 
 Modern Chronik's optional Python indexing plugins are a different extension mechanism: they customize indexed data/groups. They are not native host adapters or the old NNG process interface.
 
-## Recommended shared boundary
+## Shared source and embedded host adapters
 
-Maintain one source repository for the modern Rust core, HTTP/WebSocket/Electrum services, token engines, schema, common NNG transport and tests. Keep only native host adaptation and protocol-specific representation changes in small, independently pinned host patches. Preserve copyright/license notices and import provenance during extraction.
+The current requirement is one pinned Chronik source, built in-process with each
+node. Lotus, ABC and the existing Doged lineage already integrate Chronik; BCHN
+and Bitcoin Core need host adapters. Bitcoin Core's requested profile adds
+Chronik only, without unrelated mining, mempool or consensus changes.
+
+Automatically extract the Chronik subtree from an immutable ABC commit, retaining
+licenses and recording its source-tree hash. The subtree's Rust workspace and
+CMake assumptions need explicit adaptation: the ABC root Cargo workspace also
+lists unrelated applications, and Chronik's CMake file assumes the host source
+root. A sparse checkout alone does not make that workspace self-contained.
+
+A separate source repository can host the reproducible export. A submodule,
+pre-fetched checkout, or CMake FetchContent can pin its exact commit; use an
+explicit source path for offline builds. The initial CMake component should keep
+static Rust/CXX linkage and the existing node-owned validation lifecycle. A new
+dlopen ABI or a separate indexer process is not required for source sharing.
 
 ```mermaid
 flowchart LR
-  Shared[One pinned Chronik source repository] -. CMake builds .-> Service[Standalone Chronik process]
-  Shared -. common schema and transport .-> Adapter[Native host adapter]
-  Node[BCHN / ABC / Lotus / Doged] --> Adapter
-  Adapter <-->|NNG requests and ordered events| Service
-  Service --> Clients[HTTP / WebSocket / Electrum clients]
+  Source[One pinned Chronik source] --> Build[CMake component]
+  Host[Node and native validation lifecycle] --> Adapter[Host adapter]
+  Build --> Embedded[In-process Chronik]
+  Adapter --> Embedded
+  Embedded --> Clients[HTTP and WebSocket clients]
 ```
 
-The node still needs its native NNG service/hooks. The indexer and its Rust dependencies are deployed separately, following Tobias's original direction. Keep a direct CXX backend available for existing embedded deployments while the standalone backend is implemented and validated; using a shared repository must not force migration or NNG removal.
+Keep representation differences explicit: BTC witness serialization and
+transaction IDs, BCH CashTokens outputs, Lotus headers/metadata/merkleized TxIds,
+and Dogecoin AuxPoW. Indexer checkpoints, reorg behavior, storage access and
+shutdown ownership remain per-host acceptance requirements. Sharing source does
+not itself prove a port works or eliminate every consistency bug.
 
-Two changes should be reviewed separately:
+NNG is independent compatibility work for existing application consumers. The
+new raw publisher originally submitted as BCHN MR2176 was rejected because it
+matches neither existing Lotus/Tobias FlatBuffers consumers nor ZeroMQ; its
+passing tests do not satisfy the requested port. The replacement targets existing
+schemas and request/reply/mining functionality. NNG must not become a Chronik
+dependency. External-process/horizontal-scaling work is deferred.
 
-1. **Build-time source sharing.** Add an immutable source/provider pin and explicit CMake source/build/workspace variables. Extract the Chronik Cargo members into a self-contained workspace with a reviewed lockfile. Pass host targets/include directories and the host adapter explicitly; replace `CMAKE_SOURCE_DIR` assumptions. `FetchContent` or a pre-fetched offline checkout can supply the exact source commit. This reduces duplicated source maintenance, but an embedded build remains embedded.
-2. **Runtime/process separation.** Replace direct `ChronikBridge`/`CBlockIndex` access in the core with an owned-data node/backend contract. Implement a common NNG client and standalone executable, alongside the existing direct backend. Port the small native data service per host. This is the work that removes the indexer from the node link; no current implementation of this modern backend is claimed.
-
-A proposed common checkout should contain the Cargo workspace, core crates, shared schemas, NNG backend and CMake entry point. Each daemon records the common source commit, schema/capability revision, host adapter patch series and chain profile. Upstream ABC `1fb7db17` / Chronik subtree `84b19eab...` is the audited extraction source; no new external repository has been published by this audit. Large per-chain indexer forks are unnecessary if representation differences are explicit profiles/adapters rather than global replacements of Rust transaction logic.
+This replaces the earlier recommendation in this document to prioritize a new
+standalone NNG backend. No external Chronik repository or working BCHN/Bitcoin
+Core Chronik adapter has yet been published.
 
 ## Host obligations
 
@@ -84,12 +107,12 @@ A proposed common checkout should contain the Cargo workspace, core crates, shar
 | Coordination | Treat Avalanche finalization as an optional host capability. BCHN indexing cannot require an Avalanche quorum or unrelated miner-fund, mining, or mempool-policy changes. |
 | API operations | Preserve broadcast validation/error semantics, raw reads, status/capability reporting and orderly shutdown. Keep data-plane retrieval separate from consensus decisions. |
 
-The existing focused BCHN NNG publisher in this monorepo is independently useful but supplies a new raw-event protocol, not the complete historical FlatBuffers RPC/undo/bootstrap service. It must not be presented as wire-compatible standalone Chronik support. Existing Lotus NNG already has a richer evolved schema and should retain its current clients and service semantics.
+The focused BCHN raw NNG publisher is rejected as a substitute for the requested compatible interface. Its runtime tests establish only its own invented protocol; do not promote it as a Chronik adapter or compatible NNG port. Existing Lotus NNG already has a richer evolved schema and should retain its current clients and service semantics.
 
 Doged's variable header representation and generalized first-transaction offset are useful shared-core precedents; its ABC-derived Chronik does not establish BCHN compatibility. Current Lotus TxId/header/script adaptations must become explicit chain representation support in a common core, rather than replacing eCash's behavior globally.
 
 ## Acceptance before declaring a port working
 
-First preserve imported source and its tests through a tree-verified extraction. Then validate the common backend contract against existing ABC behavior, retaining the direct backend for comparison. Each native host adapter needs its own build and isolated bootstrap, mempool graph, reorg, restart/loss recovery, raw/undo/header/TxId parity and token fixtures. Check NNG independently from embedded Chronik, ZeroMQ and policy candidates. Finally validate bounded public-chain synchronization/indexing separately from regtest and from any Avalanche claims.
+First preserve imported source and its tests through a tree-verified extraction. Then validate the extracted in-process component against existing ABC behavior before adapting other hosts. Each native host adapter needs its own build and isolated bootstrap, mempool graph, reorg, restart consistency, raw/undo/header/TxId parity and token fixtures. Check NNG independently from embedded Chronik, ZeroMQ and policy candidates. Finally validate bounded public-chain synchronization/indexing separately from regtest and from any Avalanche claims.
 
 No current-BCHN Chronik build, sync, indexing or runtime plugin validation was performed in this design audit. The concrete results are source/history/API inspection and the failed legacy clean-application check. No working node, production workspace, chain database, tag or release asset was changed.
