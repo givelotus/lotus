@@ -70,6 +70,14 @@ Intel macOS additionally needs a separately supplied, appropriately licensed
 Xcode SDK. No Apple SDK is included, uploaded, or implied by Linux validation.
 Native macOS release builds remain the current path.
 
+The initial tooling runs use source tree
+`e0d4f9c0219739b6774864858c582a8144a443d9`, which temporarily restored the
+upstream block assembler. That source has been superseded by work to repair and
+retain Lotus's custom assembler. These running jobs remain useful for Guix
+toolchain/build diagnosis, but cannot validate or publish the final custom
+assembler. Final binary comparisons must replay the corrected V1 series and
+record its new source provenance.
+
 Initial CI proved Ubuntu's packaged Guix installs and its daemon is reachable,
 and exposed the inherited depends parser failure and obsolete Savannah channel
 URL (HTTP 500 after all depends source hashes passed). Subsequent candidate runs
