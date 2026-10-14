@@ -33,3 +33,6 @@ export 'encoding/utils.dart';
 export 'exceptions.dart';
 export 'crypto/ecies.dart';
 export 'constants.dart';
+
+export 'block/lotus_block_header.dart';
+export 'transaction/lotus_txid.dart';

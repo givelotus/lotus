@@ -64,6 +64,12 @@ class BCHSignature {
   BCHSignature.fromDER(String derBuffer, {BCHPublicKey? publicKey}) {
     _publicKey = publicKey;
     _parseDER(derBuffer);
+    if (publicKey != null) {
+      _dsaSigner.init(
+        false,
+        PublicKeyParameter(ECPublicKey(publicKey.point, _domainParams)),
+      );
+    }
   }
 
   /// Construct a signature instance from a PrivateKey for signing purposes.
@@ -94,6 +100,9 @@ class BCHSignature {
   /// [signedMessage] - Message signed with the signature in [buffer]
   ///
   BCHSignature.fromCompact(List<int> buffer, List<int> signedMessage) {
+    if (buffer.length != 65) {
+      throw SignatureException('Compact signature must be 65 bytes');
+    }
     var compressed = true;
     var i = buffer.sublist(0, 1)[0] - 27 - 4;
     if (i < 0) {
@@ -118,8 +127,8 @@ class BCHSignature {
 
     _compressed = compressed;
     _i = i;
-    _r = asn1.ASN1Utils.decodeBigInt(b2);
-    _s = asn1.ASN1Utils.decodeBigInt(b3);
+    _r = _unsignedScalar(b2);
+    _s = _unsignedScalar(b3);
 
     _rHex = _r!.toRadixString(16);
     _sHex = _s!.toRadixString(16);
@@ -127,8 +136,10 @@ class BCHSignature {
     _signature = ECSignature(_r!, _s!);
 
     _publicKey = _recoverPublicKey(i, signedMessage);
-    _dsaSigner.init(false,
-        PublicKeyParameter(ECPublicKey(_publicKey!.point, _domainParams)));
+    _dsaSigner.init(
+      false,
+      PublicKeyParameter(ECPublicKey(_publicKey!.point, _domainParams)),
+    );
   }
 
   /// Renders the signature in *compact* form.
@@ -146,8 +157,8 @@ class BCHSignature {
     }
 
     var b1 = [val];
-    var b2 = asn1.ASN1Utils.encodeBigInt(_r!);
-    var b3 = asn1.ASN1Utils.encodeBigInt(_s!);
+    var b2 = _compactScalar(_r!);
+    var b3 = _compactScalar(_s!);
     return b1 + b2 + b3;
   }
 
@@ -155,8 +166,8 @@ class BCHSignature {
   ///
   /// [message] - The message to verify as a hexadecimal string
   bool verify(String message) {
-// expecting a String here is confusing. Make it a List<int> so the caller
-// can be forced to do hex encoding via HEX.encode(utf8.encode())
+    // expecting a String here is confusing. Make it a List<int> so the caller
+    // can be forced to do hex encoding via HEX.encode(utf8.encode())
     if (_signature == null) {
       throw SignatureException('Signature is not initialized');
     }
@@ -176,19 +187,25 @@ class BCHSignature {
   String sign(String message, {bool forCompact = false}) {
     if (_privateKey == null) {
       throw SignatureException(
-          'Missing private key. Initialise this signature instance using fromPrivateKey()');
+        'Missing private key. Initialise this signature instance using fromPrivateKey()',
+      );
     }
 
     // sign it
     List<int> decodedMessage = Uint8List.fromList(HEX.decode(message).toList());
 
-    _signature = _dsaSigner.generateSignature(decodedMessage as Uint8List) as ECSignature?;
+    _signature =
+        _dsaSigner.generateSignature(decodedMessage as Uint8List)
+            as ECSignature?;
     _r = _signature!.r;
     _s = _signature!.s;
     _rHex = _r!.toRadixString(16);
     _sHex = _s!.toRadixString(16);
 
     _toLowS();
+    _signature = ECSignature(_r!, _s!);
+    _rHex = _r!.toRadixString(16);
+    _sHex = _s!.toRadixString(16);
 
     // calculate _i_
     if (forCompact) {
@@ -382,7 +399,7 @@ class BCHSignature {
       throw SignatureException('i must be equal to 0, 1, 2, or 3');
     }
 
-    var e = asn1.ASN1Utils.decodeBigInt(hashBuffer);
+    var e = _unsignedScalar(hashBuffer);
     var r = this.r!;
     var s = this.s;
 
@@ -416,8 +433,11 @@ class BCHSignature {
     // var Q = R.multiplyTwo(s, G, eNeg).mul(rInv);
     var Q = (((R * s)! + G * eNeg)! * rInv)!;
 
-    return BCHPublicKey.fromXY(Q.x!.toBigInteger()!, Q.y!.toBigInteger()!,
-        compressed: _compressed);
+    return BCHPublicKey.fromXY(
+      Q.x!.toBigInteger()!,
+      Q.y!.toBigInteger()!,
+      compressed: _compressed,
+    );
   }
 
   void _toLowS() {
@@ -428,15 +448,19 @@ class BCHSignature {
     // see BIP 62, 'low S values in signatures'
     if (_s! >
         BigInt.parse(
-            '7FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF5D576E7357A4501DDFE92F46681B20A0',
-            radix: 16)) {
+          '7FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF5D576E7357A4501DDFE92F46681B20A0',
+          radix: 16,
+        )) {
       _s = _domainParams.n - _s!;
     }
   }
 
   void _parseDER(derBuffer) {
     try {
-      var parser = ASN1Parser(HEX.decode(derBuffer) as Uint8List?);
+      if (!isTxDER('${derBuffer}01')) {
+        throw SignatureException('Non-canonical DER signature');
+      }
+      var parser = asn1.ASN1Parser(Uint8List.fromList(HEX.decode(derBuffer)));
 
       var seq = parser.nextObject() as asn1.ASN1Sequence;
 
@@ -455,6 +479,21 @@ class BCHSignature {
     }
   }
 
+  static BigInt _unsignedScalar(List<int> bytes) => bytes.fold(
+    BigInt.zero,
+    (value, byte) => (value << 8) | BigInt.from(byte),
+  );
+
+  static List<int> _compactScalar(BigInt value) {
+    if (value <= BigInt.zero || value.bitLength > 256) {
+      throw SignatureException('Invalid compact scalar');
+    }
+    return List<int>.generate(
+      32,
+      (i) => ((value >> (8 * (31 - i))) & BigInt.from(255)).toInt(),
+    );
+  }
+
   /// Returns the signature's *S* value
   BigInt? get s => _s;
 
@@ -464,7 +503,7 @@ class BCHSignature {
   /// Returns the public key that will be used to verify signatures
   BCHPublicKey? get publicKey => _publicKey;
 
-//    int get i => _i;
+  //    int get i => _i;
 
   /// Returns the [SighashType] value that was detected with [fromTxFormat()] constructor
   int get nhashtype => _nhashtype;

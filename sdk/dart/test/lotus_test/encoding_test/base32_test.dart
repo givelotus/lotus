@@ -1,5 +1,4 @@
 import 'package:test/test.dart';
-import 'package:dartz/dartz.dart';
 
 import 'package:lotus_dart/encoding/base32.dart';
 
@@ -7,7 +6,7 @@ void main() {
   test('can encode to base32', () async {
     final base32encoded = 'qpzry9x8gf2tvdw0s3jn54khce6mua7l';
 
-    var address = toBase32(iota(32).toList());
+    var address = toBase32(List<int>.generate(32, (i) => i));
     expect(address, base32encoded);
   });
 
@@ -16,11 +15,11 @@ void main() {
 
     var address = fromBase32(base32encoded);
 
-    expect(address, iota(32).toList());
+    expect(address, List<int>.generate(32, (i) => i));
   });
 
   test('can encode and decode', () async {
-    var runes = List<int>.from(iota(32).toList());
+    var runes = List<int>.from(List<int>.generate(32, (i) => i));
     runes.shuffle();
 
     var encoded = toBase32(runes);

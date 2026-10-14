@@ -1,3 +1,4 @@
+import 'lotus_txid.dart';
 import 'dart:collection';
 import 'dart:typed_data';
 
@@ -200,14 +201,14 @@ class Transaction {
 
   // The id is the hex encoded form of the hash
   String? _getId() {
-    var id = HEX.encode(_getHash().reversed.toList());
+    var id = lotusTxId(HEX.decode(serialize(performChecks: false)));
     _txId = id;
     return _txId;
   }
 
   /// Returns the transaction ID.
   ///
-  /// The transaction ID is the double-sha256 of the raw (hexadecimal) transaction.
+  /// The Lotus transaction ID merkleizes inputs and outputs, excluding unlocking scripts.
   String? get id => _getId();
 
   // transaction Hash

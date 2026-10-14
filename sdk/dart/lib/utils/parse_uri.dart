@@ -10,9 +10,15 @@ class ParseURIResult {
 ParseURIResult parseSendURI(String uri) {
   final parseObject = Uri.parse(uri);
   final unparsedAmount = parseObject.queryParameters['amount'];
-  final amount = unparsedAmount == null
-      ? BigInt.zero
-      : BigInt.tryParse(unparsedAmount) ?? BigInt.zero;
+  final amount =
+      unparsedAmount == null
+          ? BigInt.zero
+          : BigInt.tryParse(unparsedAmount) ??
+              (throw FormatException('Invalid payment amount'));
+
+  if (amount < BigInt.zero) {
+    throw FormatException('Payment amount cannot be negative');
+  }
 
   var address = parseObject.path;
 

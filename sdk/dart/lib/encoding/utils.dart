@@ -91,11 +91,6 @@ Uint8List varIntWriter(int length) {
       );
     }
 
-    /// In Dart 1 the value `0xFFFFFFFFFFFFFFFF` was too large, so it became
-    /// a [BigInt] and the comparison was ok, but in Dart 2 the same hex value
-    /// evaluate to a negative int (`-1`), so it iss necessary to use the
-    /// largest positive [int] value in Dart: `0x7fffffffffffffff`
-    /// (only with 64 bits, in Dart Web this won't work).
     if (length < 0xFD) {
       writer.writeUint8(length);
     } else if (length < 0x10000) {
@@ -104,7 +99,7 @@ Uint8List varIntWriter(int length) {
     } else if (length < 0x100000000) {
       writer.writeUint8(254);
       writer.writeUint32(length, Endian.little);
-    } else if (length <= 0x7FFFFFFFFFFFFFFF) {
+    } else {
       writer.writeUint8(255);
       writer.writeInt64(length, Endian.little);
     }
@@ -124,14 +119,18 @@ int readVarIntNum(ByteDataReader reader) {
       return reader.readUint32(Endian.little);
       break;
     case 0xFF:
-      var bn = BigInt.from(reader.readUint64(Endian.little));
-      var n = bn.toInt();
-      if (n <= pow(2, 53)) {
-        return n;
-      } else {
-        throw Exception(
-            'number too large to retain precision - use readVarintBN');
+      final bytes = reader.read(8);
+      var value = BigInt.zero;
+      for (final byte in bytes.reversed) {
+        value = (value << 8) | BigInt.from(byte);
       }
+      // Keep the API exact on Dart VM and JavaScript alike.
+      if (value <= BigInt.parse('9007199254740992')) {
+        return value.toInt();
+      }
+      throw FormatException(
+        'CompactSize exceeds exact cross-platform int range',
+      );
       break;
     default:
       return first;
@@ -167,10 +166,7 @@ BigInt readVarInt(Uint8List buffer) {
 
 /// This function will return a [BigInt]. It has the same functionality
 /// as the [decodeUInt256] method, but with the added [endian] parameter.
-BigInt bytesToBigInt({
-  required List<int> bytes,
-  Endian endian = Endian.big,
-}) {
+BigInt bytesToBigInt({required List<int> bytes, Endian endian = Endian.big}) {
   /// The line
   /// `BigInt.from(bytes[bytes.length - i - 1]) << (8 * i);`
   /// from [decodeBigInt] is the same as
@@ -210,8 +206,11 @@ List<int> toScriptNumBuffer(BigInt value) {
   return toSM(value, endian: Endian.little);
 }
 
-BigInt fromScriptNumBuffer(Uint8List buf, bool fRequireMinimal,
-    {int nMaxNumSize = 4}) {
+BigInt fromScriptNumBuffer(
+  Uint8List buf,
+  bool fRequireMinimal, {
+  int nMaxNumSize = 4,
+}) {
   if (!(buf.length <= nMaxNumSize)) {
     throw ScriptException('script number overflow');
   }
