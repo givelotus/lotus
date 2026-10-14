@@ -1,4 +1,4 @@
-/** Bounded stack-identity rewrites over lowered P03 instructions. */
+/** Bounded symbolic stack rewrites over lowered P03 instructions. */
 import type { Span } from './compiler.js';
 import { sha256 } from '@noble/hashes/sha256';
 import { blake3 } from '@noble/hashes/blake3';
@@ -90,6 +90,160 @@ function verifiedLiteral(a: Instruction, b: Instruction | undefined, c: Instruct
   return y && sameBytes(x,y) ? 3 : undefined;
 }
 
+type Cell = { id: string; start: number; removable: boolean };
+type State = { stack: Cell[]; facts: Map<string, 0 | 1> };
+const unknown = (id: string): Cell => ({ id, start: -1, removable: false });
+const copyState = (state: State): State => ({ stack: state.stack.map(cell => ({ ...cell })), facts: new Map(state.facts) });
+const numericLiteral = (entry: Instruction): bigint | undefined => {
+  const bytes = literal(entry);
+  return bytes && entry.foldable ? asInt(bytes) : undefined;
+};
+function matchingEnd(entries: readonly Instruction[], start: number, open: string, close: string): number {
+  let depth = 0;
+  for (let i = start; i < entries.length; i++) {
+    if (entries[i]!.map.op === open || (close === 'ENDENUMERATE' &&
+        ['ENUMERATE_INPUTS','ENUMERATE_OUTPUTS'].includes(entries[i]!.map.op))) depth++;
+    else if (entries[i]!.map.op === close && --depth === 0) return i;
+  }
+  return -1;
+}
+function matchingElse(entries: readonly Instruction[], start: number, end: number): number {
+  let depth = 0;
+  for (let i = start + 1; i < end; i++) {
+    const op = entries[i]!.map.op;
+    if (op === 'IF') depth++;
+    else if (op === 'ENDIF') depth--;
+    else if (op === 'ELSE' && depth === 0) return i;
+  }
+  throw new Error('IF without ELSE in optimizer');
+}
+
+/** Recurse through branches and enumerations; only erase a producer when its
+ * entire suffix is a pure stack read. An opaque constructor push has no
+ * reusable identity, even when its bytes happen to match another push. */
+function symbolicRegion(entries: readonly Instruction[], state: State, budget: { left: number; next: number }): Instruction[] {
+  if (--budget.left < 0) throw new Error('symbolic optimizer budget exceeded');
+  const fresh = (kind: string): Cell => unknown(`${kind}:${budget.next++}`);
+  const out: Instruction[] = [];
+  for (let i = 0; i < entries.length; i++) {
+    const entry = entries[i]!, op = entry.map.op;
+    if (op === 'IF') {
+      const end = matchingEnd(entries, i, 'IF', 'ENDIF');
+      const middle = matchingElse(entries, i, end);
+      const condition = state.stack.pop() ?? fresh('underflow');
+      const thenState = copyState(state), elseState = copyState(state);
+      thenState.stack = thenState.stack.map(cell => unknown(cell.id));
+      elseState.stack = elseState.stack.map(cell => unknown(cell.id));
+      // IF itself validates a canonical Boolean before either arm executes.
+      thenState.facts.set(condition.id, 1); elseState.facts.set(condition.id, 0);
+      const thenEntries = symbolicRegion(entries.slice(i + 1, middle), thenState, budget);
+      const elseEntries = symbolicRegion(entries.slice(middle + 1, end), elseState, budget);
+      out.push(entry, ...thenEntries, entries[middle]!, ...elseEntries, entries[end]!);
+      if (thenState.stack.length !== elseState.stack.length) throw new Error('optimizer branch stack mismatch');
+      state.stack = thenState.stack.map((cell, n) =>
+        cell.id === elseState.stack[n]!.id ? unknown(cell.id) : fresh('merge'));
+      state.facts = new Map([...state.facts].filter(([id, fact]) =>
+        thenState.facts.get(id) === fact && elseState.facts.get(id) === fact));
+      i = end; continue;
+    }
+    if (op === 'ENUMERATE_INPUTS' || op === 'ENUMERATE_OUTPUTS') {
+      const end = matchingEnd(entries, i, op, 'ENDENUMERATE');
+      if (end < 0) { out.push(entry); state.stack = state.stack.map(() => fresh('control')); continue; }
+      const bodyState = copyState(state);
+      // A loop may replace locals before its next iteration. Arguments are
+      // immutable; every other incoming identity and fact is a fresh unknown.
+      bodyState.stack = bodyState.stack.map(cell => cell.id.startsWith('arg:') ? unknown(cell.id) : fresh('loopInput'));
+      bodyState.facts.clear();
+      bodyState.stack.push(fresh('iterator'));
+      const body = symbolicRegion(entries.slice(i + 1, end), bodyState, budget);
+      out.push(entry, ...body, entries[end]!);
+      state.stack = state.stack.map(cell => cell.id.startsWith('arg:') ? unknown(cell.id) : fresh('loopResult'));
+      state.facts.clear(); i = end; continue;
+    }
+    if (op === 'ELSE' || op === 'ENDIF' || op === 'ENDENUMERATE') throw new Error(`unexpected ${op} in optimizer`);
+    const top = state.stack.at(-1);
+    const canErase = (cell: Cell | undefined): cell is Cell =>
+      !!cell && cell.removable && cell.start >= 0 && cell.start < out.length;
+    const pureRead = (cell: Cell): boolean => out.slice(cell.start).every(x =>
+      ['ZERO','NEGATIVE_ONE','PICK','DUP'].includes(x.map.op) || x.map.op.startsWith('N('));
+    if (op === 'PICK') {
+      const depth = state.stack.pop();
+      const n = out.at(-1) ? numericLiteral(out.at(-1)!) : undefined;
+      const source = n !== undefined && n >= 0n && n < BigInt(state.stack.length)
+        ? state.stack[state.stack.length - 1 - Number(n)] : undefined;
+      const start = depth?.removable && depth.start === out.length - 1 ? depth.start : out.length;
+      state.stack.push(source ? { id: source.id, start, removable: !!depth?.removable && depth.start === out.length - 1 } : fresh('pick'));
+      out.push(entry); continue;
+    }
+    if (op === 'DUP') {
+      state.stack.push(top ? { id: top.id, start: out.length, removable: true } : fresh('dup'));
+      out.push(entry); continue;
+    }
+    if (op === 'VERIFY' && canErase(top) && pureRead(top) && state.facts.get(top.id) === 1) {
+      out.splice(top.start); state.stack.pop(); continue;
+    }
+    if ((op === 'EQUAL' || op === 'EQUALVERIFY') && state.stack.length >= 2) {
+      const right = state.stack.at(-1)!, left = state.stack.at(-2)!;
+      if (left.id === right.id && canErase(left) && canErase(right) &&
+          left.start < right.start && right.start < out.length &&
+          out.slice(left.start, right.start).every(x => ['ZERO','NEGATIVE_ONE','PICK','DUP'].includes(x.map.op) || x.map.op.startsWith('N(')) &&
+          out.slice(right.start).every(x => ['ZERO','NEGATIVE_ONE','PICK','DUP'].includes(x.map.op) || x.map.op.startsWith('N('))) {
+        const sources = [...out.splice(left.start), entry];
+        state.stack.splice(-2, 2);
+        if (op === 'EQUAL') {
+          const replacement = push(intBytes(1n), sources, true);
+          state.stack.push({ id: 'const:1', start: out.length, removable: true });
+          state.facts.set('const:1', 1);
+          out.push(replacement);
+        }
+        continue;
+      }
+    }
+    if (op === 'NOT' && canErase(top) && pureRead(top)) {
+      const fact = state.facts.get(top.id);
+      if (fact !== undefined) {
+        const sources = [...out.splice(top.start), entry];
+        state.stack.pop();
+        const value = 1 - fact as 0 | 1;
+        state.stack.push({ id: `const:${value}`, start: out.length, removable: true });
+        out.push(push(intBytes(BigInt(value)), sources, true)); continue;
+      }
+    }
+    if (literal(entry)) {
+      const n = numericLiteral(entry);
+      const id = entry.foldable && n !== undefined ? `const:${n}` : `literal:${budget.next++}`;
+      state.stack.push({ id, start: out.length, removable: !!entry.foldable });
+      if (n === 0n || n === 1n) state.facts.set(id, Number(n) as 0 | 1);
+    } else if (op === 'DROP') state.stack.pop();
+    else if (op === 'VERIFY') {
+      const verified = state.stack.pop();
+      if (verified) state.facts.set(verified.id, 1);
+    }
+    else if (op === 'SWAP') {
+      const a = state.stack.pop() ?? fresh('swap'), b = state.stack.pop() ?? fresh('swap');
+      state.stack.push(a,b);
+    } else if (op === 'ROLL') {
+      const depth = state.stack.pop();
+      const n = depth?.id.startsWith('const:') ? Number(depth.id.slice(6)) : -1;
+      if (Number.isSafeInteger(n) && n >= 0 && n < state.stack.length)
+        state.stack.push(state.stack.splice(state.stack.length - 1 - n, 1)[0]!);
+      else state.stack = state.stack.map(() => fresh('roll'));
+    } else {
+      const binary = ['EQUAL','NUMEQUAL','ADD','SUB','MUL','BOOLAND','BOOLOR','LESSTHAN',
+        'GREATERTHAN','GREATERTHANOREQUAL','CHECKSIG','OUTPUTREQUIRESBRANCH'];
+      const unary = ['NOT','NEGATE','SHA256','HASH256','BLAKE3','INPUTFLAGS','UTXOVALUE',
+        'UTXOTOKENID','OUTPUTVALUE','OUTPUTTOKENID'];
+      const sources = binary.includes(op) || ['EQUALVERIFY','CHECKSIGVERIFY'].includes(op) ? 2 : unary.includes(op) ? 1 : 0;
+      if (sources || entry.delta === 1) {
+        for (let j = 0; j < sources; j++) state.stack.pop();
+        if (!['CHECKSIGVERIFY','EQUALVERIFY'].includes(op)) state.stack.push(fresh('result'));
+      } else state.stack = state.stack.map(() => fresh('unknownOp'));
+    }
+    out.push(entry);
+  }
+  return out;
+}
+
 /**
  * Each rewrite strictly reduces opcode count, so the fuel bound is also an
  * assertion against an accidentally nonterminating future rule. ZERO/PICK is
@@ -134,7 +288,16 @@ export function optimizeInstructions(original: readonly Instruction[], argumentC
       } else next.push(a);
     }
     entries = next;
-    if (!changed) return entries;
+    if (!changed) {
+      // Keep the symbolic pass bounded even for deeply nested source programs.
+      const budget = { left: Math.min(16384, entries.length * 2 + 1), next: 0 };
+      const symbolic = symbolicRegion(entries, {
+        stack: Array.from({ length: argumentCount }, (_, n) => unknown(`arg:${n}`)),
+        facts: new Map(),
+      }, budget);
+      if (symbolic.length === entries.length) return entries;
+      entries = symbolic;
+    }
   }
   throw new Error('optimizer fuel exhausted');
 }

@@ -5,6 +5,7 @@ import { join } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { compileContract } from '../dist/generic.js';
+import { optimizeInstructions } from '../dist/optimizer.js';
 
 const reference = process.env.LOTUS_V2_REFERENCE_PATH ?? join(import.meta.dirname, '../../lotus-v2-reference');
 const available = existsSync(join(reference, 'lotus_v2_reference/vm.py'));
@@ -16,8 +17,12 @@ test('optimized and unoptimized scripts agree in independent P03 VM', { skip: !a
   const sources = [
     ['single', 'contract C { function m(x: Bool) { require(x == true); } }'],
     ['reused', 'contract C { function m(x: Bool) { require(x == true); require(x == true); } }'],
+    ['verified fact', 'contract C { function m(x: Bool) { require(x); require(x); } }'],
     ['branch', 'contract C { function m(x: Bool) { if (x) { require(true); } else { require(false); } } }'],
     ['overflow', 'contract C { function m(x: Int) { require(x + 1 > 0); } }'],
+    ['identity', 'contract C { function m(x: Bytes32) { require(x == x); } }'],
+    ['branch facts', 'contract C { function m(flag: Bool, x: Bytes32) { if (flag) { require(flag); require(x == x); } else { require(!flag); require(x == x); } } }'],
+    ['loop', 'contract C { function m(x: Bytes32) { for i in tx.inputs { require(x == x); } } }'],
   ];
   const bools = ['00'.repeat(16), '01' + '00'.repeat(15), '02' + '00'.repeat(15)];
   const maxInt = 'ff'.repeat(15) + '7f';
@@ -26,11 +31,19 @@ test('optimized and unoptimized scripts agree in independent P03 VM', { skip: !a
     const options = { contract: 'C', bindings: {} };
     const before = compileContract(source, { ...options, optimize: false }).methods[0].scriptHex;
     const after = compileContract(source, options).methods[0].scriptHex;
-    for (const arg of name === 'overflow' ? ['00'.repeat(16), '01' + '00'.repeat(15), maxInt] : bools) {
+    if (name === 'identity') assert.ok(after.length < before.length, 'symbolic identity must reduce script bytes');
+    if (name === 'branch facts') assert.ok(after.length < before.length, 'branch facts must reduce script bytes');
+    if (name === 'loop') assert.ok(after.length < before.length, 'loop body must be optimized recursively');
+    const inputs = name === 'overflow' ? ['00'.repeat(16), '01' + '00'.repeat(15), maxInt] :
+      name === 'identity' || name === 'loop' ? ['00'.repeat(32), 'ab'.repeat(32)] : bools;
+    for (const arg of inputs) {
+      const args = name === 'branch facts' ? [arg, 'ab'.repeat(32)] : [arg];
       const expected = name === 'overflow' ? (arg === maxInt ? 'error' : 'ok') :
-        name === 'branch' ? (arg === bools[1] ? 'ok' : 'error') :
+        name === 'branch facts' ? (arg === bools[2] ? 'error' : 'ok') :
+        name === 'identity' || name === 'loop' ? 'ok' :
         (arg === bools[1] ? 'ok' : 'error');
-      fixtures.push({ name: `${name}:${arg.slice(0, 4)}`, before, after, args: [arg], expected });
+      fixtures.push({ name: `${name}:${arg.slice(0, 4)}`, before, after, args, expected,
+        ...(name === 'loop' ? { input_count: 2 } : {}) });
     }
   }
   const constant = 'contract C { function m(x: Bool) { require((1 + 2) * (3 + 4) == 21); require(x); } }';
@@ -69,4 +82,15 @@ test('optimized and unoptimized scripts agree in independent P03 VM', { skip: !a
   });
   assert.equal(run.status, 0, run.stderr || run.stdout);
   assert.match(run.stdout, /differential passed/);
+});
+
+test('symbolic optimizer reaches an idempotent bounded fixed point', () => {
+  const source = 'contract C { function m(flag: Bool, x: Bytes32) { if (flag) { require(flag); require(x == x); } else { require(!flag); require(x == x); } } }';
+  const method = compileContract(source, { contract: 'C', bindings: {} }).methods[0];
+  const bytes = Buffer.from(method.scriptHex, 'hex');
+  const delta = new Map([['PICK', 0], ['IF', -1], ['ELSE', 0], ['ENDIF', 0], ['DROP', -1]]);
+  const entries = method.sourceMap.map(map => ({ wire: bytes.subarray(map.byteStart, map.byteEnd), map,
+    delta: delta.get(map.op) ?? 1, foldable: map.op.startsWith('N(') || map.op === 'ZERO' }));
+  const again = optimizeInstructions(entries, 2);
+  assert.deepEqual(again.map(x => [...x.wire]), entries.map(x => [...x.wire]));
 });

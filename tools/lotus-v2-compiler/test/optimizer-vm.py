@@ -9,12 +9,13 @@ profile = VMProfile(8192, 8, 8192, 128, 16, 16384, 32, 1_000_000, 1,
                     {op: 1 for op in ASSIGNED})
 
 
-def result(script_hex, args, signing=False):
+def result(script_hex, args, signing=False, input_count=None):
     try:
         script = bytes.fromhex(script_hex)
         context = SigningContext(branch_leaf_hash(script), {0: bytes(32)}, 'spend', 0, 1) if signing else None
         value = evaluate(script, tuple(bytes.fromhex(arg) for arg in args), profile,
-                         input_count=1 if signing else 0, output_count=1 if signing else 0,
+                         input_count=input_count if input_count is not None else (1 if signing else 0),
+                         output_count=1 if signing else 0,
                          signing=context)
         return ("ok", [item.hex() for item in value.stack or ()], value.success, value.charged_cost)
     except UnsupportedFeature:
@@ -24,8 +25,8 @@ def result(script_hex, args, signing=False):
 
 
 for case in json.load(sys.stdin):
-    before = result(case["before"], case["args"], case.get("signing", False))
-    after = result(case["after"], case["args"], case.get("signing", False))
+    before = result(case["before"], case["args"], case.get("signing", False), case.get("input_count"))
+    after = result(case["after"], case["args"], case.get("signing", False), case.get("input_count"))
     if before[0] != case["expected"] or after[0] != case["expected"]:
         raise AssertionError(f'{case["name"]}: expected {case["expected"]}, got {before}, {after}')
     if before[:2] != after[:2] or (before[0] == "ok" and before[2] != after[2]):
