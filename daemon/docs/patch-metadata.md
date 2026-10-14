@@ -29,7 +29,7 @@ Verify every intermediate source tree without modifying the workspace:
 python3 daemon/scripts/patch-series.py /path/to/isolated/abc \
   daemon/patches/v1/series --base 8c67fe1e85a602204a2ce65aa3b643469c2c3a1d \
   --check --provenance daemon/patches/v1/metadata-provenance.json \
-  --expect-tree a8d838de8fb5887170d6f32e86fed19f8e82c124
+  --expect-tree e0d4f9c0219739b6774864858c582a8144a443d9
 ```
 
 Provenance permits appended release patches while checking all 153 recorded
@@ -66,3 +66,28 @@ Run isolated tooling checks with:
 ```sh
 python3 -m unittest discover -s daemon/scripts/tests -v
 ```
+
+## Subsequent block-assembly source repair
+
+The initial metadata migration left source tree
+`a8d838de8fb5887170d6f32e86fed19f8e82c124` unchanged. A later behavioral review
+found that the experimental block scheduler could include free descendants and
+mishandle strict block-size and fee-delta accounting. The separately committed
+repair `e21d07c27a2235667d1450a003e883b246ed5aa3` restores the retained upstream
+assembler and adds a boundary regression. It is deliberately folded into patch
+246, preserving the 153-entry mapping. Its existing author, date and subject stay
+intact; the body identifies the later source change and validation limits.
+
+Only the final two source trees change: patch 246 to
+`efc38f2ae92be9835f149bdc55ff1041ac53cc98`, and patch 247 to
+`e0d4f9c0219739b6774864858c582a8144a443d9`. Patch 247 remains a version-only change.
+The provenance file retains both prior trees and the repair commit. Replay checks
+all 153 trees and metadata digests against this new candidate, whose final tree
+exactly equals the independently tested repair commit.
+
+The repair built `lotusd`, `lotus-cli` and `test_lotus` with Chronik disabled;
+`miner_tests` and all 151 `check-bitcoin` targets passed. The same final tests
+before repair failed five assertions, including the strict-size case expecting
+three selected transactions but receiving two. These results validate the C++
+repair, not a new Chronik build, live synchronization, or released binary. Those
+checks remain separate requirements before publication or deployment.
