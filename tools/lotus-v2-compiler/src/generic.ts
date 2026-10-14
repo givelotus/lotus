@@ -15,12 +15,12 @@ type Contract = { name: string; params: Param[]; methods: Method[]; span: Span }
 type Program = { helpers: Map<string, Helper>; contracts: Map<string, Contract> };
 type Binding = { type: ValueType; value: string | boolean };
 export type MethodArtifact = { name: string; args: { name: string; type: ValueType }[]; scriptHex: string; leaf: string; proof: string[]; root: string;
-  sourceMap: { source: Span; expandedFrom?: Span; byteStart: number; byteEnd: number; op: string }[];
+  sourceMap: { source: Span; expandedFrom?: Span; optimizedFrom?: { op: string; source: Span; expandedFrom?: Span }[]; byteStart: number; byteEnd: number; op: string }[];
   staticResources: { scriptBytes: number; opcodes: number; maxStackItems: number; helperExpansions: number; dynamicSignatureChecks: number } };
 export type ContractArtifact = { schema: 'lotus-v2/contract-artifact/2'; target: 'P01-P02-P03-candidate-2026-10-14'; contract: string;
   constructor: { name: string; type: ValueType }[]; bindings: { name: string; type: ValueType; value: string | boolean }[];
   methods: MethodArtifact[]; policy: { branches: [string]; paths: [[0]]; root: string; treeRecipe: 'sorted-leaves-largest-power-split-v1' } };
-export type CompileOptions = { contract: string; bindings: Record<string, Record<string, BoundValue>> };
+export type CompileOptions = { contract: string; bindings: Record<string, Record<string, BoundValue>>; optimize?: boolean };
 
 const MAX_SOURCE = 65536, MAX_SCRIPT = 8192, MAX_OPS = 4096, MAX_EXPANSIONS = 256, MAX_METHODS = 16;
 const MAX_INFERENCE_VISITS = 8192;
@@ -172,9 +172,10 @@ type Env = Map<string, EVar>;
 type Compiled = { script: Uint8Array; leaf: Uint8Array; map: MethodArtifact['sourceMap']; resources: MethodArtifact['staticResources'] };
 const OPCODES = { VERIFY: 0x65, IF: 0x61, ELSE: 0x63, ENDIF: 0x64, DROP: 0x79, PICK: 0x7d,
   EQUAL: 0x91, NOT: 0x9c, ADD: 0x9e, SUB: 0x9f, MUL: 0xa0, BOOLAND: 0xa4, BOOLOR: 0xa5,
-  LESSTHAN: 0xa9, GREATERTHAN: 0xaa, SHA256: 0xb8, HASH256: 0xb9, BLAKE3: 0xba, CHECKSIG: 0xbb, NEGATE: 0x9a } as const;
+  LESSTHAN: 0xa9, GREATERTHAN: 0xaa, SHA256: 0xb8, HASH256: 0xb9, BLAKE3: 0xba, CHECKSIG: 0xbb, CHECKSIGVERIFY: 0xbc, NEGATE: 0x9a } as const;
+type Instruction = { wire: Uint8Array; map: MethodArtifact['sourceMap'][number]; delta: number };
 class Emitter {
-  private chunks: Uint8Array[] = [];
+  private instructions: Instruction[] = [];
   private length = 0;
   readonly map: MethodArtifact['sourceMap'] = [];
   height: number; maxHeight: number; opcodes = 0; signatureChecks = 0; expansions = 0;
@@ -183,7 +184,7 @@ class Emitter {
     if (this.length + data.length > MAX_SCRIPT) throw new Error('MAX_SCRIPT_BYTES exceeded');
     if (++this.opcodes > MAX_OPS) throw new Error('opcode budget exceeded');
     this.map.push({ source: span, ...(origin ? { expandedFrom: origin } : {}), byteStart: this.length, byteEnd: this.length + data.length, op });
-    this.chunks.push(data); this.length += data.length; this.height += delta;
+    this.instructions.push({ wire: data, map: this.map.at(-1)!, delta }); this.length += data.length; this.height += delta;
     if (this.height < 0) throw new Error('compiler stack underflow');
     this.maxHeight = Math.max(this.maxHeight, this.height);
   }
@@ -200,7 +201,45 @@ class Emitter {
   }
   op(name: keyof typeof OPCODES, span: Span, origin?: Span, delta = 0): void { this.append(Uint8Array.of(OPCODES[name]), name, span, origin, delta); if (name === 'CHECKSIG') this.signatureChecks++; }
   control(name: 'IF'|'ELSE'|'ENDIF', span: Span): void { this.op(name, span, undefined, name === 'IF' ? -1 : 0); }
-  done(): Uint8Array { return concat(...this.chunks); }
+  finish(optimize: boolean): { script: Uint8Array; map: MethodArtifact['sourceMap']; resources: Pick<MethodArtifact['staticResources'], 'scriptBytes'|'opcodes'|'maxStackItems'> } {
+    let entries = this.instructions;
+    if (optimize) {
+      // A lone argument copied at depth zero has exactly one use. Consume its
+      // original stack item, then omit the now-unnecessary final DROP. Control
+      // flow and repeated references retain the ordinary lowering.
+      const picks = entries.flatMap((entry, index) => entry.map.op === 'PICK' ? [index] : []);
+      const pick = picks[0];
+      if (this.args === 1 && picks.length === 1 && pick !== undefined && pick > 0 &&
+          entries[pick - 1]!.map.op === 'ZERO' &&
+          !entries.some(entry => ['IF','ELSE','ENDIF'].includes(entry.map.op)) &&
+          entries.at(-2)?.map.op === 'DROP' && entries.at(-1)?.map.op === 'N(1)') {
+        entries = entries.filter((_, index) => index !== pick - 1 && index !== pick && index !== this.instructions.length - 2);
+      }
+      const fused: Instruction[] = [];
+      for (let i = 0; i < entries.length; i++) {
+        const current = entries[i]!, next = entries[i + 1];
+        if (current.map.op === 'CHECKSIG' && next?.map.op === 'VERIFY') {
+          fused.push({ wire: Uint8Array.of(OPCODES.CHECKSIGVERIFY), delta: current.delta + next.delta,
+            map: { ...next.map, op: 'CHECKSIGVERIFY', optimizedFrom: [
+              { op: current.map.op, source: current.map.source, ...(current.map.expandedFrom ? { expandedFrom: current.map.expandedFrom } : {}) },
+              { op: next.map.op, source: next.map.source, ...(next.map.expandedFrom ? { expandedFrom: next.map.expandedFrom } : {}) }] } });
+          i++;
+        } else fused.push(current);
+      }
+      entries = fused;
+    }
+    const map: MethodArtifact['sourceMap'] = [];
+    let offset = 0, height = this.args, maxStackItems = height;
+    for (const entry of entries) {
+      map.push({ ...entry.map, byteStart: offset, byteEnd: offset + entry.wire.length });
+      offset += entry.wire.length; height += entry.delta;
+      if (height < 0) throw new Error('optimized compiler stack underflow');
+      maxStackItems = Math.max(maxStackItems, height);
+    }
+    if (height !== 1) throw new Error('optimized method final stack mismatch');
+    return { script: concat(...entries.map(entry => entry.wire)), map,
+      resources: { scriptBytes: offset, opcodes: entries.length, maxStackItems } };
+  }
   get bytes(): number { return this.length; }
 }
 
@@ -387,8 +426,9 @@ class Compiler {
       for (let i = 0; i < method.params.length; i++) emitter.op('DROP',method.span,undefined,-1);
       emitter.number(1n,method.span);
       if (emitter.height !== 1) throw new Error('compiled method final stack mismatch');
-      const script = emitter.done(); const compiled = { script, leaf: leafHash(script), map: emitter.map,
-        resources: { scriptBytes: emitter.bytes, opcodes: emitter.opcodes, maxStackItems: emitter.maxHeight,
+      const finished = emitter.finish(this.options.optimize !== false); const script = finished.script;
+      const compiled = { script, leaf: leafHash(script), map: finished.map,
+        resources: { ...finished.resources,
           helperExpansions: emitter.expansions, dynamicSignatureChecks: emitter.signatureChecks } };
       this.methodMemo.set(key,compiled); return compiled;
     } finally { this.methodActive.delete(key); }

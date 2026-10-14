@@ -20,6 +20,63 @@ contract Vault<owner: PublicKey, expected: Bytes32> {
 }`;
 function make(owner = key3) { return compileContract(vault, { contract: 'Vault', bindings: { Vault: { owner, expected: zero } } }); }
 
+// Test-only stack model for the Payment lowering; this is not a P03 VM.
+function runPayment(scriptHex, signatureValid) {
+  const script = unhex(scriptHex), stack = [new Uint8Array(64)];
+  for (let pc = 0; pc < script.length;) {
+    const op = script[pc++];
+    if (op === 0) stack.push(new Uint8Array());
+    else if (op === 0x20) { stack.push(script.slice(pc, pc + 32)); pc += 32; }
+    else if (op === 0x7d) { const depth = stack.pop()?.[0] ?? 0; stack.push(stack[stack.length - depth - 1]); }
+    else if (op === 0xbb || op === 0xbc) {
+      stack.pop(); stack.pop();
+      if (op === 0xbb) stack.push(Uint8Array.of(signatureValid ? 1 : 0));
+      else if (!signatureValid) throw new Error('CHECKSIGVERIFY');
+    } else if (op === 0x65) { if (stack.pop()?.[0] !== 1) throw new Error('VERIFY'); }
+    else if (op === 0x79) stack.pop();
+    else if (op === 0x4e) stack.push(Uint8Array.of(1));
+    else throw new Error(`unsupported test opcode ${op}`);
+  }
+  return stack.map(x => Buffer.from(x).toString('hex'));
+}
+
+test('optimized Payment consumes its sole argument and fuses CHECKSIGVERIFY', () => {
+  const source = 'contract Payment<owner: PublicKey> { function spend(sig: Signature) { require(checksig(sig, owner)); } }';
+  const opts = { contract: 'Payment', bindings: { Payment: { owner: key3 } } };
+  const plain = compileContract(source, { ...opts, optimize: false }).methods[0];
+  const optimized = compileContract(source, opts).methods[0];
+  assert.equal(plain.scriptHex, `007d20${key3}bb65794e`);
+  assert.equal(optimized.scriptHex, `20${key3}bc4e`);
+  assert.deepEqual(runPayment(plain.scriptHex, true), ['01']);
+  assert.deepEqual(runPayment(optimized.scriptHex, true), ['01']);
+  assert.throws(() => runPayment(plain.scriptHex, false), /VERIFY/);
+  assert.throws(() => runPayment(optimized.scriptHex, false), /CHECKSIGVERIFY/);
+  assert.equal(plain.staticResources.scriptBytes - optimized.staticResources.scriptBytes, 4);
+  assert.equal(plain.staticResources.opcodes - optimized.staticResources.opcodes, 4);
+  assert.equal(optimized.staticResources.maxStackItems, 2);
+  assert.deepEqual(optimized.sourceMap.map(x => x.op), ['PUSH_32', 'CHECKSIGVERIFY', 'N(1)']);
+  assert.deepEqual(optimized.sourceMap[1].optimizedFrom.map(x => x.op), ['CHECKSIG', 'VERIFY']);
+  assert.deepEqual(optimized.sourceMap.map(x => [x.byteStart, x.byteEnd]), [[0, 33], [33, 34], [34, 35]]);
+});
+
+test('argument reuse and control flow retain copies while safe checksig fusion applies', () => {
+  const source = `contract C<owner: PublicKey> {
+    function reused(sig: Signature) { require(checksig(sig, owner)); require(checksig(sig, owner)); }
+    function branched(sig: Signature) { if (checksig(sig, owner)) { require(true); } else { require(true); } }
+  }`;
+  const opts = { contract: 'C', bindings: { C: { owner: key3 } } };
+  const normal = compileContract(source, { ...opts, optimize: false });
+  const optimized = compileContract(source, opts);
+  for (const method of optimized.methods) {
+    const prior = normal.methods.find(x => x.name === method.name);
+    assert.equal((method.scriptHex.match(/007d/g) ?? []).length, (prior.scriptHex.match(/007d/g) ?? []).length);
+    assert.equal(method.scriptHex, prior.scriptHex.replaceAll('bb65', 'bc'));
+    assert.equal(method.staticResources.scriptBytes, method.scriptHex.length / 2);
+    assert.equal(method.sourceMap.at(-1).byteEnd, method.staticResources.scriptBytes);
+  }
+  assert.equal(optimized.methods.find(x => x.name === 'reused').sourceMap.filter(x => x.op === 'CHECKSIGVERIFY').length, 2);
+});
+
 test('bound templates change policy and build deterministic sorted method proofs', () => {
   const a = make(), b = make(key4);
   assert.equal(a.schema, 'lotus-v2/contract-artifact/2');
