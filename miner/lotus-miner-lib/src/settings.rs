@@ -42,9 +42,22 @@ gpu_index = 0
 kernel_size = 23
 "#;
 
+fn default_config() -> Result<Config, ConfigError> {
+    let mut s = Config::new();
+    s.set_default("rpc_url", DEFAULT_URL)?;
+    s.set_default("rpc_poll_interval", DEFAULT_RPC_POLL_INTERVAL)?;
+    s.set_default("rpc_user", DEFAULT_USER)?;
+    s.set_default("rpc_password", DEFAULT_PASSWORD)?;
+    s.set_default("kernel_size", DEFAULT_KERNEL_SIZE)?;
+    s.set_default("gpu_index", DEFAULT_GPU_INDEX)?;
+    s.set_default("protocol", "v1")?;
+    s.set_default("mine_to_address", "")?;
+    Ok(s)
+}
+
 impl ConfigSettings {
     pub fn load(expect_mine_to_address: bool) -> Result<Self, ConfigError> {
-        let mut s = Config::new();
+        let mut s = default_config()?;
 
         // Set defaults
         let yaml = load_yaml!("cli.yaml");
@@ -57,15 +70,6 @@ impl ConfigSettings {
             Some(some) => some,
             None => return Err(ConfigError::Message("no home directory".to_string())),
         };
-        s.set_default("rpc_url", DEFAULT_URL)?;
-        s.set_default("rpc_poll_interval", DEFAULT_RPC_POLL_INTERVAL)?;
-        s.set_default("rpc_user", DEFAULT_USER)?;
-        s.set_default("rpc_password", DEFAULT_PASSWORD)?;
-        s.set_default("kernel_size", DEFAULT_KERNEL_SIZE)?;
-        s.set_default("gpu_index", DEFAULT_GPU_INDEX)?;
-        s.set_default("protocol", "v1")?;
-        s.set_default("mine_to_address", "")?;
-
         // Load config from file
         let default_config = home_dir;
         let default_config_folder = default_config.join(FOLDER_DIR);
@@ -163,5 +167,24 @@ impl ConfigSettings {
         }
 
         s.try_into()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn protocol_defaults_to_v1() {
+        let settings: ConfigSettings = default_config().unwrap().try_into().unwrap();
+        assert_eq!(settings.protocol, Protocol::V1);
+    }
+
+    #[test]
+    fn invalid_protocol_is_rejected() {
+        let mut config = default_config().unwrap();
+        config.set("protocol", "v3").unwrap();
+        let result: Result<ConfigSettings, ConfigError> = config.try_into();
+        assert!(result.is_err());
     }
 }

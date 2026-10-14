@@ -9,6 +9,9 @@ use eyre::Result;
 pub use miner::Miner;
 pub use settings::{ConfigSettings, Protocol};
 
+pub const V2_UNAVAILABLE: &str =
+    "V2 mining is unavailable: the daemon V2 job API and GPU scheduler are not integrated";
+
 use std::{
     convert::TryInto,
     fmt::Display,
@@ -82,9 +85,7 @@ pub type ServerRef = Arc<Server>;
 impl Server {
     pub fn from_config(config: ConfigSettings, report_hashrate_interval: Duration) -> Result<Self> {
         if config.protocol == Protocol::V2 {
-            return Err(eyre::eyre!(
-                "V2 mining is unavailable: the daemon V2 job API and tagged-BLAKE3 OpenCL kernel are not integrated"
-            ));
+            return Err(eyre::eyre!(V2_UNAVAILABLE));
         }
         let mining_settings = MiningSettings {
             local_work_size: 256,

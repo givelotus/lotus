@@ -8,7 +8,9 @@ use eframe::{
     },
     epi,
 };
-use lotus_miner_lib::{settings, ConfigSettings, LogEntry, Miner, Protocol, Server, ServerRef};
+use lotus_miner_lib::{
+    settings, ConfigSettings, LogEntry, Miner, Protocol, Server, ServerRef, V2_UNAVAILABLE,
+};
 use serde::{Deserialize, Serialize};
 use tokio::runtime::Runtime;
 
@@ -27,7 +29,8 @@ pub struct UserSettings {
 
 pub struct MinerApp {
     user_settings: UserSettings,
-    server: ServerRef,
+    server: Option<ServerRef>,
+    startup_error: Option<String>,
     device_names: Vec<String>,
     rt: Runtime,
     logs: Vec<LogEntry>,
@@ -44,51 +47,81 @@ pub enum HashrateZoom {
 
 impl MinerApp {
     pub fn load() -> Self {
-        let user_settings = match ConfigSettings::load(false) {
-            Ok(config_settings) => UserSettings {
-                protocol: config_settings.protocol,
-                mine_to_address: config_settings.mine_to_address,
-                intensity: config_settings.kernel_size.try_into().unwrap(),
-                bitcoind_url: config_settings.rpc_url,
-                bitcoind_user: config_settings.rpc_user,
-                bitcoind_password: config_settings.rpc_password,
-                rpc_poll_interval: config_settings.rpc_poll_interval.try_into().unwrap(),
-                gpu_index: config_settings.gpu_index,
-            },
-            Err(err) => {
-                eprintln!("Failed to load config, falling back to defaults: {}", err);
-                UserSettings {
-                    protocol: Protocol::V1,
-                    mine_to_address: String::new(),
-                    intensity: settings::DEFAULT_KERNEL_SIZE.try_into().unwrap(),
-                    bitcoind_url: settings::DEFAULT_URL.to_string(),
-                    bitcoind_user: settings::DEFAULT_USER.to_string(),
-                    bitcoind_password: settings::DEFAULT_PASSWORD.to_string(),
-                    rpc_poll_interval: settings::DEFAULT_RPC_POLL_INTERVAL.try_into().unwrap(),
-                    gpu_index: settings::DEFAULT_GPU_INDEX,
-                }
+        let (user_settings, startup_error) = match ConfigSettings::load(false) {
+            Ok(config) => {
+                let error = protocol_error(config.protocol).map(str::to_string);
+                (UserSettings::from_config(config), error)
             }
-        };
-        let config = ConfigSettings {
-            protocol: user_settings.protocol,
-            rpc_url: user_settings.bitcoind_url.clone(),
-            rpc_user: user_settings.bitcoind_user.clone(),
-            rpc_password: user_settings.bitcoind_password.clone(),
-            rpc_poll_interval: user_settings.rpc_poll_interval.try_into().unwrap(),
-            mine_to_address: user_settings.mine_to_address.clone(),
-            kernel_size: user_settings.intensity.into(),
-            gpu_index: user_settings.gpu_index,
+            Err(err) => (
+                UserSettings::default_config(),
+                Some(format!("Invalid miner configuration: {}", err)),
+            ),
         };
         MinerApp {
             user_settings,
-            server: Arc::new(
-                Server::from_config(config, Duration::from_millis(300))
-                    .unwrap_or_else(|err| panic!("{}", err)),
-            ),
-            device_names: Miner::list_device_names(),
+            server: None,
+            startup_error,
+            device_names: Vec::new(),
             rt: tokio::runtime::Runtime::new().unwrap(),
             logs: Vec::new(),
             hashrate_zoom: HashrateZoom::T10m,
+        }
+    }
+
+    fn prepare_startup(&mut self) -> Result<(), String> {
+        if let Some(message) = protocol_error(self.user_settings.protocol) {
+            return Err(message.to_string());
+        }
+        let server =
+            Server::from_config(self.user_settings.as_config(), Duration::from_millis(300))
+                .map_err(|err| err.to_string())?;
+        self.server = Some(Arc::new(server));
+        self.device_names = Miner::list_device_names();
+        Ok(())
+    }
+}
+
+fn protocol_error(protocol: Protocol) -> Option<&'static str> {
+    (protocol == Protocol::V2).then_some(V2_UNAVAILABLE)
+}
+
+impl UserSettings {
+    fn from_config(config: ConfigSettings) -> Self {
+        Self {
+            protocol: config.protocol,
+            mine_to_address: config.mine_to_address,
+            intensity: config.kernel_size.try_into().unwrap(),
+            bitcoind_url: config.rpc_url,
+            bitcoind_user: config.rpc_user,
+            bitcoind_password: config.rpc_password,
+            rpc_poll_interval: config.rpc_poll_interval.try_into().unwrap(),
+            gpu_index: config.gpu_index,
+        }
+    }
+
+    fn default_config() -> Self {
+        Self {
+            protocol: Protocol::V1,
+            mine_to_address: String::new(),
+            intensity: settings::DEFAULT_KERNEL_SIZE.try_into().unwrap(),
+            bitcoind_url: settings::DEFAULT_URL.to_string(),
+            bitcoind_user: settings::DEFAULT_USER.to_string(),
+            bitcoind_password: settings::DEFAULT_PASSWORD.to_string(),
+            rpc_poll_interval: settings::DEFAULT_RPC_POLL_INTERVAL.try_into().unwrap(),
+            gpu_index: settings::DEFAULT_GPU_INDEX,
+        }
+    }
+
+    fn as_config(&self) -> ConfigSettings {
+        ConfigSettings {
+            protocol: self.protocol,
+            rpc_url: self.bitcoind_url.clone(),
+            rpc_user: self.bitcoind_user.clone(),
+            rpc_password: self.bitcoind_password.clone(),
+            rpc_poll_interval: self.rpc_poll_interval.try_into().unwrap(),
+            mine_to_address: self.mine_to_address.clone(),
+            kernel_size: self.intensity.into(),
+            gpu_index: self.gpu_index,
         }
     }
 }
@@ -116,11 +149,15 @@ impl epi::App for MinerApp {
             }
             None => println!("No storage"),
         }
-        if self.user_settings.protocol == Protocol::V2 {
-            panic!("V2 mining is unavailable: the daemon V2 job API and tagged-BLAKE3 OpenCL kernel are not integrated");
+        if self.startup_error.is_some() {
+            return;
         }
+        if let Err(message) = self.prepare_startup() {
+            self.startup_error = Some(message);
+            return;
+        }
+        let server = Arc::clone(self.server.as_ref().expect("server initialized"));
         std::thread::spawn({
-            let server = Arc::clone(&self.server);
             move || {
                 let rt = tokio::runtime::Runtime::new().unwrap();
                 rt.block_on(async move { server.run().await.unwrap() })
@@ -130,9 +167,16 @@ impl epi::App for MinerApp {
     }
 
     fn update(&mut self, ctx: &egui::CtxRef, _frame: &mut epi::Frame<'_>) {
+        if let Some(message) = &self.startup_error {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                ui.heading("Mining unavailable");
+                ui.colored_label(Color32::RED, message);
+            });
+            return;
+        }
+        let server = Arc::clone(self.server.as_ref().expect("server initialized in setup"));
         ctx.request_repaint();
-        self.logs
-            .append(&mut self.server.log().get_logs_and_clear());
+        self.logs.append(&mut server.log().get_logs_and_clear());
 
         egui::SidePanel::left("side_panel")
             .default_width(300.0)
@@ -207,7 +251,7 @@ impl epi::App for MinerApp {
                         ui.end_row();
                     });
 
-                let hashrate_text = match self.server.log().hashrates().last() {
+                let hashrate_text = match server.log().hashrates().last() {
                     Some(hashrate) => hashrate.to_string(),
                     None => "Hashrate: calculating...".to_string(),
                 };
@@ -233,7 +277,7 @@ impl epi::App for MinerApp {
                 let mut points: Vec<(chrono::Duration, f64)> = Vec::new();
                 let mut max_age = chrono::Duration::zero();
                 let mut max_hashrate = 0.0;
-                for hashrate in self.server.log().hashrates().iter() {
+                for hashrate in server.log().hashrates().iter() {
                     let age = now.signed_duration_since(hashrate.timestamp);
                     if age <= hashrate_duration {
                         points.push((age, hashrate.hashrate));
@@ -278,7 +322,7 @@ impl epi::App for MinerApp {
                     logs.push('\n');
                 }
                 if let Err(err) = ctx.set_contents(logs) {
-                    self.server
+                    server
                         .log()
                         .error(format!("Error setting clipboard: {}", err));
                 }
@@ -294,8 +338,10 @@ impl epi::App for MinerApp {
 
 impl MinerApp {
     fn _apply_settings(&mut self) {
-        let server = Arc::clone(&self.server);
-        self.server.log().info("Applying settings");
+        let Some(server) = self.server.as_ref().map(Arc::clone) else {
+            return;
+        };
+        server.log().info("Applying settings");
         let user_settings = self.user_settings.clone();
         self.rt.spawn(async move {
             let mut node_settings = server.node_settings().await;
@@ -311,5 +357,30 @@ impl MinerApp {
                 server.log().error(err);
             }
         });
+    }
+}
+
+#[cfg(test)]
+mod startup_tests {
+    use super::*;
+
+    #[test]
+    fn saved_v2_mode_rejects_before_gpu_or_rpc_setup() {
+        let mut app = MinerApp {
+            user_settings: UserSettings {
+                protocol: Protocol::V2,
+                ..UserSettings::default_config()
+            },
+            server: None,
+            startup_error: None,
+            device_names: Vec::new(),
+            rt: Runtime::new().unwrap(),
+            logs: Vec::new(),
+            hashrate_zoom: HashrateZoom::T10m,
+        };
+        assert_eq!(app.prepare_startup().unwrap_err(), V2_UNAVAILABLE);
+        assert!(app.server.is_none());
+        assert!(app.device_names.is_empty());
+        assert!(protocol_error(Protocol::V1).is_none());
     }
 }
