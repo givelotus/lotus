@@ -2,9 +2,11 @@
 
 Historical evidence: this report's 01 failure results refer to the superseded static-package payload (raw SHA256 `556182643ff288998a6fc1c97238a73f40268de0d5fec5f2fba2dc0c8bf1dedf`). Current eCash 01 retains a corrected custom snapshot/ready-heap assembler; see [new source and native evidence](ecash01-corrected-snapshot-assembler.md). Other candidate results below retain their recorded revision scope.
 
-The eCash directory is **not a passing patch series**. Its default manifest remains base-only. Candidate 01 has native mining-test failures, 02 fails test compilation, 03 is a no-op explanation, and 10/11 are unimplemented placeholders. Candidate 04 is a separate finalized-ancestor optimization; its results do not approve the other candidates.
+The initial `f473cb58` audit found native mining-test failures in then-current 01 and a compile failure in 02. Those two payloads are now corrected; the current 01/02/04 combination passes the separately recorded checks. Default selection remains explicit, while 03 is a no-op explanation and 10/11 are unimplemented placeholders. The results below retain their exact historical source scope.
 
 This independent verification starts from monorepo `f473cb58` in `/tmp/lotus-wt-ecash-verification`, branch `audit/ecash-independent-20261014`. It checks every payload and selected combinations using temporary Git indexes. Builds use a disposable standalone ABC clone at `/tmp/lotus-ecash04-verification`. No production node, workspace, chain data, tag, release asset, or maintained patch payload was changed.
+
+Current 02 is also corrected and independently tested; its old compile failure and append-order conflict below are historical evidence for raw payload SHA256 `cf0b36ba046f6305ae7176bd800854088f328dac0901c4c23996e5150f510432`. See [current container and combination evidence](ecash02-container-and-combinations.md). Files 03/10/11 remain non-implementations.
 
 ## Exact source revisions and application
 

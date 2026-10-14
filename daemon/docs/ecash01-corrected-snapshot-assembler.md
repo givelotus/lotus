@@ -69,7 +69,7 @@ ninja -C build -j6 bitcoind bitcoin-cli test_bitcoin check-bitcoin
 build/src/test/test_bitcoin --run_test=miner_tests --color_output=no --report_level=short
 ```
 
-Use current `BUILD_QT`/`BUILD_ZMQ` flag names on current ABC. This patch remains explicitly selectable as `block-construction`; enabling Chronik does not select it. Candidate 02's unchecked test compile defect and comment-only 03/10/11 remain separate issues. Candidate 04 retains its independent finalization evidence and dependencies.
+Use current `BUILD_QT`/`BUILD_ZMQ` flag names on current ABC. This patch remains explicitly selectable as `block-construction`; enabling Chronik does not select it. Candidate 02's former compile defect is now corrected in its independent test-only patch; see [current combination evidence](ecash02-container-and-combinations.md). Comment-only 03/10/11 remain excluded. Candidate 04 retains its independent finalization evidence and dependencies.
 
 Native logs: `/tmp/lotus-ecash01-final-regressions-old-{build,miner}.log`, `/tmp/lotus-ecash01-corrected-{dag-build,dag-miner,final-checks,current-build-checks,current-miner,operations}.log`. Machine-readable hashes, trees and results are in [evidence](evidence/ecash01-corrected-snapshot-2026-10-14.json).
 

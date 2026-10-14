@@ -156,3 +156,7 @@ update its evidence only alongside an independently reviewed source change.
 ### Later intentional eCash 01 source correction
 
 The four raw-to-mail tree comparisons above are historical evidence for the metadata-only conversion. The later eCash 01 correction changes source deliberately: it retains the custom snapshot assembler, fixes dependency/fee/resource scheduling with a ready heap, and adds native regressions in one mailbox diff. It is not an upstream restoration. `reference-metadata-provenance.json` retains 01's prior payload/tree/metadata under `history` and records the replacement independently; the other three reference payloads remain unchanged. See [the corrected assembler evidence](ecash01-corrected-snapshot-assembler.md).
+
+### Later intentional eCash 02 test correction
+
+The 02 raw-to-mail comparison above remains historical evidence for the original metadata-only conversion. Its corrected replacement changes only `src/test/mempool_tests.cpp`: use the supported sigcheck helper, verify unchecked-container graph traversal/removal, and avoid 04's test-append context. Prior payload/tree/metadata stays in `reference-metadata-provenance.json` history; current 02 has independent native results and exact replay metadata. It adds no production policy change. See [container and combination evidence](ecash02-container-and-combinations.md).
