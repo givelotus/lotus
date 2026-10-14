@@ -14,7 +14,10 @@ The underlying Guix time-machine revision is
 The obsolete Savannah URL returned HTTP 500 in the actual CI attempt; the
 revision pin and Guix authentication remain unchanged. Its manifest supplies GCC 14,
 Clang 18, Python 3.11 and Linux cross-toolchains. Existing hash-checked depends
-recipes supply Python 3.12.7, NNG 1.5.2 and Flatbuffers 2.0.0.
+recipes supply NNG 1.5.2 and Flatbuffers 2.0.0. Chronik plugins remain OFF,
+matching native defaults; the manifest's Python 3.11 supplies build scripts. The
+existing CPython 3.12.7 recipe remains available for optional plugin work but is
+not built or linked by this configuration.
 
 The separate mailbox patch in `daemon/candidates/guix` repairs an inherited
 missing `endif` in `depends/Makefile`, explicitly passes the depends toolchain
