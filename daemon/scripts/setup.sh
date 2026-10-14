@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # setup.sh — Create or reset a daemon build workspace.
 #
-# SERIES=v2 (default): clone bitcoin-abc at 252182e9, apply V2 patch series
+# SERIES=v2 (default): clone the dedicated V2 base, apply V2 patch series
 # SERIES=v1:           clone bitcoin-abc at 252182e9, apply V1 patch series (153 patches)
 # SERIES=doged:        clone doged-io/doged directly at doged-version tag/branch
 # SERIES=bchn:         clone bitcoin-cash-node at pinned tag, apply patches 29-31
@@ -110,7 +110,7 @@ fi
 
 # ─── V2: bitcoin-abc base + Lotus patch series (new chain) ───────────────────
 WORKSPACE="$DAEMON_DIR/workspace-v2"
-VERSION_FILE="$DAEMON_DIR/bitcoin-abc-version"
+VERSION_FILE="$DAEMON_DIR/bitcoin-abc-v2-version"
 SERIES_FILE="$DAEMON_DIR/patches/v2/series"
 PATCHES_DIR="$DAEMON_DIR/patches/v2"
 REMOTE="${BITCOIN_ABC_REMOTE:-https://github.com/Bitcoin-ABC/bitcoin-abc.git}"

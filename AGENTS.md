@@ -52,7 +52,7 @@ Workspaces (`daemon/workspace-*`) are **gitignored** local clones created by `ma
 | SERIES | Base | Version file | Workspace | Purpose |
 |--------|------|-------------|-----------|---------|
 | `v1` | `bitcoin-abc` `252182e9` | `bitcoin-abc-version` | `workspace-v1/` | **Lotus V1 mainnet (`v11.6.0`)** — 153 patches (`000`–`247`) + in-process Chronik (`-DBUILD_CHRONIK=ON`) |
-| `v2` (default) | `bitcoin-abc` `252182e9` | `bitcoin-abc-version` | `workspace-v2/` | **Lotus V2 new chain** (see `docs/lotus-v2/`) |
+| `v2` (default) | `bitcoin-abc` `8c67fe1e85` | `bitcoin-abc-v2-version` | `workspace-v2/` | **Lotus V2 new chain** (see `docs/lotus-v2/`) |
 | `ecash` | `bitcoin-abc` `252182e9` | `bitcoin-abc-version` | `workspace-v2/` | Upstream PR candidates for eCash ($O(n \log n)$ mining, $O(1)$ mempool, NNG) |
 | `doged` | `doged-io/doged` | `doged-version` | `workspace-doged/` | Dogecoin ABC reference |
 | `bchn` | BCHN `v28.0.0` | `bchn-version` | `workspace-bchn/` | Bitcoin Cash Node upstream PR candidates |
@@ -108,3 +108,12 @@ Upstream Bitcoin ABC's in-process Chronik (`chronik/`) assumes standard 80-byte 
 - Always run `python3 docs/lotus-v2/tools/spec_candidate_checks.py` after modifying any file under `docs/lotus-v2/`.
 - **CoreTxId Witness Commitment**: `CoreTxId` (`txid`) commits to the structural witness fields (`WitnessStripped`, excluding runtime/signature `vMethodArgs`) to prevent code/branch substitution attacks while keeping `txid` non-malleable and supporting presigned transactions.
 - **Avalanche Stake Weighting (`issuance-and-time.md` & `rationale.md`)**: Both reward weight $R(x)$ and voting weight $V(x)$ must remain strictly linear ($f(x_1 + x_2) = f(x_1) + f(x_2)$) with a bounded Top-$K$ active proof table (`AVALANCHE_MAX_ACTIVE_PROOFS`). Pairing superlinear $R(x)$ with sublinear $V(x) = \sqrt{x}$ is vulnerable to stock-vs.-flow 51% quorum Sybil splits and penalizes solo multi-UTXO `avalanche::Proof` construction.
+
+
+## V2 implementation continuation (2026-10-14)
+
+- The V2 implementation workspace is `daemon/workspace-v2` on base `8c67fe1e85a602204a2ce65aa3b643469c2c3a1d`. Completed patches 000–004 are preserved and exported; the active `daemon/patches/v2/series` lists implemented patches only. The former manifest is preserved in `series-legacy-plan.txt` for the remaining porting plan. Historical patch files remain available.
+- Use the dedicated `daemon/bitcoin-abc-v2-version`; keep the shared V1/eCash pin unchanged. Never run setup/reset on an existing workspace as a verification step. Replay patches in a temporary Git index and compare its tree with the implementation HEAD.
+- Patch 005 follows the existing chain-identity topic: Lotus daemon/CLI targets and filenames, CMake package branding, client user agent, source links, and corresponding build/test dependencies. Keep the upstream 0.34.1 development version until a V2 release number is specified. Preserve upstream copyright attribution. GUI, wallet-tool and transaction-tool renaming remain separate future work. This development series still has upstream network/genesis parameters and must not be treated as a launch-ready V2 network.
+- Candidate smoke fixtures initially had stale hashes for `commitments-and-state.md` and `issuance-and-time.md`. The generator's semantic vectors and its own digest matched exactly. Regenerated only those two stored document hashes with the existing generator; the full spec candidate checker passes. Use an isolated venv with `docs/lotus-v2/tools/requirements.txt` if system Python lacks `blake3`.
+- Validation for 005: `cmake -S . -B build -GNinja -DBUILD_QT=OFF -DBUILD_ZMQ=OFF -DBUILD_CHRONIK=OFF`; `ninja -C build -j4 lotusd lotus-cli test_bitcoin`; existing `util_tests/test_FormatUserAgent`; existing `interface_rpc.py` on isolated regtest ports/datadir; daemon/CLI version and help output. All pass. Six-patch temporary-index replay matches workspace HEAD exactly. Chronik and complete C++ suite are not covered by this identity-only validation.
