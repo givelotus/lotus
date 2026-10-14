@@ -79,19 +79,25 @@ class NumpadView extends HookWidget {
                               ),
                             ),
                           ),
-                          if (numpadModel.error != null)
-                            Flexible(
-                              child: FittedBox(
-                                fit: BoxFit.scaleDown,
-                                child: Text(
-                                  numpadModel.error!,
-                                  key: const ValueKey('calculator-error'),
-                                  style: const TextStyle(
-                                    color: Colors.redAccent,
+                          // Reserve the same flex slot for validation in every
+                          // editing state so amount entry never jumps on errors.
+                          Expanded(
+                            child: Semantics(
+                              liveRegion: true,
+                              child: Center(
+                                child: FittedBox(
+                                  fit: BoxFit.scaleDown,
+                                  child: Text(
+                                    numpadModel.error ?? '',
+                                    key: const ValueKey('calculator-error'),
+                                    style: const TextStyle(
+                                      color: Colors.redAccent,
+                                    ),
                                   ),
                                 ),
                               ),
                             ),
+                          ),
                         ],
                       ),
                     );

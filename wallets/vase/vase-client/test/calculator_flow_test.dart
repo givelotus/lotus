@@ -254,6 +254,79 @@ void main() {
     },
   );
 
+  for (final size in [const Size(390, 640), const Size(390, 844)]) {
+    testWidgets('validation preserves calculator geometry at $size', (
+      tester,
+    ) async {
+      tester.view.physicalSize = size;
+      tester.view.devicePixelRatio = 1;
+      addTearDown(tester.view.resetPhysicalSize);
+      addTearDown(tester.view.resetDevicePixelRatio);
+      final semantics = tester.ensureSemantics();
+      try {
+        final draft = NumpadModel()..setExpression('20');
+        addTearDown(draft.dispose);
+        await tester.pumpWidget(
+          app(
+            ChangeNotifierProvider.value(
+              value: draft,
+              child: Scaffold(body: NumpadView(onAmountDone: (_) {})),
+            ),
+          ),
+        );
+        final result = find.byKey(const ValueKey('calculator-result'));
+        final expression = find.byKey(const ValueKey('calculator-expression'));
+        final digit = find.widgetWithText(KeyWidget, '2');
+        final done = find.widgetWithText(ElevatedButton, 'Done');
+        final baseline = [
+          result,
+          expression,
+          digit,
+          done,
+        ].map(tester.getCenter).toList();
+        for (final input in ['20+', '20/0', '20', '20/3', '20']) {
+          draft.setExpression(input);
+          await tester.pumpAndSettle();
+          final actual = [
+            result,
+            expression,
+            digit,
+            done,
+          ].map(tester.getCenter).toList();
+          for (var index = 0; index < baseline.length; index++) {
+            // Text width can change, but vertical geometry must remain fixed.
+            expect(
+              actual[index].dy,
+              closeTo(baseline[index].dy, 0.01),
+              reason: input,
+            );
+          }
+          final error = tester.widget<Text>(
+            find.byKey(const ValueKey('calculator-error')),
+          );
+          expect(error.data, draft.error ?? '');
+          expect(tester.takeException(), isNull);
+        }
+        draft.setExpression('20+');
+        await tester.pumpAndSettle();
+        expect(
+          find.bySemanticsLabel('Complete the expression'),
+          findsOneWidget,
+        );
+        expect(
+          tester.getSemantics(find.text('Complete the expression')),
+          matchesSemantics(
+            label: 'Complete the expression',
+            isLiveRegion: true,
+            textDirection: TextDirection.ltr,
+          ),
+        );
+      } finally {
+        semantics.dispose();
+      }
+    });
+  }
+
   testWidgets(
     'scan amount opens calculator in decimal units, then manual send clears prior payment',
     (tester) async {
