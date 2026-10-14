@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { compileContract, methodLeafHash, contractRootHash } from '../dist/generic.js';
 import { unhex } from '../dist/compiler.js';
 import { generateContractPython, generateContractTypeScript } from '../dist/bindings.js';
+import { optimizeInstructions } from '../dist/optimizer.js';
 import { readFileSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
 
@@ -69,11 +70,44 @@ test('argument reuse and control flow retain copies while safe checksig fusion a
   const optimized = compileContract(source, opts);
   for (const method of optimized.methods) {
     const prior = normal.methods.find(x => x.name === method.name);
-    assert.equal(method.scriptHex, prior.scriptHex.replaceAll('007d', '7a').replaceAll('bb65', 'bc'));
+    assert.equal(method.scriptHex, prior.scriptHex.replaceAll('007d', '7a').replaceAll('bb65', 'bc').replaceAll('4e65', ''));
     assert.equal(method.staticResources.scriptBytes, method.scriptHex.length / 2);
     assert.equal(method.sourceMap.at(-1).byteEnd, method.staticResources.scriptBytes);
   }
   assert.equal(optimized.methods.find(x => x.name === 'reused').sourceMap.filter(x => x.op === 'CHECKSIGVERIFY').length, 2);
+});
+
+test('loop and unknown opcodes block argument last-use removal', () => {
+  const span = { start: 0, end: 1 };
+  const entry = (op, byte, delta) => ({ wire: Uint8Array.of(byte), map: { op, source: span, byteStart: 0, byteEnd: 1 }, delta });
+  for (const [op, byte] of [['ENUMERATE_OUTPUTS', 0x68], ['ENUMERATE_INPUTS', 0x67], ['FUTURE_CONTROL', 0xf0]]) {
+    const source = [entry('ZERO',0,1), entry('PICK',0x7d,0), entry(op,byte,0),
+      entry('DROP',0x79,-1), entry('N(1)',0x4e,1)];
+    const optimized = optimizeInstructions(source,1);
+    assert(optimized.some(x => x.map.op === 'DROP'));
+    assert(optimized.some(x => x.map.op === op));
+  }
+});
+
+test('bounded symbolic pass folds literal arithmetic and hashes without erasing bindings or errors', () => {
+  const arithmetic = 'contract C { function m(x: Bool) { require((1 + 2) * (3 + 4) == 21); require(x); } }';
+  const options = { contract: 'C', bindings: {} };
+  const plain = compileContract(arithmetic, { ...options, optimize: false }).methods[0];
+  const fast = compileContract(arithmetic, options).methods[0];
+  assert(fast.staticResources.opcodes < plain.staticResources.opcodes);
+  assert.equal(fast.sourceMap.some(x => ['ADD','MUL','EQUALVERIFY'].includes(x.op)), false);
+  assert.equal(fast.sourceMap.at(-1).byteEnd, fast.staticResources.scriptBytes);
+
+  const boundHash = 'contract H<x: Bytes32, expected: Bytes32> { function m() { require(sha256(x) == expected); } }';
+  const a = compileContract(boundHash, { contract: 'H', bindings: { H: { x: '00'.repeat(32), expected: zero } } });
+  const b = compileContract(boundHash, { contract: 'H', bindings: { H: { x: '01'.repeat(32), expected: zero } } });
+  assert.notEqual(a.methods[0].scriptHex, b.methods[0].scriptHex);
+  assert.equal(a.methods[0].sourceMap.some(x => x.op === 'SHA256'), false);
+  assert(a.methods[0].scriptHex.includes(zero));
+
+  const max = (1n << 127n) - 1n;
+  const failing = `contract C { function m() { require(${max} + 1 > 0); } }`;
+  assert(compileContract(failing, { contract: 'C', bindings: {} }).methods[0].sourceMap.some(x => x.op === 'ADD'));
 });
 
 test('bound templates change policy and build deterministic sorted method proofs', () => {
@@ -114,7 +148,7 @@ test('UTF-8 source spans, strict template types and reserved names', () => {
 });
 
 test('fully bound cross-contract root and method leaf builtins are distinct', () => {
-  const source = `contract Target { function one() { require(1 == 1); } function two() { require(2 == 2); } }
+  const source = `contract Target { function one(x: Bool) { require(x); } function two(x: Bool) { require(!x); } }
 contract Verifier<root: ContractRootHash, leaf: MethodLeafHash> {
   function check() { require(contract_root(Target) == root); require(leaf_hash(Target.one) == leaf); }
 }`;
@@ -122,6 +156,8 @@ contract Verifier<root: ContractRootHash, leaf: MethodLeafHash> {
   const verifier = compileContract(source, { contract: 'Verifier', bindings: { Verifier: { root: target.policy.root, leaf: target.methods[0].leaf } } });
   assert(verifier.methods[0].scriptHex.includes(target.policy.root));
   assert(verifier.methods[0].scriptHex.includes(target.methods[0].leaf));
+  const mismatched = compileContract(source, { contract: 'Verifier', bindings: { Verifier: { root: zero, leaf: target.methods[0].leaf } } });
+  assert.notEqual(verifier.methods[0].scriptHex, mismatched.methods[0].scriptHex);
   assert.throws(() => compileContract(source, { contract: 'Verifier', bindings: { Verifier: { root: target.policy.root } } }), /constructor arity/);
 });
 
@@ -178,8 +214,9 @@ test('type inference visits are bounded before substitution fanout', () => {
 test('signed Int minimum parses as one literal and out-of-range values reject', () => {
   const min = -(1n << 127n);
   const source = `contract C { function m() { require(${min} == ${min}); } }`;
-  const a = compileContract(source, { contract: 'C', bindings: {} });
+  const a = compileContract(source, { contract: 'C', bindings: {}, optimize: false });
   assert(a.methods[0].scriptHex.includes('00'.repeat(15) + '80'));
+  assert(compileContract(source, { contract: 'C', bindings: {} }).methods[0].scriptHex.length < a.methods[0].scriptHex.length);
   const underflow = min - 1n;
   assert.throws(() => compileContract(`contract C { function m() { require(${underflow} == 0); } }`, { contract: 'C', bindings: {} }), /signed 128-bit range/);
   const overflow = 1n << 127n;

@@ -184,24 +184,24 @@ class Emitter {
   readonly map: MethodArtifact['sourceMap'] = [];
   height: number; maxHeight: number; opcodes = 0; signatureChecks = 0; expansions = 0;
   constructor(readonly args: number) { this.height = args; this.maxHeight = args; }
-  private append(data: Uint8Array, op: string, span: Span, origin?: Span, delta = 0): void {
+  private append(data: Uint8Array, op: string, span: Span, origin?: Span, delta = 0, foldable = false): void {
     if (this.length + data.length > MAX_SCRIPT) throw new Error('MAX_SCRIPT_BYTES exceeded');
     if (++this.opcodes > MAX_OPS) throw new Error('opcode budget exceeded');
     this.map.push({ source: span, ...(origin ? { expandedFrom: origin } : {}), byteStart: this.length, byteEnd: this.length + data.length, op });
-    this.instructions.push({ wire: data, map: this.map.at(-1)!, delta }); this.length += data.length; this.height += delta;
+    this.instructions.push({ wire: data, map: this.map.at(-1)!, delta, foldable }); this.length += data.length; this.height += delta;
     if (this.height < 0) throw new Error('compiler stack underflow');
     this.maxHeight = Math.max(this.maxHeight, this.height);
   }
-  push(data: Uint8Array, span: Span, origin?: Span): void {
+  push(data: Uint8Array, span: Span, origin?: Span, foldable = false): void {
     if (data.length > 8192) throw new Error('MAX_ELEMENT_BYTES exceeded');
     const wire = data.length > 0 && data.length <= 75 ? concat(Uint8Array.of(data.length), data) : concat(Uint8Array.of(0x4c), bytes(data));
-    this.append(wire, data.length <= 75 && data.length > 0 ? `PUSH_${data.length}` : 'PUSHDATA', span, origin, 1);
+    this.append(wire, data.length <= 75 && data.length > 0 ? `PUSH_${data.length}` : 'PUSHDATA', span, origin, 1, foldable);
   }
   number(n: bigint, span: Span, origin?: Span): void {
-    if (n === 0n) this.append(Uint8Array.of(0), 'ZERO', span, origin, 1);
-    else if (n === -1n) this.append(Uint8Array.of(0x4d), 'NEGATIVE_ONE', span, origin, 1);
-    else if (n >= 1n && n <= 16n) this.append(Uint8Array.of(0x4d + Number(n)), `N(${n})`, span, origin, 1);
-    else this.push(encodedInt(n), span, origin);
+    if (n === 0n) this.append(Uint8Array.of(0), 'ZERO', span, origin, 1, true);
+    else if (n === -1n) this.append(Uint8Array.of(0x4d), 'NEGATIVE_ONE', span, origin, 1, true);
+    else if (n >= 1n && n <= 16n) this.append(Uint8Array.of(0x4d + Number(n)), `N(${n})`, span, origin, 1, true);
+    else this.push(encodedInt(n), span, origin, true);
   }
   op(name: keyof typeof OPCODES, span: Span, origin?: Span, delta = 0): void { this.append(Uint8Array.of(OPCODES[name]), name, span, origin, delta); if (name === 'CHECKSIG') this.signatureChecks++; }
   control(name: 'IF'|'ELSE'|'ENDIF', span: Span): void { this.op(name, span, undefined, name === 'IF' ? -1 : 0); }
