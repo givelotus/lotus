@@ -26,7 +26,7 @@ mkdir -p "$CANDIDATE"
 CANDIDATE="$(cd "$CANDIDATE" && pwd)"
 git clone --no-hardlinks "$SOURCE" "$CANDIDATE/source"
 git -C "$CANDIDATE/source" checkout --detach "$SOURCE_COMMIT"
-git -C "$CANDIDATE/source" -c user.name='Lotus Guix candidate' -c user.email='builds@givelotus.org' am --committer-date-is-author-date --keep-non-patch "$DAEMON_DIR/candidates/guix/000-lotus-guix-linux.patch"
+python3 "$SCRIPT_DIR/patch-series.py" "$CANDIDATE/source" "$DAEMON_DIR/candidates/guix/series" --base "$SOURCE_COMMIT"
 cd "$CANDIDATE/source"
 printf 'source_commit=%s\nsource_tree=%s\nadapted_commit=%s\nadapted_tree=%s\nsource_date_epoch=%s\nchronik=%s\nnng=%s\n' \
     "$SOURCE_COMMIT" "$SOURCE_TREE" "$(git rev-parse HEAD)" "$(git rev-parse 'HEAD^{tree}')" "$SOURCE_EPOCH" "$LOTUS_CHRONIK" "$LOTUS_NNG" > "$CANDIDATE/inputs.txt"
@@ -37,3 +37,27 @@ export FORCE_VERSION
 export DISTNAME="lotus-${FORCE_VERSION}" OUTDIR_BASE="$CANDIDATE/output"
 ./contrib/guix/guix-build
 cp "$CANDIDATE/inputs.txt" "$CANDIDATE/output/inputs.txt"
+
+# Exercise the archive itself with a new, disconnected datadir on this builder.
+ARCHIVE="$CANDIDATE/output/x86_64-linux-gnu/lotus-${FORCE_VERSION}-x86_64-linux-gnu.tar.gz"
+mkdir "$CANDIDATE/extracted" "$CANDIDATE/smoke-data"
+tar -C "$CANDIDATE/extracted" -xzf "$ARCHIVE"
+BIN="$CANDIDATE/extracted/lotus-${FORCE_VERSION}/bin"
+"$BIN/lotusd" --version
+"$BIN/lotus-cli" --version
+ldd "$BIN/lotusd" | tee "$CANDIDATE/output/runtime-libraries.txt"
+if grep -q 'not found' "$CANDIDATE/output/runtime-libraries.txt"; then
+    echo 'Archive has unresolved runtime dependencies.' >&2
+    exit 1
+fi
+CLI=("$BIN/lotus-cli" "-datadir=$CANDIDATE/smoke-data" -rpcport=18432)
+cleanup() { "${CLI[@]}" stop >/dev/null 2>&1 || true; }
+trap cleanup EXIT
+"$BIN/lotusd" "-datadir=$CANDIDATE/smoke-data" -rpcport=18432 -listen=0 -connect=0 -dnsseed=0 -discover=0 -assumevalid=0 -chronik="$([[ "$LOTUS_CHRONIK" == ON ]] && echo 1 || echo 0)" -chronikbind=127.0.0.1:18431 -daemon
+"${CLI[@]}" -rpcwait -rpcwaittimeout=60 getblockchaininfo
+"${CLI[@]}" verifychain 4 0
+if [[ "$LOTUS_CHRONIK" == ON ]]; then
+    python3 "$SCRIPT_DIR/check-v1-chronik.py" --cli "$BIN/lotus-cli" --datadir "$CANDIDATE/smoke-data" --rpcport 18432 --chronik-url http://127.0.0.1:18431 --heights 0
+fi
+cleanup
+trap - EXIT
