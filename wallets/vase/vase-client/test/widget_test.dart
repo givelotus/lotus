@@ -90,6 +90,16 @@ void main() {
     await tester.pumpAndSettle();
   }
 
+  testWidgets('storage failure displays unavailable without hiding scanner', (
+    tester,
+  ) async {
+    wallet.balance = WalletBalance(error: StateError('fixture unavailable'));
+    await launch(tester);
+    expect(find.text('Wallet unavailable'), findsOneWidget);
+    expect(find.byKey(const ValueKey('scanner')), findsOneWidget);
+    expect(find.textContaining('fixture unavailable'), findsNothing);
+  });
+
   testWidgets('opens directly into scanner with original quick actions', (
     tester,
   ) async {

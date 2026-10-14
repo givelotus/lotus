@@ -52,7 +52,7 @@ class RequestPage extends HookWidget {
                   children: [
                     Container(
                       color: Colors.white,
-                      child: QrImage(
+                      child: QrImageView(
                         data: _createAddressUri(
                             address, hideAmount.value ? '0' : amount),
                         version: QrVersions.auto,

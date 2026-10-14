@@ -58,8 +58,28 @@ go vet ./...
 go build -o /tmp/vase-server .
 ```
 
-Use `.env.example` to configure a local `.env` before starting the server. Startup requires PostgreSQL; handler tests use injected persistence and do not exercise a database. Invalid user-information requests are rejected before persistence, and the three database writes are transactional.
+Use `.env.example` to configure a local `.env` before starting the server. Startup requires PostgreSQL with PostGIS. The server uses Go standard-library HTTP routing and pgx; its schema and registration API remain compatible with the previous GORM tables. Handler tests use injected persistence; isolated PostgreSQL/PostGIS tests cover fresh and existing schemas. See [server setup and compatibility checks](vase-server/README.md). Existing databases and services were not modified during validation.
 
 ## Licensing
 
 The main body of Vase is GPLv3. The Lotus library code is MIT licensed and derives from [dartsv](https://github.com/twostack/dartsv). Its notices are preserved in the source copy and canonical SDK.
+
+## Dependencies and existing-wallet upgrades
+
+Dependencies were refreshed against official stable package releases on 2026-10-14, using Flutter 3.47.4/Dart 3.13.3. The complete [before/after inventory](vase-client/dependency-audit-20261014.json) records direct and transitive versions. Notable current versions include router 18.1.0, scanner 7.4.2, Sentry 10.0.0, package-info 10.2.2, location 10.0.2, protobuf 6.1.0 and PointyCastle 4.0.0. Unused direct dependencies were removed. Generated JSON and platform plugin registrations were refreshed.
+
+| Retained version | Reason a newer version is not used |
+|---|---|
+| flutter_secure_storage 10.3.4 | Required transition for existing v6 Android cipher data; v11 removes those legacy algorithms before an unmigrated wallet can read them. |
+| test 1.31.1 | Installed Flutter pins test_api 0.7.12; later test releases require newer test_api. |
+| build_runner 2.16.1 | Later versions require analyzer 14 or build 5, incompatible with the Flutter test stack/current JSON generator. |
+
+Other remaining transitive updates are bounded by Flutter or upstream package constraints; the inventory lists them explicitly. No overrides force incompatible versions. The latest published slide_to_confirm remains 1.1.0; it still compiles and its confirmation UI is retained.
+
+Secure storage retains the original namespaces and keychain settings, enables backup migration and Windows legacy compatibility, and disables key deletion on storage errors. Failed reads leave the wallet unavailable instead of creating replacement keys. This upgrade must pass native tests with a known dummy wallet installed through the old signed application, upgraded without uninstalling, and checked for identical wallet identity after migration/restart. Android legacy cipher, Apple keychain and Windows legacy storage paths require separate checks. Mock tests cannot establish native migration correctness; downgrading the dependency does not reverse a completed storage-format migration. The [agent notes](AGENTS.md) describe the checks.
+
+The updated native plugins require Android API 26/compile SDK 36, iOS 15 and macOS 12. Android build configuration follows the installed Flutter template and retains application identity and signing. Native builds and existing-wallet migration are not locally validated because the required native SDKs/tooling are absent. Web builds and camera-free tests do not establish native compatibility.
+
+Validation after these dependency changes: 73 Flutter tests pass, full analyzer reports no errors with inherited notices visible, the JSON generator succeeds, and the production web build passes. The canonical SDK independently passes 42 tests plus JavaScript compilation and native OpenSSL signing interoperability checks. Go race tests, vet and builds pass, with PostgreSQL 18.6/PostGIS 3.6.3 compatibility tests using isolated fresh and original schemas. These checks do not access existing wallet storage or broadcast payments.
+
+The remaining transitive gaps are traceable: analyzer/_fe_analyzer_shared/source_gen/test_core/test_api/package_config follow the Flutter test stack; build/build_config follow generator constraints; cli_util and coverage follow flutter_launcher_icons' cli_util 0.4 constraint; qr_flutter retains qr 3; Sentry retains jni below 1.1, which also bounds jni_flutter; Flutter pins material_color_utilities; flutter_secure_storage_darwin follows the deliberate v10 bridge. The full resolver inventory retains exact current/latest versions. CupertinoIcons 2.0.0 remains because Flutter widgets reference its font; removing it produced a missing-font compiler warning.

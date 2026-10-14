@@ -44,9 +44,9 @@ class _HomePageState extends State<HomePage> {
       send.setAmount(payment.amount);
       _openPage('/send');
     } catch (_) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('Unable to parse QR code')),
-      );
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(const SnackBar(content: Text('Unable to parse QR code')));
     }
   }
 
@@ -54,6 +54,9 @@ class _HomePageState extends State<HomePage> {
   Widget build(BuildContext context) {
     final balance = context.select<WalletModel, BigInt?>(
       (wallet) => wallet.balance?.balance,
+    );
+    final walletError = context.select<WalletModel, Object?>(
+      (wallet) => wallet.balance?.error,
     );
     return Scaffold(
       body: Stack(
@@ -82,15 +85,19 @@ class _HomePageState extends State<HomePage> {
               children: [
                 Container(
                   margin: const EdgeInsets.all(16),
-                  padding:
-                      const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 16,
+                    vertical: 8,
+                  ),
                   decoration: BoxDecoration(
                     color: Colors.black54,
                     borderRadius: BorderRadius.circular(12),
                   ),
                   child: Text(
                     balance == null
-                        ? 'Loading balance…'
+                        ? (walletError == null
+                              ? 'Loading balance…'
+                              : 'Wallet unavailable')
                         : formatAmount(amount: balance),
                     style: const TextStyle(color: Colors.white, fontSize: 24),
                   ),

@@ -8,6 +8,7 @@ import 'package:vase/config/constants.dart';
 import 'package:lotus_dart/lotus.dart';
 import 'package:vase/wallet/keys.dart';
 import 'package:vase/wallet/wallet.dart';
+import 'package:vase/wallet/storage/secure_storage.dart';
 
 const SCHEMA_VERSION_KEY = 'schema_version';
 
@@ -19,8 +20,12 @@ const STORAGE_XPUB_KEY = 'rootKey';
 const storageBalanceKey = 'balance';
 
 /// Generate a fresh wallet.
-Future<Wallet> generateNewWallet(String? seed, ChronikClient chronik,
-    {NetworkType network = network, String? password = ''}) async {
+Future<Wallet> generateNewWallet(
+  String? seed,
+  ChronikClient chronik, {
+  NetworkType network = network,
+  String? password = '',
+}) async {
   final keys = await Keys.construct(seed, password);
 
   return Wallet(keys, network: network, chronik: chronik);
@@ -38,54 +43,69 @@ class WalletModel with ChangeNotifier {
   final FlutterSecureStorage _storage;
   final ChronikClient chronik;
 
-  // TODO: Storage should be injected
-  WalletModel(this.chronik)
-      : _storage = const FlutterSecureStorage(),
-        balance = WalletBalance() {
-    initializeModel();
+  final Future<Wallet> Function(String?, String?) _walletFactory;
+
+  WalletModel(
+    this.chronik, {
+    FlutterSecureStorage? storage,
+    Future<Wallet> Function(String?, String?)? walletFactory,
+    bool initialize = true,
+  }) : _storage = storage ?? walletSecureStorage,
+       _walletFactory =
+           walletFactory ??
+           ((seed, password) =>
+               generateNewWallet(seed, chronik, password: password)),
+       balance = WalletBalance() {
+    if (initialize) initializeModel();
   }
 
   Future<void> initializeModel() async {
-    final balance = await _storage.read(key: storageBalanceKey);
-    if (balance != null) {
-      this.balance = WalletBalance(balance: BigInt.tryParse(balance));
-      notifyListeners();
-    }
-    final readSucceed = await readFromDisk();
-    if (!readSucceed) {
-      try {
-        // try to recover from read errors. Maybe seed is still valid.
+    try {
+      final storedBalance = await _storage.read(key: storageBalanceKey);
+      if (storedBalance != null) {
+        balance = WalletBalance(balance: BigInt.tryParse(storedBalance));
+        notifyListeners();
+      }
+      final readSucceed = await readFromDisk();
+      if (!readSucceed) {
         _seed = await readSeedFromDisk();
-        // ignore: empty_catches
-      } catch (err) {}
-      if (_seed == null || _seed!.isEmpty) {
-        final mnemonicGenerator = Mnemonic();
-        final seed = mnemonicGenerator.generateMnemonic();
-        _seed = seed;
-      }
-      try {
-        // try to recover from read errors. Maybe seed is still valid.
         _password = await readPasswordFromDisk();
-        // ignore: empty_catches
-      } catch (err) {
-        // Don't care
+        if (_seed == null || _seed!.isEmpty) {
+          final hasStoredWallet =
+              await readSchemaVersion() != null ||
+              await _storage.read(key: STORAGE_XPUB_KEY) != null ||
+              _password != null ||
+              storedBalance != null;
+          if (hasStoredWallet) {
+            throw StateError('Stored wallet seed is unavailable');
+          }
+          _seed = Mnemonic().generateMnemonic();
+        }
+        _wallet = await _walletFactory(_seed, _password);
       }
-      if (_seed == null || _seed!.isEmpty) {
-        final mnemonicGenerator = Mnemonic();
-        final seed = mnemonicGenerator.generateMnemonic();
-        _seed = seed;
-      }
-      // Don't notify listeners. Initialize will do that
-      _wallet = await generateNewWallet(_seed, chronik, password: _password);
-    }
-    wallet!.balanceUpdateHandler = (balance) async {
-      this.balance = balance;
+      wallet!.balanceUpdateHandler = (balance) async {
+        this.balance = balance;
+        notifyListeners();
+        if (balance.balance != null) {
+          await _storage.write(
+            key: storageBalanceKey,
+            value: balance.balance.toString(),
+          );
+        }
+      };
+      wallet!.initialize();
+      initialized = true;
+    } catch (_) {
+      // A failed read is not proof of an empty wallet. Do not generate or write
+      // replacement keys, and do not expose native error text containing data.
+      _initialized = false;
+      balance = WalletBalance(
+        error: StateError(
+          'Unable to open stored wallet; existing keys were not replaced.',
+        ),
+      );
       notifyListeners();
-      await _storage.write(
-          key: storageBalanceKey, value: balance.balance.toString());
-    };
-    wallet!.initialize();
-    initialized = true;
+    }
   }
 
   void resetBalance() {
@@ -137,10 +157,13 @@ class WalletModel with ChangeNotifier {
 
   Future<void> writeSchemaVersion() {
     return _storage.write(
-        key: SCHEMA_VERSION_KEY, value: CURRENT_SCHEMA_VERSION);
+      key: SCHEMA_VERSION_KEY,
+      value: CURRENT_SCHEMA_VERSION,
+    );
   }
 
   Future<void> writeToDisk() async {
+    if (!initialized || wallet == null) return;
     // Persist schema version
     await writeSchemaVersion();
 
@@ -150,26 +173,14 @@ class WalletModel with ChangeNotifier {
   }
 
   Future<bool> readFromDisk() async {
-    try {
-      // Persist schema version
-      final schemaVersion = await readSchemaVersion();
-      if (schemaVersion != CURRENT_SCHEMA_VERSION) {
-        return false;
-      }
-
-      // Persist keys
-      final keys = await readKeysFromDisk();
-
-      wallet = Wallet(
-        keys,
-        network: network,
-        chronik: chronik,
-      );
-    } catch (err) {
-      print(err);
-      return false;
+    final schemaVersion = await readSchemaVersion();
+    if (schemaVersion != CURRENT_SCHEMA_VERSION) return false;
+    _seed = await readSeedFromDisk();
+    _password = await readPasswordFromDisk();
+    if (_seed == null || _seed!.isEmpty) {
+      throw StateError('Stored wallet seed is unavailable');
     }
-
+    _wallet = await _walletFactory(_seed, _password);
     return true;
   }
 
@@ -177,16 +188,10 @@ class WalletModel with ChangeNotifier {
     // Write private keys
     try {
       // Persist seed
-      await _storage.write(
-        key: STORAGE_SEED_KEY,
-        value: seed,
-      );
+      await _storage.write(key: STORAGE_SEED_KEY, value: seed);
 
       // Persist password
-      await _storage.write(
-        key: STORAGE_PASSWORD_KEY,
-        value: password,
-      );
+      await _storage.write(key: STORAGE_PASSWORD_KEY, value: password);
 
       // Persist XPub
       await _storage.write(
