@@ -9,7 +9,10 @@ import { compileContract } from '../dist/generic.js';
 const reference = process.env.LOTUS_V2_REFERENCE_PATH ?? join(import.meta.dirname, '../../lotus-v2-reference');
 const available = existsSync(join(reference, 'lotus_v2_reference/vm.py'));
 
-test('optimized and unoptimized scripts agree in independent P03 VM', { skip: !available }, () => {
+test('optimized and unoptimized scripts agree in independent P03 VM', { skip: !available }, t => {
+  const python = process.env.LOTUS_V2_PYTHON ?? 'python3';
+  const probe = spawnSync(python, ['-c', 'import blake3, coincurve'], { encoding: 'utf8' });
+  if (probe.status !== 0) { t.skip('install reference requirements-vm.txt and set LOTUS_V2_PYTHON'); return; }
   const sources = [
     ['single', 'contract C { function m(x: Bool) { require(x == true); } }'],
     ['reused', 'contract C { function m(x: Bool) { require(x == true); require(x == true); } }'],
@@ -60,7 +63,7 @@ test('optimized and unoptimized scripts agree in independent P03 VM', { skip: !a
     ['invalid signature', '00' + validSignature.slice(2), 'error'],
     ['invalid signature length', '', 'error'],
   ]) fixtures.push({ name, before: paymentBefore, after: paymentAfter, args: [signature], signing: true, expected });
-  const run = spawnSync(process.env.LOTUS_V2_PYTHON ?? 'python3', [new URL('./optimizer-vm.py', import.meta.url).pathname], {
+  const run = spawnSync(python, [new URL('./optimizer-vm.py', import.meta.url).pathname], {
     encoding: 'utf8', input: JSON.stringify(fixtures),
     env: { ...process.env, PYTHONPATH: [reference, process.env.PYTHONPATH].filter(Boolean).join(':') },
   });
