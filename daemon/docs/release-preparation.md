@@ -6,8 +6,11 @@ in one review candidate. Preparation never changes a running daemon, a datadir,
 a published tag, a release asset, or a container registry.
 
 The current baseline retains its 153 historical patches. The generator adds a
-single **candidate-only** `999-release-metadata.patch` after the maintained
-series. Subsequent preparations replace this generated tail; they do not append
+single generated `999-release-metadata.patch` after the maintained series.
+Promotion retains that reviewed tail on main: 153 maintained patches plus one
+generated release patch means 154 executable entries for the prepared release.
+The provenance manifest continues to verify the 153 maintained entries as a
+prefix. Subsequent preparations replace this generated tail; they do not append
 one patch per version or rewrite historical patch 247. Future feature fixes can
 use 248 onward. The generated patch comes from `git format-patch`, supports
 `git am`, and uses a documented constant artifact epoch for reproducibility.
@@ -112,10 +115,13 @@ No live node is contacted by these tests.
 ## Review and publication
 
 Review the entire candidate diff, manifest, package recipes and selected network
-evidence. Build/test it in a separate workspace and datadir. In particular, the
-current mining/transaction-chain feature audit has identified correctness issues;
-a metadata candidate does not resolve or waive those findings. Preserve any
-existing release while fixes and behavioral checks remain outstanding.
+evidence. Build/test it in a separate workspace and datadir. The corrected custom
+scheduler is owned by maintained patch 001, separately
+from generated release metadata. Its current native, regression and isolated
+mainnet validation is recorded in the custom-assembler audit; the prepared
+11.6.1 tree additionally passed both native release platforms. A metadata
+candidate alone never establishes source correctness. Preserve existing releases
+until the reviewed candidate completes the publication path.
 
 Commit reviewed candidate changes and merge them normally. Run artifact-only CI
 against that exact commit, then inspect/download checksums and packaged binaries:

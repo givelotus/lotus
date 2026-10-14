@@ -45,7 +45,7 @@ the other personas are even applied.
 ## V1 — Lotus Mainnet
 
 **Base:** bitcoin-abc `8c67fe1e85a602204a2ce65aa3b643469c2c3a1d` (`daemon/bitcoin-abc-v1-version`)
-**Release:** `v11.6.0`
+**Release:** `v11.6.1`
 **Validation (2026-10-14):** All 153 patches replay onto the pinned base. Daemon/CLI, C++ tests, and Rust crate checks pass. Isolated mainnet replay reached height 1,400,898, `verifychain 4 1000` passed, and sampled Chronik headers and transactions matched RPC. This covers the V1 daemon; it does not establish validation of every monorepo component. The earlier `252182e9` rebase is historical.
 
 ### V1 Patch Manifest Summary (`daemon/patches/v1/series`)
