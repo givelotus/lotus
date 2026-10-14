@@ -221,6 +221,7 @@ Upstream Bitcoin ABC's in-process Chronik (`chronik/`) assumes standard 80-byte 
 
 - SDK and Vase now use PointyCastle 4.0.0. Both copied ASN.1 implementations are retired; compatibility exports and a small helper adapter delegate to upstream public ASN.1 APIs. Preserve unsigned fixed-width key/compact-signature encoding separately from signed DER. Original upstream PR59 and the credited rewrite are documented in `sdk/dart/docs/crypto-audit-20261014/README.md`.
 - Combined integration passes all 40 Dart SDK tests and 59 Flutter wallet tests. Independent crypto evidence includes 513 signatures accepted by OpenSSL and daemon libsecp256k1, 64 OpenSSL signatures accepted by Dart, and byte-identical valid signatures across the dependency upgrade. Exact decimal/BigInt wallet amount conversion avoids lost base units and supports six fractional digits; retain regression coverage for native and JavaScript precision. No real payment, native mobile validation, package publication or deployment is implied.
+- Vase deliberately retains PostGIS for planned nearby-user discovery and communication. Keep spatial database capability when modernizing the server; pgx and standard HTTP routing are compatible with that direction. Current dependency/server work must preserve existing data/schema/API and does not authorize implementing discovery/chat or changing live database volumes.
 
 ## Current BCHN work (2026-10-14)
 
