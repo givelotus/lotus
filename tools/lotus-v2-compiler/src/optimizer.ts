@@ -92,6 +92,16 @@ function verifiedLiteral(a: Instruction, b: Instruction | undefined, c: Instruct
 
 type Cell = { id: string; start: number; removable: boolean };
 type State = { stack: Cell[]; facts: Map<string, 0 | 1> };
+// New emitted instructions need an explicit symbolic stack model before this
+// pass may reason across them. A net stack delta alone is insufficient.
+const symbolicOps = new Set([
+  'PUSHDATA','IF','ELSE','ENDIF','ENUMERATE_INPUTS','ENUMERATE_OUTPUTS','ENDENUMERATE',
+  'PICK','DUP','DROP','VERIFY','SWAP','ROLL','EQUAL','EQUALVERIFY','NUMEQUAL',
+  'ADD','SUB','MUL','BOOLAND','BOOLOR','LESSTHAN','GREATERTHAN','GREATERTHANOREQUAL',
+  'CHECKSIG','CHECKSIGVERIFY','OUTPUTREQUIRESBRANCH','NOT','NEGATE','SHA256','HASH256',
+  'BLAKE3','INPUTFLAGS','UTXOVALUE','UTXOTOKENID','OUTPUTVALUE','OUTPUTTOKENID',
+  'BRANCHROOT','INPUTINDEX',
+]);
 const unknown = (id: string): Cell => ({ id, start: -1, removable: false });
 const copyState = (state: State): State => ({ stack: state.stack.map(cell => ({ ...cell })), facts: new Map(state.facts) });
 const numericLiteral = (entry: Instruction): bigint | undefined => {
@@ -291,6 +301,7 @@ export function optimizeInstructions(original: readonly Instruction[], argumentC
     }
     entries = next;
     if (!changed) {
+      if (entries.some(entry => !literal(entry) && !symbolicOps.has(entry.map.op))) return entries;
       // Keep the symbolic pass bounded even for deeply nested source programs.
       const budget = { left: Math.min(16384, entries.length * 2 + 1), next: 0 };
       const symbolic = symbolicRegion(entries, {

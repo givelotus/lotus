@@ -49,11 +49,31 @@ The artifact schema is `lotus-v2/payment-artifact/1`; its target is `P01-P02-P03
 
 Schema-1 source mapping retains UTF-16 offsets (JavaScript string offsets); schema 2 uses UTF-8 byte offsets.
 
+## Promise scheduler and executable optimizer demo
+
+Run the [compiler pipeline demo](examples/compiler-pipeline/README.md) to see a
+forward-reference dependency diamond, a shared compilation job, before/after
+bytecode, and independent VM execution of valid and malformed inputs.
+
+`compileContractAsync(source, options, onEvent?)` parses once and registers the
+retained declarations. Promise jobs compile method leaves and contract roots after
+awaiting their dependencies. Pure helpers are expanded within method jobs. Shared
+jobs are memoized per compilation; unused declarations are not compiled. The
+scheduler checks cycles before starting jobs and reports their declaration spans.
+It bounds jobs, dependency edges, depth, and helper dependency discovery. These are
+single-threaded dependency jobs, not CPU worker threads.
+
+`compileContractWithTrace(source, options)` returns `{ artifact, trace }`; events
+include `start`, `await`, `resolve`, and `reject`. The generic CLI now uses the
+scheduler and accepts a final `--trace` flag to write `scheduler-trace.json` next
+to the artifact and generated clients. The synchronous `compileContract` API
+remains available and produces the same artifacts for accepted inputs.
+
 ## Bounded template and method frontend (artifact schema 2)
 
 `compileContract(source, { contract, bindings })` in `@lotus/v2-payment-compiler/generic` compiles one selected `contract` or `token` tree from a source that may contain multiple trees and free pure helpers. Every constructor value for every referenced tree must be supplied explicitly. It emits `lotus-v2/contract-artifact/2` with ordered method arguments, each method's script, leaf, bottom-up membership proof, source map and static size/stack report. A contract root is a spending branch; a token root is its token ID. The `kind` and per-method `invocation` fields identify these different uses. Token methods require a first `Amount` parameter in source; that parameter is omitted from `method.args` because the node pushes the positive mint delta above witness arguments. The policy is one P02 branch root with path `[[0]]`. The deterministic method tree sorts distinct method leaves as unsigned little-endian hashes, splits at the greatest power of two below the leaf count, and uses P02's sorted-child node hash. Method names select an ABI entry; consensus sees the revealed script and proof, with no numeric method index.
 
-Compilation optimizes `CHECKSIG; VERIFY` into `CHECKSIGVERIFY`, `EQUAL; VERIFY` into `EQUALVERIFY`, and `ZERO; PICK` into `DUP` using a bounded fixed-point pass. It recursively reduces adjacent known literal expressions for checked int128 arithmetic, canonical Boolean operations, equality and hashing. A known true verification can disappear; false verification, overflow and malformed values retain their failing operations. Constructor bindings and cross-contract hashes are opaque to equality folding so policy roots still commit to them. This is a local symbolic foundation, not full symbolic execution across control flow. For a straight-line method with exactly one argument and one depth-zero use, it also consumes that argument directly and removes its copy and final drop; loops and all non-allowlisted operations disable that rewrite. For example, `require(checksig(sig, owner))` lowers to `PUSH_32 owner; CHECKSIGVERIFY; ONE` (35 bytes, three opcodes). `optimize: false` emits the original lowering for differential testing. `staticResources` and byte offsets describe the final script; a fused source-map entry records original instructions in `optimizedFrom`. Fewer bytes and opcodes lower cost only under a profile that prices those instructions accordingly. Because the script changes, so do its method leaf, contract root, signature digest and signed transaction fixture. Regenerate any schema 2 fixture from the compiler when switching modes; schema 1 Payment fixtures remain separate.
+Compilation optimizes `CHECKSIG; VERIFY` into `CHECKSIGVERIFY`, `EQUAL; VERIFY` into `EQUALVERIFY`, and `ZERO; PICK` into `DUP` using a bounded fixed-point pass. It recursively reduces adjacent known literal expressions for checked int128 arithmetic, canonical Boolean operations, equality and hashing. A known true verification can disappear; false verification, overflow and malformed values retain their failing operations. Constructor bindings and cross-contract hashes are opaque to equality folding so policy roots still commit to them. The symbolic stack pass tracks argument identities and canonical Boolean facts established by `IF` and successful `VERIFY`. It recursively analyzes both branch arms, merges compatible identities, and removes redundant pure stack reads and proven checks. Loop bodies are analyzed with fresh incoming identities and no inherited facts; loop exit also discards identities, so mutable locals cannot be mistaken for invariants. The combined literal, peephole and symbolic passes repeat to a bounded fixed point. This is a conservative supported subset, without general expression common-subexpression elimination, arithmetic theorem proving, or loop unrolling. For a straight-line method with exactly one argument and one depth-zero use, it also consumes that argument directly and removes its copy and final drop; loops and all non-allowlisted operations disable that rewrite. For example, `require(checksig(sig, owner))` lowers to `PUSH_32 owner; CHECKSIGVERIFY; ONE` (35 bytes, three opcodes). `optimize: false` emits the original lowering for differential testing. `staticResources` and byte offsets describe the final script; a fused source-map entry records original instructions in `optimizedFrom`. Fewer bytes and opcodes lower cost only under a profile that prices those instructions accordingly. Because the script changes, so do its method leaf, contract root, signature digest and signed transaction fixture. Regenerate any schema 2 fixture from the compiler when switching modes; schema 1 Payment fixtures remain separate.
 
 ```text
 function digest(x: Bytes32): Bytes32 { return sha256(x); }
