@@ -131,14 +131,13 @@ configure authentication and network exposure explicitly. No image is published
 by the release-preparation script. Release CI builds this image and checks lotusd/lotus-cli --version. It does not publish an image or run a synchronized container node.
 '''
     path = "contrib/docker/lotus/Dockerfile"
-    changes[path] = '''FROM debian:bookworm-slim
+    changes[path] = '''FROM ubuntu:24.04
 ARG RELEASE_ARCHIVE
 COPY "${RELEASE_ARCHIVE}" /tmp/release.tar.gz
-# Release binaries are dynamically linked; keep their runtime dependencies.
+# Ubuntu 24.04 release ELF dependencies: libevent, pthread support, Berkeley DB,
+# and the C++ runtime. Remaining libc/libgcc dependencies are installed by apt.
 RUN apt-get update && apt-get install -y --no-install-recommends \\
-    libboost-chrono1.74.0 libboost-filesystem1.74.0 libboost-system1.74.0 \\
-    libboost-thread1.74.0 libevent-2.1-7 libevent-pthreads-2.1-7 \\
-    libssl3 libnng1 libjemalloc2 libutf8proc2 libsqlite3-0 libdb5.3++ \\
+    libevent-2.1-7t64 libevent-pthreads-2.1-7t64 libdb5.3++t64 libstdc++6 \\
     && rm -rf /var/lib/apt/lists/* \\
     && tar xzf /tmp/release.tar.gz -C /usr/local --strip-components=1 \\
     && rm /tmp/release.tar.gz
@@ -150,8 +149,6 @@ EXPOSE 10604 10605
 USER lotus
 CMD ["lotusd", "-datadir=/data"]
 '''
-    # The Linux archive is built on Ubuntu24.04. Its ABI cannot run on Debian12.
-    changes[path] = changes[path].replace("debian:bookworm-slim", "ubuntu:24.04").replace("1.74.0", "1.83.0").replace("libevent-2.1-7 ", "libevent-2.1-7t64 ").replace("libevent-pthreads-2.1-7 ", "libevent-pthreads-2.1-7t64 ").replace("libssl3 ", "libssl3t64 ").replace("libdb5.3++ ", "libdb5.3++t64 ")
     return changes
 
 
