@@ -5,7 +5,6 @@ import 'package:pointycastle/digests/ripemd160.dart';
 import 'package:pointycastle/digests/sha256.dart';
 import 'dart:typed_data';
 import 'package:buffer/buffer.dart';
-import 'dart:math';
 
 import 'package:pointycastle/export.dart';
 
