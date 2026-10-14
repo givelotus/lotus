@@ -4,7 +4,7 @@ Lotus is a trust-minimized peer-to-peer monetary protocol. Monetary policy is go
 
 This monorepo contains the Lotus V1 node daemon, patch series, historical specifications, mining software, and SDKs.
 
-Release validation currently covers the V1 daemon and its in-process Chronik indexer. The standalone SDKs, wallet, and miner are inherited components with separate build and test requirements. See the [validation report](daemon/docs/v1-8c67fe1e85-validation.md) for the checks performed.
+Release validation covers the V1 daemon and its in-process Chronik indexer. The SDKs, Vase wallet, and miner have separate protocol/build checks and documented platform limits in their component READMEs. See the [daemon validation report](daemon/docs/v1-8c67fe1e85-validation.md) and [target support audit](daemon/docs/support-matrix.md) for exact evidence.
 
 ## Structure
 
@@ -25,6 +25,11 @@ docs/           — Documentation and historical protocol specifications
 ## Running `lotusd` with In-Process Chronik
 
 Prebuilt binaries for Linux (`x86_64`) and macOS (`arm64`) with the **in-process Chronik indexer** compiled in are published on the [GitHub Releases](https://github.com/givelotus/lotus/releases) page.
+
+Existing `v11.6.0` assets use the earlier ABC `252182e957` base. Current source and
+release candidates use `8c67fe1e85`; candidate builds do not replace published
+assets. [Release preparation](daemon/docs/release-preparation.md) produces a
+complete candidate for review before a new immutable version is published.
 
 To start `lotusd` with Chronik enabled:
 
