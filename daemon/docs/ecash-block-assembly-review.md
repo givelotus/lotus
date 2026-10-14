@@ -2,6 +2,10 @@
 
 Historical evidence: this report's 01 failure results refer to the superseded static-package payload (raw SHA256 `556182643ff288998a6fc1c97238a73f40268de0d5fec5f2fba2dc0c8bf1dedf`). Current eCash 01 retains a corrected custom snapshot/ready-heap assembler; see [new source and native evidence](ecash01-corrected-snapshot-assembler.md). Other candidate results below retain their recorded revision scope.
 
+Historical audit of the original broken payload. The upstream-restoration
+section below records a superseded mistake, not the final requested repair.
+The corrected custom scheduler is documented at the end of this report.
+
 `patches/ecash/01-nlogn-block-construction.patch` is an unvalidated historical
 candidate, not a demonstrated optimization. It changes only `src/node/miner.cpp`
 and `src/node/miner.h`; it supplies no tests. Absence of test changes is not
@@ -115,7 +119,7 @@ This audit does not modify the published Lotus V1 patch payload or running
 nodes. A V1 repair must be a separate, explicit source change with native
 regression evidence, not an incidental metadata rewrite.
 
-## Explicit Lotus V1 correction
+## Superseded temporary Lotus V1 upstream restoration
 
 A separate source correction restores the already retained upstream assembler,
 which uses the maintained fee-rate index and direct-parent counters. It removes
@@ -170,3 +174,75 @@ ninja -C build -j16 check-bitcoin
 
 The Python path above records the native macOS run; use an installed compatible
 Python interpreter on another host.
+
+## Correct custom scheduler, maintained in its own patches
+
+The user's requirement is to fix the custom algorithm in Lotus patch `001` and
+eCash patch `01` independently. The temporary upstream restoration above was
+the wrong requested fix and is superseded. Lotus patch `246` no longer reverses
+the custom scheduler. Patch `001` now contains both the implementation and its
+native regression fixtures; `077` receives context-only adaptation and `246`
+keeps Lotus-specific fixture/API adaptations.
+
+The corrected algorithm builds a flat dependency snapshot with one salted
+TxId lookup index and a max heap of dependency-ready transactions. It uses the
+existing deterministic modified-fee comparator. Only successful inclusion
+releases children. Unique direct-parent sets prevent diamond/repeated-input
+double counting. Each transaction's own fee rate, resources and contextual
+validity are checked against current block state, so already included ancestor
+resources/fees/deltas cannot leak into descendants. This retains individual-fee
+mining policy; it does not introduce CPFP. Unlike upstream's maintained
+fee-index/backlog traversal, this is a new snapshot/heap implementation.
+Expected time is O(n + m + n log n), space O(n + m). There is no demonstrated
+speedup over modern upstream.
+
+Corrected Lotus source:
+
+- Base: `8c67fe1e85a602204a2ce65aa3b643469c2c3a1d`.
+- Exactly 153 commits, tip `0b7939e926b8353ad09d8edc47f355ddacc30502`.
+- Final tree: `73e9db8356d5f9e617f40d4d9228209e117b08f0`.
+- Source/build: `/tmp/lotus-v1-custom-assembly`.
+- Historical failing source with identical final fixtures:
+  `e6408272a2df57a47314c50f31a66d3c55709376` in
+  `/tmp/lotus-v1-assembly-repair` (test-only, not a maintained candidate).
+
+The historical algorithm fails **eight** native assertions with the final
+fixtures; the corrected custom scheduler passes. Coverage includes exact byte
+and sigcheck boundaries, ten-layer shared-ancestor diamonds, repeated parent
+inputs, highest-fee ready siblings competing for limited capacity, nonfinal
+parents, and existing free-descendant/prioritisation expectations. Full normal
+**Chronik-enabled** daemon/CLI/test builds and Rust tests/Clippy pass, as do all
+**156** C++ check targets. Clean `git am` replay verifies every one of the 153
+intermediate trees and mail metadata hashes. Original authors/dates and
+unchanged messages are preserved; changed rationale is explicitly new text.
+
+Independent operation counts compile the actual method with test adapters:
+
+```sh
+python3 daemon/tests/check-ready-heap-assembly.py --source-tree /tmp/lotus-v1-custom-assembly
+```
+
+| Shape | n | m | Edge walks | Context checks | Heap comparisons |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Chain | 10,000 | 9,999 | 9,999 | 10,000 | 0 |
+| Layered diamonds | 10,003 | 20,002 | 20,002 | 10,003 | 5,001 |
+| Wide fanout | 10,000 | 9,999 | 9,999 | 10,000 | 141,809 |
+| Repeated-parent inputs | 10,000 | 9,999 | 9,999 | 10,000 | 0 |
+
+Assertions also verify unique selection and parents-before-children order.
+This supplies reproducible operation evidence, not a consensus test or
+wall-clock benchmark. Native integration tests above supply separate behavior
+evidence.
+
+Logs are `/tmp/lotus-v1-custom-assembly-miner-tests-before.log`,
+`/tmp/lotus-v1-custom-assembly-miner-tests.log`,
+`/tmp/lotus-v1-custom-assembly-build-final.log`,
+`/tmp/lotus-v1-custom-assembly-cpp-checks.log`,
+`/tmp/lotus-v1-custom-series-verify.log`, and
+`/tmp/lotus-v1-custom-series-operations.log`.
+
+New corrected-tree mainnet replay is still in progress in a fresh isolated
+datadir at `/tmp/lotus-v1-custom-assembly-mainnet-20261014` (RPC 12604, Chronik
+19331). This candidate is not ready to publish until corrected-tree mainnet
+parity is recorded. Existing working nodes, original workspaces, chain data,
+tags, and published releases remain untouched.
