@@ -21,8 +21,10 @@ The current `BlockAssembler::addTxs` already visits its fee index and handles
 missing direct parents using a count. Every successfully selected parent visits
 its direct children once. Each skipped transaction enters the FIFO backlog at
 most once. Ignoring hash collisions and per-transaction validation, selection
-has expected O(n + m) work for n transactions and m dependency edges. Its CTOR
-sort is O(k log k) for k selected transactions. The stale source comment claiming
+visits O(n + m) graph elements for n transactions and m dependency edges.
+`GetMemPoolParents`/`GetMemPoolChildren` look up `mapLinks`, a `std::map`,
+so total expected selection work is O(n log n + m), rather than strictly
+linear. Its CTOR sort is O(k log k) for k selected transactions. The stale source comment claiming
 ancestor-package feerates does not match the implementation: below-minimum-fee
 parents prevent inclusion of their paying children. Existing tests explicitly
 require this policy. It must not be silently replaced with CPFP.
