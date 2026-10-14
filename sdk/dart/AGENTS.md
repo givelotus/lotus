@@ -1,7 +1,9 @@
 # Dart SDK maintenance
 
-- Preserve the original MIT license and local ASN.1 code. No Git crypto fork is
-  configured; PointyCastle resolves from pub.dev. Do not replace compact unsigned
+- Preserve the original MIT attribution and upstream license. PointyCastle 4.0.0
+  supersedes the original local ASN.1 fork (PR59/rewrite924e526a); old paths are
+  compatibility exports, and ASN1Utils delegates to upstream public DER APIs.
+  No Git crypto fork or independent ASN.1 integer codec remains. Do not replace compact unsigned
   32-byte signature limbs with DER's signed variable-length integer encoding.
 - Lotus TxIds follow current C++ `ComputeTxId`/`TxOutputsMerkleRoot`: output leaves
   hash the serialized CTxOut (value, CompactSize script length, script bytes),
@@ -16,3 +18,8 @@
   not suppressed globally. No live transaction broadcast is authorized by tests.
 - `tool/check_chronik.dart` only performs reads; its optional live fixture refresh
   should be cross-checked with C++ RPC before accepting protocol changes.
+
+- Dependency upgrades must preserve the original high-bit DER padding and 33-byte
+  HD key fixes, and pass independent OpenSSL/libsecp256k1 interoperability checks.
+  Exact recovered provenance and reproduction commands are in
+  `docs/crypto-audit-20261014/README.md`.

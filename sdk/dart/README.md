@@ -71,11 +71,14 @@ transactions; the header fixture is at height 1,400,945.
 
 This package was extracted from the Vase wallet. `lib/LICENSE` preserves the
 original MIT attribution; root `LICENSE` makes it visible to Dart package tools.
-PointyCastle is the published 3.x dependency, not a Git fork. A local ASN.1 copy
-is retained under `lib/encoding/asn1/`; historical fork intent cannot be proven
-from the imported subtree history. Compact signature limbs are unsigned fixed
-32-byte values and must not use variable-length signed DER integer encoding.
-DER remains minimal length, adding a sign-padding byte only for high-bit values.
+PointyCastle 4.0.0 is the reviewed dependency. The original local ASN.1 fork is
+retired: old import paths forward to upstream classes, with a small adapter for
+legacy helper names. The original padding submission was PointyCastle PR #59;
+upstream incorporated it through a broader BigInt rewrite in December 2020.
+See [the crypto audit](docs/crypto-audit-20261014/README.md) for original commit
+mapping, upstream links, exact dependency versions and reproducible independent
+OpenSSL/libsecp256k1 verification. HD key padding and unsigned fixed-width compact
+signatures remain distinct from signed variable-length DER integers.
 
 `proto/chronik.proto` is copied unchanged from Bitcoin ABC commit
 `8c67fe1e85a602204a2ce65aa3b643469c2c3a1d` (MIT, copyright The Bitcoin developers).

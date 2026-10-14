@@ -1,14 +1,2 @@
-import './asn1_encoding_rule.dart';
-
-///
-/// Exception that indicates that the given [ASN1EncodingRule] is not supported
-///
-class UnsupportedAsn1EncodingRuleException implements Exception {
-  ASN1EncodingRule rule;
-
-  UnsupportedAsn1EncodingRuleException(this.rule);
-
-  @override
-  String toString() =>
-      'UnsupportedAsn1EncodingRuleException: Encoding $rule is not supported by this ASN1Object.';
-}
+// Legacy wallet import path; crypto lives in the canonical Lotus Dart SDK.
+export 'package:lotus_dart/encoding/asn1/unsupported_asn1_encoding_rule_exception.dart';

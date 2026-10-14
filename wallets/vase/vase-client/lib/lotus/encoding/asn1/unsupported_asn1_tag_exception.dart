@@ -1,12 +1,2 @@
-///
-/// Exception that indicates that the given tag is not supported
-///
-class UnsupportedASN1TagException implements Exception {
-  int tag;
-
-  UnsupportedASN1TagException(this.tag);
-
-  @override
-  String toString() =>
-      'UnsupportedASN1TagException: Tag $tag is not supported yet';
-}
+// Legacy wallet import path; crypto lives in the canonical Lotus Dart SDK.
+export 'package:lotus_dart/encoding/asn1/unsupported_asn1_tag_exception.dart';

@@ -1,12 +1,2 @@
-///
-/// Exception that indicates that the given object identifier is not supported
-///
-class UnsupportedObjectIdentifierException implements Exception {
-  String? oiString;
-
-  UnsupportedObjectIdentifierException(this.oiString);
-
-  @override
-  String toString() =>
-      'UnsupportedObjectIdentifierException: ObjectIdentifier $oiString is not supported yet';
-}
+// Legacy wallet import path; crypto lives in the canonical Lotus Dart SDK.
+export 'package:lotus_dart/encoding/asn1/unsupported_object_identifier_exception.dart';

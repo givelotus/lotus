@@ -1,21 +1,2 @@
-import 'dart:typed_data';
-
-import '../asn1_tags.dart';
-import '../primitives/asn1_integer.dart';
-
-///
-/// An ASN1Enumerated object
-///
-class ASN1Enumerated extends ASN1Integer {
-  ///
-  /// Create an [ASN1Enumerated] entity with the given integer [i].
-  ///
-  ASN1Enumerated(int i, {int tag = ASN1Tags.ENUMERATED})
-      : super(BigInt.from(i), tag: tag);
-
-  ///
-  /// Creates an [ASN1Enumerated] entity from the given [encodedBytes].
-  ///
-  ASN1Enumerated.fromBytes(Uint8List encodedBytes)
-      : super.fromBytes(encodedBytes);
-}
+// Legacy wallet import path; crypto lives in the canonical Lotus Dart SDK.
+export 'package:lotus_dart/encoding/asn1/primitives/asn1_enumerated.dart';
