@@ -11,9 +11,18 @@ typedef ScannerBuilder = Widget Function(ValueChanged<String?> onScanResult);
 
 /// The scanner is the starting point; payment details stay on their own route.
 class HomePage extends StatefulWidget {
-  const HomePage({super.key, this.scannerBuilder});
+  const HomePage({
+    super.key,
+    this.scannerBuilder,
+    this.active = true,
+    this.onSettings,
+    this.onReceive,
+  });
 
   final ScannerBuilder? scannerBuilder;
+  final bool active;
+  final VoidCallback? onSettings;
+  final VoidCallback? onReceive;
 
   @override
   State<HomePage> createState() => _HomePageState();
@@ -33,7 +42,12 @@ class _HomePageState extends State<HomePage> {
   }
 
   void _onScan(String? result) {
-    if (_detailsOpen || result == null || result.trim().isEmpty) return;
+    if (!widget.active ||
+        _detailsOpen ||
+        result == null ||
+        result.trim().isEmpty) {
+      return;
+    }
     try {
       final payment = parseSendURI(result);
       if (payment.address.isEmpty || payment.amount < BigInt.zero) {
@@ -65,7 +79,7 @@ class _HomePageState extends State<HomePage> {
         fit: StackFit.expand,
         children: [
           // Unmount the camera while another page is open, then resume on return.
-          if (!_detailsOpen)
+          if (widget.active && !_detailsOpen)
             widget.scannerBuilder?.call(_onScan) ??
                 QRView(onScanResult: _onScan)
           else
@@ -117,7 +131,8 @@ class _HomePageState extends State<HomePage> {
                         tooltip: 'Settings',
                         icon: const Icon(Icons.settings),
                         iconSize: 48,
-                        onPressed: () => _openPage('/settings'),
+                        onPressed:
+                            widget.onSettings ?? () => _openPage('/settings'),
                       ),
                       IconButton(
                         tooltip: 'Send',
@@ -133,7 +148,8 @@ class _HomePageState extends State<HomePage> {
                         tooltip: 'Receive',
                         icon: const Icon(Icons.save_alt),
                         iconSize: 48,
-                        onPressed: () => _openPage('/request'),
+                        onPressed:
+                            widget.onReceive ?? () => _openPage('/request'),
                       ),
                     ],
                   ),

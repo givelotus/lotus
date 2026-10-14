@@ -293,3 +293,14 @@ Upstream Bitcoin ABC's in-process Chronik (`chronik/`) assumes standard 80-byte 
 
 - The dedicated simulator's initial Wallet unavailable status was caused by HTTP 502 responses from the historical default Chronik service, after wallet initialization succeeded. It was not a demonstrated keychain failure; preserve the existing secure-storage guard and identity. Status now distinguishes backend balance failure from initialization failure, with a regression test.
 - Rebuilding the dedicated preview with the existing CHRONIK_URL override to read-only local Chronik at 127.0.0.1:19331, then installing without uninstall/data erasure, launches successfully and displays 0 XPI. Production service defaults remain unchanged; camera absence on the simulator remains expected. Debug diagnostics avoid wallet values and exception messages.
+
+## Release promotion and exact-main CI (2026-10-14)
+
+- Regenerate release metadata from current main with `prepare-release.py --candidate`; preserve the 153 maintained patch messages/payloads and append the single generated `999-release-metadata.patch`. Promotion retains this tail on main (154 executable entries total); future preparations replace it. Maintained provenance checks the original 153-entry prefix. Do not fold release-only packaging/version changes into historical patch 247 or alter the published 11.6.0 tag/assets.
+- The current-main snapshot reproduces all five PR9 release files and prepared source tree `2f67d96795f6c3e6236fbb189838bc28e420a97e` byte-for-byte, including the source archive validated by native CI `38621180299`. Seeds/checkpoints remain unchanged; no new network observations are invented. See `daemon/docs/evidence/v1-release-promotion-20261014.json`.
+- Native source/artifact evidence is reusable, but the publication guard requires successful artifact-only release CI for the exact final reviewed commit on origin/main. Preparation/commit/merge alone cannot publish; after that exact run passes, the reviewed publication operation creates only new tag v11.6.1. Production deployment remains separate.
+- Exact-main preflight run `38641060538` stopped before compilation because the metadata test still required six placeholders after BCHN NNG/ZeroMQ implementation reduced them to four. Use an explicit allowlist of remaining historical/unimplemented placeholders, permitting their implementation while rejecting new placeholders; this repair does not change daemon source or prepared archives.
+
+## Vase routed swipe restoration (2026-10-14)
+
+- User requested the historical PageView structure and desktop/web routes together. Restore Settings/scanner/Receive horizontal pages with URL synchronization, scanner suspension, state-owned controller lifecycle, and existing payment confirmation routes; details are in wallets/vase/AGENTS.md. Keep speculative contacts navigation separate from this historical restoration.
