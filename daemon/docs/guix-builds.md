@@ -9,7 +9,10 @@ Guix builds pass and their archives match. No Gitian installation is used here.
 Reuse the actual `contrib/guix` machinery in pinned Bitcoin ABC
 `8c67fe1e85a602204a2ce65aa3b643469c2c3a1d`, after the maintained V1 patches.
 The underlying Guix time-machine revision is
-`c5eee3336cc1d10a3cc1c97fde2809c3451624d3`. Its manifest supplies GCC 14,
+`c5eee3336cc1d10a3cc1c97fde2809c3451624d3`, fetched from the project's
+[canonical Codeberg repository](https://lists.gnu.org/r/guix-devel/2025-05/msg00279.html).
+The obsolete Savannah URL returned HTTP 500 in the actual CI attempt; the
+revision pin and Guix authentication remain unchanged. Its manifest supplies GCC 14,
 Clang 18, Python 3.11 and Linux cross-toolchains. Existing hash-checked depends
 recipes supply Python 3.12.7, NNG 1.5.2 and Flatbuffers 2.0.0.
 
@@ -68,7 +71,8 @@ Xcode SDK. No Apple SDK is included, uploaded, or implied by Linux validation.
 Native macOS release builds remain the current path.
 
 Initial CI proved Ubuntu's packaged Guix installs and its daemon is reachable,
-and exposed the inherited depends parser failure. Subsequent candidate runs
+and exposed the inherited depends parser failure and obsolete Savannah channel
+URL (HTTP 500 after all depends source hashes passed). Subsequent candidate runs
 are still pending; there is no successful Guix Lotus binary or reproducibility
 claim yet. Record exact successful run IDs and artifact hashes here before
 promoting this path into a release workflow.
