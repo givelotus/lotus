@@ -20,6 +20,14 @@ test('fungible token gallery compiles separate mint/rules trees and a mandatory 
     assert.deepEqual(summary.holder.paths, [[0, 1]]);
     assert.notEqual(summary.trees.mint, summary.trees.rules);
     assert.equal(summary.examples.implicitBurnAtoms, '50');
+    assert.equal(summary.stages.transactionFraming, 'passed');
+    assert.equal(summary.stages.signature, 'passed-schnorr');
+    assert.equal(summary.stages.accounting, 'passed-candidate-profile');
+    assert.equal(summary.stages.block, 'unavailable');
+    assert.equal(summary.transactions.mint.feeAtoms, '3000');
+    assert.equal(summary.transactions.transfer.implicitBurnAtoms, '50');
+    assert.ok(summary.transactions.mint.wireBytes >= 500);
+    assert.ok(summary.transactions.transfer.wireBytes >= 500);
     assert.ok(Object.values(summary.checks).every(Boolean));
     const mint = JSON.parse(readFileSync(join(out, 'FungibleToken.json'), 'utf8'));
     assert.equal(mint.kind, 'token');

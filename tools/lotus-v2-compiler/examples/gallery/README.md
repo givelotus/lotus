@@ -51,6 +51,36 @@ direct Hashlock example, showing that the helper is copied into its caller.
 The fungible token gallery can also be generated on its own:
 
 ```sh
+cd tools/lotus-v2-compiler
+npm ci
+npm run build
+python3.13 -m venv .venv
+.venv/bin/python -m pip install -r ../lotus-v2-reference/requirements-vm.txt
+node test/generate-fungible-token-fixture.mjs
+LOTUS_V2_PYTHON=.venv/bin/python \
+  node examples/gallery/run-fungible-token.mjs /tmp/lotus-v2-token-gallery
+npm test
+```
+
+The public-only fixture uses BIP340's published test scalar 3 in the local
+generator. It contains a two-input mint followed by a two-input transfer. The
+runner rebuilds both transactions, checks wire bytes, TxID, TxHash, method
+proofs, Schnorr signatures and candidate-profile fee/token arithmetic, then
+executes all five method invocations in the repo-local reference VM. It also
+checks rejection of an unauthorized issuer signature, a bypass path and an
+explicit burn output. The machine-readable result is
+`/tmp/lotus-v2-token-gallery/fungible-token-summary.json`. No node, wallet or
+network is used. Native framing/signature checks can additionally be run with
+a separately built V2 native checker:
+
+```sh
+node test/run-native-token-fixtures.mjs /path/to/compiler_token_native_check
+```
+
+For an artifact-only run without Python, use:
+
+```sh
+LOTUS_V2_SKIP_VM=1 \
 node examples/gallery/run-fungible-token.mjs /tmp/lotus-v2-token-gallery
 ```
 
@@ -73,9 +103,11 @@ public signed fixture. The runner reconstructs its transaction wire, TxID,
 TxHash and signing message, checks its Schnorr signature, and asks the VM to
 execute correct and altered signatures. The other examples are compiler
 artifacts, with VM checks only for hashlock, helper and linked in the base
-runner. The separate fungible-token runner reports its own stages. The current
-compiler/runtime does not implement a stateful counter, allowance state,
-relative recovery delay, full coin context or block connection. Those examples remain in the
+runner. The separate fungible-token runner reports its own stages. Its VM
+results are invocation-level checks with caller-supplied digests and
+illustrative opcode costs; no block has been connected. The current
+compiler/runtime does not implement a stateful counter, allowance state or
+relative recovery delay. Those examples remain in the
 semantic specification at `docs/lotus-v2/examples/README.md`. No node,
 network, wallet or private key is needed to run this gallery.
 
