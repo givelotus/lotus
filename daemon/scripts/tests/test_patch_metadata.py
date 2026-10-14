@@ -66,6 +66,14 @@ class PatchMetadataTests(unittest.TestCase):
         for commit, expected in zip(commits, self.metadata):
             self.assertEqual(git(self.workspace, 'show', '-s', '--format=%an%n%ae%n%aI%n%B%n%T', commit), expected)
 
+    def test_base_only_series_requires_explicit_allow_empty(self):
+        self.manifest.write_text('# Deliberately base only\n')
+        with self.assertRaises(ValueError):
+            module.replay(self.workspace, self.manifest)
+        self.assert_unchanged()
+        module.replay(self.workspace, self.manifest, base=self.base, allow_empty=True)
+        self.assert_unchanged()
+
     def test_late_conflict_does_not_leave_first_commit_or_am_state(self):
         patch = self.patches / self.names[1]
         patch.write_bytes(patch.read_bytes().replace(b'-change 0', b'-wrong base'))

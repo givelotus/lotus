@@ -19,7 +19,7 @@ def output(repo, *args):
     return git(repo, *args, stdout=subprocess.PIPE).stdout.decode().strip()
 
 
-def patches(manifest):
+def patches(manifest, allow_empty=False):
     root = manifest.parent.resolve()
     result = []
     seen = set()
@@ -53,13 +53,13 @@ def patches(manifest):
         if b'\ndiff --git ' not in b'\n' + data:
             raise ValueError(f'{name}: missing patch diff')
         result.append((path, mail))
-    if not result:
+    if not result and not allow_empty:
         raise ValueError('Empty patch series')
     return result
 
 
-def replay(workspace, manifest, base=None, check=False, provenance=None, expect_tree=None):
-    entries = patches(manifest)  # Validate all inputs before any Git mutation.
+def replay(workspace, manifest, base=None, check=False, provenance=None, expect_tree=None, allow_empty=False):
+    entries = patches(manifest, allow_empty)  # Validate all inputs before any Git mutation.
     if output(workspace, 'status', '--porcelain', '--untracked-files=normal'):
         raise ValueError('Workspace has uncommitted changes; refusing to replace them')
     for state in ('rebase-apply', 'rebase-merge', 'MERGE_HEAD', 'CHERRY_PICK_HEAD'):
@@ -119,9 +119,10 @@ def main():
     parser.add_argument('--check', action='store_true', help='Replay in isolation without changing the workspace')
     parser.add_argument('--provenance', type=Path, help='Verify every recorded intermediate tree (allows appended release patches)')
     parser.add_argument('--expect-tree', help='Require an exact final source tree')
+    parser.add_argument('--allow-empty', action='store_true', help='Explicit base-only reference series; otherwise empty manifests fail')
     args = parser.parse_args()
     try:
-        replay(args.workspace.resolve(), args.manifest.resolve(), args.base, args.check, args.provenance, args.expect_tree)
+        replay(args.workspace.resolve(), args.manifest.resolve(), args.base, args.check, args.provenance, args.expect_tree, args.allow_empty)
     except (ValueError, subprocess.CalledProcessError) as error:
         parser.exit(1, f'Patch replay failed; workspace was not promoted: {error}\n')
 

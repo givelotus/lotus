@@ -2,8 +2,8 @@
 # setup.sh — Create or replay a daemon build workspace.
 #
 # SERIES=v1 (default):           clone bitcoin-abc at bitcoin-abc-v1-version, apply V1 patch series (153 patches)
-# SERIES=doged:        clone doged-io/doged directly at doged-version tag/branch
-# SERIES=bchn:         clone bitcoin-cash-node at pinned tag, apply patches 29-31
+# SERIES=doged:        clone pinned doged-io/doged and apply compatibility patches
+# SERIES=bchn/ecash:   pinned base only; experimental features require explicit review
 #
 # Usage: ./scripts/setup.sh
 
@@ -43,7 +43,9 @@ clone_and_checkout() {
 # ─── helper: apply-patch-series ──────────────────────────────────────────────
 apply_patch_series() {
     local series_file="$1" patches_dir="$2"
-    python3 "$SCRIPT_DIR/patch-series.py" "$PWD" "$series_file" --base "$REF"
+    local extra=()
+    [[ "${3:-}" != base-only ]] || extra+=(--allow-empty)
+    python3 "$SCRIPT_DIR/patch-series.py" "$PWD" "$series_file" --base "$REF" "${extra[@]}"
 }
 
 # ─── V1: independently pinned bitcoin-abc base + Lotus mainnet patch series ───────────────
@@ -67,15 +69,15 @@ fi
 if [[ "$SERIES" == "doged" ]]; then
     WORKSPACE="$DAEMON_DIR/workspace-doged"
     VERSION_FILE="$DAEMON_DIR/doged-version"
-    REMOTE="git@github.com:doged-io/doged.git"
+    REMOTE="${DOGED_REMOTE:-https://github.com/doged-io/doged.git}"
     REF=$(grep -v '^#' "$VERSION_FILE" | grep -v '^$' | head -1)
     echo "doged ref: $REF"
     clone_and_checkout "$WORKSPACE" "$REMOTE" "$REF" "doged-work" "doged"
-    git checkout -B doged-work "$REF"
+    apply_patch_series "$DAEMON_DIR/patches/doged/series" "$DAEMON_DIR/patches/doged" base-only
     echo ""
     echo "doged workspace ready at: $WORKSPACE"
     echo "Build with: make build SERIES=doged"
-    echo "NOTE: doged is a direct clone — no patches applied (it is its own patchset)."
+    echo "Doged upstream plus the explicit compatibility series; no experimental mining patches."
     exit 0
 fi
 
@@ -89,15 +91,12 @@ if [[ "$SERIES" == "bchn" ]]; then
     REF=$(grep -v '^#' "$VERSION_FILE" | grep -v '^$' | head -1)
     echo "bitcoin-cash-node ref: $REF"
     clone_and_checkout "$WORKSPACE" "$REMOTE" "$REF" "bchn-work" "BCHN"
-    apply_patch_series "$SERIES_FILE" "$PATCHES_DIR"
+    apply_patch_series "$SERIES_FILE" "$PATCHES_DIR" base-only
     echo ""
     echo "BCHN workspace ready at: $WORKSPACE"
     echo "Build with: make build SERIES=bchn"
     echo ""
-    echo "NOTE: Patches 29-31 were written against eCash v0.24.11 and may need context"
-    echo "  adjustments to apply cleanly against BCHN. If git apply fails, port manually:"
-    echo "  cd workspace-bchn && <apply hunks by hand>"
-    echo "  make mkpatch SERIES=bchn NAME=<patch-name>"
+    echo "Experimental mining candidates are excluded; see docs/support-matrix.md."
     exit 0
 fi
 
@@ -111,7 +110,7 @@ if [[ "$SERIES" == "ecash" ]]; then
     REF=$(grep -v '^#' "$VERSION_FILE" | grep -v '^$' | head -1)
     echo "bitcoin-abc ref: $REF"
     clone_and_checkout "$WORKSPACE" "$REMOTE" "$REF" "ecash-work" "eCash candidates"
-    apply_patch_series "$SERIES_FILE" "$PATCHES_DIR"
+    apply_patch_series "$SERIES_FILE" "$PATCHES_DIR" base-only
     echo "Build with: make build SERIES=ecash"
     exit 0
 fi

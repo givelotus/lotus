@@ -44,7 +44,9 @@ rebase_patchset() {
     git -C "$workspace" fetch origin
     local resolved
     resolved=$(git -C "$workspace" rev-parse --verify "$NEW_REF^{commit}")
-    python3 "$SCRIPT_DIR/patch-series.py" "$workspace" "$series_file" --base "$resolved"
+    local extra=()
+    [[ "$series" == v1 ]] || extra+=(--allow-empty)
+    python3 "$SCRIPT_DIR/patch-series.py" "$workspace" "$series_file" --base "$resolved" "${extra[@]}"
     # Publish the pin only after the entire series succeeds.
     local pin_temp
     pin_temp=$(mktemp "$version_file.XXXXXX")
@@ -85,7 +87,8 @@ if [[ "$SERIES" == "doged" ]]; then
     fi
     git fetch origin --tags
     RESOLVED=$(git rev-parse --verify "$NEW_REF^{commit}")
-    git checkout -B doged-work "$RESOLVED"
+    python3 "$SCRIPT_DIR/patch-series.py" "$WORKSPACE" "$DAEMON_DIR/patches/doged/series" \
+        --base "$RESOLVED" --allow-empty
 
     PIN_TEMP=$(mktemp "$VERSION_FILE.XXXXXX")
     {
