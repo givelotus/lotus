@@ -15,7 +15,9 @@ import 'package:lotus_dart/bip39/bip39.dart';
 final packageInfoFuture = PackageInfo.fromPlatform();
 
 class SettingsPage extends HookWidget {
-  const SettingsPage({Key? key}) : super(key: key);
+  const SettingsPage({Key? key, this.onBack}) : super(key: key);
+
+  final VoidCallback? onBack;
 
   @override
   Widget build(BuildContext context) {
@@ -216,7 +218,7 @@ class SettingsPage extends HookWidget {
         elevation: 0,
         leading: IconButton(
           splashRadius: AppTheme.splashRadius,
-          onPressed: () => context.pop(),
+          onPressed: onBack ?? () => context.pop(),
           icon: const Icon(Icons.navigate_before),
         ),
         title: const Text(
