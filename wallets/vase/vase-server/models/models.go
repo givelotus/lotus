@@ -32,7 +32,7 @@ type Address struct {
 
 type User struct {
 	PushToken string     `json:"PushToken" gorm:"primaryKey"`
-	Addresses []Address  `json:"XPIAddresses" gorm:"foreignKey:PushToken;references:PushToken""`
+	Addresses []Address  `json:"XPIAddresses" gorm:"foreignKey:PushToken;references:PushToken"`
 	Location  []Location `json:"Location"  gorm:"foreignKey:PushToken;references:PushToken"`
 
 	CreatedAt time.Time
