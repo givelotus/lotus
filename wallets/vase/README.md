@@ -83,3 +83,16 @@ The updated native plugins require Android API 26/compile SDK 36, iOS 15 and mac
 Validation after these dependency changes: 73 Flutter tests pass, full analyzer reports no errors with inherited notices visible, the JSON generator succeeds, and the production web build passes. The canonical SDK independently passes 42 tests plus JavaScript compilation and native OpenSSL signing interoperability checks. Go race tests, vet and builds pass, with PostgreSQL 18.6/PostGIS 3.6.3 compatibility tests using isolated fresh and original schemas. These checks do not access existing wallet storage or broadcast payments.
 
 The remaining transitive gaps are traceable: analyzer/_fe_analyzer_shared/source_gen/test_core/test_api/package_config follow the Flutter test stack; build/build_config follow generator constraints; cli_util and coverage follow flutter_launcher_icons' cli_util 0.4 constraint; qr_flutter retains qr 3; Sentry retains jni below 1.1, which also bounds jni_flutter; Flutter pins material_color_utilities; flutter_secure_storage_darwin follows the deliberate v10 bridge. The full resolver inventory retains exact current/latest versions. CupertinoIcons 2.0.0 remains because Flutter widgets reference its font; removing it produced a missing-font compiler warning.
+
+### Arithmetic amount entry
+
+Send and Receive amount editors include addition, subtraction, multiplication,
+division, clear, backspace and equals, with a live expression and XPI preview.
+Calculations run left to right (`8 − 2 + 3 × 4 = 36`). Intermediate fractions
+stay exact; Done requires a positive result exactly representable in six decimal
+places. Division by zero, unfinished expressions and unrepresentable results
+show an error instead of silently rounding a payment.
+
+Closing the editor discards its draft. Done commits the amount once; reopening
+starts from that amount. Receive requests can exceed your current balance and
+remain separate from Send. QR codes and copied requests carry base-unit amounts.

@@ -4,28 +4,20 @@ class KeyWidgetOptions {
   final String label;
   final void Function() onPressed;
 
-  KeyWidgetOptions({
-    required this.label,
-    required this.onPressed,
-  });
+  KeyWidgetOptions({required this.label, required this.onPressed});
 }
 
 class KeyWidget extends StatelessWidget {
   final String label;
   final void Function() onPressed;
 
-  const KeyWidget({
-    Key? key,
-    required this.label,
-    required this.onPressed,
-  }) : super(key: key);
+  const KeyWidget({Key? key, required this.label, required this.onPressed})
+    : super(key: key);
 
   @override
   Widget build(BuildContext context) {
     return TextButton(
-      style: TextButton.styleFrom(
-        shape: const CircleBorder(),
-      ),
+      style: TextButton.styleFrom(shape: const CircleBorder()),
       onPressed: onPressed,
       child: Text(
         label,

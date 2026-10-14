@@ -6,6 +6,7 @@ import 'package:vase/config/colors.dart';
 
 import '../../utils/currency.dart';
 import '../wallet/wallet_model.dart';
+import '../send/send_model.dart';
 
 class DashboardView extends HookWidget {
   const DashboardView({super.key});
@@ -74,6 +75,7 @@ class DashboardView extends HookWidget {
                 icon: Icons.send,
                 label: "Send",
                 onPressed: () {
+                  context.read<SendModel>().clear();
                   context.push('/send');
                 },
               ),

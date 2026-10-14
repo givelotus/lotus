@@ -17,6 +17,12 @@ enum KeyValue {
   Nine,
   Period,
   Back,
+  add,
+  subtract,
+  multiply,
+  divide,
+  clear,
+  equals,
 }
 
 extension KeyValueExts on KeyValue {
@@ -46,15 +52,28 @@ extension KeyValueExts on KeyValue {
         return '.';
       case KeyValue.Back:
         return '<';
+      case KeyValue.add:
+        return '+';
+      case KeyValue.subtract:
+        return '−';
+      case KeyValue.multiply:
+        return '×';
+      case KeyValue.divide:
+        return '÷';
+      case KeyValue.clear:
+        return 'AC';
+      case KeyValue.equals:
+        return '=';
     }
   }
 }
 
 final List<List<KeyValue>> rows = [
-  [KeyValue.One, KeyValue.Two, KeyValue.Three],
-  [KeyValue.Four, KeyValue.Five, KeyValue.Six],
-  [KeyValue.Seven, KeyValue.Eight, KeyValue.Nine],
-  [KeyValue.Period, KeyValue.Zero, KeyValue.Back],
+  [KeyValue.Seven, KeyValue.Eight, KeyValue.Nine, KeyValue.divide],
+  [KeyValue.Four, KeyValue.Five, KeyValue.Six, KeyValue.multiply],
+  [KeyValue.One, KeyValue.Two, KeyValue.Three, KeyValue.subtract],
+  [KeyValue.Period, KeyValue.Zero, KeyValue.Back, KeyValue.add],
+  [KeyValue.clear, KeyValue.equals],
 ];
 
 class NumpadWidget extends StatelessWidget {
@@ -71,7 +90,7 @@ class NumpadWidget extends StatelessWidget {
 
   void Function() _handleClick(NumpadModel model, KeyValue value) => () {
     if (value == KeyValue.Back) {
-      if (model.value != '0') {
+      if (model.expression != '0') {
         model.removeLast();
       } else {
         _vibrate();

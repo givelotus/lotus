@@ -23,12 +23,14 @@ void main() {
   });
 
   test(
-    'model rejects duplicate decimals, operators and invalid pasted text',
+    'model rejects duplicate decimals and invalid pasted text, permits operators',
     () {
       final model = NumpadModel()..setValue('12.34');
       model.addValue('.');
       model.addValue('+');
       expect(model.value, '12.34');
+      expect(model.expression, '12.34+');
+      expect(model.amount, isNull);
       expect(() => model.setValue('NaN'), throwsFormatException);
       expect(model.value, '12.34');
     },

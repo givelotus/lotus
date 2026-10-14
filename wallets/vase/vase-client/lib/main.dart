@@ -52,7 +52,12 @@ class VaseApp extends StatelessWidget {
     routes: [
       GoRoute(path: '/', builder: (ctx, state) => const HomePage()),
       GoRoute(path: '/settings', builder: (ctx, state) => const SettingsPage()),
-      GoRoute(path: '/request', builder: (ctx, state) => const RequestPage()),
+      GoRoute(
+        path: '/request',
+        builder: (ctx, state) => RequestPage(
+          initialAmount: state.extra is BigInt ? state.extra as BigInt : null,
+        ),
+      ),
       GoRoute(path: '/send', builder: (ctx, state) => const SendPage()),
     ],
   );

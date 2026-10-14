@@ -40,8 +40,7 @@ class _HomePageState extends State<HomePage> {
         throw const FormatException('Invalid payment');
       }
       final send = context.read<SendModel>();
-      send.setAddress(payment.address);
-      send.setAmount(payment.amount);
+      send.setPayment(payment.address, payment.amount);
       _openPage('/send');
     } catch (_) {
       ScaffoldMessenger.of(
@@ -119,7 +118,11 @@ class _HomePageState extends State<HomePage> {
                         tooltip: 'Send',
                         icon: const Icon(Icons.send),
                         iconSize: 80,
-                        onPressed: () => _openPage('/send'),
+                        onPressed: () {
+                          if (_detailsOpen) return;
+                          context.read<SendModel>().clear();
+                          _openPage('/send');
+                        },
                       ),
                       IconButton(
                         tooltip: 'Receive',
