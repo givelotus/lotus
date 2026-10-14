@@ -60,6 +60,8 @@ def resolve(target, names, allow_experimental):
             patches.append(str(DAEMON / 'patches' / 'bchn' / '04-topological-mempool-check.patch'))
             evidence.append({'feature': name, 'kind': 'experimental-diagnostic-optimization', 'requires': [],
                              'warning': 'Optimizes optional consistency checking; no admission-policy change'})
+        elif name == 'long-chain-container-test' and target == 'bchn':
+            raise ValueError('BCHN historical 02 is not maintained at the current pin; use mempool-check for diagnostic coverage')
         elif name == 'tx-chain-limit':
             raise ValueError('No standalone admission-policy change is implemented; patch 02 only calls addUnchecked')
         else:
