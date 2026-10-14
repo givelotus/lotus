@@ -73,6 +73,7 @@ def metadata(replay, version):
         start = text.index("source=(")
         end = text.index(")", start) + 1
         text = text[:start] + "source=(https://github.com/givelotus/lotus/releases/download/v$pkgver/lotus-v$pkgver-source.tar.gz)\nsha256sums=('SKIP')\n\nprepare() {\n  curl --fail --location --proto '=https' --tlsv1.2 \\\n    https://github.com/givelotus/lotus/releases/download/v$pkgver/SHA256SUMS -o SHA256SUMS\n  grep -E \"^[0-9a-f]{64}  lotus-v${pkgver//./\\.}-source\\.tar\\.gz$\" SHA256SUMS | sha256sum --check --strict -\n  rustup toolchain install 1.93.0 --profile minimal --component clippy\n}\n" + text[end:]
+        text = text.replace("  ninja\n", "  PYO3_PYTHON=/usr/bin/python3.13 ninja\n").replace("  ninja check\n", "  PYO3_PYTHON=/usr/bin/python3.13 ninja check\n")
         text = text.replace('install=lotus.install', 'install=../common/lotus.install')
         for resource in ('lotus.conf', 'lotus.service', 'lotus-reindex.service', 'lotus.logrotate'):
             text = text.replace('"$srcdir/' + resource + '"', '"contrib/aur/common/' + resource + '"')
@@ -111,7 +112,7 @@ COPY "${RELEASE_ARCHIVE}" /tmp/release.tar.gz
 RUN apt-get update && apt-get install -y --no-install-recommends \\
     libboost-chrono1.74.0 libboost-filesystem1.74.0 libboost-system1.74.0 \\
     libboost-thread1.74.0 libevent-2.1-7 libevent-pthreads-2.1-7 \\
-    libssl3 libjemalloc2 libutf8proc2 libsqlite3-0 libdb5.3++ \\
+    libssl3 libnng1 libjemalloc2 libutf8proc2 libsqlite3-0 libdb5.3++ \\
     && rm -rf /var/lib/apt/lists/* \\
     && tar xzf /tmp/release.tar.gz -C /usr/local --strip-components=1 \\
     && rm /tmp/release.tar.gz
