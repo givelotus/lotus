@@ -85,6 +85,7 @@ if (fixture) {
       if (!saved || saved.digest !== request.digest || saved.leaf !== request.leaf ||
           saved.branchIndex !== request.branchIndex ||
           (request.positiveDelta === undefined) !== (saved.positiveDelta === undefined) ||
+          (request.positiveDelta !== undefined && saved.positiveDelta !== hex(Uint8Array.from({ length: 16 }, (_, j) => Number((request.positiveDelta >> BigInt(8 * j)) & 255n)))) ||
           !schnorr.verify(Buffer.from(saved.signature, 'hex'), Buffer.from(request.digest, 'hex'), Buffer.from(saved.publicKey, 'hex')))
         throw new Error(`token fixture signature/selector mismatch for ${request.key}`);
     }
@@ -124,7 +125,12 @@ if (vmPackage) {
     max_altstack_items: 64, max_vm_bytes: 65536, max_ast_depth: 32, max_invocation_cost: 1000000,
     structural_byte_cost: 1, opcode_costs: opcodeCosts };
   const outputProfile = { max_output_branches: 16, max_output_paths: 16, max_output_bytes: 812, max_bytes_field: 8192 };
-  const asVmOutput = output => ({ flags: output.flags, value: Number(output.valueAtoms),
+  function vmAmount(value) {
+    const n = BigInt(value);
+    if (n < 0n || n > BigInt(Number.MAX_SAFE_INTEGER)) throw new Error('gallery JSON amount exceeds exact JavaScript integer range');
+    return Number(n);
+  }
+  const asVmOutput = output => ({ flags: output.flags, value: vmAmount(output.valueAtoms),
     token_id: output.tokenId, branches: output.branches, paths: output.paths });
   function runCase(input) {
     const run = spawnSync(process.env.LOTUS_V2_PYTHON || 'python3', ['-m','lotus_v2_reference.vm_runner'], {
@@ -151,8 +157,8 @@ if (vmPackage) {
       invocation_kind: input.kind, input_index: inputIndex, branch_root: artifact.policy.root,
       output_profile: outputProfile,
       selected_path_index: input.kind === 'mint' ? null : input.pathIndex,
-      selected_branch_index: input.kind === 'mint' ? null : witnessIndex,
-      mint_delta: input.kind === 'mint' ? Number(tx.tokenDeltas[mint.policy.root]) : null };
+      selected_branch_index: input.kind === 'mint' ? null : input.coin.paths[input.pathIndex][witnessIndex],
+      mint_delta: input.kind === 'mint' ? vmAmount(tx.tokenDeltas[mint.policy.root]) : null };
     return { script: method.scriptHex, args, profile, invocation,
       ...(request ? { signing: { selected_leaf_hash: method.leaf, messages: { '0': request.digest },
         invocation_kind: input.kind, input_index: inputIndex, output_count: tx.outputs.length } } : {}) };
