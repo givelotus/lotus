@@ -51,7 +51,7 @@ class Replay:
         self.git("apply", "--cached", "--whitespace=nowarn", "-", input=patch)
 
 
-def metadata(replay, version):
+def metadata(replay, version, namespace=None):
     changes = {}
     path = "CMakeLists.txt"
     changes[path] = replace(replay.read(path), r"(?m)^\s*VERSION [0-9]+\.[0-9]+\.[0-9]+$", "\tVERSION " + version)
@@ -150,6 +150,16 @@ EXPOSE 10604 10605
 USER lotus
 CMD ["lotusd", "-datadir=/data"]
 '''
+    if namespace:
+        # The same packaging generator serves historical and component releases.
+        # Native daemon version remains numeric; only distribution URLs/names change.
+        changes = {path: text.replace(f"lotus-v{version}", f"{namespace}-v{version}")
+                   .replace("lotus-v$pkgver", f"{namespace}-v$pkgver")
+                   .replace("lotus-v${pkgver", f"{namespace}-v${{pkgver")
+                   .replace("releases/download/v$pkgver", f"releases/download/{namespace}-v$pkgver")
+                   .replace(f"releases/tag/v{version}", f"releases/tag/{namespace}-v{version}")
+                   .replace(f"lotus:{version}", f"{namespace}:{version}")
+                   for path, text in changes.items()}
     return changes
 
 
@@ -206,6 +216,8 @@ def publish(root, version, reviewed_commit, validation_run=None):
         return run(["git", "-C", str(root), *args]).decode().strip()
     if git("status", "--porcelain"):
         raise ValueError("Publish requires a clean reviewed checkout")
+    if int(version.split(".")[0]) >= 12:
+        raise ValueError("New Lotus releases use component-release.py and lotusd-v12.x or later tags")
     if git("rev-parse", "HEAD") != reviewed_commit:
         raise ValueError("HEAD differs from --reviewed-commit")
     canonical = re.compile(r"(?:https://github\.com/givelotus/lotus(?:\.git)?|git@github\.com:givelotus/lotus(?:\.git)?|ssh://git@github\.com/givelotus/lotus(?:\.git)?)\Z")
@@ -235,7 +247,7 @@ def publish(root, version, reviewed_commit, validation_run=None):
     return tag
 
 
-def prepare(root, upstream, version, write=False, check=False, archive=None, network=None, allow_network_rpc=False):
+def prepare(root, upstream, version, write=False, check=False, archive=None, network=None, allow_network_rpc=False, namespace=None):
     if not VERSION.fullmatch(version):
         raise ValueError("Version must be three numeric components without a v prefix or leading zeros")
     daemon = root / "daemon"
@@ -259,7 +271,7 @@ def prepare(root, upstream, version, write=False, check=False, archive=None, net
             patch = (daemon / "patches/v1" / entry).read_bytes()
             replay.apply(patch)
             hashes[entry] = hashlib.sha256(patch).hexdigest()
-        changes = metadata(replay, version)
+        changes = metadata(replay, version, namespace=namespace)
         network_path = daemon / "release-network.json"
         config = network if network is not None else (json.loads(network_path.read_text()) if network_path.exists() else None)
         evidence = None
@@ -309,7 +321,7 @@ def prepare(root, upstream, version, write=False, check=False, archive=None, net
         return {"version": version, "source_tree": tree, "changed": changed, "written": write}
 
 
-def candidate(root, upstream, version, destination, network=None, allow_network_rpc=False):
+def candidate(root, upstream, version, destination, network=None, allow_network_rpc=False, prepare_operation=None):
     """Promote an entire isolated Git candidate with one directory rename.
 
     Snapshot tracked content plus local edits; never copy ignored workspaces,
@@ -359,8 +371,11 @@ def candidate(root, upstream, version, destination, network=None, allow_network_
                     shutil.copy2(source, target)
             else:
                 target.unlink(missing_ok=True)
-        result = prepare(checkout, upstream, version, write=True, network=network, allow_network_rpc=allow_network_rpc)
-        prepare(checkout, upstream, version, check=True)
+        if prepare_operation is None:
+            result = prepare(checkout, upstream, version, write=True, network=network, allow_network_rpc=allow_network_rpc)
+            prepare(checkout, upstream, version, check=True)
+        else:
+            result = prepare_operation(checkout)
         os.rename(checkout, destination)
     result["candidate"] = str(destination)
     return result
@@ -387,6 +402,8 @@ def main():
         parser.error("--publish requires --reviewed-commit and --validation-run")
     try:
         version = args.version or (ROOT / "daemon/release-version").read_text().strip()
+        if VERSION.fullmatch(version) and int(version.split(".")[0]) >= 12:
+            raise ValueError("Use component-release.py --component lotusd for namespaced Lotus 12.x and later releases")
         network = json.loads(args.network_input.read_text()) if args.network_input else None
         if args.candidate:
             result = candidate(ROOT, args.upstream, version, args.candidate, network, args.allow_network_rpc)

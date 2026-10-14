@@ -48,6 +48,15 @@ apply_patch_series() {
     python3 "$SCRIPT_DIR/patch-series.py" "$PWD" "$series_file" "${extra[@]}"
 }
 
+# Bitcoin Core is a separate BTC source pin, not the ABC binary named bitcoind.
+if [[ "$SERIES" == "bitcoin" ]]; then
+    WORKSPACE="$DAEMON_DIR/workspace-bitcoin"
+    REF=$(head -1 "$DAEMON_DIR/bitcoin-core-version")
+    clone_and_checkout "$WORKSPACE" "${BITCOIN_CORE_REMOTE:-https://github.com/bitcoin/bitcoin.git}" "$REF" "bitcoin-core-work" "Bitcoin Core BTC"
+    apply_patch_series "$DAEMON_DIR/patches/bitcoin/series" "$DAEMON_DIR/patches/bitcoin" base-only
+    exit 0
+fi
+
 # ─── V1: independently pinned bitcoin-abc base + Lotus mainnet patch series ───────────────
 if [[ "$SERIES" == "v1" ]]; then
     WORKSPACE="$DAEMON_DIR/workspace-v1"
@@ -115,5 +124,5 @@ if [[ "$SERIES" == "ecash" ]]; then
     exit 0
 fi
 
-echo "Unsupported series: $SERIES (choose v1, ecash, doged, or bchn)" >&2
+echo "Unsupported series: $SERIES (choose v1, ecash, doged, bchn, or bitcoin)" >&2
 exit 1

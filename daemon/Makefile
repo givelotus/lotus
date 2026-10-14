@@ -8,19 +8,21 @@
 SCRIPTS := $(dir $(abspath $(lastword $(MAKEFILE_LIST))))scripts
 SERIES  ?= v1
 
-.PHONY: setup build run mkpatch refresh prepare-release features clean help
+.PHONY: setup build run mkpatch refresh prepare-release prepare-component features clean help
 
 help:
 	@echo "Lotus daemon build targets:"
-	@echo "  make setup [SERIES=v1|ecash|doged|bchn]      Clone workspace and apply patches"
+	@echo "  make setup [SERIES=v1|ecash|doged|bchn|bitcoin]      Clone workspace and apply patches"
 	@echo "  Existing workspaces are preserved; move an old workspace aside before setup."
-	@echo "  make build [SERIES=v1|ecash|doged|bchn]      Build lotusd and lotus-cli (with Chronik on v1)"
-	@echo "  make run   [SERIES=v1|ecash|doged|bchn] ARGS=\"...\"  Run lotusd (sets ulimit -n 65536)"
+	@echo "  make build [SERIES=v1|ecash|doged|bchn|bitcoin]      Build lotusd and lotus-cli (with Chronik on v1)"
+	@echo "  make run   [SERIES=v1|ecash|doged|bchn|bitcoin] ARGS=\"...\"  Run lotusd (sets ulimit -n 65536)"
 	@echo "  make mkpatch NAME=<n>          Export committed HEAD with authorship and rationale"
 	@echo "  make refresh COMMIT=<c>        Rebase onto new base commit or tag"
 	@echo "  make build FEATURES=chronik,nng-off       Select independent build options"
 	@echo "  make features FEATURES=chronik,zeromq-off Show resolved flags and dependencies"
-	@echo "  make prepare-release UPSTREAM=<repo> VERSION=<x.y.z> CANDIDATE=<new-dir>"
+	@echo "  make prepare-component COMPONENT=bitcoin-core UPSTREAM=<repo> VERSION=<distributor-x.y.z> CANDIDATE=<new-dir>"
+	@echo "  Component names/tags/patch profiles: daemon/docs/component-releases.md"
+	@echo "  Legacy v11: make prepare-release UPSTREAM=<repo> VERSION=<x.y.z> CANDIDATE=<new-dir>"
 	@echo "                                Prepare an atomic review candidate; never publish"
 	@echo "  Release preparation updates daemon/Arch/Docker versions and records patch hashes/source tree."
 	@echo "  UPSTREAM is a read-only local ABC repository; CANDIDATE must be a new directory."
@@ -70,6 +72,21 @@ ifndef CANDIDATE
 endif
 	python3 $(SCRIPTS)/prepare-release.py --upstream "$(UPSTREAM)" --version "$(VERSION)" --candidate "$(CANDIDATE)"
 
+prepare-component:
+ifndef COMPONENT
+	$(error COMPONENT is required: lotusd, bitcoin-abc, bchn, doged, or bitcoin-core)
+endif
+ifndef UPSTREAM
+	$(error UPSTREAM must identify an existing read-only Git object source)
+endif
+ifndef VERSION
+	$(error VERSION must identify the distributor version x.y.z)
+endif
+ifndef CANDIDATE
+	$(error CANDIDATE must identify a new isolated review directory)
+endif
+	python3 $(SCRIPTS)/component-release.py --component "$(COMPONENT)" --upstream "$(UPSTREAM)" --version "$(VERSION)" --patch-revision "$(or $(PATCH_REVISION),1)" --candidate "$(CANDIDATE)" $(if $(PROFILE),--profile "$(PROFILE)") $(if $(FEATURES),--features "$(FEATURES)") $(if $(filter 1,$(ALLOW_EXPERIMENTAL)),--allow-experimental)
+
 run:
 	SERIES=$(SERIES) $(SCRIPTS)/run.sh $(ARGS)
 
@@ -90,4 +107,4 @@ else
 endif
 
 clean:
-	rm -rf workspace-ecash/build workspace-v1/build workspace-doged/build workspace-bchn/build
+	rm -rf workspace-ecash/build workspace-v1/build workspace-doged/build workspace-bchn/build workspace-bitcoin/build

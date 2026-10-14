@@ -18,8 +18,9 @@ case "$SERIES" in
     v1) WORKSPACE="$DAEMON_DIR/workspace-v1"; LABEL="V1 (mainnet)"; TARGETS=(lotusd lotus-cli) ;;
     ecash) WORKSPACE="$DAEMON_DIR/workspace-ecash"; LABEL="eCash candidates"; TARGETS=(bitcoind bitcoin-cli) ;;
     doged) WORKSPACE="$DAEMON_DIR/workspace-doged"; LABEL="doged reference"; TARGETS=(doged doge-cli) ;;
+    bitcoin) WORKSPACE="$DAEMON_DIR/workspace-bitcoin"; LABEL="Bitcoin Core BTC"; TARGETS=(bitcoind bitcoin-cli) ;;
     bchn) WORKSPACE="$DAEMON_DIR/workspace-bchn"; LABEL="BCHN candidates"; TARGETS=(bitcoind bitcoin-cli) ;;
-    *) echo "Unsupported series: $SERIES (choose v1, ecash, doged, or bchn)" >&2; exit 1 ;;
+    *) echo "Unsupported series: $SERIES (choose v1, ecash, doged, bchn, or bitcoin)" >&2; exit 1 ;;
 esac
 
 BUILD_DIR="$WORKSPACE/build"
@@ -33,7 +34,9 @@ mkdir -p "$BUILD_DIR"
 cd "$BUILD_DIR"
 
 CMAKE_ARGS=(-GNinja)
-if [[ "$SERIES" == bchn ]]; then
+if [[ "$SERIES" == bitcoin ]]; then
+    CMAKE_ARGS+=(-DBUILD_GUI=OFF -DENABLE_IPC=OFF -DWITH_ZMQ=OFF -DBUILD_BENCH=OFF)
+elif [[ "$SERIES" == bchn ]]; then
     CMAKE_ARGS+=(-DBUILD_BITCOIN_QT=OFF -DBUILD_BITCOIN_ZMQ=OFF
                  -DENABLE_UPNP=OFF -DENABLE_NATPMP=OFF -DENABLE_MAN=OFF)
 else
@@ -64,5 +67,5 @@ ninja -j"$(nproc 2>/dev/null || sysctl -n hw.logicalcpu)" "${TARGETS[@]}"
 echo ""
 echo "Build complete ($LABEL). Binaries:"
 for target in "${TARGETS[@]}"; do
-    ls -lh "$BUILD_DIR/src/$target"
+    if [[ "$SERIES" == bitcoin ]]; then ls -lh "$BUILD_DIR/bin/$target"; else ls -lh "$BUILD_DIR/src/$target"; fi
 done
