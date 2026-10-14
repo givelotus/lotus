@@ -9,23 +9,26 @@ grammar in this package. All template values are deterministic public examples.
 cd tools/lotus-v2-compiler
 npm ci
 npm run build
-node examples/gallery/run-gallery.mjs /tmp/lotus-v2-gallery
+python3.13 -m venv /tmp/lotus-v2-gallery-venv
+/tmp/lotus-v2-gallery-venv/bin/python -m pip install -r ../../tools/lotus-v2-reference/requirements-vm.txt
+LOTUS_V2_PYTHON=/tmp/lotus-v2-gallery-venv/bin/python \
+  node examples/gallery/run-gallery.mjs /tmp/lotus-v2-gallery
 npm test
 ```
 
-If the separate reference VM candidate is available, pass its package
-directory as a second argument to execute the hashlock and inlined helper with
-correct and incorrect preimages, plus the linked commitment method:
+When the reference VM package is present at `tools/lotus-v2-reference`, the
+same command also executes the signed Payment, hashlock and inlined helper with
+positive and negative witnesses, plus the linked commitment method. For an isolated VM
+checkout, pass its package directory as a second argument:
 
 ```sh
 node examples/gallery/run-gallery.mjs /tmp/lotus-v2-gallery \
-  /tmp/lotus-v2-vm-reference/tools/lotus-v2-reference
+  "$VM_REFERENCE_PACKAGE"
 ```
 
-Install that VM package's `requirements-vm.txt` first and set
-`LOTUS_V2_PYTHON` to its Python interpreter if needed. The run supplies an
-illustrative explicit opcode cost schedule; those charges are not selected P05
-consensus values.
+Set `LOTUS_V2_SKIP_VM=1` to generate artifacts without Python dependencies.
+The VM run supplies an illustrative explicit opcode cost schedule; those
+charges are not selected P05 consensus values.
 
 The command writes one artifact per example and a machine-readable
 `summary.json`. It independently hashes each emitted script and folds each
@@ -42,12 +45,14 @@ direct Hashlock example, showing that the helper is copied into its caller.
 | `signed-hashlock.lotus` | Signature and preimage requirements together. |
 | `recovery.lotus` | Two independently committed owner and guardian methods, each with its own leaf and proof. The guardian method has no delay. |
 | `helper.lotus` | A typed free helper whose operations are inlined into a method. |
-| `linked.lotus` | A fully bound contract root and method leaf copied as compile-time constants into a second contract. |
+| `linked.lotus` | A fully bound contract root and method leaf copied as compile-time constants into a second contract. This shows byte commitments; it does not enforce execution of the referenced contract. |
 
 `summary.json` reports compile, proof, transaction framing, signature, VM,
-accounting and block stages separately. The generic Payment method has different
-script bytes from the package's earlier signed schema-1 fixture. These compiler
-artifacts are not signed transactions. The current compiler/runtime does not
+accounting and block stages separately. The generic Payment method has its own
+public signed fixture. The runner reconstructs its transaction wire, TxID,
+TxHash and signing message, checks its Schnorr signature, and asks the VM to
+execute correct and altered signatures. The other examples are compiler
+artifacts, with VM checks only for hashlock, helper and linked. The current compiler/runtime does not
 implement a stateful counter, mint policy, relative recovery delay, full coin
 context, fee accounting or block connection. Those examples remain in the
 semantic specification at `docs/lotus-v2/examples/README.md`. No node,

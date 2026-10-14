@@ -10,12 +10,19 @@ import { compileContract } from '../dist/generic.js';
 test('gallery emits deterministically checked scripts and membership proofs', () => {
   const dir = mkdtempSync(join(tmpdir(), 'lotus-v2-gallery-'));
   try {
-    const run = spawnSync(process.execPath, ['examples/gallery/run-gallery.mjs', dir], { cwd: fileURLToPath(new URL('..', import.meta.url)), encoding: 'utf8' });
+    const run = spawnSync(process.execPath, ['examples/gallery/run-gallery.mjs', dir], {
+      cwd: fileURLToPath(new URL('..', import.meta.url)), encoding: 'utf8', env: { ...process.env, LOTUS_V2_SKIP_VM: '1' },
+    });
     assert.equal(run.status, 0, run.stderr);
     const summary = JSON.parse(readFileSync(join(dir, 'summary.json'), 'utf8'));
     assert.equal(summary.examples.length, 7);
     assert.deepEqual(summary.checks, { templateKeyChangesRoot: true, linkedTargetChangesRoot: true });
     assert.equal(summary.examples.find(x => x.name === 'recovery').methods.length, 2);
+    const payment = summary.examples.find(x => x.name === 'payment');
+    assert.equal(payment.stages.transactionFraming, 'passed');
+    assert.equal(payment.stages.signature, 'passed');
+    assert.equal(payment.stages.vm, 'unavailable');
+    assert.equal(summary.payment.txid.length, 64);
     for (const item of summary.examples) {
       assert.equal(item.stages.compile, 'passed');
       assert.equal(item.stages.proof, 'passed');

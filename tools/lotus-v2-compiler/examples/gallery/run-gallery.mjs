@@ -4,6 +4,7 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { spawnSync } from 'node:child_process';
 import { blake3 } from '@noble/hashes/blake3';
+import { schnorr } from '@noble/curves/secp256k1';
 import { compileContract } from '../../dist/generic.js';
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -62,7 +63,32 @@ const changedLink = compileContract(read('linked'), { contract: 'LinkedVerifier'
 } });
 if (changedLink.policy.root === results.linked.policy.root) throw new Error('linked commitment did not change with target');
 
-const vmPackage = process.argv[3];
+const fixturePath = join(here, '../../fixtures/generic-payment-v2.json');
+let paymentEvidence;
+if (existsSync(fixturePath)) {
+  const fixture = JSON.parse(readFileSync(fixturePath, 'utf8'));
+  const method = results.payment.methods[0];
+  if (fixture.artifact.methods[0].scriptHex !== method.scriptHex || fixture.valid.leaf !== method.leaf ||
+      fixture.context.coin.branches[0] !== results.payment.policy.root) throw new Error('signed generic Payment fixture uses a different compiler artifact');
+  const { prepareContractCall, finalizeContractCall } = await import('../../dist/call-runtime.js');
+  const coin = o => ({ value: BigInt(o.valueAtoms), branches: o.branches, paths: o.paths });
+  const context = { profile: fixture.context.profile, chainId: fixture.context.chainId, prevTxid: fixture.context.prevTxid,
+    prevIndex: fixture.context.prevIndex, sequence: fixture.context.sequence, coin: coin(fixture.context.coin),
+    outputs: fixture.context.outputs.map(coin) };
+  const plan = prepareContractCall(results.payment, 'spend', context, { signature: null });
+  const final = finalizeContractCall(plan, { signature: Buffer.from(fixture.valid.signature, 'hex') });
+  if (plan.requests[0].digest !== fixture.valid.message || plan.requests[0].leaf !== method.leaf ||
+      hex(final.wire) !== fixture.valid.wire || final.txid !== fixture.valid.txid || final.txhash !== fixture.valid.txhash)
+    throw new Error('signed generic Payment fixture framing or commitments mismatch');
+  if (!schnorr.verify(Buffer.from(fixture.valid.signature, 'hex'), Buffer.from(fixture.valid.message, 'hex'), Buffer.from(owner3, 'hex')))
+    throw new Error('signed generic Payment fixture signature mismatch');
+  paymentEvidence = { wire: fixture.valid.wire, txid: final.txid, txhash: final.txhash,
+    signingMessage: fixture.valid.message, signature: fixture.valid.signature, feeAtoms: plan.requests[0].feeAtoms.toString() };
+}
+
+const localVmPackage = join(here, '../../../../tools/lotus-v2-reference');
+const vmPackage = process.env.LOTUS_V2_SKIP_VM === '1' ? undefined :
+  process.argv[3] ?? (existsSync(join(localVmPackage, 'lotus_v2_reference', 'vm_runner.py')) ? localVmPackage : undefined);
 const vmResults = {};
 if (vmPackage) {
   if (!existsSync(join(vmPackage, 'lotus_v2_reference', 'vm_runner.py'))) throw new Error('VM_REFERENCE_PACKAGE does not contain vm_runner.py');
@@ -72,8 +98,8 @@ if (vmPackage) {
   const profile = { max_script_bytes: 8192, max_arguments: 16, max_element_bytes: 8192, max_stack_items: 128,
     max_altstack_items: 64, max_vm_bytes: 65536, max_ast_depth: 32, max_invocation_cost: 1000000,
     structural_byte_cost: 1, opcode_costs: opcodeCosts };
-  function invoke(method, args) {
-    const invocation = { script: method.scriptHex, args, input_count: 1, output_count: 1, profile };
+  function invoke(method, args, signing) {
+    const invocation = { script: method.scriptHex, args, input_count: 1, output_count: 1, profile, ...(signing ? { signing } : {}) };
     const run = spawnSync(process.env.LOTUS_V2_PYTHON || 'python3', ['-m', 'lotus_v2_reference.vm_runner'], {
       input: JSON.stringify(invocation), encoding: 'utf8', env: { ...process.env, PYTHONPATH: vmPackage },
     });
@@ -91,6 +117,16 @@ if (vmPackage) {
   const linkedPositive = invoke(results.linked.methods[0], []);
   if (!linkedPositive.accepted_invocation) throw new Error(`linked: VM acceptance mismatch: ${JSON.stringify(linkedPositive)}`);
   vmResults.linked = { positive: linkedPositive };
+  if (paymentEvidence) {
+    const method = results.payment.methods[0];
+    const signing = { selected_leaf_hash: method.leaf, messages: { 0: paymentEvidence.signingMessage },
+      invocation_kind: 'spend', input_index: 0, output_count: 1 };
+    const positive = invoke(method, [paymentEvidence.signature], signing);
+    const bad = Buffer.from(paymentEvidence.signature, 'hex'); bad[0] ^= 1;
+    const negative = invoke(method, [hex(bad)], signing);
+    if (!positive.accepted_invocation || negative.accepted_invocation) throw new Error(`payment: VM signature acceptance mismatch: ${JSON.stringify({positive,negative})}`);
+    vmResults.payment = { positive, negative };
+  }
 }
 
 const summary = {
@@ -98,10 +134,13 @@ const summary = {
   samplePreimageHex: hex(preimage), sampleSha256Hex: digest,
   examples: Object.entries(results).map(([name, artifact]) => ({ name, artifact: `${name === 'twoKey' ? 'two-key' : name === 'signedHashlock' ? 'signed-hashlock' : name === 'linked' ? 'linked-verifier' : name === 'recovery' ? 'recovery' : name === 'helper' ? 'helper' : name === 'hashlock' ? 'hashlock' : 'payment'}.json`, root: artifact.policy.root,
     methods: artifact.methods.map(m => ({ name: m.name, scriptHex: m.scriptHex, leaf: m.leaf, proof: m.proof, staticResources: m.staticResources })),
-    stages: { compile: 'passed', proof: 'passed', transactionFraming: 'unavailable', signature: 'unavailable', vm: vmResults[name] ? 'passed' : 'unavailable', accounting: 'unavailable', block: 'unavailable' } })),
+    stages: { compile: 'passed', proof: 'passed', transactionFraming: name === 'payment' && paymentEvidence ? 'passed' : 'unavailable',
+      signature: name === 'payment' && paymentEvidence ? 'passed' : 'unavailable', vm: vmResults[name] ? 'passed' : 'unavailable',
+      accounting: 'unavailable', block: 'unavailable' } })),
   checks: { templateKeyChangesRoot: true, linkedTargetChangesRoot: true },
+  payment: paymentEvidence ?? null,
   vm: vmResults,
-  limitations: ['No state, token mint, relative lock, or complete block validation in this compiler slice.', 'The generic Payment script differs from the earlier schema-1 signed Payment fixture; it needs its own signed transaction and VM check.'],
+  limitations: ['No state, token mint, relative lock, or complete block validation in this compiler slice.', 'A linked constant comparison commits to known bytes; it does not enforce execution of the referenced contract.', 'VM execution is one invocation with caller-supplied signing digest, not a full transaction or block verdict.'],
 };
 writeFileSync(join(out, 'summary.json'), JSON.stringify(summary, null, 2) + '\n');
 console.log(JSON.stringify(summary, null, 2));
