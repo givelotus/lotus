@@ -1,6 +1,6 @@
 use std::io::Write;
 
-use clap::{crate_authors, crate_description, crate_version, load_yaml, App};
+use clap::{crate_description, crate_version, load_yaml, App};
 use config::{Config, ConfigError, File};
 use serde::Deserialize;
 
@@ -40,7 +40,7 @@ impl ConfigSettings {
         let yaml = load_yaml!("cli.yaml");
         let matches = App::from_yaml(yaml)
             .about(crate_description!())
-            .author(crate_authors!("\n"))
+            .author(env!("CARGO_PKG_AUTHORS"))
             .version(crate_version!())
             .get_matches();
         let home_dir = match dirs::home_dir() {
@@ -130,7 +130,7 @@ impl ConfigSettings {
         {
             return Err(ConfigError::Message(format!(
                 "Must set mine_to_address config option. You can find it in {}.toml",
-                std::fs::canonicalize(&config_path)
+                std::fs::canonicalize(config_path)
                     .map(|path| path.to_string_lossy().to_string())
                     .unwrap_or_else(|_| config_path.to_string())
             )));

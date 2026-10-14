@@ -1,10 +1,10 @@
+use eyre::{eyre, Result};
 use ocl::{
     builders::{DeviceSpecifier, ProgramBuilder},
     Buffer, Context, Device, Kernel, Platform, Queue,
 };
 use sha2::Digest;
 use std::convert::TryInto;
-use eyre::Result;
 use thiserror::Error;
 
 use crate::{sha256::lotus_hash, Log};
@@ -12,7 +12,7 @@ use crate::{sha256::lotus_hash, Log};
 #[derive(Debug, Error)]
 pub enum MinerError {
     #[error("Ocl error: {0:?}")]
-    Ocl(ocl::Error)
+    Ocl(ocl::Error),
 }
 
 #[derive(Debug, Clone)]
@@ -79,7 +79,10 @@ impl Miner {
     pub fn setup(settings: MiningSettings) -> Result<Self> {
         let mut prog_builder = ProgramBuilder::new();
         prog_builder
-            .src_file(format!("kernels/{}.cl", settings.kernel_name))
+            .src(match settings.kernel_name.as_str() {
+                "lotus_og" => include_str!("../../kernels/lotus_og.cl"),
+                name => return Err(eyre!("Unknown mining kernel: {}", name)),
+            })
             .cmplr_def("WORKSIZE", settings.local_work_size)
             .cmplr_def("ITERATIONS", settings.inner_iter_size);
         let platforms = Platform::list();
@@ -98,7 +101,7 @@ impl Miner {
         let mut platform_device = None;
         let mut gpu_index = 0;
         for cur_platform in platforms {
-            if let Ok(devices) = Device::list_all(cur_platform.clone()) {
+            if let Ok(devices) = Device::list_all(cur_platform) {
                 for cur_device in devices {
                     if gpu_index == settings.gpu_indices[0] {
                         platform_device = Some((cur_platform, cur_device));
@@ -107,26 +110,37 @@ impl Miner {
                 }
             }
         }
-        let (platform, device) = platform_device.expect("No such GPU");
+        let (platform, device) = platform_device
+            .ok_or_else(|| eyre!("OpenCL device {} not found", settings.gpu_indices[0]))?;
         let ctx = Context::builder()
-            .platform(platform.clone())
-            .devices(DeviceSpecifier::Single(device.clone()))
-            .build().map_err(Ocl)?;
+            .platform(platform)
+            .devices(DeviceSpecifier::Single(device))
+            .build()
+            .map_err(Ocl)?;
         let queue = Queue::new(&ctx, device, None).map_err(Ocl)?;
-        prog_builder.devices(DeviceSpecifier::Single(device.clone()));
+        prog_builder.devices(DeviceSpecifier::Single(device));
         let program = prog_builder.build(&ctx).map_err(Ocl)?;
         let mut kernel_builder = Kernel::builder();
         kernel_builder
             .program(&program)
             .name("search")
             .queue(queue.clone());
-        let buffer = Buffer::builder().len(0xff).queue(queue.clone()).build().map_err(Ocl)?;
-        let header_buffer = Buffer::builder().len(0xff).queue(queue).build().map_err(Ocl)?;
+        let buffer = Buffer::builder()
+            .len(0xff)
+            .queue(queue.clone())
+            .build()
+            .map_err(Ocl)?;
+        let header_buffer = Buffer::builder()
+            .len(0xff)
+            .queue(queue)
+            .build()
+            .map_err(Ocl)?;
         let search_kernel = kernel_builder
             .arg_named("offset", 0u32)
             .arg_named("partial_header", None::<&Buffer<u32>>)
             .arg_named("output", None::<&Buffer<u32>>)
-            .build().map_err(Ocl)?;
+            .build()
+            .map_err(Ocl)?;
         Ok(Miner {
             search_kernel,
             buffer,
@@ -183,10 +197,16 @@ impl Miner {
         for (chunk, int) in partial_header.chunks(4).zip(partial_header_ints.iter_mut()) {
             *int = u32::from_be_bytes(chunk.try_into().unwrap());
         }
-        self.header_buffer.write(&partial_header_ints[..]).enq().map_err(Ocl)?;
+        self.header_buffer
+            .write(&partial_header_ints[..])
+            .enq()
+            .map_err(Ocl)?;
         self.search_kernel
-            .set_arg("partial_header", &self.header_buffer).map_err(Ocl)?;
-        self.search_kernel.set_arg("output", &self.buffer).map_err(Ocl)?;
+            .set_arg("partial_header", &self.header_buffer)
+            .map_err(Ocl)?;
+        self.search_kernel
+            .set_arg("output", &self.buffer)
+            .map_err(Ocl)?;
         self.search_kernel.set_arg("offset", base).map_err(Ocl)?;
         let mut vec = vec![0; self.buffer.len()];
         self.buffer.write(&vec).enq().map_err(Ocl)?;
@@ -211,7 +231,7 @@ impl Miner {
                     log.info(format!(
                         "Candidate: nonce={}, hash={}",
                         result_nonce,
-                        hex::encode(&candidate_hash)
+                        hex::encode(candidate_hash)
                     ));
                     if hash.last() != Some(&0) {
                         log.bug(
@@ -245,5 +265,25 @@ impl Miner {
         settings.gpu_indices = vec![gpu_index.try_into().unwrap()];
         *self = Miner::setup(settings)?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    #[ignore = "requires an installed OpenCL runtime and device"]
+    fn compile_embedded_kernel() {
+        // Compiles the kernel and allocates buffers; does not start mining or use RPC.
+        Miner::setup(MiningSettings {
+            local_work_size: 256,
+            kernel_size: 256,
+            inner_iter_size: 16,
+            kernel_name: "lotus_og".into(),
+            sleep: 0,
+            gpu_indices: vec![0],
+        })
+        .unwrap();
     }
 }
