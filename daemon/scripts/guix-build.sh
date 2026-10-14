@@ -36,15 +36,15 @@ export HOSTS=x86_64-linux-gnu JOBS="${JOBS:-2}"
 export SOURCE_DATE_EPOCH="$SOURCE_EPOCH" FORCE_SOURCE_DATE_EPOCH=1
 FORCE_VERSION="$SOURCE_VERSION"
 export FORCE_VERSION
-export DISTNAME="lotus-${FORCE_VERSION}" OUTDIR_BASE="$CANDIDATE/output"
+export DISTNAME="lotus-v${FORCE_VERSION}" OUTDIR_BASE="$CANDIDATE/output"
 ./contrib/guix/guix-build
 cp "$CANDIDATE/inputs.txt" "$CANDIDATE/output/inputs.txt"
 
 # Exercise the archive itself with a new, disconnected datadir on this builder.
-ARCHIVE="$CANDIDATE/output/x86_64-linux-gnu/lotus-${FORCE_VERSION}-x86_64-linux-gnu.tar.gz"
+ARCHIVE="$CANDIDATE/output/x86_64-linux-gnu/lotus-v${FORCE_VERSION}-x86_64-linux-gnu.tar.gz"
 mkdir "$CANDIDATE/extracted" "$CANDIDATE/smoke-data"
 tar -C "$CANDIDATE/extracted" -xzf "$ARCHIVE"
-BIN="$CANDIDATE/extracted/lotus-${FORCE_VERSION}/bin"
+BIN="$CANDIDATE/extracted/lotus-v${FORCE_VERSION}/bin"
 "$BIN/lotusd" --version
 "$BIN/lotus-cli" --version
 ldd "$BIN/lotusd" | tee "$CANDIDATE/output/runtime-libraries.txt"

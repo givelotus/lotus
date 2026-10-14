@@ -24,7 +24,12 @@ missing `endif` in `depends/Makefile`, explicitly passes the depends toolchain
 to NNG/Flatbuffers, selects the validated Rust 1.93.0 instead of upstream
 1.87.0, and builds headless Lotus daemon and CLI while retaining built-in wallet RPC
 support through the existing Berkeley DB and SQLite depends recipes. C++ suites, security checks,
-and symbol checks precede packaging. Archives contain upstream COPYING.
+and symbol checks precede packaging. Archives contain upstream COPYING and a brief usage README. Source archives
+use deterministic git archive and include the depends recipes omitted by
+upstream CPack packaging. Filenames and top-level directories use
+`lotus-vVERSION`, matching native release naming. Reproducing binaries still
+uses the recorded clean Git commit and Guix recipe; a standalone source-tarball
+build without Git metadata is not claimed bitwise equivalent.
 
 Chronik and NNG use separate ON/OFF switches and do not select mining or policy
 patches. No consensus changes are introduced by this overlay. The wrapper
