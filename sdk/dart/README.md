@@ -3,6 +3,26 @@
 Keys, XAddresses, scripts and transactions for Lotus (XPI), plus separate Chronik
 HTTP/protobuf and Electrum TCP/TLS clients. Dart 3.11 or later is required.
 
+For a chain-explicit API covering Bitcoin, Bitcoin Cash, eCash, Lotus,
+Dogecoin and Litecoin, import `package:lotus_dart/nakamoto.dart`:
+
+```dart
+import 'dart:typed_data';
+import 'package:lotus_dart/nakamoto.dart';
+
+final chain = getChain('xpi-mainnet');
+final root = ChainHDKey.fromSeed(Uint8List.fromList(seedBytes));
+final account = root.deriveBip44Account(coinType: chain.registeredSlip44);
+final receivingKey = account.derive(0).derive(0).key!;
+final address = receivingKey.address(chain: chain).encode();
+```
+
+Networks are selected explicitly; unknown identifiers fail. Amounts in the new
+transaction API use `BigInt` base units, including in browsers. The existing
+`lotus.dart` API remains compatible with Vase. See [the API and support matrix](
+docs/nakamoto-parity/README.md) for signing examples, supported operations,
+reference fixtures and the differences from Frank's TypeScript library.
+
 ```sh
 dart pub get
 dart test

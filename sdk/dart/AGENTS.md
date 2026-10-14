@@ -24,6 +24,18 @@
   Exact recovered provenance and reproduction commands are in
   `docs/crypto-audit-20261014/README.md`.
 
+- `nakamoto.dart` owns the explicit-chain API; keep it browser safe and preserve
+  Vase's existing `lotus.dart` imports. Chain identity/configuration comes from
+  pinned Frank Nakamoto descriptors and its canonical protocol registry, never
+  inferred from display names or defaulted on unknown input. Update fixtures
+  and regenerate/check `chains.dart` together with the documented tools.
+- New transaction amounts are `BigInt` integer base units, including JavaScript.
+  Signing requires explicit algorithm, hash type and supplied spent-output
+  facts; it does not own wallet inventory or transport. Unsupported Script,
+  spending and proof capabilities fail explicitly and remain documented in
+  `docs/nakamoto-parity/README.md`. BIP340 primitives must not be described as
+  BCH Schnorr or as complete Taproot transaction support.
+
 - Latest dependency constraints were reviewed against official pub.dev metadata
   on 2026-10-14. Keep `unorm_dart` aligned with Vase (`^0.3.3`); BIP39 ASCII,
   composed/decomposed accents and compatibility characters have independent seed
