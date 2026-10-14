@@ -54,6 +54,9 @@ class _HomePageState extends State<HomePage> {
     final balance = context.select<WalletModel, BigInt?>(
       (wallet) => wallet.balance?.balance,
     );
+    final initialized = context.select<WalletModel, bool>(
+      (wallet) => wallet.initialized,
+    );
     final walletError = context.select<WalletModel, Object?>(
       (wallet) => wallet.balance?.error,
     );
@@ -96,6 +99,8 @@ class _HomePageState extends State<HomePage> {
                     balance == null
                         ? (walletError == null
                               ? 'Loading balance…'
+                              : initialized
+                              ? 'Balance unavailable'
                               : 'Wallet unavailable')
                         : formatAmount(amount: balance),
                     style: const TextStyle(color: Colors.white, fontSize: 24),

@@ -2,6 +2,7 @@ import 'dart:async';
 
 import 'package:flutter/foundation.dart';
 import 'package:flutter/widgets.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 import 'package:vase/chronik-client/client.dart';
 import 'package:vase/config/constants.dart';
@@ -95,7 +96,15 @@ class WalletModel with ChangeNotifier {
       };
       wallet!.initialize();
       initialized = true;
-    } catch (_) {
+    } catch (error, stack) {
+      assert(() {
+        debugPrint(
+          'Wallet initialization failed: ${error.runtimeType}'
+          '${error is PlatformException ? ' (platform code ${error.code})' : ''}',
+        );
+        debugPrintStack(stackTrace: stack, maxFrames: 6);
+        return true;
+      }());
       // A failed read is not proof of an empty wallet. Do not generate or write
       // replacement keys, and do not expose native error text containing data.
       _initialized = false;

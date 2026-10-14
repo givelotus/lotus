@@ -288,3 +288,8 @@ Upstream Bitcoin ABC's in-process Chronik (`chronik/`) assumes standard 80-byte 
 
 - Full Xcode 27 and iOS 27 simulator SDKs are installed; earlier platform-unavailable evidence reflected Command Line Tools selection. Preserve system xcode-select and use the scoped `wallets/vase/vase-client/tool/with_xcode.sh` helper, including for pub get. It passes Xcode selection through Dart native hooks without editing global SDK/package caches.
 - iOS now uses SwiftPM for all current plugins, including Sentry's pinned native framework, and current Flutter UIScene registration. The obsolete flutter_vibrate plugin is replaced by built-in Flutter haptics after its native compile failure. App identity/team/iOS 15 minimum are preserved. Simulator builds pass; physical camera, signing, push and migration of existing wallet storage remain separate unverified work.
+
+## Native Vase preview service diagnosis (2026-10-14)
+
+- The dedicated simulator's initial Wallet unavailable status was caused by HTTP 502 responses from the historical default Chronik service, after wallet initialization succeeded. It was not a demonstrated keychain failure; preserve the existing secure-storage guard and identity. Status now distinguishes backend balance failure from initialization failure, with a regression test.
+- Rebuilding the dedicated preview with the existing CHRONIK_URL override to read-only local Chronik at 127.0.0.1:19331, then installing without uninstall/data erasure, launches successfully and displays 0 XPI. Production service defaults remain unchanged; camera absence on the simulator remains expected. Debug diagnostics avoid wallet values and exception messages.

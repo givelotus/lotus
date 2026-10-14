@@ -100,6 +100,21 @@ void main() {
     expect(find.textContaining('fixture unavailable'), findsNothing);
   });
 
+  testWidgets(
+    'a balance-service failure is distinct from wallet initialization failure',
+    (tester) async {
+      wallet.initialized = true;
+      wallet.balance = WalletBalance(
+        error: StateError('fixture backend unavailable'),
+      );
+      await launch(tester);
+      expect(find.text('Balance unavailable'), findsOneWidget);
+      expect(find.text('Wallet unavailable'), findsNothing);
+      expect(find.textContaining('fixture backend unavailable'), findsNothing);
+      expect(find.byKey(const ValueKey('scanner')), findsOneWidget);
+    },
+  );
+
   testWidgets('opens directly into scanner with original quick actions', (
     tester,
   ) async {

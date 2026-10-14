@@ -122,3 +122,17 @@ take several minutes. Simulator builds do not need an Apple developer account;
 signing/distribution and physical-device checks are separate. Xcode 27 / iOS 27
 simulator builds pass; camera, push notifications and existing-wallet keychain
 migration still require separate device checks.
+
+For a local simulator preview, point the existing Chronik override at a running
+local Lotus node (the simulator shares the Mac's loopback network):
+
+```sh
+tool/with_xcode.sh flutter build ios --simulator --debug --no-pub \
+  --dart-define=CHRONIK_URL=http://127.0.0.1:19331
+```
+
+Use the port of your own isolated node. This changes the preview build only;
+it does not provide an automatic fallback or change release defaults. A backend
+balance error is displayed separately from failure to open wallet storage.
+The iOS simulator has no physical camera, so scanner availability must be tested
+on an actual device.
