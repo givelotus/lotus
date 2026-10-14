@@ -3,8 +3,10 @@
 V1 patches are single-message `git format-patch` files. Setup imports them with
 `git am`, retaining each subject, body, author and author date. Committer identity
 is the builder, not an assertion that the original author performed the replay.
-Reference series may still contain raw diffs; their synthetic commit messages are
-explicitly labeled `Apply patch:` until historical metadata is recovered.
+All tracked source patches now carry mail metadata and a nonempty explanation.
+Comment-only no-op and placeholder files remain explicit non-patches; they must
+not be imported with `git am`. The audit rejects new raw diffs or synthetic
+`Apply patch:` subjects.
 
 The metadata migration preserves the original 153 filenames and every diff byte.
 `patches/v1/metadata-provenance.json` records each pre-migration commit and tree,
@@ -95,3 +97,58 @@ checks remain separate requirements before publication or deployment.
 Follow-up integration also passes the normal Chronik-enabled build, Rust checks,
 all 156 C++ check targets, and isolated mainnet Chronik parity. See
 [v1 validation](v1-8c67fe1e85-validation.md) for the exact source and evidence.
+
+## Reference patch message backfill
+
+The remaining four raw diffs, eCash/BCHN 01 and 02, now have newly authored
+maintenance envelopes and explanations. Their original per-patch author dates
+and messages could not be recovered. These are explicitly new metadata, not
+claims of original authorship. The monorepo port/import is recorded as
+`578bbcddd210de1601b280967700e07420f23782`. Its earlier mining import
+`9686d09aac0ebe58d4ad173b2fb12360776869de` points to
+[schancel's simple-mining branch](https://github.com/schancel/bitcoin-abc/tree/simple-mining),
+whose recorded tip `c1bdbe00d29042af81e1846728088f32867c3498` has the original
+subject “WIP: Stupidly simple mining.” That 2019 source is historical lineage,
+not the adapted modern diff.
+
+The new messages explain actual behavior: 01 is a broken experimental static
+ancestor-package assembler; 02 inserts transactions with `addUnchecked` and
+does not establish admission-policy changes. Neither becomes supported through
+this metadata update. Both remain outside default executable manifests.
+`patches/reference-metadata-provenance.json` records original file hashes, exact
+unchanged payload hashes, metadata hashes, exact pinned bases and resulting trees.
+Each raw-diff tree was independently compared with its new `git am` replay:
+
+| Reference | Exact base | Unchanged source tree |
+| --- | --- | --- |
+| eCash 01 | `252182e957120652960c1f88ec96515c448b1204` | `1bffd0dba02e9440857f7abaa9fbeae7743dd2d9` |
+| eCash 02 | same | `0bed473a0ecb97967f131f26b6d0fcdcf09d92a0` |
+| BCHN 01 | `0bc23ac4c1365f34ed824e2b07e554ec06a5f5cd` | `23f266df5b173e3840516b14bf7d17832812ccfb` |
+| BCHN 02 | same | `f3d90d3c262eba8b0b1956af98e6e31bda5f060c` |
+
+These four comparisons apply each candidate independently to its exact base.
+They prove metadata conversion preserves source, not that the candidates work.
+
+Thirteen subject-only commits in the incomplete current-ABC Dogecoin candidate
+now append a labelled maintenance explanation. Original subjects, authors and
+author dates remain intact; the new prose is explicitly not original author text.
+Its manifest retains the old metadata hashes and original/adapted commit IDs
+alongside new metadata digests. Replay checks all 23 intermediate trees and
+retains final tree `bf971ab0f83cf34656bb6671e8078463099d9ee0`. The source segment
+remains incomplete, unbuilt and outside selectable series.
+
+V1's 153 already-recovered envelopes, Doged's maintained compatibility patches,
+the optional proof-score candidate and eCash's finalized-pruning patch retain
+their existing messages. No patch payload changes in this backfill. Run the
+repository-wide coverage and payload audit with:
+
+```sh
+python3 daemon/scripts/check-patch-metadata.py
+python3 -m unittest discover -s daemon/scripts/tests -v
+```
+
+The coverage check includes component patches if subsequently tracked, requires
+a meaningful subject and explanation for every source patch, validates envelope
+author/date fields, and recognizes only explicitly labelled non-patch placeholders.
+The reference payload hash guard intentionally fails after a source correction;
+update its evidence only alongside an independently reviewed source change.

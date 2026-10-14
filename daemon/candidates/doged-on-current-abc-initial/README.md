@@ -42,3 +42,9 @@ The complete conflict-resolution rationale and reviewed categories are in [`daem
 The next original commit is **`a06e1c4c831a6f0bbd9b1e3983a0c6b8d4c4594a`**, “Unbreak avalanche tests.” Its 14-file proof-score-width change intersects modern upstream overflow protection and changed coordination/test APIs. The old implementation demonstrably overflows for large Dogecoin amounts; blindly restoring it is incorrect. The independent [optional proof-score repair](../doged-avalanche-proof-score/README.md) targets pinned Doged and is separate from this incomplete ABC port and from Chronik dependencies.
 
 Remaining work includes safe numeric-width integration, historical Dogecoin DAA/subsidy rules, legacy Script behavior, full AuxPoW serialization/validation and disk access, network/genesis identity, and Chronik integration. The 273 unmatched commits with same-subject ABC counterparts require semantic delta review rather than wholesale replay. A complete port needs native builds and independent consensus, synchronization and indexer validation before becoming a maintained/selectable target. Avalanche quorum/finalization requires its own evidence.
+
+Thirteen originally subject-only messages include a labelled maintenance explanation
+added on 2026-10-14. Original author/date/subject and source payload bytes remain
+unchanged. `manifest.json` retains pre-enrichment metadata hashes and records the
+new digests; all 23 intermediate source trees are verified by replay. The added
+prose is not presented as original author text or new behavioral validation.
