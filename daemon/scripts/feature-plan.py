@@ -26,7 +26,14 @@ def resolve(target, names, allow_experimental):
         if enabled in names and feature + '-off' in names:
             raise ValueError(f'Conflicting selections for {feature}')
     for name in names:
-        if name in ('chronik', 'chronik-off', 'nng', 'nng-off'):
+        if target == 'bchn' and name in ('nng', 'nng-off'):
+            if not allow_experimental:
+                raise ValueError('BCHN NNG is an experimental new protocol; use --allow-experimental explicitly')
+            patches.append(str(DAEMON / 'patches' / 'bchn' / '10-nng-interface.patch'))
+            flags.append('-DBUILD_BITCOIN_NNG=' + ('OFF' if name.endswith('-off') else 'ON'))
+            evidence.append({'feature': name, 'kind': 'experimental-candidate', 'requires': [],
+                             'warning': 'New BCHN raw-payload publisher; not Lotus FlatBuffers/RPC wire compatible'})
+        elif name in ('chronik', 'chronik-off', 'nng', 'nng-off'):
             feature = name.removesuffix('-off')
             flag = TARGETS[target].get(feature)
             if not flag:

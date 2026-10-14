@@ -27,7 +27,7 @@ class FeatureSelectionTests(unittest.TestCase):
                 planner.resolve("v1", names, False)
 
     def test_unimplemented_ports_and_policy_are_rejected(self):
-        for target, name in (("bitcoin", "chronik"), ("bchn", "nng"),
+        for target, name in (("bitcoin", "chronik"), ("bitcoin", "nng"),
                              ("ecash", "tx-chain-limit"), ("v1", "tx-chain-limit"),
                              ("doged", "zeromq-remove")):
             with self.assertRaises(ValueError):
@@ -46,6 +46,15 @@ class FeatureSelectionTests(unittest.TestCase):
                          ["01-prioritize-ready-transactions.patch"])
         self.assertEqual(plan["cmake_args"], ["-DBUILD_BITCOIN_ZMQ=OFF"])
         self.assertEqual(plan["features"][0]["requires"], [])
+
+    def test_bchn_nng_is_independent_and_requires_protocol_opt_in(self):
+        with self.assertRaises(ValueError):
+            planner.resolve("bchn", ["nng"], False)
+        plan = planner.resolve("bchn", ["nng", "zeromq-on"], True)
+        self.assertEqual([Path(p).name for p in plan["patches"]], ["10-nng-interface.patch"])
+        self.assertEqual(plan["cmake_args"], ["-DBUILD_BITCOIN_NNG=ON", "-DBUILD_BITCOIN_ZMQ=ON"])
+        self.assertEqual(plan["features"][0]["requires"], [])
+        self.assertIn("not Lotus", plan["features"][0]["warning"])
 
     def test_experimental_selection_requires_opt_in(self):
         with self.assertRaises(ValueError):
