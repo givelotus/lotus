@@ -7,7 +7,8 @@ or cost coefficients are selected here.
 
 from dataclasses import dataclass
 from hashlib import sha256
-from typing import Mapping
+from types import MappingProxyType
+from typing import Callable, Mapping
 
 from .encoding import DecodeError, Reader
 
@@ -39,7 +40,7 @@ class VMProfile:
     max_ast_depth: int
     max_invocation_cost: int
     structural_byte_cost: int
-    opcode_costs: Mapping[int, int]
+    opcode_costs: Mapping[int, int | Callable[[tuple[int, ...], tuple[int, ...]], int]]
 
     def __post_init__(self) -> None:
         for name in ("max_script_bytes", "max_arguments", "max_element_bytes",
@@ -50,9 +51,11 @@ class VMProfile:
                 raise ValueError(f"{name} must be a positive integer")
         if self.max_invocation_cost > U128_MAX:
             raise ValueError("cost cap exceeds u128")
-        if any(type(k) is not int or k not in ASSIGNED or type(v) is not int or v <= 0
+        if any(type(k) is not int or k not in ASSIGNED or not (
+            (type(v) is int and v > 0) or callable(v))
                for k, v in self.opcode_costs.items()):
-            raise ValueError("opcode costs must be positive charges for assigned bytes")
+            raise ValueError("opcode costs must be positive integers or cost functions for assigned bytes")
+        object.__setattr__(self, "opcode_costs", MappingProxyType(dict(self.opcode_costs)))
 
 
 @dataclass(frozen=True)
@@ -196,34 +199,21 @@ def _checked_cost(value: int, cap: int) -> int:
     return value
 
 
-def static_cost(ast: tuple[Node, ...], profile: VMProfile, *, input_count: int, output_count: int) -> int:
-    """Conservative structural bound with caller-supplied worst-operand charges."""
-    def primitive(op: int) -> int:
-        try:
-            return profile.opcode_costs[op]
-        except KeyError as exc:
-            raise UnsupportedFeature(f"missing static charge for assigned opcode {op:02x}") from exc
+def static_cost(ast: tuple[Node, ...], profile: VMProfile, *, input_count: int,
+                output_count: int, initial_sizes: tuple[int, ...] = (),
+                script_length: int = 0,
+                field_sizes: Mapping[int, tuple[int, ...]] | None = None) -> int:
+    """P05 size-aware structural charge; see ``vm_cost.static_size_cost``."""
+    from .vm_cost import static_size_cost
 
-    def seq(nodes: tuple[Node, ...]) -> int:
-        total = 0
-        for node in nodes:
-            if isinstance(node, Instruction):
-                part = primitive(node.opcode)
-            elif isinstance(node, Conditional):
-                part = primitive(node.opcode) + primitive(0x64) + max(seq(node.then_arm), seq(node.else_arm))
-                if node.has_else:
-                    part += primitive(0x63)
-            else:
-                bound = {0x67: input_count, 0x68: output_count, 0x69: 256}[node.opcode]
-                part = primitive(node.opcode) + bound * (primitive(0x6a) + seq(node.body))
-            total = _checked_cost(total + part, profile.max_invocation_cost)
-        return total
-
-    return seq(ast)
+    return static_size_cost(ast, profile, initial_sizes=initial_sizes,
+                            script_length=script_length, input_count=input_count,
+                            output_count=output_count, field_sizes=field_sizes).cost
 
 
 def evaluate(script: bytes, args: tuple[bytes, ...], profile: VMProfile, *,
-             input_count: int = 0, output_count: int = 0) -> VMResult:
+             input_count: int = 0, output_count: int = 0,
+             field_sizes: Mapping[int, tuple[int, ...]] | None = None) -> VMResult:
     """Evaluate one invocation; caller handles witness, membership and outer checks."""
     if type(input_count) is not int or type(output_count) is not int or not (0 <= input_count <= 65535 and 0 <= output_count <= 65535):
         raise VMError("invalid transaction counts")
@@ -238,7 +228,9 @@ def evaluate(script: bytes, args: tuple[bytes, ...], profile: VMProfile, *,
         return VMResult(True, True, charge, None)
     ast = decode(script, profile)
     charge = _checked_cost(len(script) * profile.structural_byte_cost + static_cost(
-        ast, profile, input_count=input_count, output_count=output_count), profile.max_invocation_cost)
+        ast, profile, input_count=input_count, output_count=output_count,
+        initial_sizes=tuple(map(len, args)), script_length=len(script),
+        field_sizes=field_sizes), profile.max_invocation_cost)
     stack = list(args)
     alt: list[bytes] = []
 
