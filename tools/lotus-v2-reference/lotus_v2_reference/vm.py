@@ -11,6 +11,7 @@ from types import MappingProxyType
 from typing import Callable, Mapping
 
 from .encoding import DecodeError, Reader, encode_compact_size
+from .vm_context import InvocationContext, requires_branch
 
 
 class VMError(ValueError):
@@ -293,41 +294,71 @@ def static_cost(ast: tuple[Node, ...], profile: VMProfile, *, input_count: int,
 def validate_invocation_inputs(script: bytes, args: tuple[bytes, ...],
                                profile: VMProfile, *, input_count: int,
                                output_count: int,
-                               signing: SigningContext | None = None) -> None:
+                               signing: SigningContext | None = None,
+                               invocation: InvocationContext | None = None) -> tuple[bytes, ...]:
     """Check bounded invocation inputs before the instruction-boundary scan."""
     if not isinstance(script, bytes) or len(script) > profile.max_script_bytes:
         raise VMError("script exceeds explicit bound")
+    if invocation is not None and not isinstance(invocation, InvocationContext):
+        raise TypeError("invocation must be InvocationContext")
+    if signing is not None and not isinstance(signing, SigningContext):
+        raise TypeError("signing must be SigningContext")
     if type(input_count) is not int or type(output_count) is not int or not (0 <= input_count <= 65535 and 0 <= output_count <= 65535):
         raise VMError("invalid transaction counts")
     if not isinstance(args, tuple) or len(args) > profile.max_arguments or any(
         not isinstance(arg, bytes) or len(arg) > profile.max_element_bytes for arg in args
     ):
         raise VMError("argument framing exceeds bounds")
-    if len(args) > profile.max_stack_items or sum(map(len, args)) > profile.max_vm_bytes:
+    if invocation is not None and (invocation.input_count != input_count or
+                                   invocation.output_count != output_count):
+        raise VMError("invocation context disagrees with transaction counts")
+    if signing is not None and invocation is not None and (
+        signing.invocation_kind != invocation.invocation_kind or
+        signing.input_index != invocation.input_index or
+        signing.output_count != invocation.output_count
+    ):
+        raise VMError("signing and invocation identities disagree")
+    initial = args + ((number(invocation.mint_delta),) if invocation is not None and
+                      invocation.invocation_kind == "mint" else ())
+    if any(len(item) > profile.max_element_bytes for item in initial):
+        raise VMError("initial element exceeds bound")
+    if len(initial) > profile.max_stack_items or sum(map(len, initial)) > profile.max_vm_bytes:
         raise VMError("initial stack exceeds bounds")
     if signing is not None and (signing.output_count != output_count or
                                 signing.input_index >= input_count):
         raise VMError("signing context indices disagree with invocation counts")
     if signing is not None and branch_leaf_hash(script) != signing.selected_leaf_hash:
         raise VMError("selected leaf does not match script")
+    return initial
 
 
 def evaluate(script: bytes, args: tuple[bytes, ...], profile: VMProfile, *,
-             input_count: int = 0, output_count: int = 0,
+             input_count: int | None = None, output_count: int | None = None,
              field_sizes: Mapping[int, tuple[int, ...]] | None = None,
-             signing: SigningContext | None = None) -> VMResult:
+             signing: SigningContext | None = None,
+             invocation: InvocationContext | None = None) -> VMResult:
     """Evaluate one invocation; caller handles witness, membership and outer checks."""
-    validate_invocation_inputs(script, args, profile, input_count=input_count,
-                               output_count=output_count, signing=signing)
+    if invocation is not None:
+        if input_count is not None and input_count != invocation.input_count:
+            raise VMError("input count disagrees with invocation context")
+        if output_count is not None and output_count != invocation.output_count:
+            raise VMError("output count disagrees with invocation context")
+        input_count, output_count = invocation.input_count, invocation.output_count
+    else:
+        input_count = 0 if input_count is None else input_count
+        output_count = 0 if output_count is None else output_count
+    initial = validate_invocation_inputs(script, args, profile, input_count=input_count,
+                                         output_count=output_count, signing=signing,
+                                         invocation=invocation)
     if success_scan(script, profile):
         charge = _checked_cost(len(script) * profile.structural_byte_cost, profile.max_invocation_cost)
         return VMResult(True, True, charge, None)
     ast = decode(script, profile)
     charge = _checked_cost(len(script) * profile.structural_byte_cost + static_cost(
         ast, profile, input_count=input_count, output_count=output_count,
-        initial_sizes=tuple(map(len, args)), script_length=len(script),
+        initial_sizes=tuple(map(len, initial)), script_length=len(script),
         field_sizes=field_sizes), profile.max_invocation_cost)
-    stack = list(args)
+    stack = list(initial)
     alt: list[bytes] = []
 
     def pop() -> bytes:
@@ -345,6 +376,29 @@ def evaluate(script: bytes, args: tuple[bytes, ...], profile: VMProfile, *,
     def require(n: int) -> None:
         if len(stack) < n:
             raise VMError("stack underflow")
+
+    def context() -> InvocationContext:
+        if invocation is None:
+            raise UnsupportedFeature("introspection requires resolved invocation context")
+        return invocation
+
+    def input_view(index: int):
+        try:
+            return context().input(index)
+        except IndexError as exc:
+            raise VMError(str(exc)) from exc
+
+    def coin_view(index: int):
+        try:
+            return context().coin(index)
+        except IndexError as exc:
+            raise VMError(str(exc)) from exc
+
+    def output_view(index: int):
+        try:
+            return context().output(index)
+        except IndexError as exc:
+            raise VMError(str(exc)) from exc
 
     def execute(nodes: tuple[Node, ...], active_loops: int) -> int:
         for node in nodes:
@@ -536,6 +590,40 @@ def evaluate(script: bytes, args: tuple[bytes, ...], profile: VMProfile, *,
                         raise VMError("CHECKSIGVERIFY failed")
                 else:
                     push(number(int(verified)))
+            elif op == 0xc9:
+                push(number(context().input_count))
+            elif op == 0xca:
+                push(number(context().output_count))
+            elif op == 0xcb:
+                push(number(context().mint_count))
+            elif op == 0xd0:
+                push(number(context().input_index))
+            elif op == 0xd1:
+                push(number(input_view(_numeric(pop())).flags))
+            elif op == 0xd6:
+                push(number(coin_view(_numeric(pop())).value))
+            elif op == 0xd7:
+                coin = coin_view(_numeric(pop()))
+                push(coin.token_id if coin.token_id is not None else bytes(32))
+            elif op == 0xdd:
+                root = pop()
+                coin = coin_view(_numeric(pop()))
+                push(number(int(requires_branch(coin, root))))
+            elif op == 0xe0:
+                push(number(output_view(_numeric(pop())).flags))
+            elif op == 0xe1:
+                push(number(output_view(_numeric(pop())).value))
+            elif op == 0xe2:
+                output = output_view(_numeric(pop()))
+                push(output.token_id if output.token_id is not None else bytes(32))
+            elif op == 0xe8:
+                root = pop()
+                output = output_view(_numeric(pop()))
+                push(number(int(requires_branch(output, root))))
+            elif op == 0xf1:
+                push(number(1 if context().invocation_kind == "spend" else 3))
+            elif op == 0xf2:
+                push(context().branch_root)
             else:
                 raise UnsupportedFeature(f"assigned opcode {op:02x} is outside this VM slice")
         return 0

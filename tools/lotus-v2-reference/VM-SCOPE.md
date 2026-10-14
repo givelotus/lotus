@@ -42,9 +42,32 @@ requires a paired output. Wrong framing and malformed keys error, while a
 well-framed invalid signature produces canonical `N(0)`. Opcode `ba`
 computes unkeyed 32-byte BLAKE3 directly over its byte operand with no Lotus
 application tag. CHECKDATASIG profiles and other Merkle operations,
-transaction/UTXO/output introspection and lock checks are not implemented.
+the `UTXOREQUIRESBRANCH` and `OUTPUTREQUIRESBRANCH` path predicates, and the
+input/output count, flags, value, token ID, invocation kind, index and branch
+root reads needed by the P03 token examples are implemented against an
+explicit `InvocationContext`. Other transaction/UTXO/output introspection
+and lock checks are not implemented.
 `UnsupportedFeature` is a tool error, not consensus acceptance.
 The reference is not a complete VM or transaction validator.
+
+`InvocationContext` holds immutable, locally checked input and output views.
+For a spend it checks that the selected branch root occurs on the selected
+path of the resolved coin. For a mint it checks that the active input is a
+mint with the branch root as its token ID, and pushes the positive `mint_delta`
+as an `N` above witness arguments. That implicit value counts toward stack,
+element, VM-byte and static-cost bounds but not `MAX_ARGUMENTS`. Output
+`REQUIRESBRANCH` is true only when a spendable output includes the given
+32-byte root on **every** path; merely listing the root among its branches
+does not suffice. A missing or bypassable root returns canonical `N(0)`.
+Counts and mint-input count come from the context, and explicit duplicate
+counts must agree. The context does not resolve outpoints, prove coin or
+branch membership, authenticate the claimed mint delta, or check asset
+conservation. A transaction validator must supply and authenticate those
+facts, as well as the selected path and branch indices. `SigningContext`
+matches invocation kind, input index and output count, and authenticates only
+that its selected leaf hash matches the script. It has no selected branch
+index; the enclosing validator must bind its message digest to the proven
+branch and exact transaction.
 
 Install the signing dependencies in an isolated Python 3.13 environment with
 `pip install -r tools/lotus-v2-reference/requirements-vm.txt`. The CLI accepts
@@ -54,11 +77,19 @@ one JSON invocation on stdin or from a file:
 PYTHONPATH=tools/lotus-v2-reference python3.13 -m lotus_v2_reference.vm_runner case.json
 ```
 
-The JSON object has `script` and `args` as hex, explicit `input_count` and
-`output_count`, `profile` with every `VMProfile` cap and `opcode_costs` keyed
+The JSON object has `script` and `args` as hex, `profile` with every
+`VMProfile` cap and `opcode_costs` keyed
 by two-digit opcode hex, and optional `signing` with `selected_leaf_hash`,
 `messages` keyed by decimal mode, `invocation_kind`, `input_index` and
-`output_count`. An opcode charge is a positive integer or an object with
+`output_count`. It may include `invocation` with `inputs`, `outputs`,
+`invocation_kind`, `input_index`, `branch_root`, an explicit `output_profile`,
+and for a spend `selected_path_index` and `selected_branch_index`, or for a
+mint `mint_delta`. Each input has `flags` and either a resolved `coin` or
+`mint_token_id`; each output/coin has `flags`, `value`, nullable `token_id`,
+`branches` as root hex strings, and `paths` as index arrays. Counts are
+derived from the context; without it, explicit `input_count` and
+`output_count` are required. Supplied counts must agree with the context.
+An opcode charge is a positive integer or an object with
 `base`, `operand_byte` and `result_byte` coefficients. Each coefficient must
 be nonnegative and `base` positive. The runner emits a stage-only trace,
 invocation result and calculated script/VM cost. Its caller must derive the
@@ -78,6 +109,11 @@ wrong-message behavior and invalid x-only key framing. Runner tests exercise
 an actual `PUSH_32 owner CHECKSIG` invocation with explicit illustrative costs.
 The BLAKE3 opcode is checked against the official unkeyed empty-input vector
 and through the JSON runner with an explicit size-based charge.
+P03 hand-assembled token transfer, mint issuance and token upgrade scripts
+exercise required-path behavior, mint delta placement, signing failure,
+context/count mismatches and the same multi-input, multi-output shape used
+by the compiler gallery. These tests establish the invocation behavior, not
+end-to-end transaction validity or a consensus resource schedule.
 
 Open specification dependencies: P03's opcode allocation and P05's primitive
 cost coefficients and hard resource constants remain candidates. Field-size

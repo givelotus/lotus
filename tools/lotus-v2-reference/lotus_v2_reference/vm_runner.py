@@ -5,9 +5,11 @@ import json
 import sys
 from typing import Any
 
+from .encoding import Output, Profile as OutputProfile
 from .vm import (SigningContext, UnsupportedFeature, VMError, VMProfile,
                  decode, evaluate, static_cost, success_scan,
                  validate_invocation_inputs)
+from .vm_context import InputView, InvocationContext
 
 
 def _hex(value: Any, name: str) -> bytes:
@@ -76,6 +78,39 @@ def _signing(raw: Any) -> SigningContext | None:
         raise ValueError(f"missing signing field {exc.args[0]}") from exc
 
 
+def _output(raw: Any) -> Output:
+    if not isinstance(raw, dict):
+        raise ValueError("output must be object")
+    try:
+        return Output(raw["flags"], raw["value"],
+                      None if raw.get("token_id") is None else _hex(raw["token_id"], "token_id"),
+                      tuple(_hex(root, "branch root") for root in raw["branches"]),
+                      tuple(tuple(path) for path in raw["paths"]))
+    except KeyError as exc:
+        raise ValueError(f"missing output field {exc.args[0]}") from exc
+
+
+def _invocation(raw: Any) -> InvocationContext | None:
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        raise ValueError("invocation must be object")
+    try:
+        profile = OutputProfile(**raw["output_profile"])
+        inputs = tuple(InputView(item["flags"],
+                                 None if item.get("coin") is None else _output(item["coin"]),
+                                 None if item.get("mint_token_id") is None else
+                                 _hex(item["mint_token_id"], "mint_token_id"))
+                       for item in raw["inputs"])
+        outputs = tuple(_output(item) for item in raw["outputs"])
+        return InvocationContext(inputs, outputs, raw["invocation_kind"],
+                                 raw["input_index"], _hex(raw["branch_root"], "branch_root"),
+                                 profile, raw.get("selected_path_index"),
+                                 raw.get("selected_branch_index"), raw.get("mint_delta"))
+    except KeyError as exc:
+        raise ValueError(f"missing invocation field {exc.args[0]}") from exc
+
+
 def run_invocation(case: dict[str, Any]) -> dict[str, Any]:
     """Return a stage-only trace with explicit tool errors, never a tx verdict."""
     stage = "input"
@@ -90,13 +125,15 @@ def run_invocation(case: dict[str, Any]) -> dict[str, Any]:
         args = tuple(_hex(item, "argument") for item in case["args"])
         profile = _profile(case["profile"])
         signing = _signing(case.get("signing"))
-        input_count = case["input_count"]
-        output_count = case["output_count"]
+        invocation = _invocation(case.get("invocation"))
+        input_count = case.get("input_count", invocation.input_count if invocation else None)
+        output_count = case.get("output_count", invocation.output_count if invocation else None)
         if any(type(count) is not int or not 0 <= count <= 65535
                for count in (input_count, output_count)):
             raise ValueError("transaction counts must be u16")
-        validate_invocation_inputs(script, args, profile, input_count=input_count,
-                                   output_count=output_count, signing=signing)
+        initial = validate_invocation_inputs(script, args, profile, input_count=input_count,
+                                             output_count=output_count, signing=signing,
+                                             invocation=invocation)
         trace.append("input_framed")
         stage = "success_scan"
         automatic = success_scan(script, profile)
@@ -108,7 +145,7 @@ def run_invocation(case: dict[str, Any]) -> dict[str, Any]:
             stage = "static_charge"
             charge = static_cost(ast, profile, input_count=input_count,
                                  output_count=output_count,
-                                 initial_sizes=tuple(map(len, args)),
+                                 initial_sizes=tuple(map(len, initial)),
                                  script_length=len(script))
             charge += len(script) * profile.structural_byte_cost
             if charge > profile.max_invocation_cost:
@@ -116,7 +153,8 @@ def run_invocation(case: dict[str, Any]) -> dict[str, Any]:
             trace.append("charged")
         stage = "execution"
         result = evaluate(script, args, profile, input_count=input_count,
-                          output_count=output_count, signing=signing)
+                          output_count=output_count, signing=signing,
+                          invocation=invocation)
         trace.append("automatic_success" if result.automatic else "executed")
         return {"accepted_invocation": True, "automatic_success": result.automatic,
                 "charged_cost": result.charged_cost, "final_stack": None if result.stack is None

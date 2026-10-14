@@ -230,6 +230,8 @@ def static_size_cost(ast: tuple[Node, ...], profile: VMProfile, *,
                 if op == 0xbb: push(16)
             elif op == 0xbd:
                 pop(); pop(); pop(); pop(); push(16)
+            elif op == 0xdd:
+                pop(); pop(); push(16)
             elif op in NUMERIC:
                 # A conservative shape for supported future context operations.
                 if op in (0xd1, 0xd3, 0xd4, 0xd5, 0xd6, 0xd8, 0xda, 0xe0, 0xe1,
