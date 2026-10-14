@@ -93,3 +93,21 @@ failures. Subsequent candidate runs
 are still pending; there is no successful Guix Lotus binary or reproducibility
 claim yet. Record exact successful run IDs and artifact hashes here before
 promoting this path into a release workflow.
+
+## Tooling attempt evidence
+
+- [38591918734](https://github.com/givelotus/lotus/actions/runs/38591918734):
+  Ubuntu Guix installation and daemon access passed; depends parsing exposed the
+  missing `endif`. Explicit Bash pipefail now prevents `tee` from masking the
+  build command's failure.
+- [38592500393](https://github.com/givelotus/lotus/actions/runs/38592500393):
+  depends source hashes passed; obsolete Savannah channel fetching failed with
+  HTTP 500. The unchanged revision was independently fetched from Codeberg.
+- [38593484610](https://github.com/givelotus/lotus/actions/runs/38593484610),
+  source branch commit `d4b7fd6d`: worker a built pinned Guix and the custom GCC
+  14.3/glibc 2.31 toolchain, then its substitute subprocess failed with a TLS
+  push/write error at 16:55 UTC. No Lotus compilation or binary archive passed
+  on that worker. Worker b is still running; its result remains unverified.
+
+These attempts use the superseded source and wallet-OFF configuration described
+above. They are build-tooling evidence, not release readiness evidence.
