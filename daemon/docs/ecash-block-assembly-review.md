@@ -112,3 +112,59 @@ run against both the exact maintained base and the proposed updated upstream.
 This audit does not modify the published Lotus V1 patch payload or running
 nodes. A V1 repair must be a separate, explicit source change with native
 regression evidence, not an incidental metadata rewrite.
+
+## Explicit Lotus V1 correction
+
+A separate source correction restores the already retained upstream assembler,
+which uses the maintained fee-rate index and direct-parent counters. It removes
+the experimental package accumulator, DFS, template fields, and the misleading
+complexity description. Existing fee/prioritisation fixtures again reject free
+transactions subsidized only by previously selected ancestors. A new native
+mainnet-fixture test gives a paid parent and child precisely one byte of spare
+block capacity; both must enter the template.
+
+Source provenance (before folding into the maintained series):
+
+- Parent: `a055e77a25c1664d63080cec4d8409d3a63bc190`.
+- Repair commit: `e21d07c27a2235667d1450a003e883b246ed5aa3`.
+- Resulting source tree: `e0d4f9c0219739b6774864858c582a8144a443d9`.
+- Isolated clone: `/tmp/lotus-v1-assembly-repair`.
+- Reviewable mail patch: `/tmp/lotus-v1-assembly-repair.patch`.
+
+The same final native miner tests fail **five** assertions on the uncorrected
+source: free transaction inclusion, its descendant, constrained block count
+(two transactions including coinbase instead of three), missing fitting child,
+and inherited fee-delta grandchild inclusion (seven transactions instead of six).
+After correction, the complete `miner_tests` suite passes and all **151**
+`check-bitcoin` targets pass. `lotusd`, `lotus-cli`, and `test_lotus` build.
+
+This focused C++ validation configures **Chronik OFF** in the disposable clone;
+it does not replace the normal Chronik-enabled release checks. Rust/Chronik
+sources are unchanged by this correction. Original workspaces, running nodes,
+chain data, tags, and published assets were not modified by this audit.
+The patch-maintenance follow-up folds the correction into patch 246, preserves
+the 153-entry series, and compares the resulting complete tree with the tree
+above. The earlier V1 test/replay results describe the pre-correction tree;
+updated release evidence must identify the corrected tree explicitly.
+
+Evidence logs:
+
+- `/tmp/lotus-v1-assembly-regression-before.log`
+- `/tmp/lotus-v1-assembly-regression-after.log`
+- `/tmp/lotus-v1-assembly-repair-build-after.log`
+- `/tmp/lotus-v1-assembly-repair-cpp-checks.log`
+
+Reproduce after applying the reviewed mail patch to its recorded parent:
+
+```sh
+cmake -S . -B build -GNinja \
+  -DBUILD_BITCOIN_QT=OFF -DBUILD_BITCOIN_ZMQ=OFF \
+  -DENABLE_UPNP=OFF -DENABLE_NATPMP=OFF -DBUILD_CHRONIK=OFF \
+  -DPython_EXECUTABLE=/opt/homebrew/bin/python3.13 -DRust_TOOLCHAIN=1.93.0
+ninja -C build -j16 lotusd lotus-cli test_lotus
+(cd build && ./src/test/test_lotus --run_test=miner_tests --color_output=no)
+ninja -C build -j16 check-bitcoin
+```
+
+The Python path above records the native macOS run; use an installed compatible
+Python interpreter on another host.
