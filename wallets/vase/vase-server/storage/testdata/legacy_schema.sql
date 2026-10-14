@@ -149,5 +149,3 @@ ALTER TABLE ONLY public.locations
 --
 -- PostgreSQL database dump complete
 --
-
-
