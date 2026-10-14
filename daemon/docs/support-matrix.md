@@ -100,3 +100,7 @@ Patch 01 adds no tests and changes transaction selection. A passing compilation 
 The entry-ID topological-order assumption does have supporting ABC source invariants (`txmempool.cpp` asserts ancestor entry IDs precede a child); that evidence does not resolve the other issues. Patch 02 uses `addUnchecked`, bypassing admission policy, and its spend/value construction is not an end-to-end valid-chain fixture.
 
 Do not submit these candidates as ready upstream improvements or enable them in a supported release based on a clean patch application. Retain separate consensus, synchronization, Chronik RPC/disk parity, reorg behavior, and Avalanche tests for any Dogecoin lineage candidate.
+
+## Later independent eCash candidate verification
+
+ABC master advanced to `1fb7db17c176cdea8a2c60d887891589382ee4e3` during this session. Every eCash payload was checked again independently at that exact revision, original `8c67fe1e85`, and pinned `252182e957`. Newly added candidate 04 passes independent native builds, full `check-bitcoin`, processor tests and real isolated transaction-finalization regtest at both newer revisions, but fails application at the older default pin. Candidate 01/02 failures and no-op/placeholder classifications remain unchanged. See [the independent report](ecash-independent-verification.md) for combination conflicts, exact trees and test-only diamond coverage. This is not an all-patches-pass result.
