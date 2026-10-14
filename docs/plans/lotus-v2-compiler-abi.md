@@ -16,12 +16,32 @@ Compiler success does not establish transaction validity. The validator executes
 | Typed frontend | Source grammar, types, ownership of state transitions, bounded control flow | Source + bound template parameters → typed intermediate representation (IR) |
 | Compiler backend | Stack layout, opcode lowering, script-method emission | Typed IR → scripts, source maps, static resource report and diagnostics |
 | Policy/artifact builder | Method trees, branch/path layout, constructor dependencies and ABI | Scripts + explicit policy construction → versioned artifact, roots and proofs |
-| ABI binding generator | Safe typed encoding and decoding; call/transaction planning | Validated artifact → TypeScript first, followed by Rust/Dart bindings |
+| ABI binding generator | Safe typed encoding and decoding; call/transaction planning | Validated artifact → Python and TypeScript bindings plus their shared runtime contract; Rust/Dart later |
 | Execution harness | Independent verification and reproducible failures | Artifacts + scenario/parameter profile → traces, acceptance results, roots, costs and minimized regressions |
 
 Start under `tools/lotus-v2-compiler/`, with a machine-readable schema and fixtures under that directory. Keep the existing independent evaluator in `tools/lotus-v2-reference/`. Do not generate node validation code from the compiler backend: sharing a bug must not count as independent agreement. A pinned opcode registry can be shared; implementations of encoding, execution and cost calculation need cross-checks.
 
-Use a small Python assembler/CLI first to reach executable examples quickly and interface with the current reference. Select the typed frontend/backend implementation language in CABI-00 after a bounded prototype; the artifact and CLI contracts must not depend on Python object serialization. TypeScript bindings target the maintained Frank/Nakamoto application stack, but changes in `~/repos/frank` need a separate scoped implementation and revision record. This plan makes no changes in that repository.
+Use **Rust as the proposed implementation language for the production compiler**, with a standalone CLI and reusable compiler library. This is a design recommendation for review, not a user-selected requirement or a commitment to port Finch's implementation. Typed IR variants and explicit phase-state APIs fit the planned verifier boundary, while one compiler can emit both requested client libraries. Keep Python as the independent reference/evaluation language; a small Python reference assembler may bootstrap vectors without becoming a second production frontend. No LLVM/native-code backend is needed: the target is Lotus bytecode.
+
+The compiler implementation language and generated client languages are independent. **Python and TypeScript are equal first-release targets**, each with a generated contract-specific API and a small maintained runtime library. A standalone compiler producing versioned artifacts lets both clients work without embedding Rust, starting a compiler process during every call, or installing a native extension. WASM/Python-extension packaging is optional later work, not a dependency of the first usable bindings. Changes in `~/repos/frank` require a separate scoped revision; this plan makes no changes there.
+
+## Finch specification influence and deliberately small scope
+
+The maintainer identified `~/repos/finch-language-full-spec/` as a design reference and explicitly said its implementation is far from the specification. Use **`docs/language/SPECIFICATION.md`**, especially sections 2 (compilation), 11 (bounded compile-time evaluation), 13 (typed stack IR) and 16 (ABI separation), as inspiration. `FINCH_LANGUAGE_DESIGN.md` supplies rationale; do not infer implemented behavior, readiness or reusable compiler code from that repository.
+
+Borrow these design principles:
+
+- Preserve source spans through parsing, typed semantic construction and emitted bytecode. Verify stack heights/types at control-flow merges independently of the source frontend's claims.
+- Separate parsed, typed, lowered and verified artifacts. Compiler verification establishes properties of emitted code; it never grants consensus validity or lets the daemon skip validation.
+- Bind template values and specialize helpers at compile time. Begin with deterministic constants, bounded helper evaluation and simple typed generics; reject dependency cycles and expansion-budget exhaustion with useful source diagnostics.
+- Keep exported method/type interfaces immutable and versioned. Generate Python and TypeScript from one resolved interface model rather than scrape source text or independently infer method signatures.
+- Separate portable wire identity from host memory layout and programming-language representations. Finch's native ABI, operation selectors and message envelopes do not become Lotus consensus formats.
+
+The initial contract language can be small: named methods, typed parameters/constants, local expressions, `require`, conditionals and bounded loops. A single familiar C/D-like surface is a proposed starting point for review, using the existing contract examples. Forth-like assembly remains the inspection/debugging representation. Multiple surface syntaxes, a general effect/ownership system, exceptions, coroutines, capabilities, runtime allocation, general reflection and hygienic macros are outside the first compiler. Typed stack effects and explicit transaction/state obligations provide the useful checks without reproducing the whole Finch language.
+
+In particular, deterministic compile-time work gets fuel/output-size/instantiation limits and no ambient network, clock, random or filesystem access. If dependency files are supported, resolve only declared inputs and bind their content digests. Compile-time specialization must not silently unroll a large runtime enumeration and change code/resource requirements; emit an explicit cost/size report and require the same acceptance semantics.
+
+Finch provenance: repository HEAD `15016224e74f00b750f08d429c589f4969dc06a3`, inspected read-only on October 14, 2026. The language specification's SHA-256 is `12629049f6e588e7df55fee0e93b7fc52704f6949ecb137efcac51f0867b347a`. No Finch implementation, tests or runtime were adopted or validated by this planning review.
 
 ## Versioned ABI and artifact contract
 
@@ -66,16 +86,20 @@ Call preparation requires explicit input coins, output intents, assets, locks, s
 
 Partial signatures must show exactly which other inputs or outputs may change. SINGLE without a corresponding output rejects. Fee estimation must include actual argument/signature/proof bytes and coinbase/block requirements where applicable; P05 parameterized bounds are not a fee oracle. Finalization must validate the final complete bytes against the chosen profile and report unavailable contextual checks, not return a misleading unconditional `valid=true`.
 
-The first binding target is TypeScript, with exact-atom types and fixture tests. Rust and Dart follow the same schema and wire corpus. A generated address is only available once D14's actual address/policy encoding is specified; early tools expose explicit policy descriptors instead of inventing an address standard.
+The first release generates **both Python and TypeScript** with matching exact-atom and wire-corpus tests. Python maps integers to range-checked `int` (rejecting `bool` where an integer is required), byte values to `bytes`, and structured call/state values to generated typed dataclasses. TypeScript uses `bigint`, `Uint8Array`, generated interfaces and runtime checks; compile-time TypeScript types alone cannot validate network or JSON data. JSON export/import uses the artifact's canonical decimal/hex rules in both clients. Rust and Dart bindings may follow the same schema and corpus.
+
+Generated files contain contract-specific types, constructor/method descriptions and thin typed wrappers. Small versioned runtime libraries own canonical value/witness encoding, profile compatibility, transaction planning, signature-request assembly and finalization; they reuse reviewed signing/crypto services instead of emitting a fresh cryptographic implementation per contract. Applications supply coins, network/profile and signing callbacks. Compilation or ABI import never reads wallet secrets, chooses a network or sends a transaction implicitly.
+
+Each Python/TypeScript pair must reproduce identical constructor/script commitments, argument vectors, transaction bytes, TxID/TxHash and signing digests for the same fixture. Test signed/unsigned extrema, excess-width values, negative amounts, Boolean/int confusion, byte lengths, argument order, malformed artifact versions, partial signing and signature attachment. Also cross-consume fixtures: Python prepares and TypeScript finalizes, and vice versa. Generated APIs are source-language-specific conveniences over the same Lotus byte contract. A generated address is only available once D14's actual address/policy encoding is specified; early tools expose explicit policy descriptors instead of inventing an address standard.
 
 ## Milestones and acceptance
 
 | ID | Deliverable | Dependencies | Acceptance gate |
 | --- | --- | --- | --- |
-| CABI-00 | Artifact/ABI schema, type model, CLI contract, language prototype decision | Current versioned P01–P03 draft and registry | Golden valid/invalid schema cases; reproducible canonical digest; unresolved semantics listed |
+| CABI-00 | Artifact/ABI schema, type model, CLI contract, Rust backend and small surface-language prototype decision | Current versioned P01–P03 draft and registry | Golden valid/invalid schema cases; reproducible canonical digest; unresolved semantics listed |
 | CABI-01 | Assembler/disassembler and fixture runner | CABI-00, reference/native codec and hashes | Every assigned instruction and push boundary round-trips; canonical push bytes; source offsets; normal mode rejects success bytes; malformed inputs reject independently |
 | CABI-02 | Minimal typed payment/recovery compiler | CABI-01, signing and minimum VM subset | Exact compiled ordinary payment + generated ABI; valid signature accepted, wrong signer/output/chain rejected; recovery before/after contextual lock boundary |
-| CABI-03 | TypeScript call bindings and signed transaction workflow | CABI-00/02, transaction/signing APIs | Generated calls reproduce native/reference bytes; integer/argument/partial-signature mutation cases; no private keys in artifacts |
+| CABI-03 | Python + TypeScript call bindings/runtime libraries and signed transaction workflow | CABI-00/02, transaction/signing APIs | Both generated clients cross-reproduce native/reference bytes and signatures; integer/argument/partial-mode cases; no private keys in artifacts |
 | CABI-04 | Tokens, state and bounded covenants | CABI-02/03, needed VM/introspection and accounting | Execute mint/transfer rules, stateful counter, limit order, two-input merge and input × output loops; adversarial policy/state/asset substitutions reject |
 | CABI-05 | Differential/property/fuzz and stress harness | CABI-01 onward, expanded as validator support lands | Deterministic corpora and minimized discrepancies; correct accept/reject/results/roots/charges across independent engines; recorded stress measurements |
 | CABI-06 | Optimizer and application pilot | CABI-04/05, development-chain connect/undo | Optimized/unoptimized equivalence corpus; Frank application flow runs with generated bindings on disposable V2 chain; reorg/undo restores state |
@@ -103,7 +127,7 @@ Fuzz boundaries include source parsing, ABI deserialization, integer/bytes codec
 ## First dispatch packets
 
 1. **Schema and assembler worker:** CABI-00/01 only, new tooling files; generate Payment assembly and ABI fixture without claiming execution.
-2. **Binding worker:** begin after schema review; generate exact TypeScript value codecs and call-plan types, test against independent fixed wires. No production wallet integration yet.
+2. **Binding worker:** begin after schema review; generate Python and TypeScript contract wrappers plus shared-runtime interfaces and call-plan types, test both against independent fixed wires and cross-language round trips. No production wallet integration yet.
 3. **Compiler worker:** begin from the reviewed type/IR contract; implement CABI-02 payment and recovery lowering with stack checks and clear unsupported-feature diagnostics.
 4. **Harness worker:** independent of backend; combine existing native/reference modules as they are reviewed, retain failure corpora and identify missing validator features explicitly.
 

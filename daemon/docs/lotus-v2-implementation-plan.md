@@ -86,7 +86,7 @@ Calibrate P06 constants before freeze. Incorporate Frank's burn-to-speak demand:
 
 ## Compiler and generated ABI tooling
 
-The [compiler/ABI plan](../../docs/plans/lotus-v2-compiler-abi.md) adds CABI-00–CABI-06: canonical assembler, typed contract compiler, versioned artifacts, generated TypeScript bindings, independent execution/stress harness and later optimization. Begin schema/assembler work alongside V2-01, then compile the worked contracts as V2-04 semantics land. A compiler-generated signed payment accepted by independent engines is an explicit integration gate; complete application/block tests wait for chain transitions. Compiler work does not require final genesis parameter freeze.
+The [compiler/ABI plan](../../docs/plans/lotus-v2-compiler-abi.md) adds CABI-00–CABI-06: canonical assembler, typed contract compiler, versioned artifacts, generated Python and TypeScript bindings, independent execution/stress harness and later optimization. Begin schema/assembler work alongside V2-01, then compile the worked contracts as V2-04 semantics land. A compiler-generated signed payment accepted by independent engines is an explicit integration gate; complete application/block tests wait for chain transitions. Compiler work does not require final genesis parameter freeze.
 
 ## SDK, wallet, indexer and node integration (V2-07)
 

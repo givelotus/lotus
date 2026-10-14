@@ -40,3 +40,5 @@ The small language in [examples](examples/README.md) is explanatory pseudocode w
 Each generated artifact records compiler/evaluator revisions, consensus/parameter digests, argument order, selected policy, leaf/proof bytes, core/complete transaction bytes, TxID/TxHash, signature digest, final stack, resulting state and static charges. A pretty source listing is not a conformance vector.
 
 The [compiler and ABI implementation plan](../plans/lotus-v2-compiler-abi.md) defines staged assembler, typed language, artifact schema, binding generation and independent execution/stress-test gates. Development targets a versioned draft profile; final consensus freeze is required for launch, not for beginning tooling.
+
+The requested first client targets are **Python and TypeScript**, generated from the same versioned interface model with matching runtime libraries and exact-byte cross-language tests. The compiler plan proposes a Rust implementation and a small Finch-spec-inspired typed stack pipeline; the host language remains a review choice, and Finch implementation code is not treated as conformance evidence.
