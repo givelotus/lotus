@@ -5,6 +5,8 @@
 #
 # Usage: ./scripts/build.sh [cmake-args...]
 #   e.g. ./scripts/build.sh -DBUILD_BITCOIN_QT=OFF
+# FEATURES=chronik,nng-off selects independent build options; no policy patches
+# are applied by this script. Explicit trailing CMake arguments take precedence.
 
 set -euo pipefail
 
@@ -42,7 +44,15 @@ if [[ "$SERIES" == "v1" ]]; then
     CMAKE_ARGS+=(-DBUILD_CHRONIK=ON)
 fi
 
-CMAKE_ARGS+=(${@+"$@"})
+if [[ -n "${FEATURES:-}" ]]; then
+    PLAN=$(python3 "$SCRIPT_DIR/feature-plan.py" --target "$SERIES" --features "$FEATURES")
+    FLAGS=$(python3 -c 'import json,sys; plan=json.load(sys.stdin); assert not plan["patches"], "Build options cannot apply patches"; print("\n".join(plan["cmake_args"]))' <<< "$PLAN")
+    while IFS= read -r flag; do
+        [[ -z "$flag" ]] || CMAKE_ARGS+=("$flag")
+    done <<< "$FLAGS"
+fi
+
+CMAKE_ARGS+=("$@")
 
 echo "Configuring $LABEL with cmake..."
 cmake .. "${CMAKE_ARGS[@]}"

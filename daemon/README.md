@@ -77,7 +77,9 @@ make setup SERIES=v1
 2. Checks out the exact pinned base commit from [`bitcoin-abc-v1-version`](bitcoin-abc-v1-version) for V1.
 3. Reads [`patches/v1/series`](patches/v1/series) from top to bottom and applies all 153 Lotus patches (`000` through `247`) in order, committing each one cleanly into `workspace-v1/`.
 
-*(Need to wipe `workspace-v1/` and re-apply all patches cleanly from scratch? Run `make setup SERIES=v1 RESET=1`.)*
+Existing workspaces are preserved. To replay from scratch, use a separate
+monorepo checkout or move an unused workspace aside first. Never move or reset
+the source/build directory of a running daemon. `RESET=1` is refused.
 
 ---
 
@@ -144,11 +146,14 @@ curl -s http://127.0.0.1:8331/blockchain-info | xxd
 
 ## Developer Reference: Modifying or Rebasing Patches
 
-- **Re-apply all patches from scratch**:
+- **Validate replay without changing a workspace**:
   ```bash
-  make setup SERIES=v1 RESET=1
+  python3 scripts/patch-series.py /tmp/isolated-abc patches/v1/series \
+    --base "$(head -1 bitcoin-abc-v1-version)" --check \
+    --provenance patches/v1/metadata-provenance.json
   ```
-- **Save edits made inside `workspace-v1/` as a new patch**:
+- **Export a committed change inside an isolated workspace**: commit the intended
+  change with its rationale first, then:
   ```bash
   make mkpatch SERIES=v1 NAME=248-my-new-patch
   ```
@@ -157,3 +162,21 @@ curl -s http://127.0.0.1:8331/blockchain-info | xxd
   make refresh SERIES=v1 COMMIT=UPSTREAM_COMMIT_SHA
   ```
   The helper updates `bitcoin-abc-v1-version` and reapplies the mainnet series. Resolve conflicts, export one patch per series entry, and verify replay and protocol compatibility before replacing release artifacts.
+
+Independent options can be inspected with `make features SERIES=v1
+FEATURES=chronik,nng-off` and passed to `make build` using the same variables.
+Chronik does not select mining or policy patches. See the
+[support audit](docs/support-matrix.md) for implemented features and experimental
+candidates.
+
+Prepare an entire release candidate in a new directory with:
+
+```sh
+make prepare-release UPSTREAM=/tmp/isolated-abc VERSION=11.6.1 \
+  CANDIDATE=/tmp/lotus-release-11.6.1
+```
+
+This prepares reviewable source, packaging and release metadata without
+publishing. Network changes require explicit verified inputs. See
+[release preparation](NETWORK-RELEASE.md) for validation and the separate
+publication command.

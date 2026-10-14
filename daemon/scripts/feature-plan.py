@@ -15,21 +15,26 @@ TARGETS = {
     'bchn': {'zmq': 'BUILD_BITCOIN_ZMQ'},
     'bitcoin': {'zmq': 'WITH_ZMQ'},
 }
-FEATURES = ('chronik', 'nng', 'zeromq-off', 'zeromq-remove',
+FEATURES = ('chronik', 'chronik-off', 'nng', 'nng-off', 'zeromq-on', 'zeromq-off', 'zeromq-remove',
             'block-construction', 'tx-chain-limit', 'long-chain-container-test')
 
 
 def resolve(target, names, allow_experimental):
     flags, patches, evidence = [], [], []
+    for feature in ('chronik', 'nng', 'zeromq'):
+        enabled = 'zeromq-on' if feature == 'zeromq' else feature
+        if enabled in names and feature + '-off' in names:
+            raise ValueError(f'Conflicting selections for {feature}')
     for name in names:
-        if name in ('chronik', 'nng'):
-            flag = TARGETS[target].get(name)
+        if name in ('chronik', 'chronik-off', 'nng', 'nng-off'):
+            feature = name.removesuffix('-off')
+            flag = TARGETS[target].get(feature)
             if not flag:
-                raise ValueError(f'{target}: {name} has no implemented port in this repository')
-            flags.append(f'-D{flag}=ON')
+                raise ValueError(f'{target}: {feature} has no implemented port in this repository')
+            flags.append(f'-D{flag}=' + ('OFF' if name.endswith('-off') else 'ON'))
             evidence.append({'feature': name, 'kind': 'existing-build-option', 'requires': []})
-        elif name == 'zeromq-off':
-            flags.append(f'-D{TARGETS[target]["zmq"]}=OFF')
+        elif name in ('zeromq-on', 'zeromq-off'):
+            flags.append(f'-D{TARGETS[target]["zmq"]}=' + ('OFF' if name.endswith('-off') else 'ON'))
             evidence.append({'feature': name, 'kind': 'existing-build-option', 'requires': []})
         elif name == 'zeromq-remove':
             raise ValueError('ZeroMQ source-removal patches are placeholders; use zeromq-off')
