@@ -11,7 +11,7 @@ It replaces the previous comment-only slot with a real **optional, default-OFF
 publisher**, without mining/mempool policy/Chronik dependencies and without
 removing ZeroMQ. The current default BCHN manifest still excludes this patch;
 apply it to an isolated checkout with `git am`. Its committed source tree is
-`4aa863ddf01f482ff8591d48afcf1c6f0247aac8`; independent `git am` replay matches.
+`37640aa58bd34ad1576d7e319a8487f2ef59df40`; independent `git am` replay matches.
 
 This is a **new BCHN raw-payload wire protocol**, not a drop-in Lotus NNG port.
 Messages contain a zero-padded 12-byte topic, a shared little-endian uint64
@@ -44,7 +44,9 @@ The explicit shared-library path is for Homebrew macOS; other hosts can omit it
 when ctypes locates NNG automatically. Production has no Python dependency.
 
 Native arm64 macOS validation passed with NNG 1.12.4 in three configurations:
-NNG ON / ZeroMQ OFF, both OFF, and both ON. OFF builds omit NNG options, dynamic
+NNG ON / ZeroMQ OFF, both OFF, and both ON. The NNG-only check precedes
+context-only relocation of insertions away from ZeroMQ anchors; final-tree
+both-ON and both-OFF builds are checked again. OFF builds omit NNG options, dynamic
 linkage and undefined symbols; both-ON builds expose/link both interfaces.
 The real isolated regtest subscriber passed with ZeroMQ disabled and enabled:
 raw connected/disconnected blocks and tip hashes match RPC, sequence order is
