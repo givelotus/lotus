@@ -4,21 +4,21 @@ import { schnorr } from '@noble/curves/secp256k1';
 import { assertPortableName } from './names.js';
 import { optimizeInstructions, type Instruction } from './optimizer.js';
 
-export type ValueType = 'PublicKey' | 'Signature' | 'Bytes32' | `Bytes(${number})` | 'Int' | 'Bool' | 'MethodLeafHash' | 'ContractRootHash';
+export type ValueType = 'PublicKey' | 'Signature' | 'Bytes32' | `Bytes(${number})` | 'Int' | 'Amount' | 'TokenId' | 'Bool' | 'MethodLeafHash' | 'ContractRootHash' | 'InputIndex' | 'OutputIndex';
 export type BoundValue = string | boolean | bigint;
 type Token = { text: string; span: Span };
 type Param = { name: string; type: ValueType; span: Span };
 type Expr = { kind: 'name' | 'number' | 'bool' | 'call' | 'binary' | 'unary'; span: Span; value?: string; args?: Expr[]; left?: Expr; right?: Expr };
-type Stmt = { kind: 'require' | 'if'; span: Span; expr: Expr; then?: Stmt[]; otherwise?: Stmt[] };
+type Stmt = { kind: 'require' | 'if' | 'for' | 'assign'; span: Span; expr?: Expr; then?: Stmt[]; otherwise?: Stmt[]; variable?: string; collection?: 'tx.inputs' | 'tx.outputs'; assignOp?: '=' | '+=' | '-=' };
 type Helper = { name: string; params: Param[]; result: ValueType; body: Expr; span: Span };
 type Method = { name: string; params: Param[]; body: Stmt[]; span: Span };
-type Contract = { name: string; params: Param[]; methods: Method[]; span: Span };
+type Contract = { name: string; kind: 'contract' | 'token'; params: Param[]; methods: Method[]; span: Span };
 type Program = { helpers: Map<string, Helper>; contracts: Map<string, Contract> };
 type Binding = { type: ValueType; value: string | boolean };
-export type MethodArtifact = { name: string; args: { name: string; type: ValueType }[]; scriptHex: string; leaf: string; proof: string[]; root: string;
+export type MethodArtifact = { name: string; args: { name: string; type: ValueType }[]; invocation?: 'spend' | 'mint'; mintAmountParam?: string; scriptHex: string; leaf: string; proof: string[]; root: string;
   sourceMap: { source: Span; expandedFrom?: Span; optimizedFrom?: { op: string; source: Span; expandedFrom?: Span }[]; byteStart: number; byteEnd: number; op: string }[];
   staticResources: { scriptBytes: number; opcodes: number; maxStackItems: number; helperExpansions: number; dynamicSignatureChecks: number } };
-export type ContractArtifact = { schema: 'lotus-v2/contract-artifact/2'; target: 'P01-P02-P03-candidate-2026-10-14'; contract: string;
+export type ContractArtifact = { schema: 'lotus-v2/contract-artifact/2'; target: 'P01-P02-P03-candidate-2026-10-14'; contract: string; kind?: 'contract' | 'token';
   constructor: { name: string; type: ValueType }[]; bindings: { name: string; type: ValueType; value: string | boolean }[];
   methods: MethodArtifact[]; policy: { branches: [string]; paths: [[0]]; root: string; treeRecipe: 'sorted-leaves-largest-power-split-v1' } };
 export type CompileOptions = { contract: string; bindings: Record<string, Record<string, BoundValue>>; optimize?: boolean };
@@ -29,7 +29,7 @@ function symbol(name: string): void { assertPortableName(name); }
 function utf8Offset(source: string, utf16: number): number { return new TextEncoder().encode(source.slice(0, utf16)).length; }
 function lex(source: string): Token[] {
   if (new TextEncoder().encode(source).length > MAX_SOURCE) throw new Error('source exceeds 65536 UTF-8 bytes');
-  const re = /\s+|\/\/[^\n]*|\/\*[\s\S]*?\*\/|==|!=|&&|\|\||[A-Za-z_][A-Za-z_0-9]*|[0-9]+|[<>{}():;,.!+*\-]/gy;
+  const re = /\s+|\/\/[^\n]*|\/\*[\s\S]*?\*\/|==|!=|>=|<=|\+=|-=|&&|\|\||[A-Za-z_][A-Za-z_0-9]*|[0-9]+|[<>{}():;,.!+*\-=]/gy;
   const out: Token[] = []; let pos = 0;
   while (pos < source.length) {
     re.lastIndex = pos; const m = re.exec(source);
@@ -49,7 +49,7 @@ class Parser {
   private type(): ValueType {
     const t = this.ident();
     if (t.text === 'Bytes') { this.take('('); const n = this.take(); this.take(')'); if (!/^[0-9]+$/.test(n.text) || Number(n.text) < 1 || Number(n.text) > 8192) throw new Error(`Bytes bound 1..8192 at UTF-8 byte ${n.span.start}`); return `Bytes(${Number(n.text)})`; }
-    if (['PublicKey','Signature','Bytes32','Int','Bool','MethodLeafHash','ContractRootHash'].includes(t.text)) return t.text as ValueType;
+    if (['PublicKey','Signature','Bytes32','Int','Amount','TokenId','Bool','MethodLeafHash','ContractRootHash'].includes(t.text)) return t.text as ValueType;
     throw new Error(`unsupported type ${t.text} at UTF-8 byte ${t.span.start}`);
   }
   private params(close: string): Param[] {
@@ -80,20 +80,22 @@ class Parser {
         const end = this.take(')'); left = { kind: 'call', value, args, span: { start: name.span.start, end: end.span.end } };
       } else left = { kind: 'name', value, span: { start: name.span.start, end: this.tokens[this.i - 1]!.span.end } };
     }
-    const precedence: Record<string, number> = { '||': 1, '&&': 2, '==': 3, '!=': 3, '<': 4, '>': 4, '+': 5, '-': 5, '*': 6 };
+    const precedence: Record<string, number> = { '||': 1, '&&': 2, '==': 3, '!=': 3, '<': 4, '>': 4, '<=':4, '>=':4, '+': 5, '-': 5, '*': 6 };
     while ((precedence[this.peek().text] ?? 0) >= min && precedence[this.peek().text]) {
       const op = this.take(); const right = this.expression(precedence[op.text]! + 1,depth + 1);
       left = { kind: 'binary', value: op.text, left, right, span: { start: left.span.start, end: right.span.end } };
     }
     return left;
   }
-  private statements(depth = 0): Stmt[] {
+  private statements(depth = 0, loops = 0): Stmt[] {
     if (depth > 16) throw new Error('control nesting depth exceeded');
     this.take('{'); const out: Stmt[] = [];
     while (this.peek().text !== '}') {
       const start = this.take();
       if (start.text === 'require') { this.take('('); const expr = this.expression(); this.take(')'); const end = this.take(';'); out.push({ kind: 'require', expr, span: { start: start.span.start, end: end.span.end } }); }
-      else if (start.text === 'if') { this.take('('); const expr = this.expression(); this.take(')'); const then = this.statements(depth + 1); this.take('else'); const otherwise = this.statements(depth + 1); out.push({ kind: 'if', expr, then, otherwise, span: { start: start.span.start, end: this.tokens[this.i - 1]!.span.end } }); }
+      else if (start.text === 'if') { const expr = this.expression(); const then = this.statements(depth + 1,loops); const otherwise = this.peek().text === 'else' ? (this.take('else'), this.statements(depth + 1,loops)) : []; out.push({ kind: 'if', expr, then, otherwise, span: { start: start.span.start, end: this.tokens[this.i - 1]!.span.end } }); }
+      else if (start.text === 'for') { if (loops >= 2) throw new Error('loop nesting exceeds two'); const variable = this.ident(); this.take('in'); const collection = this.ident().text + '.' + (this.take('.'), this.ident().text); if (collection !== 'tx.inputs' && collection !== 'tx.outputs') throw new Error(`unsupported collection ${collection}`); const then = this.statements(depth + 1,loops + 1); out.push({ kind: 'for', variable: variable.text, collection, then, span: { start: start.span.start, end: this.tokens[this.i - 1]!.span.end } }); }
+      else if (/^[A-Za-z_][A-Za-z_0-9]*$/.test(start.text)) { const op = this.take(); if (!['=','+=','-='].includes(op.text)) throw new Error(`unsupported assignment ${op.text}`); const expr = this.expression(); const end = this.take(';'); out.push({ kind:'assign', variable:start.text, assignOp:op.text as '='|'+='|'-=', expr, span:{start:start.span.start,end:end.span.end} }); }
       else throw new Error(`unsupported statement ${start.text} at UTF-8 byte ${start.span.start}`);
       if (out.length > 256) throw new Error('statement budget exceeded');
     }
@@ -108,17 +110,18 @@ class Parser {
         symbol(name.text);
         if (helpers.has(name.text)) throw new Error(`duplicate helper ${name.text}`);
         helpers.set(name.text, { name: name.text, params, result, body, span: { start: start.span.start, end: end.span.end } });
-      } else if (start.text === 'contract') {
+      } else if (start.text === 'contract' || start.text === 'token') {
         const name = this.ident(); symbol(name.text); const params = this.peek().text === '<' ? (this.take('<'), this.params('>')) : [];
         this.take('{'); const methods: Method[] = [];
         while (this.peek().text !== '}') {
           this.take('function'); const method = this.ident(); symbol(method.text); this.take('('); const args = this.params(')'); const body = this.statements();
           if (!body.length || methods.some(x => x.name.toLowerCase() === method.text.toLowerCase())) throw new Error(`empty or duplicate method ${method.text}`);
+          if (start.text === 'token' && (args[0]?.type !== 'Amount')) throw new Error(`token method ${method.text} first parameter must be Amount`);
           methods.push({ name: method.text, params: args, body, span: { start: method.span.start, end: this.tokens[this.i - 1]!.span.end } });
           if (methods.length > MAX_METHODS) throw new Error('more than 16 methods');
         }
         const end = this.take('}'); if (!methods.length || contracts.has(name.text)) throw new Error(`empty or duplicate contract ${name.text}`);
-        contracts.set(name.text, { name: name.text, params, methods, span: { start: start.span.start, end: end.span.end } });
+        contracts.set(name.text, { name: name.text, kind:start.text as 'contract'|'token', params, methods, span: { start: start.span.start, end: end.span.end } });
       } else throw new Error(`expected contract or helper at UTF-8 byte ${start.span.start}`);
     }
     if (!contracts.size) throw new Error('source has no contract');
@@ -131,7 +134,7 @@ function encodedInt(value: bigint): Uint8Array {
   return uint(value < 0n ? (1n << 128n) + value : value, 16);
 }
 function literal(value: BoundValue, type: ValueType): { bytes: Uint8Array; binding: Binding } {
-  if (type === 'Int') {
+  if (type === 'Int' || type === 'Amount') {
     const text = typeof value === 'bigint' ? value.toString() : value;
     if (typeof text !== 'string' || !/^(0|-?[1-9][0-9]*)$/.test(text)) throw new Error('Int binding requires canonical decimal string or bigint');
     const n = BigInt(text); return { bytes: encodedInt(n), binding: { type, value: n.toString() } };
@@ -139,7 +142,7 @@ function literal(value: BoundValue, type: ValueType): { bytes: Uint8Array; bindi
   if (type === 'Bool') { if (typeof value !== 'boolean') throw new Error('Bool binding requires boolean'); return { bytes: encodedInt(value ? 1n : 0n), binding: { type, value } }; }
   if (typeof value !== 'string') throw new Error(`${type} binding requires lowercase hex`);
   const x = unhex(value);
-  const exact32 = ['PublicKey','Bytes32','MethodLeafHash','ContractRootHash'].includes(type);
+  const exact32 = ['PublicKey','Bytes32','MethodLeafHash','ContractRootHash','TokenId'].includes(type);
   const limit = exact32 ? 32 : type === 'Signature' ? 64 : type.startsWith('Bytes(') ? Number(type.slice(6, -1)) : 0;
   if (!limit || (exact32 ? x.length !== 32 : type === 'Signature' ? x.length !== 64 : x.length > limit)) throw new Error(`${type} binding width`);
   if (type === 'PublicKey') { try { schnorr.utils.lift_x(BigInt(`0x${value}`)); } catch { throw new Error('PublicKey is not a BIP340 x-only curve point'); } }
@@ -166,12 +169,13 @@ function tree(leaves: { name: string; hash: Uint8Array }[]): Tree {
   return build(sorted);
 }
 
-type EVar = { kind: 'argument'; type: ValueType; index: number } |
+type EVar = { kind: 'argument'; type: ValueType; index: number } | { kind:'local'; type: ValueType; index:number } |
   { kind: 'constant'; type: ValueType; data: Uint8Array } |
   { kind: 'substitute'; type: ValueType; expr: Expr; env: Env; origin: Span };
 type Env = Map<string, EVar>;
 type Compiled = { script: Uint8Array; leaf: Uint8Array; map: MethodArtifact['sourceMap']; resources: MethodArtifact['staticResources'] };
-const OPCODES = { VERIFY: 0x65, IF: 0x61, ELSE: 0x63, ENDIF: 0x64, DROP: 0x79, PICK: 0x7d,
+const OPCODES = { VERIFY: 0x65, IF: 0x61, ELSE: 0x63, ENDIF: 0x64, ENUMERATE_INPUTS:0x67, ENUMERATE_OUTPUTS:0x68, ENDENUMERATE:0x6a, DROP: 0x79, PICK: 0x7d, ROLL:0x7e,
+  SWAP:0x80, BRANCHROOT:0xf2, INPUTINDEX:0xd0, INPUTFLAGS:0xd1, UTXOVALUE:0xd6, UTXOTOKENID:0xd7, OUTPUTVALUE:0xe1, OUTPUTTOKENID:0xe2, OUTPUTREQUIRESBRANCH:0xe8, NUMEQUAL:0xa6, GREATERTHANOREQUAL:0xac,
   EQUAL: 0x91, NOT: 0x9c, ADD: 0x9e, SUB: 0x9f, MUL: 0xa0, BOOLAND: 0xa4, BOOLOR: 0xa5,
   LESSTHAN: 0xa9, GREATERTHAN: 0xaa, SHA256: 0xb8, HASH256: 0xb9, BLAKE3: 0xba, CHECKSIG: 0xbb, CHECKSIGVERIFY: 0xbc, NEGATE: 0x9a } as const;
 class Emitter {
@@ -203,14 +207,15 @@ class Emitter {
   control(name: 'IF'|'ELSE'|'ENDIF', span: Span): void { this.op(name, span, undefined, name === 'IF' ? -1 : 0); }
   finish(optimize: boolean): { script: Uint8Array; map: MethodArtifact['sourceMap']; resources: Pick<MethodArtifact['staticResources'], 'scriptBytes'|'opcodes'|'maxStackItems'> } {
     const entries = optimize ? optimizeInstructions(this.instructions, this.args) : this.instructions;
+    const structured = entries.some(entry => ['IF','ELSE','ENDIF','ENUMERATE_INPUTS','ENUMERATE_OUTPUTS','ENDENUMERATE'].includes(entry.map.op));
     const map: MethodArtifact['sourceMap'] = [];
     let offset = 0, height = this.args, maxStackItems = height;
     for (const entry of entries) {
       map.push({ ...entry.map, byteStart: offset, byteEnd: offset + entry.wire.length });
-      offset += entry.wire.length; height += entry.delta;
-      if (height < 0) throw new Error('optimized compiler stack underflow');
-      maxStackItems = Math.max(maxStackItems, height);
+      offset += entry.wire.length;
+      if (!structured) { height += entry.delta; if (height < 0) throw new Error('optimized compiler stack underflow'); maxStackItems = Math.max(maxStackItems, height); }
     }
+    if (structured) { height = this.height; maxStackItems = this.maxHeight; }
     if (height !== 1) throw new Error('optimized method final stack mismatch');
     return { script: concat(...entries.map(entry => entry.wire)), map,
       resources: { scriptBytes: offset, opcodes: entries.length, maxStackItems } };
@@ -256,11 +261,12 @@ class Compiler {
       const method = this.findMethod(contractName,methodName); const c = this.contract(contractName); const bindings = this.bound(contractName);
       const env: Env = new Map();
       for (const p of c.params) env.set(p.name,{ kind: 'constant', type: p.type, data: bindings.get(p.name)!.bytes });
-      for (const [index,p] of method.params.entries()) {
+      const stackParams = c.kind === 'token' ? [...method.params.slice(1),method.params[0]!] : method.params;
+      for (const [index,p] of stackParams.entries()) {
         if (env.has(p.name)) throw new Error(`method parameter ${p.name} shadows constructor`);
         env.set(p.name,{ kind: 'argument', type: p.type, index });
       }
-      const emitter = new Emitter(method.params.length);
+      const emitter = new Emitter(stackParams.length);
       const helperStack: string[] = [];
       let inferenceVisits = 0;
       const infer = (expr: Expr, scope: Env, active: string[] = []): ValueType => {
@@ -268,6 +274,17 @@ class Compiler {
         if (expr.kind === 'number') { encodedInt(BigInt(expr.value!)); return 'Int'; }
         if (expr.kind === 'bool') return 'Bool';
         if (expr.kind === 'name') {
+          if (expr.value === 'this.root') return c.kind === 'token' ? 'TokenId' : 'ContractRootHash';
+          if (expr.value === 'this.coin.token_id') { if (c.kind === 'token') throw new Error('mint method has no coin'); return 'TokenId'; }
+          if (expr.value === 'this.coin.value') { if (c.kind === 'token') throw new Error('mint method has no coin'); return 'Amount'; }
+          const dot = expr.value!.split('.');
+          if ((dot.length === 2 && (dot[1] === 'token_id' || dot[1] === 'value' || dot[1] === 'is_spend')) || (dot.length === 3 && dot[1] === 'coin' && ['token_id','value'].includes(dot[2]!))) {
+            const v = scope.get(dot[0]!);
+            if (!v || v.kind !== 'local' || (v.type !== 'InputIndex' && v.type !== 'OutputIndex')) throw new Error(`unbound record ${dot[0]}`);
+            if (dot.length === 3 && v.type !== 'InputIndex') throw new Error('coin field requires input');
+            if (dot[1] === 'is_spend') { if (v.type !== 'InputIndex') throw new Error('is_spend requires input'); return 'Bool'; }
+            return dot.at(-1) === 'token_id' ? 'TokenId' : 'Amount';
+          }
           const v = scope.get(expr.value!); if (!v) throw new Error(`unbound name ${expr.value}`);
           return v.kind === 'substitute' ? infer(v.expr,v.env,active) : v.type;
         }
@@ -279,17 +296,18 @@ class Compiler {
         }
         if (expr.kind === 'binary') {
           const a = infer(expr.left!,scope,active), b = infer(expr.right!,scope,active);
-          if (a !== b) throw new Error(`binary type mismatch ${a}, ${b}`);
+          if (a !== b && !(['Int','Amount'].includes(a) && ['Int','Amount'].includes(b))) throw new Error(`binary type mismatch ${a}, ${b}`);
           if (expr.value === '==' || expr.value === '!=') return 'Bool';
-          if (['+','-','*'].includes(expr.value!) && a === 'Int') return 'Int';
-          if (['<','>'].includes(expr.value!) && a === 'Int') return 'Bool';
+          if (['+','-','*'].includes(expr.value!) && ['Int','Amount'].includes(a) && ['Int','Amount'].includes(b)) return a === 'Amount' || b === 'Amount' ? 'Amount' : 'Int';
+          if (['<','>','<=','>='].includes(expr.value!) && ['Int','Amount'].includes(a) && ['Int','Amount'].includes(b)) return 'Bool';
           if (['&&','||'].includes(expr.value!) && a === 'Bool') return 'Bool';
           throw new Error(`invalid binary ${expr.value} on ${a}`);
         }
         if (expr.kind !== 'call') throw new Error('unknown expression');
         const name = expr.value!, args = expr.args ?? [];
         if (name === 'leaf_hash') { if (args.length !== 1 || args[0]!.kind !== 'name' || args[0]!.value!.split('.').length !== 2) throw new Error('leaf_hash requires Contract.method'); return 'MethodLeafHash'; }
-        if (name === 'contract_root') { if (args.length !== 1 || args[0]!.kind !== 'name' || args[0]!.value!.includes('.')) throw new Error('contract_root requires Contract'); return 'ContractRootHash'; }
+        if (name === 'contract_root' || name === 'merkle_root') { if (args.length !== 1 || args[0]!.kind !== 'name' || args[0]!.value!.includes('.')) throw new Error(`${name} requires tree name`); return this.contract(args[0]!.value!).kind === 'token' ? 'TokenId' : 'ContractRootHash'; }
+        if (name.endsWith('.requires_branch')) { if (args.length !== 1 || infer(args[0]!,scope,active) !== 'ContractRootHash' || scope.get(name.split('.')[0]!)?.type !== 'OutputIndex') throw new Error('requires_branch expects output and contract root'); return 'Bool'; }
         if (name === 'checksig') { if (args.length !== 2 || infer(args[0]!,scope,active) !== 'Signature' || infer(args[1]!,scope,active) !== 'PublicKey') throw new Error('checksig expects Signature, PublicKey'); return 'Bool'; }
         if (['sha256','hash256','blake3'].includes(name)) {
           if (args.length !== 1) throw new Error(`${name} expects one byte value`);
@@ -314,9 +332,27 @@ class Compiler {
         if (expr.kind === 'number') { emitter.number(BigInt(expr.value!),expr.span,origin); return 'Int'; }
         if (expr.kind === 'bool') { emitter.number(expr.value === 'true' ? 1n : 0n,expr.span,origin); return 'Bool'; }
         if (expr.kind === 'name') {
+          if (expr.value === 'this.root') { emitter.op('BRANCHROOT',expr.span,origin,1); return c.kind === 'token' ? 'TokenId' : 'ContractRootHash'; }
+          if (expr.value === 'this.coin.token_id' || expr.value === 'this.coin.value') {
+            if (c.kind === 'token') throw new Error('mint method has no coin');
+            emitter.op('INPUTINDEX',expr.span,origin,1);
+            emitter.op(expr.value.endsWith('token_id') ? 'UTXOTOKENID' : 'UTXOVALUE',expr.span,origin);
+            return expr.value.endsWith('token_id') ? 'TokenId' : 'Amount';
+          }
+          const dot = expr.value!.split('.');
+          if ((dot.length === 2 && ['token_id','value','is_spend'].includes(dot[1]!)) || (dot.length === 3 && dot[1] === 'coin' && ['token_id','value'].includes(dot[2]!))) {
+            const v = scope.get(dot[0]!);
+            if (!v || v.kind !== 'local' || (v.type !== 'InputIndex' && v.type !== 'OutputIndex')) throw new Error(`unbound record ${dot[0]}`);
+            if (dot.length === 3 && v.type !== 'InputIndex') throw new Error('coin field requires input');
+            emitter.number(BigInt(emitter.height - 1 - v.index),expr.span,origin); emitter.op('PICK',expr.span,origin);
+            if (dot[1] === 'is_spend') { if (v.type !== 'InputIndex') throw new Error('is_spend requires input'); emitter.op('INPUTFLAGS',expr.span,origin); emitter.number(1n,expr.span,origin); emitter.op('NUMEQUAL',expr.span,origin,-1); return 'Bool'; }
+            const field = dot.at(-1)!;
+            const op = v.type === 'OutputIndex' ? (field === 'token_id' ? 'OUTPUTTOKENID' : 'OUTPUTVALUE') : (field === 'token_id' ? 'UTXOTOKENID' : 'UTXOVALUE');
+            emitter.op(op,expr.span,origin); return field === 'token_id' ? 'TokenId' : 'Amount';
+          }
           const v = scope.get(expr.value!); if (!v) throw new Error(`unbound name ${expr.value} at UTF-8 byte ${expr.span.start}`);
           if (v.kind === 'constant') emitter.push(v.data,expr.span,origin);
-          else if (v.kind === 'argument') { emitter.number(BigInt(emitter.height - 1 - v.index),expr.span,origin); emitter.op('PICK',expr.span,origin); }
+          else if (v.kind === 'argument' || v.kind === 'local') { emitter.number(BigInt(emitter.height - 1 - v.index),expr.span,origin); emitter.op('PICK',expr.span,origin); }
           else { const actual = expression(v.expr,v.env,v.origin); if (actual !== v.type) throw new Error(`helper substitution expected ${v.type}, got ${actual}`); return actual; }
           return v.type;
         }
@@ -328,14 +364,24 @@ class Compiler {
           throw new Error(`invalid unary ${expr.value} on ${t}`);
         }
         if (expr.kind === 'binary') {
+          if (expr.value === '&&' || expr.value === '||') {
+            const a = expression(expr.left!,scope,origin); if (a !== 'Bool') throw new Error(`${expr.value} requires Bool`);
+            if (expr.value === '||') emitter.op('NOT',expr.span,origin);
+            emitter.control('IF',expr.span); const before = emitter.height;
+            const b = expression(expr.right!,scope,origin); if (b !== 'Bool') throw new Error(`${expr.value} requires Bool`);
+            if (emitter.height !== before + 1) throw new Error('logical branch stack mismatch');
+            emitter.control('ELSE',expr.span); emitter.height = before;
+            emitter.number(expr.value === '&&' ? 0n : 1n,expr.span,origin);
+            emitter.control('ENDIF',expr.span); return 'Bool';
+          }
           const a = expression(expr.left!,scope,origin), b = expression(expr.right!,scope,origin);
           if (expr.value === '==' || expr.value === '!=') {
             if (a !== b) throw new Error(`equality type mismatch ${a} and ${b}`);
             emitter.op('EQUAL',expr.span,origin,-1); if (expr.value === '!=') emitter.op('NOT',expr.span,origin); return 'Bool';
           }
-          const cases: Record<string,[ValueType,keyof typeof OPCODES,ValueType]> = { '+':['Int','ADD','Int'], '-':['Int','SUB','Int'], '*':['Int','MUL','Int'], '<':['Int','LESSTHAN','Bool'], '>':['Int','GREATERTHAN','Bool'], '&&':['Bool','BOOLAND','Bool'], '||':['Bool','BOOLOR','Bool'] };
-          const rule = cases[expr.value!]; if (!rule || a !== rule[0] || b !== rule[0]) throw new Error(`invalid ${expr.value} operands ${a}, ${b}`);
-          emitter.op(rule[1],expr.span,origin,-1); return rule[2];
+          const cases: Record<string,[keyof typeof OPCODES,ValueType]> = { '+':['ADD',a], '-':['SUB',a], '*':['MUL',a], '<':['LESSTHAN','Bool'], '>':['GREATERTHAN','Bool'], '>=':['GREATERTHANOREQUAL','Bool'] };
+          const rule = cases[expr.value!]; if (!rule || !['Int','Amount'].includes(a) || !['Int','Amount'].includes(b)) throw new Error(`invalid ${expr.value} operands ${a}, ${b}`);
+          emitter.op(rule[0],expr.span,origin,-1); return ['+','-','*'].includes(expr.value!) && (a === 'Amount' || b === 'Amount') ? 'Amount' : rule[1];
         }
         if (expr.kind !== 'call') throw new Error('unknown expression');
         const args = expr.args ?? [];
@@ -345,9 +391,15 @@ class Compiler {
           const path = args[0]!.value!.split('.'); if (path.length !== 2) throw new Error('leaf_hash requires Contract.method name');
           emitter.push(this.method(path[0]!,path[1]!).leaf,expr.span,origin); return 'MethodLeafHash';
         }
-        if (name === 'contract_root') {
+        if (name === 'contract_root' || name === 'merkle_root') {
           if (args.length !== 1 || args[0]!.kind !== 'name' || args[0]!.value!.includes('.')) throw new Error('contract_root requires Contract name');
-          emitter.push(this.root(args[0]!.value!).root,expr.span,origin); return 'ContractRootHash';
+          const other = this.contract(args[0]!.value!); emitter.push(this.root(other.name).root,expr.span,origin); return other.kind === 'token' ? 'TokenId' : 'ContractRootHash';
+        }
+        if (name.endsWith('.requires_branch')) {
+          const v = scope.get(name.split('.')[0]!); if (!v || v.kind !== 'local' || v.type !== 'OutputIndex' || args.length !== 1) throw new Error('requires_branch requires output index and one root');
+          emitter.number(BigInt(emitter.height - 1 - v.index),expr.span,origin); emitter.op('PICK',expr.span,origin);
+          const t = expression(args[0]!,scope,origin); if (t !== 'ContractRootHash') throw new Error('requires_branch requires ContractRootHash');
+          emitter.op('OUTPUTREQUIRESBRANCH',expr.span,origin,-1); return 'Bool';
         }
         if (name === 'checksig') {
           if (args.length !== 2) throw new Error('checksig needs signature and PublicKey');
@@ -379,32 +431,71 @@ class Compiler {
         try { const result = expression(helper.body,inner,expr.span); if (result !== helper.result) throw new Error(`helper ${name} returns ${result}, declared ${helper.result}`); return result; }
         finally { helperStack.pop(); }
       };
-      const statements = (body: Stmt[]): void => {
-        if (!body.length) throw new Error('empty authorization block');
+      const statements = (body: Stmt[], nested = false): void => {
         for (const stmt of body) {
-          const t = expression(stmt.expr,env);
+          if (stmt.kind === 'for') {
+            const name = stmt.variable!;
+            if (env.has(name)) throw new Error(`loop variable ${name} shadows binding`);
+            const before = emitter.height;
+            if (stmt.collection === 'tx.inputs') emitter.op('ENUMERATE_INPUTS',stmt.span,undefined,1);
+            else emitter.op('ENUMERATE_OUTPUTS',stmt.span,undefined,1);
+            env.set(name,{kind:'local',type:stmt.collection === 'tx.inputs' ? 'InputIndex' : 'OutputIndex',index:before});
+            statements(stmt.then!,true);
+            if (emitter.height !== before + 1) throw new Error('loop body stack mismatch');
+            emitter.op('DROP',stmt.span,undefined,-1);
+            emitter.op('ENDENUMERATE',stmt.span);
+            env.delete(name); continue;
+          }
+          if (stmt.kind === 'assign') {
+            const name = stmt.variable!, existing = env.get(name);
+            if (!existing && (nested || stmt.assignOp !== '=')) throw new Error(`local ${name} must be initialized at method top level`);
+            if (existing && (existing.kind !== 'local' || existing.type === 'InputIndex' || existing.type === 'OutputIndex')) throw new Error(`cannot assign ${name}`);
+            if (stmt.assignOp !== '=') {
+              emitter.number(BigInt(emitter.height - 1 - existing!.index),stmt.span); emitter.op('PICK',stmt.span);
+            }
+            const t = expression(stmt.expr!,env);
+            if (t !== 'Int' && t !== 'Amount') throw new Error('numeric local required');
+            if (stmt.assignOp !== '=') emitter.op(stmt.assignOp === '+=' ? 'ADD':'SUB',stmt.span,undefined,-1);
+            if (!existing) env.set(name,{kind:'local',type:t,index:emitter.height - 1});
+            else {
+              const oldHeight = emitter.height - 1;
+              const depth = oldHeight - existing.index;
+              emitter.number(BigInt(depth),stmt.span); emitter.op('ROLL',stmt.span,undefined,-1); emitter.op('DROP',stmt.span,undefined,-1);
+              for (let i = 0; i < depth - 1; i++) { emitter.number(BigInt(depth - 1),stmt.span); emitter.op('ROLL',stmt.span,undefined,-1); }
+              env.set(name,{...existing,type:t === 'Amount' ? 'Amount' : existing.type});
+            }
+            continue;
+          }
+          const t = expression(stmt.expr!,env);
           if (t !== 'Bool') throw new Error(`${stmt.kind} requires Bool, got ${t}`);
           if (stmt.kind === 'require') emitter.op('VERIFY',stmt.span,undefined,-1);
           else {
             emitter.control('IF',stmt.span);
             const before = emitter.height;
-            statements(stmt.then!);
+            statements(stmt.then!,true);
             if (emitter.height !== before) throw new Error('then stack mismatch');
             emitter.control('ELSE',stmt.span);
-            statements(stmt.otherwise!);
+            statements(stmt.otherwise!,true);
             if (emitter.height !== before) throw new Error('else stack mismatch');
             emitter.control('ENDIF',stmt.span);
           }
         }
       };
       statements(method.body);
+      for (let i = emitter.height - stackParams.length; i > 0; i--) emitter.op('DROP',method.span,undefined,-1);
       for (let i = 0; i < method.params.length; i++) emitter.op('DROP',method.span,undefined,-1);
       emitter.number(1n,method.span);
       if (emitter.height !== 1) throw new Error('compiled method final stack mismatch');
       const finished = emitter.finish(this.options.optimize !== false); const script = finished.script;
+      let loopMultiplier = 1, worstCaseSignatureChecks = 0;
+      for (const entry of finished.map) {
+        if (entry.op === 'ENUMERATE_INPUTS' || entry.op === 'ENUMERATE_OUTPUTS') loopMultiplier *= 65535;
+        else if (entry.op === 'ENDENUMERATE') loopMultiplier /= 65535;
+        else if (entry.op === 'CHECKSIG' || entry.op === 'CHECKSIGVERIFY') worstCaseSignatureChecks += loopMultiplier;
+      }
       const compiled = { script, leaf: leafHash(script), map: finished.map,
         resources: { ...finished.resources,
-          helperExpansions: emitter.expansions, dynamicSignatureChecks: emitter.signatureChecks } };
+          helperExpansions: emitter.expansions, dynamicSignatureChecks: worstCaseSignatureChecks } };
       this.methodMemo.set(key,compiled); return compiled;
     } finally { this.methodActive.delete(key); }
   }
@@ -412,10 +503,12 @@ class Compiler {
     const c = this.contract(this.options.contract); const root = this.root(c.name); const bound = this.bound(c.name);
     const methods: MethodArtifact[] = c.methods.map(m => {
       const compiled = this.method(c.name,m.name);
-      return { name: m.name, args: m.params.map(p => ({ name:p.name,type:p.type })), scriptHex: hex(compiled.script), leaf: hex(compiled.leaf),
+      return { name: m.name, invocation:c.kind === 'token' ? 'mint' as const : 'spend' as const,
+        ...(c.kind === 'token' ? { mintAmountParam:m.params[0]!.name } : {}),
+        args: (c.kind === 'token' ? m.params.slice(1) : m.params).map(p => ({ name:p.name,type:p.type })), scriptHex: hex(compiled.script), leaf: hex(compiled.leaf),
         proof: root.proofs.get(m.name)!.map(hex), root: hex(root.root), sourceMap: compiled.map, staticResources: compiled.resources };
     });
-    return { schema: 'lotus-v2/contract-artifact/2', target: 'P01-P02-P03-candidate-2026-10-14', contract: c.name,
+    return { schema: 'lotus-v2/contract-artifact/2', target: 'P01-P02-P03-candidate-2026-10-14', contract: c.name, kind:c.kind,
       constructor: c.params.map(p => ({ name:p.name,type:p.type })), bindings: c.params.map(p => ({ name:p.name,...bound.get(p.name)!.binding })),
       methods, policy: { branches: [hex(root.root)], paths: [[0]], root: hex(root.root), treeRecipe: 'sorted-leaves-largest-power-split-v1' } };
   }

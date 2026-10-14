@@ -22,7 +22,7 @@ export function generatePython(a: PaymentArtifact): string {
     `    def finalize_spend(self, plan: Any, signature: bytes) -> Any:\n        if type(signature) is not bytes or len(signature) != 64:\n            raise ValueError('FULL signature must be 64 bytes')\n        return self.runtime.finalize_payment(plan, signature)\n`;
 }
 
-function tsType(t: ValueType): string { return t === 'Int' ? 'bigint' : t === 'Bool' ? 'boolean' : t === 'Signature' ? 'null' : 'Uint8Array'; }
+function tsType(t: ValueType): string { return t === 'Int' || t === 'Amount' ? 'bigint' : t === 'Bool' ? 'boolean' : t === 'Signature' ? 'null' : 'Uint8Array'; }
 export function generateContractTypeScript(a: ContractArtifact): string {
   const contract = safeName(a.contract);
   const lines = [
@@ -38,7 +38,9 @@ export function generateContractTypeScript(a: ContractArtifact): string {
   }
   lines.push(`export class ${contract} {`, `  readonly artifact: ContractArtifact;`,
     `  constructor(artifact: ContractArtifact) { if (artifact.schema !== 'lotus-v2/contract-artifact/2' || artifact.contract !== '${contract}') throw new Error('artifact identity'); this.artifact = artifact; }`);
+  if (a.kind === 'token') lines.push('  // Mint calls require the transaction planner to derive the node-supplied delta.');
   for (const m of a.methods) {
+    if (a.kind === 'token') continue;
     const name = safeName(m.name), title = `${contract}${name[0]!.toUpperCase()}${name.slice(1)}`;
     lines.push(`  prepare${name[0]!.toUpperCase()}${name.slice(1)}(context: CallContext, args: ${title}Args): CallPlan { return prepareContractCall(this.artifact, '${name}', context, args); }`,
       `  finalize${name[0]!.toUpperCase()}${name.slice(1)}(plan: CallPlan, signatures: ${title}Signatures): CallFinal { if (plan.methodName !== '${name}') throw new Error('method plan mismatch'); return finalizeContractCall(plan, signatures); }`);
@@ -46,7 +48,7 @@ export function generateContractTypeScript(a: ContractArtifact): string {
   lines.push('}', ''); return lines.join('\n');
 }
 
-function pyType(t: ValueType): string { return t === 'Int' ? 'int' : t === 'Bool' ? 'bool' : t === 'Signature' ? 'None' : 'bytes'; }
+function pyType(t: ValueType): string { return t === 'Int' || t === 'Amount' ? 'int' : t === 'Bool' ? 'bool' : t === 'Signature' ? 'None' : 'bytes'; }
 export function generateContractPython(a: ContractArtifact): string {
   const contract = safeName(a.contract);
   const lines = [
@@ -66,7 +68,9 @@ export function generateContractPython(a: ContractArtifact): string {
     `        if artifact.get('schema') != 'lotus-v2/contract-artifact/2' or artifact.get('contract') != '${contract}':`,
     `            raise ValueError('artifact identity')`,
     `        self.artifact = artifact`, '');
+  if (a.kind === 'token') lines.push('    # Mint calls require the transaction planner to derive the node-supplied delta.', '');
   for (const m of a.methods) {
+    if (a.kind === 'token') continue;
     const name = safeName(m.name), title = `${contract}${name[0]!.toUpperCase()}${name.slice(1)}`;
     lines.push(`    def prepare${name[0]!.toUpperCase()}${name.slice(1)}(self, context: dict, args: ${title}Args) -> CallPlan:`,
       `        return prepare_call(self.artifact, '${name}', context, args)`, '',
