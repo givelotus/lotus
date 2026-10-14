@@ -51,7 +51,7 @@ impl UnsignedTx {
         self.tx
     }
 
-    pub fn input_at(&mut self, input_idx: usize) -> UnsignedTxInput {
+    pub fn input_at(&mut self, input_idx: usize) -> UnsignedTxInput<'_> {
         UnsignedTxInput {
             idx: input_idx,
             unsigned_tx: self,
@@ -80,6 +80,17 @@ impl<'tx> UnsignedTxInput<'tx> {
         &self,
         sig_hash_type: SigHashType,
         codesep_idx: Option<usize>,
+    ) -> Result<SighashPreimage> {
+        self.sighash_preimage_with_replay_protection(sig_hash_type, codesep_idx, false)
+    }
+
+    /// BIP143 preimage with explicit consensus replay-epoch selection.
+    /// The signature suffix stays unchanged; only the serialized fork value changes.
+    pub fn sighash_preimage_with_replay_protection(
+        &self,
+        sig_hash_type: SigHashType,
+        codesep_idx: Option<usize>,
+        replay_protection: bool,
     ) -> Result<SighashPreimage> {
         if sig_hash_type.variant != SigHashTypeVariant::Bip143 {
             return Err(SignError::InvalidSigHashType(sig_hash_type));
@@ -128,7 +139,8 @@ impl<'tx> UnsignedTxInput<'tx> {
             _ => [0; 32].into(),
         });
         preimage.put_bytes(tx.lock_time.ser());
-        preimage.put_bytes(sig_hash_type.to_u32().ser());
+        let hash_type = sig_hash_type.to_u32() | if replay_protection { 0xffdead00 } else { 0 };
+        preimage.put_bytes(hash_type.ser());
         Ok(SighashPreimage {
             bytes: preimage.freeze(),
             script_code,
@@ -417,7 +429,7 @@ mod tests {
         {
             match input.sighash_preimage(SigHashType::ALL_BIP143, Some(2)) {
                 Err(SignError::CodesepNotFound(2)) => {}
-                result => panic!("Unexpected: {:?}", result),
+                result => panic!("Unexpected: {result:?}"),
             }
         }
         Ok(())

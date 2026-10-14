@@ -1,0 +1,9 @@
+# Standalone Rust SDK integration
+
+- Import source: `LotusiaStewardship/bitcoinsuite` default branch `master`, fetched 2026-10-14 at `d425f277debbddfb0b9ebdc7e737c1c0c56c6dac` (2026-07-08). Preserve its MIT license and attribution. Record subsequent imports here.
+- Keep the standalone API: the newer daemon Chronik crates use a different module layout and do not replace this multi-network signing/NNG/Stratum workspace. Match the Rust Chronik protobuf to the pinned, validated daemon source; document that exact source in the SDK README.
+- Lotus TxIds and raw TxHashes differ. Use `lotus_txid()` for Lotus outpoints and Chronik queries; `hash()`/`tx_hash()` remain raw serialization hashes for existing callers. Output Merkle leaves serialize the complete CTxOut, matching current daemon code.
+- XAddress type 0 contains the complete locking script, including P2SH and Taproot state. Type 2 contains a 33-byte stateless Taproot commitment. Do not replace type-0 script payloads with bare HASH160 values.
+- Signature epoch selection is explicit. Do not infer replay protection from transaction locktime or wall-clock time. Taproot key-path signatures use the actual spent outputs, the Lotus preimage, and a pushed Schnorr signature plus the original one-byte sighash suffix. Verify the key's tweaked commitment against the spent script.
+- Tests use public fixtures and read-only live Chronik requests. Never broadcast to or stop a production node for SDK tests. Legacy BCH/XEC/NNG integration tests require their external test binaries and servers; their absence is a coverage limit, not a reason to silently disable them.
+- Documentation updates for these local changes are in README.md, docs/CONTEXT_MAP.md, docs/SCHEMA.md, docs/contexts/core/CONTEXT.md, and docs/contexts/chronik-client/CONTEXT.md. No new ADR is needed: the compatibility corrections preserve the deployed wire protocol.

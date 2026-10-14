@@ -1,7 +1,7 @@
 use std::{fmt::Display, str::FromStr};
 use thiserror::Error;
 
-use crate::{BytesMut, Hashed, Net, Script, Sha256};
+use crate::{ecc::PubKey, BytesMut, Hashed, Net, Script, Sha256, ShaRmd160};
 
 pub const LOTUS_ADDRESS_CHECKSUM_LEN: usize = 4;
 pub const LOTUS_PREFIX: &str = "lotus";
@@ -17,6 +17,7 @@ pub struct LotusAddress {
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
 pub enum LotusAddressType {
     OutputScript = 0,
+    TaprootCommitment = 2,
 }
 
 #[derive(Error, Clone, Debug, Eq, PartialEq)]
@@ -41,6 +42,9 @@ pub enum LotusAddressError {
 
     #[error("Missing payload")]
     MissingPayload,
+
+    #[error("Taproot commitment must be 33 bytes, got {0}")]
+    InvalidTaprootPayloadLength(usize),
 
     #[error("Invalid payload type: {0}")]
     InvalidPayloadType(u8),
@@ -75,6 +79,7 @@ impl LotusAddress {
         let net_char = match net {
             Net::Mainnet => '_',
             Net::Regtest => 'R',
+            Net::Testnet => 'T',
         };
         lotus_addr.push(net_char);
 
@@ -100,6 +105,40 @@ impl LotusAddress {
     }
 }
 
+impl LotusAddress {
+    /// Encode a P2PKH address. Type 0 carries the full locking script.
+    pub fn from_hash(prefix: &str, net: Net, hash: ShaRmd160) -> Self {
+        Self::new(prefix, net, Script::p2pkh(&hash))
+    }
+
+    /// Encode an arbitrary output script, preserving P2SH and Taproot state.
+    pub fn from_script(prefix: &str, net: Net, script: &Script) -> Result<Self, LotusAddressError> {
+        Ok(Self::new(prefix, net, script.clone()))
+    }
+
+    /// Encode the compact type-2 address used by the node for stateless Taproot.
+    pub fn from_taproot(prefix: &str, net: Net, pubkey: &PubKey) -> Self {
+        let net_char = match net {
+            Net::Mainnet => '_',
+            Net::Regtest => 'R',
+            Net::Testnet => 'T',
+        };
+        let mut data = BytesMut::new();
+        data.put_slice(&[LotusAddressType::TaprootCommitment as u8]);
+        data.put_slice(pubkey.as_slice());
+        data.put_slice(&calc_checksum(prefix, net_char, 2, pubkey.as_slice()));
+        Self {
+            prefix: prefix.to_string(),
+            net,
+            lotus_addr: format!(
+                "{prefix}{net_char}{}",
+                bs58::encode(data.as_slice()).into_string()
+            ),
+            script: Script::p2tr(pubkey, None),
+        }
+    }
+}
+
 impl FromStr for LotusAddress {
     type Err = LotusAddressError;
 
@@ -117,6 +156,7 @@ impl FromStr for LotusAddress {
         let net = match net_char {
             '_' => Net::Mainnet,
             'R' => Net::Regtest,
+            'T' => Net::Testnet,
             _ => return Err(UnsupportedNet(net_char)),
         };
         // Base58 encoded data
@@ -124,7 +164,7 @@ impl FromStr for LotusAddress {
         let data = bs58::decode(&data_b58).into_vec().map_err(InvalidBase58)?;
         // First byte indicates payload type. Currently only "0" is supported
         let payload_type = *data.first().ok_or(MissingBase58)?;
-        if payload_type != 0 {
+        if payload_type != 0 && payload_type != 2 {
             return Err(InvalidPayloadType(payload_type));
         }
         // Remainder is the payload, here the scriptPubKey
@@ -146,7 +186,14 @@ impl FromStr for LotusAddress {
                 actual: hex::encode(actual_checksum),
             });
         }
-        let script = Script::from_slice(payload);
+        let script = if payload_type == 2 {
+            let key: [u8; 33] = payload
+                .try_into()
+                .map_err(|_| InvalidTaprootPayloadLength(payload.len()))?;
+            Script::p2tr(&PubKey::new_unchecked(key), None)
+        } else {
+            Script::from_slice(payload)
+        };
         Ok(LotusAddress {
             prefix,
             net,

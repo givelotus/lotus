@@ -21,6 +21,16 @@ impl SignData {
 }
 
 impl SignData {
+    /// Actual locking script of the spent coin, never a redeem script.
+    pub fn find_output_script(&self) -> Result<Script> {
+        for field in &self.fields {
+            if let SignField::OutputScript(script) = field {
+                return Ok(script.clone());
+            }
+        }
+        Err(SignError::MissingScriptCode)
+    }
+
     pub fn find_script_code(&self) -> Result<Script> {
         let mut is_p2sh = false;
         for field in &self.fields {

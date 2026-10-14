@@ -13,6 +13,7 @@ use crate::{
         GetBlockRangeRequest, GetBlockRangeRequestArgs, GetBlockRangeResponse, GetBlockRequest,
         GetBlockRequestArgs, GetBlockResponse, GetBlockSliceRequest, GetBlockSliceRequestArgs,
         GetBlockSliceResponse, GetMempoolRequest, GetMempoolRequestArgs, GetMempoolResponse,
+        GetMiningTemplateRequest, GetMiningTemplateRequestArgs, GetMiningTemplateResponse,
         GetUndoSliceRequest, GetUndoSliceRequestArgs, GetUndoSliceResponse, Hash, RpcCall,
         RpcCallArgs, RpcRequest, RpcResult,
     },
@@ -154,6 +155,7 @@ impl RpcInterface {
         Ok(response
             .data()
             .field("GetBlockSliceResponse.data")?
+            .bytes()
             .to_vec())
     }
 
@@ -180,7 +182,11 @@ impl RpcInterface {
             &self.fbb_opts,
             self.handle_msg(&msg)?,
         )?;
-        Ok(response.data().field("GetUndoSliceResponse.data")?.to_vec())
+        Ok(response
+            .data()
+            .field("GetUndoSliceResponse.data")?
+            .bytes()
+            .to_vec())
     }
 
     pub fn get_mempool(&self) -> Result<Vec<structs::MempoolTx>> {
@@ -204,19 +210,150 @@ impl RpcInterface {
             .collect::<Result<_>>()
     }
 
+    pub fn get_mining_template(
+        &self,
+        coinbase_script: Option<&[u8]>,
+        coinbase_identity: Option<&[u8]>,
+        extranonce1_size: u32,
+        extranonce2_size: u32,
+        include_transactions: bool,
+    ) -> Result<structs::MiningTemplate> {
+        let mut fbb = flatbuffers::FlatBufferBuilder::with_capacity(2048);
+        let coinbase_script_offset = coinbase_script.map(|s| fbb.create_vector(s));
+        let coinbase_identity_offset = coinbase_identity.map(|s| fbb.create_vector(s));
+        let request = GetMiningTemplateRequest::create(
+            &mut fbb,
+            &GetMiningTemplateRequestArgs {
+                coinbase_script: coinbase_script_offset,
+                coinbase_identity: coinbase_identity_offset,
+                extranonce1_size,
+                extranonce2_size,
+                include_transactions,
+            },
+        );
+        let rpc_call = RpcCall::create(
+            &mut fbb,
+            &RpcCallArgs {
+                rpc_type: RpcRequest::GetMiningTemplateRequest,
+                rpc: Some(request.as_union_value()),
+            },
+        );
+        fbb.finish(rpc_call, None);
+        let msg = self.tranceive(&fbb)?;
+        let response = flatbuffers::root_with_opts::<GetMiningTemplateResponse>(
+            &self.fbb_opts,
+            self.handle_msg(&msg)?,
+        )?;
+        Ok(structs::MiningTemplate {
+            template_id: response.template_id(),
+            block: response
+                .block()
+                .field("GetMiningTemplateResponse.block")?
+                .bytes()
+                .to_vec(),
+            header: response
+                .header()
+                .field("GetMiningTemplateResponse.header")?
+                .bytes()
+                .to_vec(),
+            previous_block_hash: bitcoinsuite_core::Sha256d::new(
+                response
+                    .previous_block_hash()
+                    .field("GetMiningTemplateResponse.previous_block_hash")?
+                    .hash()
+                    .field("GetMiningTemplateResponse.previous_block_hash.hash")?
+                    .0,
+            ),
+            height: response.height(),
+            version: response.version(),
+            bits: response.bits(),
+            target: bitcoinsuite_core::Sha256d::new(
+                response
+                    .target()
+                    .field("GetMiningTemplateResponse.target")?
+                    .0,
+            ),
+            curtime: response.curtime(),
+            mintime: response.mintime(),
+            maxtime: response.maxtime(),
+            coinbase_value: response.coinbase_value(),
+            coinbase_tx: response
+                .coinbase_tx()
+                .field("GetMiningTemplateResponse.coinbase_tx")?
+                .bytes()
+                .to_vec(),
+            transactions: response
+                .transactions()
+                .map(|txs| {
+                    txs.iter()
+                        .map(|tx| {
+                            Ok(structs::MiningTemplateTx {
+                                raw: tx.raw().field("MiningTemplateTx.raw")?.bytes().to_vec(),
+                                txid: bitcoinsuite_core::Sha256d::new(
+                                    tx.txid()
+                                        .field("MiningTemplateTx.txid")?
+                                        .hash()
+                                        .field("MiningTemplateTx.txid.hash")?
+                                        .0,
+                                ),
+                                fee: tx.fee(),
+                                sigops: tx.sigops(),
+                            })
+                        })
+                        .collect::<Result<Vec<_>>>()
+                })
+                .transpose()?
+                .unwrap_or_default(),
+            coinbase1: response
+                .coinbase1()
+                .field("GetMiningTemplateResponse.coinbase1")?
+                .to_string(),
+            coinbase2: response
+                .coinbase2()
+                .field("GetMiningTemplateResponse.coinbase2")?
+                .to_string(),
+            merkle_branches: response
+                .merkle_branches()
+                .map(|b| b.iter().map(|s| s.to_string()).collect())
+                .unwrap_or_default(),
+            prev_hash_stratum: response
+                .prev_hash_stratum()
+                .field("GetMiningTemplateResponse.prev_hash_stratum")?
+                .to_string(),
+            nbits_stratum: response
+                .nbits_stratum()
+                .field("GetMiningTemplateResponse.nbits_stratum")?
+                .to_string(),
+            ntime_stratum: response
+                .ntime_stratum()
+                .field("GetMiningTemplateResponse.ntime_stratum")?
+                .to_string(),
+        })
+    }
+
     fn tranceive(&self, fbb: &flatbuffers::FlatBufferBuilder) -> Result<Message> {
+        self.tranceive_raw(fbb.finished_data())
+    }
+
+    /// Send pre-encoded RpcCall bytes and return raw response message.
+    pub fn tranceive_raw(&self, payload: &[u8]) -> Result<Message> {
         let _guard = self.mutex.lock().expect("Acquire mutex failed");
-        self.sock
-            .send(fbb.finished_data())
-            .map_err(|(_, err)| err)?;
+        self.sock.send(payload).map_err(|(_, err)| err)?;
         let resp = self.sock.recv()?;
         Ok(resp)
+    }
+
+    /// Forward-compatible escape hatch for callers using newer schemas than
+    /// this crate currently models.
+    pub fn call_raw(&self, rpc_call_payload: &[u8]) -> Result<Vec<u8>> {
+        let msg = self.tranceive_raw(rpc_call_payload)?;
+        Ok(self.handle_msg(&msg)?.to_vec())
     }
 
     fn handle_msg<'a>(&self, msg: &'a Message) -> Result<&'a [u8]> {
         let result = flatbuffers::root_with_opts::<RpcResult>(&self.fbb_opts, &msg[..])?;
         if result.is_success() {
-            result.data().field("data")
+            Ok(result.data().field("data")?.bytes())
         } else {
             Err(RpcError {
                 error_code: result.error_code(),
@@ -247,7 +384,7 @@ mod tests {
             "ipc://{}",
             ipc_dir.path().join("rpc.pipe").to_string_lossy()
         );
-        let rpc_arg = format!("-nngrpc={}", rpc_url);
+        let rpc_arg = format!("-nngrpc={rpc_url}");
         let conf = BitcoindConf::from_chain_regtest(
             bin_folder(),
             BitcoindChain::XPI,

@@ -3,7 +3,7 @@ use flatbuffers::VerifierOptions;
 use nng::{
     options::{
         protocol::pubsub::{Subscribe, Unsubscribe},
-        Options,
+        Options, RecvBufferSize,
     },
     Protocol, Socket,
 };
@@ -12,8 +12,8 @@ use tokio::sync::mpsc;
 
 use crate::{
     nng_interface_generated::nng_interface::{
-        BlockConnected, BlockDisconnected, ChainStateFlushed, TransactionAddedToMempool,
-        TransactionRemovedFromMempool, UpdatedBlockTip,
+        BlockConnected, BlockDisconnected, ChainStateFlushed, MiningWorkChanged,
+        TransactionAddedToMempool, TransactionRemovedFromMempool, UpdatedBlockTip,
     },
     structs,
 };
@@ -40,6 +40,9 @@ use self::PubInterfaceError::*;
 impl PubInterface {
     pub fn open(pub_url: &str) -> Result<Self> {
         let sock = Socket::new(Protocol::Sub0)?;
+        // Configure receive buffer to 1024 messages to reduce overflow risk
+        // during block bursts or reorgs. This helps preserve event ordering.
+        sock.set_opt::<RecvBufferSize>(1024)?;
         sock.dial(pub_url)?;
         Ok(PubInterface {
             sock,
@@ -78,6 +81,21 @@ impl PubInterface {
     pub fn recv(&self) -> Result<structs::Message> {
         let msg = self.sock.recv()?;
         self.parse_msg(msg)
+    }
+
+    /// Receive one pub message and return raw topic prefix + payload bytes.
+    ///
+    /// Useful for forward compatibility when lotusd adds new topics that are
+    /// not yet modeled in this crate.
+    pub fn recv_raw(&self) -> Result<(String, Vec<u8>)> {
+        const PREFIX_LEN: usize = 12;
+        let msg = self.sock.recv()?;
+        if msg.len() < PREFIX_LEN {
+            return Err(InvalidPubMessage(msg).into());
+        }
+        let prefix = String::from_utf8_lossy(&msg[..PREFIX_LEN]).to_string();
+        let payload = msg[PREFIX_LEN..].to_vec();
+        Ok((prefix, payload))
     }
 
     fn parse_msg(&self, msg: nng::Message) -> Result<structs::Message> {
@@ -125,8 +143,13 @@ impl PubInterface {
                     flatbuffers::root_with_opts::<ChainStateFlushed>(&self.fbb_opts, payload)?;
                 structs::Message::ChainStateFlushed(structs::ChainStateFlushed::from_fbs(msg)?)
             }
+            b"miningwrkchg" => {
+                let msg =
+                    flatbuffers::root_with_opts::<MiningWorkChanged>(&self.fbb_opts, payload)?;
+                structs::Message::MiningWorkChanged(structs::MiningWorkChanged::from_fbs(msg)?)
+            }
             _ => {
-                eprintln!("Unknown message prefix: {:?}", prefix);
+                eprintln!("Unknown message prefix: {prefix:?}");
                 return Err(InvalidPubMessage(msg).into());
             }
         })
@@ -157,7 +180,7 @@ mod tests {
             bin_folder(),
             BitcoindChain::XPI,
             vec![
-                OsString::from_str(&format!("-nngpub={}", pub_url))?,
+                OsString::from_str(&format!("-nngpub={pub_url}"))?,
                 OsString::from_str("-nngpubmsg=updateblktip")?,
             ],
         )?;

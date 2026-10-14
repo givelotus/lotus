@@ -1,7 +1,7 @@
 use std::{
     ffi::OsString,
     fs::File,
-    io::{Read, Write, BufRead},
+    io::{BufRead, Read, Write},
     path::{Path, PathBuf},
     process::{Child, Command, Output},
     str::FromStr,
@@ -278,7 +278,7 @@ rpcport={rpc_port}
     }
 
     pub fn terminate(&mut self) -> Result<()> {
-        let exit_code = Command::new("kill")
+        Command::new("kill")
             .args(["-s", "TERM", &self.bitcoind_child.id().to_string()])
             .spawn()?
             .wait()?;
@@ -322,7 +322,7 @@ impl Drop for BitcoindInstance {
     fn drop(&mut self) {
         if let Ok(None) = self.bitcoind_child.try_wait() {
             if let Err(err) = self.shutdown_bitcoind() {
-                eprintln!("Failed to shut down bitcoind: {}", err);
+                eprintln!("Failed to shut down bitcoind: {err}");
             }
         }
     }
@@ -332,6 +332,7 @@ fn net_conf_line(net: Net) -> &'static str {
     match net {
         Net::Mainnet => "",
         Net::Regtest => "regtest=1",
+        Net::Testnet => "testnet=1",
     }
 }
 
@@ -339,5 +340,6 @@ fn net_conf_section_header(net: Net) -> &'static str {
     match net {
         Net::Mainnet => "",
         Net::Regtest => "[regtest]",
+        Net::Testnet => "[test]",
     }
 }

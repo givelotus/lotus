@@ -4,6 +4,22 @@ use crate::SigHashType;
 
 #[derive(Error, Debug, PartialEq, Eq, Clone, Copy, Hash)]
 pub enum SignError {
+    #[error("Taproot secret key does not match its internal public key")]
+    InvalidTaprootKey,
+    #[error("Taproot signing key does not match the spent output commitment")]
+    TaprootCommitmentMismatch,
+    #[error("Invalid Taproot key tweak")]
+    TaprootTweak,
+
+    #[error("Lotus signing input index {0} is out of range")]
+    LotusInputIndex(usize),
+    #[error("Lotus signing requires one spent output for each transaction input")]
+    LotusSpentOutputsCount,
+    #[error("Lotus SIGHASH_SINGLE input {0} has no matching output")]
+    LotusSingleOutputMissing(usize),
+    #[error("Lotus signing amount is negative or its sum overflows")]
+    LotusInvalidAmount,
+
     #[error("Input has no sign data")]
     NoSignData,
     #[error(

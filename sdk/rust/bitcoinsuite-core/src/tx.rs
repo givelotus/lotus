@@ -94,6 +94,16 @@ fn lotus_tx_outputs_merkle_root(outputs: &[TxOutput]) -> (Sha256d, usize) {
 }
 
 impl Tx {
+    /// Merkleized Lotus transaction ID; use this in Lotus outpoints and Chronik queries.
+    pub fn lotus_txid(&self) -> Sha256d {
+        lotus_txid(&self.unhashed_tx)
+    }
+
+    /// Hash of the raw serialization. This differs from the Lotus transaction ID.
+    pub fn tx_hash(&self) -> &Sha256d {
+        &self.hash
+    }
+
     pub fn hash(&self) -> &Sha256d {
         &self.hash
     }

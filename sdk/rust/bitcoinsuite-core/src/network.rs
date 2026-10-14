@@ -14,9 +14,12 @@ pub enum Network {
 
 #[derive(Deserialize, Serialize, Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[serde(rename_all = "camelCase")]
+#[derive(Default)]
 pub enum Net {
+    #[default]
     Mainnet,
     Regtest,
+    Testnet,
 }
 
 impl Network {
@@ -45,7 +48,7 @@ impl Network {
 
 impl Display for Network {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{:?}", self)
+        write!(f, "{self:?}")
     }
 }
 
@@ -86,11 +89,5 @@ mod tests {
             _ => panic!("Unexpected parse result"),
         }
         Ok(())
-    }
-}
-
-impl Default for Net {
-    fn default() -> Self {
-        Net::Mainnet
     }
 }
