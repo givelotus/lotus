@@ -16,6 +16,8 @@ command -v guix >/dev/null
 SOURCE_COMMIT="$(git -C "$SOURCE" rev-parse HEAD)"
 SOURCE_TREE="$(git -C "$SOURCE" rev-parse 'HEAD^{tree}')"
 SOURCE_EPOCH="$(git -C "$SOURCE" show -s --format=%at HEAD)"
+SOURCE_VERSION="$(sed -nE 's/^[[:space:]]*VERSION ([0-9]+\.[0-9]+\.[0-9]+)$/\1/p' "$SOURCE/CMakeLists.txt")"
+[[ "$SOURCE_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "Source has no unique semantic project version." >&2; exit 1; }
 LOTUS_CHRONIK="${LOTUS_CHRONIK:-ON}"
 LOTUS_NNG="${LOTUS_NNG:-ON}"
 for feature in "$LOTUS_CHRONIK" "$LOTUS_NNG"; do
@@ -32,7 +34,7 @@ printf 'source_commit=%s\nsource_tree=%s\nadapted_commit=%s\nadapted_tree=%s\nso
     "$SOURCE_COMMIT" "$SOURCE_TREE" "$(git rev-parse HEAD)" "$(git rev-parse 'HEAD^{tree}')" "$SOURCE_EPOCH" "$LOTUS_CHRONIK" "$LOTUS_NNG" > "$CANDIDATE/inputs.txt"
 export HOSTS=x86_64-linux-gnu JOBS="${JOBS:-2}"
 export SOURCE_DATE_EPOCH="$SOURCE_EPOCH" FORCE_SOURCE_DATE_EPOCH=1
-FORCE_VERSION="$(cat "$DAEMON_DIR/release-version")"
+FORCE_VERSION="$SOURCE_VERSION"
 export FORCE_VERSION
 export DISTNAME="lotus-${FORCE_VERSION}" OUTDIR_BASE="$CANDIDATE/output"
 ./contrib/guix/guix-build
