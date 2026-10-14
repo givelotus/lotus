@@ -43,12 +43,21 @@ pub fn create_block_for_chain(
     target.reverse();
     let mut header = [0; 160];
     header[..size].copy_from_slice(&block[..size]);
-    if chain == crate::settings::Chain::Dogecoin
-        && u32::from_le_bytes(header[..4].try_into().unwrap()) & 256 != 0
-    {
-        return Err(eyre::eyre!(
-            "AuxPoW jobs require a parent-chain miner; expected a direct Scrypt job"
-        ));
+    if chain == crate::settings::Chain::Dogecoin {
+        let version = u32::from_le_bytes(header[..4].try_into().unwrap());
+        if version & 256 != 0 {
+            return Err(eyre::eyre!(
+                "AuxPoW jobs require a parent-chain miner; expected a direct Scrypt job"
+            ));
+        }
+        // The direct-mining RPC contract uses Dogecoin chain ID 98 and base
+        // version 4. Fail closed if pointed at a Lotus/Bitcoin endpoint or if a
+        // future protocol version needs explicit miner compatibility review.
+        if version >> 16 != 98 || version & 0xffff != 4 {
+            return Err(eyre::eyre!(
+                "Expected a modern Dogecoin direct-mining job (chain ID 98, version 4); check --chain and rpc_url"
+            ));
+        }
     }
     Ok(Block {
         chain,
@@ -111,6 +120,25 @@ mod tests {
             crate::settings::Chain::Dogecoin
         )
         .is_err());
+    }
+
+    #[test]
+    fn dogecoin_rejects_mismatched_chain_and_unsupported_versions() {
+        for version in [0u32, 1, 4, 0x630004, 0x620003, 0x620005, 0x620204] {
+            let mut bytes = vec![0; 164];
+            bytes[..4].copy_from_slice(&version.to_le_bytes());
+            let job = RawUnsolvedBlockAndTarget {
+                blockhex: hex::encode(bytes),
+                target: "ff".repeat(32),
+            };
+            assert!(
+                create_block_for_chain(&job, crate::settings::Chain::Dogecoin).is_err(),
+                "version {:#x}",
+                version
+            );
+            // A longer Lotus body is not evidence that a job is Dogecoin.
+            assert!(create_block(&job).is_ok());
+        }
     }
 
     #[test]

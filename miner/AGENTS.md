@@ -47,3 +47,8 @@
   digest parity, nonce0, uint32 boundary samples and actual regtest RPC mining:
   getrawunsolvedblock/submitblock accepted height22 from height21 after AuxPoW
   activation on the isolated current-ABC port. No mainnet mining was performed.
+
+- Dogecoin jobs fail closed unless their header carries chain ID 98 and base
+  version 4, matching the node's current direct-mining RPC contract. The same
+  RPC names on Lotus do not imply compatible jobs. Keep benchmark kernel batch
+  rates distinct from application rates including polling and scheduling.

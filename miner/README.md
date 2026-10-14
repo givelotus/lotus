@@ -130,7 +130,10 @@ scrypt_work_size = 1024
 ```
 
 This requires the rebased Doged node's `getrawunsolvedblock(address)` RPC
-returning `{blockhex,target}` and `submitblock(blockhex)`. It is not a
+returning `{blockhex,target}` and `submitblock(blockhex)`. Jobs must carry
+Dogecoin chain ID 98 and base version 4; other versions fail closed pending
+compatibility review. Configure `rpc_url` explicitly: chain selection does not
+change an existing RPC URL or its default. It is not a
 Stratum pool client. It mines ordinary direct Scrypt blocks, not parent-chain
 AuxPoW jobs or combined Litecoin/Dogecoin rewards. Payout validation and
 coinbase construction belong to the node; the miner preserves its entire
@@ -174,7 +177,11 @@ These checks establish direct mining correctness on this device, not pool
 compatibility, ASIC competitiveness, sustained profitability, or other GPUs.
 
 Bounded warmed OpenCL measurements on that M5 Max (1,024 batches each,
-including GPU buffer upload/readback, excluding compilation and CPU verification):
+including GPU buffer upload/readback, excluding compilation and CPU verification).
+These measure the kernel batch rate, not the application's end-to-end mining
+hashrate: RPC polling, the mining-loop sleep/scheduling, candidate verification,
+and submission add overhead:
+
 
 | Nonces/batch | Scratch | Hashes | Elapsed | Hashes/second |
 | --- | --- | --- | --- | --- |
