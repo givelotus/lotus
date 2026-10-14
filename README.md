@@ -8,7 +8,7 @@ This monorepo contains the core Lotus node daemon, patch series, specifications,
 
 ```
 daemon/         — Lotus node daemon (`lotusd` & `lotus-cli` built on Bitcoin ABC + Lotus patch series, with in-process Chronik & NNG)
-  patches/v1/   — Lotus V1 mainnet patch series (`000`–`247`, rebased onto modern Bitcoin ABC 252182e9)
+  patches/v1/   — Lotus V1 mainnet patch series (`000`–`247`, rebased onto modern Bitcoin ABC 8c67fe1e85)
   patches/v2/   — Lotus V2 next-generation chain patch series
 sdk/
   dart/         — Dart SDK for mobile wallet development
@@ -48,7 +48,7 @@ curl -s http://127.0.0.1:8331/blockchain-info | xxd
 
 ## Building `lotusd` from Source (Lotus V1 Mainnet)
 
-Rather than maintaining a diverging fork of the entire C++/Rust tree, `daemon/` pins an upstream [`Bitcoin-ABC/bitcoin-abc`](https://github.com/Bitcoin-ABC/bitcoin-abc) commit ([`daemon/bitcoin-abc-version`](daemon/bitcoin-abc-version), currently `252182e957120652960c1f88ec96515c448b1204`) and automatically applies the ordered patch series in [`daemon/patches/v1/series`](daemon/patches/v1/series).
+Rather than maintaining a diverging fork of the entire C++/Rust tree, `daemon/` pins an upstream [`Bitcoin-ABC/bitcoin-abc`](https://github.com/Bitcoin-ABC/bitcoin-abc) commit ([`daemon/bitcoin-abc-v1-version`](daemon/bitcoin-abc-v1-version), currently `8c67fe1e85a602204a2ce65aa3b643469c2c3a1d`) and automatically applies the ordered patch series in [`daemon/patches/v1/series`](daemon/patches/v1/series).
 
 ### 1. Install Dependencies
 
@@ -79,7 +79,7 @@ make -C daemon setup SERIES=v1
 
 What this does automatically (`daemon/scripts/setup.sh`):
 1. Clones `https://github.com/Bitcoin-ABC/bitcoin-abc.git` into `daemon/workspace-v1/`.
-2. Checks out the pinned base commit from [`daemon/bitcoin-abc-version`](daemon/bitcoin-abc-version) (`252182e957120652960c1f88ec96515c448b1204`) on branch `lotus-v1-work`.
+2. Checks out the pinned base commit from [`daemon/bitcoin-abc-v1-version`](daemon/bitcoin-abc-v1-version) (`8c67fe1e85a602204a2ce65aa3b643469c2c3a1d`) on branch `lotus-v1-work`.
 3. Iterates through every patch in [`daemon/patches/v1/series`](daemon/patches/v1/series) (`000` through `247`) in order, applying and committing each patch onto `daemon/workspace-v1/`.
 
 *(To wipe `daemon/workspace-v1/` and re-apply all patches from scratch at any time, run `make -C daemon setup SERIES=v1 RESET=1`.)*

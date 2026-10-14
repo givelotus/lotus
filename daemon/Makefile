@@ -2,13 +2,13 @@
 #
 # Each series has its own base:
 #   SERIES=v2    — bitcoin-abc HEAD (252182e9)       see bitcoin-abc-version
-#   SERIES=v1    — bitcoin-abc HEAD (252182e9)       see bitcoin-abc-version
+#   SERIES=v1    — bitcoin-abc (8c67fe1e85)          see bitcoin-abc-v1-version
 #   SERIES=doged — doged-io/doged  (direct clone)    see doged-version
 #   SERIES=bchn  — BCHN v28.0.0                      see bchn-version
 #
 # Four build targets are supported:
 #   SERIES=v2 (default) — new chain (workspace-v2/):   bitcoin-abc 252182e9 + Lotus v2 patches
-#   SERIES=v1           — mainnet   (workspace-v1/):   lotusd history + Chronik rebased onto bitcoin-abc 252182e9
+#   SERIES=v1           — mainnet   (workspace-v1/):   lotusd history + Chronik rebased onto bitcoin-abc 8c67fe1e85
 #   SERIES=ecash        — eCash PRs (workspace-v2/):   mining + NNG patches for upstream
 #   SERIES=doged        — doged     (workspace-doged/): doged-io/doged direct clone
 #   SERIES=bchn         — BCHN      (workspace-bchn/):  BCHN v28.0.0 + mining patches
@@ -37,7 +37,7 @@ help:
 	@echo "  make refresh COMMIT=<c>        Rebase onto new base commit or tag"
 	@echo ""
 	@echo "  SERIES=v2 (default): new chain  — workspace-v2/     (bitcoin-abc 252182e9)"
-	@echo "  SERIES=v1:           mainnet    — workspace-v1/     (bitcoin-abc 252182e9 + Chronik)"
+	@echo "  SERIES=v1:           mainnet    — workspace-v1/     (bitcoin-abc 8c67fe1e85 + Chronik)"
 	@echo "  SERIES=doged:        doged      — workspace-doged/  (direct clone doged-io/doged)"
 	@echo "  SERIES=bchn:         BCHN       — workspace-bchn/   (BCHN v28.0.0)"
 

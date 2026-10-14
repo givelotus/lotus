@@ -68,7 +68,7 @@ make setup SERIES=v1
 
 **What this command does for you:**
 1. Clones `https://github.com/Bitcoin-ABC/bitcoin-abc.git` into `workspace-v1/`.
-2. Checks out the exact pinned base commit from [`bitcoin-abc-version`](bitcoin-abc-version).
+2. Checks out the exact pinned base commit from [`bitcoin-abc-v1-version`](bitcoin-abc-v1-version) for V1 (V2 uses `bitcoin-abc-version`).
 3. Reads [`patches/v1/series`](patches/v1/series) from top to bottom and applies all 153 Lotus patches (`000` through `247`) in order, committing each one cleanly into `workspace-v1/`.
 
 *(Need to wipe `workspace-v1/` and re-apply all patches cleanly from scratch? Run `make setup SERIES=v1 RESET=1`.)*

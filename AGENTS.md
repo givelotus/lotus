@@ -51,7 +51,7 @@ Workspaces (`daemon/workspace-*`) are **gitignored** local clones created by `ma
 
 | SERIES | Base | Version file | Workspace | Purpose |
 |--------|------|-------------|-----------|---------|
-| `v1` | `bitcoin-abc` `252182e9` | `bitcoin-abc-version` | `workspace-v1/` | **Lotus V1 mainnet (`v11.6.0`)** — 153 patches (`000`–`247`) + in-process Chronik (`-DBUILD_CHRONIK=ON`) |
+| `v1` | `bitcoin-abc` `8c67fe1e85` | `bitcoin-abc-v1-version` | `workspace-v1/` | **Lotus V1 mainnet (`v11.6.0`)** — 153 patches (`000`–`247`) + in-process Chronik (`-DBUILD_CHRONIK=ON`) |
 | `v2` (default) | `bitcoin-abc` `252182e9` | `bitcoin-abc-version` | `workspace-v2/` | **Lotus V2 new chain** (see `docs/lotus-v2/`) |
 | `ecash` | `bitcoin-abc` `252182e9` | `bitcoin-abc-version` | `workspace-v2/` | Upstream PR candidates for eCash ($O(n \log n)$ mining, $O(1)$ mempool, NNG) |
 | `doged` | `doged-io/doged` | `doged-version` | `workspace-doged/` | Dogecoin ABC reference |
@@ -60,7 +60,7 @@ Workspaces (`daemon/workspace-*`) are **gitignored** local clones created by `ma
 ### Commands
 
 ```bash
-# 1. Clone bitcoin-abc at 252182e9 and apply all 153 V1 patches in order:
+# 1. Clone the pinned V1 bitcoin-abc base and apply all 153 patches in order:
 make -C daemon setup SERIES=v1
 
 # 2. Compile lotusd and lotus-cli (with -DBUILD_CHRONIK=ON enabled by default for SERIES=v1):
@@ -108,3 +108,18 @@ Upstream Bitcoin ABC's in-process Chronik (`chronik/`) assumes standard 80-byte 
 - Always run `python3 docs/lotus-v2/tools/spec_candidate_checks.py` after modifying any file under `docs/lotus-v2/`.
 - **CoreTxId Witness Commitment**: `CoreTxId` (`txid`) commits to the structural witness fields (`WitnessStripped`, excluding runtime/signature `vMethodArgs`) to prevent code/branch substitution attacks while keeping `txid` non-malleable and supporting presigned transactions.
 - **Avalanche Stake Weighting (`issuance-and-time.md` & `rationale.md`)**: Both reward weight $R(x)$ and voting weight $V(x)$ must remain strictly linear ($f(x_1 + x_2) = f(x_1) + f(x_2)$) with a bounded Top-$K$ active proof table (`AVALANCHE_MAX_ACTIVE_PROOFS`). Pairing superlinear $R(x)$ with sublinear $V(x) = \sqrt{x}$ is vulnerable to stock-vs.-flow 51% quorum Sybil splits and penalizes solo multi-UTXO `avalanche::Proof` construction.
+
+
+## V1 Rebase Validation (2026-10-14)
+
+- V1 now has its own base pin, `daemon/bitcoin-abc-v1-version`, at `8c67fe1e85a602204a2ce65aa3b643469c2c3a1d`. The shared V2/eCash pin stays at `252182e957`; advancing it would invalidate those existing patch series. The separate V2 worktrees and their completed patches 000–004 are preserved.
+- `/tmp/rebase-latest-abc` contains exactly 153 commits matching `daemon/patches/v1/series`. Export patches from each commit's parent-to-commit diff; verify replay using a temporary Git index and compare the final tree with HEAD. Never run setup/reset against the live `daemon/workspace-v1` during this work.
+- Fold leftover eCash activation removal and build compatibility repairs into patch 246, near the end of the series, preserving the 153-entry mapping. Lotus historical activation times and `secondKingsActivationTime` remain unchanged.
+- The C++ test binary/target is `test_lotus`, not `test_bitcoin`. The upstream CMake Git reflog lookup assumes `.git` is a directory; patch 246 uses `git rev-parse --path-format=absolute --git-path logs/HEAD` to support linked worktrees.
+- Original rebase HEAD is retained as `lotus-v1-before-activation-fold-20261014`; the original uncommitted cleanup is saved at `/tmp/lotus-v1-activation-cleanup-20261014.diff`.
+- Do not describe the new base as validated or replace release assets until its builds and protocol checks pass. Test with a separate datadir and ports, preserving the running mainnet daemon and its chain data.
+
+- V1 compatibility validation: `lotusd`, `lotus-cli`, `test_lotus`, and `check-crates` build successfully; all 156 `check-bitcoin` targets pass. Chronik's PyO3 0.23 bindings require Python <=3.13; configure with `-DPython_EXECUTABLE=/opt/homebrew/bin/python3.13` and run Rust checks with `PYO3_PYTHON=/opt/homebrew/bin/python3.13` locally. CI selects Python 3.13 and checks C++/Rust before packaging.
+- Preserve current upstream initialization/shutdown and node-owned `ValidationSignals`; apply only Lotus settings/NNG hooks to upstream `src/init.cpp`. Restore current optional `GetCoin`, static secp256k1 context, const network-magic lookup, and mempool options APIs in patch 246.
+- Mainnet/testnet eCash assumeutxo snapshots are removed; their commitments do not describe Lotus. Regtest keeps a regenerated deterministic Lotus snapshot at height 110, checked by snapshot loading/validation tests. Lotus fixtures use coinbase output 1, 160-byte headers plus serialized metadata, and block Merkle leaves committing to both TxHash and TxId. Tests must preserve V1 BIP143 out-of-range SINGLE behavior rather than importing an upstream consensus change.
+- Isolated mainnet replay uses `/tmp/lotus-v1-mainnet-8c67fe1e85`, RPC 11604, P2P 11605 (listening disabled), Chronik 18331. Block files were copied with APFS copy-on-write; original live data is untouched. `daemon/scripts/check-v1-chronik.py` compares headers, TxIds, and raw transaction disk bytes with RPC. Previous release assets and tag are backed up in `/tmp/lotus-v11.6.0-before-8c67fe1e85` before republishing.
