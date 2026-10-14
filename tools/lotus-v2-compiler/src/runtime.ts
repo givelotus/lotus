@@ -49,6 +49,13 @@ function txid(a: PaymentArtifact, c: PaymentContext): Uint8Array {
 function wire(a: PaymentArtifact, c: PaymentContext, signature?: Uint8Array): Uint8Array {
   return concat(header(c), inputParts(a, c, signature).full, ...c.outputs.map(encodeOutput));
 }
+// Offline negative-fixture construction only; this does not verify an invocation.
+export function encodePaymentWireUnchecked(a: PaymentArtifact, c: PaymentContext, signature: Uint8Array): Uint8Array {
+  assertArtifact(a);
+  if (!(signature instanceof Uint8Array) || signature.length !== 64) throw new Error('FULL signature must be 64 bytes');
+  preparePayment(a, c);
+  return wire(a, c, signature);
+}
 function assertArtifact(a: PaymentArtifact): void {
   if (a.schema !== 'lotus-v2/payment-artifact/1' || a.target !== 'P01-P02-P03-candidate-2026-10-14' || a.methods.length !== 1 || a.methods[0]?.name !== 'spend') throw new Error('unsupported artifact');
   const script = unhex(a.scriptHex, 34);
@@ -60,6 +67,9 @@ export function preparePayment(a: PaymentArtifact, c: PaymentContext): PaymentPl
   assertArtifact(a);
   if (c.profile !== 'payment-fixture-p01-v1') throw new Error('unsupported profile');
   unhex(c.chainId, 32); unhex(c.prevTxid, 32); u32(c.prevIndex); u32(c.sequence); uint(c.lock ?? 0n, 8);
+  const lock = c.lock ?? 0n;
+  if ((lock & 255n) > 2n || ((lock & 255n) === 0n && lock !== 0n)) throw new Error('invalid P01 lock encoding');
+  if (c.sequence !== 0xffffffff && (c.sequence & ~0x40ffff) !== 0) throw new Error('invalid P01 sequence bits');
   if (!c.outputs.length || c.outputs.length > 32) throw new Error('fixture profile output count');
   validateOutput(c.coin); c.outputs.forEach(validateOutput);
   if (c.coin.branches.length !== 1 || c.coin.branches[0] !== a.policy.leaf || JSON.stringify(c.coin.paths) !== '[[0]]') throw new Error('resolved coin policy mismatch');
