@@ -5,8 +5,8 @@ The CLI and optional desktop GUI share the same mining library. They use Lotus's
 160-byte block headers and `getrawunsolvedblock`/`submitblock` RPCs.
 
 The CLI accepts `--protocol=v1|v2`, with V1 as the default. V2 selection exits
-with an unsupported error before mining because its daemon job API and OpenCL
-kernel are pending. The candidate V2 CPU header hash and full integration gates
+with an unsupported error before mining because its daemon job API and kernel
+scheduler are pending. The candidate V2 CPU/OpenCL header hashes and integration gates
 are described in [V2-MINING.md](V2-MINING.md).
 
 ## Build

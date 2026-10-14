@@ -2,6 +2,7 @@ mod block;
 mod miner;
 pub mod settings;
 mod sha256;
+pub mod v2_gpu;
 pub mod v2_header;
 
 use eyre::Result;

@@ -2,8 +2,9 @@
 
 The current miner has an explicit `--protocol=v1|v2` setting. V1 is the default.
 V2 selection exits before GPU setup or any RPC request with a clear unsupported
-error. The V2 P04 CPU header hashing primitive is implemented and checked against
-independent vectors, but this is not a V2 mining implementation.
+error. The V2 P04 CPU primitive and OpenCL work/BlockID kernel are implemented
+and checked against independent vectors. The OpenCL code is available only
+through bounded library batches, not through the network miner.
 
 ## Protocol contract
 
@@ -25,7 +26,9 @@ hash, target, and block-framing behavior active.
 
 ## Next integration slices
 
-1. Freeze P04 and the V2 chain-manifest ChainID. Define a daemon mining-job API
+1. Pin a versioned P04 candidate profile and explicit development ChainID for
+   integration tests. Final consensus and production ChainID freeze is a launch
+   gate. Define a daemon mining-job API
    with protocol and chain identity, complete serialized block template, target,
    job/tip identity, nonce range and permitted time/template mutations. Reject
    mismatched protocol, wrong chain, stale tip, malformed length and unexpected
@@ -35,11 +38,13 @@ hash, target, and block-framing behavior active.
    post-state root and exact block size. Vanity/output changes require rebuilding
    all affected commitments and BodyHash; nonce-only changes reuse BodyHash.
    The GPU miner must never invent a state root.
-3. Add an embedded tagged-BLAKE3 OpenCL kernel accepting explicit ChainID and
-   V2 header fields. Partition the u64 nonce space without overlaps or rollover,
-   report candidate nonces, and verify every result on CPU against full target
-   before submission. Keep V1's kernel and job decoding behind its own protocol
-   dispatch. Wire the GUI only after the same V2 safeguards exist.
+3. Integrate the embedded tagged-BLAKE3 OpenCL kernel with versioned V2 jobs.
+   BodyHash is computed once per batch from the explicit ChainID and header body;
+   OpenCL computes WorkHash and BlockID for each u64 nonce. Current batches reject
+   overflow and verify each target hit again on CPU. A live scheduler must
+   partition nonce space without overlaps, handle cancellation and stale jobs,
+   and retain V1's separate kernel and job decoding. Wire the GUI only after
+   the same V2 safeguards exist.
 4. Test independent header vectors, CPU/GPU parity across nonce and target
    boundaries, template mutation and stale-job behavior, V1 regressions, and
    malformed V2 job rejection. Compile and run the kernel on each supported GPU
@@ -47,5 +52,15 @@ hash, target, and block-framing behavior active.
    independent CPU validator and daemon both accept it. Record device, driver,
    build, test commands and measured hash rate; compilation alone is insufficient.
 
-No V2 job API or accepted V2 block exists in this miner slice. No live network
-mining was performed.
+The bounded OpenCL parity test executed on Apple M5 Max on October 14, 2026:
+independent P04 vectors, four nonce windows including byte carry, u32 carry and
+the u64 end, and inclusive/lower target boundaries passed. This is GPU kernel
+execution evidence, not network mining or a measured hash rate. No V2 job API
+or accepted V2 block exists in this miner slice. No live network mining was
+performed.
+
+```sh
+cargo test --locked -p lotus-miner-lib gpu_cpu_parity_and_target_boundaries -- --ignored --nocapture
+cargo test --locked --workspace
+cargo clippy --locked --workspace --all-targets -- -D warnings
+```
