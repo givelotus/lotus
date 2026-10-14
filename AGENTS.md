@@ -221,3 +221,8 @@ Upstream Bitcoin ABC's in-process Chronik (`chronik/`) assumes standard 80-byte 
 
 - SDK and Vase now use PointyCastle 4.0.0. Both copied ASN.1 implementations are retired; compatibility exports and a small helper adapter delegate to upstream public ASN.1 APIs. Preserve unsigned fixed-width key/compact-signature encoding separately from signed DER. Original upstream PR59 and the credited rewrite are documented in `sdk/dart/docs/crypto-audit-20261014/README.md`.
 - Combined integration passes all 40 Dart SDK tests and 59 Flutter wallet tests. Independent crypto evidence includes 513 signatures accepted by OpenSSL and daemon libsecp256k1, 64 OpenSSL signatures accepted by Dart, and byte-identical valid signatures across the dependency upgrade. Exact decimal/BigInt wallet amount conversion avoids lost base units and supports six fractional digits; retain regression coverage for native and JavaScript precision. No real payment, native mobile validation, package publication or deployment is implied.
+
+## Current BCHN work (2026-10-14)
+
+- User selected latest BCHN tip, resolved to GitLab master `abd433abe04f74780744b9eac06731f3690ce68a` (29.2.1). Use a full immutable pin; v28 validation is historical. Isolated source/build lives under `/tmp/lotus-bchn-tip-*`; never reset the original workspace.
+- Current BCHN already removed transitive mempool entry updates/chain limits in 2021 and its direct-parent-count block scheduler is expected O(n + m), before CTOR sorting. Do not label either path quadratic without evidence. Ready-heap changes must be justified by fee selection behavior, with no unsupported speedup or CPFP claim. See `daemon/docs/bchn-current-audit.md`.

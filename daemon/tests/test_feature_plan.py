@@ -40,6 +40,13 @@ class FeatureSelectionTests(unittest.TestCase):
         self.assertEqual(plan["features"][0]["kind"], "integrated-custom-assembler")
         self.assertEqual(plan["features"][0]["requires"], ["complete-v1-series"])
 
+    def test_bchn_uses_reviewed_ready_priority_candidate(self):
+        plan = planner.resolve("bchn", ["block-construction", "zeromq-off"], True)
+        self.assertEqual([Path(p).name for p in plan["patches"]],
+                         ["01-prioritize-ready-transactions.patch"])
+        self.assertEqual(plan["cmake_args"], ["-DBUILD_BITCOIN_ZMQ=OFF"])
+        self.assertEqual(plan["features"][0]["requires"], [])
+
     def test_experimental_selection_requires_opt_in(self):
         with self.assertRaises(ValueError):
             planner.resolve("ecash", ["block-construction"], False)

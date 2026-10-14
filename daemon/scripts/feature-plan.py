@@ -53,13 +53,17 @@ def resolve(target, names, allow_experimental):
             if not allow_experimental:
                 raise ValueError(f'{name} is unvalidated review material; use --allow-experimental explicitly')
             series = 'ecash' if target == 'doged' else target
-            filename = ('01-nlogn-block-construction.patch' if name == 'block-construction'
+            filename = (('01-prioritize-ready-transactions.patch' if target == 'bchn' else
+                         '01-nlogn-block-construction.patch') if name == 'block-construction'
                         else '02-remove-chaintx-limit.patch')
             patches.append(str(DAEMON / 'patches' / series / filename))
             warning = 'Clean application does not establish successful builds or behavior'
             if series == 'ecash' and name == 'block-construction':
                 warning = ('Corrected custom snapshot/ready-heap assembler with native regression evidence; '
                            'expected O(n + m + n log n), no measured speedup over modern ABC')
+            if target == 'bchn' and name == 'block-construction':
+                warning = ('Ready-backlog fee-priority fix; current BCHN already avoids quadratic dependency '
+                           'traversal. Native regression evidence, no measured performance speedup')
             evidence.append({'feature': name, 'kind': 'experimental-candidate', 'requires': [],
                              'warning': warning})
     return {'target': target, 'cmake_args': flags, 'patches': patches, 'features': evidence}

@@ -1,13 +1,17 @@
-# Experimental bchn candidates
+# BCHN review features
 
-Pinned base: BCHN `v28.0.0` (`0bc23ac4c1365f34ed824e2b07e554ec06a5f5cd`). Default setup applies no patches. These are opt-in review material, not a maintained release target. See [the support audit](../../docs/support-matrix.md).
+Acceptance base: current BCHN master `abd433abe04f74780744b9eac06731f3690ce68a`
+(29.2.1), resolved 2026-10-14. Default setup applies no optional patches.
+See [the current audit](../../docs/bchn-current-audit.md).
 
-| File | Actual change | Status |
+| File | Purpose | Status |
 |---|---|---|
-| `01-nlogn-block-construction.patch` | Replaces mining transaction selection | Applies at the pinned base; not established correct or O(n log n). Shared ancestors are counted repeatedly, DFS has no visited set, and static package statistics become stale as ancestors enter the block. No regression tests accompany this patch. |
-| `02-remove-chaintx-limit.patch` | Adds a 100-entry `addUnchecked` container test | Does not remove any policy check, exercise transaction admission, or establish relay/mining acceptance. Independent of 01. |
-| `03-mempool-cleanup.patch` | Comment-only historical no-op | Excluded from executable series; `git apply` rejects a file with no diff. |
-| `10-nng-interface.patch` | Comment-only placeholder | Unimplemented; not selectable. |
-| `11-remove-zeromq.patch` | Comment-only placeholder | Unimplemented source deletion; disabling the existing CMake feature is already possible. |
+| `01-prioritize-ready-transactions.patch` | Highest modified-feerate newly ready sibling first, preserving existing direct-parent scheduler | Applies at the exact pin; native miner tests pass, including two failed assertions before the fix. Full checks/functional evidence recorded in the audit. |
+| `01-nlogn-block-construction.patch` | Historical experimental transitive-package replacement | Broken, retained for provenance; no longer selected. Current BCHN already avoids quadratic dependency traversal. |
+| `02-remove-chaintx-limit.patch` | Historical unchecked-container-only test | Not an admission-policy change. BCHN already removed chain limits in 2021. |
+| `03-mempool-cleanup.patch` | Historical comment-only no-op | Never apply. |
+| `10-nng-interface.patch` | Historical comment-only placeholder | Port in progress; do not select until a real patch and validation exist. |
+| `11-remove-zeromq.patch` | Historical source-removal placeholder | Unimplemented; existing `BUILD_BITCOIN_ZMQ=OFF` independently disables ZeroMQ. |
 
-Apply/build/test results are separate evidence. Do not describe these candidates as upstream-ready until focused mining, policy, reorg, resource-limit, and performance checks pass. No candidate changes are required to enable upstream Chronik on an ABC-derived daemon.
+Chronik would require a substantial independent port; this series does not
+provide one. Avalanche-finalization pruning does not fit BCHN's consensus model.
