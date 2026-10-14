@@ -32,6 +32,10 @@ proxy capabilities do not mean a client has contacted or verified an endpoint.
 `signSchnorrBip340` requires explicit 32-byte auxiliary randomness. It is not
 BCH Schnorr and does not implement transaction-level BIP341 signing. `ecdh`
 returns the compressed shared point, without silently applying a hash/KDF.
+As in Nakamoto, ECDH and ECDSA verification accept SEC1 or 32-byte x-only keys;
+x-only keys are lifted with even Y. Address and HD-key parsing require SEC1.
+The ECDSA facade accepts strict DER signatures; use the separate existing
+`BCHSignature` API for compact/recoverable signature formats.
 PointyCastle and Dart BigInt operations do not provide constant-time guarantees.
 
 ## Supported chains

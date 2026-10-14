@@ -147,6 +147,7 @@ Uint8List signEcdsa(Uint8List digest, Uint8List secret) {
 }
 
 /// Rejects malformed DER/high-S explicitly; a different valid signature is false.
+/// Like Nakamoto, a 32-byte x-only key is lifted with even Y; SEC1 also works.
 bool verifyEcdsa(Uint8List signature, Uint8List digest, Uint8List publicKey) {
   _length(digest, 32, 'Digest');
   final point = _point(publicKey);
@@ -256,6 +257,7 @@ bool verifySchnorrBip340(
 }
 
 /// Compressed SEC1 shared point; deliberately no implicit hash or KDF.
+/// Like Nakamoto, a 32-byte peer key is lifted with even Y before multiplication.
 Uint8List ecdh(Uint8List secret, Uint8List publicKey) =>
     _compressed((_point(publicKey) * _scalar(secret))!);
 

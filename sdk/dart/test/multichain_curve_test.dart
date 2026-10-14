@@ -13,6 +13,19 @@ const generator =
     '0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798';
 
 void main() {
+  test('Nakamoto curve APIs intentionally lift x-only keys with even Y', () {
+    final sec = hex(generator);
+    final xOnly = sec.sublist(1);
+    final digest = scalar(23);
+    final signature = signEcdsa(digest, scalar(1));
+    // Independently confirmed against Nakamoto nobleBackend.verifyEcdsa/ecdh.
+    expect(verifyEcdsa(signature, digest, xOnly), isTrue);
+    expect(ecdh(scalar(1), xOnly), sec);
+    expect(ecdh(scalar(2), xOnly), ecdh(scalar(2), sec));
+    // Address/HD boundary validation remains SEC1-only unless explicitly opted in.
+    expect(() => validatePublicKey(xOnly), throwsA(isA<CurveException>()));
+    validatePublicKey(xOnly, allowXOnly: true);
+  });
   test(
     'Public SEC1 validation rejects noncanonical coordinates and off-curve points',
     () {
