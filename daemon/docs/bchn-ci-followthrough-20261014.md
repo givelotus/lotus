@@ -44,8 +44,7 @@ After the user's report, root changed only the fork project's timeout from
 | 2174 | 17182327867 | 17184742893 |
 | 2175 | 17182330966 | 17184743711 |
 
-Both retries started on 2026-10-14 at approximately 22:14 UTC. Their full
-results remain pending. Both retries have completed all 708 C++ cases under
+Both retries started on 2026-10-14 at approximately 22:14 UTC. Their final results are recorded below. Both retries completed all 708 C++ cases under
 Linux UBSan with no errors. The full compact-block functional test also passes
 in both retries: mining MR 2174 in 47 seconds at 23:00:34 UTC and diagnostic
 MR 2175 in 41 seconds at 22:59:47 UTC. Thus the original announcement timeout
@@ -68,7 +67,8 @@ unsafe C/Windows strerror-family ban while allowing independent identifiers.
 An executable permanent regression runs through the existing CMake lint suite
 and tests the actual linter in a disposable repository. Root pushed the reviewed
 source; required GitLab lint job 17185211785 passes in pipeline 2948599926.
-The fresh sanitizer job 17185211816 remains running with the three-hour budget.
+The fresh sanitizer job 17185211816 was still running when monitoring of that
+superseded protocol candidate stopped; its CI record remains historical only.
 The maintained optional export and exact-tree/order evidence are documented
 in `bchn-nng-publisher.md`; no C++ publisher behavior changed for this lint fix.
 
@@ -81,3 +81,39 @@ lint/CI records above are historical evidence only; do not promote its raw
 protocol mailbox/export candidate or infer consumer compatibility from those
 checks. No further update or external discussion of MR 2176 is authorized by
 this followthrough work. Mining/mempool sanitizer monitoring continues separately.
+
+## Final mining and mempool retry results
+
+| MR | Retried UBSan job | Result | C++ cases | Functional cases | Duration |
+|---|---|---|---|---|---|
+| 2174 | 17184742893 | Success | 708 pass | 191 pass | 5,846 s |
+| 2175 | 17184743711 | Failed | 708 pass | 190 pass, one fail | 5,903 s |
+
+MR 2174's complete UBSan run succeeds, including Qt/seeder/util checks. Its
+latest pipeline has all 33 jobs successful. MR 2175 has 32 successful jobs and
+one failed optional sanitizer job. Neither retained full trace contains an
+explicit UBSan runtime diagnostic, but MR 2175's failed full job must not be
+described as a clean sanitizer/integration pass. Both source MRs remain unchanged.
+
+The sole MR 2175 failure is `mining_getblocktemplate_errors.py`, whose second
+node was expected to return a disconnected-node error. The retained artifact
+proves ordering: node1's GBT RPC begins at `23:47:03.932715`; its final peer's
+socket closes at `.933306` and is disconnected at `.934139`. The helper only
+waited for node0, so node1 legitimately still had a peer when called. This is
+an upstream test synchronization race, independently reproduced with upstream
+C++ code; it is not a demonstrated mempool diagnostic defect.
+
+A separate [test-only candidate](../candidates/bchn-gbt-disconnect/README.md) adds
+a second `disconnect_nodes` call in the opposite direction. It preserves both
+error assertions and existing timeouts. Real transparent TCP proxies delaying
+only FIN propagation reproduce the original failure and verify the fix with
+the identical schedule, on upstream C++ binaries and a native Debug UBSan
+binary. Ten ordinary fixed-test UBSan repetitions also pass.
+
+Candidate source commit `029370ebe42a07ee9cc19aff55a1bb963c2c1504` applies directly
+to the pinned base and has tree `997734ce27472b34c55be37628c82961e6a88bc7`. Its
+mailbox replay matches. Keep it separate from MR 2175; source publication, a
+new independent upstream MR and its Linux CI await root review. No external
+action was performed for this candidate.
+
+See [final statuses, artifact chronology and reproduction hashes](evidence/bchn-ubsan-followthrough-final-20261014.json).
