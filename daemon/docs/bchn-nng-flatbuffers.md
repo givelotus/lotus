@@ -5,17 +5,13 @@ It is one mailbox patch on exact BCHN pin
 `abd433abe04f74780744b9eac06731f3690ce68a`, independently selectable and default OFF:
 `daemon/patches/bchn/10-nng-interface.patch`.
 
-Source commit: `1d9ed45dd4244de66083e70a427f9f56e30cd36b`.
-Source tree: `736fa9a6065580caf2c76649be49b70103f8a9f3`.
-Independent mailbox replay retains that tree. Root pushed the initial compatible
-replacement as `afb6a70da7b3dcb119ca3638218fa9d49ee3001d` to MR2176.
-Its CI found dependency/format lint failures; the narrow follow-up preserves the
-schema and passes native enabled rebuild plus both existing consumer suites.
-Root pushed the reviewed follow-up as `3584a5d3c3d16646a836f4270211b8de865d4782`;
-its final tree matches this mailbox. Corrected pipeline `2948854699` is pending.
-The affected lints pass locally; full local lint encountered a mypy tool-version
-error and is being retried with CI-matching tools. Historical raw-protocol CI
-does not validate this replacement.
+Source commit: `f9966c8d3b53cbab640a34cff33d00558884ca3f`.
+Source tree: `5d16cbdd89cdcef3bd6c34cf220194cf804d9fe8`.
+Independent mailbox replay retains that tree. Root submitted the reviewed final
+source as `eb7e2f4f7ae336f6f7b54b08baf6729a212e9f39` to MR2176, with
+byte-identical final tree. Native enabled build, both existing consumer suites and
+the complete mandatory local lint suite pass. Linux pipeline `2948875484` is running;
+historical raw-protocol CI does not validate this replacement.
 
 
 `BUILD_BITCOIN_NNG` is OFF by default. This is a port of the maintained
@@ -200,3 +196,8 @@ cycle and uses fixed format strings with BCHN's existing translation API. Its ex
 final tree was rebuilt with NNG ON / ZeroMQ OFF and both existing consumer suites
 passed again. Full unit and other build-mode evidence above belongs to the previous
 implementation tree; this narrow follow-up does not repeat those broader claims.
+
+The final generated-header include-style correction leaves schema/API behavior
+unchanged. The complete mandatory CMake `check-lint` target passes on final tree
+`5d16cbdd89cdcef3bd6c34cf220194cf804d9fe8`, with no skipped lint checks; the
+recorded tool versions match the project's CI pins.

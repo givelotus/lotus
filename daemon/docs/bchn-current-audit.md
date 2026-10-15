@@ -99,13 +99,20 @@ without applying patches to the source checkout.
 
 ## Composition validation
 
-All 15 individual/ordered combinations of 01, 04 and 10 apply cleanly at the
-exact acceptance base. All six triple orders produce identical tree
-`bf50633c2575549a6b621cff8e70142df901b2f7`. Native builds of daemon, CLI and test
-binary with both NNG and ZeroMQ enabled pass, followed by all 126 C++ suites.
-Real `interface_nng.py` subscriber and `mining_prioritisetransaction.py` regtests
-pass on the combined tree. Application, builds and behavior are recorded
-separately in [combined evidence](evidence/bchn-combined-20261014.json).
+The current compatible FlatBuffers candidate10 composes with01,04,11 and12 at
+the exact acceptance pin. All170 permitted raw application orders pass; all60
+complete orders produce source tree `1c5fdb7c8018adbb386a099676fb4b8b80bab5e3`.
+Grouping ordered11+12 as one source-removal feature yields64 feature-unit orders.
+Patch12 correctly rejects application without11. These order checks prove source
+application. The same complete tree separately passes a fresh native build, both
+existing NNG consumers and all16 focused mining/mempool cases; see
+[combined runtime validation](bchn-combined-features-validation.md). See [current composition evidence](evidence/bchn-compatible-combinations-20261014.json).
+
+The older15-order/126-suite combined evidence at tree
+`bf50633c2575549a6b621cff8e70142df901b2f7` used the rejected raw-payload publisher.
+Its `interface_nng.py` and mining regtests remain historical evidence and do not
+validate the current FlatBuffers consumers or current combined source.
+See [historical combined evidence](evidence/bchn-combined-20261014.json).
 
 Select `block-construction`, `mempool-check` and/or `nng` independently through
 `feature-plan.py --target bchn --allow-experimental`. For example:
