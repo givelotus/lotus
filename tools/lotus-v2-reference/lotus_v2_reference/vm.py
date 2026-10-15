@@ -576,6 +576,10 @@ def evaluate(script: bytes, args: tuple[bytes, ...], profile: VMProfile, *,
         charge = _checked_cost(len(script) * profile.structural_byte_cost, profile.max_invocation_cost)
         return VMResult(True, True, charge, None)
     ast = decode(script, profile)
+    if invocation is not None:
+        from .vm_cost import bind_authenticated_field_sizes
+        field_sizes = bind_authenticated_field_sizes(
+            field_sizes, invocation, max_element_bytes=profile.max_element_bytes)
     charge = _checked_cost(len(script) * profile.structural_byte_cost + static_cost(
         ast, profile, input_count=input_count, output_count=output_count,
         initial_sizes=tuple(map(len, initial)), script_length=len(script),
