@@ -1,0 +1,1905 @@
+From 0459ee17e7aafde6ffe7090872df9473bee9b630 Mon Sep 17 00:00:00 2001
+From: Shammah Chancellor <shammah.chancellor@notvalid.com>
+Date: Thu, 15 Oct 2026 11:39:49 -0700
+Subject: [PATCH] Classify inconclusive VM failures and certify only bound
+ deterministic block failures
+
+Integration note (2026-10-15): the original source commit had no message body.
+This maintenance explanation is added by the series integrator without changing
+its source diff. Local cryptographic-provider, host-work and unsupported execution
+failures become inconclusive, while bound deterministic block failures produce
+an opaque proof carrying block, parent, profile and pre-block UTXO root. The
+validator profile digest moves unchanged into the block transition layer.
+Early header failures conservatively provide no proof. Focused VM, ordinary,
+complete-block and signed-runner checks pass; downstream recovery and full-tree
+evidence are recorded separately in the implementation plan.
+
+---
+ src/lotus_v2/block_transition.cpp         | 176 ++++++++++--
+ src/lotus_v2/block_transition.h           |  37 ++-
+ src/lotus_v2/header_context.cpp           |  93 ++++---
+ src/lotus_v2/header_context.h             |   5 +
+ src/lotus_v2/ordinary_validation.cpp      | 313 ++++++++++++----------
+ src/lotus_v2/ordinary_validation.h        |   8 +-
+ src/lotus_v2/signing.cpp                  | 149 +++++-----
+ src/lotus_v2/signing.h                    |  16 ++
+ src/lotus_v2/test_block_complete.cpp      |  59 ++++
+ src/lotus_v2/test_ordinary_validation.cpp |  13 +
+ src/lotus_v2/test_vm.cpp                  |  48 +++-
+ src/lotus_v2/vm.cpp                       | 287 ++++++++++++++------
+ src/lotus_v2/vm.h                         |  19 +-
+ src/lotus_v2/vm_cost.inc                  |  27 +-
+ src/lotus_v2/vm_test/runner.cpp           |   2 +
+ 15 files changed, 881 insertions(+), 371 deletions(-)
+
+diff --git a/src/lotus_v2/block_transition.cpp b/src/lotus_v2/block_transition.cpp
+index f854dea0e..e64123f94 100644
+--- a/src/lotus_v2/block_transition.cpp
++++ b/src/lotus_v2/block_transition.cpp
+@@ -1,6 +1,7 @@
+ // Copyright (c) 2026 The Lotus developers
+ #include "block_transition.h"
+ #include "signing.h"
++#include "vendor/blake3/blake3.h"
+ #include <limits>
+ #include <stdexcept>
+ namespace lotus::v2 {
+@@ -27,13 +28,99 @@ struct AbortOnFailure {
+     ~AbortOnFailure() { if (!accepted) state.Abort(); }
+ };
+ } // namespace
++Hash BlockValidationProfileDigest(const HeaderChainProfile &hp,
++                                  const OrdinaryCandidateProfile &op,
++                                  const MonetaryProfile &mp,
++                                  const BlockCostProfile &cp) {
++    std::vector<uint8_t> bytes;
++    auto put = [&](VmCostUnits value, unsigned width = 8) {
++        for (unsigned i = 0; i < width; ++i)
++            bytes.push_back(uint8_t(value >> (8 * i)));
++    };
++    auto hash = [&](const Hash &value) {
++        bytes.insert(bytes.end(), value.begin(), value.end());
++    };
++    put(2);
++    hash(hp.chain_id);
++    hash(hp.genesis_id);
++    put(hp.version);
++    put(hp.genesis_time);
++    put(hp.genesis_bits);
++    hash(hp.pow_limit);
++    put(uint64_t(hp.half_life_seconds));
++    put(uint64_t(hp.spacing_seconds));
++    const auto &t = op.transaction;
++    for (auto value :
++         {t.max_inputs, t.max_outputs, t.max_mints, t.max_script_bytes,
++          t.max_arguments, t.max_argument_bytes, t.max_branch_proof_depth})
++        put(value);
++    const auto &v = op.vm;
++    for (auto value : {v.max_script_bytes, v.max_arguments, v.max_element_bytes,
++                       v.max_stack_items, v.max_altstack_items, v.max_vm_bytes,
++                       v.max_ast_depth, v.max_steps})
++        put(value);
++    put(op.coinbase_maturity);
++    put(op.dust_limit);
++    put(op.max_total_invocation_cost, 16);
++    put(op.vm_cost.max_invocation_cost, 16);
++    put(op.vm_cost.structural_byte_cost);
++    for (const auto &cost : op.vm_cost.opcode) {
++        put(cost.base);
++        put(cost.per_operand_byte);
++        put(cost.per_result_byte);
++    }
++    put(op.vm_cost.field_sizes.size());
++    for (const auto &[opcode, sizes] : op.vm_cost.field_sizes) {
++        put(opcode, 1);
++        put(sizes.size());
++        for (auto value : sizes)
++            put(value);
++    }
++    put(mp.boot_shift);
++    put(mp.tx_knee_shift);
++    put(mp.ema_shift);
++    put(mp.ema_min);
++    put(mp.linear_shift);
++    put(mp.quad_shift);
++    put(mp.tail_min);
++    put(mp.tail_max);
++    put(mp.dust_limit);
++    put(mp.min_fee_per_kb);
++    put(cp.hash_base);
++    put(cp.hash_byte);
++    put(cp.resolve_byte);
++    put(cp.asset_comparison);
++    blake3_hasher hasher;
++    blake3_hasher_init(&hasher);
++    constexpr char domain[] = "Lotus/v2/storage-validator-profile";
++    blake3_hasher_update(&hasher, domain, sizeof(domain));
++    blake3_hasher_update(&hasher, bytes.data(), bytes.size());
++    Hash digest;
++    blake3_hasher_finalize(&hasher, digest.data(), digest.size());
++    return digest;
++}
++
+ CandidateCheckResult StageCompleteBlock(
+     const std::vector<uint8_t> &wire, const OrdinaryParentContext &parent,
+     const std::vector<Header> &history, const HeaderChainProfile &hp,
+     const OrdinaryCandidateProfile &op, const MonetaryProfile &mp,
+     const BlockCostProfile &cp, BlockStateTransaction &state,
+-    StagedBlockTransition &out, std::string &error) {
++    StagedBlockTransition &out, std::string &error,
++    DeterministicBlockFailure *failure) {
+     using Result = CandidateCheckResult;
++    if (failure) *failure = {};
++    bool bound = false;
++    Hash proof_block{}, proof_parent{}, proof_profile{}, proof_root{};
++    auto invalid = [&] {
++        if (failure && bound) {
++            failure->valid_ = true;
++            failure->block_ = proof_block;
++            failure->parent_ = proof_parent;
++            failure->profile_ = proof_profile;
++            failure->root_ = proof_root;
++        }
++        return Result::Invalid;
++    };
+     AbortOnFailure guard{state};
+     try {
+         Header claimed;
+@@ -61,11 +148,16 @@ CandidateCheckResult StageCompleteBlock(
+             error = "complete block context";
+             return Result::Invalid;
+         }
+-        if (!ValidateChildHeader(hp, parent.header, history, claimed,
+-                                 claimed.tx_root, claimed.state_root,
+-                                 wire.size(), error)) return Result::Invalid;
++        const auto header_check = ValidateChildHeaderChecked(
++            hp, parent.header, history, claimed, claimed.tx_root,
++            claimed.state_root, wire.size(), error);
++        if (header_check != HeaderCheckResult::Valid)
++            return header_check == HeaderCheckResult::Invalid
++                       ? Result::Invalid
++                       : Result::Inconclusive;
+         // Parent mismatch is local state inconsistency, not a bad child block.
+-        if (StateRoot(parent.chain_id, parent.header.height, StorageCall([&] { return state.Root(); }),
++        const auto parent_root = StorageCall([&] { return state.Root(); });
++        if (StateRoot(parent.chain_id, parent.header.height, parent_root,
+                       parent.monetary) != parent.header.state_root) {
+             error = "parent storage state root mismatch";
+             return Result::StorageError;
+@@ -78,7 +170,7 @@ CandidateCheckResult StageCompleteBlock(
+             !DecodeTarget(claimed.bits, hp.pow_limit, child_target) ||
+             !BlockId(parent.chain_id, parent.header, parent_id)) {
+             error = "complete block target or parent id";
+-            return Result::Invalid;
++            return Result::Inconclusive;
+         }
+         const MonetaryInteger parent_work = (MonetaryInteger(1) << 256) /
+                                  (Integer(parent_target) + 1);
+@@ -86,6 +178,23 @@ CandidateCheckResult StageCompleteBlock(
+             error = "parent monetary work does not match target";
+             return Result::StorageError;
+         }
++        // Invalid parent monetary state is a local-context problem. Validation
++        // of a child must never certify an invalid-root fact from it.
++        if (parent.monetary.tail_subsidy < mp.tail_min ||
++            parent.monetary.tail_subsidy > mp.tail_max) {
++            error = "parent monetary tail context";
++            return Result::Inconclusive;
++        }
++        std::string profile_error;
++        bound = ValidateOrdinaryProfile(op, profile_error) &&
++                BlockId(parent.chain_id, claimed, proof_block);
++        proof_parent = parent_id;
++        proof_root = parent_root;
++        if (bound) proof_profile = BlockValidationProfileDigest(hp, op, mp, cp);
++        if (claimed.prev_id != parent_id) {
++            error = "candidate is not bound to this authenticated parent";
++            return Result::Inconclusive;
++        }
+         const MonetaryInteger child_work = (MonetaryInteger(1) << 256) /
+                                 (Integer(child_target) + 1);
+         uint64_t frames = 0, coinbase_bytes = 0;
+@@ -100,12 +209,12 @@ CandidateCheckResult StageCompleteBlock(
+             OrdinaryCandidateEffects effects;
+             if (n == 0) {
+                 if (!CheckCoinbaseContext(tx, parent_id, claimed.height, error))
+-                    return Result::Invalid;
++                    return invalid();
+                 std::vector<uint8_t> bytes;
+                 IdentityDigests ids;
+                 if (!EncodeTransaction(tx, op.transaction, bytes, error) ||
+                     !ComputeIdentities(tx, op.transaction, parent.chain_id, ids, error))
+-                    return Result::Invalid;
++                    return invalid();
+                 coinbase_bytes = bytes.size();
+                 for (size_t j = 0; j < tx.outputs.size(); ++j) {
+                     const Output &output = tx.outputs[j];
+@@ -122,7 +231,7 @@ CandidateCheckResult StageCompleteBlock(
+                             return Result::StorageError;
+                         }
+                         error = "created outpoint already occupied";
+-                        return Result::Invalid;
++                        return invalid();
+                     }
+                     effects.created.push_back(std::move(coin));
+                 }
+@@ -138,18 +247,24 @@ CandidateCheckResult StageCompleteBlock(
+                 };
+                 const auto result = CheckOrdinaryWithLookup(
+                     tx, op, parent.chain_id, lookup, effects, error);
+-                if (result != Result::Accepted) return result;
++                if (result != Result::Accepted)
++                    return result == Result::Invalid ? invalid() : result;
+                 for (const auto &key : effects.consumed) resolved.push_back(read_coins.at(key));
+                 if (effects.invocation_cost > ~VmCostUnits{0} - invocation ||
+                     (invocation += effects.invocation_cost) > op.max_total_invocation_cost) {
+                     error = "block invocation cost over budget";
+-                    return Result::Invalid;
++                    return invalid();
+                 }
+-                accounted.push_back(AccountValidatedOrdinary(tx, effects, op.transaction, mp));
++                accounted.push_back(StorageCall([&] {
++                    return AccountValidatedOrdinary(tx, effects, op.transaction,
++                                                    mp);
++                }));
+             }
+-            const auto costs = AuthenticatedTransactionCostsResolved(
+-                tx, op.transaction, resolved, claimed.height, op.parent_mtp,
+-                effects.invocation_cost, cp);
++            const auto costs = StorageCall([&] {
++                return AuthenticatedTransactionCostsResolved(
++                    tx, op.transaction, resolved, claimed.height, op.parent_mtp,
++                    effects.invocation_cost, cp);
++            });
+             account_linear.push_back(costs.account_linear);
+             enforce_linear.push_back(costs.enforce_linear);
+             for (const auto &key : effects.consumed)
+@@ -163,17 +278,27 @@ CandidateCheckResult StageCompleteBlock(
+         staged.utxo_root = StorageCall([&] { return state.Root(); });
+         staged.account_cost = BlockEffectiveCost(envelope, account_linear, mp);
+         staged.enforce_cost = BlockEffectiveCost(envelope, enforce_linear, mp);
+-        staged.monetary = AdvanceMonetary(
+-            mp, parent.monetary, child_work, accounted, cb_outputs, cb_burn,
+-            coinbase_bytes, frames, staged.account_cost, staged.enforce_cost);
++        try {
++            staged.monetary =
++                AdvanceMonetary(mp, parent.monetary, child_work, accounted,
++                                cb_outputs, cb_burn, coinbase_bytes, frames,
++                                staged.account_cost, staged.enforce_cost);
++        } catch (const std::invalid_argument &exception) {
++            error = exception.what();
++            return invalid();
++        }
+         staged.state_root = StateRoot(parent.chain_id, claimed.height,
+                                       staged.utxo_root, staged.monetary.state);
+-        if (!ValidateChildHeader(hp, parent.header, history, claimed,
+-                                 claimed.tx_root, staged.state_root, wire.size(), error))
+-            return Result::Invalid;
++        const auto final_header = ValidateChildHeaderChecked(
++            hp, parent.header, history, claimed, claimed.tx_root,
++            staged.state_root, wire.size(), error);
++        if (final_header != HeaderCheckResult::Valid)
++            return final_header == HeaderCheckResult::Invalid
++                       ? invalid()
++                       : Result::Inconclusive;
+         if (!BlockId(parent.chain_id, claimed, staged.block_id)) {
+             error = "child block id";
+-            return Result::Invalid;
++            return invalid();
+         }
+         staged.invocation_cost = invocation;
+         out = std::move(staged);
+@@ -185,10 +310,13 @@ CandidateCheckResult StageCompleteBlock(
+         return Result::StorageError;
+     } catch (const std::invalid_argument &e) {
+         error = e.what();
+-        return Result::Invalid;
++        return Result::Inconclusive;
+     } catch (const std::bad_alloc &) {
+         error = "block transition allocation failure";
+-        return Result::StorageError;
++        return Result::Inconclusive;
++    } catch (const std::exception &exception) {
++        error = exception.what();
++        return Result::Inconclusive;
+     }
+ }
+ } // namespace lotus::v2
+diff --git a/src/lotus_v2/block_transition.h b/src/lotus_v2/block_transition.h
+index 23d24adb9..99c808756 100644
+--- a/src/lotus_v2/block_transition.h
++++ b/src/lotus_v2/block_transition.h
+@@ -25,14 +25,45 @@ struct StagedBlockTransition {
+     MonetaryInteger account_cost{}, enforce_cost{};
+     VmCostUnits invocation_cost{};
+ };
++// Storage fingerprint, moved unchanged from disk_block.cpp. No backend linkage.
++Hash BlockValidationProfileDigest(const HeaderChainProfile &,
++                                  const OrdinaryCandidateProfile &,
++                                  const MonetaryProfile &,
++                                  const BlockCostProfile &);
++
++// Only StageCompleteBlock can issue this proof, after authenticating the parent
++// state and matching the complete body's commitments. An Invalid enum without
++// this proof is insufficient to persist a header-invalid fact.
++class DeterministicBlockFailure {
++public:
++    bool Valid() const { return valid_; }
++    const Hash &BlockId() const { return block_; }
++    const Hash &ParentId() const { return parent_; }
++    const Hash &ProfileDigest() const { return profile_; }
++    const Hash &ParentRoot() const { return root_; }
++
++private:
++    bool valid_ = false;
++    Hash block_{}, parent_{}, profile_{}, root_{};
++    friend CandidateCheckResult StageCompleteBlock(
++        const std::vector<uint8_t> &, const OrdinaryParentContext &,
++        const std::vector<Header> &, const HeaderChainProfile &,
++        const OrdinaryCandidateProfile &, const MonetaryProfile &,
++        const BlockCostProfile &, BlockStateTransaction &,
++        StagedBlockTransition &, std::string &, DeterministicBlockFailure *);
++};
++
+ // No full UTXO enumeration/copy. Memory is bounded by the decoded block and
+ // transaction/block deltas, plus the backend's operational cache/overlay limits.
+ // Accepted means validated and staged, not durably published or ConnectTip.
+ CandidateCheckResult StageCompleteBlock(
+     const std::vector<uint8_t> &wire, const OrdinaryParentContext &parent,
+-    const std::vector<Header> &history, const HeaderChainProfile &header_profile,
++    const std::vector<Header> &history,
++    const HeaderChainProfile &header_profile,
+     const OrdinaryCandidateProfile &ordinary_profile,
+-    const MonetaryProfile &monetary_profile, const BlockCostProfile &cost_profile,
+-    BlockStateTransaction &state, StagedBlockTransition &out, std::string &error);
++    const MonetaryProfile &monetary_profile,
++    const BlockCostProfile &cost_profile, BlockStateTransaction &state,
++    StagedBlockTransition &out, std::string &error,
++    DeterministicBlockFailure *failure = nullptr);
+ } // namespace lotus::v2
+ #endif
+diff --git a/src/lotus_v2/header_context.cpp b/src/lotus_v2/header_context.cpp
+index bc2488a43..5924266ec 100644
+--- a/src/lotus_v2/header_context.cpp
++++ b/src/lotus_v2/header_context.cpp
+@@ -48,42 +48,69 @@ std::optional<uint64_t> ParentMedianTime(const HeaderChainProfile &p,
+     std::sort(times.begin(), times.end());
+     return times[times.size() / 2];
+ }
++HeaderCheckResult ValidateChildHeaderChecked(
++    const HeaderChainProfile &p, const Header &parent,
++    const std::vector<Header> &history, const Header &child, const Hash &tx,
++    const Hash &state, uint64_t size, std::string &error) {
++    try {
++        auto fail = [&](const char *why) {
++            error = why;
++            return HeaderCheckResult::Invalid;
++        };
++        const auto mtp = ParentMedianTime(p, parent, history);
++        if (!mtp) {
++            error = "authenticated parent history";
++            return HeaderCheckResult::Inconclusive;
++        }
++        const auto limit = Integer(p.pow_limit);
++        const auto genesis = DecodeCompactTarget(p.genesis_bits, limit);
++        if (!genesis || p.half_life_seconds <= 0 || p.spacing_seconds <= 0 ||
++            p.genesis_time > MAX_TIME) {
++            error = "chain profile";
++            return HeaderCheckResult::Inconclusive;
++        }
++        if (parent.height == std::numeric_limits<uint64_t>::max()) {
++            error = "parent height exhausted";
++            return HeaderCheckResult::Inconclusive;
++        }
++        if (child.height != parent.height + 1) return fail("child height");
++        Hash parent_id{};
++        if (!BlockId(p.chain_id, parent, parent_id)) {
++            error = "parent identity unavailable";
++            return HeaderCheckResult::Inconclusive;
++        }
++        if (child.prev_id != parent_id) return fail("child parent");
++        if (child.version != p.version) return fail("child version");
++        if (child.time > MAX_TIME || child.time <= *mtp)
++            return fail("child median time");
++        if (child.tx_root != tx || child.state_root != state ||
++            child.size != size)
++            return fail("child commitments");
++        const auto required = RequiredAsertCandidateBits(
++            p.half_life_seconds, p.spacing_seconds, *genesis, p.genesis_time,
++            limit, {parent.time, parent.height});
++        Hash target{}, id{};
++        if (!required) {
++            error = "required target context";
++            return HeaderCheckResult::Inconclusive;
++        }
++        if (child.bits != required->bits ||
++            !DecodeTarget(child.bits, p.pow_limit, target))
++            return fail("required target");
++        if (!BlockId(p.chain_id, child, id) || !MeetsTarget(id, target))
++            return fail("proof of work");
++        error.clear();
++        return HeaderCheckResult::Valid;
++    } catch (const std::exception &exception) {
++        error = exception.what();
++        return HeaderCheckResult::Inconclusive;
++    }
++}
+ bool ValidateChildHeader(const HeaderChainProfile &p, const Header &parent,
+                          const std::vector<Header> &history,
+                          const Header &child, const Hash &tx, const Hash &state,
+                          uint64_t size, std::string &error) {
+-    auto fail = [&](const char *why) {
+-        error = why;
+-        return false;
+-    };
+-    const auto mtp = ParentMedianTime(p, parent, history);
+-    if (!mtp) return fail("authenticated parent history");
+-    const auto limit = Integer(p.pow_limit);
+-    const auto genesis = DecodeCompactTarget(p.genesis_bits, limit);
+-    if (!genesis || p.half_life_seconds <= 0 || p.spacing_seconds <= 0 ||
+-        p.genesis_time > MAX_TIME)
+-        return fail("chain profile");
+-    if (parent.height == std::numeric_limits<uint64_t>::max() ||
+-        child.height != parent.height + 1)
+-        return fail("child height");
+-    Hash parent_id{};
+-    if (!BlockId(p.chain_id, parent, parent_id) || child.prev_id != parent_id)
+-        return fail("child parent");
+-    if (child.version != p.version) return fail("child version");
+-    if (child.time > MAX_TIME || child.time <= *mtp)
+-        return fail("child median time");
+-    if (child.tx_root != tx || child.state_root != state || child.size != size)
+-        return fail("child commitments");
+-    const auto required = RequiredAsertCandidateBits(
+-        p.half_life_seconds, p.spacing_seconds, *genesis, p.genesis_time, limit,
+-        {parent.time, parent.height});
+-    Hash target{}, id{};
+-    if (!required || child.bits != required->bits ||
+-        !DecodeTarget(child.bits, p.pow_limit, target))
+-        return fail("required target");
+-    if (!BlockId(p.chain_id, child, id) || !MeetsTarget(id, target))
+-        return fail("proof of work");
+-    error.clear();
+-    return true;
++    return ValidateChildHeaderChecked(p, parent, history, child, tx, state,
++                                      size, error) == HeaderCheckResult::Valid;
+ }
+ } // namespace lotus::v2
+diff --git a/src/lotus_v2/header_context.h b/src/lotus_v2/header_context.h
+index ce7fa3e25..360b5b18a 100644
+--- a/src/lotus_v2/header_context.h
++++ b/src/lotus_v2/header_context.h
+@@ -26,6 +26,11 @@ std::optional<uint64_t> ParentMedianTime(const HeaderChainProfile &profile,
+                                          const std::vector<Header> &history);
+ // Roots and size must be independently derived by the complete-block caller.
+ // Failure does not mutate any chain state. Future eligibility remains separate.
++enum class HeaderCheckResult { Valid, Invalid, Inconclusive };
++HeaderCheckResult
++ValidateChildHeaderChecked(const HeaderChainProfile &, const Header &,
++                           const std::vector<Header> &, const Header &,
++                           const Hash &, const Hash &, uint64_t, std::string &);
+ bool ValidateChildHeader(const HeaderChainProfile &profile,
+                          const Header &parent,
+                          const std::vector<Header> &history,
+diff --git a/src/lotus_v2/ordinary_validation.cpp b/src/lotus_v2/ordinary_validation.cpp
+index e36c8e148..7e27a0d1b 100644
+--- a/src/lotus_v2/ordinary_validation.cpp
++++ b/src/lotus_v2/ordinary_validation.cpp
+@@ -81,175 +81,206 @@ bool AddAsset(std::map<Hash32, Totals> &tokens, Wide &native,
+ }
+ } // namespace
+ 
++bool ValidateOrdinaryProfile(const OrdinaryCandidateProfile &profile,
++                             std::string &error) {
++    const auto &p = profile.transaction;
++    if (!p.max_inputs || p.max_inputs > 65535 || p.max_outputs > 65535 ||
++        p.max_mints > p.max_inputs || p.max_arguments > 65535 ||
++        p.max_argument_bytes > VM_HARD_ELEMENT_BYTES ||
++        p.max_branch_proof_depth > 64 || !profile.candidate_height ||
++        !profile.coinbase_maturity || !profile.dust_limit ||
++        !profile.max_total_invocation_cost) {
++        error = "invalid ordinary profile or context";
++        return false;
++    }
++    return ValidateVmCostProfile(profile.vm, profile.vm_cost, error);
++}
++
+ CandidateCheckResult CheckOrdinaryWithLookup(const Transaction &tx,
+                             const OrdinaryCandidateProfile &profile,
+                             const ChainId &chain_id,
+                             const CoinLookup &lookup,
+                             OrdinaryCandidateEffects &effects,
+                             std::string &error) {
+-    if (!profile.candidate_height || !profile.coinbase_maturity ||
+-        !profile.dust_limit || !profile.max_total_invocation_cost) {
+-        error = "missing development context or resource limits";
+-        return CandidateCheckResult::Invalid;
+-    }
+-    std::vector<uint8_t> wire;
+-    if (!EncodeTransaction(tx, profile.transaction, wire, error)) return CandidateCheckResult::Invalid;
+-    std::vector<Coin> spent;
+-    ResolvedCoins resolved(tx.inputs.size());
+-    std::set<Outpoint, OutpointLess> seen;
+-    spent.reserve(tx.inputs.size());
+-    OrdinaryCandidateEffects staged;
+-    for (size_t i = 0; i < tx.inputs.size(); ++i) {
+-        const Input &input = tx.inputs[i];
+-        if (input.flags == 2) {
+-            error = "coinbase is not an ordinary transaction";
+-            return CandidateCheckResult::Invalid;
+-        }
+-        if (input.flags != 1) continue;
+-        const Outpoint outpoint{input.prev_txid, input.prev_index};
+-        if (!seen.insert(outpoint).second) {
+-            error = "repeated spend";
++    try {
++        if (!ValidateOrdinaryProfile(profile, error))
++            return CandidateCheckResult::Inconclusive;
++        std::vector<uint8_t> wire;
++        if (!EncodeTransaction(tx, profile.transaction, wire, error))
+             return CandidateCheckResult::Invalid;
++        std::vector<Coin> spent;
++        ResolvedCoins resolved(tx.inputs.size());
++        std::set<Outpoint, OutpointLess> seen;
++        spent.reserve(tx.inputs.size());
++        OrdinaryCandidateEffects staged;
++        for (size_t i = 0; i < tx.inputs.size(); ++i) {
++            const Input &input = tx.inputs[i];
++            if (input.flags == 2) {
++                error = "coinbase is not an ordinary transaction";
++                return CandidateCheckResult::Invalid;
++            }
++            if (input.flags != 1) continue;
++            const Outpoint outpoint{input.prev_txid, input.prev_index};
++            if (!seen.insert(outpoint).second) {
++                error = "repeated spend";
++                return CandidateCheckResult::Invalid;
++            }
++            Coin coin;
++            const auto read = lookup(outpoint, coin, error);
++            if (read == CoinReadResult::Error)
++                return CandidateCheckResult::StorageError;
++            if (read == CoinReadResult::Missing) {
++                error = "unresolved spend";
++                return CandidateCheckResult::Invalid;
++            }
++            if (coin.outpoint != outpoint) {
++                error = "coin lookup returned a different outpoint";
++                return CandidateCheckResult::StorageError;
++            }
++            std::vector<uint8_t> encoded_coin;
++            if (!EncodeCoin(coin, encoded_coin)) {
++                error = "invalid resolved coin";
++                return CandidateCheckResult::StorageError;
++            }
++            spent.push_back(coin);
++            resolved[i] = coin.output;
++            staged.consumed.push_back(outpoint);
+         }
+-        Coin coin;
+-        const auto read = lookup(outpoint, coin, error);
+-        if (read == CoinReadResult::Error)
+-            return CandidateCheckResult::StorageError;
+-        if (read == CoinReadResult::Missing) {
+-            error = "unresolved spend";
++        if (!CheckLocks(tx, spent, profile, error))
+             return CandidateCheckResult::Invalid;
++
++        Wide native_inputs = 0, native_outputs = 0;
++        std::map<Hash32, Totals> tokens;
++        for (const Coin &coin : spent) {
++            if (!AddAsset(tokens, native_inputs, coin.output, error, true))
++                return CandidateCheckResult::Invalid;
+         }
+-        if (coin.outpoint != outpoint) {
+-            error = "coin lookup returned a different outpoint";
+-            return CandidateCheckResult::StorageError;
++        size_t token_output_count = 0;
++        for (const Output &output : tx.outputs) {
++            token_output_count += output.HasToken();
++            if (!AddAsset(tokens, native_outputs, output, error, false))
++                return CandidateCheckResult::Invalid;
+         }
+-        std::vector<uint8_t> encoded_coin;
+-        if (!EncodeCoin(coin, encoded_coin)) {
+-            error = "invalid resolved coin";
+-            return CandidateCheckResult::StorageError;
++        if (native_inputs < native_outputs) {
++            error = "native inflation";
++            return CandidateCheckResult::Invalid;
+         }
+-        spent.push_back(coin);
+-        resolved[i] = coin.output;
+-        staged.consumed.push_back(outpoint);
+-    }
+-    if (!CheckLocks(tx, spent, profile, error)) return CandidateCheckResult::Invalid;
+-
+-    Wide native_inputs = 0, native_outputs = 0;
+-    std::map<Hash32, Totals> tokens;
+-    for (const Coin &coin : spent) {
+-        if (!AddAsset(tokens, native_inputs, coin.output, error, true))
++        staged.native_fee = native_inputs - native_outputs;
++        Wide token_floor;
++        if (!Multiply(Wide{2} * profile.dust_limit, token_output_count,
++                      token_floor)) {
++            error = "token floor overflow";
+             return CandidateCheckResult::Invalid;
+-    }
+-    size_t token_output_count = 0;
+-    for (const Output &output : tx.outputs) {
+-        token_output_count += output.HasToken();
+-        if (!AddAsset(tokens, native_outputs, output, error, false))
++        }
++        staged.token_output_burn_floor = token_floor;
++        Wide byte_numerator;
++        if (!Multiply(Wide{1000}, wire.size(), byte_numerator) ||
++            !Add(byte_numerator, 999)) {
++            error = "byte fee overflow";
+             return CandidateCheckResult::Invalid;
+-    }
+-    if (native_inputs < native_outputs) {
+-        error = "native inflation";
+-        return CandidateCheckResult::Invalid;
+-    }
+-    staged.native_fee = native_inputs - native_outputs;
+-    Wide token_floor;
+-    if (!Multiply(Wide{2} * profile.dust_limit, token_output_count,
+-                  token_floor)) {
+-        error = "token floor overflow";
+-        return CandidateCheckResult::Invalid;
+-    }
+-    staged.token_output_burn_floor = token_floor;
+-    Wide byte_numerator;
+-    if (!Multiply(Wide{1000}, wire.size(), byte_numerator) ||
+-        !Add(byte_numerator, 999)) {
+-        error = "byte fee overflow";
+-        return CandidateCheckResult::Invalid;
+-    }
+-    const Wide byte_floor = byte_numerator / 1000;
+-    if (staged.native_fee < byte_floor || staged.native_fee < token_floor) {
+-        error = "native fee below byte or token-output floor";
+-        return CandidateCheckResult::Invalid;
+-    }
+-
+-    std::map<Hash32, PositiveDelta> positive_deltas;
+-    for (const auto &[token_id, totals] : tokens) {
+-        if (totals.outputs <= totals.inputs) continue;
+-        const Wide delta = totals.outputs - totals.inputs;
+-        PositiveDelta encoded{};
+-        for (size_t b = 0; b < encoded.size(); ++b)
+-            encoded[b] = uint8_t(delta >> (8 * b));
+-        positive_deltas.emplace(token_id, encoded);
+-    }
+-    for (const Input &input : tx.inputs) {
+-        if (input.flags != 3) continue;
+-        if (positive_deltas.erase(input.prev_txid) != 1) {
+-            error = "mint without matching positive token delta";
++        }
++        const Wide byte_floor = byte_numerator / 1000;
++        if (staged.native_fee < byte_floor || staged.native_fee < token_floor) {
++            error = "native fee below byte or token-output floor";
+             return CandidateCheckResult::Invalid;
+         }
+-    }
+-    if (!positive_deltas.empty()) {
+-        error = "positive token delta lacks mint input";
+-        return CandidateCheckResult::Invalid;
+-    }
+ 
+-    PreparedVmTransaction prepared_vm;
+-    if (!prepared_vm.Prepare(tx, profile.transaction, chain_id, resolved,
+-                             profile.vm_cost, error)) return CandidateCheckResult::Invalid;
+-    const auto &identities = prepared_vm.Signing().Identities();
+-    staged.txid = identities.txid;
+-    staged.txhash = identities.txhash;
+-    for (size_t i = 0; i < tx.inputs.size(); ++i) {
+-        const Input &input = tx.inputs[i];
+-        std::optional<PositiveDelta> delta;
+-        if (input.flags == 3) {
+-            const Totals &totals = tokens.at(input.prev_txid);
+-            const Wide amount = totals.outputs - totals.inputs;
++        std::map<Hash32, PositiveDelta> positive_deltas;
++        for (const auto &[token_id, totals] : tokens) {
++            if (totals.outputs <= totals.inputs) continue;
++            const Wide delta = totals.outputs - totals.inputs;
+             PositiveDelta encoded{};
+             for (size_t b = 0; b < encoded.size(); ++b)
+-                encoded[b] = uint8_t(amount >> (8 * b));
+-            delta = encoded;
++                encoded[b] = uint8_t(delta >> (8 * b));
++            positive_deltas.emplace(token_id, encoded);
+         }
+-        for (size_t j = 0; j < input.witnesses.size(); ++j) {
+-            const BranchWitness &witness = input.witnesses[j];
+-            const auto context = prepared_vm.Invocation(i, j, delta);
+-            const VmChargedResult vm = EvaluateVmCharged(
+-                witness.script, witness.arguments, profile.vm,
+-                prepared_vm.Cost(), uint16_t(tx.inputs.size()),
+-                uint16_t(tx.outputs.size()), &context);
+-            if (vm.invocation.status != VmStatus::Success &&
+-                vm.invocation.status != VmStatus::AutomaticSuccess) {
+-                error = "witness VM invalid/unsupported: " + vm.invocation.error;
++        for (const Input &input : tx.inputs) {
++            if (input.flags != 3) continue;
++            if (positive_deltas.erase(input.prev_txid) != 1) {
++                error = "mint without matching positive token delta";
+                 return CandidateCheckResult::Invalid;
+             }
+-            if (!vm.charged || !Add(staged.invocation_cost,
+-                                    vm.accounting_cost) ||
+-                staged.invocation_cost > profile.max_total_invocation_cost) {
+-                error = "invocation cost unavailable or over budget";
+-                return CandidateCheckResult::Invalid;
++        }
++        if (!positive_deltas.empty()) {
++            error = "positive token delta lacks mint input";
++            return CandidateCheckResult::Invalid;
++        }
++
++        PreparedVmTransaction prepared_vm;
++        const auto preparation =
++            prepared_vm.PrepareChecked(tx, profile.transaction, chain_id,
++                                       resolved, profile.vm_cost, error);
++        if (preparation != SigningPreparationStatus::Ready)
++            return preparation == SigningPreparationStatus::InvalidWitness
++                       ? CandidateCheckResult::Invalid
++                       : CandidateCheckResult::Inconclusive;
++        const auto &identities = prepared_vm.Signing().Identities();
++        staged.txid = identities.txid;
++        staged.txhash = identities.txhash;
++        for (size_t i = 0; i < tx.inputs.size(); ++i) {
++            const Input &input = tx.inputs[i];
++            std::optional<PositiveDelta> delta;
++            if (input.flags == 3) {
++                const Totals &totals = tokens.at(input.prev_txid);
++                const Wide amount = totals.outputs - totals.inputs;
++                PositiveDelta encoded{};
++                for (size_t b = 0; b < encoded.size(); ++b)
++                    encoded[b] = uint8_t(amount >> (8 * b));
++                delta = encoded;
++            }
++            for (size_t j = 0; j < input.witnesses.size(); ++j) {
++                const BranchWitness &witness = input.witnesses[j];
++                const auto context = prepared_vm.Invocation(i, j, delta);
++                const VmChargedResult vm = EvaluateVmCharged(
++                    witness.script, witness.arguments, profile.vm,
++                    prepared_vm.Cost(), uint16_t(tx.inputs.size()),
++                    uint16_t(tx.outputs.size()), &context);
++                if (vm.invocation.status != VmStatus::Success &&
++                    vm.invocation.status != VmStatus::AutomaticSuccess) {
++                    error = "witness VM invalid/unsupported: " +
++                            vm.invocation.error;
++                    return vm.invocation.status == VmStatus::Invalid
++                               ? CandidateCheckResult::Invalid
++                               : CandidateCheckResult::Inconclusive;
++                }
++                if (!vm.charged) {
++                    error = "invocation cost unavailable";
++                    return CandidateCheckResult::Inconclusive;
++                }
++                if (!Add(staged.invocation_cost, vm.accounting_cost) ||
++                    staged.invocation_cost >
++                        profile.max_total_invocation_cost) {
++                    error = "invocation cost unavailable or over budget";
++                    return CandidateCheckResult::Invalid;
++                }
+             }
+         }
+-    }
+-    for (size_t j = 0; j < tx.outputs.size(); ++j) {
+-        if (tx.outputs[j].IsBurn()) continue;
+-        const Outpoint outpoint{identities.txid, uint32_t(j)};
+-        Coin occupied;
+-        const auto read = lookup(outpoint, occupied, error);
+-        if (read == CoinReadResult::Error)
+-            return CandidateCheckResult::StorageError;
+-        if (read == CoinReadResult::Found) {
+-            if (occupied.outpoint != outpoint) {
+-                error = "coin lookup returned a different outpoint";
++        for (size_t j = 0; j < tx.outputs.size(); ++j) {
++            if (tx.outputs[j].IsBurn()) continue;
++            const Outpoint outpoint{identities.txid, uint32_t(j)};
++            Coin occupied;
++            const auto read = lookup(outpoint, occupied, error);
++            if (read == CoinReadResult::Error)
+                 return CandidateCheckResult::StorageError;
++            if (read == CoinReadResult::Found) {
++                if (occupied.outpoint != outpoint) {
++                    error = "coin lookup returned a different outpoint";
++                    return CandidateCheckResult::StorageError;
++                }
++                error = "created outpoint already occupied";
++                return CandidateCheckResult::Invalid;
+             }
+-            error = "created outpoint already occupied";
+-            return CandidateCheckResult::Invalid;
++            staged.created.push_back(Coin{outpoint, tx.outputs[j],
++                                          profile.candidate_height,
++                                          profile.parent_mtp, false});
+         }
+-        staged.created.push_back(
+-            Coin{outpoint, tx.outputs[j], profile.candidate_height,
+-                 profile.parent_mtp, false});
++        effects = std::move(staged);
++        error.clear();
++        return CandidateCheckResult::Accepted;
++    } catch (const std::exception &exception) {
++        error = exception.what();
++        return CandidateCheckResult::Inconclusive;
+     }
+-    effects = std::move(staged);
+-    error.clear();
+-    return CandidateCheckResult::Accepted;
+ }
+ 
+ bool CheckOrdinaryCandidate(const Transaction &tx,
+diff --git a/src/lotus_v2/ordinary_validation.h b/src/lotus_v2/ordinary_validation.h
+index c77ff27ca..c5df0f13e 100644
+--- a/src/lotus_v2/ordinary_validation.h
++++ b/src/lotus_v2/ordinary_validation.h
+@@ -64,7 +64,13 @@ bool CheckOrdinaryCandidate(const Transaction &tx,
+ enum class CoinReadResult { Found, Missing, Error };
+ using CoinLookup = std::function<CoinReadResult(const Outpoint &, Coin &,
+                                                std::string &)>;
+-enum class CandidateCheckResult { Accepted, Invalid, StorageError };
++enum class CandidateCheckResult {
++    Accepted,
++    Invalid,
++    StorageError,
++    Inconclusive
++};
++bool ValidateOrdinaryProfile(const OrdinaryCandidateProfile &, std::string &);
+ CandidateCheckResult CheckOrdinaryWithLookup(
+     const Transaction &tx, const OrdinaryCandidateProfile &profile,
+     const ChainId &chain_id, const CoinLookup &lookup,
+diff --git a/src/lotus_v2/signing.cpp b/src/lotus_v2/signing.cpp
+index fc003086c..4a93e958c 100644
+--- a/src/lotus_v2/signing.cpp
++++ b/src/lotus_v2/signing.cpp
+@@ -157,82 +157,97 @@ bool ComputeOwnInputHash(const Transaction &tx, const TxProfile &profile,
+                           *resolved[input_index], result, error);
+ }
+ 
+-bool PrepareSigningContext(const Transaction &tx, const TxProfile &profile,
+-                           const ChainId &chain_id,
+-                           const ResolvedCoins &resolved,
+-                           PreparedSigningContext &result,
+-                           std::string &error) {
+-    IdentityDigests ids;
+-    if (!ComputeIdentities(tx, profile, chain_id, ids, error)) return false;
+-    PreparedSigningContext prepared;
+-    if (!ComputeCoinsRoot(tx, resolved, prepared.coins_root_, error))
+-        return false;
+-    prepared.chain_id_ = chain_id;
+-    prepared.lock_ = tx.lock;
+-    prepared.identities_ = ids;
+-    prepared.txid_ = ids.txid;
+-    prepared.outputs_root_ = ids.outputs_root;
+-    prepared.output_leaves_ = std::move(ids.output_leaves);
+-    prepared.own_input_hashes_.resize(tx.inputs.size());
+-    prepared.invocations_.resize(tx.inputs.size());
+-    for (size_t i = 0; i < tx.inputs.size(); ++i) {
+-        const Input &input = tx.inputs[i];
+-        auto &invocations = prepared.invocations_[i];
+-        if (input.flags == 1) {
+-            const Output &coin = *resolved[i];
+-            if (input.path_index >= coin.paths.size() ||
+-                input.witnesses.size() != coin.paths[input.path_index].size()) {
+-                error = "positional witness count/index";
+-                return false;
+-            }
+-            if (!OwnInputHashOf(input, profile, coin,
+-                                prepared.own_input_hashes_[i].emplace(),
+-                                error))
+-                return false;
+-            const auto &path = coin.paths[input.path_index];
+-            invocations.reserve(path.size());
+-            for (size_t j = 0; j < path.size(); ++j) {
+-                const uint8_t branch_index = path[j];
+-                const BranchWitness &witness = input.witnesses[j];
++SigningPreparationStatus PrepareSigningContextChecked(
++    const Transaction &tx, const TxProfile &profile, const ChainId &chain_id,
++    const ResolvedCoins &resolved, PreparedSigningContext &result,
++    std::string &error) {
++    try {
++        IdentityDigests ids;
++        if (!ComputeIdentities(tx, profile, chain_id, ids, error))
++            return SigningPreparationStatus::OperationalError;
++        PreparedSigningContext prepared;
++        if (!ComputeCoinsRoot(tx, resolved, prepared.coins_root_, error))
++            return SigningPreparationStatus::OperationalError;
++        prepared.chain_id_ = chain_id;
++        prepared.lock_ = tx.lock;
++        prepared.identities_ = ids;
++        prepared.txid_ = ids.txid;
++        prepared.outputs_root_ = ids.outputs_root;
++        prepared.output_leaves_ = std::move(ids.output_leaves);
++        prepared.own_input_hashes_.resize(tx.inputs.size());
++        prepared.invocations_.resize(tx.inputs.size());
++        for (size_t i = 0; i < tx.inputs.size(); ++i) {
++            const Input &input = tx.inputs[i];
++            auto &invocations = prepared.invocations_[i];
++            if (input.flags == 1) {
++                const Output &coin = *resolved[i];
++                if (input.path_index >= coin.paths.size() ||
++                    input.witnesses.size() !=
++                        coin.paths[input.path_index].size()) {
++                    error = "positional witness count/index";
++                    return SigningPreparationStatus::InvalidWitness;
++                }
++                if (!OwnInputHashOf(input, profile, coin,
++                                    prepared.own_input_hashes_[i].emplace(),
++                                    error))
++                    return SigningPreparationStatus::OperationalError;
++                const auto &path = coin.paths[input.path_index];
++                invocations.reserve(path.size());
++                for (size_t j = 0; j < path.size(); ++j) {
++                    const uint8_t branch_index = path[j];
++                    const BranchWitness &witness = input.witnesses[j];
++                    const Hash leaf = BranchLeaf(witness.script);
++                    if (branch_index >= coin.branches.size() ||
++                        BranchProofRoot(leaf, witness.siblings) !=
++                            coin.branches[branch_index]) {
++                        error = "branch membership";
++                        return SigningPreparationStatus::InvalidWitness;
++                    }
++                    PreparedSigningContext::Invocation invocation;
++                    invocation.kind = 1;
++                    invocation.selector.push_back(1);
++                    Integer(i, 4, invocation.selector);
++                    Integer(branch_index, 4, invocation.selector);
++                    invocation.selector.insert(invocation.selector.end(),
++                                               leaf.begin(), leaf.end());
++                    invocations.push_back(std::move(invocation));
++                }
++            } else if (input.flags == 3) {
++                const BranchWitness &witness = input.witnesses[0];
+                 const Hash leaf = BranchLeaf(witness.script);
+-                if (branch_index >= coin.branches.size() ||
+-                    BranchProofRoot(leaf, witness.siblings) !=
+-                        coin.branches[branch_index]) {
+-                    error = "branch membership";
+-                    return false;
++                if (BranchProofRoot(leaf, witness.siblings) !=
++                    input.prev_txid) {
++                    error = "mint root";
++                    return SigningPreparationStatus::InvalidWitness;
+                 }
+                 PreparedSigningContext::Invocation invocation;
+-                invocation.kind = 1;
+-                invocation.selector.push_back(1);
+-                Integer(i, 4, invocation.selector);
+-                Integer(branch_index, 4, invocation.selector);
++                invocation.kind = 3;
++                invocation.selector.push_back(3);
++                invocation.selector.insert(invocation.selector.end(),
++                                           input.prev_txid.begin(),
++                                           input.prev_txid.end());
++                invocation.selector.insert(invocation.selector.end(), 16, 0);
+                 invocation.selector.insert(invocation.selector.end(),
+                                            leaf.begin(), leaf.end());
+                 invocations.push_back(std::move(invocation));
+             }
+-        } else if (input.flags == 3) {
+-            const BranchWitness &witness = input.witnesses[0];
+-            const Hash leaf = BranchLeaf(witness.script);
+-            if (BranchProofRoot(leaf, witness.siblings) != input.prev_txid) {
+-                error = "mint root";
+-                return false;
+-            }
+-            PreparedSigningContext::Invocation invocation;
+-            invocation.kind = 3;
+-            invocation.selector.push_back(3);
+-            invocation.selector.insert(invocation.selector.end(),
+-                                       input.prev_txid.begin(),
+-                                       input.prev_txid.end());
+-            invocation.selector.insert(invocation.selector.end(), 16, 0);
+-            invocation.selector.insert(invocation.selector.end(), leaf.begin(),
+-                                       leaf.end());
+-            invocations.push_back(std::move(invocation));
+         }
++        prepared.ready_ = true;
++        result = std::move(prepared);
++        error.clear();
++        return SigningPreparationStatus::Ready;
++    } catch (const std::exception &exception) {
++        error = exception.what();
++        return SigningPreparationStatus::OperationalError;
+     }
+-    prepared.ready_ = true;
+-    result = std::move(prepared);
+-    error.clear();
+-    return true;
++}
++
++bool PrepareSigningContext(const Transaction &tx, const TxProfile &profile,
++                           const ChainId &chain, const ResolvedCoins &coins,
++                           PreparedSigningContext &result, std::string &error) {
++    return PrepareSigningContextChecked(tx, profile, chain, coins, result,
++                                        error) ==
++           SigningPreparationStatus::Ready;
+ }
+ 
+ bool SigningMessage(const PreparedSigningContext &prepared, size_t input_index,
+diff --git a/src/lotus_v2/signing.h b/src/lotus_v2/signing.h
+index 9804ebcac..c52c8fd99 100644
+--- a/src/lotus_v2/signing.h
++++ b/src/lotus_v2/signing.h
+@@ -30,6 +30,13 @@ using PositiveDelta = std::array<uint8_t, 16>; // u128 little-endian, nonzero
+ 
+ // Immutable snapshot for repeated CHECKSIG/SIGHASH calls on one validated
+ // transaction. Rebuild it if the transaction or resolved coins change.
++enum class SigningPreparationStatus {
++    Ready,
++    InvalidWitness,
++    Unsupported,
++    OperationalError
++};
++
+ class PreparedSigningContext {
+ public:
+     PreparedSigningContext() = default;
+@@ -51,6 +58,10 @@ private:
+     std::vector<std::vector<Invocation>> invocations_;
+     bool ready_ = false;
+ 
++    friend SigningPreparationStatus
++    PrepareSigningContextChecked(const Transaction &, const TxProfile &,
++                                 const ChainId &, const ResolvedCoins &,
++                                 PreparedSigningContext &, std::string &);
+     friend bool PrepareSigningContext(
+         const Transaction &, const TxProfile &, const ChainId &,
+         const ResolvedCoins &, PreparedSigningContext &, std::string &);
+@@ -59,6 +70,11 @@ private:
+                                Hash &, std::string &);
+ };
+ 
++SigningPreparationStatus PrepareSigningContextChecked(
++    const Transaction &tx, const TxProfile &profile, const ChainId &chain_id,
++    const ResolvedCoins &resolved, PreparedSigningContext &result,
++    std::string &error);
++
+ bool PrepareSigningContext(const Transaction &tx, const TxProfile &profile,
+                            const ChainId &chain_id,
+                            const ResolvedCoins &resolved,
+diff --git a/src/lotus_v2/test_block_complete.cpp b/src/lotus_v2/test_block_complete.cpp
+index 27f04f025..c7b6a5d97 100644
+--- a/src/lotus_v2/test_block_complete.cpp
++++ b/src/lotus_v2/test_block_complete.cpp
+@@ -494,6 +494,65 @@ void CompleteChecks() {
+                   EncodeMonetaryState(transition.state) &&
+               disk_result.invocation_cost == effects.invocation_cost,
+           "storage transition matches oracle roots money and costs");
++    // Header-invalid persistence requires an opaque, exact-body/parent proof.
++    // Reuse the proof output to prove every inconclusive path clears stale
++    // facts.
++    DeterministicBlockFailure proof;
++    auto classified = [&](Header header, std::vector<Transaction> txs,
++                          const OrdinaryCandidateProfile &local,
++                          CandidateCheckResult expected_result,
++                          bool expected_proof) {
++        auto bytes = Wire(header, txs);
++        Hash candidate_target{}, candidate_id{};
++        Check(DecodeTarget(header.bits, limit, candidate_target),
++              "typed target");
++        while (true) {
++            Check(BlockId({}, header, candidate_id), "typed id");
++            if (MeetsTarget(candidate_id, candidate_target)) break;
++            ++header.nonce;
++        }
++        bytes = Wire(header, txs);
++        TestState state(view);
++        StagedBlockTransition untouched;
++        Check(StageCompleteBlock(bytes, parent, {parent.header, genesis}, hp,
++                                 local, DevelopmentGenesis, COST, state,
++                                 untouched, error, &proof) == expected_result,
++              "typed classification: " + error);
++        Check(proof.Valid() == expected_proof, "typed invalid proof presence");
++        if (expected_proof)
++            Check(proof.BlockId() == candidate_id &&
++                      proof.ParentId() == parent_id &&
++                      proof.ParentRoot() == utxo.Root() &&
++                      proof.ProfileDigest() ==
++                          BlockValidationProfileDigest(
++                              hp, local, DevelopmentGenesis, COST),
++                  "typed invalid proof binds exact identity/profile/parent "
++                  "state");
++    };
++    auto overclaim = cb;
++    overclaim.outputs[0].value = UINT64_MAX;
++    classified(child, {overclaim, spend}, profile,
++               CandidateCheckResult::Invalid, true);
++    auto wrong_witness = spend;
++    wrong_witness.inputs[0].witnesses[0].script = {0x66};
++    classified(child, {cb, wrong_witness}, profile,
++               CandidateCheckResult::Invalid, true);
++    auto local_configuration = profile;
++    local_configuration.vm_cost.field_sizes = {{0xe7, {1}}};
++    classified(child, {cb, spend}, local_configuration,
++               CandidateCheckResult::Inconclusive, false);
++    {
++        auto tampered = wire;
++        tampered.back() ^= 0xff;
++        TestState state(view);
++        StagedBlockTransition untouched;
++        Check(StageCompleteBlock(tampered, parent, {parent.header, genesis}, hp,
++                                 profile, DevelopmentGenesis, COST, state,
++                                 untouched, error,
++                                 &proof) == CandidateCheckResult::Invalid &&
++                  !proof.Valid(),
++              "unbound supplied body cannot certify header invalidity");
++    }
+     for (bool write_failure : {false, true}) {
+         TestState failed(view);
+         failed.fail_reads = !write_failure;
+diff --git a/src/lotus_v2/test_ordinary_validation.cpp b/src/lotus_v2/test_ordinary_validation.cpp
+index 0c7fe0e92..39cf98722 100644
+--- a/src/lotus_v2/test_ordinary_validation.cpp
++++ b/src/lotus_v2/test_ordinary_validation.cpp
+@@ -406,6 +406,19 @@ void LookupBoundary() {
+               untouched.created.empty());
+         CHECK(error == "injected disk read failure");
+     }
++    for (unsigned kind = 0; kind < 4; ++kind) {
++        auto local = profile;
++        if (kind == 0) local.vm.max_steps = 1;
++        if (kind == 1) local.vm.max_steps = 0;
++        if (kind == 2) local.vm_cost.opcode[0x4e].base = 0;
++        if (kind == 3) local.vm_cost.field_sizes = {{0xe7, {1}}};
++        OrdinaryCandidateEffects untouched;
++        untouched.native_fee = 123;
++        CHECK(CheckOrdinaryWithLookup(f.tx, local, f.chain, lookup, untouched,
++                                      error) ==
++              CandidateCheckResult::Inconclusive);
++        CHECK(untouched.native_fee == 123 && untouched.created.empty());
++    }
+     CoinLookup absent = [](const Outpoint &, Coin &, std::string &) {
+         return CoinReadResult::Missing;
+     };
+diff --git a/src/lotus_v2/test_vm.cpp b/src/lotus_v2/test_vm.cpp
+index 03bda6641..f4d0ddf3e 100644
+--- a/src/lotus_v2/test_vm.cpp
++++ b/src/lotus_v2/test_vm.cpp
+@@ -77,7 +77,7 @@ void ControlAndArithmetic() {
+     VmProfile one_step = PROFILE;
+     one_step.max_steps = 1;
+     Expect("4e", VmStatus::Success, {}, one_step);
+-    Expect("4e4e91", VmStatus::Invalid, {}, one_step);
++    Expect("4e4e91", VmStatus::OperationalError, {}, one_step);
+ }
+ void StackOpcodes() {
+     auto check = [](std::initializer_list<uint8_t> initial, uint8_t op,
+@@ -406,7 +406,7 @@ void HashAndBounds() {
+     VmProfile hard = PROFILE;
+     hard.max_element_bytes = VM_HARD_ELEMENT_BYTES + 1;
+     hard.max_vm_bytes = VM_HARD_ELEMENT_BYTES + 32;
+-    Expect("5e", VmStatus::Invalid, {}, hard);
++    Expect("5e", VmStatus::OperationalError, {}, hard);
+     hard.max_element_bytes = VM_HARD_ELEMENT_BYTES;
+     hard.max_script_bytes = VM_HARD_ELEMENT_BYTES + 32;
+     hard.max_stack_items = 2;
+@@ -540,14 +540,14 @@ void AuthenticatedPayment() {
+     auto wrong_args = witness.arguments;
+     wrong_args[0][0] ^= 1;
+     CHECK(EvaluateVmWithContext(witness.script, wrong_args, PROFILE, context)
+-              .status == VmStatus::Invalid);
++              .status == VmStatus::OperationalError);
+     witness.arguments = wrong_args;
+     CHECK(EvaluateVmWithContext(witness.script, witness.arguments, PROFILE,
+                                 context)
+               .status == VmStatus::Invalid);
+     witness.arguments = original_args;
+     CHECK(EvaluateVmWithContext(Hex("5e"), witness.arguments, PROFILE, context)
+-              .status == VmStatus::Invalid);
++              .status == VmStatus::OperationalError);
+     witness.script = Hex("5e");
+     witness.siblings.clear();
+     resolved[0]->branches[0] = BranchLeaf(witness.script);
+@@ -670,7 +670,8 @@ void AuthenticatedFieldSizeHints() {
+                                  schedule, 0, 0, &ctx);
+     };
+     auto rejected = [&](const VmChargedResult &result, const char *message) {
+-        return !result.charged && result.invocation.status == VmStatus::Invalid &&
++        return !result.charged &&
++               result.invocation.status == VmStatus::OperationalError &&
+                result.invocation.error == message;
+     };
+     std::map<uint8_t, std::vector<size_t>> derived;
+@@ -850,9 +851,41 @@ void PreparedTransactionOwnership() {
+                                     std::nullopt, &prepared};
+     const auto rejected = EvaluateVmCharged(Hex("4e"), {}, PROFILE,
+                                            prepared.Cost(), 0, 0, &forged);
+-    CHECK(rejected.invocation.status == VmStatus::Invalid);
++    CHECK(rejected.invocation.status == VmStatus::OperationalError);
+     CHECK(rejected.invocation.error == "prepared transaction ownership mismatch");
+ }
++#ifdef LOTUS_V2_VM_TEST_INSTRUMENTATION
++void TypedCryptoFailures() {
++    SetVmCryptoFault(VmCryptoFault::Digest);
++    CHECK(EvaluateVm(Hex("b8794e"), {VmBytes{1}}, PROFILE).status ==
++          VmStatus::OperationalError);
++    // Valid P-256 generator, public fixture signature framing. Provider faults
++    // are injected after operand validation; no secret key material is used.
++    const auto p256 = Hex(
++        "036b17d1f2e12c4247f8bce6e563a440f277037d812deb33a0f4a13945d898c296");
++    auto signature = VmBytes(64);
++    signature[31] = 1;
++    signature[63] = 1;
++    SetVmCryptoFault(VmCryptoFault::P256Context);
++    CHECK(EvaluateVm(Hex("bd794e"), {signature, VmBytes(32), p256, Number(1)},
++                     PROFILE)
++              .status == VmStatus::OperationalError);
++    SetVmCryptoFault(VmCryptoFault::P256Verify);
++    CHECK(EvaluateVm(Hex("bd794e"), {signature, VmBytes(32), p256, Number(1)},
++                     PROFILE)
++              .status == VmStatus::OperationalError);
++    SetVmCryptoFault(VmCryptoFault::EdAllocation);
++    CHECK(EvaluateVm(Hex("bd794e"),
++                     {signature, VmBytes(32), VmBytes(32), Number(2)}, PROFILE)
++              .status == VmStatus::OperationalError);
++    SetVmCryptoFault(VmCryptoFault::None);
++    // The same well-framed but wrong P-256 signature is a deterministic false,
++    // demonstrated by NOT, while provider -1 above never became false.
++    CHECK(EvaluateVm(Hex("bd9c"), {signature, VmBytes(32), p256, Number(1)},
++                     PROFILE)
++              .status == VmStatus::Success);
++}
++#endif
+ } // namespace
+ int main() {
+     FramingAndSuccess();
+@@ -867,5 +900,8 @@ int main() {
+     AuthenticatedPayment();
+     AuthenticatedFieldSizeHints();
+     PreparedTransactionOwnership();
++#ifdef LOTUS_V2_VM_TEST_INSTRUMENTATION
++    TypedCryptoFailures();
++#endif
+     std::cout << "Lotus V2 VM core vectors pass\n";
+ }
+diff --git a/src/lotus_v2/vm.cpp b/src/lotus_v2/vm.cpp
+index bb6873a16..4f0884b8e 100644
+--- a/src/lotus_v2/vm.cpp
++++ b/src/lotus_v2/vm.cpp
+@@ -25,10 +25,19 @@ namespace lotus::v2 {
+ namespace {
+     using Int = __int128_t;
+     using UInt = __uint128_t;
++#ifdef LOTUS_V2_VM_TEST_INSTRUMENTATION
++    VmCryptoFault vm_crypto_fault = VmCryptoFault::None;
++#define VM_TEST_CRYPTO_FAIL(name) (vm_crypto_fault == VmCryptoFault::name)
++#else
++#define VM_TEST_CRYPTO_FAIL(name) false
++#endif
+     struct VmFailure : std::runtime_error {
+-        bool unsupported;
++        VmStatus status;
+         VmFailure(const char *message, bool unsupported = false)
+-            : std::runtime_error(message), unsupported(unsupported) {}
++            : std::runtime_error(message),
++              status(unsupported ? VmStatus::Unsupported : VmStatus::Invalid) {}
++        VmFailure(const char *message, VmStatus kind)
++            : std::runtime_error(message), status(kind) {}
+     };
+     struct Instruction {
+         uint8_t op;
+@@ -173,10 +182,11 @@ namespace {
+     VmBytes Sha256(std::span<const uint8_t> value) {
+         VmBytes out(32);
+         unsigned int len = 0;
+-        if (!EVP_Digest(value.data(), value.size(), out.data(), &len,
++        if (VM_TEST_CRYPTO_FAIL(Digest) ||
++            !EVP_Digest(value.data(), value.size(), out.data(), &len,
+                         EVP_sha256(), nullptr) ||
+             len != 32)
+-            throw VmFailure("SHA256 failure");
++            throw VmFailure("SHA256 failure", VmStatus::OperationalError);
+         return out;
+     }
+     VmBytes Blake3(std::span<const uint8_t> value) {
+@@ -338,17 +348,31 @@ namespace {
+             OSSL_PARAM_construct_octet_string(OSSL_PKEY_PARAM_PUB_KEY,
+                                               point.data(), point.size()),
+             OSSL_PARAM_construct_end()};
+-        PkeyCtxPtr import(EVP_PKEY_CTX_new_from_name(nullptr, "EC", nullptr));
++        PkeyCtxPtr import(
++            VM_TEST_CRYPTO_FAIL(P256Context)
++                ? nullptr
++                : EVP_PKEY_CTX_new_from_name(nullptr, "EC", nullptr));
+         EVP_PKEY *raw = nullptr;
+-        if (!import || EVP_PKEY_fromdata_init(import.get()) != 1 ||
+-            EVP_PKEY_fromdata(import.get(), &raw, EVP_PKEY_PUBLIC_KEY,
++        if (!import || EVP_PKEY_fromdata_init(import.get()) != 1)
++            throw VmFailure("CHECKDATASIG P-256 provider unavailable",
++                            VmStatus::OperationalError);
++        // Import failure does not prove malformed key: providers may fail for
++        // local reasons. Keep rejection conservative until independently known.
++        if (EVP_PKEY_fromdata(import.get(), &raw, EVP_PKEY_PUBLIC_KEY,
+                               params) != 1)
+-            throw VmFailure("CHECKDATASIG P-256 key encoding");
++            throw VmFailure("CHECKDATASIG P-256 key import failed",
++                            VmStatus::OperationalError);
+         PkeyPtr pkey(raw);
+         PkeyCtxPtr check(EVP_PKEY_CTX_new_from_pkey(nullptr, pkey.get(),
+                                                     nullptr));
+-        if (!check || EVP_PKEY_public_check(check.get()) != 1)
+-            throw VmFailure("CHECKDATASIG P-256 key encoding");
++        if (!check)
++            throw VmFailure("CHECKDATASIG P-256 check unavailable",
++                            VmStatus::OperationalError);
++        const int key_check = EVP_PKEY_public_check(check.get());
++        if (key_check < 0)
++            throw VmFailure("CHECKDATASIG P-256 check failed",
++                            VmStatus::OperationalError);
++        if (key_check == 0) throw VmFailure("CHECKDATASIG P-256 key encoding");
+         // Range/low-S failures are false, not errors (well-sized signature).
+         if (!StrictLowSRange(signature, P256_ORDER, P256_HALF_ORDER))
+             return false;
+@@ -359,9 +383,17 @@ namespace {
+         PkeyCtxPtr verify(EVP_PKEY_CTX_new_from_pkey(nullptr, pkey.get(),
+                                                      nullptr));
+         if (!verify || EVP_PKEY_verify_init(verify.get()) != 1)
+-            throw VmFailure("CHECKDATASIG P-256 verifier unavailable");
+-        return EVP_PKEY_verify(verify.get(), der.data(), der.size(),
+-                               message.data(), message.size()) == 1;
++            throw VmFailure("CHECKDATASIG P-256 verifier unavailable",
++                            VmStatus::OperationalError);
++        const int verified =
++            VM_TEST_CRYPTO_FAIL(P256Verify)
++                ? -1
++                : EVP_PKEY_verify(verify.get(), der.data(), der.size(),
++                                  message.data(), message.size());
++        if (verified < 0)
++            throw VmFailure("CHECKDATASIG P-256 verification failed",
++                            VmStatus::OperationalError);
++        return verified == 1;
+     }
+     // Profile 3: SEC1-compressed secp256k1 key, strict low-S r||s.
+     bool VerifySecp256k1Ecdsa(std::span<const uint8_t> key,
+@@ -406,11 +438,15 @@ namespace {
+     // h = SHA512(R || A || message).
+     struct EdBn {
+         BIGNUM *n;
+-        EdBn() : n(BN_new()) {
+-            if (!n) throw VmFailure("CHECKDATASIG Ed25519 arithmetic");
++        EdBn() : n(VM_TEST_CRYPTO_FAIL(EdAllocation) ? nullptr : BN_new()) {
++            if (!n)
++                throw VmFailure("CHECKDATASIG Ed25519 arithmetic",
++                                VmStatus::OperationalError);
+         }
+         explicit EdBn(BIGNUM *owned) : n(owned) {
+-            if (!n) throw VmFailure("CHECKDATASIG Ed25519 arithmetic");
++            if (!n)
++                throw VmFailure("CHECKDATASIG Ed25519 arithmetic",
++                                VmStatus::OperationalError);
+         }
+         ~EdBn() { BN_free(n); }
+         EdBn(const EdBn &) = delete;
+@@ -440,7 +476,9 @@ namespace {
+               exp(Hex("ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffe")),
+               bx(Hex("216936d3cd6e53fec0a4e231fdd6dc5c692cc7609525a7b2c9562d608f25d51a")),
+               by(Hex("6666666666666666666666666666666666666666666666666666666666666658")) {
+-            if (!ctx) throw VmFailure("CHECKDATASIG Ed25519 arithmetic");
++            if (!ctx)
++                throw VmFailure("CHECKDATASIG Ed25519 arithmetic",
++                                VmStatus::OperationalError);
+         }
+         ~Ed25519() { BN_CTX_free(ctx); }
+         Ed25519(const Ed25519 &) = delete;
+@@ -448,11 +486,14 @@ namespace {
+         static EdBn Hex(const char *digits) {
+             BIGNUM *value = nullptr;
+             if (BN_hex2bn(&value, digits) <= 0)
+-                throw VmFailure("CHECKDATASIG Ed25519 arithmetic");
++                throw VmFailure("CHECKDATASIG Ed25519 arithmetic",
++                                VmStatus::OperationalError);
+             return EdBn(value);
+         }
+         void Require(bool ok) const {
+-            if (!ok) throw VmFailure("CHECKDATASIG Ed25519 arithmetic");
++            if (!ok)
++                throw VmFailure("CHECKDATASIG Ed25519 arithmetic",
++                                VmStatus::OperationalError);
+         }
+         EdBn Mod(const BIGNUM *a, const BIGNUM *b) {
+             EdBn out;
+@@ -472,7 +513,8 @@ namespace {
+         EdBn Inv(const BIGNUM *a) {
+             EdBn out;
+             if (!BN_mod_inverse(out.n, a, p.n, ctx))
+-                throw VmFailure("CHECKDATASIG Ed25519 arithmetic");
++                throw VmFailure("CHECKDATASIG Ed25519 arithmetic",
++                                VmStatus::OperationalError);
+             return out;
+         }
+         // RFC 8032 square root of u/v for p ≡ 5 (mod 8); nullopt-as-false.
+@@ -490,7 +532,8 @@ namespace {
+         }
+         bool Decode(std::span<const uint8_t> bytes, EdPoint &out) {
+             if (!BN_lebin2bn(bytes.data(), int(bytes.size()), out.y.n))
+-                throw VmFailure("CHECKDATASIG Ed25519 arithmetic");
++                throw VmFailure("CHECKDATASIG Ed25519 arithmetic",
++                                VmStatus::OperationalError);
+             const int sign = BN_is_bit_set(out.y.n, 255);
+             if (sign) BN_clear_bit(out.y.n, 255);
+             if (BN_cmp(out.y.n, p.n) >= 0) return false;
+@@ -562,7 +605,8 @@ namespace {
+             return false;
+         EdBn scalar;
+         if (!BN_lebin2bn(signature.data() + 32, 32, scalar.n))
+-            throw VmFailure("CHECKDATASIG Ed25519 arithmetic");
++            throw VmFailure("CHECKDATASIG Ed25519 arithmetic",
++                            VmStatus::OperationalError);
+         if (BN_cmp(scalar.n, curve.l.n) >= 0 ||
+             !curve.InPrimeSubgroup(public_key) ||
+             !curve.InPrimeSubgroup(commitment))
+@@ -573,17 +617,21 @@ namespace {
+         std::copy_n(signature.begin(), 32, preimage.begin());
+         std::copy_n(key.begin(), 32, preimage.begin() + 32);
+         std::copy(message.begin(), message.end(), preimage.begin() + 64);
+-        if (!EVP_Digest(preimage.data(), preimage.size(), digest.data(), &len,
++        if (VM_TEST_CRYPTO_FAIL(Digest) ||
++            !EVP_Digest(preimage.data(), preimage.size(), digest.data(), &len,
+                         EVP_sha512(), nullptr) ||
+             len != 64)
+-            throw VmFailure("CHECKDATASIG Ed25519 arithmetic");
++            throw VmFailure("CHECKDATASIG Ed25519 arithmetic",
++                            VmStatus::OperationalError);
+         EdBn challenge;
+         if (!BN_lebin2bn(digest.data(), 64, challenge.n) ||
+             BN_mod(challenge.n, challenge.n, curve.l.n, curve.ctx) != 1)
+-            throw VmFailure("CHECKDATASIG Ed25519 arithmetic");
++            throw VmFailure("CHECKDATASIG Ed25519 arithmetic",
++                            VmStatus::OperationalError);
+         EdPoint base;
+         if (!BN_copy(base.x.n, curve.bx.n) || !BN_copy(base.y.n, curve.by.n))
+-            throw VmFailure("CHECKDATASIG Ed25519 arithmetic");
++            throw VmFailure("CHECKDATASIG Ed25519 arithmetic",
++                            VmStatus::OperationalError);
+         EdPoint left = curve.Scale(scalar.n, base);
+         EdPoint right =
+             curve.Combine(commitment, curve.Scale(challenge.n, public_key));
+@@ -629,7 +677,8 @@ namespace {
+         }
+         void Tick() {
+             if (++steps > profile.max_steps)
+-                throw VmFailure("step bound exceeded");
++                throw VmFailure("step bound exceeded",
++                                VmStatus::OperationalError);
+         }
+         size_t Index(Int value, size_t bound) const {
+             if (value < 0 || value >= Int(bound))
+@@ -668,7 +717,8 @@ namespace {
+             VmBytes encoded;
+             std::string error;
+             if (!EncodeOutput(output, encoded, error))
+-                throw VmFailure("output encoding unavailable");
++                throw VmFailure("output encoding unavailable",
++                                VmStatus::OperationalError);
+             return encoded;
+         }
+         bool ExclusiveBranch(const Output &output, const VmBytes &root) const {
+@@ -1247,12 +1297,18 @@ namespace {
+                         if (selected < 0 || selected > 2)
+                             throw VmFailure("SIGHASH mode");
+                         const auto &ctx = Context();
++                        if ((selected &&
++                             ctx.tx.inputs[ctx.input_index].flags == 3) ||
++                            (selected == 2 &&
++                             ctx.input_index >= ctx.tx.outputs.size()))
++                            throw VmFailure("SIGHASH invocation mode");
+                         Hash message;
+                         std::string error;
+                         if (!SigningMessage(*prepared_signing, ctx.input_index,
+                                             ctx.witness_index, uint8_t(selected),
+                                             ctx.positive_delta, message, error))
+-                            throw VmFailure("SIGHASH message unavailable");
++                            throw VmFailure("SIGHASH message unavailable",
++                                            VmStatus::OperationalError);
+                         Push(VmBytes(message.begin(), message.end()));
+                         break;
+                     }
+@@ -1264,6 +1320,16 @@ namespace {
+                                 "CHECKSIG needs authenticated context", true);
+                         const uint8_t mode =
+                             signature.size() == 65 ? signature.back() : 0;
++                        const bool mint =
++                            context->tx.inputs[context->input_index].flags == 3;
++                        if ((signature.size() != 64 &&
++                             signature.size() != 65) ||
++                            (signature.size() == 65 &&
++                             (mode == 0 || mode > 2)) ||
++                            (mode && mint) ||
++                            (mode == 2 && context->input_index >=
++                                              context->tx.outputs.size()))
++                            throw VmFailure("CHECKSIG wire encoding");
+                         Hash message;
+                         std::string error;
+                         if (!SigningMessage(*prepared_signing,
+@@ -1271,9 +1337,8 @@ namespace {
+                                             context->witness_index, mode,
+                                             context->positive_delta, message,
+                                             error))
+-                            throw VmFailure("CHECKSIG message unavailable");
+-                        const bool mint =
+-                            context->tx.inputs[context->input_index].flags == 3;
++                            throw VmFailure("CHECKSIG message unavailable",
++                                            VmStatus::OperationalError);
+                         const auto verified = VerifyBip340Signature(
+                             key, signature, message, mint);
+                         if (verified == SignatureStatus::InvalidEncoding ||
+@@ -1543,60 +1608,98 @@ namespace {
+ #include "vm_cost.inc"
+ } // namespace
+ bool ValidateVmCostProfile(const VmProfile &vm, const VmCostProfile &cost, std::string &error) {
+-    try { CheckCostProfile(cost, vm); error.clear(); return true; }
+-    catch (const std::exception &e) { error = e.what(); return false; }
++    try {
++        if (!vm.max_script_bytes || !vm.max_element_bytes ||
++            vm.max_element_bytes > VM_HARD_ELEMENT_BYTES ||
++            !vm.max_stack_items || !vm.max_altstack_items || !vm.max_vm_bytes ||
++            !vm.max_ast_depth || !vm.max_steps)
++            throw VmFailure("invalid explicit VM profile",
++                            VmStatus::OperationalError);
++        CheckCostProfile(cost, vm);
++        error.clear();
++        return true;
++    } catch (const std::exception &e) {
++        error = e.what();
++        return false;
++    }
+ }
+ 
+ 
+ #ifdef LOTUS_V2_VM_TEST_INSTRUMENTATION
+ namespace { VmPreparationCounts preparation_counts; }
+ VmPreparationCounts VmPreparationWorkCounts() { return preparation_counts; }
++void SetVmCryptoFault(VmCryptoFault fault) {
++    vm_crypto_fault = fault;
++}
+ #define VM_COUNT_PREPARATION(field) (++preparation_counts.field)
+ #else
+ #define VM_COUNT_PREPARATION(field) ((void)0)
+ #endif
+ 
+-bool PreparedVmTransaction::Prepare(const Transaction &tx, const TxProfile &profile,
+-    const ChainId &chain, const ResolvedCoins &coins, const VmCostProfile &cost,
+-    std::string &error) {
+-    ready_ = false;
+-    tx_ = tx;
+-    profile_ = profile;
+-    chain_ = chain;
+-    coins_ = coins;
+-    cost_ = cost;
+-    mint_count_ = std::count_if(tx_.inputs.begin(), tx_.inputs.end(),
+-        [](const Input &input) { return input.flags == 3; });
+-    VM_COUNT_PREPARATION(signing);
+-    if (!PrepareSigningContext(tx_, profile_, chain_, coins_, signing_, error)) return false;
+-    const auto context = Invocation(0, 0);
++SigningPreparationStatus PreparedVmTransaction::PrepareChecked(
++    const Transaction &tx, const TxProfile &profile, const ChainId &chain,
++    const ResolvedCoins &coins, const VmCostProfile &cost, std::string &error) {
+     try {
+-        VM_COUNT_PREPARATION(field_sizes);
+-        // Explicit hints obey the caller element limit; derived field bounds
+-        // may exceed it for fields that this particular script never reads.
+-        max_field_bound_ = 0;
+-        for (const auto &[op, sizes] : cost_.field_sizes) {
+-            (void)op;
+-            for (auto size : sizes) max_field_bound_ = std::max(max_field_bound_, size);
+-        }
+-        // Validate the immutable schedule once; each invocation only compares
+-        // its stricter element limit with this precomputed maximum.
+-        const VmProfile hard_profile{1, 1, VM_HARD_ELEMENT_BYTES, 1, 1, 1, 1, 1};
+-        CheckCostProfile(cost_, hard_profile);
+-        ApplyDerivedFieldSizes(cost_, context);
+-        field_maxima_.clear();
+-        for (const auto &[op, sizes] : cost_.field_sizes) {
+-            size_t maximum = 0;
+-            for (auto size : sizes) maximum = std::max(maximum, size);
+-            field_maxima_[op] = maximum;
++        ready_ = false;
++        tx_ = tx;
++        profile_ = profile;
++        chain_ = chain;
++        coins_ = coins;
++        cost_ = cost;
++        mint_count_ =
++            std::count_if(tx_.inputs.begin(), tx_.inputs.end(),
++                          [](const Input &input) { return input.flags == 3; });
++        VM_COUNT_PREPARATION(signing);
++        const auto signing_status = PrepareSigningContextChecked(
++            tx_, profile_, chain_, coins_, signing_, error);
++        if (signing_status != SigningPreparationStatus::Ready)
++            return signing_status;
++        const auto context = Invocation(0, 0);
++        try {
++            VM_COUNT_PREPARATION(field_sizes);
++            // Explicit hints obey the caller element limit; derived field
++            // bounds may exceed it for fields that this particular script never
++            // reads.
++            max_field_bound_ = 0;
++            for (const auto &[op, sizes] : cost_.field_sizes) {
++                (void)op;
++                for (auto size : sizes)
++                    max_field_bound_ = std::max(max_field_bound_, size);
++            }
++            // Validate the immutable schedule once; each invocation only
++            // compares its stricter element limit with this precomputed
++            // maximum.
++            const VmProfile hard_profile{1, 1, VM_HARD_ELEMENT_BYTES, 1, 1, 1,
++                                         1, 1};
++            CheckCostProfile(cost_, hard_profile);
++            ApplyDerivedFieldSizes(cost_, context);
++            field_maxima_.clear();
++            for (const auto &[op, sizes] : cost_.field_sizes) {
++                size_t maximum = 0;
++                for (auto size : sizes)
++                    maximum = std::max(maximum, size);
++                field_maxima_[op] = maximum;
++            }
++        } catch (const VmFailure &failure) {
++            error = failure.what();
++            return failure.status == VmStatus::Unsupported
++                       ? SigningPreparationStatus::Unsupported
++                       : SigningPreparationStatus::OperationalError;
+         }
+-    } catch (const VmFailure &failure) {
+-        error = failure.what();
+-        return false;
++        ready_ = true;
++        error.clear();
++        return SigningPreparationStatus::Ready;
++    } catch (const std::exception &exception) {
++        error = exception.what();
++        return SigningPreparationStatus::OperationalError;
+     }
+-    ready_ = true;
+-    error.clear();
+-    return true;
++}
++
++bool PreparedVmTransaction::Prepare(
++    const Transaction &tx, const TxProfile &profile, const ChainId &chain,
++    const ResolvedCoins &coins, const VmCostProfile &cost, std::string &error) {
++    return PrepareChecked(tx, profile, chain, coins, cost, error) ==
++           SigningPreparationStatus::Ready;
+ }
+ 
+ VmResult EvaluateVmImpl(std::span<const uint8_t> script,
+@@ -1612,7 +1715,8 @@ VmResult EvaluateVmImpl(std::span<const uint8_t> script,
+             !profile.max_stack_items || !profile.max_altstack_items ||
+             !profile.max_vm_bytes || !profile.max_ast_depth ||
+             !profile.max_steps)
+-            throw VmFailure("invalid explicit VM profile");
++            throw VmFailure("invalid explicit VM profile",
++                            VmStatus::OperationalError);
+         if (script.size() > profile.max_script_bytes ||
+             arguments.size() > profile.max_arguments)
+             throw VmFailure("invocation framing limit");
+@@ -1630,12 +1734,14 @@ VmResult EvaluateVmImpl(std::span<const uint8_t> script,
+         // caller's profile is left unchanged. Charging below reads this copy.
+         std::optional<VmCostProfile> authenticated_cost;
+         if (context && context->prepared && !context->prepared->Owns(*context))
+-            throw VmFailure("prepared transaction ownership mismatch");
++            throw VmFailure("prepared transaction ownership mismatch",
++                            VmStatus::OperationalError);
+         const bool cached_cost = context && context->prepared &&
+             cost_profile == &context->prepared->Cost();
+         if (cached_cost) {
+             if (context->prepared->MaxFieldBound() > profile.max_element_bytes)
+-                throw VmFailure("invalid field-size bound");
++                throw VmFailure("invalid field-size bound",
++                                VmStatus::OperationalError);
+         } else if (cost_profile) {
+             CheckCostProfile(*cost_profile, profile);
+         }
+@@ -1650,7 +1756,8 @@ VmResult EvaluateVmImpl(std::span<const uint8_t> script,
+         const PreparedSigningContext *prepared_signing = nullptr;
+         if (context) {
+             if (context->input_index >= context->tx.inputs.size())
+-                throw VmFailure("invocation input index");
++                throw VmFailure("invocation input index",
++                                VmStatus::OperationalError);
+             const auto &input = context->tx.inputs[context->input_index];
+             if (input.flags == 3) {
+                 if (!context->positive_delta ||
+@@ -1665,29 +1772,37 @@ VmResult EvaluateVmImpl(std::span<const uint8_t> script,
+                     throw VmFailure("mint delta is not positive N");
+             }
+             if (context->witness_index >= input.witnesses.size())
+-                throw VmFailure("invocation witness index");
++                throw VmFailure("invocation witness index",
++                                VmStatus::OperationalError);
+             const auto &witness = input.witnesses[context->witness_index];
+             if (!std::equal(script.begin(), script.end(),
+                             witness.script.begin(), witness.script.end()) ||
+                 arguments != witness.arguments)
+-                throw VmFailure("invocation bytes disagree with witness");
++                throw VmFailure("invocation bytes disagree with witness",
++                                VmStatus::OperationalError);
+             std::string error;
+             if (context->prepared) {
+                 prepared_signing = &context->prepared->Signing();
+             } else {
+                 local_signing.emplace();
+                 VM_COUNT_PREPARATION(signing);
+-                if (!PrepareSigningContext(context->tx, context->tx_profile,
+-                                           context->chain_id, context->resolved,
+-                                           *local_signing, error))
+-                    throw VmFailure("invocation membership/context invalid");
++                const auto preparation = PrepareSigningContextChecked(
++                    context->tx, context->tx_profile, context->chain_id,
++                    context->resolved, *local_signing, error);
++                if (preparation != SigningPreparationStatus::Ready)
++                    throw VmFailure(
++                        "invocation membership/context invalid",
++                        preparation == SigningPreparationStatus::InvalidWitness
++                            ? VmStatus::Invalid
++                            : VmStatus::OperationalError);
+                 prepared_signing = &*local_signing;
+             }
+             Hash message;
+             if (!SigningMessage(*prepared_signing, context->input_index,
+                                 context->witness_index, 0,
+                                 context->positive_delta, message, error))
+-                throw VmFailure("invocation membership/context invalid");
++                throw VmFailure("invocation membership/context invalid",
++                                VmStatus::OperationalError);
+         }
+         std::vector<Instruction> code;
+         if (cost_profile) {
+@@ -1735,9 +1850,9 @@ VmResult EvaluateVmImpl(std::span<const uint8_t> script,
+                         context, prepared_signing);
+         return {VmStatus::Success, {}, machine.Run()};
+     } catch (const VmFailure &failure) {
+-        return {failure.unsupported ? VmStatus::Unsupported : VmStatus::Invalid,
+-                failure.what(),
+-                {}};
++        return {failure.status, failure.what(), {}};
++    } catch (const std::exception &failure) {
++        return {VmStatus::OperationalError, failure.what(), {}};
+     }
+ }
+ VmResult EvaluateVm(std::span<const uint8_t> script,
+diff --git a/src/lotus_v2/vm.h b/src/lotus_v2/vm.h
+index d2b68a5e1..6fa23aec6 100644
+--- a/src/lotus_v2/vm.h
++++ b/src/lotus_v2/vm.h
+@@ -30,7 +30,13 @@ struct VmProfile {
+     size_t max_steps; // host-work guard; P05 cost is a separate obligation
+ };
+ 
+-enum class VmStatus { Success, AutomaticSuccess, Invalid, Unsupported };
++enum class VmStatus {
++    Success,
++    AutomaticSuccess,
++    Invalid,
++    Unsupported,
++    OperationalError
++};
+ struct VmResult {
+     VmStatus status = VmStatus::Invalid;
+     std::string error;
+@@ -76,12 +82,23 @@ bool ValidateVmCostProfile(const VmProfile &, const VmCostProfile &, std::string
+ // invocations. Contexts must refer to this snapshot's exact objects; a cache
+ // from another transaction or mutable caller objects is never trusted.
+ #ifdef LOTUS_V2_VM_TEST_INSTRUMENTATION
++enum class VmCryptoFault {
++    None,
++    Digest,
++    P256Context,
++    P256Verify,
++    EdAllocation
++};
++void SetVmCryptoFault(VmCryptoFault);
+ struct VmPreparationCounts { size_t signing = 0; size_t field_sizes = 0; };
+ VmPreparationCounts VmPreparationWorkCounts();
+ #endif
+ 
+ class PreparedVmTransaction {
+ public:
++    SigningPreparationStatus
++    PrepareChecked(const Transaction &, const TxProfile &, const ChainId &,
++                   const ResolvedCoins &, const VmCostProfile &, std::string &);
+     bool Prepare(const Transaction &, const TxProfile &, const ChainId &,
+                  const ResolvedCoins &, const VmCostProfile &, std::string &);
+     VmExecutionContext Invocation(size_t input, size_t witness,
+diff --git a/src/lotus_v2/vm_cost.inc b/src/lotus_v2/vm_cost.inc
+index 66cf7c6e4..0676fb150 100644
+--- a/src/lotus_v2/vm_cost.inc
++++ b/src/lotus_v2/vm_cost.inc
+@@ -85,16 +85,19 @@ VmCostUnits WorstOpCost(uint8_t op, size_t limit,
+ }
+ void CheckCostProfile(const VmCostProfile &cost, const VmProfile &vm_profile) {
+     if (!cost.max_invocation_cost || !cost.structural_byte_cost)
+-        throw VmFailure("invalid explicit cost profile");
++        throw VmFailure("invalid explicit cost profile",
++                        VmStatus::OperationalError);
+     for (unsigned op = 0; op <= 255; ++op)
+         if (GenesisAssigned(uint8_t(op)) && !cost.opcode[op].base)
+             throw VmFailure("missing assigned opcode cost", true);
+     for (const auto &[op, sizes] : cost.field_sizes) {
+         if (op != 0xdb && op != 0xdc && op != 0xe6 && op != 0xe7 && op != 0xf0)
+-            throw VmFailure("invalid field-size opcode");
++            throw VmFailure("invalid field-size opcode",
++                            VmStatus::OperationalError);
+         for (size_t size : sizes)
+             if (size > vm_profile.max_element_bytes)
+-                throw VmFailure("invalid field-size bound");
++                throw VmFailure("invalid field-size bound",
++                                VmStatus::OperationalError);
+     }
+ }
+ // Field-size hints lower static charges below MAX_ELEMENT_BYTES, so they must
+@@ -111,7 +114,8 @@ void CheckFieldSizesAgainstContext(const VmCostProfile &cost,
+         size_t size = 0;
+         std::string error;
+         if (!OutputSerializedSize(output, size, error))
+-            throw VmFailure("field-size output encoding");
++            throw VmFailure("field-size output encoding",
++                            VmStatus::OperationalError);
+         return size;
+     };
+     auto coin = [&](size_t i) -> const Output * {
+@@ -124,12 +128,14 @@ void CheckFieldSizesAgainstContext(const VmCostProfile &cost,
+             const size_t count =
+                 op == 0xe7 ? ctx.tx.outputs.size() : ctx.tx.inputs.size();
+             if (sizes.size() != count)
+-                throw VmFailure("field-size hint count");
++                throw VmFailure("field-size hint count",
++                                VmStatus::OperationalError);
+             for (size_t i = 0; i < count; ++i) {
+                 const Output *field =
+                     op == 0xe7 ? &ctx.tx.outputs[i] : coin(i);
+                 if (field && sizes[i] < output_size(*field))
+-                    throw VmFailure("field-size hint below authenticated field");
++                    throw VmFailure("field-size hint below authenticated field",
++                                    VmStatus::OperationalError);
+             }
+         } else {
+             const size_t widest =
+@@ -147,13 +153,15 @@ void CheckFieldSizesAgainstContext(const VmCostProfile &cost,
+                 for (const auto &output : ctx.tx.outputs)
+                     if (too_small(output))
+                         throw VmFailure(
+-                            "field-size hint below authenticated field");
++                            "field-size hint below authenticated field",
++                            VmStatus::OperationalError);
+             } else {
+                 for (size_t i = 0; i < ctx.tx.inputs.size(); ++i)
+                     if (const Output *field = coin(i))
+                         if (too_small(*field))
+                             throw VmFailure(
+-                                "field-size hint below authenticated field");
++                                "field-size hint below authenticated field",
++                                VmStatus::OperationalError);
+             }
+         }
+     }
+@@ -165,7 +173,8 @@ void ApplyDerivedFieldSizes(VmCostProfile &cost, const VmExecutionContext &ctx)
+     std::map<uint8_t, std::vector<size_t>> derived;
+     std::string error;
+     if (!DeriveFieldSizes(ctx, derived, error))
+-        throw VmFailure("field-size output encoding");
++        throw VmFailure("field-size output encoding",
++                        VmStatus::OperationalError);
+     for (auto &[op, sizes] : derived) {
+         if (sizes.empty()) continue;
+         const auto found = cost.field_sizes.find(op);
+diff --git a/src/lotus_v2/vm_test/runner.cpp b/src/lotus_v2/vm_test/runner.cpp
+index 5f71feb5a..1841dd295 100644
+--- a/src/lotus_v2/vm_test/runner.cpp
++++ b/src/lotus_v2/vm_test/runner.cpp
+@@ -42,6 +42,8 @@ char Status(VmStatus status) {
+             return 'I';
+         case VmStatus::Unsupported:
+             return 'U';
++        case VmStatus::OperationalError:
++            return 'E';
+     }
+     return 'I';
+ }
+-- 
+2.50.1 (Apple Git-155)
+
