@@ -29,6 +29,7 @@ function run(testCase, expectedFailure) {
   if (expectedFailure) {
     if (result.status === 0 || !result.stderr.includes(expectedFailure))
       throw new Error(`expected ${expectedFailure}, got status=${result.status}: ${result.stderr}`);
+    if (process.env.LOTUS_NATIVE_TRACE_REJECTIONS === '1') console.log(result.stderr.trim());
   } else if (result.status !== 0) {
     throw new Error(result.stderr || `native checker exited ${result.status}`);
   } else {
@@ -60,6 +61,19 @@ const tokenFixture = new URL('../fixtures/fungible-token-v2.json', import.meta.u
 if (existsSync(tokenFixture)) {
   const fixture = JSON.parse(readFileSync(tokenFixture));
   const transactions = fixture.transactions ?? {};
+  const { prepareTransactionCall, finalizeTransactionCall } = await import('../dist/transaction-runtime.js');
+  const { schnorr } = await import('@noble/curves/secp256k1');
+  const { hex, unhex } = await import('../dist/compiler.js');
+  const asOutput = output => ({ flags: output.flags, value: BigInt(output.valueAtoms),
+    ...(output.tokenId == null ? {} : { tokenId: output.tokenId }),
+    branches: output.branches, paths: output.paths });
+  const asInput = input => input.kind === 'mint' ?
+    { kind: 'mint', artifact: fixture.artifacts[input.artifact], methodName: input.methodName,
+      args: input.args } :
+    { kind: 'spend', prevTxid: input.prevTxid, prevIndex: input.prevIndex,
+      sequence: input.sequence, coin: asOutput(input.coin), pathIndex: input.pathIndex,
+      witnesses: input.witnesses.map(witness => ({ artifact: fixture.artifacts[witness.artifact],
+        methodName: witness.methodName, args: witness.args })) };
   for (const [name, tx] of Object.entries(transactions)) {
     run(tx);
     const proofScript = (name === 'mint' ? fixture.artifacts.FungibleToken : fixture.artifacts.FungibleRules).methods[0].scriptHex;
@@ -79,9 +93,38 @@ if (existsSync(tokenFixture)) {
       const original = deltaHex(request.positiveDelta);
       request.positiveDelta = (original.slice(0, 2) === '01' ? '02' : '01') + original.slice(2);
       run({ ...tx, requests }, 'mint positive delta mismatch');
+      const issuer = tx.requests.find(request => request.positiveDelta);
+      const badSignature = (issuer.signature[0] === 'f' ? 'e' : 'f') + issuer.signature.slice(1);
+      if (!tx.wire.includes(issuer.signature)) throw new Error('issuer signature not in mint wire');
+      run({ ...tx, wire: tx.wire.replace(issuer.signature, badSignature), txhash: '-', requests: [] },
+        'VM invocation rejected: CHECKSIGVERIFY false');
+    }
+    if (name === 'transfer') {
+      const tokenOutput = tx.outputs.find(output => output.flags & 1);
+      if (!tokenOutput) throw new Error('transfer token output missing');
+      const intent = { profile: tx.profile, chainId: tx.chainId,
+        dustLimitAtoms: BigInt(tx.dustLimitAtoms), inputs: tx.inputs.map(asInput),
+        outputs: tx.outputs.map(output => asOutput(output === tokenOutput ?
+          { ...output, paths: [[0]] } : output)) };
+      const plan = prepareTransactionCall(intent);
+      const secret = unhex('00'.repeat(31) + '03');
+      const signatures = Object.fromEntries(plan.requests.map(request => [request.key,
+        schnorr.sign(unhex(request.digest), secret, new Uint8Array(32))]));
+      const signed = finalizeTransactionCall(plan, signatures);
+      run({ ...tx, wire: hex(signed.wire), txid: signed.txid, txhash: signed.txhash,
+        requests: plan.requests.map(request => ({ ...request, publicKey: fixture.publicTestKey,
+          argumentIndex: 0, positiveDelta: request.positiveDelta == null ? undefined :
+            request.positiveDelta.toString() })) }, 'VM invocation rejected: VERIFY false');
     }
     console.log(`${name}: native fixture verified`);
   }
+  const mint = transactions.mint;
+  if (!mint) throw new Error('token fixture requires mint transaction');
+  const probe = spawnSync(executable, ['--probe-mint-coin-read', mint.wire,
+    mint.chainId, String(mint.coinWires.length), ...mint.coinWires.map(coin => coin ?? '-')],
+  { encoding: 'utf8' });
+  if (probe.status !== 0) throw new Error(probe.stderr || 'mint coin read probe failed');
+  console.log(probe.stdout.trim());
 } else {
   if (!baselineOnly) throw new Error('required fungible-token-v2.json fixture missing');
   console.log('generic native checker baseline passed');

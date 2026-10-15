@@ -1,6 +1,6 @@
-// Independent native checks of compiler-emitted P01 transaction and signing bytes.
-// The native P01 candidate does not execute scripts or validate whole blocks.
-#include "signing.h"
+// Native candidate P01/P03/P05 checks of compiler-emitted transactions.
+// The illustrative VM cost schedule is not a network parameter or block validator.
+#include "vm.h"
 
 #include <algorithm>
 #include <cstdint>
@@ -68,10 +68,71 @@ struct Amount {
 void Require(bool condition, const std::string &reason) {
     if (!condition) throw std::runtime_error(reason);
 }
+VmProfile IllustrativeVmProfile() {
+    return {8192, 16, 8192, 128, 64, 65536, 32, 1000000};
+}
+VmCostProfile IllustrativeCostProfile() {
+    VmCostProfile cost;
+    cost.max_invocation_cost = 1000000000;
+    cost.structural_byte_cost = 1;
+    for (auto &opcode : cost.opcode) opcode = {1, 1, 1};
+    return cost;
+}
+void ProbeMintCoinRead(int argc, char **argv) {
+    // The minted input has a valid revealed root and positive delta, but no
+    // resolved coin. A direct UTXOVALUE read must fail at the VM boundary.
+    Require(argc >= 6, "probe requires wire, chain, and resolved coins");
+    const TxProfile tx_profile{32, 32, 8, 8192, 16, 8192, 64};
+    Transaction tx;
+    std::string error;
+    Require(DecodeTransaction(Hex(argv[2]), tx_profile, tx, error), "probe transaction: " + error);
+    const ChainId chain = HashHex(argv[3]);
+    const size_t count = Number(argv[4]);
+    Require(count == tx.inputs.size() && size_t(argc) == 5 + count, "probe resolved count");
+    ResolvedCoins resolved;
+    for (size_t i = 0; i < count; ++i) {
+        if (std::string(argv[5 + i]) == "-") resolved.push_back(std::nullopt);
+        else {
+            Output coin;
+            Require(DecodeOutput(Hex(argv[5 + i]), coin, error), "probe coin: " + error);
+            resolved.push_back(coin);
+        }
+    }
+    const auto mint_iter = std::find_if(tx.inputs.begin(), tx.inputs.end(),
+        [](const Input &input) { return input.flags == 3; });
+    Require(mint_iter != tx.inputs.end(), "probe requires mint input");
+    const size_t mint_index = size_t(mint_iter - tx.inputs.begin());
+    const Hash old_root = mint_iter->prev_txid;
+    auto &witness = mint_iter->witnesses.at(0);
+    witness.script = {0xd0, 0xd6, 0x4e}; // INPUTINDEX UTXOVALUE N(1)
+    mint_iter->prev_txid = BranchLeaf(witness.script);
+    uint64_t minted = 0;
+    for (auto &output : tx.outputs) {
+        if (output.HasToken() && output.token_id == old_root) {
+            output.token_id = mint_iter->prev_txid;
+            minted += output.value;
+        }
+    }
+    Require(minted > 0, "probe requires positive mint output");
+    PositiveDelta delta{};
+    for (size_t i = 0; i < 8; ++i) delta[i] = uint8_t(minted >> (8 * i));
+    const VmExecutionContext context{tx, tx_profile, chain, resolved, mint_index, 0, delta};
+    const auto result = EvaluateVmCharged(witness.script, witness.arguments,
+        IllustrativeVmProfile(), IllustrativeCostProfile(),
+        uint16_t(tx.inputs.size()), uint16_t(tx.outputs.size()), &context);
+    Require(result.charged && result.invocation.status == VmStatus::Invalid &&
+            result.invocation.error == "UTXO read at nonspend input",
+            "mint coin read was not rejected: " + result.invocation.error);
+    std::cout << "native VM rejects mint coin read\n";
+}
 } // namespace
 
 int main(int argc, char **argv) {
     try {
+        if (argc > 2 && std::string(argv[1]) == "--probe-mint-coin-read") {
+            ProbeMintCoinRead(argc, argv);
+            return 0;
+        }
         // wire chain txid txhash coin-count coin-or-dash... signature-count
         // (input-index witness-index argument-index pubkey digest branch-index-or-dash delta-or-dash)...
         Require(argc >= 7, "usage: wire chain txid txhash coin-count coins... signature-count checks...");
@@ -175,9 +236,32 @@ int main(int argc, char **argv) {
             Require(VerifyBip340Signature(Hex(argv[base + 3]), signature, digest, mint) == SignatureStatus::Valid,
                     "BIP340 signature mismatch");
         }
+        // The candidate VM checks signed scripts, including the unsigned rules
+        // branch. Cost coefficients here are illustrative and explicitly bounded.
+        const VmProfile vm_profile = IllustrativeVmProfile();
+        const VmCostProfile cost_profile = IllustrativeCostProfile();
+        size_t executed = 0;
+        for (size_t i = 0; i < tx.inputs.size(); ++i) {
+            const auto &input = tx.inputs[i];
+            const std::optional<PositiveDelta> delta = input.flags == 3
+                ? std::optional<PositiveDelta>(deltas.at(input.prev_txid)) : std::nullopt;
+            for (size_t j = 0; j < input.witnesses.size(); ++j) {
+                const auto &witness = input.witnesses[j];
+                const VmExecutionContext context{tx, profile, chain, resolved, i, j, delta};
+                const auto result = EvaluateVmCharged(witness.script, witness.arguments,
+                    vm_profile, cost_profile, uint16_t(tx.inputs.size()),
+                    uint16_t(tx.outputs.size()), &context);
+                Require(result.charged, "VM static cost unavailable: " + result.invocation.error);
+                Require(result.invocation.status == VmStatus::Success,
+                        "VM invocation rejected: " + result.invocation.error);
+                ++executed;
+            }
+        }
+        Require(executed == invocation_count, "VM invocation coverage mismatch");
         std::cout << "native token candidate: " << tx.inputs.size() << " inputs, "
                   << invocation_count << " proven branches, " << sig_count
-                  << " signatures, " << mint_count.size() << " mint(s)\n";
+                  << " signatures, " << executed << " charged VM invocations, "
+                  << mint_count.size() << " mint(s)\n";
         return 0;
     } catch (const std::exception &e) {
         std::cerr << e.what() << '\n';
