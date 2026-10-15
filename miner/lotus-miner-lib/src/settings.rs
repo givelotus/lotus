@@ -14,6 +14,9 @@ pub const DEFAULT_GPU_INDEX: i64 = 0;
 
 #[derive(Debug, Deserialize)]
 pub struct ConfigSettings {
+    #[serde(default)]
+    pub chain: Chain,
+    pub scrypt_work_size: u32,
     pub rpc_url: String,
     pub rpc_user: String,
     pub rpc_password: String,
@@ -47,6 +50,8 @@ impl ConfigSettings {
             Some(some) => some,
             None => return Err(ConfigError::Message("no home directory".to_string())),
         };
+        s.set_default("chain", "lotus")?;
+        s.set_default("scrypt_work_size", 1024)?;
         s.set_default("rpc_url", DEFAULT_URL)?;
         s.set_default("rpc_poll_interval", DEFAULT_RPC_POLL_INTERVAL)?;
         s.set_default("rpc_user", DEFAULT_USER)?;
@@ -95,6 +100,10 @@ impl ConfigSettings {
             }
         };
         s.merge(File::with_name(config_path).required(false))?;
+
+        if let Some(chain) = matches.value_of("chain") {
+            s.set("chain", chain)?;
+        }
 
         // Set bind address from cmd line
         if let Some(rpc_url) = matches.value_of("rpc_url") {
@@ -147,5 +156,22 @@ impl ConfigSettings {
         }
 
         s.try_into()
+    }
+}
+
+/// Selects the header format and proof-of-work together; never inferred from RPC.
+#[derive(Debug, Clone, Copy, Default, Deserialize, serde::Serialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum Chain {
+    #[default]
+    Lotus,
+    Dogecoin,
+}
+impl Chain {
+    pub fn header_len(self) -> usize {
+        match self {
+            Self::Lotus => 160,
+            Self::Dogecoin => 80,
+        }
     }
 }

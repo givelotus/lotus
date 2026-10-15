@@ -1,0 +1,165 @@
+From ff2785db59a175492d1c7d50dcbc568ea89a5886 Mon Sep 17 00:00:00 2001
+From: Tobias <ruck.tobias@gmail.com>
+Date: Thu, 21 Nov 2024 19:35:28 +0100
+Subject: [PATCH] [DogeCash] Parallelize PoW check (#62)
+
+On Dogecoin, the PoW check is very expensive, which slows down the (on Bitcoin, quite fast) header pre-sync and sync.
+
+Instead of running PoW checks sequentially, we run them in parallel using the same worker queue as for the script checks.
+
+Current-ABC adaptation: worker queues now own their threads via RAII. Place
+an independent PoW queue in ChainstateManager instead of restoring global
+startup/shutdown hooks. Use the current optional-error queue interface;
+keep the sequential public helper for callers and as a test oracle. Network
+header validation uses the node-owned queue, without touching validation
+signals or node shutdown ordering. Parameters outlive the synchronous batch.
+
+Add real Scrypt header regression coverage for empty batches, valid batches
+larger than the queue batch size, failed batches and recovery, using both
+zero and two worker threads. AuxPoW checks use the unchanged verifier.
+
+Original-Commit: 5ec37db12d4e7a9cdfbe3fcc6a5ae18e545581f6
+Adapted-From: Tobias's Doged parallel PoW implementation
+
+diff --git a/src/net_processing.cpp b/src/net_processing.cpp
+index 7a5625bcea1e7163d23d7e30252e66568b6ca8d6..6639227702f0cc4826442d19fa7b8077bc8845cc 100644
+--- a/src/net_processing.cpp
++++ b/src/net_processing.cpp
+@@ -3781,7 +3781,7 @@ bool PeerManagerImpl::CheckHeadersPoW(const std::vector<CBlockHeader> &headers,
+                                       const Consensus::Params &consensusParams,
+                                       Peer &peer) {
+     // Do these headers have proof-of-work matching what's claimed?
+-    if (!HasValidProofOfWork(headers, consensusParams)) {
++    if (!m_chainman.HasValidProofOfWork(headers, consensusParams)) {
+         Misbehaving(peer, "header with invalid proof of work");
+         return false;
+     }
+diff --git a/src/test/validation_tests.cpp b/src/test/validation_tests.cpp
+index f5bb2b2b87ba0a0b246e9f593eb2be212590a719..fc00924d9331c0f5aa4c6368a048de913c486a31 100644
+--- a/src/test/validation_tests.cpp
++++ b/src/test/validation_tests.cpp
+@@ -32,6 +32,37 @@
+ 
+ BOOST_FIXTURE_TEST_SUITE(validation_tests, TestingSetup)
+ 
++BOOST_AUTO_TEST_CASE(parallel_header_pow) {
++    const auto chainparams = CreateChainParams(ArgsManager{}, ChainType::MAIN);
++    const auto &params = chainparams->GetConsensus();
++    const auto valid = chainparams->GenesisBlock().GetBlockHeader();
++    auto invalid = valid;
++    invalid.nBits = 0;
++
++    // Exercise the real queue with no worker and multiple workers, including
++    // empty batches and error reset after a failed batch.
++    for (const int workers : {0, 2}) {
++        CCheckQueue<CPowCheck> queue(128, workers);
++        for (const auto &headers :
++             {std::vector<CBlockHeader>{},
++              std::vector<CBlockHeader>(257, valid),
++              std::vector<CBlockHeader>{valid, invalid, valid},
++              std::vector<CBlockHeader>{valid}}) {
++            CCheckQueueControl<CPowCheck> control(queue);
++            std::vector<CPowCheck> checks;
++            for (const auto &header : headers) {
++                checks.emplace_back(header, params);
++            }
++            control.Add(std::move(checks));
++            BOOST_CHECK_EQUAL(!control.Complete().has_value(),
++                              HasValidProofOfWork(headers, params));
++        }
++    }
++    BOOST_CHECK(m_node.chainman->HasValidProofOfWork({valid}, params));
++    BOOST_CHECK(!m_node.chainman->HasValidProofOfWork({invalid}, params));
++    BOOST_CHECK(m_node.chainman->HasValidProofOfWork({}, params));
++}
++
+ // First 20 blocks on the Dogecoin network, with their coinbase subsidy
+ const std::vector<std::tuple<std::string, int64_t>> DOGECOIN_BLOCKS = {
+     // Genesis block has 88 DOGE blockreward, but not used in the tests here.
+diff --git a/src/validation.cpp b/src/validation.cpp
+index c009e72aebe1f245b2599b20643d55f729389342..c992c6de7814af07b47189cc2f526007fd76d490 100644
+--- a/src/validation.cpp
++++ b/src/validation.cpp
+@@ -4509,6 +4509,27 @@ bool HasValidProofOfWork(const std::vector<CBlockHeader> &headers,
+                        });
+ }
+ 
++std::optional<bool> CPowCheck::operator()() {
++    if (CheckAuxProofOfWork(m_header, *m_params)) {
++        return std::nullopt;
++    }
++    return false;
++}
++
++bool ChainstateManager::HasValidProofOfWork(
++    const std::vector<CBlockHeader> &headers, const Consensus::Params &params) {
++    // Scrypt is expensive. The controlling thread also performs work, so this
++    // works unchanged with -par=1 (zero additional worker threads).
++    CCheckQueueControl<CPowCheck> control(m_pow_check_queue);
++    std::vector<CPowCheck> checks;
++    checks.reserve(headers.size());
++    for (const auto &header : headers) {
++        checks.emplace_back(header, params);
++    }
++    control.Add(std::move(checks));
++    return !control.Complete().has_value();
++}
++
+ bool IsBlockMutated(const CBlock &block) {
+     BlockValidationState state;
+     if (!CheckMerkleRoot(block, state)) {
+@@ -7375,6 +7396,9 @@ ChainstateManager::ChainstateManager(
+     : m_script_check_queue{
+           /*batch_size=*/128,
+           std::clamp(options.worker_threads_num, 0, MAX_SCRIPTCHECK_THREADS)},
++      m_pow_check_queue{
++          /*batch_size=*/128,
++          std::clamp(options.worker_threads_num, 0, MAX_SCRIPTCHECK_THREADS)},
+       m_interrupt{interrupt}, m_options{Flatten(std::move(options))},
+       m_blockman{interrupt, std::move(blockman_options)},
+       m_validation_cache{m_options.script_execution_cache_bytes,
+diff --git a/src/validation.h b/src/validation.h
+index b1b47ed9cf8bde191bb5c746fa2e79f0355776e5..9ceb0dce1a57daded431db43e9c93a357ecb24b1 100644
+--- a/src/validation.h
++++ b/src/validation.h
+@@ -616,6 +616,19 @@ bool TestBlockValidity(
+ bool HasValidProofOfWork(const std::vector<CBlockHeader> &headers,
+                          const Consensus::Params &consensusParams);
+ 
++/** A single Scrypt/AuxPoW verification for the node-owned worker queue.
++ * The consensus parameters must remain alive until the queue completes.
++ */
++class CPowCheck {
++    CBlockHeader m_header;
++    const Consensus::Params *m_params;
++
++public:
++    CPowCheck(const CBlockHeader &header, const Consensus::Params &params)
++        : m_header(header), m_params(&params) {}
++    std::optional<bool> operator()();
++};
++
+ /**
+  * Check if a block has been mutated (with respect to its merkle root).
+  */
+@@ -1262,6 +1275,9 @@ private:
+     //! threads.
+     CCheckQueue<CScriptCheck> m_script_check_queue;
+ 
++    //! Separate from script checks, with the same node-owned RAII lifecycle.
++    CCheckQueue<CPowCheck> m_pow_check_queue;
++
+     //! Timers and counters used for benchmarking validation in both background
+     //! and active chainstates.
+     SteadyClock::duration GUARDED_BY(::cs_main) time_check{};
+@@ -1688,6 +1704,10 @@ public:
+     std::optional<int> GetSnapshotBaseHeight() const
+         EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
+ 
++    //! Validate a header batch in parallel; false if any Scrypt/AuxPoW fails.
++    bool HasValidProofOfWork(const std::vector<CBlockHeader> &headers,
++                             const Consensus::Params &params);
++
+     CCheckQueue<CScriptCheck> &GetCheckQueue() { return m_script_check_queue; }
+ 
+     //! If, due to invalidation / reconsideration of blocks, the previous

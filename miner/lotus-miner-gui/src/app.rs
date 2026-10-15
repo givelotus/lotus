@@ -14,6 +14,10 @@ use tokio::runtime::Runtime;
 
 #[derive(Deserialize, Serialize, Debug, Clone, Default)]
 pub struct UserSettings {
+    #[serde(default)]
+    chain: settings::Chain,
+    #[serde(default = "default_scrypt_work_size")]
+    scrypt_work_size: u32,
     mine_to_address: String,
     intensity: i32,
     bitcoind_url: String,
@@ -21,6 +25,10 @@ pub struct UserSettings {
     bitcoind_password: String,
     rpc_poll_interval: u64,
     gpu_index: i64,
+}
+
+fn default_scrypt_work_size() -> u32 {
+    1024
 }
 
 pub struct MinerApp {
@@ -44,6 +52,8 @@ impl MinerApp {
     pub fn load() -> Self {
         let user_settings = match ConfigSettings::load(false) {
             Ok(config_settings) => UserSettings {
+                chain: config_settings.chain,
+                scrypt_work_size: config_settings.scrypt_work_size,
                 mine_to_address: config_settings.mine_to_address,
                 intensity: config_settings.kernel_size.try_into().unwrap(),
                 bitcoind_url: config_settings.rpc_url,
@@ -55,6 +65,8 @@ impl MinerApp {
             Err(err) => {
                 eprintln!("Failed to load config, falling back to defaults: {}", err);
                 UserSettings {
+                    chain: settings::Chain::Lotus,
+                    scrypt_work_size: 1024,
                     mine_to_address: String::new(),
                     intensity: settings::DEFAULT_KERNEL_SIZE.try_into().unwrap(),
                     bitcoind_url: settings::DEFAULT_URL.to_string(),
@@ -66,6 +78,8 @@ impl MinerApp {
             }
         };
         let config = ConfigSettings {
+            chain: user_settings.chain,
+            scrypt_work_size: user_settings.scrypt_work_size,
             rpc_url: user_settings.bitcoind_url.clone(),
             rpc_user: user_settings.bitcoind_user.clone(),
             rpc_password: user_settings.bitcoind_password.clone(),
@@ -102,8 +116,10 @@ impl epi::App for MinerApp {
     ) {
         match storage {
             Some(storage) => {
-                if let Some(user_settings) = epi::get_value(storage, epi::APP_KEY) {
-                    self.user_settings = user_settings;
+                if let Some(user_settings) = epi::get_value::<UserSettings>(storage, epi::APP_KEY) {
+                    if user_settings.chain == self.user_settings.chain {
+                        self.user_settings = user_settings;
+                    }
                 }
             }
             None => println!("No storage"),
@@ -126,6 +142,10 @@ impl epi::App for MinerApp {
         egui::SidePanel::left("side_panel")
             .default_width(300.0)
             .show(ctx, |ui| {
+                ui.label(format!(
+                    "Chain: {:?} (select with --chain at startup)",
+                    self.user_settings.chain
+                ));
                 ui.heading("Settings (\"Apply & Mine\" to update)");
 
                 egui::Grid::new("panel_grid")
@@ -137,10 +157,17 @@ impl epi::App for MinerApp {
                         ui.end_row();
 
                         ui.label("Intensity: ");
-                        ui.add(egui::Slider::new(
-                            &mut self.user_settings.intensity,
-                            8i32..=27,
-                        ));
+                        if self.user_settings.chain == settings::Chain::Lotus {
+                            ui.add(egui::Slider::new(
+                                &mut self.user_settings.intensity,
+                                8i32..=27,
+                            ));
+                        } else {
+                            ui.label(format!(
+                                "{} Scrypt nonces/batch (config)",
+                                self.user_settings.scrypt_work_size
+                            ));
+                        }
                         ui.end_row();
 
                         ui.label("RPC URL: ");

@@ -1,5 +1,6 @@
 mod block;
 mod miner;
+mod scrypt;
 pub mod settings;
 mod sha256;
 
@@ -17,7 +18,7 @@ use std::{
     time::{Duration, SystemTime},
 };
 
-use block::{create_block, Block, GetRawUnsolvedBlockResponse};
+use block::{create_block_for_chain, Block, GetRawUnsolvedBlockResponse};
 use miner::{MiningSettings, Work};
 use rand::{Rng, SeedableRng};
 use reqwest::{RequestBuilder, StatusCode};
@@ -25,6 +26,7 @@ use serde::Deserialize;
 use tokio::sync::{Mutex, MutexGuard};
 
 pub struct Server {
+    chain: settings::Chain,
     client: reqwest::Client,
     miner: std::sync::Mutex<Miner>,
     node_settings: Mutex<NodeSettings>,
@@ -80,15 +82,26 @@ pub type ServerRef = Arc<Server>;
 impl Server {
     pub fn from_config(config: ConfigSettings, report_hashrate_interval: Duration) -> Self {
         let mining_settings = MiningSettings {
+            scrypt_work_size: config.scrypt_work_size,
             local_work_size: 256,
             inner_iter_size: 16,
-            kernel_size: 1 << config.kernel_size,
-            kernel_name: "lotus_og".to_string(),
+            kernel_size: if config.chain == settings::Chain::Dogecoin {
+                1
+            } else {
+                1 << config.kernel_size
+            },
+            kernel_name: if config.chain == settings::Chain::Dogecoin {
+                "dogecoin"
+            } else {
+                "lotus_og"
+            }
+            .to_string(),
             sleep: 0,
             gpu_indices: vec![config.gpu_index as usize],
         };
         let miner = Miner::setup(mining_settings.clone()).unwrap();
         Server {
+            chain: config.chain,
             miner: std::sync::Mutex::new(miner),
             client: reqwest::Client::new(),
             node_settings: Mutex::new(NodeSettings {
@@ -210,7 +223,7 @@ async fn update_next_block(server: &Server) -> Result<(), Box<dyn std::error::Er
             return Ok(());
         }
     };
-    let block = create_block(&unsolved_block)?;
+    let block = create_block_for_chain(&unsolved_block, server.chain)?;
     if let Some(current_block) = &block_state.current_block {
         if current_block.prev_hash() != block.prev_hash() {
             log.info(format!(
@@ -233,15 +246,26 @@ async fn mine_some_nonces(server: ServerRef) -> Result<()> {
     let log = server.log();
     let mut block_state = server.block_state.lock().await;
     if let Some(next_block) = block_state.next_block.take() {
-        block_state.current_work = Work::from_header(next_block.header, next_block.target);
-        block_state.current_block = Some(next_block);
+        if server.chain != settings::Chain::Dogecoin
+            || block_state.current_block.as_ref().is_none_or(|current| {
+                current.header != next_block.header
+                    || current.body != next_block.body
+                    || current.target != next_block.target
+            })
+        {
+            block_state.current_work =
+                Work::from_header(next_block.header, next_block.target).with_chain(server.chain);
+            block_state.current_block = Some(next_block);
+        }
     }
     if block_state.current_block.is_none() {
         return Ok(());
     }
     let mut work = block_state.current_work;
     let big_nonce = server.rng.lock().await.gen();
-    work.set_big_nonce(big_nonce);
+    if server.chain == settings::Chain::Lotus {
+        work.set_big_nonce(big_nonce);
+    }
     drop(block_state); // release lock
     let (nonce, num_nonces_per_search) = tokio::task::spawn_blocking({
         let server = Arc::clone(&server);
@@ -307,10 +331,11 @@ async fn mine_some_nonces(server: ServerRef) -> Result<()> {
 async fn submit_block(server: &Server, block: &Block) -> Result<(), Box<dyn std::error::Error>> {
     #[derive(Deserialize)]
     struct SubmitBlockResponse {
-        result: Option<String>,
+        result: serde_json::Value,
+        error: Option<serde_json::Value>,
     }
     let log = server.log();
-    let mut serialized_block = block.header.to_vec();
+    let mut serialized_block = block.header[..block.chain.header_len()].to_vec();
     serialized_block.extend_from_slice(&block.body);
     let response = init_request(server)
         .await
@@ -321,9 +346,12 @@ async fn submit_block(server: &Server, block: &Block) -> Result<(), Box<dyn std:
         .send()
         .await?;
     let response: SubmitBlockResponse = serde_json::from_str(&response.text().await?)?;
+    if let Some(error) = response.error {
+        return Err(eyre::eyre!("submitblock RPC error: {}", error).into());
+    }
     match response.result {
-        None => log.info("BLOCK ACCEPTED!"),
-        Some(reason) => {
+        serde_json::Value::Null => log.info("BLOCK ACCEPTED!"),
+        serde_json::Value::String(reason) => {
             log.error(format!("REJECTED BLOCK: {}", reason));
             if reason == "inconclusive" {
                 log.warn(
@@ -337,6 +365,7 @@ async fn submit_block(server: &Server, block: &Block) -> Result<(), Box<dyn std:
                 );
             }
         }
+        other => return Err(eyre::eyre!("Invalid submitblock result: {}", other).into()),
     }
     Ok(())
 }
@@ -424,5 +453,65 @@ impl Display for HashrateEntry {
             self.timestamp.to_rfc3339(),
             self.hashrate / 1_000_000.0
         )
+    }
+}
+
+#[cfg(test)]
+mod dogecoin_rpc_tests {
+    use super::*;
+    async fn rpc(server: &Server, method: &str) -> serde_json::Value {
+        let response = init_request(server)
+            .await
+            .body(
+                serde_json::json!({"jsonrpc":"1.0","id":"miner-test","method":method,"params":[]})
+                    .to_string(),
+            )
+            .send()
+            .await
+            .unwrap();
+        let value: serde_json::Value =
+            serde_json::from_str(&response.text().await.unwrap()).unwrap();
+        assert!(value["error"].is_null(), "{}", value);
+        value["result"].clone()
+    }
+    #[tokio::test]
+    #[ignore = "requires explicitly configured isolated Dogecoin regtest RPC and OpenCL"]
+    async fn dogecoin_regtest_gpu_submit() {
+        let config = ConfigSettings {
+            chain: settings::Chain::Dogecoin,
+            scrypt_work_size: 1024,
+            rpc_url: std::env::var("DOGE_REGTEST_RPC_URL").unwrap(),
+            rpc_user: std::env::var("DOGE_REGTEST_RPC_USER").unwrap(),
+            rpc_password: std::env::var("DOGE_REGTEST_RPC_PASSWORD").unwrap(),
+            mine_to_address: std::env::var("DOGE_REGTEST_PAYOUT").unwrap(),
+            rpc_poll_interval: 3,
+            kernel_size: 8,
+            gpu_index: 0,
+        };
+        let server = Arc::new(Server::from_config(config, Duration::from_secs(10)));
+        let info = rpc(&server, "getblockchaininfo").await;
+        assert_eq!(
+            info["chain"], "regtest",
+            "Test refuses to mine outside regtest"
+        );
+        let height = info["blocks"].as_u64().unwrap();
+        update_next_block(&server).await.unwrap();
+        for _ in 0..16 {
+            mine_some_nonces(Arc::clone(&server)).await.unwrap();
+            if server.block_state.lock().await.current_block.is_none() {
+                break;
+            }
+        }
+        let after = rpc(&server, "getblockchaininfo").await;
+        assert_eq!(after["blocks"].as_u64().unwrap(), height + 1);
+        assert!(server
+            .log()
+            .get_logs_and_clear()
+            .iter()
+            .any(|entry| entry.msg == "BLOCK ACCEPTED!"));
+        println!(
+            "GPU Scrypt getrawunsolvedblock/submitblock accepted regtest height {}",
+            height + 1
+        );
     }
 }

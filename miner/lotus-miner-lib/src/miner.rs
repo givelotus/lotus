@@ -17,6 +17,7 @@ pub enum MinerError {
 
 #[derive(Debug, Clone)]
 pub struct MiningSettings {
+    pub scrypt_work_size: u32,
     pub local_work_size: i32,
     pub kernel_size: u32,
     pub inner_iter_size: i32,
@@ -26,14 +27,16 @@ pub struct MiningSettings {
 }
 
 pub struct Miner {
-    search_kernel: Kernel,
-    header_buffer: Buffer<u32>,
-    buffer: Buffer<u32>,
+    doge: Option<crate::scrypt::DogeMiner>,
+    search_kernel: Option<Kernel>,
+    header_buffer: Option<Buffer<u32>>,
+    buffer: Option<Buffer<u32>>,
     settings: MiningSettings,
 }
 
 #[derive(Debug, Clone, Copy)]
 pub struct Work {
+    chain: crate::settings::Chain,
     header: [u8; 160],
     target: [u8; 32],
     pub nonce_idx: u32,
@@ -50,6 +53,7 @@ use self::MinerError::*;
 impl Work {
     pub fn from_header(header: [u8; 160], target: [u8; 32]) -> Work {
         Work {
+            chain: crate::settings::Chain::Lotus,
             header,
             target,
             nonce_idx: 0,
@@ -57,7 +61,19 @@ impl Work {
     }
 
     pub fn set_big_nonce(&mut self, big_nonce: u64) {
-        self.header[44..52].copy_from_slice(&big_nonce.to_le_bytes());
+        match self.chain {
+            crate::settings::Chain::Lotus => {
+                self.header[44..52].copy_from_slice(&big_nonce.to_le_bytes())
+            }
+            crate::settings::Chain::Dogecoin => {
+                self.header[76..80].copy_from_slice(&(big_nonce as u32).to_le_bytes())
+            }
+        }
+    }
+
+    pub fn with_chain(mut self, chain: crate::settings::Chain) -> Self {
+        self.chain = chain;
+        self
     }
 
     pub fn header(&self) -> &[u8; 160] {
@@ -68,6 +84,7 @@ impl Work {
 impl Default for Work {
     fn default() -> Self {
         Work {
+            chain: crate::settings::Chain::Lotus,
             header: [0; 160],
             target: [0; 32],
             nonce_idx: 0,
@@ -77,6 +94,18 @@ impl Default for Work {
 
 impl Miner {
     pub fn setup(settings: MiningSettings) -> Result<Self> {
+        if settings.kernel_name == "dogecoin" {
+            return Ok(Self {
+                doge: Some(crate::scrypt::DogeMiner::new(
+                    settings.gpu_indices[0],
+                    settings.scrypt_work_size as usize,
+                )?),
+                search_kernel: None,
+                header_buffer: None,
+                buffer: None,
+                settings,
+            });
+        }
         let mut prog_builder = ProgramBuilder::new();
         prog_builder
             .src(match settings.kernel_name.as_str() {
@@ -142,9 +171,10 @@ impl Miner {
             .build()
             .map_err(Ocl)?;
         Ok(Miner {
-            search_kernel,
-            buffer,
-            header_buffer,
+            doge: None,
+            search_kernel: Some(search_kernel),
+            buffer: Some(buffer),
+            header_buffer: Some(header_buffer),
             settings,
         })
     }
@@ -167,16 +197,30 @@ impl Miner {
     }
 
     pub fn has_nonces_left(&self, work: &Work) -> bool {
-        work.nonce_idx
-            .checked_mul(self.settings.kernel_size)
-            .is_some()
+        (work.nonce_idx as u64) * self.num_nonces_per_search() < (1u64 << 32)
     }
 
     pub fn num_nonces_per_search(&self) -> u64 {
-        self.settings.kernel_size as u64 * self.settings.inner_iter_size as u64
+        if self.doge.is_some() {
+            self.settings.scrypt_work_size as u64
+        } else {
+            self.settings.kernel_size as u64 * self.settings.inner_iter_size as u64
+        }
     }
 
     pub fn find_nonce(&mut self, work: &Work, log: &Log) -> Result<Option<u64>> {
+        if let Some(doge) = &self.doge {
+            return doge
+                .search(
+                    &work.header[..80],
+                    &work.target,
+                    work.nonce_idx as u64 * self.num_nonces_per_search(),
+                )
+                .map(|nonce| nonce.map(u64::from));
+        }
+        let search_kernel = self.search_kernel.as_ref().unwrap();
+        let header_buffer = self.header_buffer.as_ref().unwrap();
+        let buffer = self.buffer.as_ref().unwrap();
         let base = match work
             .nonce_idx
             .checked_mul(self.num_nonces_per_search().try_into().unwrap())
@@ -197,27 +241,24 @@ impl Miner {
         for (chunk, int) in partial_header.chunks(4).zip(partial_header_ints.iter_mut()) {
             *int = u32::from_be_bytes(chunk.try_into().unwrap());
         }
-        self.header_buffer
+        header_buffer
             .write(&partial_header_ints[..])
             .enq()
             .map_err(Ocl)?;
-        self.search_kernel
-            .set_arg("partial_header", &self.header_buffer)
+        search_kernel
+            .set_arg("partial_header", header_buffer)
             .map_err(Ocl)?;
-        self.search_kernel
-            .set_arg("output", &self.buffer)
-            .map_err(Ocl)?;
-        self.search_kernel.set_arg("offset", base).map_err(Ocl)?;
-        let mut vec = vec![0; self.buffer.len()];
-        self.buffer.write(&vec).enq().map_err(Ocl)?;
-        let cmd = self
-            .search_kernel
+        search_kernel.set_arg("output", buffer).map_err(Ocl)?;
+        search_kernel.set_arg("offset", base).map_err(Ocl)?;
+        let mut vec = vec![0; buffer.len()];
+        buffer.write(&vec).enq().map_err(Ocl)?;
+        let cmd = search_kernel
             .cmd()
             .global_work_size(self.settings.kernel_size);
         unsafe {
             cmd.enq().map_err(Ocl)?;
         }
-        self.buffer.read(&mut vec).enq().map_err(Ocl)?;
+        buffer.read(&mut vec).enq().map_err(Ocl)?;
         if vec[0x80] != 0 {
             let mut header = work.header;
             'nonce: for &nonce in &vec[..0x7f] {
@@ -273,10 +314,21 @@ mod tests {
     use super::*;
 
     #[test]
+    fn dogecoin_nonce_changes_only_four_header_bytes() {
+        let header = [0x55; 160];
+        let mut work =
+            Work::from_header(header, [0xff; 32]).with_chain(crate::settings::Chain::Dogecoin);
+        work.set_big_nonce(u32::MAX as u64);
+        assert_eq!(&work.header()[..76], &header[..76]);
+        assert_eq!(&work.header()[76..80], &[255; 4]);
+        assert_eq!(&work.header()[80..], &header[80..]);
+    }
+    #[test]
     #[ignore = "requires an installed OpenCL runtime and device"]
     fn compile_embedded_kernel() {
         // Compiles the kernel and allocates buffers; does not start mining or use RPC.
         Miner::setup(MiningSettings {
+            scrypt_work_size: 1024,
             local_work_size: 256,
             kernel_size: 256,
             inner_iter_size: 16,
