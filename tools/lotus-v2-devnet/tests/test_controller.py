@@ -280,9 +280,20 @@ def fake_wallet(mode, report, native_argv):
             time.sleep(30)
             return 9
         return 9  # no stdout: controller must report OutcomeUnknown, no retry
+    if mode == "pay-inconclusive" and command == "pay":
+        home.mkdir(mode=0o700, parents=True, exist_ok=True)
+        value = {"txid": TXID, "txhash": TXHASH, "wire": "010203", "digest": "33" * 32}
+        pending_path.write_text(json.dumps(value))
+        emit({"result": "inconclusive", "error": "submission response lost", **value})
+        return 2
     if mode == "silent":
         time.sleep(30)
         return 9
+    if mode == "pay-inconclusive" and command in ("status", "broadcast"):
+        value = json.loads(pending_path.read_text())
+        emit({"result": "success", "txid": value["txid"], "txhash": value["txhash"],
+              **({"state": "unknown"} if command == "status" else {"submission": "accepted", "missing": []})})
+        return 0
     channel = socket.socket(fileno=int(flags["--node-fd"]))
     channel.settimeout(2)
     if mode in ("route", "lost-sign") and command not in ("pending", "export"):

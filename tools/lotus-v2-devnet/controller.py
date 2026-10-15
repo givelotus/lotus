@@ -789,7 +789,9 @@ class WalletProcess:
                     "outcome_unknown",
                     "signing outcome requires pending/export recovery",
                 )
-            if command in ("sign", "pay") and value["result"] == "success":
+            if command in ("sign", "pay") and (
+                value["result"] == "success" or command == "pay" and "wire" in value
+            ):
                 for field in ("txid", "txhash", "digest"):
                     hexadecimal(value.get(field))
                 require(
@@ -1029,6 +1031,13 @@ class Controller:
                 "wallet home disappeared",
             )
             value = wallet.invoke(command, request, password, deadline)
+            if command == "pay" and value["result"] == "inconclusive" and "wire" in value:
+                # Signing committed before the submission response was lost.
+                # Preserve the existing transaction for status/rebroadcast recovery.
+                self._save_wire(value)
+                error = ControllerError("outcome_unknown", "payment persisted; broadcast outcome unknown; query status or rebroadcast the existing transaction")
+                error.persisted_transaction = value
+                raise error
             if value["result"] != "success":
                 raise ControllerError(
                     value["result"],
@@ -1406,16 +1415,22 @@ class Controller:
         except ControllerError as error:
             result = {"ok": False, "result": error.code, "error": str(error)}
             if error.code == "outcome_unknown" and signing_wallet is not None:
-                result["recovery_note"] = self._recovery_note(signing_wallet)
+                persisted = getattr(error, "persisted_transaction", None)
+                result["recovery_note"] = self._recovery_note(signing_wallet, persisted)
+                txid = persisted["txid"] if persisted else "TXID"
                 result["recovery"] = [
                     "wallet pending " + signing_wallet,
-                    "wallet export " + signing_wallet + " TXID",
+                    "wallet export " + signing_wallet + " " + txid,
+                    "wallet status " + signing_wallet + " " + txid,
+                    "wallet broadcast " + signing_wallet + " " + txid,
                 ]
+                if persisted:
+                    result["persisted_transaction"] = persisted
             return result
         except (ValueError, KeyError, TypeError, OSError) as error:
             return {"ok": False, "result": "invalid", "error": str(error)}
 
-    def _recovery_note(self, wallet):
+    def _recovery_note(self, wallet, persisted=None):
         # Public bounded facts only; never infer a txid that was not received.
         note = {
             "schema": 1,
@@ -1428,6 +1443,14 @@ class Controller:
                 "wallet reconcile " + wallet,
             ],
         }
+        if persisted is not None:
+            note["txid"] = hexadecimal(persisted["txid"])
+            note["txhash"] = hexadecimal(persisted["txhash"])
+            note["wire_artifact"] = str(self.session / "public" / (note["txid"] + ".json"))
+            note["recovery"] += [
+                "wallet status " + wallet + " " + note["txid"],
+                "wallet broadcast " + wallet + " " + note["txid"],
+            ]
         path = (
             self.session
             / "public"

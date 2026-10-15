@@ -207,6 +207,32 @@ class CommandFlowTests(ControllerCase):
             ["info", "pay", "pending", "export"],
         )
 
+    def test_pay_inconclusive_retains_native_signed_transaction_for_rebroadcast(self):
+        controller, _ = self.make_controller("pay-inconclusive")
+        self.create_wallets(controller)
+        before = len(self.events())
+        answer = controller.execute("pay alice --to bob --amount 10 --fee 1 --mine-to alice --claim 100 --time now --batches 1")
+        self.assertEqual(answer["result"], "outcome_unknown")
+        self.assertEqual(answer["persisted_transaction"]["txid"], TXID)
+        note = json.loads(Path(answer["recovery_note"]).read_text())
+        self.assertEqual(note["txid"], TXID)
+        self.assertFalse(note["automatic_retry"])
+        artifact = json.loads(Path(note["wire_artifact"]).read_text())
+        self.assertEqual(artifact["wire"], "010203")
+        self.assertEqual(artifact["txhash"], TXHASH)
+        self.assertIn("wallet status alice " + TXID, answer["recovery"])
+        self.assertIn("wallet broadcast alice " + TXID, answer["recovery"])
+        records = self.events()[before:]
+        self.assertEqual([x["command"] for x in records if x["kind"] == "wallet-start"], ["info", "pay"])
+        self.assertFalse(any(x["kind"] == "node-request" and x["request"]["command"] in ("mineblock", "minepool") for x in records))
+        status = controller.execute("wallet status alice " + TXID)
+        self.assertTrue(status["ok"])
+        self.assertEqual(status["data"]["state"], "unknown")
+        broadcast = controller.execute("wallet broadcast alice " + TXID)
+        self.assertTrue(broadcast["ok"])
+        self.assertEqual(broadcast["data"]["submission"], "accepted")
+        self.assertEqual([x["command"] for x in self.events()[before:] if x["kind"] == "wallet-start"], ["info", "pay", "status", "broadcast"])
+
     def test_interrupted_persisted_sign_note_and_recovery(self):
         controller, _ = self.make_controller("sign-interrupt")
         self.create_wallets(controller)

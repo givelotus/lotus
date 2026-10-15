@@ -236,3 +236,11 @@ These checks do not establish native relay or consensus acceptance. Promotion
 requires a fresh A → B → C native run with C mining its relayed pool, consistent
 schema-2 private profile identities, wallet confirmation history, and restart
 reconciliation using exact recorded binary hashes.
+
+
+If native `pay` returns `inconclusive` with a persisted transaction's wire and
+identities, the controller reports `outcome_unknown`, saves that exact native
+artifact, and writes its IDs/artifact path into a durable recovery note. Query
+`wallet status NAME TXID`; `unknown` means the node has no authoritative history
+for it. Use `wallet broadcast NAME TXID` to submit the already persisted wire
+explicitly. Do not issue another payment to recover a lost broadcast response.
