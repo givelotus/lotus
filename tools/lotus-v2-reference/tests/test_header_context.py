@@ -2,7 +2,7 @@ import unittest
 from dataclasses import replace
 from lotus_v2_reference.header_context import HeaderChainProfile, parent_median_time, validate_child_header
 from lotus_v2_reference.block_seal import Header, block_id
-from lotus_v2_reference.asert import Parent, required_bits
+from lotus_v2_reference.asert import Parent, required_bits, compact_decode
 
 class HeaderContextTest(unittest.TestCase):
     def setUp(self):
@@ -13,12 +13,15 @@ class HeaderContextTest(unittest.TestCase):
             h = Header(block_id(self.p.chain_id, self.history[0]) if self.history else bytes(32),
                        self.p.genesis_bits, 1000+height*120 if height<11 else 5000,
                        0, 2, 200, height, bytes(32), bytes(32))
+            history_target=compact_decode(h.bits,self.p.pow_limit)
+            while int.from_bytes(block_id(self.p.chain_id,h),'little')>history_target:
+                h=replace(h,nonce=h.nonce+1)
             self.history.insert(0,h)
         self.history = self.history[:11]
         parent=self.history[0]
         bits=required_bits(Parent(parent.time,parent.height),t0=1000,genesis_target=0x7fffff << 232,spacing=120,half_life=172800,pow_limit=self.p.pow_limit)
         self.child=Header(block_id(self.p.chain_id,parent),bits,2400,0,2,200,12,bytes(32),bytes(32))
-        target = __import__('lotus_v2_reference.asert',fromlist=['compact_decode']).compact_decode(bits,self.p.pow_limit)
+        target = compact_decode(bits,self.p.pow_limit)
         while int.from_bytes(block_id(self.p.chain_id,self.child),'little')>target:
             self.child=replace(self.child,nonce=self.child.nonce+1)
     def validate(self, child=None, history=None):
