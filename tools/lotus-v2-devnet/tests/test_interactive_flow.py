@@ -117,6 +117,26 @@ class CommandFlowTests(ControllerCase):
         self.addCleanup(controller.close)
         return controller, config_path
 
+    def test_explicit_manual_private_endpoints_validate(self):
+        _, config_path = self.make_controller()
+        config = json.loads(config_path.read_text())
+        network_path = Path(config["nodes"][0]["network"]["path"])
+        network = json.loads(network_path.read_text())
+        network["listen"] = {"address": "0.0.0.0", "port": 29001}
+        network["connect"] = [{"address": "192.0.2.10", "port": 29002},
+                              {"address": "2001:db8::1", "port": 29003}]
+        network_path.write_text(json.dumps(network))
+        for node in config["nodes"]:
+            node["network"] = pinned(network_path)
+        config_path.write_text(json.dumps(config))
+        normalized = self.api.load_config(config_path)
+        self.assertEqual(normalized["nodes"][0]["resolved_network"], network)
+        for bad in ({"address": "node.example", "port": 29002},
+                    {"address": "0.0.0.0", "port": 29002},
+                    {"address": "192.0.2.10", "port": 0}):
+            with self.assertRaises((self.api.ControllerError, ValueError)):
+                self.api.endpoint(bad)
+
     def create_wallets(self, controller):
         for name, node in (("alice", "left"), ("bob", "right")):
             answer = controller.execute("wallet create " + name + " --node " + node)
@@ -158,11 +178,11 @@ class CommandFlowTests(ControllerCase):
         records = self.events()[before:]
         self.assertEqual(
             [x["command"] for x in records if x["kind"] == "wallet-start"],
-            ["info", "sign"],
+            ["info", "pay"],
         )
         self.assertFalse(
             any(
-                x["kind"] == "node-request" and x["request"]["command"] == "mineblock"
+                x["kind"] == "node-request" and x["request"]["command"] in ("mineblock", "minepool")
                 for x in records
             )
         )
@@ -184,7 +204,7 @@ class CommandFlowTests(ControllerCase):
                 for x in self.events()[before:]
                 if x["kind"] == "wallet-start"
             ],
-            ["info", "sign", "pending", "export"],
+            ["info", "pay", "pending", "export"],
         )
 
     def test_interrupted_persisted_sign_note_and_recovery(self):
@@ -672,3 +692,65 @@ class ApprovedNativeFlowTests(unittest.TestCase):
             finally:
                 secret[:] = b"\0" * len(secret)
                 print("preserved approved native fixture:", root, file=sys.stderr)
+
+
+class PrivatePaymentContractTests(unittest.TestCase):
+    def test_provider_allows_only_bounded_transaction_commands(self):
+        api = load_controller()
+        for request in (
+            {"id": "wallettransaction-1", "command": "submittransaction", "wire": "ab", "expected_tip": TXID},
+            {"id": "wallettransaction-2", "command": "transactionstatus", "txid": TXID, "txhash": TXHASH, "wire": "ab"},
+        ):
+            api.WalletProcess._validate_provider_request(request)
+            with self.assertRaises(api.ControllerError):
+                api.WalletProcess._validate_provider_request(dict(request, secret="forbidden"))
+
+    def test_mining_selects_pool_without_supplied_wire(self):
+        api = load_controller()
+        ctl = api.Controller({"limits": LIMITS}, "/unused")
+        node = mock.Mock()
+        node.request.return_value = {"ok": True, "found": True, "block_id": TXID,
+                                     "coinbase_txid": TXHASH, "coinbase_index": 0}
+        ctl._wallet = mock.Mock(return_value=mock.Mock(node=node))
+        ctl._invoke = mock.Mock(return_value={"payment_policy_registered": True, "payment_output_hex": "ab"})
+        ctl._status = mock.Mock(return_value={"tip": TXID})
+        ctl._wait_active = mock.Mock()
+        ctl._mine("miner", "1", "123", 1, [], time.monotonic() + 1)
+        request = node.request.call_args.args[0]
+        self.assertEqual(request["command"], "minepool")
+        self.assertNotIn("transactions", request)
+        self.assertNotIn("wire", request)
+        with self.assertRaises(api.ControllerError):
+            ctl._mine("miner", "1", "123", 1, ["ab"], time.monotonic() + 1)
+
+    def test_pay_uses_persisted_wallet_then_observed_relay(self):
+        api = load_controller()
+        ctl = api.Controller({"limits": LIMITS}, "/unused")
+        ctl.started = True
+        miner = mock.Mock(name="C")
+        wallets = {name: mock.Mock(node=mock.Mock(name=node))
+                   for name, node in (("alice", "A"), ("bob", "B"))}
+        wallets["miner"] = mock.Mock(node=miner)
+        ctl._wallet = mock.Mock(side_effect=wallets.__getitem__)
+        signed = {"txid": TXID, "txhash": TXHASH, "wire": "ab", "submission": "accepted"}
+        def invoke(name, command, request, deadline, secret=False):
+            if command == "info":
+                return {"payment_policy_registered": True, "payment_output": {"value": "0"}}
+            if command == "pay":
+                self.assertEqual(name, "alice")
+                self.assertTrue(secret)
+                return signed
+            if command == "status":
+                return {"state": "confirmed", "block_id": TXHASH}
+            return {}
+        ctl._invoke = mock.Mock(side_effect=invoke)
+        ctl._save_wire = mock.Mock()
+        ctl._wait_pending = mock.Mock()
+        ctl._wait_active = mock.Mock()
+        ctl._mine = mock.Mock(return_value={"block_id": TXHASH})
+        answer = ctl.execute("pay alice --to bob --amount 10 --fee 1 --mine-to miner --claim 1 --time 123 --batches 1")
+        self.assertTrue(answer["ok"], answer)
+        self.assertEqual(answer["transaction_status"]["state"], "confirmed")
+        self.assertEqual(ctl._wait_pending.call_args.args[:2], (miner, TXID))
+        self.assertEqual(ctl._mine.call_args.args[4], [])
+        self.assertNotIn("sign", [call.args[1] for call in ctl._invoke.call_args_list])

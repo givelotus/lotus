@@ -9,7 +9,8 @@ transaction codec, consensus implementation or direct database access.
 
 Use a reviewed Lotus V2 development checkout and its exact tested `lotusd` and
 `lotus-v2-wallet-client` binaries. The wallet executable must implement private-FD
-`walletcontext`, `pending` and `export`. An ordinary V1 daemon is insufficient.
+`walletcontext`, `submittransaction`, `transactionstatus`, persisted `pay`,
+`broadcast`, `status`, `pending` and `export`. An ordinary V1 daemon is insufficient.
 Do not point this tool at a running production process or existing chain home.
 
 Build the shared compiler from the same checkout using its committed lockfile:
@@ -44,13 +45,21 @@ Required top-level fields are:
 `home` is a relative path beneath the **new** session directory. Homes must not
 overlap or use controller namespaces. `network` is a pinned network JSON file
 with the native node's exact schema, explicit magic and receive limit. Its
-listener must be a numeric loopback address with port `0`; `connect` must be
-empty. No seeds, endpoints, chain parameters or network magic are generated.
-`connect_to` explicitly names earlier entries. The controller replaces the
-empty connection list with those nodes' reported ephemeral endpoints and saves
-the effective network files. For two nodes, the second can name the first;
-that accepted connection carries traffic in both directions. This packet does
-not support cyclic startup dependencies or external/fixed-port connections.
+listener and peers must use canonical numeric IPv4/IPv6 addresses and explicit
+ports (port `0` is allowed for an ephemeral listener). `connect` may contain
+manual peer endpoints on other machines. `connect_to` names earlier local
+entries and appends their reported listeners. A wildcard listener must use a
+separate reachable numeric address in manually configured peers; it is not a
+connect destination. No SSH orchestration is required. Only native P2P traffic
+uses TCP; node commands and wallet secrets remain on local pipes/private FDs.
+Use the reviewed private testnet manifest (schema 2, explicit genesis/clock
+anchors) consistently on every machine; this is a private development profile
+and makes no production readiness claim.
+
+For a local A → B → C topology, configure B's `connect_to` as `["A"]` and C's
+as `["B"]`, with no A–C connection. Bind sender wallet to A and miner wallet to
+C. The payment command waits for C's transaction status before mining its pool;
+it never supplies the signed transaction to C's mining command.
 
 Wallet homes are checked within the canonical session namespace before and
 after prompting, with symlinks/escapes refused. This does not eliminate
@@ -102,9 +111,12 @@ wallet info NAME
 wallet reconcile NAME
 wallet pending NAME
 wallet export NAME TXID
+wallet broadcast NAME TXID
+wallet status NAME TXID
 wallet abandon NAME TXID
 wallet prepare FROM --to TO --amount AMOUNT --fee FEE
 wallet sign FROM --to TO --amount AMOUNT --fee FEE
+wallet pay FROM --to TO --amount AMOUNT --fee FEE
 fund NAME --claim CLAIM --time now|SECONDS --batches N
 mine COUNT --to NAME --claim CLAIM --time now|SECONDS --batches N
 mature NAME --max-blocks N --claim CLAIM --time now|SECONDS --batches N
@@ -126,12 +138,16 @@ Claims are explicit policy caps; native monetary validation determines the
 actual payout. `mine`/`fund` do not invent issuance or create a prefunded UTXO.
 
 `prepare` does not sign. `sign` signs/reserves exactly once and saves the native
-exported wire. `pay` signs once, mines that exact wire, waits for authoritative
-acceptance, tracks recipient output zero and reconciles both wallets. Output
-zero is a convention of this native PaymentEngine only; arbitrary imported
-transactions do not inherit it. Native signing automatically tracks wallet-owned
-change. There is no mempool or standalone transaction broadcast: another wallet
-can observe the payment only after the complete block is accepted/synchronized.
+exported wire. `pay` invokes the native persisted wallet payment operation,
+which submits through its private provider channel to the sender node. It waits
+for peer relay to the miner node, invokes `minepool` without transaction wire,
+waits for authoritative acceptance, tracks recipient output zero and reconciles
+both wallets. The returned wallet transaction status records confirmation.
+Output zero is this PaymentEngine's convention. `wallet pay` signs, persists and broadcasts without mining.
+`wallet broadcast NAME TXID`
+explicitly resubmits an already persisted transaction; `wallet status NAME TXID`
+queries its native status/history. Neither signs a replacement. All funding and
+maturity mining also uses the node's ordinary pool selection.
 
 A found nonce or retained candidate is **not acceptance**. Funding/payment waits
 for authoritative `blockstatus.is_active_tip`, without recovery/receipt/
@@ -175,10 +191,12 @@ Python/terminal/runtime copies are not a secure-memory guarantee. The native
 client owns secret cleansing and encrypted persistence. Noninteractive tests
 must inject a bounded `bytearray` prompt rather than embed secrets in commands.
 
-The native client's other private socketpair permits only exact bounded
-`walletcontext` JSONL. IDs are correlated through unique controller IDs and
-mapped back; node events never enter the wallet channel. Requests are at most
-1024 bytes, responses at most 32768 bytes. Public wallet stdin is at most 1 MiB;
+The native client's private socketpair permits exact bounded `walletcontext`,
+`submittransaction` and `transactionstatus` JSONL. IDs are correlated through
+unique controller IDs and mapped back; node events never enter the wallet
+channel. Context requests are at most 1024 bytes. Transaction requests are at
+most 2 MiB plus 1024 bytes, further bounded by `max_line_bytes`; responses are
+at most 32768 bytes. Public wallet stdin is at most 1 MiB;
 its stdout is limited by `max_wallet_bytes` (native output can require up to
 4 MiB for reconciliation). Configuring a smaller output budget can make a
 successful signing result unavailable; the same recovery rules apply.
@@ -197,7 +215,7 @@ unresponsive owned process is terminated, then killed after a bounded grace
 period. Existing external processes are never signaled. Homes and public
 artifacts are preserved, including incomplete operations. `session.json` records
 binary/manifest pins, compiler entry/source hashes and observed identities;
-effective network configurations record the chosen ephemeral endpoints.
+effective network configurations record the configured and chosen endpoints.
 
 ## Test and promotion gates
 
@@ -210,3 +228,11 @@ isolated homes. Required evidence is two live isolated nodes completing native
 wallet create/register, funding, immature refusal/maturity, signed payment,
 authoritative synchronization and reconciliation, followed by complete owned
 process cleanup. Passing fake-process tests alone does not establish that flow.
+
+
+This controller change is covered by fake process/FD routing and mocked payment
+contract checks, including explicit numeric endpoints and mining with no wire.
+These checks do not establish native relay or consensus acceptance. Promotion
+requires a fresh A → B → C native run with C mining its relayed pool, consistent
+schema-2 private profile identities, wallet confirmation history, and restart
+reconciliation using exact recorded binary hashes.

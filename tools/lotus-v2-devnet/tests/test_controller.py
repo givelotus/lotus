@@ -250,7 +250,7 @@ def fake_wallet(mode, report, native_argv):
             "sign-setup",
             "sign-interrupt",
         )
-        and command == "sign"
+        and command in ("sign", "pay")
     ):
         home.mkdir(mode=0o700, parents=True, exist_ok=True)
         fd = os.open(pending_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
@@ -293,6 +293,14 @@ def fake_wallet(mode, report, native_argv):
                 "tip": None,
                 "outpoint": outpoint,
             }
+            if command == "broadcast":
+                request = {"id": "wallettransaction-" + str(n),
+                           "command": "submittransaction", "wire": "ab",
+                           "expected_tip": TXID}
+            elif command == "status":
+                request = {"id": "wallettransaction-" + str(n),
+                           "command": "transactionstatus", "txid": TXID,
+                           "txhash": TXHASH, "wire": "ab"}
             channel.sendall(json.dumps(request, separators=(",", ":")).encode() + b"\n")
             response = read_line(channel)
             if (
@@ -325,7 +333,7 @@ def fake_wallet(mode, report, native_argv):
         if mode == "private-truncated":
             raw = raw[:-1]
         if mode == "private-oversized":
-            raw = b"x" * 1025
+            raw = b"x" * (LIMITS["max_line_bytes"] + 1)
         if mode == "private-coalesced":
             raw += raw
         if mode.startswith("private-cap-"):
@@ -333,7 +341,7 @@ def fake_wallet(mode, report, native_argv):
             raw = json.dumps(request, separators=(",", ":")).encode()
             raw += b" " * (target - len(raw) - 1) + b"\n"
         if mode == "private-exact-no-newline":
-            raw = b"x" * 1024
+            raw = b"x" * LIMITS["max_line_bytes"]
         channel.sendall(raw)
         if mode == "private-truncated":
             channel.shutdown(socket.SHUT_WR)
@@ -582,6 +590,17 @@ class WalletTransportTests(ControllerCase):
         marker = b"controller-fake-secret"
         self.assertNotIn(marker, self.report.read_bytes())
         self.assertNotIn(marker.decode(), captured.getvalue())
+
+    def test_private_transaction_provider_routing(self):
+        node = self.node("normal")
+        wallet = self.wallet(node, "route")
+        for command in ("broadcast", "status"):
+            result = wallet.invoke(command, {"txid": TXID})
+            self.assertEqual(result["result"], "success")
+        routed = [item["request"]["command"] for item in self.events()
+                  if item["kind"] == "node-request"]
+        self.assertEqual(routed, ["submittransaction", "submittransaction",
+                                  "transactionstatus", "transactionstatus"])
 
     def test_private_and_public_frame_failures(self):
         node = self.node()

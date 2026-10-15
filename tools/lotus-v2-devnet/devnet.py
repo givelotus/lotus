@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run a foreground, explicitly configured isolated Lotus V2 playground."""
+"""Run a foreground, explicitly configured private Lotus V2 testnet playground."""
 import argparse
 import getpass
 import hmac

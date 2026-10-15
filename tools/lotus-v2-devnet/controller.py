@@ -80,6 +80,16 @@ def hexadecimal(value, size=32):
     return value
 
 
+def endpoint(value, listen=False):
+    exact(value, ("address", "port"))
+    require(isinstance(value["address"], str), "numeric IP address required")
+    address = ipaddress.ip_address(value["address"])
+    require(str(address) == value["address"], "canonical numeric IP address required")
+    require(not address.is_multicast and (listen or not address.is_unspecified),
+            "unicast endpoint required")
+    integer(value["port"], 0 if listen else 1, 65535)
+
+
 def decimal(value):
     require(
         isinstance(value, str) and re.fullmatch(r"0|[1-9][0-9]*", value),
@@ -289,16 +299,11 @@ def _load_config(path):
             "network schema/policy",
         )
         exact(network["listen"], ("address", "port"))
-        require(
-            ipaddress.ip_address(network["listen"]["address"]).is_loopback
-            and type(network["listen"]["port"]) is int
-            and network["listen"]["port"] == 0,
-            "isolated loopback ephemeral listener required",
-        )
-        require(
-            network["connect"] == [],
-            "use explicit connect_to aliases, not existing endpoints",
-        )
+        endpoint(network["listen"], listen=True)
+        require(isinstance(network["connect"], list) and len(network["connect"]) <= 64,
+                "bounded explicit peer endpoints required")
+        for peer in network["connect"]:
+            endpoint(peer)
         hexadecimal(network["magic"], 4)
         require(
             magic is None or magic == network["magic"],
@@ -579,6 +584,33 @@ class WalletProcess:
         )
         self.node, self.limits = node, limits
 
+    @staticmethod
+    def _validate_provider_request(request):
+        require(isinstance(request, dict), "wallet provider object", "protocol_error")
+        command = request.get("command")
+        shapes = {
+            "walletcontext": ("id", "command", "tip", "outpoint"),
+            "submittransaction": ("id", "command", "wire", "expected_tip"),
+            "transactionstatus": ("id", "command", "txid", "txhash", "wire"),
+        }
+        require(command in shapes, "wallet private command", "protocol_error")
+        exact(request, shapes[command])
+        require(isinstance(request["id"], str) and
+                re.fullmatch(r"[A-Za-z][A-Za-z0-9_-]{0,63}", request["id"]),
+                "wallet private id", "protocol_error")
+        for field in ("tip", "expected_tip", "txid", "txhash"):
+            if field in request and request[field] is not None:
+                hexadecimal(request[field])
+        if "wire" in request:
+            require(isinstance(request["wire"], str) and
+                    re.fullmatch(r"(?:[0-9a-f]{2})+", request["wire"]) and
+                    len(request["wire"]) <= 2 * 1048576,
+                    "wallet wire capacity/encoding", "protocol_error")
+        if request.get("outpoint") is not None:
+            exact(request["outpoint"], ("txid", "index"))
+            hexadecimal(request["outpoint"]["txid"])
+            integer(request["outpoint"]["index"], 0, 0xFFFFFFFF)
+
     def invoke(self, command, publicrequest, passphrase=None, deadline=None):
         try:
             return self._invoke(command, publicrequest, passphrase, deadline)
@@ -600,6 +632,9 @@ class WalletProcess:
                 "info",
                 "pending",
                 "export",
+                "pay",
+                "broadcast",
+                "status",
             ),
             "wallet command",
         )
@@ -676,7 +711,7 @@ class WalletProcess:
                         else output if key.data == "stdout" else errors
                     )
                     cap = (
-                        1024
+                        min(2098176, self.limits["max_line_bytes"])
                         if key.data == "private"
                         else (
                             self.limits["max_wallet_bytes"]
@@ -718,30 +753,15 @@ class WalletProcess:
                     if key.data == "private" and b"\n" in private:
                         line, _, tail = private.partition(b"\n")
                         require(
-                            not tail and len(line) + 1 <= 1024,
+                            not tail and len(line) + 1 <= cap,
                             "wallet private framing",
                             "protocol_error",
                         )
                         private.clear()
                         request = decode_json(line)
-                        exact(request, ("id", "command", "tip", "outpoint"))
-                        require(
-                            isinstance(request["id"], str)
-                            and re.fullmatch(r"walletcontext-[0-9]+", request["id"]),
-                            "wallet private id",
-                            "protocol_error",
-                        )
-                        require(
-                            request["command"] == "walletcontext",
-                            "wallet private command",
-                            "protocol_error",
-                        )
-                        if request["tip"] is not None:
-                            hexadecimal(request["tip"])
-                        if request["outpoint"] is not None:
-                            exact(request["outpoint"], ("txid", "index"))
-                            hexadecimal(request["outpoint"]["txid"])
-                            integer(request["outpoint"]["index"], 0, 0xFFFFFFFF)
+                        self._validate_provider_request(request)
+                        if request["command"] == "walletcontext":
+                            require(len(line) + 1 <= 1024, "wallet context request capacity", "protocol_error")
                         response = self.node.request(
                             {k: v for k, v in request.items() if k != "id"}, deadline
                         )
@@ -760,7 +780,7 @@ class WalletProcess:
                 "wallet public result schema",
                 "protocol_error",
             )
-            if command == "sign" and value["result"] in (
+            if command in ("sign", "pay") and value["result"] in (
                 "setup_error",
                 "storage_error",
                 "outcome_unknown",
@@ -769,7 +789,7 @@ class WalletProcess:
                     "outcome_unknown",
                     "signing outcome requires pending/export recovery",
                 )
-            if command == "sign" and value["result"] == "success":
+            if command in ("sign", "pay") and value["result"] == "success":
                 for field in ("txid", "txhash", "digest"):
                     hexadecimal(value.get(field))
                 require(
@@ -792,7 +812,7 @@ class WalletProcess:
             )
             return value
         except BaseException as error:
-            if command == "sign" and process is not None:
+            if command in ("sign", "pay") and process is not None:
                 if isinstance(error, (KeyboardInterrupt, SystemExit)):
                     raise SigningInterrupted(
                         "sign outcome unknown; recover using wallet pending/export before any retry"
@@ -859,9 +879,11 @@ class Controller:
                 home.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
                 require(not home.exists(), "node home already exists")
                 network = dict(item["resolved_network"])
-                network["connect"] = [
+                network["connect"] = list(network["connect"]) + [
                     self.nodes[name].ready["listen"] for name in item["connect_to"]
                 ]
+                for peer in network["connect"]:
+                    endpoint(peer)
                 network_path = self.session / "network" / (item["name"] + ".json")
                 self._write_new(network_path, encode_json(network) + b"\n")
                 node = NodeProcess(
@@ -885,11 +907,12 @@ class Controller:
                     "inconclusive",
                 )
                 exact(ready.get("listen"), ("address", "port"))
-                require(
-                    ipaddress.ip_address(ready["listen"]["address"]).is_loopback,
-                    "node reported nonloopback listener",
-                )
+                endpoint(ready["listen"], listen=True)
                 integer(ready["listen"]["port"], 1, 65535)
+                require(ready["listen"]["address"] == network["listen"]["address"]
+                        and (network["listen"]["port"] == 0 or
+                             ready["listen"]["port"] == network["listen"]["port"]),
+                        "node listener differs from configured endpoint")
                 observed = tuple(
                     hexadecimal(ready.get(field))
                     for field in ("chain_id", "genesis_id", "profile_digest")
@@ -1124,7 +1147,18 @@ class Controller:
                 return value
             time.sleep(min(0.02, remaining(deadline)))
 
+    def _wait_pending(self, node, txid, deadline):
+        # Observe peer relay at the mining node; never inject wallet wire there.
+        while True:
+            value = node.request({"command": "transactionstatus", "txid": hexadecimal(txid)}, deadline)
+            require(value.get("ok") is True, "transaction status unavailable", "inconclusive")
+            if value.get("state") in ("pending", "confirmed"):
+                return value
+            require(value.get("state") != "conflicted", "transaction conflicted", "conflicted")
+            time.sleep(min(0.02, remaining(deadline)))
+
     def _mine(self, name, claim, clock, batches, transactions, deadline):
+        require(not transactions, "minepool accepts no injected transactions")
         info = self._invoke(name, "info", {}, deadline)
         require(
             info.get("payment_policy_registered") is True,
@@ -1143,13 +1177,12 @@ class Controller:
             else integer(int(clock), 0, (1 << 48) - 1)
         )
         request = {
-            "command": "mineblock",
+            "command": "minepool",
             "expected_parent": status["tip"],
             "time": when,
             "max_claim": decimal(claim),
             "coinbase_output": output,
             "coinbase_data": None,
-            "transactions": transactions,
             "start_nonce": "0",
             "max_attempts": 256,
         }
@@ -1225,6 +1258,9 @@ class Controller:
                         "abandon",
                         "prepare",
                         "sign",
+                        "pay",
+                        "broadcast",
+                        "status",
                     ),
                     "wallet command",
                 )
@@ -1259,7 +1295,7 @@ class Controller:
                 elif command in ("info", "reconcile", "pending"):
                     require(len(words) == 3, "wallet " + command + " NAME")
                     value = self._invoke(name, command, {}, deadline)
-                elif command in ("export", "abandon"):
+                elif command in ("export", "abandon", "broadcast", "status"):
                     require(len(words) == 4, "wallet " + command + " NAME TXID")
                     request = {"txid": hexadecimal(words[3])}
                     if command == "export":
@@ -1277,16 +1313,16 @@ class Controller:
                     recipient = dict(
                         info["payment_output"], value=decimal(options["amount"])
                     )
-                    if command == "sign":
+                    if command in ("sign", "pay"):
                         signing_wallet = name
                     value = self._invoke(
                         name,
                         command,
                         {"recipient": recipient, "fee": decimal(options["fee"])},
                         deadline,
-                        command == "sign",
+                        command in ("sign", "pay"),
                     )
-                    if command == "sign":
+                    if command in ("sign", "pay"):
                         self._save_wire(value)
                 return {
                     "ok": True,
@@ -1317,18 +1353,22 @@ class Controller:
                 signing_wallet = words[1]
                 signed = self._invoke(
                     words[1],
-                    "sign",
+                    "pay",
                     {"recipient": recipient, "fee": decimal(options["fee"])},
                     deadline,
                     True,
                 )
                 self._save_wire(signed)
+                require(signed.get("submission") in ("accepted", "duplicate"),
+                        "native transaction submission refused", signed.get("submission", "inconclusive"))
+                mining_node = self._wallet(options["mine-to"]).node
+                self._wait_pending(mining_node, signed["txid"], deadline)
                 mined = self._mine(
                     options["mine-to"],
                     options["claim"],
                     options["time"],
                     self._batches(options["batches"]),
-                    [signed["wire"]],
+                    [],
                     deadline,
                 )
                 # Only this native PaymentEngine's output ordering is assumed.
@@ -1340,12 +1380,17 @@ class Controller:
                     {"prev_txid": hexadecimal(signed["txid"]), "prev_index": 0},
                     deadline,
                 )
+                self._wait_active(self._wallet(words[1]).node, mined["block_id"], deadline)
                 receiver = self._invoke(options["to"], "reconcile", {}, deadline)
                 sender = self._invoke(words[1], "reconcile", {}, deadline)
+                history = self._invoke(words[1], "status", {"txid": signed["txid"]}, deadline)
+                require(history.get("state") == "confirmed" and history.get("block_id") == mined["block_id"],
+                        "wallet confirmation history unavailable", "inconclusive")
                 return {
                     "ok": True,
                     "result": "paid",
                     "signed": signed,
+                    "transaction_status": history,
                     "mined": mined,
                     "sender": sender,
                     "receiver": receiver,
