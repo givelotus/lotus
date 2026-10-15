@@ -43,3 +43,15 @@ Passing inherited crypto, serialization, storage, legacy block validation and ne
 Configure with `cmake -S . -B build-abc-audit -G Ninja -DCMAKE_BUILD_TYPE=Debug -DBUILD_CHRONIK=ON -DRust_TOOLCHAIN=1.93.0 -DPython_EXECUTABLE=/opt/homebrew/bin/python3.13 -DBUILD_QT=OFF -DBUILD_SEEDER=OFF`. Set `LIBCLANG_PATH=/Library/Developer/CommandLineTools/usr/lib` and `PYO3_PYTHON=/opt/homebrew/bin/python3.13`. Execute `ninja -C build-abc-audit -j2 -k0 check-bitcoin check-avalanche check-pow check-secp256k1 check-univalue check-leveldb`.
 
 [Evidence](evidence/v2-abc-unit-audit/) retains target discovery, baseline/fixed command logs, exact failures and per-suite verdicts. Large individual test logs remain in the isolated build; their filenames, sizes and SHA256 hashes are recorded. No controlled pinned-ABC comparison has yet been run, so inherited versus introduced attribution beyond direct fixture evidence remains pending.
+
+## Independent repair validation
+
+The original failed evidence above is retained. Ordered test fixture commits `d3f1adb136`, `bb53094b56`, `52bcb2521f`, `3f48611f5f`, `00c2352c02`, and `955dfa2ff8` were applied independently to the audit clone after the startup correction. Native audit HEAD is `32078e3833` (equivalent cherry-picks). These change test fixtures only.
+
+`net_tests`, `v2_wallet_tests`, and all 11 Avalanche suites pass. The validation fixture first progressed from `bad-cb-height` to `bad-txns-undersize` after correcting branch heights; preserving assembler minimum coinbase padding then made the full `validation_block_tests` pass. The two Chronik fixtures violated `AssertLockNotHeldInternal` by holding blanket `cs_main` locks across bridge/block-processing calls. Narrowing fixture lock scopes preserves production assertions; both complete Chronik suites now pass.
+
+After targeted reruns, all 147 default Boost runners have executed: 146 pass and only the source-path `getarg_tests` false positive remains. All 147 separately registered `upgrade-activated` runners also executed, with the same 146 passes and one environmental failure. An unchanged controlled full `getarg_tests` rerun using `-logsourcelocations=0` passes. The default aggregate is therefore still recorded FAILED under this path, with a passing controlled check of the actual sensitive-value behavior.
+
+The `upgrade-activated` CMake runners presently supply only a different test-suite name and logger configuration; they do not supply an activation override. Their results establish execution of those registered runners, not a distinct activation scenario.
+
+The coherent daemon supplied to the functional audit was built at `0fce47dc21`, before subsequent test-only commits; its passing startup result has that exact source provenance. No production behavior was changed by fixture repairs. Rust crate tests and a controlled pristine-ABC attribution comparison remain NOT RUN.
