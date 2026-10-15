@@ -44,6 +44,27 @@ contract Treasury<owner: PublicKey, digest: Bytes32, budget: Amount> {
     function reveal(preimage: Bytes32, value: Amount, fee: Amount) { require(opens(preimage, digest)); require(paid(value, fee, budget)); }
 }`;
 
+test('an imported statement helper inlines like the same flattened helper', async () => {
+  const { base, dir } = copy();
+  try {
+    const body = `package function authorized(sig: Signature, owner: PublicKey): Bool {
+    let ok: Bool = checksig(sig, owner);
+    require(ok);
+    return ok;
+}
+`;
+    edit(dir, 'src/policy.lotus', source => source.replace(/package function authorized[\s\S]*$/, body), true);
+    const artifact = (await compilePackage(dir, options)).artifact;
+    const flat = flattened.replace(
+      'function authorized(sig: Signature, owner: PublicKey): Bool { return checksig(sig, owner); }',
+      'function authorized(sig: Signature, owner: PublicKey): Bool { let ok: Bool = checksig(sig, owner); require(ok); return ok; }');
+    const single = compileContract(flat, options);
+    assert.deepEqual(artifact.methods.map(method => [method.name, method.scriptHex]), single.methods.map(method => [method.name, method.scriptHex]));
+    assert.ok(artifact.methods.find(method => method.name === 'spend').staticResources.helperExpansions > 0);
+    assert.ok(artifact.methods.find(method => method.name === 'spend').sourceMap.some(entry => entry.expandedFrom && entry.source.module === 'app@0.1.0/policy'));
+  } finally { rmSync(base, { recursive: true, force: true }); }
+});
+
 test('diamond package builds offline, parses each module identity once and matches a flattened single file', async () => {
   const { artifact, trace, parses } = await compilePackage(fixture, options);
   assert.deepEqual(Object.values(parses), Object.values(parses).map(() => 1));

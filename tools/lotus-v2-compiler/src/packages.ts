@@ -12,7 +12,7 @@ import { join, relative, sep } from 'node:path';
 import { bytes, concat, cs, hex, tagged, type Span } from './compiler.js';
 import { CompileError, SourceManager, diagnostic } from './diagnostics.js';
 import { compileLinkedProgramAsync, parseModuleSource, type CompileOptions, type Contract, type ContractArtifact, type Expr, type Helper,
-  type ImportDecl, type Method, type Param, type Program, type SchedulerEvent, type Stmt } from './generic.js';
+  type HelperStmt, type ImportDecl, type Method, type Param, type Program, type SchedulerEvent, type Stmt } from './generic.js';
 import { assertPortableName } from './names.js';
 import { PromiseScheduler } from './scheduler.js';
 import { parseTomlSubset, type TomlValue } from './toml-subset.js';
@@ -442,10 +442,15 @@ export async function compilePackage(projectDir: string, options: PackageCompile
     };
     const stmt = (s: Stmt): Stmt => ({ ...s, span: span(s.span), ...(s.expr ? { expr: expr(s.expr) } : {}),
       ...(s.then ? { then: s.then.map(stmt) } : {}), ...(s.otherwise ? { otherwise: s.otherwise.map(stmt) } : {}) });
+    const helperStmt = (s: HelperStmt): HelperStmt => s.kind === 'let'
+      ? { ...s, span: span(s.span), nameSpan: span(s.nameSpan), expr: expr(s.expr) }
+      : s.kind === 'if'
+        ? { ...s, span: span(s.span), expr: expr(s.expr), then: s.then.map(helperStmt), otherwise: s.otherwise.map(helperStmt) }
+        : { ...s, span: span(s.span), expr: expr(s.expr) };
     const param = (p: Param): Param => ({ ...p, span: span(p.span) });
     for (const helper of node.program.helpers.values()) {
       const name = canonical(node, helper.name);
-      helpers.set(name, { ...helper, name, params: helper.params.map(param), body: expr(helper.body), span: span(helper.span) });
+      helpers.set(name, { ...helper, name, params: helper.params.map(param), body: helper.body.map(helperStmt), span: span(helper.span) });
     }
     if (node.isEntry) for (const contract of node.program.contracts.values())
       contracts.set(contract.name, { ...contract, params: contract.params.map(param), span: span(contract.span),
