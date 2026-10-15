@@ -1,0 +1,1062 @@
+From f7a5488d0debc74a086e64b52d78522805a12892 Mon Sep 17 00:00:00 2001
+From: Shammah Chancellor <shammah.chancellor@notvalid.com>
+Date: Wed, 14 Oct 2026 22:47:08 -0700
+Subject: [PATCH] Connect and disconnect a block of ordinary V2 transactions.
+
+Apply ordered ordinary transactions through the existing validator and
+incremental UTXO view, sum invocation cost, and roll the block back when
+the sum exceeds the profile cap. Disconnect restores the prior UTXO root
+and monetary record. This is a standalone model, not lotusd ConnectTip.
+---
+ src/lotus_v2/block.cpp                     | 400 ++++++++++++++++++++
+ src/lotus_v2/block.h                       |  82 +++++
+ src/lotus_v2/block_test/CMakeLists.txt     |  32 ++
+ src/lotus_v2/block_test/check_reference.py |  36 ++
+ src/lotus_v2/incremental_utxo.cpp          |  14 +
+ src/lotus_v2/incremental_utxo.h            |   2 +
+ src/lotus_v2/test_block.cpp                | 410 +++++++++++++++++++++
+ 7 files changed, 976 insertions(+)
+ create mode 100644 src/lotus_v2/block.cpp
+ create mode 100644 src/lotus_v2/block.h
+ create mode 100644 src/lotus_v2/block_test/CMakeLists.txt
+ create mode 100644 src/lotus_v2/block_test/check_reference.py
+ create mode 100644 src/lotus_v2/test_block.cpp
+
+diff --git a/src/lotus_v2/block.cpp b/src/lotus_v2/block.cpp
+new file mode 100644
+index 000000000..8056b3a64
+--- /dev/null
++++ b/src/lotus_v2/block.cpp
+@@ -0,0 +1,400 @@
++// Copyright (c) 2026 The Lotus developers
++#include "block.h"
++
++#include <limits>
++#include <stdexcept>
++#include <utility>
++
++namespace lotus::v2 {
++namespace {
++constexpr uint32_t SNAPSHOT_COIN_CAP = 65535;
++
++bool SameMonetary(const MonetaryState &a, const MonetaryState &b) {
++    return a.bootstrap_reserve == b.bootstrap_reserve &&
++           a.tail_subsidy == b.tail_subsidy && a.prev_work == b.prev_work &&
++           a.ema_block_cost == b.ema_block_cost;
++}
++
++MonetaryInteger WideToInteger(VmCostUnits value) {
++    MonetaryInteger out = 0;
++    for (int byte = 0; byte < 16; ++byte) {
++        out += MonetaryInteger(static_cast<unsigned>(
++                   static_cast<uint8_t>(value >> (8 * byte))))
++               << (8 * byte);
++    }
++    return out;
++}
++
++MonetaryInteger WorkOf(const Hash &work) {
++    MonetaryInteger value = 0;
++    for (size_t i = work.size(); i > 0; --i) {
++        value <<= 8;
++        value += work[i - 1];
++    }
++    return value;
++}
++
++bool ViewAgrees(const DevelopmentUtxoView &view, const IncrementalUtxoSet &utxo,
++                std::string &error) {
++    UtxoSet scalar;
++    for (const auto &entry : view) {
++        if (entry.first != entry.second.outpoint ||
++            !scalar.Insert(entry.second)) {
++            error = "development view is not a utxo set";
++            return false;
++        }
++    }
++    if (scalar.Size() != utxo.Size() || scalar.Root() != utxo.Root()) {
++        error = "incremental utxo view diverges from development view";
++        return false;
++    }
++    return true;
++}
++
++void ReverseApplied(DevelopmentUtxoView &view,
++                    const std::vector<Coin> &removed,
++                    const OrdinaryCandidateEffects &effects) {
++    for (const Coin &coin : effects.created) view.erase(coin.outpoint);
++    for (const Coin &coin : removed) view.emplace(coin.outpoint, coin);
++}
++
++bool PutU32(std::vector<uint8_t> &out, uint32_t value) {
++    for (int byte = 0; byte < 4; ++byte)
++        out.push_back(static_cast<uint8_t>(value >> (8 * byte)));
++    return true;
++}
++
++bool TakeU32(const std::vector<uint8_t> &bytes, size_t &offset, uint32_t &value) {
++    if (offset > bytes.size() || bytes.size() - offset < 4) return false;
++    value = 0;
++    for (int byte = 0; byte < 4; ++byte)
++        value |= uint32_t(bytes[offset + byte]) << (8 * byte);
++    offset += 4;
++    return true;
++}
++
++uint64_t ReadLE(const uint8_t *data, unsigned width) {
++    uint64_t value = 0;
++    for (unsigned i = 0; i < width; ++i) value |= uint64_t(data[i]) << (8 * i);
++    return value;
++}
++
++bool ReadCompact(const uint8_t *data, size_t size, size_t &offset, uint64_t cap,
++                 uint64_t &value) {
++    if (offset >= size) return false;
++    const uint64_t lead = data[offset++];
++    if (lead < 253) {
++        value = lead;
++    } else {
++        const unsigned width = lead == 253 ? 2 : lead == 254 ? 4 : 8;
++        if (offset > size || size - offset < width) return false;
++        value = ReadLE(data + offset, width);
++        offset += width;
++        const uint64_t min_value = width == 2 ? 253 : width == 4 ? 65536ULL
++                                                                 : 4294967296ULL;
++        if (value < min_value) return false;
++    }
++    return value <= cap;
++}
++
++bool DecodeSnapshotCoin(const std::vector<uint8_t> &encoded, Coin &coin) {
++    if (encoded.size() > MAX_COIN_BYTES) return false;
++    size_t offset = 0;
++    const uint8_t *raw = encoded.data();
++    if (encoded.size() < 36) return false;
++    std::copy_n(raw, 32, coin.outpoint.tx_id.begin());
++    coin.outpoint.index = static_cast<uint32_t>(ReadLE(raw + 32, 4));
++    offset = 36;
++    uint64_t output_len = 0;
++    if (!ReadCompact(raw, encoded.size(), offset, MAX_COIN_BYTES, output_len) ||
++        offset > encoded.size() || encoded.size() - offset < output_len)
++        return false;
++    std::string error;
++    Output output;
++    if (!DecodeOutput(
++            std::vector<uint8_t>(raw + offset, raw + offset + output_len),
++            output, error))
++        return false;
++    offset += static_cast<size_t>(output_len);
++    if (encoded.size() - offset != 17) return false;
++    coin.output = std::move(output);
++    coin.creation_height = ReadLE(raw + offset, 8);
++    coin.creation_parent_mtp = ReadLE(raw + offset + 8, 8);
++    const uint8_t flag = raw[offset + 16];
++    if (flag > 1) return false;
++    coin.coinbase = flag == 1;
++    return true;
++}
++} // namespace
++
++bool DisconnectOrdinaryBlock(const OrdinaryBlockUndo &undo,
++                             DevelopmentUtxoView &view, IncrementalUtxoSet &utxo,
++                             MonetaryState &monetary, std::string &error) {
++    for (size_t i = undo.steps.size(); i-- > 0;) {
++        const OrdinaryUndoStep &step = undo.steps[i];
++        if (step.coin.output.branches.empty()) {
++            error = "undo coin is empty";
++            return false;
++        }
++        if (step.created) {
++            if (view.erase(step.coin.outpoint) != 1 ||
++                !utxo.Erase(step.coin.outpoint)) {
++                error = "undo missing created coin";
++                return false;
++            }
++        } else if (!view.emplace(step.coin.outpoint, step.coin).second ||
++                   !utxo.Insert(step.coin)) {
++            error = "undo cannot restore spent coin";
++            return false;
++        }
++    }
++    monetary = undo.prior_monetary;
++    if (EncodeMonetaryState(monetary) != undo.prior_monetary_bytes) {
++        error = "undo did not restore monetary root";
++        return false;
++    }
++    if (!ViewAgrees(view, utxo, error)) return false;
++    if (utxo.Root() != undo.prior_utxo_root) {
++        error = "undo did not restore utxo root";
++        return false;
++    }
++    error.clear();
++    return true;
++}
++
++bool ConnectOrdinaryBlock(const std::vector<Transaction> &transactions,
++                          const OrdinaryParentContext &parent,
++                          const OrdinaryCandidateProfile &profile,
++                          const MonetaryProfile &monetary_profile,
++                          DevelopmentUtxoView &view, IncrementalUtxoSet &utxo,
++                          MonetaryState &monetary,
++                          OrdinaryBlockConnected &connected,
++                          std::string &error) {
++    if (parent.header.height == std::numeric_limits<uint64_t>::max() ||
++        profile.candidate_height != parent.header.height + 1 ||
++        profile.parent_mtp != parent.header.time ||
++        parent.header.time > MAX_TIME) {
++        error = "parent header context";
++        return false;
++    }
++    if (!SameMonetary(monetary, parent.monetary)) {
++        error = "parent monetary context";
++        return false;
++    }
++    if (!ViewAgrees(view, utxo, error)) return false;
++    if (StateRoot(parent.chain_id, parent.header.height, utxo.Root(),
++                  monetary) != parent.header.state_root) {
++        error = "parent state root";
++        return false;
++    }
++
++    OrdinaryBlockUndo undo;
++    undo.prior_monetary = monetary;
++    undo.prior_utxo_root = utxo.Root();
++    undo.prior_monetary_bytes = EncodeMonetaryState(monetary);
++    auto rollback = [&](std::string &why) {
++        std::string undo_error;
++        if (!DisconnectOrdinaryBlock(undo, view, utxo, monetary, undo_error)) {
++            why += "; undo failed: ";
++            why += undo_error;
++        }
++    };
++
++    VmCostUnits invocation_cost = 0;
++    std::vector<MonetaryOrdinaryTx> accounted;
++    accounted.reserve(transactions.size());
++    for (const Transaction &tx : transactions) {
++        OrdinaryCandidateEffects preview;
++        if (!CheckOrdinaryCandidate(tx, profile, parent.chain_id, view, preview,
++                                    error)) {
++            rollback(error);
++            return false;
++        }
++        std::vector<Coin> removed;
++        removed.reserve(preview.consumed.size());
++        for (const Outpoint &outpoint : preview.consumed) {
++            const auto found = view.find(outpoint);
++            if (found == view.end()) {
++                error = "spend disappeared";
++                rollback(error);
++                return false;
++            }
++            removed.push_back(found->second);
++        }
++        OrdinaryCandidateEffects effects;
++        if (!ApplyOrdinaryCandidate(tx, profile, parent.chain_id, view, effects,
++                                    error)) {
++            rollback(error);
++            return false;
++        }
++        size_t erased = 0;
++        for (; erased < removed.size(); ++erased) {
++            if (!utxo.Erase(removed[erased].outpoint)) break;
++        }
++        size_t inserted = 0;
++        bool staged = erased == removed.size();
++        if (staged) {
++            for (; inserted < effects.created.size(); ++inserted) {
++                if (!utxo.Insert(effects.created[inserted])) break;
++            }
++            staged = inserted == effects.created.size();
++        }
++        if (!staged) {
++            for (size_t i = inserted; i-- > 0;)
++                utxo.Erase(effects.created[i].outpoint);
++            for (size_t i = erased; i-- > 0;) utxo.Insert(removed[i]);
++            ReverseApplied(view, removed, effects);
++            error = "incremental utxo update failed";
++            rollback(error);
++            return false;
++        }
++        for (const Coin &coin : removed)
++            undo.steps.push_back(OrdinaryUndoStep{false, coin});
++        for (const Coin &coin : effects.created)
++            undo.steps.push_back(OrdinaryUndoStep{true, coin});
++        if (effects.invocation_cost > ~VmCostUnits(0) - invocation_cost) {
++            error = "block invocation cost overflow";
++            rollback(error);
++            return false;
++        }
++        invocation_cost += effects.invocation_cost;
++        if (invocation_cost > profile.max_total_invocation_cost) {
++            error = "block invocation cost over cap";
++            rollback(error);
++            return false;
++        }
++        try {
++            accounted.push_back(AccountValidatedOrdinary(
++                tx, effects, profile.transaction, monetary_profile));
++        } catch (const std::invalid_argument &failure) {
++            error = failure.what();
++            rollback(error);
++            return false;
++        }
++    }
++
++    MonetaryTransition transition;
++    try {
++        transition = AdvanceMonetary(
++            monetary_profile, undo.prior_monetary, WorkOf(monetary.prev_work),
++            accounted, MonetaryInteger{0}, MonetaryInteger{0}, 0, 0,
++            WideToInteger(invocation_cost), WideToInteger(invocation_cost));
++    } catch (const std::invalid_argument &failure) {
++        error = failure.what();
++        rollback(error);
++        return false;
++    }
++
++    monetary = transition.state;
++    OrdinaryBlockConnected staged;
++    staged.utxo_root = utxo.Root();
++    staged.monetary_bytes = EncodeMonetaryState(monetary);
++    staged.state_root = StateRoot(parent.chain_id, profile.candidate_height,
++                                   staged.utxo_root, monetary);
++    staged.monetary = std::move(transition);
++    staged.undo = std::move(undo);
++    staged.invocation_cost = invocation_cost;
++    if (!ViewAgrees(view, utxo, error)) {
++        std::string ignored;
++        DisconnectOrdinaryBlock(staged.undo, view, utxo, monetary, ignored);
++        return false;
++    }
++    connected = std::move(staged);
++    error.clear();
++    return true;
++}
++
++bool WriteInMemorySnapshot(const DevelopmentUtxoView &view,
++                           const MonetaryState &monetary,
++                           std::vector<uint8_t> &bytes, std::string &error) {
++    if (view.size() > SNAPSHOT_COIN_CAP) {
++        error = "snapshot coin cap";
++        return false;
++    }
++    std::vector<uint8_t> encoded;
++    encoded.push_back('L');
++    encoded.push_back('V');
++    encoded.push_back('2');
++    encoded.push_back('S');
++    PutU32(encoded, static_cast<uint32_t>(view.size()));
++    for (const auto &entry : view) {
++        if (entry.first != entry.second.outpoint) {
++            error = "snapshot coin outpoint mismatch";
++            return false;
++        }
++        std::vector<uint8_t> coin;
++        if (!EncodeCoin(entry.second, coin) || coin.size() > MAX_COIN_BYTES) {
++            error = "snapshot coin encoding";
++            return false;
++        }
++        PutU32(encoded, static_cast<uint32_t>(coin.size()));
++        encoded.insert(encoded.end(), coin.begin(), coin.end());
++    }
++    const auto record = EncodeMonetaryState(monetary);
++    encoded.insert(encoded.end(), record.begin(), record.end());
++    bytes = std::move(encoded);
++    error.clear();
++    return true;
++}
++
++bool LoadInMemorySnapshot(const std::vector<uint8_t> &bytes,
++                          DevelopmentUtxoView &view, IncrementalUtxoSet &utxo,
++                          MonetaryState &monetary, std::string &error) {
++    if (bytes.size() < 4 + 4 + 56 || bytes[0] != 'L' || bytes[1] != 'V' ||
++        bytes[2] != '2' || bytes[3] != 'S') {
++        error = "snapshot header";
++        return false;
++    }
++    size_t offset = 4;
++    uint32_t count = 0;
++    if (!TakeU32(bytes, offset, count) || count > SNAPSHOT_COIN_CAP) {
++        error = "snapshot coin count";
++        return false;
++    }
++    DevelopmentUtxoView loaded_view;
++    IncrementalUtxoSet loaded_utxo;
++    for (uint32_t i = 0; i < count; ++i) {
++        uint32_t length = 0;
++        if (!TakeU32(bytes, offset, length) || length == 0 ||
++            length > MAX_COIN_BYTES || offset > bytes.size() ||
++            bytes.size() - offset < length) {
++            error = "snapshot coin frame";
++            return false;
++        }
++        Coin coin;
++        if (!DecodeSnapshotCoin(
++                std::vector<uint8_t>(bytes.begin() + offset,
++                                     bytes.begin() + offset + length),
++                coin) ||
++            !loaded_view.emplace(coin.outpoint, coin).second ||
++            !loaded_utxo.Insert(coin)) {
++            error = "snapshot coin rejected";
++            return false;
++        }
++        offset += length;
++    }
++    if (bytes.size() - offset != 56) {
++        error = "snapshot monetary frame";
++        return false;
++    }
++    MonetaryState loaded_monetary;
++    try {
++        loaded_monetary = DecodeMonetaryState(
++            std::vector<uint8_t>(bytes.begin() + offset, bytes.end()));
++    } catch (const std::invalid_argument &failure) {
++        error = failure.what();
++        return false;
++    }
++    std::string agree;
++    if (!ViewAgrees(loaded_view, loaded_utxo, agree)) {
++        error = agree;
++        return false;
++    }
++    view.swap(loaded_view);
++    utxo = std::move(loaded_utxo);
++    monetary = loaded_monetary;
++    error.clear();
++    return true;
++}
++
++} // namespace lotus::v2
+diff --git a/src/lotus_v2/block.h b/src/lotus_v2/block.h
+new file mode 100644
+index 000000000..fa3986358
+--- /dev/null
++++ b/src/lotus_v2/block.h
+@@ -0,0 +1,82 @@
++// Copyright (c) 2026 The Lotus developers
++// Standalone ordinary-block connect/disconnect model. Not lotusd ConnectTip,
++// not a disk chainstate, and not mining, ASERT, or coinbase consensus.
++#ifndef LOTUS_V2_BLOCK_H
++#define LOTUS_V2_BLOCK_H
++
++#include "incremental_utxo.h"
++#include "monetary.h"
++
++#include <array>
++#include <string>
++#include <vector>
++
++namespace lotus::v2 {
++
++// Parent header plus the monetary record committed at that header. The child
++// block header, PoW, and coinbase transaction are not represented.
++struct OrdinaryParentContext {
++    Header header;
++    ChainId chain_id{};
++    MonetaryState monetary{};
++};
++
++// One UTXO change, in application order. created=false is a coin removed by
++// a spend; created=true is a coin inserted for a non-burn output.
++struct OrdinaryUndoStep {
++    bool created = false;
++    Coin coin;
++};
++
++struct OrdinaryBlockUndo {
++    std::vector<OrdinaryUndoStep> steps;
++    MonetaryState prior_monetary{};
++    Hash prior_utxo_root{};
++    std::array<uint8_t, 56> prior_monetary_bytes{};
++};
++
++// monetary is AdvanceMonetary's result for these ordinary transactions with
++// a zero coinbase payout and the parent work integer. This slice does not
++// decide a miner claim or a new work value.
++struct OrdinaryBlockConnected {
++    Hash utxo_root{};
++    Hash state_root{};
++    std::array<uint8_t, 56> monetary_bytes{};
++    MonetaryTransition monetary{};
++    OrdinaryBlockUndo undo;
++    VmCostUnits invocation_cost{};
++};
++
++// Apply transactions in order. The running invocation-cost sum rejects when
++// it exceeds profile.max_total_invocation_cost; equal to the cap is accepted.
++// Any rejection leaves the view, incremental root, and monetary bytes as
++// they were. profile.candidate_height must be parent.header.height+1 and
++// profile.parent_mtp must be parent.header.time. The parent state_root must
++// already commit the supplied UTXO root and monetary record.
++bool ConnectOrdinaryBlock(const std::vector<Transaction> &transactions,
++                          const OrdinaryParentContext &parent,
++                          const OrdinaryCandidateProfile &profile,
++                          const MonetaryProfile &monetary_profile,
++                          DevelopmentUtxoView &view, IncrementalUtxoSet &utxo,
++                          MonetaryState &monetary,
++                          OrdinaryBlockConnected &connected,
++                          std::string &error);
++
++// Reverse undo.steps, then restore the prior monetary record. Success leaves
++// the incremental UTXO root and the 56-byte monetary record byte-for-byte.
++bool DisconnectOrdinaryBlock(const OrdinaryBlockUndo &undo,
++                             DevelopmentUtxoView &view, IncrementalUtxoSet &utxo,
++                             MonetaryState &monetary, std::string &error);
++
++// In-memory coin image plus the 56-byte monetary record. Same process only.
++// Not a database, snapshot trust model, or undo log. Reload rebuilds the
++// incremental root from the encoded coins.
++bool WriteInMemorySnapshot(const DevelopmentUtxoView &view,
++                           const MonetaryState &monetary,
++                           std::vector<uint8_t> &bytes, std::string &error);
++bool LoadInMemorySnapshot(const std::vector<uint8_t> &bytes,
++                          DevelopmentUtxoView &view, IncrementalUtxoSet &utxo,
++                          MonetaryState &monetary, std::string &error);
++
++} // namespace lotus::v2
++#endif
+diff --git a/src/lotus_v2/block_test/CMakeLists.txt b/src/lotus_v2/block_test/CMakeLists.txt
+new file mode 100644
+index 000000000..ca46ab1af
+--- /dev/null
++++ b/src/lotus_v2/block_test/CMakeLists.txt
+@@ -0,0 +1,32 @@
++cmake_minimum_required(VERSION 3.18)
++project(lotus_v2_block_review LANGUAGES C CXX)
++set(CMAKE_CXX_STANDARD 20)
++set(CMAKE_CXX_STANDARD_REQUIRED ON)
++find_package(OpenSSL REQUIRED COMPONENTS Crypto)
++find_path(LOTUS_BOOST_INCLUDE boost/multiprecision/cpp_int.hpp
++    PATHS /opt/homebrew/opt/boost/include)
++if(NOT LOTUS_BOOST_INCLUDE)
++    message(FATAL_ERROR "Set LOTUS_BOOST_INCLUDE to Boost headers")
++endif()
++get_filename_component(LOTUS_SRC "${CMAKE_CURRENT_SOURCE_DIR}/../.." ABSOLUTE)
++if(NOT DEFINED LOTUS_SECP_LIBRARY OR NOT EXISTS "${LOTUS_SECP_LIBRARY}")
++    message(FATAL_ERROR "Set LOTUS_SECP_LIBRARY to a locally built ABC libsecp256k1.a")
++endif()
++add_library(lotus_v2_block_blake3 STATIC
++    ../vendor/blake3/blake3.c
++    ../vendor/blake3/blake3_dispatch.c
++    ../vendor/blake3/blake3_portable.c)
++target_compile_definitions(lotus_v2_block_blake3 PRIVATE
++    BLAKE3_NO_SSE2 BLAKE3_NO_SSE41 BLAKE3_NO_AVX2 BLAKE3_NO_AVX512 BLAKE3_USE_NEON=0)
++add_executable(lotus_v2_block_test
++    ../output.cpp ../transaction.cpp ../commitment.cpp ../tagged_hash.cpp
++    ../signing.cpp ../vm.cpp ../sparse_state.cpp ../incremental_utxo.cpp
++    ../ordinary_validation.cpp ../monetary.cpp ../block.cpp ../test_block.cpp)
++target_include_directories(lotus_v2_block_test PRIVATE
++    "${LOTUS_SRC}/secp256k1/include" "${LOTUS_BOOST_INCLUDE}" ../vendor/blake3)
++target_link_libraries(lotus_v2_block_test PRIVATE
++    lotus_v2_block_blake3 OpenSSL::Crypto "${LOTUS_SECP_LIBRARY}")
++target_compile_options(lotus_v2_block_test PRIVATE
++    $<$<COMPILE_LANGUAGE:CXX>:-Wall;-Wextra;-Wpedantic;-Werror>)
++enable_testing()
++add_test(NAME lotus_v2_block_test COMMAND lotus_v2_block_test)
+diff --git a/src/lotus_v2/block_test/check_reference.py b/src/lotus_v2/block_test/check_reference.py
+new file mode 100644
+index 000000000..48aa26dfd
+--- /dev/null
++++ b/src/lotus_v2/block_test/check_reference.py
+@@ -0,0 +1,36 @@
++#!/usr/bin/env python3
++"""Differential ordinary-block roots and reject reasons.
++
++Usage: check_reference.py NATIVE_TEST_EXE PATH_TO_lotus-v2-reference
++The reference source is supplied explicitly; no source is copied into this tree.
++This compares a standalone model. It does not mean lotusd parsed or accepted a block.
++"""
++
++import subprocess
++import sys
++from pathlib import Path
++
++reference_root = Path(sys.argv[2]).resolve()
++sys.path.insert(0, str(reference_root))
++sys.path.insert(0, str(reference_root / "tests"))
++from test_block import reference_report  # noqa: E402
++
++expected = reference_report()
++result = subprocess.run([sys.argv[1], "--report"], text=True, capture_output=True, check=True)
++actual = {}
++for line in result.stdout.splitlines():
++    key, value = line.split(" ", 1)
++    actual[key] = value
++missing = [key for key in expected if key not in actual and key not in
++           ("over_root_unchanged", "bad_root_unchanged")]
++if missing:
++    raise SystemExit(f"native report missing {missing}")
++compared = 0
++for key, want in expected.items():
++    if key in ("over_root_unchanged", "bad_root_unchanged"):
++        continue
++    got = actual[key]
++    if got != want:
++        raise SystemExit(f"{key}: native {got} != python {want}")
++    compared += 1
++print(f"{compared} Python/native ordinary-block fields matched")
+diff --git a/src/lotus_v2/incremental_utxo.cpp b/src/lotus_v2/incremental_utxo.cpp
+index 43665aa95..2cc45817f 100644
+--- a/src/lotus_v2/incremental_utxo.cpp
++++ b/src/lotus_v2/incremental_utxo.cpp
+@@ -5,6 +5,7 @@
+ #include <utility>
+ #include <vector>
+ 
++
+ namespace lotus::v2 {
+ namespace {
+ bool KeyBit(const Hash &key, unsigned depth) {
+@@ -44,6 +45,19 @@ struct IncrementalUtxoSet::Node {
+ 
+ IncrementalUtxoSet::IncrementalUtxoSet() = default;
+ IncrementalUtxoSet::~IncrementalUtxoSet() = default;
++IncrementalUtxoSet::IncrementalUtxoSet(IncrementalUtxoSet &&other) noexcept
++    : root_(std::move(other.root_)), size_(other.size_) {
++    other.size_ = 0;
++}
++IncrementalUtxoSet &
++IncrementalUtxoSet::operator=(IncrementalUtxoSet &&other) noexcept {
++    if (this != &other) {
++        root_ = std::move(other.root_);
++        size_ = other.size_;
++        other.size_ = 0;
++    }
++    return *this;
++}
+ 
+ std::unique_ptr<IncrementalUtxoSet::Node>
+ IncrementalUtxoSet::MakeLeaf(const Coin &coin, const Hash &key,
+diff --git a/src/lotus_v2/incremental_utxo.h b/src/lotus_v2/incremental_utxo.h
+index 076fbd76e..65f526379 100644
+--- a/src/lotus_v2/incremental_utxo.h
++++ b/src/lotus_v2/incremental_utxo.h
+@@ -17,6 +17,8 @@ public:
+     ~IncrementalUtxoSet();
+     IncrementalUtxoSet(const IncrementalUtxoSet &) = delete;
+     IncrementalUtxoSet &operator=(const IncrementalUtxoSet &) = delete;
++    IncrementalUtxoSet(IncrementalUtxoSet &&) noexcept;
++    IncrementalUtxoSet &operator=(IncrementalUtxoSet &&) noexcept;
+ 
+     bool Insert(const Coin &coin);
+     bool Erase(const Outpoint &outpoint);
+diff --git a/src/lotus_v2/test_block.cpp b/src/lotus_v2/test_block.cpp
+new file mode 100644
+index 000000000..1f0df9c4b
+--- /dev/null
++++ b/src/lotus_v2/test_block.cpp
+@@ -0,0 +1,410 @@
++// Copyright (c) 2026 The Lotus developers
++// Standalone ordinary-block model. This does not connect a block in lotusd.
++#include "block.h"
++
++#include "commitment.h"
++#include "signing.h"
++
++#include <cstdint>
++#include <iostream>
++#include <stdexcept>
++#include <string>
++
++using namespace lotus::v2;
++
++namespace {
++void Check(bool ok, const std::string &message) {
++    if (!ok) throw std::runtime_error(message);
++}
++
++std::string Hex(const uint8_t *data, size_t size) {
++    static const char *digits = "0123456789abcdef";
++    std::string out(size * 2, '0');
++    for (size_t i = 0; i < size; ++i) {
++        out[2 * i] = digits[data[i] >> 4];
++        out[2 * i + 1] = digits[data[i] & 0xf];
++    }
++    return out;
++}
++std::string HexHash(const Hash &hash) { return Hex(hash.data(), hash.size()); }
++
++const std::vector<uint8_t> TRUE_SCRIPT{0x4e};
++const MonetaryProfile kMonetary{2, 3, 2, 4, 3, 5, 2, 2000, 3, 1000};
++
++OrdinaryCandidateProfile MakeProfile(VmCostUnits block_cap) {
++    OrdinaryCandidateProfile profile{
++        TxProfile{32, 32, 8, 512, 8, 8192, 64},
++        VmProfile{512, 8, 8192, 32, 32, 65536, 16, 100000},
++        VmCostProfile{}, 100, 50000, 2, 3, block_cap};
++    profile.vm_cost.max_invocation_cost = 1000000;
++    profile.vm_cost.structural_byte_cost = 1;
++    for (auto &opcode : profile.vm_cost.opcode) opcode = {1, 1, 1};
++    return profile;
++}
++
++Hash Chain() {
++    Hash chain{};
++    for (size_t i = 0; i < chain.size(); ++i) chain[i] = static_cast<uint8_t>(i);
++    return chain;
++}
++
++MonetaryState InitialMoney() {
++    MonetaryState money;
++    money.bootstrap_reserve = 9;
++    money.tail_subsidy = 200;
++    money.prev_work[0] = 9;
++    money.ema_block_cost = 4;
++    return money;
++}
++
++Coin MakeFunding(uint8_t tag, uint32_t index, uint64_t value, const Hash &branch) {
++    Coin coin;
++    coin.outpoint.tx_id[0] = tag;
++    coin.outpoint.index = index;
++    coin.output.flags = 0;
++    coin.output.value = value;
++    coin.output.branches = {branch};
++    coin.output.paths = {{0}};
++    coin.creation_height = 90;
++    coin.creation_parent_mtp = 49000;
++    coin.coinbase = false;
++    return coin;
++}
++
++Transaction Payment(const Outpoint &spent, uint64_t value) {
++    Transaction tx;
++    Input input;
++    input.prev_txid = spent.tx_id;
++    input.prev_index = spent.index;
++    input.sequence = UINT32_MAX;
++    input.flags = 1;
++    input.path_index = 0;
++    input.witnesses = {BranchWitness{TRUE_SCRIPT, {}, {}}};
++    tx.inputs.push_back(input);
++    Output output;
++    output.value = value;
++    output.branches = {BranchLeaf(TRUE_SCRIPT)};
++    output.paths = {{0}};
++    tx.outputs.push_back(output);
++    return tx;
++}
++
++struct World {
++    DevelopmentUtxoView view;
++    IncrementalUtxoSet utxo;
++    MonetaryState monetary = InitialMoney();
++    OrdinaryParentContext parent;
++    Hash branch = BranchLeaf(TRUE_SCRIPT);
++    Coin funding;
++    Coin other;
++    World() : funding(MakeFunding(0x71, 3, 20000, branch)),
++              other(MakeFunding(0x72, 1, 8000, branch)) {
++        Check(view.emplace(funding.outpoint, funding).second &&
++                  view.emplace(other.outpoint, other).second &&
++                  utxo.Insert(funding) && utxo.Insert(other),
++              "parent coins");
++        parent.chain_id = Chain();
++        parent.monetary = monetary;
++        parent.header.height = 99;
++        parent.header.time = 50000;
++        parent.header.version = 1;
++        parent.header.size = HEADER_SIZE;
++        parent.header.state_root =
++            StateRoot(parent.chain_id, parent.header.height, utxo.Root(), monetary);
++    }
++};
++
++struct Built {
++    Transaction first;
++    Transaction second;
++    Transaction third;
++    VmCostUnits one_cost{};
++    OrdinaryCandidateProfile profile;
++};
++
++Built BuildPayments(World &world) {
++    Built built;
++    built.first = Payment(world.funding.outpoint, 15000);
++    auto wide = MakeProfile(1000000);
++    OrdinaryCandidateEffects effects;
++    std::string error;
++    Check(CheckOrdinaryCandidate(built.first, wide, world.parent.chain_id,
++                                 world.view, effects, error),
++          "measure first payment: " + error);
++    // OP_1 charges a 16-byte numeric result plus one structural byte.
++    Check(effects.invocation_cost == 18 && effects.native_fee == 5000,
++          "unexpected first payment cost or fee");
++    built.one_cost = effects.invocation_cost;
++    built.profile = MakeProfile(built.one_cost * 2);
++    IdentityDigests first_id;
++    Check(ComputeIdentities(built.first, built.profile.transaction,
++                            world.parent.chain_id, first_id, error),
++          "first identity");
++    built.second = Payment(Outpoint{first_id.txid, 0}, 10000);
++    Check(CheckOrdinaryCandidate(built.second, wide, world.parent.chain_id,
++                                 world.view, effects, error) == false,
++          "second must be unspendable until the first is connected");
++    IdentityDigests second_id;
++    // The second identity does not depend on the parent view.
++    Check(ComputeIdentities(built.second, built.profile.transaction,
++                            world.parent.chain_id, second_id, error),
++          "second identity");
++    built.third = Payment(Outpoint{second_id.txid, 0}, 5000);
++    return built;
++}
++
++struct Report {
++    OrdinaryBlockConnected connected;
++    Hash parent_utxo{};
++    Hash parent_state{};
++    std::array<uint8_t, 56> parent_monetary{};
++    Hash undo_utxo{};
++    Hash undo_state{};
++    std::array<uint8_t, 56> undo_monetary{};
++    Hash snapshot_utxo{};
++    Hash snapshot_state{};
++    Hash over_cap_utxo{};
++    std::array<uint8_t, 56> over_cap_monetary{};
++    std::string over_cap;
++    std::string coinbase;
++    std::string mint;
++    std::string bad_second;
++    Hash bad_second_utxo{};
++    Hash txid1{};
++    Hash txid2{};
++    std::vector<uint8_t> tx1_core;
++    std::vector<uint8_t> tx1_output;
++};
++
++Report Run() {
++    Report report;
++    World world;
++    report.parent_utxo = world.utxo.Root();
++    report.parent_state = world.parent.header.state_root;
++    report.parent_monetary = EncodeMonetaryState(world.monetary);
++    Built built = BuildPayments(world);
++    std::string error;
++    Check(ConnectOrdinaryBlock({built.first, built.second}, world.parent,
++                               built.profile, kMonetary, world.view, world.utxo,
++                               world.monetary, report.connected, error),
++          "connect two dependent payments: " + error);
++    Check(report.connected.invocation_cost == built.one_cost * 2, "block cost");
++    Check(report.connected.monetary.total_fees == 10000 &&
++              report.connected.monetary.token_burn == 0 &&
++              report.connected.monetary.burned_fees == 5000 &&
++              report.connected.monetary.required_underclaim == 138 &&
++              report.connected.monetary.actual_underclaim == 5202 &&
++              report.connected.monetary.spendable_supply_delta == -10000 &&
++              report.connected.monetary.subsidy == 202 &&
++              report.connected.monetary.bootstrap_issued == 2 &&
++              report.connected.monetary.state.bootstrap_reserve == 7 &&
++              report.connected.monetary.state.tail_subsidy == 200 &&
++              report.connected.monetary.state.ema_block_cost == 12 &&
++              report.connected.monetary.state.prev_work[0] == 9,
++          "monetary delta");
++    Check(report.connected.utxo_root == world.utxo.Root() &&
++              report.connected.state_root ==
++                  StateRoot(world.parent.chain_id, 100, world.utxo.Root(),
++                            world.monetary) &&
++              report.connected.state_root != report.parent_state &&
++              world.view.count(world.funding.outpoint) == 0 &&
++              world.view.count(world.other.outpoint) == 1 &&
++              world.view.size() == 2,
++          "connected view");
++    const Outpoint second_out{[&] {
++        IdentityDigests ids;
++        Check(ComputeIdentities(built.second, built.profile.transaction,
++                                world.parent.chain_id, ids, error),
++              "connected second id");
++        report.txid2 = ids.txid;
++        return Outpoint{ids.txid, 0};
++    }()};
++    Check(world.view.count(second_out) == 1, "second payment output is live");
++    IdentityDigests first_id;
++    Check(ComputeIdentities(built.first, built.profile.transaction,
++                            world.parent.chain_id, first_id, error),
++          "report first id");
++    report.txid1 = first_id.txid;
++    Check(EncodeInputCore(built.first.inputs[0], built.profile.transaction,
++                          report.tx1_core, error) &&
++              EncodeOutput(built.first.outputs[0], report.tx1_output, error),
++          "report wires");
++
++    std::vector<uint8_t> image;
++    Check(WriteInMemorySnapshot(world.view, world.monetary, image, error),
++          "write snapshot");
++    Check(DisconnectOrdinaryBlock(report.connected.undo, world.view, world.utxo,
++                                  world.monetary, error),
++          "disconnect: " + error);
++    report.undo_utxo = world.utxo.Root();
++    report.undo_monetary = EncodeMonetaryState(world.monetary);
++    report.undo_state = StateRoot(world.parent.chain_id, 99, report.undo_utxo,
++                                  world.monetary);
++    Check(report.undo_utxo == report.parent_utxo &&
++              report.undo_monetary == report.parent_monetary &&
++              report.undo_state == report.parent_state,
++          "disconnect did not restore parent roots byte for byte");
++
++    DevelopmentUtxoView reloaded_view;
++    IncrementalUtxoSet reloaded_utxo;
++    MonetaryState reloaded_money;
++    Check(LoadInMemorySnapshot(image, reloaded_view, reloaded_utxo,
++                               reloaded_money, error),
++          "reload snapshot: " + error);
++    report.snapshot_utxo = reloaded_utxo.Root();
++    report.snapshot_state =
++        StateRoot(world.parent.chain_id, 100, report.snapshot_utxo, reloaded_money);
++    Check(report.snapshot_utxo == report.connected.utxo_root &&
++              report.snapshot_state == report.connected.state_root &&
++              EncodeMonetaryState(reloaded_money) ==
++                  report.connected.monetary_bytes,
++          "reloaded snapshot root mismatch");
++    Check(DisconnectOrdinaryBlock(report.connected.undo, reloaded_view,
++                                  reloaded_utxo, reloaded_money, error) &&
++              reloaded_utxo.Root() == report.parent_utxo,
++          "undo after reload");
++
++    World over;
++    Built over_built = BuildPayments(over);
++    OrdinaryBlockConnected discarded;
++    std::string over_error;
++    Check(!ConnectOrdinaryBlock(
++              {over_built.first, over_built.second, over_built.third},
++              over.parent, over_built.profile, kMonetary, over.view, over.utxo,
++              over.monetary, discarded, over_error),
++          "over-cap block was accepted");
++    report.over_cap = over_error;
++    report.over_cap_utxo = over.utxo.Root();
++    report.over_cap_monetary = EncodeMonetaryState(over.monetary);
++    Check(report.over_cap == "block invocation cost over cap" &&
++              report.over_cap_utxo == report.parent_utxo &&
++              report.over_cap_monetary == report.parent_monetary &&
++              over.view.count(over.funding.outpoint) == 1 &&
++              StateRoot(over.parent.chain_id, over.parent.header.height,
++                        over.utxo.Root(), over.monetary) == report.parent_state,
++          "over-cap block left partial state");
++
++    World coinbase_world;
++    Built coinbase_profile = BuildPayments(coinbase_world);
++    Transaction coinbase;
++    Input coinbase_input;
++    coinbase_input.sequence = UINT32_MAX;
++    coinbase_input.flags = 2;
++    coinbase.inputs.push_back(coinbase_input);
++    coinbase.outputs.push_back(coinbase_profile.first.outputs[0]);
++    std::string coinbase_error;
++    OrdinaryBlockConnected unused;
++    Check(!ConnectOrdinaryBlock({coinbase}, coinbase_world.parent,
++                                coinbase_profile.profile, kMonetary,
++                                coinbase_world.view, coinbase_world.utxo,
++                                coinbase_world.monetary, unused, coinbase_error),
++          "coinbase accepted");
++    report.coinbase = coinbase_error;
++    Check(coinbase_world.utxo.Root() == report.parent_utxo &&
++              EncodeMonetaryState(coinbase_world.monetary) ==
++                  report.parent_monetary,
++          "coinbase rejection mutated state");
++
++    World mint_world;
++    Built mint_built = BuildPayments(mint_world);
++    Transaction mint = mint_built.first;
++    Input mint_input;
++    mint_input.prev_txid[0] = 0x11;
++    mint_input.sequence = UINT32_MAX;
++    mint_input.flags = 3;
++    mint_input.witnesses = {BranchWitness{TRUE_SCRIPT, {}, {}}};
++    mint.inputs.push_back(mint_input);
++    std::string mint_error;
++    Check(!ConnectOrdinaryBlock({mint}, mint_world.parent, mint_built.profile,
++                                kMonetary, mint_world.view, mint_world.utxo,
++                                mint_world.monetary, unused, mint_error),
++          "mint accepted");
++    report.mint = mint_error;
++    Check(mint_world.utxo.Root() == report.parent_utxo &&
++              mint_world.view.count(mint_world.funding.outpoint) == 1,
++          "mint rejection mutated state");
++
++    World bad_world;
++    Built bad_built = BuildPayments(bad_world);
++    Transaction bad = Payment(Outpoint{Hash{}, 9}, 1000);
++    bad.inputs[0].prev_txid[0] = 0x99;
++    std::string bad_error;
++    Check(!ConnectOrdinaryBlock({bad_built.first, bad}, bad_world.parent,
++                                bad_built.profile, kMonetary, bad_world.view,
++                                bad_world.utxo, bad_world.monetary, unused,
++                                bad_error),
++          "bad second accepted");
++    report.bad_second = bad_error;
++    report.bad_second_utxo = bad_world.utxo.Root();
++    Check(bad_world.utxo.Root() == report.parent_utxo &&
++              bad_world.view.count(bad_world.funding.outpoint) == 1,
++          "invalid second left the first payment applied");
++    return report;
++}
++
++void PrintReport(const Report &report) {
++    const auto &m = report.connected.monetary;
++    std::cout << "invocation_cost " << static_cast<unsigned long long>(
++                     report.connected.invocation_cost)
++              << "\n"
++              << "total_fees " << m.total_fees << "\n"
++              << "token_burn " << m.token_burn << "\n"
++              << "burned_fees " << m.burned_fees << "\n"
++              << "required_underclaim " << m.required_underclaim << "\n"
++              << "actual_underclaim " << m.actual_underclaim << "\n"
++              << "spendable_supply_delta " << m.spendable_supply_delta << "\n"
++              << "subsidy " << m.subsidy << "\n"
++              << "bootstrap_issued " << m.bootstrap_issued << "\n"
++              << "reserve " << m.state.bootstrap_reserve << "\n"
++              << "tail " << m.state.tail_subsidy << "\n"
++              << "ema " << m.state.ema_block_cost << "\n"
++              << "work " << static_cast<unsigned>(m.state.prev_work[0]) << "\n"
++              << "parent_utxo " << HexHash(report.parent_utxo) << "\n"
++              << "parent_state " << HexHash(report.parent_state) << "\n"
++              << "parent_monetary "
++              << Hex(report.parent_monetary.data(), report.parent_monetary.size())
++              << "\n"
++              << "connected_utxo " << HexHash(report.connected.utxo_root) << "\n"
++              << "connected_state " << HexHash(report.connected.state_root) << "\n"
++              << "connected_monetary "
++              << Hex(report.connected.monetary_bytes.data(),
++                     report.connected.monetary_bytes.size())
++              << "\n"
++              << "undo_utxo " << HexHash(report.undo_utxo) << "\n"
++              << "undo_state " << HexHash(report.undo_state) << "\n"
++              << "undo_monetary "
++              << Hex(report.undo_monetary.data(), report.undo_monetary.size())
++              << "\n"
++              << "snapshot_utxo " << HexHash(report.snapshot_utxo) << "\n"
++              << "snapshot_state " << HexHash(report.snapshot_state) << "\n"
++              << "over_cap " << report.over_cap << "\n"
++              << "over_cap_utxo " << HexHash(report.over_cap_utxo) << "\n"
++              << "over_cap_monetary "
++              << Hex(report.over_cap_monetary.data(),
++                     report.over_cap_monetary.size())
++              << "\n"
++              << "coinbase " << report.coinbase << "\n"
++              << "mint " << report.mint << "\n"
++              << "bad_second " << report.bad_second << "\n"
++              << "bad_second_utxo " << HexHash(report.bad_second_utxo) << "\n"
++              << "txid1 " << HexHash(report.txid1) << "\n"
++              << "txid2 " << HexHash(report.txid2) << "\n"
++              << "tx1_core " << Hex(report.tx1_core.data(), report.tx1_core.size())
++              << "\n"
++              << "tx1_output "
++              << Hex(report.tx1_output.data(), report.tx1_output.size()) << "\n";
++}
++} // namespace
++
++int main(int argc, char **argv) {
++    try {
++        const bool report = argc == 2 && std::string(argv[1]) == "--report";
++        const Report result = Run();
++        if (report) PrintReport(result);
++        else std::cout << "ordinary block connect/disconnect checks passed\n";
++        return 0;
++    } catch (const std::exception &failure) {
++        std::cerr << failure.what() << '\n';
++        return 1;
++    }
++}
+-- 
+2.50.1 (Apple Git-155)
+

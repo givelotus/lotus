@@ -6,15 +6,15 @@ Updated October 14, 2026. Development plan; no genesis parameters are frozen and
 
 ## Source foundation and current status
 
-The current executable [V2 series](../patches/v2/series) contains 34 patches,
-`000`–`033`, on ABC master `1fb7db17c176cdea8a2c60d887891589382ee4e3`.
+The current executable [V2 series](../patches/v2/series) contains 35 patches,
+`000`–`034`, on ABC master `1fb7db17c176cdea8a2c60d887891589382ee4e3`.
 The [review packet](../candidates/v2-native-reviewed-20261014/README.md) records
 intermediate replay trees and focused validation through patch 032. That reviewed source tree is
 `507c91e64c205df7b38e77abff6ebe02fb99bffe`. It includes transaction framing,
 commitments, scalar and incremental UTXO models, signing, and a bounded native VM
 with explicit static accounting, plus a standalone ordinary-transaction validator, parameterized P05/P06/C16
 monetary arithmetic (029), and VM context introspection plus Merkle-proof
-opcodes (030), with root's field-size hint validation (031) and the signed compiler token merge in ordinary-validator tests (032). Patch 033 adds wide arithmetic and CHECKDATASIG execution. These remain isolated modules: daemon consensus,
+opcodes (030), with root's field-size hint validation (031) and the signed compiler token merge in ordinary-validator tests (032). Patch 033 adds wide arithmetic and CHECKDATASIG execution. Patch 034 adds an in-memory ordinary-block connect/undo model. It does not call lotusd `ConnectTip`, and lotusd has not accepted a V2 block. These remain isolated modules: daemon consensus,
 persistent chainstate, full transaction/block resource validation,
 and mining job integration are still outstanding.
 
@@ -130,4 +130,4 @@ The compiler plan also owns [V2-native fixture infrastructure](../../docs/plans/
 
 ## Next bounded work
 
-The coinbase-data and Frank appendix changes are specified. The reviewed 33-patch native series is integrated on the exact ABC pin above; the independent output reference remains `beebcbde`. Patch 033 executes b0–b4 and bd, and the Python Merkle cost model exists. Whole-daemon block acceptance is not done. Derive P05 field sizes from authenticated context, then wire monetary transition into block connect with persistent state/undo, and add mining jobs. Continue with a disposable development genesis/payment/block/undo slice before broad optimization. Do not mark the complete plan implemented merely because documentation, patches or a genesis-search script exist.
+The coinbase-data and Frank appendix changes are specified. The reviewed 33-patch native series is integrated on the exact ABC pin above; the independent output reference remains `beebcbde`. Patch 033 executes b0–b4 and bd, and the Python Merkle cost model exists. Patch 034 is only an in-memory ordinary-block connect/undo model; lotusd `ConnectTip` does not use it, and no V2 block has been accepted. Whole-daemon block acceptance is not done. Derive P05 field sizes from authenticated context, then wire monetary transition into block connect with persistent state/undo, and add mining jobs. Continue with a disposable development genesis/payment/block/undo slice before broad optimization. Do not mark the complete plan implemented merely because documentation, patches or a genesis-search script exist.
