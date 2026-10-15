@@ -331,7 +331,7 @@ type Compiled = { script: Uint8Array; leaf: Uint8Array; map: MethodArtifact['sou
 const OPCODES = { VERIFY: 0x65, IF: 0x61, ELSE: 0x63, ENDIF: 0x64, ENUMERATE_INPUTS:0x67, ENUMERATE_OUTPUTS:0x68, ENDENUMERATE:0x6a, DROP: 0x79, PICK: 0x7d, ROLL:0x7e,
   UTXOPATHCOUNT:0xda, UTXOPATH:0xdb, OUTPUTPATHCOUNT:0xe5, OUTPUTPATH:0xe6, UTXOREQUIRESBRANCH:0xdd, UTXOBRANCHCOUNT:0xd8, UTXOBRANCH:0xd9, OUTPUTBRANCHCOUNT:0xe3, OUTPUTBRANCH:0xe4, OUTPUTEXCLUSIVEBRANCH:0xe9, OUTPUTCONTINUESBRANCH:0xea, CHECKLOCKTIMEVERIFY:0xf3, CHECKSEQUENCEVERIFY:0xf4, SWAP:0x80, BRANCHROOT:0xf2, INPUTINDEX:0xd0, INPUTFLAGS:0xd1, UTXOVALUE:0xd6, UTXOTOKENID:0xd7, OUTPUTVALUE:0xe1, OUTPUTTOKENID:0xe2, OUTPUTREQUIRESBRANCH:0xe8, NUMEQUAL:0xa6, GREATERTHANOREQUAL:0xac,
   EQUAL: 0x91, NOT: 0x9c, ADD: 0x9e, SUB: 0x9f, MUL: 0xa0, BOOLAND: 0xa4, BOOLOR: 0xa5,
-  LESSTHAN: 0xa9, GREATERTHAN: 0xaa, SHA256: 0xb8, HASH256: 0xb9, BLAKE3: 0xba, CHECKSIG: 0xbb, CHECKSIGVERIFY: 0xbc, NEGATE: 0x9a } as const;
+  LESSTHAN: 0xa9, GREATERTHAN: 0xaa, LESSTHANOREQUAL: 0xab, SHA256: 0xb8, HASH256: 0xb9, BLAKE3: 0xba, CHECKSIG: 0xbb, CHECKSIGVERIFY: 0xbc, NEGATE: 0x9a } as const;
 class Emitter {
   private instructions: Instruction[] = [];
   private length = 0;
@@ -720,7 +720,7 @@ class Compiler {
             if (a !== b) return this.problem('E0401', `equality type mismatch ${a} and ${b}`, expr.span, frames);
             emitter.op('EQUAL', expr.span, origin, -1); if (expr.value === '!=') emitter.op('NOT', expr.span, origin); return 'Bool';
           }
-          const cases: Record<string, [keyof typeof OPCODES, ValueType]> = { '+':['ADD', a], '-':['SUB', a], '*':['MUL', a], '<':['LESSTHAN', 'Bool'], '>':['GREATERTHAN', 'Bool'], '>=':['GREATERTHANOREQUAL', 'Bool'] };
+          const cases: Record<string, [keyof typeof OPCODES, ValueType]> = { '+':['ADD', a], '-':['SUB', a], '*':['MUL', a], '<':['LESSTHAN', 'Bool'], '>':['GREATERTHAN', 'Bool'], '<=':['LESSTHANOREQUAL', 'Bool'], '>=':['GREATERTHANOREQUAL', 'Bool'] };
           const rule = cases[expr.value!]; if (!rule || !['Int','Amount'].includes(a) || !['Int','Amount'].includes(b)) return this.problem('E0403', `invalid ${expr.value} operands ${a}, ${b}`, expr.span, frames);
           emitter.op(rule[0], expr.span, origin, -1); return ['+','-','*'].includes(expr.value!) && (a === 'Amount' || b === 'Amount') ? 'Amount' : rule[1];
         }
