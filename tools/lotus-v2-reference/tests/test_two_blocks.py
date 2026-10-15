@@ -9,7 +9,7 @@ from lotus_v2_reference.block import (
     utxo_root,
 )
 from lotus_v2_reference.block_seal import (
-    HEADER_SIZE, Header, seal_child_header, serialize_header,
+    HEADER_SIZE, Header, block_id, seal_child_header, serialize_header,
 )
 from lotus_v2_reference.dev_genesis import (
     DEVELOPMENT_CHAIN_ID, DEVELOPMENT_GENESIS, DevelopmentGenesisFixture,
@@ -124,6 +124,7 @@ class TwoBlockUndoTests(unittest.TestCase):
         self.assertEqual(sealed.height, 1)
         self.assertEqual(sealed.tx_root, tx_root)
         self.assertEqual(sealed.state_root, first.state_root)
+        self.assertEqual(sealed.prev_id, block_id(DEVELOPMENT_CHAIN_ID, seal_header))
 
         block1_coins = _coin_bytes(coins)
         block1_money = first.monetary_bytes
@@ -183,6 +184,7 @@ class TwoBlockUndoTests(unittest.TestCase):
         self.assertEqual(sealed2.tx_root, tx_root2)
         self.assertEqual(sealed2.state_root, second.state_root)
         self.assertNotEqual(sealed2.state_root, sealed.state_root)
+        self.assertEqual(sealed2.prev_id, block_id(DEVELOPMENT_CHAIN_ID, sealed))
 
         restored = disconnect(second.undo, coins)
         self.assertEqual(restored.to_bytes(), block1_money)
