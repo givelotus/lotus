@@ -6,9 +6,9 @@ Updated October 15, 2026. Development plan; no genesis parameters are frozen and
 
 ## Source foundation and current status
 
-The current executable [V2 series](../patches/v2/series) contains 171 patches,
-`000`–`170`, on ABC master `1fb7db17c176cdea8a2c60d887891589382ee4e3`.
-[Latest replay evidence](evidence/v2-series-replay-170.json) verifies every
+The current executable [V2 series](../patches/v2/series) contains 173 patches,
+`000`–`172`, on ABC master `1fb7db17c176cdea8a2c60d887891589382ee4e3`.
+[Latest replay evidence](evidence/v2-series-replay-172.json) verifies every
 intermediate tree. Offline daemon acceptance, restart, disconnect/reconnect,
 resumable fork recovery, bounded selection and actual two-process TCP full/compact
 synchronization have separate evidence below. Native production of signed fixture-payment blocks also passes across two nodes.
