@@ -187,6 +187,30 @@ restore and foreign-format rejection. That evidence is for the wallet packet's
 exact source, not a full combined-tree daemon build or V2 transaction signing.
 The storage development marker still needs binding to an adopted network profile.
 
+## Full build, restart context and undo integrity (patches 081–083)
+
+All 84 mailboxes replay with exact intermediate trees; final tree
+`304e8896364cd69bd92aece89427687811feb844`.
+See [replay evidence](evidence/v2-series-replay-083.json).
+
+The full ABC build now exposes the V2 validation library and disk checks. A fresh
+Debug clone builds daemon, CLI and SQLite wallet tool, and passes both disk
+checks with Chronik off. Building this library does not enable V2 daemon acceptance.
+
+Disk transitions persist the newest eleven headers with complete block bytes.
+The stored connector authenticates the linked window against the stored tip and
+derives height/MTP after reopen and disconnect; caller-stale values are replaced.
+The reader checks stored body header and length, not full transaction validity.
+Trusted initial-state construction remains the enclosing initializer's job.
+Malformed history tests pass; eleven-header rollover coverage remains pending.
+
+A reproduced corruption of an undo record's old coin previously published an
+inconsistent restored state. Disconnect now authenticates changed restored coins,
+reachable tree paths and immediate child records before its atomic write.
+Eight corruption cases leave the current state unchanged. Debug and sanitizer
+checks pass for the repair, and both disk suites pass on the combined source.
+Opaque header/monetary metadata semantics remain validator-owned.
+
 ## Next bounded work
 
 Wire the tested disk-backed complete-block boundary into a separate development
