@@ -124,6 +124,63 @@ class SizeCostTests(unittest.TestCase):
             with self.assertRaises(VMError):
                 evaluate(bytes.fromhex(malformed), (), selected)
 
+    def test_constant_path_index_uses_that_slot(self):
+        # 00 is the path slot. The input index is already on the stack.
+        slot0 = sized("00db", initial=(16,), fields={0xdb: (4, 50)})
+        slot1 = sized("4edb", initial=(16,), fields={0xdb: (4, 50)})
+        any_slot = sized("db", initial=(16, 16), fields={0xdb: (4, 50)})
+        out0 = sized("00e6", initial=(16,), fields={0xe6: (4, 50)})
+        self.assertEqual(slot0.state.main, (4,))
+        self.assertEqual(slot1.state.main, (50,))
+        self.assertEqual(any_slot.state.main, (50,))
+        self.assertEqual(out0.state.main, (4,))
+        self.assertEqual(slot0.cost, 17 + (1 + 16 + 16 + 4))
+        self.assertEqual(slot1.cost, 17 + (1 + 16 + 16 + 50))
+        self.assertEqual(any_slot.cost, 1 + 16 + 16 + 50)
+        self.assertEqual(out0.cost, slot0.cost)
+        self.assertLess(slot0.cost, any_slot.cost)
+        # A constant past the hint vector still pays the widest slot.
+        self.assertEqual(sized("52db", initial=(16,), fields={0xdb: (4, 50)}).state.main,
+                         (50,))
+
+    def test_merkle_step_charges_four_algorithms(self):
+        def step(script, tail, selected=None):
+            zero = sized(script, initial=(32, 0) + tail, selected=selected)
+            wide = sized(script, initial=(32, 64) + tail, selected=selected)
+            # Two proof steps, plus the 64-byte operand bound itself.
+            return (wide.cost - zero.cost - 64) // 2
+
+        blake_tagged = 1 + 96 + 32
+        pair = 1 + 64 + 32
+        self.assertEqual(step("00c0", ()), blake_tagged)
+        self.assertNotEqual(step("00c0", ()), pair)
+        self.assertEqual(step("4ec0", ()), pair)
+        self.assertEqual(step("4fc0", ()), pair)
+        self.assertEqual(step("50c0", ()), pair)
+        nonconstant = step("c0", (16,))
+        for selector in ("00c0", "4ec0", "4fc0", "50c0"):
+            self.assertGreaterEqual(nonconstant, step(selector, ()))
+        self.assertEqual(nonconstant, blake_tagged)
+        # Unknown proofs pay the full step cap, and algorithm 0 dominates.
+        base = 1 + 6 * 128 + 4 * 128
+        self.assertEqual(sized("c0").cost, base + 64 * blake_tagged)
+        self.assertEqual(sized("c1").cost, base + 4 * blake_tagged)
+        iteration = 1 + base + 64 * blake_tagged
+        self.assertEqual(sized("67c06a", inputs=0).cost, 1)
+        self.assertEqual(sized("67c06a", inputs=1).cost, 1 + iteration)
+        self.assertEqual(sized("67c06a", inputs=2).cost, 1 + 2 * iteration)
+
+        def sha_heavy(op):
+            per = 100 if op == 0xb8 else 1
+            return lambda operands, results, per=per: 1 + per * sum(operands) + sum(results)
+
+        heavy = profile({op: sha_heavy(op) for op in ASSIGNED})
+        sha_step = 1 + 100 * 64 + 32
+        self.assertEqual(step("4fc0", (), heavy), sha_step)
+        self.assertGreater(sha_step, step("00c0", (), heavy))
+        self.assertGreater(sha_step, step("50c0", (), heavy))
+        self.assertEqual(step("c0", (16,), heavy), sha_step)
+
 
 if __name__ == "__main__":
     unittest.main()

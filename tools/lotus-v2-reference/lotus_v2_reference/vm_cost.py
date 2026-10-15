@@ -97,13 +97,55 @@ def static_size_cost(ast: tuple[Node, ...], profile: VMProfile, *,
             raise ValueError(f"invalid cost formula for {op:02x}")
         return _checked_cost(amount, U128_MAX) if enforce else amount
 
+    def merkle_step(selector: int | None) -> int:
+        # resources-and-parameters.md charges max(C_blake3, C_hash256). That
+        # sentence under-charges algorithm 0, whose tagged preimage is 96
+        # bytes rather than a 64-byte pair, and it ignores a schedule where
+        # SHA256 is the dearest of the four. Use the max of all four.
+        tagged, pair, digest = (96,), (64,), (32,)
+        options = (
+            charge(0xba, tagged, digest),
+            charge(0xba, pair, digest),
+            charge(0xb8, pair, digest),
+            charge(0xb9, pair, digest),
+        )
+        if selector is not None and 0 <= selector <= 3:
+            return options[selector]
+        return max(options)
+
+    def merkle_steps(op: int, proof_bound: int | None) -> int:
+        if op == 0xc0:
+            return 64 if proof_bound is None else min(64, proof_bound // 32)
+        if op == 0xc1:
+            # Unknown proofs are bounded by the element-size limit. A known
+            # proof uses its own bound, capped at 256 indexed steps.
+            if proof_bound is None:
+                return min(256, limit // 32)
+            return min(256, proof_bound // 32)
+        return 0
+
+    def add_merkle(op: int, base: int, selector: int | None,
+                   proof_bound: int | None, *, enforce: bool) -> int:
+        steps = merkle_steps(op, proof_bound)
+        if steps == 0:
+            return base
+        extra = merkle_step(selector) * steps
+        if not enforce:
+            return base + extra
+        return _checked_cost(base + extra, U128_MAX)
+
+    def worst_charge(op: int, *, enforce: bool) -> int:
+        base = charge(op, (limit,) * 6, (limit,) * 4, enforce=enforce)
+        return add_merkle(op, base, None, None, enforce=enforce)
+
     def transfer(ins: Instruction, state: SizeState, previous: Instruction | None) -> tuple[SizeState, int]:
         op = ins.opcode
         if state.main is None:
-            return UNKNOWN, charge(op, (limit,) * 6, (limit,) * 4)
+            return UNKNOWN, worst_charge(op, enforce=True)
         main, alt = list(state.main), list(state.alt)
         operands: list[int] = []
         result: list[int] = []
+        merkle_op: tuple[int, int | None, int] | None = None
 
         def pop() -> int:
             if not main:
@@ -223,8 +265,15 @@ def static_size_cost(ast: tuple[Node, ...], profile: VMProfile, *,
             elif op in HASHES:
                 arity = {0xbf: 2, 0xc0: 3, 0xc1: 4, 0xc2: 1,
                          0xd9: 2, 0xe4: 2}.get(op, 0 if op in (0xce, 0xcf, 0xf2) else 1)
-                for _ in range(arity): pop()
+                proof_bound = 0
+                for index in range(arity):
+                    operand = pop()
+                    # Top is the selector; the next pop is the proof.
+                    if op in (0xc0, 0xc1) and index == 1:
+                        proof_bound = operand
                 push(32)
+                if op in (0xc0, 0xc1):
+                    merkle_op = (op, _literal(previous), proof_bound)
             elif op in (0xbb, 0xbc):
                 pop(); pop()
                 if op == 0xbb: push(16)
@@ -239,19 +288,27 @@ def static_size_cost(ast: tuple[Node, ...], profile: VMProfile, *,
                 if op in (0xe8, 0xe9, 0xea): pop(); pop()
                 push(16)
             elif op in FIELD_READS:
+                # The literal is the top operand: input/output index for a
+                # complete read, path slot for UTXOPATH/OUTPUTPATH. An in-range
+                # constant uses that slot; anything else uses the widest hint.
                 index = _literal(previous)
                 for _ in range(2 if op in (0xdb, 0xe6) else 0 if op == 0xf0 else 1): pop()
                 sizes = fields.get(op)
-                size = (script_length if op == 0xf0 else
-                        sizes[index] if sizes is not None and op in (0xdc, 0xe7) and
-                        index is not None and 0 <= index < len(sizes)
-                        else max(sizes) if sizes else limit)
+                if op == 0xf0:
+                    size = script_length
+                elif sizes and index is not None and 0 <= index < len(sizes):
+                    size = sizes[index]
+                else:
+                    size = max(sizes) if sizes else limit
                 push(size)
             else:
-                return UNKNOWN, charge(op, (limit,) * 6, (limit,) * 4)
+                return UNKNOWN, worst_charge(op, enforce=True)
         except IndexError:
-            return UNKNOWN, charge(op, (limit,) * 6, (limit,) * 4)
-        return SizeState(tuple(main), tuple(alt)), charge(op, tuple(operands), tuple(result))
+            return UNKNOWN, worst_charge(op, enforce=True)
+        base = charge(op, tuple(operands), tuple(result))
+        if merkle_op is not None:
+            base = add_merkle(merkle_op[0], base, merkle_op[1], merkle_op[2], enforce=True)
+        return SizeState(tuple(main), tuple(alt)), base
 
     def sequence(nodes: tuple[Node, ...], state: SizeState, entries: tuple[SizeState, ...]) -> SizeCharge:
         current: SizeState | None = state
@@ -283,7 +340,7 @@ def static_size_cost(ast: tuple[Node, ...], profile: VMProfile, *,
                 else:
                     next_state, part = transfer(node, starting, previous)
                     current = next_state if current is not None else None
-                worst_part = charge(node.opcode, (limit,) * 6, (limit,) * 4, enforce=False)
+                worst_part = worst_charge(node.opcode, enforce=False)
                 previous = node
             elif isinstance(node, Conditional):
                 condition_size = starting.main[-1] if starting.main else limit
