@@ -1,0 +1,237 @@
+From 54e913624d3e9c301d924aeb99eef8dcbab3d8d5 Mon Sep 17 00:00:00 2001
+From: Shammah Chancellor <shammah.chancellor@notvalid.com>
+Date: Thu, 15 Oct 2026 08:59:18 -0700
+Subject: [PATCH] Publish validated V2 block transitions atomically in LevelDB
+
+Bind validation to the stored parent header, monetary record and root. Publish exact block bytes, child header, monetary state and staged coins/tree in one synchronous batch. Reuse complete-block fixtures to check database reopen, durable disconnect and reconnect against the in-memory oracle with a tiny cache. This remains a module integration, not lotusd ConnectTip or a launched network.
+---
+ src/lotus_v2/disk_block.cpp                 | 89 +++++++++++++++++++++
+ src/lotus_v2/disk_block.h                   | 17 ++++
+ src/lotus_v2/disk_block_test/CMakeLists.txt | 25 ++++++
+ src/lotus_v2/test_block_complete.cpp        | 51 ++++++++++++
+ 4 files changed, 182 insertions(+)
+ create mode 100644 src/lotus_v2/disk_block.cpp
+ create mode 100644 src/lotus_v2/disk_block.h
+ create mode 100644 src/lotus_v2/disk_block_test/CMakeLists.txt
+
+diff --git a/src/lotus_v2/disk_block.cpp b/src/lotus_v2/disk_block.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..d149dd062fe0fa73c13ca1ce718719a041c51e11
+--- /dev/null
++++ b/src/lotus_v2/disk_block.cpp
+@@ -0,0 +1,89 @@
++// Copyright (c) 2026 The Lotus developers
++#include "disk_block.h"
++#include <stdexcept>
++namespace lotus::v2 {
++namespace {
++class Adapter final : public BlockStateTransaction {
++public:
++    DiskStateTransaction &tx;
++    explicit Adapter(DiskStateTransaction &value) : tx(value) {}
++    CoinReadResult Read(const Outpoint &key, Coin &coin, std::string &error) override {
++        std::optional<Coin> found;
++        DiskStateError failure;
++        if (!tx.ReadCoin(key, found, failure)) {
++            error = failure.message; return CoinReadResult::Error;
++        }
++        if (!found) return CoinReadResult::Missing;
++        coin = std::move(*found); return CoinReadResult::Found;
++    }
++    bool Insert(const Coin &coin, std::string &error) override {
++        DiskStateError failure;
++        if (tx.Insert(coin, failure)) return true;
++        error = failure.message; return false;
++    }
++    bool Erase(const Outpoint &key, std::string &error) override {
++        DiskStateError failure;
++        if (tx.Erase(key, failure)) return true;
++        error = failure.message; return false;
++    }
++    Hash Root() const override { return tx.Root(); }
++    void Abort() noexcept override { tx.Abort(); }
++};
++} // namespace
++CandidateCheckResult ConnectDiskBlock(
++    const std::vector<uint8_t> &wire, const std::vector<Header> &history,
++    const HeaderChainProfile &hp, const OrdinaryCandidateProfile &op,
++    const MonetaryProfile &mp, const BlockCostProfile &cp,
++    DiskStateStore &store, StagedBlockTransition &out, std::string &error) {
++    using Result = CandidateCheckResult;
++    try {
++        if (!store.IsOpen()) { error = "chainstate database unavailable"; return Result::StorageError; }
++        const auto before = store.Metadata();
++        OrdinaryParentContext parent;
++        parent.chain_id = hp.chain_id;
++        if (!ParseHeader(before.header.data(), before.header.size(), parent.header)) {
++            error = "stored parent header encoding"; return Result::StorageError;
++        }
++        parent.monetary = DecodeMonetaryState(before.monetary);
++        Hash parent_id;
++        if (!BlockId(parent.chain_id, parent.header, parent_id) || parent_id != before.tip ||
++            StateRoot(parent.chain_id, parent.header.height, store.Root(), parent.monetary) !=
++                parent.header.state_root) {
++            error = "stored parent tip or state mismatch"; return Result::StorageError;
++        }
++        DiskStateTransaction tx;
++        DiskStateError failure;
++        if (!store.Begin(tx, failure)) { error = failure.message; return Result::StorageError; }
++        Adapter adapter(tx);
++        StagedBlockTransition staged;
++        const auto result = StageCompleteBlock(wire, parent, history, hp, op, mp, cp,
++                                               adapter, staged, error);
++        if (result != Result::Accepted) return result;
++        // Single-writer API plus this fence prohibits publication against a
++        // different tip. Store's active transaction also prevents disconnect.
++        if (store.Metadata() != before) {
++            error = "chainstate parent changed during validation";
++            return Result::StorageError;
++        }
++        DiskStateMetadata next;
++        next.tip = staged.block_id;
++        std::array<uint8_t, HEADER_SIZE> header;
++        if (!SerializeHeader(staged.header, header)) {
++            error = "validated header serialization"; return Result::StorageError;
++        }
++        next.header.assign(header.begin(), header.end());
++        const auto money = EncodeMonetaryState(staged.monetary.state);
++        next.monetary.assign(money.begin(), money.end());
++        // Persist exact complete bytes with the same atomic state transition.
++        // Backend limits are operational; no partial/truncated block is stored.
++        next.auxiliary = wire;
++        if (!tx.Commit(next, failure)) { error = failure.message; return Result::StorageError; }
++        out = std::move(staged);
++        error.clear();
++        return Result::Accepted;
++    } catch (const std::exception &e) {
++        error = e.what();
++        return Result::StorageError;
++    }
++}
++} // namespace lotus::v2
+diff --git a/src/lotus_v2/disk_block.h b/src/lotus_v2/disk_block.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..622d8641c76858807e4649f44a0d0bd40ffaefcb
+--- /dev/null
++++ b/src/lotus_v2/disk_block.h
+@@ -0,0 +1,17 @@
++// Copyright (c) 2026 The Lotus developers
++#ifndef LOTUS_V2_DISK_BLOCK_H
++#define LOTUS_V2_DISK_BLOCK_H
++#include "block_transition.h"
++#include "disk_state.h"
++namespace lotus::v2 {
++// Caller serializes access to the store. History is authenticated chain ancestry
++// ending at its stored tip; clock eligibility and best-chain selection are
++// enclosing-node responsibilities. Success means one durable database batch.
++// On StorageError after a failed sync, reopen before determining which tip won.
++CandidateCheckResult ConnectDiskBlock(
++    const std::vector<uint8_t> &wire, const std::vector<Header> &history,
++    const HeaderChainProfile &hp, const OrdinaryCandidateProfile &op,
++    const MonetaryProfile &mp, const BlockCostProfile &cp,
++    DiskStateStore &store, StagedBlockTransition &out, std::string &error);
++} // namespace lotus::v2
++#endif
+diff --git a/src/lotus_v2/disk_block_test/CMakeLists.txt b/src/lotus_v2/disk_block_test/CMakeLists.txt
+new file mode 100644
+index 0000000000000000000000000000000000000000..ff4636d9bde9d8486b339be1080a97c3f4ffcd38
+--- /dev/null
++++ b/src/lotus_v2/disk_block_test/CMakeLists.txt
+@@ -0,0 +1,25 @@
++cmake_minimum_required(VERSION 3.18)
++project(lotus_v2_disk_block LANGUAGES C CXX)
++set(CMAKE_CXX_STANDARD 20)
++set(CMAKE_CXX_STANDARD_REQUIRED ON)
++add_subdirectory(../disk_state_test disk_state)
++find_package(OpenSSL REQUIRED COMPONENTS Crypto)
++if(NOT DEFINED LOTUS_SECP_LIBRARY OR NOT EXISTS "${LOTUS_SECP_LIBRARY}")
++    message(FATAL_ERROR "Set LOTUS_SECP_LIBRARY to ABC libsecp256k1.a")
++endif()
++get_filename_component(LOTUS_SRC "${CMAKE_CURRENT_SOURCE_DIR}/../.." ABSOLUTE)
++add_executable(disk_block_test
++    ../disk_block.cpp ../block_transition.cpp ../test_block_complete.cpp
++    ../output.cpp ../transaction.cpp ../commitment.cpp ../tagged_hash.cpp
++    ../signing.cpp ../vm.cpp ../field_size.cpp ../sparse_state.cpp
++    ../incremental_utxo.cpp ../ordinary_validation.cpp ../monetary.cpp
++    ../block.cpp ../block_wire.cpp ../block_cost.cpp ../header_context.cpp
++    ../asert_candidate.cpp ../header.cpp ../persistent_utxo.cpp ../persistent_monetary.cpp)
++target_compile_definitions(disk_block_test PRIVATE LOTUS_V2_TEST_DISK=1)
++target_include_directories(disk_block_test PRIVATE "${LOTUS_SRC}/secp256k1/include"
++    "${LOTUS_BOOST_INCLUDE}" ../vendor/blake3)
++target_link_libraries(disk_block_test PRIVATE lotus_v2_disk_state blake3
++    OpenSSL::Crypto "${LOTUS_SECP_LIBRARY}")
++target_compile_options(disk_block_test PRIVATE -Wall -Wextra -Wpedantic -Werror)
++enable_testing()
++add_test(NAME disk_block_test COMMAND disk_block_test)
+diff --git a/src/lotus_v2/test_block_complete.cpp b/src/lotus_v2/test_block_complete.cpp
+index 1b64323103e2d41750c85766da8d5df88383b6f1..26dca3cb0fa07100c49be9a15a56075dc2a2fc87 100644
+--- a/src/lotus_v2/test_block_complete.cpp
++++ b/src/lotus_v2/test_block_complete.cpp
+@@ -2,6 +2,11 @@
+ // Synthetic authenticated parent for module checks; no genesis funding claim.
+ #include "block.h"
+ #include "block_transition.h"
++#ifdef LOTUS_V2_TEST_DISK
++#include "disk_block.h"
++#include <filesystem>
++#include <cstdlib>
++#endif
+ #include "dev_genesis.h"
+ #include "signing.h"
+ #include <iostream>
+@@ -330,6 +335,52 @@ void CompleteChecks() {
+               == CandidateCheckResult::StorageError && throwing.aborted &&
+               throwing.coins.empty() && throwing.writes == 2,
+           "backend exception after mutation aborts as operational failure");
++#ifdef LOTUS_V2_TEST_DISK
++    char directory[] = "/private/tmp/lotus-v2-disk-block-XXXXXX";
++    Check(mkdtemp(directory) != nullptr, "disk test directory");
++    {
++        DiskStateOptions options;
++        options.cache_bytes = 1024;
++        options.write_buffer_bytes = 64 << 10;
++        options.profile_digest[0] = 1; // Explicit isolated fixture identity.
++        DiskStateStore db;
++        DiskStateError failure;
++        Check(DiskStateStore::Open(directory, options, {}, db, failure), failure.message);
++        DiskStateMetadata parent_meta;
++        Check(BlockId({}, parent.header, parent_meta.tip), "stored parent id");
++        std::array<uint8_t, HEADER_SIZE> header_bytes;
++        Check(SerializeHeader(parent.header, header_bytes), "stored parent header");
++        parent_meta.header.assign(header_bytes.begin(), header_bytes.end());
++        const auto monetary_bytes = EncodeMonetaryState(parent.monetary);
++        parent_meta.monetary.assign(monetary_bytes.begin(), monetary_bytes.end());
++        {
++            DiskStateTransaction seed;
++            Check(db.Begin(seed, failure) && seed.Insert(funding, failure) &&
++                      seed.Commit(parent_meta, failure), failure.message);
++        }
++        StagedBlockTransition durable;
++        Check(ConnectDiskBlock(wire, {parent.header, genesis}, hp, profile,
++                               DevelopmentGenesis, COST, db, durable, error)
++                  == CandidateCheckResult::Accepted, error);
++        Check(db.Root() == expected.Root() && db.Metadata().tip == durable.block_id &&
++                  db.Metadata().auxiliary == wire, "atomic block bytes and tip");
++        db = DiskStateStore{};
++        Check(DiskStateStore::Open(directory, options, {}, db, failure), failure.message);
++        Check(db.Root() == expected.Root() && db.Metadata().tip == durable.block_id,
++              "reopened complete state");
++        Check(db.Disconnect(durable.block_id, failure), failure.message);
++        Check(db.Root() == utxo.Root() && db.Metadata() == parent_meta,
++              "durable disconnect restores exact parent tuple");
++        db = DiskStateStore{};
++        Check(DiskStateStore::Open(directory, options, {}, db, failure), failure.message);
++        Check(db.Metadata() == parent_meta && db.Root() == utxo.Root(),
++              "reopened disconnected parent");
++        Check(ConnectDiskBlock(wire, {parent.header, genesis}, hp, profile,
++                               DevelopmentGenesis, COST, db, durable, error)
++                  == CandidateCheckResult::Accepted, error);
++    }
++    std::filesystem::remove_all(directory);
++#endif
+     const auto before_root = utxo.Root();
+     const auto before_money = EncodeMonetaryState(money);
+     // Invalid PoW wins over malformed transaction bytes: no body hashing/VM
+-- 
+2.50.1 (Apple Git-155)
+

@@ -1,0 +1,311 @@
+From 17e12fabd342139c21e57764ef235bd2a6462881 Mon Sep 17 00:00:00 2001
+From: Shammah Chancellor <shammah.chancellor@notvalid.com>
+Date: Thu, 15 Oct 2026 08:48:27 -0700
+Subject: [PATCH] Separate ordinary validation from coin storage with
+ operational read errors
+
+Add a read-only lookup boundary preserving the map-backed oracle. Database failures and mismatched stored outpoints return StorageError rather than consensus Invalid. Exercise every spend and output-collision read failure without publishing partial effects; the ordinary validator suite passes.
+---
+ src/lotus_v2/ordinary_validation.cpp      | 84 +++++++++++++++--------
+ src/lotus_v2/ordinary_validation.h        | 13 ++++
+ src/lotus_v2/test_ordinary_validation.cpp | 56 +++++++++++++++
+ 3 files changed, 125 insertions(+), 28 deletions(-)
+
+diff --git a/src/lotus_v2/ordinary_validation.cpp b/src/lotus_v2/ordinary_validation.cpp
+index 8559fefd9f053426bfcedbb6d537f63e9c7264b0..d5ac820295d5a8a8d94652ab897a5f571638c981 100644
+--- a/src/lotus_v2/ordinary_validation.cpp
++++ b/src/lotus_v2/ordinary_validation.cpp
+@@ -81,19 +81,19 @@ bool AddAsset(std::map<Hash32, Totals> &tokens, Wide &native,
+ }
+ } // namespace
+ 
+-bool CheckOrdinaryCandidate(const Transaction &tx,
++CandidateCheckResult CheckOrdinaryWithLookup(const Transaction &tx,
+                             const OrdinaryCandidateProfile &profile,
+                             const ChainId &chain_id,
+-                            const DevelopmentUtxoView &view,
++                            const CoinLookup &lookup,
+                             OrdinaryCandidateEffects &effects,
+                             std::string &error) {
+     if (!profile.candidate_height || !profile.coinbase_maturity ||
+         !profile.dust_limit || !profile.max_total_invocation_cost) {
+         error = "missing development context or resource limits";
+-        return false;
++        return CandidateCheckResult::Invalid;
+     }
+     std::vector<uint8_t> wire;
+-    if (!EncodeTransaction(tx, profile.transaction, wire, error)) return false;
++    if (!EncodeTransaction(tx, profile.transaction, wire, error)) return CandidateCheckResult::Invalid;
+     std::vector<Coin> spent;
+     ResolvedCoins resolved(tx.inputs.size());
+     std::set<Outpoint, OutpointLess> seen;
+@@ -103,64 +103,71 @@ bool CheckOrdinaryCandidate(const Transaction &tx,
+         const Input &input = tx.inputs[i];
+         if (input.flags == 2) {
+             error = "coinbase is not an ordinary transaction";
+-            return false;
++            return CandidateCheckResult::Invalid;
+         }
+         if (input.flags != 1) continue;
+         const Outpoint outpoint{input.prev_txid, input.prev_index};
+         if (!seen.insert(outpoint).second) {
+             error = "repeated spend";
+-            return false;
++            return CandidateCheckResult::Invalid;
+         }
+-        const auto found = view.find(outpoint);
+-        if (found == view.end() || found->second.outpoint != outpoint) {
++        Coin coin;
++        const auto read = lookup(outpoint, coin, error);
++        if (read == CoinReadResult::Error)
++            return CandidateCheckResult::StorageError;
++        if (read == CoinReadResult::Missing) {
+             error = "unresolved spend";
+-            return false;
++            return CandidateCheckResult::Invalid;
++        }
++        if (coin.outpoint != outpoint) {
++            error = "coin lookup returned a different outpoint";
++            return CandidateCheckResult::StorageError;
+         }
+         std::vector<uint8_t> encoded_coin;
+-        if (!EncodeCoin(found->second, encoded_coin)) {
++        if (!EncodeCoin(coin, encoded_coin)) {
+             error = "invalid resolved coin";
+-            return false;
++            return CandidateCheckResult::StorageError;
+         }
+-        spent.push_back(found->second);
+-        resolved[i] = found->second.output;
++        spent.push_back(coin);
++        resolved[i] = coin.output;
+         staged.consumed.push_back(outpoint);
+     }
+-    if (!CheckLocks(tx, spent, profile, error)) return false;
++    if (!CheckLocks(tx, spent, profile, error)) return CandidateCheckResult::Invalid;
+ 
+     Wide native_inputs = 0, native_outputs = 0;
+     std::map<Hash32, Totals> tokens;
+     for (const Coin &coin : spent) {
+         if (!AddAsset(tokens, native_inputs, coin.output, error, true))
+-            return false;
++            return CandidateCheckResult::Invalid;
+     }
+     size_t token_output_count = 0;
+     for (const Output &output : tx.outputs) {
+         token_output_count += output.HasToken();
+         if (!AddAsset(tokens, native_outputs, output, error, false))
+-            return false;
++            return CandidateCheckResult::Invalid;
+     }
+     if (native_inputs < native_outputs) {
+         error = "native inflation";
+-        return false;
++        return CandidateCheckResult::Invalid;
+     }
+     staged.native_fee = native_inputs - native_outputs;
+     Wide token_floor;
+     if (!Multiply(Wide{2} * profile.dust_limit, token_output_count,
+                   token_floor)) {
+         error = "token floor overflow";
+-        return false;
++        return CandidateCheckResult::Invalid;
+     }
+     staged.token_output_burn_floor = token_floor;
+     Wide byte_numerator;
+     if (!Multiply(Wide{1000}, wire.size(), byte_numerator) ||
+         !Add(byte_numerator, 999)) {
+         error = "byte fee overflow";
+-        return false;
++        return CandidateCheckResult::Invalid;
+     }
+     const Wide byte_floor = byte_numerator / 1000;
+     if (staged.native_fee < byte_floor || staged.native_fee < token_floor) {
+         error = "native fee below byte or token-output floor";
+-        return false;
++        return CandidateCheckResult::Invalid;
+     }
+ 
+     std::map<Hash32, PositiveDelta> positive_deltas;
+@@ -176,17 +183,17 @@ bool CheckOrdinaryCandidate(const Transaction &tx,
+         if (input.flags != 3) continue;
+         if (positive_deltas.erase(input.prev_txid) != 1) {
+             error = "mint without matching positive token delta";
+-            return false;
++            return CandidateCheckResult::Invalid;
+         }
+     }
+     if (!positive_deltas.empty()) {
+         error = "positive token delta lacks mint input";
+-        return false;
++        return CandidateCheckResult::Invalid;
+     }
+ 
+     PreparedVmTransaction prepared_vm;
+     if (!prepared_vm.Prepare(tx, profile.transaction, chain_id, resolved,
+-                             profile.vm_cost, error)) return false;
++                             profile.vm_cost, error)) return CandidateCheckResult::Invalid;
+     const auto &identities = prepared_vm.Signing().Identities();
+     staged.txid = identities.txid;
+     staged.txhash = identities.txhash;
+@@ -211,22 +218,26 @@ bool CheckOrdinaryCandidate(const Transaction &tx,
+             if (vm.invocation.status != VmStatus::Success &&
+                 vm.invocation.status != VmStatus::AutomaticSuccess) {
+                 error = "witness VM invalid/unsupported: " + vm.invocation.error;
+-                return false;
++                return CandidateCheckResult::Invalid;
+             }
+             if (!vm.charged || !Add(staged.invocation_cost,
+                                     vm.accounting_cost) ||
+                 staged.invocation_cost > profile.max_total_invocation_cost) {
+                 error = "invocation cost unavailable or over budget";
+-                return false;
++                return CandidateCheckResult::Invalid;
+             }
+         }
+     }
+     for (size_t j = 0; j < tx.outputs.size(); ++j) {
+         if (tx.outputs[j].IsBurn()) continue;
+         const Outpoint outpoint{identities.txid, uint32_t(j)};
+-        if (view.contains(outpoint)) {
++        Coin occupied;
++        const auto read = lookup(outpoint, occupied, error);
++        if (read == CoinReadResult::Error)
++            return CandidateCheckResult::StorageError;
++        if (read == CoinReadResult::Found) {
+             error = "created outpoint already occupied";
+-            return false;
++            return CandidateCheckResult::Invalid;
+         }
+         staged.created.push_back(
+             Coin{outpoint, tx.outputs[j], profile.candidate_height,
+@@ -234,7 +245,24 @@ bool CheckOrdinaryCandidate(const Transaction &tx,
+     }
+     effects = std::move(staged);
+     error.clear();
+-    return true;
++    return CandidateCheckResult::Accepted;
++}
++
++bool CheckOrdinaryCandidate(const Transaction &tx,
++                            const OrdinaryCandidateProfile &profile,
++                            const ChainId &chain_id,
++                            const DevelopmentUtxoView &view,
++                            OrdinaryCandidateEffects &effects,
++                            std::string &error) {
++    const CoinLookup lookup = [&view](const Outpoint &outpoint, Coin &coin,
++                                     std::string &) {
++        const auto found = view.find(outpoint);
++        if (found == view.end()) return CoinReadResult::Missing;
++        coin = found->second;
++        return CoinReadResult::Found;
++    };
++    return CheckOrdinaryWithLookup(tx, profile, chain_id, lookup, effects,
++                                   error) == CandidateCheckResult::Accepted;
+ }
+ 
+ bool ApplyOrdinaryCandidate(const Transaction &tx,
+diff --git a/src/lotus_v2/ordinary_validation.h b/src/lotus_v2/ordinary_validation.h
+index 8a1a6c427af1adce66fde466e839d315baaf5357..c77ff27cae7db246cf9214da68d3021669b21a81 100644
+--- a/src/lotus_v2/ordinary_validation.h
++++ b/src/lotus_v2/ordinary_validation.h
+@@ -7,6 +7,7 @@
+ #include "vm.h"
+ 
+ #include <map>
++#include <functional>
+ #include <string>
+ #include <vector>
+ 
+@@ -57,6 +58,18 @@ bool CheckOrdinaryCandidate(const Transaction &tx,
+                             OrdinaryCandidateEffects &effects,
+                             std::string &error);
+ 
++// Read-only backend boundary. Error is operational, never evidence of an
++// invalid transaction. The callback must read one stable transaction view and
++// return the complete authenticated coin on Found. No full-set scan is needed.
++enum class CoinReadResult { Found, Missing, Error };
++using CoinLookup = std::function<CoinReadResult(const Outpoint &, Coin &,
++                                               std::string &)>;
++enum class CandidateCheckResult { Accepted, Invalid, StorageError };
++CandidateCheckResult CheckOrdinaryWithLookup(
++    const Transaction &tx, const OrdinaryCandidateProfile &profile,
++    const ChainId &chain_id, const CoinLookup &lookup,
++    OrdinaryCandidateEffects &effects, std::string &error);
++
+ // Reference atomic application: validate against the original view, then
+ // stage changes in a copy and swap only after every operation succeeds.
+ bool ApplyOrdinaryCandidate(const Transaction &tx,
+diff --git a/src/lotus_v2/test_ordinary_validation.cpp b/src/lotus_v2/test_ordinary_validation.cpp
+index 66e5d19ed574e2f3d84ccca1cc24632c949ec803..0c7fe0e92c5ee36ed4f9dab59daa00be5990eeea 100644
+--- a/src/lotus_v2/test_ordinary_validation.cpp
++++ b/src/lotus_v2/test_ordinary_validation.cpp
+@@ -365,9 +365,65 @@ void CompilerMintAndTransfer() {
+     CHECK(view.contains(merged.outpoint) && merged.output.value == 950 &&
+           merged.output.HasToken() && merged.output.token_id == token_id);
+ }
++void LookupBoundary() {
++    Fixture f;
++    const auto profile = Profile();
++    OrdinaryCandidateEffects expected, actual;
++    std::string error;
++    CHECK(CheckOrdinaryCandidate(f.tx, profile, f.chain, f.view, expected, error));
++    size_t reads = 0;
++    CoinLookup lookup = [&](const Outpoint &key, Coin &coin, std::string &) {
++        ++reads;
++        auto it = f.view.find(key);
++        if (it == f.view.end()) return CoinReadResult::Missing;
++        coin = it->second;
++        return CoinReadResult::Found;
++    };
++    CHECK(CheckOrdinaryWithLookup(f.tx, profile, f.chain, lookup, actual, error)
++          == CandidateCheckResult::Accepted);
++    CHECK(actual.txid == expected.txid && actual.txhash == expected.txhash);
++    CHECK(actual.native_fee == expected.native_fee &&
++          actual.invocation_cost == expected.invocation_cost);
++    CHECK(actual.consumed == expected.consumed &&
++          actual.created.size() == expected.created.size());
++    CHECK(reads == 1 + expected.created.size());
++    // Fail each read, including output collision checks. No staged effects
++    // escape, and an I/O failure cannot be classified as invalid consensus.
++    for (size_t fail_at = 1; fail_at <= 1 + expected.created.size(); ++fail_at) {
++        size_t calls = 0;
++        CoinLookup fail = [&](const Outpoint &key, Coin &coin, std::string &why) {
++            if (++calls == fail_at) {
++                why = "injected disk read failure";
++                return CoinReadResult::Error;
++            }
++            return lookup(key, coin, why);
++        };
++        OrdinaryCandidateEffects untouched;
++        untouched.native_fee = 123;
++        CHECK(CheckOrdinaryWithLookup(f.tx, profile, f.chain, fail, untouched,
++                                      error) == CandidateCheckResult::StorageError);
++        CHECK(untouched.native_fee == 123 && untouched.consumed.empty() &&
++              untouched.created.empty());
++        CHECK(error == "injected disk read failure");
++    }
++    CoinLookup absent = [](const Outpoint &, Coin &, std::string &) {
++        return CoinReadResult::Missing;
++    };
++    CHECK(CheckOrdinaryWithLookup(f.tx, profile, f.chain, absent, actual, error)
++          == CandidateCheckResult::Invalid);
++    CoinLookup corrupt = [&](const Outpoint &, Coin &coin, std::string &) {
++        coin = f.view.begin()->second;
++        ++coin.outpoint.index;
++        return CoinReadResult::Found;
++    };
++    CHECK(CheckOrdinaryWithLookup(f.tx, profile, f.chain, corrupt, actual, error)
++          == CandidateCheckResult::StorageError);
++}
++
+ } // namespace
+ 
+ int main() {
++    LookupBoundary();
+     ValidMintAndAccounting();
+     InvalidAccountingAndCoverage();
+     InvalidVmAndContext();
+-- 
+2.50.1 (Apple Git-155)
+

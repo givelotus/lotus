@@ -1,0 +1,162 @@
+From e4b512bd039ad643fa5da0180a0448695884c244 Mon Sep 17 00:00:00 2001
+From: Shammah Chancellor <shammah.chancellor@notvalid.com>
+Date: Thu, 15 Oct 2026 08:57:17 -0700
+Subject: [PATCH] Keep backend exceptions and local context faults out of
+ consensus rejection
+
+Wrap storage calls with an operational exception boundary, validate supplied history and cost schedules separately, and test an exception after a successful mutation. Every failed stage aborts; the complete-block suite passes.
+---
+ src/lotus_v2/block_transition.cpp    | 38 +++++++++++++++++++++++-----
+ src/lotus_v2/test_block_complete.cpp | 22 ++++++++++++++++
+ 2 files changed, 53 insertions(+), 7 deletions(-)
+
+diff --git a/src/lotus_v2/block_transition.cpp b/src/lotus_v2/block_transition.cpp
+index f39d8cc37e909703184cd22e872b9b653a13067f..dfeb34490e1cf4a696d67eeb25d776134d71a0bf 100644
+--- a/src/lotus_v2/block_transition.cpp
++++ b/src/lotus_v2/block_transition.cpp
+@@ -13,6 +13,14 @@ MonetaryInteger Integer(const Hash &bytes) {
+     }
+     return value;
+ }
++class StorageFailure : public std::runtime_error {
++public:
++    using std::runtime_error::runtime_error;
++};
++template <typename F> auto StorageCall(F &&call) {
++    try { return call(); }
++    catch (const std::exception &e) { throw StorageFailure(e.what()); }
++}
+ struct AbortOnFailure {
+     BlockStateTransaction &state;
+     bool accepted = false;
+@@ -36,7 +44,20 @@ CandidateCheckResult StageCompleteBlock(
+         }
+         const auto mtp = ParentMedianTime(hp, parent.header, history);
+         if (!mtp || hp.chain_id != parent.chain_id || op.parent_mtp != *mtp ||
+-            op.candidate_height != claimed.height) {
++            parent.header.height == std::numeric_limits<uint64_t>::max() ||
++            op.candidate_height != parent.header.height + 1) {
++            error = "local parent history or profile context mismatch";
++            return Result::StorageError;
++        }
++        // Configuration is trusted local input; its errors must not poison a
++        // peer's block ID. Validate these schedules before processing its body.
++        try {
++            (void)RequiredBlockBurn(0, parent.monetary.ema_block_cost, mp);
++            (void)AuthenticatedEnvelopeCost(0, 1, cp);
++        } catch (const std::invalid_argument &e) {
++            throw StorageFailure(e.what());
++        }
++        if (op.candidate_height != claimed.height) {
+             error = "complete block context";
+             return Result::Invalid;
+         }
+@@ -44,7 +65,7 @@ CandidateCheckResult StageCompleteBlock(
+                                  claimed.tx_root, claimed.state_root,
+                                  wire.size(), error)) return Result::Invalid;
+         // Parent mismatch is local state inconsistency, not a bad child block.
+-        if (StateRoot(parent.chain_id, parent.header.height, state.Root(),
++        if (StateRoot(parent.chain_id, parent.header.height, StorageCall([&] { return state.Root(); }),
+                       parent.monetary) != parent.header.state_root) {
+             error = "parent storage state root mismatch";
+             return Result::StorageError;
+@@ -93,7 +114,7 @@ CandidateCheckResult StageCompleteBlock(
+                     Coin coin{{ids.txid, uint32_t(j)}, output, claimed.height,
+                               op.parent_mtp, true};
+                     Coin occupied;
+-                    const auto read = state.Read(coin.outpoint, occupied, error);
++                    const auto read = StorageCall([&] { return state.Read(coin.outpoint, occupied, error); });
+                     if (read == CoinReadResult::Error) return Result::StorageError;
+                     if (read == CoinReadResult::Found) {
+                         if (occupied.outpoint != coin.outpoint) {
+@@ -111,7 +132,7 @@ CandidateCheckResult StageCompleteBlock(
+                 DevelopmentUtxoView read_coins;
+                 CoinLookup lookup = [&](const Outpoint &key, Coin &coin,
+                                         std::string &why) {
+-                    const auto read = state.Read(key, coin, why);
++                    const auto read = StorageCall([&] { return state.Read(key, coin, why); });
+                     if (read == CoinReadResult::Found) read_coins.emplace(key, coin);
+                     return read;
+                 };
+@@ -132,14 +153,14 @@ CandidateCheckResult StageCompleteBlock(
+             account_linear.push_back(costs.account_linear);
+             enforce_linear.push_back(costs.enforce_linear);
+             for (const auto &key : effects.consumed)
+-                if (!state.Erase(key, error)) return Result::StorageError;
++                if (!StorageCall([&] { return state.Erase(key, error); })) return Result::StorageError;
+             for (const auto &coin : effects.created)
+-                if (!state.Insert(coin, error)) return Result::StorageError;
++                if (!StorageCall([&] { return state.Insert(coin, error); })) return Result::StorageError;
+         }
+         const auto envelope = AuthenticatedEnvelopeCost(frames, block.transactions.size(), cp);
+         StagedBlockTransition staged;
+         staged.header = claimed;
+-        staged.utxo_root = state.Root();
++        staged.utxo_root = StorageCall([&] { return state.Root(); });
+         staged.monetary = AdvanceMonetary(
+             mp, parent.monetary, child_work, accounted, cb_outputs, cb_burn,
+             coinbase_bytes, frames, BlockEffectiveCost(envelope, account_linear, mp),
+@@ -158,6 +179,9 @@ CandidateCheckResult StageCompleteBlock(
+         guard.accepted = true;
+         error.clear();
+         return Result::Accepted;
++    } catch (const StorageFailure &e) {
++        error = e.what();
++        return Result::StorageError;
+     } catch (const std::invalid_argument &e) {
+         error = e.what();
+         return Result::Invalid;
+diff --git a/src/lotus_v2/test_block_complete.cpp b/src/lotus_v2/test_block_complete.cpp
+index 173b3ec0a9571bff248580ca1ad7a40a29036d3e..1b64323103e2d41750c85766da8d5df88383b6f1 100644
+--- a/src/lotus_v2/test_block_complete.cpp
++++ b/src/lotus_v2/test_block_complete.cpp
+@@ -16,6 +16,8 @@ public:
+     DevelopmentUtxoView coins;
+     IncrementalUtxoSet tree;
+     bool aborted = false, fail_reads = false, fail_writes = false;
++    bool throw_writes = false;
++    unsigned writes = 0;
+     explicit TestState(const DevelopmentUtxoView &initial) : coins(initial) {
+         for (const auto &[key, coin] : initial) {
+             (void)key;
+@@ -29,10 +31,14 @@ public:
+         coin = it->second; return CoinReadResult::Found;
+     }
+     bool Insert(const Coin &coin, std::string &error) override {
++        if (throw_writes && ++writes == 2)
++            throw std::invalid_argument("injected backend exception after mutation");
+         if (fail_writes) { error = "injected storage write"; return false; }
+         return coins.emplace(coin.outpoint, coin).second && tree.Insert(coin);
+     }
+     bool Erase(const Outpoint &key, std::string &error) override {
++        if (throw_writes && ++writes == 2)
++            throw std::invalid_argument("injected backend exception after mutation");
+         if (fail_writes) { error = "injected storage write"; return false; }
+         return coins.erase(key) == 1 && tree.Erase(key);
+     }
+@@ -308,6 +314,22 @@ void CompleteChecks() {
+         Check(failed.aborted && untouched.block_id[0] == 123,
+               "failed staging aborts without publishing result");
+     }
++    TestState bad_context(view);
++    auto wrong_context = profile;
++    ++wrong_context.parent_mtp;
++    StagedBlockTransition no_context;
++    Check(StageCompleteBlock(wire, parent, {parent.header, genesis}, hp,
++                             wrong_context, DevelopmentGenesis, COST, bad_context,
++                             no_context, error) == CandidateCheckResult::StorageError &&
++              bad_context.aborted, "bad local context is operational");
++    TestState throwing(view);
++    throwing.throw_writes = true;
++    StagedBlockTransition untouched_throw;
++    Check(StageCompleteBlock(wire, parent, {parent.header, genesis}, hp, profile,
++                             DevelopmentGenesis, COST, throwing, untouched_throw, error)
++              == CandidateCheckResult::StorageError && throwing.aborted &&
++              throwing.coins.empty() && throwing.writes == 2,
++          "backend exception after mutation aborts as operational failure");
+     const auto before_root = utxo.Root();
+     const auto before_money = EncodeMonetaryState(money);
+     // Invalid PoW wins over malformed transaction bytes: no body hashing/VM
+-- 
+2.50.1 (Apple Git-155)
+

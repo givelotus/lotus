@@ -1,0 +1,1201 @@
+From 3343a283d5ed187dadae255e2d462389fec3e552 Mon Sep 17 00:00:00 2001
+From: Shammah Chancellor <shammah.chancellor@notvalid.com>
+Date: Thu, 15 Oct 2026 08:58:24 -0700
+Subject: [PATCH] Persist V2 coins and compact authenticated tree in atomic
+ LevelDB batches
+
+Review correction: Persist V2 coins and compact authenticated tree in atomic LevelDB batches.
+
+This isolated V2 implementation is module-tested; it does not establish
+lotusd V2 block acceptance or select a network profile.
+---
+ src/lotus_v2/disk_state.cpp                 | 589 ++++++++++++++++++++
+ src/lotus_v2/disk_state.h                   | 108 ++++
+ src/lotus_v2/disk_state_test/CMakeLists.txt |  27 +
+ src/lotus_v2/disk_state_test/README.md      |  90 +++
+ src/lotus_v2/test_disk_state.cpp            | 331 +++++++++++
+ 5 files changed, 1145 insertions(+)
+ create mode 100644 src/lotus_v2/disk_state.cpp
+ create mode 100644 src/lotus_v2/disk_state.h
+ create mode 100644 src/lotus_v2/disk_state_test/CMakeLists.txt
+ create mode 100644 src/lotus_v2/disk_state_test/README.md
+ create mode 100644 src/lotus_v2/test_disk_state.cpp
+
+diff --git a/src/lotus_v2/disk_state.cpp b/src/lotus_v2/disk_state.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..b2208a59fa33c03552cde75479b135421d6c8c96
+--- /dev/null
++++ b/src/lotus_v2/disk_state.cpp
+@@ -0,0 +1,589 @@
++// Copyright (c) 2026 The Lotus developers
++#include "disk_state.h"
++
++#include <leveldb/cache.h>
++#include <leveldb/db.h>
++#include <leveldb/env.h>
++#include <leveldb/write_batch.h>
++
++#include <algorithm>
++#include <array>
++#include <limits>
++#include <map>
++#include <stdexcept>
++#include <utility>
++
++namespace lotus::v2 {
++namespace {
++using Bytes = std::string;
++using Value = std::optional<Bytes>;
++struct Failure { DiskStateError error; };
++[[noreturn]] void Fail(DiskStateErrorCode code, const std::string &message) {
++    throw Failure{{code, message}};
++}
++[[noreturn]] void Corrupt(const char *message) { Fail(DiskStateErrorCode::Corruption, message); }
++void Require(bool condition, const char *message) { if (!condition) Corrupt(message); }
++void CheckStatus(const leveldb::Status &status) {
++    if (!status.ok()) Fail(status.IsCorruption() ? DiskStateErrorCode::Corruption
++                                               : DiskStateErrorCode::Database, status.ToString());
++}
++template <typename F> bool Guard(DiskStateError &error, F &&f) {
++    error = {};
++    try { f(); return true; }
++    catch (const Failure &failure) { error = failure.error; }
++    catch (const std::bad_alloc &) { error = {DiskStateErrorCode::Resource, "allocation failed"}; }
++    catch (const std::length_error &) { error = {DiskStateErrorCode::Resource, "allocation length"}; }
++    return false;
++}
++void Put(Bytes &out, uint64_t n, unsigned width = 8) {
++    for (unsigned i = 0; i < width; ++i) out.push_back(static_cast<char>(n >> (8 * i)));
++}
++void PutHash(Bytes &out, const Hash &hash) {
++    out.append(reinterpret_cast<const char *>(hash.data()), hash.size());
++}
++void PutBlob(Bytes &out, const Bytes &value) { Put(out, value.size()); out += value; }
++void PutBlob(Bytes &out, const std::vector<uint8_t> &value) {
++    Put(out, value.size());
++    if (!value.empty()) out.append(reinterpret_cast<const char *>(value.data()), value.size());
++}
++struct Reader {
++    const Bytes &bytes;
++    size_t at{};
++    uint64_t Int(unsigned width = 8) {
++        Require(width <= bytes.size() - at, "truncated integer");
++        uint64_t value{};
++        for (unsigned i = 0; i < width; ++i) value |= uint64_t(uint8_t(bytes[at++])) << (8 * i);
++        return value;
++    }
++    Hash Digest() {
++        Require(32 <= bytes.size() - at, "truncated digest");
++        Hash result;
++        std::copy_n(reinterpret_cast<const uint8_t *>(bytes.data() + at), 32, result.begin());
++        at += 32;
++        return result;
++    }
++    Bytes Blob(size_t cap = std::numeric_limits<size_t>::max()) {
++        const uint64_t n = Int();
++        Require(n <= cap && n <= bytes.size() - at, "invalid stored length");
++        Bytes result = bytes.substr(at, static_cast<size_t>(n));
++        at += static_cast<size_t>(n);
++        return result;
++    }
++    void End() { Require(at == bytes.size(), "trailing stored bytes"); }
++};
++bool Bit(const Hash &key, unsigned depth) {
++    Require(depth < 256, "tree depth");
++    return (key[depth / 8] >> (depth % 8)) & 1;
++}
++struct Path {
++    Hash prefix{};
++    unsigned depth{};
++    Path Child(bool bit) const {
++        Require(depth < 256, "child depth");
++        Path child = *this;
++        if (bit) child.prefix[depth / 8] |= uint8_t(1 << (depth % 8));
++        ++child.depth;
++        return child;
++    }
++    Bytes Key() const {
++        // v1 schema: N || 32-byte logical prefix || depth_u16le. Shared
++        // ancestors are overwritten once in the final deduplicated batch.
++        Bytes key(1, 'N'); PutHash(key, prefix); Put(key, depth, 2); return key;
++    }
++    bool Contains(const Hash &key) const {
++        for (unsigned d = 0; d < depth; ++d) if (Bit(key, d) != Bit(prefix, d)) return false;
++        return true;
++    }
++};
++Bytes CoinKey(const Outpoint &outpoint) {
++    Bytes key(1, 'C'); PutHash(key, outpoint.tx_id); Put(key, outpoint.index, 4); return key;
++}
++Bytes UndoKey(const Hash &tip) { Bytes key(1, 'U'); PutHash(key, tip); return key; }
++Bytes CoinBytes(const Coin &coin) {
++    std::vector<uint8_t> encoded;
++    if (!EncodeCoin(coin, encoded)) Fail(DiskStateErrorCode::InvalidCoin, "invalid coin");
++    return Bytes(reinterpret_cast<const char *>(encoded.data()), encoded.size());
++}
++Coin ParseCoin(const Bytes &bytes) {
++    Require(bytes.size() <= MAX_COIN_BYTES && bytes.size() >= 54, "coin size");
++    Reader r{bytes};
++    Coin coin;
++    coin.outpoint.tx_id = r.Digest();
++    coin.outpoint.index = r.Int(4);
++    const uint64_t lead = r.Int(1);
++    uint64_t size = lead;
++    if (lead >= 253) {
++        const unsigned width = lead == 253 ? 2 : lead == 254 ? 4 : 8;
++        size = r.Int(width);
++        Require(size >= (width == 2 ? 253 : width == 4 ? 65536ULL : 4294967296ULL),
++                "noncanonical coin length");
++    }
++    Require(size <= MAX_OUTPUT_BYTES && size <= bytes.size() - r.at, "coin output size");
++    std::vector<uint8_t> output(bytes.begin() + r.at, bytes.begin() + r.at + size);
++    r.at += size;
++    std::string error;
++    Require(DecodeOutput(output, coin.output, error), "coin output");
++    coin.creation_height = r.Int();
++    coin.creation_parent_mtp = r.Int();
++    const auto flag = r.Int(1);
++    Require(flag <= 1, "coinbase flag"); coin.coinbase = flag;
++    r.End();
++    std::vector<uint8_t> canonical;
++    Require(EncodeCoin(coin, canonical) &&
++            Bytes(reinterpret_cast<const char *>(canonical.data()), canonical.size()) == bytes,
++            "noncanonical coin");
++    return coin;
++}
++// Cardinality is only 0, 1, or many; no global coin-count representation cap.
++struct Summary {
++    uint8_t kind{};
++    Hash digest{EmptyUtxoRoot()};
++    bool operator==(const Summary &) const = default;
++};
++void PutSummary(Bytes &out, const Summary &summary) {
++    Put(out, summary.kind, 1); PutHash(out, summary.digest);
++}
++Summary GetSummary(Reader &r) {
++    Summary result{static_cast<uint8_t>(r.Int(1)), r.Digest()};
++    Require(result.kind <= 2 && (result.kind == 0) == (result.digest == EmptyUtxoRoot()),
++            "invalid tree summary");
++    return result;
++}
++struct Node {
++    Summary summary;
++    std::optional<Coin> coin;
++    std::array<Summary, 2> children;
++};
++Node Leaf(const Coin &coin) {
++    Node node; node.summary.kind = 1; node.coin = coin;
++    if (!UtxoLeaf(coin, node.summary.digest)) Fail(DiskStateErrorCode::InvalidCoin, "invalid leaf");
++    return node;
++}
++Node Branch(unsigned depth, const Summary &left, const Summary &right) {
++    Require(depth < 256, "branch depth");
++    Require((left.kind != 0 || right.kind != 0) &&
++            !(left.kind == 0 && right.kind == 1) && !(left.kind == 1 && right.kind == 0),
++            "uncollapsed branch");
++    Node node; node.summary.kind = 2; node.children = {left, right};
++    Require(UtxoNode(depth, left.digest, right.digest, node.summary.digest), "node hash");
++    return node;
++}
++Bytes EncodeNode(const Node &node) {
++    Bytes bytes;
++    PutSummary(bytes, node.summary);
++    if (node.summary.kind == 1) PutBlob(bytes, CoinBytes(*node.coin));
++    else { PutSummary(bytes, node.children[0]); PutSummary(bytes, node.children[1]); }
++    return bytes;
++}
++Node ParseNode(const Bytes &bytes, const Path &path, const Summary &expected) {
++    Require(bytes.size() <= MAX_COIN_BYTES + 41, "node size");
++    Reader r{bytes};
++    const Summary stored = GetSummary(r);
++    Require(stored == expected && stored.kind != 0, "node/head disagreement");
++    Node node;
++    if (stored.kind == 1) {
++        node = Leaf(ParseCoin(r.Blob(MAX_COIN_BYTES)));
++        Require(path.Contains(OutpointKey(node.coin->outpoint)), "leaf path mismatch");
++    } else {
++        auto left = GetSummary(r); auto right = GetSummary(r);
++        node = Branch(path.depth, left, right);
++    }
++    r.End(); Require(node.summary == stored, "node hash mismatch");
++    return node;
++}
++struct Head { Summary root; DiskStateMetadata metadata; };
++Bytes Schema(const DiskStateOptions &options) {
++    Bytes bytes("LotusV2State\1", 13);
++    PutHash(bytes, options.identity); PutHash(bytes, options.profile_digest); return bytes;
++}
++void CheckMetadata(const DiskStateMetadata &metadata, size_t cap) {
++    if (metadata.header.size() > cap || metadata.monetary.size() > cap - metadata.header.size() ||
++        metadata.auxiliary.size() > cap - metadata.header.size() - metadata.monetary.size())
++        Fail(DiskStateErrorCode::Resource, "metadata exceeds operational limit");
++}
++Bytes EncodeHead(const Head &head, const DiskStateOptions &options) {
++    CheckMetadata(head.metadata, options.max_metadata_bytes);
++    Bytes bytes = Schema(options);
++    PutSummary(bytes, head.root); PutHash(bytes, head.metadata.tip);
++    PutBlob(bytes, head.metadata.header); PutBlob(bytes, head.metadata.monetary);
++    PutBlob(bytes, head.metadata.auxiliary); return bytes;
++}
++Head ParseHead(const Bytes &bytes, const DiskStateOptions &options) {
++    const Bytes schema = Schema(options);
++    Require(bytes.size() >= schema.size(), "head schema missing");
++    if (bytes.compare(0, schema.size(), schema) != 0)
++        Fail(DiskStateErrorCode::ProfileMismatch, "head identity/profile mismatch");
++    Reader r{bytes, schema.size()}; Head result;
++    result.root = GetSummary(r); result.metadata.tip = r.Digest();
++    auto Copy = [&](std::vector<uint8_t> &out) {
++        const Bytes value = r.Blob(options.max_metadata_bytes); out.assign(value.begin(), value.end());
++    };
++    Copy(result.metadata.header); Copy(result.metadata.monetary); Copy(result.metadata.auxiliary);
++    r.End(); CheckMetadata(result.metadata, options.max_metadata_bytes); return result;
++}
++struct Change { Value before; Value after; };
++using Changes = std::map<Bytes, Change>;
++void PutValue(Bytes &out, const Value &value) {
++    Put(out, value.has_value(), 1); if (value) PutBlob(out, *value);
++}
++Value GetValue(Reader &r) {
++    const auto present = r.Int(1); Require(present <= 1, "undo presence");
++    return present ? Value{r.Blob()} : std::nullopt;
++}
++Bytes EncodeUndo(const Bytes &before, const Bytes &after, const Changes &changes) {
++    Bytes bytes; PutBlob(bytes, before); PutBlob(bytes, after); Put(bytes, changes.size());
++    for (const auto &[key, change] : changes) {
++        PutBlob(bytes, key); PutValue(bytes, change.before); PutValue(bytes, change.after);
++    }
++    return bytes;
++}
++} // namespace
++
++struct DiskStateStore::Impl {
++    DiskStateOptions options;
++    // DB must be destroyed before its cache.
++    std::unique_ptr<leveldb::Cache> cache;
++    std::unique_ptr<leveldb::DB> db;
++    Head head;
++    bool active{};
++    bool poisoned{};
++    mutable DiskStateStats stats;
++    void Usable() const {
++        if (!db) Fail(DiskStateErrorCode::Closed, "closed store");
++        if (poisoned) Fail(DiskStateErrorCode::Database, "reopen required after failed write");
++    }
++    Value Read(const Bytes &key) const {
++        Usable(); ++stats.database_reads;
++        Bytes value;
++        leveldb::ReadOptions read; read.verify_checksums = true;
++        const auto status = db->Get(read, key, &value);
++        if (status.IsNotFound()) return std::nullopt;
++        CheckStatus(status); return value;
++    }
++    void Write(leveldb::WriteBatch &batch) {
++        Usable(); leveldb::WriteOptions write; write.sync = true;
++        const auto status = db->Write(write, &batch);
++        if (!status.ok()) { poisoned = true; CheckStatus(status); }
++    }
++};
++
++struct DiskStateTransaction::Impl {
++    std::shared_ptr<DiskStateStore::Impl> store;
++    Head head;
++    Changes changes;
++    mutable DiskStateStats stats;
++    bool failed{};
++    bool finished{};
++    explicit Impl(std::shared_ptr<DiskStateStore::Impl> owner)
++        : store(std::move(owner)), head(store->head) {}
++    ~Impl() { if (!finished) store->active = false; }
++    void Usable() const {
++        store->Usable();
++        if (failed || finished) Fail(DiskStateErrorCode::TransactionAborted, "transaction aborted");
++    }
++    Value Read(const Bytes &key) const {
++        Usable();
++        const auto it = changes.find(key);
++        if (it != changes.end()) return it->second.after;
++        ++stats.database_reads;
++        return store->Read(key);
++    }
++    void Set(const Bytes &key, Value value) {
++        Usable();
++        auto it = changes.find(key);
++        if (it == changes.end()) {
++            Value before = Read(key);
++            if (before == value) return;
++            it = changes.emplace(key, Change{before, before}).first;
++            stats.pending_bytes += key.size() + (before ? 2 * before->size() : 0);
++        }
++        if (it->second.after) stats.pending_bytes -= it->second.after->size();
++        it->second.after = std::move(value);
++        if (it->second.after) stats.pending_bytes += it->second.after->size();
++        if (it->second.before == it->second.after) {
++            stats.pending_bytes -= key.size() + (it->second.before ? it->second.before->size() : 0) +
++                                   (it->second.after ? it->second.after->size() : 0);
++            changes.erase(it);
++        }
++        if (stats.pending_bytes > store->options.max_pending_bytes)
++            Fail(DiskStateErrorCode::Resource, "transaction exceeds operational memory limit");
++    }
++    Node GetNode(const Path &path, const Summary &summary) const {
++        Require(summary.kind != 0, "read empty node");
++        const Value bytes = Read(path.Key()); Require(bytes.has_value(), "missing tree node");
++        return ParseNode(*bytes, path, summary);
++    }
++    Summary SetNode(const Path &path, const Node &node) {
++        Set(path.Key(), EncodeNode(node)); return node.summary;
++    }
++    Summary Join(const Path &path, const Node &old, const Node &added) {
++        const Hash old_key = OutpointKey(old.coin->outpoint);
++        const Hash key = OutpointKey(added.coin->outpoint);
++        Require(key != old_key, "leaf key collision");
++        const bool old_bit = Bit(old_key, path.depth), bit = Bit(key, path.depth);
++        std::array<Summary, 2> children;
++        if (old_bit == bit) children[bit] = Join(path.Child(bit), old, added);
++        else {
++            children[old_bit] = SetNode(path.Child(old_bit), old);
++            children[bit] = SetNode(path.Child(bit), added);
++        }
++        return SetNode(path, Branch(path.depth, children[0], children[1]));
++    }
++    Summary InsertAt(const Path &path, const Summary &summary, const Node &added) {
++        if (!summary.kind) return SetNode(path, added);
++        Node old = GetNode(path, summary);
++        if (old.summary.kind == 1) {
++            if (OutpointKey(old.coin->outpoint) == OutpointKey(added.coin->outpoint))
++                Fail(DiskStateErrorCode::Duplicate, "occupied outpoint key");
++            return Join(path, old, added);
++        }
++        const bool bit = Bit(OutpointKey(added.coin->outpoint), path.depth);
++        old.children[bit] = InsertAt(path.Child(bit), old.children[bit], added);
++        return SetNode(path, Branch(path.depth, old.children[0], old.children[1]));
++    }
++    Summary EraseAt(const Path &path, const Summary &summary, const Outpoint &outpoint) {
++        if (!summary.kind) Fail(DiskStateErrorCode::Missing, "missing leaf");
++        Node old = GetNode(path, summary);
++        if (old.summary.kind == 1) {
++            Require(old.coin->outpoint == outpoint, "coin/tree disagreement");
++            Set(path.Key(), std::nullopt); return {};
++        }
++        const bool bit = Bit(OutpointKey(outpoint), path.depth);
++        old.children[bit] = EraseAt(path.Child(bit), old.children[bit], outpoint);
++        const auto left = old.children[0].kind, right = old.children[1].kind;
++        if ((left == 0 && right == 1) || (left == 1 && right == 0)) {
++            const bool survivor = right == 1;
++            Node leaf = GetNode(path.Child(survivor), old.children[survivor]);
++            Set(path.Child(survivor).Key(), std::nullopt);
++            return SetNode(path, leaf);
++        }
++        return SetNode(path, Branch(path.depth, old.children[0], old.children[1]));
++    }
++    void End() { finished = true; store->active = false; }
++    DiskStateStats Stats() const {
++        auto result = stats;
++        for (const auto &[key, change] : changes) {
++            (void)change;
++            if (key[0] == 'C') ++result.dirty_coins;
++            if (key[0] == 'N') ++result.dirty_nodes;
++        }
++        return result;
++    }
++};
++
++namespace {
++template <typename Read> void RawReadCoin(Read read, const Outpoint &outpoint, std::optional<Coin> &out) {
++    const Value bytes = read(CoinKey(outpoint));
++    if (!bytes) { out.reset(); return; }
++    Coin coin = ParseCoin(*bytes); Require(coin.outpoint == outpoint, "coin key mismatch");
++    out = std::move(coin);
++}
++template <typename Read> void Prove(Read read, const Head &head, const Outpoint &query, CoinProof &out) {
++    CoinProof proof;
++    Path path;
++    Summary summary = head.root;
++    const Hash key = OutpointKey(query);
++    std::vector<std::pair<unsigned, Hash>> ancestors;
++    while (summary.kind) {
++        const Value bytes = read(path.Key()); Require(bytes.has_value(), "missing proof node");
++        const Node node = ParseNode(*bytes, path, summary);
++        if (summary.kind == 1) {
++            proof.coin = node.coin;
++            proof.presence = proof.coin->outpoint == query ? ProofPresence::Present : ProofPresence::OtherLeaf;
++            const Value coin = read(CoinKey(proof.coin->outpoint));
++            Require(coin && *coin == CoinBytes(*proof.coin), "coin/tree proof disagreement");
++            break;
++        }
++        const bool bit = Bit(key, path.depth);
++        ancestors.emplace_back(path.depth, node.children[1 - bit].digest);
++        summary = node.children[bit]; path = path.Child(bit);
++    }
++    for (auto it = ancestors.rbegin(); it != ancestors.rend(); ++it) {
++        if (it->second != EmptyUtxoRoot()) {
++            proof.bitmap[it->first / 8] |= uint8_t(1 << (it->first % 8));
++            proof.siblings.push_back(it->second);
++        }
++    }
++    Require(VerifyCoinProof(query, proof, head.root.digest), "generated proof mismatch");
++    out = std::move(proof);
++}
++template <typename Read> void AuthReadCoin(Read read, const Head &head, const Outpoint &outpoint,
++                                          std::optional<Coin> &out) {
++    CoinProof proof; Prove(read, head, outpoint, proof);
++    std::optional<Coin> coin; RawReadCoin(read, outpoint, coin);
++    Require(coin.has_value() == (proof.presence == ProofPresence::Present),
++            "coin membership disagreement");
++    if (coin) Require(CoinBytes(*coin) == CoinBytes(*proof.coin), "authenticated coin mismatch");
++    out = std::move(coin);
++}
++void AddBatch(leveldb::WriteBatch &batch, const Bytes &key, const Value &value, DiskStateStats &stats) {
++    if (value) { batch.Put(key, *value); ++stats.batch_puts; }
++    else { batch.Delete(key); ++stats.batch_deletes; }
++    stats.batch_bytes += key.size() + (value ? value->size() : 0);
++}
++} // namespace
++
++DiskStateStore::DiskStateStore() = default;
++DiskStateStore::~DiskStateStore() = default;
++DiskStateStore::DiskStateStore(DiskStateStore &&) noexcept = default;
++DiskStateStore &DiskStateStore::operator=(DiskStateStore &&) noexcept = default;
++DiskStateTransaction::DiskStateTransaction() = default;
++DiskStateTransaction::~DiskStateTransaction() = default;
++DiskStateTransaction::DiskStateTransaction(DiskStateTransaction &&) noexcept = default;
++DiskStateTransaction &DiskStateTransaction::operator=(DiskStateTransaction &&) noexcept = default;
++
++bool DiskStateStore::Open(const std::string &directory, const DiskStateOptions &options,
++                          const DiskStateMetadata &initial, DiskStateStore &out, DiskStateError &error) {
++    return Guard(error, [&] {
++        if (out.impl_) Fail(DiskStateErrorCode::Closed, "output store already open");
++        if (options.cache_bytes == 0 || options.write_buffer_bytes < (64 << 10) ||
++            options.max_pending_bytes == 0 || options.max_metadata_bytes == 0)
++            Fail(DiskStateErrorCode::Resource, "invalid storage limits");
++        auto impl = std::make_shared<Impl>(); impl->options = options;
++        impl->cache.reset(leveldb::NewLRUCache(options.cache_bytes));
++        leveldb::Options dboptions;
++        dboptions.create_if_missing = true; dboptions.paranoid_checks = true;
++        dboptions.block_cache = impl->cache.get(); dboptions.write_buffer_size = options.write_buffer_bytes;
++        dboptions.max_open_files = 64;
++        if (options.env) dboptions.env = options.env;
++        leveldb::DB *db{}; CheckStatus(leveldb::DB::Open(dboptions, directory, &db)); impl->db.reset(db);
++        const Value schema = impl->Read("V"), head = impl->Read("S");
++        if (!schema) {
++            Require(!head, "head without schema");
++            std::unique_ptr<leveldb::Iterator> iterator(impl->db->NewIterator(leveldb::ReadOptions{}));
++            iterator->SeekToFirst(); CheckStatus(iterator->status());
++            Require(!iterator->Valid(), "nonempty database without schema");
++            impl->head.metadata = initial;
++            leveldb::WriteBatch batch; batch.Put("V", Schema(options)); batch.Put("S", EncodeHead(impl->head, options));
++            impl->Write(batch);
++        } else {
++            if (*schema != Schema(options)) Fail(DiskStateErrorCode::ProfileMismatch, "database identity/profile/schema mismatch");
++            Require(head.has_value(), "missing head"); impl->head = ParseHead(*head, options);
++        }
++        const Value node = impl->Read(Path{}.Key());
++        if (impl->head.root.kind) {
++            Require(node.has_value(), "missing root node");
++            const Node root = ParseNode(*node, Path{}, impl->head.root);
++            if (root.coin) {
++                const Value coin = impl->Read(CoinKey(root.coin->outpoint));
++                Require(coin && *coin == CoinBytes(*root.coin), "singleton root coin mismatch");
++            }
++        } else Require(!node, "unexpected root node");
++        out.impl_ = std::move(impl);
++    });
++}
++bool DiskStateStore::IsOpen() const { return impl_ && !impl_->poisoned; }
++Hash DiskStateStore::Root() const { return impl_ ? impl_->head.root.digest : EmptyUtxoRoot(); }
++DiskStateMetadata DiskStateStore::Metadata() const { return impl_ ? impl_->head.metadata : DiskStateMetadata{}; }
++DiskStateStats DiskStateStore::LastStats() const { return impl_ ? impl_->stats : DiskStateStats{}; }
++bool DiskStateStore::ReadCoin(const Outpoint &outpoint, std::optional<Coin> &out, DiskStateError &error) const {
++    return Guard(error, [&] {
++        if (!impl_) Fail(DiskStateErrorCode::Closed, "closed store");
++        ::lotus::v2::AuthReadCoin([&](const Bytes &key) { return impl_->Read(key); }, impl_->head, outpoint, out);
++    });
++}
++bool DiskStateStore::Prove(const Outpoint &query, CoinProof &out, DiskStateError &error) const {
++    return Guard(error, [&] {
++        if (!impl_) Fail(DiskStateErrorCode::Closed, "closed store");
++        impl_->Usable(); ::lotus::v2::Prove([&](const Bytes &key) { return impl_->Read(key); }, impl_->head, query, out);
++    });
++}
++bool DiskStateStore::Begin(DiskStateTransaction &out, DiskStateError &error) {
++    return Guard(error, [&] {
++        if (!impl_) Fail(DiskStateErrorCode::Closed, "closed store");
++        impl_->Usable();
++        if (impl_->active || out.impl_) Fail(DiskStateErrorCode::TransactionAborted, "active transaction");
++        out.impl_ = std::make_unique<DiskStateTransaction::Impl>(impl_); impl_->active = true;
++    });
++}
++Hash DiskStateTransaction::Root() const { return impl_ ? impl_->head.root.digest : EmptyUtxoRoot(); }
++DiskStateStats DiskStateTransaction::Stats() const { return impl_ ? impl_->Stats() : DiskStateStats{}; }
++bool DiskStateTransaction::ReadCoin(const Outpoint &outpoint, std::optional<Coin> &out, DiskStateError &error) const {
++    return Guard(error, [&] {
++        if (!impl_) Fail(DiskStateErrorCode::Closed, "closed transaction");
++        ::lotus::v2::AuthReadCoin([&](const Bytes &key) { return impl_->Read(key); }, impl_->head, outpoint, out);
++    });
++}
++bool DiskStateTransaction::Prove(const Outpoint &query, CoinProof &out, DiskStateError &error) const {
++    return Guard(error, [&] {
++        if (!impl_) Fail(DiskStateErrorCode::Closed, "closed transaction");
++        impl_->Usable(); ::lotus::v2::Prove([&](const Bytes &key) { return impl_->Read(key); }, impl_->head, query, out);
++    });
++}
++bool DiskStateTransaction::Insert(const Coin &coin, DiskStateError &error) {
++    const bool ok = Guard(error, [&] {
++        if (!impl_) Fail(DiskStateErrorCode::Closed, "closed transaction");
++        impl_->Usable(); const Bytes bytes = CoinBytes(coin);
++        std::optional<Coin> existing;
++        AuthReadCoin([&](const Bytes &key) { return impl_->Read(key); }, impl_->head, coin.outpoint, existing);
++        if (existing) Fail(DiskStateErrorCode::Duplicate, "duplicate coin");
++        impl_->head.root = impl_->InsertAt(Path{}, impl_->head.root, Leaf(coin));
++        impl_->Set(CoinKey(coin.outpoint), bytes);
++    });
++    if (!ok && impl_ && error.code != DiskStateErrorCode::Duplicate && error.code != DiskStateErrorCode::InvalidCoin)
++        impl_->failed = true;
++    return ok;
++}
++bool DiskStateTransaction::Erase(const Outpoint &outpoint, DiskStateError &error) {
++    const bool ok = Guard(error, [&] {
++        if (!impl_) Fail(DiskStateErrorCode::Closed, "closed transaction");
++        impl_->Usable(); std::optional<Coin> existing;
++        AuthReadCoin([&](const Bytes &key) { return impl_->Read(key); }, impl_->head, outpoint, existing);
++        if (!existing) Fail(DiskStateErrorCode::Missing, "missing coin");
++        impl_->head.root = impl_->EraseAt(Path{}, impl_->head.root, outpoint);
++        impl_->Set(CoinKey(outpoint), std::nullopt);
++    });
++    if (!ok && impl_ && error.code != DiskStateErrorCode::Missing) impl_->failed = true;
++    return ok;
++}
++void DiskStateTransaction::Abort() { impl_.reset(); }
++bool DiskStateTransaction::Commit(const DiskStateMetadata &next, DiskStateError &error) {
++    return Guard(error, [&] {
++        if (!impl_) Fail(DiskStateErrorCode::Closed, "closed transaction");
++        impl_->Usable(); auto &store = *impl_->store;
++        if (next.tip == store.head.metadata.tip) Fail(DiskStateErrorCode::UndoMismatch, "commit must advance tip identity");
++        Head next_head = impl_->head; next_head.metadata = next;
++        const Bytes before = EncodeHead(store.head, store.options), after = EncodeHead(next_head, store.options);
++        const Bytes undo = EncodeUndo(before, after, impl_->changes);
++        const Bytes undo_key = UndoKey(next.tip);
++        const Value prior = store.Read(undo_key);
++        if (prior && *prior != undo) Fail(DiskStateErrorCode::UndoMismatch, "immutable undo differs for existing tip");
++        auto stats = impl_->Stats(); ++stats.database_reads; leveldb::WriteBatch batch;
++        for (const auto &[key, change] : impl_->changes) AddBatch(batch, key, change.after, stats);
++        AddBatch(batch, "S", after, stats); AddBatch(batch, "V", Schema(store.options), stats);
++        if (!prior) AddBatch(batch, undo_key, undo, stats);
++        store.Write(batch); store.head = std::move(next_head); store.stats = stats; impl_->End();
++    });
++}
++bool DiskStateStore::Disconnect(const Hash &expected_tip, DiskStateError &error) {
++    return Guard(error, [&] {
++        if (!impl_) Fail(DiskStateErrorCode::Closed, "closed store");
++        impl_->Usable();
++        if (impl_->active) Fail(DiskStateErrorCode::TransactionAborted, "active transaction");
++        if (impl_->head.metadata.tip != expected_tip) Fail(DiskStateErrorCode::UndoMismatch, "disconnect tip mismatch");
++        const uint64_t reads_before = impl_->stats.database_reads;
++        const Value undo = impl_->Read(UndoKey(expected_tip));
++        if (!undo) Fail(DiskStateErrorCode::Missing, "missing undo");
++        Reader r{*undo}; const Bytes before = r.Blob(), after = r.Blob();
++        Require(after == EncodeHead(impl_->head, impl_->options), "undo successor mismatch");
++        Head previous = ParseHead(before, impl_->options);
++        const uint64_t count = r.Int(); Require(count <= undo->size() / 10, "undo count");
++        leveldb::WriteBatch batch; DiskStateStats stats;
++        Bytes previous_key;
++        for (uint64_t i = 0; i < count; ++i) {
++            const Bytes key = r.Blob(37);
++            Require((key.size() == 37 && key[0] == 'C') || (key.size() == 35 && key[0] == 'N'), "undo key");
++            Require(previous_key.empty() || key > previous_key, "unordered/duplicate undo key"); previous_key = key;
++            const Value old_value = GetValue(r), current_value = GetValue(r);
++            Require(impl_->Read(key) == current_value, "undo current value mismatch");
++            AddBatch(batch, key, old_value, stats);
++            if (key[0] == 'C') ++stats.dirty_coins; else ++stats.dirty_nodes;
++        }
++        r.End();
++        AddBatch(batch, "S", before, stats); AddBatch(batch, "V", Schema(impl_->options), stats);
++        // Undo records are immutable and retained across disconnect/reorg.
++        stats.database_reads = impl_->stats.database_reads - reads_before;
++        impl_->Write(batch); impl_->head = std::move(previous); impl_->stats = stats;
++    });
++}
++} // namespace lotus::v2
+diff --git a/src/lotus_v2/disk_state.h b/src/lotus_v2/disk_state.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..f0d91718bb461737297abd0a8f9f77ec8bba80fb
+--- /dev/null
++++ b/src/lotus_v2/disk_state.h
+@@ -0,0 +1,108 @@
++// Copyright (c) 2026 The Lotus developers
++#ifndef LOTUS_V2_DISK_STATE_H
++#define LOTUS_V2_DISK_STATE_H
++
++#include "sparse_state.h"
++
++#include <memory>
++#include <string>
++#include <vector>
++
++namespace leveldb { class Env; }
++namespace lotus::v2 {
++
++// Storage failures are operational; callers must never translate them into a
++// consensus-invalid block. Mutation errors are separate from storage errors.
++enum class DiskStateErrorCode {
++    None, Database, Resource, Corruption, ProfileMismatch, Closed,
++    Duplicate, Missing, InvalidCoin, UndoMismatch, TransactionAborted
++};
++struct DiskStateError {
++    DiskStateErrorCode code{DiskStateErrorCode::None};
++    std::string message;
++};
++struct DiskStateOptions {
++    Hash identity{};
++    Hash profile_digest{};
++    size_t cache_bytes{8 << 20};
++    size_t write_buffer_bytes{4 << 20}; // LevelDB's minimum is 64 KiB.
++    // Limits retained overlay key/value payload, not total RAM. Map overhead,
++    // LevelDB buffers and temporary batch/undo encoding add memory overhead.
++    size_t max_pending_bytes{64 << 20}; // Operational limit, not consensus.
++    size_t max_metadata_bytes{16 << 20};
++    // Optional borrowed Env for embedding/testing; must outlive store/transactions.
++    leveldb::Env *env{nullptr};
++};
++// Enclosing validator owns framing and semantic checks of these opaque bytes.
++// All metadata and the authenticated UTXO root commit in the same sync batch.
++struct DiskStateMetadata {
++    Hash tip{};
++    std::vector<uint8_t> header;
++    std::vector<uint8_t> monetary;
++    std::vector<uint8_t> auxiliary;
++    bool operator==(const DiskStateMetadata &) const = default;
++};
++struct DiskStateStats {
++    uint64_t database_reads{};
++    uint64_t dirty_nodes{};
++    uint64_t dirty_coins{};
++    uint64_t batch_puts{};
++    uint64_t batch_deletes{};
++    uint64_t batch_bytes{};
++    uint64_t pending_bytes{};
++};
++class DiskStateTransaction;
++// Bundled ABC LevelDB, hidden behind this backend seam. No complete UTXO set is
++// held in memory or scanned on open, connect, proof, or disconnect. Callers must
++// serialize operations on one store and its transactions. A transaction keeps
++// its store alive; only one may be active. Read the staged view through it.
++class DiskStateStore {
++public:
++    DiskStateStore();
++    ~DiskStateStore();
++    DiskStateStore(DiskStateStore &&) noexcept;
++    DiskStateStore &operator=(DiskStateStore &&) noexcept;
++    DiskStateStore(const DiskStateStore &) = delete;
++    DiskStateStore &operator=(const DiskStateStore &) = delete;
++    static bool Open(const std::string &directory, const DiskStateOptions &options,
++                     const DiskStateMetadata &initial, DiskStateStore &out,
++                     DiskStateError &error);
++    bool IsOpen() const;
++    Hash Root() const;
++    DiskStateMetadata Metadata() const;
++    bool ReadCoin(const Outpoint &, std::optional<Coin> &, DiskStateError &) const;
++    bool Prove(const Outpoint &, CoinProof &, DiskStateError &) const;
++    bool Begin(DiskStateTransaction &, DiskStateError &);
++    bool Disconnect(const Hash &expected_tip, DiskStateError &);
++    DiskStateStats LastStats() const;
++private:
++    struct Impl;
++    std::shared_ptr<Impl> impl_;
++    friend class DiskStateTransaction;
++};
++class DiskStateTransaction {
++public:
++    DiskStateTransaction();
++    ~DiskStateTransaction();
++    DiskStateTransaction(DiskStateTransaction &&) noexcept;
++    DiskStateTransaction &operator=(DiskStateTransaction &&) noexcept;
++    DiskStateTransaction(const DiskStateTransaction &) = delete;
++    DiskStateTransaction &operator=(const DiskStateTransaction &) = delete;
++    bool ReadCoin(const Outpoint &, std::optional<Coin> &, DiskStateError &) const;
++    bool Prove(const Outpoint &, CoinProof &, DiskStateError &) const;
++    bool Insert(const Coin &, DiskStateError &);
++    bool Erase(const Outpoint &, DiskStateError &);
++    Hash Root() const;
++    DiskStateStats Stats() const;
++    // One sync WriteBatch: changed coins/nodes, head, identity/profile and
++    // immutable undo keyed by next.tip. A failed write poisons the store until
++    // reopen because a failed sync can have an ambiguous durability outcome.
++    bool Commit(const DiskStateMetadata &next, DiskStateError &);
++    void Abort();
++private:
++    struct Impl;
++    std::unique_ptr<Impl> impl_;
++    friend class DiskStateStore;
++};
++} // namespace lotus::v2
++#endif
+diff --git a/src/lotus_v2/disk_state_test/CMakeLists.txt b/src/lotus_v2/disk_state_test/CMakeLists.txt
+new file mode 100644
+index 0000000000000000000000000000000000000000..4cc2b5e5e250882cd760d63f4fcf00fea327c5f0
+--- /dev/null
++++ b/src/lotus_v2/disk_state_test/CMakeLists.txt
+@@ -0,0 +1,27 @@
++# Isolated native review target using the exact bundled ABC LevelDB/crc32c.
++cmake_minimum_required(VERSION 3.18)
++project(lotus_v2_disk_state LANGUAGES C CXX)
++set(CMAKE_CXX_STANDARD 20)
++set(CMAKE_CXX_STANDARD_REQUIRED ON)
++list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/../../../cmake/modules")
++include(AddCompilerFlags)
++set(LEVELDB_BUILD_TESTS OFF CACHE BOOL "" FORCE)
++set(LEVELDB_BUILD_BENCHMARKS OFF CACHE BOOL "" FORCE)
++set(CRC32C_BUILD_TESTS OFF CACHE BOOL "" FORCE)
++set(CRC32C_BUILD_BENCHMARKS OFF CACHE BOOL "" FORCE)
++add_subdirectory(../../crc32c crc32c)
++add_subdirectory(../../leveldb leveldb)
++find_path(LOTUS_BOOST_INCLUDE boost/multiprecision/cpp_int.hpp PATHS /opt/homebrew/opt/boost/include REQUIRED)
++add_library(blake3 STATIC ../vendor/blake3/blake3.c ../vendor/blake3/blake3_dispatch.c ../vendor/blake3/blake3_portable.c)
++target_compile_definitions(blake3 PRIVATE BLAKE3_NO_SSE2 BLAKE3_NO_SSE41 BLAKE3_NO_AVX2 BLAKE3_NO_AVX512 BLAKE3_USE_NEON=0)
++add_library(lotus_v2_disk_state STATIC ../disk_state.cpp)
++target_compile_features(lotus_v2_disk_state PUBLIC cxx_std_20)
++target_link_libraries(lotus_v2_disk_state PUBLIC leveldb)
++target_compile_options(lotus_v2_disk_state PRIVATE -Wall -Wextra -Wpedantic -Werror)
++add_executable(disk_state_test ../test_disk_state.cpp ../sparse_state.cpp ../incremental_utxo.cpp ../output.cpp ../header.cpp ../tagged_hash.cpp)
++target_compile_features(disk_state_test PRIVATE cxx_std_20)
++target_include_directories(disk_state_test SYSTEM PRIVATE "${LOTUS_BOOST_INCLUDE}")
++target_link_libraries(disk_state_test PRIVATE lotus_v2_disk_state blake3)
++target_compile_options(disk_state_test PRIVATE -Wall -Wextra -Wpedantic -Werror)
++enable_testing()
++add_test(NAME disk_state_test COMMAND disk_state_test)
+diff --git a/src/lotus_v2/disk_state_test/README.md b/src/lotus_v2/disk_state_test/README.md
+new file mode 100644
+index 0000000000000000000000000000000000000000..0e1ca268a84bfa40dd76581dd1cdf73f838d4fdc
+--- /dev/null
++++ b/src/lotus_v2/disk_state_test/README.md
+@@ -0,0 +1,90 @@
++# Disk state storage candidate
++
++`DiskStateStore` persists both canonical P02 coin records and the collapsed
++sparse authenticated tree in Bitcoin ABC's bundled LevelDB. The implementation
++uses that library's API directly to keep the isolated review target independent
++of `CDBWrapper`'s node-wide logging/system dependencies. It introduces no new
++storage engine or dependency. The public API and LevelDB implementation are
++separated by a PImpl; callers supply already-validated opaque header, monetary
++and auxiliary metadata. This component does not execute consensus or select a
++network/profile.
++
++## Version 1 keys and values
++
++| Key | Value |
++| --- | --- |
++| `V` | `LotusV2State` + version byte 1 + 32-byte identity + 32-byte profile digest |
++| `S` | Same schema/identity/profile, root summary, tip ID, framed header/monetary/auxiliary bytes |
++| `C` + tx ID + index u32le | Exact `EncodeCoin` bytes |
++| `N` + zero-padded logical key prefix + depth u16le | Leaf summary and canonical coin, or branch summary and two child summaries |
++| `U` + block/tip ID | Predecessor/successor heads and ordered before/after values of changed `C`/`N` keys |
++
++Tree summaries distinguish empty, one leaf, and multiple leaves, with the exact
++P02 digest; no global UTXO count or coin-count limit is required. Branch hashes
++include their absolute depth. Zero/one-leaf collapse, little-endian bit order,
++empty hashing, proof bitmap and deepest-first siblings use the existing P02
++helpers. Logical prefix keys keep tree position stable as its hash changes.
++
++A single sync `WriteBatch` writes changed coin/tree keys, head, schema identity
++and profile, and immutable undo. The transaction overlay coalesces shared
++ancestors and removes net no-op changes. Disconnect verifies current changed
++values and the successor head before atomically restoring predecessor values
++and metadata. Undo survives disconnect; reusing a tip ID with different undo
++rejects. An aborted transaction writes nothing.
++
++## Memory and storage behavior
++
++Open reads only schema/head/root (and the coin for a singleton root). It checks
++the root record and its immediate summaries without claiming to scan or certify
++all descendants. Descendants and coin/table agreement are authenticated when
++read. Lookup, insert, erase and proofs access a bounded 256-bit path; they never
++scan/load all UTXOs. The overlay grows with changed paths/coins in one block,
++not the entire set. Clean nodes are not retained in an application cache.
++
++`cache_bytes` bounds LevelDB's LRU block cache. The separately configured write
++buffer (minimum 64 KiB), current/immutable memtables, table handles, compaction
++buffers and metadata also use memory. `max_pending_bytes` limits retained
++overlay key/value payload; it is **not a hard process RAM limit**. Map overhead,
++coin objects and temporary undo/WriteBatch encodings add memory. A large block
++can exceed this operational budget and must be retried under an adequate
++resource configuration; it must not be labeled consensus-invalid.
++
++Disk usage includes immutable undo for every committed branch. No finalized
++undo pruning or storage migration is implemented. Deletes create LevelDB
++tombstones; normal LevelDB compaction reclaims obsolete mutable versions, while
++retained undo continues to occupy disk. A future pruning policy must preserve
++supported reorgs. An immutable/content-addressed staging backend could reduce
++block-sized memory further, but would also need ownership and unreferenced-node
++cleanup. No LevelDB-versus-RocksDB performance result is asserted.
++
++`DiskStateStats` exposes database Gets, distinct dirty coin/node keys, final
++batch puts/deletes, logical batch key/value bytes, and overlay payload bytes.
++These are operation counters, not physical I/O or write amplification metrics.
++Callers serialize access to a store and its single active transaction. A write
++or sync error poisons the store until reopen because durability may be
++ambiguous; the recovered database may contain the complete previous or complete
++new batch. Database, corruption, profile and resource errors are operational.
++
++## Reproduce
++
++```sh
++cmake -S src/lotus_v2/disk_state_test -B build-disk-state -GNinja -DCMAKE_BUILD_TYPE=Debug
++cmake --build build-disk-state -j4
++ctest --test-dir build-disk-state --output-on-failure
++```
++
++The isolated build exposes the reusable `lotus_v2_disk_state` target (storage
++source plus bundled LevelDB linkage); enclosing targets provide existing P02
++primitives. Tests compare roots after every one of 4096 inserts and 512 mixed
++delete/insert operations with `IncrementalUtxoSet`, and compare exact inclusion
++and absence proof structures. The database exceeds the 1 KiB block cache by
++more than 100 times; reopen performs at most four Gets. This checks storage
++behavior, not a production-size RAM or throughput benchmark.
++
++Additional cases cover multi-leaf/singleton/empty collapse, no-op coalescing,
++staging/abort, metadata atomicity, reopen/disconnect, alternate branches and
++immutable undo reuse, profile/identity mismatch, operational memory exhaustion,
++injected first WAL Append and WAL Sync failures, missing/changed canonical coin
++rows, orphan rows, and missing root nodes. Failure artifacts are preserved on
++assertion failure. Debug and AddressSanitizer/UndefinedBehaviorSanitizer runs
++are the intended local review gates; full daemon integration is separate.
+diff --git a/src/lotus_v2/test_disk_state.cpp b/src/lotus_v2/test_disk_state.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..7eaf7dc46b121b72438a2335923140f69a098444
+--- /dev/null
++++ b/src/lotus_v2/test_disk_state.cpp
+@@ -0,0 +1,331 @@
++// Copyright (c) 2026 The Lotus developers
++#include "disk_state.h"
++#include "incremental_utxo.h"
++
++#include <leveldb/db.h>
++#include <leveldb/env.h>
++
++#include <algorithm>
++#include <cstdlib>
++#include <filesystem>
++#include <iostream>
++#include <numeric>
++#include <random>
++#include <string>
++#include <vector>
++
++using namespace lotus::v2;
++namespace {
++void Check(bool condition, const std::string &message) {
++    if (!condition) { std::cerr << "V2 disk state: " << message << '\n'; std::exit(1); }
++}
++void Ok(bool value, const DiskStateError &error, const char *message) {
++    Check(value, std::string(message) + ": " + error.message);
++}
++Hash Id(uint32_t id) {
++    Hash hash{};
++    for (unsigned i = 0; i < 4; ++i) hash[i] = id >> (8 * i);
++    return hash;
++}
++Coin MakeCoin(uint32_t index) {
++    Coin coin;
++    coin.outpoint.tx_id = Id(index * 17);
++    coin.outpoint.index = index;
++    coin.output.value = 1000 + index;
++    coin.output.branches = {Id(0x12345678)};
++    coin.output.paths = {{0}};
++    coin.creation_height = 1 + index;
++    coin.creation_parent_mtp = 123456 + index;
++    coin.coinbase = index % 2;
++    return coin;
++}
++DiskStateMetadata Meta(uint32_t id) {
++    DiskStateMetadata meta;
++    meta.tip = Id(id); meta.header = {1, uint8_t(id), 3};
++    meta.monetary = {4, uint8_t(id >> 8), 6}; meta.auxiliary = {7, uint8_t(id), 9};
++    return meta;
++}
++DiskStateOptions Options() {
++    DiskStateOptions opts;
++    opts.identity = Id(0x1234); opts.profile_digest = Id(0x5678);
++    opts.cache_bytes = 1024; opts.write_buffer_bytes = 64 << 10;
++    return opts;
++}
++std::string Key(const Outpoint &outpoint) {
++    std::string key(1, 'C');
++    key.append(reinterpret_cast<const char *>(outpoint.tx_id.data()), 32);
++    for (unsigned i = 0; i < 4; ++i) key.push_back(outpoint.index >> (8 * i));
++    return key;
++}
++std::string Encoded(const Coin &coin) {
++    std::vector<uint8_t> bytes; Check(EncodeCoin(coin, bytes), "encode fixture");
++    return std::string(bytes.begin(), bytes.end());
++}
++void SameProof(const CoinProof &actual, const CoinProof &expected, const Outpoint &query, const Hash &root) {
++    Check(actual.presence == expected.presence && actual.bitmap == expected.bitmap &&
++          actual.siblings == expected.siblings && actual.coin.has_value() == expected.coin.has_value(),
++          "exact oracle proof structure");
++    if (actual.coin) Check(Encoded(*actual.coin) == Encoded(*expected.coin), "exact terminal coin");
++    Check(VerifyCoinProof(query, actual, root), "proof verification");
++}
++void Probe(DiskStateStore &store, const IncrementalUtxoSet &oracle, uint32_t index, bool present) {
++    DiskStateError error;
++    const auto query = MakeCoin(index).outpoint;
++    CoinProof proof; Ok(store.Prove(query, proof, error), error, "prove disk state");
++    SameProof(proof, oracle.Prove(query), query, oracle.Root());
++    std::optional<Coin> coin;
++    Ok(store.ReadCoin(query, coin, error), error, "authenticated coin read");
++    Check(coin.has_value() == present, "authenticated membership");
++    if (coin) Check(Encoded(*coin) == Encoded(MakeCoin(index)), "coin bytes");
++}
++// Inject failures into the existing LevelDB WAL, never into an invented DB.
++class FaultEnv : public leveldb::EnvWrapper {
++public:
++    enum class Fault { None, Append, Sync } fault{Fault::None};
++    FaultEnv() : EnvWrapper(leveldb::Env::Default()) {}
++    class File : public leveldb::WritableFile {
++        FaultEnv &env;
++        std::unique_ptr<leveldb::WritableFile> file;
++    public:
++        File(FaultEnv &e, leveldb::WritableFile *f) : env(e), file(f) {}
++        std::string GetName() const override { return file->GetName(); }
++        leveldb::Status Append(const leveldb::Slice &data) override {
++            if (env.fault == Fault::Append) return leveldb::Status::IOError("injected WAL append");
++            return file->Append(data);
++        }
++        leveldb::Status Close() override { return file->Close(); }
++        leveldb::Status Flush() override { return file->Flush(); }
++        leveldb::Status Sync() override {
++            if (env.fault == Fault::Sync) return leveldb::Status::IOError("injected WAL sync");
++            return file->Sync();
++        }
++    };
++    leveldb::Status NewWritableFile(const std::string &name, leveldb::WritableFile **out) override {
++        auto status = target()->NewWritableFile(name, out);
++        if (status.ok() && name.ends_with(".log")) *out = new File(*this, *out);
++        return status;
++    }
++    leveldb::Status NewAppendableFile(const std::string &name, leveldb::WritableFile **out) override {
++        auto status = target()->NewAppendableFile(name, out);
++        if (status.ok() && name.ends_with(".log")) *out = new File(*this, *out);
++        return status;
++    }
++};
++void RawChange(const std::string &directory, const std::string &key, const std::optional<std::string> &value) {
++    leveldb::Options options; leveldb::DB *raw{};
++    auto status = leveldb::DB::Open(options, directory, &raw);
++    Check(status.ok(), "raw reopen: " + status.ToString());
++    std::unique_ptr<leveldb::DB> db(raw);
++    leveldb::WriteOptions write; write.sync = true;
++    status = value ? db->Put(write, key, *value) : db->Delete(write, key);
++    Check(status.ok(), "raw mutation");
++}
++void SmallCases(const std::string &directory) {
++    DiskStateError error; auto options = Options(); DiskStateStore store;
++    Ok(DiskStateStore::Open(directory, options, Meta(0), store, error), error, "open empty");
++    IncrementalUtxoSet oracle;
++    Probe(store, oracle, 0, false);
++    Check(store.Root() == EmptyUtxoRoot() && store.Metadata() == Meta(0), "empty initial state");
++    DiskStateTransaction tx;
++    Ok(store.Begin(tx, error), error, "begin");
++    DiskStateTransaction second;
++    Check(!store.Begin(second, error) && error.code == DiskStateErrorCode::TransactionAborted, "single writer");
++    Ok(tx.Insert(MakeCoin(0), error), error, "stage aborted coin");
++    Check(store.Root() == EmptyUtxoRoot(), "stage invisible to committed root");
++    tx.Abort(); Probe(store, oracle, 0, false);
++    for (uint32_t id = 1; id <= 3; ++id) {
++        Ok(store.Begin(tx, error), error, "begin small");
++        Ok(tx.Insert(MakeCoin(id), error), error, "insert small"); Check(oracle.Insert(MakeCoin(id)), "oracle small");
++        Check(tx.Root() == oracle.Root(), "staged root");
++        CoinProof proof; Ok(tx.Prove(MakeCoin(id).outpoint, proof, error), error, "staged proof");
++        SameProof(proof, oracle.Prove(MakeCoin(id).outpoint), MakeCoin(id).outpoint, oracle.Root());
++        Check(!tx.Insert(MakeCoin(id), error) && error.code == DiskStateErrorCode::Duplicate, "duplicate");
++        Check(!tx.Erase(MakeCoin(999).outpoint, error) && error.code == DiskStateErrorCode::Missing, "missing erase");
++        Coin invalid = MakeCoin(999); invalid.output.flags = 2; invalid.output.paths.clear();
++        Check(!tx.Insert(invalid, error) && error.code == DiskStateErrorCode::InvalidCoin, "burn coin");
++        Ok(tx.Commit(Meta(id), error), error, "commit small"); tx.Abort();
++        Check(store.Root() == oracle.Root() && store.Metadata() == Meta(id), "committed root and metadata");
++        Probe(store, oracle, id, true);
++    }
++    const Hash three = store.Root();
++    Ok(store.Begin(tx, error), error, "begin multi collapse");
++    for (uint32_t id : {2U, 1U, 3U}) {
++        Ok(tx.Erase(MakeCoin(id).outpoint, error), error, "erase multi collapse");
++        Check(oracle.Erase(MakeCoin(id).outpoint), "oracle multi collapse");
++        Check(tx.Root() == oracle.Root(), "collapse to one then empty root");
++    }
++    Ok(tx.Commit(Meta(4), error), error, "commit empty after multi erase"); tx.Abort();
++    Check(store.Root() == EmptyUtxoRoot(), "multi erase commits empty");
++    store = {}; Ok(DiskStateStore::Open(directory, options, Meta(0), store, error), error, "reopen collapsed empty");
++    Ok(store.Disconnect(Id(4), error), error, "undo multi erase");
++    for (uint32_t id = 1; id <= 3; ++id) Check(oracle.Insert(MakeCoin(id)), "oracle restore multi");
++    Check(store.Root() == three, "multi erase exact rollback");
++    Check(!store.Disconnect(Id(2), error) && error.code == DiskStateErrorCode::UndoMismatch, "wrong tip rejects");
++    Ok(store.Disconnect(Id(3), error), error, "disconnect"); Check(oracle.Erase(MakeCoin(3).outpoint), "oracle disconnect");
++    Probe(store, oracle, 3, false);
++    // Existing undo cannot be replaced by a divergent state for the same ID.
++    Ok(store.Begin(tx, error), error, "begin immutable undo check");
++    Ok(tx.Insert(MakeCoin(44), error), error, "divergent coin");
++    Check(!tx.Commit(Meta(3), error) && error.code == DiskStateErrorCode::UndoMismatch, "immutable undo");
++    tx.Abort(); Check(store.Root() == oracle.Root(), "failed undo overwrite leaves state");
++    Ok(store.Begin(tx, error), error, "reconnect");
++    Ok(tx.Insert(MakeCoin(3), error), error, "reconnect coin"); Ok(tx.Commit(Meta(3), error), error, "reuse immutable undo"); tx.Abort();
++    Check(store.Root() == three, "reconnect exact root"); Check(oracle.Insert(MakeCoin(3)), "oracle reconnect");
++    for (uint32_t id = 3; id > 0; --id) {
++        Ok(store.Disconnect(Id(id), error), error, "disconnect to empty");
++        Check(oracle.Erase(MakeCoin(id).outpoint), "oracle collapse");
++        Check(store.Root() == oracle.Root(), "single/empty collapse"); Probe(store, oracle, id, false);
++    }
++    Ok(store.Begin(tx, error), error, "begin net empty");
++    Ok(tx.Insert(MakeCoin(81), error), error, "transient insert");
++    Ok(tx.Erase(MakeCoin(81).outpoint, error), error, "transient erase");
++    Check(tx.Stats().dirty_coins == 0 && tx.Stats().dirty_nodes == 0 && tx.Stats().pending_bytes == 0,
++          "net no-op delta eliminated");
++    Ok(tx.Commit(Meta(100), error), error, "empty delta metadata commit"); tx.Abort();
++    Check(store.LastStats().batch_puts == 3 && store.LastStats().batch_deletes == 0, "empty batch schema/head/undo");
++    Ok(store.Disconnect(Id(100), error), error, "empty delta undo");
++    store = {};
++    auto wrong = options; wrong.profile_digest = Id(99);
++    Check(!DiskStateStore::Open(directory, wrong, Meta(0), store, error) && error.code == DiskStateErrorCode::ProfileMismatch,
++          "profile mismatch");
++    wrong = options; wrong.identity = Id(99);
++    Check(!DiskStateStore::Open(directory, wrong, Meta(0), store, error) && error.code == DiskStateErrorCode::ProfileMismatch,
++          "identity mismatch");
++    Ok(DiskStateStore::Open(directory, options, Meta(9), store, error), error, "reopen empty");
++    Check(store.Root() == EmptyUtxoRoot() && store.Metadata() == Meta(0), "persisted metadata overrides initializer");
++}
++void LargeAndMixed(const std::string &directory) {
++    DiskStateStore store; DiskStateError error; auto options = Options();
++    Ok(DiskStateStore::Open(directory, options, Meta(0), store, error), error, "open large");
++    IncrementalUtxoSet oracle;
++    constexpr uint32_t total = 4096, group = 64;
++    uint32_t tip{};
++    for (uint32_t start = 0; start < total; start += group) {
++        DiskStateTransaction tx; Ok(store.Begin(tx, error), error, "begin large");
++        for (uint32_t id = start; id < start + group; ++id) {
++            Ok(tx.Insert(MakeCoin(id), error), error, "large insert");
++            Check(oracle.Insert(MakeCoin(id)), "large oracle insert"); Check(tx.Root() == oracle.Root(), "every insertion root");
++        }
++        const auto staged = tx.Stats();
++        Check(staged.dirty_coins == group && staged.dirty_nodes < group * 257 && staged.database_reads < group * 1100,
++              "changed-state path bounds");
++        Ok(tx.Commit(Meta(++tip), error), error, "large commit");
++        Check(store.LastStats().batch_puts == staged.dirty_coins + staged.dirty_nodes + 3,
++              "deduplicated dirty nodes written once");
++    }
++    const Hash full = oracle.Root(); store = {};
++    uint64_t data_size{};
++    for (const auto &entry : std::filesystem::directory_iterator(directory))
++        if (entry.is_regular_file()) data_size += entry.file_size();
++    Check(data_size > options.cache_bytes * 100, "database much larger than tiny cache");
++    Ok(DiskStateStore::Open(directory, options, Meta(0), store, error), error, "reopen large");
++    Check(store.Root() == full && store.LastStats().database_reads <= 4, "bounded reopen without UTXO scan");
++    for (uint32_t id = 0; id < total; id += 97) Probe(store, oracle, id, true);
++    Probe(store, oracle, total + 5, false);
++    const auto before = store.Metadata();
++    std::vector<uint32_t> permutation(total); std::iota(permutation.begin(), permutation.end(), 0);
++    std::mt19937 random(12345); std::shuffle(permutation.begin(), permutation.end(), random);
++    DiskStateTransaction tx; Ok(store.Begin(tx, error), error, "mixed begin");
++    for (uint32_t i = 0; i < 512; ++i) {
++        Ok(tx.Erase(MakeCoin(permutation[i]).outpoint, error), error, "mixed delete");
++        Check(oracle.Erase(MakeCoin(permutation[i]).outpoint), "mixed oracle delete");
++        Ok(tx.Insert(MakeCoin(total + i), error), error, "mixed insert");
++        Check(oracle.Insert(MakeCoin(total + i)), "mixed oracle insert");
++        Check(tx.Root() == oracle.Root(), "every mixed update root");
++        if (i % 41 == 0) {
++            CoinProof proof; const auto query = MakeCoin(permutation[i]).outpoint;
++            Ok(tx.Prove(query, proof, error), error, "staged absence proof");
++            SameProof(proof, oracle.Prove(query), query, oracle.Root());
++        }
++    }
++    Ok(tx.Commit(Meta(++tip), error), error, "mixed commit"); tx.Abort();
++    Check(store.Root() == oracle.Root(), "mixed committed root");
++    for (uint32_t i = 0; i < 512; i += 31) { Probe(store, oracle, permutation[i], false); Probe(store, oracle, total + i, true); }
++    store = {}; Ok(DiskStateStore::Open(directory, options, Meta(0), store, error), error, "reopen mixed");
++    Ok(store.Disconnect(Id(tip), error), error, "disconnect after reopen");
++    Check(store.Root() == full && store.Metadata() == before, "exact atomic metadata/root rollback");
++    for (uint32_t i = 0; i < 512; ++i) { Check(oracle.Erase(MakeCoin(total + i).outpoint), "oracle undo insert"); Check(oracle.Insert(MakeCoin(permutation[i])), "oracle undo delete"); }
++    Probe(store, oracle, permutation[0], true); Probe(store, oracle, total, false);
++    // Alternate branch from the same predecessor, retained old branch undo.
++    Ok(store.Begin(tx, error), error, "reorg begin");
++    Ok(tx.Erase(MakeCoin(17).outpoint, error), error, "reorg delete");
++    Ok(tx.Insert(MakeCoin(9000), error), error, "reorg insert");
++    Ok(tx.Commit(Meta(9000), error), error, "reorg commit"); tx.Abort();
++    Ok(store.Disconnect(Id(9000), error), error, "reorg disconnect");
++    Check(store.Root() == full && store.Metadata() == before, "reorg predecessor restored");
++    std::cout << "large-state bytes=" << data_size << " cache=" << options.cache_bytes
++              << " oracle-coins=" << total << '\n';
++}
++void FailureCases(const std::string &directory) {
++    DiskStateError error; auto options = Options(); DiskStateStore store;
++    options.max_pending_bytes = 1;
++    Ok(DiskStateStore::Open(directory + "-resource", options, Meta(0), store, error), error, "resource open");
++    DiskStateTransaction tx; Ok(store.Begin(tx, error), error, "resource begin");
++    Check(!tx.Insert(MakeCoin(1), error) && error.code == DiskStateErrorCode::Resource, "resource distinct");
++    Check(!tx.Commit(Meta(1), error) && error.code == DiskStateErrorCode::TransactionAborted, "partial stage cannot commit");
++    tx.Abort(); Check(store.Root() == EmptyUtxoRoot() && store.Metadata() == Meta(0), "resource atomic abort");
++    store = {}; options = Options();
++    FaultEnv env; options.env = &env;
++    for (auto fault : {FaultEnv::Fault::Append, FaultEnv::Fault::Sync}) {
++        const auto path = directory + (fault == FaultEnv::Fault::Append ? "-append" : "-sync");
++        Ok(DiskStateStore::Open(path, options, Meta(0), store, error), error, "fault open");
++        Ok(store.Begin(tx, error), error, "fault begin"); Ok(tx.Insert(MakeCoin(1), error), error, "fault stage");
++        const Hash staged = tx.Root(); env.fault = fault;
++        Check(!tx.Commit(Meta(1), error) && error.code == DiskStateErrorCode::Database, "write error is operational");
++        Check(!store.IsOpen(), "failed write requires reopen");
++        Check(!tx.Commit(Meta(1), error), "failed write cannot retry poisoned store");
++        tx.Abort(); store = {}; env.fault = FaultEnv::Fault::None;
++        Ok(DiskStateStore::Open(path, options, Meta(0), store, error), error, "reopen after WAL failure");
++        if (fault == FaultEnv::Fault::Append) Check(store.Root() == EmptyUtxoRoot(), "failed first WAL append publishes nothing");
++        const bool committed = store.Root() == staged;
++        Check(committed || store.Root() == EmptyUtxoRoot(), "failed sync recovers a whole state");
++        Check(store.Metadata() == Meta(committed ? 1 : 0), "failure root/metadata atomicity");
++        std::optional<Coin> coin; Ok(store.ReadCoin(MakeCoin(1).outpoint, coin, error), error, "postfailure coin");
++        Check(coin.has_value() == committed, "failure coin/root atomicity");
++        if (committed) { Ok(store.Disconnect(Id(1), error), error, "recovered commit has undo"); Check(store.Root() == EmptyUtxoRoot(), "recovered undo"); }
++        store = {};
++    }
++}
++void CorruptionCases(const std::string &directory) {
++    auto options = Options(); DiskStateStore store; DiskStateError error;
++    Ok(DiskStateStore::Open(directory, options, Meta(0), store, error), error, "corruption open");
++    DiskStateTransaction tx; Ok(store.Begin(tx, error), error, "corruption begin");
++    for (uint32_t id = 1; id <= 4; ++id) Ok(tx.Insert(MakeCoin(id), error), error, "corruption fixture insert");
++    Ok(tx.Commit(Meta(1), error), error, "corruption fixture commit"); tx.Abort(); store = {};
++    const auto coin = MakeCoin(1); const auto key = Key(coin.outpoint);
++    for (bool missing : {true, false}) {
++        Coin altered = coin; ++altered.output.value;
++        RawChange(directory, key, missing ? std::nullopt : std::optional<std::string>(Encoded(altered)));
++        Ok(DiskStateStore::Open(directory, options, Meta(0), store, error), error, "lazy corruption reopen");
++        std::optional<Coin> out;
++        Check(!store.ReadCoin(coin.outpoint, out, error) && error.code == DiskStateErrorCode::Corruption,
++              "missing/changed committed row is operational corruption");
++        Ok(store.Begin(tx, error), error, "corrupt transaction begin");
++        Check(!tx.Erase(coin.outpoint, error) && error.code == DiskStateErrorCode::Corruption, "erase authenticates corrupted row");
++        Check(!tx.Commit(Meta(2), error) && error.code == DiskStateErrorCode::TransactionAborted, "corrupt mutation aborts transaction");
++        tx.Abort(); store = {};
++    }
++    RawChange(directory, key, Encoded(coin));
++    // Orphan coin table rows also cannot resolve as real inputs.
++    const auto orphan = MakeCoin(100); RawChange(directory, Key(orphan.outpoint), Encoded(orphan));
++    Ok(DiskStateStore::Open(directory, options, Meta(0), store, error), error, "orphan reopen");
++    std::optional<Coin> out;
++    Check(!store.ReadCoin(orphan.outpoint, out, error) && error.code == DiskStateErrorCode::Corruption, "orphan row rejected");
++    store = {}; RawChange(directory, Key(orphan.outpoint), std::nullopt);
++    std::string root_key(1, 'N'); root_key.append(34, '\0');
++    RawChange(directory, root_key, std::nullopt);
++    Check(!DiskStateStore::Open(directory, options, Meta(0), store, error) && error.code == DiskStateErrorCode::Corruption,
++          "reopen detects missing authenticated root");
++}
++} // namespace
++int main() {
++    const auto base = std::filesystem::temp_directory_path();
++    const auto path = (base / ("lotus-v2-disk-state-test-" + std::to_string(std::random_device{}()))).string();
++    Check(std::filesystem::create_directory(path), "temporary directory");
++    // Preserve artifacts automatically on any assertion failure.
++    std::cout << "disk state test artifacts: " << path << '\n';
++    SmallCases(path + "/small"); LargeAndMixed(path + "/large");
++    FailureCases(path + "/failure"); CorruptionCases(path + "/corrupt");
++    std::filesystem::remove_all(path);
++    std::cout << "V2 disk state differential, atomicity, reopen, undo, reorg, corruption cases passed\n";
++}
+-- 
+2.50.1 (Apple Git-155)
+
