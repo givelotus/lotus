@@ -162,14 +162,37 @@ The final manifest must contain exact serialized parameters, their digest and al
 
 The compiler plan also owns [V2-native fixture infrastructure](../../docs/plans/lotus-v2-compiler-abi.md#v2-native-test-fixture-infrastructure): deterministic basic-contract builders, offline JSON bundles for native/functional tests, and an inventory distinguishing reusable, migrated, retired and new tests. Preserve rejection intent and independently hand-encoded vectors. A compiler-generated signature-valid transaction is not a full-validity fixture until the relevant VM/accounting/block checks pass.
 
+## Disk validation and SQLite wallet evidence (patches 070–080)
+
+The 81-entry series replays from the pinned ABC base with every intermediate
+source tree checked. Final tree: `739cfb30718475b24421e8143cdaed877977d1f8`.
+See [replay evidence](evidence/v2-series-replay-080.json).
+
+Storage-independent complete-block validation now stages coin, authenticated-tree,
+monetary and header changes before one synchronous LevelDB batch publishes them
+with immutable undo and complete block bytes. Reads authenticate stored coins;
+backend faults remain operational errors. The store binds the full validator
+parameter fingerprint. Tests cover restart, disconnect, reconnect, resource
+limits and injected storage failures. Eight block tests and both disk suites pass.
+The cache is bounded; pending block overlays and undo consume additional memory.
+Undo pruning, full startup integrity scans and a daemon chain coordinator remain
+open. These are module results, not `lotusd` V2 acceptance.
+
+V2 wallet storage is SQLite-only (`wallet.sqlite`). BerkeleyDB sources, discovery,
+link requirements and dependency selection are removed; no legacy `wallet.dat`
+loading or migration is supported. The wallet packet builds daemon, CLI, wallet
+tool and unit tests without BerkeleyDB. Nine wallet suites (40 cases) and an
+isolated ABC regtest wallet test pass, including encryption, reopening, backup,
+restore and foreign-format rejection. That evidence is for the wallet packet's
+exact source, not a full combined-tree daemon build or V2 transaction signing.
+The storage development marker still needs binding to an adopted network profile.
+
 ## Next bounded work
 
-The complete in-memory boundary is available through patch 069. Wire it into a
-separate development-chain daemon path with atomic block/UTXO/monetary/undo
-persistence; prove restart, disconnect and crash recovery before accepting peer
-blocks. Preserve existing Bitcoin parsing and mainnet chainparams. Review the
-proposed development profile before adoption. Then implement the reviewed TCP
-and compact-block milestone, followed by the separately reviewed QUIC milestone.
-Compiler stateful allowance coverage and full transaction/block fixture execution
-remain open. No V2 daemon acceptance, public testnet or mainnet parameter freeze
-is claimed by the isolated module results.
+Wire the tested disk-backed complete-block boundary into a separate development
+chain daemon path, with authenticated history, clock eligibility and reorg state
+refresh. Preserve Bitcoin parsing and mainnet chainparams. Review the proposed
+development profile before adoption. Then finish the TCP/compact-block milestone,
+followed by separately reviewed QUIC work. Compiler stateful allowance fixtures
+now execute signed transitions; full transaction/block fixture execution remains
+open. No V2 daemon acceptance, public testnet or mainnet parameter freeze is claimed.
