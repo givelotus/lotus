@@ -1,0 +1,1046 @@
+From dad9d15851a569f0b2650cf12dbb07521b286c4c Mon Sep 17 00:00:00 2001
+From: Shammah Chancellor <shammah.chancellor@notvalid.com>
+Date: Wed, 14 Oct 2026 23:27:25 -0700
+Subject: [PATCH 1/3] Add a file-backed V2 monetary snapshot and undo log
+
+Persist EncodeMonetaryState beside the UTXO snapshot as a versioned
+checksummed monetary.dat plus one undo record per commit. Reopen returns
+the same bytes. Undo restores the previous monetary bytes and state root.
+A truncated record fails closed and does not publish a root. This rename
+is not atomic with the UTXO snapshot, lotusd does not call this store,
+and no V2 block is accepted.
+---
+ src/lotus_v2/CMakeLists.txt               |  11 +
+ src/lotus_v2/persistent_monetary.cpp      | 541 ++++++++++++++++++++++
+ src/lotus_v2/persistent_monetary.h        |  87 ++++
+ src/lotus_v2/test_persistent_monetary.cpp | 357 ++++++++++++++
+ 4 files changed, 996 insertions(+)
+ create mode 100644 src/lotus_v2/persistent_monetary.cpp
+ create mode 100644 src/lotus_v2/persistent_monetary.h
+ create mode 100644 src/lotus_v2/test_persistent_monetary.cpp
+
+diff --git a/src/lotus_v2/CMakeLists.txt b/src/lotus_v2/CMakeLists.txt
+index 544f448b3..77de928ba 100644
+--- a/src/lotus_v2/CMakeLists.txt
++++ b/src/lotus_v2/CMakeLists.txt
+@@ -103,3 +103,14 @@ add_custom_target(check-lotus-v2-persistent-utxo
+     COMMAND $<TARGET_FILE:test_lotus_v2_persistent_utxo>
+     DEPENDS test_lotus_v2_persistent_utxo
+ )
++
++# Standalone monetary snapshot and undo log. lotusd does not link this target.
++# Renames are not atomic with the UTXO snapshot. Not ConnectTip.
++add_library(lotus_v2_persistent_monetary STATIC persistent_monetary.cpp)
++target_link_libraries(lotus_v2_persistent_monetary PUBLIC lotus_v2_sparse_state)
++add_executable(test_lotus_v2_persistent_monetary test_persistent_monetary.cpp)
++target_link_libraries(test_lotus_v2_persistent_monetary lotus_v2_persistent_monetary)
++add_custom_target(check-lotus-v2-persistent-monetary
++    COMMAND $<TARGET_FILE:test_lotus_v2_persistent_monetary>
++    DEPENDS test_lotus_v2_persistent_monetary
++)
+diff --git a/src/lotus_v2/persistent_monetary.cpp b/src/lotus_v2/persistent_monetary.cpp
+new file mode 100644
+index 000000000..30438b9ec
+--- /dev/null
++++ b/src/lotus_v2/persistent_monetary.cpp
+@@ -0,0 +1,541 @@
++// Copyright (c) 2026 The Lotus developers
++#include "persistent_monetary.h"
++
++#include "vendor/blake3/blake3.h"
++
++#include <algorithm>
++#include <cerrno>
++#include <cstdio>
++#include <fcntl.h>
++#include <filesystem>
++#include <unistd.h>
++#include <utility>
++#include <vector>
++
++namespace lotus::v2 {
++namespace {
++
++constexpr uint8_t kMagic[8] = {'L', 'T', 'S', 'V', '2', 'M', 'O', 'N'};
++constexpr uint32_t kKindSnapshot = 1;
++constexpr uint32_t kKindUndo = 2;
++constexpr size_t kSnapshotBytes = PERSISTENT_MONETARY_SNAPSHOT_BYTES;
++constexpr size_t kUndoBytes = kSnapshotBytes * 2;
++constexpr size_t kMaxRecordBytes = 1024u * 1024u;
++constexpr char kChecksumTag[] = "Lotus/v2/persist-monetary";
++constexpr size_t kMoneyOff = 40;
++constexpr size_t kRootOff = 96;
++
++using Payload = std::array<uint8_t, kSnapshotBytes>;
++
++bool Fail(std::string &error, const char *what) {
++    error = what;
++    return false;
++}
++
++struct Fd {
++    int fd = -1;
++    explicit Fd(int opened) : fd(opened) {}
++    ~Fd() {
++        if (fd >= 0) ::close(fd);
++    }
++    Fd(const Fd &) = delete;
++    Fd &operator=(const Fd &) = delete;
++};
++
++uint32_t ReadU32(const uint8_t *p) {
++    return uint32_t(p[0]) | (uint32_t(p[1]) << 8) | (uint32_t(p[2]) << 16) |
++           (uint32_t(p[3]) << 24);
++}
++
++uint64_t ReadU64(const uint8_t *p) {
++    uint64_t value = 0;
++    for (unsigned i = 0; i < 8; ++i) value |= uint64_t(p[i]) << (8 * i);
++    return value;
++}
++
++void AppendU32(std::vector<uint8_t> &out, uint32_t value) {
++    for (unsigned i = 0; i < 4; ++i)
++        out.push_back(static_cast<uint8_t>(value >> (8 * i)));
++}
++
++void AppendU64(std::vector<uint8_t> &out, uint64_t value) {
++    for (unsigned i = 0; i < 8; ++i)
++        out.push_back(static_cast<uint8_t>(value >> (8 * i)));
++}
++
++void AppendHash(std::vector<uint8_t> &out, const Hash &hash) {
++    out.insert(out.end(), hash.begin(), hash.end());
++}
++
++Hash Checksum(const uint8_t *data, size_t size) {
++    blake3_hasher hasher;
++    blake3_hasher_init(&hasher);
++    blake3_hasher_update(&hasher, kChecksumTag, sizeof(kChecksumTag) - 1);
++    const uint8_t separator = 0;
++    blake3_hasher_update(&hasher, &separator, 1);
++    if (size != 0) blake3_hasher_update(&hasher, data, size);
++    Hash out{};
++    blake3_hasher_finalize(&hasher, out.data(), out.size());
++    return out;
++}
++
++// The 56 bytes are EncodeMonetaryState, not a second layout.
++bool MonetaryOk(const uint8_t *encoded) {
++    MonetaryState state;
++    state.bootstrap_reserve = ReadU64(encoded);
++    state.tail_subsidy = ReadU64(encoded + 8);
++    std::copy_n(encoded + 16, 32, state.prev_work.begin());
++    state.ema_block_cost = ReadU64(encoded + 48);
++    const std::array<uint8_t, 56> again = EncodeMonetaryState(state);
++    return std::equal(again.begin(), again.end(), encoded);
++}
++
++bool AcceptPayload(const uint8_t *data, Payload &out, std::string &error) {
++    if (!MonetaryOk(data + kMoneyOff)) return Fail(error, "monetary");
++    std::copy_n(data, kSnapshotBytes, out.begin());
++    return true;
++}
++
++Payload Pack(const ChainId &chain_id, uint64_t height, const MonetaryState &monetary,
++             const Hash &state_root) {
++    Payload out{};
++    const std::array<uint8_t, 56> encoded = EncodeMonetaryState(monetary);
++    std::copy(chain_id.begin(), chain_id.end(), out.begin());
++    for (unsigned i = 0; i < 8; ++i)
++        out[32 + i] = static_cast<uint8_t>(height >> (8 * i));
++    std::copy(encoded.begin(), encoded.end(), out.begin() + kMoneyOff);
++    std::copy(state_root.begin(), state_root.end(), out.begin() + kRootOff);
++    return out;
++}
++
++Hash RootOf(const Payload &payload) {
++    Hash root{};
++    std::copy_n(payload.begin() + kRootOff, 32, root.begin());
++    return root;
++}
++
++std::array<uint8_t, 56> MonetaryOf(const Payload &payload) {
++    std::array<uint8_t, 56> out{};
++    std::copy_n(payload.begin() + kMoneyOff, 56, out.begin());
++    return out;
++}
++
++struct RecordView {
++    uint32_t kind = 0;
++    const uint8_t *payload = nullptr;
++    size_t payload_len = 0;
++};
++
++// Length is checked before the payload root is interpreted. A truncated file
++// often still contains those 32 bytes; they are not a valid root.
++bool ParseRecord(const std::vector<uint8_t> &bytes, RecordView &out, std::string &error) {
++    if (bytes.size() < 56) return Fail(error, "truncated");
++    if (!std::equal(bytes.begin(), bytes.begin() + 8, kMagic)) return Fail(error, "magic");
++    const size_t payload_len = bytes.size() - 56;
++    if (ReadU64(bytes.data() + 16) != payload_len) return Fail(error, "truncated");
++    const Hash sum = Checksum(bytes.data(), 24 + payload_len);
++    if (!std::equal(sum.begin(), sum.end(), bytes.end() - 32)) return Fail(error, "checksum");
++    if (ReadU32(bytes.data() + 8) != PERSISTENT_MONETARY_VERSION) return Fail(error, "version");
++    const uint32_t kind = ReadU32(bytes.data() + 12);
++    if (kind != kKindSnapshot && kind != kKindUndo) return Fail(error, "kind");
++    out.kind = kind;
++    out.payload = bytes.data() + 24;
++    out.payload_len = payload_len;
++    return true;
++}
++
++std::vector<uint8_t> Finish(uint32_t kind, const uint8_t *payload, size_t payload_len) {
++    std::vector<uint8_t> out;
++    out.reserve(24 + payload_len + 32);
++    out.insert(out.end(), kMagic, kMagic + 8);
++    AppendU32(out, PERSISTENT_MONETARY_VERSION);
++    AppendU32(out, kind);
++    AppendU64(out, payload_len);
++    out.insert(out.end(), payload, payload + payload_len);
++    AppendHash(out, Checksum(out.data(), out.size()));
++    return out;
++}
++
++std::vector<uint8_t> FinishPayload(uint32_t kind, const Payload &payload) {
++    return Finish(kind, payload.data(), payload.size());
++}
++
++bool ReadFile(const std::filesystem::path &path, std::vector<uint8_t> &out, std::string &error) {
++    std::error_code ec;
++    if (std::filesystem::is_symlink(path, ec)) return Fail(error, "directory");
++    if (ec) return Fail(error, "io");
++    Fd file(::open(path.c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW));
++    if (file.fd < 0) return Fail(error, "io");
++    std::vector<uint8_t> data;
++    uint8_t buffer[8192];
++    for (;;) {
++        const ssize_t n = ::read(file.fd, buffer, sizeof(buffer));
++        if (n < 0) {
++            if (errno == EINTR) continue;
++            return Fail(error, "io");
++        }
++        if (n == 0) break;
++        if (data.size() + static_cast<size_t>(n) > kMaxRecordBytes) return Fail(error, "size");
++        data.insert(data.end(), buffer, buffer + n);
++    }
++    out = std::move(data);
++    return true;
++}
++
++bool WriteAll(int fd, const uint8_t *data, size_t size) {
++    while (size > 0) {
++        const ssize_t n = ::write(fd, data, size);
++        if (n < 0) {
++            if (errno == EINTR) continue;
++            return false;
++        }
++        if (n == 0) return false;
++        data += n;
++        size -= static_cast<size_t>(n);
++    }
++    return true;
++}
++
++bool FsyncFd(int fd) {
++    for (;;) {
++        if (::fsync(fd) == 0) return true;
++        if (errno != EINTR) return false;
++    }
++}
++
++void FsyncDir(const std::filesystem::path &dir) {
++    const int fd = ::open(dir.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
++    if (fd < 0) return;
++    ::fsync(fd);
++    ::close(fd);
++}
++
++// Rename is the publication point. A crash before it leaves only the temp file,
++// which reopen ignores. The temp file is in the destination's directory.
++bool WriteAtomic(const std::filesystem::path &destination, const std::vector<uint8_t> &bytes,
++                 std::string &error) {
++    if (bytes.size() > kMaxRecordBytes) return Fail(error, "size");
++    const std::filesystem::path temporary(destination.string() + ".tmp");
++    Fd file(::open(temporary.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC | O_NOFOLLOW, 0644));
++    if (file.fd < 0) return Fail(error, "io");
++    if (!WriteAll(file.fd, bytes.data(), bytes.size()) || !FsyncFd(file.fd)) {
++        ::unlink(temporary.c_str());
++        return Fail(error, "io");
++    }
++    if (::close(file.fd) != 0) {
++        file.fd = -1;
++        ::unlink(temporary.c_str());
++        return Fail(error, "io");
++    }
++    file.fd = -1;
++    if (::rename(temporary.c_str(), destination.c_str()) != 0) {
++        ::unlink(temporary.c_str());
++        return Fail(error, "io");
++    }
++    std::filesystem::path parent = destination.parent_path();
++    if (parent.empty()) parent = ".";
++    FsyncDir(parent);
++    return true;
++}
++
++bool IsTempName(const std::string &name) {
++    return name.size() >= 4 && name.compare(name.size() - 4, 4, ".tmp") == 0;
++}
++
++bool ParseSequence(const std::string &name, uint32_t &sequence) {
++    if (name.size() != 12 || name.compare(8, 4, ".dat") != 0) return false;
++    sequence = 0;
++    for (int i = 0; i < 8; ++i) {
++        const char ch = name[static_cast<size_t>(i)];
++        if (ch < '0' || ch > '9') return false;
++        sequence = sequence * 10u + static_cast<uint32_t>(ch - '0');
++    }
++    return sequence >= 1 && sequence <= 99999999u;
++}
++
++std::filesystem::path UndoFile(const std::filesystem::path &undo_dir, uint32_t sequence) {
++    char name[16];
++    std::snprintf(name, sizeof(name), "%08u.dat", static_cast<unsigned>(sequence));
++    return undo_dir / name;
++}
++
++struct LoadedUndo {
++    uint32_t sequence = 0;
++    std::filesystem::path path;
++    Payload prev{};
++    Payload next{};
++};
++
++bool Replay(const std::vector<LoadedUndo> &undos, Payload &out, std::string &error) {
++    Payload cur{};
++    for (const LoadedUndo &undo : undos) {
++        if (undo.prev != cur) return Fail(error, "undo chain");
++        cur = undo.next;
++    }
++    out = cur;
++    return true;
++}
++
++bool ParseSnapshotPayload(const uint8_t *data, size_t size, Payload &out, std::string &error) {
++    if (size != kSnapshotBytes) return Fail(error, "truncated");
++    return AcceptPayload(data, out, error);
++}
++
++bool ParseUndoPayload(const uint8_t *data, size_t size, Payload &prev, Payload &next,
++                      std::string &error) {
++    if (size != kUndoBytes) return Fail(error, "truncated");
++    if (!AcceptPayload(data, prev, error)) return false;
++    return AcceptPayload(data + kSnapshotBytes, next, error);
++}
++
++} // namespace
++
++struct PersistentMonetaryStore::Impl {
++    std::filesystem::path directory;
++    bool has_snapshot = false;
++    Payload payload{};
++    uint32_t undo_tip = 0;
++
++    std::filesystem::path SnapshotPath() const { return directory / "monetary.dat"; }
++    std::filesystem::path UndoDir() const { return directory / "monetary-undo"; }
++
++    bool Load(const std::string &dir, std::string &error);
++    bool Commit(const ChainId &chain_id, uint64_t height, const MonetaryState &monetary,
++                const Hash &state_root, std::string &error);
++    bool Undo(std::string &error);
++};
++
++bool PersistentMonetaryStore::Impl::Load(const std::string &dir, std::string &error) {
++    directory = std::filesystem::path(dir);
++    if (!directory.is_absolute()) return Fail(error, "directory");
++    std::error_code ec;
++    std::filesystem::create_directories(directory, ec);
++    if (ec || !std::filesystem::is_directory(directory, ec) || ec) return Fail(error, "directory");
++
++    bool saw_snapshot = false;
++    bool saw_undo = false;
++    std::filesystem::directory_iterator it(directory, ec);
++    if (ec) return Fail(error, "io");
++    for (; it != std::filesystem::directory_iterator(); it.increment(ec)) {
++        if (ec) return Fail(error, "io");
++        const std::string name = it->path().filename().string();
++        if (IsTempName(name)) continue;
++        if (std::filesystem::is_symlink(it->path(), ec) || ec) return Fail(error, "directory");
++        if (name == "monetary.dat") {
++            if (!std::filesystem::is_regular_file(it->path(), ec) || ec)
++                return Fail(error, "directory");
++            saw_snapshot = true;
++            continue;
++        }
++        if (name == "monetary-undo") {
++            if (!std::filesystem::is_directory(it->path(), ec) || ec)
++                return Fail(error, "directory");
++            saw_undo = true;
++            continue;
++        }
++        // Coin files may share this directory. They are not part of this record.
++        if (name == "snapshot.dat") {
++            if (!std::filesystem::is_regular_file(it->path(), ec) || ec)
++                return Fail(error, "directory");
++            continue;
++        }
++        if (name == "undo") {
++            if (!std::filesystem::is_directory(it->path(), ec) || ec)
++                return Fail(error, "directory");
++            continue;
++        }
++        return Fail(error, "directory");
++    }
++
++    Payload snapshot{};
++    if (saw_snapshot) {
++        std::vector<uint8_t> bytes;
++        if (!ReadFile(SnapshotPath(), bytes, error)) return false;
++        RecordView record;
++        if (!ParseRecord(bytes, record, error)) return false;
++        if (record.kind != kKindSnapshot) return Fail(error, "kind");
++        if (!ParseSnapshotPayload(record.payload, record.payload_len, snapshot, error))
++            return false;
++    }
++
++    std::vector<LoadedUndo> undos;
++    if (saw_undo) {
++        std::filesystem::directory_iterator undo_it(UndoDir(), ec);
++        if (ec) return Fail(error, "io");
++        for (; undo_it != std::filesystem::directory_iterator(); undo_it.increment(ec)) {
++            if (ec) return Fail(error, "io");
++            const std::string name = undo_it->path().filename().string();
++            if (IsTempName(name)) continue;
++            if (std::filesystem::is_symlink(undo_it->path(), ec) || ec)
++                return Fail(error, "directory");
++            if (!std::filesystem::is_regular_file(undo_it->path(), ec) || ec)
++                return Fail(error, "directory");
++            LoadedUndo loaded;
++            if (!ParseSequence(name, loaded.sequence)) return Fail(error, "directory");
++            loaded.path = undo_it->path();
++            std::vector<uint8_t> bytes;
++            if (!ReadFile(loaded.path, bytes, error)) return false;
++            RecordView record;
++            if (!ParseRecord(bytes, record, error)) return false;
++            if (record.kind != kKindUndo) return Fail(error, "kind");
++            if (!ParseUndoPayload(record.payload, record.payload_len, loaded.prev, loaded.next,
++                                  error))
++                return false;
++            undos.push_back(std::move(loaded));
++        }
++    }
++    std::sort(undos.begin(), undos.end(), [](const LoadedUndo &a, const LoadedUndo &b) {
++        return a.sequence < b.sequence;
++    });
++    for (size_t i = 0; i < undos.size(); ++i) {
++        if (undos[i].sequence != i + 1) return Fail(error, "undo chain");
++    }
++
++    Payload replayed{};
++    if (!Replay(undos, replayed, error)) return false;
++    if (replayed != snapshot) {
++        if (undos.empty() || undos.back().prev != snapshot || undos.back().next == snapshot)
++            return Fail(error, "undo chain");
++        undos.pop_back();
++        Payload shortened{};
++        if (!Replay(undos, shortened, error) || shortened != snapshot)
++            return Fail(error, "undo chain");
++        std::filesystem::remove(UndoFile(UndoDir(), static_cast<uint32_t>(undos.size() + 1)), ec);
++        if (ec) return Fail(error, "io");
++        replayed = shortened;
++    }
++
++    has_snapshot = saw_snapshot;
++    payload = replayed;
++    undo_tip = static_cast<uint32_t>(undos.size());
++    error.clear();
++    return true;
++}
++
++bool PersistentMonetaryStore::Impl::Commit(const ChainId &chain_id, uint64_t height,
++                                           const MonetaryState &monetary, const Hash &state_root,
++                                           std::string &error) {
++    if (undo_tip >= 99999999u) return Fail(error, "undo chain");
++    const Payload next = Pack(chain_id, height, monetary, state_root);
++    Payload checked{};
++    if (!AcceptPayload(next.data(), checked, error) || checked != next ||
++        MonetaryOf(next) != EncodeMonetaryState(monetary) || RootOf(next) != state_root)
++        return Fail(error, "internal");
++    const Payload prev = payload;
++
++    std::vector<uint8_t> undo_payload;
++    undo_payload.insert(undo_payload.end(), prev.begin(), prev.end());
++    undo_payload.insert(undo_payload.end(), next.begin(), next.end());
++    const std::vector<uint8_t> undo_bytes = Finish(kKindUndo, undo_payload.data(), undo_payload.size());
++    const std::vector<uint8_t> snapshot_bytes = FinishPayload(kKindSnapshot, next);
++    RecordView undo_view;
++    RecordView snapshot_view;
++    Payload parsed_prev{};
++    Payload parsed_next{};
++    Payload parsed_snapshot{};
++    if (!ParseRecord(undo_bytes, undo_view, error) || undo_view.kind != kKindUndo ||
++        !ParseUndoPayload(undo_view.payload, undo_view.payload_len, parsed_prev, parsed_next,
++                          error) ||
++        parsed_prev != prev || parsed_next != next)
++        return Fail(error, "internal");
++    if (!ParseRecord(snapshot_bytes, snapshot_view, error) ||
++        snapshot_view.kind != kKindSnapshot ||
++        !ParseSnapshotPayload(snapshot_view.payload, snapshot_view.payload_len, parsed_snapshot,
++                              error) ||
++        parsed_snapshot != next)
++        return Fail(error, "internal");
++
++    std::error_code ec;
++    std::filesystem::create_directories(UndoDir(), ec);
++    if (ec) return Fail(error, "directory");
++    const uint32_t sequence = undo_tip + 1;
++    const std::filesystem::path undo_path = UndoFile(UndoDir(), sequence);
++    if (!WriteAtomic(undo_path, undo_bytes, error)) return false;
++    if (!WriteAtomic(SnapshotPath(), snapshot_bytes, error)) {
++        ec.clear();
++        std::filesystem::remove(undo_path, ec);
++        if (ec) error = "io";
++        return false;
++    }
++    payload = next;
++    has_snapshot = true;
++    undo_tip = sequence;
++    error.clear();
++    return true;
++}
++
++bool PersistentMonetaryStore::Impl::Undo(std::string &error) {
++    if (undo_tip == 0) return Fail(error, "no undo");
++    const std::filesystem::path path = UndoFile(UndoDir(), undo_tip);
++    std::vector<uint8_t> bytes;
++    if (!ReadFile(path, bytes, error)) return false;
++    RecordView record;
++    if (!ParseRecord(bytes, record, error)) return false;
++    if (record.kind != kKindUndo) return Fail(error, "kind");
++    Payload prev{};
++    Payload next{};
++    if (!ParseUndoPayload(record.payload, record.payload_len, prev, next, error)) return false;
++    if (next != payload) return Fail(error, "undo chain");
++
++    const Payload current = payload;
++    const bool had_snapshot = has_snapshot;
++    if (!WriteAtomic(SnapshotPath(), FinishPayload(kKindSnapshot, prev), error)) return false;
++    std::error_code ec;
++    if (!std::filesystem::remove(path, ec) || ec) {
++        std::string rollback_error;
++        if (had_snapshot) {
++            WriteAtomic(SnapshotPath(), FinishPayload(kKindSnapshot, current), rollback_error);
++        } else {
++            std::filesystem::remove(SnapshotPath(), ec);
++        }
++        return Fail(error, "io");
++    }
++    payload = prev;
++    has_snapshot = true;
++    --undo_tip;
++    error.clear();
++    return true;
++}
++
++PersistentMonetaryStore::PersistentMonetaryStore() = default;
++PersistentMonetaryStore::~PersistentMonetaryStore() = default;
++PersistentMonetaryStore::PersistentMonetaryStore(PersistentMonetaryStore &&) noexcept = default;
++PersistentMonetaryStore &
++PersistentMonetaryStore::operator=(PersistentMonetaryStore &&) noexcept = default;
++
++bool PersistentMonetaryStore::Open(const std::string &directory, PersistentMonetaryStore &store,
++                                   std::string &error) {
++    store.impl_.reset();
++    auto loaded = std::make_unique<Impl>();
++    if (!loaded->Load(directory, error)) return false;
++    store.impl_ = std::move(loaded);
++    return true;
++}
++
++bool PersistentMonetaryStore::IsOpen() const { return impl_ != nullptr; }
++
++bool PersistentMonetaryStore::Root(Hash &out) const {
++    if (!impl_ || !impl_->has_snapshot) return false;
++    out = RootOf(impl_->payload);
++    return true;
++}
++
++bool PersistentMonetaryStore::Monetary(std::array<uint8_t, 56> &out) const {
++    if (!impl_ || !impl_->has_snapshot) return false;
++    out = MonetaryOf(impl_->payload);
++    return true;
++}
++
++bool PersistentMonetaryStore::Commit(const ChainId &chain_id, uint64_t height,
++                                     const MonetaryState &monetary, const Hash &state_root,
++                                     std::string &error) {
++    if (!impl_) return Fail(error, "closed");
++    return impl_->Commit(chain_id, height, monetary, state_root, error);
++}
++
++bool PersistentMonetaryStore::Undo(std::string &error) {
++    if (!impl_) return Fail(error, "closed");
++    return impl_->Undo(error);
++}
++
++} // namespace lotus::v2
+diff --git a/src/lotus_v2/persistent_monetary.h b/src/lotus_v2/persistent_monetary.h
+new file mode 100644
+index 000000000..16c1df691
+--- /dev/null
++++ b/src/lotus_v2/persistent_monetary.h
+@@ -0,0 +1,87 @@
++// Copyright (c) 2026 The Lotus developers
++// File-backed monetary snapshot and one undo record per commit.
++// Not used by lotusd, not ConnectTip, and not V2 block acceptance.
++// Renames are not atomic with the coin snapshot.dat renames.
++//
++// Format version 1. The caller passes an absolute directory, which is created.
++// It may be the same directory as the UTXO store. snapshot.dat and undo/ are
++// not required and are not read or modified.
++//   monetary.dat                 current record; absent before the first commit
++//   monetary-undo/00000001.dat   one record per commit, contiguous from 1
++// A record is written to "<final>.tmp" in the same directory, fsynced, and
++// renamed into place. Names ending in ".tmp" are ignored. A short or
++// length-mismatched record fails as truncated before its embedded state root
++// is treated as state. Open republishes the record only when the checksum
++// matches. Undo restores the previous snapshot payload byte for byte.
++// One record is at most 1 MiB.
++//
++// Little-endian record:
++//   magic[8] = "LTSV2MON"
++//   version u32 = 1
++//   kind u32 = 1 snapshot, 2 undo
++//   payload_len u64
++//   payload[payload_len]
++//   checksum[32] = BLAKE3("Lotus/v2/persist-monetary" || 0x00 || bytes before it)
++//
++// Snapshot payload, 128 bytes:
++//   chain_id[32] | height u64 | monetary[56] | state_root[32]
++// monetary[56] is EncodeMonetaryState. Undo payload is the previous snapshot
++// payload followed by the next one. The chain starts at 128 zero bytes, which
++// is not a published record until an undo writes it back. state_root is stored
++// as given; this store does not compute StateRoot and does not accept a block.
++#ifndef LOTUS_V2_PERSISTENT_MONETARY_H
++#define LOTUS_V2_PERSISTENT_MONETARY_H
++
++#include "sparse_state.h"
++
++#include <array>
++#include <cstddef>
++#include <cstdint>
++#include <memory>
++#include <string>
++
++namespace lotus::v2 {
++
++constexpr uint32_t PERSISTENT_MONETARY_VERSION = 1;
++constexpr size_t PERSISTENT_MONETARY_SNAPSHOT_BYTES = 32 + 8 + 56 + 32;
++
++class PersistentMonetaryStore {
++public:
++    PersistentMonetaryStore();
++    ~PersistentMonetaryStore();
++    PersistentMonetaryStore(PersistentMonetaryStore &&) noexcept;
++    PersistentMonetaryStore &operator=(PersistentMonetaryStore &&) noexcept;
++    PersistentMonetaryStore(const PersistentMonetaryStore &) = delete;
++    PersistentMonetaryStore &operator=(const PersistentMonetaryStore &) = delete;
++
++    // Creates `directory` when needed. On failure `store` is closed and no
++    // root is written to an output parameter.
++    static bool Open(const std::string &directory, PersistentMonetaryStore &store,
++                     std::string &error);
++
++    bool IsOpen() const;
++
++    // Copies the stored state root. Returns false when closed or before the
++    // first committed snapshot, and does not modify `out`.
++    bool Root(Hash &out) const;
++
++    // Copies the 56 EncodeMonetaryState bytes. Same failure rule as Root.
++    bool Monetary(std::array<uint8_t, 56> &out) const;
++
++    // Writes one undo record, then the snapshot. Failure leaves the previous
++    // directory bytes and this object unchanged. `state_root` is not checked
++    // against StateRoot and is not block acceptance.
++    bool Commit(const ChainId &chain_id, uint64_t height, const MonetaryState &monetary,
++                const Hash &state_root, std::string &error);
++
++    // Re-reads the last undo record and writes its previous snapshot payload
++    // back byte for byte.
++    bool Undo(std::string &error);
++
++private:
++    struct Impl;
++    std::unique_ptr<Impl> impl_;
++};
++
++} // namespace lotus::v2
++#endif
+diff --git a/src/lotus_v2/test_persistent_monetary.cpp b/src/lotus_v2/test_persistent_monetary.cpp
+new file mode 100644
+index 000000000..2f24bb148
+--- /dev/null
++++ b/src/lotus_v2/test_persistent_monetary.cpp
+@@ -0,0 +1,357 @@
++// Copyright (c) 2026 The Lotus developers
++// Reopen and undo a monetary record under /tmp.
++// This does not accept a V2 block and is not atomic with UTXO renames.
++#include "persistent_monetary.h"
++#include "sparse_state.h"
++#include "vendor/blake3/blake3.h"
++
++#include <algorithm>
++#include <cstdint>
++#include <cstdlib>
++#include <cstring>
++#include <filesystem>
++#include <fstream>
++#include <iostream>
++#include <limits.h>
++#include <string>
++#include <unistd.h>
++#include <vector>
++
++using namespace lotus::v2;
++
++namespace {
++
++void Check(bool condition, const char *message) {
++    if (!condition) {
++        std::cerr << "V2 persistent monetary: " << message << '\n';
++        std::exit(1);
++    }
++}
++
++std::vector<uint8_t> ReadRaw(const std::filesystem::path &path) {
++    std::ifstream in(path, std::ios::binary);
++    Check(static_cast<bool>(in), "read record");
++    return std::vector<uint8_t>(std::istreambuf_iterator<char>(in),
++                                std::istreambuf_iterator<char>());
++}
++
++void WriteRaw(const std::filesystem::path &path, const std::vector<uint8_t> &bytes) {
++    std::ofstream out(path, std::ios::binary | std::ios::trunc);
++    Check(static_cast<bool>(out), "write raw record");
++    if (!bytes.empty()) {
++        out.write(reinterpret_cast<const char *>(bytes.data()),
++                  static_cast<std::streamsize>(bytes.size()));
++    }
++    out.close();
++    Check(static_cast<bool>(out), "close raw record");
++}
++
++Hash FileChecksum(const uint8_t *data, size_t size) {
++    blake3_hasher hasher;
++    blake3_hasher_init(&hasher);
++    const char tag[] = "Lotus/v2/persist-monetary";
++    blake3_hasher_update(&hasher, tag, sizeof(tag) - 1);
++    const uint8_t separator = 0;
++    blake3_hasher_update(&hasher, &separator, 1);
++    if (size != 0) blake3_hasher_update(&hasher, data, size);
++    Hash out{};
++    blake3_hasher_finalize(&hasher, out.data(), out.size());
++    return out;
++}
++
++void CheckFraming(const std::vector<uint8_t> &bytes, uint32_t kind, size_t payload_len) {
++    Check(bytes.size() == 24 + payload_len + 32, "record size");
++    Check(std::string(bytes.begin(), bytes.begin() + 8) == "LTSV2MON", "magic");
++    Check(std::string(bytes.begin(), bytes.begin() + 8) != "LTSV2UTX", "not the coin magic");
++    const uint32_t version = uint32_t(bytes[8]) | (uint32_t(bytes[9]) << 8) |
++                             (uint32_t(bytes[10]) << 16) | (uint32_t(bytes[11]) << 24);
++    Check(version == PERSISTENT_MONETARY_VERSION, "explicit version integer");
++    const uint32_t got_kind = uint32_t(bytes[12]) | (uint32_t(bytes[13]) << 8) |
++                              (uint32_t(bytes[14]) << 16) | (uint32_t(bytes[15]) << 24);
++    Check(got_kind == kind, "record kind");
++    uint64_t got_len = 0;
++    for (unsigned i = 0; i < 8; ++i) got_len |= uint64_t(bytes[16 + i]) << (8 * i);
++    Check(got_len == payload_len, "payload length matches file");
++    const Hash sum = FileChecksum(bytes.data(), bytes.size() - 32);
++    Check(std::equal(sum.begin(), sum.end(), bytes.end() - 32), "documented checksum");
++}
++
++MonetaryState MakeState(uint64_t reserve, uint64_t tail, uint8_t work, uint64_t ema) {
++    MonetaryState state;
++    state.bootstrap_reserve = reserve;
++    state.tail_subsidy = tail;
++    state.prev_work.fill(work);
++    state.prev_work[31] = static_cast<uint8_t>(work + 1);
++    state.ema_block_cost = ema;
++    return state;
++}
++
++ChainId MakeChain(uint8_t tag) {
++    ChainId id{};
++    for (size_t i = 0; i < id.size(); ++i) id[i] = static_cast<uint8_t>(tag + i);
++    return id;
++}
++
++Hash MakeRoot(uint8_t tag) {
++    Hash root{};
++    root.fill(tag);
++    root[0] = static_cast<uint8_t>(tag ^ 0xff);
++    return root;
++}
++
++void ExpectClosed(const std::string &directory, const char *expect_error) {
++    PersistentMonetaryStore store;
++    std::string error;
++    Hash sentinel{};
++    sentinel.fill(0x5a);
++    Hash out = sentinel;
++    std::array<uint8_t, 56> money_sentinel{};
++    money_sentinel.fill(0x5a);
++    std::array<uint8_t, 56> money = money_sentinel;
++    const bool opened = PersistentMonetaryStore::Open(directory, store, error);
++    if (opened || error != expect_error || store.IsOpen() || store.Root(out) ||
++        store.Monetary(money) || out != sentinel || money != money_sentinel) {
++        std::cerr << "open error: [" << error << "]\n";
++        Check(false, "corrupt record must not publish a root");
++    }
++}
++
++std::string TempDir() {
++    char templ[] = "/tmp/lotus-v2-monetary-XXXXXX";
++    Check(::mkdtemp(templ) != nullptr, "mkdtemp");
++    const std::string path(templ);
++    Check(path.rfind("/tmp/", 0) == 0, "temporary directory is under /tmp");
++    Check(path.find("..") == std::string::npos, "temporary path has no parent segment");
++    Check(path.find(".lotus") == std::string::npos && path.find("datadir") == std::string::npos,
++          "temporary path is not a datadir");
++    char resolved[PATH_MAX];
++    Check(::realpath(path.c_str(), resolved) != nullptr, "realpath");
++    const std::string absolute(resolved);
++    Check(absolute.rfind("/tmp/", 0) == 0 || absolute.rfind("/private/tmp/", 0) == 0,
++          "resolved temporary directory stays under /tmp");
++    return path;
++}
++
++void WriteCoinFiles(const std::filesystem::path &dir, const std::vector<uint8_t> &snapshot,
++                    const std::vector<uint8_t> &undo) {
++    std::error_code ec;
++    std::filesystem::create_directories(dir / "undo", ec);
++    Check(!ec, "create coin undo directory");
++    WriteRaw(dir / "snapshot.dat", snapshot);
++    WriteRaw(dir / "undo" / "00000001.dat", undo);
++}
++
++void CheckCoinUntouched(const std::filesystem::path &dir, const std::vector<uint8_t> &snapshot,
++                        const std::vector<uint8_t> &undo) {
++    Check(ReadRaw(dir / "snapshot.dat") == snapshot, "coin snapshot.dat is not modified");
++    Check(ReadRaw(dir / "undo" / "00000001.dat") == undo, "coin undo record is not modified");
++}
++
++void Run() {
++    const std::string base = TempDir();
++    const std::filesystem::path bare = std::filesystem::path(base) / "bare";
++    PersistentMonetaryStore bare_store;
++    std::string error;
++    Check(PersistentMonetaryStore::Open(bare.string(), bare_store, error),
++          "open without a coin snapshot.dat");
++    Check(std::filesystem::is_directory(bare), "Open creates the caller directory");
++    Check(!std::filesystem::exists(bare / "snapshot.dat"), "coin snapshot.dat is not required");
++    Check(!std::filesystem::exists(bare / "undo"), "coin undo directory is not required");
++    Check(!std::filesystem::exists(bare / "monetary.dat"), "empty store has no monetary record");
++    Hash bare_root{};
++    bare_root.fill(0xa5);
++    std::array<uint8_t, 56> bare_money{};
++    bare_money.fill(0xa5);
++    Check(!bare_store.Root(bare_root) && bare_root[0] == 0xa5, "empty store returns no root");
++    Check(!bare_store.Monetary(bare_money) && bare_money[0] == 0xa5,
++          "empty store returns no monetary bytes");
++
++    const MonetaryState bare_state = MakeState(1, 2, 3, 4);
++    const ChainId bare_chain = MakeChain(9);
++    const Hash bare_state_root = MakeRoot(0x44);
++    Check(bare_store.Commit(bare_chain, 7, bare_state, bare_state_root, error),
++          "commit does not need a coin snapshot");
++    Check(!std::filesystem::exists(bare / "snapshot.dat"),
++          "commit does not create snapshot.dat");
++    Check(!std::filesystem::exists(bare / "undo"), "commit does not create coin undo/");
++    Check(std::filesystem::exists(bare / "monetary.dat"), "commit writes monetary.dat");
++
++    std::vector<uint8_t> coin_snapshot = {'L', 'T', 'S', 'V', '2', 'U', 'T', 'X'};
++    coin_snapshot.insert(coin_snapshot.end(), 180, 0xab);
++    std::vector<uint8_t> coin_undo = {'L', 'T', 'S', 'V', '2', 'U', 'T', 'X', 'u', 'n', 'd', 'o'};
++    coin_undo.insert(coin_undo.end(), 40, 0xcd);
++    const std::filesystem::path store_dir = std::filesystem::path(base) / "store";
++    WriteCoinFiles(store_dir, coin_snapshot, coin_undo);
++
++    PersistentMonetaryStore store;
++    Check(PersistentMonetaryStore::Open(store_dir.string(), store, error),
++          "open beside an existing coin snapshot");
++    CheckCoinUntouched(store_dir, coin_snapshot, coin_undo);
++    Hash untouched{};
++    untouched.fill(0x5a);
++    Hash root_out = untouched;
++    Check(!store.Root(root_out) && root_out == untouched,
++          "coin snapshot is not a monetary root");
++
++    const MonetaryState state_a = MakeState(0x1122334455667788ull, 42, 0x10, 99);
++    const MonetaryState state_b = MakeState(7, 1000, 0x22, 0xabcdef);
++    const ChainId chain_a = MakeChain(0x30);
++    const ChainId chain_b = MakeChain(0x80);
++    const uint64_t height_a = 0x0102030405060708ull;
++    const uint64_t height_b = 0x1112131415161718ull;
++    const Hash root_a = MakeRoot(0x91);
++    const Hash root_b = MakeRoot(0x92);
++    const std::array<uint8_t, 56> encoded_a = EncodeMonetaryState(state_a);
++    const std::array<uint8_t, 56> encoded_b = EncodeMonetaryState(state_b);
++    Check(encoded_a != encoded_b && root_a != root_b, "the two records differ");
++
++    Check(store.Commit(chain_a, height_a, state_a, root_a, error), "write the first record");
++    const std::filesystem::path monetary = store_dir / "monetary.dat";
++    const std::vector<uint8_t> bytes_a = ReadRaw(monetary);
++    CheckFraming(bytes_a, 1, PERSISTENT_MONETARY_SNAPSHOT_BYTES);
++    Check(std::equal(encoded_a.begin(), encoded_a.end(), bytes_a.begin() + 24 + 40),
++          "snapshot stores EncodeMonetaryState");
++    Check(std::equal(root_a.begin(), root_a.end(), bytes_a.begin() + 24 + 96),
++          "snapshot stores the state root after the monetary bytes");
++    uint64_t got_height = 0;
++    for (unsigned i = 0; i < 8; ++i) got_height |= uint64_t(bytes_a[24 + 32 + i]) << (8 * i);
++    Check(got_height == height_a, "height is little-endian");
++    Check(std::equal(chain_a.begin(), chain_a.end(), bytes_a.begin() + 24), "chain id is stored");
++    std::array<uint8_t, 56> money_a{};
++    Hash opened_root{};
++    Check(store.Monetary(money_a) && money_a == encoded_a, "open object returns the 56 bytes");
++    Check(store.Root(opened_root) && opened_root == root_a, "open object returns the state root");
++    CheckCoinUntouched(store_dir, coin_snapshot, coin_undo);
++
++    const std::vector<uint8_t> undo1 = ReadRaw(store_dir / "monetary-undo" / "00000001.dat");
++    CheckFraming(undo1, 2, PERSISTENT_MONETARY_SNAPSHOT_BYTES * 2);
++    Check(std::all_of(undo1.begin() + 24, undo1.begin() + 24 + 128,
++                      [](uint8_t b) { return b == 0; }),
++          "first undo starts at the zero predecessor payload");
++    Check(std::equal(bytes_a.begin() + 24, bytes_a.begin() + 24 + 128, undo1.begin() + 24 + 128),
++          "first undo ends with the snapshot payload");
++
++    PersistentMonetaryStore reopened;
++    Check(PersistentMonetaryStore::Open(store_dir.string(), reopened, error), "reopen the record");
++    Check(ReadRaw(monetary) == bytes_a, "reopen leaves the file bytes unchanged");
++    std::array<uint8_t, 56> reopened_money{};
++    Hash reopened_root{};
++    Check(reopened.Monetary(reopened_money) && reopened_money == encoded_a,
++          "reopen returns the same 56 bytes");
++    Check(reopened.Root(reopened_root) && reopened_root == root_a,
++          "reopen returns the same state root");
++    CheckCoinUntouched(store_dir, coin_snapshot, coin_undo);
++
++    Check(reopened.Commit(chain_b, height_b, state_b, root_b, error), "write the second record");
++    const std::vector<uint8_t> bytes_b = ReadRaw(monetary);
++    Check(bytes_b != bytes_a, "second record changes monetary.dat");
++    CheckFraming(bytes_b, 1, PERSISTENT_MONETARY_SNAPSHOT_BYTES);
++    Check(std::equal(encoded_b.begin(), encoded_b.end(), bytes_b.begin() + 24 + 40),
++          "second snapshot stores EncodeMonetaryState");
++    const std::vector<uint8_t> undo2 = ReadRaw(store_dir / "monetary-undo" / "00000002.dat");
++    CheckFraming(undo2, 2, PERSISTENT_MONETARY_SNAPSHOT_BYTES * 2);
++    Check(std::equal(bytes_a.begin() + 24, bytes_a.begin() + 24 + 128, undo2.begin() + 24),
++          "undo stores the previous payload byte for byte");
++    Check(std::equal(bytes_b.begin() + 24, bytes_b.begin() + 24 + 128, undo2.begin() + 24 + 128),
++          "undo stores the next payload byte for byte");
++    CheckCoinUntouched(store_dir, coin_snapshot, coin_undo);
++
++    Check(reopened.Undo(error), "undo the second record");
++    Check(ReadRaw(monetary) == bytes_a, "undo rewrites the previous snapshot bytes");
++    std::array<uint8_t, 56> restored_money{};
++    Hash restored_root{};
++    Check(reopened.Monetary(restored_money) && restored_money == encoded_a,
++          "undo restores the prior 56 bytes");
++    Check(reopened.Root(restored_root) && restored_root == root_a,
++          "undo restores the prior state root");
++    Check(!std::filesystem::exists(store_dir / "monetary-undo" / "00000002.dat"),
++          "undo removes the newest monetary undo record");
++    Check(ReadRaw(store_dir / "monetary-undo" / "00000001.dat") == undo1,
++          "older monetary undo record stays");
++    CheckCoinUntouched(store_dir, coin_snapshot, coin_undo);
++
++    PersistentMonetaryStore after_undo;
++    Check(PersistentMonetaryStore::Open(store_dir.string(), after_undo, error),
++          "reopen after undo");
++    Check(ReadRaw(monetary) == bytes_a, "reopen after undo keeps the restored bytes");
++    std::array<uint8_t, 56> after_money{};
++    Hash after_root{};
++    Check(after_undo.Monetary(after_money) && after_money == encoded_a &&
++              after_undo.Root(after_root) && after_root == root_a,
++          "reopen republishes the restored monetary bytes and state root");
++    CheckCoinUntouched(store_dir, coin_snapshot, coin_undo);
++
++    const std::vector<uint8_t> good = bytes_a;
++    const std::vector<uint8_t> good_undo = undo1;
++    WriteRaw(monetary, {});
++    ExpectClosed(store_dir.string(), "truncated");
++    Check(ReadRaw(monetary).empty(), "truncated open does not repair monetary.dat");
++    CheckCoinUntouched(store_dir, coin_snapshot, coin_undo);
++
++    // Header plus payload, including the state root, but no checksum.
++    Check(good.size() > 152, "snapshot extends past its embedded root");
++    WriteRaw(monetary, std::vector<uint8_t>(good.begin(), good.begin() + 152));
++    ExpectClosed(store_dir.string(), "truncated");
++    CheckCoinUntouched(store_dir, coin_snapshot, coin_undo);
++
++    std::vector<uint8_t> mismatched = good;
++    mismatched[16] ^= 0xff;
++    WriteRaw(monetary, mismatched);
++    ExpectClosed(store_dir.string(), "truncated");
++    WriteRaw(monetary, good);
++
++    std::vector<uint8_t> flipped = good;
++    flipped.back() ^= 0xff;
++    WriteRaw(monetary, flipped);
++    ExpectClosed(store_dir.string(), "checksum");
++    WriteRaw(monetary, good);
++
++    WriteRaw(store_dir / "monetary.dat.tmp", flipped);
++    PersistentMonetaryStore ignored_temp;
++    Check(PersistentMonetaryStore::Open(store_dir.string(), ignored_temp, error),
++          "temp file is not a record");
++    std::array<uint8_t, 56> temp_money{};
++    Hash temp_root{};
++    Check(ignored_temp.Monetary(temp_money) && temp_money == encoded_a &&
++              ignored_temp.Root(temp_root) && temp_root == root_a,
++          "a temp monetary root is not published");
++    std::filesystem::remove(store_dir / "monetary.dat.tmp");
++
++    WriteRaw(store_dir / "monetary-undo" / "00000001.dat",
++             std::vector<uint8_t>(good_undo.begin(), good_undo.begin() + 80));
++    ExpectClosed(store_dir.string(), "truncated");
++    Check(ReadRaw(monetary) == good, "truncated undo does not rewrite the snapshot");
++    WriteRaw(store_dir / "monetary-undo" / "00000001.dat", good_undo);
++
++    std::vector<uint8_t> huge(1024u * 1024u + 1, 0);
++    WriteRaw(monetary, huge);
++    ExpectClosed(store_dir.string(), "size");
++    WriteRaw(monetary, good);
++    PersistentMonetaryStore restored;
++    Check(PersistentMonetaryStore::Open(store_dir.string(), restored, error),
++          "reopen the restored record");
++    std::array<uint8_t, 56> final_money{};
++    Hash final_root{};
++    Check(restored.Monetary(final_money) && final_money == encoded_a &&
++              restored.Root(final_root) && final_root == root_a,
++          "checksum match republishes the record");
++    Check(ReadRaw(monetary) == good, "reopen still does not rewrite monetary.dat");
++    CheckCoinUntouched(store_dir, coin_snapshot, coin_undo);
++
++    std::error_code remove_ec;
++    std::filesystem::remove_all(base, remove_ec);
++    Check(!remove_ec, "remove temporary directory");
++}
++
++} // namespace
++
++int main(int argc, char **argv) {
++    if (argc != 1) {
++        std::cerr << "usage: test_lotus_v2_persistent_monetary\n";
++        return 2;
++    }
++    (void)argv;
++    Run();
++    std::cout << "V2 persistent monetary snapshot and undo cases passed\n";
++    return 0;
++}
+-- 
+2.50.1 (Apple Git-155)
+
