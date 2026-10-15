@@ -166,6 +166,42 @@ class Tests(unittest.TestCase):
             server.server_close()
             thread.join()
 
+    def test_deep_http_json_returns_failure_without_native_tracking(self):
+        raw = b'[' * 100000 + b'0' + b']' * 100000
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, *args):
+                pass
+            def do_GET(self):
+                self.send_response(200)
+                self.send_header('Content-Length', str(len(raw)))
+                self.end_headers()
+                self.wfile.write(raw)
+        server = ThreadingHTTPServer(('127.0.0.1', 0), Handler)
+        server.daemon_threads = True
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        ctl = self.controller()
+        ctl.config['nodes'][0]['chronik']['url'] = f'http://127.0.0.1:{server.server_port}'
+        try:
+            result = ctl.execute('wallet balance alice')
+            self.assertFalse(result['ok'], result)
+            self.assertEqual(result['result'], 'protocol_error')
+            self.assertEqual([x[0] for x in ctl.calls], ['info'])
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join()
+
+    def test_json_depth_bound_ignores_escaped_string_delimiters(self):
+        leaf = json.dumps('"' + '[' * 100 + '\\' + ']' * 100)
+        self.assertIsInstance(c.decode_json('[' * 32 + leaf + ']' * 32, max_depth=32), list)
+        with self.assertRaises(c.ControllerError) as caught:
+            c.decode_json('[' * 33 + '0' + ']' * 33, max_depth=32)
+        self.assertEqual(caught.exception.code, 'protocol_error')
+        with self.assertRaises(c.ControllerError) as caught:
+            c.decode_json('[' * 100000 + '0' + ']' * 100000)
+        self.assertEqual(caught.exception.code, 'protocol_error')
+
     def test_native_tracking_never_starts_after_deadline(self):
         ctl = self.controller()
         ctl.config['limits']['deadline_ms'] = 10

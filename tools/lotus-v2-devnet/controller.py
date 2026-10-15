@@ -158,7 +158,7 @@ class DiscoveryTransport:
             raw = response.read(256 * 1024 + 1)
             remaining(self.deadline)
             require(len(raw) <= 256 * 1024, "Chronik response capacity", "capacity_refused")
-            return decode_json(raw)
+            return decode_json(raw, max_depth=32)
         except (TimeoutError, socket.timeout) as error:
             raise ControllerError("timeout", "Chronik operation deadline expired") from error
         except (OSError, http.client.HTTPException) as error:
@@ -178,7 +178,7 @@ def decimal(value):
     return value
 
 
-def decode_json(data):
+def decode_json(data, max_depth=None):
     def pairs(items):
         result = {}
         for key, value in items:
@@ -187,6 +187,26 @@ def decode_json(data):
         return result
 
     try:
+        if max_depth is not None:
+            # Scan before recursive JSON parsing; brackets inside strings do not
+            # contribute to structural depth. Syntax remains json.loads' job.
+            data = data.decode("utf8") if isinstance(data, bytes) else data
+            depth, quoted, escaped = 0, False, False
+            for char in data:
+                if quoted:
+                    if escaped:
+                        escaped = False
+                    elif char == "\\":
+                        escaped = True
+                    elif char == '"':
+                        quoted = False
+                elif char == '"':
+                    quoted = True
+                elif char in "[{":
+                    depth += 1
+                    require(depth <= max_depth, "JSON nesting capacity", "protocol_error")
+                elif char in "]}":
+                    depth -= 1
         return json.loads(
             data,
             object_pairs_hook=pairs,
@@ -196,7 +216,7 @@ def decode_json(data):
         )
     except ControllerError:
         raise
-    except (ValueError, UnicodeError) as error:
+    except (ValueError, UnicodeError, RecursionError) as error:
         raise ControllerError("protocol_error", "invalid JSON") from error
 
 
