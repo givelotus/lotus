@@ -151,3 +151,26 @@ func TestRouterRecoversPersistencePanic(t *testing.T) {
 		t.Fatalf("unexpected panic response: %d %s", response.Code, response.Body.String())
 	}
 }
+
+func TestNotificationRegistrationHooks(t *testing.T) {
+	removed := false
+	router := newRouter(func(context.Context, UserInfo) error { return nil }, registrationHooks{
+		Validate: func(UserInfo) error { return errors.New("invalid address") },
+		Remove: func(_ context.Context, info UserInfo) error {
+			removed = info.PushToken == "dummy-token" && info.Address == "dummy-address"
+			return nil
+		},
+	})
+	req := httptest.NewRequest(http.MethodPost, "/userinfo", strings.NewReader(`{"PushToken":"dummy-token","Address":"invalid","Longitude":0,"Latitude":0}`))
+	out := httptest.NewRecorder()
+	router.ServeHTTP(out, req)
+	if out.Code != 400 {
+		t.Fatalf("invalid registration: %d", out.Code)
+	}
+	req = httptest.NewRequest(http.MethodPost, "/notifications/unregister", strings.NewReader(`{"PushToken":"dummy-token","Address":"dummy-address"}`))
+	out = httptest.NewRecorder()
+	router.ServeHTTP(out, req)
+	if out.Code != 204 || !removed {
+		t.Fatalf("unregister: %d %v", out.Code, removed)
+	}
+}
