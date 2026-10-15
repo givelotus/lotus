@@ -2,7 +2,9 @@
 
 This packages the versioned **absolute-tail local test fixture**
 `lotus-v2-local-test-20261015-absolute1`, derived from the earlier tested local
-fixture. Native execution evidence for schema 1 does not validate this migration.
+fixture. The schema 2 fixture passes native manifest checks and local multi-node wallet,
+relay, mining, restart and reorg tests. Those tests do not demonstrate operation
+on separate machines.
 Its easy proof of work, monetary parameters and magic are for isolated tests.
 Do not expose its listeners, allocate public ports, or use real funds. Setup runs
 no daemon, wallet client, Node process or compiler and creates no chain homes.
@@ -35,6 +37,8 @@ while IFS= read -r patch; do
   case "$patch" in ''|'#'*) continue ;; esac
   git -C "$NATIVE" am --keep-non-patch "$MONOREPO/daemon/patches/v2/$patch" || exit 1
 done < "$MONOREPO/daemon/patches/v2/series"
+test "$(git -C "$NATIVE" rev-parse HEAD^{tree})" = \
+  028e4b47980e6d3e3f52c987b17f2df96f772313
 cmake -S "$NATIVE" -B "$NATIVE/build" -G Ninja \
   -DCMAKE_BUILD_TYPE=Debug -DBUILD_CHRONIK=OFF \
   -DBUILD_QT=OFF -DBUILD_SEEDER=OFF -DBUILD_ZMQ=OFF \
@@ -44,8 +48,10 @@ cmake --build "$NATIVE/build" --target lotusd lotus-v2-wallet-client -j 6
 ```
 
 Stop if patch application fails; preserve that clone and its diagnostics.
-The checked-in 173-entry series through mailboxes 171–172 includes the private
-FD wallet client and its build target. Use the complete series, not a V1 build
+The checked-in 219-entry series through mailbox 218 includes the private
+FD wallet client, pool-based mining and TCP transaction relay. Every intermediate
+source tree is recorded in `daemon/docs/evidence/v2-series-replay-218.json`.
+The final tree must be `028e4b47980e6d3e3f52c987b17f2df96f772313`. Use the complete series, not a V1 build
 or the earlier indexed-store wallet pilot. The executable paths are
 `$NATIVE/build/src/lotusd` and
 `$NATIVE/build/src/wallet/lotus-v2-wallet-client`. This recipe uses no setup/reset
