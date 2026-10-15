@@ -405,7 +405,7 @@ export async function compilePackage(projectDir: string, options: PackageCompile
     const data = pkg.files.find(f => f.path === rel)!;
     const isEntry = pkg.isRoot && path === pkg.manifest.entry;
     let program: Program;
-    try { program = parseModuleSource(decode(data.content, file), isEntry, file, sources); }
+    try { program = parseModuleSource(decode(data.content, file), isEntry, file, sources, options.languageVersion); }
     catch (error) { if (error instanceof CompileError) throw error; throw new PackageError('parse', (error as Error).message, file); }
     parses[id] = (parses[id] ?? 0) + 1;
     const node: ModuleNode = { id, pkg, path, file, digest: data.digest, program, isEntry, imports: [] };
@@ -588,7 +588,7 @@ export async function compilePackage(projectDir: string, options: PackageCompile
       exports: exported.map(x => ({ name: x.name, signature: x.signature, digest: hex(x.digest) })) });
   };
   await scheduler.run(`module:${entry.id}`);
-  const { artifact, roots } = await compileLinkedProgramAsync({ helpers, contracts, imports: [] }, options, event => trace.push(event), sources);
+  const { artifact, roots } = await compileLinkedProgramAsync({ ...(options.languageVersion === 1 ? { languageVersion: 1 as const } : {}), helpers, contracts, imports: [] }, options, event => trace.push(event), sources);
   const links: LinkedContract[] = roots.filter(item => item.name !== artifact.contract && owners.get(item.name)?.pkg.id !== root.id).map(item => {
     const owner = owners.get(item.name)!;
     return { name: item.name, kind: owner.kind, package: owner.pkg.id, module: owner.moduleId, packageDigest: hex(owner.pkg.treeDigest), root: item.root, methods: item.methods };
