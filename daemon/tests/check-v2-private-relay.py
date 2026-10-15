@@ -82,7 +82,7 @@ def main(argv=None):
         for node in nodes:
             eventually(lambda: status(node), lambda s: all(s[k] == wanted[k] for k in local.STATE_FIELDS), 'chain did not converge '+node.label)
     def call(node, home, command, payload=None):
-        """Forward bounded JSONL requests unchanged over a private socketpair.
+        """Forward bounded native JSONL commands over a private socketpair.
 
         The bridge owns no chain/wallet logic. Each invocation reopens the real
         encrypted SQLite wallet, testing durability on every operation.
@@ -221,6 +221,9 @@ def main(argv=None):
         b=launch('b-reorg',root/'home-b',[c.ready['listen']])
         a=launch('a-reorg',root/'home-a',[b.ready['listen']])
         same((a,b),fork)
+        detached=a.request('blockstatus',block_id=confirmation['block_id'])
+        require(detached.get('ever_connected') is True and detached.get('is_active_tip') is False,'original confirmation block lacks native detach evidence')
+        check('confirmation-block-detached',response=detached)
         states=[]
         for payment in payments:
             observed=eventually(lambda:a.request('transactionstatus',txid=payment['txid'],txhash=payment['txhash'],wire=payment['wire']),lambda s:s.get('state') in ('pending','conflicted'),'detached transaction reconciliation')
