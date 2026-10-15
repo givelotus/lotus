@@ -654,3 +654,40 @@ exercise allocation failures and pinned-object lifetime. These checks validate
 modules and offline complete-block execution. Runtime orchestration, socket
 activation and two-node synchronization remain outstanding; this is not evidence
 of a usable public testnet.
+
+
+## Explicit TCP streams and shared manifest parsing (140–142)
+
+All 143 mailboxes replay with every intermediate tree checked; final tree
+`6d5ac2f059e4ec757c7d20465225f3f348d51de0`. See
+[evidence](evidence/v2-series-replay-142.json). Existing mailboxes 000–139 remain
+byte-identical. No partial replay was promoted.
+
+The strict development manifest parser is now callable without opening the
+legacy offline command home. It supplies no networking defaults and parsing
+alone does not establish genesis validity. The existing command uses the same
+parser and initialization path. Clean native `17d6c881e` builds lotusd and the
+wallet helper with Chronik off; its signed-wallet complete-block pilot passes at
+`/private/tmp/lotus-v2-wallet-chain-runtime-manifest-20261015`. Build logs:
+`/private/tmp/lotus-v2-runtime-staging-configure.log` and
+`/private/tmp/lotus-v2-runtime-staging-build.log`.
+
+The TCP adapter implements caller-selected numeric IPv4/IPv6 endpoints,
+nonblocking connect/listen/accept/read/write, fixed connect deadlines, explicit
+readiness polling and descriptor ownership. Interrupted I/O returns WouldBlock;
+close does not retry an ambiguous descriptor. SIGPIPE is suppressed on supported
+Linux/macOS paths. No DNS, default endpoints, seeds or daemon listener is added.
+The abstract stream remains available on other platforms.
+
+Actual macOS arm64 IPv4/IPv6 loopback tests use ephemeral port zero and pass in
+Debug and ASan/UBSan. Coverage includes fragmented Transport handshake/application
+messages, bounded backpressure, EPIPE survival, failure-preserved outputs,
+deadlines, moves and descriptor reuse after close. Independent read-only review
+found no blocker. Native `8a4cc1aa7` full-tree build and check-lotus-v2-peer-tcp
+also pass in `/private/tmp/lotus-v2-daemon-runtime-staging-20261015`; log
+`/private/tmp/lotus-v2-runtime-tcp-build.log`. Linux execution remains unverified.
+
+These are transport tests, not synchronized nodes. The runtime owner, peer
+application dispatcher, local block production/transaction submission and actual
+two-node synchronization remain integration gates. No published development
+network or mainnet parameter selection is implied.
