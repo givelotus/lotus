@@ -144,6 +144,48 @@ def state_root(chain_id: bytes, height: int, root: bytes, monetary: MonetaryStat
     return tagged("Lotus/v2/state", payload)
 
 
+def _transaction_subtree(identities: tuple[tuple[bytes, bytes], ...]) -> bytes:
+    count = len(identities)
+    if count == 0:
+        return tagged("Lotus/v2/txroot", bytes([2]))
+    if count == 1:
+        tx_hash, tx_id = identities[0]
+        return tagged("Lotus/v2/txroot", bytes([0]) + tx_hash + tx_id)
+    # Greatest power of two strictly less than count. Children stay ordered.
+    split = 1
+    while split < count - split:
+        split <<= 1
+    left = _transaction_subtree(identities[:split])
+    right = _transaction_subtree(identities[split:])
+    return tagged("Lotus/v2/txroot", bytes([1]) + left + right)
+
+
+def transaction_root(identities: tuple[tuple[bytes, bytes], ...]) -> bytes:
+    """Count-wrapped ordered root of ``(tx_hash, tx_id)`` pairs.
+
+    Empty is defined for tools. This does not require a coinbase or accept a block.
+    """
+    if isinstance(identities, (bytes, bytearray)) or not isinstance(identities, (list, tuple)):
+        raise ValueError("transaction identities")
+    count = len(identities)
+    if count > 0xFFFFFFFF:
+        raise ValueError("transaction count")
+    leaves: list[tuple[bytes, bytes]] = []
+    for item in identities:
+        if (isinstance(item, (bytes, bytearray)) or not isinstance(item, (list, tuple))
+                or len(item) != 2):
+            raise ValueError("transaction identity")
+        tx_hash, tx_id = item
+        if (not isinstance(tx_hash, bytes) or len(tx_hash) != 32
+                or not isinstance(tx_id, bytes) or len(tx_id) != 32):
+            raise ValueError("transaction identity")
+        leaves.append((tx_hash, tx_id))
+    payload = bytes([3]) + count.to_bytes(4, "little") + _transaction_subtree(tuple(leaves))
+    if len(payload) != 37:
+        raise ValueError("transaction root preimage width")
+    return tagged("Lotus/v2/txroot", payload)
+
+
 @dataclass(frozen=True)
 class Parent:
     chain_id: bytes
