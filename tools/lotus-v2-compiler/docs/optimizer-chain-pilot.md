@@ -1,7 +1,7 @@
 # Optimizer complete-block pilot
 
 This explicit opt-in gate reuses the shared
-[development-chain pilot](../tools/lotus-v2-compiler/test/development-chain-pilot/run.py)
+[development-chain pilot](../test/development-chain-pilot/run.py)
 through `PilotConfig` and `run_pilot`. The original inspection at monorepo
 `642d0e3b` found no reusable interface; the shared pilot owner supplied the
 configurable API before this matrix could run. The new files contain compiler
@@ -33,7 +33,7 @@ asserted. An explicit assertion confirms these source families actually optimize
 and produce different policy/final-state commitments.
 
 The original
-[exact-cap observations](../tools/lotus-v2-compiler/fixtures/optimizer-equivalence/observations.json)
+[exact-cap observations](../fixtures/optimizer-equivalence/observations.json)
 are read without changes, hashed and copied as retained cap discrepancies.
 For example equalverify charge 14 versus 6 changes admission at cap 6 under
 that corpus's unit-cost profile. That profile differs from the caller's block
@@ -75,7 +75,7 @@ and manifest SHA256
 `33d84853403b2eaa686a5ad4fdd799daffc8fc9c712b0f8662d914a29f11d720`.
 The shared API prerequisite is commit `a661f23a`. Full retained bytes and commands
 are at `/private/tmp/lotus-v2-optimizer-chain-evidence-20261015`; a
-[checked-in execution summary](../tools/lotus-v2-compiler/test/optimizer-chain-pilot/evidence-20261015.json)
+[checked-in execution summary](../test/optimizer-chain-pilot/evidence-20261015.json)
 records per-artifact commitments and charges. This execution summary is evidence,
 not a regenerated expected-output file.
 
@@ -94,3 +94,10 @@ artifacts rejected independently signed wrong-integer spends. The optional
 integration unittest also passed, including exclusive-output preservation.
 These results close this bounded full-block optimizer matrix; broader CABI06
 obligations listed above remain open.
+
+Root independently reran all six cases after integration with the exact clean
+`dca9abe76` daemon. The matrix passed; complete per-case bytes, roots, charges,
+negative outcomes and restart/undo evidence are retained at
+`/private/tmp/lotus-v2-optimizer-chain-root-20261015`. This is evidence for these
+three source families, not a proof of general optimizer equivalence or network
+readiness. The original exact-cap discrepancies remain unchanged.
