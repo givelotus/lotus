@@ -87,7 +87,30 @@ Nonce changes do not require recomputing body/transaction/state commitments in t
 
 Interpret BlockID as an unsigned little-endian 256-bit integer; valid PoW requires `value <= T`. Compact target encoding uses unsigned exponent e (high byte) and 23-bit mantissa m (low bits); the sign bit must be zero. Decode T as `m >> (8*(3−e))` when e≤3 and `m << (8*(e−3))` otherwise. Reject zero, overflow beyond 256 bits and T>POW_LIMIT. Require canonical re-encoding: set e=ceil(bit_length(T)/8); set m=T<<[8*(3−e)] if e≤3, otherwise m=T>>[8*(e−3)]; if m has bit 23 set, shift m right by eight and increment e. Return (e<<24)|m. Decoding and re-encoding must reproduce bits.
 
-Per-block chainwork is `floor(2^256/(T+1))`, with mathematical or sufficiently wide intermediates. Accumulate without wrapping. Prefer greatest accumulated work among fully valid eligible chains. At equal work retain the current valid tip; nodes may temporarily choose different equal-work tips. Advisory voting cannot override a strictly heavier eligible chain. The candidate ASERT arithmetic below fixes the algorithm and anchor. Half-life/powLimit and future-time eligibility values still need acceptance/calibration.
+Per-block chainwork is `floor(2^256/(T+1))`, with mathematical or sufficiently wide intermediates. Accumulate without wrapping. The currently implemented development slice prefers greatest accumulated work among fully valid eligible chains and retains its current valid tip at equal work. The selected Avalanche integration direction below supersedes the earlier proposal that advisory voting could never override a heavier chain; that integration is not yet implemented. The candidate ASERT arithmetic below fixes the algorithm and anchor. Half-life/powLimit and future-time eligibility values still need acceptance/calibration.
+
+## Selected Avalanche/PoW integration direction
+
+Maintainer decision, October 15, 2026: follow Bitcoin ABC's existing Avalanche/PoW
+chain-selection rules and default settings at the pinned V2 base
+`1fb7db17c176cdea8a2c60d887891589382ee4e3`. Do not design a separate Lotus work
+override threshold or assume a ten-block override. This selects the upstream
+behavior, not an automatically changing dependency on future upstream revisions.
+
+The source anchors are `src/validation.cpp` (chain selection and finalized-block
+protection), `src/node/chainstatemanager_args.cpp` (automatic-unparking defaults),
+and `test/functional/abc_p2p_avalanche_voting.py` (finalization behavior).
+Automatic unparking defaults off with Avalanche enabled. The optional upstream
+work-based unparking rule has a fork-relative work threshold and shallow-fork
+exceptions; it is not an unconditional promise that additional PoW overrides
+Avalanche finalization under default settings.
+
+Integration must preserve the pinned behavior for acceptance, parking,
+finalization, conflicting forks, restart and explicit operator overrides, with
+V2-specific tests. Polling knowledge remains distinct from deterministic block
+validity and monetary state. This decision does not import eCash issuance,
+transaction formats or payout amounts. The present local playground still uses
+its tested PoW-only selector; it does not demonstrate Avalanche integration.
 
 ## ASERT arithmetic candidate
 
