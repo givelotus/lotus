@@ -5,10 +5,10 @@ from dataclasses import replace
 
 from coincurve import PublicKeyXOnly
 
-from lotus_v2_reference.encoding import Profile, decode_output
+from lotus_v2_reference.encoding import Output, Profile, decode_output
 from lotus_v2_reference.signing import (
     Input, SigningError, Transaction, TxProfile, Witness, coins_root, decode_transaction,
-    identity_digests, own_input_hash, signing_message,
+    encode_transaction, identity_digests, own_input_hash, signing_message,
 )
 from lotus_v2_reference.vm import branch_leaf_hash
 
@@ -89,6 +89,80 @@ class SighashFixtureTests(unittest.TestCase):
             signing_message(minted, PROFILE, CHAIN, resolved, 1, 0, 0, None)
         with self.assertRaises(SigningError):
             signing_message(minted, PROFILE, CHAIN, resolved, 1, 0, 0, bytes(16))
+
+
+# Native Coinbase() vector. Profile matches test_transaction.cpp.
+COINBASE_PROFILE = TxProfile(32, 32, 8, 8192, 16, 8192, 64)
+COINBASE_WIRE = bytes.fromhex(
+    "07000000000000000000000001000100"
+    "0707070707070707070707070707070707070707070707070707070707070707"
+    "0c000000ffffffff0201035e4c00"
+    "00e80300000000000001a88cef369f758aec3e594eaa4e8d08c9f12ef3f11bea"
+    "972ec53a416a148f0605010100")
+
+
+class CoinbaseWireTests(unittest.TestCase):
+    def test_native_frame_round_trip_and_absent_data(self):
+        tx = decode_transaction(COINBASE_WIRE, COINBASE_PROFILE)
+        self.assertEqual(encode_transaction(tx, COINBASE_PROFILE), COINBASE_WIRE)
+        self.assertEqual(tx.lock, 0)
+        self.assertEqual(len(tx.inputs), 1)
+        self.assertEqual(tx.inputs[0].flags, 2)
+        self.assertEqual(tx.inputs[0].prev_index, 12)
+        self.assertEqual(tx.inputs[0].sequence, 0xFFFFFFFF)
+        self.assertEqual(tx.inputs[0].coinbase_data, bytes.fromhex("5e4c00"))
+        self.assertFalse(tx.inputs[0].witnesses)
+        self.assertEqual(tx.outputs[0].flags & 1, 0)
+        absent_input = replace(tx.inputs[0], coinbase_data=None)
+        absent_tx = replace(tx, inputs=(absent_input,))
+        absent = encode_transaction(absent_tx, COINBASE_PROFILE)
+        self.assertEqual(absent[57], 0)
+        self.assertNotEqual(absent, COINBASE_WIRE)
+        self.assertEqual(encode_transaction(
+            decode_transaction(absent, COINBASE_PROFILE), COINBASE_PROFILE), absent)
+        full = encode_transaction(absent_tx, COINBASE_PROFILE)
+        core_id = identity_digests(absent_tx, COINBASE_PROFILE, bytes(32))
+        self.assertEqual(len(core_id.txid), 32)
+        self.assertNotEqual(core_id.txid, core_id.txhash)
+        self.assertEqual(full, absent)
+        maximum = replace(absent_input, coinbase_data=bytes([0x5e]) * 8192)
+        maximum_tx = replace(tx, inputs=(maximum,))
+        maximum_wire = encode_transaction(maximum_tx, COINBASE_PROFILE)
+        self.assertEqual(encode_transaction(
+            decode_transaction(maximum_wire, COINBASE_PROFILE), COINBASE_PROFILE),
+            maximum_wire)
+
+    def test_empty_overlong_nonminimal_and_token_reject(self):
+        tx = decode_transaction(COINBASE_WIRE, COINBASE_PROFILE)
+        empty = replace(tx, inputs=(replace(tx.inputs[0], coinbase_data=b""),))
+        with self.assertRaises(SigningError) as caught:
+            encode_transaction(empty, COINBASE_PROFILE)
+        self.assertEqual(str(caught.exception), "coinbase data")
+        overlong = replace(tx, inputs=(replace(tx.inputs[0], coinbase_data=bytes(8193)),))
+        with self.assertRaises(SigningError) as caught:
+            encode_transaction(overlong, COINBASE_PROFILE)
+        self.assertEqual(str(caught.exception), "coinbase data")
+        absent = encode_transaction(
+            replace(tx, inputs=(replace(tx.inputs[0], coinbase_data=None),)),
+            COINBASE_PROFILE)
+        present_empty = bytearray(absent)
+        present_empty[57] = 1
+        present_empty.insert(58, 0)
+        with self.assertRaises(SigningError):
+            decode_transaction(bytes(present_empty), COINBASE_PROFILE)
+        nonminimal = bytearray(COINBASE_WIRE)
+        nonminimal[58] = 253
+        nonminimal[59:59] = bytes((3, 0))
+        with self.assertRaises(SigningError):
+            decode_transaction(bytes(nonminimal), COINBASE_PROFILE)
+        token = Output(1, tx.outputs[0].value, bytes([1]) + bytes(31),
+                       tx.outputs[0].branches, tx.outputs[0].paths)
+        with self.assertRaises(SigningError) as caught:
+            encode_transaction(replace(tx, outputs=(token,)), COINBASE_PROFILE)
+        self.assertEqual(str(caught.exception), "coinbase shape")
+        with self.assertRaises(SigningError) as caught:
+            signing_message(tx, COINBASE_PROFILE, bytes(32), (None,), 0, 0, 0)
+        self.assertEqual(str(caught.exception), "coinbase is not signed")
 
 
 if __name__ == "__main__":
