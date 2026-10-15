@@ -200,8 +200,10 @@ def main(argv=None):
             if command=='stop':save()
             return response
         def stop(self):
-            if self.process.poll() is None:self.audit(force=True)
-            super().stop()
+            try:
+                if self.process.poll() is None:self.audit(force=True)
+            finally:
+                super().stop()
     local.Node=Node
     private.local_module=lambda:local
     try:
