@@ -134,6 +134,8 @@ export const DIAGNOSTIC_CODES: Record<string, string> = {
   E0130: 'explicit invocation marker required',
   E0131: 'language version mismatch',
   E0132: 'unsupported language version',
+  E0930: 'invalid program instance binding',
+  E0931: 'program root dependency cycle',
   E1200: 'unknown compiler target',
   E1201: 'unsupported target capability',
   E1202: 'invalid target entrypoint',

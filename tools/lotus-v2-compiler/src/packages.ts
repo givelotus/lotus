@@ -15,7 +15,7 @@ import { lstatSync, readdirSync, readFileSync, realpathSync, statSync, writeFile
 import { join, relative, sep } from 'node:path';
 import { bytes, concat, cs, hex, tagged, type Span } from './compiler.js';
 import { CompileError, SourceManager, diagnostic } from './diagnostics.js';
-import { compileLinkedProgramAsync, parseModuleSource, type CompileOptions, type Contract, type ContractArtifact, type Expr, type Helper,
+import { compileLinkedProgramAsync, parseModuleSource, type BoundValue, type CompileOptions, type Contract, type ContractArtifact, type Expr, type Helper,
   type HelperStmt, type ImportDecl, type LinkedContract, type Method, type Param, type Program, type SchedulerEvent, type Stmt } from './generic.js';
 import { assertPortableName } from './names.js';
 import { assertGitLocator, classifyRequirement, isGitLocator, isModulePath, resolveDistributedSources, type FetchOptions } from './package-sources.js';
@@ -38,7 +38,7 @@ export const DEFAULT_PACKAGE_LIMITS: PackageLimits = { maxPackages: 64, maxModul
 
 export type PackageErrorCode = 'manifest' | 'path-escape' | 'symlink-escape' | 'path-collision' | 'undeclared-file' | 'missing-module' | 'lock-missing' |
   'lock-mismatch' | 'lock-stale' | 'version-conflict' | 'package-cycle' | 'parse' | 'unknown-alias' | 'not-exported' | 'missing-symbol' |
-  'visibility' | 'duplicate-name' | 'import-cycle' | 'declaration-only' | 'limit' | 'branch' | 'unfetched' | 'locator' | 'fetch';
+  'instance' | 'root-cycle' | 'visibility' | 'duplicate-name' | 'import-cycle' | 'declaration-only' | 'limit' | 'branch' | 'unfetched' | 'locator' | 'fetch';
 
 /** Diagnostic with a project-relative file and an optional UTF-8 byte span (`file:start..end: message [code]`). */
 export class PackageError extends Error {
@@ -53,6 +53,7 @@ const PACKAGE_DIAGNOSTIC: Record<PackageErrorCode, string> = {
   'missing-module': 'E0906', 'lock-missing': 'E0907', 'lock-mismatch': 'E0908', 'lock-stale': 'E0909', 'version-conflict': 'E0910',
   'package-cycle': 'E0911', parse: 'E0912', 'unknown-alias': 'E0913', 'not-exported': 'E0914', 'missing-symbol': 'E0915',
   visibility: 'E0916', 'duplicate-name': 'E0917', 'import-cycle': 'E0918', 'declaration-only': 'E0919', limit: 'E0920',
+  instance: 'E0930', 'root-cycle': 'E0931',
   branch: 'E0921', unfetched: 'E0922', locator: 'E0923', fetch: 'E0924',
 };
 /** CLI view of a package error. The library still throws `PackageError` with its own code. */
@@ -74,6 +75,8 @@ export type LockFile = { schema: typeof LOCK_SCHEMA; root: { name: string; versi
 
 export type BuildGraph = {
   schema: typeof BUILD_GRAPH_SCHEMA;
+  interfaceVersion?: 'lotus-v2/module-interface/lc1';
+  instances?: { name: string; template: string; bindings: ContractArtifact['bindings']; root: string }[];
   compiler: { name: string; version: string; profile: 'optimized' | 'unoptimized' };
   target: string;
   root: { package: string; module: string };
@@ -83,7 +86,15 @@ export type BuildGraph = {
     exports: { name: string; signature: string; digest: string }[]; imports: string[] }[];
   digest: string;
 };
-export type PackageCompileOptions = CompileOptions & { limits?: Partial<PackageLimits> };
+/** Explicit compile-time references, never state reads or deployment actions. */
+export type ProgramBinding = BoundValue | { root: string } | { leaf: string };
+export type ProgramInstance = { template: string; bindings: Record<string, ProgramBinding> };
+export type PackageCompileOptions = Omit<CompileOptions, 'bindings'> & {
+  bindings: Record<string, Record<string, ProgramBinding>>;
+  /** LC1 only. Templates resolve in the entry module's import namespace. */
+  instances?: Record<string, ProgramInstance>;
+  limits?: Partial<PackageLimits>;
+};
 export type PackageBuild = { artifact: ContractArtifact; trace: SchedulerEvent[]; parses: Record<string, number> };
 
 const utf8 = (text: string): Uint8Array => new TextEncoder().encode(text);
@@ -386,8 +397,100 @@ function verifyLock(ws: Workspace): Uint8Array {
 
 function signature(helper: Helper): string { return `${helper.name}(${helper.params.map(p => `${p.name}: ${p.type}`).join(', ')}): ${helper.result}`; }
 
+/** Validate explicit bindings and the complete root DAG before emitting any program. */
+function bindInstances(contracts: Map<string, Contract>, templates: Map<string, { contract: Contract; owner: ModuleNode }>,
+  owners: Map<string, { pkg: PackageInfo; moduleId: string; kind: Contract['kind'] }>, resolve: (name: string) => string, options: PackageCompileOptions, linkedHelpersForBindings: Map<string, Helper>) {
+  const fail = (message: string): never => { throw new PackageError('instance', message); };
+  const instances = options.instances ?? {};
+  if (!instances || typeof instances !== 'object' || Array.isArray(instances)) fail('instances must be a named map');
+  const inputs: Record<string, Record<string, ProgramBinding>> = { ...options.bindings };
+  const rewrite = (e: Expr, from: string, to: string): Expr => ({ ...e,
+    ...(e.kind === 'name' && (e.value === from || e.value?.startsWith(from + '.')) ? { value: to + e.value!.slice(from.length) } : {}),
+    ...(e.args ? { args: e.args.map(a => rewrite(a, from, to)) } : {}),
+    ...(e.left ? { left: rewrite(e.left, from, to) } : {}), ...(e.right ? { right: rewrite(e.right, from, to) } : {}) });
+  const statements = (body: Stmt[], from: string, to: string): Stmt[] => body.map(s => ({ ...s,
+    ...(s.expr ? { expr: rewrite(s.expr, from, to) } : {}), ...(s.then ? { then: statements(s.then, from, to) } : {}),
+    ...(s.otherwise ? { otherwise: statements(s.otherwise, from, to) } : {}) }));
+  for (const [name, instance] of Object.entries(instances)) {
+    try { assertPortableName(name); } catch { fail(`invalid instance name ${name}`); }
+    if (contracts.has(name) || Object.hasOwn(options.bindings, name)) fail(`duplicate instance binding ${name}`);
+    if (!instance || typeof instance !== 'object' || Object.keys(instance).some(k => !['template', 'bindings'].includes(k)) || typeof instance.template !== 'string') fail(`invalid instance ${name}; expected template and bindings only (state/effect lowering is unsupported)`);
+    const key = resolve(instance.template), template = templates.get(key);
+    if (!template) fail(`unresolved template ${instance.template}`);
+    const c = template!.contract;
+    contracts.set(name, { ...c, name, methods: c.methods.map(m => ({ ...m, body: statements(m.body, c.name, name) })) });
+    owners.set(name, { pkg: template!.owner.pkg, moduleId: template!.owner.id, kind: c.kind });
+    inputs[name] = instance.bindings;
+  }
+  // Local contracts use their ordinary names; canonical self references must follow them.
+  for (const [name, c] of contracts) {
+    const owner = owners.get(name)!;
+    const canonical = `${owner.moduleId}::${name}`;
+    if (!Object.hasOwn(instances, name)) contracts.set(name, { ...c, methods: c.methods.map(m => ({ ...m, body: statements(m.body, canonical, name) })) });
+  }
+  const references = new Map<string, [string, { name: string; method?: string }][]>();
+  const bindings: CompileOptions['bindings'] = {};
+  const deps = new Map<string, Set<string>>();
+  for (const [name, c] of contracts) {
+    const input = inputs[name] ?? (c.params.length === 0 ? {} : undefined);
+    if (!input || typeof input !== 'object' || Array.isArray(input)) fail(`missing binding map for ${name}`);
+    if (Object.keys(input!).some(p => !c.params.some(x => x.name === p))) fail(`surplus constructor binding for ${name}`);
+    const refs: [string, { name: string; method?: string }][] = [], edges = new Set<string>();
+    const values: Record<string, BoundValue> = {};
+    for (const p of c.params) {
+      if (!Object.hasOwn(input!, p.name)) fail(`missing constructor binding ${name}.${p.name}`);
+      const value = input![p.name]!;
+      if (value !== null && typeof value === 'object') {
+        const keys = Object.keys(value);
+        if (keys.length !== 1 || !['root', 'leaf'].includes(keys[0]!)) fail(`unsupported binding ${name}.${p.name}; expected a literal, root or leaf reference`);
+        const leaf = keys[0] === 'leaf', text = leaf ? (value as { leaf: string }).leaf : (value as { root: string }).root;
+        if (typeof text !== 'string') fail(`invalid reference ${name}.${p.name}`);
+        const parts = text.split('.'), target = contracts.get(parts[0]!);
+        if (!target || parts.length !== (leaf ? 2 : 1)) fail(`unresolved bound program reference ${text}`);
+        if (leaf && !target!.methods.some(m => m.name === parts[1])) fail(`missing entry ${text}`);
+        const valid = leaf ? ['MethodLeafHash', 'Bytes32'] : target!.kind === 'token' ? ['TokenId', 'Bytes32'] : ['ContractRootHash', 'Bytes32'];
+        if (!valid.includes(p.type)) fail(`reference type mismatch for ${name}.${p.name}: ${p.type}`);
+        refs.push([p.name, { name: parts[0]!, ...(leaf ? { method: parts[1]! } : {}) }]); edges.add(parts[0]!);
+      } else values[p.name] = value as BoundValue;
+    }
+    bindings[name] = values; references.set(name, refs); deps.set(name, edges);
+  }
+  for (const name of Object.keys(options.bindings)) if (!contracts.has(name)) fail(`binding names unbound template ${name}`);
+  // Include source/helper root dependencies, so constructor edges cannot hide mixed cycles.
+  const scanExpr = (e: Expr, edges: Set<string>, seen: Set<string>): void => {
+    if (e.kind === 'call') {
+      if (COMMITMENT_BUILTINS.has(e.value!) && e.args?.[0]?.kind === 'name') {
+        const target = e.args[0].value!.split('.')[0]!;
+        if (!contracts.has(target)) fail(`root reference ${target} requires an explicit bound instance`);
+        edges.add(target);
+      } else if (!seen.has(e.value!)) {
+        seen.add(e.value!);
+        const h = linkedHelpersForBindings?.get(e.value!);
+        if (h) scanBody(h.body, edges, seen);
+      }
+    }
+    for (const arg of e.args ?? []) scanExpr(arg, edges, seen);
+    if (e.left) scanExpr(e.left, edges, seen); if (e.right) scanExpr(e.right, edges, seen);
+  };
+  const scanBody = (body: (Stmt | HelperStmt)[], edges: Set<string>, seen: Set<string>): void => {
+    for (const s of body) { if (s.expr) scanExpr(s.expr, edges, seen); if ('then' in s && s.then) scanBody(s.then, edges, seen); if ('otherwise' in s && s.otherwise) scanBody(s.otherwise, edges, seen); }
+  };
+  for (const [name, c] of contracts) for (const m of c.methods) scanBody(m.body, deps.get(name)!, new Set());
+  const active: string[] = [], done = new Set<string>(), order: string[] = [];
+  const visit = (name: string): void => {
+    if (done.has(name)) return;
+    if (active.includes(name)) throw new PackageError('root-cycle', `root dependency cycle: ${[...active.slice(active.indexOf(name)), name].join(' -> ')}`);
+    if (!deps.has(name)) fail(`unknown bound program ${name}`);
+    active.push(name); for (const dependency of deps.get(name)!) visit(dependency); active.pop(); done.add(name); order.push(name);
+  };
+  visit(options.contract);
+  for (const name of Object.keys(instances).sort()) visit(name);
+  return { bindings, references, order };
+}
+
 export async function compilePackage(projectDir: string, options: PackageCompileOptions): Promise<PackageBuild> {
   if (typeof options?.contract !== 'string' || !options.bindings || typeof options.bindings !== 'object') throw new Error('compile options require contract and bindings');
+  if (options.instances !== undefined && options.languageVersion !== 1) throw new PackageError('instance', 'explicit instances require languageVersion 1');
   const limits = { ...DEFAULT_PACKAGE_LIMITS, ...(options.limits ?? {}) };
   const ws = resolveWorkspace(projectDir, limits);
   const { root } = ws;
@@ -459,6 +562,9 @@ export async function compilePackage(projectDir: string, options: PackageCompile
   const scheduler = new PromiseScheduler<void>(event => trace.push(event), { maxJobs: limits.maxModules });
   const helpers = new Map<string, Helper>(); const contracts = new Map<string, Contract>();
   const owners = new Map<string, { pkg: PackageInfo; moduleId: string; kind: Contract['kind'] }>();
+  const templates = new Map<string, { contract: Contract; owner: ModuleNode }>();
+  let resolveTemplate: ((name: string) => string) | undefined;
+  const lc1 = options.languageVersion === 1;
   const interfaces = new Map<string, { digest: Uint8Array; exports: { name: string; signature: string; digest: string }[] }>();
   for (const node of modules.values())
     scheduler.register(`module:${node.id}`, [...new Set(node.imports.map(x => `module:${x.target.id}`))], () => link(node));
@@ -498,6 +604,11 @@ export async function compilePackage(projectDir: string, options: PackageCompile
     const span = (s: Span): Span => ({ start: s.start, end: s.end, module: node.id, ...(s.file !== undefined ? { file: s.file } : {}) });
     // Rewrite commitment arguments to the contract's declared name. The compiler then pins that bytecode root.
     const rewriteContractRef = (text: string, at: Span, expectMethod: boolean): string => {
+      const direct = text.split('.');
+      if (lc1 && options.instances && Object.hasOwn(options.instances, direct[0]!)) {
+        if (expectMethod !== (direct.length === 2) || direct.length > 2) throw new PackageError('instance', `invalid bound program reference ${text}`, node.file, at);
+        return text;
+      }
       let owner = node, body = text;
       if (text.includes('::')) {
         const parts = text.split('::');
@@ -523,8 +634,10 @@ export async function compilePackage(projectDir: string, options: PackageCompile
       }
       const contract = home.program.contracts.get(programName);
       if (method && !contract?.methods.some(m => m.name === method)) throw new PackageError('missing-symbol', `${programName} has no method ${method}`, node.file, at);
-      return method ? `${programName}.${method}` : programName;
+      const selectedName = lc1 ? canonical(home, programName) : programName;
+      return method ? `${selectedName}.${method}` : selectedName;
     };
+    if (node.isEntry) resolveTemplate = name => rewriteContractRef(name, node.program.contracts.values().next().value?.span ?? { start: 0, end: 0 }, false);
     const expr = (e: Expr): Expr => {
       let value = e.value, args = e.args;
       if (e.kind === 'call' && value !== undefined && COMMITMENT_BUILTINS.has(value)) {
@@ -564,11 +677,17 @@ export async function compilePackage(projectDir: string, options: PackageCompile
       helpers.set(name, { ...helper, name, params: helper.params.map(param), body: helper.body.map(helperStmt), span: span(helper.span) });
     }
     for (const contract of node.program.contracts.values()) {
-      if (contracts.has(contract.name)) throw new PackageError('duplicate-name', `contract ${contract.name} is already declared in ${owners.get(contract.name)!.moduleId}`, node.file, contract.span);
+      if (!lc1 && contracts.has(contract.name)) throw new PackageError('duplicate-name', `contract ${contract.name} is already declared in ${owners.get(contract.name)!.moduleId}`, node.file, contract.span);
       const linked = { ...contract, params: contract.params.map(param), span: span(contract.span),
         methods: contract.methods.map((m: Method) => ({ ...m, params: m.params.map(param), body: m.body.map(stmt), span: span(m.span) })) };
-      owners.set(contract.name, { pkg: node.pkg, moduleId: node.id, kind: contract.kind });
-      contracts.set(contract.name, linked);
+      const name = lc1 ? canonical(node, contract.name) : contract.name;
+      templates.set(canonical(node, contract.name), { contract: { ...linked, name }, owner: node });
+      if (!lc1 || (node.isEntry && contract.name === options.contract && !Object.hasOwn(options.instances ?? {}, contract.name))) {
+        // LC1 imports expose templates only. A local entry contract may still be selected directly.
+        const selected = lc1 ? contract.name : name;
+        owners.set(selected, { pkg: node.pkg, moduleId: node.id, kind: contract.kind });
+        contracts.set(selected, { ...linked, name: selected });
+      }
     }
     // Stable interface: exported helper signatures, then exported contract/token signatures.
     // Helper declaration bytes stay exactly as before so helper-only modules keep their digest.
@@ -578,23 +697,45 @@ export async function compilePackage(projectDir: string, options: PackageCompile
     });
     const contractExports = [...node.program.contracts.values()].filter(c => c.visibility === 'export').sort(byName).map(c => {
       const head = c.params.length ? `${c.kind} ${c.name}<${c.params.map(p => `${p.name}: ${p.type}`).join(', ')}>` : `${c.kind} ${c.name}`;
-      const methods = c.methods.map(m => `${m.name}(${m.params.map(p => `${p.name}: ${p.type}`).join(', ')})`).join('; ');
-      const digest = tagged('package/contract', concat(str(c.kind), str(c.name), cs(c.params.length), ...c.params.map(p => concat(str(p.name), str(p.type))),
-        cs(c.methods.length), ...c.methods.flatMap(m => [str(m.name), cs(m.params.length), ...m.params.map(p => concat(str(p.name), str(p.type)))])));
+      const methods = c.methods.map(m => `${lc1 ? m.invocation + ' ' : ''}${m.name}(${m.params.map(p => `${p.name}: ${p.type}`).join(', ')})`).join('; ');
+      const digest = tagged(lc1 ? 'package/contract/lc1' : 'package/contract', concat(str(c.kind), str(c.name), cs(c.params.length), ...c.params.map(p => concat(str(p.name), str(p.type))),
+        cs(c.methods.length), ...c.methods.flatMap(m => [...(lc1 ? [str(m.invocation!)] : []), str(m.name), cs(m.params.length), ...m.params.map(p => concat(str(p.name), str(p.type)))])));
       return { name: c.name, signature: `${head} { ${methods} }`, digest };
     });
     const exported = [...helperExports, ...contractExports];
-    interfaces.set(node.id, { digest: tagged('package/interface', concat(str(node.pkg.manifest.name), str(node.path), cs(exported.length), ...exported.map(x => x.digest))),
+    interfaces.set(node.id, { digest: tagged(lc1 ? 'package/interface/lc1' : 'package/interface', concat(str(node.pkg.manifest.name), str(node.path), cs(exported.length), ...exported.map(x => x.digest))),
       exports: exported.map(x => ({ name: x.name, signature: x.signature, digest: hex(x.digest) })) });
   };
   await scheduler.run(`module:${entry.id}`);
-  const { artifact, roots } = await compileLinkedProgramAsync({ ...(options.languageVersion === 1 ? { languageVersion: 1 as const } : {}), helpers, contracts, imports: [] }, options, event => trace.push(event), sources);
-  const links: LinkedContract[] = roots.filter(item => item.name !== artifact.contract && owners.get(item.name)?.pkg.id !== root.id).map(item => {
+  let effectiveOptions: CompileOptions = options as CompileOptions;
+  const instanceArtifacts = new Map<string, ContractArtifact>();
+  if (lc1) {
+    if (Object.keys(options.instances ?? {}).length > limits.maxImportBindings) throw new PackageError('limit', `instances exceed ${limits.maxImportBindings}`);
+    const bound = bindInstances(contracts, templates, owners, resolveTemplate!, options, helpers);
+    effectiveOptions = { ...options, bindings: bound.bindings };
+    const program: Program = { languageVersion: 1, helpers, contracts, imports: [] };
+    // Resolve constructor references in topological order. Every explicitly requested binding is checked.
+    const completed = instanceArtifacts;
+    for (const name of bound.order) {
+      for (const [param, reference] of bound.references.get(name) ?? []) {
+        const target = completed.get(reference.name)!;
+        bound.bindings[name]![param] = reference.method ? target.methods.find(m => m.name === reference.method)!.leaf : target.policy.root;
+      }
+      const result = await compileLinkedProgramAsync(program, { ...effectiveOptions, contract: name }, undefined, sources);
+      completed.set(name, result.artifact);
+    }
+  }
+  const { artifact, roots } = await compileLinkedProgramAsync({ ...(options.languageVersion === 1 ? { languageVersion: 1 as const } : {}), helpers, contracts, imports: [] }, effectiveOptions, event => trace.push(event), sources);
+  const allRoots = new Map(roots.map(item => [item.name, item]));
+  for (const [name, item] of instanceArtifacts) allRoots.set(name, { name, root: item.policy.root, methods: item.methods.map(m => ({ name: m.name, leaf: m.leaf })) });
+  const links: LinkedContract[] = [...allRoots.values()].filter(item => item.name !== artifact.contract && owners.get(item.name)?.pkg.id !== root.id).map(item => {
     const owner = owners.get(item.name)!;
     return { name: item.name, kind: owner.kind, package: owner.pkg.id, module: owner.moduleId, packageDigest: hex(owner.pkg.treeDigest), root: item.root, methods: item.methods };
   }).sort(byName);
   const graph: Omit<BuildGraph, 'digest'> = {
     schema: BUILD_GRAPH_SCHEMA,
+    ...(lc1 ? { interfaceVersion: 'lotus-v2/module-interface/lc1' as const,
+      instances: [...instanceArtifacts].filter(([name]) => Object.hasOwn(options.instances ?? {}, name)).map(([name, item]) => ({ name, template: options.instances![name]!.template, bindings: item.bindings, root: item.policy.root })).sort(byName) } : {}),
     compiler: { name: COMPILER_NAME, version: COMPILER_VERSION, profile: options.optimize === false ? 'unoptimized' : 'optimized' },
     target: TARGET,
     root: { package: root.id, module: entry.id },
