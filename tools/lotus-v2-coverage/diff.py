@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Intersect LLVM source coverage segments with added executable lines in a Git diff."""
 import argparse,json,pathlib,re,subprocess
-p=argparse.ArgumentParser();p.add_argument('native',type=pathlib.Path);p.add_argument('coverage',type=pathlib.Path);p.add_argument('--baseline',default='f5cd728ab');a=p.parse_args()
+p=argparse.ArgumentParser();p.add_argument('native',type=pathlib.Path);p.add_argument('coverage',type=pathlib.Path);p.add_argument('--baseline',default='f5cd728ab');p.add_argument('--path',action='append');a=p.parse_args()
 d=json.loads(a.coverage.read_text()); counts={}
 for group in d['data']:
  for f in group['files']:
@@ -14,7 +14,7 @@ for group in d['data']:
    end=max(s[0], seg[i+1][0]-1) if i+1<len(seg) else s[0]
    for n in range(s[0],end+1):lines[n]=max(lines.get(n,0),s[2])
   counts[rel]=lines
-patch=subprocess.check_output(['git','-C',str(a.native),'diff','--unified=0',a.baseline,'HEAD','--','src'],text=True)
+patch=subprocess.check_output(['git','-C',str(a.native),'diff','--unified=0',a.baseline,'HEAD','--',*(a.path or ['src'])],text=True)
 changed={};path=None;line=0
 for s in patch.splitlines():
  if s.startswith('+++ b/'):path=s[6:]

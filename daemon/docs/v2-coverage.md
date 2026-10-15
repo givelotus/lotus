@@ -11,7 +11,8 @@ with no production node, peer, chain data, or release changes.
 |---|---:|---:|---:|---:|
 | Python reference, every package module | 95 passed | 2640/3212 (82.19%) | 1059/1508 (70.23%) | not supplied by coverage.py |
 | Compiler emitted JavaScript, all `dist/**/*.js` | 159 passed | 5520/5927 (93.13%) | 2628/3258 (80.66%) | 353/364 (96.98%) |
-| Native V2 production C++ | build/run pending | pending | pending | pending |
+| Native mapped V2 + wallet C++ (execution coverage; 5 failures) | 31 passed, 5 failed | 14996/20381 (73.58%) | 7521/13440 (55.96%) | 1284/1508 (85.15%) |
+| Rust core V2 production module | 4 passed | 134/136 (98.53%) | not emitted | 12/12 (100%) |
 
 Python's combined statement/branch percentage is 78.37%; it must not be mistaken
 for its line percentage. No Python lines are excluded. Node reported 93.76% lines / 83.83% branches / 96.79% functions; Node and c8 use different
@@ -23,7 +24,7 @@ percentage is meaningful.
 
 JSON and LCOV are in `evidence/v2-coverage/`; HTML archives extract to an ordinary
 browser-readable index. Test logs record skips and unavailable optional native
-compiler stages. Coverage was gathered from passing test runs; earlier dependency
+compiler stages. Reference/compiler coverage was gathered from passing test runs; earlier dependency
 failures were corrected by installing requirements, without changing test expectations.
 
 ## Reproduction
@@ -84,16 +85,39 @@ machine-readable report is `mcdc-tool-probe.json`. This demonstrates toolchain
 support only. Production was **not** compiled with MC/DC in this first run, and
 MC/DC is not full path coverage.
 
-Native focused tests cover bounded reorg/recovery, disk/state storage, transaction
-rejection, relay and peer state scenarios. Their coverage report identifies actual
-uncovered branches; a named state-transition matrix still needs mapping to each
-case and failure condition. Fault injection for short writes, fsync/rename errors,
+The native instrumented run failed five tests: reorg recovery (`zero genesis work anchor`),
+peer transport (action/read/write count assertion), peer dispatcher (`zero genesis work anchor`),
+block preview (monetary tail/time context), and block assembler (genesis anchor mismatch).
+Their profiles are retained in the aggregate and exact logs are supplied. The measurement
+is execution evidence and **does not validate the native build**. The driver exports
+all results and exits unsuccessfully when any test fails. No fixture or consensus code
+was modified.
+
+LLVM reports 648 missing profile records with CFG hash zero (see
+`native-profile-mapping-warnings.log`); all warnings were inspected, and none has
+a nonzero CFG hash. These are functions without an emitted matching counter record,
+including unused inline functions; the warnings are retained rather than suppressed.
+The mapped totals exclude 42 inventoried files without mappings, including headers
+without executable regions and seven `.cpp` files. Native commands, Chronik sync,
+block/transaction seal helpers, Avalanche chain adapter and wallet client need separate
+coverage. The gap report has exact source branches and summaries. Largest measured
+branch gaps include VM (916), peer dispatcher (492), disk state (321), wallet payment
+(294), and wallet node provider (256). Wallet objects were included explicitly, so
+unexecuted wallet code contributes zero coverage rather than disappearing.
+
+Native focused tests exercise bounded reorg/recovery, disk/state storage, transaction
+rejection, relay and peer state scenarios. The scenario inventory records exact bounded test entrypoint calls; a complete
+state-transition matrix still needs mapping to each case and failure condition. Fault injection for short writes, fsync/rename errors,
 restart at each journal phase, and VM rejection at each validation boundary should
 be prioritized against uncovered code rather than adding tests to raise a number.
 
-Changed wallet sources, complete daemon command/RPC paths, real-node integration
-profiles, and new Rust Chronik V2 modules are **not measured** by these first focused
-reports. Chronik is OFF for the native coverage build. Existing passing integration
+Wallet v2 object mappings are included, but wallet unit/integration execution and
+complete daemon command/RPC paths and real-node integration profiles are **not measured**.
+Rust core V2 encoding/validation is measured separately with Rust1.93.0 and its matching
+LLVM21.1.8 tools (`rust-core.sh`); source lines before inline cfg(test) at line299 give
+134/136 production lines. Raw Rust exports also include inline test lines; the summary
+filters those explicitly. Stable Rust emits no branch mapping here, so its zero branch
+denominator means unavailable. Chronik Rust server/indexer/database modules remain unmeasured. Chronik is OFF for the native coverage build. Existing passing integration
 and Rust checks are separate evidence and supply no coverage percentages. Coverage
 of compiler optional native fixtures is also not implied by Python execution.
 There is no arbitrary 100% gate and no defensive/error-path exclusion.
@@ -102,3 +126,14 @@ The reference gap inventory (`reference-gaps.json`) shows the largest measured g
 in VM (167 missing branches), block validation (64), signing (49), cost accounting
 (49), and VM context (27). These are actual uncovered branch counters, not claims
 that every gap is an untested security condition.
+
+Native and Rust raw JSON reports are gzip-compressed; decompress before feeding them
+to JSON tooling. HTML archives contain the actual per-source reports, including unexecuted
+lines. `--export-existing` regenerates native exports from the recorded complete profile
+inventory without rerunning tests; it refuses changed target inventories or missing profiles.
+
+The maintained-baseline diff has 531 covered of 637 mapped added lines (83.36%),
+with 2383 added lines explicitly unmapped across 34 changed files. This conditional
+percentage omits unmapped code and is not overall new-code coverage.
+`new-modules-since-abc.json` separately inventories every added V2/wallet module line
+since ABC `1fb7db17`; its unmapped lines include test files and non-executable text.
