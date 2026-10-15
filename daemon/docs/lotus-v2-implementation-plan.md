@@ -6,8 +6,8 @@ Updated October 14, 2026. Development plan; no genesis parameters are frozen and
 
 ## Source foundation and current status
 
-The current executable [V2 series](../patches/v2/series) contains 35 patches,
-`000`–`034`, on ABC master `1fb7db17c176cdea8a2c60d887891589382ee4e3`.
+The current executable [V2 series](../patches/v2/series) contains 49 patches,
+`000`–`048`, on ABC master `1fb7db17c176cdea8a2c60d887891589382ee4e3`.
 The [review packet](../candidates/v2-native-reviewed-20261014/README.md) records
 intermediate replay trees and focused validation through patch 032. That reviewed source tree is
 `507c91e64c205df7b38e77abff6ebe02fb99bffe`. It includes transaction framing,
@@ -21,7 +21,7 @@ and mining job integration are still outstanding.
 Root review reproduced and corrected maximum-count proof arithmetic, enforced the
 8192-byte witness limit, reviewed prepared signing and incremental-tree ownership,
 and reran native primitive checks. All 33 mailboxes replay to the recorded trees.
-On the 032 tree, the native VM agrees with Python on 363 execution and 494 static-charge cases, plus 3,017 independent byte/arithmetic vectors and 684 Merkle vectors; 103 assigned operations execute and 6 (b0–b4, bd) reject as unsupported. That six-opcode rejection is historical for the 032 tree and is not the current status. In the 033 candidate, b0–b4 and bd execute, and the Python Merkle cost model exists. Native monetary arithmetic agrees with the Python reference on 300 packet and 20,000 root differential vectors. P05 field-size hints are validated against the authenticated transaction. The native stack and the Python reference now derive absent hints for the variable-length field opcodes when an execution context is present. A smaller caller hint still fails. Patch 035 carries that derivation. Patches 036–041 add the development genesis fixture, the local header template, the 256-attempt nonce search, the file-backed UTXO store, and the failing-script rollback tests. Patches 042–045 add the Bitcoin header-parser boundary, the child-header sealer, the harness link, and the ordered transaction root. Replay of patches 000–045 ends at tree 9b315e8bba67e675b40893e0a33871e092ccb0c1. The per-transaction UTXO commit and the monetary snapshot are not in the series yet.
+On the 032 tree, the native VM agrees with Python on 363 execution and 494 static-charge cases, plus 3,017 independent byte/arithmetic vectors and 684 Merkle vectors; 103 assigned operations execute and 6 (b0–b4, bd) reject as unsupported. That six-opcode rejection is historical for the 032 tree and is not the current status. In the 033 candidate, b0–b4 and bd execute, and the Python Merkle cost model exists. Native monetary arithmetic agrees with the Python reference on 300 packet and 20,000 root differential vectors. P05 field-size hints are validated against the authenticated transaction. The native stack and the Python reference now derive absent hints for the variable-length field opcodes when an execution context is present. A smaller caller hint still fails. Patch 035 carries that derivation. Patches 036–041 add the development genesis fixture, the local header template, the 256-attempt nonce search, the file-backed UTXO store, and the failing-script rollback tests. Patches 042–045 add the Bitcoin header-parser boundary, the child-header sealer, the harness link, and the ordered transaction root. Replay of patches 000–048 ends at tree f700309b16ac6a1068c950c8c7b6bde98b67c4a3. Patches 046–048 add the monetary snapshot, the in-memory BIP340 CHECKSIG spend, and the per-transaction UTXO commit. ConnectOrdinaryBlock still does not write the monetary file. lotusd has not accepted a V2 block.
 Signed compiler mint/transfer/merge fixtures execute all selected invocations in
 both engines, including rejection cases. Whole-daemon V2 validity, inherited
 unit/functional suites, Chronik and network integration remain separate gates.
