@@ -106,6 +106,11 @@ test('pinned ABC executes hashlocks, branches, exact byte widths and clean stack
  assert.equal(invoke(compile(program([],[require_(bool(true))])),Array(1001).fill('')).accepted,false);
  const both=compile(program([['flag',{kind:'bool'}]],[{kind:'if',condition:arg('flag'),then:[require_(bool(true))],otherwise:[require_(bool(true))],span}]));
  for(const value of ['','01'])assert.equal(invoke(both,[value]).accepted,true);
+ for(const value of ['00','01','10','81','80']) {
+  const artifact=compile(program([['x',byteType(1)]],[require_(equal(arg('x'),bytes(value)))]));
+  assert.equal(invoke(artifact,[value]).accepted,true,`exact one-byte ${value}`);
+  assert.equal(invoke(artifact,[value==='00'?'01':'00']).accepted,false,`wrong one-byte ${value}`);
+ }
  for(const length of [0,1,75,76,255,256,520]) {
   const data='11'.repeat(length);const artifact=compile(program([],[require_(equal(bytes(data),bytes(data)))]));
   assert.equal(invoke(artifact,[]).accepted,true,`push length ${length}`);
