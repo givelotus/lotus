@@ -115,3 +115,37 @@ those expectations on disagreement. Root's preserved derivation artifact is
 `/private/tmp/lotus-v2-local-node-reference-corpus-20261015.json`, backed by
 `/private/tmp/lotus-v2-local-node-corpus-derive-20261015.py`. No native node was
 launched during that derivation.
+
+## Observed isolated execution
+
+Root approved native source pin
+`cecfdc1ed69c60c72ad5457a0f99c88e8b1e8a01`, binary
+`/private/tmp/lotus-v2-daemon-runtime-staging-20261015/build/src/lotusd`, SHA256
+`167cfe2538a9fccfd7cf3e29a70b769a34ae930c349b62772dec9862058bf1f6`.
+The recorded build command is `cmake --build build --target lotusd check-lotus-v2-peer-dispatcher -j 6`
+in that clone; build log is `/private/tmp/lotus-v2-node-command-full-build.log`.
+The independent reference derivation used monorepo commit
+`58b72d8c7ee40abfed460fc3e41fde3f5a00cf1d` and the preserved native-wallet pilot
+blocks. No expected state or corpus bytes changed after native execution.
+
+The first actual run passed at
+`/private/tmp/lotus-v2-two-real-nodes-first-20261015`. Its first matching sync
+snapshot still had a pending journal, so checkpoint waits were strengthened to
+require `tip_known=true` and false reopen/paused/journal/receipt/propagation flags.
+The fresh run at `/private/tmp/lotus-v2-two-real-nodes-quiescent-20261015` passed
+with those stricter checkpoints. The earlier evidence remains intact.
+
+Observed: two full-block requests/retained bodies synchronized node B to height
+two; its persisted restart restored the same roots and monetary bytes. The
+bad-signature sibling obtained its exact deterministic-invalid causal root and
+was never connected. One newer compact request/retained body, with zero full
+requests/fallbacks, brought both stores to the independent expected height-three
+tip, roots and money. Membership, spent-outpoint OtherLeaf nonmembership, and new
+output membership proofs agreed across stores; all queried coin frames matched
+independent supplied expectations. The 50ms relay forwarded 38 actual chunks /
+4740 bytes over two connections. All three process starts (including B restart)
+exited zero, with no cleanup errors or remaining child handles.
+
+These observations demonstrate local socket synchronization and persistence for
+this exact supplied corpus/profile/binary. They do not establish native mining,
+a usable testnet, arbitrary transaction acceptance, or public-network readiness.

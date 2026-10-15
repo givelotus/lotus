@@ -258,7 +258,9 @@ class DelayRelay:
 
 
 def state_matches(actual, expected):
-    return all(actual.get(field) == expected[field] for field in STATE_FIELDS)
+    return (all(actual.get(field) == expected[field] for field in STATE_FIELDS)
+        and actual.get('tip_known') is True
+        and all(actual.get(field) is False for field in ('reopen_required','execution_paused','pending_journal','pending_receipt','pending_propagation')))
 
 
 def wait_state(node, expected, timeout):
