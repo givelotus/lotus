@@ -87,15 +87,16 @@ impl Server {
         if config.protocol == Protocol::V2 {
             return Err(eyre::eyre!(V2_UNAVAILABLE));
         }
+        config.validate()?;
         let mining_settings = MiningSettings {
             local_work_size: 256,
             inner_iter_size: 16,
             kernel_size: 1 << config.kernel_size,
             kernel_name: "lotus_og".to_string(),
             sleep: 0,
-            gpu_indices: vec![config.gpu_index as usize],
+            gpu_indices: vec![config.gpu_index.try_into()?],
         };
-        let miner = Miner::setup(mining_settings.clone()).unwrap();
+        let miner = Miner::setup(mining_settings)?;
         Ok(Server {
             miner: std::sync::Mutex::new(miner),
             client: reqwest::Client::new(),
@@ -103,7 +104,7 @@ impl Server {
                 bitcoind_url: config.rpc_url.clone(),
                 bitcoind_user: config.rpc_user.clone(),
                 bitcoind_password: config.rpc_password.clone(),
-                rpc_poll_interval: config.rpc_poll_interval.try_into().unwrap(),
+                rpc_poll_interval: config.rpc_poll_interval.try_into()?,
                 miner_addr: config.mine_to_address.clone(),
             }),
             block_state: Mutex::new(BlockState {

@@ -6,6 +6,7 @@ fn validate_cli_config(config: &ConfigSettings) -> Result<(), Box<dyn std::error
     if config.protocol == Protocol::V2 {
         return Err(V2_UNAVAILABLE.into());
     }
+    config.validate()?;
     if config.mine_to_address.is_empty() {
         return Err("V1 mining requires mine_to_address".into());
     }

@@ -3,9 +3,12 @@
 The current miner has an explicit `--protocol=v1|v2` setting. V1 is the default.
 CLI V2 selection exits before GPU setup or any RPC request with a clear
 unsupported error. The GUI displays the error without starting mining, including
-when V2 was saved in its settings. The V2 P04 CPU primitive and OpenCL work/BlockID kernel are implemented
-and checked against independent vectors. The OpenCL code is available only
-through bounded library batches, not through the network miner.
+when V2 was saved in its settings. The V2 P04 CPU primitive and OpenCL
+work/BlockID kernel are implemented and checked against independent vectors.
+The OpenCL code is available only through bounded library batches, not through
+the network miner.
+Malformed numeric settings also produce CLI errors or a GUI error panel before
+server, OpenCL device or RPC initialization.
 
 ## Protocol contract
 

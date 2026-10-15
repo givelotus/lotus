@@ -1,4 +1,4 @@
-use std::{convert::TryInto, sync::Arc, time::Duration};
+use std::{convert::TryFrom, sync::Arc, time::Duration};
 
 use clipboard::{ClipboardContext, ClipboardProvider};
 use eframe::{
@@ -47,10 +47,20 @@ pub enum HashrateZoom {
 
 impl MinerApp {
     pub fn load() -> Self {
-        let (user_settings, startup_error) = match ConfigSettings::load(false) {
+        Self::from_config_result(ConfigSettings::load(false).map_err(|err| err.to_string()))
+    }
+
+    fn from_config_result(result: Result<ConfigSettings, String>) -> Self {
+        let (user_settings, startup_error) = match result {
             Ok(config) => {
                 let error = protocol_error(config.protocol).map(str::to_string);
-                (UserSettings::from_config(config), error)
+                match UserSettings::from_config(config) {
+                    Ok(settings) => (settings, error),
+                    Err(err) => (
+                        UserSettings::default_config(),
+                        Some(format!("Invalid miner configuration: {}", err)),
+                    ),
+                }
             }
             Err(err) => (
                 UserSettings::default_config(),
@@ -72,9 +82,9 @@ impl MinerApp {
         if let Some(message) = protocol_error(self.user_settings.protocol) {
             return Err(message.to_string());
         }
-        let server =
-            Server::from_config(self.user_settings.as_config(), Duration::from_millis(300))
-                .map_err(|err| err.to_string())?;
+        let config = self.user_settings.as_config()?;
+        let server = Server::from_config(config, Duration::from_millis(300))
+            .map_err(|err| err.to_string())?;
         self.server = Some(Arc::new(server));
         self.device_names = Miner::list_device_names();
         Ok(())
@@ -86,43 +96,48 @@ fn protocol_error(protocol: Protocol) -> Option<&'static str> {
 }
 
 impl UserSettings {
-    fn from_config(config: ConfigSettings) -> Self {
-        Self {
+    fn from_config(config: ConfigSettings) -> Result<Self, String> {
+        config.validate().map_err(|err| err.to_string())?;
+        Ok(Self {
             protocol: config.protocol,
             mine_to_address: config.mine_to_address,
-            intensity: config.kernel_size.try_into().unwrap(),
+            intensity: config.kernel_size as i32,
             bitcoind_url: config.rpc_url,
             bitcoind_user: config.rpc_user,
             bitcoind_password: config.rpc_password,
-            rpc_poll_interval: config.rpc_poll_interval.try_into().unwrap(),
+            rpc_poll_interval: config.rpc_poll_interval as u64,
             gpu_index: config.gpu_index,
-        }
+        })
     }
 
     fn default_config() -> Self {
         Self {
             protocol: Protocol::V1,
             mine_to_address: String::new(),
-            intensity: settings::DEFAULT_KERNEL_SIZE.try_into().unwrap(),
+            intensity: settings::DEFAULT_KERNEL_SIZE as i32,
             bitcoind_url: settings::DEFAULT_URL.to_string(),
             bitcoind_user: settings::DEFAULT_USER.to_string(),
             bitcoind_password: settings::DEFAULT_PASSWORD.to_string(),
-            rpc_poll_interval: settings::DEFAULT_RPC_POLL_INTERVAL.try_into().unwrap(),
+            rpc_poll_interval: settings::DEFAULT_RPC_POLL_INTERVAL as u64,
             gpu_index: settings::DEFAULT_GPU_INDEX,
         }
     }
 
-    fn as_config(&self) -> ConfigSettings {
-        ConfigSettings {
+    fn as_config(&self) -> Result<ConfigSettings, String> {
+        let interval = i64::try_from(self.rpc_poll_interval)
+            .map_err(|_| "rpc_poll_interval exceeds signed 64-bit range".to_string())?;
+        let config = ConfigSettings {
             protocol: self.protocol,
             rpc_url: self.bitcoind_url.clone(),
             rpc_user: self.bitcoind_user.clone(),
             rpc_password: self.bitcoind_password.clone(),
-            rpc_poll_interval: self.rpc_poll_interval.try_into().unwrap(),
+            rpc_poll_interval: interval,
             mine_to_address: self.mine_to_address.clone(),
             kernel_size: self.intensity.into(),
             gpu_index: self.gpu_index,
-        }
+        };
+        config.validate().map_err(|err| err.to_string())?;
+        Ok(config)
     }
 }
 
@@ -382,5 +397,36 @@ mod startup_tests {
         assert!(app.server.is_none());
         assert!(app.device_names.is_empty());
         assert!(protocol_error(Protocol::V1).is_none());
+    }
+
+    #[test]
+    fn malformed_numeric_config_stays_in_error_state_without_setup() {
+        for protocol in [Protocol::V1, Protocol::V2] {
+            let mut config = UserSettings::default_config().as_config().unwrap();
+            config.protocol = protocol;
+            config.rpc_poll_interval = -1;
+            let app = MinerApp::from_config_result(Ok(config));
+            assert!(app.startup_error.unwrap().contains("rpc_poll_interval"));
+            assert!(app.server.is_none());
+            assert!(app.device_names.is_empty());
+        }
+        let mut app = MinerApp {
+            user_settings: UserSettings {
+                rpc_poll_interval: u64::MAX,
+                ..UserSettings::default_config()
+            },
+            server: None,
+            startup_error: None,
+            device_names: Vec::new(),
+            rt: Runtime::new().unwrap(),
+            logs: Vec::new(),
+            hashrate_zoom: HashrateZoom::T10m,
+        };
+        assert!(app
+            .prepare_startup()
+            .unwrap_err()
+            .contains("rpc_poll_interval"));
+        assert!(app.server.is_none());
+        assert!(app.device_names.is_empty());
     }
 }

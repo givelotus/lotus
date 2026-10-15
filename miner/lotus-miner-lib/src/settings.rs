@@ -1,4 +1,4 @@
-use std::io::Write;
+use std::{convert::TryFrom, io::Write};
 
 use clap::{crate_description, crate_version, load_yaml, App};
 use config::{Config, ConfigError, File};
@@ -55,7 +55,32 @@ fn default_config() -> Result<Config, ConfigError> {
     Ok(s)
 }
 
+fn parse_i64_arg(value: &str, name: &str) -> Result<i64, ConfigError> {
+    value
+        .parse::<i64>()
+        .map_err(|_| ConfigError::Message(format!("{} must be a signed 64-bit integer", name)))
+}
+
 impl ConfigSettings {
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        if self.rpc_poll_interval <= 0 {
+            return Err(ConfigError::Message(
+                "rpc_poll_interval must be positive".into(),
+            ));
+        }
+        if !(0..=27).contains(&self.kernel_size) {
+            return Err(ConfigError::Message(
+                "kernel_size must be between 0 and 27".into(),
+            ));
+        }
+        if self.gpu_index < 0 || usize::try_from(self.gpu_index).is_err() {
+            return Err(ConfigError::Message(
+                "gpu_index must be a nonnegative device index".into(),
+            ));
+        }
+        Ok(())
+    }
+
     pub fn load(expect_mine_to_address: bool) -> Result<Self, ConfigError> {
         let mut s = default_config()?;
 
@@ -121,7 +146,7 @@ impl ConfigSettings {
         if let Some(rpc_poll_interval) = matches.value_of("rpc_poll_interval") {
             s.set(
                 "rpc_poll_interval",
-                rpc_poll_interval.parse::<i64>().unwrap(),
+                parse_i64_arg(rpc_poll_interval, "rpc_poll_interval")?,
             )?;
         }
 
@@ -154,19 +179,21 @@ impl ConfigSettings {
 
         // Set the bitcoin network
         if let Some(kernel_size) = matches.value_of("kernel_size") {
-            s.set("kernel_size", kernel_size.parse::<i64>().unwrap())?;
+            s.set("kernel_size", parse_i64_arg(kernel_size, "kernel_size")?)?;
         }
 
         // Set the GPU index
         if let Some(gpu_index) = matches.value_of("gpu_index") {
-            s.set("gpu_index", gpu_index.parse::<i64>().unwrap())?;
+            s.set("gpu_index", parse_i64_arg(gpu_index, "gpu_index")?)?;
         }
 
         if let Some(protocol) = matches.value_of("protocol") {
             s.set("protocol", protocol)?;
         }
 
-        s.try_into()
+        let settings: Self = s.try_into()?;
+        settings.validate()?;
+        Ok(settings)
     }
 }
 
@@ -186,5 +213,21 @@ mod tests {
         config.set("protocol", "v3").unwrap();
         let result: Result<ConfigSettings, ConfigError> = config.try_into();
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn numeric_config_errors_are_fallible() {
+        assert!(parse_i64_arg("not-a-number", "kernel_size").is_err());
+        for (key, value) in [
+            ("rpc_poll_interval", -1),
+            ("kernel_size", -1),
+            ("kernel_size", 28),
+            ("gpu_index", -1),
+        ] {
+            let mut config = default_config().unwrap();
+            config.set(key, value).unwrap();
+            let settings: ConfigSettings = config.try_into().unwrap();
+            assert!(settings.validate().is_err(), "{}={}", key, value);
+        }
     }
 }
