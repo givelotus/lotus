@@ -612,3 +612,45 @@ These results supersede the generic-Invalid classification warning for the teste
 paths above. Durable terminal receipts, persistent invalid-root propagation,
 candidate selection and network activation remain separate integration gates.
 No live peer synchronization or public testnet readiness is claimed.
+
+
+## Candidate selection and durable recovery (131–139)
+
+All 140 mailboxes replay with every intermediate tree checked; final tree
+`5bb91c1495838ce19893162fa797f7ffa6c97fdb`. See
+[evidence](evidence/v2-series-replay-139.json). Mailboxes 000–130 are unchanged.
+Empty source commit bodies in 131, 133, 135, 136 and 138 receive explicitly
+attributed integration explanations without changing source payloads.
+
+Explicit opt-in V4 storage adds bounded candidate inventory, work ranking,
+terminal recovery receipts and invalid-descendant propagation. V3 remains
+supported without automatic migration. Selection uses bounded passes and checks
+availability, eligibility and state fences again before dispatch. Choices are
+trusted controller data, not cryptographically sealed rankings; recovery Prepare
+rechecks definitive fences. The body pool authenticates framing and commitments;
+retention is distinct from contextual block acceptance. Pins and logical byte
+budgets do not establish a process RSS bound. Connected history is not pruned.
+
+Recovery records deterministic failure against its historical target-parent root,
+not the restored source root. Operational failures remain inconclusive. Terminal
+receipt creation and journal removal are atomic; acknowledgement and descendant
+propagation fence subsequent recovery. Journal checksums detect local corruption,
+not malicious disk rewriting. Review also repaired invalid-target dispatch and
+aliased-output reentry accounting. V3 journal behavior remains covered.
+
+Clean native `f93ea73fd` at
+`/private/tmp/lotus-v2-daemon-candidates-exact-20261015` builds lotusd and the wallet
+pilot with Chronik off. Full-tree reorg, wallet, development-chain, candidate-store,
+candidate-selection, candidate-body-pool and peer-download checks pass. Wallet
+checks observed 191 assertions (nonce-search counts vary). Logs:
+`/private/tmp/lotus-v2-candidates-configure.log` and
+`/private/tmp/lotus-v2-candidates-build.log`. The signed native-wallet complete-block
+pilot passes at `/private/tmp/lotus-v2-wallet-chain-candidates-exact-20261015`.
+
+Root standalone store, selector, recovery/disk, body-pool, download and signing
+checks pass. Independent packet checks include Debug/Release and ASan/UBSan
+coverage; storage sanitizer checks disabled leak detection. Body-pool checks
+exercise allocation failures and pinned-object lifetime. These checks validate
+modules and offline complete-block execution. Runtime orchestration, socket
+activation and two-node synchronization remain outstanding; this is not evidence
+of a usable public testnet.
