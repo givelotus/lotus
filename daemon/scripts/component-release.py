@@ -94,7 +94,8 @@ def deterministic_source_archive(replay, commit, tag, destination, epoch):
     tar_bytes = replay.git('archive', '--format=tar', f'--prefix={tag}/', commit)
     with tarfile.open(fileobj=io.BytesIO(tar_bytes), mode='r:') as source:
         with destination.open('wb') as raw_output:
-            with gzip.GzipFile(fileobj=raw_output, mode='wb', filename='', mtime=epoch) as compressed:
+            with gzip.GzipFile(fileobj=raw_output, mode='wb', filename='', mtime=epoch,
+                               compresslevel=0) as compressed:
                 with tarfile.open(fileobj=compressed, mode='w', format=tarfile.PAX_FORMAT) as archive:
                     for member in source:
                         info = copy.copy(member)
@@ -233,7 +234,15 @@ VOLUME /data
                    target / 'Dockerfile': docker.encode()}
         changed = [str(path.relative_to(root)) for path, data in outputs.items() if not path.exists() or path.read_bytes()!=data]
         if check and changed:
-            raise ValueError('Component metadata drift: '+', '.join(changed))
+            details = []
+            manifest_path = target / 'manifest.json'
+            if manifest_path in outputs and manifest_path.exists():
+                previous = json.loads(manifest_path.read_text())
+                generated = json.loads(outputs[manifest_path])
+                details = [key for key in sorted(set(previous) | set(generated))
+                           if previous.get(key) != generated.get(key)]
+            suffix = ' (manifest fields: '+', '.join(details)+')' if details else ''
+            raise ValueError('Component metadata drift: '+', '.join(changed)+suffix)
         if not check:
             target.mkdir(parents=True, exist_ok=True)
             legacy.atomic_write(outputs)

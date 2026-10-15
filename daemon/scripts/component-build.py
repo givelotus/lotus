@@ -28,7 +28,7 @@ def output(args):
 
 def deterministic_export_archive(export, destination, epoch):
     with destination.open('wb') as output:
-        with gzip.GzipFile(fileobj=output, mode='wb', mtime=epoch, filename='') as compressed:
+        with gzip.GzipFile(fileobj=output, mode='wb', mtime=epoch, filename='', compresslevel=0) as compressed:
             with tarfile.open(fileobj=compressed, mode='w', format=tarfile.PAX_FORMAT) as archive:
                 for path in sorted(export.rglob('*')):
                     relative = Path('chronik-export') / path.relative_to(export)
@@ -41,6 +41,15 @@ def deterministic_export_archive(export, destination, epoch):
                             archive.addfile(info, contents)
                     else:
                         archive.addfile(info)
+
+
+def cmake_flags(manifest, component, python_executable):
+    flags = list(manifest['cmake_args'])
+    if component != 'bitcoin-core':
+        flags.append('-DPython_EXECUTABLE='+python_executable)
+    if manifest['toolchains']['rust']:
+        flags.append('-DRust_TOOLCHAIN='+manifest['toolchains']['rust'])
+    return flags
 
 
 def build(root, component, source, dist, target, jobs, chronik_export=None):
@@ -59,7 +68,7 @@ def build(root, component, source, dist, target, jobs, chronik_export=None):
     if (target.startswith('x86_64') and platform.machine()!='x86_64') or (target.startswith('arm64') and platform.machine() not in ('arm64','aarch64')):
         raise ValueError('Cross compilation is not configured by this workflow')
     dist.mkdir(parents=True,exist_ok=True)
-    flags=manifest['cmake_args']
+    flags=cmake_flags(manifest,component,shutil.which('python3'))
     host=manifest.get('chronik_host')
     if host:
         if chronik_export is None:
@@ -81,10 +90,6 @@ def build(root, component, source, dist, target, jobs, chronik_export=None):
         deterministic_export_archive(chronik_export,export_archive,manifest['source_date_epoch'])
     build_dir=source/'build'
     cmake=['cmake','-S',source,'-B',build_dir,'-GNinja','-DCMAKE_BUILD_TYPE=Release',*flags]
-    if component!='bitcoin-core':
-        cmake += ['-DPython_EXECUTABLE='+shutil.which('python3')]
-        if manifest['toolchains']['rust']:
-            cmake += ['-DRust_TOOLCHAIN='+manifest['toolchains']['rust']]
     command(cmake)
     command(['cmake','--build',build_dir,'--parallel',jobs,'--target',*manifest['binaries'],manifest['test_target']])
     if component=='bitcoin-core':

@@ -13,6 +13,9 @@ from unittest.mock import patch
 spec=importlib.util.spec_from_file_location('component_release',Path(__file__).with_name('component-release.py'))
 release=importlib.util.module_from_spec(spec)
 spec.loader.exec_module(release)
+build_spec=importlib.util.spec_from_file_location('component_build',Path(__file__).with_name('component-build.py'))
+build=importlib.util.module_from_spec(build_spec)
+build_spec.loader.exec_module(build)
 fixture_spec=importlib.util.spec_from_file_location('legacy_fixtures',Path(__file__).with_name('test_prepare_release.py'))
 fixtures=importlib.util.module_from_spec(fixture_spec)
 fixture_spec.loader.exec_module(fixtures)
@@ -87,6 +90,13 @@ class ComponentTests(unittest.TestCase):
         self.assertEqual(manifest['chronik_host']['profile'],'bitcoin-core')
         self.assertEqual(manifest['patches'][0]['path'],
                          'daemon/chronik/hosts/bitcoin-core/node/0001-wire-chronik-lifecycle-and-native-storage.patch')
+
+    def test_core_chronik_build_receives_required_rust_toolchain(self):
+        manifest={'cmake_args':['-DBUILD_CHRONIK=ON'],
+                  'toolchains':{'rust':'1.87.0'}}
+        flags=build.cmake_flags(manifest,'bitcoin-core','/usr/bin/python3')
+        self.assertIn('-DRust_TOOLCHAIN=1.87.0',flags)
+        self.assertNotIn('-DPython_EXECUTABLE=/usr/bin/python3',flags)
 
     def test_drift_rejected_and_stock_cannot_silently_enable_candidates(self):
         self.prepare()
