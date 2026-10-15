@@ -6,14 +6,13 @@ Updated October 15, 2026. Development plan; no genesis parameters are frozen and
 
 ## Source foundation and current status
 
-The current executable [V2 series](../patches/v2/series) contains 163 patches,
-`000`–`162`, on ABC master `1fb7db17c176cdea8a2c60d887891589382ee4e3`.
-[Latest replay evidence](evidence/v2-series-replay-162.json) verifies every
+The current executable [V2 series](../patches/v2/series) contains 165 patches,
+`000`–`164`, on ABC master `1fb7db17c176cdea8a2c60d887891589382ee4e3`.
+[Latest replay evidence](evidence/v2-series-replay-164.json) verifies every
 intermediate tree. Offline daemon acceptance, restart, disconnect/reconnect,
 resumable fork recovery, bounded selection and actual two-process TCP full/compact
-synchronization have separate evidence below. The signed local assembler passes
-native tests, but its interactive node command and a usable wallet/mining workflow
-remain unfinished. Development profile adoption and public launch remain pending.
+synchronization have separate evidence below. Native production of signed fixture-payment blocks also passes across two nodes.
+A usable live-wallet/controller workflow remains unfinished. Development profile adoption and public launch remain pending.
 
 ### Historical source milestones through 069
 
@@ -828,3 +827,38 @@ This run uses independently supplied block bytes. Native interactive production,
 wallet submission without competing for the live database lock, and user-facing
 local network setup remain subsequent gates. No public service, frozen issuance,
 mainnet parameters, QUIC or quicksync capability is claimed.
+
+## Native mining command (163–164)
+
+All 165 intermediate replay trees match; final tree
+`536775a80a980e5427c0a958c8bed6f0ac8cb342`. See
+[replay evidence](evidence/v2-series-replay-164.json). Earlier mailboxes remain
+byte-identical. `mineblock` accepts canonical signed transaction bytes in order,
+an explicit zero-valued native coinbase destination, parent/time/claim and a
+bounded nonce slice. It performs two abort-only previews and at most 256 nonce
+attempts, with no wrapping. Found bytes enter normal admission and retention;
+the response explicitly reports pending validation, not acceptance. One mining
+request executes per event-loop pass. Typed capacity/reopen failures stay local.
+`readblock` serves chunks of at most 64 KiB from previously connected disk bodies;
+whole-body reads remain bounded by the manifest cap.
+
+Exact native `3a8b8dcaaa68b095ec2b22611f82e2f4bf29ea37`, binary SHA256
+`fdffaaf226fab90220d2c8571cbafb7b675d40db6fe1035014d795c1bf870b34`,
+passes real two-process funding, maturity and signed Payment mining. The actual
+242/242/450-byte blocks were fetched in 97-byte chunks and independently executed
+by the Python reference. Header/transaction/coinbase identities, roots, monetary
+bytes, charges, live coins and proofs agree. Peer propagation and restart persist
+those results. Twenty-one negative requests preserve the observed chain and
+invalidity state, including canonical-number, capacity, stale-parent, immature
+and invalid-signature cases. Zero attempts do not mutate state, and exhaustion
+at the maximum u64 nonce returns no next nonce. All process starts exit zero.
+
+See [test protocol and scope](lotus-v2-native-mining-check.md) and
+[recorded run](evidence/v2-native-mining-164.json). Raw artifacts remain at
+`/private/tmp/lotus-v2-native-mining-chunked-20261015`; build log is
+`/private/tmp/lotus-v2-native-mine-command-final-build.log`.
+
+The signer in this gate is an independent public fixture. It is not a user-wallet
+claim. The existing offline wallet helper cannot open the node's live V4 home;
+a proof-verifying provider and controller are separate implementation packets.
+No profile adoption, issuance freeze or public listener is implied.
