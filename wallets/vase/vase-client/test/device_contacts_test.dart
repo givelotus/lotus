@@ -3,6 +3,7 @@ import 'package:flutter_contacts/flutter_contacts.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:lotus_dart/lotus.dart' as lotus;
 import 'package:vase/features/contacts/device_contacts.dart';
+import 'package:vase/features/contacts/contacts_model.dart';
 
 void main() {
   TestWidgetsFlutterBinding.ensureInitialized();
@@ -66,6 +67,52 @@ void main() {
       calls.clear();
       await device.read(requestPermission: true);
       expect(calls.map((c) => c.method), ['permissions.check', 'crud.getAll']);
+    },
+  );
+
+  test(
+    'phone address update replaces managed fields and preserves other websites',
+    () async {
+      var native = const Contact(
+        id: 'a',
+        websites: [
+          Website(url: 'https://example.com'),
+          Website(
+            url: 'old-address',
+            label: Label(WebsiteLabel.custom, 'Lotus XPI'),
+          ),
+          Website(
+            url: 'older-address',
+            label: Label(WebsiteLabel.custom, 'Lotus XPI'),
+          ),
+        ],
+      );
+      var writes = 0;
+      TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+          .setMockMethodCallHandler(channel, (call) async {
+            if (call.method == 'permissions.request') return 'limited';
+            if (call.method == 'crud.get') return native.toJson();
+            if (call.method == 'crud.update') {
+              native = Contact.fromJson(call.arguments['contact'] as Map);
+              writes++;
+              return null;
+            }
+            throw StateError('Unexpected ${call.method}');
+          });
+      final recipient = WalletContact(
+        id: 'local',
+        name: 'Alice',
+        address: address,
+        deviceContactId: 'a',
+      );
+      await const DeviceContacts().writeAddress(recipient);
+      expect(native.websites.map((w) => w.url), [
+        address,
+        'https://example.com',
+      ]);
+      expect(native.websites.first.label.customLabel, 'Lotus XPI');
+      await const DeviceContacts().writeAddress(recipient);
+      expect(writes, 1);
     },
   );
 

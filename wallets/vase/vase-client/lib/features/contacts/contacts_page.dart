@@ -110,11 +110,16 @@ class _ContactsPageState extends State<ContactsPage>
   }
 
   Future<void> _edit({WalletContact? contact, DeviceContactLink? link}) async {
-    await showDialog<void>(
+    final phoneUpdate = await showDialog<WalletContact>(
       context: context,
-      builder: (_) =>
-          _ContactEditor(model: _model, contact: contact, link: link),
+      builder: (_) => _ContactEditor(
+        model: _model,
+        contact: contact,
+        link: link,
+        canWritePhone: widget.deviceContacts.supported,
+      ),
     );
+    if (phoneUpdate != null && mounted) await _writePhone(phoneUpdate);
   }
 
   Future<void> _pick({WalletContact? contact}) async {
@@ -163,7 +168,7 @@ class _ContactsPageState extends State<ContactsPage>
       builder: (ctx) => AlertDialog(
         title: const Text('Save address to phone contact?'),
         content: Text(
-          'Add a website field labelled Lotus XPI to the linked phone contact for ${contact.name}:\n\n${contact.address}',
+          'Save this address in the Lotus XPI website field of the linked phone contact for ${contact.name}? Existing Lotus XPI fields will be replaced. Other fields, including the phone contact name, are kept. Your Vase copy is already saved.\n\nAddress:\n\n${contact.address}',
         ),
         actions: [
           TextButton(
@@ -477,7 +482,13 @@ class _ContactsPageState extends State<ContactsPage>
 }
 
 class _ContactEditor extends StatefulWidget {
-  const _ContactEditor({required this.model, this.contact, this.link});
+  const _ContactEditor({
+    required this.model,
+    this.contact,
+    this.link,
+    required this.canWritePhone,
+  });
+  final bool canWritePhone;
   final ContactsModel model;
   final WalletContact? contact;
   final DeviceContactLink? link;
@@ -494,6 +505,7 @@ class _ContactEditorState extends State<_ContactEditor> {
   );
   final _addressFocus = FocusNode();
   bool _saving = false;
+  bool _saveToPhone = false;
   String? _error;
   @override
   void dispose() {
@@ -523,7 +535,19 @@ class _ContactEditorState extends State<_ContactEditor> {
         address: _address.text,
         deviceContactId: widget.link?.id ?? widget.contact?.deviceContactId,
       );
-      if (mounted) Navigator.pop(context);
+      if (mounted)
+        Navigator.pop(
+          context,
+          _saveToPhone
+              ? WalletContact(
+                  id: widget.contact?.id ?? 'phone-update',
+                  name: _name.text.trim(),
+                  address: contactAddress(_address.text),
+                  deviceContactId:
+                      widget.link?.id ?? widget.contact?.deviceContactId,
+                )
+              : null,
+        );
     } catch (_) {
       if (mounted) {
         setState(
@@ -576,9 +600,19 @@ class _ContactEditorState extends State<_ContactEditor> {
               isDense: true,
             ),
           ),
-          if (widget.link != null || widget.contact?.deviceContactId != null)
-            const Text(
-              'Linked to a phone contact. Saving here does not change your phone contact.',
+          if (widget.canWritePhone &&
+              (widget.link != null || widget.contact?.deviceContactId != null))
+            CheckboxListTile(
+              contentPadding: EdgeInsets.zero,
+              controlAffinity: ListTileControlAffinity.leading,
+              value: _saveToPhone,
+              onChanged: _saving
+                  ? null
+                  : (value) => setState(() => _saveToPhone = value!),
+              title: const Text('Also update phone contact'),
+              subtitle: const Text(
+                'Save the Lotus address after confirmation. The name above is used only in Vase.',
+              ),
             ),
           if (_error != null)
             Text(

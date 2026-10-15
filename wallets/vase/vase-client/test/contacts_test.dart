@@ -49,6 +49,14 @@ class _SyncDeviceContacts extends DeviceContacts {
   );
   final requests = <bool>[];
   bool fail = false;
+  bool failPhoneWrite = false;
+  final phoneWrites = <WalletContact>[];
+  @override
+  Future<void> writeAddress(WalletContact contact) async {
+    if (failPhoneWrite) throw StateError('fixture denied');
+    phoneWrites.add(contact);
+  }
+
   @override
   bool get supported => true;
   @override
@@ -73,6 +81,53 @@ void main() {
     model = ContactsModel(storage: storage);
   });
   tearDown(() => model.dispose());
+
+  for (final outcome in ['confirm', 'cancel', 'failure', 'local only']) {
+    testWidgets('editor phone update: $outcome', (tester) async {
+      final phone = _SyncDeviceContacts();
+      addTearDown(phone.events.close);
+      await tester.pumpWidget(
+        MaterialApp(
+          home: ContactsPage(model: model, deviceContacts: phone),
+        ),
+      );
+      await tester.pumpAndSettle();
+      await tester.tap(find.text('Phone Alice'));
+      await tester.pumpAndSettle();
+      await tester.enterText(
+        find.widgetWithText(TextField, 'Lotus address'),
+        address,
+      );
+      if (outcome != 'local only') {
+        await tester.ensureVisible(find.byType(CheckboxListTile));
+        await tester.tap(find.byType(CheckboxListTile));
+      }
+      await tester.tap(find.widgetWithText(TextButton, 'Save'));
+      await tester.pumpAndSettle();
+      expect(model.contacts.single.address, address);
+      expect(phone.phoneWrites, isEmpty);
+      if (outcome != 'local only') {
+        expect(find.text('Save address to phone contact?'), findsOneWidget);
+        phone.failPhoneWrite = outcome == 'failure';
+        await tester.tap(
+          find.widgetWithText(
+            TextButton,
+            outcome == 'cancel' ? 'Cancel' : 'Save address',
+          ),
+        );
+        await tester.pumpAndSettle();
+      }
+      expect(phone.phoneWrites.length, outcome == 'confirm' ? 1 : 0);
+      expect(model.contacts.single.deviceContactId, 'phone-a');
+      expect(storage.values['seed'], 'untouched wallet fixture');
+      if (outcome == 'failure') {
+        expect(
+          find.textContaining('Unable to update phone contact'),
+          findsOneWidget,
+        );
+      }
+    });
+  }
 
   test(
     'saved contacts survive restart with independent stable identity and phone link',

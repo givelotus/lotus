@@ -95,14 +95,18 @@ class DeviceContacts {
     if (current == null) {
       throw StateError('Linked phone contact no longer exists');
     }
-    final websites = [...current.websites];
-    if (websites.any((w) => w.url == contact.address)) return;
-    websites.add(
+    // Replace only our explicitly labelled fields; preserve all other websites.
+    final websites = current.websites
+        .where((w) => w.label.customLabel != 'Lotus XPI')
+        .toList();
+    websites.insert(
+      0,
       Website(
         url: contact.address,
         label: const Label(WebsiteLabel.custom, 'Lotus XPI'),
       ),
     );
+    if (listEquals(current.websites, websites)) return;
     await FlutterContacts.update(current.copyWith(websites: websites));
   }
 }
