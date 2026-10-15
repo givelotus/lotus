@@ -2,13 +2,17 @@
 
 import unittest
 
+from coincurve import PrivateKey, PublicKeyXOnly
+
 from lotus_v2_reference.block import (
-    OP_TRUE, OP_TRUE_COST, PAYMENT_VM, Parent, Payment, branch_leaf, Coin,
-    connect_ordinary_block, encode_native_output, encode_spend_core,
-    state_root, transaction_id, utxo_root,
+    OP_TRUE, OP_TRUE_COST, PAYMENT_TX_PROFILE, PAYMENT_VM, Parent, Payment,
+    branch_leaf, Coin, connect_ordinary_block, encode_native_output,
+    encode_spend_core, state_root, transaction_id, utxo_root,
 )
+from lotus_v2_reference.encoding import Output
 from lotus_v2_reference.monetary import MonetaryState, Profile
-from lotus_v2_reference.vm import VMError, evaluate
+from lotus_v2_reference.signing import Input, Transaction, Witness, identity_digests, signing_message
+from lotus_v2_reference.vm import UnsupportedFeature, VMError, branch_leaf_hash, evaluate
 
 CHAIN = bytes(range(32))
 BRANCH = branch_leaf(OP_TRUE)
@@ -128,6 +132,75 @@ class OrdinaryScriptConnectTests(unittest.TestCase):
         )
         self.assertEqual(connected.invocation_cost, result.charged_cost)
         self.assertNotEqual(utxo_root(coins), root)
+
+    def test_checksig_spend_connects_and_flipped_signature_rolls_back(self):
+        pubkey = bytes.fromhex(
+            "f9308a019258c31049344f85f89d5229b531c845836f99b08601f113bce036f9")
+        secret = bytes(31) + bytes([3])
+        self.assertEqual(PrivateKey(secret).public_key_xonly.format(), pubkey)
+        script = b"\x20" + pubkey + b"\xbb"
+        self.assertEqual(branch_leaf(script), branch_leaf_hash(script))
+        branch = branch_leaf(script)
+        coins = {
+            coin.key(): coin
+            for coin in (
+                Coin(FUNDING, 3, 20000, branch, 90, 49000),
+                Coin(bytes([0x72]) + bytes(31), 1, 8000, BRANCH, 90, 49000),
+            )
+        }
+        root = utxo_root(coins)
+        parent = Parent(CHAIN, 99, 50000, state_root(CHAIN, 99, root, MONEY), MONEY)
+        parent_money = MONEY.to_bytes()
+        parent_coins = tuple(coins[key].encode() for key in sorted(coins))
+        created = Output(0, 15000, None, (branch,), ((0,),))
+        resolved = Output(0, 20000, None, (branch,), ((0,),))
+        blank = Transaction(
+            0,
+            (Input(FUNDING, 3, 0xFFFFFFFF, 1, 0, (Witness(script, (), (bytes(64),)),)),),
+            (created,),
+        )
+        message = signing_message(blank, PAYMENT_TX_PROFILE, CHAIN, (resolved,), 0, 0, 0)
+        signature = PrivateKey(secret).sign_schnorr(message, aux_randomness=bytes(32))
+        self.assertEqual(len(signature), 64)
+        self.assertTrue(PublicKeyXOnly(pubkey).verify(signature, message))
+        signed = Transaction(
+            0,
+            (Input(FUNDING, 3, 0xFFFFFFFF, 1, 0, (Witness(script, (), (signature,)),)),),
+            (created,),
+        )
+        self.assertEqual(signing_message(signed, PAYMENT_TX_PROFILE, CHAIN, (resolved,), 0, 0, 0),
+                         message)
+        self.assertEqual(
+            identity_digests(signed, PAYMENT_TX_PROFILE, CHAIN).txid,
+            transaction_id(CHAIN, encode_spend_core(FUNDING, 3, script),
+                           encode_native_output(15000, branch)),
+        )
+        with self.assertRaises(UnsupportedFeature) as missing:
+            evaluate(script, (signature,), PAYMENT_VM, input_count=1, output_count=1)
+        self.assertEqual(str(missing.exception), "CHECKSIG requires an authenticated signing context")
+        flipped = bytes([signature[0] ^ 1]) + signature[1:]
+        self.assertFalse(PublicKeyXOnly(pubkey).verify(flipped, message))
+        with self.assertRaises(ValueError) as caught:
+            connect_ordinary_block(
+                (Payment(FUNDING, 3, 15000, script=script, arguments=(flipped,)),),
+                parent, coins, MONEY, MONETARY, candidate_height=100, parent_mtp=50000,
+                block_cap=1_000_000,
+            )
+        self.assertEqual(str(caught.exception), "unclean final stacks")
+        self.assertEqual(utxo_root(coins), root)
+        self.assertEqual(MONEY.to_bytes(), parent_money)
+        self.assertEqual(tuple(coins[key].encode() for key in sorted(coins)), parent_coins)
+        self.assertIn((FUNDING, 3), coins)
+        connected = connect_ordinary_block(
+            (Payment(FUNDING, 3, 15000, script=script, arguments=(signature,)),),
+            parent, coins, MONEY, MONETARY, candidate_height=100, parent_mtp=50000,
+            block_cap=1_000_000,
+        )
+        self.assertGreater(connected.invocation_cost, 0)
+        self.assertNotEqual(connected.utxo_root, root)
+        self.assertNotEqual(connected.monetary_bytes, parent_money)
+        self.assertNotIn((FUNDING, 3), coins)
+        self.assertEqual(utxo_root(coins), connected.utxo_root)
 
 
 if __name__ == "__main__":
