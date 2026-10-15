@@ -78,7 +78,7 @@ class PrepareAbcRefresh(unittest.TestCase):
         self.assertEqual(updated["patches"][0]["metadata_sha256"], row["metadata_sha256"])
         self.assertIn("validation pending", result["validation"])
 
-    def test_candidate_worktree_survives_moving_candidate_directory(self):
+    def test_candidate_build_clone_survives_moving_candidate_directory(self):
         source = self.root / "source"
         source.mkdir()
         self.git(source, "init", "-q")
@@ -91,13 +91,15 @@ class PrepareAbcRefresh(unittest.TestCase):
         candidate.mkdir()
         upstream = candidate / "abc-upstream.git"
         subprocess.run(["git", "clone", "--quiet", "--bare", str(source), str(upstream)], check=True)
-        worktree = candidate / "workspaces/ecash"
-        worktree.parent.mkdir()
-        subprocess.run(["git", "-C", str(upstream), "worktree", "add", "--quiet", "--detach",
-                        str(worktree), "HEAD"], check=True)
-        ABC_REFRESH.make_worktree_portable(worktree)
+        workspace = candidate / "workspaces/ecash"
+        ABC_REFRESH.materialize_source(upstream, workspace,
+                                       self.git(source, "rev-parse", "HEAD").decode().strip(),
+                                       str(upstream))
         moved = self.root / "renamed-candidate"
         shutil.move(candidate, moved)
+        self.assertTrue((moved / "workspaces/ecash/.git").is_dir())
+        self.assertEqual(self.git(moved / "workspaces/ecash", "remote", "get-url", "origin").decode().strip(),
+                         str(upstream))
         self.assertEqual(self.git(moved / "workspaces/ecash", "rev-parse", "HEAD").decode().strip(),
                          self.git(moved / "abc-upstream.git", "rev-parse", "HEAD").decode().strip())
 

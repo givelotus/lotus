@@ -184,11 +184,14 @@ nodes/data.
 Only `x86_64-linux-gnu` is enabled. Upstream explicitly marks ARM macOS cross
 compilation TODO; Intel macOS additionally requires a separately supplied,
 appropriately licensed Xcode SDK. No Apple SDK is committed or uploaded. Native
-macOS release builds remain in place. Doged `9690833b` and Bitcoin Core
-`f13ae519` contain upstream `contrib/guix` build machinery, but those recipes
-have not been adapted and validated with Lotus's component manifests, Chronik
-settings and release packager. No BCHN Guix release path has been validated at
-its current pin; do not infer that BCHN lacks a recipe from this audit. Keep all
-three on their current native Linux jobs until each exact release candidate
-passes its own Guix build, package and behavior checks. Lotus validation does not
-transfer across daemons.
+macOS release builds remain in place. The Doged candidate at ABC `33ae885a`
+inherits ABC's `contrib/guix` machinery and passes native macOS build, unit, and
+selected functional checks, but that exact Doged candidate has not been built
+or compared in Guix. Doged's current release manifest still selects historical
+source `9690833b`. Bitcoin Core `f13ae519` also contains upstream Guix build
+machinery, but its recipe has not been adapted and validated with the component
+manifest, Chronik settings, and release packager. No BCHN Guix release path has
+been validated at its current pin; do not infer that BCHN lacks a recipe from
+this audit. Keep those components on their native Linux jobs until each exact
+release candidate passes its own Guix build, packaging, and behavior checks.
+Lotus validation does not transfer across daemons.

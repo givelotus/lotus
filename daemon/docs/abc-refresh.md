@@ -44,6 +44,14 @@ indexing parity, or reorg handling. Run each target's documented build and
 behavioral checks against the candidate before promotion. A failed target does
 not stop the remaining checks and never changes the active pin.
 
+The 2026-10-15 candidate at ABC `33ae885a` has since passed Doged patch
+provenance, an arm64 macOS CMake build, all 757 `test_bitcoin` cases, all 144
+Avalanche unit cases, PoW checks, and selected AuxPoW/activation/P2P/mining/
+Chronik functional tests. Exact identities and limits are in
+[Doged candidate validation](doged-abc-33ae-validation.md). This is not full
+mainnet-tip sync or reproducible-binary evidence, and it does not promote the
+active selector or historical Doged release manifest.
+
 ## Promote only after validation
 
 After reviewing the candidate and passing the required target checks, promote

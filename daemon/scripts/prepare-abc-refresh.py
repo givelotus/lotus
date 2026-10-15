@@ -11,7 +11,6 @@ import argparse
 import hashlib
 import importlib.util
 import json
-import os
 from pathlib import Path
 import subprocess
 import sys
@@ -64,22 +63,33 @@ def resolve_base(repo: Path, requested: str, remote: str) -> tuple[str, str]:
     return commit, branch
 
 
-def worktree(repo: Path, path: Path, commit: str, remote: str) -> None:
+def materialize_source(repo: Path, path: Path, commit: str, remote: str) -> None:
+    """Materialize a normal clone that upstream CMake can inspect directly.
+
+    Several upstream CMake files assume .git is a directory. Linked worktrees
+    use a .git file, so candidate builds would otherwise fail before compiling.
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
-    git(repo, "worktree", "add", "--quiet", "--detach", str(path), commit)
+    hydrate = path.parent / f".{path.name}-base-checkout"
+    branch = f"lotus-candidate-{path.name}"
+    try:
+        # Hydrate the base tree in the partial upstream clone first. A local
+        # clone of a promisor repository otherwise cannot transfer missing
+        # blobs, and a remote clone would needlessly fetch the same large base
+        # once for each patch stack.
+        git(repo, "worktree", "add", "--quiet", "--detach", str(hydrate), commit)
+        git(repo, "update-ref", f"refs/heads/{branch}", commit)
+        git(repo, "clone", "--quiet", "--no-hardlinks", "--dissociate", "--branch", branch,
+            str(repo), str(path))
+    finally:
+        if hydrate.exists():
+            git(repo, "worktree", "remove", "--force", str(hydrate))
+    git(path, "checkout", "--quiet", "--detach", commit)
     git(path, "remote", "set-url", "origin", remote)
-    make_worktree_portable(path)
-
-
-def make_worktree_portable(path: Path) -> None:
-    admin = Path(git(path, "rev-parse", "--path-format=absolute", "--git-dir").stdout.strip())
-    admin_link = os.path.relpath(admin.resolve(), path.resolve())
-    reverse_link = os.path.relpath((path / ".git").resolve(), admin.resolve())
-    (path / ".git").write_text(f"gitdir: {admin_link}\n")
-    (admin / "gitdir").write_text(f"{reverse_link}\n")
-    # Verify the relative gitdir/commondir links before making candidate edits.
+    if not (path / ".git").is_dir():
+        raise ValueError(f"Candidate source is not a normal Git clone: {path}")
     if git(path, "rev-parse", "--show-toplevel").stdout.strip() != str(path.resolve()):
-        raise ValueError(f"Could not make candidate worktree portable: {path}")
+        raise ValueError(f"Could not materialize candidate source: {path}")
 
 
 def patch_names(series_path: Path) -> list[str]:
@@ -180,7 +190,7 @@ def prepare(requested: str, candidate: Path) -> dict:
             workspace = candidate / "workspaces" / name
             result = report["targets"][name]
             try:
-                worktree(base_repo, workspace, commit, remote)
+                materialize_source(base_repo, workspace, commit, remote)
                 command = [sys.executable, str(PATCH_SERIES), str(workspace),
                            str(DAEMON / "patches" / series / "series"), "--base", commit]
                 if allow_empty:
