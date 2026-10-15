@@ -95,13 +95,22 @@ source/target/fork mismatch and profile mismatch. Journal revisions never wrap;
 exhaustion is an operational refusal before mutation.
 
 Replacement bodies need bounded durable staging because the retained-body API
-only addresses locally committed records. Introduce a private `B` namespace for
-canonical full bytes keyed by block ID, with a body digest, length and pin reference.
-Admission to this store checks exact header binding, canonical framing and TxRoot;
-full contextual validity remains pending. Existing retained source bodies can be
-copied into the same bounded pinned store to simplify restoration. Do not overload
-`H` stage or infer body availability from it. Pins remain until the journal is
-terminal and cleanup is safe. No pruning runs against pinned bodies/undo records.
+only addresses locally committed records. The initial implementation embeds exact
+source and replacement body bytes in the capped `J` payload, with their identities
+and lengths, rather than adding a separate body store. Preparation checks header
+binding, canonical framing and TxRoot; full contextual validity remains pending.
+The journal retains these bytes through restoration or target completion. Do not
+overload `H` stage or infer body availability from it. No pruning runs against the
+attempt's source undo records.
+
+This intentionally rewrites the capped bodies on each journal revision. Memory
+budgets must include simultaneous previous/next journal payloads, storage envelopes,
+decoded bodies and validation overlays; a payload cap is not an RSS measurement.
+A later separate body-pin store may reduce copying, but is outside this packet.
+Recovery-capable homes use an explicit new storage schema with journal/undo
+creation limits. Iterator value-size checks precede application copies; LevelDB
+still owns internal block decompression/allocation. These limits do not establish
+an adversarial-corrupt-database engine allocation bound.
 
 ## Preparation before changing the active chain
 
@@ -213,6 +222,8 @@ selection owner must define that bounded inventory and invalid-descendant policy
 
 ## Proposed API and exclusive implementation ownership
 
+The initial API uses a capped embedded-body journal as specified above; the
+following API sketch records intended responsibilities, not exact C++ names.
 New `src/lotus_v2/reorg_recovery.{h,cpp}` owns canonical journal parsing, preparation,
 state-machine decisions and validation callbacks. Proposed public types:
 
