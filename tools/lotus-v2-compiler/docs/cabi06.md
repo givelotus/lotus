@@ -4,8 +4,8 @@ This packet prepares a retained corpus for the existing optimizer. It does not
 complete CABI06 or establish daemon acceptance. No optimizer source changes
 were needed: no semantic optimizer bug was demonstrated.
 
-`tools/lotus-v2-compiler/fixtures/optimizer-equivalence/corpus.json` contains nine
-programs and 24 argument cases. `observations.json` retains source, both scripts,
+[corpus.json](../fixtures/optimizer-equivalence/corpus.json) contains nine
+programs and 24 argument cases. [observations.json](../fixtures/optimizer-equivalence/observations.json) retains source, both scripts,
 arguments, independent Python VM results, per-artifact P02 branch leaves,
 accounting/enforcement charges and exact-cap boundary observations. The test
 compares the complete record exactly. No regeneration mode is supplied; changed
@@ -19,8 +19,11 @@ Accounting and enforcement coincide for this unchanged assigned-opcode schedule;
 future extension repricing is untested. Failure charges are independently computed
 before execution; malformed arguments can reject before a charge is admitted.
 
-Wide-cap semantic checks compare acceptance/rejection and accepted stack bytes,
-success and automatic-success status. Failure diagnostics remain separately
+The [independent Python helper](../test/cabi06-reference.py) explicitly asserts
+wide-cap acceptance/rejection equality and accepted stack bytes,
+success and automatic-success status before the snapshot comparison. The explicit
+1000000 cap does not bind any corpus case; no infinite profile is claimed.
+Failure diagnostics remain separately
 recorded because fused instructions can report differently. Coverage includes
 EQUALVERIFY, CHECKSIGVERIFY, literal arithmetic/Boolean folds, noncanonical bool
 and int arguments, signed i128 extrema, retained overflow failures, skipped
