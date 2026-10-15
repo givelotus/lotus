@@ -1,4 +1,6 @@
 """Offline setup regressions: python3 -m unittest discover -s this directory."""
+import hashlib
+import json
 import importlib.util
 from pathlib import Path
 import tempfile
@@ -11,6 +13,33 @@ spec.loader.exec_module(setup)
 
 
 class PrepareTests(unittest.TestCase):
+    def test_versioned_fixture_and_preserved_legacy(self):
+        fixtures = Path(__file__).resolve().parent
+        raw = (fixtures / 'local-test-manifest.json').read_bytes()
+        current = json.loads(raw)
+        old_raw = (fixtures / 'legacy-schema1-local-test-manifest.json').read_bytes()
+        old = json.loads(old_raw)
+        provenance = json.loads((fixtures / 'provenance.json').read_text())
+        self.assertEqual(hashlib.sha256(raw).hexdigest(), setup.MANIFEST_SHA256)
+        self.assertEqual(hashlib.sha256(old_raw).hexdigest(), provenance['legacy_manifest_sha256'])
+        self.assertEqual(current['schema'], 2)
+        self.assertEqual(current['tail_formula_version'], 1)
+        self.assertEqual(current['monetary'][:10], old['monetary'])
+        self.assertEqual(current['monetary'][10:], [1000000, '02' + '00' * 31])
+        self.assertEqual(current['header']['chain_id'], provenance['chain_id'])
+        self.assertEqual(current['header']['genesis_id'], provenance['genesis_id'])
+        for key in old:
+            if key not in ('schema', 'header', 'monetary', 'genesis'):
+                self.assertEqual(current[key], old[key], key)
+        for key in old['header']:
+            if key not in ('chain_id', 'genesis_id'):
+                self.assertEqual(current['header'][key], old['header'][key], key)
+        self.assertNotEqual(current['header']['chain_id'], old['header']['chain_id'])
+        self.assertNotEqual(current['header']['genesis_id'], old['header']['genesis_id'])
+        state = bytes.fromhex(current['initial_monetary'])
+        self.assertEqual(int.from_bytes(state[8:16], 'little'), current['monetary'][10])
+        self.assertEqual(state[16:48].hex(), current['monetary'][11])
+
     def test_fresh_and_alias_paths(self):
         with tempfile.TemporaryDirectory() as directory:
             base = Path(directory).resolve()

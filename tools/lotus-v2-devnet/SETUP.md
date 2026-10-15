@@ -1,6 +1,8 @@
 # Prepare an isolated local session
 
-This packages an **existing tested local fixture**, not a public network profile.
+This packages the versioned **absolute-tail local test fixture**
+`lotus-v2-local-test-20261015-absolute1`, derived from the earlier tested local
+fixture. Native execution evidence for schema 1 does not validate this migration.
 Its easy proof of work, monetary parameters and magic are for isolated tests.
 Do not expose its listeners, allocate public ports, or use real funds. Setup runs
 no daemon, wallet client, Node process or compiler and creates no chain homes.
@@ -87,7 +89,40 @@ separately. Preserve the generated inputs alongside runtime evidence.
 
 The output contains complete `config.json`, exact copied `manifest.json` and
 `network.json`, `provenance.json`, and shell-quoted `commands.txt`. The manifest
-SHA256 is `33d84853403b2eaa686a5ad4fdd799daffc8fc9c712b0f8662d914a29f11d720`.
+SHA256 is `0ccb2872198a354e9cdc5e9c91d1816cf65bf8109efc200d86537d65dc660d05`.
+The manifest uses schema 2 and `tail_formula_version=1`. Its monetary array
+retains the original ten fields, then appends genesis tail `1000000` and work `2`
+as 32 little-endian bytes. These are the actual local fixture anchors; the
+reference toy profile uses `200`/`9`, and the proposed development profile in
+`docs/lotus-v2/development-profile.md` is a separate artifact.
+
+The chain ID is `6ff87f5f041a6e4e16018ac58b33f7397d956da5712642015edf5fc560deb9c9`,
+genesis ID `53e6c3d9bf12bc18f84e818349da5e5d3d11ee6e33576dab3b81be0a7a978959`,
+and native validator profile digest
+`1415adf3bc8c1f4d868ddb65aebb8e50205cb07e18d2feef006d4dfca4ecb39b`.
+The initial 56-byte monetary envelope, timestamp, difficulty, limits, maturity
+and cost schedules are unchanged. Chain ID and genesis commitments are new.
+Always choose fresh homes for this identity. Preserve previous homes as legacy
+evidence; do not reset or reuse them.
+
+The exact old manifest and provenance are preserved as
+`fixtures/legacy-schema1-local-test-manifest.json` and
+`fixtures/legacy-schema1-provenance.json`. The schema 2 loader must reject the
+legacy manifest. Reproduce and compare every new manifest byte offline using an
+environment with the reference dependencies (including `blake3`):
+
+```sh
+PYTHONPATH=tools/lotus-v2-reference python3 \
+  tools/lotus-v2-devnet/fixtures/reproduce_absolute_fixture.py
+```
+
+The script derives the chain ID and zero-value burn note with tagged BLAKE3
+using the versioned name, rebuilds transaction/state commitments, and selects
+the first valid nonce from zero. It prints the manifest SHA256 and the exact
+schema 2 native validator digest. That digest inserts formula version as u64,
+genesis tail as u64 and 32 little-endian work bytes after the original ten
+monetary fields and before outer costs.
+
 Fixture provenance is checked in under `fixtures/`; no historical `/tmp`
 artifact is needed. Network magic `31435769` is the dispatcher test fixture,
 with only `127.0.0.1:0`, empty initial peers and receive limit 2097152. Node `b`
@@ -121,9 +156,10 @@ These use temporary inert executable files and check path aliases, fresh output
 and session preservation; no native binary is invoked.
 
 
-## Tested two-wallet walkthrough
+## Two-wallet walkthrough for fresh schema 2 sessions
 
-With the bundled fixture and a fresh session, enter these commands at the
+The historical schema 1 walkthrough used these amounts and timestamps. With
+the bundled schema 2 fixture and a fresh session, enter these commands at the
 controller prompt. Choose wallet passphrases when prompted; the commands contain
 only public inputs. Node names `a` and `b` come from `prepare-local.py`.
 
@@ -139,7 +175,7 @@ stop
 ```
 
 The explicit timestamps belong to the checked-in local fixture. The amounts are
-atoms, and `claim` is a requested ceiling subject to native validation. This
+atoms, and `claim` is a requested ceiling subject to native validation. The intended
 sequence produces funding, maturity and payment blocks; the recipient receives
 10000 atoms and the funding input returns 89000 atoms as change. A fee of 100 was
 rejected as below the transaction byte floor during validation; 1000 passed.

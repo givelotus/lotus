@@ -8,7 +8,7 @@ from pathlib import Path
 import shlex
 import shutil
 
-MANIFEST_SHA256 = '33d84853403b2eaa686a5ad4fdd799daffc8fc9c712b0f8662d914a29f11d720'
+MANIFEST_SHA256 = '0ccb2872198a354e9cdc5e9c91d1816cf65bf8109efc200d86537d65dc660d05'
 LIMITS = dict(deadline_ms=60000, max_line_bytes=8388608,
               max_wallet_bytes=4194304, max_events=256, max_blocks=256,
               max_batches=4096)
