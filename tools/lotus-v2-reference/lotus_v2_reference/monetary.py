@@ -55,7 +55,7 @@ class Profile:
             uint(getattr(self, name), U64, name)
         uint(self.genesis_tail, U64, "genesis_tail")
         uint(self.genesis_work, U256, "genesis_work")
-        if self.genesis_work == 0 or not self.tail_min <= self.genesis_tail <= self.tail_max:
+        if self.genesis_work == 0 or not 0 < self.tail_min <= self.genesis_tail <= self.tail_max:
             raise ValueError("invalid absolute tail anchors")
         if self.tail_min > self.tail_max or self.min_fee_per_kb != 1000:
             raise ValueError("invalid tail bounds or P05 byte-fee constant")

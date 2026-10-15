@@ -72,10 +72,13 @@ class MonetaryTests(unittest.TestCase):
         self.assertEqual([absolute_tail(upper, w) for w in (36, 9)], [300, 200])
         lower = replace(P, tail_min=180)
         self.assertEqual([absolute_tail(lower, w) for w in (1, 9)], [180, 200])
+        smallest = replace(P, tail_min=1, genesis_tail=1, genesis_work=1)
+        self.assertEqual(absolute_tail(smallest, 1), 1)
         wide = replace(P, genesis_tail=U64, genesis_work=1, tail_max=U64)
         self.assertEqual(absolute_tail(wide, U256), U64)
         for changes in ({"genesis_work": 0}, {"genesis_work": U256+1},
-                        {"genesis_tail": 2001}):
+                        {"genesis_tail": 2001}, {"genesis_tail": 0},
+                        {"tail_min": 0}, {"tail_min": 0, "genesis_tail": 0}):
             with self.assertRaises(ValueError):
                 replace(P, **changes)
         with self.assertRaises(ValueError):
