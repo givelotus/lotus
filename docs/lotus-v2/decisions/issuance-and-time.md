@@ -38,22 +38,31 @@ This integer recurrence satisfies four foundational properties:
 2. **Exact telescoping conservation:** Because $B_n = R_n - R_{n+1}$ and $B_n \ge 1$ whenever $R_n > 0$, the sequence strictly decreases to $0$ in finite steps and telescopes to the exact atom:
    $$\sum_{n=0}^{\infty} B_n = \sum_{n=0}^{\infty} (R_n - R_{n+1}) = R_0 = M_{\text{boot}}$$
    No fractional fixed-point state is required and no rounding dust is ever lost or created; once $R_n = 0$, $B_n = 0$ permanently.
-3. **Homomorphic scale invariance:** In the interior regime ($R_n \ge 2^{k_{\text{boot}}}$, $T_{\min} \le T_n \le T_{\max}$), both the bootstrap recurrence $B_n = R_n \gg k_{\text{boot}}$ and the tail recurrence $T_{n+1} = \text{isqrt}(\lfloor T_n^2 W_n / W_{n-1} \rfloor)$ are **homogeneous of degree 1 in currency units** (scaling initial parameters $R_0, T_0, T_{\min}, T_{\max} \mapsto \lambda R_0, \lambda T_0, \lambda T_{\min}, \lambda T_{\max}$ scales all block rewards by $\lambda$ up to integer floor rounding) and **homogeneous of degree 0 in work units** (rescaling $W_n \mapsto c W_n$ cancels identically in $W_n / W_{n-1}$).
+3. **Homomorphic scale invariance:** In the interior regime ($R_n \ge 2^{k_{\text{boot}}}$, $T_{\min} \le T_n \le T_{\max}$), both the bootstrap recurrence $B_n = R_n \gg k_{\text{boot}}$ and the absolute tail $T_{n+1} = \text{isqrt}(\lfloor T_g^2 W_n / W_g \rfloor)$ are **homogeneous of degree 1 in currency units** (scaling initial parameters $R_0, T_0, T_{\min}, T_{\max} \mapsto \lambda R_0, \lambda T_0, \lambda T_{\min}, \lambda T_{\max}$ scales all block rewards by $\lambda$ up to integer floor rounding) and **homogeneous of degree 0 in work units** (rescaling $W_n \mapsto c W_n$ cancels identically in $W_n / W_g$).
 4. **Long-run supply equilibrium:** Because $\sum_{n=0}^{\infty} B_n = R_0$ is strictly finite, long-run net issuance per block is governed by $\Delta M_n = T_n - \text{Burn}_n$ (where $\text{Burn}_n$ is the sum of mandatory native fee burns `B`, any coinbase underclaim `U`, and explicit `IS_BURN` outputs under `C16`), so total circulating supply stabilizes smoothly where per-block burns match the adaptive tail $T_n$.
 
-### Adaptive tail recurrence ($T_n$, `u64` atoms)
+### Absolute adaptive tail (adopted October 15, 2026)
 
-The paper's $\gamma = 1/2$ work-responsive tail recurrence is defined in exact integer arithmetic, avoiding floating-point `sqrt` or approximate log interpolation. Let $W_n$ be the exact 256-bit per-block chainwork (`floor(2^256 / (T + 1))`) from [P04](header-and-mining.md)'s decoded target convention, and let $T_n$ (`tail_subsidy:u64` in `MonetaryState`) be the integer tail entitlement of issuance step $n$. After accepting issuance step $n$, compute the post-state tail entitlement $T_{n+1}$ and work baseline $W'_n$:
+The maintainer authorized the genesis-anchored formula after the [absolute reward review](../../plans/lotus-v2-absolute-reward-research.md). This supersedes the recurrent tail formula; bootstrap scheduling, genesis native issuance (zero), fee/burn accounting and the one-block lag retain their defined rules. This selects a formula, not numerical mainnet constants or economic acceptance.
+
+Immutable profile parameters are `genesis_tail` ($T_g$, an in-range `u64` amount) and `genesis_work` ($W_g$, positive `u256` per-block work from the genesis target). Define version 1:
 
 ```text
-Q = floor(T_n * T_n * W_n / W_(n-1))
-T_(n+1) = min(T_max, max(T_min, isqrt(Q)))
-W'_n = W_n
+F(work) = min(T_max, max(T_min, isqrt((T_g * T_g * work) // W_g)))
+T_n = F(W_(n-1))
+S_n = B_n + T_n
+T_(n+1) = F(W_n)
 ```
 
-This floors the unscaled recurrence once before clipping; `isqrt(floor(x)) = floor(sqrt(x))` for nonnegative $x$. Compute the mathematical product $T_n^2 \cdot W_n$ before division with bounded wide integers, not modular multiplication. With $T_n < 2^{64}$ and $W_n < 2^{256}$, the numerator $T_n^2 \cdot W_n < 2^{384}$ fits in 384 bits (`u384` / `u512`).
+For issuance step `n` (height `n+1`), derive `W_(n-1)` from the authenticated parent header target. The current candidate's validated target gives `W_n`; it affects the next payment. A cached parent tail is never the formula input, and the parent is never substituted for a missing genesis anchor. At height 1, `F(W_g)=T_g` exactly.
 
-Genesis initializes $R_0 = M_{\text{boot}}$ (candidate $2^{20} \cdot B_0 = 2.62144 \times 10^{17}\text{ atoms}$), $T_0$ (candidate $2.5 \times 10^{11}\text{ atoms}$), $W_{-1} > 0$ (the genesis target's per-block work), and $E_0$ (`ema_block_cost:u64` in [P05](resources-and-parameters.md)). Reward lag is deliberate: issuance step $n$'s subsidy entitlement $S_n = B_n + T_n$ is fixed by the parent block's `MonetaryState`, while issuance step $n$'s target/work $W_n$ updates $T_{n+1}$ for issuance step $n+1$. Clipping and integer rounding make `MonetaryState` path-dependent and it MUST be restored exactly on reorg. This recurrence is stateful and distinct from a memoryless $K\sqrt{W_n}$ rule; integer rounding dead zones when $\lfloor T_n^2 W_n / W_{n-1} \rfloor$ changes by less than $2 T_n + 1$ must be evaluated during parameter calibration before freezing $T_0, T_{\min}, T_{\max}$.
+Calculate the numerator as a checked mathematical `u384` integer, divide with floor rounding, then apply exact integer square root. Clamp the possibly wider-than-u64 result before narrowing to `u64`. Require `0 < W_g <= 2^256-1`, positive input work, and `T_min <= T_g <= T_max <= 2^64-1`. Zero work/anchors are invalid. Bind anchors and formula version 1 into the validation profile digest and manifest identity. Changing either anchor or formula requires explicit profile migration; incompatible existing homes fail closed and are not reset automatically.
+
+Retain the 56-byte monetary envelope for this adoption. `tail_subsidy` and `prev_work` are checked redundancy: accepted parent state must have `prev_work` equal to authenticated parent work and `tail_subsidy == F(parent_work)`. Post-state stores `F(W_n)` and `W_n`. Reserve, EMA and UTXO transitions still require exact branch restoration on reorg; tail can be recomputed from the new authenticated parent. Schema removal is a separate decision.
+
+Rounding and clipping differ from the superseded recurrence. With anchors 100/10, works 11 then 10 yield absolute tails 104 then 100, while the recurrence yields 104 then 99. With upper bound 150, works 40 then 10 yield absolute 150 then 100 versus recurrent 150 then75. With anchors 100/4 and lower bound 80, works 1 then 4 yield absolute 80 then 100 versus recurrent 80 then 160. Absolute evaluation removes terminal-tail history dependence; cumulative issuance still depends on work history.
+
+The toy development fixture explicitly uses anchors 200/9. The independently tested private manifest uses 1000000/2. These are separate profiles and neither selects a mainnet anchor. Native manifest schema 2 explicitly records formula version 1 and both anchors; schema 1 is rejected. Simulation must use these exact integer rules with P04 ASERT and P05 accounting before constants are frozen.
 
 ## Bootstrap clock comparison and why height-based telescoping was selected
 
@@ -73,7 +82,7 @@ A narrow information limitation is already clear: chain bytes alone do not revea
 
 Do not optimize reward/work over arbitrary independent difficulties. Difficulty is a function of permitted ancestor timestamps and the exact ASERT algorithm. Compare feasible timestamp histories and complete discounted outcomes. Current reward may depend on current/parent state while future work/reward effects accrue partly to other miners. A mobile miner's incentives cannot be inferred from a permanent 100%-share miner or a fixed-hashrate Jensen bound.
 
-The analysis deliverable is: model/assumptions, feasible controls, honest baseline, best-response computation or a proved bound, sensitivity across miner share/discount/cost/fee regimes, and a narrowly stated conclusion. Simulations must use the exact integer ASERT and `MonetaryState` ($R_n, T_n, W_{n-1}, E_n$) recurrences specified in P04–P06, not a continuous approximation substituted at the last step.
+The analysis deliverable is: model/assumptions, feasible controls, honest baseline, best-response computation or a proved bound, sensitivity across miner share/discount/cost/fee regimes, and a narrowly stated conclusion. Simulations must use the exact integer ASERT and bootstrap/EMA recurrences and absolute tail with checked `MonetaryState` ($R_n, T_n, W_{n-1}, E_n$) specified in P04–P06, not a continuous approximation substituted at the last step.
 
 ## Avalanche-controlled payouts (D11)
 

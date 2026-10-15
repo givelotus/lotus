@@ -12,7 +12,7 @@ from lotus_v2_reference.monetary import MonetaryState, Profile
 CHAIN = bytes(range(32))
 BRANCH = branch_leaf(b"\x4e")
 MONEY = MonetaryState(9, 200, 9, 4)
-MONETARY = Profile(2, 3, 2, 4, 3, 5, 2, 2000, 3, 1000)
+MONETARY = Profile(2, 3, 2, 4, 3, 5, 2, 2000, 3, 1000, 200, 9)
 
 
 def _coin(tag: int, index: int, value: int) -> Coin:

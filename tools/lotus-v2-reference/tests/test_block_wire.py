@@ -108,7 +108,7 @@ class BlockWireTests(unittest.TestCase):
         from lotus_v2_reference.block import _complete_ordinary, PAYMENT_VM
         from lotus_v2_reference.monetary import MonetaryState
         from lotus_v2_reference.signing import identity_digests
-        money = MonetaryState(9, 200, 2, 4)
+        money = MonetaryState(9, 94, 2, 4)
         funding = Coin(bytes([7])+bytes(31),0,10**18,branch_leaf(OP_TRUE),0,1000)
         coins = {funding.key():funding}
         genesis = Header(bytes(32),0x207fffff,1000,0,2,134,0,bytes(32),bytes(32))

@@ -6,6 +6,10 @@ Research date: 2026-10-15. Specification baseline: `8914db5177d7b97fa7aa7d04172f
 
 The absolute formula is practical and preserves the intended square-root response to work. Its principal benefit is that an earlier clamp or rounding event cannot permanently alter the reward associated with a given work level. It also makes the tail computable from one validated parent header and immutable genesis parameters. It does **not** prescribe future issuance by date or height, eliminate the UTXO/EMA state commitment, or establish timestamp honesty or price stability.
 
+## Subsequent adoption note (2026-10-15)
+
+After this research was completed, the maintainer explicitly authorized implementation of the absolute tail across the paper, P06 specification, Python reference and native candidate. The review below remains the historical analysis at its recorded baseline; its statements that adoption is pending describe that baseline. P06 now selects formula version 1, immutable genesis tail/work anchors and the same one-block lag. The 56-byte envelope retains checked tail/work redundancy. Profile/manifest identity changes explicitly; incompatible homes fail closed. Bootstrap, zero native genesis issuance and open mainnet constant calibration retain their existing scope. Arithmetic and native verification evidence accompany the implementation; this note does not imply economic calibration or private-testnet acceptance.
+
 ## Evidence and terminology
 
 The full issue body and comments were fetched read-only with `gh issue view 22 --repo givelotus/lotus --json number,title,body,comments,url,state,updatedAt`. At retrieval the ticket was OPEN, updated `2026-10-15T14:59:03Z`, with zero comments. Its requested comparison is between the paper's recurrence and an absolute evaluation from genesis; bootstrap is outside its requested change. It expressly requests analysis without a patch or launch-constant selection. [Issue 22](https://github.com/givelotus/lotus/issues/22)

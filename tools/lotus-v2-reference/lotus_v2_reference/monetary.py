@@ -11,6 +11,7 @@ U64 = (1 << 64) - 1
 U128 = (1 << 128) - 1
 U256 = (1 << 256) - 1
 U384 = (1 << 384) - 1
+ABSOLUTE_TAIL_FORMULA_VERSION = 1
 
 
 def uint(value: int, maximum: int, name: str) -> int:
@@ -41,6 +42,8 @@ class Profile:
     tail_max: int
     dust_limit: int
     min_fee_per_kb: int
+    genesis_tail: int
+    genesis_work: int
 
     def __post_init__(self):
         for name in ("boot_shift", "tx_knee_shift", "ema_shift",
@@ -50,6 +53,10 @@ class Profile:
                 raise ValueError(f"{name} must be a nonnegative integer")
         for name in ("ema_min", "tail_min", "tail_max", "dust_limit", "min_fee_per_kb"):
             uint(getattr(self, name), U64, name)
+        uint(self.genesis_tail, U64, "genesis_tail")
+        uint(self.genesis_work, U256, "genesis_work")
+        if self.genesis_work == 0 or not self.tail_min <= self.genesis_tail <= self.tail_max:
+            raise ValueError("invalid absolute tail anchors")
         if self.tail_min > self.tail_max or self.min_fee_per_kb != 1000:
             raise ValueError("invalid tail bounds or P05 byte-fee constant")
 
@@ -96,7 +103,18 @@ def initialize_genesis(profile: Profile, *, bootstrap_reserve: int,
     state = MonetaryState(bootstrap_reserve, tail_subsidy, genesis_work, ema_block_cost)
     if not profile.tail_min <= state.tail_subsidy <= profile.tail_max:
         raise ValueError("initial tail outside profile bounds")
+    if state.tail_subsidy != profile.genesis_tail or state.prev_work != profile.genesis_work:
+        raise ValueError("genesis anchor mismatch")
     return state
+
+
+def absolute_tail(profile: Profile, work: int) -> int:
+    """Version 1: exact genesis-anchored square root, clamp before narrowing."""
+    work = uint(work, U256, "work")
+    if work == 0:
+        raise ValueError("work must be positive")
+    numerator = uint(profile.genesis_tail**2 * work, U384, "tail numerator")
+    return min(profile.tail_max, max(profile.tail_min, isqrt(numerator // profile.genesis_work)))
 
 
 def transaction_cost(linear_cost: int, profile: Profile) -> int:
@@ -173,6 +191,9 @@ def advance(profile: Profile, parent: MonetaryState, *, work: int,
     enforce = uint(enforce_block_cost, U128, "enforce_block_cost")
     if not profile.tail_min <= parent.tail_subsidy <= profile.tail_max:
         raise ValueError("parent tail outside profile bounds")
+    paid_tail = absolute_tail(profile, parent.prev_work)
+    if parent.tail_subsidy != paid_tail:
+        raise ValueError("parent cached tail mismatch")
     if enforce < account:
         raise ValueError("enforcement charge below frozen accounting charge")
     fees_and_tokens = tuple(tx.accounting(profile) for tx in transactions)
@@ -182,7 +203,7 @@ def advance(profile: Profile, parent: MonetaryState, *, work: int,
     burned_fees = remaining - remaining // 2
     bootstrap = max(1, parent.bootstrap_reserve >> profile.boot_shift) if parent.bootstrap_reserve else 0
     reserve = parent.bootstrap_reserve - bootstrap
-    subsidy = uint(bootstrap + parent.tail_subsidy, U64, "subsidy")
+    subsidy = uint(bootstrap + paid_tail, U64, "subsidy")
     entitlement = uint(subsidy + remaining // 2, U128, "coinbase entitlement")
     # 134-byte header, 4-byte tx count, all CompactSize frame prefixes.
     overhead = checked_sum((134, 4, uint(tx_frame_prefix_bytes, U64, "frame prefixes")),
@@ -201,9 +222,7 @@ def advance(profile: Profile, parent: MonetaryState, *, work: int,
     if payout > entitlement - required:
         raise ValueError("coinbase overclaims")
     underclaim = entitlement - payout
-    numerator = uint(parent.tail_subsidy**2 * work, U384, "tail numerator")
-    raw_tail = isqrt(numerator // parent.prev_work)
-    tail = min(profile.tail_max, max(profile.tail_min, raw_tail))
+    tail = absolute_tail(profile, work)
     ema = uint(parent.ema_block_cost - (parent.ema_block_cost >> profile.ema_shift)
                + (account >> profile.ema_shift), U64, "next EMA")
     explicit = checked_sum((coinbase_burn, *(tx.explicit_native_burn for tx in transactions)),

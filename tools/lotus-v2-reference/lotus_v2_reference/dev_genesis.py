@@ -23,7 +23,7 @@ if HEADER_TIME > MAX_TIME:
     raise ValueError("development header time exceeds MAX_TIME")
 
 # Existing monetary test profile. Not a mainnet genesis.
-DEVELOPMENT_GENESIS = Profile(2, 3, 2, 4, 3, 5, 2, 2000, 3, 1000)
+DEVELOPMENT_GENESIS = Profile(2, 3, 2, 4, 3, 5, 2, 2000, 3, 1000, 200, 9)
 # All-zero id for this development candidate. Not a mainnet chain id.
 DEVELOPMENT_CHAIN_ID = bytes(32)
 

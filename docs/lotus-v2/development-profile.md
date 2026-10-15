@@ -1,6 +1,6 @@
 # Separate Lotus V2 development profile proposal
 
-Status: **exact proposed test profile, 2026-10-15; not selected for deployment**. The maintainer authorized proposing a separate development-only profile. This document supplies its values, canonical parameter bytes, complete genesis and a funded first-block example. It does not change the existing zero-ChainID fixtures or adopt mainnet parameters. The candidate name is `lotus-v2-devnet-20261015-a`; balances are disposable test coins. Implementation and launch follow the review gates in [peering milestones](../plans/lotus-v2-peering-milestones.md).
+Status: **exact proposed test profile, 2026-10-15; not selected for deployment**. The maintainer authorized proposing a separate development-only profile. This document supplies its values, canonical parameter bytes, complete genesis and a funded first-block example. It does not change the existing zero-ChainID fixtures or adopt mainnet parameters. The candidate name is `lotus-v2-devnet-20261015-absolute1`; balances are disposable test coins. Implementation and launch follow the review gates in [peering milestones](../plans/lotus-v2-peering-milestones.md).
 
 “Separate” means a distinct ChainID, genesis, profile digest, network magic and datadir namespace. Nodes using this profile can agree on exactly which development chain to validate. Existing fixture values remain available for their original tests. After review and implementation, changing any consensus parameter requires a new development network name/ChainID and reset; it is not an in-place monetary upgrade. Mainnet D10–D14 stay open. The previously selected development P2P/RPC defaults are **10605/10604**.
 
@@ -8,7 +8,7 @@ Status: **exact proposed test profile, 2026-10-15; not selected for deployment**
 
 | Parameter | Proposed value and reason |
 | --- | --- |
-| Name | `lotus-v2-devnet-20261015-a`, a versioned disposable network |
+| Name | `lotus-v2-devnet-20261015-absolute1`, a versioned disposable network |
 | ChainID | `BLAKE3(ASCII("Lotus/v2/development-chain") || 00 || ASCII(name))`; chosen from the name alone, before genesis or profile hashing |
 | Header / transaction version | 2 / 7, exact P04/P01 layouts |
 | Genesis time | **1792022400**, `2026-10-15T00:00:00Z`, an ordinary UTC timestamp |
@@ -27,7 +27,7 @@ The future window is a proposed development eligibility policy with a named cloc
 
 ## 2. Monetary parameters and actual affordability
 
-All values below are atoms unless specified; `1 XPI = 1,000,000 atoms`. These are proposed development constants, not economic recommendations. The P06 **stored inductive tail recurrence** is unchanged: step n uses the parent's stored tail, then derives the next tail using the current and previous target work, integer square root and existing bounds.
+All values below are atoms unless specified; `1 XPI = 1,000,000 atoms`. These are proposed development constants, not economic recommendations. P06 uses absolute formula version 1: derive the paid tail from authenticated parent work with immutable anchors 1000000/2, and the next cache from current work. Cached tail/work must match this derivation.
 
 | Parameter | Exact proposed value |
 | --- | --- |
@@ -113,7 +113,7 @@ This model intentionally overcounts some tree work and reserves quadratic compar
 
 Genesis is a complete **240-byte block**: 134-byte header, u32 transaction count 1, one-byte frame length 101 and the 101-byte P01 coinbase. Coinbase version is 7, lock zero, one flags-02 input naming zero parent/height 0, sequence `ffffffff`, absent CoinbaseData, and one native `IS_BURN` output of value zero. Its one branch word is `H("Lotus/v2/development-genesis-note", ASCII(name))`, with no paths. This opaque commitment is legal C05 burn data; no new VM hash domain or instruction is added. It creates no UTXO and no genesis endowment. The committed initial MonetaryState is unchanged by genesis.
 
-Compute both coinbase identities, the P02 ordered count-bound transaction root and the state root of the empty UTXO map plus initial monetary record. Set height/previous ID to zero and size to 240. Search nonce from zero upward at the exact easy target. The first valid nonce is zero for this proposal. No genesis field depends on the profile digest or on a signature committing back to genesis. The separately published profile digest binds the selected parameter bytes; the outer manifest then binds that digest to exact genesis bytes and BlockID.
+Compute both coinbase identities, the P02 ordered count-bound transaction root and the state root of the empty UTXO map plus initial monetary record. Set height/previous ID to zero and size to 240. Search nonce from zero upward at the exact easy target. The nonce is the first valid value found by the documented deterministic search. No genesis field depends on the profile digest or on a signature committing back to genesis. The separately published profile digest binds the selected parameter bytes; the outer manifest then binds that digest to exact genesis bytes and BlockID.
 
 The first-block example uses time genesis+120, the genesis BlockID as parent and target work 2. Its coinbase has one ordinary spendable native output to the single-leaf script `PUSH32(79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798) CHECKSIG`, with one path `[0]`, and value 1,999,758. This is the public secp256k1 fixture key for scalar 1, deliberately usable by anyone running these tests. It is not a treasury or a required ongoing payout destination. Later miners choose their own legal output policies within the same total entitlement. No spend signature executes in this coinbase-only example.
 
@@ -123,7 +123,7 @@ The executable construction below is also the exact canonical parameter-file rec
 
 The ChainID is computed from the independent name before creating this stream. `profile_digest=BLAKE3(ASCII("Lotus/v2/p2p/profile") || 00 || parameter_bytes)`. Neither digest nor genesis hash occurs inside parameter bytes. Outer manifest JSON is human/machine reporting only: its JSON formatting is not a hashed consensus preimage.
 
-Proposed TCP magic is `d7 6c 32 a9`, matching the [peering proposal](peering.md); TCP 10605 and authenticated loopback RPC 10604 use the maintainer's defaults. Proposed future QUIC uses UDP 10605. Transport revision 1 and features `0x07` follow N02. Initially receive cap is 2 MiB, negotiable within 1..16 MiB as specified there. Transport values are outside the consensus parameter stream. No seeds, checkpoints, assumevalid, assumeutxo, production addresses or wallet prefix are selected. Use explicit loopback peers, separate namespace `lotus-v2-devnet-20261015-a`, and automatically allocated test ports rather than occupied defaults.
+Proposed TCP magic is `d7 6c 32 a9`, matching the [peering proposal](peering.md); TCP 10605 and authenticated loopback RPC 10604 use the maintainer's defaults. Proposed future QUIC uses UDP 10605. Transport revision 1 and features `0x07` follow N02. Initially receive cap is 2 MiB, negotiable within 1..16 MiB as specified there. Transport values are outside the consensus parameter stream. No seeds, checkpoints, assumevalid, assumeutxo, production addresses or wallet prefix are selected. Use explicit loopback peers, separate namespace `lotus-v2-devnet-20261015-absolute1`, and automatically allocated test ports rather than occupied defaults.
 
 The receive cap is local transport capacity, not a new consensus byte ceiling. Valid larger blocks can exceed the initial peering implementation; N05's availability follow-up remains required before general-network claims. Proposed operational defaults are a 10-second handshake timeout, 16 in-flight blocks per peer, 64 globally, 256 MiB mempool, 1 GiB received-body staging quota and disabled automatic public discovery. These limits are cancel/retry/refusal policy, never permanent-invalid cache keys. Peer scheduling/resource measurements and separate disk-magic/schema allocation remain implementation gates.
 
@@ -162,7 +162,7 @@ from lotus_v2_reference.vm import ASSIGNED, VMProfile
 
 def H(tag, payload):
     return blake3(tag.encode('ascii') + b'\0' + payload).digest()
-name = 'lotus-v2-devnet-20261015-a'
+name = 'lotus-v2-devnet-20261015-absolute1'
 chain = H('Lotus/v2/development-chain', name.encode('ascii'))
 t0 = int(datetime(2026, 10, 15, tzinfo=timezone.utc).timestamp())
 limit = 0x7fffff << 232
@@ -170,6 +170,7 @@ p = dict(name=name, chain_id=chain.hex(), header_version=2, transaction_version=
     genesis_time=t0, genesis_bits=0x207fffff, pow_limit=limit,
     spacing_seconds=120, half_life_seconds=172800, mtp_window=11,
     coinbase_maturity=2, boot_shift=20, bootstrap_reserve=1048576000000,
+    tail_formula_version=1, genesis_tail=1000000, genesis_work=2,
     initial_tail=1000000, tail_min=1000000, tail_max=1000000000,
     initial_work=2, initial_ema=65536, ema_min=65536, ema_shift=10,
     tx_knee_shift=17, linear_shift=64, quad_shift=32,
@@ -212,7 +213,7 @@ params = ('Lotus/v2/development-profile/1\n' + ''.join(
     f'{key}={p[key]}\n' for key in sorted(p))).encode('ascii')
 profile_digest = H('Lotus/v2/p2p/profile', params)
 TX = TxProfile(256,256,256,8192,64,8192,64)
-M = Profile(20,17,10,65536,64,32,1000000,1000000000,546,1000)
+M = Profile(20,17,10,65536,64,32,1000000,1000000000,546,1000,1000000,2)
 COST = BlockCostProfile(1,1,1,1)
 VM = VMProfile(8192,64,8192,256,256,1048576,64,100000000,1,
     {op:(lambda operands, results, b=b: b+sum(operands)+sum(results)) for op,b in base.items()})
@@ -289,20 +290,20 @@ manifest=dict(name=name,chain_id=chain.hex(),profile_digest=profile_digest.hex()
     netmagic='d76c32a9',tcp_port=10605,rpc_port=10604,
     future_eligibility_seconds=7200, receive_limit=2097152)
 print(json.dumps(manifest,sort_keys=True,indent=2))
-Path('lotus-v2-devnet-20261015-a.parameters').write_bytes(params)
-Path('lotus-v2-devnet-20261015-a.manifest.json').write_text(json.dumps(manifest,sort_keys=True,indent=2)+'\n')
+Path('lotus-v2-devnet-20261015-absolute1.parameters').write_bytes(params)
+Path('lotus-v2-devnet-20261015-absolute1.manifest.json').write_text(json.dumps(manifest,sort_keys=True,indent=2)+'\n')
 ```
 
 Expected artifact identifiers and measurements from that run:
 
-- `chain_id`: `63b5ddca6f75cbc64df5ff128cadd35e8658905595afc290b7698b2419b9745c`
-- `profile_digest`: `384bb3c6cd4f47eb84860ebb56f4ceafebaa6414ebf7f230e85682a2afe8fdd1`
-- `parameter_bytes`: `5750`
-- `parameter_sha256`: `13aa2c85aa178e331298cc72fb583ddcb1fa5c6e847ea7201bc81ae78d900c7c`
-- `genesis_id`: `9dc4d2fa9803bad48ae38ec24027bf55abff952f7e549a738986112848fab629`
+- `chain_id`: `00fee6074719a08dda1bfca8e1d3c9831338af36f493626348ff935551466b80`
+- `profile_digest`: `96d3b061700fd82efaa7189f51a8111880f74f0cbf4fa757e22cab16676b3ee5`
+- `parameter_bytes`: `5817`
+- `parameter_sha256`: `6ffd57a2ce8cd85cbd6b691e882b13fc16fc74a8ec78ad4967822f2a88311fb7`
+- `genesis_id`: `7b76718e1f49d8bbad83cc6db172d99c7ea1a377802b646975b2a7865eaaed4a`
 - `genesis_nonce`: `0`
-- `first_id`: `a7edf76ddaacd6dd59023be9468e6d0724482fd6f794ebc473d1edd54d66af2b`
-- `first_nonce`: `0`
+- `first_id`: `b92f6c5855ab2ca5db099d9fa4fd098a1cbf0a4f177ec1ca7521787069acc013`
+- `first_nonce`: `2`
 - `linear_cost`: `35665`
 - `envelope_cost`: `993`
 - `block_cost`: `46362`
@@ -314,11 +315,13 @@ Expected artifact identifiers and measurements from that run:
 Exact genesis block bytes (240 bytes, hexadecimal, digest order):
 
 ```text
-0000000000000000000000000000000000000000000000000000000000000000ffff7f208017d06a0000000000000000000002000000f0000000000000000000000000000000fbcbdc903ed556474f951ad2ffb14053eeadd3f3451ec53308b44654be79916334e7e326e15b8deb99d092ac6ec1fa9c866b43933e18beda3e45550df4857d8a010000006507000000000000000000000001000100000000000000000000000000000000000000000000000000000000000000000000000000ffffffff02000200000000000000000119bb83be3bee6d8f041e8e0923a87e9289c30ad8d13e48e72a8d5db3f260d03c00
+0000000000000000000000000000000000000000000000000000000000000000ffff7f208017d06a0000000000000000000002000000f0000000000000000000000000000000a07e5c4611c38eba225ab1b32225f094fae68388900b5ffe8d6e853fe50734e9372714a12df138b80f0d36967eb25e8649a9c5f9741fc28bdeea08ab13faf39a010000006507000000000000000000000001000100000000000000000000000000000000000000000000000000000000000000000000000000ffffffff020002000000000000000001882401d84d04d8d4bd2c90b32a5924cdc5d643c0cf7827f923cfac1506858d3400
 ```
 
 Exact first block bytes (242 bytes; this is an illustrative mined child, not a checkpoint):
 
 ```text
-9dc4d2fa9803bad48ae38ec24027bf55abff952f7e549a738986112848fab629ffff7f20f817d06a0000000000000000000002000000f20000000000000001000000000000006305c84d303ec1244c062ea1ad7311c5b7676e03ac6603123ee928b4f273d1ead3a19d0f6d0f7414bdf1ccaaf8eb38c46f28d2c3017ffedf71762fcc289006690100000067070000000000000000000000010001009dc4d2fa9803bad48ae38ec24027bf55abff952f7e549a738986112848fab62901000000ffffffff0200008e831e00000000000159128a347a29ca0178ac8ab3dd868a6a30ab185e9f51dad77c5737e4cbad0526010100
+7b76718e1f49d8bbad83cc6db172d99c7ea1a377802b646975b2a7865eaaed4affff7f20f817d06a0000020000000000000002000000f2000000000000000100000000000000fc65566329c5f2498b97ddedfdf06969a159c3543e606aca5b7b8c166c1629fcf1ef7c63096370db38913d7e4d7d26dd125941c4cd1c23985afcbe6253b9844b0100000067070000000000000000000000010001007b76718e1f49d8bbad83cc6db172d99c7ea1a377802b646975b2a7865eaaed4a01000000ffffffff0200008e831e00000000000159128a347a29ca0178ac8ab3dd868a6a30ab185e9f51dad77c5737e4cbad0526010100
 ```
+
+Absolute-tail migration (2026-10-15): this renamed proposal replaces prior `lotus-v2-devnet-20261015-a`. Historical ChainID `63b5ddca6f75cbc64df5ff128cadd35e8658905595afc290b7698b2419b9745c`, profile digest `384bb3c6cd4f47eb84860ebb56f4ceafebaa6414ebf7f230e85682a2afe8fdd1` and genesis `9dc4d2fa9803bad48ae38ec24027bf55abff952f7e549a738986112848fab629` describe that earlier recurrence proposal. The actual tested controller fixture has separate migration evidence.

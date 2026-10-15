@@ -808,12 +808,19 @@ def make_vectors() -> dict:
         assert log_q64(1 << e) == e << 64
     logs = [log_q64(x) for x in range(1, 1000)]
     assert logs == sorted(logs)
+    # These scalar inputs are explicit immutable genesis tail/work anchors.
     tails = []
     for subsidy, work, prior in ((100, 4, 1), (100, 1, 4), (101, 2, 3), (2**64-1, 2**255, 1)):
         q = subsidy * subsidy * work // prior
         r = isqrt(q)
         assert r*r*prior <= subsidy*subsidy*work < (r+1)*(r+1)*prior
         tails.append({'tail': str(subsidy), 'work': str(work), 'prior_work': str(prior), 'unclipped_next': str(r)})
+
+    absolute = lambda tail, anchor_work, work, lo, hi: min(hi, max(lo, isqrt(tail*tail*work//anchor_work)))
+    assert [absolute(100,10,w,1,1000) for w in (11,10)] == [104,100]
+    assert [absolute(100,10,w,1,150) for w in (40,10)] == [150,100]
+    assert [absolute(100,4,w,80,1000) for w in (1,4)] == [80,100]
+    assert absolute(2**64-1,1,2**256-1,1,2**64-1) == 2**64-1
 
     # P02/P06 56-byte MonetaryState, StateRoot commitment, telescoping bootstrap reserve (k_boot = 20), and additive S_n = B_n + T_n.
     atoms_per_xpi = 10**6

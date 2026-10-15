@@ -34,8 +34,9 @@ class DevelopmentGenesisTests(unittest.TestCase):
              DEVELOPMENT_GENESIS.ema_shift, DEVELOPMENT_GENESIS.ema_min,
              DEVELOPMENT_GENESIS.linear_shift, DEVELOPMENT_GENESIS.quad_shift,
              DEVELOPMENT_GENESIS.tail_min, DEVELOPMENT_GENESIS.tail_max,
-             DEVELOPMENT_GENESIS.dust_limit, DEVELOPMENT_GENESIS.min_fee_per_kb),
-            (2, 3, 2, 4, 3, 5, 2, 2000, 3, 1000),
+             DEVELOPMENT_GENESIS.dust_limit, DEVELOPMENT_GENESIS.min_fee_per_kb, DEVELOPMENT_GENESIS.genesis_tail,
+             DEVELOPMENT_GENESIS.genesis_work),
+            (2, 3, 2, 4, 3, 5, 2, 2000, 3, 1000, 200, 9),
         )
         fixture = DevelopmentGenesisFixture(header=Header(version=1))
         self.assertTrue(make_development_genesis(bytes(32), 0, fixture))

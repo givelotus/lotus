@@ -29,7 +29,7 @@ Open specification point for the implementation owner: P01 says to check additio
 
 `lotus_v2_reference.monetary` checks the candidate's 56-byte little-endian
 `MonetaryState`, genesis initialization boundary, bootstrap and adaptive-tail
-integer recurrences, parabolic cost and burn formulas, fee/token-burn split,
+bootstrap integer recurrence and absolute genesis-anchored tail, parabolic cost and burn formulas, fee/token-burn split,
 coinbase underclaim, explicit native burns (including coinbase burn outputs),
 and post-block EMA. It accepts an explicit frozen `Profile`;
 the small numbers in `tests/test_monetary.py` are **illustrative test inputs**,
@@ -69,3 +69,5 @@ serialized output amount is `u64`. Fees, token burns, coinbase total, and
 explicit burns in this reference therefore use checked `u128` aggregates;
 individual transaction/output framing and per-input `u64` amounts must be
 verified by the caller. The canonical subsidy and state fields retain `u64`.
+
+Absolute-tail formula version 1 requires explicit immutable `Profile.genesis_tail` and `Profile.genesis_work`. `advance` derives entitlement from parent work, rejects mismatched cached tails, and stores the absolute next tail. The 56-byte envelope is retained.

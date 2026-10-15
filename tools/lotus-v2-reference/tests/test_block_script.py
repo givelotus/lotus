@@ -17,7 +17,7 @@ from lotus_v2_reference.vm import UnsupportedFeature, VMError, branch_leaf_hash,
 CHAIN = bytes(range(32))
 BRANCH = branch_leaf(OP_TRUE)
 MONEY = MonetaryState(9, 200, 9, 4)
-MONETARY = Profile(2, 3, 2, 4, 3, 5, 2, 2000, 3, 1000)
+MONETARY = Profile(2, 3, 2, 4, 3, 5, 2, 2000, 3, 1000, 200, 9)
 FUNDING = bytes([0x71]) + bytes(31)
 
 
