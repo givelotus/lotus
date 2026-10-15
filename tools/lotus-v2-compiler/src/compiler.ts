@@ -2,8 +2,17 @@ import { blake3 } from '@noble/hashes/blake3';
 import { schnorr } from '@noble/curves/secp256k1';
 import { assertPortableName } from './names.js';
 
-/** UTF-8 (schema 2) or UTF-16 (schema 1) offsets. `module` is set only by package builds. */
-export type Span = { start: number; end: number; module?: string };
+/**
+ * UTF-8 (schema 2) or UTF-16 (schema 1) offsets; `end` is exclusive. `module` is set
+ * only by package builds and is part of emitted schema-2 source maps. `file` is the
+ * internal diagnostic identity of the source file (project-relative path or the
+ * single-file source name); it never appears in artifacts (see `artifactSpan`).
+ */
+export type Span = { start: number; end: number; module?: string; file?: string };
+/** The artifact/trace form of a span: exactly `{ start, end[, module] }`, in that key order. */
+export function artifactSpan(span: Span): Span {
+  return span.module !== undefined ? { start: span.start, end: span.end, module: span.module } : { start: span.start, end: span.end };
+}
 type Token = { text: string; span: Span };
 export type PaymentAst = { kind: 'Payment'; name: string; ownerName: string; signatureName: string; span: Span; ownerSpan: Span; checkSpan: Span };
 export type PaymentIr = { kind: 'checksig'; signature: 'Signature'; publicKey: 'PublicKey'; stackBefore: ['Signature']; stackAfter: ['Boolean']; span: Span };

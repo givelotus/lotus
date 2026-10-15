@@ -1,6 +1,7 @@
 /** Bounded, typed P03 contract frontend. No VM or consensus-validation code. */
-import { bytes, concat, cs, hex, tagged, unhex, uint, type Span } from './compiler.js';
+import { artifactSpan, bytes, concat, cs, hex, tagged, unhex, uint, type Span } from './compiler.js';
 import { schnorr } from '@noble/curves/secp256k1';
+import { DiagnosticBag, SourceManager, suggest, type DiagnosticExtra } from './diagnostics.js';
 import { assertPortableName } from './names.js';
 import { optimizeInstructions, type Instruction } from './optimizer.js';
 import { PromiseScheduler, type SchedulerEvent } from './scheduler.js';
@@ -35,49 +36,78 @@ export type CompileOptions = { contract: string; bindings: Record<string, Record
 const MAX_SOURCE = 65536, MAX_SCRIPT = 8192, MAX_OPS = 4096, MAX_EXPANSIONS = 256, MAX_METHODS = 16;
 const MAX_INFERENCE_VISITS = 8192;
 const MAX_DEPENDENCY_VISITS = 8192;
-function symbol(name: string): void { assertPortableName(name); }
+const INT_MIN = -(1n << 127n), INT_MAX = 1n << 127n;
+const INT_RANGE = 'Int exceeds signed 128-bit range';
+/** Notes for an inlined helper chain. The expansion stack itself is capped at 16. */
+const MAX_INLINE_NOTES = 16;
+type Frame = { name: string; at: Span };
+type Checked = ValueType | 'Error';
+function bindName(name: string, span: Span, bag: DiagnosticBag): void {
+  try { assertPortableName(name); }
+  catch (error) { bag.raise('E0115', (error as Error).message, span); }
+}
 function utf8Offset(source: string, utf16: number): number { return new TextEncoder().encode(source.slice(0, utf16)).length; }
-function lex(source: string): Token[] {
-  if (new TextEncoder().encode(source).length > MAX_SOURCE) throw new Error('source exceeds 65536 UTF-8 bytes');
+function spanAt(file: string, start: number, end: number): Span { return { start, end, file }; }
+function cover(start: Span, end: Span): Span {
+  return { start: start.start, end: end.end, ...(start.file !== undefined ? { file: start.file } : {}), ...(start.module !== undefined ? { module: start.module } : {}) };
+}
+function lex(source: string, file: string, bag: DiagnosticBag): Token[] {
+  const encoded = new TextEncoder().encode(source);
+  if (encoded.length > MAX_SOURCE) bag.raise('E0002', 'source exceeds 65536 UTF-8 bytes', spanAt(file, 0, encoded.length));
   const re = /\s+|\/\/[^\n]*|\/\*[\s\S]*?\*\/|==|!=|>=|<=|\+=|-=|&&|\|\||::|[A-Za-z_][A-Za-z_0-9]*|[0-9]+|[<>{}():;,.!+*\-=]/gy;
   const out: Token[] = []; let pos = 0;
   while (pos < source.length) {
     re.lastIndex = pos; const m = re.exec(source);
-    if (!m) throw new Error(`unsupported character at UTF-8 byte ${utf8Offset(source, pos)}`);
-    if (!/^\s|^\//.test(m[0])) out.push({ text: m[0], span: { start: utf8Offset(source, pos), end: utf8Offset(source, re.lastIndex) } });
+    if (!m) {
+      const cp = source.codePointAt(pos) ?? 0, width = cp > 0xffff ? 2 : 1;
+      const start = utf8Offset(source, pos);
+      if (source.startsWith('/*', pos)) bag.raise('E0003', 'unterminated block comment', spanAt(file, start, encoded.length));
+      if (source.startsWith('"', pos) || source.startsWith("'", pos)) bag.raise('E0004', 'unterminated string literal', spanAt(file, start, encoded.length));
+      bag.raise('E0001', 'unsupported character', spanAt(file, start, utf8Offset(source, pos + width)));
+    }
+    if (!/^\s|^\//.test(m[0])) out.push({ text: m[0], span: spanAt(file, utf8Offset(source, pos), utf8Offset(source, re.lastIndex)) });
     pos = re.lastIndex;
   }
-  out.push({ text: '<eof>', span: { start: utf8Offset(source, pos), end: utf8Offset(source, pos) } });
+  out.push({ text: '<eof>', span: spanAt(file, utf8Offset(source, pos), utf8Offset(source, pos)) });
   return out;
 }
 class Parser {
   private i = 0;
-  constructor(private readonly tokens: Token[]) {}
+  constructor(private readonly tokens: Token[], private readonly bag: DiagnosticBag) {}
   private peek(): Token { return this.tokens[this.i]!; }
-  private take(expected?: string): Token { const t = this.peek(); if (expected && t.text !== expected) throw new Error(`expected ${expected} at UTF-8 byte ${t.span.start}`); this.i++; return t; }
-  private ident(): Token { const t = this.take(); if (!/^[A-Za-z_][A-Za-z_0-9]*$/.test(t.text)) throw new Error(`expected identifier at UTF-8 byte ${t.span.start}`); return t; }
+  private fatal(code: string, message: string, span?: Span): never { this.bag.raise(code, message, span); }
+  private take(expected?: string): Token {
+    const t = this.peek();
+    if (expected && t.text !== expected) this.fatal('E0101', `expected ${expected}`, t.span);
+    this.i++; return t;
+  }
+  private ident(): Token { const t = this.take(); if (!/^[A-Za-z_][A-Za-z_0-9]*$/.test(t.text)) this.fatal('E0102', 'expected identifier', t.span); return t; }
   private type(): ValueType {
     const t = this.ident();
-    if (t.text === 'Bytes') { this.take('('); const n = this.take(); this.take(')'); if (!/^[0-9]+$/.test(n.text) || Number(n.text) < 1 || Number(n.text) > 8192) throw new Error(`Bytes bound 1..8192 at UTF-8 byte ${n.span.start}`); return `Bytes(${Number(n.text)})`; }
+    if (t.text === 'Bytes') {
+      this.take('('); const n = this.take(); this.take(')');
+      if (!/^[0-9]+$/.test(n.text) || Number(n.text) < 1 || Number(n.text) > 8192) this.fatal('E0104', 'Bytes bound 1..8192', n.span);
+      return `Bytes(${Number(n.text)})`;
+    }
     if (['PublicKey','Signature','Bytes32','Int','Amount','TokenId','Bool','MethodLeafHash','ContractRootHash'].includes(t.text)) return t.text as ValueType;
-    throw new Error(`unsupported type ${t.text} at UTF-8 byte ${t.span.start}`);
+    this.fatal('E0103', `unsupported type ${t.text}`, t.span);
   }
   private params(close: string): Param[] {
     const out: Param[] = [];
     if (this.peek().text !== close) while (true) {
       const name = this.ident(); this.take(':'); const type = this.type();
-      symbol(name.text);
-      if (out.some(x => x.name === name.text)) throw new Error(`duplicate parameter ${name.text}`);
+      bindName(name.text, name.span, this.bag);
+      if (out.some(x => x.name === name.text)) this.fatal('E0201', `duplicate parameter ${name.text}`, name.span);
       out.push({ name: name.text, type, span: name.span });
       if (this.peek().text !== ',') break; this.take(',');
     }
     this.take(close); return out;
   }
   private expression(min = 0, depth = 0): Expr {
-    if (depth > 64) throw new Error('expression depth exceeded');
+    if (depth > 64) this.fatal('E0105', 'expression depth exceeded', this.peek().span);
     let left: Expr;
     const start = this.peek();
-    if (start.text === '!' || start.text === '-') { this.take(); const inner = this.expression(7,depth + 1); left = { kind: 'unary', value: start.text, right: inner, span: { start: start.span.start, end: inner.span.end } }; }
+    if (start.text === '!' || start.text === '-') { this.take(); const inner = this.expression(7,depth + 1); left = { kind: 'unary', value: start.text, right: inner, span: cover(start.span, inner.span) }; }
     else if (start.text === '(') { this.take(); left = this.expression(0,depth + 1); this.take(')'); }
     else if (/^[0-9]+$/.test(start.text)) { this.take(); left = { kind: 'number', value: start.text, span: start.span }; }
     else if (start.text === 'true' || start.text === 'false') { this.take(); left = { kind: 'bool', value: start.text, span: start.span }; }
@@ -86,101 +116,111 @@ class Parser {
       if (this.peek().text === '::') {
         // Module-alias call `alias::helper(...)`; only meaningful in package builds.
         this.take('::'); value += '::' + this.ident().text;
-        if (this.peek().text !== '(') throw new Error(`qualified name ${value} must be called at UTF-8 byte ${name.span.start}`);
+        if (this.peek().text !== '(') this.fatal('E0120', `qualified name ${value} must be called`, name.span);
       }
       while (this.peek().text === '.') { this.take('.'); value += '.' + this.ident().text; }
       if (this.peek().text === '(') {
         this.take('('); const args: Expr[] = [];
         if (this.peek().text !== ')') while (true) { args.push(this.expression(0,depth + 1)); if (this.peek().text !== ',') break; this.take(','); }
-        const end = this.take(')'); left = { kind: 'call', value, args, span: { start: name.span.start, end: end.span.end } };
-      } else left = { kind: 'name', value, span: { start: name.span.start, end: this.tokens[this.i - 1]!.span.end } };
+        const end = this.take(')'); left = { kind: 'call', value, args, span: cover(name.span, end.span) };
+      } else left = { kind: 'name', value, span: cover(name.span, this.tokens[this.i - 1]!.span) };
     }
     const precedence: Record<string, number> = { '||': 1, '&&': 2, '==': 3, '!=': 3, '<': 4, '>': 4, '<=':4, '>=':4, '+': 5, '-': 5, '*': 6 };
     while ((precedence[this.peek().text] ?? 0) >= min && precedence[this.peek().text]) {
       const op = this.take(); const right = this.expression(precedence[op.text]! + 1,depth + 1);
-      left = { kind: 'binary', value: op.text, left, right, span: { start: left.span.start, end: right.span.end } };
+      left = { kind: 'binary', value: op.text, left, right, span: cover(left.span, right.span) };
     }
     return left;
   }
   private statements(depth = 0, loops = 0): Stmt[] {
-    if (depth > 16) throw new Error('control nesting depth exceeded');
+    if (depth > 16) this.fatal('E0106', 'control nesting depth exceeded', this.peek().span);
     this.take('{'); const out: Stmt[] = [];
     while (this.peek().text !== '}') {
       const start = this.take();
-      if (start.text === 'require') { this.take('('); const expr = this.expression(); this.take(')'); const end = this.take(';'); out.push({ kind: 'require', expr, span: { start: start.span.start, end: end.span.end } }); }
-      else if (start.text === 'if') { const expr = this.expression(); const then = this.statements(depth + 1,loops); const otherwise = this.peek().text === 'else' ? (this.take('else'), this.statements(depth + 1,loops)) : []; out.push({ kind: 'if', expr, then, otherwise, span: { start: start.span.start, end: this.tokens[this.i - 1]!.span.end } }); }
-      else if (start.text === 'for') { if (loops >= 2) throw new Error('loop nesting exceeds two'); const variable = this.ident(); this.take('in'); const collection = this.ident().text + '.' + (this.take('.'), this.ident().text); if (collection !== 'tx.inputs' && collection !== 'tx.outputs') throw new Error(`unsupported collection ${collection}`); const then = this.statements(depth + 1,loops + 1); out.push({ kind: 'for', variable: variable.text, collection, then, span: { start: start.span.start, end: this.tokens[this.i - 1]!.span.end } }); }
-      else if (/^[A-Za-z_][A-Za-z_0-9]*$/.test(start.text)) { const op = this.take(); if (!['=','+=','-='].includes(op.text)) throw new Error(`unsupported assignment ${op.text}`); const expr = this.expression(); const end = this.take(';'); out.push({ kind:'assign', variable:start.text, assignOp:op.text as '='|'+='|'-=', expr, span:{start:start.span.start,end:end.span.end} }); }
-      else throw new Error(`unsupported statement ${start.text} at UTF-8 byte ${start.span.start}`);
-      if (out.length > 256) throw new Error('statement budget exceeded');
+      if (start.text === 'require') { this.take('('); const expr = this.expression(); this.take(')'); const end = this.take(';'); out.push({ kind: 'require', expr, span: cover(start.span, end.span) }); }
+      else if (start.text === 'if') { const expr = this.expression(); const then = this.statements(depth + 1,loops); const otherwise = this.peek().text === 'else' ? (this.take('else'), this.statements(depth + 1,loops)) : []; out.push({ kind: 'if', expr, then, otherwise, span: cover(start.span, this.tokens[this.i - 1]!.span) }); }
+      else if (start.text === 'for') {
+        if (loops >= 2) this.fatal('E0108', 'loop nesting exceeds two', start.span);
+        const variable = this.ident(); this.take('in'); const collection = this.ident().text + '.' + (this.take('.'), this.ident().text);
+        if (collection !== 'tx.inputs' && collection !== 'tx.outputs') this.fatal('E0109', `unsupported collection ${collection}`, start.span);
+        const then = this.statements(depth + 1,loops + 1);
+        out.push({ kind: 'for', variable: variable.text, collection, then, span: cover(start.span, this.tokens[this.i - 1]!.span) });
+      }
+      else if (/^[A-Za-z_][A-Za-z_0-9]*$/.test(start.text)) {
+        const op = this.take(); if (!['=','+=','-='].includes(op.text)) this.fatal('E0110', `unsupported assignment ${op.text}`, op.span);
+        const expr = this.expression(); const end = this.take(';');
+        out.push({ kind:'assign', variable:start.text, assignOp:op.text as '='|'+='|'-=', expr, span: cover(start.span, end.span) });
+      }
+      else this.fatal('E0111', `unsupported statement ${start.text}`, start.span);
+      if (out.length > 256) this.fatal('E0107', 'statement budget exceeded', start.span);
     }
     this.take('}'); return out;
   }
   private importDecl(start: Token): ImportDecl {
     const target = this.take();
-    if (target.text !== 'package' && !/^[A-Za-z_][A-Za-z_0-9]*$/.test(target.text)) throw new Error(`expected dependency alias or package at UTF-8 byte ${target.span.start}`);
-    if (target.text !== 'package') symbol(target.text);
-    const path: string[] = []; let items: ImportDecl['items']; let pathEnd = target.span.end;
+    if (target.text !== 'package' && !/^[A-Za-z_][A-Za-z_0-9]*$/.test(target.text)) this.fatal('E0112', 'expected dependency alias or package', target.span);
+    if (target.text !== 'package') bindName(target.text, target.span, this.bag);
+    const path: string[] = []; let items: ImportDecl['items']; let pathEnd = target.span;
     while (this.peek().text === '::') {
       this.take('::');
       if (this.peek().text === '{') {
         this.take('{'); items = [];
         while (this.peek().text !== '}') {
-          const name = this.ident(); symbol(name.text); let local = name;
-          if (this.peek().text === 'as') { this.take('as'); local = this.ident(); symbol(local.text); }
-          items.push({ name: name.text, local: local.text, span: { start: name.span.start, end: local.span.end } });
+          const name = this.ident(); bindName(name.text, name.span, this.bag); let local = name;
+          if (this.peek().text === 'as') { this.take('as'); local = this.ident(); bindName(local.text, local.span, this.bag); }
+          items.push({ name: name.text, local: local.text, span: cover(name.span, local.span) });
           if (this.peek().text !== ',') break; this.take(',');
         }
         this.take('}');
-        if (!items.length) throw new Error(`empty import list at UTF-8 byte ${start.span.start}`);
+        if (!items.length) this.fatal('E0112', 'empty import list', start.span);
         break;
       }
-      const segment = this.ident(); path.push(segment.text); pathEnd = segment.span.end;
+      const segment = this.ident(); path.push(segment.text); pathEnd = segment.span;
     }
-    if (!path.length) throw new Error(`import requires a module path at UTF-8 byte ${start.span.start}`);
+    if (!path.length) this.fatal('E0112', 'import requires a module path', start.span);
     let moduleAlias: ImportDecl['moduleAlias'];
     if (!items) {
-      if (this.peek().text !== 'as') throw new Error(`import requires ::{names} or 'as alias' at UTF-8 byte ${this.peek().span.start}`);
-      this.take('as'); const alias = this.ident(); symbol(alias.text); moduleAlias = { name: alias.text, span: alias.span };
+      if (this.peek().text !== 'as') this.fatal('E0112', "import requires ::{names} or 'as alias'", this.peek().span);
+      this.take('as'); const alias = this.ident(); bindName(alias.text, alias.span, this.bag); moduleAlias = { name: alias.text, span: alias.span };
     }
     const end = this.take(';');
-    return { target: target.text, targetSpan: target.span, path, pathSpan: { start: target.span.start, end: pathEnd },
-      span: { start: start.span.start, end: end.span.end }, ...(items ? { items } : {}), ...(moduleAlias ? { moduleAlias } : {}) };
+    return { target: target.text, targetSpan: target.span, path, pathSpan: cover(target.span, pathEnd),
+      span: cover(start.span, end.span), ...(items ? { items } : {}), ...(moduleAlias ? { moduleAlias } : {}) };
   }
   parse(requireContract = true): Program {
     const helpers = new Map<string, Helper>(); const contracts = new Map<string, Contract>(); const imports: ImportDecl[] = [];
     while (this.peek().text !== '<eof>') {
       let start = this.take();
       if (start.text === 'import') {
-        if (helpers.size || contracts.size) throw new Error(`import must precede declarations at UTF-8 byte ${start.span.start}`);
+        if (helpers.size || contracts.size) this.fatal('E0113', 'import must precede declarations', start.span);
         imports.push(this.importDecl(start)); continue;
       }
       let visibility: Visibility = 'private';
       if (start.text === 'export' || start.text === 'package') {
         visibility = start.text;
-        if (this.peek().text !== 'function') throw new Error(`${start.text} applies only to helper functions at UTF-8 byte ${start.span.start}`);
-        const modifier = start; start = this.take(); start = { text: start.text, span: { start: modifier.span.start, end: start.span.end } };
+        if (this.peek().text !== 'function') this.fatal('E0114', `${start.text} applies only to helper functions`, start.span);
+        const modifier = start; start = this.take(); start = { text: start.text, span: cover(modifier.span, start.span) };
       }
       if (start.text === 'function') {
         const name = this.ident(); this.take('('); const params = this.params(')'); this.take(':'); const result = this.type(); this.take('{'); this.take('return'); const body = this.expression(); this.take(';'); const end = this.take('}');
-        symbol(name.text);
-        if (helpers.has(name.text)) throw new Error(`duplicate helper ${name.text}`);
-        helpers.set(name.text, { name: name.text, params, result, body, span: { start: start.span.start, end: end.span.end }, visibility });
+        bindName(name.text, name.span, this.bag);
+        if (helpers.has(name.text)) this.fatal('E0202', `duplicate helper ${name.text}`, name.span);
+        helpers.set(name.text, { name: name.text, params, result, body, span: cover(start.span, end.span), visibility });
       } else if (start.text === 'contract' || start.text === 'token') {
-        const name = this.ident(); symbol(name.text); const params = this.peek().text === '<' ? (this.take('<'), this.params('>')) : [];
+        const name = this.ident(); bindName(name.text, name.span, this.bag); const params = this.peek().text === '<' ? (this.take('<'), this.params('>')) : [];
         this.take('{'); const methods: Method[] = [];
         while (this.peek().text !== '}') {
-          this.take('function'); const method = this.ident(); symbol(method.text); this.take('('); const args = this.params(')'); const body = this.statements();
-          if (!body.length || methods.some(x => x.name.toLowerCase() === method.text.toLowerCase())) throw new Error(`empty or duplicate method ${method.text}`);
-          if (start.text === 'token' && (args[0]?.type !== 'Amount')) throw new Error(`token method ${method.text} first parameter must be Amount`);
-          methods.push({ name: method.text, params: args, body, span: { start: method.span.start, end: this.tokens[this.i - 1]!.span.end } });
-          if (methods.length > MAX_METHODS) throw new Error('more than 16 methods');
+          this.take('function'); const method = this.ident(); bindName(method.text, method.span, this.bag); this.take('('); const args = this.params(')'); const body = this.statements();
+          if (!body.length || methods.some(x => x.name.toLowerCase() === method.text.toLowerCase())) this.fatal('E0203', `empty or duplicate method ${method.text}`, method.span);
+          if (start.text === 'token' && (args[0]?.type !== 'Amount')) this.fatal('E0118', `token method ${method.text} first parameter must be Amount`, args[0]?.span ?? method.span);
+          methods.push({ name: method.text, params: args, body, span: cover(method.span, this.tokens[this.i - 1]!.span) });
+          if (methods.length > MAX_METHODS) this.fatal('E0117', 'more than 16 methods', method.span);
         }
-        const end = this.take('}'); if (!methods.length || contracts.has(name.text)) throw new Error(`empty or duplicate contract ${name.text}`);
-        contracts.set(name.text, { name: name.text, kind:start.text as 'contract'|'token', params, methods, span: { start: start.span.start, end: end.span.end } });
-      } else throw new Error(`expected contract or helper at UTF-8 byte ${start.span.start}`);
+        const end = this.take('}'); if (!methods.length || contracts.has(name.text)) this.fatal('E0204', `empty or duplicate contract ${name.text}`, name.span);
+        contracts.set(name.text, { name: name.text, kind:start.text as 'contract'|'token', params, methods, span: cover(start.span, end.span) });
+      } else this.fatal('E0101', 'expected contract or helper', start.span);
     }
-    if (requireContract && !contracts.size) throw new Error('source has no contract');
+    if (requireContract && !contracts.size) this.fatal('E0116', 'source has no contract', this.peek().span);
     return { helpers, contracts, imports };
   }
 }
@@ -227,7 +267,7 @@ function tree(leaves: { name: string; hash: Uint8Array }[]): Tree {
 
 type EVar = { kind: 'argument'; type: ValueType; index: number } | { kind:'local'; type: ValueType; index:number } |
   { kind: 'constant'; type: ValueType; data: Uint8Array } |
-  { kind: 'substitute'; type: ValueType; expr: Expr; env: Env; origin: Span };
+  { kind: 'substitute'; type: ValueType; expr: Expr; env: Env; origin: Span; frames: Frame[] };
 type Env = Map<string, EVar>;
 type Compiled = { script: Uint8Array; leaf: Uint8Array; map: MethodArtifact['sourceMap']; resources: MethodArtifact['staticResources'] };
 const OPCODES = { VERIFY: 0x65, IF: 0x61, ELSE: 0x63, ENDIF: 0x64, ENUMERATE_INPUTS:0x67, ENUMERATE_OUTPUTS:0x68, ENDENUMERATE:0x6a, DROP: 0x79, PICK: 0x7d, ROLL:0x7e,
@@ -239,17 +279,20 @@ class Emitter {
   private length = 0;
   readonly map: MethodArtifact['sourceMap'] = [];
   height: number; maxHeight: number; opcodes = 0; signatureChecks = 0; expansions = 0;
-  constructor(readonly args: number) { this.height = args; this.maxHeight = args; }
+  /** Inline chain of the expression currently being lowered. */
+  frames: Frame[] = [];
+  constructor(readonly args: number, private readonly fail: (code: string, message: string, span: Span, frames: Frame[]) => never) { this.height = args; this.maxHeight = args; }
   private append(data: Uint8Array, op: string, span: Span, origin?: Span, delta = 0, foldable = false): void {
-    if (this.length + data.length > MAX_SCRIPT) throw new Error('MAX_SCRIPT_BYTES exceeded');
-    if (++this.opcodes > MAX_OPS) throw new Error('opcode budget exceeded');
-    this.map.push({ source: span, ...(origin ? { expandedFrom: origin } : {}), byteStart: this.length, byteEnd: this.length + data.length, op });
+    if (this.length + data.length > MAX_SCRIPT) this.fail('E0701', 'MAX_SCRIPT_BYTES exceeded', span, this.frames);
+    if (++this.opcodes > MAX_OPS) this.fail('E0702', 'opcode budget exceeded', span, this.frames);
+    // Artifacts and traces keep `{start,end[,module]}` only; `file` is diagnostic-only.
+    this.map.push({ source: artifactSpan(span), ...(origin ? { expandedFrom: artifactSpan(origin) } : {}), byteStart: this.length, byteEnd: this.length + data.length, op });
     this.instructions.push({ wire: data, map: this.map.at(-1)!, delta, foldable }); this.length += data.length; this.height += delta;
-    if (this.height < 0) throw new Error('compiler stack underflow');
+    if (this.height < 0) this.fail('E9001', 'compiler stack underflow', span, this.frames);
     this.maxHeight = Math.max(this.maxHeight, this.height);
   }
   push(data: Uint8Array, span: Span, origin?: Span, foldable = false): void {
-    if (data.length > 8192) throw new Error('MAX_ELEMENT_BYTES exceeded');
+    if (data.length > 8192) this.fail('E0707', 'MAX_ELEMENT_BYTES exceeded', span, this.frames);
     const wire = data.length > 0 && data.length <= 75 ? concat(Uint8Array.of(data.length), data) : concat(Uint8Array.of(0x4c), bytes(data));
     this.append(wire, data.length <= 75 && data.length > 0 ? `PUSH_${data.length}` : 'PUSHDATA', span, origin, 1, foldable);
   }
@@ -269,10 +312,10 @@ class Emitter {
     for (const entry of entries) {
       map.push({ ...entry.map, byteStart: offset, byteEnd: offset + entry.wire.length });
       offset += entry.wire.length;
-      if (!structured) { height += entry.delta; if (height < 0) throw new Error('optimized compiler stack underflow'); maxStackItems = Math.max(maxStackItems, height); }
+      if (!structured) { height += entry.delta; if (height < 0) this.fail('E9001', 'optimized compiler stack underflow', entry.map.source, this.frames); maxStackItems = Math.max(maxStackItems, height); }
     }
     if (structured) { height = this.height; maxStackItems = this.maxHeight; }
-    if (height !== 1) throw new Error('optimized method final stack mismatch');
+    if (height !== 1) this.fail('E9001', 'optimized method final stack mismatch', map.at(-1)?.source ?? { start: 0, end: 0 }, this.frames);
     return { script: concat(...entries.map(entry => entry.wire)), map,
       resources: { scriptBytes: offset, opcodes: entries.length, maxStackItems } };
   }
@@ -289,24 +332,45 @@ class Compiler {
   private rootMemo = new Map<string, Tree>();
   private rootActive = new Set<string>();
   private bindingMemo = new Map<string, Map<string, { bytes: Uint8Array; binding: Binding }>>();
-  constructor(private readonly program: Program, private readonly options: CompileOptions) {}
-  private contract(name: string): Contract { const c = this.program.contracts.get(name); if (!c) throw new Error(`unknown contract ${name}`); return c; }
+  constructor(private readonly program: Program, private readonly options: CompileOptions, private readonly diag: DiagnosticBag) {}
+  /** Record a diagnostic, including the inline-expansion chain, and keep going until the cap. */
+  private problem(code: string, message: string, span: Span | undefined, frames: Frame[] = [], extra: DiagnosticExtra = {}): 'Error' {
+    const related = frames.slice(-MAX_INLINE_NOTES).reverse().map(frame => ({
+      file: frame.at.file ?? this.diag.fallbackFile, span: frame.at, message: `in expansion of helper ${frame.name} called here`,
+    }));
+    this.diag.report(code, message, span, { ...extra, related: [...(extra.related ?? []), ...related] });
+    return 'Error';
+  }
+  private fatal(code: string, message: string, span?: Span, frames: Frame[] = [], extra: DiagnosticExtra = {}): never {
+    this.problem(code, message, span, frames, extra); this.diag.finish();
+  }
+  private hint(name: string, scope?: Env): DiagnosticExtra {
+    const best = suggest(name, [...(scope ? scope.keys() : []), ...this.program.helpers.keys(), ...this.program.contracts.keys(),
+      'checksig', 'sha256', 'hash256', 'blake3', 'leaf_hash', 'contract_root', 'merkle_root']);
+    return best ? { help: `did you mean '${best}'?` } : {};
+  }
+  private contract(name: string, span?: Span): Contract { const c = this.program.contracts.get(name); if (!c) this.fatal(span ? 'E0303' : 'E0605', `unknown contract ${name}`, span ?? this.program.contracts.values().next().value?.span); return c; }
   private bound(name: string): Map<string, { bytes: Uint8Array; binding: Binding }> {
     const old = this.bindingMemo.get(name); if (old) return old;
     const c = this.contract(name); const input = this.options.bindings[name] ?? (c.params.length === 0 ? {} : undefined);
-    if (!input || Object.keys(input).length !== c.params.length) throw new Error(`constructor arity mismatch for ${name}`);
+    if (!input || Object.keys(input).length !== c.params.length) this.fatal('E0602', `constructor arity mismatch for ${name}`, c.span);
     const out = new Map<string, { bytes: Uint8Array; binding: Binding }>();
     for (const p of c.params) {
-      if (!Object.hasOwn(input,p.name)) throw new Error(`missing constructor binding ${name}.${p.name}`);
-      out.set(p.name,literal(input[p.name]!,p.type));
+      if (!Object.hasOwn(input, p.name)) this.fatal('E0603', `missing constructor binding ${name}.${p.name}`, p.span);
+      try { out.set(p.name, literal(input[p.name]!, p.type)); }
+      catch (error) { this.fatal('E0604', (error as Error).message, p.span); }
     }
-    this.bindingMemo.set(name,out); return out;
+    this.bindingMemo.set(name, out); return out;
   }
-  private findMethod(contract: string, method: string): Method { const m = this.contract(contract).methods.find(x => x.name === method); if (!m) throw new Error(`unknown method ${contract}.${method}`); return m; }
+  private findMethod(contract: string, method: string, span?: Span): Method {
+    const m = this.contract(contract, span).methods.find(x => x.name === method);
+    if (!m) this.fatal('E0304', `unknown method ${contract}.${method}`, span);
+    return m;
+  }
   private dependencies(method: Method): string[] {
     const found = new Set<string>();
     const scan = (expr: Expr, target: Set<string>, helpers: string[]): void => {
-      if (++this.dependencyVisits > MAX_DEPENDENCY_VISITS) throw new Error('dependency scan visit budget exceeded');
+      if (++this.dependencyVisits > MAX_DEPENDENCY_VISITS) this.fatal('E0705', 'dependency scan visit budget exceeded', expr.span);
       if (expr.kind === 'call') {
         const args = expr.args ?? [];
         if (expr.value === 'leaf_hash' && args.length === 1 && args[0]?.kind === 'name') {
@@ -322,7 +386,7 @@ class Compiler {
           if (helper && !helpers.includes(helper.name)) {
             let dependencies = this.helperDependencies.get(helper.name);
             if (!dependencies) {
-              if (helpers.length >= 16) throw new Error('helper dependency depth exceeded');
+              if (helpers.length >= 16) this.fatal('E0706', 'helper dependency depth exceeded', expr.span);
               const inner = new Set<string>();
               scan(helper.body, inner, [...helpers, helper.name]);
               dependencies = [...inner];
@@ -359,10 +423,10 @@ class Compiler {
     for (const contract of this.program.contracts.values()) {
       for (const method of contract.methods) {
         const name = `leaf:${contract.name}.${method.name}`;
-        scheduler.register(name, () => this.dependencies(method), () => execute(name, () => { this.method(contract.name, method.name); }), method.span);
+        scheduler.register(name, () => this.dependencies(method), () => execute(name, () => { this.method(contract.name, method.name); }), artifactSpan(method.span));
       }
       const name = `root:${contract.name}`;
-      scheduler.register(name, contract.methods.map(method => `leaf:${contract.name}.${method.name}`), () => execute(name, () => { this.root(contract.name); }), contract.span);
+      scheduler.register(name, contract.methods.map(method => `leaf:${contract.name}.${method.name}`), () => execute(name, () => { this.root(contract.name); }), artifactSpan(contract.span));
     }
     await scheduler.run(`root:${this.options.contract}`);
     this.enforceScheduledJobs = false;
@@ -370,19 +434,25 @@ class Compiler {
   }
   private root(name: string): Tree {
     const old = this.rootMemo.get(name); if (old) return old;
-    if (this.enforceScheduledJobs && this.scheduledJob !== `root:${name}`) throw new Error(`unscheduled root dependency ${name}`);
-    if (this.rootActive.has(name)) throw new Error(`contract-root dependency cycle at ${name}`);
+    if (this.enforceScheduledJobs && this.scheduledJob !== `root:${name}`) this.fatal('E9001', `unscheduled root dependency ${name}`, this.contract(name).span);
+    if (this.rootActive.has(name)) this.fatal('E0801', `contract-root dependency cycle at ${name}`, this.contract(name).span);
     this.rootActive.add(name);
     try {
       this.bound(name);
       const leaves = this.contract(name).methods.map(m => ({ name: m.name, hash: this.method(name,m.name).leaf }));
-      const result = tree(leaves); this.rootMemo.set(name,result); return result;
+      let result: Tree;
+      try { result = tree(leaves); }
+      catch (error) {
+        const message = (error as Error).message;
+        this.fatal(message === 'duplicate method leaf' ? 'E0207' : 'E0119', message, this.contract(name).span);
+      }
+      this.rootMemo.set(name, result); return result;
     } finally { this.rootActive.delete(name); }
   }
   private method(contractName: string, methodName: string): Compiled {
     const key = `${contractName}.${methodName}`; const old = this.methodMemo.get(key); if (old) return old;
-    if (this.enforceScheduledJobs && this.scheduledJob !== `leaf:${key}`) throw new Error(`unscheduled leaf dependency ${key}`);
-    if (this.methodActive.has(key)) throw new Error(`method-leaf dependency cycle at ${key}`);
+    if (this.enforceScheduledJobs && this.scheduledJob !== `leaf:${key}`) this.fatal('E9001', `unscheduled leaf dependency ${key}`, this.findMethod(contractName, methodName).span);
+    if (this.methodActive.has(key)) this.fatal('E0801', `method-leaf dependency cycle at ${key}`, this.findMethod(contractName, methodName).span);
     this.methodActive.add(key);
     try {
       const method = this.findMethod(contractName,methodName); const c = this.contract(contractName); const bindings = this.bound(contractName);
@@ -390,198 +460,240 @@ class Compiler {
       for (const p of c.params) env.set(p.name,{ kind: 'constant', type: p.type, data: bindings.get(p.name)!.bytes });
       const stackParams = c.kind === 'token' ? [...method.params.slice(1),method.params[0]!] : method.params;
       for (const [index,p] of stackParams.entries()) {
-        if (env.has(p.name)) throw new Error(`method parameter ${p.name} shadows constructor`);
+        if (env.has(p.name)) this.fatal('E0205', `method parameter ${p.name} shadows constructor`, p.span);
         env.set(p.name,{ kind: 'argument', type: p.type, index });
       }
-      const emitter = new Emitter(stackParams.length);
+      const emitter = new Emitter(stackParams.length, (code, message, span, frames) => this.fatal(code, message, span, frames));
       const helperStack: string[] = [];
       let inferenceVisits = 0;
-      const infer = (expr: Expr, scope: Env, active: string[] = []): ValueType => {
-        if (++inferenceVisits > MAX_INFERENCE_VISITS) throw new Error('type inference visit budget exceeded');
-        if (expr.kind === 'number') { encodedInt(BigInt(expr.value!)); return 'Int'; }
+      const infer = (expr: Expr, scope: Env, active: string[] = [], frames: Frame[] = []): Checked => {
+        if (++inferenceVisits > MAX_INFERENCE_VISITS) this.fatal('E0704', 'type inference visit budget exceeded', expr.span, frames);
+        if (expr.kind === 'number') { const n = BigInt(expr.value!); if (n < INT_MIN || n >= INT_MAX) return this.problem('E0413', INT_RANGE, expr.span, frames); return 'Int'; }
         if (expr.kind === 'bool') return 'Bool';
         if (expr.kind === 'name') {
           if (expr.value === 'this.root') return c.kind === 'token' ? 'TokenId' : 'ContractRootHash';
-          if (expr.value === 'this.coin.token_id') { if (c.kind === 'token') throw new Error('mint method has no coin'); return 'TokenId'; }
-          if (expr.value === 'this.coin.value') { if (c.kind === 'token') throw new Error('mint method has no coin'); return 'Amount'; }
+          if (expr.value === 'this.coin.token_id') { if (c.kind === 'token') return this.problem('E0411', 'mint method has no coin', expr.span, frames); return 'TokenId'; }
+          if (expr.value === 'this.coin.value') { if (c.kind === 'token') return this.problem('E0411', 'mint method has no coin', expr.span, frames); return 'Amount'; }
           const dot = expr.value!.split('.');
           if ((dot.length === 2 && (dot[1] === 'token_id' || dot[1] === 'value' || dot[1] === 'is_spend')) || (dot.length === 3 && dot[1] === 'coin' && ['token_id','value'].includes(dot[2]!))) {
             const v = scope.get(dot[0]!);
-            if (!v || v.kind !== 'local' || (v.type !== 'InputIndex' && v.type !== 'OutputIndex')) throw new Error(`unbound record ${dot[0]}`);
-            if (dot.length === 3 && v.type !== 'InputIndex') throw new Error('coin field requires input');
-            if (dot[1] === 'is_spend') { if (v.type !== 'InputIndex') throw new Error('is_spend requires input'); return 'Bool'; }
+            if (!v || v.kind !== 'local' || (v.type !== 'InputIndex' && v.type !== 'OutputIndex')) return this.problem('E0305', `unbound record ${dot[0]}`, expr.span, frames, this.hint(dot[0]!, scope));
+            if (dot.length === 3 && v.type !== 'InputIndex') return this.problem('E0412', 'coin field requires input', expr.span, frames);
+            if (dot[1] === 'is_spend') { if (v.type !== 'InputIndex') return this.problem('E0412', 'is_spend requires input', expr.span, frames); return 'Bool'; }
             return dot.at(-1) === 'token_id' ? 'TokenId' : 'Amount';
           }
-          const v = scope.get(expr.value!); if (!v) throw new Error(`unbound name ${expr.value}`);
-          return v.kind === 'substitute' ? infer(v.expr,v.env,active) : v.type;
+          const v = scope.get(expr.value!); if (!v) return this.problem('E0301', `unbound name ${expr.value}`, expr.span, frames, this.hint(expr.value!, scope));
+          return v.kind === 'substitute' ? infer(v.expr, v.env, active, v.frames) : v.type;
         }
         if (expr.kind === 'unary') {
-          if (expr.value === '-' && expr.right?.kind === 'number') { encodedInt(-BigInt(expr.right.value!)); return 'Int'; }
-          const t = infer(expr.right!,scope,active);
+          if (expr.value === '-' && expr.right?.kind === 'number') { const n = -BigInt(expr.right.value!); if (n < INT_MIN || n >= INT_MAX) return this.problem('E0413', INT_RANGE, expr.span, frames); return 'Int'; }
+          const t = infer(expr.right!, scope, active, frames);
+          if (t === 'Error') return 'Error';
           if ((expr.value === '!' && t === 'Bool') || (expr.value === '-' && t === 'Int')) return t;
-          throw new Error(`invalid unary ${expr.value} on ${t}`);
+          return this.problem('E0402', `invalid unary ${expr.value} on ${t}`, expr.span, frames);
         }
         if (expr.kind === 'binary') {
-          const a = infer(expr.left!,scope,active), b = infer(expr.right!,scope,active);
-          if (a !== b && !(['Int','Amount'].includes(a) && ['Int','Amount'].includes(b))) throw new Error(`binary type mismatch ${a}, ${b}`);
+          const a = infer(expr.left!, scope, active, frames), b = infer(expr.right!, scope, active, frames);
+          if (a === 'Error' || b === 'Error') return 'Error';
+          if (a !== b && !(['Int','Amount'].includes(a) && ['Int','Amount'].includes(b))) return this.problem('E0401', `binary type mismatch ${a}, ${b}`, expr.span, frames);
           if (expr.value === '==' || expr.value === '!=') return 'Bool';
           if (['+','-','*'].includes(expr.value!) && ['Int','Amount'].includes(a) && ['Int','Amount'].includes(b)) return a === 'Amount' || b === 'Amount' ? 'Amount' : 'Int';
           if (['<','>','<=','>='].includes(expr.value!) && ['Int','Amount'].includes(a) && ['Int','Amount'].includes(b)) return 'Bool';
           if (['&&','||'].includes(expr.value!) && a === 'Bool') return 'Bool';
-          throw new Error(`invalid binary ${expr.value} on ${a}`);
+          return this.problem('E0403', `invalid binary ${expr.value} on ${a}`, expr.span, frames);
         }
-        if (expr.kind !== 'call') throw new Error('unknown expression');
+        if (expr.kind !== 'call') return this.problem('E9001', 'unknown expression', expr.span, frames);
         const name = expr.value!, args = expr.args ?? [];
-        if (name === 'leaf_hash') { if (args.length !== 1 || args[0]!.kind !== 'name' || args[0]!.value!.split('.').length !== 2) throw new Error('leaf_hash requires Contract.method'); return 'MethodLeafHash'; }
-        if (name === 'contract_root' || name === 'merkle_root') { if (args.length !== 1 || args[0]!.kind !== 'name' || args[0]!.value!.includes('.')) throw new Error(`${name} requires tree name`); return this.contract(args[0]!.value!).kind === 'token' ? 'TokenId' : 'ContractRootHash'; }
-        if (name.endsWith('.requires_branch')) { if (args.length !== 1 || infer(args[0]!,scope,active) !== 'ContractRootHash' || scope.get(name.split('.')[0]!)?.type !== 'OutputIndex') throw new Error('requires_branch expects output and contract root'); return 'Bool'; }
-        if (name === 'checksig') { if (args.length !== 2 || infer(args[0]!,scope,active) !== 'Signature' || infer(args[1]!,scope,active) !== 'PublicKey') throw new Error('checksig expects Signature, PublicKey'); return 'Bool'; }
+        if (name === 'leaf_hash') { if (args.length !== 1 || args[0]!.kind !== 'name' || args[0]!.value!.split('.').length !== 2) return this.problem('E0502', 'leaf_hash requires Contract.method', expr.span, frames); return 'MethodLeafHash'; }
+        if (name === 'contract_root' || name === 'merkle_root') { if (args.length !== 1 || args[0]!.kind !== 'name' || args[0]!.value!.includes('.')) return this.problem('E0502', `${name} requires tree name`, expr.span, frames); return this.contract(args[0]!.value!, args[0]!.span).kind === 'token' ? 'TokenId' : 'ContractRootHash'; }
+        if (name.endsWith('.requires_branch')) {
+          if (args.length !== 1) return this.problem('E0412', 'requires_branch expects output and contract root', expr.span, frames);
+          const arg = infer(args[0]!, scope, active, frames); if (arg === 'Error') return 'Error';
+          if (arg !== 'ContractRootHash' || scope.get(name.split('.')[0]!)?.type !== 'OutputIndex') return this.problem('E0412', 'requires_branch expects output and contract root', expr.span, frames);
+          return 'Bool';
+        }
+        if (name === 'checksig') { if (args.length !== 2) return this.problem('E0502', 'checksig expects Signature, PublicKey', expr.span, frames); const a = infer(args[0]!, scope, active, frames), b = infer(args[1]!, scope, active, frames); if (a === 'Error' || b === 'Error') return 'Error'; if (a !== 'Signature' || b !== 'PublicKey') return this.problem('E0405', 'checksig expects Signature, PublicKey', expr.span, frames); return 'Bool'; }
         if (['sha256','hash256','blake3'].includes(name)) {
-          if (args.length !== 1) throw new Error(`${name} expects one byte value`);
-          const t = infer(args[0]!,scope,active);
-          if (!['PublicKey','Signature','Bytes32','MethodLeafHash','ContractRootHash'].includes(t) && !t.startsWith('Bytes(')) throw new Error(`${name} expects bytes`);
+          if (args.length !== 1) return this.problem('E0502', `${name} expects one byte value`, expr.span, frames);
+          const t = infer(args[0]!, scope, active, frames);
+          if (t === 'Error') return 'Error';
+          if (!['PublicKey','Signature','Bytes32','MethodLeafHash','ContractRootHash'].includes(t) && !t.startsWith('Bytes(')) return this.problem('E0405', `${name} expects bytes`, expr.span, frames);
           return 'Bytes32';
         }
-        const helper = this.program.helpers.get(name); if (!helper) throw new Error(`unknown function ${name}`);
-        if (helper.params.length !== args.length) throw new Error(`helper ${name} arity mismatch`);
-        if (active.includes(name) || active.length >= 16) throw new Error(`recursive helper ${name}`);
+        const helper = this.program.helpers.get(name); if (!helper) return this.problem('E0302', `unknown function ${name}`, expr.span, frames, this.hint(name, scope));
+        if (helper.params.length !== args.length) return this.problem('E0501', `helper ${name} arity mismatch`, expr.span, frames);
+        if (active.includes(name) || active.length >= 16) this.fatal('E0503', `recursive helper ${name}`, expr.span, frames);
         const inner: Env = new Map();
+        const next = [...frames, { name: helper.name, at: expr.span }];
         for (let i = 0; i < args.length; i++) {
-          const p = helper.params[i]!, actual = infer(args[i]!,scope,active);
-          if (actual !== p.type) throw new Error(`helper ${name}.${p.name} expects ${p.type}, got ${actual}`);
-          inner.set(p.name,{ kind:'substitute', type:p.type, expr:args[i]!, env:scope, origin:expr.span });
+          const p = helper.params[i]!, actual = infer(args[i]!, scope, active, frames);
+          if (actual === 'Error') return 'Error';
+          if (actual !== p.type) return this.problem('E0406', `helper ${name}.${p.name} expects ${p.type}, got ${actual}`, args[i]!.span, frames);
+          inner.set(p.name, { kind:'substitute', type:p.type, expr:args[i]!, env:scope, origin:expr.span, frames });
         }
-        const result = infer(helper.body,inner,[...active,name]);
-        if (result !== helper.result) throw new Error(`helper ${name} returns ${result}, declared ${helper.result}`);
+        const result = infer(helper.body, inner, [...active, name], next);
+        if (result === 'Error') return 'Error';
+        if (result !== helper.result) return this.problem('E0407', `helper ${name} returns ${result}, declared ${helper.result}`, helper.body.span, next);
         return result;
       };
-      const expression = (expr: Expr, scope: Env, origin?: Span): ValueType => {
-        if (expr.kind === 'number') { emitter.number(BigInt(expr.value!),expr.span,origin); return 'Int'; }
-        if (expr.kind === 'bool') { emitter.number(expr.value === 'true' ? 1n : 0n,expr.span,origin); return 'Bool'; }
+      const expression = (expr: Expr, scope: Env, origin?: Span, frames: Frame[] = []): Checked => {
+        emitter.frames = frames;
+        if (expr.kind === 'number') {
+          const n = BigInt(expr.value!); if (n < INT_MIN || n >= INT_MAX) return this.problem('E0413', INT_RANGE, expr.span, frames);
+          emitter.number(n, expr.span, origin); return 'Int';
+        }
+        if (expr.kind === 'bool') { emitter.number(expr.value === 'true' ? 1n : 0n, expr.span, origin); return 'Bool'; }
         if (expr.kind === 'name') {
-          if (expr.value === 'this.root') { emitter.op('BRANCHROOT',expr.span,origin,1); return c.kind === 'token' ? 'TokenId' : 'ContractRootHash'; }
+          if (expr.value === 'this.root') { emitter.op('BRANCHROOT', expr.span, origin, 1); return c.kind === 'token' ? 'TokenId' : 'ContractRootHash'; }
           if (expr.value === 'this.coin.token_id' || expr.value === 'this.coin.value') {
-            if (c.kind === 'token') throw new Error('mint method has no coin');
-            emitter.op('INPUTINDEX',expr.span,origin,1);
-            emitter.op(expr.value.endsWith('token_id') ? 'UTXOTOKENID' : 'UTXOVALUE',expr.span,origin);
+            if (c.kind === 'token') return this.problem('E0411', 'mint method has no coin', expr.span, frames);
+            emitter.op('INPUTINDEX', expr.span, origin, 1);
+            emitter.op(expr.value.endsWith('token_id') ? 'UTXOTOKENID' : 'UTXOVALUE', expr.span, origin);
             return expr.value.endsWith('token_id') ? 'TokenId' : 'Amount';
           }
           const dot = expr.value!.split('.');
           if ((dot.length === 2 && ['token_id','value','is_spend'].includes(dot[1]!)) || (dot.length === 3 && dot[1] === 'coin' && ['token_id','value'].includes(dot[2]!))) {
             const v = scope.get(dot[0]!);
-            if (!v || v.kind !== 'local' || (v.type !== 'InputIndex' && v.type !== 'OutputIndex')) throw new Error(`unbound record ${dot[0]}`);
-            if (dot.length === 3 && v.type !== 'InputIndex') throw new Error('coin field requires input');
-            emitter.number(BigInt(emitter.height - 1 - v.index),expr.span,origin); emitter.op('PICK',expr.span,origin);
-            if (dot[1] === 'is_spend') { if (v.type !== 'InputIndex') throw new Error('is_spend requires input'); emitter.op('INPUTFLAGS',expr.span,origin); emitter.number(1n,expr.span,origin); emitter.op('NUMEQUAL',expr.span,origin,-1); return 'Bool'; }
+            if (!v || v.kind !== 'local' || (v.type !== 'InputIndex' && v.type !== 'OutputIndex')) return this.problem('E0305', `unbound record ${dot[0]}`, expr.span, frames, this.hint(dot[0]!, scope));
+            if (dot.length === 3 && v.type !== 'InputIndex') return this.problem('E0412', 'coin field requires input', expr.span, frames);
+            emitter.number(BigInt(emitter.height - 1 - v.index), expr.span, origin); emitter.op('PICK', expr.span, origin);
+            if (dot[1] === 'is_spend') { if (v.type !== 'InputIndex') return this.problem('E0412', 'is_spend requires input', expr.span, frames); emitter.op('INPUTFLAGS', expr.span, origin); emitter.number(1n, expr.span, origin); emitter.op('NUMEQUAL', expr.span, origin, -1); return 'Bool'; }
             const field = dot.at(-1)!;
             const op = v.type === 'OutputIndex' ? (field === 'token_id' ? 'OUTPUTTOKENID' : 'OUTPUTVALUE') : (field === 'token_id' ? 'UTXOTOKENID' : 'UTXOVALUE');
-            emitter.op(op,expr.span,origin); return field === 'token_id' ? 'TokenId' : 'Amount';
+            emitter.op(op, expr.span, origin); return field === 'token_id' ? 'TokenId' : 'Amount';
           }
-          const v = scope.get(expr.value!); if (!v) throw new Error(`unbound name ${expr.value} at UTF-8 byte ${expr.span.start}`);
-          if (v.kind === 'constant') emitter.push(v.data,expr.span,origin);
-          else if (v.kind === 'argument' || v.kind === 'local') { emitter.number(BigInt(emitter.height - 1 - v.index),expr.span,origin); emitter.op('PICK',expr.span,origin); }
-          else { const actual = expression(v.expr,v.env,v.origin); if (actual !== v.type) throw new Error(`helper substitution expected ${v.type}, got ${actual}`); return actual; }
+          const v = scope.get(expr.value!); if (!v) return this.problem('E0301', `unbound name ${expr.value}`, expr.span, frames, this.hint(expr.value!, scope));
+          if (v.kind === 'constant') emitter.push(v.data, expr.span, origin);
+          else if (v.kind === 'argument' || v.kind === 'local') { emitter.number(BigInt(emitter.height - 1 - v.index), expr.span, origin); emitter.op('PICK', expr.span, origin); }
+          else {
+            const actual = expression(v.expr, v.env, v.origin, v.frames);
+            if (actual === 'Error') return 'Error';
+            if (actual !== v.type) return this.problem('E0406', `helper substitution expected ${v.type}, got ${actual}`, expr.span, frames);
+            return actual;
+          }
           return v.type;
         }
         if (expr.kind === 'unary') {
-          if (expr.value === '-' && expr.right?.kind === 'number') { emitter.number(-BigInt(expr.right.value!),expr.span,origin); return 'Int'; }
-          const t = expression(expr.right!,scope,origin);
-          if (expr.value === '!' && t === 'Bool') { emitter.op('NOT',expr.span,origin); return 'Bool'; }
-          if (expr.value === '-' && t === 'Int') { emitter.op('NEGATE',expr.span,origin); return 'Int'; }
-          throw new Error(`invalid unary ${expr.value} on ${t}`);
+          if (expr.value === '-' && expr.right?.kind === 'number') {
+            const n = -BigInt(expr.right.value!); if (n < INT_MIN || n >= INT_MAX) return this.problem('E0413', INT_RANGE, expr.span, frames);
+            emitter.number(n, expr.span, origin); return 'Int';
+          }
+          const t = expression(expr.right!, scope, origin, frames);
+          if (t === 'Error') return 'Error';
+          if (expr.value === '!' && t === 'Bool') { emitter.op('NOT', expr.span, origin); return 'Bool'; }
+          if (expr.value === '-' && t === 'Int') { emitter.op('NEGATE', expr.span, origin); return 'Int'; }
+          return this.problem('E0402', `invalid unary ${expr.value} on ${t}`, expr.span, frames);
         }
         if (expr.kind === 'binary') {
           if (expr.value === '&&' || expr.value === '||') {
-            const a = expression(expr.left!,scope,origin); if (a !== 'Bool') throw new Error(`${expr.value} requires Bool`);
-            if (expr.value === '||') emitter.op('NOT',expr.span,origin);
-            emitter.control('IF',expr.span); const before = emitter.height;
-            const b = expression(expr.right!,scope,origin); if (b !== 'Bool') throw new Error(`${expr.value} requires Bool`);
-            if (emitter.height !== before + 1) throw new Error('logical branch stack mismatch');
-            emitter.control('ELSE',expr.span); emitter.height = before;
-            emitter.number(expr.value === '&&' ? 0n : 1n,expr.span,origin);
-            emitter.control('ENDIF',expr.span); return 'Bool';
+            const a = expression(expr.left!, scope, origin, frames);
+            if (a === 'Error') return 'Error';
+            if (a !== 'Bool') return this.problem('E0404', `${expr.value} requires Bool`, expr.left?.span ?? expr.span, frames);
+            if (expr.value === '||') emitter.op('NOT', expr.span, origin);
+            emitter.control('IF', expr.span); const before = emitter.height;
+            const b = expression(expr.right!, scope, origin, frames);
+            if (b === 'Error') return 'Error';
+            if (b !== 'Bool') return this.problem('E0404', `${expr.value} requires Bool`, expr.right?.span ?? expr.span, frames);
+            if (emitter.height !== before + 1) this.fatal('E9001', 'logical branch stack mismatch', expr.span, frames);
+            emitter.control('ELSE', expr.span); emitter.height = before;
+            emitter.number(expr.value === '&&' ? 0n : 1n, expr.span, origin);
+            emitter.control('ENDIF', expr.span); return 'Bool';
           }
-          const a = expression(expr.left!,scope,origin), b = expression(expr.right!,scope,origin);
+          const a = expression(expr.left!, scope, origin, frames), b = expression(expr.right!, scope, origin, frames);
+          if (a === 'Error' || b === 'Error') return 'Error';
           if (expr.value === '==' || expr.value === '!=') {
-            if (a !== b) throw new Error(`equality type mismatch ${a} and ${b}`);
-            emitter.op('EQUAL',expr.span,origin,-1); if (expr.value === '!=') emitter.op('NOT',expr.span,origin); return 'Bool';
+            if (a !== b) return this.problem('E0401', `equality type mismatch ${a} and ${b}`, expr.span, frames);
+            emitter.op('EQUAL', expr.span, origin, -1); if (expr.value === '!=') emitter.op('NOT', expr.span, origin); return 'Bool';
           }
-          const cases: Record<string,[keyof typeof OPCODES,ValueType]> = { '+':['ADD',a], '-':['SUB',a], '*':['MUL',a], '<':['LESSTHAN','Bool'], '>':['GREATERTHAN','Bool'], '>=':['GREATERTHANOREQUAL','Bool'] };
-          const rule = cases[expr.value!]; if (!rule || !['Int','Amount'].includes(a) || !['Int','Amount'].includes(b)) throw new Error(`invalid ${expr.value} operands ${a}, ${b}`);
-          emitter.op(rule[0],expr.span,origin,-1); return ['+','-','*'].includes(expr.value!) && (a === 'Amount' || b === 'Amount') ? 'Amount' : rule[1];
+          const cases: Record<string, [keyof typeof OPCODES, ValueType]> = { '+':['ADD', a], '-':['SUB', a], '*':['MUL', a], '<':['LESSTHAN', 'Bool'], '>':['GREATERTHAN', 'Bool'], '>=':['GREATERTHANOREQUAL', 'Bool'] };
+          const rule = cases[expr.value!]; if (!rule || !['Int','Amount'].includes(a) || !['Int','Amount'].includes(b)) return this.problem('E0403', `invalid ${expr.value} operands ${a}, ${b}`, expr.span, frames);
+          emitter.op(rule[0], expr.span, origin, -1); return ['+','-','*'].includes(expr.value!) && (a === 'Amount' || b === 'Amount') ? 'Amount' : rule[1];
         }
-        if (expr.kind !== 'call') throw new Error('unknown expression');
+        if (expr.kind !== 'call') return this.problem('E9001', 'unknown expression', expr.span, frames);
         const args = expr.args ?? [];
         const name = expr.value!;
         if (name === 'leaf_hash') {
-          if (args.length !== 1 || args[0]!.kind !== 'name') throw new Error('leaf_hash requires Contract.method name');
-          const path = args[0]!.value!.split('.'); if (path.length !== 2) throw new Error('leaf_hash requires Contract.method name');
-          emitter.push(this.method(path[0]!,path[1]!).leaf,expr.span,origin); return 'MethodLeafHash';
+          if (args.length !== 1 || args[0]!.kind !== 'name') return this.problem('E0502', 'leaf_hash requires Contract.method name', expr.span, frames);
+          const path = args[0]!.value!.split('.'); if (path.length !== 2) return this.problem('E0502', 'leaf_hash requires Contract.method name', expr.span, frames);
+          emitter.push(this.method(path[0]!, path[1]!).leaf, expr.span, origin); return 'MethodLeafHash';
         }
         if (name === 'contract_root' || name === 'merkle_root') {
-          if (args.length !== 1 || args[0]!.kind !== 'name' || args[0]!.value!.includes('.')) throw new Error('contract_root requires Contract name');
-          const other = this.contract(args[0]!.value!); emitter.push(this.root(other.name).root,expr.span,origin); return other.kind === 'token' ? 'TokenId' : 'ContractRootHash';
+          if (args.length !== 1 || args[0]!.kind !== 'name' || args[0]!.value!.includes('.')) return this.problem('E0502', 'contract_root requires Contract name', expr.span, frames);
+          const other = this.contract(args[0]!.value!, args[0]!.span); emitter.push(this.root(other.name).root, expr.span, origin); return other.kind === 'token' ? 'TokenId' : 'ContractRootHash';
         }
         if (name.endsWith('.requires_branch')) {
-          const v = scope.get(name.split('.')[0]!); if (!v || v.kind !== 'local' || v.type !== 'OutputIndex' || args.length !== 1) throw new Error('requires_branch requires output index and one root');
-          emitter.number(BigInt(emitter.height - 1 - v.index),expr.span,origin); emitter.op('PICK',expr.span,origin);
-          const t = expression(args[0]!,scope,origin); if (t !== 'ContractRootHash') throw new Error('requires_branch requires ContractRootHash');
-          emitter.op('OUTPUTREQUIRESBRANCH',expr.span,origin,-1); return 'Bool';
+          const v = scope.get(name.split('.')[0]!);
+          if (!v || v.kind !== 'local' || v.type !== 'OutputIndex' || args.length !== 1) return this.problem('E0412', 'requires_branch requires output index and one root', expr.span, frames);
+          emitter.number(BigInt(emitter.height - 1 - v.index), expr.span, origin); emitter.op('PICK', expr.span, origin);
+          const t = expression(args[0]!, scope, origin, frames);
+          if (t === 'Error') return 'Error';
+          if (t !== 'ContractRootHash') return this.problem('E0412', 'requires_branch requires ContractRootHash', args[0]!.span, frames);
+          emitter.op('OUTPUTREQUIRESBRANCH', expr.span, origin, -1); return 'Bool';
         }
         if (name === 'checksig') {
-          if (args.length !== 2) throw new Error('checksig needs signature and PublicKey');
-          const a = expression(args[0]!,scope,origin), b = expression(args[1]!,scope,origin);
-          if (a !== 'Signature' || b !== 'PublicKey') throw new Error('checksig expects Signature, PublicKey');
-          emitter.op('CHECKSIG',expr.span,origin,-1); return 'Bool';
+          if (args.length !== 2) return this.problem('E0502', 'checksig needs signature and PublicKey', expr.span, frames);
+          const a = expression(args[0]!, scope, origin, frames), b = expression(args[1]!, scope, origin, frames);
+          if (a === 'Error' || b === 'Error') return 'Error';
+          if (a !== 'Signature' || b !== 'PublicKey') return this.problem('E0405', 'checksig expects Signature, PublicKey', expr.span, frames);
+          emitter.op('CHECKSIG', expr.span, origin, -1); return 'Bool';
         }
-        const hashes: Record<string,keyof typeof OPCODES> = { sha256:'SHA256', hash256:'HASH256', blake3:'BLAKE3' };
+        const hashes: Record<string, keyof typeof OPCODES> = { sha256:'SHA256', hash256:'HASH256', blake3:'BLAKE3' };
         if (hashes[name]) {
-          if (args.length !== 1) throw new Error(`${name} expects one byte value`);
-          const t = expression(args[0]!,scope,origin);
-          if (!['PublicKey','Signature','Bytes32','MethodLeafHash','ContractRootHash'].includes(t) && !t.startsWith('Bytes(')) throw new Error(`${name} expects byte value, got ${t}`);
-          emitter.op(hashes[name],expr.span,origin); return 'Bytes32';
+          if (args.length !== 1) return this.problem('E0502', `${name} expects one byte value`, expr.span, frames);
+          const t = expression(args[0]!, scope, origin, frames);
+          if (t === 'Error') return 'Error';
+          if (!['PublicKey','Signature','Bytes32','MethodLeafHash','ContractRootHash'].includes(t) && !t.startsWith('Bytes(')) return this.problem('E0405', `${name} expects byte value, got ${t}`, expr.span, frames);
+          emitter.op(hashes[name], expr.span, origin); return 'Bytes32';
         }
-        const helper = this.program.helpers.get(name); if (!helper) throw new Error(`unknown function ${name}`);
-        if (helper.params.length !== args.length) throw new Error(`helper ${name} arity mismatch`);
-        if (helperStack.includes(name)) throw new Error(`recursive helper ${name}`);
-        if (++emitter.expansions > MAX_EXPANSIONS || helperStack.length >= 16) throw new Error('helper expansion budget exceeded');
+        const helper = this.program.helpers.get(name); if (!helper) return this.problem('E0302', `unknown function ${name}`, expr.span, frames, this.hint(name, scope));
+        if (helper.params.length !== args.length) return this.problem('E0501', `helper ${name} arity mismatch`, expr.span, frames);
+        if (helperStack.includes(name)) this.fatal('E0503', `recursive helper ${name}`, expr.span, frames);
+        if (++emitter.expansions > MAX_EXPANSIONS || helperStack.length >= 16) this.fatal('E0703', 'helper expansion budget exceeded', expr.span, frames);
         const inner: Env = new Map();
         // Each helper parameter is a hygienically scoped expression thunk. The
         // source argument is checked against the declared parameter type once.
+        // `frames` stays the caller's chain; the body is checked under `next`.
         for (let i = 0; i < args.length; i++) {
           const p = helper.params[i]!;
-          const actual = infer(args[i]!,scope,helperStack);
-          if (actual !== p.type) throw new Error(`helper ${name}.${p.name} expects ${p.type}, got ${actual}`);
-          inner.set(p.name,{ kind: 'substitute', type: p.type, expr: args[i]!, env: scope, origin: expr.span });
+          const actual = infer(args[i]!, scope, helperStack, frames);
+          if (actual === 'Error') return 'Error';
+          if (actual !== p.type) return this.problem('E0406', `helper ${name}.${p.name} expects ${p.type}, got ${actual}`, args[i]!.span, frames);
+          inner.set(p.name, { kind: 'substitute', type: p.type, expr: args[i]!, env: scope, origin: expr.span, frames });
         }
+        const next = [...frames, { name: helper.name, at: expr.span }];
         helperStack.push(name);
-        try { const result = expression(helper.body,inner,expr.span); if (result !== helper.result) throw new Error(`helper ${name} returns ${result}, declared ${helper.result}`); return result; }
-        finally { helperStack.pop(); }
+        try {
+          const result = expression(helper.body, inner, expr.span, next);
+          if (result === 'Error') return 'Error';
+          if (result !== helper.result) return this.problem('E0407', `helper ${name} returns ${result}, declared ${helper.result}`, helper.body.span, next);
+          return result;
+        } finally { helperStack.pop(); }
       };
       const statements = (body: Stmt[], nested = false): void => {
         for (const stmt of body) {
           if (stmt.kind === 'for') {
             const name = stmt.variable!;
-            if (env.has(name)) throw new Error(`loop variable ${name} shadows binding`);
+            if (env.has(name)) this.fatal('E0206', `loop variable ${name} shadows binding`, stmt.span);
             const before = emitter.height;
             if (stmt.collection === 'tx.inputs') emitter.op('ENUMERATE_INPUTS',stmt.span,undefined,1);
             else emitter.op('ENUMERATE_OUTPUTS',stmt.span,undefined,1);
             env.set(name,{kind:'local',type:stmt.collection === 'tx.inputs' ? 'InputIndex' : 'OutputIndex',index:before});
             statements(stmt.then!,true);
-            if (emitter.height !== before + 1) throw new Error('loop body stack mismatch');
+            if (emitter.height !== before + 1) this.fatal('E9001', 'loop body stack mismatch', stmt.span);
             emitter.op('DROP',stmt.span,undefined,-1);
             emitter.op('ENDENUMERATE',stmt.span);
             env.delete(name); continue;
           }
           if (stmt.kind === 'assign') {
             const name = stmt.variable!, existing = env.get(name);
-            if (!existing && (nested || stmt.assignOp !== '=')) throw new Error(`local ${name} must be initialized at method top level`);
-            if (existing && (existing.kind !== 'local' || existing.type === 'InputIndex' || existing.type === 'OutputIndex')) throw new Error(`cannot assign ${name}`);
+            if (!existing && (nested || stmt.assignOp !== '=')) this.fatal('E0410', `local ${name} must be initialized at method top level`, stmt.span);
+            if (existing && (existing.kind !== 'local' || existing.type === 'InputIndex' || existing.type === 'OutputIndex')) this.fatal('E0409', `cannot assign ${name}`, stmt.span);
             if (stmt.assignOp !== '=') {
               emitter.number(BigInt(emitter.height - 1 - existing!.index),stmt.span); emitter.op('PICK',stmt.span);
             }
             const t = expression(stmt.expr!,env);
-            if (t !== 'Int' && t !== 'Amount') throw new Error('numeric local required');
+            if (t === 'Error') continue;
+            if (t !== 'Int' && t !== 'Amount') this.fatal('E0408', 'numeric local required', stmt.expr?.span ?? stmt.span);
             if (stmt.assignOp !== '=') emitter.op(stmt.assignOp === '+=' ? 'ADD':'SUB',stmt.span,undefined,-1);
             if (!existing) env.set(name,{kind:'local',type:t,index:emitter.height - 1});
             else {
@@ -594,25 +706,27 @@ class Compiler {
             continue;
           }
           const t = expression(stmt.expr!,env);
-          if (t !== 'Bool') throw new Error(`${stmt.kind} requires Bool, got ${t}`);
+          if (t === 'Error') continue;
+          if (t !== 'Bool') { this.problem('E0404', `${stmt.kind} requires Bool, got ${t}`, stmt.expr?.span ?? stmt.span); continue; }
           if (stmt.kind === 'require') emitter.op('VERIFY',stmt.span,undefined,-1);
           else {
             emitter.control('IF',stmt.span);
             const before = emitter.height;
             statements(stmt.then!,true);
-            if (emitter.height !== before) throw new Error('then stack mismatch');
+            if (emitter.height !== before) this.fatal('E9001', 'then stack mismatch', stmt.span);
             emitter.control('ELSE',stmt.span);
             statements(stmt.otherwise!,true);
-            if (emitter.height !== before) throw new Error('else stack mismatch');
+            if (emitter.height !== before) this.fatal('E9001', 'else stack mismatch', stmt.span);
             emitter.control('ENDIF',stmt.span);
           }
         }
       };
       statements(method.body);
+      this.diag.checkpoint();
       for (let i = emitter.height - stackParams.length; i > 0; i--) emitter.op('DROP',method.span,undefined,-1);
       for (let i = 0; i < method.params.length; i++) emitter.op('DROP',method.span,undefined,-1);
       emitter.number(1n,method.span);
-      if (emitter.height !== 1) throw new Error('compiled method final stack mismatch');
+      if (emitter.height !== 1) this.fatal('E9001', 'compiled method final stack mismatch', method.span);
       const finished = emitter.finish(this.options.optimize !== false); const script = finished.script;
       let loopMultiplier = 1, worstCaseSignatureChecks = 0;
       for (const entry of finished.map) {
@@ -641,31 +755,43 @@ class Compiler {
   }
 }
 
-function singleModule(source: string): Program {
-  const program = new Parser(lex(source)).parse();
-  if (program.imports.length) throw new Error(`import at UTF-8 byte ${program.imports[0]!.span.start} requires a package build (compilePackage)`);
+function requireOptions(options: CompileOptions, bag: DiagnosticBag): void {
+  if (typeof options?.contract !== 'string' || !options.bindings || typeof options.bindings !== 'object') bag.raise('E0601', 'compile options require contract and bindings');
+}
+function openSource(source: string, file: string, sources = new SourceManager()): DiagnosticBag {
+  if (!sources.get(file)) sources.add(file, source);
+  return new DiagnosticBag(sources, file);
+}
+function singleModule(source: string, file: string, bag: DiagnosticBag): Program {
+  const program = new Parser(lex(source, file, bag), bag).parse();
+  if (program.imports.length) bag.raise('E0121', 'import requires a package build (compilePackage)', program.imports[0]!.span);
+  bag.checkpoint();
   return program;
 }
-export function compileContract(source: string, options: CompileOptions): ContractArtifact {
-  if (typeof options?.contract !== 'string' || !options.bindings || typeof options.bindings !== 'object') throw new Error('compile options require contract and bindings');
-  return new Compiler(singleModule(source), options).compile();
+export function compileContract(source: string, options: CompileOptions, file = '<source>'): ContractArtifact {
+  const bag = openSource(source, file); requireOptions(options, bag);
+  return new Compiler(singleModule(source, file, bag), options, bag).compile();
 }
-export async function compileContractAsync(source: string, options: CompileOptions, onEvent?: (event: SchedulerEvent) => void): Promise<ContractArtifact> {
-  if (typeof options?.contract !== 'string' || !options.bindings || typeof options.bindings !== 'object') throw new Error('compile options require contract and bindings');
-  return new Compiler(singleModule(source), options).compileAsync(onEvent);
+export async function compileContractAsync(source: string, options: CompileOptions, onEvent?: (event: SchedulerEvent) => void, file = '<source>'): Promise<ContractArtifact> {
+  const bag = openSource(source, file); requireOptions(options, bag);
+  return new Compiler(singleModule(source, file, bag), options, bag).compileAsync(onEvent);
 }
 /** @internal Package linker entry: parse one module (declaration-only modules may omit contracts). */
-export function parseModuleSource(source: string, requireContract: boolean): Program {
-  return new Parser(lex(source)).parse(requireContract);
+export function parseModuleSource(source: string, requireContract: boolean, file = '<source>', sources?: SourceManager): Program {
+  const bag = openSource(source, file, sources);
+  const program = new Parser(lex(source, file, bag), bag).parse(requireContract);
+  bag.checkpoint();
+  return program;
 }
 /** @internal Package linker entry: compile an already linked program through the promise scheduler. */
-export async function compileLinkedProgramAsync(program: Program, options: CompileOptions, onEvent?: (event: SchedulerEvent) => void): Promise<ContractArtifact> {
-  if (typeof options?.contract !== 'string' || !options.bindings || typeof options.bindings !== 'object') throw new Error('compile options require contract and bindings');
-  return new Compiler(program, options).compileAsync(onEvent);
+export async function compileLinkedProgramAsync(program: Program, options: CompileOptions, onEvent?: (event: SchedulerEvent) => void, sources?: SourceManager): Promise<ContractArtifact> {
+  const bag = new DiagnosticBag(sources ?? new SourceManager(), '<source>');
+  requireOptions(options, bag);
+  return new Compiler(program, options, bag).compileAsync(onEvent);
 }
-export async function compileContractWithTrace(source: string, options: CompileOptions): Promise<{ artifact: ContractArtifact; trace: SchedulerEvent[] }> {
+export async function compileContractWithTrace(source: string, options: CompileOptions, file = '<source>'): Promise<{ artifact: ContractArtifact; trace: SchedulerEvent[] }> {
   const trace: SchedulerEvent[] = [];
-  const artifact = await compileContractAsync(source, options, event => trace.push(event));
+  const artifact = await compileContractAsync(source, options, event => trace.push(event), file);
   return { artifact, trace };
 }
 export function methodLeafHash(artifact: ContractArtifact, method: string): { kind: 'MethodLeafHash'; hex: string } {
