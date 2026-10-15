@@ -77,7 +77,7 @@ class VMTests(unittest.TestCase):
             evaluate(bytes.fromhex("4e"), (), VMProfile(
                 512, 8, 128, 16, 8, 256, 8, 1, 1,
                 {op: 1 for op in ASSIGNED}))
-        with self.assertRaises(UnsupportedFeature):
+        with self.assertRaisesRegex(VMError, "stack underflow"):
             evaluate(bytes.fromhex("bd"), (), PROFILE)
         with self.assertRaises(UnsupportedFeature):
             evaluate(bytes.fromhex("4e"), (), VMProfile(

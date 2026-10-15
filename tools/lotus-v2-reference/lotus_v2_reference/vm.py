@@ -5,8 +5,9 @@ snapshot of docs/lotus-v2/tools/opcodes.json (2026-10-14). No production limits
 or cost coefficients are selected here.
 """
 
+import math
 from dataclasses import dataclass
-from hashlib import sha256
+from hashlib import sha256, sha512
 from types import MappingProxyType
 from typing import Callable, Mapping
 
@@ -186,6 +187,227 @@ def _boolean(data: bytes) -> bool:
     if value not in (0, 1):
         raise VMError("noncanonical Boolean")
     return bool(value)
+
+
+_U128_MASK = (1 << 128) - 1
+
+
+def _unsigned(data: bytes) -> int:
+    if len(data) != 16:
+        raise VMError("operand is not U")
+    return int.from_bytes(data, "little", signed=False)
+
+
+def _unsigned_bytes(value: int) -> bytes:
+    if type(value) is not int or not 0 <= value <= _U128_MASK:
+        raise VMError("unsigned width")
+    return value.to_bytes(16, "little")
+
+
+def _log2_q64(x: int) -> int:
+    """P03 LOG2_Q64. Not a claim of exact real-logarithm rounding."""
+    if x <= 0:
+        raise VMError("LOG requires x>0")
+    e = x.bit_length() - 1
+    z = x << (127 - e)
+    fraction = 0
+    for _ in range(64):
+        t = (z * z) >> 127
+        bit = 1 if t >= (1 << 128) else 0
+        z = (t >> 1) if bit else t
+        fraction = (fraction << 1) | bit
+    return (e << 64) | fraction
+
+
+# CHECKDATASIG profiles. Algorithm 2 is the strict prime-subgroup Ed25519
+# equation, not a library's default cofactored verifier.
+_ED_P = 2**255 - 19
+_ED_L = 2**252 + 27742317777372353535851937790883648493
+_ED_D = (-121665 * pow(121666, -1, _ED_P)) % _ED_P
+_ED_I = pow(2, (_ED_P - 1) // 4, _ED_P)
+
+
+def _ed_sqrt_ratio(u: int, v: int) -> int | None:
+    root = pow((u * pow(v, _ED_P - 2, _ED_P)) % _ED_P, (_ED_P + 3) // 8, _ED_P)
+    squared = (v * root * root) % _ED_P
+    if squared == u % _ED_P:
+        return root
+    if squared == (-u) % _ED_P:
+        return (root * _ED_I) % _ED_P
+    return None
+
+
+def _ed_decode(encoded: bytes) -> tuple[int, int] | None:
+    if len(encoded) != 32:
+        return None
+    raw = int.from_bytes(encoded, "little")
+    sign = raw >> 255
+    y = raw & ((1 << 255) - 1)
+    if y >= _ED_P:
+        return None
+    x = _ed_sqrt_ratio((y * y - 1) % _ED_P, (_ED_D * y * y + 1) % _ED_P)
+    if x is None or (x == 0 and sign == 1):
+        return None
+    if (x & 1) != sign:
+        x = _ED_P - x
+    return (x, y)
+
+
+def _ed_add(p1: tuple[int, int], p2: tuple[int, int]) -> tuple[int, int]:
+    x1, y1 = p1
+    x2, y2 = p2
+    product = (_ED_D * x1 * x2 * y1 * y2) % _ED_P
+    return (
+        ((x1 * y2 + y1 * x2) * pow(1 + product, -1, _ED_P)) % _ED_P,
+        ((y1 * y2 + x1 * x2) * pow(1 - product, -1, _ED_P)) % _ED_P,
+    )
+
+
+def _ed_mul(scalar: int, point: tuple[int, int]) -> tuple[int, int]:
+    result = (0, 1)
+    acc = point
+    while scalar:
+        if scalar & 1:
+            result = _ed_add(result, acc)
+        acc = _ed_add(acc, acc)
+        scalar >>= 1
+    return result
+
+
+_ED_B = _ed_decode(bytes.fromhex(
+    "5866666666666666666666666666666666666666666666666666666666666666"))
+assert _ED_B is not None
+
+
+def _ed_prime_nonidentity(point: tuple[int, int]) -> bool:
+    return point != (0, 1) and _ed_mul(_ED_L, point) == (0, 1)
+
+
+def _verify_ed25519(signature: bytes, public_key: bytes, message: bytes) -> bool:
+    if len(public_key) != 32:
+        raise VMError("CHECKDATASIG Ed25519 key encoding")
+    if len(signature) != 64:
+        raise VMError("CHECKDATASIG signature width")
+    decoded_key = _ed_decode(public_key)
+    if decoded_key is None:
+        raise VMError("CHECKDATASIG Ed25519 key encoding")
+    commitment = _ed_decode(signature[:32])
+    scalar = int.from_bytes(signature[32:], "little")
+    if (commitment is None or scalar >= _ED_L or
+            not _ed_prime_nonidentity(decoded_key) or
+            not _ed_prime_nonidentity(commitment)):
+        return False
+    challenge = int.from_bytes(
+        sha512(signature[:32] + public_key + message).digest(), "little") % _ED_L
+    return _ed_mul(scalar, _ED_B) == _ed_add(
+        commitment, _ed_mul(challenge, decoded_key))
+
+
+class _Curve:
+    def __init__(self, p: int, a: int, b: int, gx: int, gy: int, order: int):
+        self.p, self.a, self.b, self.n = p, a, b, order
+        self.g = (gx, gy)
+
+    def _lift(self, x: int) -> int | None:
+        rhs = (x * x * x + self.a * x + self.b) % self.p
+        y = pow(rhs, (self.p + 1) // 4, self.p)
+        return y if y * y % self.p == rhs else None
+
+    def _add(self, p1, p2):
+        if p1 is None:
+            return p2
+        if p2 is None:
+            return p1
+        (x1, y1), (x2, y2) = p1, p2
+        if x1 == x2 and (y1 + y2) % self.p == 0:
+            return None
+        if p1 == p2:
+            slope = (3 * x1 * x1 + self.a) * pow(2 * y1, -1, self.p)
+        else:
+            slope = (y2 - y1) * pow(x2 - x1, -1, self.p)
+        x3 = (slope * slope - x1 - x2) % self.p
+        return (x3, (slope * (x1 - x3) - y1) % self.p)
+
+    def _mul(self, k: int, point):
+        result = None
+        while k:
+            if k & 1:
+                result = self._add(result, point)
+            point = self._add(point, point)
+            k >>= 1
+        return result
+
+    def verify_digest(self, key: bytes, signature: bytes, message: bytes) -> bool:
+        """SEC1 compressed key, low-S r||s, message is the raw digest."""
+        if len(key) != 33 or key[0] not in (2, 3):
+            raise VMError("CHECKDATASIG key encoding")
+        if len(signature) != 64:
+            raise VMError("CHECKDATASIG signature width")
+        x = int.from_bytes(key[1:], "big")
+        if x >= self.p:
+            raise VMError("CHECKDATASIG key encoding")
+        y = self._lift(x)
+        if y is None:
+            raise VMError("CHECKDATASIG key encoding")
+        if (y & 1) != (key[0] & 1):
+            y = self.p - y
+        r = int.from_bytes(signature[:32], "big")
+        s = int.from_bytes(signature[32:], "big")
+        if not (1 <= r < self.n and 1 <= s <= self.n // 2):
+            return False
+        e = int.from_bytes(message, "big")
+        w = pow(s, -1, self.n)
+        point = self._add(self._mul(e * w % self.n, self.g),
+                          self._mul(r * w % self.n, (x, y)))
+        return point is not None and point[0] % self.n == r
+
+
+_P256 = _Curve(
+    2**256 - 2**224 + 2**192 + 2**96 - 1,
+    2**256 - 2**224 + 2**192 + 2**96 - 1 - 3,
+    0x5AC635D8AA3A93E7B3EBBD55769886BC651D06B0CC53B0F63BCE3C3E27D2604B,
+    0x6B17D1F2E12C4247F8BCE6E563A440F277037D812DEB33A0F4A13945D898C296,
+    0x4FE342E2FE1A7F9B8EE7EB4A7C0F9E162BCE33576B315ECECBB6406837BF51F5,
+    0xFFFFFFFF00000000FFFFFFFFFFFFFFFFBCE6FAADA7179E84F3B9CAC2FC632551)
+_SECP256K1 = _Curve(
+    2**256 - 2**32 - 977, 0, 7,
+    0x79BE667EF9DCBBAC55A06295CE870B07029BFCDB2DCE28D959F2815B16F81798,
+    0x483ADA7726A3C4655DA4FBFC0E1108A8FD17B448A68554199C47D08FFB10D4B8,
+    0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141)
+
+
+def _verify_bip340_message(signature: bytes, public_key: bytes, message: bytes) -> bool:
+    if len(public_key) != 32:
+        raise VMError("CHECKDATASIG x-only key encoding")
+    if len(signature) != 64:
+        raise VMError("CHECKDATASIG signature width")
+    try:
+        from coincurve import PublicKeyXOnly
+    except ImportError as exc:
+        raise UnsupportedFeature("coincurve 21 dependency is required for CHECKDATASIG") from exc
+    try:
+        key = PublicKeyXOnly(public_key)
+    except ValueError as exc:
+        raise VMError("CHECKDATASIG x-only key encoding") from exc
+    try:
+        return bool(key.verify(signature, message))
+    except ValueError:
+        return False
+
+
+def _verify_datasig(signature: bytes, message: bytes, public_key: bytes,
+                    algorithm: int) -> bool:
+    if algorithm not in (0, 1, 2, 3):
+        raise VMError("CHECKDATASIG algorithm")
+    if len(message) != 32:
+        raise VMError("CHECKDATASIG message width")
+    if algorithm == 0:
+        return _verify_bip340_message(signature, public_key, message)
+    if algorithm == 1:
+        return _P256.verify_digest(public_key, signature, message)
+    if algorithm == 2:
+        return _verify_ed25519(signature, public_key, message)
+    return _SECP256K1.verify_digest(public_key, signature, message)
 
 
 def _instruction(script: bytes, pos: int, profile: VMProfile) -> tuple[Instruction, int]:
@@ -571,6 +793,34 @@ def evaluate(script: bytes, args: tuple[bytes, ...], profile: VMProfile, *,
             elif op == 0xaf:
                 hi, lo, x = _numeric(pop()), _numeric(pop()), _numeric(pop())
                 push(number(int(lo <= x < hi)))
+            elif op in (0xb0, 0xb1):
+                carry = _numeric(pop())
+                b, a = _unsigned(pop()), _unsigned(pop())
+                if carry not in (0, 1):
+                    raise VMError("carry is not N(0)/N(1)")
+                if op == 0xb0:
+                    total = a + b + carry
+                    push(_unsigned_bytes(total & _U128_MASK))
+                    push(number(total >> 128))
+                else:
+                    push(_unsigned_bytes((a - b - carry) % (1 << 128)))
+                    push(number(int(a < b + carry)))
+            elif op == 0xb2:
+                b, a = _unsigned(pop()), _unsigned(pop())
+                product = a * b
+                push(_unsigned_bytes(product >> 128))
+                push(_unsigned_bytes(product & _U128_MASK))
+            elif op == 0xb3:
+                push(number(_log2_q64(_numeric(pop()))))
+            elif op == 0xb4:
+                value = _numeric(pop())
+                if value < 0:
+                    raise VMError("SQRT requires x>=0")
+                push(number(math.isqrt(value)))
+            elif op == 0xbd:
+                algorithm = _numeric(pop())
+                public_key, message, signature = pop(), pop(), pop()
+                push(number(int(_verify_datasig(signature, message, public_key, algorithm))))
             elif op in (0xb8, 0xb9):
                 data = pop()
                 digest = sha256(data).digest()
