@@ -1,0 +1,181 @@
+From c7d9bbad09da14710edc2fffd0b3ebdf9523d998 Mon Sep 17 00:00:00 2001
+From: Shammah Chancellor <shammah.chancellor@notvalid.com>
+Date: Thu, 15 Oct 2026 08:29:29 -0700
+Subject: [PATCH] Cache immutable field maxima and validate cost hints once per
+ transaction
+
+Review correction: Cache immutable field maxima and validate cost hints once per transaction.
+
+This isolated V2 candidate change preserves the existing Bitcoin parser and
+mainnet parameters. Module tests do not establish lotusd block acceptance.
+---
+ src/lotus_v2/test_vm.cpp | 15 +++++++++++++--
+ src/lotus_v2/vm.cpp      | 30 ++++++++++++++++++++++++++++--
+ src/lotus_v2/vm.h        |  7 +++++++
+ src/lotus_v2/vm_cost.inc | 10 ++++++----
+ 4 files changed, 54 insertions(+), 8 deletions(-)
+
+diff --git a/src/lotus_v2/test_vm.cpp b/src/lotus_v2/test_vm.cpp
+index f14f6af202af54c19f0ab3e85ed486195e9b7793..03bda664151c5829ffb12bbd66f829411b79a185 100644
+--- a/src/lotus_v2/test_vm.cpp
++++ b/src/lotus_v2/test_vm.cpp
+@@ -801,6 +801,13 @@ void PreparedTransactionOwnership() {
+         coins.push_back(coin);
+     }
+     tx.outputs.push_back(*coins[0]);
++    // A large unused authenticated field is legal with a tighter VM item
++    // limit: only an opcode actually pushing it would exceed that limit.
++    for (uint8_t i = 0; i < 4; ++i) {
++        Hash branch{};
++        branch.fill(uint8_t(0x90 + i));
++        tx.outputs[0].branches.push_back(branch);
++    }
+     auto cost = IllustrativeCost();
+     PreparedVmTransaction prepared;
+     std::string error;
+@@ -808,6 +815,10 @@ void PreparedTransactionOwnership() {
+     const auto before = VmPreparationWorkCounts();
+ #endif
+     CHECK(prepared.Prepare(tx, tp, chain, coins, cost, error));
++    CHECK(prepared.MaxFieldBound(0xe7) > PROFILE.max_element_bytes);
++    const auto original_context = VmExecutionContext{tx, tp, chain, coins, 0, 0, std::nullopt};
++    const auto original = EvaluateVmCharged(Hex("4e"), {}, PROFILE, cost, 0, 0, &original_context);
++    CHECK(original.invocation.status == VmStatus::Success);
+     const auto *signing = &prepared.Signing();
+     const auto *fields = &prepared.Cost();
+     const auto first = prepared.Invocation(0, 0);
+@@ -830,8 +841,8 @@ void PreparedTransactionOwnership() {
+     }
+ #ifdef LOTUS_V2_VM_TEST_INSTRUMENTATION
+     const auto after = VmPreparationWorkCounts();
+-    CHECK(after.signing == before.signing + 1);
+-    CHECK(after.field_sizes == before.field_sizes + 1);
++    CHECK(after.signing == before.signing + 2);
++    CHECK(after.field_sizes == before.field_sizes + 2);
+ #endif
+     // A cache pointer cannot authenticate caller-owned or foreign snapshot
+     // references, even when the serialized bytes happen to be identical.
+diff --git a/src/lotus_v2/vm.cpp b/src/lotus_v2/vm.cpp
+index c7183c886171d59176165a593073482381299768..ca27eba3ce7455477a780a45eb7ee725fe359593 100644
+--- a/src/lotus_v2/vm.cpp
++++ b/src/lotus_v2/vm.cpp
+@@ -1564,7 +1564,24 @@ bool PreparedVmTransaction::Prepare(const Transaction &tx, const TxProfile &prof
+     const auto context = Invocation(0, 0);
+     try {
+         VM_COUNT_PREPARATION(field_sizes);
++        // Explicit hints obey the caller element limit; derived field bounds
++        // may exceed it for fields that this particular script never reads.
++        max_field_bound_ = 0;
++        for (const auto &[op, sizes] : cost_.field_sizes) {
++            (void)op;
++            for (auto size : sizes) max_field_bound_ = std::max(max_field_bound_, size);
++        }
++        // Validate the immutable schedule once; each invocation only compares
++        // its stricter element limit with this precomputed maximum.
++        const VmProfile hard_profile{1, 1, VM_HARD_ELEMENT_BYTES, 1, 1, 1, 1, 1};
++        CheckCostProfile(cost_, hard_profile);
+         ApplyDerivedFieldSizes(cost_, context);
++        field_maxima_.clear();
++        for (const auto &[op, sizes] : cost_.field_sizes) {
++            size_t maximum = 0;
++            for (auto size : sizes) maximum = std::max(maximum, size);
++            field_maxima_[op] = maximum;
++        }
+     } catch (const VmFailure &failure) {
+         error = failure.what();
+         return false;
+@@ -1600,12 +1617,20 @@ VmResult EvaluateVmImpl(std::span<const uint8_t> script,
+         }
+         if (arguments.size() > profile.max_stack_items)
+             throw VmFailure("argument count exceeds stack cap");
+-        if (cost_profile) CheckCostProfile(*cost_profile, profile);
++
+         // Copy so a derived size cannot shrink a caller hint, and so the
+         // caller's profile is left unchanged. Charging below reads this copy.
+         std::optional<VmCostProfile> authenticated_cost;
+         if (context && context->prepared && !context->prepared->Owns(*context))
+             throw VmFailure("prepared transaction ownership mismatch");
++        const bool cached_cost = context && context->prepared &&
++            cost_profile == &context->prepared->Cost();
++        if (cached_cost) {
++            if (context->prepared->MaxFieldBound() > profile.max_element_bytes)
++                throw VmFailure("invalid field-size bound");
++        } else if (cost_profile) {
++            CheckCostProfile(*cost_profile, profile);
++        }
+         if (cost_profile && context &&
+             (!context->prepared || cost_profile != &context->prepared->Cost())) {
+             authenticated_cost = *cost_profile;
+@@ -1686,7 +1711,8 @@ VmResult EvaluateVmImpl(std::span<const uint8_t> script,
+                         *cost_profile);
+             const auto instructions =
+                 SizePass(code, profile, *cost_profile, script.size(),
+-                         input_count, output_count)
++                         input_count, output_count,
++                         cached_cost ? context->prepared : nullptr)
+                     .Charge(
+                         arguments,
+                         context &&
+diff --git a/src/lotus_v2/vm.h b/src/lotus_v2/vm.h
+index bebfb881c8f8f464d7de74f7f4d9b241f74f53fc..da7892585dc25023c3c721214240f4f38e44daae 100644
+--- a/src/lotus_v2/vm.h
++++ b/src/lotus_v2/vm.h
+@@ -86,6 +86,11 @@ public:
+         return {tx_, profile_, chain_, coins_, input, witness, delta, this};
+     }
+     const VmCostProfile &Cost() const { return cost_; }
++    size_t MaxFieldBound(uint8_t op) const {
++        const auto found = field_maxima_.find(op);
++        return found == field_maxima_.end() ? 0 : found->second;
++    }
++    size_t MaxFieldBound() const { return max_field_bound_; }
+     const PreparedSigningContext &Signing() const { return signing_; }
+     bool Owns(const VmExecutionContext &context) const {
+         return ready_ && &context.tx == &tx_ && &context.tx_profile == &profile_ &&
+@@ -98,6 +103,8 @@ private:
+     ResolvedCoins coins_;
+     VmCostProfile cost_;
+     PreparedSigningContext signing_;
++    std::map<uint8_t, size_t> field_maxima_;
++    size_t max_field_bound_ = 0;
+     bool ready_ = false;
+ };
+ 
+diff --git a/src/lotus_v2/vm_cost.inc b/src/lotus_v2/vm_cost.inc
+index bbae6ac0f50ae98cfac00b4026651780ffee582d..66cf7c6e4e606e837e977372bebdea0ad10d421d 100644
+--- a/src/lotus_v2/vm_cost.inc
++++ b/src/lotus_v2/vm_cost.inc
+@@ -187,6 +187,7 @@ std::optional<Int> LiteralValue(const Instruction *previous) {
+ class SizePass {
+     const std::vector<Instruction> &code;
+     const VmCostProfile &schedule;
++    const PreparedVmTransaction *prepared;
+     size_t script_length;
+     uint16_t input_count;
+     uint16_t output_count;
+@@ -442,8 +443,8 @@ class SizePass {
+                             *literal < Int(found->second.size()))
+                             size = found->second[size_t(*literal)];
+                         else
+-                            size = *std::max_element(found->second.begin(),
+-                                                     found->second.end());
++                            size = prepared ? prepared->MaxFieldBound(op) :
++                                *std::max_element(found->second.begin(), found->second.end());
+                     }
+                 }
+                 push(size);
+@@ -651,8 +652,9 @@ class SizePass {
+ public:
+     SizePass(const std::vector<Instruction> &code, const VmProfile &vm,
+              const VmCostProfile &schedule, size_t script_length,
+-             uint16_t input_count, uint16_t output_count)
+-        : code(code), schedule(schedule), script_length(script_length),
++             uint16_t input_count, uint16_t output_count,
++             const PreparedVmTransaction *prepared = nullptr)
++        : code(code), schedule(schedule), prepared(prepared), script_length(script_length),
+           input_count(input_count), output_count(output_count),
+           limit(vm.max_element_bytes) {}
+     VmCostUnits Charge(const std::vector<VmBytes> &arguments, bool mint) const {
+-- 
+2.50.1 (Apple Git-155)
+
