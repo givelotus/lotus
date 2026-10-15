@@ -1,0 +1,234 @@
+From b24fd82470d972ab917689c52175121f61bf80e0 Mon Sep 17 00:00:00 2001
+From: Shammah Chancellor <shammah.chancellor@notvalid.com>
+Date: Thu, 15 Oct 2026 15:18:47 -0700
+Subject: [PATCH] fix(v2): resume fenced pool reconciliation across bounded
+ ticks
+
+Maintenance explanation added during mailbox export:
+Retain a fenced staged pool rebuild across bounded validation ticks instead of restarting the whole reconstruction on every budget exhaustion. Regressions cover parent and child continuation, anchor changes, storage failures and publication only after complete reconstruction.
+
+---
+ src/lotus_v2/test_transaction_pool.cpp |  42 ++++++++++
+ src/lotus_v2/transaction_pool.cpp      | 104 +++++++++++++++++++------
+ src/lotus_v2/transaction_pool.h        |  21 +++++
+ 3 files changed, 143 insertions(+), 24 deletions(-)
+
+diff --git a/src/lotus_v2/test_transaction_pool.cpp b/src/lotus_v2/test_transaction_pool.cpp
+index a203beb4ce1b793b1a82eba2c51c9046f56324b2..32fd5b778fcfb4807c692a0ecafb06a37e2e7949 100644
+--- a/src/lotus_v2/test_transaction_pool.cpp
++++ b/src/lotus_v2/test_transaction_pool.cpp
+@@ -100,5 +100,47 @@ int main() {try {
+     TransactionPool locks(limits);CHECK(locks.Admit(Wire(time_locked),lc,b).status==PoolStatus::Accepted);
+     lc.profile.parent_mtp=49998;lc.anchor.generation=2;
+     CHECK(locks.Reconcile(lc,{}, {},{},b).status==PoolStatus::Accepted);CHECK(locks.Size()==0);
++    // Rebuilds retain progress with one validation per call, including a
++    // child-first detached batch and a subsequent survivor-only rebuild.
++    Fixture incremental;auto ic=incremental.Context();TransactionPool staged(limits);
++    std::vector<std::vector<uint8_t>> detached{Wire(left),Wire(parent)};
++    PoolBudget one{1,10000000};
++    CHECK(staged.Reconcile(ic,{}, {},detached,one).status==PoolStatus::Capacity);
++    CHECK(one.validations==0);CHECK(staged.ReconcilePending());CHECK(!staged.Enabled());
++    CHECK(staged.Size()==0);CHECK(staged.Inventory(0,10).empty());
++    one={1,10000000};CHECK(staged.Reconcile(ic,{}, {},detached,one).status==PoolStatus::Accepted);
++    CHECK(staged.Size()==2);CHECK(staged.Enabled());CHECK(!staged.ReconcilePending());
++    auto initial=staged.Snapshot(ic.anchor,10,1000000);CHECK(initial.entries.size()==2);
++    CHECK(initial.entries[0].effects.txid==pid);CHECK(initial.entries[1].effects.txid==Id(left));
++    ic.anchor.generation=2;one={1,10000000};
++    CHECK(staged.Reconcile(ic,{}, {},{},one).status==PoolStatus::Capacity);
++    CHECK(staged.Size()==2);CHECK(!staged.Enabled());CHECK(staged.ReconcilePending());
++    // A new anchor must discard the prior staged parent and spend fresh work.
++    ic.anchor.generation=3;one={1,10000000};
++    CHECK(staged.Reconcile(ic,{}, {},{},one).status==PoolStatus::Capacity);
++    CHECK(one.validations==0);CHECK(staged.ReconcilePending());
++    one={1,10000000};CHECK(staged.Reconcile(ic,{}, {},{},one).status==PoolStatus::Accepted);
++    CHECK(staged.Size()==2);CHECK(staged.Snapshot(ic.anchor,10,1000000).entries.size()==2);
++    // An authoritative output read error on the second tick discards staging
++    // while retaining the old disabled data for a complete retry.
++    ic.anchor.generation=4;one={1,10000000};
++    CHECK(staged.Reconcile(ic,{}, {},{},one).status==PoolStatus::Capacity);
++    incremental.error=true;one={1,10000000};
++    CHECK(staged.Reconcile(ic,{}, {},{},one).status==PoolStatus::Operational);
++    CHECK(!staged.ReconcilePending());CHECK(!staged.Enabled());CHECK(staged.Size()==2);
++    incremental.error=false;one={1,10000000};
++    CHECK(staged.Reconcile(ic,{}, {},{},one).status==PoolStatus::Capacity);
++    one={1,10000000};CHECK(staged.Reconcile(ic,{}, {},{},one).status==PoolStatus::Accepted);
++    // A failed snapshot fence also discards the staged rebuild.
++    ic.anchor.generation=5;one={1,10000000};
++    CHECK(staged.Reconcile(ic,{}, {},{},one).status==PoolStatus::Capacity);
++    incremental.current=false;one={1,10000000};
++    CHECK(staged.Reconcile(ic,{}, {},{},one).status==PoolStatus::Stale);
++    CHECK(!staged.ReconcilePending());CHECK(!staged.Enabled());CHECK(staged.Size()==2);
++    // Hard resource refusal is distinguishable from a budget pause.
++    incremental.current=true;PoolLimits bounded=limits;bounded.max_entries=1;
++    TransactionPool too_many(bounded);one={1,10000000};
++    CHECK(too_many.Reconcile(ic,{}, {},detached,one).status==PoolStatus::Capacity);
++    CHECK(!too_many.ReconcilePending());CHECK(!too_many.Enabled());
+     std::cout<<"transaction pool tests passed\n";return 0;
+ } catch(const std::exception&e){std::cerr<<e.what()<<'\n';return 1;}}
+diff --git a/src/lotus_v2/transaction_pool.cpp b/src/lotus_v2/transaction_pool.cpp
+index 5fc3ed88d6d10f872e0a5cd305142c652213e53e..327f95f3a2b91c4f2a053a3c5bac82a36ebf32f6 100644
+--- a/src/lotus_v2/transaction_pool.cpp
++++ b/src/lotus_v2/transaction_pool.cpp
+@@ -139,33 +139,89 @@ PoolResult TransactionPool::Reconcile(const PoolContext &ctx,const std::set<Hash
+     const std::vector<Outpoint>&connected_spends,const std::vector<std::vector<uint8_t>>&detached,PoolBudget&budget) {
+     enabled_=false;
+     PoolResult result;
++    auto fail=[&](PoolStatus status,const std::string &error) {
++        rebuild_.reset();result.status=status;result.error=error;return result;
++    };
+     try {
+-        TransactionPool next(limits_);
+-        std::set<Hash> removed=connected;
+-        for(const auto&op:connected_spends) {auto it=spends_.find(op); if(it!=spends_.end() && !connected.contains(it->second)) removed.insert(it->second);}
+-        bool changed=true;
+-        while(changed) {changed=false;for(const auto &[id,e]:entries_) if(!removed.contains(id))
+-            for(const auto&p:e.parents) if(removed.contains(p) && !connected.contains(p)) {removed.insert(id);changed=true;break;}}
+-        std::vector<std::vector<uint8_t>> pending;
+-        for(const auto &[id,e]:entries_) if(!removed.contains(id)) pending.push_back(e.wire);
+-        if(detached.size()>limits_.max_entries || pending.size()>limits_.max_entries-detached.size()) {
+-            result.status=PoolStatus::Capacity; result.error="reconciliation input count";return result;
+-        }
+-        pending.insert(pending.end(),detached.begin(),detached.end());
+-        size_t total=0;for(const auto&w:pending) {if(w.size()>limits_.max_bytes-total) {result.status=PoolStatus::Capacity;return result;}total+=w.size();}
+-        while(!pending.empty()) {
+-            bool progress=false; std::vector<std::vector<uint8_t>> retry;
+-            for(const auto&w:pending) {
+-                auto r=next.Admit(w,ctx,budget);
+-                if(r.status==PoolStatus::Operational || r.status==PoolStatus::Stale || r.status==PoolStatus::Capacity) return r;
+-                if(r.status==PoolStatus::MissingParents) retry.push_back(w); else progress=true;
++        if(!ctx.current || !ctx.current()) return fail(PoolStatus::Stale,"reconciliation context unavailable");
++        if(rebuild_ && (rebuild_->anchor!=ctx.anchor || rebuild_->connected!=connected ||
++                       rebuild_->connected_spends!=connected_spends || rebuild_->detached!=detached))
++            rebuild_.reset();
++        if(!rebuild_) {
++            Rebuild stage;stage.anchor=ctx.anchor;stage.connected=connected;
++            stage.connected_spends=connected_spends;
++            std::map<Hash,std::vector<Hash>> descendants;
++            for(const auto &[id,e]:entries_) for(const auto &parent:e.parents)
++                descendants[parent].push_back(id);
++            std::set<Hash> removed=connected;
++            for(const auto &op:connected_spends) {
++                auto it=spends_.find(op);
++                if(it!=spends_.end() && !connected.contains(it->second)) removed.insert(it->second);
++            }
++            std::vector<Hash> pending;
++            for(const auto &id:removed) if(!connected.contains(id)) pending.push_back(id);
++            for(size_t i=0;i<pending.size();++i) for(const auto &child:descendants[pending[i]])
++                if(removed.insert(child).second) pending.push_back(child);
++            for(const auto &[id,e]:entries_) if(!removed.contains(id)) stage.wires.push_back(e.wire);
++            if(detached.size()>limits_.max_entries || stage.wires.size()>limits_.max_entries-detached.size())
++                return fail(PoolStatus::Capacity,"reconciliation input count");
++            size_t total=0;
++            for(const auto *batch:{static_cast<const std::vector<std::vector<uint8_t>> *>(&stage.wires),&detached}) for(const auto &wire:*batch) {
++                if(wire.size()>limits_.max_bytes-total) return fail(PoolStatus::Capacity,"reconciliation input bytes");
++                total+=wire.size();
++            }
++            stage.detached=detached;
++            stage.wires.insert(stage.wires.end(),detached.begin(),detached.end());
++            // Schedule each candidate once, after its in-batch parents. Missing
++            // external inputs and rejected parents do not trigger retry scans.
++            std::vector<Transaction> transactions(stage.wires.size());
++            std::map<Hash,size_t> candidates;
++            for(size_t i=0;i<stage.wires.size();++i) {
++                IdentityDigests ids;std::string error;
++                if(DecodeTransaction(stage.wires[i],ctx.profile.transaction,transactions[i],error) &&
++                   ComputeIdentities(transactions[i],ctx.profile.transaction,ctx.chain_id,ids,error))
++                    candidates.emplace(ids.txid,i);
+             }
+-            if(!progress) break;
+-            pending.swap(retry);
++            stage.children.resize(stage.wires.size());stage.remaining.resize(stage.wires.size());
++            size_t edges=0;
++            for(size_t i=0;i<transactions.size();++i) {
++                std::set<size_t> parents;
++                for(const auto &input:transactions[i].inputs) if(input.flags==1) {
++                    auto parent=candidates.find(input.prev_txid);
++                    if(parent!=candidates.end()) parents.insert(parent->second);
++                }
++                if(parents.size()>limits_.max_edges-edges) return fail(PoolStatus::Capacity,"reconciliation input edges");
++                edges+=parents.size();stage.remaining[i]=parents.size();
++                for(auto parent:parents) stage.children[parent].push_back(i);
++                if(parents.empty()) stage.ready.push_back(i);
++            }
++            rebuild_=std::move(stage);
++        }
++        auto &stage=*rebuild_;
++        TransactionPool next(limits_);next.anchor_=ctx.anchor;next.anchored_=true;
++        next.entries_=std::move(stage.entries);next.hashes_=std::move(stage.hashes);
++        next.spends_=std::move(stage.spends);next.bytes_=stage.bytes;next.edges_=stage.edges;
++        auto pause=[&]() {
++            stage.entries=std::move(next.entries_);stage.hashes=std::move(next.hashes_);
++            stage.spends=std::move(next.spends_);stage.bytes=next.bytes_;stage.edges=next.edges_;
++            result.status=PoolStatus::Capacity;result.error="reconciliation validation budget";return result;
++        };
++        while(!stage.ready.empty()) {
++            if(!ctx.current()) return fail(PoolStatus::Stale,"context changed during reconciliation");
++            if(!budget.validations || !budget.invocation_cost) return pause();
++            auto index=stage.ready.front();auto before=budget.validations;
++            auto admitted=next.Admit(stage.wires[index],ctx,budget);
++            // Even cheap refusals consume bounded reconciliation work.
++            if(budget.validations==before) --budget.validations;
++            if(admitted.status==PoolStatus::Capacity &&
++               admitted.error=="invocation cost unavailable or over budget") return pause();
++            if(admitted.status==PoolStatus::Operational || admitted.status==PoolStatus::Stale ||
++               admitted.status==PoolStatus::Capacity) return fail(admitted.status,admitted.error);
++            stage.ready.pop_front();
++            for(auto child:stage.children[index]) if(--stage.remaining[child]==0) stage.ready.push_back(child);
+         }
+-        if(!ctx.current || !ctx.current()) {result.status=PoolStatus::Stale;return result;}
+-        next.anchor_=ctx.anchor;next.anchored_=true;
++        if(!ctx.current()) return fail(PoolStatus::Stale,"context changed before reconciliation publication");
+         *this=std::move(next);result.status=PoolStatus::Accepted;return result;
+-    } catch(const std::exception&e) {result.status=PoolStatus::Operational;result.error=e.what();return result;}
++    } catch(const std::exception &e) {return fail(PoolStatus::Operational,e.what());}
+ }
+ }
+diff --git a/src/lotus_v2/transaction_pool.h b/src/lotus_v2/transaction_pool.h
+index c026103be5d9d81dd997f6a932b001445c70dd7c..efd29a99346775f8848c94f99f5417bb691dbc57 100644
+--- a/src/lotus_v2/transaction_pool.h
++++ b/src/lotus_v2/transaction_pool.h
+@@ -3,6 +3,8 @@
+ #define LOTUS_V2_TRANSACTION_POOL_H
+ #include "block_cost.h"
+ #include <set>
++#include <deque>
++#include <optional>
+ namespace lotus::v2 {
+ struct PoolAnchor { Hash tip{}; uint64_t generation{}; bool operator==(const PoolAnchor &) const = default; };
+ enum class PoolMissingState { Unknown, Spent, Error };
+@@ -55,13 +57,32 @@ public:
+     // Rebuild against the NEW authoritative anchor, even when old==new.
+     // Operational/stale/capacity failures preserve data but disable every read
+     // until a successful retry. Detached wires are ordinary transactions only.
++    // Repeated calls with identical anchor/inputs resume a bounded rebuild.
++    // Capacity with ReconcilePending() means fresh budget can make progress;
++    // other failures discard staging. Changed anchor/inputs restart safely.
+     PoolResult Reconcile(const PoolContext &, const std::set<Hash> &connected,
+                          const std::vector<Outpoint> &connected_spends,
+                          const std::vector<std::vector<uint8_t>> &detached,
+                          PoolBudget &);
++    // True only while a budget-limited rebuild can resume.
++    bool ReconcilePending() const { return rebuild_.has_value(); }
+     size_t Size() const { return entries_.size(); }
+     bool Enabled() const { return enabled_; }
+ private:
++    struct Rebuild {
++        PoolAnchor anchor;
++        std::set<Hash> connected;
++        std::vector<Outpoint> connected_spends;
++        std::vector<std::vector<uint8_t>> detached, wires;
++        std::vector<std::vector<size_t>> children;
++        std::vector<size_t> remaining;
++        std::deque<size_t> ready;
++        size_t bytes=0, edges=0;
++        std::map<Hash, PoolEntry> entries;
++        std::map<Hash, Hash> hashes;
++        std::map<Outpoint, Hash, OutpointLess> spends;
++    };
++    std::optional<Rebuild> rebuild_;
+     PoolLimits limits_;
+     PoolAnchor anchor_{};
+     bool anchored_ = false, enabled_ = true;
+-- 
+2.50.1 (Apple Git-155)
+

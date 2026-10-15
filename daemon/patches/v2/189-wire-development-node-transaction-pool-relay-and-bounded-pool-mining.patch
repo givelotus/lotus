@@ -1,0 +1,347 @@
+From eef81fc189c4a7e52c91a98146ae68716d3d9a1a Mon Sep 17 00:00:00 2001
+From: Shammah Chancellor <shammah.chancellor@notvalid.com>
+Date: Thu, 15 Oct 2026 15:15:27 -0700
+Subject: [PATCH] Wire development node transaction pool relay and bounded pool
+ mining
+
+Maintenance explanation added during mailbox export:
+Connect the development node command to the transaction coordinator, negotiated relay actions and bounded pool-backed block template assembly. Serving and mining use the synchronized pool view; the development command remains a private testnet interface rather than a production node compatibility claim.
+
+---
+ src/lotus_v2/development_node_command.cpp | 221 +++++++++++++++++++++-
+ 1 file changed, 215 insertions(+), 6 deletions(-)
+
+diff --git a/src/lotus_v2/development_node_command.cpp b/src/lotus_v2/development_node_command.cpp
+index 3bb3b426cd97bd86f680d4f512fdb884878eaa10..77373479a7c8636a2f5ad0117521724a81f2342b 100644
+--- a/src/lotus_v2/development_node_command.cpp
++++ b/src/lotus_v2/development_node_command.cpp
+@@ -5,6 +5,8 @@
+ #include "development_runtime.h"
+ #include "peer_dispatcher.h"
+ #include "peer_tcp.h"
++#include "pool_coordinator.h"
++#include "transaction_relay.h"
+ #include <algorithm>
+ #include <array>
+ #include <chrono>
+@@ -381,7 +383,7 @@ namespace {
+     class Node {
+     public:
+         Node(DevelopmentManifest m, NetworkConfig n,
+-             std::unique_ptr<DevelopmentRuntime> r)
++             std::unique_ptr<DevelopmentRuntime> r, const std::string &directory)
+             : manifest(std::move(m)), network(std::move(n)),
+               runtime(std::move(r)) {
+             manager = std::make_unique<DownloadManager>(
+@@ -394,6 +396,28 @@ namespace {
+                         return serving.Reserve(need);
+                     },
+                     [](uint64_t &nonce) { return Entropy(nonce); }});
++            const auto anchor = runtime->Snapshot();
++            Require(bool(anchor.chain), "pool runtime anchor unavailable");
++            PoolCoordinatorConfig pc{};
++            pc.directory = directory + "/transaction-index";
++            pc.identity = anchor.chain->identity;
++            pc.profile_digest = network.profile.profile_digest;
++            pc.headers = manifest.hp;
++            pc.ordinary = manifest.op;
++            pc.cost = manifest.cp;
++            pc.max_block_bytes = manifest.block_read_limit;
++            std::string error;
++            Require(PoolCoordinator::Open(*runtime, pc, pool, error), error);
++            RelayLimits rl{};
++            rl.peers = MaxPeers;
++            rl.transaction_bytes = pc.pool.max_transaction_bytes;
++            relay = std::make_unique<TransactionRelay>(network.profile, rl,
++                [this](const Bytes &wire) {
++                    const auto snap = runtime->Snapshot();
++                    if (!snap.chain) return RelayAdmission::Stale;
++                    PoolBudget budget{1, 1000000};
++                    return static_cast<RelayAdmission>(pool->Submit(wire, snap.chain->stable_tip, budget).status);
++                }, [this](const Hash &hash, Bytes &wire) { return pool->ReadWire(hash, wire); });
+             retry.resize(network.connect.size());
+             connections.reserve(MaxPeers);
+             tracked_bodies.reserve(32);
+@@ -417,6 +441,19 @@ namespace {
+             serving{0, 96 * MiB, 0, 4000000};
+         std::unique_ptr<DownloadManager> manager;
+         std::unique_ptr<PeerDispatcher> dispatcher;
++        std::unique_ptr<PoolCoordinator> pool;
++        std::unique_ptr<TransactionRelay> relay;
++        std::set<ConnectionId> relay_peers;
++        size_t inventory_cursor{};
++        uint64_t inventory_refresh{};
++        std::vector<Hash> relay_inventory;
++        CoordinatorResult pool_result = CoordinatorResult::Deferred;
++        std::string pool_diagnostic;
++        void RelayActions(RelayResult, uint64_t);
++        UniValue SubmitTransaction(const UniValue &);
++        UniValue TransactionQuery(const UniValue &);
++        UniValue Mempool();
++        UniValue MinePool(const UniValue &);
+         TcpListener listener;
+         TcpEndpoint bound;
+         std::vector<std::unique_ptr<Connection>> connections;
+@@ -581,6 +618,111 @@ namespace {
+             }
+         }
+     }
++    void Node::RelayActions(RelayResult result, uint64_t now) {
++        // SendApplication accepts a whole Message or none. A failed enqueue
++        // invalidates that peer's relay state and closes its physical session.
++        for (auto &action : result.actions) {
++            const ConnectionId connection{action.peer};
++            if (!relay_peers.contains(connection)) continue;
++            if (dispatcher->SendApplication(connection, std::move(action.message), now) != DispatcherResult::Queued) {
++                relay->RemovePeer(action.peer);
++                relay_peers.erase(connection);
++                dispatcher->Remove(connection);
++                for (auto &c : connections) if(c->id == connection) c->stream.Close();
++            }
++        }
++    }
++    UniValue Node::SubmitTransaction(const UniValue &request) {
++        Keys(request, {"id", "command", "wire", "expected_tip"});
++        const auto wire = Unhex(request["wire"], 1000000);
++        PoolBudget budget{1, 1000000};
++        const auto result = pool->Submit(wire, HashOf(request["expected_tip"]), budget);
++        static const char *names[] = {"accepted", "duplicate", "conflict", "missing_parents", "invalid", "capacity_refused", "stale_tip", "inconclusive"};
++        UniValue answer(UniValue::VOBJ), missing(UniValue::VARR);
++        answer.pushKV("ok", result.status == PoolStatus::Accepted || result.status == PoolStatus::Duplicate);
++        answer.pushKV("result", names[static_cast<size_t>(result.status)]);
++        answer.pushKV("txid", Hex(result.txid));
++        answer.pushKV("txhash", Hex(result.txhash));
++        answer.pushKV("error", result.error.substr(0, 1024));
++        for (const auto &outpoint : result.missing) {
++            UniValue item(UniValue::VOBJ);
++            item.pushKV("txid", Hex(outpoint.tx_id));
++            item.pushKV("index", uint64_t(outpoint.index));
++            missing.push_back(item);
++        }
++        answer.pushKV("missing", missing);
++        if (result.status == PoolStatus::Accepted) inventory_refresh = 0;
++        return answer;
++    }
++    UniValue Node::TransactionQuery(const UniValue &request) {
++        std::set<std::string> keys{"id", "command", "txid"};
++        if (request.exists("txhash")) keys.insert("txhash");
++        if (request.exists("wire")) keys.insert("wire");
++        Keys(request, keys);
++        std::optional<Hash> hash;
++        if (request.exists("txhash")) hash = HashOf(request["txhash"]);
++        std::vector<uint8_t> wire;
++        const bool has_wire = request.exists("wire");
++        if (has_wire) wire = Unhex(request["wire"], 1000000);
++        const auto status = pool->Status(HashOf(request["txid"]), hash, has_wire ? &wire : nullptr);
++        static const char *names[] = {"pending", "confirmed", "conflicted", "unknown", "inconclusive"};
++        UniValue answer(UniValue::VOBJ);
++        answer.pushKV("state", names[static_cast<size_t>(status.state)]);
++        answer.pushKV("txid", Hex(status.txid));
++        answer.pushKV("txhash", Hex(status.txhash));
++        answer.pushKV("error", status.diagnostic.substr(0, 1024));
++        if (status.confirmation) {
++            answer.pushKV("block_id", Hex(status.confirmation->block));
++            answer.pushKV("height", status.confirmation->height);
++        }
++        return answer;
++    }
++    UniValue Node::Mempool() {
++        const auto snapshot = pool->Snapshot(1000, 16000000);
++        UniValue answer(UniValue::VOBJ), entries(UniValue::VARR);
++        size_t bytes = 0;
++        for (const auto &entry : snapshot.entries) {
++            UniValue item(UniValue::VOBJ);
++            item.pushKV("txid", Hex(entry.effects.txid));
++            item.pushKV("txhash", Hex(entry.effects.txhash));
++            entries.push_back(item);
++            bytes += entry.wire.size();
++        }
++        answer.pushKV("ready", snapshot.status == PoolStatus::Accepted);
++        answer.pushKV("tip", Hex(snapshot.anchor.tip));
++        answer.pushKV("count", uint64_t(snapshot.entries.size()));
++        answer.pushKV("bytes", uint64_t(bytes));
++        answer.pushKV("transactions", entries);
++        return answer;
++    }
++    UniValue Node::MinePool(const UniValue &request) {
++        Keys(request, {"id", "command", "expected_parent", "time", "max_claim", "coinbase_output", "coinbase_data", "start_nonce", "max_attempts"});
++        const auto snapshot = pool->Snapshot(1000, 16000000);
++        Require(snapshot.status == PoolStatus::Accepted, "transaction pool authority unavailable");
++        Require(snapshot.anchor.tip == HashOf(request["expected_parent"]), "stale pool parent");
++        UniValue expanded = request;
++        UniValue transactions(UniValue::VARR);
++        // Validate each candidate prefix against the real block builder. Costs
++        // and parabolic burn may reject a pool-valid transaction in a block.
++        // One rejection does not prevent independent later entries being used.
++        size_t attempts = 0, skipped = 0;
++        for (const auto &entry : snapshot.entries) {
++            if (++attempts > 64) break;
++            UniValue candidate = transactions;
++            candidate.push_back(Hex(entry.wire));
++            UniValue probe = request;
++            probe.pushKV("transactions", candidate);
++            probe.pushKV("max_attempts", uint64_t(0));
++            const auto result = MineBlock(probe);
++            if (result["result"].isStr() && result["result"].get_str() == "nonce_exhausted") transactions = std::move(candidate);
++            else ++skipped;
++        }
++        expanded.pushKV("transactions", transactions);
++        auto answer = MineBlock(expanded);
++        answer.pushKV("pool_selected", uint64_t(transactions.size()));
++        answer.pushKV("pool_skipped", uint64_t(skipped));
++        return answer;
++    }
+     UniValue Node::Status() {
+         UniValue v(UniValue::VOBJ);
+         const auto snap = runtime->Snapshot();
+@@ -608,6 +750,10 @@ namespace {
+             v.pushKV("pending_propagation", snap.chain->pending_propagation);
+             v.pushKV("invalid_roots", snap.chain->invalid_root_count);
+         }
++        v.pushKV("mempool_ready", pool->Snapshot(0, 0).status == PoolStatus::Accepted);
++        static const char *coordinator_names[] = {"ready", "progress", "deferred", "capacity_refused", "storage_error"};
++        v.pushKV("transaction_index", coordinator_names[static_cast<size_t>(pool_result)]);
++        v.pushKV("transaction_index_error", pool_diagnostic.substr(0, 1024));
+         v.pushKV("chain_id", Hex(network.profile.chain_id));
+         v.pushKV("genesis_id", Hex(network.profile.genesis_id));
+         v.pushKV("profile_digest", Hex(network.profile.profile_digest));
+@@ -1130,7 +1276,7 @@ namespace {
+             Require(!id.empty() && id.size() <= 64, "command id bound");
+             Require(request["command"].isStr(), "command name required");
+             const auto name = request["command"].get_str();
+-            producer = name == "mineblock";
++            producer = name == "mineblock" || name == "minepool";
+             if (name == "status" || name == "stop") {
+                 Keys(request, {"id", "command"});
+                 answer = Status();
+@@ -1139,6 +1285,15 @@ namespace {
+                 Keys(request, {"id", "command", "block"});
+                 answer = SubmitBlock(
+                     Unhex(request["block"], manifest.block_read_limit));
++            } else if (name == "submittransaction") {
++                answer = SubmitTransaction(request);
++            } else if (name == "transactionstatus") {
++                answer = TransactionQuery(request);
++            } else if (name == "mempool") {
++                Keys(request, {"id", "command"});
++                answer = Mempool();
++            } else if (name == "minepool") {
++                answer = MinePool(request);
+             } else if (name == "mineblock") {
+                 answer = MineBlock(request);
+             } else if (name == "readblock") {
+@@ -1207,8 +1362,7 @@ namespace {
+                 }
+             } else
+                 throw std::runtime_error(
+-                    "unsupported local command; transaction relay and signing "
+-                    "are not implemented");
++                    "unsupported local command");
+             if (!answer.exists("ok")) answer.pushKV("ok", true);
+         } catch (const std::exception &e) {
+             answer = UniValue(UniValue::VOBJ);
+@@ -1267,6 +1421,8 @@ namespace {
+         Require(Entropy(extra), "version extra entropy unavailable");
+         SessionConfig s{};
+         s.network = network.profile;
++        s.supported_features |= TRANSACTION_RELAY_FEATURE;
++        s.required_features |= TRANSACTION_RELAY_FEATURE;
+         s.inbound = c.inbound;
+         s.handshake_timeout_ms = 10000;
+         s.incoming_nonce_allowed = [this](uint64_t nonce) {
+@@ -1316,6 +1472,8 @@ namespace {
+             if (!c.stream.IsOpen() ||
+                 (c.transport && c.transport->State() == SessionState::Closed)) {
+                 if (c.transport) dispatcher->Remove(c.id);
++                relay->RemovePeer(c.id.value);
++                relay_peers.erase(c.id);
+                 outbound_nonces.erase(c.nonce);
+                 if (c.target) retry[*c.target] = now + 1000;
+                 i = connections.erase(i);
+@@ -1392,8 +1550,26 @@ namespace {
+         for (size_t n = 0; n < 256; ++n) {
+             auto notice = dispatcher->TakeNotice();
+             if (!notice) break;
+-            if (notice->kind == DispatcherNoticeKind::Activated)
++            if (notice->kind == DispatcherNoticeKind::Activated) {
+                 Count(active_events);
++                const auto features = dispatcher->ActiveFeatures(notice->connection);
++                const auto limit = dispatcher->ActiveLimit(notice->connection);
++                if (features && limit && relay->AddPeer(notice->connection.value, *limit,
++                        (*features & TRANSACTION_RELAY_FEATURE) != 0)) {
++                    relay_peers.insert(notice->connection);
++                    inventory_refresh = 0;
++                }
++            }
++            if (notice->kind == DispatcherNoticeKind::Application && notice->application) {
++                auto result = relay->Handle(notice->connection.value, *notice->application, Monotonic());
++                if (result.invalid_peer) {
++                    relay->RemovePeer(notice->connection.value);
++                    relay_peers.erase(notice->connection);
++                    dispatcher->Remove(notice->connection);
++                    for (auto &c : connections) if(c->id == notice->connection) c->stream.Close();
++                }
++                RelayActions(std::move(result), Monotonic());
++            }
+             if (notice->kind == DispatcherNoticeKind::Download &&
+                 notice->download) {
+                 const auto &e = *notice->download;
+@@ -1538,6 +1714,15 @@ namespace {
+             const auto usage =
+                 dispatcher->Tick(now, Utc(), manifest.future_window, budget);
+             Count(served_bytes, usage.served_bytes);
++            // Closed notices may be suppressed by notice backpressure. Fence
++            // relay ownership against dispatcher authority every turn anyway.
++            for (auto i = relay_peers.begin(); i != relay_peers.end();) {
++                const auto features = dispatcher->ActiveFeatures(*i);
++                if (!features || !(*features & TRANSACTION_RELAY_FEATURE)) {
++                    relay->RemovePeer(i->value);
++                    i = relay_peers.erase(i);
++                } else ++i;
++            }
+             Drain();
+             auto tick = runtime->Tick(Utc(), manifest.future_window, limits);
+             if (tick.choices) choices = std::move(tick.choices);
+@@ -1554,6 +1739,30 @@ namespace {
+                 event.pushKV("event", "tip");
+                 Queue(event);
+             }
++            PoolCoordinatorBudget pool_budget{};
++            pool_budget.validation = {1000, 100000000};
++            pool_result = pool->Tick(pool_budget, pool_diagnostic);
++            RelayActions(relay->Tick(now), now);
++            if (changed) inventory_refresh = 0;
++            if (pool->Snapshot(0, 0).status != PoolStatus::Accepted) {
++                relay_inventory.clear();
++                inventory_refresh = 0;
++            } else if (now >= inventory_refresh) {
++                // Snapshot order is parent before child; Inventory() itself
++                // does not promise this order. Cache only identities between
++                // bounded one-second refreshes and fence every page above.
++                const auto snapshot = pool->Snapshot(1000, 16000000);
++                relay_inventory.clear();
++                for (const auto &entry : snapshot.entries)
++                    relay_inventory.push_back(entry.effects.txhash);
++                inventory_cursor = 0;
++                inventory_refresh = now + 1000;
++            }
++            if (inventory_cursor < relay_inventory.size()) {
++                const auto count = std::min<size_t>(128, relay_inventory.size() - inventory_cursor);
++                RelayActions(relay->AnnounceMany(std::span<const Hash>(relay_inventory).subspan(inventory_cursor, count), now), now);
++                inventory_cursor += count;
++            }
+             CleanupBodies();
+             Headers(now, changed);
+             Schedule(now);
+@@ -1603,7 +1812,7 @@ int RunDevelopmentNodeCommand(int argc, char *argv[]) {
+         Require(DevelopmentRuntime::Open(RuntimeConfig(manifest, directory),
+                                          runtime, error),
+                 error);
+-        Node node(std::move(manifest), network, std::move(runtime));
++        Node node(std::move(manifest), network, std::move(runtime), directory);
+         node.Run();
+         return 0;
+     } catch (const std::exception &e) {
+-- 
+2.50.1 (Apple Git-155)
+

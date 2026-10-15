@@ -1,0 +1,661 @@
+From 59ffe68de64637c2fb3a9e5b3a0fe60809728919 Mon Sep 17 00:00:00 2001
+From: Shammah Chancellor <shammah.chancellor@notvalid.com>
+Date: Thu, 15 Oct 2026 15:16:30 -0700
+Subject: [PATCH] Add bounded snapshot V2 branch query kernel
+
+Maintenance explanation added during mailbox export:
+Introduce a snapshot-bound V2 branch query kernel with bounded pagination and tests for branch-oriented reads. The kernel defines a reusable query contract over authenticated index snapshots rather than an HTTP endpoint or live indexing integration.
+
+---
+ .../chronik-indexer/src/query/v2_branches.rs  | 303 ++++++++++++++++
+ .../src/query/v2_branches_test/tests.rs       | 328 ++++++++++++++++++
+ 2 files changed, 631 insertions(+)
+ create mode 100644 chronik/chronik-indexer/src/query/v2_branches.rs
+ create mode 100644 chronik/chronik-indexer/src/query/v2_branches_test/tests.rs
+
+diff --git a/chronik/chronik-indexer/src/query/v2_branches.rs b/chronik/chronik-indexer/src/query/v2_branches.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..31152277a395059726d6dcc50519adbf6c45d847
+--- /dev/null
++++ b/chronik/chronik-indexer/src/query/v2_branches.rs
+@@ -0,0 +1,303 @@
++//! Bounded confirmed V2 branch discovery over a pinned posting snapshot.
++//! Roots use native wire byte order. Matching does not imply ownership.
++use bitcoinsuite_core::{
++    hash::{Hashed, Sha256},
++    lotus_v2::{Hash32, OutPoint, Output, OutputRecord},
++};
++
++#[derive(Clone, Debug, Eq, PartialEq)]
++pub struct PositionClause {
++    pub position: u8,
++    pub roots: Vec<Hash32>,
++}
++#[derive(Clone, Debug, Eq, PartialEq)]
++pub struct BranchFilter {
++    pub any_branch: Vec<Hash32>,
++    pub positions: Vec<PositionClause>,
++}
++#[derive(Clone, Copy, Debug, Eq, PartialEq)]
++pub enum QueryKind {
++    History { include_burn: bool },
++    Utxos,
++}
++#[derive(Clone, Copy, Debug, Eq, PartialEq)]
++pub struct Snapshot {
++    pub chain_id: Hash32,
++    pub profile_id: Hash32,
++    pub tip: Hash32,
++    pub height: u64,
++}
++/// Fixed-size, typed continuation. Transport encoding is a separate concern.
++#[derive(Clone, Copy, Debug, Eq, PartialEq)]
++pub struct Cursor {
++    pub version: u8,
++    pub snapshot: Snapshot,
++    pub filter_digest: Hash32,
++    pub last_key: Option<OutPoint>,
++}
++#[derive(Clone, Copy, Debug)]
++pub struct Limits {
++    pub roots: usize,
++    pub clauses: usize,
++    pub page_size: usize,
++    pub posting_reads: usize,
++    pub work: usize,
++    pub result_bytes: usize,
++}
++impl Default for Limits {
++    fn default() -> Self {
++        Self {
++            roots: 256,
++            clauses: 16,
++            page_size: 100,
++            posting_reads: 4096,
++            work: 8192,
++            result_bytes: 128 * 1024,
++        }
++    }
++}
++#[derive(Clone, Debug, Eq, PartialEq)]
++pub enum QueryError {
++    InvalidFilter,
++    InvalidLimits,
++    StaleCursor,
++    Source(&'static str),
++    RecordTooLarge,
++}
++/// Each call must be bounded: seek to the first strictly greater key in this
++/// root/optional-position posting, with no scan over unrelated output records.
++/// All methods operate on the same immutable snapshot, including spend state.
++pub trait PostingSource {
++    fn snapshot(&self) -> Snapshot;
++    fn next_posting(
++        &self,
++        root: Hash32,
++        position: Option<u8>,
++        after: Option<OutPoint>,
++    ) -> Result<Option<OutPoint>, QueryError>;
++    fn output(&self, key: OutPoint)
++        -> Result<Option<OutputRecord>, QueryError>;
++}
++#[derive(Clone, Debug)]
++pub struct Match {
++    pub record: OutputRecord,
++    pub matching_positions: Vec<u8>,
++}
++#[derive(Clone, Debug)]
++pub struct Page {
++    pub snapshot: Snapshot,
++    pub matches: Vec<Match>,
++    pub continuation: Option<Cursor>,
++    pub posting_reads: usize,
++    pub work: usize,
++    pub result_bytes: usize,
++}
++impl BranchFilter {
++    /// Bounds are checked before sorting/copying root arrays. Duplicate roots
++    /// are set members; duplicate positions and empty clauses are invalid.
++    pub fn canonicalize(&self, limits: Limits) -> Result<Self, QueryError> {
++        if self.positions.len() > limits.clauses || self.positions.len() > 16 {
++            return Err(QueryError::InvalidFilter);
++        }
++        let count = self
++            .positions
++            .iter()
++            .try_fold(self.any_branch.len(), |n, c| {
++                n.checked_add(c.roots.len())
++            })
++            .ok_or(QueryError::InvalidFilter)?;
++        if count == 0 || count > limits.roots {
++            return Err(QueryError::InvalidFilter);
++        }
++        let mut seen = [false; 16];
++        for c in &self.positions {
++            if c.position >= 16
++                || c.roots.is_empty()
++                || seen[c.position as usize]
++            {
++                return Err(QueryError::InvalidFilter);
++            }
++            seen[c.position as usize] = true;
++        }
++        let mut f = self.clone();
++        f.any_branch.sort_unstable();
++        f.any_branch.dedup();
++        for c in &mut f.positions {
++            c.roots.sort_unstable();
++            c.roots.dedup();
++        }
++        f.positions.sort_unstable_by_key(|c| c.position);
++        Ok(f)
++    }
++    pub fn matches(&self, output: &Output) -> bool {
++        (self.any_branch.is_empty()
++            || output.branches.iter().any(|r| self.any_branch.contains(r)))
++            && self.positions.iter().all(|c| {
++                output
++                    .branches
++                    .get(c.position as usize)
++                    .is_some_and(|r| c.roots.contains(r))
++            })
++    }
++    /// Canonicalization is internal so callers cannot hash noncanonical sets.
++    pub fn digest(
++        &self,
++        kind: QueryKind,
++        limits: Limits,
++    ) -> Result<Hash32, QueryError> {
++        let f = self.canonicalize(limits)?;
++        let mut bytes = b"LotusV2BranchQuery\0v1".to_vec();
++        bytes.push(match kind {
++            QueryKind::Utxos => 0,
++            QueryKind::History {
++                include_burn: false,
++            } => 1,
++            QueryKind::History { include_burn: true } => 2,
++        });
++        bytes.extend((f.any_branch.len() as u64).to_le_bytes());
++        for r in f.any_branch {
++            bytes.extend(r.0);
++        }
++        bytes.push(f.positions.len() as u8);
++        for c in f.positions {
++            bytes.push(c.position);
++            bytes.extend((c.roots.len() as u64).to_le_bytes());
++            for r in c.roots {
++                bytes.extend(r.0);
++            }
++        }
++        Ok(Hash32(Sha256::digest(bytes).0))
++    }
++}
++/// Fetch one bounded page. Exhausted work returns the last fully processed key;
++/// an unreturned matching candidate is retried on the next page, never skipped.
++pub fn query<S: PostingSource>(
++    source: &S,
++    filter: &BranchFilter,
++    kind: QueryKind,
++    limits: Limits,
++    cursor: Option<Cursor>,
++) -> Result<Page, QueryError> {
++    let filter = filter.canonicalize(limits)?;
++    let digest = filter.digest(kind, limits)?;
++    let snapshot = source.snapshot();
++    if let Some(c) = cursor {
++        if c.version != 1 || c.snapshot != snapshot || c.filter_digest != digest
++        {
++            return Err(QueryError::StaleCursor);
++        }
++    }
++    let (roots, position) = if !filter.any_branch.is_empty() {
++        (&filter.any_branch, None)
++    } else {
++        (
++            &filter.positions[0].roots,
++            Some(filter.positions[0].position),
++        )
++    };
++    if limits.page_size == 0
++        || limits.posting_reads < roots.len()
++        || limits.work < roots.len() + 1
++        || limits.result_bytes == 0
++    {
++        return Err(QueryError::InvalidLimits);
++    }
++    let mut last = cursor.and_then(|c| c.last_key);
++    let mut page = Page {
++        snapshot,
++        matches: vec![],
++        continuation: None,
++        posting_reads: 0,
++        work: 0,
++        result_bytes: 0,
++    };
++    loop {
++        if page.matches.len() == limits.page_size
++            || limits.posting_reads - page.posting_reads < roots.len()
++            || limits.work - page.work < roots.len() + 1
++        {
++            break;
++        }
++        let mut candidate = None;
++        for &root in roots {
++            let key = source.next_posting(root, position, last)?;
++            page.posting_reads += 1;
++            page.work += 1;
++            if let Some(k) = key {
++                if last.is_some_and(|l| k <= l) {
++                    return Err(QueryError::Source("unordered posting"));
++                }
++                candidate =
++                    Some(candidate.map_or(k, |old: OutPoint| old.min(k)));
++            }
++        }
++        let Some(key) = candidate else {
++            return Ok(page);
++        };
++        let record = source
++            .output(key)?
++            .ok_or(QueryError::Source("missing posting record"))?;
++        page.work += 1;
++        if record.outpoint != key || record.output.validate().is_err() {
++            return Err(QueryError::Source("invalid posting record"));
++        }
++        let eligible = match kind {
++            QueryKind::Utxos => {
++                !record.output.is_burn() && record.spend.is_none()
++            }
++            QueryKind::History { include_burn } => {
++                include_burn || !record.output.is_burn()
++            }
++        };
++        if eligible && filter.matches(&record.output) {
++            let matching_positions: Vec<u8> = record
++                .output
++                .branches
++                .iter()
++                .enumerate()
++                .filter(|(i, r)| {
++                    filter.any_branch.contains(r)
++                        || filter.positions.iter().any(|c| {
++                            c.position as usize == *i && c.roots.contains(r)
++                        })
++                })
++                .map(|(i, _)| i as u8)
++                .collect();
++            // Stable logical binary result budget: outpoint + framed output +
++            // creation/spend locations + matching-position framing.
++            let size = 36
++                + record
++                    .output
++                    .encode()
++                    .map_err(|_| QueryError::Source("invalid output"))?
++                    .len()
++                + 108
++                + 1
++                + if record.spend.is_some() { 112 } else { 0 }
++                + 1
++                + matching_positions.len();
++            if size > limits.result_bytes {
++                return Err(QueryError::RecordTooLarge);
++            }
++            if size > limits.result_bytes - page.result_bytes {
++                break;
++            }
++            page.result_bytes += size;
++            page.matches.push(Match {
++                record,
++                matching_positions,
++            });
++        }
++        last = Some(key);
++    }
++    page.continuation = Some(Cursor {
++        version: 1,
++        snapshot,
++        filter_digest: digest,
++        last_key: last,
++    });
++    Ok(page)
++}
++#[cfg(test)]
++#[path = "v2_branches_test/tests.rs"]
++mod tests;
+diff --git a/chronik/chronik-indexer/src/query/v2_branches_test/tests.rs b/chronik/chronik-indexer/src/query/v2_branches_test/tests.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..b9e8f02a9ca20b7ac1e67dd8b34943369e8a4f31
+--- /dev/null
++++ b/chronik/chronik-indexer/src/query/v2_branches_test/tests.rs
+@@ -0,0 +1,328 @@
++use super::*;
++use bitcoinsuite_core::lotus_v2::{TxHash, TxId, TxLocation};
++use std::collections::BTreeMap;
++struct Source(BTreeMap<OutPoint, OutputRecord>);
++fn anchor() -> Snapshot {
++    Snapshot {
++        chain_id: Hash32([1; 32]),
++        profile_id: Hash32([2; 32]),
++        tip: Hash32([3; 32]),
++        height: 10,
++    }
++}
++impl PostingSource for Source {
++    fn snapshot(&self) -> Snapshot {
++        anchor()
++    }
++    fn next_posting(
++        &self,
++        root: Hash32,
++        pos: Option<u8>,
++        after: Option<OutPoint>,
++    ) -> Result<Option<OutPoint>, QueryError> {
++        // Test-only scan oracle; production adapters must seek postings.
++        Ok(self
++            .0
++            .iter()
++            .filter(|(k, r)| {
++                after.is_none_or(|a| **k > a)
++                    && pos.map_or_else(
++                        || r.output.branches.contains(&root),
++                        |p| r.output.branches.get(p as usize) == Some(&root),
++                    )
++            })
++            .map(|(k, _)| *k)
++            .next())
++    }
++    fn output(
++        &self,
++        key: OutPoint,
++    ) -> Result<Option<OutputRecord>, QueryError> {
++        Ok(self.0.get(&key).cloned())
++    }
++}
++fn root(n: u8) -> Hash32 {
++    Hash32([n; 32])
++}
++fn source() -> Source {
++    Source(
++        (0..40)
++            .map(|i| {
++                let key = OutPoint {
++                    txid: TxId(root(i)),
++                    out_idx: 0,
++                };
++                let output = Output {
++                    flags: if i % 7 == 0 { 2 } else { 0 },
++                    value: i as u64,
++                    token_id: Hash32::default(),
++                    branches: vec![root(i % 3), root(8 + i % 2)],
++                    paths: if i % 7 == 0 { vec![] } else { vec![vec![0, 1]] },
++                };
++                (
++                    key,
++                    OutputRecord {
++                        outpoint: key,
++                        output,
++                        creation: TxLocation {
++                            block_id: root(3),
++                            height: 10,
++                            tx_index: i as u32,
++                            txid: key.txid,
++                            txhash: TxHash(root(i)),
++                        },
++                        spend: None,
++                    },
++                )
++            })
++            .collect(),
++    )
++}
++#[test]
++fn pagination_matches_same_output_oracle() {
++    let s = source();
++    for kind in [
++        QueryKind::Utxos,
++        QueryKind::History { include_burn: true },
++        QueryKind::History {
++            include_burn: false,
++        },
++    ] {
++        for f in [
++            BranchFilter {
++                any_branch: vec![root(0), root(1), root(0)],
++                positions: vec![],
++            },
++            BranchFilter {
++                any_branch: vec![],
++                positions: vec![
++                    PositionClause {
++                        position: 1,
++                        roots: vec![root(9)],
++                    },
++                    PositionClause {
++                        position: 0,
++                        roots: vec![root(0), root(2)],
++                    },
++                ],
++            },
++            BranchFilter {
++                any_branch: vec![root(0)],
++                positions: vec![PositionClause {
++                    position: 1,
++                    roots: vec![root(9)],
++                }],
++            },
++        ] {
++            let expected: Vec<_> =
++                s.0.values()
++                    .filter(|r| {
++                        f.matches(&r.output)
++                            && (matches!(
++                                kind,
++                                QueryKind::History { include_burn: true }
++                            ) || !r.output.is_burn())
++                    })
++                    .map(|r| r.outpoint)
++                    .collect();
++            let limits = Limits {
++                page_size: 2,
++                posting_reads: 6,
++                work: 9,
++                ..Limits::default()
++            };
++            let mut cursor = None;
++            let mut actual = vec![];
++            for _ in 0..100 {
++                let p = query(&s, &f, kind, limits, cursor).unwrap();
++                assert!(
++                    p.posting_reads <= limits.posting_reads
++                        && p.work <= limits.work
++                );
++                actual.extend(p.matches.into_iter().map(|m| m.record.outpoint));
++                cursor = p.continuation;
++                if cursor.is_none() {
++                    break;
++                }
++            }
++            assert!(cursor.is_none());
++            assert_eq!(actual, expected);
++        }
++    }
++}
++#[test]
++fn bounds_canonical_digest_and_stale_cursor() {
++    let s = source();
++    let limits = Limits::default();
++    let f = BranchFilter {
++        any_branch: vec![root(1), root(0), root(1)],
++        positions: vec![],
++    };
++    let mut canonical = f.clone();
++    canonical.any_branch = vec![root(0), root(1)];
++    assert_eq!(
++        f.digest(QueryKind::Utxos, limits),
++        canonical.digest(QueryKind::Utxos, limits)
++    );
++    for bad in [
++        BranchFilter {
++            any_branch: vec![],
++            positions: vec![],
++        },
++        BranchFilter {
++            any_branch: vec![],
++            positions: vec![PositionClause {
++                position: 16,
++                roots: vec![root(0)],
++            }],
++        },
++        BranchFilter {
++            any_branch: vec![],
++            positions: vec![PositionClause {
++                position: 0,
++                roots: vec![],
++            }],
++        },
++        BranchFilter {
++            any_branch: vec![],
++            positions: vec![
++                PositionClause {
++                    position: 0,
++                    roots: vec![root(0)]
++                };
++                2
++            ],
++        },
++    ] {
++        assert_eq!(bad.canonicalize(limits), Err(QueryError::InvalidFilter));
++    }
++    assert_eq!(
++        f.canonicalize(Limits { roots: 2, ..limits }),
++        Err(QueryError::InvalidFilter)
++    );
++    let page = query(
++        &s,
++        &f,
++        QueryKind::Utxos,
++        Limits {
++            page_size: 1,
++            ..limits
++        },
++        None,
++    )
++    .unwrap();
++    let mut c = page.continuation.unwrap();
++    c.snapshot.tip = root(55);
++    assert!(matches!(
++        query(&s, &f, QueryKind::Utxos, limits, Some(c)),
++        Err(QueryError::StaleCursor)
++    ));
++    assert!(matches!(
++        query(
++            &s,
++            &f,
++            QueryKind::Utxos,
++            Limits {
++                result_bytes: 1,
++                ..limits
++            },
++            None
++        ),
++        Err(QueryError::RecordTooLarge)
++    ));
++}
++#[test]
++fn byte_continuation_and_all_positions() {
++    let mut s = source();
++    let record = s.0.values_mut().next().unwrap();
++    record.output.flags = 0;
++    record.output.branches = (0..16).map(root).collect();
++    record.output.paths = vec![(0..16).collect()];
++    let f = BranchFilter {
++        any_branch: vec![],
++        positions: (0..16)
++            .map(|position| PositionClause {
++                position,
++                roots: vec![root(position)],
++            })
++            .collect(),
++    };
++    assert_eq!(
++        query(&s, &f, QueryKind::Utxos, Limits::default(), None)
++            .unwrap()
++            .matches
++            .len(),
++        1
++    );
++    let f = BranchFilter {
++        any_branch: vec![root(0), root(1), root(2)],
++        positions: vec![],
++    };
++    let limits = Limits {
++        result_bytes: 1000,
++        ..Limits::default()
++    };
++    let mut cursor = None;
++    let mut keys = vec![];
++    loop {
++        let p = query(&s, &f, QueryKind::Utxos, limits, cursor).unwrap();
++        keys.extend(p.matches.iter().map(|m| m.record.outpoint));
++        cursor = p.continuation;
++        if cursor.is_none() {
++            break;
++        }
++    }
++    assert_eq!(
++        keys.len(),
++        s.0.values().filter(|r| !r.output.is_burn()).count()
++    );
++}
++
++#[test]
++fn spent_token_history_and_missing_positions() {
++    use bitcoinsuite_core::lotus_v2::SpendLocation;
++    let mut s = source();
++    let record = s.0.values_mut().nth(1).unwrap();
++    let key = record.outpoint;
++    record.output.flags = 1;
++    record.output.token_id = root(80);
++    record.output.value = u64::MAX;
++    record.spend = Some(SpendLocation {
++        transaction: record.creation,
++        input_index: 7,
++    });
++    let f = BranchFilter {
++        any_branch: vec![root(1)],
++        positions: vec![],
++    };
++    let h = query(
++        &s,
++        &f,
++        QueryKind::History { include_burn: true },
++        Limits::default(),
++        None,
++    )
++    .unwrap();
++    let found = h.matches.iter().find(|m| m.record.outpoint == key).unwrap();
++    assert_eq!(found.record.output.value, u64::MAX);
++    assert_eq!(found.record.spend.unwrap().input_index, 7);
++    let u = query(&s, &f, QueryKind::Utxos, Limits::default(), None).unwrap();
++    assert!(!u.matches.iter().any(|m| m.record.outpoint == key));
++    let missing = BranchFilter {
++        any_branch: vec![root(1)],
++        positions: vec![PositionClause {
++            position: 15,
++            roots: vec![root(9)],
++        }],
++    };
++    assert!(query(
++        &s,
++        &missing,
++        QueryKind::History { include_burn: true },
++        Limits::default(),
++        None
++    )
++    .unwrap()
++    .matches
++    .is_empty());
++}
+-- 
+2.50.1 (Apple Git-155)
+
