@@ -1,0 +1,1336 @@
+From 9a58d7d5f3abca7fc5046291d21684f480ad4032 Mon Sep 17 00:00:00 2001
+From: Shammah Chancellor <shammah.chancellor@notvalid.com>
+Date: Thu, 15 Oct 2026 00:00:45 -0700
+Subject: [PATCH 2/2] Add a file-backed V2 header snapshot and undo log
+
+Persist the caller-supplied header as a versioned checksummed header.dat
+plus one numbered undo record per commit. The payload is the chain id,
+height, 134-byte SerializeHeader encoding, and the existing BlockId.
+Reopen returns the same bytes. Undo of the only record leaves no header;
+a later undo restores the previous header bytes, including height. A
+truncated record fails closed. This is a header file snapshot, not block
+acceptance and not ConnectTip.
+---
+ src/lotus_v2/CMakeLists.txt             |  13 +
+ src/lotus_v2/persistent_header.cpp      | 620 ++++++++++++++++++++++++
+ src/lotus_v2/persistent_header.h        |  94 ++++
+ src/lotus_v2/test_persistent_header.cpp | 558 +++++++++++++++++++++
+ 4 files changed, 1285 insertions(+)
+ create mode 100644 src/lotus_v2/persistent_header.cpp
+ create mode 100644 src/lotus_v2/persistent_header.h
+ create mode 100644 src/lotus_v2/test_persistent_header.cpp
+
+diff --git a/src/lotus_v2/CMakeLists.txt b/src/lotus_v2/CMakeLists.txt
+index 77de928ba..0526f761a 100644
+--- a/src/lotus_v2/CMakeLists.txt
++++ b/src/lotus_v2/CMakeLists.txt
+@@ -114,3 +114,16 @@ add_custom_target(check-lotus-v2-persistent-monetary
+     COMMAND $<TARGET_FILE:test_lotus_v2_persistent_monetary>
+     DEPENDS test_lotus_v2_persistent_monetary
+ )
++
++# Standalone header snapshot and undo log. lotusd does not link this target.
++# Not block acceptance and not ConnectTip. Uses the existing blake3 library.
++add_library(lotus_v2_persistent_header STATIC persistent_header.cpp)
++target_link_libraries(lotus_v2_persistent_header PUBLIC lotus_v2_header)
++add_executable(test_lotus_v2_persistent_header
++    test_persistent_header.cpp dev_genesis.cpp monetary.cpp transaction.cpp)
++target_link_libraries(test_lotus_v2_persistent_header
++    PRIVATE lotus_v2_persistent_header lotus_v2_sparse_state Boost::headers)
++add_custom_target(check-lotus-v2-persistent-header
++    COMMAND $<TARGET_FILE:test_lotus_v2_persistent_header>
++    DEPENDS test_lotus_v2_persistent_header
++)
+diff --git a/src/lotus_v2/persistent_header.cpp b/src/lotus_v2/persistent_header.cpp
+new file mode 100644
+index 000000000..3c825513a
+--- /dev/null
++++ b/src/lotus_v2/persistent_header.cpp
+@@ -0,0 +1,620 @@
++// Copyright (c) 2026 The Lotus developers
++#include "persistent_header.h"
++
++#include "vendor/blake3/blake3.h"
++
++#include <algorithm>
++#include <cerrno>
++#include <cstdio>
++#include <fcntl.h>
++#include <filesystem>
++#include <unistd.h>
++#include <utility>
++#include <vector>
++
++namespace lotus::v2 {
++namespace {
++
++constexpr uint8_t kMagic[8] = {'L', 'T', 'S', 'V', '2', 'H', 'D', 'R'};
++constexpr uint32_t kKindSnapshot = 1;
++constexpr uint32_t kKindUndo = 2;
++constexpr size_t kSnapshotBytes = PERSISTENT_HEADER_SNAPSHOT_BYTES;
++constexpr size_t kUndoBytes = kSnapshotBytes * 2;
++constexpr size_t kMaxRecordBytes = 1024u * 1024u;
++constexpr char kChecksumTag[] = "Lotus/v2/persist-header";
++constexpr size_t kHeightOff = 32;
++constexpr size_t kHeaderOff = 40;
++constexpr size_t kIdOff = 40 + HEADER_SIZE;
++static_assert(HEADER_SIZE == 134, "V2 header encoding is 134 bytes");
++static_assert(kSnapshotBytes == 206, "header snapshot payload is 206 bytes");
++static_assert(kIdOff + 32 == kSnapshotBytes, "header id is the last 32 bytes");
++
++using Payload = std::array<uint8_t, kSnapshotBytes>;
++
++bool Fail(std::string &error, const char *what) {
++    error = what;
++    return false;
++}
++
++struct Fd {
++    int fd = -1;
++    explicit Fd(int opened) : fd(opened) {}
++    ~Fd() {
++        if (fd >= 0) ::close(fd);
++    }
++    Fd(const Fd &) = delete;
++    Fd &operator=(const Fd &) = delete;
++};
++
++uint32_t ReadU32(const uint8_t *p) {
++    return uint32_t(p[0]) | (uint32_t(p[1]) << 8) | (uint32_t(p[2]) << 16) |
++           (uint32_t(p[3]) << 24);
++}
++
++uint64_t ReadU64(const uint8_t *p) {
++    uint64_t value = 0;
++    for (unsigned i = 0; i < 8; ++i) value |= uint64_t(p[i]) << (8 * i);
++    return value;
++}
++
++void WriteU64(uint8_t *p, uint64_t value) {
++    for (unsigned i = 0; i < 8; ++i)
++        p[i] = static_cast<uint8_t>(value >> (8 * i));
++}
++
++void AppendU32(std::vector<uint8_t> &out, uint32_t value) {
++    for (unsigned i = 0; i < 4; ++i)
++        out.push_back(static_cast<uint8_t>(value >> (8 * i)));
++}
++
++void AppendU64(std::vector<uint8_t> &out, uint64_t value) {
++    for (unsigned i = 0; i < 8; ++i)
++        out.push_back(static_cast<uint8_t>(value >> (8 * i)));
++}
++
++void AppendHash(std::vector<uint8_t> &out, const Hash &hash) {
++    out.insert(out.end(), hash.begin(), hash.end());
++}
++
++Hash Checksum(const uint8_t *data, size_t size) {
++    blake3_hasher hasher;
++    blake3_hasher_init(&hasher);
++    blake3_hasher_update(&hasher, kChecksumTag, sizeof(kChecksumTag) - 1);
++    const uint8_t separator = 0;
++    blake3_hasher_update(&hasher, &separator, 1);
++    if (size != 0) blake3_hasher_update(&hasher, data, size);
++    Hash out{};
++    blake3_hasher_finalize(&hasher, out.data(), out.size());
++    return out;
++}
++
++bool IsChainStart(const uint8_t *data, size_t size) {
++    return size == kSnapshotBytes &&
++           std::all_of(data, data + size, [](uint8_t byte) { return byte == 0; });
++}
++
++bool IsChainStart(const Payload &payload) {
++    return IsChainStart(payload.data(), payload.size());
++}
++
++// V2 ParseHeader only. A buffer that is not 134 bytes is not a header.
++// The Bitcoin 80-byte header parser is not used.
++bool DecodeHeaderBytes(const uint8_t *data, size_t size, Header &out, std::string &error) {
++    if (data == nullptr || size != HEADER_SIZE) return Fail(error, "truncated");
++    Header parsed;
++    if (!ParseHeader(data, size, parsed)) return Fail(error, "truncated");
++    if (parsed.size != HEADER_SIZE) return Fail(error, "header");
++    std::array<uint8_t, HEADER_SIZE> again{};
++    if (!SerializeHeader(parsed, again) ||
++        !std::equal(again.begin(), again.end(), data))
++        return Fail(error, "header");
++    out = parsed;
++    return true;
++}
++
++bool AcceptHeader(const uint8_t *data, Payload &out, std::string &error) {
++    Header parsed;
++    if (!DecodeHeaderBytes(data + kHeaderOff, HEADER_SIZE, parsed, error)) return false;
++    ChainId chain{};
++    std::copy_n(data, 32, chain.begin());
++    Hash stored{};
++    std::copy_n(data + kIdOff, 32, stored.begin());
++    Hash id{};
++    // Existing BlockId. Failure leaves `id` unused and does not publish.
++    if (!BlockId(chain, parsed, id) || id != stored) return Fail(error, "header");
++    std::copy_n(data, kSnapshotBytes, out.begin());
++    return true;
++}
++
++Payload Pack(const ChainId &chain_id, uint64_t height, const std::array<uint8_t, HEADER_SIZE> &header,
++             const Hash &header_id) {
++    Payload out{};
++    std::copy(chain_id.begin(), chain_id.end(), out.begin());
++    WriteU64(out.data() + kHeightOff, height);
++    std::copy(header.begin(), header.end(), out.begin() + kHeaderOff);
++    std::copy(header_id.begin(), header_id.end(), out.begin() + kIdOff);
++    return out;
++}
++
++ChainId ChainOf(const Payload &payload) {
++    ChainId chain{};
++    std::copy_n(payload.begin(), 32, chain.begin());
++    return chain;
++}
++
++uint64_t HeightOf(const Payload &payload) { return ReadU64(payload.data() + kHeightOff); }
++
++std::array<uint8_t, HEADER_SIZE> HeaderBytesOf(const Payload &payload) {
++    std::array<uint8_t, HEADER_SIZE> out{};
++    std::copy_n(payload.begin() + kHeaderOff, HEADER_SIZE, out.begin());
++    return out;
++}
++
++Hash IdOf(const Payload &payload) {
++    Hash id{};
++    std::copy_n(payload.begin() + kIdOff, 32, id.begin());
++    return id;
++}
++
++struct RecordView {
++    uint32_t kind = 0;
++    const uint8_t *payload = nullptr;
++    size_t payload_len = 0;
++};
++
++// Length is checked before the header bytes are interpreted. A truncated file
++// often still contains a prefix of those bytes; they are not a valid header.
++bool ParseRecord(const std::vector<uint8_t> &bytes, RecordView &out, std::string &error) {
++    if (bytes.size() < 56) return Fail(error, "truncated");
++    if (!std::equal(bytes.begin(), bytes.begin() + 8, kMagic)) return Fail(error, "magic");
++    const size_t payload_len = bytes.size() - 56;
++    if (ReadU64(bytes.data() + 16) != payload_len) return Fail(error, "truncated");
++    const Hash sum = Checksum(bytes.data(), 24 + payload_len);
++    if (!std::equal(sum.begin(), sum.end(), bytes.end() - 32)) return Fail(error, "checksum");
++    if (ReadU32(bytes.data() + 8) != PERSISTENT_HEADER_VERSION) return Fail(error, "version");
++    const uint32_t kind = ReadU32(bytes.data() + 12);
++    if (kind != kKindSnapshot && kind != kKindUndo) return Fail(error, "kind");
++    out.kind = kind;
++    out.payload = bytes.data() + 24;
++    out.payload_len = payload_len;
++    return true;
++}
++
++std::vector<uint8_t> Finish(uint32_t kind, const uint8_t *payload, size_t payload_len) {
++    std::vector<uint8_t> out;
++    out.reserve(24 + payload_len + 32);
++    out.insert(out.end(), kMagic, kMagic + 8);
++    AppendU32(out, PERSISTENT_HEADER_VERSION);
++    AppendU32(out, kind);
++    AppendU64(out, payload_len);
++    out.insert(out.end(), payload, payload + payload_len);
++    AppendHash(out, Checksum(out.data(), out.size()));
++    return out;
++}
++
++std::vector<uint8_t> FinishPayload(uint32_t kind, const Payload &payload) {
++    return Finish(kind, payload.data(), payload.size());
++}
++
++bool ReadFile(const std::filesystem::path &path, std::vector<uint8_t> &out, std::string &error) {
++    std::error_code ec;
++    if (std::filesystem::is_symlink(path, ec)) return Fail(error, "directory");
++    if (ec) return Fail(error, "io");
++    Fd file(::open(path.c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW));
++    if (file.fd < 0) return Fail(error, "io");
++    std::vector<uint8_t> data;
++    uint8_t buffer[8192];
++    for (;;) {
++        const ssize_t n = ::read(file.fd, buffer, sizeof(buffer));
++        if (n < 0) {
++            if (errno == EINTR) continue;
++            return Fail(error, "io");
++        }
++        if (n == 0) break;
++        if (data.size() + static_cast<size_t>(n) > kMaxRecordBytes) return Fail(error, "size");
++        data.insert(data.end(), buffer, buffer + n);
++    }
++    out = std::move(data);
++    return true;
++}
++
++bool WriteAll(int fd, const uint8_t *data, size_t size) {
++    while (size > 0) {
++        const ssize_t n = ::write(fd, data, size);
++        if (n < 0) {
++            if (errno == EINTR) continue;
++            return false;
++        }
++        if (n == 0) return false;
++        data += n;
++        size -= static_cast<size_t>(n);
++    }
++    return true;
++}
++
++bool FsyncFd(int fd) {
++    for (;;) {
++        if (::fsync(fd) == 0) return true;
++        if (errno != EINTR) return false;
++    }
++}
++
++void FsyncDir(const std::filesystem::path &dir) {
++    const int fd = ::open(dir.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
++    if (fd < 0) return;
++    ::fsync(fd);
++    ::close(fd);
++}
++
++// Rename is the publication point. A crash before it leaves only the temp file,
++// which reopen ignores. The temp file is in the destination's directory.
++bool WriteAtomic(const std::filesystem::path &destination, const std::vector<uint8_t> &bytes,
++                 std::string &error) {
++    if (bytes.size() > kMaxRecordBytes) return Fail(error, "size");
++    const std::filesystem::path temporary(destination.string() + ".tmp");
++    Fd file(::open(temporary.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC | O_NOFOLLOW, 0644));
++    if (file.fd < 0) return Fail(error, "io");
++    if (!WriteAll(file.fd, bytes.data(), bytes.size()) || !FsyncFd(file.fd)) {
++        ::unlink(temporary.c_str());
++        return Fail(error, "io");
++    }
++    if (::close(file.fd) != 0) {
++        file.fd = -1;
++        ::unlink(temporary.c_str());
++        return Fail(error, "io");
++    }
++    file.fd = -1;
++    if (::rename(temporary.c_str(), destination.c_str()) != 0) {
++        ::unlink(temporary.c_str());
++        return Fail(error, "io");
++    }
++    std::filesystem::path parent = destination.parent_path();
++    if (parent.empty()) parent = ".";
++    FsyncDir(parent);
++    return true;
++}
++
++bool RemoveFile(const std::filesystem::path &path, std::string &error) {
++    std::error_code ec;
++    if (!std::filesystem::is_regular_file(path, ec) || ec) return Fail(error, "io");
++    if (!std::filesystem::remove(path, ec) || ec) return Fail(error, "io");
++    return true;
++}
++
++bool IsTempName(const std::string &name) {
++    return name.size() >= 4 && name.compare(name.size() - 4, 4, ".tmp") == 0;
++}
++
++bool ParseSequence(const std::string &name, uint32_t &sequence) {
++    if (name.size() != 12 || name.compare(8, 4, ".dat") != 0) return false;
++    sequence = 0;
++    for (int i = 0; i < 8; ++i) {
++        const char ch = name[static_cast<size_t>(i)];
++        if (ch < '0' || ch > '9') return false;
++        sequence = sequence * 10u + static_cast<uint32_t>(ch - '0');
++    }
++    return sequence >= 1 && sequence <= 99999999u;
++}
++
++std::filesystem::path UndoFile(const std::filesystem::path &undo_dir, uint32_t sequence) {
++    char name[16];
++    std::snprintf(name, sizeof(name), "%08u.dat", static_cast<unsigned>(sequence));
++    return undo_dir / name;
++}
++
++struct LoadedUndo {
++    uint32_t sequence = 0;
++    std::filesystem::path path;
++    Payload prev{};
++    Payload next{};
++};
++
++bool Replay(const std::vector<LoadedUndo> &undos, Payload &out, std::string &error) {
++    Payload cur{};
++    for (const LoadedUndo &undo : undos) {
++        if (undo.prev != cur) return Fail(error, "undo chain");
++        cur = undo.next;
++    }
++    out = cur;
++    return true;
++}
++
++bool ParseSnapshotPayload(const uint8_t *data, size_t size, Payload &out, std::string &error) {
++    if (size != kSnapshotBytes) return Fail(error, "truncated");
++    return AcceptHeader(data, out, error);
++}
++
++bool ParseUndoPayload(const uint8_t *data, size_t size, Payload &prev, Payload &next,
++                      std::string &error) {
++    if (size != kUndoBytes) return Fail(error, "truncated");
++    if (IsChainStart(data, kSnapshotBytes)) {
++        prev = {};
++    } else if (!AcceptHeader(data, prev, error)) {
++        return false;
++    }
++    return AcceptHeader(data + kSnapshotBytes, next, error);
++}
++
++} // namespace
++
++struct PersistentHeaderStore::Impl {
++    std::filesystem::path directory;
++    bool has_snapshot = false;
++    Payload payload{};
++    uint32_t undo_tip = 0;
++
++    std::filesystem::path SnapshotPath() const { return directory / "header.dat"; }
++    std::filesystem::path UndoDir() const { return directory / "undo"; }
++
++    bool Load(const std::string &dir, std::string &error);
++    bool Commit(const ChainId &chain_id, uint64_t height, const Header &header, std::string &error);
++    bool Undo(std::string &error);
++};
++
++bool PersistentHeaderStore::Impl::Load(const std::string &dir, std::string &error) {
++    directory = std::filesystem::path(dir);
++    if (!directory.is_absolute()) return Fail(error, "directory");
++    std::error_code ec;
++    std::filesystem::create_directories(directory, ec);
++    if (ec || !std::filesystem::is_directory(directory, ec) || ec) return Fail(error, "directory");
++
++    bool saw_snapshot = false;
++    bool saw_undo = false;
++    std::filesystem::directory_iterator it(directory, ec);
++    if (ec) return Fail(error, "io");
++    for (; it != std::filesystem::directory_iterator(); it.increment(ec)) {
++        if (ec) return Fail(error, "io");
++        const std::string name = it->path().filename().string();
++        if (IsTempName(name)) continue;
++        if (std::filesystem::is_symlink(it->path(), ec) || ec) return Fail(error, "directory");
++        if (name == "header.dat") {
++            if (!std::filesystem::is_regular_file(it->path(), ec) || ec)
++                return Fail(error, "directory");
++            saw_snapshot = true;
++            continue;
++        }
++        if (name == "undo") {
++            if (!std::filesystem::is_directory(it->path(), ec) || ec)
++                return Fail(error, "directory");
++            saw_undo = true;
++            continue;
++        }
++        // Monetary and coin snapshots may share this directory. Do not read them.
++        if (name == "monetary.dat" || name == "snapshot.dat") {
++            if (!std::filesystem::is_regular_file(it->path(), ec) || ec)
++                return Fail(error, "directory");
++            continue;
++        }
++        if (name == "monetary-undo") {
++            if (!std::filesystem::is_directory(it->path(), ec) || ec)
++                return Fail(error, "directory");
++            continue;
++        }
++        return Fail(error, "directory");
++    }
++
++    Payload snapshot{};
++    if (saw_snapshot) {
++        std::vector<uint8_t> bytes;
++        if (!ReadFile(SnapshotPath(), bytes, error)) return false;
++        RecordView record;
++        if (!ParseRecord(bytes, record, error)) return false;
++        if (record.kind != kKindSnapshot) return Fail(error, "kind");
++        if (!ParseSnapshotPayload(record.payload, record.payload_len, snapshot, error))
++            return false;
++    }
++
++    std::vector<LoadedUndo> undos;
++    if (saw_undo) {
++        std::filesystem::directory_iterator undo_it(UndoDir(), ec);
++        if (ec) return Fail(error, "io");
++        for (; undo_it != std::filesystem::directory_iterator(); undo_it.increment(ec)) {
++            if (ec) return Fail(error, "io");
++            const std::string name = undo_it->path().filename().string();
++            if (IsTempName(name)) continue;
++            if (std::filesystem::is_symlink(undo_it->path(), ec) || ec)
++                return Fail(error, "directory");
++            if (!std::filesystem::is_regular_file(undo_it->path(), ec) || ec)
++                return Fail(error, "directory");
++            LoadedUndo loaded;
++            if (!ParseSequence(name, loaded.sequence)) return Fail(error, "directory");
++            loaded.path = undo_it->path();
++            std::vector<uint8_t> bytes;
++            if (!ReadFile(loaded.path, bytes, error)) return false;
++            RecordView record;
++            if (!ParseRecord(bytes, record, error)) return false;
++            if (record.kind != kKindUndo) return Fail(error, "kind");
++            if (!ParseUndoPayload(record.payload, record.payload_len, loaded.prev, loaded.next,
++                                  error))
++                return false;
++            undos.push_back(std::move(loaded));
++        }
++    }
++    std::sort(undos.begin(), undos.end(), [](const LoadedUndo &a, const LoadedUndo &b) {
++        return a.sequence < b.sequence;
++    });
++    for (size_t i = 0; i < undos.size(); ++i) {
++        if (undos[i].sequence != i + 1) return Fail(error, "undo chain");
++    }
++
++    Payload replayed{};
++    if (!Replay(undos, replayed, error)) return false;
++    if (replayed != snapshot) {
++        if (undos.empty() || undos.back().prev != snapshot || undos.back().next == snapshot)
++            return Fail(error, "undo chain");
++        undos.pop_back();
++        Payload shortened{};
++        if (!Replay(undos, shortened, error) || shortened != snapshot)
++            return Fail(error, "undo chain");
++        std::filesystem::remove(UndoFile(UndoDir(), static_cast<uint32_t>(undos.size() + 1)), ec);
++        if (ec) return Fail(error, "io");
++        replayed = shortened;
++    }
++
++    has_snapshot = saw_snapshot;
++    payload = replayed;
++    undo_tip = static_cast<uint32_t>(undos.size());
++    error.clear();
++    return true;
++}
++
++bool PersistentHeaderStore::Impl::Commit(const ChainId &chain_id, uint64_t height,
++                                         const Header &header, std::string &error) {
++    if (undo_tip >= 99999999u) return Fail(error, "undo chain");
++    if (header.size != HEADER_SIZE) return Fail(error, "header");
++    std::array<uint8_t, HEADER_SIZE> serialized{};
++    if (!SerializeHeader(header, serialized)) return Fail(error, "header");
++    Header parsed;
++    if (!DecodeHeaderBytes(serialized.data(), serialized.size(), parsed, error)) return false;
++    Hash header_id{};
++    if (!BlockId(chain_id, parsed, header_id)) return Fail(error, "header");
++    const Payload next = Pack(chain_id, height, serialized, header_id);
++    Payload checked{};
++    if (!AcceptHeader(next.data(), checked, error) || checked != next ||
++        ChainOf(next) != chain_id || HeightOf(next) != height ||
++        HeaderBytesOf(next) != serialized || IdOf(next) != header_id)
++        return Fail(error, "internal");
++    const Payload prev = payload;
++
++    std::vector<uint8_t> undo_payload;
++    undo_payload.insert(undo_payload.end(), prev.begin(), prev.end());
++    undo_payload.insert(undo_payload.end(), next.begin(), next.end());
++    const std::vector<uint8_t> undo_bytes =
++        Finish(kKindUndo, undo_payload.data(), undo_payload.size());
++    const std::vector<uint8_t> snapshot_bytes = FinishPayload(kKindSnapshot, next);
++    RecordView undo_view;
++    RecordView snapshot_view;
++    Payload parsed_prev{};
++    Payload parsed_next{};
++    Payload parsed_snapshot{};
++    if (!ParseRecord(undo_bytes, undo_view, error) || undo_view.kind != kKindUndo ||
++        !ParseUndoPayload(undo_view.payload, undo_view.payload_len, parsed_prev, parsed_next,
++                          error) ||
++        parsed_prev != prev || parsed_next != next)
++        return Fail(error, "internal");
++    if (!ParseRecord(snapshot_bytes, snapshot_view, error) ||
++        snapshot_view.kind != kKindSnapshot ||
++        !ParseSnapshotPayload(snapshot_view.payload, snapshot_view.payload_len, parsed_snapshot,
++                              error) ||
++        parsed_snapshot != next)
++        return Fail(error, "internal");
++
++    std::error_code ec;
++    std::filesystem::create_directories(UndoDir(), ec);
++    if (ec) return Fail(error, "directory");
++    const uint32_t sequence = undo_tip + 1;
++    const std::filesystem::path undo_path = UndoFile(UndoDir(), sequence);
++    if (!WriteAtomic(undo_path, undo_bytes, error)) return false;
++    if (!WriteAtomic(SnapshotPath(), snapshot_bytes, error)) {
++        ec.clear();
++        std::filesystem::remove(undo_path, ec);
++        if (ec) error = "io";
++        return false;
++    }
++    payload = next;
++    has_snapshot = true;
++    undo_tip = sequence;
++    error.clear();
++    return true;
++}
++
++bool PersistentHeaderStore::Impl::Undo(std::string &error) {
++    if (undo_tip == 0) return Fail(error, "no undo");
++    const std::filesystem::path path = UndoFile(UndoDir(), undo_tip);
++    std::vector<uint8_t> bytes;
++    if (!ReadFile(path, bytes, error)) return false;
++    RecordView record;
++    if (!ParseRecord(bytes, record, error)) return false;
++    if (record.kind != kKindUndo) return Fail(error, "kind");
++    Payload prev{};
++    Payload next{};
++    if (!ParseUndoPayload(record.payload, record.payload_len, prev, next, error)) return false;
++    if (next != payload) return Fail(error, "undo chain");
++
++    const Payload current = payload;
++    if (IsChainStart(prev)) {
++        if (!RemoveFile(SnapshotPath(), error)) return false;
++        std::error_code ec;
++        if (!std::filesystem::remove(path, ec) || ec) {
++            std::string rollback_error;
++            WriteAtomic(SnapshotPath(), FinishPayload(kKindSnapshot, current), rollback_error);
++            return Fail(error, "io");
++        }
++        payload = {};
++        has_snapshot = false;
++        --undo_tip;
++        error.clear();
++        return true;
++    }
++
++    if (!WriteAtomic(SnapshotPath(), FinishPayload(kKindSnapshot, prev), error)) return false;
++    std::error_code ec;
++    if (!std::filesystem::remove(path, ec) || ec) {
++        std::string rollback_error;
++        WriteAtomic(SnapshotPath(), FinishPayload(kKindSnapshot, current), rollback_error);
++        return Fail(error, "io");
++    }
++    payload = prev;
++    has_snapshot = true;
++    --undo_tip;
++    error.clear();
++    return true;
++}
++
++PersistentHeaderStore::PersistentHeaderStore() = default;
++PersistentHeaderStore::~PersistentHeaderStore() = default;
++PersistentHeaderStore::PersistentHeaderStore(PersistentHeaderStore &&) noexcept = default;
++PersistentHeaderStore &
++PersistentHeaderStore::operator=(PersistentHeaderStore &&) noexcept = default;
++
++bool PersistentHeaderStore::Open(const std::string &directory, PersistentHeaderStore &store,
++                                 std::string &error) {
++    store.impl_.reset();
++    auto loaded = std::make_unique<Impl>();
++    if (!loaded->Load(directory, error)) return false;
++    store.impl_ = std::move(loaded);
++    return true;
++}
++
++bool PersistentHeaderStore::IsOpen() const { return impl_ != nullptr; }
++
++bool PersistentHeaderStore::GetHeader(Header &out) const {
++    if (!impl_ || !impl_->has_snapshot) return false;
++    Header parsed;
++    std::string error;
++    if (!DecodeHeaderBytes(impl_->payload.data() + kHeaderOff, HEADER_SIZE, parsed, error))
++        return false;
++    out = parsed;
++    return true;
++}
++
++bool PersistentHeaderStore::Height(uint64_t &out) const {
++    if (!impl_ || !impl_->has_snapshot) return false;
++    out = HeightOf(impl_->payload);
++    return true;
++}
++
++bool PersistentHeaderStore::Chain(ChainId &out) const {
++    if (!impl_ || !impl_->has_snapshot) return false;
++    out = ChainOf(impl_->payload);
++    return true;
++}
++
++bool PersistentHeaderStore::HeaderId(Hash &out) const {
++    if (!impl_ || !impl_->has_snapshot) return false;
++    out = IdOf(impl_->payload);
++    return true;
++}
++
++bool PersistentHeaderStore::Commit(const ChainId &chain_id, uint64_t height, const Header &header,
++                                   std::string &error) {
++    if (!impl_) return Fail(error, "closed");
++    return impl_->Commit(chain_id, height, header, error);
++}
++
++bool PersistentHeaderStore::Undo(std::string &error) {
++    if (!impl_) return Fail(error, "closed");
++    return impl_->Undo(error);
++}
++
++} // namespace lotus::v2
+diff --git a/src/lotus_v2/persistent_header.h b/src/lotus_v2/persistent_header.h
+new file mode 100644
+index 000000000..92cdf5d23
+--- /dev/null
++++ b/src/lotus_v2/persistent_header.h
+@@ -0,0 +1,94 @@
++// Copyright (c) 2026 The Lotus developers
++// File-backed header snapshot and one undo record per commit.
++// Not used by lotusd, not ConnectTip, and not V2 block acceptance.
++// The caller supplies the header. This store does not mine, set a nonce,
++// or check proof of work.
++//
++// Format version 1. The caller passes an absolute directory, which is created.
++//   header.dat              current record; absent before the first commit
++//   undo/00000001.dat       one record per commit, contiguous from 1
++// Undo names match the monetary store's eight-digit sequence. monetary.dat,
++// monetary-undo/, and snapshot.dat may share the directory. They are not
++// required and are not read or modified. This undo/ is not the UTXO undo log.
++// A record is written to "<final>.tmp" in the same directory, fsynced, and
++// renamed into place. Names ending in ".tmp" are ignored. A short or
++// length-mismatched record fails as truncated before its header bytes are
++// treated as a header. Open republishes the record only when the checksum
++// matches. Undo restores the previous snapshot payload byte for byte.
++// Undo of the only record removes header.dat. One record is at most 1 MiB.
++//
++// Little-endian record:
++//   magic[8] = "LTSV2HDR"
++//   version u32 = 1
++//   kind u32 = 1 snapshot, 2 undo
++//   payload_len u64
++//   payload[payload_len]
++//   checksum[32] = BLAKE3("Lotus/v2/persist-header" || 0x00 || bytes before it)
++//
++// Snapshot payload, 206 bytes:
++//   chain_id[32] | height u64 | header[134] | header_id[32]
++// header[134] is SerializeHeader. A buffer that is not 134 bytes is rejected,
++// as is a header whose size field is not 134. header_id is BlockId(chain_id,
++// header), the existing header id. No new header-id domain is defined.
++// The chain starts at 206 zero bytes, which is not a header and is not written
++// as header.dat. The first undo stores that predecessor.
++#ifndef LOTUS_V2_PERSISTENT_HEADER_H
++#define LOTUS_V2_PERSISTENT_HEADER_H
++
++#include "header.h"
++
++#include <cstdint>
++#include <memory>
++#include <string>
++
++namespace lotus::v2 {
++
++constexpr uint32_t PERSISTENT_HEADER_VERSION = 1;
++constexpr size_t PERSISTENT_HEADER_SNAPSHOT_BYTES = 32 + 8 + HEADER_SIZE + 32;
++
++class PersistentHeaderStore {
++public:
++    PersistentHeaderStore();
++    ~PersistentHeaderStore();
++    PersistentHeaderStore(PersistentHeaderStore &&) noexcept;
++    PersistentHeaderStore &operator=(PersistentHeaderStore &&) noexcept;
++    PersistentHeaderStore(const PersistentHeaderStore &) = delete;
++    PersistentHeaderStore &operator=(const PersistentHeaderStore &) = delete;
++
++    // Creates `directory` when needed. On failure `store` is closed and no
++    // header is written to an output parameter.
++    static bool Open(const std::string &directory, PersistentHeaderStore &store,
++                     std::string &error);
++
++    bool IsOpen() const;
++
++    // Copies the stored header. Returns false when closed or before the first
++    // committed snapshot, and does not modify `out`.
++    bool GetHeader(Header &out) const;
++
++    // Copies the stored height. Same failure rule as GetHeader.
++    bool Height(uint64_t &out) const;
++
++    // Copies the stored chain id. Same failure rule as GetHeader.
++    bool Chain(ChainId &out) const;
++
++    // Copies the stored BlockId. Same failure rule as GetHeader.
++    bool HeaderId(Hash &out) const;
++
++    // Writes one undo record, then the snapshot. Failure leaves the previous
++    // directory bytes and this object unchanged. `header` is not modified.
++    // This is not block acceptance.
++    bool Commit(const ChainId &chain_id, uint64_t height, const Header &header,
++                std::string &error);
++
++    // Re-reads the last undo record and writes its previous snapshot payload
++    // back byte for byte. The only record instead returns to an empty store.
++    bool Undo(std::string &error);
++
++private:
++    struct Impl;
++    std::unique_ptr<Impl> impl_;
++};
++
++} // namespace lotus::v2
++#endif
+diff --git a/src/lotus_v2/test_persistent_header.cpp b/src/lotus_v2/test_persistent_header.cpp
+new file mode 100644
+index 000000000..b48a84179
+--- /dev/null
++++ b/src/lotus_v2/test_persistent_header.cpp
+@@ -0,0 +1,558 @@
++// Copyright (c) 2026 The Lotus developers
++// Reopen and undo a header record under /tmp.
++// Development genesis is a test profile, not mainnet.
++// This does not mine, does not accept a V2 block, and is not ConnectTip.
++#include "dev_genesis.h"
++#include "persistent_header.h"
++#include "vendor/blake3/blake3.h"
++
++#include <algorithm>
++#include <array>
++#include <cstdint>
++#include <cstdlib>
++#include <filesystem>
++#include <fstream>
++#include <iostream>
++#include <limits.h>
++#include <string>
++#include <unistd.h>
++#include <vector>
++
++using namespace lotus::v2;
++
++namespace {
++
++void Check(bool condition, const char *message) {
++    if (!condition) {
++        std::cerr << "V2 persistent header: " << message << '\n';
++        std::exit(1);
++    }
++}
++
++std::vector<uint8_t> ReadRaw(const std::filesystem::path &path) {
++    std::ifstream in(path, std::ios::binary);
++    Check(static_cast<bool>(in), "read record");
++    return std::vector<uint8_t>(std::istreambuf_iterator<char>(in),
++                                std::istreambuf_iterator<char>());
++}
++
++void WriteRaw(const std::filesystem::path &path, const std::vector<uint8_t> &bytes) {
++    std::ofstream out(path, std::ios::binary | std::ios::trunc);
++    Check(static_cast<bool>(out), "write raw record");
++    if (!bytes.empty()) {
++        out.write(reinterpret_cast<const char *>(bytes.data()),
++                  static_cast<std::streamsize>(bytes.size()));
++    }
++    out.close();
++    Check(static_cast<bool>(out), "close raw record");
++}
++
++Hash FileChecksum(const uint8_t *data, size_t size) {
++    blake3_hasher hasher;
++    blake3_hasher_init(&hasher);
++    const char tag[] = "Lotus/v2/persist-header";
++    blake3_hasher_update(&hasher, tag, sizeof(tag) - 1);
++    const uint8_t separator = 0;
++    blake3_hasher_update(&hasher, &separator, 1);
++    if (size != 0) blake3_hasher_update(&hasher, data, size);
++    Hash out{};
++    blake3_hasher_finalize(&hasher, out.data(), out.size());
++    return out;
++}
++
++void AppendU32(std::vector<uint8_t> &out, uint32_t value) {
++    for (unsigned i = 0; i < 4; ++i)
++        out.push_back(static_cast<uint8_t>(value >> (8 * i)));
++}
++
++void AppendU64(std::vector<uint8_t> &out, uint64_t value) {
++    for (unsigned i = 0; i < 8; ++i)
++        out.push_back(static_cast<uint8_t>(value >> (8 * i)));
++}
++
++std::vector<uint8_t> Frame(uint32_t kind, const std::vector<uint8_t> &payload) {
++    std::vector<uint8_t> out;
++    const char magic[] = {'L', 'T', 'S', 'V', '2', 'H', 'D', 'R'};
++    out.insert(out.end(), magic, magic + 8);
++    AppendU32(out, PERSISTENT_HEADER_VERSION);
++    AppendU32(out, kind);
++    AppendU64(out, payload.size());
++    out.insert(out.end(), payload.begin(), payload.end());
++    const Hash sum = FileChecksum(out.data(), out.size());
++    out.insert(out.end(), sum.begin(), sum.end());
++    return out;
++}
++
++void CheckFraming(const std::vector<uint8_t> &bytes, uint32_t kind, size_t payload_len) {
++    Check(bytes.size() == 24 + payload_len + 32, "record size");
++    Check(std::string(bytes.begin(), bytes.begin() + 8) == "LTSV2HDR", "magic");
++    Check(std::string(bytes.begin(), bytes.begin() + 8) != "LTSV2MON", "not the monetary magic");
++    Check(std::string(bytes.begin(), bytes.begin() + 8) != "LTSV2UTX", "not the coin magic");
++    const uint32_t version = uint32_t(bytes[8]) | (uint32_t(bytes[9]) << 8) |
++                             (uint32_t(bytes[10]) << 16) | (uint32_t(bytes[11]) << 24);
++    Check(version == PERSISTENT_HEADER_VERSION, "explicit version integer");
++    const uint32_t got_kind = uint32_t(bytes[12]) | (uint32_t(bytes[13]) << 8) |
++                              (uint32_t(bytes[14]) << 16) | (uint32_t(bytes[15]) << 24);
++    Check(got_kind == kind, "record kind");
++    uint64_t got_len = 0;
++    for (unsigned i = 0; i < 8; ++i) got_len |= uint64_t(bytes[16 + i]) << (8 * i);
++    Check(got_len == payload_len, "payload length matches file");
++    const Hash sum = FileChecksum(bytes.data(), bytes.size() - 32);
++    Check(std::equal(sum.begin(), sum.end(), bytes.end() - 32), "documented checksum");
++}
++
++bool SameHeader(const Header &a, const Header &b) {
++    return a.prev_id == b.prev_id && a.bits == b.bits && a.time == b.time &&
++           a.nonce == b.nonce && a.version == b.version && a.size == b.size &&
++           a.height == b.height && a.tx_root == b.tx_root && a.state_root == b.state_root;
++}
++
++Header SentinelHeader() {
++    Header header;
++    header.size = 0x5a5a5a5aull;
++    header.nonce = 0x1111111111111111ull;
++    header.height = 99;
++    header.time = 7;
++    header.version = 0x22222222u;
++    header.bits = 0x33333333u;
++    header.prev_id.fill(0x5a);
++    header.tx_root.fill(0x5a);
++    header.state_root.fill(0x5a);
++    return header;
++}
++
++bool HeaderUntouched(const Header &header) { return SameHeader(header, SentinelHeader()); }
++
++uint64_t ReadU64(const std::vector<uint8_t> &bytes, size_t offset) {
++    uint64_t value = 0;
++    for (unsigned i = 0; i < 8; ++i) value |= uint64_t(bytes[offset + i]) << (8 * i);
++    return value;
++}
++
++void ExpectClosed(const std::string &directory, const char *expect_error) {
++    PersistentHeaderStore store;
++    std::string error;
++    Header out = SentinelHeader();
++    uint64_t height = 0x2222;
++    ChainId chain{};
++    chain.fill(0x5a);
++    Hash id{};
++    id.fill(0x5a);
++    const ChainId chain_sentinel = chain;
++    const Hash id_sentinel = id;
++    const bool opened = PersistentHeaderStore::Open(directory, store, error);
++    if (opened || error != expect_error || store.IsOpen() || store.GetHeader(out) ||
++        store.Height(height) || store.Chain(chain) || store.HeaderId(id) ||
++        !HeaderUntouched(out) || height != 0x2222 || chain != chain_sentinel ||
++        id != id_sentinel) {
++        std::cerr << "open error: [" << error << "]\n";
++        Check(false, "corrupt record must not publish a header");
++    }
++}
++
++std::string TempDir() {
++    char templ[] = "/tmp/lotus-v2-header-XXXXXX";
++    Check(::mkdtemp(templ) != nullptr, "mkdtemp");
++    const std::string path(templ);
++    Check(path.rfind("/tmp/", 0) == 0, "temporary directory is under /tmp");
++    Check(path.find("..") == std::string::npos, "temporary path has no parent segment");
++    Check(path.find(".lotus") == std::string::npos && path.find("datadir") == std::string::npos,
++          "temporary path is not a datadir");
++    char resolved[PATH_MAX];
++    Check(::realpath(path.c_str(), resolved) != nullptr, "realpath");
++    const std::string absolute(resolved);
++    Check(absolute.rfind("/tmp/", 0) == 0 || absolute.rfind("/private/tmp/", 0) == 0,
++          "resolved temporary directory stays under /tmp");
++    return path;
++}
++
++void WriteSiblingFiles(const std::filesystem::path &dir, const std::vector<uint8_t> &monetary,
++                       const std::vector<uint8_t> &monetary_undo,
++                       const std::vector<uint8_t> &snapshot) {
++    std::error_code ec;
++    std::filesystem::create_directories(dir / "monetary-undo", ec);
++    Check(!ec, "create monetary undo directory");
++    WriteRaw(dir / "monetary.dat", monetary);
++    WriteRaw(dir / "monetary-undo" / "00000001.dat", monetary_undo);
++    WriteRaw(dir / "snapshot.dat", snapshot);
++}
++
++void CheckSiblingsUntouched(const std::filesystem::path &dir, const std::vector<uint8_t> &monetary,
++                            const std::vector<uint8_t> &monetary_undo,
++                            const std::vector<uint8_t> &snapshot) {
++    Check(ReadRaw(dir / "monetary.dat") == monetary, "monetary.dat is not modified");
++    Check(ReadRaw(dir / "monetary-undo" / "00000001.dat") == monetary_undo,
++          "monetary undo record is not modified");
++    Check(ReadRaw(dir / "snapshot.dat") == snapshot, "coin snapshot.dat is not modified");
++}
++
++DevelopmentGenesisFixture DevelopmentFixture() {
++    DevelopmentGenesisFixture fixture;
++    fixture.header.version = 1;
++    Check(MakeDevelopmentGenesis({}, 0, fixture), "development test profile, not mainnet");
++    Check(fixture.chain_id == kDevelopmentChainId, "development chain id");
++    Check(fixture.header.size == HEADER_SIZE && fixture.header.height == 0,
++          "development header is 134 bytes at height 0");
++    Check(fixture.header.nonce == 0, "development header nonce is supplied as zero");
++    return fixture;
++}
++
++Header SecondHeader(const Header &first) {
++    Header header = first;
++    header.height = 2;
++    header.nonce = 0;
++    header.time = first.time + 1;
++    header.state_root[0] ^= 0x5a;
++    header.size = HEADER_SIZE;
++    return header;
++}
++
++ChainId SecondChain() {
++    ChainId chain{};
++    for (size_t i = 0; i < chain.size(); ++i) chain[i] = static_cast<uint8_t>(0x40 + i);
++    return chain;
++}
++
++void CheckPayload(const std::vector<uint8_t> &bytes, const ChainId &chain, uint64_t height,
++                  const Header &header, const Hash &header_id) {
++    CheckFraming(bytes, 1, PERSISTENT_HEADER_SNAPSHOT_BYTES);
++    constexpr size_t payload = 24;
++    Check(std::equal(chain.begin(), chain.end(), bytes.begin() + payload), "chain id is stored");
++    Check(ReadU64(bytes, payload + 32) == height, "height is little-endian");
++    std::array<uint8_t, HEADER_SIZE> serialized{};
++    Check(SerializeHeader(header, serialized), "serialize stored header");
++    Check(std::equal(serialized.begin(), serialized.end(), bytes.begin() + payload + 40),
++          "snapshot stores the 134 serialized header bytes");
++    Check(std::equal(header_id.begin(), header_id.end(), bytes.begin() + payload + 40 + HEADER_SIZE),
++          "snapshot stores BlockId");
++    Check(header_id != header.state_root, "stored id is BlockId, not the state root");
++}
++
++void Run() {
++    Check(HEADER_SIZE == 134, "header encoding is 134 bytes");
++    Check(PERSISTENT_HEADER_SNAPSHOT_BYTES == 32 + 8 + 134 + 32, "payload width");
++    const DevelopmentGenesisFixture genesis = DevelopmentFixture();
++    std::array<uint8_t, HEADER_SIZE> genesis_bytes{};
++    Check(SerializeHeader(genesis.header, genesis_bytes), "serialize development header");
++    Header short_parse = SentinelHeader();
++    Check(!ParseHeader(genesis_bytes.data(), 133, short_parse) && HeaderUntouched(short_parse),
++          "133-byte buffer is not a header");
++    Check(!ParseHeader(genesis_bytes.data(), 80, short_parse) && HeaderUntouched(short_parse),
++          "80-byte buffer is not a V2 header");
++    Hash genesis_id{};
++    Check(BlockId(genesis.chain_id, genesis.header, genesis_id), "existing BlockId");
++    Check(genesis_id != genesis.header.state_root, "BlockId is not the state root");
++
++    PersistentHeaderStore relative;
++    std::string error;
++    Check(!PersistentHeaderStore::Open("relative-header", relative, error) &&
++              error == "directory" && !relative.IsOpen(),
++          "directory must be absolute");
++
++    const std::string base = TempDir();
++    const std::filesystem::path bare = std::filesystem::path(base) / "bare";
++    PersistentHeaderStore bare_store;
++    Check(PersistentHeaderStore::Open(bare.string(), bare_store, error), "open an empty store");
++    Check(std::filesystem::is_directory(bare), "Open creates the caller directory");
++    Check(!std::filesystem::exists(bare / "header.dat"), "empty store has no header");
++    Check(!std::filesystem::exists(bare / "snapshot.dat"), "empty store does not create snapshot.dat");
++    Check(!std::filesystem::exists(bare / "monetary.dat"), "empty store does not create monetary.dat");
++    Header bare_header = SentinelHeader();
++    uint64_t bare_height = 0x2222;
++    Check(!bare_store.GetHeader(bare_header) && HeaderUntouched(bare_header),
++          "empty store returns no header");
++    Check(!bare_store.Height(bare_height) && bare_height == 0x2222, "empty store returns no height");
++    Check(!bare_store.Undo(error) && error == "no undo", "empty store has no undo");
++
++    const Header supplied = genesis.header;
++    Check(bare_store.Commit(genesis.chain_id, genesis.header.height, genesis.header, error),
++          "first commit writes the snapshot");
++    Check(SameHeader(genesis.header, supplied), "commit does not rewrite the supplied header");
++    Check(std::filesystem::exists(bare / "header.dat"), "commit writes header.dat");
++    Check(std::filesystem::exists(bare / "undo" / "00000001.dat"),
++          "commit numbers the undo record");
++    Check(!std::filesystem::exists(bare / "snapshot.dat"), "commit does not create snapshot.dat");
++    Check(!std::filesystem::exists(bare / "monetary.dat"), "commit does not create monetary.dat");
++    const std::vector<uint8_t> bare_bytes = ReadRaw(bare / "header.dat");
++    CheckPayload(bare_bytes, genesis.chain_id, 0, genesis.header, genesis_id);
++    const std::vector<uint8_t> bare_undo = ReadRaw(bare / "undo" / "00000001.dat");
++    CheckFraming(bare_undo, 2, PERSISTENT_HEADER_SNAPSHOT_BYTES * 2);
++    Check(std::all_of(bare_undo.begin() + 24, bare_undo.begin() + 24 + PERSISTENT_HEADER_SNAPSHOT_BYTES,
++                      [](uint8_t byte) { return byte == 0; }),
++          "first undo starts at the zero predecessor");
++    Check(std::equal(bare_bytes.begin() + 24,
++                     bare_bytes.begin() + 24 + PERSISTENT_HEADER_SNAPSHOT_BYTES,
++                     bare_undo.begin() + 24 + PERSISTENT_HEADER_SNAPSHOT_BYTES),
++          "first undo ends with the snapshot payload");
++
++    PersistentHeaderStore bare_reopened;
++    Check(PersistentHeaderStore::Open(bare.string(), bare_reopened, error), "reopen after commit");
++    Check(ReadRaw(bare / "header.dat") == bare_bytes, "reopen leaves the file bytes unchanged");
++    Header reopened_header;
++    uint64_t reopened_height = 1;
++    ChainId reopened_chain{};
++    Hash reopened_id{};
++    Check(bare_reopened.GetHeader(reopened_header) && SameHeader(reopened_header, genesis.header),
++          "reopen returns the same header");
++    Check(bare_reopened.Height(reopened_height) && reopened_height == 0, "reopen returns the height");
++    Check(bare_reopened.Chain(reopened_chain) && reopened_chain == genesis.chain_id,
++          "reopen returns the chain id");
++    Check(bare_reopened.HeaderId(reopened_id) && reopened_id == genesis_id,
++          "reopen returns BlockId");
++
++    Check(bare_reopened.Undo(error), "undo of the only record");
++    Check(!std::filesystem::exists(bare / "header.dat"), "undo of the only record removes header.dat");
++    Check(!std::filesystem::exists(bare / "undo" / "00000001.dat"),
++          "undo of the only record removes that undo file");
++    Header cleared = SentinelHeader();
++    uint64_t cleared_height = 0x2222;
++    Check(!bare_reopened.GetHeader(cleared) && HeaderUntouched(cleared) &&
++              !bare_reopened.Height(cleared_height) && cleared_height == 0x2222,
++          "undo of the only record leaves no header");
++    Check(!bare_reopened.Undo(error) && error == "no undo", "empty store still has no undo");
++    PersistentHeaderStore bare_empty;
++    Check(PersistentHeaderStore::Open(bare.string(), bare_empty, error) && bare_empty.IsOpen(),
++          "reopen the empty store");
++    Check(!bare_empty.GetHeader(cleared) && HeaderUntouched(cleared),
++          "reopened empty store has no header");
++
++    std::vector<uint8_t> monetary = {'L', 'T', 'S', 'V', '2', 'M', 'O', 'N'};
++    monetary.insert(monetary.end(), 64, 0xab);
++    std::vector<uint8_t> monetary_undo = {'L', 'T', 'S', 'V', '2', 'M', 'O', 'N', 'u'};
++    monetary_undo.insert(monetary_undo.end(), 40, 0xcd);
++    std::vector<uint8_t> snapshot = {'L', 'T', 'S', 'V', '2', 'U', 'T', 'X'};
++    snapshot.insert(snapshot.end(), 48, 0xef);
++    const std::filesystem::path store_dir = std::filesystem::path(base) / "store";
++    WriteSiblingFiles(store_dir, monetary, monetary_undo, snapshot);
++
++    PersistentHeaderStore store;
++    Check(PersistentHeaderStore::Open(store_dir.string(), store, error),
++          "open beside monetary and coin files");
++    CheckSiblingsUntouched(store_dir, monetary, monetary_undo, snapshot);
++    Header ignored = SentinelHeader();
++    Check(!store.GetHeader(ignored) && HeaderUntouched(ignored),
++          "monetary and coin files are not a header");
++
++    Check(store.Commit(genesis.chain_id, genesis.header.height, genesis.header, error),
++          "write the first header");
++    const std::filesystem::path header_path = store_dir / "header.dat";
++    const std::vector<uint8_t> bytes_a = ReadRaw(header_path);
++    CheckPayload(bytes_a, genesis.chain_id, genesis.header.height, genesis.header, genesis_id);
++    Header opened_header;
++    uint64_t opened_height = 9;
++    Hash opened_id{};
++    Check(store.GetHeader(opened_header) && SameHeader(opened_header, genesis.header),
++          "open object returns the header");
++    Check(store.Height(opened_height) && opened_height == genesis.header.height,
++          "open object returns the height");
++    Check(store.HeaderId(opened_id) && opened_id == genesis_id, "open object returns BlockId");
++    const std::vector<uint8_t> undo1 = ReadRaw(store_dir / "undo" / "00000001.dat");
++    CheckSiblingsUntouched(store_dir, monetary, monetary_undo, snapshot);
++
++    Header bad_size = genesis.header;
++    bad_size.size = 80;
++    Check(!store.Commit(genesis.chain_id, genesis.header.height, bad_size, error) &&
++              error == "header",
++          "reject a header whose size field is not 134");
++    Check(ReadRaw(header_path) == bytes_a, "rejected size leaves the snapshot bytes");
++    Header bad_time = genesis.header;
++    bad_time.time = MAX_TIME + 1;
++    bad_time.size = HEADER_SIZE;
++    Check(!store.Commit(genesis.chain_id, 1, bad_time, error) && error == "header",
++          "reject a header SerializeHeader rejects");
++    Check(ReadRaw(header_path) == bytes_a, "rejected header leaves the snapshot bytes");
++    Check(store.GetHeader(opened_header) && SameHeader(opened_header, genesis.header),
++          "rejected commit leaves the open header");
++    CheckSiblingsUntouched(store_dir, monetary, monetary_undo, snapshot);
++
++    std::error_code mkdir_ec;
++    std::filesystem::create_directory(store_dir / "header.dat.tmp", mkdir_ec);
++    Check(!mkdir_ec, "plant a directory where the temp snapshot would be written");
++    const Header second = SecondHeader(genesis.header);
++    const ChainId chain_b = SecondChain();
++    Hash second_id{};
++    Check(BlockId(chain_b, second, second_id), "second header has a BlockId");
++    Check(second.nonce == 0 && second.size == HEADER_SIZE, "second header is not mined");
++    Check(!store.Commit(chain_b, second.height, second, error) && error == "io",
++          "failed commit");
++    Check(ReadRaw(header_path) == bytes_a, "failed commit leaves the previous snapshot bytes");
++    Check(!std::filesystem::exists(store_dir / "undo" / "00000002.dat"),
++          "failed commit does not keep a new undo record");
++    Check(ReadRaw(store_dir / "undo" / "00000001.dat") == undo1,
++          "failed commit leaves the previous undo bytes");
++    Check(store.GetHeader(opened_header) && SameHeader(opened_header, genesis.header) &&
++              store.Height(opened_height) && opened_height == 0,
++          "failed commit leaves the open object unchanged");
++    std::filesystem::remove(store_dir / "header.dat.tmp", mkdir_ec);
++    Check(!mkdir_ec, "remove the planted temp directory");
++    CheckSiblingsUntouched(store_dir, monetary, monetary_undo, snapshot);
++
++    const Header second_supplied = second;
++    Check(store.Commit(chain_b, second.height, second, error), "write the second header");
++    Check(SameHeader(second, second_supplied), "second commit does not change nonce or header");
++    const std::vector<uint8_t> bytes_b = ReadRaw(header_path);
++    Check(bytes_b != bytes_a, "second record changes header.dat");
++    CheckPayload(bytes_b, chain_b, second.height, second, second_id);
++    const std::vector<uint8_t> undo2 = ReadRaw(store_dir / "undo" / "00000002.dat");
++    CheckFraming(undo2, 2, PERSISTENT_HEADER_SNAPSHOT_BYTES * 2);
++    Check(std::equal(bytes_a.begin() + 24, bytes_a.begin() + 24 + PERSISTENT_HEADER_SNAPSHOT_BYTES,
++                     undo2.begin() + 24),
++          "second undo stores the previous payload byte for byte");
++    Check(std::equal(bytes_b.begin() + 24, bytes_b.begin() + 24 + PERSISTENT_HEADER_SNAPSHOT_BYTES,
++                     undo2.begin() + 24 + PERSISTENT_HEADER_SNAPSHOT_BYTES),
++          "second undo stores the next payload byte for byte");
++    CheckSiblingsUntouched(store_dir, monetary, monetary_undo, snapshot);
++
++    Check(store.Undo(error), "undo the second header");
++    Check(ReadRaw(header_path) == bytes_a, "undo restores the first header file byte for byte");
++    Header restored;
++    uint64_t restored_height = 9;
++    Hash restored_id{};
++    Check(store.GetHeader(restored) && SameHeader(restored, genesis.header),
++          "undo restores the first header");
++    Check(store.Height(restored_height) && restored_height == genesis.header.height,
++          "undo restores the height");
++    Check(store.HeaderId(restored_id) && restored_id == genesis_id, "undo restores BlockId");
++    Check(!std::filesystem::exists(store_dir / "undo" / "00000002.dat"),
++          "undo removes the newest undo record");
++    Check(ReadRaw(store_dir / "undo" / "00000001.dat") == undo1, "older undo record stays");
++    CheckSiblingsUntouched(store_dir, monetary, monetary_undo, snapshot);
++
++    PersistentHeaderStore after_undo;
++    Check(PersistentHeaderStore::Open(store_dir.string(), after_undo, error), "reopen after undo");
++    Check(ReadRaw(header_path) == bytes_a, "reopen after undo keeps the restored bytes");
++    Header after_header;
++    uint64_t after_height = 9;
++    Check(after_undo.GetHeader(after_header) && SameHeader(after_header, genesis.header) &&
++              after_undo.Height(after_height) && after_height == 0,
++          "reopen republishes the restored header and height");
++    CheckSiblingsUntouched(store_dir, monetary, monetary_undo, snapshot);
++
++    Check(after_undo.Commit(chain_b, second.height, second, error), "commit again after undo");
++    Check(ReadRaw(header_path) == bytes_b, "the second snapshot bytes are deterministic");
++    WriteRaw(header_path, bytes_a);
++    PersistentHeaderStore recovered;
++    Check(PersistentHeaderStore::Open(store_dir.string(), recovered, error),
++          "drop an undo whose snapshot rename did not finish");
++    Check(!std::filesystem::exists(store_dir / "undo" / "00000002.dat"),
++          "orphan undo is discarded");
++    Check(ReadRaw(header_path) == bytes_a, "orphan undo does not replace the previous snapshot");
++    Header recovered_header;
++    uint64_t recovered_height = 9;
++    Check(recovered.GetHeader(recovered_header) && SameHeader(recovered_header, genesis.header) &&
++              recovered.Height(recovered_height) && recovered_height == 0,
++          "recovery republishes the previous header");
++    CheckSiblingsUntouched(store_dir, monetary, monetary_undo, snapshot);
++
++    const std::vector<uint8_t> good = bytes_a;
++    const std::vector<uint8_t> good_undo = undo1;
++    constexpr size_t header_at = 24 + 32 + 8;
++    WriteRaw(header_path, {});
++    ExpectClosed(store_dir.string(), "truncated");
++    Check(ReadRaw(header_path).empty(), "truncated open does not repair header.dat");
++    CheckSiblingsUntouched(store_dir, monetary, monetary_undo, snapshot);
++
++    Check(good.size() > header_at + 80, "snapshot extends past an 80-byte prefix");
++    WriteRaw(header_path, std::vector<uint8_t>(good.begin(), good.begin() + header_at + 80));
++    ExpectClosed(store_dir.string(), "truncated");
++    WriteRaw(header_path, std::vector<uint8_t>(good.begin(), good.begin() + header_at + 133));
++    ExpectClosed(store_dir.string(), "truncated");
++    CheckSiblingsUntouched(store_dir, monetary, monetary_undo, snapshot);
++
++    std::vector<uint8_t> short_payload(32 + 8 + 80 + 32, 0x11);
++    WriteRaw(header_path, Frame(1, short_payload));
++    ExpectClosed(store_dir.string(), "truncated");
++    std::vector<uint8_t> zero_payload(PERSISTENT_HEADER_SNAPSHOT_BYTES, 0);
++    WriteRaw(header_path, Frame(1, zero_payload));
++    ExpectClosed(store_dir.string(), "header");
++
++    std::vector<uint8_t> bad_size_field = good;
++    Check(header_at + 54 + 8 <= bad_size_field.size() - 32, "size field is inside the checksum");
++    for (unsigned i = 0; i < 8; ++i) bad_size_field[header_at + 54 + i] = (i == 0 ? 80 : 0);
++    const Hash resized = FileChecksum(bad_size_field.data(), bad_size_field.size() - 32);
++    std::copy(resized.begin(), resized.end(), bad_size_field.end() - 32);
++    WriteRaw(header_path, bad_size_field);
++    ExpectClosed(store_dir.string(), "header");
++    CheckSiblingsUntouched(store_dir, monetary, monetary_undo, snapshot);
++
++    std::vector<uint8_t> mismatched = good;
++    mismatched[16] ^= 0xff;
++    WriteRaw(header_path, mismatched);
++    ExpectClosed(store_dir.string(), "truncated");
++    WriteRaw(header_path, good);
++
++    std::vector<uint8_t> flipped = good;
++    flipped.back() ^= 0xff;
++    WriteRaw(header_path, flipped);
++    ExpectClosed(store_dir.string(), "checksum");
++    WriteRaw(header_path, good);
++
++    WriteRaw(store_dir / "header.dat.tmp", flipped);
++    PersistentHeaderStore ignored_temp;
++    Check(PersistentHeaderStore::Open(store_dir.string(), ignored_temp, error),
++          "temp file is not a record");
++    Header temp_header;
++    uint64_t temp_height = 9;
++    Check(ignored_temp.GetHeader(temp_header) && SameHeader(temp_header, genesis.header) &&
++              ignored_temp.Height(temp_height) && temp_height == 0,
++          "a temp header is not published");
++    std::filesystem::remove(store_dir / "header.dat.tmp");
++
++    WriteRaw(store_dir / "undo" / "00000001.dat",
++             std::vector<uint8_t>(good_undo.begin(), good_undo.begin() + 80));
++    ExpectClosed(store_dir.string(), "truncated");
++    Check(ReadRaw(header_path) == good, "truncated undo does not rewrite the snapshot");
++    WriteRaw(store_dir / "undo" / "00000001.dat", good_undo);
++
++    PersistentHeaderStore live;
++    Check(PersistentHeaderStore::Open(store_dir.string(), live, error), "reopen before undo failure");
++    WriteRaw(store_dir / "undo" / "00000001.dat",
++             std::vector<uint8_t>(good_undo.begin(), good_undo.begin() + 80));
++    Check(!live.Undo(error) && error == "truncated", "truncated undo fails Undo");
++    Check(ReadRaw(header_path) == good, "failed Undo leaves the snapshot bytes");
++    Header live_header;
++    uint64_t live_height = 9;
++    Check(live.GetHeader(live_header) && SameHeader(live_header, genesis.header) &&
++              live.Height(live_height) && live_height == 0,
++          "failed Undo leaves the open header");
++    WriteRaw(store_dir / "undo" / "00000001.dat", good_undo);
++    CheckSiblingsUntouched(store_dir, monetary, monetary_undo, snapshot);
++
++    std::vector<uint8_t> huge(1024u * 1024u + 1, 0);
++    WriteRaw(header_path, huge);
++    ExpectClosed(store_dir.string(), "size");
++    WriteRaw(header_path, good);
++    PersistentHeaderStore restored_open;
++    Check(PersistentHeaderStore::Open(store_dir.string(), restored_open, error),
++          "reopen the restored record");
++    Header final_header;
++    uint64_t final_height = 9;
++    Hash final_id{};
++    Check(restored_open.GetHeader(final_header) && SameHeader(final_header, genesis.header) &&
++              restored_open.Height(final_height) && final_height == 0 &&
++              restored_open.HeaderId(final_id) && final_id == genesis_id,
++          "checksum match republishes the header");
++    Check(ReadRaw(header_path) == good, "reopen still does not rewrite header.dat");
++    Check(restored_open.Undo(error), "undo the restored first header");
++    Check(!std::filesystem::exists(header_path), "final undo returns to no header");
++    Header gone = SentinelHeader();
++    Check(!restored_open.GetHeader(gone) && HeaderUntouched(gone), "final undo publishes no header");
++    CheckSiblingsUntouched(store_dir, monetary, monetary_undo, snapshot);
++
++    std::error_code remove_ec;
++    std::filesystem::remove_all(base, remove_ec);
++    Check(!remove_ec, "remove temporary directory");
++}
++
++} // namespace
++
++int main(int argc, char **argv) {
++    if (argc != 1) {
++        std::cerr << "usage: test_lotus_v2_persistent_header\n";
++        return 2;
++    }
++    (void)argv;
++    Run();
++    std::cout << "V2 persistent header snapshot and undo cases passed\n";
++    return 0;
++}
+-- 
+2.50.1 (Apple Git-155)
+
