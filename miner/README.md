@@ -7,6 +7,7 @@ The CLI and optional desktop GUI share the same mining library. They use Lotus's
 The CLI accepts `--protocol=v1|v2`, with V1 as the default. V2 selection exits
 with an unsupported error before mining because its daemon job API and GPU
 scheduler are pending. The GUI shows the same error without starting mining.
+A V2 job can be parsed and hashed locally. Network submission is still refused.
 The candidate V2 CPU/OpenCL header hashes and integration gates
 are described in [V2-MINING.md](V2-MINING.md).
 
