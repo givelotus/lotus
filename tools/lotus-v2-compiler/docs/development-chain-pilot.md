@@ -87,3 +87,16 @@ pruned genesis outputs with the empty authenticated UTXO root. Unsupported input
 fail before opening the daemon home. The malformed-signature negative must
 report CHECKSIGVERIFY failure in both engines; an unrelated rejection does not
 satisfy that gate. Its core TxId must remain identical while its TxHash changes.
+
+Root independently reran the complete pilot against fresh clean native commit
+`dca9abe76` at `/private/tmp/lotus-v2-daemon-costs-exact-20261015` after a Debug
+Chronik-OFF build and development-chain/disk/peer-codec checks. Evidence:
+`/private/tmp/lotus-v2-signed-pilot-exact-20261015`. The accepted signed spend is
+at height 3, tip
+`360c4b9efd2075255e164a0aac3d7dda6c81842e41a9928c89fc9bc794b6b86d`,
+state root `34871de41cbd90fddc1d049830eab41e7c9ae4e0b8367fa52073e430a3330448`.
+All seven charges and both roots agree, including after undo/reconnect. The
+daemon SHA256 is
+`c6ab2d7720a9ee603581a6ac80107e18975272fd0c6c69c7032513ba5b463b15`.
+This supersedes the scratch-build limitation for this exact pilot run; the
+network, wallet and general-equivalence limitations still apply.
