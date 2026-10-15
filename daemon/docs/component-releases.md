@@ -85,6 +85,12 @@ that is a temporary implementation boundary, not completion of the BTC Chronik g
 
 ## Validation and publication
 
+Component macOS builds select Xcode16.4 on macos-15. The pinned Bitcoin Core
+source requires Xcode command-line tools16.2 or newer; the initial macos-14
+AppleClang15 runner failed its aggregate CTAD check. The updated macOS
+artifact job passes. Historical Lotus release CI and assets are unchanged.
+
+
 Commit the reviewed candidate normally, then run artifact-only CI for its exact
 commit. The new workflow reads only the requested component's reviewed manifest:
 
