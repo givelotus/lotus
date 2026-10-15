@@ -408,6 +408,41 @@ mod tests {
     }
 
     #[test]
+    fn parses_cpp_block_template_and_refuses_network_submission() {
+        // Nonce-0 header from the native-037 BuildChildHeader fixture.
+        // Digests are that process's BodyHash, WorkHash, and BlockId.
+        const JSON: &str = r#"{"protocol":"v2","job_id":"native-037-template","chain_id":"000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f","header":"2ba3f975fbc1840b9cb4acc6aa84a88539010eb2132cb06a43168b1cb6b66ae5ffff002178f1536500000000000000000000020000009001000000000000050000000000000033333333333333333333333333333333333333333333333333333333333333334444444444444444444444444444444444444444444444444444444444444444","target":"000000000000000000000000000000000000000000000000000000000000ffff"}"#;
+        let job = V2Job::from_json(JSON).unwrap();
+        assert_eq!(job.job_id(), "native-037-template");
+        assert_eq!(job.header().len(), HEADER_LEN);
+        assert_eq!(job.chain_id().len(), 32);
+        assert_eq!(job.target().len(), 32);
+        let (body, work, block_id) = job.hashes().unwrap();
+        assert_eq!(
+            hex::encode(body),
+            "e6488811010b45ed6ce854cdc9758edb80b552d23e75948e7ccc1fe0f5145bea"
+        );
+        assert_eq!(
+            hex::encode(work),
+            "67609329f280d16be8df0d4c20d8e2ffd6fadca4b69750f93bd432d492e1587c"
+        );
+        assert_eq!(
+            hex::encode(block_id),
+            "d9ba1f949132940f2a3e4c1cf5c15dd8ecdb7718055f686ac5e3d3b2c5824d2a"
+        );
+        assert_eq!(
+            job.hashes().unwrap(),
+            hashes(job.header(), job.chain_id()).unwrap()
+        );
+        let expected =
+            "unsupported V2 network submission: daemon jobs and pool submission are not available";
+        for err in [job.submit().unwrap_err(), job.mine_network().unwrap_err()] {
+            assert_eq!(err, V2JobError::UnsupportedNetworkSubmission);
+            assert_eq!(err.to_string(), expected);
+        }
+    }
+
+    #[test]
     #[ignore = "requires an installed OpenCL runtime and device"]
     fn job_gpu_batch_matches_cpu_for_four_nonces() {
         // Digest parity only. This does not accept or submit a block.
