@@ -51,7 +51,12 @@ export HOSTS=x86_64-linux-gnu JOBS="${JOBS:-2}"
 export SOURCE_DATE_EPOCH="$SOURCE_EPOCH" FORCE_SOURCE_DATE_EPOCH=1
 FORCE_VERSION="$SOURCE_VERSION"
 export FORCE_VERSION
-export DISTNAME="lotus-v${FORCE_VERSION}" OUTDIR_BASE="$CANDIDATE/output"
+DISTNAME="${LOTUS_DISTNAME:-lotus-v${FORCE_VERSION}}"
+[[ "$DISTNAME" =~ ^[A-Za-z0-9._+-]+-v${FORCE_VERSION//./\\.}$ ]] || {
+    echo "Distribution name must end in the exact source version ${FORCE_VERSION}." >&2
+    exit 1
+}
+export DISTNAME OUTDIR_BASE="$CANDIDATE/output"
 ./contrib/guix/guix-build
 cp "$CANDIDATE/inputs.txt" "$CANDIDATE/output/inputs.txt"
 

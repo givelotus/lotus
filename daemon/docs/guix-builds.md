@@ -80,14 +80,20 @@ socket, privileged containers, or access to a developer machine. The workflow
 uploads validation artifacts and compares the release archives; it does not publish
 a GitHub release.
 
-The current component-tag release workflow still builds its Linux asset through
-the native build path. This successful Guix run validated the maintained V1 tree
-and produced reproducible `v11.6.0` archives; it does not by itself validate the
-current `v11.6.1` component candidate. Switching the published Linux asset to
-Guix should happen only after the Guix job consumes the exact reviewed component
-manifest/tag source and produces the same expected package layout and version.
-The manual Guix workflow can run on GitHub Actions now; no Docker socket setup is
-needed.
+The component release workflow now calls this workflow for Lotus. Both replicas
+materialize the exact reviewed component manifest/tag source, build the tagged
+version, and compare binary/debug/source hashes. Only the verified replica is
+uploaded as `lotusd-x86_64-linux-gnu`; the release job cannot publish unless that
+workflow succeeds. It also includes the exact Guix-adapted source archive and
+records both source identities in build info. BCHN, Doged and Bitcoin Core retain
+their native Linux build jobs because no Guix build path has been validated for
+those projects. The manual component dispatch remains artifact-only.
+
+The earlier reproducibility run validated the maintained V1 `v11.6.0` source.
+It is evidence for the Guix machinery, not for the `v11.6.1` component package;
+the new tag-bound workflow is the check for that exact candidate. Neither flow
+needs a Docker socket for Guix. Container smoke runs separately on the hosted
+runner after Guix produces the release archive.
 
 ## Run on a dedicated Linux builder
 
@@ -159,15 +165,20 @@ the installer's configured signing-key trust policy.
 
 ## Promotion and platform limits
 
-Keep the overlay explicit until its build-only changes are reviewed into the
-shared release source. Native and Guix candidate manifests must then identify
-the same final source tree. Regenerate the prepared release and rerun checks
-against that exact common tree before switching the Linux release path. Avoid
-applying the temporary overlay twice once it is integrated. This workflow does
-not publish, retag existing versions, or modify working nodes/data.
+The Guix overlay remains an explicit build-only patch, separate from the
+component's maintained patch series. Release metadata records the component
+source tree; build info and the additional adapted-source archive record the
+overlay result. Do not fold the overlay into the consensus patch series or apply
+it twice. The workflow does not retag existing versions or modify working
+nodes/data.
 
 Only `x86_64-linux-gnu` is enabled. Upstream explicitly marks ARM macOS cross
 compilation TODO; Intel macOS additionally requires a separately supplied,
 appropriately licensed Xcode SDK. No Apple SDK is committed or uploaded. Native
-macOS release builds remain in place. No BCHN, Core or Doged Guix coverage is
-inherited from this V1-specific build.
+macOS release builds remain in place. Doged `9690833b` and Bitcoin Core
+`f13ae519` contain their own upstream `contrib/guix` build machinery, but those
+recipes have not been adapted and validated with Lotus's component manifests,
+Chronik settings and release packager. The pinned BCHN source has no
+`contrib/guix` recipe. Keep all three on their current native Linux jobs until
+each exact release candidate passes its own Guix build, package and behavior
+checks; this Lotus validation does not transfer across daemons.

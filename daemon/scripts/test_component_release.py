@@ -1,6 +1,7 @@
 """Offline component identity, tag isolation and publication guard regressions."""
 import hashlib
 import importlib.util
+import io
 import json
 from pathlib import Path
 import shutil
@@ -20,6 +21,9 @@ build_spec.loader.exec_module(build)
 fixture_spec=importlib.util.spec_from_file_location('legacy_fixtures',Path(__file__).with_name('test_prepare_release.py'))
 fixtures=importlib.util.module_from_spec(fixture_spec)
 fixture_spec.loader.exec_module(fixtures)
+guix_spec=importlib.util.spec_from_file_location('guix_component_package',Path(__file__).with_name('guix-component-package.py'))
+guix_package=importlib.util.module_from_spec(guix_spec)
+guix_spec.loader.exec_module(guix_package)
 
 
 class ComponentTests(unittest.TestCase):
@@ -73,6 +77,47 @@ class ComponentTests(unittest.TestCase):
         self.prepare(check=True,archive=archive)
         self.assertEqual(before,hashlib.sha256(archive.read_bytes()).hexdigest())
         self.assertEqual(self.git('status','--porcelain'),b'')
+
+    def test_guix_package_requires_exact_component_inputs_and_package_paths(self):
+        manifest={
+            'source_commit':'a'*40,
+            'source_tree':'b'*40,
+            'binaries':['lotusd','lotus-cli'],
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            inputs=Path(temporary)/'inputs.txt'
+            inputs.write_text(
+                f"source_commit={manifest['source_commit']}\n"
+                f"source_tree={manifest['source_tree']}\n"
+                'adapted_commit='+'c'*40+'\n'
+                'adapted_tree='+'d'*40+'\n'
+                'source_date_epoch=1791962988\nchronik=ON\nnng=ON\n')
+            self.assertEqual(guix_package.parse_inputs(inputs,manifest)['chronik'],'ON')
+            inputs.write_text(inputs.read_text().replace(manifest['source_tree'],'e'*40))
+            with self.assertRaisesRegex(ValueError,'source tree differs'):
+                guix_package.parse_inputs(inputs,manifest)
+
+            archive=Path(temporary)/'release.tar.gz'
+            with tarfile.open(archive,'w:gz') as bundle:
+                for name in ('lotusd-v11.6.1','lotusd-v11.6.1/COPYING',
+                             'lotusd-v11.6.1/bin/lotusd','lotusd-v11.6.1/bin/lotus-cli'):
+                    info=tarfile.TarInfo(name)
+                    if name.endswith('/') or name=='lotusd-v11.6.1':
+                        info.type=tarfile.DIRTYPE
+                        bundle.addfile(info)
+                    else:
+                        payload=b'fixture'
+                        info.size=len(payload)
+                        bundle.addfile(info,io.BytesIO(payload))
+            self.assertTrue(guix_package.archive_members(
+                archive,'lotusd-v11.6.1',manifest['binaries']))
+            unsafe=Path(temporary)/'unsafe.tar.gz'
+            with tarfile.open(unsafe,'w:gz') as bundle:
+                info=tarfile.TarInfo('../escape')
+                info.size=1
+                bundle.addfile(info,io.BytesIO(b'x'))
+            with self.assertRaisesRegex(ValueError,'outside its versioned'):
+                guix_package.archive_members(unsafe,'lotusd-v11.6.1',manifest['binaries'])
 
     def test_unsupported_features_and_bad_identity_fail_before_writes(self):
         for feature in ('nng','tx-chain-limit','unknown'):

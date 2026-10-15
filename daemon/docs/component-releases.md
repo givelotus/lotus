@@ -104,10 +104,12 @@ gh workflow run release-components.yml --repo givelotus/lotus \
   --ref REVIEW_BRANCH -f component=bitcoin-core
 ```
 
-Both macOS arm64 and Linux x86_64 jobs fetch only the exact upstream pin, replay
-selected patches, verify manifests/archives, build native daemon/CLI and tests,
-run C++ suites (Rust checks when Chronik is ON), bundle/sign macOS libraries,
-check packaged native versions, and smoke the Linux container without networking.
+The macOS arm64 job and the component-specific Linux job fetch only the exact
+upstream pin, replay selected patches, verify manifests/archives, build daemon/CLI
+and tests, run C++ suites (Rust checks when Chronik is ON), check packaged versions,
+and smoke the Linux container without networking. Lotus Linux uses two independent
+Guix builders and a byte-for-byte archive comparison; BCHN, Doged and Bitcoin Core
+use their native Linux build jobs. macOS libraries are bundled and signed natively.
 Artifacts use the same component tag in filenames and carry COPYING, manifest,
 release notes, actual compiler/tool versions, binary version output and checksums.
 Source archives/checksums are deterministic for source identity; binary
@@ -122,7 +124,9 @@ Linux container, checks both same-run artifact sets and checksums, then publishe
 those artifacts, source archive, notes and manifest as one GitHub Release. A
 `workflow_dispatch` run remains artifact-only. Existing tags/releases are never
 overwritten; use a new distributor version for changes. No container registry
-push or production deployment is implied.
+push or production deployment is implied. Lotus releases additionally publish a
+`*-guix-source.tar.gz` archive for the exact build-overlay tree beside the normal
+component source archive.
 
 `component-release.py --publish` remains an optional stricter preflight helper:
 it can require a successful artifact-only run before creating the tag. Direct
@@ -140,7 +144,7 @@ has been published by this workflow. Run artifact-only CI first; successful
 artifact-only runs are a useful preflight, but tag CI itself remains the final
 publication gate.
 
-## Build-label audit and Guix boundary
+## Build-label audit and Guix release path
 
 No production monorepo build consumer derives component versions from `git describe`.
 All actual executable consumers in the pinned source trees were inventoried in
@@ -154,11 +158,13 @@ helper is not a release-build consumer and must run against its own library hist
 Build materialization uses a private repository with no inherited tags, so old
 monorepo `v11` or unrelated Vase/miner tags cannot select native release identity.
 
-The experimental Guix workflow/wrapper remains separately scoped to Lotus and
-unchanged. Its build-only overlay is not applied to ABC/BCHN/Doged/Core. Current
-Guix `lotus-vVERSION` filenames are not component publication assets; adopting the
-registry/archive names there requires coordinated wrapper/archive lookup work
-and completed Guix validation. No binary reproducibility claim is added here.
+The Guix workflow/wrapper is scoped to Lotus. Its build-only overlay is not applied
+to ABC/BCHN/Doged/Core. The Lotus tag release calls the workflow with the exact
+component manifest, compares two independent binaries, and stages the verified
+`lotusd-vVERSION` archive using the same asset naming scheme as the other targets.
+The earlier `v11.6.0` run establishes reproducibility for that source only; each
+new Lotus tag must pass its own Guix build before publication. The validated Guix
+workflow runs directly on hosted Linux runners and does not need a Docker socket.
 
 ## Optional BCHN and Bitcoin Core Chronik hosts
 
