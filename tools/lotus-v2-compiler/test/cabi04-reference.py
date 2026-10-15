@@ -25,7 +25,7 @@ try:
     tx_inputs = []
     for index, item in enumerate(items):
         witnesses = tuple(Witness(bytes.fromhex(w['script']), tuple(bytes.fromhex(x) for x in w['proof']), tuple(bytes.fromhex(x) for x in w['args'])) for w in item.get('witnesses', [item]))
-        tx_inputs.append(Input(bytes([0x55 + index]) * 32, index, item.get('sequence', 0xffffffff), 1, 0, witnesses))
+        tx_inputs.append(Input(bytes.fromhex(item['prev_txid']) if 'prev_txid' in item else bytes([0x55 + index]) * 32, item.get('prev_index', index), item.get('sequence', 0xffffffff), 1, 0, witnesses))
     tx = Transaction(case.get('lock', 0), tuple(tx_inputs), tuple(output(item) for item in case['outputs']))
     resolved = tuple(output(item['coin']) for item in items)
     script = tx.inputs[active].witnesses[selected_witness].script

@@ -199,7 +199,9 @@ recipient changes, asset substitutions and bypass/hostage paths reject.
 
 The fixture uses a native state coin of 100, budget 50 and cap 20. A spend pays
 20 to the recipient and leaves inventory 80 / budget 30. A later spend of 10
-consumes that exact successor and leaves inventory 70 / budget 20. A separate
+references the prior transaction's actual TxID/output 0, resolves that exact
+successor, and leaves inventory 70 / budget 20. The second fee input uses a distinct
+fixture outpoint; no spend-outpoint or chain-state validation is implied. A separate
 native input of 10 funds fees; both actual consuming invocations receive FULL
 signatures and execute independently. A token-inventory variant also executes,
 as does one-unit spending and exact budget exhaustion. Token rules beyond this
