@@ -31,7 +31,9 @@ pre-handshake envelope bound still applies.
 Raise the accepted minimum to 70017 as proposed. Ignore duplicate version
 without reparsing or changing peer state. Ignore established duplicate verack.
 Duplicate hello closes. Check self-connection against outstanding outbound local
-nonces; an omitted nonce supplies no such evidence. User-agent bytes are
+nonces, including the inherited default nonce 1 when the sender group is omitted
+(`net_processing.cpp:5034`, `net.cpp:399`). This is a collision/self-connection
+heuristic, not authenticated peer identity. User-agent bytes are
 untrusted and must be sanitized before diagnostic display.
 
 ### Session ordering and resource limits
