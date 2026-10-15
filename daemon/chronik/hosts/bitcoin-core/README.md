@@ -1,4 +1,6 @@
-# Bitcoin Core Chronik host foundation
+# Bitcoin Core Chronik codec foundation
+
+For the optional real host adapter and its separate runtime evidence, see [HOST.md](HOST.md). This document describes mailbox 0001 by itself.
 
 This optional mailbox adds a tested Bitcoin witness transaction codec. It does **not** implement or enable a Bitcoin Core Chronik bridge, indexer, provider profile or HTTP server. Provider gates, default series, public schemas and releases remain unchanged.
 

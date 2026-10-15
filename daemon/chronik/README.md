@@ -64,12 +64,12 @@ candidate. Existing live nodes and published releases remain untouched.
 
 ## Host boundaries and publication
 
-Only the ABC profile is implemented here. CMake rejects BCHN, Bitcoin Core,
-Lotus and Doged profiles instead of substituting ABC serialization or consensus.
-Lotus and Doged retain their existing embedded forks until their chain-specific
-profiles are ported and tested. BCHN needs native bridge/CashTokens handling;
-Bitcoin Core additionally needs witness-aware transaction parsing and indexing.
-Neither adapter is implemented by this proof.
+ABC remains the unchanged extraction proof. An optional exact-pin [Bitcoin Core
+host profile](hosts/bitcoin-core/HOST.md) now has native macOS regtest evidence,
+including witness storage, events and restart recovery. Other profiles require
+independent reviewed adapters; CMake fails closed when their profile is absent.
+Lotus and Doged retain their embedded forks. This does not enable Core Chronik
+in default component releases or establish mainnet/cross-platform support.
 
 A separate shared-source repository can later receive these deterministic
 exports, with original licenses/provenance and exact export pins. This candidate
