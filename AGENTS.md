@@ -419,8 +419,20 @@ Upstream Bitcoin ABC's in-process Chronik (`chronik/`) assumes standard 80-byte 
 - Native oracle verifies 161 wire cases and serialized block offsets. This is a codec foundation, not a functioning BTC Chronik host. Keep provider gates/default series/releases unchanged until adapters, full-byte queries, XOR storage, acceptance-time spent coins, chainstate roles and reorg/crash lifecycle are implemented and validated.
 - Patch only private verified export copies. Focused strict Clippy passes; inherited all-target warning at script/compress.rs:93 reproduces on pristine source and remains qualified. No production data, source pin, publication or tag changes.
 
+<<<<<<< HEAD
 - Root independently regenerated all161 BTC codec fixtures byte-identically against the native Core oracle and reran all3 codec integration tests successfully before integration. This adds only an optional codec candidate; Core/BCHN in-process host adapters are being implemented in isolated worktrees with provider gates unchanged. ABC artifact run38660102967 Linux job116179077835 completed native checks, packaging and container smoke successfully; corrected macOS-path matrix38661920638 remains pending.
 
 ## Human patch-maintenance entry point (2026-10-14)
 
 - daemon/docs/adding-patches.md is the short contributor workflow linked from daemon/README.md and make help. Use isolated monorepo/source workspaces, one authored commit per patch, explicit candidate manifests for optional features and exact replay/tree checks before native validation. mkpatch currently supports v1/ecash/bchn/doged, not Bitcoin Core or shared-source overlay profile generation. Keep generated V1 release metadata separate and regenerate complete release candidates; document final Chronik overlay commands when the pending adapter tooling is integrated.
+=======
+## Optional shared Chronik host overlays (2026-10-14)
+
+- Preserve ABC's verified export/staging behavior. Other explicitly selected host profiles require an offline profile manifest, exact host/provider pins, native source hashes, mailbox hashes and complete changed-file result hashes before CMake compiles anything. Apply only inside a separate provider-owned host build directory; reconstruct it on reconfiguration so stale overlay additions cannot survive.
+- Adding this mechanism alone enables no host: a reviewed profile and real native/runtime evidence are required. Keep default series/releases and source pins unchanged. Host source mailboxes and shared-source overlays are separate, both recorded in the profile for offline review.
+>>>>>>> 9e000802 (Verify offline Chronik host overlays before staged compilation)
+
+## Optional shared Chronik host overlays (2026-10-14)
+
+- Preserve ABC's verified export/staging behavior. Other explicitly selected host profiles require an offline profile manifest, exact host/provider pins, native source hashes, mailbox hashes and complete changed-file result hashes before CMake compiles anything. Apply only inside a separate provider-owned host build directory; reconstruct it on reconfiguration so stale overlay additions cannot survive.
+- Adding this mechanism alone enables no host: a reviewed profile and real native/runtime evidence are required. Keep default series/releases and source pins unchanged. Host source mailboxes and shared-source overlays are separate, both recorded in the profile for offline review.
