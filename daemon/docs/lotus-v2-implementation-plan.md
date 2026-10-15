@@ -541,3 +541,27 @@ some unsupported/provider/host-limit paths; do not turn the coordinator's return
 replacement-invalid flag into a permanent invalid-root fact. A typed failure audit
 and repair must precede that selector behavior. No network/profile adoption or
 public testnet readiness is claimed.
+
+
+## Bounded injected-stream transport (126–127)
+
+All 128 mailboxes replay with exact intermediate trees; final tree
+`3b6cfed8197ab22e295530098b1d348d90a53c13`. See
+[replay evidence](evidence/v2-series-replay-127.json). Existing mailboxes,
+including the binary CSV in 033, remain byte-identical.
+
+The transport owns the existing session over a caller-owned, already-connected
+nonblocking stream interface. Explicit caps bound logical read buffers, queued
+frames and I/O work; fixed frame and handshake deadlines survive partial writes,
+trickle reads and coalesced input. Reentry guards, pending-event backpressure,
+callback failure and close-once cleanup are tested. These are logical byte bounds,
+not process RSS bounds; caller-owned and allocator buffers remain separate.
+
+Independent review found no blocker. Mocked-stream Debug, Release and ASan/UBSan
+checks passed; allocation-failure injection remains untested. Root standalone
+Debug check passes. Clean native `3fa0c7073` at
+`/private/tmp/lotus-v2-daemon-transport-exact-20261015` builds and passes the
+full-tree transport, session and download targets with Chronik off. Build log:
+`/private/tmp/lotus-v2-transport-build.log`. No full daemon rebuild or live socket
+behavior is claimed for this packet. Socket activation, adopted profile,
+candidate selection and typed permanent-invalidity evidence remain open gates.
