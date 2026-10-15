@@ -11,8 +11,11 @@ Independent mailbox replay retains that tree. Root pushed the initial compatible
 replacement as `afb6a70da7b3dcb119ca3638218fa9d49ee3001d` to MR2176.
 Its CI found dependency/format lint failures; the narrow follow-up preserves the
 schema and passes native enabled rebuild plus both existing consumer suites.
-The reviewed follow-up is awaiting final lint before submission. Historical
-raw-protocol CI does not validate this replacement.
+Root pushed the reviewed follow-up as `3584a5d3c3d16646a836f4270211b8de865d4782`;
+its final tree matches this mailbox. Corrected pipeline `2948854699` is pending.
+The affected lints pass locally; full local lint encountered a mypy tool-version
+error and is being retried with CI-matching tools. Historical raw-protocol CI
+does not validate this replacement.
 
 
 `BUILD_BITCOIN_NNG` is OFF by default. This is a port of the maintained
