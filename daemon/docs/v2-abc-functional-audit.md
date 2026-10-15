@@ -10,7 +10,7 @@ Executed daemon: `/private/tmp/lotus-v2-daemon-runtime-staging-20261015/build-ch
 
 The existing generated config selects Lotus daemon/CLI names, wallet ON, Chronik ON, ZMQ OFF. CLI executable was absent at initial inspection. These selected tests use RPC, so no CLI rename or source workaround was applied.
 
-Every invocation used a new `/private/tmp/lotus-v2-abc-functional-case-*` datadir and separate cache. `TEST_RUNNER_PORT_MIN=38000`, seeds 41–48, MAX_NODES 64: initial P2P bases 38201–40944 (seed wraparound), RPC bases 41201–43944, Chronik bases 44201–46944 (remaining framework port classes use further 3000 increments). No 10604, 10605, or 8331. Framework config disables discovery, DNS/fixed seeds and automatic connections (`connect=0`); P2P test connections are local framework peers. Failed processes were cleaned by the framework; `cleanup.txt` confirms zero remaining audit child daemons. No external peers or existing chain data were used.
+Every invocation used a new `/private/tmp/lotus-v2-abc-functional-case-*` datadir and separate cache. `TEST_RUNNER_PORT_MIN=38000`, seeds 41–48, MAX_NODES 64: initial P2P base is `38000 + (64 * seed) % 2935`; RPC adds 3000 and Chronik adds 6000 (remaining framework port classes use further 3000 increments). Exact generated ports are retained in `port-and-isolation-evidence.json`. No 10604, 10605, or 8331. Framework config disables discovery, DNS/fixed seeds and automatic connections (`connect=0`); P2P test connections are local framework peers. Failed processes were cleaned by the framework; `cleanup.txt` confirms zero remaining audit child daemons. No external peers or existing chain data were used.
 
 ## Measured executions
 
