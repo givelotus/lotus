@@ -2,7 +2,6 @@
 """Prepare, verify, build and publish explicitly named daemon components."""
 import argparse
 import copy
-import gzip
 import hashlib
 import importlib.util
 import io
@@ -11,9 +10,11 @@ import os
 from pathlib import Path
 import re
 import shutil
+import struct
 import subprocess
 import tempfile
 import tarfile
+import zlib
 
 ROOT = Path(__file__).resolve().parents[2]
 SOURCE_DATE_EPOCH = 1000684800
@@ -89,22 +90,48 @@ def path_for(root, component):
     return root / 'daemon/releases' / component
 
 
+def write_gzip_stored(data, destination, epoch):
+    """Write a byte-stable gzip stream without platform zlib variation."""
+    with destination.open('wb') as output:
+        output.write(b'\x1f\x8b\x08\x00'+struct.pack('<I', epoch)+b'\x00\xff')
+        block_size = 65535
+        if not data:
+            output.write(b'\x01\x00\x00\xff\xff')
+        else:
+            for offset in range(0, len(data), block_size):
+                block = data[offset:offset+block_size]
+                final = offset + len(block) == len(data)
+                output.write(bytes((1 if final else 0,)))
+                output.write(struct.pack('<HH', len(block), len(block) ^ 0xffff))
+                output.write(block)
+        output.write(struct.pack('<II', zlib.crc32(data) & 0xffffffff, len(data) & 0xffffffff))
+
+
 def deterministic_source_archive(replay, commit, tag, destination, epoch):
     """Normalize Git's export-subst tar to stable ownership, time and gzip bytes."""
     tar_bytes = replay.git('archive', '--format=tar', f'--prefix={tag}/', commit)
+    commit_id = commit[:12].encode()
+    commit_date = replay.git('show', '-s', '--format=%cD', commit).strip()
+    normalized_tar = io.BytesIO()
     with tarfile.open(fileobj=io.BytesIO(tar_bytes), mode='r:') as source:
-        with destination.open('wb') as raw_output:
-            with gzip.GzipFile(fileobj=raw_output, mode='wb', filename='', mtime=epoch,
-                               compresslevel=0) as compressed:
-                with tarfile.open(fileobj=compressed, mode='w', format=tarfile.PAX_FORMAT) as archive:
-                    for member in source:
-                        info = copy.copy(member)
-                        info.uid = info.gid = 0
-                        info.uname = info.gname = ''
-                        info.mtime = epoch
-                        info.pax_headers = {}
-                        contents = source.extractfile(member) if member.isfile() else None
-                        archive.addfile(info, contents)
+        with tarfile.open(fileobj=normalized_tar, mode='w', format=tarfile.PAX_FORMAT) as archive:
+            for member in source:
+                info = copy.copy(member)
+                info.uid = info.gid = 0
+                info.uname = info.gname = ''
+                info.mtime = epoch
+                info.pax_headers = {}
+                contents = source.extractfile(member) if member.isfile() else None
+                if contents and member.name.endswith('/src/clientversion.cpp'):
+                    data = contents.read()
+                    data = re.sub(rb'(?m)^#define GIT_COMMIT_ID "[^"]*"$',
+                                  b'#define GIT_COMMIT_ID "'+commit_id+b'"', data)
+                    data = re.sub(rb'(?m)^#define GIT_COMMIT_DATE "[^"]*"$',
+                                  b'#define GIT_COMMIT_DATE "'+commit_date+b'"', data)
+                    info.size = len(data)
+                    contents = io.BytesIO(data)
+                archive.addfile(info, contents)
+    write_gzip_stored(normalized_tar.getvalue(), destination, epoch)
 
 
 CHRONIK_HOSTS = {'bchn': 'bchn', 'bitcoin-core': 'bitcoin-core'}

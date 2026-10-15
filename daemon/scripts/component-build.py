@@ -2,8 +2,8 @@
 """Build/test/package one reviewed component manifest; never tag or publish."""
 import argparse
 import hashlib
-import gzip
 import json
+import io
 import os
 from pathlib import Path
 import platform
@@ -27,20 +27,20 @@ def output(args):
 
 
 def deterministic_export_archive(export, destination, epoch):
-    with destination.open('wb') as output:
-        with gzip.GzipFile(fileobj=output, mode='wb', mtime=epoch, filename='', compresslevel=0) as compressed:
-            with tarfile.open(fileobj=compressed, mode='w', format=tarfile.PAX_FORMAT) as archive:
-                for path in sorted(export.rglob('*')):
-                    relative = Path('chronik-export') / path.relative_to(export)
-                    info = archive.gettarinfo(str(path), arcname=str(relative))
-                    info.uid = info.gid = 0
-                    info.uname = info.gname = ''
-                    info.mtime = epoch
-                    if path.is_file():
-                        with path.open('rb') as contents:
-                            archive.addfile(info, contents)
-                    else:
-                        archive.addfile(info)
+    normalized_tar = io.BytesIO()
+    with tarfile.open(fileobj=normalized_tar, mode='w', format=tarfile.PAX_FORMAT) as archive:
+        for path in sorted(export.rglob('*')):
+            relative = Path('chronik-export') / path.relative_to(export)
+            info = archive.gettarinfo(str(path), arcname=str(relative))
+            info.uid = info.gid = 0
+            info.uname = info.gname = ''
+            info.mtime = epoch
+            if path.is_file():
+                with path.open('rb') as contents:
+                    archive.addfile(info, contents)
+            else:
+                archive.addfile(info)
+    release.write_gzip_stored(normalized_tar.getvalue(), destination, epoch)
 
 
 def cmake_flags(manifest, component, python_executable):

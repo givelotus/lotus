@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 import shutil
 import subprocess
+import tarfile
 import tempfile
 import time
 import unittest
@@ -32,6 +33,10 @@ class ComponentTests(unittest.TestCase):
         (self.upstream/'CMakeLists.txt').write_text('set(CLIENT_VERSION_MAJOR 32)\nset(CLIENT_VERSION_MINOR 99)\nset(CLIENT_VERSION_BUILD 0)\n')
         (self.upstream/'share').mkdir()
         (self.upstream/'share/genbuild.sh').write_text('#!/bin/sh\ncd "$2" || exit 1\nDESC=$(git describe --abbrev=0 2>/dev/null)\nif [ -n "$DESC" ]; then echo "$DESC" > "$1"; else git rev-parse --short HEAD > "$1"; fi\n')
+        (self.upstream/'src').mkdir()
+        (self.upstream/'src/clientversion.cpp').write_text(
+            '#define GIT_COMMIT_ID "$Format:%h$"\n#define GIT_COMMIT_DATE "$Format:%cD$"\n')
+        (self.upstream/'.gitattributes').write_text('src/clientversion.cpp export-subst\n')
         self.git('add','.')
         self.git('-c','user.name=Fixture','-c','user.email=fixture@example.invalid','commit','-qm','Native development source')
         self.base=self.git('rev-parse','HEAD').strip().decode()
@@ -61,6 +66,9 @@ class ComponentTests(unittest.TestCase):
         archive=self.root/'source.tar.gz'
         self.prepare(check=True,archive=archive)
         before=hashlib.sha256(archive.read_bytes()).hexdigest()
+        with tarfile.open(archive,'r:gz') as source:
+            client=source.extractfile('bitcoin-core-v1.0.0/src/clientversion.cpp').read().decode()
+        self.assertIn(f'#define GIT_COMMIT_ID "{data["source_commit"][:12]}"',client)
         time.sleep(1.05)
         self.prepare(check=True,archive=archive)
         self.assertEqual(before,hashlib.sha256(archive.read_bytes()).hexdigest())
