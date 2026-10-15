@@ -48,6 +48,24 @@ The keypad preserves all six fractional digits, trailing decimal/zero editing st
 
 Validation: the initial unchanged-code regression run failed 10 of 11 tests. The corrected wallet passes 59 Flutter tests, including 15 amount/keypad regressions; 12 amount/model tests also pass in headless Chrome to cover JavaScript precision. The production web build passes. Tests use mock wallet/haptics and do not access a real wallet, camera, storage, or broadcast a transaction.
 
+## Recovery-share backups
+
+Open **Settings → Recovery & backup** to create a threshold set or restore a
+wallet. Keep each share private and store enough shares in separate locations;
+anyone with the threshold can recover the wallet. Vase asks you to verify saved
+shares before marking the backup complete.
+
+For an existing BIP39 wallet, shares contain the exact 64-byte seed derived
+from its words and passphrase. They restore the same wallet, but cannot recover
+the original words or passphrase. Restoring words keeps the passphrase's exact
+case and whitespace. Wallet replacement requires confirmation and persists the
+new material only after key derivation succeeds. Existing secure-storage keys
+are left in place; unreadable recovery records fail closed instead of falling
+back to an older wallet.
+
+The SDK's ms1 Codex32 parser and Frank's typed fr1 wallet shares are separate
+formats. See sdk/dart/docs/codex32.md for the encoding boundary and tests.
+
 ## Server development
 
 From `wallets/vase/vase-server`:

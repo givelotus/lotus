@@ -10,7 +10,8 @@ import 'package:url_launcher/url_launcher.dart';
 import 'package:vase/config/constants.dart';
 import 'package:vase/config/theme.dart';
 import 'package:vase/features/wallet/wallet_model.dart';
-import 'package:lotus_dart/bip39/bip39.dart';
+import 'package:vase/features/settings/recovery_page.dart';
+import 'package:vase/wallet/recovery_material.dart';
 
 final packageInfoFuture = PackageInfo.fromPlatform();
 
@@ -21,6 +22,8 @@ class SettingsPage extends HookWidget {
 
   @override
   Widget build(BuildContext context) {
+    final wallet = context.watch<WalletModel>();
+    final mnemonicWallet = isMnemonicMaterial(wallet.seed ?? '');
     final scrollController = useScrollController();
     final swipeStart = useRef<Offset?>(null);
     void dismiss() => onBack != null
@@ -31,8 +34,6 @@ class SettingsPage extends HookWidget {
 
     final showSeedTextController = useTextEditingController();
     final showPasswordTextController = useTextEditingController();
-    final newSeedController = useTextEditingController();
-    final newPasswordController = useTextEditingController();
 
     void showSeedDialog() {
       showDialog(
@@ -121,89 +122,6 @@ class SettingsPage extends HookWidget {
       );
     }
 
-    void showEnterSeedDialog() {
-      showDialog(
-        context: context,
-        builder: (context) => AlertDialog(
-          title: const Text('Enter Seed Phrase'),
-          contentPadding: stdPadding,
-          content: SingleChildScrollView(
-            child: Column(
-              mainAxisSize: MainAxisSize.min,
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                const Padding(
-                  padding: EdgeInsets.fromLTRB(0, 12, 0, 12),
-                  child: Text('Seed'),
-                ),
-                Row(
-                  children: [
-                    Expanded(
-                      child: TextField(
-                        maxLines: null,
-                        minLines: 2,
-                        controller: newSeedController,
-                        readOnly: false,
-                        decoration: const InputDecoration(
-                          border: OutlineInputBorder(),
-                        ),
-                      ),
-                    ),
-                  ],
-                ),
-                const Padding(
-                  padding: EdgeInsets.fromLTRB(0, 12, 0, 12),
-                  child: Text('Password (Optional)'),
-                ),
-                Row(
-                  children: [
-                    Expanded(
-                      child: TextField(
-                        maxLines: null,
-                        minLines: 2,
-                        controller: newPasswordController,
-                        readOnly: false,
-                        decoration: const InputDecoration(
-                          border: OutlineInputBorder(),
-                        ),
-                      ),
-                    ),
-                  ],
-                ),
-              ],
-            ),
-          ),
-          actions: [
-            TextButton(
-              onPressed: () {
-                final mnemonicGenerator = Mnemonic();
-                final enteredSeed = newSeedController.text.trim().toLowerCase();
-                final enteredPassword = newPasswordController.text
-                    .trim()
-                    .toLowerCase();
-
-                if (!mnemonicGenerator.validateMnemonic(enteredSeed)) {
-                  ScaffoldMessenger.of(context).showSnackBar(
-                    const SnackBar(
-                      content: Text('Invalid Seed Phrase'),
-                      duration: Duration(seconds: 1),
-                    ),
-                  );
-                  return;
-                }
-
-                final walletModel = context.read<WalletModel>();
-                // This will regenerate everything
-                walletModel.setSeed(enteredSeed, password: enteredPassword);
-                Navigator.of(context).pop();
-              },
-              child: const Text('Save'),
-            ),
-          ],
-        ),
-      );
-    }
-
     Future<void> Function() _launchUrl(String url) => () async {
       final uri = Uri.tryParse(url);
       if (uri == null) {
@@ -259,17 +177,31 @@ class SettingsPage extends HookWidget {
                 style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold),
               ),
             ),
+            if (mnemonicWallet)
+              ListTile(
+                title: const Text('Seed Phrase'),
+                leading: const Icon(Icons.nature),
+                trailing: const Icon(Icons.keyboard_arrow_right),
+                onTap: () => showSeedDialog(),
+              ),
             ListTile(
-              title: const Text('Seed Phrase'),
-              leading: const Icon(Icons.nature),
-              trailing: const Icon(Icons.keyboard_arrow_right),
-              onTap: () => showSeedDialog(),
-            ),
-            ListTile(
-              title: const Text('Import Seed Phrase'),
+              title: const Text('Import wallet'),
+              subtitle: const Text('BIP39 words or recovery shares'),
               leading: const Icon(Icons.upload),
               trailing: const Icon(Icons.keyboard_arrow_right),
-              onTap: () => showEnterSeedDialog(),
+              onTap: () => Navigator.of(context).push(
+                MaterialPageRoute<void>(
+                  builder: (_) => const RecoveryPage(initialRestore: true),
+                ),
+              ),
+            ),
+            ListTile(
+              title: const Text('Recovery & backup'),
+              leading: const Icon(Icons.shield_outlined),
+              trailing: const Icon(Icons.keyboard_arrow_right),
+              onTap: () => Navigator.of(context).push(
+                MaterialPageRoute<void>(builder: (_) => const RecoveryPage()),
+              ),
             ),
             const Divider(),
             const ListTile(
