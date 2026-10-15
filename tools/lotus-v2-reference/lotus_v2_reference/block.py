@@ -9,6 +9,10 @@ lotusd accepted a block.
 The monetary delta is ``advance`` with a zero coinbase payout and the parent
 work integer. Those arguments let the existing arithmetic return its delta;
 they are not a coinbase or work rule implemented here.
+
+A CHECKSIG witness is retried with the mode-0 sighash from
+``lotus_v2_reference.signing``. This is the reference connector, not lotusd
+ConnectTip.
 """
 
 from __future__ import annotations
@@ -19,7 +23,11 @@ import blake3
 
 from .encoding import Output, Profile, decode_output, encode_compact_size, encode_output
 from .monetary import MonetaryState, OrdinaryTx, Profile as MonetaryProfile, advance
-from .vm import ASSIGNED, VMError, VMProfile, evaluate
+from .signing import Input, Transaction, TxProfile, Witness, signing_message
+from .vm import (
+    ASSIGNED, SigningContext, UnsupportedFeature, VMError, VMProfile,
+    branch_leaf_hash, evaluate,
+)
 
 OUTPUT_PROFILE = Profile(16, 16, 812, 8192)
 OP_TRUE = b"\x4e"
@@ -90,11 +98,18 @@ def transaction_id(chain_id: bytes, spend_core: bytes, output: bytes) -> bytes:
     return tagged("Lotus/v2/txid", payload)
 
 
-def full_payment_bytes(core: bytes, output: bytes) -> bytes:
-    # Core omits the argument vector. This witness has an empty one.
+def encode_witness_arguments(arguments: tuple[bytes, ...]) -> bytes:
+    encoded = encode_compact_size(len(arguments))
+    for argument in arguments:
+        encoded += encode_compact_size(len(argument)) + argument
+    return encoded
+
+
+def full_payment_bytes(core: bytes, output: bytes, arguments: tuple[bytes, ...] = ()) -> bytes:
+    # Core omits the argument vector. Empty arguments are one zero byte.
     header = (7).to_bytes(4, "little") + (0).to_bytes(8, "little")
     header += (1).to_bytes(2, "little") + (1).to_bytes(2, "little")
-    return header + core + b"\x00" + output
+    return header + core + encode_witness_arguments(arguments) + output
 
 
 @dataclass(frozen=True)
@@ -239,6 +254,11 @@ class Connected:
     invocation_cost: int
 
 
+# Ordinary payment bounds. The sighash profile does not select a fee or locktime rule.
+PAYMENT_TX_PROFILE = TxProfile(32, 32, 8, 512, 8, 8192, 64)
+_CHECKSIG_CONTEXT = "CHECKSIG requires an authenticated signing context"
+
+
 @dataclass(frozen=True)
 class Payment:
     spent_tx: bytes
@@ -246,6 +266,13 @@ class Payment:
     value: int
     kind: str = "spend"  # spend, coinbase, or mint
     script: bytes = OP_TRUE
+    arguments: tuple[bytes, ...] = ()
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.arguments, tuple) or any(
+            not isinstance(item, bytes) for item in self.arguments
+        ):
+            raise ValueError("witness arguments")
 
 
 def disconnect(undo: Undo, coins: dict[tuple[bytes, int], Coin]) -> MonetaryState:
@@ -268,10 +295,41 @@ def disconnect(undo: Undo, coins: dict[tuple[bytes, int], Coin]) -> MonetaryStat
     return undo.prior_monetary
 
 
-def _witness_charge(script: bytes) -> int:
+def _payment_output(value: int, branch: bytes) -> Output:
+    return Output(0, value, None, (branch,), ((0,),))
+
+
+def _mode0_context(tx: Payment, parent: Parent, spent: Coin) -> SigningContext:
+    transaction = Transaction(
+        0,
+        (Input(
+            spent.tx_id, spent.index, 0xFFFFFFFF, 1, 0,
+            (Witness(tx.script, (), tx.arguments),),
+        ),),
+        (_payment_output(tx.value, spent.branch),),
+    )
+    message = signing_message(
+        transaction, PAYMENT_TX_PROFILE, parent.chain_id,
+        (_payment_output(spent.value, spent.branch),), 0, 0, 0,
+    )
+    return SigningContext(branch_leaf_hash(tx.script), {0: message}, "spend", 0, 1)
+
+
+def _witness_charge(tx: Payment, parent: Parent, spent: Coin) -> int:
     # One spend input and one output, matching this payment model.
+    # Scripts that do not execute CHECKSIG keep the no-context evaluation.
     try:
-        result = evaluate(script, (), PAYMENT_VM, input_count=1, output_count=1)
+        result = evaluate(tx.script, tx.arguments, PAYMENT_VM, input_count=1, output_count=1)
+    except UnsupportedFeature as exc:
+        if str(exc) != _CHECKSIG_CONTEXT:
+            raise ValueError(str(exc)) from exc
+        try:
+            result = evaluate(
+                tx.script, tx.arguments, PAYMENT_VM, input_count=1, output_count=1,
+                signing=_mode0_context(tx, parent, spent),
+            )
+        except VMError as inner:
+            raise ValueError(str(inner)) from inner
     except VMError as exc:
         raise ValueError(str(exc)) from exc
     if not result.success:
@@ -299,10 +357,10 @@ def _apply_one(
     if spent.creation_height > candidate_height or candidate_height < spent.creation_height + delay:
         raise ValueError("coinbase maturity or future coin")
     # Fee, locktime, and field-size checks are still the existing block.py rules.
-    witness_cost = _witness_charge(tx.script)
+    witness_cost = _witness_charge(tx, parent, spent)
     output = encode_native_output(tx.value, spent.branch)
     core = encode_spend_core(tx.spent_tx, tx.spent_index, tx.script)
-    wire = full_payment_bytes(core, output)
+    wire = full_payment_bytes(core, output, tx.arguments)
     if tx.value > spent.value or spent.value - tx.value < len(wire):
         raise ValueError("native fee below byte or token-output floor" if tx.value <= spent.value
                          else "native inflation")
