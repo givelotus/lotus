@@ -329,3 +329,47 @@ Serving validated history needs a separate authenticated body retrieval interfac
 legacy service bits cannot substitute for that evidence. Network/profile adoption
 and isolated listening-node tests remain pending, without changing the remaining
 TCP/compact and QUIC milestone scope.
+
+## Socket-free sessions and retained bodies (104–108)
+
+All 109 mailboxes replay with exact intermediate trees; final tree
+`c32e78420c3eacaa30f2de5c68491a7a3060949d`. See
+[replay evidence](evidence/v2-series-replay-108.json). Earlier mailbox bytes are
+unchanged. The test-only mailbox with an empty original commit body carries an
+explicitly attributed integration review note; source payloads are unchanged.
+
+The version codec preserves inherited optional suffixes, nonce defaults and
+bounded trailing bytes. The independent session gates hello/verack/application
+ordering, fixed monotonic deadlines and receive-limit switching between coalesced
+frames. Local services remain zero. Debug and ASan/UBSan suites pass, including
+two-session action exchange and tiny advertised limits. Independent review found
+no blocker. This packet opens no sockets and makes no history availability claim.
+
+Retained-state reads use the current head or immutable undo record by BlockID,
+without scanning the live UTXO set. Persisted/cached head mismatch, malformed
+undo records and profile errors fail operationally without changing output.
+Debug and ASan/UBSan disk suites pass, including a checksum-preserving persisted
+head mutation. Historical reads still allocate the full undo record: this API
+does not establish a network memory budget or promise pruning/retention policy.
+
+The enclosing body reader checks complete framing, transaction root, BlockID,
+PoW, monetary work and state commitment. Capacity refusal precedes a second
+body copy. Missing includes checkpoint metadata without a body. Available does
+not assert active-chain membership or rerun historical VM execution. Native
+regressions cover current/historical reads, corruption, cap boundaries and
+unchanged state/output; synthetic checkpoint cases are explicitly not evidence
+of complete-block acceptance.
+
+Clean native commit `7432a0aa1` in
+`/private/tmp/lotus-v2-daemon-session-storage-20261015` builds Debug lotusd and
+passes full-tree development-chain, disk, peer-codec and peer-session checks with
+Chronik off. Log: `/private/tmp/lotus-v2-session-storage-combined.log`. The signed
+Payment process pilot also passes on that exact build, retaining roots, all seven
+charges, intended signature/maturity rejection, restart and undo/reconnect at
+`/private/tmp/lotus-v2-signed-pilot-session-storage-20261015`.
+
+Next runtime dependencies include an indexed active header chain, best-work fork
+selection, bounded downloads/reorg recovery and body serving. Profile adoption
+and isolated socket tests remain pending. The six-case compiler optimizer block
+pilot is integrated separately; its retained cost-cap discrepancies preclude a
+general equivalence claim. No public testnet or QUIC readiness is claimed.
