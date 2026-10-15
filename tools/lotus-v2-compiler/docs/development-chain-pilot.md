@@ -100,3 +100,48 @@ daemon SHA256 is
 `c6ab2d7720a9ee603581a6ac80107e18975272fd0c6c69c7032513ba5b463b15`.
 This supersedes the scratch-build limitation for this exact pilot run; the
 network, wallet and general-equivalence limitations still apply.
+
+## Reusable compiler pilot API
+
+Importing `run.py` creates no directory and launches no subprocess. Call
+`run_pilot(PilotConfig(...), compiler=None)` explicitly; it returns the same
+summary stored in `summary.json`. `main(argv=None)` retains the original CLI and
+Payment defaults. Configuration includes manifest, daemon, output, daemon_source,
+node, optional compiler_helper path, source text, compiler options, method,
+non-signature arguments, and signature_argument. The built-in helper accepts
+Int/Amount arguments as decimal strings, Bool as booleans and byte arguments as
+hex strings. It continues to use only the public fixture secret 1.
+
+The optional compiler callback has signature `compiler(mode, request) -> dict`.
+Alternatively `compiler_helper` selects a Node module invoked with mode
+`artifact` or `sign`. Both receive the same JSON request fields: source, options,
+method, args, signature_argument; sign additionally receives `context` with the
+dynamically mined funding outpoint and coin. Helper subprocesses inherit the
+caller's environment. Artifact response remains `{source, artifact, owner}`;
+sign response remains `{wire, bad_wire, txid, txhash, digest, signature}`.
+The harness still independently validates both complete-block engines; the
+compiler callback cannot supply roots, charges or acceptance results.
+
+A sign response may additionally supply `negatives` with up to 31 entries
+`{name, wire, reference_errors?, native_errors?}`. Each name is a unique lowercase
+ASCII/digit/hyphen identifier, maximum 64 characters. These exact full transactions
+are framed into freshly mined negative blocks, rejected by both engines, retained
+as `<name>.block`, and followed by restart checks. Evidence uses the exact name
+as its native label. Extra negatives default to intended `VERIFY` failures.
+The original bad signature keeps its identical TxId/different TxHash gate.
+
+`reference_negative_errors` and `native_negative_errors` configure allowed
+substrings for the bad-signature diagnostic; defaults remain CHECKSIGVERIFY.
+For optimized versus unoptimized contracts callers can explicitly accept
+`('CHECKSIG', 'VERIFY')`. Empty sequences explicitly request rejection-only
+coverage, which does not establish the intended failure category. Per-negative
+error sequences have the same meaning. No expectations are inferred from a
+failed execution or refreshed automatically.
+
+CLI equivalents include `--compiler-helper`, `--source` (file), `--options`
+(JSON file), `--method`, `--arguments` (JSON file), `--signature-argument`, and
+repeatable `--reference-negative-error`/`--native-negative-error` arguments.
+Default Payment observations and complete bytes remain unchanged by this API
+refactoring. The integration tests now also exercise a different method name,
+renamed signature argument, Int argument and optimization disabled, plus import
+without filesystem/process side effects, against the exact `dca9abe76` daemon.
