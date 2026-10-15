@@ -112,3 +112,14 @@ selection, multiple policies, address encoding, backup recovery, wallet RPC,
 broadcast and automatic chain scanning are outside it. The transient test
 passphrase is intentionally removed, so retained encrypted wallet files are
 inspection artifacts; full block bytes remain independently replayable.
+
+## Root integration rerun
+
+The clean combined native commit `9f529da1c` builds daemon and wallet helper from
+the same source at `/private/tmp/lotus-v2-daemon-wallet-download-exact-20261015`.
+Root reran the full wallet pilot successfully with both exact binaries at
+`/private/tmp/lotus-v2-wallet-chain-root-exact-20261015`. This pins the native wallet
+implementation and removes the earlier draft-helper source-identity limitation.
+The full-build focused wallet test also passes (194 observed checks in this run);
+checks involving fresh keys may take different numbers of fixture search attempts.
+No broadcast, wallet RPC or network acceptance is established by this rerun.
