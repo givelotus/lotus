@@ -19,12 +19,32 @@ import blake3
 
 from .encoding import Output, Profile, decode_output, encode_compact_size, encode_output
 from .monetary import MonetaryState, OrdinaryTx, Profile as MonetaryProfile, advance
+from .vm import ASSIGNED, VMError, VMProfile, evaluate
 
 OUTPUT_PROFILE = Profile(16, 16, 812, 8192)
 OP_TRUE = b"\x4e"
 # OP_1 pushes a numeric result bounded at 16 bytes. With base = per-result = 1
 # and one structural unit per script byte, one empty-argument witness costs 18.
 OP_TRUE_COST = 1 + 16 + 1
+
+
+def _unit_witness_price(operands: tuple[int, ...], results: tuple[int, ...]) -> int:
+    return 1 + sum(operands) + sum(results)
+
+
+# Native ordinary schedule: base 1, per operand byte 1, per result byte 1.
+PAYMENT_VM = VMProfile(
+    max_script_bytes=512,
+    max_arguments=8,
+    max_element_bytes=8192,
+    max_stack_items=32,
+    max_altstack_items=32,
+    max_vm_bytes=65536,
+    max_ast_depth=16,
+    max_invocation_cost=1_000_000,
+    structural_byte_cost=1,
+    opcode_costs={op: _unit_witness_price for op in ASSIGNED},
+)
 
 
 def tagged(tag: str, payload: bytes) -> bytes:
@@ -248,6 +268,17 @@ def disconnect(undo: Undo, coins: dict[tuple[bytes, int], Coin]) -> MonetaryStat
     return undo.prior_monetary
 
 
+def _witness_charge(script: bytes) -> int:
+    # One spend input and one output, matching this payment model.
+    try:
+        result = evaluate(script, (), PAYMENT_VM, input_count=1, output_count=1)
+    except VMError as exc:
+        raise ValueError(str(exc)) from exc
+    if not result.success:
+        raise ValueError("witness VM invalid/unsupported")
+    return result.charged_cost
+
+
 def _apply_one(
     tx: Payment,
     parent: Parent,
@@ -258,7 +289,7 @@ def _apply_one(
     candidate_height: int,
     parent_mtp: int,
     coinbase_maturity: int,
-) -> None:
+) -> int:
     if tx.kind == "coinbase":
         raise ValueError("coinbase is not an ordinary transaction")
     spent = coins.get((tx.spent_tx, tx.spent_index))
@@ -267,8 +298,8 @@ def _apply_one(
     delay = coinbase_maturity if spent.coinbase else 0
     if spent.creation_height > candidate_height or candidate_height < spent.creation_height + delay:
         raise ValueError("coinbase maturity or future coin")
-    if tx.script != OP_TRUE:
-        raise ValueError("reference block slice only prices OP_TRUE payments")
+    # Fee, locktime, and field-size checks are still the existing block.py rules.
+    witness_cost = _witness_charge(tx.script)
     output = encode_native_output(tx.value, spent.branch)
     core = encode_spend_core(tx.spent_tx, tx.spent_index, tx.script)
     wire = full_payment_bytes(core, output)
@@ -288,6 +319,7 @@ def _apply_one(
     undo.steps.append(UndoStep(False, spent))
     undo.steps.append(UndoStep(True, created))
     accounted.append(OrdinaryTx(spent.value, tx.value, len(wire), 0, 0))
+    return witness_cost
 
 
 def connect_ordinary_block(
@@ -321,14 +353,14 @@ def connect_ordinary_block(
     total_cost = 0
     try:
         for tx in transactions:
-            _apply_one(
+            cost = _apply_one(
                 tx, parent, coins, undo, accounted,
                 candidate_height=candidate_height, parent_mtp=parent_mtp,
                 coinbase_maturity=coinbase_maturity,
             )
-            if total_cost > (1 << 128) - 1 - OP_TRUE_COST:
+            if total_cost > (1 << 128) - 1 - cost:
                 raise ValueError("block invocation cost overflow")
-            total_cost += OP_TRUE_COST
+            total_cost += cost
             if total_cost > block_cap:
                 raise ValueError("block invocation cost over cap")
         transition = advance(
