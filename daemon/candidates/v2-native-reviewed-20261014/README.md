@@ -1,9 +1,9 @@
 # Reviewed V2 native primitives — October 14, 2026
 
-This 26-mailbox development series applies to Bitcoin ABC
+This 29-mailbox development series applies to Bitcoin ABC
 `1fb7db17c176cdea8a2c60d887891589382ee4e3`. The source is
-`/tmp/lotus-v2-native-slice-review`, commit `67cb95ce6`, final tree
-`b0c32ae8ded2cdfa520bd91cf579d991c8dfa004`. The manifest records every
+`/tmp/lotus-v2-native-slice-review`, commit `33563a734`, final tree
+`f3fd01ed1d52e21a48dd746e4c1a5a3bb9d2fb5f`. The manifest records every
 intermediate tree, mailbox digest, and source author/date. Patches 000–014 retain
 the earlier worker packet's bytes. Six later mailboxes have explicitly labelled
 review explanations added to their messages; their source diffs are unchanged.
@@ -34,6 +34,34 @@ prices are illustrative. Signing commitments and mint count are prepared once
 per invocation, then reused by its instructions. Sharing that preparation across
 all transaction invocations remains an integration task. Resolved coins and mint
 deltas still require validation by the outer transaction/state layer.
+
+## Ordinary transaction and expanded VM slice
+
+Patches 026–027 add byte/string and checked numeric/logical operations, an opcode
+inventory, and independent arithmetic vectors. The inventory accounts for all
+215 assigned bytes: 94 pushes, 12 control operations, 77 other implemented
+operations and 32 unsupported operations that reject when executed. Root ran
+900 independent byte vectors, 2,117 independent arithmetic vectors, 363
+Python/native execution comparisons and 494 static-cost comparisons.
+
+Patch 028 adds a standalone ordinary-transaction validator over an explicit
+in-memory UTXO view. It resolves spends once, checks duplicate outpoints,
+locks/maturity, checked native/token sums, exact positive mint coverage and
+both fee floors, and executes every selected witness. Application stages effects
+and changes the view only after success. Tests include signed compiler mint and
+transfer transactions, altered resolved Coins, missing/extra/failing branches,
+inflation, underfees, duplicate spends and mint-context coin access. Both workers'
+Debug/Release tests and root's fresh combined Release VM/validator tests pass.
+
+This validator excludes transaction-wide P05 resource derivation, block burn,
+coinbase, ordering, persistent state and network integration. It does not turn
+these modules into a full V2 daemon. Prepared signing is still repeated across
+invocations; that performance issue remains an integration obligation.
+
+Reproduce the additional native check by configuring `src/lotus_v2/ordinary_test`
+with the same CMake compiler/OpenSSL/secp256k1 settings used below. The scripts
+`vm_test/differential_bytes.py` and `differential_numeric.py` take the native runner
+path; `check_opcode_coverage.py` takes the spec opcode JSON and runner paths.
 
 ## Review and validation
 

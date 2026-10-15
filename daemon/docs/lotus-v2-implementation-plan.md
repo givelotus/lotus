@@ -6,20 +6,20 @@ Updated October 14, 2026. Development plan; no genesis parameters are frozen and
 
 ## Source foundation and current status
 
-The current executable [V2 series](../patches/v2/series) contains 26 patches,
-`000`–`025`, on ABC master `1fb7db17c176cdea8a2c60d887891589382ee4e3`.
+The current executable [V2 series](../patches/v2/series) contains 29 patches,
+`000`–`028`, on ABC master `1fb7db17c176cdea8a2c60d887891589382ee4e3`.
 The [review packet](../candidates/v2-native-reviewed-20261014/README.md) records
 all intermediate replay trees and focused validation. The source tree is
-`b0c32ae8ded2cdfa520bd91cf579d991c8dfa004`. It includes transaction framing,
+`f3fd01ed1d52e21a48dd746e4c1a5a3bb9d2fb5f`. It includes transaction framing,
 commitments, scalar and incremental UTXO models, signing, and a bounded native VM
-with explicit static accounting. These remain isolated modules: daemon consensus,
-persistent chainstate, complete opcode coverage, transaction/block validation,
+with explicit static accounting, plus a standalone ordinary-transaction validator. These remain isolated modules: daemon consensus,
+persistent chainstate, complete opcode coverage, full transaction/block resource validation,
 and mining job integration are still outstanding.
 
 Root review reproduced and corrected maximum-count proof arithmetic, enforced the
 8192-byte witness limit, reviewed prepared signing and incremental-tree ownership,
-and reran native primitive checks. All 26 mailboxes replay to the recorded trees.
-The native VM agrees with Python on 298 execution and 477 static-charge cases.
+and reran native primitive checks. All 29 mailboxes replay to the recorded trees.
+The native VM agrees with Python on 363 execution and 494 static-charge cases, plus 3,017 independent byte/arithmetic vectors.
 Signed compiler mint/transfer fixtures execute all five selected invocations in
 both engines, including rejection cases. Whole-daemon V2 validity, inherited
 unit/functional suites, Chronik and network integration remain separate gates.
@@ -128,4 +128,4 @@ The compiler plan also owns [V2-native fixture infrastructure](../../docs/plans/
 
 ## Next bounded work
 
-The coinbase-data and Frank appendix changes are specified. The reviewed 26-patch primitive series is integrated on the exact ABC pin above; the independent output reference remains `beebcbde`. Continue complete ordinary transaction validation and remaining native VM operations, then persistent state, monetary/block transitions, and mining jobs. Continue with a disposable development genesis/payment/block/undo slice before broad optimization. Do not mark the complete plan implemented merely because documentation, patches or a genesis-search script exist.
+The coinbase-data and Frank appendix changes are specified. The reviewed 29-patch native series is integrated on the exact ABC pin above; the independent output reference remains `beebcbde`. Complete outer transaction resource validation and remaining native VM operations, then persistent state, monetary/block transitions, and mining jobs. Continue with a disposable development genesis/payment/block/undo slice before broad optimization. Do not mark the complete plan implemented merely because documentation, patches or a genesis-search script exist.
