@@ -393,5 +393,11 @@ Root review rebuilt exact source `0e9d9fefc` signing tests in Release at
 instrumented cleanup suites pass, including allocation-failure paths. The Release
 VM suite and runner build also pass at
 `/private/tmp/lotus-v2-vm-cleanse-integration-20261015`. A fresh full daemon build
-at `/private/tmp/lotus-v2-daemon-signer-cleanup-20261015` is still pending at this
-record's creation; these targeted checks do not establish that broader result.
+at `/private/tmp/lotus-v2-daemon-signer-cleanup-20261015` subsequently passed:
+Debug lotusd plus development-chain, disk, peer-codec and peer-session checks,
+with Chronik off. The checkout is clean at exact native commit `0e9d9fefc`;
+build log: `/private/tmp/lotus-v2-signer-cleanup-build.log`. The signed compiler
+Payment pilot passes again at
+`/private/tmp/lotus-v2-signed-pilot-signer-cleanup-20261015`, including mature spend
+acceptance, independent roots/charges, intended negative cases, restart,
+undo and reconnect. This remains offline acceptance, without socket activation.
