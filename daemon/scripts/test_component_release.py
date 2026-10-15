@@ -6,6 +6,7 @@ from pathlib import Path
 import shutil
 import subprocess
 import tempfile
+import time
 import unittest
 from unittest.mock import patch
 
@@ -57,6 +58,7 @@ class ComponentTests(unittest.TestCase):
         archive=self.root/'source.tar.gz'
         self.prepare(check=True,archive=archive)
         before=hashlib.sha256(archive.read_bytes()).hexdigest()
+        time.sleep(1.05)
         self.prepare(check=True,archive=archive)
         self.assertEqual(before,hashlib.sha256(archive.read_bytes()).hexdigest())
         self.assertEqual(self.git('status','--porcelain'),b'')

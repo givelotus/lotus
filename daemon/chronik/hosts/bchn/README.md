@@ -1,15 +1,16 @@
-# Optional BCHN in-process Chronik profile
+# BCHN in-process Chronik release profile
 
 This review candidate builds the pinned Bitcoin ABC Chronik indexer directly
 inside exact BCHN `abd433abe04f74780744b9eac06731f3690ce68a` (29.2.1). It uses the
 existing HTTP/WebSocket protobuf API and an unmodified public Chronik client.
 It requires no NNG, mining-priority, mempool-diagnostic or ZeroMQ-removal patch.
-The feature and runtime service are both OFF by default.
+The upstream feature and runtime service remain OFF by default; the prepared
+givelotus release profile enables the feature explicitly.
 
 Native macOS arm64 builds and fresh regtest behavior are validated. Mainnet
 synchronization, Linux/Windows, sustained load and reproducible binaries remain
-unverified. This profile is outside every default daemon patch manifest and
-release workflow.
+unverified. This profile is selectable through the component release manifest;
+it does not enter the default BCHN patch series.
 
 ## Exact source and verification
 

@@ -177,18 +177,19 @@ and [BCHN](../chronik/hosts/bchn/README.md) host records.
 
 The host profiles have passed local macOS regtest checks. Tag CI additionally
 builds both Linux x86_64 and macOS arm64 from the exact manifest, runs each
-host's fresh regtest behavior suite and packages the verified ABC Chronik export
-with the source and binaries. Successful tag CI is required before publication;
-local host tests do not establish Linux/Windows, mainnet sync, long-running load
-or reproducible binary behavior.
+host's fresh regtest behavior suite and publishes the verified ABC Chronik export
+alongside the node source and binaries. Successful tag CI is required before
+publication; local host tests do not establish Linux/Windows, mainnet sync,
+long-running load or reproducible binary behavior.
 
 ## Shared-source provider packaging
 
 The CMake provider verifies the exact pinned Chronik export, native host inputs,
 ordered source mailboxes and resulting source hashes before building in a private
-copy. Component release archives include those verified files and lockfile. The
-reviewed manifest records the export digest, host profile and adapter hash, and
-artifact CI checks them against the pinned provider before building.
+copy. BCHN/Core releases include a separate deterministic Chronik source-export
+archive and its checksum alongside the node source archive. The reviewed manifest
+records the export digest, host profile and adapter hash, and artifact CI checks
+them against the pinned provider before building.
 
 ## Component-specific Rust selection
 

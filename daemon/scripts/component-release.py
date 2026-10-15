@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
 """Prepare, verify, build and publish explicitly named daemon components."""
 import argparse
+import copy
+import gzip
 import hashlib
 import importlib.util
+import io
 import json
 import os
 from pathlib import Path
@@ -10,8 +13,10 @@ import re
 import shutil
 import subprocess
 import tempfile
+import tarfile
 
 ROOT = Path(__file__).resolve().parents[2]
+SOURCE_DATE_EPOCH = 1000684800
 
 
 def module(name, path):
@@ -84,6 +89,23 @@ def path_for(root, component):
     return root / 'daemon/releases' / component
 
 
+def deterministic_source_archive(replay, commit, tag, destination, epoch):
+    """Normalize Git's export-subst tar to stable ownership, time and gzip bytes."""
+    tar_bytes = replay.git('archive', '--format=tar', f'--prefix={tag}/', commit)
+    with tarfile.open(fileobj=io.BytesIO(tar_bytes), mode='r:') as source:
+        with destination.open('wb') as raw_output:
+            with gzip.GzipFile(fileobj=raw_output, mode='wb', filename='', mtime=epoch) as compressed:
+                with tarfile.open(fileobj=compressed, mode='w', format=tarfile.PAX_FORMAT) as archive:
+                    for member in source:
+                        info = copy.copy(member)
+                        info.uid = info.gid = 0
+                        info.uname = info.gname = ''
+                        info.mtime = epoch
+                        info.pax_headers = {}
+                        contents = source.extractfile(member) if member.isfile() else None
+                        archive.addfile(info, contents)
+
+
 CHRONIK_HOSTS = {'bchn': 'bchn', 'bitcoin-core': 'bitcoin-core'}
 
 
@@ -150,7 +172,8 @@ def prepare(root, upstream, component, version, revision, profile=None, features
             patch_rows.append({'path': str(path.relative_to(root)), 'sha256': hashlib.sha256(payload).hexdigest()})
         native = native_version(replay.read('CMakeLists.txt'))
         before = replay.git('write-tree').decode().strip()
-        parent = replay.git('commit-tree', before, '-p', base, input=b'Component maintained and selected patches\n').decode().strip()
+        parent = replay.git('commit-tree', before, '-p', base,
+                            input=b'Component maintained and selected patches\n').decode().strip()
         changes = scoped_describe(replay, native, component, version)
         if changes:
             replay.apply(legacy.diff(replay, changes))
@@ -159,7 +182,7 @@ def prepare(root, upstream, component, version, revision, profile=None, features
                             input=f'Scope {component} source build labels to native version tags\n\nKeep distributor release identity in the component manifest.\nUnrelated monorepo component tags must not override native build labels.\n'.encode()).decode().strip()
         patch = replay.git('format-patch', '-1', '--stdout', '--no-signature', '--full-index', '--no-stat', commit)
         source_archive = Path(temporary) / 'source.tar.gz'
-        replay.git('archive', '--format=tar.gz', f'--prefix={tag}/', '--output='+str(source_archive), commit)
+        deterministic_source_archive(replay, commit, tag, source_archive, SOURCE_DATE_EPOCH)
         with source_archive.open('rb') as stream:
             source_sha256 = hashlib.file_digest(stream, 'sha256').hexdigest()
         manifest = {'schema': 1, 'component': component, 'tag': tag, 'distributor_version': version,
@@ -174,7 +197,8 @@ def prepare(root, upstream, component, version, revision, profile=None, features
                                    'cmake': 'runner package; actual version recorded in artifact build-info',
                                    'compiler': 'runner package; actual version recorded in artifact build-info'},
                     'network_evidence': (json.loads((root/'daemon/release-network.json').read_text()) if component=='lotusd' and (root/'daemon/release-network.json').exists() else None),
-                    'source_archive': f'{tag}-source.tar.gz', 'source_archive_sha256': source_sha256, 'source_date_epoch': 1000684800,
+                    'source_archive': f'{tag}-source.tar.gz', 'source_archive_sha256': source_sha256,
+                    'source_date_epoch': SOURCE_DATE_EPOCH,
                     'publication_workflow': 'Daemon component artifacts and releases',
                     'validation_scope': 'prepared source identity only; CI/native and behavioral results are separate'}
         if chronik_host:

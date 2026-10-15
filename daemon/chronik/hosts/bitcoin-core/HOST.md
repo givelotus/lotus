@@ -1,8 +1,8 @@
-# Optional Bitcoin Core in-process host
+# Bitcoin Core in-process Chronik host
 
-This adapter builds and runs Chronik inside exact Bitcoin Core `f13ae519de94394314cd63a27924b0998ac65d45` (32.99.0 development source), using the pinned ABC `1fb7db17c176cdea8a2c60d887891589382ee4e3` export. Native macOS regtest tests pass. It is not selected by default component/release profiles; stock Core artifact CI does not validate this adapter. Mainnet synchronization, Linux/Windows builds, long-running load and power-loss recovery remain untested.
+This adapter builds and runs Chronik inside exact Bitcoin Core `f13ae519de94394314cd63a27924b0998ac65d45` (32.99.0 development source), using the pinned ABC `1fb7db17c176cdea8a2c60d887891589382ee4e3` export. Native macOS regtest tests pass. A custom Core release manifest selects this adapter; upstream and stock profiles leave it disabled. Linux artifact CI and release publication are pending. Mainnet synchronization, Linux/Windows builds, long-running load and power-loss recovery remain untested.
 
-`profile.json` records the native mailbox, both shared-source mailboxes, exact upstream pins, and changed-file hashes. The provider verifies the pristine export before applying the offline source overlays in a private build directory. It checks the installed native adapter files and resultant shared files before compilation, and repeats validation if inputs change. Existing ABC staging is preserved. The export manifest's historical host-status entries remain unchanged to preserve its pinned digest; optional host support is recorded separately in the reviewed profile.
+`profile.json` records the native mailbox, both shared-source mailboxes, exact upstream pins, and changed-file hashes. The provider verifies the pristine export before applying the offline source overlays in a private build directory. It checks the installed native adapter files and resultant shared files before compilation, and repeats validation if inputs change. Existing ABC staging is preserved. The source export's host-status entries, reviewed digest, and Core profile hash identify this as a release-selectable candidate; the exact pin must be regenerated if any input changes.
 
 ## Build
 
