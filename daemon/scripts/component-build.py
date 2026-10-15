@@ -176,7 +176,8 @@ def build(root, component, source, dist, target, jobs, chronik_export=None):
     shutil.copy2(package/'Dockerfile',dist/'Dockerfile')
     outputs=[archive,dist/manifest['source_archive'],dist/'manifest.json',dist/('build-info-'+target+'.json'),dist/'NOTES.md',dist/'Dockerfile']
     if host:
-        shutil.copy2(host_evidence,dist/host_evidence.name)
+        # host_regtest writes evidence directly into dist, so keep that copy in
+        # place; the package itself received its own copy above.
         outputs.extend([dist/'chronik-export.tar.gz',host_evidence])
     for path in outputs:
         with path.open('rb') as stream:
