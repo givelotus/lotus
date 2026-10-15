@@ -68,6 +68,38 @@ explicit source path for offline builds. The initial CMake component should keep
 static Rust/CXX linkage and the existing node-owned validation lifecycle. A new
 dlopen ABI or a separate indexer process is not required for source sharing.
 
+### Preparing a provider refresh candidate
+
+Use the candidate command when ABC advances; `REF=latest` resolves the
+advertised default branch from the canonical ABC URL in `daemon/chronik/source.json`.
+An explicit branch/tag/commit resolves against the supplied clone's `origin`.
+Both paths fetch into temporary storage and write a new directory only:
+
+```sh
+make -C daemon refresh-chronik \
+  UPSTREAM=/path/to/bitcoin-abc \
+  REF=latest \
+  CANDIDATE=/tmp/chronik-provider-candidate
+```
+
+The candidate contains `provider/source.json`, a source-verified `export/`, and
+`refresh-report.json`. Existing ABC, BCHN, and Bitcoin Core Chronik-source
+overlays are checked for clean application to the candidate export. Clean
+application only means patch context matched: profile result hashes, native
+host overlays, builds, regtest, indexing, and reorg behavior still need fresh
+validation. The script retains the reviewed Cargo lockfile and refuses source
+dependency drift rather than silently upgrading crates. If that check fails,
+review dependency changes and create a deliberate updated lockfile before
+retrying. It never updates `daemon/chronik/source.json`, host profile pins,
+release manifests, workspaces, or published assets. This deliberately leaves
+adapter rebases and pin promotion as explicit review steps.
+
+The provider candidate can be handed to an LLM with the host-specific task:
+rebase that host's overlay and native lifecycle patch against the candidate,
+update the profile hashes, then build and run the documented host regtest.
+Provider pin promotion waits until each intended host has its own passing
+evidence; no single clean-apply result implies that all hosts are compatible.
+
 ```mermaid
 flowchart LR
   Source[One pinned Chronik source] --> Build[CMake component]

@@ -9,7 +9,7 @@
 SCRIPTS := $(dir $(abspath $(lastword $(MAKEFILE_LIST))))scripts
 SERIES  ?= v1
 
-.PHONY: setup build run mkpatch refresh prepare-release prepare-component features clean help
+.PHONY: setup build run mkpatch refresh refresh-chronik prepare-release prepare-component features clean help
 
 help:
 	@echo "Lotus daemon build targets:"
@@ -20,6 +20,9 @@ help:
 	@echo "  make mkpatch NAME=<n>          Export committed HEAD with authorship and rationale"
 	@echo "  make refresh COMMIT=<sha|tag|latest> [SERIES=...]  Rebase patches, then advance the pin"
 	@echo "    COMMIT=latest resolves origin's advertised default branch; review every rebase/build result."
+	@echo "  make refresh-chronik UPSTREAM=<ABC clone> [REF=latest] CANDIDATE=<new-dir>"
+	@echo "    Prepare an isolated shared-Chronik source/export candidate and test adapter patch application."
+	@echo "    Does not change active provider pins, host profiles, workspaces, or releases."
 	@echo "  Human patch workflow: daemon/docs/adding-patches.md"
 	@echo "  make build FEATURES=chronik,nng-off       Select independent build options"
 	@echo "  make features FEATURES=chronik,zeromq-off Show resolved flags and dependencies"
@@ -114,6 +117,15 @@ ifdef DESC
 else
 	SERIES=$(SERIES) $(SCRIPTS)/refresh.sh $(COMMIT)
 endif
+
+refresh-chronik:
+ifndef UPSTREAM
+	$(error UPSTREAM must identify an existing Bitcoin ABC clone)
+endif
+ifndef CANDIDATE
+	$(error CANDIDATE must identify a new output directory)
+endif
+	python3 $(SCRIPTS)/prepare-chronik-refresh.py --upstream "$(UPSTREAM)" --ref "$(or $(REF),latest)" --candidate "$(CANDIDATE)"
 
 clean:
 	rm -rf workspace-ecash/build workspace-v1/build workspace-doged-abc/build workspace-doged-reference/build workspace-bchn/build workspace-bitcoin/build
