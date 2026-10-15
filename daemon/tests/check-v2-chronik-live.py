@@ -223,7 +223,34 @@ def main(argv=None):
             history={(x['record']['txid'],x['record']['out_idx']) for x in snap['history']}
             presence.append((int(snap['snapshot']['height']), (payment,0) in history))
         require(any(h==5 and present for h,present in presence) and any(h==7 and not present for h,present in presence) and any(h==8 and present for h,present in presence),'HTTP history did not remove then restore re-mined payment')
-        require(any(any(v['spend'] is not None for v in entries) and any(v['spend'] is None for v in entries) for entries in observed.values()),'confirmed spent history never reverted to unspent')
+        # One surviving native home must show the same funding outpoint spent
+        # by this exact payment, restored by detach, and spent by its re-mining.
+        # Initial funding followed by an ordinary spend cannot satisfy this.
+        payment_wire=submitted[payment]['wire']
+        funding_points=[(txid,0) for txid in known_coinbases if txid in payment_wire]
+        require(len(funding_points)==1,'detached payment must resolve one native funding outpoint')
+        funding_point=funding_points[0]
+        rollback_witness=None
+        for home in {process['command'][3] for process in driver['processes']}:
+            labels={process['label'] for process in driver['processes'] if process['command'][3]==home}
+            phase=0; transitions=[]
+            for snap in snapshots:
+                if snap['node'] not in labels:continue
+                height=int(snap['snapshot']['height'])
+                matches=[item['record'] for item in snap['history'] if (item['record']['txid'],item['record']['out_idx'])==funding_point]
+                if not matches:continue
+                row=matches[0]; spend=row['spend']
+                spends_payment=spend is not None and spend['transaction']['txid']==payment and spend['transaction']['txhash']==submitted[payment]['txhash']
+                expected_height=(5,7,8)[phase] if phase<3 else None
+                if height==expected_height and ((phase in (0,2) and spends_payment) or (phase==1 and spend is None)):
+                    transitions.append(dict(node=snap['node'],snapshot=snap['snapshot'],record=row))
+                    phase+=1
+                    if phase==3:break
+            if phase==3:
+                rollback_witness=dict(home=home,outpoint=dict(txid=funding_point[0],out_idx=0),payment=payment,transitions=transitions)
+                break
+        require(rollback_witness is not None,'same native home lacks chronological payment spent(h5)->unspent(h7)->re-mined spent(h8) history')
+        record('specific-payment-funding-spend-rollback-remine',**rollback_witness)
         expected_payments={}
         for check in driver['checks']:
             if check['check']=='wallet-pay':

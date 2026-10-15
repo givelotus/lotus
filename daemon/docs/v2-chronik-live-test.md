@@ -36,7 +36,10 @@ this fixture does not create a multi-branch output with multiple matching
 positions. Pagination uses one output per page, checks deduplication, retains a
 continuation across same-tip restart, and rejects old-tip cursors. History must
 remove the detached payment at height 7 and restore it when re-mined at height 8;
-confirmed spent funding history must also revert to an unspent observation.
+the same native home must show the surviving payment’s exact funding outpoint
+spent by that payment at height 5, unspent after detach at height 7, and spent by
+the same payment after re-mining at height 8. The evidence retains this ordered
+three-snapshot witness, including the spending TxId and TxHash.
 
 Listeners bind ephemeral loopback ports; ports 10604, 10605 and 8331 are refused.
 No existing home is reset. The driver owns and stops its exact child processes.
