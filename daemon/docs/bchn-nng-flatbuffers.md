@@ -5,11 +5,13 @@ It is one mailbox patch on exact BCHN pin
 `abd433abe04f74780744b9eac06731f3690ce68a`, independently selectable and default OFF:
 `daemon/patches/bchn/10-nng-interface.patch`.
 
-Source commit: `875318a9be268a3e8ba5d81e82f78ee94ff21980`.
-Source tree: `471209a4bb2384e1764e2aaaa62622097fd7ad9d`.
-Independent mailbox replay retains that tree. Root reviewed the candidate and
-pushed corrective commit `afb6a70da7b3dcb119ca3638218fa9d49ee3001d` to MR2176,
-whose final tree is identical. Its new pipeline `2948830422` is running; previous
+Source commit: `1d9ed45dd4244de66083e70a427f9f56e30cd36b`.
+Source tree: `736fa9a6065580caf2c76649be49b70103f8a9f3`.
+Independent mailbox replay retains that tree. Root pushed the initial compatible
+replacement as `afb6a70da7b3dcb119ca3638218fa9d49ee3001d` to MR2176.
+Its CI found dependency/format lint failures; the narrow follow-up preserves the
+schema and passes native enabled rebuild plus both existing consumer suites.
+The reviewed follow-up is awaiting final lint before submission. Historical
 raw-protocol CI does not validate this replacement.
 
 
@@ -176,8 +178,8 @@ skips. Testing the daemon with ZeroMQ both ON and OFF remains independent.
 base, mailbox replay, combination trees, tool versions and validation logs.
 Native macOS arm64 builds pass with NNG ON / ZeroMQ OFF, both ON, and both OFF.
 The unchanged daemon implementation passes 653 C++ cases (62,621,532 assertions).
-The final commit differs from the built implementation commit `0ad0aca89d` only
-in the functional test and Rust probe: both enabled binaries pass those strengthened
+The prior candidate `875318a9be` differs from implementation commit `0ad0aca89d` only
+in the functional test and Rust probe: both prior enabled binaries pass those strengthened
 undo-decoding tests using the unmodified public SDK codec. Original Tobias RPC
 fixtures pass independently against both enabled builds. OFF builds expose no NNG
 help, linked library or undefined symbol, and the functional test explicitly skips.
@@ -189,3 +191,9 @@ indexer remain unvalidated. An additional pruning experiment did not start becau
 BCHN rejects ABC's `-fastprune` test option; it supplies no pruning evidence.
 The original 2021 publication dialect is not implemented. See the protocol matrix
 above for the evolved publication interface and separately supported legacy RPC.
+
+The reviewed lint follow-up separates the admission-hook header to avoid a module
+cycle and uses fixed format strings with BCHN's existing translation API. Its exact
+final tree was rebuilt with NNG ON / ZeroMQ OFF and both existing consumer suites
+passed again. Full unit and other build-mode evidence above belongs to the previous
+implementation tree; this narrow follow-up does not repeat those broader claims.
