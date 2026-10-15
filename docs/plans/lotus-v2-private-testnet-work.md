@@ -14,7 +14,8 @@ The deliverable is real native nodes on separate machines, with one wallet origi
 
 | Owner | Exclusive files or boundary | Integration contract |
 | --- | --- | --- |
-| Monetary/spec owner | Monetary paper/spec sections, Python monetary reference/tests; native `monetary.*` and direct monetary tests | One absolute-tail definition and shared vectors; document profile migration |
+| Absolute-paper owner | Separate LaTeX worktree `main.tex` / `README` | Absolute-tail definition reviewed against implementation |
+| Monetary implementation owner | Python monetary reference/tests; native `monetary.*` and direct monetary tests | Shared absolute-tail vectors; root integrates profile changes |
 | Pool owner | New native transaction-pool module and its tests | Admission, dependency graph, conflicts, limits, template snapshot, reconciliation |
 | Relay owner | New transaction relay module/tests; coordinated additions to `peer_codec.*` | Existing inventory identity, bounded requests, canonical transaction bodies, admission callback |
 | Wallet owner | `src/wallet/v2_*` wallet/client/provider changes and tests | Submit/status contract, persisted pending wire, rebroadcast, restart/reorg states |
@@ -23,6 +24,10 @@ The deliverable is real native nodes on separate machines, with one wallet origi
 | Avalanche/PoW owner | Explicitly assigned upstream dependency analysis and adapter files/tests | Preserve pinned defaults; real V2 identity/state integration before claiming Avalanche support |
 
 No two owners edit runtime/dispatcher/CMake or export mailboxes concurrently. Agree headers first, implement against them, then root integrates monetary/profile identity, runtime hooks, pool, relay, wallet and orchestration in dependency order. Parameter choices stay open; use the current tested profile until an explicit absolute-tail migration is specified. Neither exploratory changes nor acceptance tests touch main, existing data, releases or production ports.
+
+## Absolute-tail invariants
+
+Bind immutable genesis tail/work anchors to ChainProfile, manifest and consensus profile digest. Derive entitlement directly from authenticated parent-header work, never from previous cached tail or a parent-as-genesis fallback. The existing 56-byte MonetaryState may retain redundant fields temporarily only if validation rejects cached tail values inconsistent with derivation. Current toy test anchors 200/9 and real manifest anchors 1m/2 are distinct: migrate each explicitly and regenerate corresponding vectors/profile bindings rather than conflating them. Root owns profile/header integration; monetary implementation owner supplies derivation and boundary tests; separate absolute-paper owner owns LaTeX. Avalanche audit owner owns only its new `docs/plans/lotus-v2-avalanche-integration.md` during the initial read-only audit.
 
 ## Native API contracts
 
