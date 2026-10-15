@@ -737,3 +737,39 @@ This owner has no sockets or implicit profile adoption. Peer application routing
 production of locally mined signed-payment blocks, and a runnable two-process
 node remain subsequent gates. Passing this suite alone does not prove network
 synchronization or a usable testnet.
+
+## Runtime peer dispatcher (146–151)
+
+All 152 mailboxes replay in a fresh worktree with every intermediate tree
+verified; final tree `a016a158d309c188999b2501bb8f738cd1f47d1b`.
+See [replay evidence](evidence/v2-series-replay-151.json). Prior mailboxes remain
+byte-identical. The public development-home helper preserves the existing
+namespace/identity checks without opening storage. The runtime metadata query
+now enforces its documented aggregate header, monetary and auxiliary payload cap;
+auxiliary-only and one-byte-short caps preserve outputs, and exact caps succeed.
+Runtime and disk tests pass (2/2) in the focused Debug build.
+
+The dispatcher routes header pages, full blocks, compact blocks and missing
+transactions through the existing transport, shared download manager and runtime.
+Fetch epochs survive ordinary tip growth. Serving queries resume across ticks
+with budgets of one; timeout and peer work progress with one-action budgets.
+Drivers must drain notices before and after ticks. Backpressure retains output,
+and terminal connection failures cancel downloads. Storage ambiguity invalidates
+cached authority before reopening.
+
+Ten integration groups pass in Debug and ASan/UBSan. They include actual
+127.0.0.1 ephemeral TCP synchronization of five blocks between two independent
+V4 runtimes, exact tip/root/monetary/coin/proof comparisons, compact completion
+and full fallback, invalid-fork restoration, ordinary growth with pending jobs,
+WAL write ambiguity and tiny-budget fairness. This is a single-process runtime
+test, not yet a two-process daemon demonstration.
+
+Full-tree native `6a527b286` builds lotusd and passes runtime and dispatcher
+checks with Chronik off. Log:
+`/private/tmp/lotus-v2-dispatcher-full-build.log`. Aggregate metadata boundary
+checks: `/private/tmp/lotus-v2-runtime-cap-test.log`. Replay log:
+`/private/tmp/lotus-v2-replay-151.log`.
+
+The runnable development node command, local block-template production and
+signed-payment propagation remain subsequent gates. No network parameters or
+mainnet defaults are frozen by this integration.
