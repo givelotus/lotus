@@ -103,9 +103,10 @@ The current compatible FlatBuffers candidate10 composes with01,04,11 and12 at
 the exact acceptance pin. All170 permitted raw application orders pass; all60
 complete orders produce source tree `1c5fdb7c8018adbb386a099676fb4b8b80bab5e3`.
 Grouping ordered11+12 as one source-removal feature yields64 feature-unit orders.
-Patch12 correctly rejects application without11. These checks prove source
-application only; combined native build/runtime validation is being prepared
-separately. See [current composition evidence](evidence/bchn-compatible-combinations-20261014.json).
+Patch12 correctly rejects application without11. These order checks prove source
+application. The same complete tree separately passes a fresh native build, both
+existing NNG consumers and all16 focused mining/mempool cases; see
+[combined runtime validation](bchn-combined-features-validation.md). See [current composition evidence](evidence/bchn-compatible-combinations-20261014.json).
 
 The older15-order/126-suite combined evidence at tree
 `bf50633c2575549a6b621cff8e70142df901b2f7` used the rejected raw-payload publisher.
