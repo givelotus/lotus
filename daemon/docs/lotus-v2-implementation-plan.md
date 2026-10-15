@@ -6,9 +6,9 @@ Updated October 15, 2026. Development plan; no genesis parameters are frozen and
 
 ## Source foundation and current status
 
-The current executable [V2 series](../patches/v2/series) contains 119 patches,
-`000`–`118`, on ABC master `1fb7db17c176cdea8a2c60d887891589382ee4e3`.
-[Latest replay evidence](evidence/v2-series-replay-118.json) verifies every
+The current executable [V2 series](../patches/v2/series) contains 126 patches,
+`000`–`125`, on ABC master `1fb7db17c176cdea8a2c60d887891589382ee4e3`.
+[Latest replay evidence](evidence/v2-series-replay-125.json) verifies every
 intermediate tree. The exact clean daemon build and signed Payment pilot recorded
 below establish offline block acceptance, restart, disconnect and reconnect.
 Network activation, global fork selection, resumable reorgs and a usable peer
@@ -497,3 +497,47 @@ The registered Boost wallet test also passes syntax compilation using its actual
 `test_bitcoin` compile command from exact `9f529da1c`. This checks registration and
 fixture compatibility; it is not a claim that the complete inherited test binary
 has been built or executed for this packet.
+
+## Explicit recovery homes and resumable fork switching (119–125)
+
+All 126 mailboxes replay with exact intermediate trees; final tree
+`86981cda134577304e58bf58b00cdb5159b6ed00`. See
+[replay evidence](evidence/v2-series-replay-125.json). Earlier mailboxes remain
+byte-identical. Two empty-body original commits carry explicitly attributed
+integration notes without changing their source payloads.
+
+Recovery is opt-in on fresh schema-V3 indexed homes with explicit journal and undo
+creation caps. Existing V2 command homes remain unchanged. Journal progress and
+active state publish together; ordinary writers are fenced while recovery is
+pending. Failed sync poisons the handle until reopen reveals which complete batch
+won. Journals embed bounded source/replacement bodies and reserve fixed diagnostic
+space; decoding and preparation check body/aggregate allowances before copies.
+LevelDB internal block allocation and repeated journal copies remain documented
+resource limitations, not claimed total-memory bounds.
+
+The coordinator executes at most one block transition per call through the
+existing complete connector and predecessor-checked undo. Tests use immutable
+Python-generated complete blocks, first validated by the native oracle, for two
+source detaches and three replacement attaches. Invalid-middle replacement,
+all-ancestor clock rollback, source-detach operational refusal, restart at every
+step and exact journal-cap fallback all restore the expected complete state.
+Source operational causes are retained without classifying the target invalid.
+Independent Debug/Release tests and focused source review pass. Storage Debug and
+ASan/UBSan tests cover corruption, quotas, CAS and injected WAL failures. Darwin
+rejects leak detection before execution; the passing sanitizer run disabled that
+unsupported feature.
+
+Clean native `11dd297c3` at `/private/tmp/lotus-v2-daemon-recovery-exact-20261015`
+builds Debug lotusd and the wallet helper with Chronik off. Full-tree recovery
+storage, real-fork, wallet and initializer checks pass. Log:
+`/private/tmp/lotus-v2-recovery-build.log`. The actual native-wallet complete-block
+pilot also passes at `/private/tmp/lotus-v2-wallet-chain-recovery-exact-20261015`.
+That pilot uses the existing offline command; it does not demonstrate daemon
+reorg orchestration or peer synchronization.
+
+Candidate selection, durable terminal receipts, cancellation and node integration
+remain separate gates. The current generic validator Invalid result includes
+some unsupported/provider/host-limit paths; do not turn the coordinator's returned
+replacement-invalid flag into a permanent invalid-root fact. A typed failure audit
+and repair must precede that selector behavior. No network/profile adoption or
+public testnet readiness is claimed.
