@@ -113,10 +113,13 @@ is the difference between consumed and created token amounts (zero for the
 merge). The issuer can mint again under the same token ID. There is no supply
 cap or allowance state in this example.
 
-The standalone daemon ordinary-validator tests in V2 patch 028 embed an earlier
-copy of this fixture (mint and transfer only, SHA-256
-`8fe8b6fe…a52a431f`, before the wallet-path requirement). Those tests remain
-self-consistent but do not yet cover the merge or the current token roots.
+V2 daemon patch 032 pins this fixture (SHA-256 `5e9151b9…fc716`) in the
+standalone native ordinary validator, which applies the signed mint, transfer
+and merge against a development UTXO view and rejects an inflated merge, a
+dropped token input and a missing rules witness. Regenerate that header only
+through a new daemon patch, using `node test/emit-ordinary-fixture-header.mjs`.
+This is still transaction-level validation; no block containing these
+transactions has been connected.
 
 `summary.json` reports compile, proof, transaction framing, signature, VM,
 accounting and block stages separately. The generic Payment method has its own

@@ -6,21 +6,21 @@ Updated October 14, 2026. Development plan; no genesis parameters are frozen and
 
 ## Source foundation and current status
 
-The current executable [V2 series](../patches/v2/series) contains 32 patches,
-`000`–`031`, on ABC master `1fb7db17c176cdea8a2c60d887891589382ee4e3`.
+The current executable [V2 series](../patches/v2/series) contains 33 patches,
+`000`–`032`, on ABC master `1fb7db17c176cdea8a2c60d887891589382ee4e3`.
 The [review packet](../candidates/v2-native-reviewed-20261014/README.md) records
 all intermediate replay trees and focused validation. The source tree is
-`04b5d3c167ead1b0a1d8187821f72333ac6bded9`. It includes transaction framing,
+`507c91e64c205df7b38e77abff6ebe02fb99bffe`. It includes transaction framing,
 commitments, scalar and incremental UTXO models, signing, and a bounded native VM
 with explicit static accounting, plus a standalone ordinary-transaction validator, parameterized P05/P06/C16
 monetary arithmetic (029), and VM context introspection plus Merkle-proof
-opcodes (030), with root's field-size hint validation (031). These remain isolated modules: daemon consensus,
+opcodes (030), with root's field-size hint validation (031) and the signed compiler token merge in ordinary-validator tests (032). These remain isolated modules: daemon consensus,
 persistent chainstate, complete opcode coverage, full transaction/block resource validation,
 and mining job integration are still outstanding.
 
 Root review reproduced and corrected maximum-count proof arithmetic, enforced the
 8192-byte witness limit, reviewed prepared signing and incremental-tree ownership,
-and reran native primitive checks. All 32 mailboxes replay to the recorded trees.
+and reran native primitive checks. All 33 mailboxes replay to the recorded trees.
 The native VM agrees with Python on 363 execution and 494 static-charge cases, plus 3,017 independent byte/arithmetic vectors and 684 Merkle vectors; 103 assigned operations execute and 6 (b0–b4, bd) reject as unsupported. Native monetary arithmetic agrees with the Python reference on 300 packet and 20,000 root differential vectors. Merkle step charges still lack an independent Python cost model, and P05 field-size hints are validated against, but not yet derived from, authenticated transaction data.
 Signed compiler mint/transfer/merge fixtures execute all selected invocations in
 both engines, including rejection cases. Whole-daemon V2 validity, inherited
@@ -130,4 +130,4 @@ The compiler plan also owns [V2-native fixture infrastructure](../../docs/plans/
 
 ## Next bounded work
 
-The coinbase-data and Frank appendix changes are specified. The reviewed 32-patch native series is integrated on the exact ABC pin above; the independent output reference remains `beebcbde`. Complete outer transaction resource validation (including deriving P05 field sizes from context and a reference Merkle cost model) and the six remaining VM operations, then wire monetary transition into block connect with persistent state/undo, and add mining jobs. Continue with a disposable development genesis/payment/block/undo slice before broad optimization. Do not mark the complete plan implemented merely because documentation, patches or a genesis-search script exist.
+The coinbase-data and Frank appendix changes are specified. The reviewed 33-patch native series is integrated on the exact ABC pin above; the independent output reference remains `beebcbde`. Complete outer transaction resource validation (including deriving P05 field sizes from context and a reference Merkle cost model) and the six remaining VM operations, then wire monetary transition into block connect with persistent state/undo, and add mining jobs. Continue with a disposable development genesis/payment/block/undo slice before broad optimization. Do not mark the complete plan implemented merely because documentation, patches or a genesis-search script exist.
