@@ -36,6 +36,11 @@ nonces, including the inherited default nonce 1 when the sender group is omitted
 heuristic, not authenticated peer identity. User-agent bytes are
 untrusted and must be sanitized before diagnostic display.
 
+The integrated V2 envelope codec requires empty `verack` and `sendaddrv2`
+payloads. This is an explicit stricter control-message rule: ABC handlers ignore
+payload bytes for these commands. Session tests must retain that distinction;
+only the version optional suffix behavior above claims inherited compatibility.
+
 ### Session ordering and resource limits
 
 Send version first, hello after accepted version, and verack after accepted
