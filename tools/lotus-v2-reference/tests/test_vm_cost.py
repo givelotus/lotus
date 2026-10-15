@@ -2,7 +2,7 @@
 
 import unittest
 
-from lotus_v2_reference.vm import ASSIGNED, VMProfile, decode, static_cost
+from lotus_v2_reference.vm import ASSIGNED, VMError, VMProfile, U128_MAX, decode, evaluate, static_cost
 from lotus_v2_reference.vm_cost import UNKNOWN, static_size_cost
 
 
@@ -79,6 +79,50 @@ class SizeCostTests(unittest.TestCase):
         ast = decode(bytes.fromhex("03616263b8"), vm_profile)
         self.assertEqual(static_cost(ast, vm_profile, input_count=0, output_count=0,
                                      script_length=5), 40)
+
+    def test_zero_bound_body_above_cap_and_positive_bound(self):
+        script = bytes.fromhex("67794e796a4e")
+        limited = VMProfile(512, 8, 128, 16, 8, 256, 8, 24, 1,
+                            {op: price for op in ASSIGNED})
+        result = evaluate(script, (), limited, input_count=0)
+        self.assertTrue(result.success)
+        self.assertEqual(result.charged_cost, 24)
+        with self.assertRaises(VMError):
+            evaluate(script, (), limited, input_count=1)
+        enough = VMProfile(512, 8, 128, 16, 8, 256, 8, 76, 1,
+                           {op: price for op in ASSIGNED})
+        self.assertEqual(evaluate(script, (), enough, input_count=1).charged_cost, 76)
+
+    def test_zero_bound_does_not_hide_u128_overflow(self):
+        overflow_control = VMProfile(512, 8, 128, 16, 8, 256, 8,
+                                     U128_MAX, 1,
+                                     {op: U128_MAX if op == 0x6a else 1
+                                      for op in ASSIGNED})
+        with self.assertRaisesRegex(VMError, "static cost exceeds bound"):
+            evaluate(bytes.fromhex("67796a4e"), (), overflow_control, input_count=0)
+        worst_overflow = VMProfile(512, 8, 128, 16, 8, 256, 8,
+                                   U128_MAX, 1,
+                                   {op: (lambda a, b: U128_MAX + 1 if 128 in (*a, *b) else 1)
+                                    if op == 0xb8 else 1 for op in ASSIGNED})
+        with self.assertRaisesRegex(VMError, "static cost exceeds bound"):
+            evaluate(bytes.fromhex("677ab86a4e"), (), worst_overflow, input_count=0)
+        huge = VMProfile(512, 8, (1 << 64) - 1, 16, 8, 256, 8,
+                         U128_MAX, 1,
+                         {op: (lambda a, b: 1 + sum(a) * ((1 << 64) - 1)
+                               + sum(b)) if op == 0xb8 else 1
+                          for op in ASSIGNED})
+        with self.assertRaisesRegex(VMError, "static cost exceeds bound"):
+            evaluate(bytes.fromhex("6779b86a4e"), (), huge, input_count=0)
+
+    def test_break_in_skipped_code_is_runtime_only(self):
+        selected = profile()
+        self.assertTrue(evaluate(bytes.fromhex("00614e6b634e64"), (), selected).success)
+        self.assertTrue(evaluate(bytes.fromhex("00696b6a4e"), (), selected).success)
+        with self.assertRaisesRegex(VMError, "BREAK depth outside"):
+            evaluate(bytes.fromhex("4e614e6b634e64"), (), selected)
+        for malformed in ("00616b", "006b6a"):
+            with self.assertRaises(VMError):
+                evaluate(bytes.fromhex(malformed), (), selected)
 
 
 if __name__ == "__main__":

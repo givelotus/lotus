@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from typing import Mapping
 
 from .vm import (Conditional, Instruction, Loop, Node, UnsupportedFeature,
-                 VMError, VMProfile, _checked_cost)
+                 VMError, VMProfile, U128_MAX, _checked_cost)
 
 
 @dataclass(frozen=True)
@@ -95,7 +95,7 @@ def static_size_cost(ast: tuple[Node, ...], profile: VMProfile, *,
         amount = formula(operands, results) if callable(formula) else formula
         if type(amount) is not int or amount <= 0:
             raise ValueError(f"invalid cost formula for {op:02x}")
-        return _checked_cost(amount, profile.max_invocation_cost) if enforce else amount
+        return _checked_cost(amount, U128_MAX) if enforce else amount
 
     def transfer(ins: Instruction, state: SizeState, previous: Instruction | None) -> tuple[SizeState, int]:
         op = ins.opcode
@@ -327,17 +327,18 @@ def static_size_cost(ast: tuple[Node, ...], profile: VMProfile, *,
                         body = second
                         post = _merge(loop_entry, second_joined)
                     else:
-                        body = SizeCharge(second.worst_cost, UNKNOWN,
+                        body = SizeCharge(_checked_cost(second.worst_cost, U128_MAX), UNKNOWN,
                                           {depth: UNKNOWN for depth in second.exits}, second.worst_cost)
                         post = UNKNOWN
                 elif joined is None:
                     post = _merge(loop_entry, local_break)
                 else:
-                    body = SizeCharge(body.worst_cost, UNKNOWN,
+                    body = SizeCharge(_checked_cost(body.worst_cost, U128_MAX), UNKNOWN,
                                       {depth: UNKNOWN for depth in body.exits}, body.worst_cost)
                     post = UNKNOWN
                 part = charge(node.opcode, (16,) if node.opcode == 0x69 else (), ())
-                part += bound * (charge(0x6a, (), ()) + body.cost)
+                iteration = _checked_cost(charge(0x6a, (), ()) + body.cost, U128_MAX)
+                part = _checked_cost(part + _checked_cost(bound * iteration, U128_MAX), U128_MAX)
                 worst_part = (charge(node.opcode, (limit,) * 6, (limit,) * 4, enforce=False) +
                               bound * (charge(0x6a, (), (), enforce=False) + body.worst_cost))
                 current = post if current is not None else None
@@ -345,8 +346,10 @@ def static_size_cost(ast: tuple[Node, ...], profile: VMProfile, *,
                     if depth > 1:
                         exits[depth-1] = _merge(exits.get(depth-1), exit_state)
                 previous = None
-            total = _checked_cost(total + part, profile.max_invocation_cost)
+            total = _checked_cost(total + part, U128_MAX)
             worst_total += worst_part
         return SizeCharge(total, current, exits, worst_total)
 
-    return sequence(ast, SizeState(initial_sizes, ()), ())
+    result = sequence(ast, SizeState(initial_sizes, ()), ())
+    _checked_cost(result.cost, profile.max_invocation_cost)
+    return result

@@ -235,7 +235,7 @@ Grammar: a sequence consists of ordinary instructions, `IF sequence [ELSE sequen
 
 A loop captures its bound once on entry. Each iteration pushes N(index), evaluates its body, then advances; the body may consume or leave that index like any stack value. Bound zero does not evaluate the body. IF consumes one canonical Boolean only when executed. Underflow/runtime operand errors in unexecuted code do not occur; its syntax/opcodes are nevertheless checked and charged conservatively.
 
-Define evaluation results `Continue`, `ExitLoops(d)`, or `Error`. BREAK with `1≤d≤active_loop_depth` produces ExitLoops(d). Sequence/conditional nodes immediately propagate it. A loop receiving ExitLoops(1) terminates and returns Continue; receiving ExitLoops(d>1) terminates and returns ExitLoops(d−1). This specifies conditional-frame unwinding without byte-offset guesses. All existing stack effects persist. No BREAK signal may escape the top-level sequence.
+Define evaluation results `Continue`, `ExitLoops(d)`, or `Error`. BREAK with `1≤d≤active_loop_depth` produces ExitLoops(d). Sequence/conditional nodes immediately propagate it. A loop receiving ExitLoops(1) terminates and returns Continue; receiving ExitLoops(d>1) terminates and returns ExitLoops(d−1). This specifies conditional-frame unwinding without byte-offset guesses. All existing stack effects persist. No BREAK signal may escape the top-level sequence. BREAK is an ordinary instruction in the decode grammar: an out-of-range depth or BREAK outside a loop errors when that instruction executes, while BREAK in a skipped conditional arm or zero-iteration loop does not itself reject. The containing syntax must still decode and nest correctly.
 
 ## Exclusive branch and branch-continuation checks
 
