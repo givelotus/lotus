@@ -6,9 +6,9 @@ Updated October 15, 2026. Development plan; no genesis parameters are frozen and
 
 ## Source foundation and current status
 
-The current executable [V2 series](../patches/v2/series) contains 165 patches,
-`000`–`164`, on ABC master `1fb7db17c176cdea8a2c60d887891589382ee4e3`.
-[Latest replay evidence](evidence/v2-series-replay-164.json) verifies every
+The current executable [V2 series](../patches/v2/series) contains 171 patches,
+`000`–`170`, on ABC master `1fb7db17c176cdea8a2c60d887891589382ee4e3`.
+[Latest replay evidence](evidence/v2-series-replay-170.json) verifies every
 intermediate tree. Offline daemon acceptance, restart, disconnect/reconnect,
 resumable fork recovery, bounded selection and actual two-process TCP full/compact
 synchronization have separate evidence below. Native production of signed fixture-payment blocks also passes across two nodes.
@@ -862,3 +862,46 @@ The signer in this gate is an independent public fixture. It is not a user-walle
 claim. The existing offline wallet helper cannot open the node's live V4 home;
 a proof-verifying provider and controller are separate implementation packets.
 No profile adoption, issuance freeze or public listener is implied.
+
+## Authenticated wallet providers and outgoing recovery (165–170)
+
+All 171 replay trees match; final tree
+`997831f6ce8d95e0538220e1d01bfeb0f003fd44`. See
+[replay evidence](evidence/v2-series-replay-170.json). Earlier mailboxes are
+byte-identical. Existing disk Payment APIs now adapt to the same provider-based
+engine, preserving deterministic selection, FULL signing, ordinary validation,
+anchor rechecks and atomic SQLite outgoing/reservation writes.
+
+The node exposes a bounded `walletcontext` query only at a quiescent authoritative
+state. It returns the profile identity, canonical tip/header history, monetary
+bytes, UTXO root and an optional coin proof. The native adapter checks exact JSON
+shape and correlation, profile binding, header links/MTP, state commitments and
+canonical native inclusion/absence proofs. Malformed or unavailable replies are
+operational failures, never absent coins. The caller-controlled full node remains
+the chain validation authority: eleven headers and coin proofs do not establish
+full chain validity. A final anchor check cannot lock an advancing chain through
+a subsequent SQLite commit; exported bytes still require node validation.
+
+Read-only outgoing recovery lists at most the existing 1,000 stored IDs and
+returns exact persisted signed bytes under a caller byte cap. It works while
+locked, preserves reservations, and refuses a wallet requiring reopen. This lets
+a client recover after signing persisted but its response was lost; it must not
+automatically resign or abandon an uncertain payment. Canonical transaction and
+ID checks belong to the consuming client before recovered bytes are returned.
+
+Focused Debug and optimized Release provider suites each pass 2/2, including the
+existing wallet regression suite. Optimized local objects link the reviewed
+Debug dependencies; this is not a full Release daemon claim. Test source SHA256
+`92e0ec3a123332e857705627813818fa1cd1bde126a5a4b125d39a8d0714df69`;
+logs `/private/tmp/lotus-v2-provider-tests-debug-ctest.log` and
+`/private/tmp/lotus-v2-provider-tests-release-ctest.log`. Mutations cover context,
+profiles, headers/history, monetary/root commitments and real coin proofs;
+stale-anchor/typed failure cases preserve output and reservations. Disk/provider
+unsigned intent matches, and independently randomized signatures validate.
+
+Full-tree `7505c866f` builds lotusd and passes 208 wallet and 481 provider checks
+with Chronik off. Log `/private/tmp/lotus-v2-live-wallet-provider-build.log`.
+Source review also checks bounded context output including escaped IDs/newline,
+quiescence and final identity/root rechecks. The standalone wallet client and
+interactive controller are not yet integrated or demonstrated against live
+nodes; this packet alone does not close that user-facing workflow gate.
