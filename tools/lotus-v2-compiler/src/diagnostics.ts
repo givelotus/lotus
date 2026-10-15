@@ -123,6 +123,10 @@ export const DIAGNOSTIC_CODES: Record<string, string> = {
   E0918: 'module import cycle',
   E0919: 'declaration-only module rule',
   E0920: 'package graph limit exceeded',
+  E0921: 'branch or range selector outside package update',
+  E0922: 'module not present in the offline cache',
+  E0923: 'invalid git locator',
+  E0924: 'git fetch failed',
   E9001: 'internal compiler invariant failed',
 };
 

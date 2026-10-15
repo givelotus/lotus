@@ -156,6 +156,7 @@ test('imports diagnose duplicate names, visibility, missing modules/symbols and 
     await rejects(dir, code, e => e.file === at && e.span !== undefined && /:\d+\.\.\d+: /.test(e.message));
   }
   assert.throws(() => compileContract('import lib::m::{f};\ncontract C { function f() { require(true); } }', { contract: 'C', bindings: {} }), /requires a package build/);
+  assert.throws(() => compileContract('import "github.com/acme/lotus-std@v1.2.0"::amounts::{checkedAdd};\ncontract C { function f() { require(true); } }', { contract: 'C', bindings: {} }), /requires a package build/);
 });
 
 test('import cycles report every hop with file spans', async () => {

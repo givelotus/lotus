@@ -1,11 +1,10 @@
 /**
- * CABI-07: deterministic, offline package/module resolution for the contract compiler.
+ * CABI-07: deterministic package/module resolution for the contract compiler.
  *
- * Build-time only. Nothing here is consensus, VM, runtime or transaction code: the
- * resolver reads declared local files, checks them against `lotus.lock`, parses each
- * immutable module identity once, links explicit imports into one helper namespace and
- * hands the linked program to the existing scheduler/compiler. There is no network,
- * registry, clock or environment input.
+ * Build-time only. Nothing here is consensus, VM, runtime or transaction code.
+ * Local path packages and `compilePackage` read declared files, `lotus.lock` and
+ * (for module paths) the project cache or `vendor/` tree. They do not spawn git
+ * or use the network. `lotus-v2-package-fetch` is the networked entry.
  */
 import { lstatSync, readdirSync, readFileSync, realpathSync, statSync, writeFileSync } from 'node:fs';
 import { join, relative, sep } from 'node:path';
@@ -14,6 +13,7 @@ import { CompileError, SourceManager, diagnostic } from './diagnostics.js';
 import { compileLinkedProgramAsync, parseModuleSource, type CompileOptions, type Contract, type ContractArtifact, type Expr, type Helper,
   type ImportDecl, type Method, type Param, type Program, type SchedulerEvent, type Stmt } from './generic.js';
 import { assertPortableName } from './names.js';
+import { assertGitLocator, classifyRequirement, isGitLocator, isModulePath, resolveDistributedSources, type FetchOptions } from './package-sources.js';
 import { PromiseScheduler } from './scheduler.js';
 import { parseTomlSubset, type TomlValue } from './toml-subset.js';
 
@@ -33,7 +33,7 @@ export const DEFAULT_PACKAGE_LIMITS: PackageLimits = { maxPackages: 64, maxModul
 
 export type PackageErrorCode = 'manifest' | 'path-escape' | 'symlink-escape' | 'path-collision' | 'undeclared-file' | 'missing-module' | 'lock-missing' |
   'lock-mismatch' | 'lock-stale' | 'version-conflict' | 'package-cycle' | 'parse' | 'unknown-alias' | 'not-exported' | 'missing-symbol' |
-  'visibility' | 'duplicate-name' | 'import-cycle' | 'declaration-only' | 'limit';
+  'visibility' | 'duplicate-name' | 'import-cycle' | 'declaration-only' | 'limit' | 'branch' | 'unfetched' | 'locator' | 'fetch';
 
 /** Diagnostic with a project-relative file and an optional UTF-8 byte span (`file:start..end: message [code]`). */
 export class PackageError extends Error {
@@ -48,6 +48,7 @@ const PACKAGE_DIAGNOSTIC: Record<PackageErrorCode, string> = {
   'missing-module': 'E0906', 'lock-missing': 'E0907', 'lock-mismatch': 'E0908', 'lock-stale': 'E0909', 'version-conflict': 'E0910',
   'package-cycle': 'E0911', parse: 'E0912', 'unknown-alias': 'E0913', 'not-exported': 'E0914', 'missing-symbol': 'E0915',
   visibility: 'E0916', 'duplicate-name': 'E0917', 'import-cycle': 'E0918', 'declaration-only': 'E0919', limit: 'E0920',
+  branch: 'E0921', unfetched: 'E0922', locator: 'E0923', fetch: 'E0924',
 };
 /** CLI view of a package error. The library still throws `PackageError` with its own code. */
 export function packageCompileError(error: PackageError, sources = new SourceManager()): CompileError {
@@ -56,10 +57,12 @@ export function packageCompileError(error: PackageError, sources = new SourceMan
 }
 
 export type Manifest = { name: string; version: string; kind: 'library' | 'contract'; source: string; modules: string[]; exports: string[]; entry?: string;
-  /** alias -> exact `name@version` */ dependencies: Map<string, string>;
-  /** Root-only package locators (`name -> project-relative path`). Ignored (never inherited) in dependencies. */ sources: Map<string, string> };
-type PackageFile = { path: string; digest: Uint8Array; content: Uint8Array };
-type PackageInfo = { id: string; manifest: Manifest; root: string; manifestFile: string; files: PackageFile[]; treeDigest: Uint8Array; isRoot: boolean };
+  /** alias -> `name@version` or `module@selector` */ dependencies: Map<string, string>;
+  /** Root-only locators. Short names are project-relative paths; other hosts are git URLs. */ sources: Map<string, string>;
+  /** Root-only module-path replacements (relative path or git locator). Never inherited. */ replace: Map<string, string> };
+export type PackageFile = { path: string; digest: Uint8Array; content: Uint8Array };
+export type PackageInfo = { id: string; manifest: Manifest; root: string; manifestFile: string; files: PackageFile[]; treeDigest: Uint8Array; isRoot: boolean;
+  /** Git/replace packages record the selected tag (`vX.Y.Z`) or commit. Path packages omit it. */ selectedVersion?: string };
 type ModuleNode = { id: string; pkg: PackageInfo; path: string; file: string; digest: Uint8Array; program: Program; isEntry: boolean; imports: { decl: ImportDecl; target: ModuleNode }[] };
 type LockPackage = { name: string; version: string; locator: { kind: 'path'; path: string }; root: string; dependencies: Record<string, string>; files: { path: string; digest: string }[]; treeDigest: string };
 export type LockFile = { schema: typeof LOCK_SCHEMA; root: { name: string; version: string; dependencies: Record<string, string> }; packages: LockPackage[] };
@@ -83,6 +86,17 @@ const str = (text: string): Uint8Array => bytes(utf8(text));
 const fold = (text: string): string => text.normalize('NFKC').toUpperCase().toLowerCase().normalize('NFKC');
 const posix = (...parts: string[]): string => parts.filter(part => part !== '' && part !== '.').join('/') || '.';
 const sorted = (record: Map<string, string>): Record<string, string> => Object.fromEntries([...record].sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0));
+function graphDependencies(pkg: PackageInfo, ws: Workspace): Record<string, string> {
+  if (!ws.modules) return sorted(pkg.manifest.dependencies);
+  const mapped = new Map<string, string>();
+  for (const [alias, spec] of pkg.manifest.dependencies) {
+    const req = classifyRequirement(spec, pkg.manifestFile);
+    const selected = req.kind === 'module' ? ws.modules.get(req.module) : ws.packages.get(req.name);
+    if (!selected) throw new PackageError('manifest', `missing dependency ${spec}`, pkg.manifestFile);
+    mapped.set(alias, selected.id);
+  }
+  return sorted(mapped);
+}
 const byName = <T extends { name: string }>(a: T, b: T): number => a.name < b.name ? -1 : a.name > b.name ? 1 : 0;
 
 function decode(data: Uint8Array, file: string): string {
@@ -91,7 +105,7 @@ function decode(data: Uint8Array, file: string): string {
 }
 
 /** Project/package-relative path: no absolute paths, traversal, empty or `.` segments, backslashes. */
-function relPath(value: string, what: string, file: string): string {
+export function relPath(value: string, what: string, file: string): string {
   if (value.startsWith('/') || /^[A-Za-z]:/.test(value) || value.includes('\\')) throw new PackageError('path-escape', `${what} ${JSON.stringify(value)} must be a relative POSIX path`, file);
   const parts = value.split('/');
   if (parts.includes('..')) throw new PackageError('path-escape', `${what} ${JSON.stringify(value)} contains path traversal`, file);
@@ -107,7 +121,7 @@ function inside(child: string, parent: string): boolean { return child === paren
 export function parseManifest(text: string, file: string): Manifest {
   let doc;
   try { doc = parseTomlSubset(text, file); } catch (error) { throw new PackageError('manifest', (error as Error).message.replace(`${file}:`, 'line '), file); }
-  for (const table of doc.keys()) if (!['package', 'dependencies', 'sources'].includes(table)) throw new PackageError('manifest', `unknown table [${table}]`, file);
+  for (const table of doc.keys()) if (!['package', 'dependencies', 'sources', 'replace'].includes(table)) throw new PackageError('manifest', `unknown table [${table}]`, file);
   const pkg = doc.get('package'); if (!pkg) throw new PackageError('manifest', 'missing [package] table', file);
   for (const key of pkg.keys()) if (!['name', 'version', 'kind', 'source', 'modules', 'exports', 'entry'].includes(key)) throw new PackageError('manifest', `unknown package key ${key}`, file);
   const string = (key: string, required = true): string | undefined => {
@@ -123,8 +137,9 @@ export function parseManifest(text: string, file: string): Manifest {
     return value;
   };
   const name = string('name')!;
-  if (!/^[a-z_][a-z0-9_]{0,63}$/.test(name)) throw new PackageError('manifest', `package name ${JSON.stringify(name)} must match [a-z_][a-z0-9_]{0,63}`, file);
-  try { assertPortableName(name); } catch { throw new PackageError('manifest', `package name ${name} is reserved`, file); }
+  if (/^[a-z_][a-z0-9_]{0,63}$/.test(name)) {
+    try { assertPortableName(name); } catch { throw new PackageError('manifest', `package name ${name} is reserved`, file); }
+  } else if (!isModulePath(name)) throw new PackageError('manifest', `package name ${JSON.stringify(name)} must be a short name or a module path`, file);
   const version = string('version')!;
   if (!/^(0|[1-9][0-9]{0,8})\.(0|[1-9][0-9]{0,8})\.(0|[1-9][0-9]{0,8})$/.test(version)) throw new PackageError('manifest', `version ${JSON.stringify(version)} must be exact MAJOR.MINOR.PATCH`, file);
   const kind = string('kind')!;
@@ -159,21 +174,32 @@ export function parseManifest(text: string, file: string): Manifest {
   const dependencies = table('dependencies');
   for (const [alias, target] of dependencies) {
     try { assertPortableName(alias); } catch { throw new PackageError('manifest', `dependency alias ${alias} is reserved or invalid`, file); }
-    if (!/^[a-z_][a-z0-9_]{0,63}@(0|[1-9][0-9]{0,8})\.(0|[1-9][0-9]{0,8})\.(0|[1-9][0-9]{0,8})$/.test(target)) throw new PackageError('manifest', `dependency ${alias} must be an exact "name@MAJOR.MINOR.PATCH"`, file);
-    if (target.split('@')[0] === name) throw new PackageError('package-cycle', `package ${name} depends on itself`, file);
+    const req = classifyRequirement(target, file);
+    if ((req.kind === 'path' ? req.name : req.module) === name) throw new PackageError('package-cycle', `package ${name} depends on itself`, file);
   }
   const sources = table('sources');
   for (const [pkgName, path] of sources) {
-    if (!/^[a-z_][a-z0-9_]{0,63}$/.test(pkgName)) throw new PackageError('manifest', `[sources] key ${pkgName} must be a package name`, file);
-    relPath(path, `[sources] ${pkgName}`, file);
+    if (isModulePath(pkgName)) {
+      if (!isGitLocator(path)) throw new PackageError('manifest', `[sources] ${pkgName} must be an https or file locator`, file);
+      assertGitLocator(path, file);
+    } else {
+      if (!/^[a-z_][a-z0-9_]{0,63}$/.test(pkgName)) throw new PackageError('manifest', `[sources] key ${pkgName} must be a package name`, file);
+      relPath(path, `[sources] ${pkgName}`, file);
+    }
   }
-  return { name, version, kind, source, modules, exports, ...(entry !== undefined ? { entry } : {}), dependencies, sources };
+  const replace = table('replace');
+  for (const [pkgName, path] of replace) {
+    if (!isModulePath(pkgName)) throw new PackageError('manifest', `[replace] key ${pkgName} must be a module path`, file);
+    if (isGitLocator(path)) assertGitLocator(path, file);
+    else relPath(path, `[replace] ${pkgName}`, file);
+  }
+  return { name, version, kind, source, modules, exports, ...(entry !== undefined ? { entry } : {}), dependencies, sources, replace };
 }
 
 // ---------------------------------------------------------------------------
 // Package scanning: one immutable snapshot of each package's declared files.
 
-function scanPackage(project: string, locator: string, isRoot: boolean, budget: { bytes: number; limit: number }): PackageInfo {
+export function scanPackage(project: string, locator: string, isRoot: boolean, budget: { bytes: number; limit: number }): PackageInfo {
   const dir = locator === '.' ? project : join(project, ...locator.split('/'));
   let real: string;
   try { real = realpathSync(dir); } catch { throw new PackageError('manifest', `package directory ${locator} does not exist`, locator); }
@@ -241,17 +267,37 @@ function scanPackage(project: string, locator: string, isRoot: boolean, budget: 
   return { id: `${manifest.name}@${manifest.version}`, manifest, root, manifestFile, files, treeDigest, isRoot };
 }
 
-type Workspace = { project: string; root: PackageInfo; packages: Map<string, PackageInfo>; lockText: string };
+export type Workspace = { project: string; root: PackageInfo; packages: Map<string, PackageInfo>; lockText: string;
+  /** Selected git packages by module path. Absent for a path-only graph so lock bytes stay schema 1. */ modules?: Map<string, PackageInfo> };
 
-function resolveWorkspace(projectDir: string, limits: PackageLimits): Workspace {
+function needsDistributed(info: PackageInfo): boolean {
+  if (info.manifest.replace.size > 0) return true;
+  for (const spec of info.manifest.dependencies.values()) if (spec.includes('/')) return true;
+  for (const [key, value] of info.manifest.sources) if (key.includes('/') || isGitLocator(value)) return true;
+  for (const file of info.files) {
+    if (!file.path.endsWith('.lotus')) continue;
+    if (/(^|\n)[ \t]*import[ \t]+"/.test(decode(file.content, posix(info.root, file.path)))) return true;
+  }
+  return false;
+}
+
+function finishDistributed(project: string, root: PackageInfo, limits: PackageLimits, budget: { bytes: number; limit: number }, online?: FetchOptions): Workspace {
+  const resolved = resolveDistributedSources(project, root, limits, budget, online);
+  return { project, root, packages: resolved.packages, lockText: resolved.lockText, modules: resolved.modules };
+}
+
+export function resolveWorkspace(projectDir: string, limits: PackageLimits, online?: FetchOptions): Workspace {
   let project: string;
   try { project = realpathSync(projectDir); } catch { throw new PackageError('manifest', 'root project directory does not exist'); }
   const budget = { bytes: 0, limit: limits.maxSourceBytes };
   const root = scanPackage(project, '.', true, budget);
+  const fresh = (): { bytes: number; limit: number } => ({ bytes: root.files.reduce((sum, file) => sum + file.content.length, 0), limit: limits.maxSourceBytes });
+  if (needsDistributed(root)) return finishDistributed(project, root, limits, budget, online);
   const packages = new Map<string, PackageInfo>();
   const queue: { id: string; from: PackageInfo }[] = [...root.manifest.dependencies.values()].map(id => ({ id, from: root }));
   while (queue.length) {
     const { id, from } = queue.shift()!;
+    if (id.includes('/')) return finishDistributed(project, root, limits, fresh(), online);
     const [name, version] = id.split('@') as [string, string];
     if (name === root.manifest.name) throw new PackageError('package-cycle', `${from.id} depends on the root package ${root.id}`, from.manifestFile);
     const prior = packages.get(name);
@@ -280,6 +326,7 @@ function resolveWorkspace(projectDir: string, limits: PackageLimits): Workspace 
     state.set(pkg.id, 'done');
   };
   for (const pkg of packages.values()) visit(pkg, []);
+  if ([root, ...packages.values()].some(needsDistributed)) return finishDistributed(project, root, limits, fresh(), online);
   return { project, root, packages, lockText: renderLock(root, packages) };
 }
 
@@ -316,7 +363,8 @@ function verifyLock(ws: Workspace): Uint8Array {
     try { lock = JSON.parse(text) as LockFile; } catch { /* reported below */ }
     if (lock && Array.isArray(lock.packages)) for (const entry of lock.packages) {
       const pkg = ws.packages.get(entry?.name);
-      if (!pkg || pkg.manifest.version !== entry.version || !Array.isArray(entry.files)) continue;
+      // Git lock versions are selected tags (`vX.Y.Z`) or commits, not the manifest's MAJOR.MINOR.PATCH.
+      if (!pkg || !Array.isArray(entry.files)) continue;
       for (const file of pkg.files) {
         const pinned = entry.files.find(x => x?.path === file.path);
         if (pinned && pinned.digest !== hex(file.digest))
@@ -372,10 +420,20 @@ export async function compilePackage(projectDir: string, options: PackageCompile
       if (bindings > limits.maxImportBindings) throw new PackageError('limit', `import bindings exceed ${limits.maxImportBindings}`, node.file, decl.span);
       let pkg: PackageInfo;
       if (decl.target === 'package') pkg = node.pkg;
-      else {
+      else if (ws.modules && decl.target.includes('/')) {
+        const req = classifyRequirement(decl.target, node.file);
+        const selected = req.kind === 'module' ? ws.modules.get(req.module) : undefined;
+        if (!selected) throw new PackageError('unknown-alias', `${decl.target} is not a resolved module of ${node.pkg.id}`, node.file, decl.targetSpan);
+        pkg = selected;
+      } else {
         const dep = node.pkg.manifest.dependencies.get(decl.target);
         if (!dep) throw new PackageError('unknown-alias', `${decl.target} is not a dependency alias of ${node.pkg.id}`, node.file, decl.targetSpan);
-        pkg = byId.get(dep)!;
+        if (ws.modules) {
+          const req = classifyRequirement(dep, node.pkg.manifestFile);
+          const selected = req.kind === 'module' ? ws.modules.get(req.module) : ws.packages.get(req.name);
+          if (!selected) throw new PackageError('unknown-alias', `${decl.target} does not resolve in ${node.pkg.id}`, node.file, decl.targetSpan);
+          pkg = selected;
+        } else pkg = byId.get(dep)!;
       }
       const path = decl.path.join('/');
       if (!pkg.manifest.modules.includes(path)) throw new PackageError('missing-module', `module ${decl.target}::${decl.path.join('::')} does not exist in ${pkg.id}`, node.file, decl.pathSpan);
@@ -466,8 +524,8 @@ export async function compilePackage(projectDir: string, options: PackageCompile
     target: TARGET,
     root: { package: root.id, module: entry.id },
     lockDigest: hex(lockDigest),
-    packages: [...byId.values()].map(pkg => ({ id: pkg.id, name: pkg.manifest.name, version: pkg.manifest.version, root: pkg.root, treeDigest: hex(pkg.treeDigest),
-      dependencies: sorted(pkg.manifest.dependencies) })).sort((a, b) => a.id < b.id ? -1 : 1),
+    packages: [...byId.values()].map(pkg => ({ id: pkg.id, name: pkg.manifest.name, version: pkg.selectedVersion ?? pkg.manifest.version, root: pkg.root, treeDigest: hex(pkg.treeDigest),
+      dependencies: graphDependencies(pkg, ws) })).sort((a, b) => a.id < b.id ? -1 : 1),
     modules: [...modules.values()].map(node => ({ id: node.id, package: node.pkg.id, path: node.path, file: node.file, sourceDigest: hex(node.digest),
       interfaceDigest: hex(interfaces.get(node.id)!.digest), exports: interfaces.get(node.id)!.exports,
       imports: [...new Set(node.imports.map(x => x.target.id))].sort() })).sort((a, b) => a.id < b.id ? -1 : 1),
