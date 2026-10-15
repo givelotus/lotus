@@ -148,7 +148,6 @@ test('imports diagnose duplicate names, visibility, missing modules/symbols and 
     ['packages/lib_a/src/limits.lotus', s => s.replace('{checkedAdd, atLeast}', '{checkedAdd, atLeast, bounded}'), 'visibility', 'packages/lib_a/src/limits.lotus', true],
     ['packages/lib_b/src/digests.lotus', s => s.replace('amounts::atLeast(', 'amounts::positive('), 'visibility', 'packages/lib_b/src/digests.lotus', true],
     ['packages/lib_a/src/limits.lotus', s => 'import core::internal::{nonNegative};\n' + s, 'not-exported', 'packages/lib_a/src/limits.lotus', true],
-    ['packages/core/src/amounts.lotus', s => s + '\ncontract Hidden { function f() { require(true); } }\n', 'declaration-only', 'packages/core/src/amounts.lotus', true],
   ];
   for (const [file, change, code, at, relock] of cases) {
     const { dir } = copy();
@@ -156,6 +155,20 @@ test('imports diagnose duplicate names, visibility, missing modules/symbols and 
     await rejects(dir, code, e => e.file === at && e.span !== undefined && /:\d+\.\.\d+: /.test(e.message));
   }
   assert.throws(() => compileContract('import lib::m::{f};\ncontract C { function f() { require(true); } }', { contract: 'C', bindings: {} }), /requires a package build/);
+});
+
+test('a private contract in a library module does not change helper bytecode and is not importable', async () => {
+  const { dir } = copy();
+  const before = (await compilePackage(dir, options)).artifact;
+  edit(dir, 'packages/core/src/amounts.lotus', s => s + '\ncontract Hidden { function f() { require(true); } }\n', true);
+  const after = (await compilePackage(dir, options)).artifact;
+  assert.deepEqual(after.methods.map(m => m.scriptHex), before.methods.map(m => m.scriptHex));
+  assert.equal(after.policy.root, before.policy.root);
+  assert.equal(after.links, undefined);
+  const amounts = id => after.build.modules.find(m => m.id === id);
+  assert.equal(amounts('core@1.0.0/amounts').interfaceDigest, before.build.modules.find(m => m.id === 'core@1.0.0/amounts').interfaceDigest);
+  edit(dir, 'packages/lib_a/src/limits.lotus', s => s.replace('{checkedAdd, atLeast}', '{checkedAdd, atLeast, Hidden}'), true);
+  await rejects(dir, 'visibility', e => e.file === 'packages/lib_a/src/limits.lotus');
 });
 
 test('import cycles report every hop with file spans', async () => {

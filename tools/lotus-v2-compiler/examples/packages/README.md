@@ -28,3 +28,14 @@ builtin-shadowing names, private/package-scoped access, missing module/symbol,
 unknown alias, cycles, lock digest mismatch, `..`/absolute/symlink escapes, case and
 Unicode collisions, undeclared files, limits) are generated from copies of this
 fixture in temporary directories by `test/packages.test.mjs`.
+
+## Linked contracts (CABI-08)
+
+`linked/` is one library, `policy@1.0.0`, and two consumers in `pay@0.1.0`:
+
+```text
+pay@0.1.0 (src/main.lotus: Payer, Receiver)
+└── policy@1.0.0 (escrow: export function authorized, export contract Escrow)
+```
+
+`options.json` compiles `Escrow` (owner `79be…1798`). `Payer` and `Receiver` bind that contract's root, and `Payer` also binds `Escrow.spend`'s leaf. `lotus.lock` is the local tree digest of `packages/policy`. `test/linked-libraries.test.mjs` checks the link record, the one-byte semantic root change, private names, inlined script bytes and the signed Python VM calls.

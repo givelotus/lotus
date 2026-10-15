@@ -17,7 +17,10 @@ export type Stmt = { kind: 'require' | 'if' | 'for' | 'assign'; span: Span; expr
 export type Visibility = 'private' | 'package' | 'export';
 export type Helper = { name: string; params: Param[]; result: ValueType; body: Expr; span: Span; visibility: Visibility };
 export type Method = { name: string; params: Param[]; body: Stmt[]; span: Span };
-export type Contract = { name: string; kind: 'contract' | 'token'; params: Param[]; methods: Method[]; span: Span };
+export type Contract = { name: string; kind: 'contract' | 'token'; params: Param[]; methods: Method[]; span: Span; visibility: Visibility };
+/** Compile-time link to a library contract. Not a VM call. Present only on package artifacts that commit to one. */
+export type LinkedContract = { name: string; kind: 'contract' | 'token'; package: string; module: string; packageDigest: string; root: string;
+  methods: { name: string; leaf: string }[] };
 /** `import TARGET::path::{a, b as c};` or `import TARGET::path as alias;` where TARGET is a dependency alias or `package`. */
 export type ImportDecl = { target: string; targetSpan: Span; path: string[]; pathSpan: Span; span: Span;
   items?: { name: string; local: string; span: Span }[]; moduleAlias?: { name: string; span: Span } };
@@ -30,7 +33,9 @@ export type ContractArtifact = { schema: 'lotus-v2/contract-artifact/2'; target:
   constructor: { name: string; type: ValueType }[]; bindings: { name: string; type: ValueType; value: string | boolean }[];
   methods: MethodArtifact[]; policy: { branches: [string]; paths: [[0]]; root: string; treeRecipe: 'sorted-leaves-largest-power-split-v1' };
   /** Present only for package builds (CABI-07); see packages.ts. */
-  build?: import('./packages.js').BuildGraph };
+  build?: import('./packages.js').BuildGraph;
+  /** Library contracts this artifact commits to (CABI-08). Omitted when empty so single-file artifacts stay unchanged. */
+  links?: LinkedContract[]; }
 export type CompileOptions = { contract: string; bindings: Record<string, Record<string, BoundValue>>; optimize?: boolean };
 
 const MAX_SOURCE = 65536, MAX_SCRIPT = 8192, MAX_OPS = 4096, MAX_EXPANSIONS = 256, MAX_METHODS = 16;
@@ -114,9 +119,8 @@ class Parser {
     else {
       const name = this.ident(); let value = name.text;
       if (this.peek().text === '::') {
-        // Module-alias call `alias::helper(...)`; only meaningful in package builds.
+        // `alias::helper(...)` or a contract reference `alias::Contract` / `alias::Contract.method`.
         this.take('::'); value += '::' + this.ident().text;
-        if (this.peek().text !== '(') this.fatal('E0120', `qualified name ${value} must be called`, name.span);
       }
       while (this.peek().text === '.') { this.take('.'); value += '.' + this.ident().text; }
       if (this.peek().text === '(') {
@@ -198,7 +202,7 @@ class Parser {
       let visibility: Visibility = 'private';
       if (start.text === 'export' || start.text === 'package') {
         visibility = start.text;
-        if (this.peek().text !== 'function') this.fatal('E0114', `${start.text} applies only to helper functions`, start.span);
+        if (!['function', 'contract', 'token'].includes(this.peek().text)) this.fatal('E0114', `${start.text} applies only to a function, contract or token`, start.span);
         const modifier = start; start = this.take(); start = { text: start.text, span: cover(modifier.span, start.span) };
       }
       if (start.text === 'function') {
@@ -217,7 +221,7 @@ class Parser {
           if (methods.length > MAX_METHODS) this.fatal('E0117', 'more than 16 methods', method.span);
         }
         const end = this.take('}'); if (!methods.length || contracts.has(name.text)) this.fatal('E0204', `empty or duplicate contract ${name.text}`, name.span);
-        contracts.set(name.text, { name: name.text, kind:start.text as 'contract'|'token', params, methods, span: cover(start.span, end.span) });
+        contracts.set(name.text, { name: name.text, kind:start.text as 'contract'|'token', params, methods, span: cover(start.span, end.span), visibility });
       } else this.fatal('E0101', 'expected contract or helper', start.span);
     }
     if (requireContract && !contracts.size) this.fatal('E0116', 'source has no contract', this.peek().span);
@@ -753,6 +757,20 @@ class Compiler {
       constructor: c.params.map(p => ({ name:p.name,type:p.type })), bindings: c.params.map(p => ({ name:p.name,...bound.get(p.name)!.binding })),
       methods, policy: { branches: [hex(root.root)], paths: [[0]], root: hex(root.root), treeRecipe: 'sorted-leaves-largest-power-split-v1' } };
   }
+  /** Roots actually compiled for this program, including dependencies of the selected contract. */
+  computedRoots(): { name: string; root: string; methods: { name: string; leaf: string }[] }[] {
+    const out: { name: string; root: string; methods: { name: string; leaf: string }[] }[] = [];
+    for (const [name, tree] of this.rootMemo) {
+      const c = this.contract(name);
+      out.push({ name, root: hex(tree.root), methods: c.methods.map(m => {
+        const compiled = this.methodMemo.get(`${name}.${m.name}`);
+        if (!compiled) this.fatal('E9001', `missing compiled method ${name}.${m.name}`, m.span);
+        return { name: m.name, leaf: hex(compiled.leaf) };
+      }) });
+    }
+    out.sort((a, b) => a.name < b.name ? -1 : a.name > b.name ? 1 : 0);
+    return out;
+  }
 }
 
 function requireOptions(options: CompileOptions, bag: DiagnosticBag): void {
@@ -784,10 +802,12 @@ export function parseModuleSource(source: string, requireContract: boolean, file
   return program;
 }
 /** @internal Package linker entry: compile an already linked program through the promise scheduler. */
-export async function compileLinkedProgramAsync(program: Program, options: CompileOptions, onEvent?: (event: SchedulerEvent) => void, sources?: SourceManager): Promise<ContractArtifact> {
+export async function compileLinkedProgramAsync(program: Program, options: CompileOptions, onEvent?: (event: SchedulerEvent) => void, sources?: SourceManager): Promise<{ artifact: ContractArtifact; roots: { name: string; root: string; methods: { name: string; leaf: string }[] }[] }> {
   const bag = new DiagnosticBag(sources ?? new SourceManager(), '<source>');
   requireOptions(options, bag);
-  return new Compiler(program, options, bag).compileAsync(onEvent);
+  const compiler = new Compiler(program, options, bag);
+  const artifact = await compiler.compileAsync(onEvent);
+  return { artifact, roots: compiler.computedRoots() };
 }
 export async function compileContractWithTrace(source: string, options: CompileOptions, file = '<source>'): Promise<{ artifact: ContractArtifact; trace: SchedulerEvent[] }> {
   const trace: SchedulerEvent[] = [];

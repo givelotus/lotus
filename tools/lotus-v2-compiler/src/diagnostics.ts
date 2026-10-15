@@ -53,7 +53,7 @@ export const DIAGNOSTIC_CODES: Record<string, string> = {
   E0111: 'unsupported statement',
   E0112: 'malformed import',
   E0113: 'import after declarations',
-  E0114: 'visibility modifier on a non-helper',
+  E0114: 'visibility modifier on a non-declaration',
   E0115: 'reserved or invalid binding name',
   E0116: 'source has no contract',
   E0117: 'more than 16 methods',
