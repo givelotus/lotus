@@ -1,6 +1,6 @@
 # Reviewed V2 native primitives — October 14, 2026
 
-This 29-mailbox development series applies to Bitcoin ABC
+This 31-mailbox development series applies to Bitcoin ABC
 `1fb7db17c176cdea8a2c60d887891589382ee4e3`. The source is
 `/tmp/lotus-v2-native-slice-review`, commit `33563a734`, final tree
 `f3fd01ed1d52e21a48dd746e4c1a5a3bb9d2fb5f`. The manifest records every
@@ -120,3 +120,80 @@ python src/lotus_v2/vm_test/differential_cost.py MONOREPO/tools/lotus-v2-referen
 The VM build requires OpenSSL Crypto. The Python interpreter needs the reference
 package's `requirements-vm.txt`; it is an independent test dependency, not a daemon
 runtime dependency. Compiler/native fixture commands are in the compiler README.
+
+## Root review and integration of 029–030 (October 14, 2026)
+
+Two candidates were reviewed against the spec, replayed, rebuilt independently,
+and appended without changing any mailbox byte. The original packets are kept in
+[`../v2-monetary-20261014/`](../v2-monetary-20261014/README.md) and
+[`../v2-vm-context-proofs-20261014/`](../v2-vm-context-proofs-20261014/PROVENANCE.md).
+Applying all 31 mailboxes to ABC `1fb7db17` gives final tree
+`c3925f143830827a7289bf6dead09811983fbaa6`, and 028 still lands on
+`f3fd01ed`. Patch 029 alone lands on the candidate tree `88e74840`. Patch 030
+on 028 lands on `c71e4259`. On 029 it lands on `c3925f14`, which is exactly
+the union of the two reviewed trees, because their files do not overlap.
+
+**029 monetary arithmetic (P05/P06/C16).**
+- *Formula check:* each formula matches the spec. This includes coinbase
+  `overhead_bytes = 134 + 4 + Σ prefix` from `resources-and-parameters.md`,
+  the half-fee split rounded up, the telescoping bootstrap, the clamped tail
+  `isqrt(T²·W/W_prev)` bounded by U384, and the EMA. The
+  spendable-supply-delta identity was checked algebraically.
+- *Boost dependency:* ABC already uses Boost headers (`src/CMakeLists.txt`),
+  and `depends/packages/boost.mk` (1.81) stages the full header tree.
+  `boost/multiprecision/cpp_int.hpp` is header-only, so this adds no new
+  library. For now only the standalone harness locates Boost. Daemon
+  integration must link the existing Boost headers target.
+- *Root tests:* Debug with ASan and UBSan, plus Release, pass CTest and the
+  packet's 300-vector differential. Root also ran an extra differential
+  ([`root_differential.py`](../v2-monetary-20261014/root_differential.py), seed `0x5EED2026`) of 20,000 vectors
+  biased toward accepted cases, including 64-bit reserve and work values:
+  19,396 accepted, 604 rejected, 0 mismatches, in both configurations.
+- *Harness weaknesses (not consensus):* the packet differential compares only
+  `ERR` for 274 of 300 vectors, without checking the rejection reason. Also,
+  `--vectors` reads negative `enforce` values into `uint64_t`.
+- Rule failures are reported by throwing `std::invalid_argument`, so block
+  integration must catch them and map them to validation state.
+
+**030 VM context introspection and Merkle proofs.**
+- *Semantics checked against the P03 table:* c0/c1 framing, ordering and the
+  four algorithms; c8 = 7 (fixed transaction version); cc/cd/ce/cf; d2–d5;
+  d8–dc; e3–e7; e9 exclusive branch (both conditions); ea continuation
+  (spend-only, exact paths and branches with `k` replaced); f0; and the
+  f3/f4 lock checks, including mint rejection for CSV. The prose at
+  `vm-semantics.md` lines 253 and 290 calls OUTPUTCONTINUESBRANCH `cf`. The
+  table and both engines use `ea`; `cf` is CHAINID. This is a spec typo and
+  was left unedited, to avoid changing the pinned P03 digest.
+- *Merkle P05 cost:* steps are `min(cap, floor(bound(proof)/32))`, with a cap
+  of 64 for sorted and 256 for indexed proofs. The proof bound comes from the
+  correct pop position (the second pop) for both opcodes. Tagged nodes are
+  charged as 96-byte BLAKE3 preimages. Actual sizes are branch 16+1+64 = 81
+  bytes and merkleidx 19+1+2+64 = 86 bytes, so this is a safe upper bound.
+  Root probes confirmed a literal selector 0 costs 129 per step and selectors
+  1–3 cost 97 (uniform test schedule). A non-constant selector is charged the
+  maximum of all four step costs (129). The spec says
+  `max(C_blake3, C_hash256)`, which here would be 97 and would under-charge
+  algorithm 0. The implementation is the safer choice, so the spec text should
+  be amended before the freeze. The Python reference `vm_cost.py` has no Merkle
+  step charge, and `differential_cost.py` produces no c0/c1 scripts, so Merkle
+  charges have no independent cost oracle yet.
+- *Authenticated field-size bounds:* the hints in `VmCostProfile.field_sizes`
+  (db/dc/e6/e7) are supplied by the caller. They are only checked to be
+  `≤ max_element_bytes`. Nothing checks them against the transaction, or checks
+  at runtime that a pushed field fits its bound, so an integrator passing
+  smaller-than-actual hints would under-charge. The ordinary validator
+  currently passes no hints and falls back to MAX_ELEMENT_BYTES, which is
+  safe. Path reads (db/e6) ignore a constant index and charge the maximum.
+  That over-charges compared with the P05 table and is a cost divergence to
+  resolve. Before wiring hints into validation, derive them from
+  `VmExecutionContext` or reject hints smaller than the actual field.
+- *Root tests (Debug with ASan and UBSan, plus Release):* CTest passes, and all
+  differentials agree in both configurations: 363 core cases, 900 byte vectors,
+  2,117 arithmetic vectors, 494 P05 charges and 684 Merkle vectors. Coverage is
+  94 push, 12 control, 103 implemented and 6 unsupported opcodes (b0–b4, bd).
+
+**Combined Release run on `c3925f14`:** the vm, ordinary, monetary, signing and
+output CTests all pass. The compiler native token checker verifies the signed
+mint, transfer and the new two-input merge fixture, including all VM
+rejections. These are still module results. No V2 block is parsed, connected
+or accepted, and monetary state is not persisted or undone.

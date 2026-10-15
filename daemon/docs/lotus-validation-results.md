@@ -13,9 +13,9 @@ This file records executed evidence, not planned acceptance. Updated October 14,
 | V1-SYNC | Full clean live-network sync and stalled-state recovery | NOT_RUN | Requires faster hardware and incident evidence |
 | V1-RELEASE | Modern compatible daemon release | NOT_RUN | No validated-v1 commit selected |
 | V2-REFERENCE | Executable consensus/ABI corpus | PARTIAL: Python reference and TypeScript compiler tests, executable signed payment/token fixtures, native differential checks | Full consensus and block conformance remain incomplete; see October 14 evidence below |
-| V2-DAEMON | Payment/block/undo and full feature conformance | PARTIAL: 29 reviewed native module patches replay exactly | Full daemon consensus wiring, block acceptance and persistent undo remain untested |
+| V2-DAEMON | Payment/block/undo and full feature conformance | PARTIAL: 31 reviewed native module patches replay exactly | Full daemon consensus wiring, block acceptance and persistent undo remain untested |
 | V2-PERFORMANCE | Storage, mining, VM, crypto and propagation measurements | NOT_RUN | No nanosecond/throughput/recovery guarantees |
-| V2-MONETARY | Exact recurrence and timestamp-incentive analysis | PARTIAL: executable Python recurrence and accounting tests | Native integration, economic simulation and production parameter acceptance remain outstanding |
+| V2-MONETARY | Exact recurrence and timestamp-incentive analysis | PARTIAL: executable Python recurrence and accounting tests; native patch 029 matches it on 20,300 differential vectors | Native integration, economic simulation and production parameter acceptance remain outstanding |
 
 ## October 14 implementation evidence
 
@@ -30,6 +30,8 @@ Spec/reference correction `7af9277b` passes 44 Python reference tests and the st
 Miner integration `41456528` has exact subtree `ade6e7c5c3a3d6cf13d8d44eeec570d37729bf8d`. Root reran 17 workspace tests, strict Clippy and formatting checks; all three OpenCL device tests passed on Apple M5 Max. The [miner packet](../candidates/v2-miner-20261014/README.md) preserves six ordered mailboxes and replay evidence. P04 CPU/GPU parity and startup rejection are tested; daemon mining jobs, submission and an accepted GPU-mined development block remain outstanding.
 
 The subsequent 29-patch source is `33563a7341b6393bf50246c25ab7acb18c31da5c`, tree `f3fd01ed1d52e21a48dd746e4c1a5a3bb9d2fb5f`. Its added byte/numeric operations pass root's 900 independent byte vectors, 2,117 integer vectors, 363 Python execution comparisons and 494 static-charge comparisons. All 215 assigned bytes are classified; 32 unsupported operations reject. The combined VM and ordinary validator pass fresh strict Release builds/CTest. Ordinary validation tests cover signed compiler mint/transfer, authentication/accounting consistency, locks, fee floors, mint coverage, mandatory paths and atomic rejected application. Outer resource derivation and full block consensus remain separate. The first 26 replay trees are unchanged; all three appended trees also match mailbox replay.
+
+The 31-patch source adds 029 (monetary arithmetic) and 030 (VM context/Merkle proofs), final tree `c3925f143830827a7289bf6dead09811983fbaa6`; exact replay from the ABC base reproduces every recorded tree. Root Debug (ASan/UBSan) and Release runs pass all VM differentials (363/900/2,117/494/684), monetary CTest plus 300 packet and 20,000 root differential vectors, and combined vm/ordinary/monetary/signing/output CTests. The compiler native token checker verifies signed mint, transfer and two-input merge fixtures on this tree. No block is parsed, connected or accepted; see the [review record](../candidates/v2-native-reviewed-20261014/README.md#root-review-and-integration-of-029030-october-14-2026) for open cost-model findings.
 
 The October 9 MODEL-01 hashes below identify that historical run. Current saved fixture digests are maintained in `docs/lotus-v2/examples/candidate-smoke-vectors.json`; do not use the historical hashes as current-file checksums.
 
