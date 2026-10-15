@@ -28,6 +28,13 @@ test('fungible token gallery compiles separate mint/rules trees and a mandatory 
     assert.equal(summary.transactions.transfer.implicitBurnAtoms, '50');
     assert.ok(summary.transactions.mint.wireBytes >= 500);
     assert.ok(summary.transactions.transfer.wireBytes >= 500);
+    assert.deepEqual(summary.transactions.merge.tokenInputs, ['700', '250']);
+    assert.equal(summary.transactions.merge.tokenOutputAtoms, '950');
+    assert.equal(summary.transactions.merge.implicitBurnAtoms, '0');
+    assert.equal(summary.checks.holderRequiresWallet, true);
+    assert.equal(summary.checks.missingWalletPathRejects, true);
+    assert.equal(summary.checks.mergeCombinesTwoInputs, true);
+    assert.equal(summary.checks.mergeBurnsNoSupply, true);
     assert.ok(Object.values(summary.checks).every(Boolean));
     const mint = JSON.parse(readFileSync(join(out, 'FungibleToken.json'), 'utf8'));
     assert.equal(mint.kind, 'token');

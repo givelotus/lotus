@@ -99,22 +99,26 @@ if (existsSync(tokenFixture)) {
       run({ ...tx, wire: tx.wire.replace(issuer.signature, badSignature), txhash: '-', requests: [] },
         'VM invocation rejected: CHECKSIGVERIFY false');
     }
-    if (name === 'transfer') {
+    if (name === 'transfer' || name === 'merge') {
       const tokenOutput = tx.outputs.find(output => output.flags & 1);
-      if (!tokenOutput) throw new Error('transfer token output missing');
-      const intent = { profile: tx.profile, chainId: tx.chainId,
-        dustLimitAtoms: BigInt(tx.dustLimitAtoms), inputs: tx.inputs.map(asInput),
-        outputs: tx.outputs.map(output => asOutput(output === tokenOutput ?
-          { ...output, paths: [[0]] } : output)) };
-      const plan = prepareTransactionCall(intent);
-      const secret = unhex('00'.repeat(31) + '03');
-      const signatures = Object.fromEntries(plan.requests.map(request => [request.key,
-        schnorr.sign(unhex(request.digest), secret, new Uint8Array(32))]));
-      const signed = finalizeTransactionCall(plan, signatures);
-      run({ ...tx, wire: hex(signed.wire), txid: signed.txid, txhash: signed.txhash,
-        requests: plan.requests.map(request => ({ ...request, publicKey: fixture.publicTestKey,
-          argumentIndex: 0, positiveDelta: request.positiveDelta == null ? undefined :
-            request.positiveDelta.toString() })) }, 'VM invocation rejected: VERIFY false');
+      if (!tokenOutput) throw new Error(`${name} token output missing`);
+      const resigned = changed => {
+        const intent = { profile: tx.profile, chainId: tx.chainId,
+          dustLimitAtoms: BigInt(tx.dustLimitAtoms), inputs: tx.inputs.map(asInput),
+          outputs: tx.outputs.map(output => asOutput(output === tokenOutput ? { ...output, ...changed } : output)) };
+        const plan = prepareTransactionCall(intent);
+        const secret = unhex('00'.repeat(31) + '03');
+        const signatures = Object.fromEntries(plan.requests.map(request => [request.key,
+          schnorr.sign(unhex(request.digest), secret, new Uint8Array(32))]));
+        const signed = finalizeTransactionCall(plan, signatures);
+        return { ...tx, wire: hex(signed.wire), txid: signed.txid, txhash: signed.txhash,
+          requests: plan.requests.map(request => ({ ...request, publicKey: fixture.publicTestKey,
+            argumentIndex: 0, positiveDelta: request.positiveDelta == null ? undefined :
+              request.positiveDelta.toString() })) };
+      };
+      run(resigned({ paths: [[0]] }), 'VM invocation rejected: VERIFY false');
+      const rulesRoot = fixture.artifacts.FungibleRules.policy.root;
+      run(resigned({ branches: [rulesRoot], paths: [[0]] }), 'VM invocation rejected: VERIFY false');
     }
     console.log(`${name}: native fixture verified`);
   }

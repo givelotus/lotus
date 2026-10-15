@@ -13,7 +13,7 @@ if (!out) throw new Error('usage: node examples/gallery/run-fungible-token.mjs O
 mkdirSync(out, { recursive: true });
 const source = readFileSync(join(here, 'fungible-token.lotus'), 'utf8');
 const publicKey = 'f9308a019258c31049344f85f89d5229b531c845836f99b08601f113bce036f9';
-const bindings = { TokenWallet: { owner: publicKey }, FungibleToken: { issuer: publicKey } };
+const bindings = { TokenWallet: { owner: publicKey }, FungibleRules: {}, FungibleToken: { issuer: publicKey } };
 const compile = contract => compileContract(source, { contract, bindings });
 const wallet = compile('TokenWallet');
 const rules = compile('FungibleRules');
@@ -49,9 +49,13 @@ const requiresBranch = (output, root) => {
   const index = output.branches.indexOf(root);
   return index !== -1 && output.paths.every(path => path.includes(index));
 };
+const requiresPathBranches = (output, roots) => roots.every(root => requiresBranch(output, root));
 const bypass = { ...holder, paths: [[0], [0, 1]] };
 const explicitBurn = { ...holder, flags: 3, paths: [] };
-if (!requiresBranch(holder, rules.policy.root) || requiresBranch(bypass, rules.policy.root) ||
+const missingWallet = { ...holder, branches: [rules.policy.root], paths: [[0]] };
+if (!requiresPathBranches(holder, [rules.policy.root, wallet.policy.root]) ||
+    requiresBranch(bypass, rules.policy.root) ||
+    requiresPathBranches(missingWallet, [rules.policy.root, wallet.policy.root]) ||
     requiresBranch(explicitBurn, rules.policy.root)) throw new Error('required-path policy check mismatch');
 const fixturePath = join(here, '../../fixtures/fungible-token-v2.json');
 const fixture = existsSync(fixturePath) ? JSON.parse(readFileSync(fixturePath, 'utf8')) : null;
@@ -98,12 +102,17 @@ if (fixture) {
   }
   transactions.mint = replay(fixture.transactions.mint);
   transactions.transfer = replay(fixture.transactions.transfer);
+  transactions.merge = replay(fixture.transactions.merge);
   const id = mint.policy.root;
   if (transactions.mint.plan.tokenDeltas[id] !== 1000n ||
       transactions.transfer.plan.tokenBurns[id] !== 50n ||
       transactions.transfer.intent.inputs[0].prevTxid !== transactions.mint.final.txid ||
       transactions.transfer.intent.inputs[1].prevTxid !== transactions.mint.final.txid)
     throw new Error('token fixture mint, burn or chained outpoint mismatch');
+  if (transactions.merge.intent.inputs.filter(input => input.kind === 'spend' && input.coin.tokenId === id).length !== 2 ||
+      transactions.merge.plan.tokenBurns[id] !== undefined ||
+      transactions.merge.intent.outputs.find(output => output.tokenId === id)?.value !== 950n)
+    throw new Error('token merge did not combine both inputs without burning supply');
   const transfer = transactions.transfer.intent;
   const withoutMint = { ...transfer, outputs: [
     { ...transfer.outputs[0], value: 751n }, transfer.outputs[1], transfer.outputs[2] ] };
@@ -179,21 +188,45 @@ if (vmPackage) {
       { ...item, flags: 3, paths: [] } : item);
     const negatives = { unauthorizedIssuer: runCase(unauthorized),
       bypassPath: runCase(caseFor(transferTx, 0, 1, bypassOutputs)),
+      missingWalletPath: runCase(caseFor(transferTx, 0, 1, transferTx.outputs.map((item, index) => index === 1 ?
+        { ...item, branches: [rules.policy.root], paths: [[0]] } : item))),
       explicitBurnPath: runCase(caseFor(transferTx, 0, 1, burnOutputs)) };
     if (Object.values(negatives).some(result => result.accepted_invocation))
       throw new Error(`token fixture VM negative accepted: ${JSON.stringify(negatives)}`);
     vm.fixture = { checks, negatives };
+    const mergeTx = fixture.transactions.merge;
+    vm.fixture.merge = mergeTx.inputs.flatMap((input, inputIndex) => input.kind === 'mint' ? [] :
+      input.witnesses.map((_, witnessIndex) => runCase(caseFor(mergeTx, inputIndex, witnessIndex))))
+      .map(result => result.accepted_invocation);
+    if (vm.fixture.merge.some(result => !result) || vm.fixture.merge.length !== 5)
+      throw new Error('one or more merge witness invocations failed');
+    const mergeTokenIndex = mergeTx.outputs.findIndex(output => output.tokenId === mint.policy.root);
+    const mergeNegatives = {
+      missingWalletPath: runCase(caseFor(mergeTx, 0, 1, mergeTx.outputs.map((item, index) => index === mergeTokenIndex ?
+        { ...item, branches: [rules.policy.root], paths: [[0]] } : item))),
+      missingRulesPath: runCase(caseFor(mergeTx, 1, 1, mergeTx.outputs.map((item, index) => index === mergeTokenIndex ?
+        { ...item, branches: [wallet.policy.root], paths: [[0]] } : item))) };
+    if (Object.values(mergeNegatives).some(result => result.accepted_invocation))
+      throw new Error(`token merge VM negative accepted: ${JSON.stringify(mergeNegatives)}`);
+    vm.fixture.mergeNegatives = mergeNegatives;
   }
 
 }
 const summary = { schema: 'lotus-v2/fungible-token-gallery/1', target: mint.target,
   trees: { wallet: wallet.policy.root, rules: rules.policy.root, mint: mint.policy.root },
-  holder, examples: { mintAtoms: '1000', transferOutputsAtoms: ['700', '250'], implicitBurnAtoms: '50' },
+  holder, examples: { mintAtoms: '1000', transferOutputsAtoms: ['700', '250'], implicitBurnAtoms: '50',
+    mergeInputsAtoms: ['700', '250'], mergeOutputAtoms: '950' },
   checks: { separateMintTree: true, methodProofs: true, nodeProvidedMintAmount: true,
-    holderRequiresRules: true, bypassPathRejects: true, explicitTokenBurnPathRejects: true },
+    holderRequiresRules: true, holderRequiresWallet: true, missingWalletPathRejects: true,
+    bypassPathRejects: true, explicitTokenBurnPathRejects: true,
+    mergeCombinesTwoInputs: fixture ? true : undefined, mergeBurnsNoSupply: fixture ? true : undefined },
   vm,
   transactions: fixture ? { mint: { txid: fixture.transactions.mint.txid, wireBytes: fixture.transactions.mint.wire.length / 2, feeAtoms: fixture.transactions.mint.feeAtoms, tokenDeltaAtoms: '1000' },
-    transfer: { txid: fixture.transactions.transfer.txid, wireBytes: fixture.transactions.transfer.wire.length / 2, feeAtoms: fixture.transactions.transfer.feeAtoms, implicitBurnAtoms: '50' } } : undefined,
+    transfer: { txid: fixture.transactions.transfer.txid, wireBytes: fixture.transactions.transfer.wire.length / 2, feeAtoms: fixture.transactions.transfer.feeAtoms, implicitBurnAtoms: '50' },
+    merge: { txid: fixture.transactions.merge.txid, wireBytes: fixture.transactions.merge.wire.length / 2, feeAtoms: fixture.transactions.merge.feeAtoms,
+      tokenInputs: fixture.transactions.merge.inputs.filter(input => input.kind === 'spend' && input.coin.tokenId === mint.policy.root).map(input => input.coin.valueAtoms),
+      tokenOutputAtoms: fixture.transactions.merge.outputs.find(output => output.tokenId === mint.policy.root).valueAtoms,
+      implicitBurnAtoms: fixture.transactions.merge.tokenBurns[mint.policy.root] ?? '0' } } : undefined,
   stages: { compile: 'passed', proof: 'passed', transactionFraming: fixture ? 'passed' : 'unavailable', signature: fixture ? 'passed-schnorr' : 'unavailable',
     vm: vm.fixture ? 'passed-invocation-only' : 'unavailable', accounting: fixture ? 'passed-candidate-profile' : 'unavailable', block: 'unavailable' },
 };

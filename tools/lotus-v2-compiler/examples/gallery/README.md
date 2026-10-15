@@ -64,20 +64,29 @@ LOTUS_V2_PYTHON=.venv/bin/python npm test
 ```
 
 The public-only fixture uses BIP340's published test scalar 3 in the local
-generator. It contains a two-input mint followed by a two-input transfer. The
-runner rebuilds both transactions, checks wire bytes, TxID, TxHash, method
-proofs, Schnorr signatures and candidate-profile fee/token arithmetic, then
-executes all five method invocations in the repo-local reference VM. It also
-checks rejection of an unauthorized issuer signature, a bypass path and an
-explicit burn output. The machine-readable result is
+generator. It contains three chained transactions: a two-input mint, a
+two-input transfer, and a three-input merge that spends both transfer token
+outputs (700 + 250 units) plus the native change output into one 950-unit token
+output with no token burn. The runner rebuilds all three transactions, checks
+wire bytes, TxID, TxHash, method proofs, Schnorr signatures and
+candidate-profile fee/token arithmetic, then executes every method invocation
+in the repo-local reference VM: five for mint/transfer and five for the merge
+(wallet and rules on each token input, wallet on the native input). It also
+checks rejection of an unauthorized issuer signature, a bypass path, a token
+output missing the wallet path, and an explicit burn output; for the merge it
+checks that dropping either the wallet or the rules path from the merged output
+is rejected. The machine-readable result is
 `/tmp/lotus-v2-token-gallery/fungible-token-summary.json`. No node, wallet or
-network is used. Native framing/signature checks and charged execution of all five
-invocations can additionally be run with the separately built V2 native checker
-([build instructions](../../README.md)):
+network is used. Native framing/signature checks and charged execution of all
+mint, transfer and merge invocations can additionally be run with the
+separately built V2 native checker ([build instructions](../../README.md)):
 
 ```sh
 node test/run-native-token-fixtures.mjs /path/to/compiler_token_native_check
 ```
+
+The native runner applies the same proof, selector and re-signed
+missing-rules / missing-wallet path rejections to both transfer and merge.
 
 For an artifact-only run without Python, use:
 
@@ -87,17 +96,27 @@ node examples/gallery/run-fungible-token.mjs /tmp/lotus-v2-token-gallery
 ```
 
 `FungibleToken` is a mint-only tree. Its root is the token ID. `FungibleRules`
-is a separate spend tree that checks every output carrying that token ID; its
-root must appear on **every path** of those outputs. A holder output has
+is a separate spend tree that checks every output carrying that token ID.
+Both the `FungibleRules` root and the `TokenWallet` root must appear on
+**every path** of those outputs; the issuer's mint method enforces the same
+two requirements on freshly minted outputs. A holder output has
 `branches=[TokenWallet,FungibleRules]` and `paths=[[0,1]]`, so spending it
 requires both the wallet and rules witnesses. `paths=[[0],[0,1]]` is a valid
-policy shape but violates the token rule, because the first path bypasses it.
+policy shape but violates the token rule, because the first path bypasses the
+rules branch; `branches=[FungibleRules]`, `paths=[[0]]` violates it because no
+wallet signature would be required to spend.
 
-The example mints 1,000 units, then transfers 700 and 250 while implicitly
-burning 50. A token `IS_BURN` output has no paths, so the rules script rejects
-it; the burn is the difference between consumed and created token amounts.
-The issuer can mint again under the same token ID. There is no supply cap or
-allowance state in this example.
+The example mints 1,000 units, transfers 700 and 250 while implicitly burning
+50, then merges the 700- and 250-unit outputs back into one 950-unit output.
+A token `IS_BURN` output has no paths, so the rules script rejects it; the burn
+is the difference between consumed and created token amounts (zero for the
+merge). The issuer can mint again under the same token ID. There is no supply
+cap or allowance state in this example.
+
+The standalone daemon ordinary-validator tests in V2 patch 028 embed an earlier
+copy of this fixture (mint and transfer only, SHA-256
+`8fe8b6fe…a52a431f`, before the wallet-path requirement). Those tests remain
+self-consistent but do not yet cover the merge or the current token roots.
 
 `summary.json` reports compile, proof, transaction framing, signature, VM,
 accounting and block stages separately. The generic Payment method has its own

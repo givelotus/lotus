@@ -56,10 +56,11 @@ cmake --build /tmp/lotus-native-token-vm
 node test/run-native-token-fixtures.mjs /tmp/lotus-native-token-vm/compiler_token_native_check
 ```
 
-This target requires OpenSSL Crypto. It verifies the signed Payment and all five
-mint/transfer witness invocations under an explicit illustrative cost profile.
-Negative probes reach the VM for an unauthorized issuer, a re-signed transfer
-removing mandatory rules, and a mint input's nonexistent coin. These invocation
+This target requires OpenSSL Crypto. It verifies the signed Payment and all ten
+mint/transfer/merge witness invocations under an explicit illustrative cost profile.
+Negative probes reach the VM for an unauthorized issuer, re-signed transfer and
+merge outputs removing the mandatory rules or wallet path, and a mint input's
+nonexistent coin. These invocation
 checks still leave complete transaction, lock, monetary and block validation to
 the daemon integration work.
 

@@ -37,6 +37,18 @@ outputs: [token(700n), token(250n), native(4000n)] };
 const transferPlan = prepareTransactionCall(transferIntent);
 const transferSigs = signatures(transferPlan);
 const transferred = finalizeTransactionCall(transferPlan, transferSigs);
+const mergeIntent = { ...common, inputs: [
+  { kind: 'spend', prevTxid: transferred.txid, prevIndex: 0, sequence: 0xffffffff,
+    coin: token(700n), pathIndex: 0,
+    witnesses: [witness(wallet, 'spend', { signature: null }), witness(rules, 'transfer', {})] },
+  { kind: 'spend', prevTxid: transferred.txid, prevIndex: 1, sequence: 0xffffffff,
+    coin: token(250n), pathIndex: 0,
+    witnesses: [witness(wallet, 'spend', { signature: null }), witness(rules, 'transfer', {})] },
+  nativeSpend(transferred.txid, 2, native(4000n))],
+outputs: [token(950n), native(2500n)] };
+const mergePlan = prepareTransactionCall(mergeIntent);
+const mergeSigs = signatures(mergePlan);
+const merged = finalizeTransactionCall(mergePlan, mergeSigs);
 
 const outputJson = output => ({ flags: output.flags, valueAtoms: output.value.toString(),
   tokenId: output.tokenId ?? null, branches: output.branches, paths: output.paths });
@@ -74,8 +86,12 @@ const fixture = { schema: 'lotus-v2/fungible-token-fixture/1', source, publicTes
   artifacts: { TokenWallet: wallet, FungibleRules: rules, FungibleToken: mint },
   holderPolicy: { branches: [wallet.policy.root, rules.policy.root], paths: [[0, 1]] },
   transactions: { mint: transaction(mintPlan, minted, mintSigs),
-    transfer: transaction(transferPlan, transferred, transferSigs) } };
+    transfer: transaction(transferPlan, transferred, transferSigs),
+    merge: transaction(mergePlan, merged, mergeSigs) } };
 if (fixture.transactions.mint.tokenDeltas[tokenId] !== '1000' ||
-    fixture.transactions.transfer.tokenBurns[tokenId] !== '50') throw new Error('unexpected token accounting');
+    fixture.transactions.transfer.tokenBurns[tokenId] !== '50' ||
+    fixture.transactions.merge.inputs.filter(input => input.kind === 'spend' && input.coin.tokenId === tokenId).length !== 2 ||
+    fixture.transactions.merge.outputs[0].valueAtoms !== '950' ||
+    fixture.transactions.merge.tokenBurns[tokenId] !== undefined) throw new Error('unexpected token accounting or merge');
 const output = process.argv[2] ?? new URL('../fixtures/fungible-token-v2.json', import.meta.url);
 writeFileSync(output, JSON.stringify(fixture, null, 2) + '\n');
