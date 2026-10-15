@@ -1,8 +1,10 @@
 # Daemon component releases
 
-This is reviewable build/release infrastructure. No component release has been
-published through it. Historical `v11.6.0` and `v11.6.1` tags/assets and their
-workflow remain immutable. Namespaced tags do not require a major version bump;
+Namespaced component tags build both supported release targets and publish a
+GitHub Release from those same-run artifacts. A pushed component tag is the
+publication trigger; no component release has yet been published through it.
+Historical `v11.6.0` and `v11.6.1` tags/assets and their workflow remain
+immutable. Namespaced tags do not require a major version bump;
 for example, a future reviewed maintenance candidate can use `lotusd-v11.6.2`.
 Preparing an example version does not schedule or authorize that release.
 
@@ -19,9 +21,9 @@ versions are not bumped to impersonate a newer official upstream release.
 |---|---|---|---|---|
 | `lotusd` | `v1` | Prepared Lotus numeric version | maintained | Existing in-process, ON |
 | `bitcoin-abc` | `ecash` | 0.34.1 | stock | Existing in-process, explicit opt-in |
-| `bchn` | `bchn` | 29.2.1 | stock | Port absent; selection rejected |
-| `doged` | `doged` | 0.4.0 | maintained compatibility/test patches | Existing in-process, explicit opt-in |
-| `bitcoin-core` | `bitcoin` | 32.99.0 | stock | Port absent; selection rejected |
+| `bchn` | `bchn` | 29.2.1 | stock | Optional host candidate exists; release profile is not yet packaged |
+| `doged` | `doged` | 0.4.0 | maintained compatibility/test patches | Existing in-process; release manifest still needs preparation |
+| `bitcoin-core` | `bitcoin` | 32.99.0 | stock | Optional host candidate exists; current stock manifest has Chronik OFF and is refused for publication |
 
 ABC/BCHN/Doged/Core pins currently represent development snapshots, not assertions
 that upstream released those exact commits as stable versions. A future stable
@@ -80,8 +82,9 @@ Chronik does not select mining/chain-limit/NNG/ZeroMQ-removal patches. BCHN NNG
 selects the reviewed existing FlatBuffers compatibility port only with an explicit
 custom profile and experimental opt-in. Its native macOS checks do not establish
 Linux package validation; exact component artifact CI is required for publication.
-BCHN/Core Chronik and Core NNG fail closed;
-that is a temporary implementation boundary, not completion of the BTC Chronik goal.
+BCHN/Core Chronik host adapters exist as separately validated candidates, but
+the release builder does not yet bundle their pinned shared export and host
+profiles. The tag workflow refuses manifests without Chronik enabled.
 
 ## Validation and publication
 
@@ -108,22 +111,32 @@ release notes, actual compiler/tool versions, binary version output and checksum
 Source archives/checksums are deterministic for source identity; binary
 reproducibility, synchronization and host-specific behavior require separate evidence.
 
-After the final reviewed commit reaches `origin/main` and its exact component
-artifact run passes, the separate publication operation verifies canonical origin
-fetch/push URLs, exact clean commit, matching successful manual workflow, matching
-component artifact manifest, and absence of the new tag:
+After the reviewed manifest and all required source changes reach `origin/main`,
+create and push its exact component tag (for example `bitcoin-abc-v0.34.2`). The
+tag workflow verifies manifest/tag identity, confirms the tagged commit is
+reachable from `main`, and refuses a release unless the manifest explicitly
+builds Chronik. It builds/tests Linux x86_64 and macOS arm64, smoke-tests the
+Linux container, checks both same-run artifact sets and checksums, then publishes
+those artifacts, source archive, notes and manifest as one GitHub Release. A
+`workflow_dispatch` run remains artifact-only. Existing tags/releases are never
+overwritten; use a new distributor version for changes. No container registry
+push or production deployment is implied.
 
-```sh
-python3 daemon/scripts/component-release.py --component bitcoin-core \
-  --upstream /path/to/bitcoin --publish --reviewed-commit FULL_SHA \
-  --validation-run RUN_ID
-```
+`component-release.py --publish` remains an optional stricter preflight helper:
+it can require a successful artifact-only run before creating the tag. Direct
+tag pushes use the same build/test gates and publish only after those gates pass.
 
-It creates/pushes one new annotated component tag. Tag CI rebuilds/tests both
-platforms, independently downloads the expected component artifact from the
-recorded validation run and compares its manifest bytes to current main, refuses
-an existing release, and publishes component assets/checksums/notes. Manual runs
-never publish; no container registry push or production deployment is implied.
+## Current tag readiness
+
+The legacy `v*` workflow publishes Lotus V1 binaries with in-process Chronik.
+The component workflow recognizes `lotusd-v*`, `bitcoin-abc-v*`, `bchn-v*`,
+`doged-v*`, and `bitcoin-core-v*`; it publishes only when that exact tag has a
+reviewed manifest on `main` whose final `BUILD_CHRONIK` setting is ON. At this
+revision, Bitcoin ABC has a prepared Chronik manifest. Lotus's namespaced
+manifest and Doged's release manifest still need preparation. BCHN and Bitcoin
+Core host adapters still need their shared Chronik export/profile carried through
+source archives and artifact builds; their current manifests cannot pass the
+Chronik gate. Do not create release tags for those unready profiles.
 
 ## Build-label audit and Guix boundary
 
@@ -164,8 +177,10 @@ The component release builder still materializes only the upstream node source
 and its current release manifest patches. It does not yet bundle the verified
 ABC Chronik export, apply the host mailboxes or pass the provider/profile pins
 through artifact CI. Therefore these profiles are reviewable integration
-candidates, not selectable release features. Keep default release manifests
-stock until source archive, artifact CI and host-specific release evidence are
+candidates, not selectable release features. The publishing workflow rejects a
+tag whose reviewed component manifest does not explicitly enable Chronik. Keep
+default release manifests stock until source archive, artifact CI and host-specific
+release evidence are
 added and pass. No Linux/Windows, mainnet sync, long-running load or reproducible
 binary claim follows from the macOS regtest results.
 
