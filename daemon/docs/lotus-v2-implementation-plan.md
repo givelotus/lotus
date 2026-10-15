@@ -6,13 +6,14 @@ Updated October 15, 2026. Development plan; no genesis parameters are frozen and
 
 ## Source foundation and current status
 
-The current executable [V2 series](../patches/v2/series) contains 126 patches,
-`000`–`125`, on ABC master `1fb7db17c176cdea8a2c60d887891589382ee4e3`.
-[Latest replay evidence](evidence/v2-series-replay-125.json) verifies every
-intermediate tree. The exact clean daemon build and signed Payment pilot recorded
-below establish offline block acceptance, restart, disconnect and reconnect.
-Network activation, global fork selection, resumable reorgs and a usable peer
-network remain incomplete. Development profile adoption is still pending.
+The current executable [V2 series](../patches/v2/series) contains 163 patches,
+`000`–`162`, on ABC master `1fb7db17c176cdea8a2c60d887891589382ee4e3`.
+[Latest replay evidence](evidence/v2-series-replay-162.json) verifies every
+intermediate tree. Offline daemon acceptance, restart, disconnect/reconnect,
+resumable fork recovery, bounded selection and actual two-process TCP full/compact
+synchronization have separate evidence below. The signed local assembler passes
+native tests, but its interactive node command and a usable wallet/mining workflow
+remain unfinished. Development profile adoption and public launch remain pending.
 
 ### Historical source milestones through 069
 
@@ -773,3 +774,57 @@ checks: `/private/tmp/lotus-v2-runtime-cap-test.log`. Replay log:
 The runnable development node command, local block-template production and
 signed-payment propagation remain subsequent gates. No network parameters or
 mainnet defaults are frozen by this integration.
+
+## Native production and two-process development nodes (152–162)
+
+All 163 mailboxes replay with every intermediate tree checked in a new replay
+worktree; final tree `3ca125eace35c7d933320934711d62628ee78675`.
+See [replay evidence](evidence/v2-series-replay-162.json). Mailboxes 000–151 are
+byte-identical, including original binary patch 033. The fresh replay through
+161 was extended by the separately checked test-only 162 commit.
+
+Block preview reuses the transaction evaluator while preserving Stage's leading
+checks and failure-proof authority. Every preview aborts, including Ready. The
+assembler performs two aborted previews: a zero claim quotes existing monetary
+entitlement and mandatory deductions, then the final fixed-width claim computes
+roots and verifies unchanged charge/framing invariants. Supplied signed ordinary
+transactions execute in order. Nonce search keeps the existing 256-attempt and
+nonwrapping limits. Found bytes still require normal full validation.
+
+The runtime facade owns all access to private profiles/storage. Preview leaves
+selector state and epochs unchanged, respects journal/receipt/propagation fences,
+and preserves outputs on Busy/Closed access refusal. Allocation refusal is local;
+storage failure discards cached authority and requires reopen. Signed dependent
+payment tests, exact wire/roots/cost comparisons, raw database preservation,
+nonce limits, stale parents and recovery fences pass in Debug and Release.
+Final test SHA256 `2008c51c18a445dc80aac931ca366210f3e554a183a3c856d3cd7562e72b3b84`;
+Release log `/private/tmp/lotus-v2-assembler-tests-release-test.log`.
+Full-tree `b968c50a8` builds lotusd and passes preview, assembler, runtime and
+dispatcher checks; `eaecdb04b` also passes the final wrapper test extension.
+Logs: `/private/tmp/lotus-v2-runtime-assembly-full-build.log` and
+`/private/tmp/lotus-v2-runtime-assembly-final-check.log`.
+
+The explicit `-lotusv2node MANIFEST HOME NETWORK.json` mode owns isolated V4
+storage, bounded TCP peers, one download manager and a nonblocking JSONL control
+loop. Its entry precedes inherited network initialization. Mainnet parsing,
+chainparams and the 80-byte reader are unchanged. Numeric endpoints, magic and
+profiles are caller supplied. Notice draining, duplicate-download Busy handling,
+serving budgets and transport lifetime fixes were independently reviewed.
+
+Actual node source `cecfdc1ed69c60c72ad5457a0f99c88e8b1e8a01`, binary SHA256
+`167cfe2538a9fccfd7cf3e29a70b769a34ae930c349b62772dec9862058bf1f6`,
+passes two-process testing with a transparent 50 ms TCP delay relay, fresh homes
+and ephemeral loopback ports. Node B synchronizes two full blocks, restarts with
+exact persistent state, rejects a known-invalid body with its exact durable
+causal root, and accepts the next valid signed-payment block through compact
+relay. Reference roots, monetary bytes and coin frames agree; membership and
+nonmembership proofs agree between stores. Checkpoints wait for all recovery
+flags to clear. All three process starts exit zero and cleanup reports no errors.
+See [test protocol and limits](lotus-v2-local-node-check.md) and the
+[recorded run](evidence/v2-two-local-nodes-160.json). Raw artifacts remain at
+`/private/tmp/lotus-v2-two-real-nodes-quiescent-20261015`.
+
+This run uses independently supplied block bytes. Native interactive production,
+wallet submission without competing for the live database lock, and user-facing
+local network setup remain subsequent gates. No public service, frozen issuance,
+mainnet parameters, QUIC or quicksync capability is claimed.
