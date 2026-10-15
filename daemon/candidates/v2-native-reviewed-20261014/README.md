@@ -1,6 +1,6 @@
 # Reviewed V2 native primitives — October 14, 2026
 
-This 31-mailbox development series applies to Bitcoin ABC
+This 32-mailbox development series applies to Bitcoin ABC
 `1fb7db17c176cdea8a2c60d887891589382ee4e3`. The source is
 `/tmp/lotus-v2-native-slice-review`, commit `33563a734`, final tree
 `f3fd01ed1d52e21a48dd746e4c1a5a3bb9d2fb5f`. The manifest records every
@@ -197,3 +197,20 @@ output CTests all pass. The compiler native token checker verifies the signed
 mint, transfer and the new two-input merge fixture, including all VM
 rejections. These are still module results. No V2 block is parsed, connected
 or accepted, and monetary state is not persisted or undone.
+
+**031 root follow-up: authenticated field-size hints.** Root authored this
+patch in response to the 030 finding. When a cost profile and an execution
+context are both present, a non-empty hint is rejected before charging if it
+is smaller than the authenticated field. Complete-output hints need one entry
+per output (e7) or per input (dc), each covering its encoded output or
+resolved coin. Path hints (db/e6) must cover the widest path. Empty hints
+still fall back to MAX_ELEMENT_BYTES, and context-free charging is unchanged.
+New tests cover exact, wider, absent, short and mis-sized hints. A mutation
+that disables the check makes them fail. On tree
+`04b5d3c167ead1b0a1d8187821f72333ac6bded9`, Debug (ASan/UBSan) and Release
+VM core tests pass. The Release differentials (363/494/684/900/2,117), the
+ordinary-validator CTest and the native token mint/transfer/merge fixtures
+also pass. Exact replay of all 32 mailboxes from ABC `1fb7db17` reproduces
+this tree. Still open: path reads ignore a constant index (an over-charge),
+the Merkle cost model has no Python reference, and the spec's
+`max(C_blake3, C_hash256)` text needs a decision.

@@ -1,0 +1,180 @@
+From 4b4a9617545f9baedaefff53c15327302f2689de Mon Sep 17 00:00:00 2001
+From: Shammah Chancellor <shammah.chancellor@notvalid.com>
+Date: Wed, 14 Oct 2026 20:25:12 -0700
+Subject: [PATCH] Validate P05 field-size hints against the authenticated
+ context
+
+Static charging lowers the size bound of path and complete-output reads
+(db, dc, e6, e7) from MAX_ELEMENT_BYTES to caller-supplied field-size
+hints. A hint smaller than the field the instruction actually pushes would
+under-charge every later operation on that value.
+
+When an execution context is present, reject any non-empty hint below the
+authenticated field before charging: complete-output hints need one entry
+per output (e7) or input (dc) and must cover each encoded output/resolved
+coin; path hints must cover the widest path of the transaction outputs or
+resolved coins. Empty hints keep the MAX_ELEMENT_BYTES fallback; f0 keeps
+the running script length. Context-free charging is unchanged.
+
+Tests cover exact, wider and absent hints, short complete-output and path
+hints, and wrong hint counts; a mutation disabling the check fails them.
+---
+ src/lotus_v2/test_vm.cpp | 58 ++++++++++++++++++++++++++++++++++++++++
+ src/lotus_v2/vm.cpp      |  2 ++
+ src/lotus_v2/vm_cost.inc | 52 +++++++++++++++++++++++++++++++++++
+ 3 files changed, 112 insertions(+)
+
+diff --git a/src/lotus_v2/test_vm.cpp b/src/lotus_v2/test_vm.cpp
+index e85db1030..c51ab74e3 100644
+--- a/src/lotus_v2/test_vm.cpp
++++ b/src/lotus_v2/test_vm.cpp
+@@ -634,6 +634,63 @@ void AuthenticatedPayment() {
+                                 mint_context)
+               .status == VmStatus::Invalid);
+ }
++void AuthenticatedFieldSizeHints() {
++    const TxProfile tx_profile{32, 32, 8, 8192, 16, 8192, 64};
++    ChainId chain{};
++    Transaction tx;
++    Input spend;
++    spend.flags = 1;
++    spend.prev_txid.fill(0x55);
++    spend.sequence = UINT32_MAX;
++    spend.witnesses.push_back(BranchWitness{Hex("00e775"), {}, {}});
++    tx.inputs.push_back(spend);
++    Output coin;
++    coin.value = 2000;
++    coin.branches = {BranchLeaf(spend.witnesses[0].script), Hash32{}};
++    coin.branches[1].fill(0x66);
++    coin.paths = {{0}};
++    ResolvedCoins resolved{coin};
++    Output created = coin;
++    created.value = 1000;
++    tx.outputs.push_back(created);
++    VmExecutionContext ctx{tx, tx_profile, chain, resolved, 0, 0, std::nullopt};
++    std::vector<uint8_t> encoded;
++    std::string error;
++    CHECK(EncodeOutput(created, encoded, error));
++    const size_t output_bytes = encoded.size();
++    CHECK(EncodeOutput(coin, encoded, error));
++    const size_t coin_bytes = encoded.size();
++    auto charge = [&](std::map<uint8_t, std::vector<size_t>> hints) {
++        auto schedule = IllustrativeCost();
++        schedule.field_sizes = std::move(hints);
++        const auto &witness = tx.inputs[0].witnesses[0];
++        return EvaluateVmCharged(witness.script, witness.arguments, PROFILE,
++                                 schedule, 0, 0, &ctx);
++    };
++    auto rejected = [&](const VmChargedResult &result, const char *message) {
++        return !result.charged && result.invocation.status == VmStatus::Invalid &&
++               result.invocation.error == message;
++    };
++    const auto none = charge({});
++    const auto exact = charge({{0xe7, {output_bytes}}, {0xdc, {coin_bytes}},
++                               {0xe6, {2}}, {0xdb, {2}}});
++    const auto wider = charge({{0xe7, {output_bytes + 10}}});
++    CHECK(none.charged && exact.charged && wider.charged);
++    CHECK(exact.accounting_cost < wider.accounting_cost &&
++          wider.accounting_cost < none.accounting_cost);
++    CHECK(charge({{0xe7, {}}}).accounting_cost == none.accounting_cost);
++    const char *below = "field-size hint below authenticated field";
++    CHECK(rejected(charge({{0xe7, {output_bytes - 1}}}), below));
++    CHECK(rejected(charge({{0xdc, {coin_bytes - 1}}}), below));
++    CHECK(rejected(charge({{0xe6, {1}}}), below));
++    CHECK(rejected(charge({{0xdb, {1, 1}}}), below));
++    CHECK(rejected(charge({{0xe7, {output_bytes, output_bytes}}}),
++                   "field-size hint count"));
++    // Context-free charging keeps the earlier explicit-hint behavior.
++    auto schedule = IllustrativeCost();
++    schedule.field_sizes = {{0xe7, {1}}};
++    CHECK(EvaluateVmCharged(Hex("00e775"), {}, PROFILE, schedule, 0, 1).charged);
++}
+ } // namespace
+ int main() {
+     FramingAndSuccess();
+@@ -646,5 +703,6 @@ int main() {
+     HashAndBounds();
+     ChargedAccounting();
+     AuthenticatedPayment();
++    AuthenticatedFieldSizeHints();
+     std::cout << "Lotus V2 VM core vectors pass\n";
+ }
+diff --git a/src/lotus_v2/vm.cpp b/src/lotus_v2/vm.cpp
+index 5c2550689..895bb5d6d 100644
+--- a/src/lotus_v2/vm.cpp
++++ b/src/lotus_v2/vm.cpp
+@@ -1125,6 +1125,8 @@ VmResult EvaluateVmImpl(std::span<const uint8_t> script,
+         if (arguments.size() > profile.max_stack_items)
+             throw VmFailure("argument count exceeds stack cap");
+         if (cost_profile) CheckCostProfile(*cost_profile, profile);
++        if (cost_profile && context)
++            CheckFieldSizesAgainstContext(*cost_profile, *context);
+         std::optional<PreparedSigningContext> prepared_signing;
+         if (context) {
+             if (context->input_index >= context->tx.inputs.size())
+diff --git a/src/lotus_v2/vm_cost.inc b/src/lotus_v2/vm_cost.inc
+index eb300f17d..d0f3d3fe3 100644
+--- a/src/lotus_v2/vm_cost.inc
++++ b/src/lotus_v2/vm_cost.inc
+@@ -97,6 +97,58 @@ void CheckCostProfile(const VmCostProfile &cost, const VmProfile &vm_profile) {
+                 throw VmFailure("invalid field-size bound");
+     }
+ }
++// Field-size hints lower static charges below MAX_ELEMENT_BYTES, so they must
++// never be smaller than the field the instruction can actually push. With an
++// execution context, check every non-empty hint against the authenticated
++// transaction outputs and resolved coins before charging. Indexed hints
++// (complete outputs) need one entry per output/input; path hints are used only
++// through their maximum, which must cover every path in the transaction.
++void CheckFieldSizesAgainstContext(const VmCostProfile &cost,
++                                   const VmExecutionContext &ctx) {
++    auto output_size = [](const Output &output) {
++        std::vector<uint8_t> encoded;
++        std::string error;
++        if (!EncodeOutput(output, encoded, error))
++            throw VmFailure("field-size output encoding");
++        return encoded.size();
++    };
++    auto max_path = [](const Output &output) {
++        size_t widest = 0;
++        for (const auto &path : output.paths)
++            widest = std::max(widest, 1 + path.size());
++        return widest;
++    };
++    auto coin = [&](size_t i) -> const Output * {
++        return i < ctx.resolved.size() && ctx.resolved[i] ? &*ctx.resolved[i]
++                                                          : nullptr;
++    };
++    for (const auto &[op, sizes] : cost.field_sizes) {
++        if (sizes.empty() || op == 0xf0) continue; // f0 uses the script length
++        if (op == 0xe7 || op == 0xdc) {
++            const size_t count =
++                op == 0xe7 ? ctx.tx.outputs.size() : ctx.tx.inputs.size();
++            if (sizes.size() != count)
++                throw VmFailure("field-size hint count");
++            for (size_t i = 0; i < count; ++i) {
++                const Output *field =
++                    op == 0xe7 ? &ctx.tx.outputs[i] : coin(i);
++                if (field && sizes[i] < output_size(*field))
++                    throw VmFailure("field-size hint below authenticated field");
++            }
++        } else {
++            size_t actual = 0;
++            if (op == 0xe6)
++                for (const auto &output : ctx.tx.outputs)
++                    actual = std::max(actual, max_path(output));
++            else
++                for (size_t i = 0; i < ctx.tx.inputs.size(); ++i)
++                    if (const Output *field = coin(i))
++                        actual = std::max(actual, max_path(*field));
++            if (*std::max_element(sizes.begin(), sizes.end()) < actual)
++                throw VmFailure("field-size hint below authenticated field");
++        }
++    }
++}
+ std::optional<Int> LiteralValue(const Instruction *previous) {
+     if (!previous) return std::nullopt;
+     const auto op = previous->op;
+-- 
+2.50.1 (Apple Git-155)
+
