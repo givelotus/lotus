@@ -143,3 +143,61 @@ the test inventory. It was preserved separately at
 `/private/tmp/lotus-v2-coverage-build-tool-default-20261015.profraw`; build-generator
 execution is outside application coverage. Build/export commands and each test now
 use coverage-owned working directories. Production checkout status is clean.
+
+## Independent fixture repair review and rerun
+
+The original failed report above is preserved. Four reviewed test-only commits
+`84450021724dcb07ba4b9a799d2d1bcea96bba1d`,
+`0214598f75a5b2a3ec29fd557fc4087428dad580`,
+`f546e4d6967a6d9e444e8deffb65224fb3713914`, and
+`744ee5eca85bec42c96c861f832adef78be24b7d` were applied in the isolated coverage
+clone, producing `7a816b8c655f2999e42af471c1e03d8ea0631761`.
+The resulting diff from the original native pin changes only five test files,
+with 14 added and 3 removed lines. No production source changes, golden fixture
+replacement, weakened assertions, or expected rejection removals were found.
+
+The reorg/dispatcher profiles now explicitly supply the immutable tail 1000000
+and work 2 already represented by their fixtures. Preview derives the synthetic
+parent's absolute tail for work 2 before authenticating its state root; its
+previous literal came from a different anchor. The assembler's separately mined
+toy genesis declares work 2 while retaining its initial state and insufficient
+funding assertions. Transport advertises transaction relay on both sides of the
+mock handshake so the transaction-frame timer test reaches its intended state.
+These changes repair fixture setup rather than alter validation rules.
+
+All five previously failed suites pass under the **same LLVM 23.1.2 instrumented
+Debug build and compiler flags**. Only these five suites were rebuilt and rerun.
+The 31 unchanged suites retain their original passing profiles and per-suite
+source pins; this is not a claim that all 36 were rerun. Actual Ninja compiler
+dependency records confirm that exactly these five targets depend on the edited
+sources/headers. Production source is identical across the two pins. The rerun
+script verifies those constraints before reusing profiles.
+
+| Mapped native coverage | Original run | Fixture repair aggregate | Additional covered |
+|---|---:|---:|---:|
+| Lines | 14996/20381 (73.58%) | 15699/20381 (77.03%) | 703 |
+| Branches | 7521/13440 (55.96%) | 7920/13440 (58.93%) | 399 |
+| Functions | 1284/1508 (85.15%) | 1307/1508 (86.67%) | 23 |
+
+All denominators are unchanged. This is additional execution reached after valid
+fixture initialization, not a production behavior change. The 42 unmapped files,
+wallet execution gaps, real-node integration gaps, and path/MC/DC limitations
+remain. This pin does not include the separate later daemon-startup repair.
+
+Actual repaired JSON, LCOV, HTML, test logs, source/profile provenance, diff report
+and counter comparison are under `evidence/v2-coverage/fixture-repaired/`. Reproduce:
+
+```sh
+python3 tools/lotus-v2-coverage/rerun.py "$NATIVE" "$ORIGINAL_REPORT" "$FRESH_OUTPUT" \
+  --target test_lotus_v2_reorg_recovery \
+  --target test_lotus_v2_peer_dispatcher \
+  --target test_lotus_v2_block_preview \
+  --target test_lotus_v2_block_assembler \
+  --target test_lotus_v2_peer_transport
+```
+
+The repaired export reports 651 missing records, again all CFG hash zero and none
+nonzero. An optional unfiltered diagnostic `llvm-cov export --dump` crashed in
+LLVM's concurrent report output; its crash log is preserved separately. Repeating
+that diagnostic with `--num-threads=1` succeeded and produced the complete warning
+inventory. Normal scoped JSON, LCOV and HTML exports completed successfully.
