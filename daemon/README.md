@@ -5,6 +5,8 @@ This directory builds Lotus V1 mainnet on pinned Bitcoin ABC `8c67fe1e85`. It co
 > **Don't want to compile from source?**
 > Download prebuilt Linux (`x86_64`) and macOS (`arm64`) binaries directly from **[GitHub Releases](https://github.com/givelotus/lotus/releases)**.
 
+For contributors: [adding and updating patches](docs/adding-patches.md).
+
 ---
 
 ## Step-by-Step Build Guide (Copy & Paste)

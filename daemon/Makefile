@@ -18,6 +18,7 @@ help:
 	@echo "  make run   [SERIES=v1|ecash|doged|bchn|bitcoin] ARGS=\"...\"  Run lotusd (sets ulimit -n 65536)"
 	@echo "  make mkpatch NAME=<n>          Export committed HEAD with authorship and rationale"
 	@echo "  make refresh COMMIT=<c>        Rebase onto new base commit or tag"
+	@echo "  Human patch workflow: daemon/docs/adding-patches.md"
 	@echo "  make build FEATURES=chronik,nng-off       Select independent build options"
 	@echo "  make features FEATURES=chronik,zeromq-off Show resolved flags and dependencies"
 	@echo "  make prepare-component COMPONENT=bitcoin-core UPSTREAM=<repo> VERSION=<distributor-x.y.z> CANDIDATE=<new-dir>"

@@ -420,3 +420,7 @@ Upstream Bitcoin ABC's in-process Chronik (`chronik/`) assumes standard 80-byte 
 - Patch only private verified export copies. Focused strict Clippy passes; inherited all-target warning at script/compress.rs:93 reproduces on pristine source and remains qualified. No production data, source pin, publication or tag changes.
 
 - Root independently regenerated all161 BTC codec fixtures byte-identically against the native Core oracle and reran all3 codec integration tests successfully before integration. This adds only an optional codec candidate; Core/BCHN in-process host adapters are being implemented in isolated worktrees with provider gates unchanged. ABC artifact run38660102967 Linux job116179077835 completed native checks, packaging and container smoke successfully; corrected macOS-path matrix38661920638 remains pending.
+
+## Human patch-maintenance entry point (2026-10-14)
+
+- daemon/docs/adding-patches.md is the short contributor workflow linked from daemon/README.md and make help. Use isolated monorepo/source workspaces, one authored commit per patch, explicit candidate manifests for optional features and exact replay/tree checks before native validation. mkpatch currently supports v1/ecash/bchn/doged, not Bitcoin Core or shared-source overlay profile generation. Keep generated V1 release metadata separate and regenerate complete release candidates; document final Chronik overlay commands when the pending adapter tooling is integrated.
