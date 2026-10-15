@@ -111,7 +111,8 @@ python3 daemon/scripts/component-release.py --component bitcoin-core \
 ```
 
 It creates/pushes one new annotated component tag. Tag CI rebuilds/tests both
-platforms, checks the recorded validation run and current main identity, refuses
+platforms, independently downloads the expected component artifact from the
+recorded validation run and compares its manifest bytes to current main, refuses
 an existing release, and publishes component assets/checksums/notes. Manual runs
 never publish; no container registry push or production deployment is implied.
 
@@ -159,3 +160,20 @@ exported sources and lockfile must be included in the offline source archive;
 a remote pin alone is insufficient. `CHRONIK_SOURCE_DIR` and
 `CHRONIK_PROVIDER_MODULE` must then resolve only to those verified local inputs.
 Keep unsupported host profiles closed until their real bridge is validated.
+
+## Component-specific Rust selection
+
+Lotus retains its validated Rust 1.93.0 pin. ABC at `1fb7db17` independently uses
+1.87.0, the minimum required by its
+[CMake Rust helper](https://github.com/Bitcoin-ABC/bitcoin-abc/blob/1fb7db17c176cdea8a2c60d887891589382ee4e3/cmake/modules/RustHelper.cmake).
+The older Cargo workspace MSRV 1.80.0 is not the complete host-build requirement.
+Strict bridge Clippy fails with 21 generated attribute errors on 1.93 and passes
+on 1.87; ABC core's 48 unit and 58 doc tests pass on 1.87. No source bridge
+attributes are rewritten to accommodate a different compiler.
+
+CI installs the selected component toolchain, rather than applying Lotus's pin
+to every daemon. Existing prepared ABC manifests must be regenerated/reviewed;
+source trees and archive hashes stay unchanged when only this toolchain metadata
+changes. The independent extracted 14-crate provider build is separate evidence,
+not a claim that the full native root workspace was checked here. See
+[guard/toolchain evidence](evidence/component-release-guard-rust-20261014.json).

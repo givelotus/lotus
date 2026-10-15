@@ -237,35 +237,61 @@ def materialize(root, upstream, component, destination):
 
 
 def publish(root, component, upstream, reviewed_commit, validation_run):
+    """Publish only the component and bytes validated on the exact main commit."""
     verify(root, upstream, component)
-    manifest = json.loads((path_for(root,component)/'manifest.json').read_text())
+    manifest_path = path_for(root, component) / 'manifest.json'
+    manifest = json.loads(manifest_path.read_text())
+
     def git(*args):
-        return run(['git','-C',str(root),*args]).decode().strip()
-    if not re.fullmatch('[0-9a-f]{40}',reviewed_commit) or git('rev-parse','HEAD')!=reviewed_commit or git('status','--porcelain'):
+        return run(['git', '-C', str(root), *args]).decode().strip()
+
+    if (not re.fullmatch('[0-9a-f]{40}', reviewed_commit)
+            or git('rev-parse', 'HEAD') != reviewed_commit
+            or git('status', '--porcelain')):
         raise ValueError('Publication requires the exact clean reviewed checkout')
-    canonical=re.compile(r'(?:https://github\.com/givelotus/lotus(?:\.git)?|git@github\.com:givelotus/lotus(?:\.git)?|ssh://git@github\.com/givelotus/lotus(?:\.git)?)\Z')
-    for option in ((),('--push',)):
-        urls=git('remote','get-url',*option,'--all','origin').splitlines()
-        if len(urls)!=1 or not canonical.fullmatch(urls[0]):
+
+    canonical = re.compile(
+        r'(?:https://github\.com/givelotus/lotus(?:\.git)?'
+        r'|git@github\.com:givelotus/lotus(?:\.git)?'
+        r'|ssh://git@github\.com/givelotus/lotus(?:\.git)?)\Z'
+    )
+    for option in ((), ('--push',)):
+        urls = git('remote', 'get-url', *option, '--all', 'origin').splitlines()
+        if len(urls) != 1 or not canonical.fullmatch(urls[0]):
             raise ValueError('Publication requires canonical single origin fetch/push URLs')
-    remote_main=git('ls-remote','origin','refs/heads/main').split()
-    if not remote_main or remote_main[0]!=reviewed_commit:
+    remote_main = git('ls-remote', 'origin', 'refs/heads/main').split()
+    if not remote_main or remote_main[0] != reviewed_commit:
         raise ValueError('Exact reviewed commit must be on origin/main')
-    validation=json.loads(run(['gh','run','view',str(validation_run),'--repo','givelotus/lotus','--json','headSha,conclusion,event,workflowName']))
-    if (validation.get('headSha')!=reviewed_commit or validation.get('conclusion')!='success' or
-        validation.get('event')!='workflow_dispatch' or validation.get('workflowName')!=manifest['publication_workflow']):
+
+    validation = json.loads(run([
+        'gh', 'run', 'view', str(validation_run), '--repo', 'givelotus/lotus',
+        '--json', 'headSha,conclusion,event,workflowName',
+    ]))
+    if (validation.get('headSha') != reviewed_commit
+            or validation.get('conclusion') != 'success'
+            or validation.get('event') != 'workflow_dispatch'
+            or validation.get('workflowName') != manifest['publication_workflow']):
         raise ValueError('Require successful component artifact CI for exact commit')
-    # Match the run's recorded component, not another successful component matrix.
-    with tempfile.TemporaryDirectory(prefix='component-validation-') as temp:
-        run(['gh','run','download',str(validation_run),'--repo','givelotus/lotus','--name',component+'-x86_64-linux-gnu','--dir',temp])
-        if json.loads((Path(temp)/'manifest.json').read_text())!=manifest:
+
+    # Another component's successful run at the same commit is insufficient.
+    # Compare the exact bytes, matching the independent tag-workflow guard.
+    with tempfile.TemporaryDirectory(prefix='component-validation-') as temporary:
+        run([
+            'gh', 'run', 'download', str(validation_run), '--repo', 'givelotus/lotus',
+            '--name', component + '-x86_64-linux-gnu', '--dir', temporary,
+        ])
+        if (Path(temporary) / 'manifest.json').read_bytes() != manifest_path.read_bytes():
             raise ValueError('Validation artifacts do not match this exact component manifest')
-    tag=manifest['tag']
-    if git('tag','--list',tag) or git('ls-remote','origin','refs/tags/'+tag):
+
+    tag = manifest['tag']
+    if git('tag', '--list', tag) or git('ls-remote', 'origin', 'refs/tags/' + tag):
         raise ValueError('Existing tags/releases are immutable')
-    git('tag','-a',tag,reviewed_commit,'-m',f'{tag}\nSource tree: {manifest["source_tree"]}\nDistributor patch revision: {manifest["patch_revision"]}\nValidation run: {validation_run}')
-    git('push','--atomic','origin','refs/tags/'+tag)
-    return {'tag':tag,'published_trigger':True}
+    message = (f'{tag}\nSource tree: {manifest["source_tree"]}'
+               f'\nDistributor patch revision: {manifest["patch_revision"]}'
+               f'\nValidation run: {validation_run}')
+    git('tag', '-a', tag, reviewed_commit, '-m', message)
+    git('push', '--atomic', 'origin', 'refs/tags/' + tag)
+    return {'tag': tag, 'published_trigger': True}
 
 
 def main():

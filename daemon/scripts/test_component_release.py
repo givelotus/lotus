@@ -147,7 +147,7 @@ class ComponentTests(unittest.TestCase):
                 if args[:3]==['gh','run','download']:
                     artifact=dict(manifest)
                     if scenario=='wrong-component': artifact['component']='bchn'
-                    (Path(args[-1])/'manifest.json').write_text(json.dumps(artifact))
+                    (Path(args[-1])/'manifest.json').write_bytes((self.root/'daemon/releases/bitcoin-core/manifest.json').read_bytes() if artifact==manifest else json.dumps(artifact).encode())
                     return b''
                 raise AssertionError(str(args))
             with self.subTest(scenario=scenario),patch.object(release,'verify'),patch.object(release,'run',side_effect=fake_run):
