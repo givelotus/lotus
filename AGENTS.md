@@ -394,6 +394,7 @@ Upstream Bitcoin ABC's in-process Chronik (`chronik/`) assumes standard 80-byte 
 - Root reviewed/pushed NNG lint follow-up3584a5d3c after exact affected lint checks, native enabled rebuild and both existing consumer suites passed; final tree736fa9 matches the refreshed single mailbox. Corrected pipeline2948854699 is pending. Full local lint hit a mypy tool-version internal error, so matching CI tools are being prepared; no full-lint success is claimed yet. The old failed pipeline is superseded and its useful logs retained.
 - Integrated source verification still reproduces published11.6.1 tree2f67d967 with no metadata drift. Release/component guard, network, feature, extraction and patch-maintenance tests pass; workflow syntax checks pass. Optional candidates remain outside maintained/default series. Shared Chronik full C++ checks also pass with the host Chronik directory absent.
 
+<<<<<<< HEAD
 - Final generated-header includes use brackets as required by the existing include linter; exact tree `5d16cbdd89cdcef3bd6c34cf220194cf804d9fe8` passes the full mandatory CMake lint target with no skipped checks, native NNG ON / ZeroMQ OFF rebuild, and both consumer suites. Single mailbox replay and both-order ZeroMQ source-removal application remain exact; preserved broader validation is explicitly prior-tree evidence.
 
 ## Final compatible NNG lint and composition evidence (2026-10-14)
@@ -465,3 +466,12 @@ Upstream Bitcoin ABC's in-process Chronik (`chronik/`) assumes standard 80-byte 
 - The pinned Rust listener starts before native observer registration. Reject HTTP broadcast until observer readiness; stop HTTP before native teardown, stop writers and drain callbacks before unregistering/destroying the indexer. Do not replace this lifecycle with later UTXO lookups or transport-only tests.
 - Actual staged macOS builds, disabled-feature absence, ZeroMQ coexistence, fresh existing-chain bootstrap, full-script/raw/header/coin/RPC parity, HTTP broadcast, conflicts, expiry, WS, restart and bind cleanup pass. Full native lint and 16 provider/export checks pass; focused mining/mempool suites pass 14 cases. Preserve separate ABC generalized-provider regression evidence. Mainnet, cross-platform, load, full BCHN C++/Rust suites and unclean-shutdown recovery remain unverified.
 - Upstream global-only transaction WS subscriptions omit block-confirmed messages without grouped subscriptions; explicit txid confirmation and single-stream removal order are tested. Keep that shared-source issue separate from host adaptation. See the profile README/evidence before changing capability claims or enabling defaults.
+=======
+## Component macOS compiler candidate (2026-10-14)
+
+- First artifact-only Core run38660106111 failed macOS configuration because macos-14 selected AppleClang15, which lacks the required aggregate CTAD feature. Exact pinned Core documentation requires Xcode Command Line Tools16.2 or newer; preserve its feature check. Candidate generic component CI uses macos-15 with explicit Xcode16.4, matching the official runner-image inventory (https://github.com/actions/runner-images/blob/main/images/macos/macos-15-arm64-Readme.md). This changes no daemon source or published legacy release workflow. The replacement compiler build remains pending until actual CI passes.
+>>>>>>> 52b530bc (Select Xcode 16.4 for component builds requiring modern C++ features)
+
+## Component macOS compiler candidate (2026-10-14)
+
+- First artifact-only Core run38660106111 failed macOS configuration because macos-14 selected AppleClang15, which lacks the required aggregate CTAD feature. Exact pinned Core documentation requires Xcode Command Line Tools16.2 or newer; preserve its feature check. Candidate generic component CI uses macos-15 with explicit Xcode16.4, matching the official runner-image inventory (https://github.com/actions/runner-images/blob/main/images/macos/macos-15-arm64-Readme.md). This changes no daemon source or published legacy release workflow. The replacement compiler build remains pending until actual CI passes.
