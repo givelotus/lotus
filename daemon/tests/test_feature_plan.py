@@ -55,7 +55,8 @@ class FeatureSelectionTests(unittest.TestCase):
         self.assertEqual([Path(p).name for p in plan["patches"]], ["10-nng-interface.patch"])
         self.assertEqual(plan["cmake_args"], ["-DBUILD_BITCOIN_NNG=ON", "-DBUILD_BITCOIN_ZMQ=ON"])
         self.assertEqual(plan["features"][0]["requires"], [])
-        self.assertIn("not Lotus", plan["features"][0]["warning"])
+        self.assertIn("FlatBuffers", plan["features"][0]["warning"])
+        self.assertIn("separate Tobias legacy RPC", plan["features"][0]["warning"])
 
     def test_bchn_diagnostic_check_is_independent_from_mining(self):
         plan = planner.resolve("bchn", ["mempool-check"], True)

@@ -11,7 +11,7 @@ See [the current audit](../../docs/bchn-current-audit.md).
 | `02-remove-chaintx-limit.patch` | Historical unchecked-container-only test | Not an admission-policy change. BCHN already removed chain limits in 2021. |
 | `03-mempool-cleanup.patch` | Historical comment-only no-op | Never apply. |
 | `04-topological-mempool-check.patch` | Use existing topological index for optional diagnostic checking | Independent exact-tip replay/build/C++ checks pass. Native 512-chain ancestor visits fall from 130,816 to zero; admission policy is unchanged. Select `mempool-check` with experimental opt-in. |
-| `10-nng-interface.patch` | Optional default-OFF NNG raw-payload publisher | Exact-pin independent NNG ON/OFF and ZeroMQ coexistence builds and real subscriber regtests pass; new framing is not Lotus wire compatibility. Select with explicit experimental opt-in. |
+| `10-nng-interface.patch` | Optional default-OFF existing FlatBuffers pub/sub and RPC, with separate original Tobias legacy RPC | Exact-pin native macOS builds and unmodified existing consumer regtests pass; see [compatibility and limits](../../docs/bchn-nng-flatbuffers.md). Select with explicit experimental opt-in. |
 | `11-disable-zeromq.patch` | Default ZeroMQ OFF; source and explicit ON preserved | Independent one-line CMake default change; fresh default-OFF native daemon/CLI build and mining regtest pass. |
 | `12-remove-zeromq.patch` | Delete implementation, dependencies, CLI/RPC/logging/docs/tests | Requires 11 first; no NNG/mining/mempool dependency. Exact application and native validation are documented in [the removal audit](../../docs/bchn-zeromq-removal.md). |
 

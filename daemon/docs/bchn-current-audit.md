@@ -45,11 +45,13 @@ ancestors before and zero afterward, while checking the same 512 entries.
 This does not accelerate normal admission: consistency checking is disabled
 by default. See [the detailed mempool audit](bchn-mempool-complexity-review.md).
 
-Independent default-OFF `10-nng-interface.patch` implements a new raw-payload
-publisher. Native NNG ON/OFF and ZeroMQ coexistence builds, and real subscriber
-regtests pass. It is not wire-compatible with Lotus's FlatBuffers/request-reply
-interface; see [NNG scope](bchn-nng-publisher.md). ZeroMQ is already independently disableable using
-`BUILD_BITCOIN_ZMQ=OFF`; source removal must remain a separate optional change.
+Independent default-OFF `10-nng-interface.patch` now ports the existing evolved
+FlatBuffers pub/sub and request/reply interface, plus a separate original Tobias
+legacy RPC endpoint including submission. The incompatible raw publisher is
+superseded. Native macOS builds and unmodified public consumer/legacy fixture
+checks pass; see [the compatibility matrix and validation limits](bchn-nng-flatbuffers.md).
+ZeroMQ remains independently disableable using `BUILD_BITCOIN_ZMQ=OFF`; source
+removal is a separate optional change.
 Chronik is not present in BCHN and would require a substantial independent port.
 ABC Avalanche-finalization pruning cannot be transplanted into a node without
 that finalization model.

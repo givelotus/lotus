@@ -116,3 +116,12 @@ Doged's variable header representation and generalized first-transaction offset 
 First preserve imported source and its tests through a tree-verified extraction. Then validate the extracted in-process component against existing ABC behavior before adapting other hosts. Each native host adapter needs its own build and isolated bootstrap, mempool graph, reorg, restart consistency, raw/undo/header/TxId parity and token fixtures. Check NNG independently from embedded Chronik, ZeroMQ and policy candidates. Finally validate bounded public-chain synchronization/indexing separately from regtest and from any Avalanche claims.
 
 No current-BCHN Chronik build, sync, indexing or runtime plugin validation was performed in this design audit. The concrete results are source/history/API inspection and the failed legacy clean-application check. No working node, production workspace, chain database, tag or release asset was changed.
+
+### BCHN NNG replacement review (2026-10-14)
+
+The raw-payload publisher discussed in the earlier audit is superseded. It was not
+compatible with existing consumers and is not a suitable indexing bridge.
+[The replacement](bchn-nng-flatbuffers.md) ports the existing public FlatBuffers
+consumer contract and provides original Tobias RPC on a separate optional
+endpoint. Neither this transport nor its passing native checks constitute a
+standalone Chronik port. Original 2021 PUB compatibility is not claimed.

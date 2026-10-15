@@ -60,7 +60,7 @@ Local evidence logs: `/tmp/lotus-ecash-standalone-configure.log`, `/tmp/lotus-ec
 | Feature | ABC / ecash | ABC-derived Dogecoin | BCHN | Bitcoin Core |
 |---|---|---|---|---|
 | Chronik | Existing `BUILD_CHRONIK`; runtime `-chronik=1` | Existing `BUILD_CHRONIK`; Dogecoin consensus/indexing still requires its separate lineage validation | No implemented port here | No implemented port here |
-| NNG | Implemented in Lotus V1 with `BUILD_BITCOIN_NNG`; ecash slot 10 is a placeholder | No implemented local port | Independent default-OFF raw-payload publisher, explicitly experimental and not Lotus wire-compatible | No port |
+| NNG | Implemented in Lotus V1 with `BUILD_BITCOIN_NNG`; ecash slot 10 is a placeholder | No implemented local port | Independent default-OFF maintained Lotus/Rust FlatBuffers port plus explicit original Tobias RPC endpoint; native macOS checked, Linux/Windows pending | No port |
 | Block construction | Corrected ecash 01 uses a custom snapshot/ready heap; native pinned/current checks pass, with no measured speedup claim | Original ecash 01 application was checked; corrected Dogecoin port is not validated here | Current-tip ready-backlog fee-priority fix has native and functional evidence; no speedup claim | Requires a new port/review of current mining interfaces |
 | Transaction chain limits | Existing ABC policy must be assessed as upstream behavior; candidate 02 changes no policy | 02 changes no policy | Limits already removed upstream in 2021; historical 02 changes no policy | No implemented policy change; current cluster/package policy must be evaluated independently |
 | Disable ZeroMQ | `BUILD_ZMQ=OFF` (legacy `BUILD_BITCOIN_ZMQ` alias) | `BUILD_ZMQ=OFF` | `BUILD_BITCOIN_ZMQ=OFF` | `WITH_ZMQ=OFF` |

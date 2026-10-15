@@ -30,11 +30,11 @@ def resolve(target, names, allow_experimental):
     for name in names:
         if target == 'bchn' and name in ('nng', 'nng-off'):
             if not allow_experimental:
-                raise ValueError('BCHN NNG is an experimental new protocol; use --allow-experimental explicitly')
+                raise ValueError('BCHN NNG is an experimental FlatBuffers port; use --allow-experimental explicitly')
             patches.append(str(DAEMON / 'patches' / 'bchn' / '10-nng-interface.patch'))
             flags.append('-DBUILD_BITCOIN_NNG=' + ('OFF' if name.endswith('-off') else 'ON'))
             evidence.append({'feature': name, 'kind': 'experimental-candidate', 'requires': [],
-                             'warning': 'New BCHN raw-payload publisher; not Lotus FlatBuffers/RPC wire compatible'})
+                             'warning': 'Existing Lotus/Rust FlatBuffers data/mining/event contract with separate Tobias legacy RPC; native macOS validation, no standalone Chronik'})
         elif name in ('chronik', 'chronik-off', 'nng', 'nng-off'):
             feature = name.removesuffix('-off')
             flag = TARGETS[target].get(feature)
