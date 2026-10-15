@@ -395,3 +395,8 @@ Upstream Bitcoin ABC's in-process Chronik (`chronik/`) assumes standard 80-byte 
 - Integrated source verification still reproduces published11.6.1 tree2f67d967 with no metadata drift. Release/component guard, network, feature, extraction and patch-maintenance tests pass; workflow syntax checks pass. Optional candidates remain outside maintained/default series. Shared Chronik full C++ checks also pass with the host Chronik directory absent.
 
 - Final generated-header includes use brackets as required by the existing include linter; exact tree `5d16cbdd89cdcef3bd6c34cf220194cf804d9fe8` passes the full mandatory CMake lint target with no skipped checks, native NNG ON / ZeroMQ OFF rebuild, and both consumer suites. Single mailbox replay and both-order ZeroMQ source-removal application remain exact; preserved broader validation is explicitly prior-tree evidence.
+
+## Final compatible NNG lint and composition evidence (2026-10-14)
+
+- Final reviewed source eb7e2f4f7 / tree5d16 passes enabled native rebuild, both existing consumer suites and complete mandatory BCHN check-lint with CI-matching isolated Python tools. Preserve host include style and declaration-only validation hooks; never add lint exemptions or substitute ABC translation APIs. MR2176's corrected pipeline2948875484 is running. GitLab gateway failures before checkout are infrastructure failures, not source compilation results.
+- Current compatible10 plus independent01/04/11/12 passes170 permitted source application orders; all60 complete orders yield tree1c5fdb7c. Ordered source removal requires11 before12. Native combined-feature runtime is separate/pending. Older combined126-suite/raw-publisher results are explicitly historical and do not validate current consumer compatibility.

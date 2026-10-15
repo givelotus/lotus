@@ -10,7 +10,7 @@ Source tree: `5d16cbdd89cdcef3bd6c34cf220194cf804d9fe8`.
 Independent mailbox replay retains that tree. Root submitted the reviewed final
 source as `eb7e2f4f7ae336f6f7b54b08baf6729a212e9f39` to MR2176, with
 byte-identical final tree. Native enabled build, both existing consumer suites and
-the complete mandatory local lint suite pass. New Linux CI remains pending;
+the complete mandatory local lint suite pass. Linux pipeline `2948875484` is running;
 historical raw-protocol CI does not validate this replacement.
 
 
