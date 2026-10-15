@@ -286,8 +286,9 @@ public testnet. The proposed network profile has not been adopted.
 Finish the TCP/compact-block runtime with handshake ordering/timeouts, bounded
 request retention, download scheduling and chain synchronization. Preserve Bitcoin
 parsing and mainnet chainparams. Review the proposed development profile before
-adoption. Exercise signed mature spends and reorgs through the daemon path, then
-complete the compiler transaction/block pilot. QUIC remains a separately reviewed
+adoption. The signed Payment pilot below establishes mature spending and one-block
+undo/reconnect. Extend coverage to fork selection, token/covenant transactions and
+optimizer variants. QUIC remains a separately reviewed
 second networking milestone. No public testnet or mainnet parameter freeze is claimed.
 
 ## Accepted-block cost diagnostics (patch 103)
@@ -308,3 +309,23 @@ accounting/enforcement totals both equal the independent Python value 46,362,
 and rejected submissions expose no accepted costs. Restart/undo/reconnect and
 malformed-input checks retain their prior scope. This enables full signed compiler
 block comparisons without changing schedules or adopting a network profile.
+
+## Signed compiler block pilot and next peer interfaces
+
+Compiler work integrated separately after patch 103 now compiles Payment, funds
+its policy with a coinbase, rejects an immature spend and a changed signature at
+the intended checks, and accepts the signed mature spend at height 3. The fresh
+clean `dca9abe76` daemon and Python reference agree on UTXO/state roots and all
+seven exported charges. Separate-process restarts, undo and reconnect pass.
+See [compiler pilot](../../tools/lotus-v2-compiler/docs/development-chain-pilot.md)
+for exact source, binary hash, commands and evidence. This is offline daemon
+acceptance; wallet operation, transaction relay, fork selection and general
+optimizer equivalence are still open.
+
+The [session review](../../docs/plans/lotus-v2-peering-session-review.md) records
+upstream version suffix behavior and the V2 ordering/capacity boundary. The next
+packet is a socket-free, parameterized handshake session with services zero.
+Serving validated history needs a separate authenticated body retrieval interface;
+legacy service bits cannot substitute for that evidence. Network/profile adoption
+and isolated listening-node tests remain pending, without changing the remaining
+TCP/compact and QUIC milestone scope.
