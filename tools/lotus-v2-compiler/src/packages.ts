@@ -10,6 +10,7 @@
 import { lstatSync, readdirSync, readFileSync, realpathSync, statSync, writeFileSync } from 'node:fs';
 import { join, relative, sep } from 'node:path';
 import { bytes, concat, cs, hex, tagged, type Span } from './compiler.js';
+import { CompileError, SourceManager, diagnostic } from './diagnostics.js';
 import { compileLinkedProgramAsync, parseModuleSource, type CompileOptions, type Contract, type ContractArtifact, type Expr, type Helper,
   type ImportDecl, type Method, type Param, type Program, type SchedulerEvent, type Stmt } from './generic.js';
 import { assertPortableName } from './names.js';
@@ -40,6 +41,18 @@ export class PackageError extends Error {
     super(`${file ? `${file}${span ? `:${span.start}..${span.end}` : ''}: ` : ''}${detail} [${code}]`);
     this.name = 'PackageError';
   }
+}
+
+const PACKAGE_DIAGNOSTIC: Record<PackageErrorCode, string> = {
+  manifest: 'E0901', 'path-escape': 'E0902', 'symlink-escape': 'E0903', 'path-collision': 'E0904', 'undeclared-file': 'E0905',
+  'missing-module': 'E0906', 'lock-missing': 'E0907', 'lock-mismatch': 'E0908', 'lock-stale': 'E0909', 'version-conflict': 'E0910',
+  'package-cycle': 'E0911', parse: 'E0912', 'unknown-alias': 'E0913', 'not-exported': 'E0914', 'missing-symbol': 'E0915',
+  visibility: 'E0916', 'duplicate-name': 'E0917', 'import-cycle': 'E0918', 'declaration-only': 'E0919', limit: 'E0920',
+};
+/** CLI view of a package error. The library still throws `PackageError` with its own code. */
+export function packageCompileError(error: PackageError, sources = new SourceManager()): CompileError {
+  const primary = error.file ? { file: error.file, ...(error.span ? { span: error.span } : {}) } : undefined;
+  return new CompileError([diagnostic(PACKAGE_DIAGNOSTIC[error.code], error.detail, primary)], sources);
 }
 
 export type Manifest = { name: string; version: string; kind: 'library' | 'contract'; source: string; modules: string[]; exports: string[]; entry?: string;
@@ -329,6 +342,7 @@ export async function compilePackage(projectDir: string, options: PackageCompile
   const lockDigest = verifyLock(ws);
   const byId = new Map<string, PackageInfo>([[root.id, root], ...[...ws.packages.values()].map(pkg => [pkg.id, pkg] as const)]);
   const modules = new Map<string, ModuleNode>(); const parses: Record<string, number> = {};
+  const sources = new SourceManager();
   let bindings = 0;
   const load = (pkg: PackageInfo, path: string, from?: { file: string; span: Span }): ModuleNode => {
     const id = `${pkg.id}/${path}`;
@@ -338,8 +352,8 @@ export async function compilePackage(projectDir: string, options: PackageCompile
     const data = pkg.files.find(f => f.path === rel)!;
     const isEntry = pkg.isRoot && path === pkg.manifest.entry;
     let program: Program;
-    try { program = parseModuleSource(decode(data.content, file), isEntry); }
-    catch (error) { throw new PackageError('parse', (error as Error).message, file); }
+    try { program = parseModuleSource(decode(data.content, file), isEntry, file, sources); }
+    catch (error) { if (error instanceof CompileError) throw error; throw new PackageError('parse', (error as Error).message, file); }
     parses[id] = (parses[id] ?? 0) + 1;
     const node: ModuleNode = { id, pkg, path, file, digest: data.digest, program, isEntry, imports: [] };
     modules.set(id, node);
@@ -407,7 +421,7 @@ export async function compilePackage(projectDir: string, options: PackageCompile
       if (decl.moduleAlias) declare(decl.moduleAlias.name, { kind: 'module', target }, decl.moduleAlias.span);
       for (const item of decl.items ?? []) declare(item.local, { kind: 'helper', canonical: access(target, item.name, item.span) }, item.span);
     }
-    const span = (s: Span): Span => ({ start: s.start, end: s.end, module: node.id });
+    const span = (s: Span): Span => ({ start: s.start, end: s.end, module: node.id, ...(s.file !== undefined ? { file: s.file } : {}) });
     const expr = (e: Expr): Expr => {
       let value = e.value;
       if (e.kind === 'call' && value !== undefined && !BUILTINS.has(value) && !value.includes('.')) {
@@ -445,7 +459,7 @@ export async function compilePackage(projectDir: string, options: PackageCompile
       exports: exported.map(x => ({ name: x.name, signature: x.signature, digest: hex(x.digest) })) });
   };
   await scheduler.run(`module:${entry.id}`);
-  const artifact = await compileLinkedProgramAsync({ helpers, contracts, imports: [] }, options, event => trace.push(event));
+  const artifact = await compileLinkedProgramAsync({ helpers, contracts, imports: [] }, options, event => trace.push(event), sources);
   const graph: Omit<BuildGraph, 'digest'> = {
     schema: BUILD_GRAPH_SCHEMA,
     compiler: { name: COMPILER_NAME, version: COMPILER_VERSION, profile: options.optimize === false ? 'unoptimized' : 'optimized' },
