@@ -11,7 +11,7 @@ from hashlib import sha256, sha512
 from types import MappingProxyType
 from typing import Callable, Mapping
 
-from .encoding import DecodeError, Reader, encode_compact_size
+from .encoding import DecodeError, Reader, encode_compact_size, encode_output
 from .vm_context import InvocationContext, requires_branch
 
 
@@ -844,6 +844,67 @@ def evaluate(script: bytes, args: tuple[bytes, ...], profile: VMProfile, *,
                         raise VMError("CHECKSIGVERIFY failed")
                 else:
                     push(number(int(verified)))
+            elif op == 0xbe:
+                push(branch_leaf_hash(pop()))
+            elif op == 0xbf:
+                right, left = pop(), pop()
+                if len(left) != 32 or len(right) != 32:
+                    raise VMError("node children must be h32")
+                from .signing import _branch_node
+                push(_branch_node(left, right))
+            elif op in (0xc0, 0xc1):
+                algorithm = _numeric(pop())
+                proof = pop()
+                key = pop() if op == 0xc1 else None
+                accumulator = pop()
+                if algorithm not in range(4) or len(accumulator) != 32 or len(proof) % 32:
+                    raise VMError("invalid Merkle operands")
+                steps = len(proof) // 32
+                if (op == 0xc0 and steps > 64) or (op == 0xc1 and
+                    (not 1 <= len(key) <= 32 or steps > 8 * len(key))):
+                    raise VMError("Merkle depth/key bound")
+                from .signing import _tagged
+                from blake3 import blake3
+                for step in range(steps):
+                    sibling = proof[32 * step:32 * (step + 1)]
+                    if op == 0xc0:
+                        left, right = sorted((accumulator, sibling), key=lambda b: int.from_bytes(b, "little"))
+                    else:
+                        left, right = ((sibling, accumulator) if (key[step // 8] >> (step % 8)) & 1
+                                       else (accumulator, sibling))
+                    pair = left + right
+                    if algorithm == 0:
+                        accumulator = _tagged("Lotus/v2/branch" if op == 0xc0 else "Lotus/v2/merkleidx",
+                            b"\x01" + (b"" if op == 0xc0 else step.to_bytes(2, "little")) + pair)
+                    elif algorithm == 1:
+                        accumulator = blake3(pair).digest()
+                    else:
+                        accumulator = sha256(pair).digest()
+                        if algorithm == 3:
+                            accumulator = sha256(accumulator).digest()
+                push(accumulator)
+            elif op == 0xc2:
+                mode = _numeric(pop())
+                if signing is None:
+                    raise UnsupportedFeature("SIGHASH requires authenticated context")
+                if mode not in (0, 1, 2) or (mode and signing.invocation_kind != "spend") or (mode == 2 and signing.input_index >= signing.output_count):
+                    raise VMError("invalid signing mode")
+                if mode not in signing.messages:
+                    raise UnsupportedFeature("signing mode message unavailable")
+                push(signing.messages[mode])
+            elif op == 0xc8:
+                context()
+                push(number(7))
+            elif op in (0xcc, 0xcd, 0xce, 0xcf):
+                ctx = context()
+                if ctx.transaction is None:
+                    raise UnsupportedFeature("exact transaction context required")
+                if op == 0xcc:
+                    push(number(ctx.transaction.lock >> 8))
+                elif op == 0xcd:
+                    push(number(ctx.transaction.lock & 255))
+                else:
+                    push(ctx.txid if op == 0xce else ctx.chain_id)
             elif op == 0xc9:
                 push(number(context().input_count))
             elif op == 0xca:
@@ -854,6 +915,32 @@ def evaluate(script: bytes, args: tuple[bytes, ...], profile: VMProfile, *,
                 push(number(context().input_index))
             elif op == 0xd1:
                 push(number(input_view(_numeric(pop())).flags))
+            elif op in (0xd2, 0xd3, 0xd4, 0xd5):
+                index = _numeric(pop())
+                input_view(index)
+                ctx = context()
+                if ctx.transaction is None:
+                    raise UnsupportedFeature("exact input context required")
+                item = ctx.transaction.inputs[index]
+                if op == 0xd5 and item.flags != 1:
+                    raise VMError("path index at nonspend input")
+                push(item.prev_txid if op == 0xd2 else number(
+                    {0xd3: item.prev_index, 0xd4: item.sequence, 0xd5: item.path_index}[op]))
+            elif op in (0xd8, 0xda, 0xe3, 0xe5):
+                item = coin_view(_numeric(pop())) if op < 0xe0 else output_view(_numeric(pop()))
+                push(number(len(item.branches if op in (0xd8, 0xe3) else item.paths)))
+            elif op in (0xd9, 0xdb, 0xe4, 0xe6):
+                subindex, index = _numeric(pop()), _numeric(pop())
+                item = coin_view(index) if op < 0xe0 else output_view(index)
+                collection = item.branches if op in (0xd9, 0xe4) else item.paths
+                if not 0 <= subindex < len(collection):
+                    raise VMError("field index out of range")
+                value = collection[subindex]
+                push(value if op in (0xd9, 0xe4) else encode_compact_size(len(value)) +
+                     b"".join(encode_compact_size(i) for i in value))
+            elif op in (0xdc, 0xe7):
+                item = coin_view(_numeric(pop())) if op == 0xdc else output_view(_numeric(pop()))
+                push(encode_output(item, context().output_profile))
             elif op == 0xd6:
                 push(number(coin_view(_numeric(pop())).value))
             elif op == 0xd7:
@@ -874,6 +961,39 @@ def evaluate(script: bytes, args: tuple[bytes, ...], profile: VMProfile, *,
                 root = pop()
                 output = output_view(_numeric(pop()))
                 push(number(int(requires_branch(output, root))))
+            elif op == 0xe9:
+                root, index = pop(), _numeric(pop())
+                if len(root) != 32:
+                    raise VMError("exclusive root width")
+                item = output_view(index)
+                push(number(int(requires_branch(item, root) and any(
+                    len(path) == 1 and item.branches[path[0]] == root for path in item.paths))))
+            elif op == 0xea:
+                root, index = pop(), _numeric(pop())
+                if len(root) != 32 or context().invocation_kind != "spend":
+                    raise VMError("continuation requires spend and h32")
+                coin = context().coin(context().input_index)
+                item = output_view(index)
+                branches = list(coin.branches)
+                branches[context().selected_branch_index] = root
+                push(number(int(not item.flags & 2 and len(set(branches)) == len(branches)
+                    and item.paths == coin.paths and item.branches == tuple(branches))))
+            elif op == 0xf0:
+                context()
+                push(script)
+            elif op in (0xf3, 0xf4):
+                bound, kind = _numeric(pop()), _numeric(pop())
+                ctx = context()
+                if ctx.transaction is None:
+                    raise UnsupportedFeature("exact transaction context required")
+                if op == 0xf3:
+                    lock = ctx.transaction.lock
+                    if kind not in (1, 2) or not 0 <= bound < 1 << 56 or lock & 255 != kind or lock >> 8 < bound:
+                        raise VMError("absolute lock unsatisfied")
+                else:
+                    item = ctx.transaction.inputs[ctx.input_index]
+                    if item.flags != 1 or kind not in (1, 2) or not 0 <= bound <= 65535 or item.sequence == 0xffffffff or bool(item.sequence & (1 << 22)) != (kind == 2) or item.sequence & 65535 < bound:
+                        raise VMError("relative lock unsatisfied")
             elif op == 0xf1:
                 push(number(1 if context().invocation_kind == "spend" else 3))
             elif op == 0xf2:

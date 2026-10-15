@@ -44,6 +44,9 @@ class InvocationContext:
     selected_path_index: int | None = None
     selected_branch_index: int | None = None
     mint_delta: int | None = None
+    transaction: object | None = None
+    chain_id: bytes | None = None
+    txid: bytes | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.output_profile, OutputProfile):
@@ -144,3 +147,43 @@ def requires_branch(output: Output, root: bytes) -> bool:
     except ValueError:
         return False
     return all(branch_index in path for path in output.paths)
+
+
+def authenticated_context(tx, profile, chain_id: bytes, resolved: tuple,
+                          input_index: int, witness_index: int):
+    """Derive both VM views from exact transaction/coins, checking all proofs.
+
+    The caller resolves coins against its authenticated state. This function
+    authenticates branch membership, and derives messages without trusted
+    digest inputs; contextual height/MTP locks remain an outer obligation.
+    """
+    from .signing import _prepare, identity_digests, signing_message, _branch_leaf
+    from .vm import SigningContext
+    _prepare(tx, profile, chain_id, resolved)
+    active = tx.inputs[input_index]
+    witness = active.witnesses[witness_index]
+    mint = active.flags == 3
+    delta = None
+    if mint:
+        token = active.prev_txid
+        incoming = sum(c.value for c in resolved if c is not None and c.token_id == token)
+        outgoing = sum(c.value for c in tx.outputs if c.token_id == token)
+        delta = outgoing - incoming
+        if not 0 < delta <= (1 << 127) - 1:
+            raise ValueError("mint delta must be positive N")
+    coin = resolved[input_index]
+    branch = None if mint else coin.paths[active.path_index][witness_index]
+    root = active.prev_txid if mint else coin.branches[branch]
+    inputs = tuple(InputView(i.flags, c, i.prev_txid if i.flags == 3 else None)
+                   for i, c in zip(tx.inputs, resolved))
+    invocation = InvocationContext(inputs, tx.outputs, "mint" if mint else "spend",
+        input_index, root, OutputProfile(16, 16, 812, 8192),
+        None if mint else active.path_index, branch, delta, tx, chain_id,
+        identity_digests(tx, profile, chain_id).txid)
+    modes = (0,) if mint else ((0, 1, 2) if input_index < len(tx.outputs) else (0, 1))
+    messages = {mode: signing_message(tx, profile, chain_id, resolved,
+        input_index, witness_index, mode, None if delta is None else delta.to_bytes(16, "little"))
+        for mode in modes}
+    signing = SigningContext(_branch_leaf(witness.script), messages,
+        invocation.invocation_kind, input_index, len(tx.outputs))
+    return invocation, signing

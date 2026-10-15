@@ -126,6 +126,24 @@ def run_invocation(case: dict[str, Any]) -> dict[str, Any]:
         profile = _profile(case["profile"])
         signing = _signing(case.get("signing"))
         invocation = _invocation(case.get("invocation"))
+        if "transaction_context" in case:
+            if signing is not None or invocation is not None:
+                raise ValueError("exact transaction context excludes supplied VM/signing views")
+            from .signing import TxProfile, decode_transaction
+            from .encoding import decode_output
+            from .vm_context import authenticated_context
+            raw = case["transaction_context"]
+            tx_profile = TxProfile(**raw["profile"])
+            tx = decode_transaction(_hex(raw["full_tx"], "full_tx"), tx_profile)
+            chain = _hex(raw["chain_id"], "chain_id")
+            output_profile = OutputProfile(16, 16, 812, 8192)
+            coins = tuple(None if item is None else decode_output(_hex(item, "coin"), output_profile)
+                          for item in raw["coins"])
+            invocation, signing = authenticated_context(tx, tx_profile, chain, coins,
+                raw["input_index"], raw["witness_index"])
+            active = tx.inputs[raw["input_index"]].witnesses[raw["witness_index"]]
+            if script != active.script or args != active.arguments:
+                raise ValueError("script/arguments differ from exact transaction witness")
         input_count = case.get("input_count", invocation.input_count if invocation else None)
         output_count = case.get("output_count", invocation.output_count if invocation else None)
         if any(type(count) is not int or not 0 <= count <= 65535
