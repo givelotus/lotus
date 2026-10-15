@@ -1,4 +1,4 @@
-//! Bounded P04 GPU hashing batches. Network mining remains disabled until V2 jobs exist.
+//! Bounded P04 GPU hashing batches. Network mining stays disabled.
 
 use std::convert::TryInto;
 
