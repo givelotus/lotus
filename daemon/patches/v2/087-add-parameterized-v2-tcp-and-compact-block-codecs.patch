@@ -1,0 +1,1598 @@
+From a4621991b97cd5d28ee9d9ac568b5a33a5fa65a4 Mon Sep 17 00:00:00 2001
+From: Shammah Chancellor <shammah.chancellor@notvalid.com>
+Date: Thu, 15 Oct 2026 09:14:57 -0700
+Subject: [PATCH] Add parameterized V2 TCP and compact-block codecs
+
+Keep all network identities and resource quotas caller supplied. Bound transport parsing, retain full witness-specific TxHash matching, and distinguish malformed messages from full-body fallback and unvalidated reconstruction.
+---
+ src/lotus_v2/peer_codec.cpp                 | 832 ++++++++++++++++++++
+ src/lotus_v2/peer_codec.h                   | 167 ++++
+ src/lotus_v2/peer_codec_test/CMakeLists.txt |  26 +
+ src/lotus_v2/peer_codec_test/README.md      | 100 +++
+ src/lotus_v2/test_peer_codec.cpp            | 421 ++++++++++
+ 5 files changed, 1546 insertions(+)
+ create mode 100644 src/lotus_v2/peer_codec.cpp
+ create mode 100644 src/lotus_v2/peer_codec.h
+ create mode 100644 src/lotus_v2/peer_codec_test/CMakeLists.txt
+ create mode 100644 src/lotus_v2/peer_codec_test/README.md
+ create mode 100644 src/lotus_v2/test_peer_codec.cpp
+
+diff --git a/src/lotus_v2/peer_codec.cpp b/src/lotus_v2/peer_codec.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..2cee73b6a74b1c8a75c982554d771ae9ebfb00cf
+--- /dev/null
++++ b/src/lotus_v2/peer_codec.cpp
+@@ -0,0 +1,832 @@
++// Copyright (c) 2026 The Lotus developers
++#include "peer_codec.h"
++#include "signing.h"
++#include "vendor/blake3/blake3.h"
++#include <algorithm>
++#include <crypto/sha256.h>
++#include <crypto/siphash.h>
++#include <limits>
++#include <set>
++#include <utility>
++namespace lotus::v2::peer {
++namespace {
++    bool Fail(std::string &e, const char *s) {
++        e = s;
++        return false;
++    }
++    bool Success(std::string &e) {
++        e.clear();
++        return true;
++    }
++    void Put(Bytes &b, uint64_t n, unsigned w) {
++        for (unsigned i = 0; i < w; ++i)
++            b.push_back(uint8_t(n >> (8 * i)));
++    }
++    uint64_t Get(const uint8_t *p, unsigned w) {
++        uint64_t n = 0;
++        for (unsigned i = 0; i < w; ++i)
++            n |= uint64_t(p[i]) << (8 * i);
++        return n;
++    }
++    void CS(Bytes &b, uint64_t n) {
++        if (n < 253)
++            Put(b, n, 1);
++        else {
++            unsigned w = n <= 65535 ? 2 : n <= UINT32_MAX ? 4 : 8;
++            Put(b, w == 2 ? 253 : w == 4 ? 254 : 255, 1);
++            Put(b, n, w);
++        }
++    }
++    void HashBytes(Bytes &b, const Hash &h) {
++        b.insert(b.end(), h.begin(), h.end());
++    }
++    class Reader {
++    public:
++        explicit Reader(std::span<const uint8_t> b) : b_(b) {}
++        size_t Left() const { return b_.size() - pos_; }
++        bool Take(size_t n, std::span<const uint8_t> &b) {
++            if (n > Left()) return false;
++            b = b_.subspan(pos_, n);
++            pos_ += n;
++            return true;
++        }
++        bool Int(unsigned w, uint64_t &n) {
++            std::span<const uint8_t> b;
++            if (!Take(w, b)) return false;
++            n = Get(b.data(), w);
++            return true;
++        }
++        bool HashValue(Hash &h) {
++            std::span<const uint8_t> b;
++            if (!Take(32, b)) return false;
++            std::copy(b.begin(), b.end(), h.begin());
++            return true;
++        }
++        bool Compact(uint64_t cap, uint64_t &n) {
++            uint64_t lead;
++            if (!Int(1, lead)) return false;
++            if (lead < 253)
++                n = lead;
++            else {
++                unsigned w = lead == 253 ? 2 : lead == 254 ? 4 : 8;
++                if (!Int(w, n) || n < (w == 2   ? 253ULL
++                                       : w == 4 ? 65536ULL
++                                                : 4294967296ULL))
++                    return false;
++            }
++            return n <= cap;
++        }
++        bool HeaderValue(Header &h) {
++            std::span<const uint8_t> b;
++            return Take(HEADER_SIZE, b) && ParseHeader(b.data(), b.size(), h) &&
++                   h.version == 2;
++        }
++        bool Tx(const TxProfile &p, Transaction &tx) {
++            uint64_t n;
++            std::span<const uint8_t> b;
++            std::string error;
++            return Compact(Left(), n) && n >= 16 && Take(size_t(n), b) &&
++                   DecodeTransaction(Bytes(b.begin(), b.end()), p, tx, error);
++        }
++
++    private:
++        std::span<const uint8_t> b_;
++        size_t pos_ = 0;
++    };
++    bool Limit(uint32_t n) {
++        return n >= 1 && n <= MAX_RECEIVE_LIMIT;
++    }
++    bool Bound(size_t n, uint32_t cap, std::string &e) {
++        return Limit(cap) && n <= cap ? true : Fail(e, "message capacity");
++    }
++    bool Command(std::span<const uint8_t> b, std::string &out) {
++        bool zero = false;
++        std::string s;
++        for (auto c : b) {
++            if (!c)
++                zero = true;
++            else if (zero || c < 0x20 || c > 0x7e)
++                return false;
++            else
++                s.push_back(char(c));
++        }
++        if (s.empty()) return false;
++        out = std::move(s);
++        return true;
++    }
++    uint32_t CommandCap(const std::string &c, uint32_t limit) {
++        uint32_t n = limit;
++        if (c == "v2hello")
++            n = 118;
++        else if (c == "verack" || c == "sendheaders" || c == "sendaddrv2" ||
++                 c == "getaddr")
++            n = 0;
++        else if (c == "ping" || c == "pong")
++            n = 8;
++        else if (c == "sendcmpct")
++            n = 9;
++        else if (c == "headers")
++            n = 3 + 2000 * 135;
++        else if (c == "getheaders" || c == "getblocks")
++            n = 4 + 1 + 101 * 32 + 32;
++        else if (c == "inv" || c == "getdata" || c == "notfound")
++            n = 3 + 50000 * 36;
++        return std::min(limit, n);
++    }
++    Hash Checksum(std::span<const uint8_t> b) {
++        Hash h;
++        CSHA256().Write(b.data(), b.size()).Finalize(h.data());
++        CSHA256().Write(h.data(), h.size()).Finalize(h.data());
++        return h;
++    }
++    bool PutHeader(Bytes &b, const Header &h) {
++        std::array<uint8_t, HEADER_SIZE> raw;
++        if (h.version != 2 || !SerializeHeader(h, raw)) return false;
++        b.insert(b.end(), raw.begin(), raw.end());
++        return true;
++    }
++    bool PutTx(Bytes &b, const Transaction &tx, const TxProfile &p,
++               uint32_t cap, std::string &e) {
++        Bytes raw;
++        if (!EncodeTransaction(tx, p, raw, e)) return false;
++        if (raw.size() > cap || b.size() > cap ||
++            CompactSizeWidth(raw.size()) + raw.size() > cap - b.size())
++            return Fail(e, "transaction capacity");
++        CS(b, raw.size());
++        b.insert(b.end(), raw.begin(), raw.end());
++        return true;
++    }
++    bool CompactShape(const CompactBlock &c, const NetworkProfile &p,
++                      uint32_t &n, std::string &e) {
++        uint64_t count = uint64_t(c.short_ids.size()) + c.prefilled.size();
++        if (!count || count > UINT32_MAX ||
++            count > p.max_reconstruction_transactions ||
++            c.header.version != 2 || c.header.size < HEADER_SIZE + 4 ||
++            count > (c.header.size - HEADER_SIZE - 4) / 17)
++            return Fail(e, "compact transaction quota/size");
++        n = uint32_t(count);
++        if (c.prefilled.empty() || c.prefilled[0].index != 0 ||
++            c.prefilled[0].transaction.inputs.size() != 1 ||
++            c.prefilled[0].transaction.inputs[0].flags != 2)
++            return Fail(e, "coinbase must be prefilled");
++        uint32_t prev = 0;
++        for (size_t i = 0; i < c.prefilled.size(); ++i) {
++            auto idx = c.prefilled[i].index;
++            if (idx >= n || (i && idx <= prev))
++                return Fail(e, "prefilled indices");
++            prev = idx;
++        }
++        for (auto s : c.short_ids)
++            if (s >> 48) return Fail(e, "short ID width");
++        return true;
++    }
++    bool Indices(std::span<const uint32_t> indices, uint32_t total,
++                 std::string &e) {
++        if (indices.empty() || indices.size() > total)
++            return Fail(e, "missing-index count");
++        for (size_t i = 0; i < indices.size(); ++i)
++            if (indices[i] >= total || (i && indices[i] <= indices[i - 1]))
++                return Fail(e, "missing indices");
++        return true;
++    }
++    bool Delta(Reader &r, uint64_t &next, uint32_t total, uint32_t &index) {
++        uint64_t delta;
++        if (!r.Compact(UINT32_MAX, delta) || next > UINT32_MAX ||
++            delta > UINT32_MAX - next)
++            return false;
++        uint64_t absolute = next + delta;
++        if (absolute >= total) return false;
++        index = uint32_t(absolute);
++        next = absolute + 1;
++        return true;
++    }
++} // namespace
++Hash ConsensusProfileDigest(std::span<const uint8_t> parameters) {
++    static constexpr char domain[] = "Lotus/v2/p2p/profile";
++    blake3_hasher h;
++    blake3_hasher_init(&h);
++    blake3_hasher_update(&h, domain, sizeof(domain));
++    blake3_hasher_update(&h, parameters.data(), parameters.size());
++    Hash out;
++    blake3_hasher_finalize(&h, out.data(), out.size());
++    return out;
++}
++bool EncodeHello(const Hello &h, Bytes &out, std::string &e) {
++    if (!Limit(h.receive_limit)) return Fail(e, "hello receive limit");
++    Bytes b;
++    Put(b, h.revision, 2);
++    HashBytes(b, h.chain_id);
++    HashBytes(b, h.genesis_id);
++    HashBytes(b, h.profile_digest);
++    Put(b, h.supported, 8);
++    Put(b, h.required, 8);
++    Put(b, h.receive_limit, 4);
++    out = std::move(b);
++    return Success(e);
++}
++bool DecodeHello(std::span<const uint8_t> b, Hello &out, std::string &e) {
++    if (b.size() != 118) return Fail(e, "hello size");
++    Reader r(b);
++    Hello h;
++    uint64_t n;
++    if (!r.Int(2, n)) return Fail(e, "hello revision");
++    h.revision = uint16_t(n);
++    if (!r.HashValue(h.chain_id) || !r.HashValue(h.genesis_id) ||
++        !r.HashValue(h.profile_digest) || !r.Int(8, h.supported) ||
++        !r.Int(8, h.required) || !r.Int(4, n) || !Limit(uint32_t(n)))
++        return Fail(e, "hello fields");
++    h.receive_limit = uint32_t(n);
++    out = h;
++    return Success(e);
++}
++bool NegotiateHello(const NetworkProfile &p, const Hello &h, uint32_t &active,
++                    std::string &e) {
++    if (h.revision != 1 || h.chain_id != p.chain_id ||
++        h.genesis_id != p.genesis_id || h.profile_digest != p.profile_digest)
++        return Fail(e, "hello network identity/revision");
++    if ((h.supported & MANDATORY_FEATURES) != MANDATORY_FEATURES ||
++        (h.required & MANDATORY_FEATURES) != MANDATORY_FEATURES ||
++        (h.required & ~MANDATORY_FEATURES) || (h.required & ~h.supported))
++        return Fail(e, "hello required features");
++    if (!Limit(h.receive_limit) || !Limit(p.receive_limit))
++        return Fail(e, "hello receive limit");
++    active = std::min(p.receive_limit, h.receive_limit);
++    return Success(e);
++}
++bool EncodeEnvelope(const NetworkProfile &p, uint32_t limit, const Message &m,
++                    Bytes &out, std::string &e) {
++    if (limit > p.receive_limit || !Bound(m.payload.size(), limit, e) ||
++        m.payload.size() > CommandCap(m.command, limit) || m.command.empty() ||
++        m.command.size() > 12)
++        return Fail(e, "envelope bounds");
++    std::array<uint8_t, 12> cmd{};
++    std::copy(m.command.begin(), m.command.end(), cmd.begin());
++    std::string check;
++    if (!Command(cmd, check) || check != m.command)
++        return Fail(e, "envelope command");
++    Bytes b(p.magic.begin(), p.magic.end());
++    b.insert(b.end(), cmd.begin(), cmd.end());
++    Put(b, m.payload.size(), 4);
++    Hash sum = Checksum(m.payload);
++    b.insert(b.end(), sum.begin(), sum.begin() + 4);
++    b.insert(b.end(), m.payload.begin(), m.payload.end());
++    out = std::move(b);
++    return Success(e);
++}
++EnvelopeDecoder::EnvelopeDecoder(const NetworkProfile &p)
++    : profile_(p), limit_(std::min(p.receive_limit, PRE_HELLO_LIMIT)) {}
++void EnvelopeDecoder::Reset() {
++    header_bytes_ = 0;
++    expected_ = 0;
++    pending_ = {};
++    failed_ = false;
++}
++bool EnvelopeDecoder::SetActiveLimit(uint32_t n, std::string &e) {
++    if (header_bytes_ || failed_ || !Limit(n) || n > profile_.receive_limit)
++        return Fail(e, "active limit transition");
++    limit_ = n;
++    return Success(e);
++}
++FeedStatus EnvelopeDecoder::Feed(std::span<const uint8_t> b, size_t &used,
++                                 Message &out, std::string &e) {
++    used = 0;
++    auto invalid = [&](const char *s) {
++        failed_ = true;
++        e = s;
++        pending_ = {};
++        return FeedStatus::InvalidPeerMessage;
++    };
++    if (failed_ || !Limit(limit_)) return invalid("decoder state/profile");
++    if (header_bytes_ < 24) {
++        size_t take = std::min(b.size(), 24 - header_bytes_);
++        std::copy_n(b.begin(), take, header_.begin() + header_bytes_);
++        used += take;
++        header_bytes_ += take;
++        b = b.subspan(take);
++        if (header_bytes_ < 24) {
++            e.clear();
++            return FeedStatus::Incomplete;
++        }
++        if (!std::equal(profile_.magic.begin(), profile_.magic.end(),
++                        header_.begin()))
++            return invalid("network magic");
++        if (!Command(std::span<const uint8_t>(header_).subspan(4, 12),
++                     pending_.command))
++            return invalid("command padding/ASCII");
++        expected_ = uint32_t(Get(header_.data() + 16, 4));
++        if (expected_ > CommandCap(pending_.command, limit_))
++            return invalid("payload limit");
++    }
++    size_t take =
++        std::min(b.size(), size_t(expected_) - pending_.payload.size());
++    pending_.payload.insert(pending_.payload.end(), b.begin(),
++                            b.begin() + take);
++    used += take;
++    if (pending_.payload.size() != expected_) {
++        e.clear();
++        return FeedStatus::Incomplete;
++    }
++    Hash sum = Checksum(pending_.payload);
++    if (!std::equal(sum.begin(), sum.begin() + 4, header_.begin() + 20))
++        return invalid("checksum");
++    out = std::move(pending_);
++    Reset();
++    e.clear();
++    return FeedStatus::MessageReady;
++}
++bool KnownInventoryType(uint32_t t) {
++    return t == 1 || t == 2 || t == 4;
++}
++bool EncodeInventory(std::span<const Inventory> v, uint32_t limit, Bytes &out,
++                     std::string &e) {
++    if (v.size() > 50000 ||
++        !Bound(CompactSizeWidth(v.size()) + 36 * v.size(), limit, e))
++        return Fail(e, "inventory count/capacity");
++    Bytes b;
++    CS(b, v.size());
++    for (const auto &i : v) {
++        Put(b, i.type, 4);
++        HashBytes(b, i.hash);
++    }
++    out = std::move(b);
++    return Success(e);
++}
++bool DecodeInventory(std::span<const uint8_t> b, uint32_t limit,
++                     std::vector<Inventory> &out, std::string &e) {
++    if (!Bound(b.size(), limit, e)) return false;
++    Reader r(b);
++    uint64_t count;
++    if (!r.Compact(50000, count) || count > r.Left() / 36 ||
++        count * 36 != r.Left())
++        return Fail(e, "inventory count/bytes");
++    std::vector<Inventory> v;
++    for (uint64_t i = 0; i < count; ++i) {
++        uint64_t type;
++        Inventory item{};
++        if (!r.Int(4, type) || !r.HashValue(item.hash))
++            return Fail(e, "inventory item");
++        item.type = uint32_t(type);
++        v.push_back(item);
++    }
++    out = std::move(v);
++    return Success(e);
++}
++bool EncodeHeaders(std::span<const Header> v, uint32_t limit, Bytes &out,
++                   std::string &e) {
++    if (v.size() > 2000 ||
++        !Bound(CompactSizeWidth(v.size()) + 135 * v.size(), limit, e))
++        return Fail(e, "headers count/capacity");
++    Bytes b;
++    CS(b, v.size());
++    for (const auto &h : v) {
++        if (!PutHeader(b, h)) return Fail(e, "header structure");
++        b.push_back(0);
++    }
++    out = std::move(b);
++    return Success(e);
++}
++bool DecodeHeaders(std::span<const uint8_t> b, uint32_t limit,
++                   std::vector<Header> &out, std::string &e) {
++    if (!Bound(b.size(), limit, e)) return false;
++    Reader r(b);
++    uint64_t count;
++    if (!r.Compact(2000, count) || count > r.Left() / 135 ||
++        count * 135 != r.Left())
++        return Fail(e, "headers count/bytes");
++    std::vector<Header> v;
++    for (uint64_t i = 0; i < count; ++i) {
++        Header h;
++        uint64_t zero;
++        if (!r.HeaderValue(h) || !r.Int(1, zero) || zero)
++            return Fail(e, "header/sentinel");
++        v.push_back(h);
++    }
++    out = std::move(v);
++    return Success(e);
++}
++bool EncodeLocator(const Locator &v, uint32_t limit, Bytes &out,
++                   std::string &e) {
++    if (v.ids.size() > 101 ||
++        !Bound(4 + CompactSizeWidth(v.ids.size()) + 32 * v.ids.size() + 32,
++               limit, e))
++        return Fail(e, "locator count/capacity");
++    Bytes b;
++    Put(b, uint32_t(v.version), 4);
++    CS(b, v.ids.size());
++    for (const auto &id : v.ids)
++        HashBytes(b, id);
++    HashBytes(b, v.stop);
++    out = std::move(b);
++    return Success(e);
++}
++bool DecodeLocator(std::span<const uint8_t> b, uint32_t limit, Locator &out,
++                   std::string &e) {
++    if (!Bound(b.size(), limit, e)) return false;
++    Reader r(b);
++    uint64_t version, count;
++    if (!r.Int(4, version) || !r.Compact(101, count) || r.Left() < 32 ||
++        count != (r.Left() - 32) / 32 || r.Left() != 32 * (count + 1))
++        return Fail(e, "locator count/bytes");
++    Locator v{};
++    v.version = int32_t(version);
++    for (uint64_t i = 0; i < count; ++i) {
++        Hash h;
++        if (!r.HashValue(h)) return Fail(e, "locator hash");
++        v.ids.push_back(h);
++    }
++    if (!r.HashValue(v.stop)) return Fail(e, "locator stop");
++    out = std::move(v);
++    return Success(e);
++}
++bool EncodeSendCompact(const SendCompact &s, Bytes &out, std::string &e) {
++    Bytes b;
++    Put(b, s.announce, 1);
++    Put(b, s.version, 8);
++    out = std::move(b);
++    return Success(e);
++}
++bool DecodeSendCompact(std::span<const uint8_t> b, SendCompact &out,
++                       std::string &e) {
++    if (b.size() != 9 || b[0] > 1) return Fail(e, "sendcmpct shape");
++    out = {b[0] != 0, Get(b.data() + 1, 8)};
++    return Success(e);
++}
++bool DeriveCompactKeys(const Header &h, uint64_t nonce, CompactKeys &out) {
++    std::array<uint8_t, HEADER_SIZE> raw;
++    if (!SerializeHeader(h, raw)) return false;
++    Bytes n;
++    Put(n, nonce, 8);
++    Hash sum;
++    CSHA256()
++        .Write(raw.data(), raw.size())
++        .Write(n.data(), n.size())
++        .Finalize(sum.data());
++    out = {Get(sum.data(), 8), Get(sum.data() + 8, 8)};
++    return true;
++}
++uint64_t ShortId(const CompactKeys &keys, const Hash &h) {
++    return CSipHasher(keys.k0, keys.k1)
++               .Write(Span<const uint8_t>(h.data(), h.size()))
++               .Finalize() &
++           0xffffffffffffULL;
++}
++bool MakeCompact(const FramedBlock &b, const NetworkProfile &p, uint64_t nonce,
++                 std::span<const uint32_t> indices, CompactBlock &out,
++                 std::string &e) {
++    if (b.transactions.size() > UINT32_MAX ||
++        !Indices(indices, uint32_t(b.transactions.size()), e) ||
++        indices[0] != 0)
++        return Fail(e, "compact prefilled selection");
++    CompactBlock c{b.header, nonce, {}, {}};
++    CompactKeys keys;
++    if (!DeriveCompactKeys(c.header, nonce, keys))
++        return Fail(e, "compact header");
++    size_t j = 0;
++    for (size_t i = 0; i < b.transactions.size(); ++i) {
++        if (j < indices.size() && indices[j] == i) {
++            c.prefilled.push_back({uint32_t(i), b.transactions[i]});
++            ++j;
++        } else {
++            IdentityDigests d;
++            if (!ComputeIdentities(b.transactions[i], p.transaction, p.chain_id,
++                                   d, e))
++                return false;
++            c.short_ids.push_back(ShortId(keys, d.txhash));
++        }
++    }
++    uint32_t n;
++    if (!CompactShape(c, p, n, e)) return false;
++    out = std::move(c);
++    return Success(e);
++}
++bool EncodeCompact(const CompactBlock &c, const NetworkProfile &p,
++                   uint32_t limit, Bytes &out, std::string &e) {
++    uint32_t n;
++    if (!Limit(limit) || !CompactShape(c, p, n, e)) return false;
++    if (c.short_ids.size() > (limit / 6)) return Fail(e, "compact capacity");
++    Bytes b;
++    if (!PutHeader(b, c.header)) return Fail(e, "compact header");
++    Put(b, c.nonce, 8);
++    CS(b, c.short_ids.size());
++    for (auto id : c.short_ids)
++        Put(b, id, 6);
++    CS(b, c.prefilled.size());
++    uint64_t next = 0;
++    for (const auto &v : c.prefilled) {
++        CS(b, v.index - next);
++        next = uint64_t(v.index) + 1;
++        if (!PutTx(b, v.transaction, p.transaction, limit, e)) return false;
++    }
++    if (!Bound(b.size(), limit, e)) return false;
++    out = std::move(b);
++    return Success(e);
++}
++bool DecodeCompact(std::span<const uint8_t> b, const NetworkProfile &p,
++                   uint32_t limit, CompactBlock &out, std::string &e) {
++    if (!Bound(b.size(), limit, e)) return false;
++    Reader r(b);
++    CompactBlock c{};
++    uint64_t count;
++    if (!r.HeaderValue(c.header) || !r.Int(8, c.nonce) ||
++        !r.Compact(p.max_reconstruction_transactions, count) ||
++        count > r.Left() / 6 || c.header.size < HEADER_SIZE + 4 ||
++        count > (c.header.size - HEADER_SIZE - 4) / 17)
++        return Fail(e, "compact header/short count");
++    for (uint64_t i = 0; i < count; ++i) {
++        uint64_t id;
++        if (!r.Int(6, id)) return Fail(e, "short ID");
++        c.short_ids.push_back(id);
++    }
++    uint64_t prefilled;
++    if (!r.Compact(p.max_reconstruction_transactions, prefilled) ||
++        !prefilled || prefilled > r.Left() / 18 ||
++        count + prefilled > UINT32_MAX ||
++        count + prefilled > p.max_reconstruction_transactions ||
++        c.header.size < HEADER_SIZE + 4 ||
++        (count + prefilled) > (c.header.size - HEADER_SIZE - 4) / 17)
++        return Fail(e, "prefilled count/size");
++    uint64_t next = 0;
++    for (uint64_t i = 0; i < prefilled; ++i) {
++        Prefilled v{};
++        if (!Delta(r, next, uint32_t(count + prefilled), v.index) ||
++            !r.Tx(p.transaction, v.transaction))
++            return Fail(e, "prefilled index/transaction");
++        c.prefilled.push_back(std::move(v));
++    }
++    uint32_t n;
++    if (r.Left() || !CompactShape(c, p, n, e))
++        return Fail(e, "compact shape/trailing");
++    out = std::move(c);
++    return Success(e);
++}
++bool EncodeMissingRequest(const MissingRequest &q, uint32_t total,
++                          uint32_t limit, Bytes &out, std::string &e) {
++    if (!Indices(q.indices, total, e)) return false;
++    Bytes b;
++    HashBytes(b, q.block_id);
++    CS(b, q.indices.size());
++    uint64_t next = 0;
++    for (auto idx : q.indices) {
++        CS(b, idx - next);
++        next = uint64_t(idx) + 1;
++    }
++    if (!Bound(b.size(), limit, e)) return false;
++    out = std::move(b);
++    return Success(e);
++}
++bool DecodeMissingRequest(std::span<const uint8_t> b, uint32_t total,
++                          uint32_t max_count, uint32_t limit,
++                          MissingRequest &out, std::string &e) {
++    if (!Bound(b.size(), limit, e)) return false;
++    Reader r(b);
++    MissingRequest q;
++    uint64_t count;
++    if (!r.HashValue(q.block_id) ||
++        !r.Compact(std::min(total, max_count), count) || !count ||
++        count > r.Left())
++        return Fail(e, "missing request count");
++    uint64_t next = 0;
++    for (uint64_t i = 0; i < count; ++i) {
++        uint32_t idx;
++        if (!Delta(r, next, total, idx))
++            return Fail(e, "missing request delta");
++        q.indices.push_back(idx);
++    }
++    if (r.Left()) return Fail(e, "missing request trailing");
++    out = std::move(q);
++    return Success(e);
++}
++bool EncodeMissingResponse(const MissingResponse &q, const NetworkProfile &p,
++                           uint32_t limit, Bytes &out, std::string &e) {
++    if (q.transactions.empty() ||
++        q.transactions.size() > p.max_reconstruction_transactions)
++        return Fail(e, "missing response count");
++    Bytes b;
++    HashBytes(b, q.block_id);
++    CS(b, q.transactions.size());
++    for (const auto &tx : q.transactions)
++        if (!PutTx(b, tx, p.transaction, limit, e)) return false;
++    if (!Bound(b.size(), limit, e)) return false;
++    out = std::move(b);
++    return Success(e);
++}
++bool DecodeMissingResponse(std::span<const uint8_t> b, const NetworkProfile &p,
++                           uint32_t max_count, uint32_t limit,
++                           MissingResponse &out, std::string &e) {
++    if (!Bound(b.size(), limit, e)) return false;
++    Reader r(b);
++    MissingResponse q;
++    uint64_t count;
++    if (!r.HashValue(q.block_id) ||
++        !r.Compact(std::min(max_count, p.max_reconstruction_transactions),
++                   count) ||
++        !count || count > r.Left() / 17)
++        return Fail(e, "missing response count");
++    for (uint64_t i = 0; i < count; ++i) {
++        Transaction tx;
++        if (!r.Tx(p.transaction, tx))
++            return Fail(e, "missing response transaction");
++        q.transactions.push_back(std::move(tx));
++    }
++    if (r.Left()) return Fail(e, "missing response trailing");
++    out = std::move(q);
++    return Success(e);
++}
++std::optional<Hash> UniqueCandidate(std::span<const Hash> v) {
++    if (v.empty()) return std::nullopt;
++    for (const auto &h : v)
++        if (h != v[0]) return std::nullopt;
++    return v[0];
++}
++CompactReconstruction::CompactReconstruction(const NetworkProfile &p)
++    : profile_(p) {}
++void CompactReconstruction::Cancel() {
++    outstanding_ = false;
++    request_ = {};
++    slots_.clear();
++    expected_short_ids_.clear();
++    complete_.reset();
++    compact_ = {};
++    retained_wire_bytes_ = HEADER_SIZE + 4;
++}
++ReconstructionStatus CompactReconstruction::Start(
++    const CompactBlock &c, std::span<const Transaction> cache, std::string &e) {
++    Cancel();
++    uint32_t n;
++    if (c.header.size > profile_.max_reconstruction_bytes ||
++        uint64_t(c.short_ids.size()) + c.prefilled.size() >
++            profile_.max_reconstruction_transactions) {
++        e = "reconstruction byte quota";
++        return ReconstructionStatus::NeedFullBlock;
++    }
++    if (!CompactShape(c, profile_, n, e) ||
++        !DeriveCompactKeys(c.header, c.nonce, keys_))
++        return ReconstructionStatus::InvalidPeerMessage;
++    std::set<uint64_t> seen;
++    for (auto id : c.short_ids)
++        if (!seen.insert(id).second) {
++            e = "duplicate compact short ID";
++            return ReconstructionStatus::NeedFullBlock;
++        }
++    compact_ = c;
++    if (!BlockId(profile_.chain_id, c.header, request_.block_id)) {
++        e = "compact block identity";
++        return ReconstructionStatus::InvalidPeerMessage;
++    }
++    // Local quota bounds slots independent of a peer's claimed block size.
++    slots_.resize(n);
++    expected_short_ids_.resize(n);
++    for (const auto &v : c.prefilled) {
++        Bytes raw;
++        if (!EncodeTransaction(v.transaction, profile_.transaction, raw, e)) {
++            Cancel();
++            return ReconstructionStatus::InvalidPeerMessage;
++        }
++        if (!Store(v.index, v.transaction, e)) {
++            Cancel();
++            return ReconstructionStatus::NeedFullBlock;
++        }
++    }
++    std::map<uint64_t, std::map<Hash, const Transaction *>> matches;
++    // Cache is trusted local input. Store only candidates needed by this block.
++    for (const auto &tx : cache) {
++        IdentityDigests d;
++        if (!ComputeIdentities(tx, profile_.transaction, profile_.chain_id, d,
++                               e)) {
++            Cancel();
++            return ReconstructionStatus::NeedFullBlock;
++        }
++        uint64_t id = ShortId(keys_, d.txhash);
++        if (seen.count(id)) {
++            auto &bucket = matches[id];
++            // Two distinct full hashes suffice to prove ambiguity; never retain
++            // an unbounded number of variants for a colliding short ID.
++            if (bucket.size() < 2) bucket.emplace(d.txhash, &tx);
++        }
++    }
++    size_t j = 0;
++    for (uint32_t i = 0; i < n; ++i)
++        if (!slots_[i]) {
++            uint64_t id = c.short_ids[j++];
++            expected_short_ids_[i] = id;
++            auto found = matches.find(id);
++            std::vector<Hash> hashes;
++            if (found != matches.end())
++                for (const auto &entry : found->second)
++                    hashes.push_back(entry.first);
++            auto unique = UniqueCandidate(hashes);
++            if (unique) {
++                if (!Store(i, *found->second.at(*unique), e)) {
++                    Cancel();
++                    return ReconstructionStatus::NeedFullBlock;
++                }
++            } else
++                request_.indices.push_back(i);
++        }
++    if (!request_.indices.empty()) {
++        outstanding_ = true;
++        e.clear();
++        return ReconstructionStatus::NeedTransactions;
++    }
++    return Finish(e);
++}
++ReconstructionStatus CompactReconstruction::Apply(const MissingResponse &q,
++                                                  std::string &e) {
++    if (!outstanding_ || q.block_id != request_.block_id) {
++        // A late response must not mutate a different active reconstruction.
++        e = "unsolicited/mismatched missing response";
++        return ReconstructionStatus::InvalidPeerMessage;
++    }
++    if (q.transactions.size() != request_.indices.size()) {
++        e = "missing response count";
++        Cancel();
++        return ReconstructionStatus::InvalidPeerMessage;
++    }
++    // Clear the outstanding request on every response, including failures.
++    outstanding_ = false;
++    for (size_t i = 0; i < q.transactions.size(); ++i) {
++        IdentityDigests d;
++        uint32_t idx = request_.indices[i];
++        if (!ComputeIdentities(q.transactions[i], profile_.transaction,
++                               profile_.chain_id, d, e) ||
++            !expected_short_ids_[idx] ||
++            ShortId(keys_, d.txhash) != *expected_short_ids_[idx]) {
++            e = "missing response short ID/transaction";
++            Cancel();
++            return ReconstructionStatus::InvalidPeerMessage;
++        }
++        if (!Store(idx, q.transactions[i], e)) {
++            Cancel();
++            return ReconstructionStatus::NeedFullBlock;
++        }
++    }
++    request_.indices.clear();
++    return Finish(e);
++}
++bool CompactReconstruction::Store(uint32_t index, const Transaction &tx,
++                                  std::string &e) {
++    Bytes raw;
++    if (!EncodeTransaction(tx, profile_.transaction, raw, e)) return false;
++    if (retained_wire_bytes_ > profile_.max_reconstruction_bytes ||
++        raw.size() > profile_.max_reconstruction_bytes - retained_wire_bytes_ ||
++        CompactSizeWidth(raw.size()) > profile_.max_reconstruction_bytes -
++                                           retained_wire_bytes_ - raw.size())
++        return Fail(e, "reconstruction byte quota");
++    retained_wire_bytes_ += raw.size() + CompactSizeWidth(raw.size());
++    slots_[index] = tx;
++    return true;
++}
++ReconstructionStatus CompactReconstruction::Finish(std::string &e) {
++    std::vector<Transaction> txs;
++    txs.reserve(slots_.size());
++    for (auto &v : slots_) {
++        if (!v) {
++            e = "incomplete reconstruction";
++            Cancel();
++            return ReconstructionStatus::NeedFullBlock;
++        }
++        txs.push_back(std::move(*v));
++    }
++    uint64_t total = HEADER_SIZE + 4;
++    for (const auto &tx : txs) {
++        Bytes raw;
++        if (!EncodeTransaction(tx, profile_.transaction, raw, e) ||
++            total > profile_.max_reconstruction_bytes ||
++            raw.size() > profile_.max_reconstruction_bytes - total ||
++            CompactSizeWidth(raw.size()) >
++                profile_.max_reconstruction_bytes - total - raw.size()) {
++            e = "reconstruction byte quota";
++            Cancel();
++            return ReconstructionStatus::NeedFullBlock;
++        }
++        total += raw.size() + CompactSizeWidth(raw.size());
++    }
++    Hash root;
++    Bytes wire;
++    FramedBlock complete;
++    // Root, duplicate core identities and exact complete size are checked
++    // before handing bytes to the common contextual consensus validator.
++    if (!CompleteTransactionRoot(txs, profile_.transaction, profile_.chain_id,
++                                 root, e) ||
++        root != compact_.header.tx_root ||
++        !EncodeBlockWire(compact_.header, txs, profile_.transaction, wire, e) ||
++        !DecodeBlockWire(wire, profile_.transaction, profile_.chain_id,
++                         complete, e)) {
++        if (e.empty()) e = "compact transaction root/size mismatch";
++        Cancel();
++        return ReconstructionStatus::NeedFullBlock;
++    }
++    complete_ = std::move(complete);
++    slots_.clear();
++    expected_short_ids_.clear();
++    request_.indices.clear();
++    e.clear();
++    return ReconstructionStatus::CompleteUnvalidated;
++}
++bool CompactReconstruction::TakeComplete(FramedBlock &out) {
++    if (!complete_) return false;
++    out = std::move(*complete_);
++    complete_.reset();
++    return true;
++}
++} // namespace lotus::v2::peer
+diff --git a/src/lotus_v2/peer_codec.h b/src/lotus_v2/peer_codec.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..909bd01a6e0418415ca192f5fbcc907e92cb3d80
+--- /dev/null
++++ b/src/lotus_v2/peer_codec.h
+@@ -0,0 +1,167 @@
++// Copyright (c) 2026 The Lotus developers
++#ifndef LOTUS_V2_PEER_CODEC_H
++#define LOTUS_V2_PEER_CODEC_H
++#include "block_wire.h"
++#include <map>
++#include <optional>
++#include <span>
++#include <string>
++#include <vector>
++namespace lotus::v2::peer {
++using Bytes = std::vector<uint8_t>;
++constexpr uint64_t MANDATORY_FEATURES = 7;
++constexpr uint32_t MAX_RECEIVE_LIMIT = 16 * 1024 * 1024;
++constexpr uint32_t PRE_HELLO_LIMIT = 2 * 1024 * 1024;
++struct NetworkProfile {
++    std::array<uint8_t, 4> magic;
++    ChainId chain_id;
++    Hash genesis_id;
++    Hash profile_digest;
++    uint32_t receive_limit;
++    TxProfile transaction;
++    // Local resource quota, independent of consensus and peer header.size.
++    uint32_t max_reconstruction_transactions;
++    uint64_t max_reconstruction_bytes;
++};
++Hash ConsensusProfileDigest(std::span<const uint8_t> canonical_parameters);
++struct Hello {
++    uint16_t revision = 1;
++    ChainId chain_id{};
++    Hash genesis_id{}, profile_digest{};
++    uint64_t supported = MANDATORY_FEATURES, required = MANDATORY_FEATURES;
++    uint32_t receive_limit = 0;
++};
++bool EncodeHello(const Hello &, Bytes &, std::string &);
++bool DecodeHello(std::span<const uint8_t>, Hello &, std::string &);
++bool NegotiateHello(const NetworkProfile &, const Hello &,
++                    uint32_t &active_limit, std::string &);
++struct Message {
++    std::string command;
++    Bytes payload;
++};
++bool EncodeEnvelope(const NetworkProfile &, uint32_t active_limit,
++                    const Message &, Bytes &, std::string &);
++enum class FeedStatus { Incomplete, MessageReady, InvalidPeerMessage };
++// One message per call. Caller retains input.subspan(consumed). Header checks
++// precede payload allocation. Errors are terminal until Reset().
++class EnvelopeDecoder {
++public:
++    explicit EnvelopeDecoder(const NetworkProfile &);
++    bool SetActiveLimit(uint32_t, std::string &); // only between messages
++    FeedStatus Feed(std::span<const uint8_t>, size_t &consumed, Message &,
++                    std::string &);
++    void Reset();
++
++private:
++    NetworkProfile profile_;
++    uint32_t limit_;
++    std::array<uint8_t, 24> header_{};
++    size_t header_bytes_ = 0;
++    uint32_t expected_ = 0;
++    Message pending_;
++    bool failed_ = false;
++};
++struct Inventory {
++    uint32_t type;
++    Hash hash;
++}; // 1=TxHash, 2/4=BlockID
++bool EncodeInventory(std::span<const Inventory>, uint32_t limit, Bytes &,
++                     std::string &);
++bool DecodeInventory(std::span<const uint8_t>, uint32_t limit,
++                     std::vector<Inventory> &, std::string &);
++bool KnownInventoryType(uint32_t);
++bool EncodeHeaders(std::span<const Header>, uint32_t limit, Bytes &,
++                   std::string &);
++bool DecodeHeaders(std::span<const uint8_t>, uint32_t limit,
++                   std::vector<Header> &, std::string &);
++struct Locator {
++    int32_t version;
++    std::vector<Hash> ids;
++    Hash stop{};
++};
++bool EncodeLocator(const Locator &, uint32_t limit, Bytes &, std::string &);
++bool DecodeLocator(std::span<const uint8_t>, uint32_t limit, Locator &,
++                   std::string &);
++struct SendCompact {
++    bool announce;
++    uint64_t version;
++};
++bool EncodeSendCompact(const SendCompact &, Bytes &, std::string &);
++bool DecodeSendCompact(std::span<const uint8_t>, SendCompact &, std::string &);
++struct Prefilled {
++    uint32_t index;
++    Transaction transaction;
++};
++struct CompactBlock {
++    Header header;
++    uint64_t nonce;
++    std::vector<uint64_t> short_ids;
++    std::vector<Prefilled> prefilled;
++};
++struct CompactKeys {
++    uint64_t k0, k1;
++};
++bool DeriveCompactKeys(const Header &, uint64_t nonce, CompactKeys &);
++uint64_t ShortId(const CompactKeys &, const Hash &tx_hash);
++bool MakeCompact(const FramedBlock &, const NetworkProfile &, uint64_t nonce,
++                 std::span<const uint32_t> prefilled_indices, CompactBlock &,
++                 std::string &);
++bool EncodeCompact(const CompactBlock &, const NetworkProfile &, uint32_t limit,
++                   Bytes &, std::string &);
++bool DecodeCompact(std::span<const uint8_t>, const NetworkProfile &,
++                   uint32_t limit, CompactBlock &, std::string &);
++struct MissingRequest {
++    Hash block_id;
++    std::vector<uint32_t> indices;
++};
++struct MissingResponse {
++    Hash block_id;
++    std::vector<Transaction> transactions;
++};
++bool EncodeMissingRequest(const MissingRequest &, uint32_t total_transactions,
++                          uint32_t limit, Bytes &, std::string &);
++bool DecodeMissingRequest(std::span<const uint8_t>, uint32_t total_transactions,
++                          uint32_t max_count, uint32_t limit, MissingRequest &,
++                          std::string &);
++bool EncodeMissingResponse(const MissingResponse &, const NetworkProfile &,
++                           uint32_t limit, Bytes &, std::string &);
++bool DecodeMissingResponse(std::span<const uint8_t>, const NetworkProfile &,
++                           uint32_t max_count, uint32_t limit,
++                           MissingResponse &, std::string &);
++// Pure ambiguity policy: repeat sightings of one full hash are not ambiguity;
++// distinct full hashes sharing a short ID are. Never resolves by TxID.
++std::optional<Hash> UniqueCandidate(std::span<const Hash> full_hashes);
++enum class ReconstructionStatus {
++    InvalidPeerMessage,
++    NeedTransactions,
++    NeedFullBlock,
++    CompleteUnvalidated
++};
++// Caller supplies validated, complete cached transactions, reserves quotas and
++// checks contextual header/PoW eligibility before Start(). No consensus-invalid
++// verdict is returned. A failed root/size always requests a full body.
++class CompactReconstruction {
++public:
++    explicit CompactReconstruction(const NetworkProfile &);
++    ReconstructionStatus Start(const CompactBlock &,
++                               std::span<const Transaction>, std::string &);
++    const MissingRequest &Request() const { return request_; }
++    ReconstructionStatus Apply(const MissingResponse &, std::string &);
++    bool TakeComplete(FramedBlock &); // one-shot, still unvalidated
++    void Cancel();
++
++private:
++    ReconstructionStatus Finish(std::string &);
++    bool Store(uint32_t, const Transaction &, std::string &);
++    uint64_t retained_wire_bytes_ = HEADER_SIZE + 4;
++    NetworkProfile profile_;
++    CompactBlock compact_;
++    CompactKeys keys_{};
++    MissingRequest request_{};
++    std::vector<std::optional<Transaction>> slots_;
++    std::vector<std::optional<uint64_t>> expected_short_ids_;
++    std::optional<FramedBlock> complete_;
++    bool outstanding_ = false;
++};
++} // namespace lotus::v2::peer
++#endif
+diff --git a/src/lotus_v2/peer_codec_test/CMakeLists.txt b/src/lotus_v2/peer_codec_test/CMakeLists.txt
+new file mode 100644
+index 0000000000000000000000000000000000000000..1a1d9272000ceb6c0265faf3ebc20e1c0b81d49f
+--- /dev/null
++++ b/src/lotus_v2/peer_codec_test/CMakeLists.txt
+@@ -0,0 +1,26 @@
++cmake_minimum_required(VERSION 3.18)
++project(lotus_v2_peer_codec_review LANGUAGES C CXX)
++set(CMAKE_CXX_STANDARD 20)
++set(CMAKE_CXX_STANDARD_REQUIRED ON)
++get_filename_component(LOTUS_SRC "${CMAKE_CURRENT_SOURCE_DIR}/../.." ABSOLUTE)
++if(NOT DEFINED LOTUS_SECP_LIBRARY OR NOT EXISTS "${LOTUS_SECP_LIBRARY}")
++    message(FATAL_ERROR "Set LOTUS_SECP_LIBRARY to a locally built ABC libsecp256k1.a")
++endif()
++add_library(peer_blake3 STATIC ../vendor/blake3/blake3.c
++    ../vendor/blake3/blake3_dispatch.c ../vendor/blake3/blake3_portable.c)
++target_compile_definitions(peer_blake3 PRIVATE BLAKE3_NO_SSE2 BLAKE3_NO_SSE41
++    BLAKE3_NO_AVX2 BLAKE3_NO_AVX512 BLAKE3_USE_NEON=0)
++add_executable(lotus_v2_peer_codec_test ../peer_codec.cpp ../test_peer_codec.cpp
++    ../header.cpp ../block_wire.cpp ../transaction.cpp ../output.cpp
++    ../commitment.cpp ../signing.cpp ../tagged_hash.cpp
++    ../../crypto/sha256.cpp ../../crypto/siphash.cpp)
++target_include_directories(lotus_v2_peer_codec_test PRIVATE "${LOTUS_SRC}"
++    "${LOTUS_SRC}/secp256k1/include")
++target_link_libraries(lotus_v2_peer_codec_test PRIVATE peer_blake3 "${LOTUS_SECP_LIBRARY}")
++target_compile_options(lotus_v2_peer_codec_test PRIVATE -Wall -Wextra -Wpedantic -Werror)
++if(LOTUS_SANITIZE)
++    target_compile_options(lotus_v2_peer_codec_test PRIVATE -fsanitize=address,undefined -fno-omit-frame-pointer)
++    target_link_options(lotus_v2_peer_codec_test PRIVATE -fsanitize=address,undefined)
++endif()
++enable_testing()
++add_test(NAME lotus_v2_peer_codec_test COMMAND lotus_v2_peer_codec_test)
+diff --git a/src/lotus_v2/peer_codec_test/README.md b/src/lotus_v2/peer_codec_test/README.md
+new file mode 100644
+index 0000000000000000000000000000000000000000..15fa53c22ec7c0a8889bf5a88da4e2ae59339091
+--- /dev/null
++++ b/src/lotus_v2/peer_codec_test/README.md
+@@ -0,0 +1,100 @@
++# Isolated V2 peer codec candidate
++
++This packet implements the reviewed proposal's byte codecs and compact-body
++reconstruction. It does not run a peer or change ABC's existing dispatcher.
++The caller supplies every network identity, magic, transaction profile, receive
++limit and local reconstruction quota. No development magic, ChainID, genesis,
++port, target, issuance or production profile is selected here. Test magic and
++identities are arbitrary test fixtures.
++
++Implemented:
++
++- Exact 24-byte TCP framing, inherited SHA256d checksum, printable command and
++  zero-padding checks, explicit payload/per-command caps, terminal framing errors
++  and fragmented-input decoding. `Feed` emits one message and reports input
++  consumption; callers must retain any remaining input. Length checks precede
++  payload allocation, and no allocation uses an unchecked announced length.
++- Exact 118-byte hello codecs, explicit identity/revision/required-feature
++  negotiation, min(local, remote) receive capacity, and the proposed canonical
++  BLAKE3 consensus-profile digest. Unknown supported features are ignored.
++- Native 134-byte V2 headers with one-byte zero sentinel (135-byte entries),
++  2000-header bound, 101-BlockID locators, 50000-entry inventory with full-TxHash
++  semantics for type 1, and sendcmpct framing. Unknown inventory types and compact
++  versions remain visible to the caller so it can ignore them explicitly.
++- Compact profile 2, shortest CompactSize framing, checked prefilled/request
++  deltas, prefilled coinbase at index zero, native complete transactions,
++  SHA256(Header || LE64(nonce)) keys and inherited SipHash-2-4 low-48-bit IDs.
++  No legacy CBlock or CTransaction conversion occurs.
++- One missing request per reconstruction; exact response ID/count/order and
++  complete-TxHash short-ID checks. A response for another BlockID cannot mutate
++  the current reconstruction. Same-ID malformed responses cancel their request.
++- Full-hash candidate deduplication, bounded collision buckets, ambiguity
++  requests, duplicate compact-short-ID fallback, and strict witness-variant
++  separation. Reconstruction verifies ordered transaction root, unique TxIDs,
++  first-and-only coinbase and exact complete block bytes. A root/size/core
++  mismatch requests a full block, never marks consensus invalid. Completion is
++  explicitly `CompleteUnvalidated` and must enter the common contextual block
++  validator.
++
++`NetworkProfile.max_reconstruction_transactions` bounds slot allocation, and
++`max_reconstruction_bytes` bounds the aggregate complete framed body before
++cached/response transactions are copied into slots. These are local quotas,
++not consensus limits. A byte/quota refusal from reconstruction means
++`NeedFullBlock`. A peer's claimed header size never authorizes allocating that
++size. Memory contains decoded transaction objects and temporary serialization,
++so this byte quota is not a claim of an equal resident-memory ceiling. Caller
++must also bound its existing cache, per-peer/global queues and retained codec
++objects. The decoder count checks use both available wire bytes and local caps;
++malformed requests cannot allocate a peer-declared count blindly.
++
++Functions returning bool leave their result unchanged on failure; error text
++classifies the failure for diagnostics. `EnvelopeDecoder` is stateful and
++terminal after a framing error. `CompactReconstruction` has explicit state
++transitions and `TakeComplete` consumes its result once. To replace an existing
++reconstruction, the caller starts a new one or calls `Cancel`; it owns request
++scheduling and timeout policy. Negotiation does not by itself activate relay.
++
++Not implemented in this packet (all remain transport/runtime integration work):
++
++- ABC version-70017 field codec, nonce self-connection checks, version/hello/verack
++  ordering, duplicate-handshake rejection, activation and 10-second timers;
++  parent integration must enforce these before dispatching application messages.
++- Sockets, connection lifecycle, datadir/network namespace isolation, disk magic,
++  address/addrv2 codecs/discovery, address databases, bans, peer selection,
++  ping/pong scheduling, quotas across peers, download queues and retries.
++- Headers-first synchronization, presynchronization, locators-to-chain lookup,
++  contextual target/PoW/parent eligibility, validated-chain service advertising,
++  persistent-state connection/reorg and atomic consensus validation.
++- Inventory batching, request tracking, full-TxHash tx-response verification,
++  notfound/capacity fallback scheduling, high-bandwidth compact announcement
++  permission, near-tip history/anti-amplification rules, and serving known-block
++  missing-index requests. Existing native transaction and block codecs supply
++  full-object framing; the dispatcher must enforce envelope capacity and request
++  identity before the common validator.
++- Optional unsupported-command/service disabling, fee policy, mempool/orphan and
++  witness-variant cache admission/replacement. Cached inputs supplied to `Start`
++  must already be complete and independently validated.
++- QUIC, TLS/ALPN, chunking or delivery of every economically valid P05 object.
++  Whole-object TCP capacity is deliberately finite. No public readiness claim.
++
++## Standalone verification
++
++```sh
++cmake -S src/lotus_v2/peer_codec_test -B /tmp/v2-peer-codec-build -GNinja \
++  -DCMAKE_BUILD_TYPE=Debug \
++  -DLOTUS_SECP_LIBRARY=/absolute/path/to/libsecp256k1.a
++cmake --build /tmp/v2-peer-codec-build
++ctest --test-dir /tmp/v2-peer-codec-build --output-on-failure
++```
++
++Set `-DLOTUS_SANITIZE=ON` for AddressSanitizer/UndefinedBehaviorSanitizer.
++The prebuilt archive is the existing ABC secp implementation; SHA256 and SipHash
++are compiled directly from the inherited ABC crypto sources. Chronik is absent.
++The standalone suite checks full/compact identical bytes and BlockIDs, exact
++identities, witness variants, deterministic ambiguity policy, duplicate short-ID
++fallback, incremental envelope splits, malformed lengths/counts/deltas/trailing
++bytes, wrong network/identity, absent witnesses, response association, exact
++root/size fallback and local capacity refusal. A 48-bit SipHash collision is not
++brute-forced: distinct candidate hashes exercise the actual uniqueness policy,
++and duplicated announced short IDs exercise reconstruction fallback. This is
++codec evidence, not live two-node or chain-validation evidence.
+diff --git a/src/lotus_v2/test_peer_codec.cpp b/src/lotus_v2/test_peer_codec.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..6d0cb87581178db881776607ef300f6b73525aec
+--- /dev/null
++++ b/src/lotus_v2/test_peer_codec.cpp
+@@ -0,0 +1,421 @@
++// Copyright (c) 2026 The Lotus developers
++#include "peer_codec.h"
++#include "signing.h"
++#include <crypto/sha256.h>
++#include <iostream>
++#include <stdexcept>
++using namespace lotus::v2;
++using namespace lotus::v2::peer;
++#define CHECK(c)                                                               \
++    do {                                                                       \
++        if (!(c))                                                              \
++            throw std::runtime_error("line " + std::to_string(__LINE__) +      \
++                                     ": " #c);                                 \
++    } while (false)
++namespace {
++NetworkProfile Profile() {
++    NetworkProfile p{};
++    p.magic = {0xab, 0xcd, 0xef, 0x01}; // test-only, not a network allocation
++    p.chain_id[0] = 31;
++    p.genesis_id[0] = 32;
++    p.profile_digest[0] = 33;
++    p.receive_limit = 2 * 1024 * 1024;
++    p.transaction = {32, 32, 8, 8192, 16, 8192, 64};
++    p.max_reconstruction_transactions = 1000;
++    p.max_reconstruction_bytes = 4 * 1024 * 1024;
++    return p;
++}
++Transaction Spend(uint8_t outpoint, uint8_t argument) {
++    Transaction tx;
++    Input i;
++    i.prev_txid[0] = outpoint;
++    i.sequence = UINT32_MAX;
++    i.flags = 1;
++    i.witnesses.push_back({{0x51}, {}, {{argument}}});
++    tx.inputs.push_back(i);
++    Output o;
++    o.value = 100;
++    o.branches.push_back(Hash{});
++    o.paths = {{0}};
++    tx.outputs.push_back(o);
++    return tx;
++}
++Transaction Coinbase() {
++    Transaction tx = Spend(0, 0);
++    auto &i = tx.inputs[0];
++    i.flags = 2;
++    i.witnesses.clear();
++    return tx;
++}
++FramedBlock Block(const NetworkProfile &p) {
++    FramedBlock b;
++    b.header.version = 2;
++    b.header.time = 12345;
++    b.header.bits = 0x207fffff;
++    b.header.height = 1;
++    b.transactions = {Coinbase(), Spend(1, 7), Spend(2, 8)};
++    std::string e;
++    CHECK(CompleteTransactionRoot(b.transactions, p.transaction, p.chain_id,
++                                  b.header.tx_root, e));
++    b.header.size = HEADER_SIZE + 4;
++    for (const auto &tx : b.transactions) {
++        Bytes raw;
++        CHECK(EncodeTransaction(tx, p.transaction, raw, e));
++        b.header.size += raw.size() + CompactSizeWidth(raw.size());
++    }
++    Bytes raw;
++    CHECK(EncodeBlockWire(b.header, b.transactions, p.transaction, raw, e));
++    FramedBlock decoded;
++    CHECK(DecodeBlockWire(raw, p.transaction, p.chain_id, decoded, e));
++    return decoded;
++}
++void HelloTests() {
++    auto p = Profile();
++    Hello h;
++    h.chain_id = p.chain_id;
++    h.genesis_id = p.genesis_id;
++    h.profile_digest = p.profile_digest;
++    h.receive_limit = 123456;
++    Bytes b;
++    std::string e;
++    CHECK(EncodeHello(h, b, e) && b.size() == 118);
++    Hello d;
++    CHECK(DecodeHello(b, d, e));
++    uint32_t active = 0;
++    CHECK(NegotiateHello(p, d, active, e) && active == 123456);
++    for (size_t n = 0; n < 118; ++n)
++        CHECK(!DecodeHello(std::span(b).first(n), d, e));
++    b.push_back(0);
++    CHECK(!DecodeHello(b, d, e));
++    b.pop_back();
++    h.supported |= uint64_t(1) << 63;
++    CHECK(NegotiateHello(p, h, active, e));
++    h.required |= 8;
++    CHECK(!NegotiateHello(p, h, active, e));
++    h.required = 7;
++    h.supported = 3;
++    CHECK(!NegotiateHello(p, h, active, e));
++    h.supported = 7;
++    h.chain_id[0] ^= 1;
++    CHECK(!NegotiateHello(p, h, active, e));
++    h.chain_id = p.chain_id;
++    h.genesis_id[0] ^= 1;
++    CHECK(!NegotiateHello(p, h, active, e));
++    h.genesis_id = p.genesis_id;
++    h.profile_digest[0] ^= 1;
++    CHECK(!NegotiateHello(p, h, active, e));
++    h.profile_digest = p.profile_digest;
++    h.revision = 2;
++    CHECK(!NegotiateHello(p, h, active, e));
++    h.revision = 1;
++    h.receive_limit = 0;
++    CHECK(!EncodeHello(h, b, e));
++    h.receive_limit = MAX_RECEIVE_LIMIT + 1;
++    CHECK(!NegotiateHello(p, h, active, e));
++    const auto digest = ConsensusProfileDigest(Bytes{1, 2, 3});
++    const Hash expected_digest{0x23, 0xab, 0x4e, 0x5f, 0x78, 0xf8, 0xda, 0xcd,
++                               0x28, 0x9c, 0xdc, 0xba, 0x24, 0x4d, 0x53, 0x44,
++                               0x6e, 0xaf, 0x79, 0xb0, 0x02, 0xed, 0xec, 0x51,
++                               0x26, 0x19, 0x0f, 0xe2, 0xcc, 0xf8, 0xa6, 0x72};
++    CHECK(digest == expected_digest); // independent Python blake3 vector
++    CHECK(digest != ConsensusProfileDigest(Bytes{1, 2, 4}));
++}
++void EnvelopeTests() {
++    auto p = Profile();
++    Message m{"tx", {1, 2, 3, 4}}, out;
++    Bytes b;
++    std::string e;
++    CHECK(EncodeEnvelope(p, p.receive_limit, m, b, e) && b.size() == 28);
++    CHECK(b[4] == 't' && b[5] == 'x' && b[6] == 0 && b[16] == 4);
++    CHECK(b[20] == 0x8d && b[21] == 0xe4 && b[22] == 0x72 &&
++          b[23] == 0xe2); // Python hashlib vector
++    for (size_t split = 0; split <= b.size(); ++split) {
++        EnvelopeDecoder decoder(p);
++        size_t used;
++        auto s = decoder.Feed(std::span(b).first(split), used, out, e);
++        CHECK(used == split);
++        if (split < b.size()) {
++            CHECK(s == FeedStatus::Incomplete);
++            s = decoder.Feed(std::span(b).subspan(split), used, out, e);
++            CHECK(used == b.size() - split);
++        }
++        CHECK(s == FeedStatus::MessageReady && out.command == m.command &&
++              out.payload == m.payload);
++    }
++    EnvelopeDecoder decoder(p);
++    size_t used;
++    for (size_t i = 0; i < b.size(); ++i) {
++        auto s = decoder.Feed(std::span(b).subspan(i, 1), used, out, e);
++        CHECK(used == 1);
++        CHECK(s == (i + 1 == b.size() ? FeedStatus::MessageReady
++                                      : FeedStatus::Incomplete));
++    }
++    Bytes joined = b;
++    joined.insert(joined.end(), b.begin(), b.end());
++    CHECK(decoder.Feed(joined, used, out, e) == FeedStatus::MessageReady &&
++          used == b.size());
++    auto reject = [&](Bytes bad) {
++        EnvelopeDecoder d(p);
++        CHECK(d.Feed(bad, used, out, e) == FeedStatus::InvalidPeerMessage);
++        CHECK(d.Feed(b, used, out, e) == FeedStatus::InvalidPeerMessage);
++    };
++    auto bad = b;
++    bad[0] ^= 1;
++    reject(bad);
++    bad = b;
++    bad[7] = 'z';
++    reject(bad);
++    bad = b;
++    bad[4] = 0x1f;
++    reject(bad);
++    bad = b;
++    bad.back() ^= 1;
++    reject(bad);
++    bad = b;
++    bad[16] = 255;
++    bad[17] = 255;
++    bad[18] = 255;
++    bad[19] = 255;
++    bad.resize(24);
++    reject(bad);
++    Message empty{"verack", {}};
++    CHECK(EncodeEnvelope(p, p.receive_limit, empty, b, e));
++    CHECK(decoder.Feed(b, used, out, e) == FeedStatus::MessageReady);
++    empty.payload = {0};
++    CHECK(!EncodeEnvelope(p, p.receive_limit, empty, b, e));
++    CHECK(!EncodeEnvelope(p, p.receive_limit, {"a\nb", {}}, b, e));
++    CHECK(decoder.SetActiveLimit(1, e));
++    CHECK(!decoder.SetActiveLimit(p.receive_limit + 1, e));
++    CHECK(EncodeEnvelope(p, p.receive_limit, m, b, e));
++    CHECK(decoder.Feed(b, used, out, e) == FeedStatus::InvalidPeerMessage);
++    EnvelopeDecoder partial(p);
++    CHECK(partial.Feed(std::span(b).first(1), used, out, e) ==
++          FeedStatus::Incomplete);
++    CHECK(!partial.SetActiveLimit(100, e));
++}
++void Vectors() {
++    auto p = Profile();
++    auto block = Block(p);
++    std::string e;
++    Bytes b, again;
++    CHECK(EncodeHeaders(std::span(&block.header, 1), p.receive_limit, b, e) &&
++          b.size() == 136 && b[0] == 1 && b.back() == 0);
++    std::vector<Header> headers;
++    CHECK(DecodeHeaders(b, p.receive_limit, headers, e));
++    CHECK(EncodeHeaders(headers, p.receive_limit, again, e) && again == b);
++    b.back() = 1;
++    CHECK(!DecodeHeaders(b, p.receive_limit, headers, e));
++    b.back() = 0;
++    b.push_back(0);
++    CHECK(!DecodeHeaders(b, p.receive_limit, headers, e));
++    std::vector<Header> huge(2000, block.header);
++    CHECK(EncodeHeaders(huge, p.receive_limit, b, e));
++    CHECK(DecodeHeaders(b, p.receive_limit, headers, e) &&
++          headers.size() == 2000);
++    huge.push_back(block.header);
++    CHECK(!EncodeHeaders(huge, p.receive_limit, b, e));
++    std::vector<Inventory> inv{{1, {}}, {2, {}}, {4, {}}, {99, {}}}, items;
++    inv[0].hash[0] = 55;
++    CHECK(EncodeInventory(inv, p.receive_limit, b, e));
++    CHECK(DecodeInventory(b, p.receive_limit, items, e) && items.size() == 4 &&
++          items[3].type == 99);
++    CHECK(KnownInventoryType(1) && KnownInventoryType(2) &&
++          KnownInventoryType(4) && !KnownInventoryType(99));
++    CHECK(EncodeInventory(items, p.receive_limit, again, e) && again == b);
++    b[0] = 5;
++    CHECK(!DecodeInventory(b, p.receive_limit, items, e));
++    CHECK(!EncodeInventory(inv, 100, b, e));
++    b = {253, 0, 0};
++    CHECK(!DecodeInventory(b, p.receive_limit, items, e));
++    Locator l{70017, {p.genesis_id, p.chain_id}, p.profile_digest}, ld;
++    CHECK(EncodeLocator(l, p.receive_limit, b, e) &&
++          DecodeLocator(b, p.receive_limit, ld, e));
++    CHECK(ld.ids == l.ids && ld.stop == l.stop && ld.version == 70017);
++    b.push_back(0);
++    CHECK(!DecodeLocator(b, p.receive_limit, ld, e));
++    l.ids.resize(102);
++    CHECK(!EncodeLocator(l, p.receive_limit, b, e));
++    SendCompact s{true, 2}, sd;
++    CHECK(EncodeSendCompact(s, b, e) && DecodeSendCompact(b, sd, e) &&
++          sd.announce && sd.version == 2);
++    b[0] = 2;
++    CHECK(!DecodeSendCompact(b, sd, e));
++    s.version = 123;
++    CHECK(EncodeSendCompact(s, b, e) && DecodeSendCompact(b, sd, e) &&
++          sd.version == 123); // caller ignores version !=2
++}
++void CompactTests() {
++    auto p = Profile();
++    auto b = Block(p);
++    std::string e;
++    Bytes wire, reencoded;
++    const uint32_t first[] = {0};
++    CompactBlock compact;
++    CHECK(MakeCompact(b, p, 999, first, compact, e));
++    CHECK(compact.short_ids.size() == 2 && compact.prefilled.size() == 1);
++    CompactKeys keys;
++    CHECK(DeriveCompactKeys(b.header, 999, keys));
++    IdentityDigests id;
++    CHECK(
++        ComputeIdentities(b.transactions[1], p.transaction, p.chain_id, id, e));
++    CHECK(compact.short_ids[0] == ShortId(keys, id.txhash));
++    // Independent SHA256 preimage and SipHash known vector guard the inherited
++    // mechanics.
++    std::array<uint8_t, HEADER_SIZE> raw;
++    CHECK(SerializeHeader(b.header, raw));
++    Bytes preimage(raw.begin(), raw.end());
++    for (unsigned i = 0; i < 8; ++i)
++        preimage.push_back(uint8_t(999ULL >> (8 * i)));
++    Hash digest;
++    CSHA256().Write(preimage.data(), preimage.size()).Finalize(digest.data());
++    uint64_t k0 = 0, k1 = 0;
++    for (unsigned i = 0; i < 8; ++i) {
++        k0 |= uint64_t(digest[i]) << (8 * i);
++        k1 |= uint64_t(digest[8 + i]) << (8 * i);
++    }
++    CHECK(keys.k0 == k0 && keys.k1 == k1);
++    Hash sip_input;
++    for (unsigned i = 0; i < 32; ++i)
++        sip_input[i] = uint8_t(i);
++    CHECK(ShortId({0x0706050403020100ULL, 0x0f0e0d0c0b0a0908ULL}, sip_input) ==
++          (0x7127512f72f27cceULL & 0xffffffffffffULL));
++    CHECK(EncodeCompact(compact, p, p.receive_limit, wire, e));
++    CompactBlock decoded;
++    CHECK(DecodeCompact(wire, p, p.receive_limit, decoded, e));
++    CHECK(EncodeCompact(decoded, p, p.receive_limit, reencoded, e) &&
++          wire == reencoded);
++    for (size_t n = 0; n < wire.size(); ++n)
++        CHECK(!DecodeCompact(std::span(wire).first(n), p, p.receive_limit,
++                             decoded, e));
++    auto bad = wire;
++    bad.push_back(0);
++    CHECK(!DecodeCompact(bad, p, p.receive_limit, decoded, e));
++    CHECK(!DecodeCompact(wire, p, uint32_t(wire.size() - 1), decoded, e));
++    bad = wire;
++    bad[HEADER_SIZE + 8] = 253;
++    bad.insert(bad.begin() + HEADER_SIZE + 9, {2, 0});
++    CHECK(!DecodeCompact(bad, p, p.receive_limit, decoded, e));
++    bad = wire;
++    bad[HEADER_SIZE + 8 + 1 + 12 + 1] = 3;
++    CHECK(!DecodeCompact(bad, p, p.receive_limit, decoded,
++                         e)); // out of range prefilled
++    CompactReconstruction r(p);
++    CHECK(r.Start(compact, b.transactions, e) ==
++          ReconstructionStatus::CompleteUnvalidated);
++    FramedBlock complete;
++    CHECK(r.TakeComplete(complete) && !r.TakeComplete(complete));
++    Bytes full, rebuilt;
++    CHECK(EncodeBlockWire(b.header, b.transactions, p.transaction, full, e));
++    CHECK(EncodeBlockWire(complete.header, complete.transactions, p.transaction,
++                          rebuilt, e) &&
++          full == rebuilt);
++    Hash block_id, rebuilt_id;
++    CHECK(BlockId(p.chain_id, b.header, block_id) &&
++          BlockId(p.chain_id, complete.header, rebuilt_id) &&
++          block_id == rebuilt_id);
++    CHECK(r.Start(compact, {}, e) == ReconstructionStatus::NeedTransactions);
++    CHECK(r.Request().indices == std::vector<uint32_t>({1, 2}));
++    MissingRequest request = r.Request(), qd;
++    CHECK(EncodeMissingRequest(request, 3, p.receive_limit, wire, e));
++    CHECK(DecodeMissingRequest(wire, 3, 100, p.receive_limit, qd, e) &&
++          qd.indices == request.indices && qd.block_id == block_id);
++    bad = wire;
++    bad.back() = 2;
++    CHECK(!DecodeMissingRequest(bad, 3, 100, p.receive_limit, qd, e));
++    bad = wire;
++    bad.push_back(0);
++    CHECK(!DecodeMissingRequest(bad, 3, 100, p.receive_limit, qd, e));
++    bad = Bytes(block_id.begin(), block_id.end());
++    bad.insert(bad.end(), {2, 0, 254, 255, 255, 255, 255});
++    CHECK(!DecodeMissingRequest(bad, UINT32_MAX, 100, p.receive_limit, qd, e));
++    MissingResponse response{block_id, {b.transactions[1], b.transactions[2]}},
++        rd;
++    CHECK(EncodeMissingResponse(response, p, p.receive_limit, wire, e));
++    CHECK(DecodeMissingResponse(wire, p, 2, p.receive_limit, rd, e));
++    CHECK(!DecodeMissingResponse(wire, p, 1, p.receive_limit, rd, e));
++    for (size_t n = 0; n < wire.size(); ++n)
++        CHECK(!DecodeMissingResponse(std::span(wire).first(n), p, 2,
++                                     p.receive_limit, rd, e));
++    CHECK(r.Apply(response, e) == ReconstructionStatus::CompleteUnvalidated &&
++          r.TakeComplete(complete));
++    CHECK(r.Apply(response, e) == ReconstructionStatus::InvalidPeerMessage);
++    CHECK(r.Start(compact, {}, e) == ReconstructionStatus::NeedTransactions);
++    response.block_id[0] ^= 1;
++    CHECK(r.Apply(response, e) == ReconstructionStatus::InvalidPeerMessage);
++    response.block_id = block_id;
++    CHECK(r.Request().indices == std::vector<uint32_t>({1, 2}));
++    CHECK(r.Apply(response, e) == ReconstructionStatus::CompleteUnvalidated);
++    CHECK(r.TakeComplete(complete));
++    CHECK(r.Start(compact, {}, e) == ReconstructionStatus::NeedTransactions);
++    response.transactions.pop_back();
++    CHECK(r.Apply(response, e) == ReconstructionStatus::InvalidPeerMessage);
++    response.transactions.push_back(b.transactions[2]);
++    CHECK(r.Start(compact, {}, e) == ReconstructionStatus::NeedTransactions);
++    response.transactions[0].inputs[0].witnesses[0].arguments[0] = {42};
++    CHECK(r.Apply(response, e) == ReconstructionStatus::InvalidPeerMessage);
++    // A witness variant shares TxID, but must not satisfy a full-TxHash
++    // request.
++    auto variant = b.transactions[1];
++    variant.inputs[0].witnesses[0].arguments[0] = {99};
++    IdentityDigests other;
++    CHECK(ComputeIdentities(variant, p.transaction, p.chain_id, other, e) &&
++          id.txid == other.txid && id.txhash != other.txhash);
++    std::vector<Transaction> cache{b.transactions[0], variant,
++                                   b.transactions[2]};
++    CHECK(r.Start(compact, cache, e) ==
++              ReconstructionStatus::NeedTransactions &&
++          r.Request().indices == std::vector<uint32_t>{1});
++    auto duplicate = compact;
++    duplicate.short_ids[1] = duplicate.short_ids[0];
++    CHECK(r.Start(duplicate, {}, e) == ReconstructionStatus::NeedFullBlock);
++    Hash hashes[] = {id.txhash, id.txhash};
++    CHECK(UniqueCandidate(hashes) == id.txhash);
++    hashes[1] = other.txhash;
++    CHECK(!UniqueCandidate(hashes));
++    CHECK(!UniqueCandidate({}));
++    auto wrong = compact;
++    wrong.header.tx_root[0] ^=
++        1; // changed keys require all missing, response then fails root
++    CHECK(r.Start(wrong, {}, e) == ReconstructionStatus::NeedTransactions);
++    // Root-only mutation changes short IDs. Rebuild them for the wrong claimed
++    // root.
++    auto wrongblock = b;
++    wrongblock.header.tx_root[0] ^= 1;
++    CHECK(MakeCompact(wrongblock, p, 999, first, wrong, e));
++    CHECK(r.Start(wrong, b.transactions, e) ==
++          ReconstructionStatus::NeedFullBlock);
++    wrongblock = b;
++    wrongblock.header.size += 1;
++    CHECK(MakeCompact(wrongblock, p, 999, first, wrong, e));
++    CHECK(r.Start(wrong, b.transactions, e) ==
++          ReconstructionStatus::NeedFullBlock);
++    auto limited = p;
++    limited.max_reconstruction_bytes = b.header.size - 1;
++    CompactReconstruction refusal(limited);
++    CHECK(refusal.Start(compact, {}, e) == ReconstructionStatus::NeedFullBlock);
++    const uint32_t extra[] = {0, 2};
++    CHECK(MakeCompact(b, p, 123, extra, compact, e));
++    CHECK(EncodeCompact(compact, p, p.receive_limit, wire, e) &&
++          DecodeCompact(wire, p, p.receive_limit, decoded, e));
++    CHECK(decoded.prefilled.size() == 2 && decoded.prefilled[1].index == 2);
++    CHECK(r.Start(decoded, b.transactions, e) ==
++          ReconstructionStatus::CompleteUnvalidated);
++    // Missing complete witness is rejected by the transaction codec, not
++    // repaired from cache.
++    Bytes stripped;
++    CHECK(EncodeTransaction(b.transactions[1], p.transaction, stripped, e));
++    stripped[58] = 0; // spend witness count removed: no executable full object
++    Transaction stripped_result;
++    CHECK(!DecodeTransaction(stripped, p.transaction, stripped_result, e));
++    compact.prefilled[1].transaction.inputs[0].witnesses.clear();
++    CHECK(!EncodeCompact(compact, p, p.receive_limit, wire, e));
++}
++} // namespace
++int main() {
++    HelloTests();
++    EnvelopeTests();
++    Vectors();
++    CompactTests();
++    std::cout
++        << "V2 bounded peer codec and compact reconstruction checks pass\n";
++}
+-- 
+2.50.1 (Apple Git-155)
+

@@ -1,0 +1,679 @@
+From 8fa53b166b5dabaad49a749c1964a56f4dfa0508 Mon Sep 17 00:00:00 2001
+From: Shammah Chancellor <shammah.chancellor@notvalid.com>
+Date: Thu, 15 Oct 2026 09:24:57 -0700
+Subject: [PATCH] Distinguish compact capacity refusal and guard reconstruction
+ lifecycle
+
+Scan resource-refused compact frames without retaining over-quota objects, preflight prefills before slot copies, and prevent late same-BlockID responses from being confused with a second missing request. Exercise real ambiguity branches with a standalone test-only collision seam; production hashing remains fixed.
+---
+ src/lotus_v2/peer_codec.cpp                 | 120 ++++++++++---
+ src/lotus_v2/peer_codec.h                   |  35 +++-
+ src/lotus_v2/peer_codec_test/CMakeLists.txt |   4 +
+ src/lotus_v2/peer_codec_test/README.md      |  46 +++--
+ src/lotus_v2/test_peer_codec.cpp            | 189 +++++++++++++++++++-
+ 5 files changed, 343 insertions(+), 51 deletions(-)
+
+diff --git a/src/lotus_v2/peer_codec.cpp b/src/lotus_v2/peer_codec.cpp
+index 6702742e64073d8a2d25e0fe4f456a1cb8511a31..ba57cc35dddbf249fe6debfa770de3c16953d6f1 100644
+--- a/src/lotus_v2/peer_codec.cpp
++++ b/src/lotus_v2/peer_codec.cpp
+@@ -536,43 +536,71 @@ bool EncodeCompact(const CompactBlock &c, const NetworkProfile &p,
+     out = std::move(b);
+     return Success(e);
+ }
+-bool DecodeCompact(std::span<const uint8_t> b, const NetworkProfile &p,
+-                   uint32_t limit, CompactBlock &out, std::string &e) {
+-    if (!Bound(b.size(), limit, e)) return false;
++CompactDecodeStatus DecodeCompact(std::span<const uint8_t> b,
++                                  const NetworkProfile &p, uint32_t limit,
++                                  CompactBlock &out, std::string &e) {
++    using Status = CompactDecodeStatus;
++    auto invalid = [&](const char *why) {
++        e = why;
++        return Status::InvalidPeerMessage;
++    };
++    if (!Bound(b.size(), limit, e)) return Status::CapacityRefused;
+     Reader r(b);
+     CompactBlock c{};
+     uint64_t count;
+     if (!r.HeaderValue(c.header) || !r.Int(8, c.nonce) ||
+-        !r.Compact(p.max_reconstruction_transactions, count) ||
+-        count > r.Left() / 6 || c.header.size < HEADER_SIZE + 4 ||
++        !r.Compact(UINT32_MAX, count) || count > r.Left() / 6 ||
++        c.header.size < HEADER_SIZE + 4 ||
+         count > (c.header.size - HEADER_SIZE - 4) / 17)
+-        return Fail(e, "compact header/short count");
++        return invalid("compact header/short count");
++    bool refused = count > p.max_reconstruction_transactions ||
++                   c.header.size > p.max_reconstruction_bytes;
+     for (uint64_t i = 0; i < count; ++i) {
+         uint64_t id;
+-        if (!r.Int(6, id)) return Fail(e, "short ID");
+-        c.short_ids.push_back(id);
++        if (!r.Int(6, id)) return invalid("short ID");
++        if (!refused) c.short_ids.push_back(id);
+     }
+     uint64_t prefilled;
+-    if (!r.Compact(p.max_reconstruction_transactions, prefilled) ||
+-        !prefilled || prefilled > r.Left() / 18 ||
+-        count + prefilled > UINT32_MAX ||
+-        count + prefilled > p.max_reconstruction_transactions ||
+-        c.header.size < HEADER_SIZE + 4 ||
++    if (!r.Compact(UINT32_MAX, prefilled) || !prefilled ||
++        prefilled > r.Left() / 18 || count + prefilled > UINT32_MAX ||
+         (count + prefilled) > (c.header.size - HEADER_SIZE - 4) / 17)
+-        return Fail(e, "prefilled count/size");
++        return invalid("prefilled count/size");
++    refused |= count + prefilled > p.max_reconstruction_transactions;
++    if (refused) c.short_ids.clear();
+     uint64_t next = 0;
++    uint64_t prefilled_bytes = HEADER_SIZE + 4;
+     for (uint64_t i = 0; i < prefilled; ++i) {
+         Prefilled v{};
+-        if (!Delta(r, next, uint32_t(count + prefilled), v.index) ||
+-            !r.Tx(p.transaction, v.transaction))
+-            return Fail(e, "prefilled index/transaction");
+-        c.prefilled.push_back(std::move(v));
++        if (!Delta(r, next, uint32_t(count + prefilled), v.index))
++            return invalid("prefilled index");
++        size_t transaction_start = r.Left();
++        if (!r.Tx(p.transaction, v.transaction))
++            return invalid("prefilled transaction");
++        if (i == 0 && (v.index != 0 || v.transaction.inputs.size() != 1 ||
++                       v.transaction.inputs[0].flags != 2))
++            return invalid("coinbase must be prefilled");
++        // The serialized transaction frame length is bounded by this message;
++        // accumulate it with checked arithmetic before retaining any object.
++        uint64_t frame_bytes = transaction_start - r.Left();
++        if (prefilled_bytes > p.max_reconstruction_bytes ||
++            frame_bytes > p.max_reconstruction_bytes - prefilled_bytes)
++            refused = true;
++        else
++            prefilled_bytes += frame_bytes;
++        if (refused) {
++            c.short_ids.clear();
++            c.prefilled.clear();
++        } else
++            c.prefilled.push_back(std::move(v));
++    }
++    if (r.Left()) return invalid("compact trailing bytes");
++    if (refused) {
++        e = "compact reconstruction capacity";
++        return Status::CapacityRefused;
+     }
+-    uint32_t n;
+-    if (r.Left() || !CompactShape(c, p, n, e))
+-        return Fail(e, "compact shape/trailing");
+     out = std::move(c);
+-    return Success(e);
++    e.clear();
++    return Status::Decoded;
+ }
+ bool EncodeMissingRequest(const MissingRequest &q, uint32_t total,
+                           uint32_t limit, Bytes &out, std::string &e) {
+@@ -655,17 +683,36 @@ std::optional<Hash> UniqueCandidate(std::span<const Hash> v) {
+ }
+ CompactReconstruction::CompactReconstruction(const NetworkProfile &p)
+     : profile_(p) {}
++#ifdef LOTUS_V2_PEER_CODEC_TESTING
++CompactReconstruction::CompactReconstruction(const NetworkProfile &p,
++                                             TestShortId short_id)
++    : profile_(p), test_short_id_(short_id) {}
++#endif
++uint64_t CompactReconstruction::MatchShortId(const Hash &hash) const {
++#ifdef LOTUS_V2_PEER_CODEC_TESTING
++    if (test_short_id_) return test_short_id_(keys_, hash) & 0xffffffffffffULL;
++#endif
++    return ShortId(keys_, hash);
++}
+ void CompactReconstruction::Cancel() {
+     outstanding_ = false;
+     request_ = {};
+     slots_.clear();
+     expected_short_ids_.clear();
+     complete_.reset();
+-    compact_ = {};
++    header_ = {};
+     retained_wire_bytes_ = HEADER_SIZE + 4;
+ }
+ ReconstructionStatus CompactReconstruction::Start(
+     const CompactBlock &c, std::span<const Transaction> cache, std::string &e) {
++    if (outstanding_) {
++        e = "missing request already outstanding";
++        return ReconstructionStatus::RequestOutstanding;
++    }
++    if (request_issued_) {
++        e = "missing request lifecycle exhausted; full block required";
++        return ReconstructionStatus::NeedFullBlock;
++    }
+     Cancel();
+     uint32_t n;
+     if (c.header.size > profile_.max_reconstruction_bytes ||
+@@ -683,11 +730,27 @@ ReconstructionStatus CompactReconstruction::Start(
+             e = "duplicate compact short ID";
+             return ReconstructionStatus::NeedFullBlock;
+         }
+-    compact_ = c;
+     if (!BlockId(profile_.chain_id, c.header, request_.block_id)) {
+         e = "compact block identity";
+         return ReconstructionStatus::InvalidPeerMessage;
+     }
++    // Preflight aggregate prefilled bytes before slot allocation/copies. Retain
++    // only the header, never a second copy of peer-supplied prefilled vectors.
++    uint64_t prefilled_bytes = HEADER_SIZE + 4;
++    for (const auto &v : c.prefilled) {
++        Bytes raw;
++        if (!EncodeTransaction(v.transaction, profile_.transaction, raw, e))
++            return ReconstructionStatus::InvalidPeerMessage;
++        if (prefilled_bytes > profile_.max_reconstruction_bytes ||
++            raw.size() > profile_.max_reconstruction_bytes - prefilled_bytes ||
++            CompactSizeWidth(raw.size()) > profile_.max_reconstruction_bytes -
++                                               prefilled_bytes - raw.size()) {
++            e = "prefilled reconstruction byte quota";
++            return ReconstructionStatus::NeedFullBlock;
++        }
++        prefilled_bytes += raw.size() + CompactSizeWidth(raw.size());
++    }
++    header_ = c.header;
+     // Local quota bounds slots independent of a peer's claimed block size.
+     slots_.resize(n);
+     expected_short_ids_.resize(n);
+@@ -711,7 +774,7 @@ ReconstructionStatus CompactReconstruction::Start(
+             Cancel();
+             return ReconstructionStatus::NeedFullBlock;
+         }
+-        uint64_t id = ShortId(keys_, d.txhash);
++        uint64_t id = MatchShortId(d.txhash);
+         if (seen.count(id)) {
+             auto &bucket = matches[id];
+             // Two distinct full hashes suffice to prove ambiguity; never retain
+@@ -740,6 +803,7 @@ ReconstructionStatus CompactReconstruction::Start(
+         }
+     if (!request_.indices.empty()) {
+         outstanding_ = true;
++        request_issued_ = true;
+         e.clear();
+         return ReconstructionStatus::NeedTransactions;
+     }
+@@ -765,7 +829,7 @@ ReconstructionStatus CompactReconstruction::Apply(const MissingResponse &q,
+         if (!ComputeIdentities(q.transactions[i], profile_.transaction,
+                                profile_.chain_id, d, e) ||
+             !expected_short_ids_[idx] ||
+-            ShortId(keys_, d.txhash) != *expected_short_ids_[idx]) {
++            MatchShortId(d.txhash) != *expected_short_ids_[idx]) {
+             e = "missing response short ID/transaction";
+             Cancel();
+             return ReconstructionStatus::InvalidPeerMessage;
+@@ -823,8 +887,8 @@ ReconstructionStatus CompactReconstruction::Finish(std::string &e) {
+     // before handing bytes to the common contextual consensus validator.
+     if (!CompleteTransactionRoot(txs, profile_.transaction, profile_.chain_id,
+                                  root, e) ||
+-        root != compact_.header.tx_root ||
+-        !EncodeBlockWire(compact_.header, txs, profile_.transaction, wire, e) ||
++        root != header_.tx_root ||
++        !EncodeBlockWire(header_, txs, profile_.transaction, wire, e) ||
+         !DecodeBlockWire(wire, profile_.transaction, profile_.chain_id,
+                          complete, e)) {
+         if (e.empty()) e = "compact transaction root/size mismatch";
+diff --git a/src/lotus_v2/peer_codec.h b/src/lotus_v2/peer_codec.h
+index bdff648e7fd5e521832d83301786e6b75834f668..8b516c40826ddab30874e2e41a5dd03345a47c5a 100644
+--- a/src/lotus_v2/peer_codec.h
++++ b/src/lotus_v2/peer_codec.h
+@@ -114,8 +114,13 @@ bool MakeCompact(const FramedBlock &, const NetworkProfile &, uint64_t nonce,
+                  std::string &);
+ bool EncodeCompact(const CompactBlock &, const NetworkProfile &, uint32_t limit,
+                    Bytes &, std::string &);
+-bool DecodeCompact(std::span<const uint8_t>, const NetworkProfile &,
+-                   uint32_t limit, CompactBlock &, std::string &);
++enum class CompactDecodeStatus { Decoded, InvalidPeerMessage, CapacityRefused };
++// Resource refusal is distinct from malformed framing. On either failure the
++// output remains unchanged. Refused bounded frames are still checked for
++// malformed counts, indices, full transactions and trailing bytes.
++CompactDecodeStatus DecodeCompact(std::span<const uint8_t>,
++                                  const NetworkProfile &, uint32_t limit,
++                                  CompactBlock &, std::string &);
+ struct MissingRequest {
+     Hash block_id;
+     std::vector<uint32_t> indices;
+@@ -141,14 +146,29 @@ enum class ReconstructionStatus {
+     InvalidPeerMessage,
+     NeedTransactions,
+     NeedFullBlock,
+-    CompleteUnvalidated
++    CompleteUnvalidated,
++    RequestOutstanding
+ };
+ // Caller supplies validated, complete cached transactions, reserves quotas and
+ // checks contextual header/PoW eligibility before Start(). No consensus-invalid
+ // verdict is returned. A failed root/size always requests a full body.
++// A lifecycle issues at most one missing request. Start while it is outstanding
++// returns RequestOutstanding without mutation; after completion/cancellation it
++// requires full-block fallback. The caller must retain this lifecycle for that
++// peer/BlockID until disconnection, because blocktxn carries no request nonce.
++// The caller bounds these retained tombstones and refuses further compact
++// lifecycles or disconnects when that quota is reached; it cannot evict one
++// while allowing a same-peer/same-BlockID missing request again.
++// Allocation failures are operational exceptions for the caller to handle.
+ class CompactReconstruction {
+ public:
+     explicit CompactReconstruction(const NetworkProfile &);
++#ifdef LOTUS_V2_PEER_CODEC_TESTING
++    // Standalone test-only seam to exercise true collision state transitions.
++    // Absent from production builds; production hashing is not configurable.
++    using TestShortId = uint64_t (*)(const CompactKeys &, const Hash &);
++    CompactReconstruction(const NetworkProfile &, TestShortId);
++#endif
+     ReconstructionStatus Start(const CompactBlock &,
+                                std::span<const Transaction>, std::string &);
+     const MissingRequest &Request() const { return request_; }
+@@ -161,13 +181,20 @@ private:
+     bool Store(uint32_t, const Transaction &, std::string &);
+     uint64_t retained_wire_bytes_ = HEADER_SIZE + 4;
+     NetworkProfile profile_;
+-    CompactBlock compact_;
++    Header header_{};
++    uint64_t MatchShortId(const Hash &) const;
++#ifdef LOTUS_V2_PEER_CODEC_TESTING
++    TestShortId test_short_id_ = nullptr;
++#endif
+     CompactKeys keys_{};
+     MissingRequest request_{};
+     std::vector<std::optional<Transaction>> slots_;
+     std::vector<std::optional<uint64_t>> expected_short_ids_;
+     std::optional<FramedBlock> complete_;
+     bool outstanding_ = false;
++    // A blocktxn response has no nonce/request generation. Never issue another
++    // missing request from this lifecycle after cancellation/completion.
++    bool request_issued_ = false;
+ };
+ } // namespace lotus::v2::peer
+ #endif
+diff --git a/src/lotus_v2/peer_codec_test/CMakeLists.txt b/src/lotus_v2/peer_codec_test/CMakeLists.txt
+index 1a1d9272000ceb6c0265faf3ebc20e1c0b81d49f..d7bdcec2ea09e4893a54f6570a2bf2f1fe0e3003 100644
+--- a/src/lotus_v2/peer_codec_test/CMakeLists.txt
++++ b/src/lotus_v2/peer_codec_test/CMakeLists.txt
+@@ -14,6 +14,10 @@ add_executable(lotus_v2_peer_codec_test ../peer_codec.cpp ../test_peer_codec.cpp
+     ../header.cpp ../block_wire.cpp ../transaction.cpp ../output.cpp
+     ../commitment.cpp ../signing.cpp ../tagged_hash.cpp
+     ../../crypto/sha256.cpp ../../crypto/siphash.cpp)
++option(LOTUS_PEER_CODEC_SYNTHETIC_COLLISIONS "Standalone test-only collision injection" ON)
++if(LOTUS_PEER_CODEC_SYNTHETIC_COLLISIONS)
++    target_compile_definitions(lotus_v2_peer_codec_test PRIVATE LOTUS_V2_PEER_CODEC_TESTING)
++endif()
+ target_include_directories(lotus_v2_peer_codec_test PRIVATE "${LOTUS_SRC}"
+     "${LOTUS_SRC}/secp256k1/include")
+ target_link_libraries(lotus_v2_peer_codec_test PRIVATE peer_blake3 "${LOTUS_SECP_LIBRARY}")
+diff --git a/src/lotus_v2/peer_codec_test/README.md b/src/lotus_v2/peer_codec_test/README.md
+index b0c861c180658e64faab5ff5a420bb7f427e14ef..2653bad034b5a41c7538bcb428b55c0fe7c0c8fd 100644
+--- a/src/lotus_v2/peer_codec_test/README.md
++++ b/src/lotus_v2/peer_codec_test/README.md
+@@ -32,9 +32,23 @@ Implemented:
+   deltas, prefilled coinbase at index zero, native complete transactions,
+   SHA256(Header || LE64(nonce)) keys and inherited SipHash-2-4 low-48-bit IDs.
+   No legacy CBlock or CTransaction conversion occurs.
+-- One missing request per reconstruction; exact response ID/count/order and
++- Typed compact decode results distinguish `Decoded`, `InvalidPeerMessage`
++  and `CapacityRefused`. Local transaction/byte quotas do not turn otherwise
++  well-framed compact messages into peer-invalid verdicts. Resource-refused
++  bounded messages are structurally scanned without retaining over-quota
++  vectors; malformed counts/indices/transactions/trailing bytes remain invalid.
++- One missing request per reconstruction lifecycle; exact response ID/count/order and
+   complete-TxHash short-ID checks. A response for another BlockID cannot mutate
+   the current reconstruction. Same-ID malformed responses cancel their request.
++  `Start` returns `RequestOutstanding` without changing an active request. Once
++  any missing request is issued, that lifecycle cannot issue another, including
++  after `Cancel`: a late response has no request nonce to distinguish attempts.
++  The caller retains lifecycle ownership for each peer/BlockID until disconnect;
++  retries on the same connection require a full body. Recreating a fresh object
++  for the same peer/BlockID would bypass that caller responsibility. Bound the
++  retained tombstone/object count per peer: refuse new compact lifecycles or
++  rotate/disconnect the connection at that quota. Evicting tombstones while
++  allowing the same peer/BlockID to issue another request is unsafe.
+ - Full-hash candidate deduplication, bounded collision buckets, ambiguity
+   requests, duplicate compact-short-ID fallback, and strict witness-variant
+   separation. Reconstruction verifies ordered transaction root, unique TxIDs,
+@@ -48,18 +62,22 @@ Implemented:
+ cached/response transactions are copied into slots. These are local quotas,
+ not consensus limits. A byte/quota refusal from reconstruction means
+ `NeedFullBlock`. A peer's claimed header size never authorizes allocating that
+-size. Memory contains decoded transaction objects and temporary serialization,
++size. Start preflights aggregate prefilled frames before allocating slots and
++retains only the announced header, avoiding a duplicate prefilled-vector copy.
++Memory contains decoded transaction objects and temporary serialization,
+ so this byte quota is not a claim of an equal resident-memory ceiling. Caller
+ must also bound its existing cache, per-peer/global queues and retained codec
+-objects. The decoder count checks use both available wire bytes and local caps;
++objects. Allocation failure (`std::bad_alloc`) is an operational exception for
++connection/runtime cleanup, never a peer-invalid or consensus-invalid verdict.
++The decoder count checks use both available wire bytes and local caps;
+ malformed requests cannot allocate a peer-declared count blindly.
+ 
+ Functions returning bool leave their result unchanged on failure; error text
+ classifies the failure for diagnostics. `EnvelopeDecoder` is stateful and
+ terminal after a framing error. `CompactReconstruction` has explicit state
+-transitions and `TakeComplete` consumes its result once. To replace an existing
+-reconstruction, the caller starts a new one or calls `Cancel`; it owns request
+-scheduling and timeout policy. Negotiation does not by itself activate relay.
++transitions and `TakeComplete` consumes its result once. The caller owns request
++scheduling and timeout policy. `Cancel` drops retained objects but preserves the
++one-request lifecycle guard. Negotiation does not by itself activate relay.
+ 
+ Not implemented in this packet (all remain transport/runtime integration work):
+ 
+@@ -95,13 +113,21 @@ ctest --test-dir /tmp/v2-peer-codec-build --output-on-failure
+ ```
+ 
+ Set `-DLOTUS_SANITIZE=ON` for AddressSanitizer/UndefinedBehaviorSanitizer.
++The standalone target alone defines `LOTUS_V2_PEER_CODEC_TESTING`, enabling a
++synthetic short-ID collision seam through the real reconstruction state machine.
++Production code has no configurable hashing override. Set
++`-DLOTUS_PEER_CODEC_SYNTHETIC_COLLISIONS=OFF` to compile and test the production
++path without that seam. Do not link objects compiled with different values of
++this test macro into one target.
+ The prebuilt archive is the existing ABC secp implementation; SHA256 and SipHash
+ are compiled directly from the inherited ABC crypto sources. Chronik is absent.
+ The standalone suite checks full/compact identical bytes and BlockIDs, exact
+ identities, witness variants, deterministic ambiguity policy, duplicate short-ID
+ fallback, incremental envelope splits, malformed lengths/counts/deltas/trailing
+ bytes, wrong network/identity, absent witnesses, response association, exact
+-root/size fallback and local capacity refusal. A 48-bit SipHash collision is not
+-brute-forced: distinct candidate hashes exercise the actual uniqueness policy,
+-and duplicated announced short IDs exercise reconstruction fallback. This is
+-codec evidence, not live two-node or chain-validation evidence.
++root/size fallback, typed local capacity refusal and same-BlockID/new-nonce
++request overlap/cancellation. A 48-bit SipHash collision is not brute-forced:
++test-only synthetic colliding witness variants exercise the actual cache buckets,
++missing-request and response state transitions and real root verification;
++duplicated announced short IDs exercise immediate fallback. This is codec
++evidence, not live two-node or chain-validation evidence.
+diff --git a/src/lotus_v2/test_peer_codec.cpp b/src/lotus_v2/test_peer_codec.cpp
+index 1b96a7185d613abad49da5ed095d276f4aea62d3..18f31c700b2d1b54737bc6c6b016585ed100b107 100644
+--- a/src/lotus_v2/test_peer_codec.cpp
++++ b/src/lotus_v2/test_peer_codec.cpp
+@@ -330,25 +330,32 @@ void CompactTests() {
+           (0x7127512f72f27cceULL & 0xffffffffffffULL));
+     CHECK(EncodeCompact(compact, p, p.receive_limit, wire, e));
+     CompactBlock decoded;
+-    CHECK(DecodeCompact(wire, p, p.receive_limit, decoded, e));
++    CHECK((DecodeCompact(wire, p, p.receive_limit, decoded, e) ==
++           CompactDecodeStatus::Decoded));
+     CHECK(EncodeCompact(decoded, p, p.receive_limit, reencoded, e) &&
+           wire == reencoded);
+     for (size_t n = 0; n < wire.size(); ++n)
+-        CHECK(!DecodeCompact(std::span(wire).first(n), p, p.receive_limit,
+-                             decoded, e));
++        CHECK((DecodeCompact(std::span(wire).first(n), p, p.receive_limit,
++                             decoded,
++                             e) == CompactDecodeStatus::InvalidPeerMessage));
+     auto bad = wire;
+     bad.push_back(0);
+-    CHECK(!DecodeCompact(bad, p, p.receive_limit, decoded, e));
+-    CHECK(!DecodeCompact(wire, p, uint32_t(wire.size() - 1), decoded, e));
++    CHECK((DecodeCompact(bad, p, p.receive_limit, decoded, e) ==
++           CompactDecodeStatus::InvalidPeerMessage));
++    CHECK((DecodeCompact(wire, p, uint32_t(wire.size() - 1), decoded, e) ==
++           CompactDecodeStatus::CapacityRefused));
+     bad = wire;
+     bad[HEADER_SIZE + 8] = 253;
+     bad.insert(bad.begin() + HEADER_SIZE + 9, {2, 0});
+-    CHECK(!DecodeCompact(bad, p, p.receive_limit, decoded, e));
++    CHECK((DecodeCompact(bad, p, p.receive_limit, decoded, e) ==
++           CompactDecodeStatus::InvalidPeerMessage));
+     bad = wire;
+     bad[HEADER_SIZE + 8 + 1 + 12 + 1] = 3;
+-    CHECK(!DecodeCompact(bad, p, p.receive_limit, decoded,
+-                         e)); // out of range prefilled
++    CHECK((DecodeCompact(bad, p, p.receive_limit, decoded,
++                         e) ==
++           CompactDecodeStatus::InvalidPeerMessage)); // out of range prefilled
+     CompactReconstruction r(p);
++    r = CompactReconstruction(p);
+     CHECK(r.Start(compact, b.transactions, e) ==
+           ReconstructionStatus::CompleteUnvalidated);
+     FramedBlock complete;
+@@ -362,6 +369,7 @@ void CompactTests() {
+     CHECK(BlockId(p.chain_id, b.header, block_id) &&
+           BlockId(p.chain_id, complete.header, rebuilt_id) &&
+           block_id == rebuilt_id);
++    r = CompactReconstruction(p);
+     CHECK(r.Start(compact, {}, e) == ReconstructionStatus::NeedTransactions);
+     CHECK(r.Request().indices == std::vector<uint32_t>({1, 2}));
+     MissingRequest request = r.Request(), qd;
+@@ -388,6 +396,7 @@ void CompactTests() {
+     CHECK(r.Apply(response, e) == ReconstructionStatus::CompleteUnvalidated &&
+           r.TakeComplete(complete));
+     CHECK(r.Apply(response, e) == ReconstructionStatus::InvalidPeerMessage);
++    r = CompactReconstruction(p);
+     CHECK(r.Start(compact, {}, e) == ReconstructionStatus::NeedTransactions);
+     response.block_id[0] ^= 1;
+     CHECK(r.Apply(response, e) == ReconstructionStatus::InvalidPeerMessage);
+@@ -395,10 +404,12 @@ void CompactTests() {
+     CHECK(r.Request().indices == std::vector<uint32_t>({1, 2}));
+     CHECK(r.Apply(response, e) == ReconstructionStatus::CompleteUnvalidated);
+     CHECK(r.TakeComplete(complete));
++    r = CompactReconstruction(p);
+     CHECK(r.Start(compact, {}, e) == ReconstructionStatus::NeedTransactions);
+     response.transactions.pop_back();
+     CHECK(r.Apply(response, e) == ReconstructionStatus::InvalidPeerMessage);
+     response.transactions.push_back(b.transactions[2]);
++    r = CompactReconstruction(p);
+     CHECK(r.Start(compact, {}, e) == ReconstructionStatus::NeedTransactions);
+     response.transactions[0].inputs[0].witnesses[0].arguments[0] = {42};
+     CHECK(r.Apply(response, e) == ReconstructionStatus::InvalidPeerMessage);
+@@ -411,11 +422,13 @@ void CompactTests() {
+           id.txid == other.txid && id.txhash != other.txhash);
+     std::vector<Transaction> cache{b.transactions[0], variant,
+                                    b.transactions[2]};
++    r = CompactReconstruction(p);
+     CHECK(r.Start(compact, cache, e) ==
+               ReconstructionStatus::NeedTransactions &&
+           r.Request().indices == std::vector<uint32_t>{1});
+     auto duplicate = compact;
+     duplicate.short_ids[1] = duplicate.short_ids[0];
++    r = CompactReconstruction(p);
+     CHECK(r.Start(duplicate, {}, e) == ReconstructionStatus::NeedFullBlock);
+     Hash hashes[] = {id.txhash, id.txhash};
+     CHECK(UniqueCandidate(hashes) == id.txhash);
+@@ -425,17 +438,20 @@ void CompactTests() {
+     auto wrong = compact;
+     wrong.header.tx_root[0] ^=
+         1; // changed keys require all missing, response then fails root
++    r = CompactReconstruction(p);
+     CHECK(r.Start(wrong, {}, e) == ReconstructionStatus::NeedTransactions);
+     // Root-only mutation changes short IDs. Rebuild them for the wrong claimed
+     // root.
+     auto wrongblock = b;
+     wrongblock.header.tx_root[0] ^= 1;
+     CHECK(MakeCompact(wrongblock, p, 999, first, wrong, e));
++    r = CompactReconstruction(p);
+     CHECK(r.Start(wrong, b.transactions, e) ==
+           ReconstructionStatus::NeedFullBlock);
+     wrongblock = b;
+     wrongblock.header.size += 1;
+     CHECK(MakeCompact(wrongblock, p, 999, first, wrong, e));
++    r = CompactReconstruction(p);
+     CHECK(r.Start(wrong, b.transactions, e) ==
+           ReconstructionStatus::NeedFullBlock);
+     auto limited = p;
+@@ -445,8 +461,10 @@ void CompactTests() {
+     const uint32_t extra[] = {0, 2};
+     CHECK(MakeCompact(b, p, 123, extra, compact, e));
+     CHECK(EncodeCompact(compact, p, p.receive_limit, wire, e) &&
+-          DecodeCompact(wire, p, p.receive_limit, decoded, e));
++          (DecodeCompact(wire, p, p.receive_limit, decoded, e) ==
++           CompactDecodeStatus::Decoded));
+     CHECK(decoded.prefilled.size() == 2 && decoded.prefilled[1].index == 2);
++    r = CompactReconstruction(p);
+     CHECK(r.Start(decoded, b.transactions, e) ==
+           ReconstructionStatus::CompleteUnvalidated);
+     // Missing complete witness is rejected by the transaction codec, not
+@@ -459,6 +477,155 @@ void CompactTests() {
+     compact.prefilled[1].transaction.inputs[0].witnesses.clear();
+     CHECK(!EncodeCompact(compact, p, p.receive_limit, wire, e));
+ }
++void CapacityAndLifecycleTests() {
++    auto p = Profile();
++    auto b = Block(p);
++    const uint32_t first[] = {0};
++    CompactBlock compact;
++    std::string e;
++    CHECK(MakeCompact(b, p, 999, first, compact, e));
++    Bytes wire;
++    CHECK(EncodeCompact(compact, p, p.receive_limit, wire, e));
++    auto small_count = p;
++    small_count.max_reconstruction_transactions = 2;
++    CompactBlock unchanged;
++    unchanged.nonce = 123;
++    CHECK(DecodeCompact(wire, small_count, p.receive_limit, unchanged, e) ==
++          CompactDecodeStatus::CapacityRefused);
++    CHECK(unchanged.nonce == 123);
++    CompactReconstruction count_refusal(small_count);
++    CHECK(count_refusal.Start(compact, {}, e) ==
++          ReconstructionStatus::NeedFullBlock);
++    // A malformed count is peer-invalid even when it also exceeds our quota.
++    auto malformed = wire;
++    malformed[HEADER_SIZE + 8] = 200;
++    CHECK(DecodeCompact(malformed, small_count, p.receive_limit, unchanged,
++                        e) == CompactDecodeStatus::InvalidPeerMessage);
++    malformed = wire;
++    malformed[HEADER_SIZE + 8 + 1 + 12 + 1] = 3;
++    CHECK(DecodeCompact(malformed, small_count, p.receive_limit, unchanged,
++                        e) == CompactDecodeStatus::InvalidPeerMessage);
++    malformed = wire;
++    malformed.push_back(0);
++    CHECK(DecodeCompact(malformed, small_count, p.receive_limit, unchanged,
++                        e) == CompactDecodeStatus::InvalidPeerMessage);
++    auto small_bytes = p;
++    small_bytes.max_reconstruction_bytes = b.header.size - 1;
++    CHECK(DecodeCompact(wire, small_bytes, p.receive_limit, unchanged, e) ==
++          CompactDecodeStatus::CapacityRefused);
++    CHECK(DecodeCompact(wire, p, uint32_t(wire.size() - 1), unchanged, e) ==
++          CompactDecodeStatus::CapacityRefused);
++    CHECK(unchanged.nonce == 123);
++    // A small claimed size cannot authorize copying large prefilled bodies.
++    // Decode scans the bounded object but retains no over-quota output;
++    // Start preflights complete prefills before allocating/copying its slots.
++    const uint32_t extra[] = {0, 1};
++    CHECK(MakeCompact(b, p, 999, extra, compact, e));
++    compact.prefilled[1].transaction.inputs[0].witnesses[0].arguments[0].resize(
++        8192);
++    compact.header.size = 400;
++    auto budget = p;
++    budget.max_reconstruction_bytes = 500;
++    CHECK(EncodeCompact(compact, p, p.receive_limit, wire, e));
++    CHECK(DecodeCompact(wire, budget, p.receive_limit, unchanged, e) ==
++          CompactDecodeStatus::CapacityRefused);
++    CHECK(unchanged.nonce == 123);
++    CompactReconstruction prefilled_refusal(budget);
++    CHECK(prefilled_refusal.Start(compact, {}, e) ==
++          ReconstructionStatus::NeedFullBlock);
++    CHECK(e == "prefilled reconstruction byte quota");
++    CHECK(prefilled_refusal.Request().indices.empty());
++    malformed = wire;
++    malformed.push_back(0);
++    CHECK(DecodeCompact(malformed, budget, p.receive_limit, unchanged, e) ==
++          CompactDecodeStatus::InvalidPeerMessage);
++    CHECK(MakeCompact(b, p, 999, first, compact, e));
++    CompactBlock new_nonce;
++    CHECK(MakeCompact(b, p, 1000, first, new_nonce, e));
++    CompactReconstruction reconstruction(p);
++    CHECK(reconstruction.Start(compact, {}, e) ==
++          ReconstructionStatus::NeedTransactions);
++    MissingRequest original = reconstruction.Request();
++    CHECK(reconstruction.Start(new_nonce, {}, e) ==
++          ReconstructionStatus::RequestOutstanding);
++    CHECK(reconstruction.Request().block_id == original.block_id &&
++          reconstruction.Request().indices == original.indices);
++    MissingResponse response{original.block_id,
++                             {b.transactions[1], b.transactions[2]}};
++    CHECK(reconstruction.Apply(response, e) ==
++          ReconstructionStatus::CompleteUnvalidated);
++    FramedBlock complete;
++    CHECK(reconstruction.TakeComplete(complete));
++    CHECK(reconstruction.Start(new_nonce, {}, e) ==
++          ReconstructionStatus::NeedFullBlock);
++    // Cancellation cannot distinguish an old response from a new same-ID
++    // request: retain the exhausted lifecycle and fall back to a full body.
++    CompactReconstruction cancelled(p);
++    CHECK(cancelled.Start(compact, {}, e) ==
++          ReconstructionStatus::NeedTransactions);
++    cancelled.Cancel();
++    CHECK(cancelled.Start(new_nonce, {}, e) ==
++          ReconstructionStatus::NeedFullBlock);
++    CHECK(cancelled.Apply(response, e) ==
++          ReconstructionStatus::InvalidPeerMessage);
++}
++#ifdef LOTUS_V2_PEER_CODEC_TESTING
++Hash synthetic_collision_a{}, synthetic_collision_b{}, synthetic_collision_c{};
++uint64_t SyntheticCollision(const CompactKeys &, const Hash &hash) {
++    return hash == synthetic_collision_a || hash == synthetic_collision_b ||
++                   hash == synthetic_collision_c
++               ? 42
++               : 43;
++}
++void SyntheticCollisionStateTests() {
++    // This seam changes compression matching only in this standalone test
++    // build. Consensus identities and roots remain the real BLAKE3 values.
++    auto p = Profile();
++    auto b = Block(p);
++    auto variant = b.transactions[1];
++    variant.inputs[0].witnesses[0].arguments[0] = {99};
++    auto third_variant = variant;
++    third_variant.inputs[0].witnesses[0].arguments[0] = {100};
++    IdentityDigests a, other, third;
++    std::string e;
++    CHECK(
++        ComputeIdentities(b.transactions[1], p.transaction, p.chain_id, a, e));
++    CHECK(ComputeIdentities(variant, p.transaction, p.chain_id, other, e));
++    CHECK(
++        ComputeIdentities(third_variant, p.transaction, p.chain_id, third, e));
++    CHECK(a.txid == other.txid && a.txhash != other.txhash);
++    synthetic_collision_a = a.txhash;
++    synthetic_collision_b = other.txhash;
++    synthetic_collision_c = third.txhash;
++    CompactBlock compact;
++    const uint32_t first[] = {0};
++    CHECK(MakeCompact(b, p, 999, first, compact, e));
++    compact.short_ids = {42, 43};
++    std::vector<Transaction> cache{b.transactions[1], b.transactions[1],
++                                   variant, third_variant, b.transactions[2]};
++    CompactReconstruction ambiguous(p, SyntheticCollision);
++    CHECK(ambiguous.Start(compact, cache, e) ==
++          ReconstructionStatus::NeedTransactions);
++    CHECK(ambiguous.Request().indices == std::vector<uint32_t>{1});
++    MissingResponse response{ambiguous.Request().block_id, {b.transactions[1]}};
++    CHECK(ambiguous.Apply(response, e) ==
++          ReconstructionStatus::CompleteUnvalidated);
++    FramedBlock complete;
++    CHECK(ambiguous.TakeComplete(complete));
++    // Duplicate sightings of the exact full hash do not create ambiguity.
++    cache = {b.transactions[1], b.transactions[1], b.transactions[2]};
++    CompactReconstruction duplicates(p, SyntheticCollision);
++    CHECK(duplicates.Start(compact, cache, e) ==
++          ReconstructionStatus::CompleteUnvalidated);
++    CHECK(duplicates.TakeComplete(complete));
++    // A unique colliding witness variant still fails the real ordered root
++    // and requests a full block without any consensus-invalid verdict.
++    cache = {variant, b.transactions[2]};
++    CompactReconstruction wrong_variant(p, SyntheticCollision);
++    CHECK(wrong_variant.Start(compact, cache, e) ==
++          ReconstructionStatus::NeedFullBlock);
++}
++#endif
+ } // namespace
+ int main() {
+     HelloTests();
+@@ -466,6 +633,10 @@ int main() {
+     SmallHandshakeLimits();
+     Vectors();
+     CompactTests();
++    CapacityAndLifecycleTests();
++#ifdef LOTUS_V2_PEER_CODEC_TESTING
++    SyntheticCollisionStateTests();
++#endif
+     std::cout
+         << "V2 bounded peer codec and compact reconstruction checks pass\n";
+ }
+-- 
+2.50.1 (Apple Git-155)
+
