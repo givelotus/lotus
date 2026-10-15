@@ -6,9 +6,9 @@ Updated October 15, 2026. Development plan; no genesis parameters are frozen and
 
 ## Source foundation and current status
 
-The current executable [V2 series](../patches/v2/series) contains 111 patches,
-`000`–`110`, on ABC master `1fb7db17c176cdea8a2c60d887891589382ee4e3`.
-[Latest replay evidence](evidence/v2-series-replay-110.json) verifies every
+The current executable [V2 series](../patches/v2/series) contains 115 patches,
+`000`–`114`, on ABC master `1fb7db17c176cdea8a2c60d887891589382ee4e3`.
+[Latest replay evidence](evidence/v2-series-replay-114.json) verifies every
 intermediate tree. The exact clean daemon build and signed Payment pilot recorded
 below establish offline block acceptance, restart, disconnect and reconnect.
 Network activation, global fork selection, resumable reorgs and a usable peer
@@ -411,3 +411,39 @@ Payment pilot passes again at
 `/private/tmp/lotus-v2-signed-pilot-signer-cleanup-20261015`, including mature spend
 acceptance, independent roots/charges, intended negative cases, restart,
 undo and reconnect. This remains offline acceptance, without socket activation.
+
+## Indexed development chain and shared home loader (111–114)
+
+All 115 mailboxes replay with exact intermediate trees; final tree
+`cafb55a9957cb39e6825e6bb30d021740bd88d88`. See
+[replay evidence](evidence/v2-series-replay-114.json). Earlier mailbox bytes are
+unchanged; the test-only empty-body commit has an attributed integration note.
+
+Indexed development homes publish header records, active-height mappings and
+active summaries in the same synchronous batch as coins, state and undo.
+Disconnect retains historical Connected knowledge while removing active mapping.
+Generic older homes fail closed; no implicit migration or reset is performed.
+Header-only admission verifies PoW and bounded ancestry without accepting a body
+or promoting its state root. Locator/header queries use direct height lookups;
+single-candidate fork planning enforces actual database-read budgets and explicit
+all-ancestor time eligibility. It does not perform global selection or activation.
+
+Debug and ASan/UBSan index/storage suites pass, including an independent Boost
+work-arithmetic oracle, corruption, injected writes and reopen checks. Root's
+combined Release initializer/disk suites pass. Clean native `97b78c684` at
+`/private/tmp/lotus-v2-daemon-indexed-exact-20261015` builds Debug lotusd and passes
+full-tree chain-index, development-chain, disk, peer-codec and peer-session checks
+with Chronik off. Log: `/private/tmp/lotus-v2-indexed-exact-build.log`.
+
+The shared home loader reuses strict manifest parsing and namespace checks for
+offline consumers. Process checks pass at
+`/private/tmp/lotus-v2-indexed-command-evidence-20261015`, including malformed
+configuration and legacy-looking-directory refusal. The signed Payment pilot
+passes at `/private/tmp/lotus-v2-signed-pilot-indexed-20261015`, retaining independent
+roots/charges, negative cases, restart, undo and reconnect. Wallet-produced bytes
+remain a separate pending pilot; these results do not establish wallet integration.
+
+[Resumable reorg recovery](../../docs/plans/lotus-v2-reorg-recovery.md) remains an
+implementation proposal. Per-block atomicity does not establish multi-block
+recovery. Network/profile adoption, socket tests and public testnet readiness
+remain pending.
