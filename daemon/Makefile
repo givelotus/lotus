@@ -18,7 +18,8 @@ help:
 	@echo "  make build [SERIES=v1|ecash|doged|doged-reference|bchn|bitcoin] Build selected daemon and CLI"
 	@echo "  make run   [SERIES=v1|ecash|doged|doged-reference|bchn|bitcoin] ARGS=\"...\"  Run selected daemon"
 	@echo "  make mkpatch NAME=<n>          Export committed HEAD with authorship and rationale"
-	@echo "  make refresh COMMIT=<c>        Rebase onto new base commit or tag"
+	@echo "  make refresh COMMIT=<sha|tag|latest> [SERIES=...]  Rebase patches, then advance the pin"
+	@echo "    COMMIT=latest resolves origin's advertised default branch; review every rebase/build result."
 	@echo "  Human patch workflow: daemon/docs/adding-patches.md"
 	@echo "  make build FEATURES=chronik,nng-off       Select independent build options"
 	@echo "  make features FEATURES=chronik,zeromq-off Show resolved flags and dependencies"
@@ -106,7 +107,7 @@ endif
 
 refresh:
 ifndef COMMIT
-	$(error COMMIT is required: make refresh COMMIT=<hash-or-tag>)
+	$(error COMMIT is required: make refresh COMMIT=<hash-or-tag|latest>)
 endif
 ifdef DESC
 	SERIES=$(SERIES) $(SCRIPTS)/refresh.sh $(COMMIT) "$(DESC)"

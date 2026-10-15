@@ -115,6 +115,14 @@ release notes, actual compiler/tool versions, binary version output and checksum
 Source archives/checksums are deterministic for source identity; binary
 reproducibility, synchronization and host-specific behavior require separate evidence.
 
+For Lotus, the matched Guix Linux archive also produces an amd64 `.deb` and
+x86-64 `.rpm`. Release CI verifies install, daemon/CLI version output and package
+removal in Ubuntu 24.04, Debian 12 and Fedora 44 containers while checking that
+pre-existing node-data directories survive. These packages install binaries and
+documentation only; package metadata and container tests are not included in
+the independent Guix binary comparison. Other daemon components continue to
+publish their native Linux archives until their Guix build paths are validated.
+
 After the reviewed manifest and all required source changes reach `origin/main`,
 create and push its exact component tag (for example `bchn-v29.2.2`). The
 tag workflow verifies manifest/tag identity, confirms the tagged commit is

@@ -24,6 +24,9 @@ fixture_spec.loader.exec_module(fixtures)
 guix_spec=importlib.util.spec_from_file_location('guix_component_package',Path(__file__).with_name('guix-component-package.py'))
 guix_package=importlib.util.module_from_spec(guix_spec)
 guix_spec.loader.exec_module(guix_package)
+linux_package_spec=importlib.util.spec_from_file_location('package_linux',Path(__file__).with_name('package-linux.py'))
+linux_package=importlib.util.module_from_spec(linux_package_spec)
+linux_package_spec.loader.exec_module(linux_package)
 
 
 class ComponentTests(unittest.TestCase):
@@ -118,6 +121,63 @@ class ComponentTests(unittest.TestCase):
                 bundle.addfile(info,io.BytesIO(b'x'))
             with self.assertRaisesRegex(ValueError,'outside its versioned'):
                 guix_package.archive_members(unsafe,'lotusd-v11.6.1',manifest['binaries'])
+
+    def test_system_packages_use_verified_payload_without_data_or_service_hooks(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root=Path(temporary)
+            manifest={
+                'component':'lotusd', 'native_version':'11.6.1',
+                'tag':'lotusd-v11.6.1', 'source_date_epoch':1000684800,
+                'binaries':['lotusd','lotus-cli'],
+            }
+            manifest_path=root/'manifest.json'
+            manifest_path.write_text(json.dumps(manifest))
+            notes=root/'NOTES.md'
+            notes.write_text('Release notes\n')
+            archive=root/f"{manifest['tag']}-x86_64-linux-gnu.tar.gz"
+            with tarfile.open(archive,'w:gz') as bundle:
+                for name, payload, mode in (
+                    (f"{manifest['tag']}/COPYING",b'MIT\n',0o644),
+                    (f"{manifest['tag']}/bin/lotusd",b'fake daemon',0o755),
+                    (f"{manifest['tag']}/bin/lotus-cli",b'fake cli',0o755),
+                ):
+                    info=tarfile.TarInfo(name)
+                    info.size=len(payload)
+                    info.mode=mode
+                    bundle.addfile(info,io.BytesIO(payload))
+            build_info=root/'build-info.json'
+            build_info.write_text('{"build_method":"GNU Guix"}\n')
+            output=root/'dist'
+            calls=[]
+            def fake_run(args,env=None):
+                calls.append(args)
+                if args[0]=='dpkg-deb':
+                    control=Path(args[-2])/'DEBIAN/control'
+                    control_text=control.read_text()
+                    self.assertIn('Package: lotusd',control_text)
+                    self.assertIn('Architecture: amd64',control_text)
+                    self.assertIn('libc6 (>= 2.31)',control_text)
+                    self.assertFalse((Path(args[-2])/'var/lib/lotusd').exists())
+                    Path(args[-1]).write_bytes(b'deb fixture')
+                else:
+                    spec=Path(args[-1]).read_text()
+                    self.assertIn('BuildArch: x86_64',spec)
+                    self.assertIn('%license /usr/share/licenses/lotusd/COPYING',spec)
+                    self.assertNotIn('%post',spec)
+                    top=Path(args[args.index('--define')+1].split(' ',1)[1])
+                    rpm=top/'RPMS/x86_64/lotusd-11.6.1-1.x86_64.rpm'
+                    rpm.parent.mkdir(parents=True)
+                    rpm.write_bytes(b'rpm fixture')
+            with patch.object(linux_package,'run',side_effect=fake_run):
+                linux_package.package(archive,manifest_path,notes,output,build_info)
+            self.assertEqual(len(calls),2)
+            self.assertTrue((output/'lotusd_11.6.1_amd64.deb').is_file())
+            self.assertTrue((output/'lotusd-11.6.1-1.x86_64.rpm').is_file())
+            self.assertTrue((output/'lotusd_11.6.1_amd64.deb.sha256').is_file())
+            data=json.loads(build_info.read_text())
+            self.assertEqual(len(data['system_packages']),2)
+            self.assertIn('not part of the independent Guix rebuild comparison',
+                          data['system_package_reproducibility'])
 
     def test_unsupported_features_and_bad_identity_fail_before_writes(self):
         for feature in ('nng','tx-chain-limit','unknown'):

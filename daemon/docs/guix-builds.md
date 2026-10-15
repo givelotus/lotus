@@ -89,6 +89,15 @@ records both source identities in build info. BCHN, Doged and Bitcoin Core retai
 their native Linux build jobs because no Guix build path has been validated for
 those projects. The manual component dispatch remains artifact-only.
 
+After the two Guix release archives match, the reusable workflow generates an
+amd64 `.deb` and x86-64 `.rpm` from the verified archive and adds package hashes
+to build info. Clean-container install, version, removal and data-preservation
+smokes run on Ubuntu 24.04, Debian 12 and Fedora 44. The packages install only
+the daemon, CLI and documentation; they do not create a service or touch chain
+data. Package metadata/container tests are release checks, but the package file
+bytes themselves are not covered by the independent Guix binary reproducibility
+comparison.
+
 The earlier reproducibility run validated the maintained V1 `v11.6.0` source.
 It is evidence for the Guix machinery, not for the `v11.6.1` component package;
 the new tag-bound workflow is the check for that exact candidate. Neither flow

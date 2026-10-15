@@ -66,7 +66,15 @@ make -C daemon build SERIES=v1
 
 # 3. Run lotusd on mainnet with in-process Chronik enabled:
 ./daemon/workspace-v1/build/src/lotusd -chronik=1 -daemon
+
+# Rebase a selected patch stack against its upstream's current default branch:
+make -C daemon refresh SERIES=v1 COMMIT=latest
 ```
+
+`COMMIT=latest` resolves the workspace remote's advertised default branch and
+updates its selector only after the complete patch replay succeeds. It does not
+upgrade the independent Chronik provider pin or validate behavior; see
+`daemon/docs/adding-patches.md`.
 
 Default mainnet ports:
 - **P2P**: `10605`
@@ -342,6 +350,7 @@ Upstream Bitcoin ABC's in-process Chronik (`chronik/`) assumes standard 80-byte 
 - The maintained 153-patch V1 source plus the build-only Guix overlay completed on two independent ephemeral GitHub Actions Ubuntu runners. Run `38672796277` passed all 156 C++ check targets, security/symbol checks, extracted wallet and Chronik genesis smoke, and byte-for-byte comparisons of binary, debug and source archives. Artifact hashes and exact input commits are recorded in `daemon/docs/guix-builds.md`.
 - The reusable source/overlay, pinned bootstrap, build wrapper and manual GitHub Actions workflow are on main. The run does not use Docker or require an exposed Docker socket; Guix runs its own isolated builds on each hosted runner.
 - The Lotus component release workflow now uses Guix for Linux, builds the exact reviewed manifest/tag on two replicas, verifies archive equality and gates publication on the successful Guix artifact. BCHN, Doged and Bitcoin Core retain native Linux release builds because their Guix paths have not been validated. Guix remains Linux-only; macOS release artifacts use native builds.
+- The Lotus Guix release gate also emits `.deb` and `.rpm` packages from the matched binary archive, then installs/runs/removes them in Ubuntu 24.04, Debian 12 and Fedora 44 containers. Packages contain binaries and docs only; they install no service and have no node-data lifecycle hooks. Package metadata and install smoke are validated, but package archive bytes are outside the Guix reproducibility comparison.
 
 ## BCHN NNG compatibility replacement (2026-10-14)
 

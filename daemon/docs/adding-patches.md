@@ -67,6 +67,33 @@ not prove compilation or behavior: run the affected native tests, build the
 selected features, and record what passed against the exact base and tree.
 Review and commit the patch, manifest and evidence together in the monorepo.
 
+## Refresh a daemon base
+
+In an isolated Lotus checkout, `make refresh` can resolve the selected
+workspace's remote default branch and replay its maintained patch series onto
+that immutable tip. It advances the selector file only after the full series
+applies successfully:
+
+```sh
+make -C daemon refresh SERIES=v1 COMMIT=latest
+make -C daemon refresh SERIES=bchn COMMIT=latest
+make -C daemon refresh SERIES=bitcoin COMMIT=latest
+```
+
+Use `SERIES=ecash` or `SERIES=doged-reference` for those reference stacks.
+`COMMIT=<sha-or-tag>` continues to select a specific reviewed upstream revision.
+The command does not resolve conflicts, edit patch contents, build, or claim
+behavioral compatibility; it leaves the replayed candidate workspace for an
+LLM or maintainer to repair and validate. It does not update component release
+manifests or the separate shared-Chronik provider pin. The maintained Dogecoin
+on-ABC series is intentionally rejected by this generic refresh because its
+per-patch provenance manifest must be regenerated with its new base.
+
+For a shared Chronik refresh, update its independent ABC provider pin and
+regenerate the export/lockfile manifests as a separate review candidate, then
+rebase and test each host adapter. Do not treat refreshing a node's ABC base as
+an automatic Chronik-provider upgrade.
+
 ## Change an existing patch
 
 In an isolated source checkout, use interactive rebase to edit the corresponding

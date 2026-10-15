@@ -3,7 +3,7 @@
 #
 #
 # SERIES=v1 (default) — reapply Lotus patches onto a new bitcoin-abc commit
-#   Usage: SERIES=v1 ./scripts/refresh.sh <bitcoin-abc-commit> [description]
+#   Usage: SERIES=v1 ./scripts/refresh.sh <commit-or-tag|latest> [description]
 # SERIES=ecash / SERIES=bchn — refresh the corresponding reference patch series
 #
 # SERIES=doged — rebase the maintained ABC patchset only after refreshing its provenance manifest
@@ -14,9 +14,10 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DAEMON_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 SERIES="${SERIES:-v1}"
+source "$SCRIPT_DIR/upstream-ref.sh"
 
 if [[ $# -lt 1 ]]; then
-    echo "Usage: SERIES=<series> $0 <new-ref> [description]"
+    echo "Usage: SERIES=<series> $0 <commit-or-tag|latest> [description]"
     exit 1
 fi
 
@@ -40,9 +41,8 @@ rebase_patchset() {
         echo "Workspace has uncommitted changes; refusing refresh" >&2
         exit 1
     fi
-    git -C "$workspace" fetch origin
     local resolved
-    resolved=$(git -C "$workspace" rev-parse --verify "$NEW_REF^{commit}")
+    resolved=$(resolve_upstream_ref "$workspace" "$NEW_REF")
     local extra=(--base "$resolved")
     [[ "$series" == v1 ]] || extra+=(--allow-empty)
     python3 "$SCRIPT_DIR/patch-series.py" "$workspace" "$series_file" "${extra[@]}"
@@ -88,14 +88,37 @@ if [[ "$SERIES" == "doged-reference" ]]; then
         echo "Workspace has uncommitted changes; refusing refresh" >&2
         exit 1
     fi
-    git fetch origin --tags
-    RESOLVED=$(git rev-parse --verify "$NEW_REF^{commit}")
+    RESOLVED=$(resolve_upstream_ref "$WORKSPACE" "$NEW_REF")
     python3 "$SCRIPT_DIR/patch-series.py" "$WORKSPACE" "$DAEMON_DIR/patches/doged-reference/series" \
         --base "$RESOLVED" --allow-empty
     PIN_TEMP=$(mktemp "$VERSION_FILE.XXXXXX")
     { echo "$RESOLVED"; echo "# $DESCRIPTION"; echo "# Previous: $OLD_REF"; } > "$PIN_TEMP"
     mv "$PIN_TEMP" "$VERSION_FILE"
     echo "Build with: make build SERIES=doged-reference"
+    exit 0
+fi
+
+if [[ "$SERIES" == "bitcoin" ]]; then
+    WORKSPACE="$DAEMON_DIR/workspace-bitcoin"
+    VERSION_FILE="$DAEMON_DIR/bitcoin-core-version"
+    SERIES_FILE="$DAEMON_DIR/patches/bitcoin/series"
+    OLD_REF=$(grep -v '^#' "$VERSION_FILE" | grep -v '^$' | head -1)
+    if [[ ! -d "$WORKSPACE" ]]; then
+        echo "workspace-bitcoin not found — run: make setup SERIES=bitcoin first" >&2
+        exit 1
+    fi
+    if [[ -n "$(git -C "$WORKSPACE" status --porcelain)" ]]; then
+        echo "workspace-bitcoin has uncommitted changes; refusing refresh" >&2
+        exit 1
+    fi
+    echo "Updating Bitcoin Core base: $OLD_REF → $NEW_REF ($DESCRIPTION)"
+    RESOLVED=$(resolve_upstream_ref "$WORKSPACE" "$NEW_REF")
+    python3 "$SCRIPT_DIR/patch-series.py" "$WORKSPACE" "$DAEMON_DIR/patches/bitcoin/series" \
+        --base "$RESOLVED" --allow-empty
+    PIN_TEMP=$(mktemp "$VERSION_FILE.XXXXXX")
+    { echo "$RESOLVED"; echo "# $DESCRIPTION"; echo "# Previous: $OLD_REF"; } > "$PIN_TEMP"
+    mv "$PIN_TEMP" "$VERSION_FILE"
+    echo "Refresh complete. Build with: make build SERIES=bitcoin"
     exit 0
 fi
 
@@ -108,5 +131,5 @@ if [[ "$SERIES" == "bchn" ]]; then
     exit 0
 fi
 
-echo "Unsupported series: $SERIES (choose v1, ecash, doged, doged-reference, or bchn)" >&2
+echo "Unsupported series: $SERIES (choose v1, ecash, doged, doged-reference, bchn, or bitcoin)" >&2
 exit 1
