@@ -691,3 +691,49 @@ These are transport tests, not synchronized nodes. The runtime owner, peer
 application dispatcher, local block production/transaction submission and actual
 two-node synchronization remain integration gates. No published development
 network or mainnet parameter selection is implied.
+
+
+## Bounded development runtime owner (143–145)
+
+All 146 mailboxes replay with every intermediate tree checked; final tree
+`0f3fb028b95ef20df63728d65a4a8cd8d2c785d5`. See
+[evidence](evidence/v2-series-replay-145.json). Mailboxes 000–142 remain
+byte-identical. Each new mailbox retains its source commit explanation.
+
+DevelopmentRuntime owns explicit V4 storage, the body pool and candidate
+selector. Each tick performs one selection, preparation, recovery, acknowledgement,
+propagation or reopen action. Recovery performs at most one block transition;
+its VM/overlay/undo bounds remain separate from selector query limits. Header
+insertion preserves in-progress scans and availability epochs. Bodies and chain
+changes invalidate cached choices. Inconclusive execution pauses with the exact
+journal checkpoint intact. Storage ambiguity discards cached authority and
+requires a separate reopen tick; no cached result decides whether a write landed.
+
+The runtime exposes bounded read-only queries without a mutable store handle.
+Source restoration uses retained disk bodies even when the volatile pool is
+empty. Pool retention remains authentication, not contextual acceptance. Epoch
+exhaustion refuses changes before wraparound. Reentrant mutation returns Busy.
+Peer fetch epochs must be distinct from selector context generations: immutable
+body downloads need not be cancelled by ordinary active-chain growth.
+
+The real-block suite covers competing forks, stale choices, invalid-middle
+rollback and exact source restoration, receipt/propagation gates, host-limit
+pause/retry/reopen, insertion during bounded scans, callback reentry, capacity
+refusal and counter exhaustion. A write injector reports failure after a
+successful synchronous write; reopening observes the actual durable detach
+checkpoint and resumes. Tests compare monetary bytes, roots, coins/proofs and
+raw journal/metadata. Existing golden bytes remain unchanged.
+
+Exact runtime source `86676b778` (agent `d3e86735b`) and tests `1859fe3fa`
+(agent `442f73617`) pass strict Debug, ASan/UBSan and independent Release. Final
+Release 2/2 passes against test SHA256
+`2299f66ea45986af7054fa76c75f094ae1bb45f460be116e28c6a615681dd62e`;
+log `/private/tmp/lotus-v2-header-runtime-final-test.log`. Full-tree native
+`9345b70ec` builds lotusd and passes check-lotus-v2-development-runtime in
+`/private/tmp/lotus-v2-daemon-runtime-staging-20261015`; log
+`/private/tmp/lotus-v2-development-runtime-full-build.log`.
+
+This owner has no sockets or implicit profile adoption. Peer application routing,
+production of locally mined signed-payment blocks, and a runnable two-process
+node remain subsequent gates. Passing this suite alone does not prove network
+synchronization or a usable testnet.
