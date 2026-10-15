@@ -17,13 +17,21 @@ def output(item):
 try:
     script = bytes.fromhex(case['script'])
     arguments = tuple(bytes.fromhex(arg) for arg in case['args'])
-    witness = Witness(script, tuple(bytes.fromhex(x) for x in case['proof']), arguments)
-    tx = Transaction(case.get('lock', 0),
-        (Input(bytes.fromhex('55' * 32), 0, case.get('sequence', 0xffffffff), 1, 0, (witness,)),),
-        tuple(output(item) for item in case['outputs']))
-    resolved = (output(case['coin']),)
+    items = case.get('inputs')
+    if items is None:
+        items = [{'coin': case['coin'], 'script': case['script'], 'proof': case['proof'], 'args': case['args'], 'sequence': case.get('sequence', 0xffffffff)}]
+    active = case.get('input_index', 0)
+    selected_witness = case.get('witness_index', 0)
+    tx_inputs = []
+    for index, item in enumerate(items):
+        witnesses = tuple(Witness(bytes.fromhex(w['script']), tuple(bytes.fromhex(x) for x in w['proof']), tuple(bytes.fromhex(x) for x in w['args'])) for w in item.get('witnesses', [item]))
+        tx_inputs.append(Input(bytes([0x55 + index]) * 32, index, item.get('sequence', 0xffffffff), 1, 0, witnesses))
+    tx = Transaction(case.get('lock', 0), tuple(tx_inputs), tuple(output(item) for item in case['outputs']))
+    resolved = tuple(output(item['coin']) for item in items)
+    script = tx.inputs[active].witnesses[selected_witness].script
+    arguments = tx.inputs[active].witnesses[selected_witness].arguments
     chain = bytes.fromhex('66' * 32)
-    invocation, signing = authenticated_context(tx, profile, chain, resolved, 0, 0)
+    invocation, signing = authenticated_context(tx, profile, chain, resolved, active, selected_witness)
     identities = identity_digests(tx, profile, chain)
     evidence = {'wire': encode_transaction(tx, profile).hex(), 'txid': identities.txid.hex(),
                 'txhash': identities.txhash.hex(), 'message': signing.messages[0].hex()}
@@ -31,7 +39,7 @@ try:
         print(json.dumps(evidence))
     else:
         result = evaluate(script, arguments, vm_profile, invocation=invocation, signing=signing,
-                          input_count=1, output_count=len(tx.outputs))
+                          input_count=len(tx.inputs), output_count=len(tx.outputs))
         print(json.dumps({**evidence, 'status': 'accepted', 'stack': [x.hex() for x in result.stack],
                           'charged_cost': result.charged_cost}))
 except UnsupportedFeature as exc:
