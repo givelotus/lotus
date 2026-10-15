@@ -45,6 +45,24 @@ node test/run-native-fixtures.mjs /tmp/lotus-compiler-native/compiler_fixture_na
 
 This checker runs native framing, identities, signing message and BIP340 verification for both baseline transactions and all six changed-context/signature mutations. It does not run VM execution. The gallery adds mint and transfer fixtures through the separate transaction runtime; stateful contracts and delayed recovery remain future work.
 
+The separate token checker now also runs the native P03/P05 VM. Build it against
+the reviewed V2 native series (through patch 025):
+
+```sh
+cmake -S test/native-token-check -B /tmp/lotus-native-token-vm \
+  -DLOTUS_V2_CPP=/path/to/native-source/src/lotus_v2 \
+  -DLOTUS_SECP_LIBRARY=/path/to/libsecp256k1.a
+cmake --build /tmp/lotus-native-token-vm
+node test/run-native-token-fixtures.mjs /tmp/lotus-native-token-vm/compiler_token_native_check
+```
+
+This target requires OpenSSL Crypto. It verifies the signed Payment and all five
+mint/transfer witness invocations under an explicit illustrative cost profile.
+Negative probes reach the VM for an unauthorized issuer, a re-signed transfer
+removing mandatory rules, and a mint input's nonexistent coin. These invocation
+checks still leave complete transaction, lock, monetary and block validation to
+the daemon integration work.
+
 The artifact schema is `lotus-v2/payment-artifact/1`; its target is `P01-P02-P03-candidate-2026-10-14`. JSON hashes and bytecode are lowercase hex; user-facing native amounts must be decimal atom strings and parsed to checked `bigint`. The runtime accepts no implicit network and rejects an artifact whose policy root does not match its script. Generated clients must pin this schema and supply a separately reviewed signer; they must not assume that a valid signature alone makes a transaction valid.
 
 Schema-1 source mapping retains UTF-16 offsets (JavaScript string offsets); schema 2 uses UTF-8 byte offsets.

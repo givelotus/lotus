@@ -71,8 +71,9 @@ executes all five method invocations in the repo-local reference VM. It also
 checks rejection of an unauthorized issuer signature, a bypass path and an
 explicit burn output. The machine-readable result is
 `/tmp/lotus-v2-token-gallery/fungible-token-summary.json`. No node, wallet or
-network is used. Native framing/signature checks can additionally be run with
-a separately built V2 native checker:
+network is used. Native framing/signature checks and charged execution of all five
+invocations can additionally be run with the separately built V2 native checker
+([build instructions](../../README.md)):
 
 ```sh
 node test/run-native-token-fixtures.mjs /path/to/compiler_token_native_check

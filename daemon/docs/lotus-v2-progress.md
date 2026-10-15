@@ -1,19 +1,26 @@
 # V2 implementation progress — October 14, 2026
 
-The [implementation plan](lotus-v2-implementation-plan.md) owns the full gates. This ledger distinguishes integrated code from worker candidates. No complete V2 block has been mined and accepted.
+The [implementation plan](lotus-v2-implementation-plan.md) owns the full gates.
+No complete V2 block has been mined and accepted.
 
 | Slice | State and evidence |
 | --- | --- |
-| Output reference | Integrated `beebcbde`; independent fixed wires and rejection cases |
-| Spec and launch plan | Checkpoint `4060859e`; structural checks pass, not independent full consensus validation |
-| Monetary reference | Integrated `b9563366`; root reviewed and ran all12 reference tests, including coinbase burns and u128 aggregate amounts |
-| ABC foundations | Integrated `b1c0bd77`:9 patches on ABC master `1fb7db17`; exact replay, six miner cases, header vectors and Debug/Release output tests. Root reran miner/header/Release checks. Source tree `2e373abb42c7989587cc8083de79a86a00efe3bf`. |
-| Miner CPU/OpenCL | Isolated V2 integration `a3ea57d2`; worker executed V1 and expanded V2 GPU tests on Apple M5 Max. Root reran original V2 GPU parity. GUI unsupported-mode error handling has a worker fix awaiting root review; daemon job integration absent. |
-| Transaction framing | Python `a95b9366`, native `b58c83fa`; worker reports Debug/Release and independent corpus passes; root review pending |
-| Commitment primitives | Native `de5f497f`; branch/indexed/ordered trees and transaction identity wrappers, independent vectors; root review pending |
-| VM reference | Integrated bounded interpreter, size-aware static charging, BIP340 and raw BLAKE3; root ran 41 reference tests, including mint context and mandatory-path introspection. Explicit profiles and unsupported-feature errors; no complete transaction validator. |
-| Compiler and ABI | Integrated TypeScript templates, helper inlining, multi-method P02 proofs, typed hash references, TS/Python multi-input spend/mint runtimes and gallery with fungible-token and burn-to-upgrade sources. Bounded fixed-point literal/stack rewrites preserve tested failures. Root ran 44 package tests (no skips), rebuilt the native fixture checker, verified signed mint/transfer proofs, identities and signatures, and ran all five token invocations plus rejection cases in the reference VM. |
+| Native development series | Integrated 26 patches, 000–025, on ABC `1fb7db17`. Fresh mailbox replay matches every recorded tree; final `b0c32ae8ded2cdfa520bd91cf579d991c8dfa004`. See the [review packet](../candidates/v2-native-reviewed-20261014/README.md). Modules remain isolated from daemon consensus. |
+| Framing, commitments and signing | Bounded output/transaction/coinbase encoding, complete core/full identities, branch/indexed/ordered commitments, resolved-coin roots and prepared signing. Debug/Release focused tests pass; root reviewed and reran checks. |
+| UTXO models | Scalar oracle plus incremental in-memory path updates/proofs. Mixed update, insertion-order and undo/reinsert comparisons pass. Worker AddressSanitizer and root Release checks pass. No persistent chainstate or block undo yet. |
+| Native VM | Bounded P03 subset, authenticated witness/branch checks, signature/introspection operations, and explicit P05 charging. Root fresh Release build passes; 298 execution and 477 cost cases agree with Python. Signing preparation is reused within an invocation; transaction-wide sharing is pending. |
+| Python reference | Output/monetary and bounded VM reference integrated; 44 tests pass. P05 now applies the cap to the complete composed invocation charge, preserving checked-u128 intermediate rejection. Skipped BREAK semantics are explicit. |
+| Compiler and ABI | TypeScript templates, helpers, typed commitments, promise dependency scheduler, bounded recursive symbolic stack optimizer, generated TS/Python clients and spend/mint planners. Root ran 56 tests with no skips, including 256 seeded VM comparisons. The pipeline demo reduces 31 to 11 opcodes and 95 to 75 bytes. |
+| Native compiler integration | Signed Payment plus all five mint/transfer invocations pass the native charged VM. Unauthorized issuer, re-signed bypass policy and mint coin-read probes reject. Full transaction/block validity is not established by these fixtures. |
+| Miner CPU/OpenCL | Candidate `a3ea57d2`; worker GPU/CPU and GUI-mode checks pass. Root reran original GPU parity. Final miner patch integration and daemon job API remain separate review work. |
 
-Active daemon lanes: native foundation integration (ordered patches 009–014 for commitments, sparse state, transaction framing and signing; combined candidate `283ded8c6`, Debug/Release and replay checks in progress) and a native VM implementation. Next gates are root review of these candidates, complete transaction validation, persistent state and monetary/block transition, then mining job integration. Workers continue in isolated worktrees; candidates are not automatically accepted because tests pass. Unfrozen cost/monetary/network parameters must remain explicit development profiles.
+Active next lanes: ordinary transaction validation (conservation, mint delta,
+resolved spends, fees and all selected invocations) and remaining assigned native
+VM operations. Persistent state, monetary/block transitions, genesis calibration,
+and end-to-end mining follow those gates. All unfrozen parameters remain explicit
+development profiles; no production release or live workspace was changed.
 
-Review caught and requested fixes for release-disabled C++ assertions, mismatched C++ namespaces, omitted coinbase explicit burns, aggregate amount widths, and GUI panics. Fixes to the first four are reflected in integrated slices; GUI correction is pending. These are bounded correctness checks, not a claim that the whole design is audited.
+Review corrections include the maximum-count indexed-proof overflow, witness
+profile limit bypass, repeated transaction hashing per signature, incremental-tree
+leaf ownership, symbolic loop aliases, and zero-bound static-cost composition.
+Passing focused tests does not close the full protocol implementation plan.
