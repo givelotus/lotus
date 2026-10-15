@@ -51,3 +51,9 @@ Inherited clean/cached regtest tests remain legacy execution unless their chain 
 3. Review each inventory entry's fixtures and classify assertions precisely; retain useful generic RPC/P2P/storage/wallet checks while adapting chain-sensitive fixtures in separate reviewed changes.
 4. Add explicit native V2 fixtures for handshake/compact block transport, accepted/rejected V2 mempool transactions, ordered disconnect/connect plus wallet/Chronik parity, and block/header storage/reindex restart. The present inherited scripts do not demonstrate those paths.
 5. Expand execution only after the shared startup blocker is resolved. Publish pass/fail/not-run script and variant counts without conflating bespoke native harness results with inherited suite results.
+
+## Coherent rebuild retry
+
+A fresh real clone at exact `f1c8c92d87023c620819dfc4a6bd88a28c446d46` built Debug/Chronik ON daemon, CLI and wallet tool successfully. Fresh daemon `/private/tmp/lotus-v2-abc-unit-audit-20261015/build-abc-audit/src/lotusd` SHA256 `a4b74599175e5ad42e9e1fca20e786e281d3b924bcf20bd8176653356009db8e` still crashes on `-version` (unit audit exit 139). The unchanged SQLite functional script was retried with this exact binary/config, seed 49, and another fresh datadir/cache. It again reports initialization exit `-11`; see `coherent-rebuild-wallet_sqlite_v2.log`. This rules out the earlier runtime checkout/binary provenance mismatch as a sufficient explanation. No further repeated functional startup attempts were useful. Totals above remain counts of distinct scripts; there were nine invocations including this retry.
+
+The lock-debug ABI hypothesis remains unresolved; a fresh build alone did not fix startup. Native V2 harness success reported elsewhere must be scoped to its actual executable and arguments and does not establish inherited legacy startup.
