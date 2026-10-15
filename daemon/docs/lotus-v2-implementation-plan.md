@@ -1,13 +1,13 @@
 # Lotus V2 implementation and launch plan
 
-Updated October 14, 2026. Development plan; no genesis parameters are frozen and no launch is authorized by this document. This restores the implementation plan previously present at `5d7d7130`, retaining milestone IDs while updating source routing, specification dependencies and release requirements.
+Updated October 15, 2026. Development plan; no genesis parameters are frozen and no launch is authorized by this document. This restores the implementation plan previously present at `5d7d7130`, retaining milestone IDs while updating source routing, specification dependencies and release requirements.
 
 [Consensus](../../docs/lotus-v2/consensus.md) owns validity, [decisions](../../docs/lotus-v2/decisions.md) owns open choices, and [validation](../../docs/lotus-v2/validation.md) owns conformance obligations. A patch existing, applying, building, passing a model, and passing independent consensus validation are separate statuses.
 
 ## Source foundation and current status
 
-The current executable [V2 series](../patches/v2/series) contains 57 patches,
-`000`–`056`, on ABC master `1fb7db17c176cdea8a2c60d887891589382ee4e3`.
+The current executable [V2 series](../patches/v2/series) contains 70 patches,
+`000`–`069`, on ABC master `1fb7db17c176cdea8a2c60d887891589382ee4e3`.
 The [review packet](../candidates/v2-native-reviewed-20261014/README.md) records
 intermediate replay trees and focused validation through patch 032. That reviewed source tree is
 `507c91e64c205df7b38e77abff6ebe02fb99bffe`. It includes transaction framing,
@@ -25,6 +25,40 @@ On the 032 tree, the native VM agrees with Python on 363 execution and 494 stati
 Signed compiler mint/transfer/merge fixtures execute all selected invocations in
 both engines, including rejection cases. Whole-daemon V2 validity, inherited
 unit/functional suites, Chronik and network integration remain separate gates.
+
+### Conformance integration through 069 (October 15)
+
+The [ordered gap audit](../../docs/plans/lotus-v2-conformance-gap-audit.md)
+records specification ownership and remaining limitations. Patches 057–059 add
+contextual header/ASERT validation and valid nonmonotone-time history coverage.
+Patches 060–062 and 064–067 add authenticated signing contexts to the native
+runner, immutable transaction preparation, negative signing cases and explicit
+coverage limits. Patch 063 preserves complete block sizes in header snapshots.
+Patch 068 corrects token amounts entering native monetary totals. Patch 069 adds
+complete framed-block acceptance with first-only coinbase, duplicate TxID checks,
+child-target work, actual frame charges, contextual headers and atomic in-memory
+state validation. Its outer cost schedule is an explicit uncalibrated development
+model; full-view copying and bounded ancestor verification overhead are not a
+measured resource bound.
+
+Fresh replay checks all 70 intermediate trees and ends at `5eadbbf0d3149be54eab8955178b26e09da2c728`.
+[Replay evidence](evidence/v2-series-replay-069.json) records source hashes and
+expected trees. Mailboxes 000–056, including the binary CSV in 033, are unchanged.
+The integrated source passes eight native block suites and the native VM suite;
+the combined reference passes 94 tests. The compiler passes 126 tests with no
+skips, including authenticated native/Python linked invocations and reference
+partial-fill orders. These counts describe their respective suites, not every
+V2 requirement. The retained Merkle-cost prose discrepancy and optimizer budget
+mismatch remain visible in their reports.
+
+The [separate development profile](../../docs/lotus-v2/development-profile.md)
+is proposed only. Its embedded generator reproduces complete genesis and first
+block bytes, reference acceptance, overclaim rejection and undo. Existing genesis
+fixtures remain unchanged. No daemon has accepted a V2 block. Next gates are
+atomic persistent chainstate/undo with restart and crash evidence, a daemon path
+calling the tested complete connector, and reviewed development profile/peering
+integration. Absolute reward scheduling is under separate research; the stored
+inductive recurrence remains implemented.
 
 ### Preserved overnight implementation
 
@@ -130,4 +164,12 @@ The compiler plan also owns [V2-native fixture infrastructure](../../docs/plans/
 
 ## Next bounded work
 
-The coinbase-data and Frank appendix changes are specified. The reviewed 33-patch native series is integrated on the exact ABC pin above; the independent output reference remains `beebcbde`. Patch 033 executes b0–b4 and bd, and the Python Merkle cost model exists. Patch 034 is only an in-memory ordinary-block connect/undo model; lotusd `ConnectTip` does not use it, and no V2 block has been accepted. Whole-daemon block acceptance is not done. Derive P05 field sizes from authenticated context, then wire monetary transition into block connect with persistent state/undo, and add mining jobs. Continue with a disposable development genesis/payment/block/undo slice before broad optimization. Do not mark the complete plan implemented merely because documentation, patches or a genesis-search script exist.
+The complete in-memory boundary is available through patch 069. Wire it into a
+separate development-chain daemon path with atomic block/UTXO/monetary/undo
+persistence; prove restart, disconnect and crash recovery before accepting peer
+blocks. Preserve existing Bitcoin parsing and mainnet chainparams. Review the
+proposed development profile before adoption. Then implement the reviewed TCP
+and compact-block milestone, followed by the separately reviewed QUIC milestone.
+Compiler stateful allowance coverage and full transaction/block fixture execution
+remain open. No V2 daemon acceptance, public testnet or mainnet parameter freeze
+is claimed by the isolated module results.
