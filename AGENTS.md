@@ -27,7 +27,7 @@ lotus/
 │   ├── bitcoin-abc-v1-version
 │   ├── Makefile
 │   ├── scripts/         # setup.sh, build.sh, run.sh, mkpatch.sh, refresh.sh
-│   ├── patches/v1/      # 153 verified patches (000–247) for Lotus V1 mainnet (v11.6.0)
+│   ├── patches/v1/      # 153 maintained patches (000–247) plus generated release metadata (v11.6.1)
 │   └── docs/            # patch-strategy.md, impcpd-methodology.md, v1-8c67fe1e85-validation.md
 ├── sdk/
 │   ├── dart/            # Dart SDK (extracted from wallets/vase)
@@ -49,7 +49,7 @@ Workspaces (`daemon/workspace-*`) are **gitignored** local clones created by `ma
 
 | SERIES | Base | Version file | Workspace | Purpose |
 |--------|------|-------------|-----------|---------|
-| `v1` | `bitcoin-abc` `8c67fe1e85` | `bitcoin-abc-v1-version` | `workspace-v1/` | **Lotus V1 mainnet (`v11.6.0`)** — 153 patches (`000`–`247`) + in-process Chronik (`-DBUILD_CHRONIK=ON`) |
+| `v1` | `bitcoin-abc` `8c67fe1e85` | `bitcoin-abc-v1-version` | `workspace-v1/` | **Lotus V1 mainnet (`v11.6.1`)** — 153 maintained patches (`000`–`247`) plus generated release metadata + in-process Chronik (`-DBUILD_CHRONIK=ON`) |
 | `ecash` | `bitcoin-abc` `1fb7db17` | `bitcoin-abc-version` | `workspace-ecash/` | Upstream reference patches |
 | `doged` | `doged-io/doged` | `doged-version` | `workspace-doged/` | Dogecoin ABC reference |
 | `bchn` | BCHN `abd433abe0` (29.2.1) | `bchn-version` | `workspace-bchn/` | Current-tip Bitcoin Cash Node upstream candidates |
