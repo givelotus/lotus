@@ -3,12 +3,13 @@
 This mirrors the standalone C++ model: ordered ordinary transactions, one
 invocation-cost sum, rollback when that sum exceeds the block cap, and an undo
 object that restores the UTXO root and 56-byte monetary record. It does not
-parse a block wire, mine, run ASERT, construct a coinbase, or claim that
-lotusd accepted a block.
+parse a block wire, mine, run ASERT, or claim that lotusd accepted a block.
 
-The monetary delta is ``advance`` with a zero coinbase payout and the parent
-work integer. Those arguments let the existing arithmetic return its delta;
-they are not a coinbase or work rule implemented here.
+A first payment with kind ``coinbase`` is a development-profile coinbase when
+the parent carries a header. Its wire is the flags-2 transaction codec, and
+``advance`` receives that output value and encoded length. Ordinary blocks
+still pass a zero coinbase payout. The parent work integer is not a new work
+rule.
 
 A CHECKSIG witness is retried with the mode-0 sighash from
 ``lotus_v2_reference.signing``. This is the reference connector, not lotusd
@@ -23,7 +24,10 @@ import blake3
 
 from .encoding import Output, Profile, decode_output, encode_compact_size, encode_output
 from .monetary import MonetaryState, OrdinaryTx, Profile as MonetaryProfile, advance
-from .signing import Input, Transaction, TxProfile, Witness, signing_message
+from .signing import (
+    Input, Transaction, TxProfile, Witness, encode_transaction, identity_digests,
+    signing_message,
+)
 from .vm import (
     ASSIGNED, SigningContext, UnsupportedFeature, VMError, VMProfile,
     branch_leaf_hash, evaluate,
@@ -228,6 +232,8 @@ class Parent:
     time: int
     state_root: bytes
     monetary: MonetaryState
+    # Sealer header. Required only for a development coinbase block id.
+    header: object | None = None
 
 
 @dataclass(frozen=True)
@@ -380,6 +386,47 @@ def _apply_one(
     return witness_cost
 
 
+def _apply_coinbase(
+    tx: Payment,
+    parent: Parent,
+    coins: dict[tuple[bytes, int], Coin],
+    undo: Undo,
+    *,
+    candidate_height: int,
+    parent_mtp: int,
+) -> int:
+    """Create one coinbase coin. Returns the encoded transaction length.
+
+    No witness VM and no spent coin. Callers without a parent header keep the
+    ordinary-transaction rejection; the block id is not invented.
+    """
+    if parent.header is None:
+        raise ValueError("coinbase is not an ordinary transaction")
+    from .block_seal import Header, block_id
+    if type(candidate_height) is not int or not 0 <= candidate_height <= 0xFFFFFFFF:
+        raise ValueError("coinbase parent/height")
+    raw = parent.header
+    seal_header = raw if isinstance(raw, Header) else Header(
+        getattr(raw, "prev_id"), getattr(raw, "bits"), getattr(raw, "time"),
+        getattr(raw, "nonce"), getattr(raw, "version"), getattr(raw, "size"),
+        getattr(raw, "height"), getattr(raw, "tx_root"), getattr(raw, "state_root"),
+    )
+    prev_txid = block_id(parent.chain_id, seal_header)
+    transaction = Transaction(
+        0,
+        (Input(prev_txid, candidate_height, 0xFFFFFFFF, 2, 0, (), None),),
+        (_payment_output(tx.value, tx.script),),
+    )
+    wire = encode_transaction(transaction, PAYMENT_TX_PROFILE)
+    txid = identity_digests(transaction, PAYMENT_TX_PROFILE, parent.chain_id).txid
+    if (txid, 0) in coins:
+        raise ValueError("created outpoint already occupied")
+    created = Coin(txid, 0, tx.value, tx.script, candidate_height, parent_mtp, True)
+    coins[created.key()] = created
+    undo.steps.append(UndoStep(True, created))
+    return len(wire)
+
+
 def connect_ordinary_block(
     transactions: tuple[Payment, ...],
     parent: Parent,
@@ -409,13 +456,25 @@ def connect_ordinary_block(
                 prior_monetary_bytes=monetary.to_bytes())
     accounted: list[OrdinaryTx] = []
     total_cost = 0
+    coinbase_outputs = 0
+    coinbase_bytes = 0
     try:
-        for tx in transactions:
-            cost = _apply_one(
-                tx, parent, coins, undo, accounted,
-                candidate_height=candidate_height, parent_mtp=parent_mtp,
-                coinbase_maturity=coinbase_maturity,
-            )
+        for index, tx in enumerate(transactions):
+            if tx.kind == "coinbase":
+                if index != 0:
+                    raise ValueError("coinbase is not an ordinary transaction")
+                coinbase_bytes = _apply_coinbase(
+                    tx, parent, coins, undo,
+                    candidate_height=candidate_height, parent_mtp=parent_mtp,
+                )
+                coinbase_outputs = tx.value
+                cost = 0
+            else:
+                cost = _apply_one(
+                    tx, parent, coins, undo, accounted,
+                    candidate_height=candidate_height, parent_mtp=parent_mtp,
+                    coinbase_maturity=coinbase_maturity,
+                )
             if total_cost > (1 << 128) - 1 - cost:
                 raise ValueError("block invocation cost overflow")
             total_cost += cost
@@ -423,8 +482,10 @@ def connect_ordinary_block(
                 raise ValueError("block invocation cost over cap")
         transition = advance(
             monetary_profile, monetary, work=monetary.prev_work,
-            transactions=tuple(accounted), coinbase_native_outputs=0,
-            coinbase_native_burn=0, coinbase_bytes=0, tx_frame_prefix_bytes=0,
+            transactions=tuple(accounted),
+            coinbase_native_outputs=coinbase_outputs,
+            coinbase_native_burn=0, coinbase_bytes=coinbase_bytes,
+            tx_frame_prefix_bytes=0,
             account_block_cost=total_cost, enforce_block_cost=total_cost,
         )
     except ValueError:

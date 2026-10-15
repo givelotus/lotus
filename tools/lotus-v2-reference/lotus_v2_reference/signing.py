@@ -48,6 +48,8 @@ class Input:
     flags: int
     path_index: int = 0
     witnesses: tuple[Witness, ...] = ()
+    # None is canonical absence (compact-size 0). Present data is nonempty.
+    coinbase_data: bytes | None = None
 
 
 @dataclass(frozen=True)
@@ -116,21 +118,33 @@ def _witness_wire(witness: Witness, profile: TxProfile, core: bool) -> bytes:
 
 
 def _input_wire(inp: Input, profile: TxProfile, core: bool) -> bytes:
-    if inp.flags not in (1, 3):
+    if inp.flags not in (1, 2, 3):
         raise SigningError("unsupported input kind for signing")
     if not isinstance(inp.prev_txid, bytes) or len(inp.prev_txid) != 32:
         raise SigningError("prev txid")
     encoded = inp.prev_txid + _u32(inp.prev_index, "prev index")
     encoded += _u32(inp.sequence, "sequence") + bytes([inp.flags])
     if inp.flags == 1:
-        if (type(inp.path_index) is not int or inp.path_index >= 16 or not inp.witnesses
-                or len(inp.witnesses) > 16
+        if (inp.coinbase_data is not None or type(inp.path_index) is not int
+                or inp.path_index >= 16 or not inp.witnesses or len(inp.witnesses) > 16
                 or (inp.sequence != 0xFFFFFFFF and (inp.sequence & ~0x40FFFF))):
             raise SigningError("spend authorization")
         encoded += encode_compact_size(inp.path_index) + encode_compact_size(len(inp.witnesses))
         for witness in inp.witnesses:
             encoded += _witness_wire(witness, profile, core)
         return encoded
+    if inp.flags == 2:
+        # Core and full wires both retain CoinbaseData. Arguments are not stripped.
+        data = inp.coinbase_data
+        if inp.sequence != 0xFFFFFFFF or inp.path_index != 0 or inp.witnesses:
+            raise SigningError("coinbase data")
+        if data is None:
+            return encoded + encode_compact_size(0)
+        if not isinstance(data, bytes) or not 1 <= len(data) <= 8192:
+            raise SigningError("coinbase data")
+        return encoded + encode_compact_size(1) + encode_bytes(data, max_length=8192)
+    if inp.coinbase_data is not None:
+        raise SigningError("mint coinbase data")
     if (inp.prev_txid == bytes(32) or inp.prev_index != 0 or inp.sequence != 0xFFFFFFFF
             or inp.path_index != 0 or len(inp.witnesses) != 1):
         raise SigningError("mint pseudo-outpoint")
@@ -147,18 +161,37 @@ def _require_transaction(tx: Transaction, profile: TxProfile) -> None:
     seen: set[tuple[bytes, int]] = set()
     spends = 0
     mints = 0
+    has_coinbase = False
     for inp in tx.inputs:
         spends += inp.flags == 1
         mints += inp.flags == 3
+        has_coinbase = has_coinbase or inp.flags == 2
         key = (inp.prev_txid, inp.prev_index)
         if key in seen:
             raise SigningError("repeated outpoint")
         seen.add(key)
+    if has_coinbase:
+        # One coinbase input, lock zero, at least one native output, no spend required.
+        if (len(tx.inputs) != 1 or tx.inputs[0].flags != 2 or tx.lock != 0
+                or not tx.outputs or any(output.flags & 1 for output in tx.outputs)):
+            raise SigningError("coinbase shape")
+    for inp in tx.inputs:
         _input_wire(inp, profile, False)
-    if spends == 0 or mints > profile.max_mints:
+    if not has_coinbase and (spends == 0 or mints > profile.max_mints):
         raise SigningError("ordinary input mix")
     for output in tx.outputs:
         _output_bytes(output)
+
+
+def encode_transaction(tx: Transaction, profile: TxProfile) -> bytes:
+    """Serialize one full transaction. Coinbase data is not stripped."""
+    _require_transaction(tx, profile)
+    encoded = _header(tx)
+    for inp in tx.inputs:
+        encoded += _input_wire(inp, profile, False)
+    for output in tx.outputs:
+        encoded += _output_bytes(output)
+    return encoded
 
 
 def _header(tx: Transaction) -> bytes:
@@ -313,6 +346,8 @@ def _prepare(tx: Transaction, profile: TxProfile, chain_id: bytes,
                 selector = bytes([1]) + _u32(index, "input index") + _u32(branch_index, "branch index") + leaf
                 built.append(_Invocation(1, selector))
             invocations.append(tuple(built))
+        elif inp.flags == 2:
+            raise SigningError("coinbase is not signed")
         else:
             witness = inp.witnesses[0]
             leaf = _branch_leaf(witness.script)
@@ -424,6 +459,15 @@ def _read_input(reader: Reader, profile: TxProfile) -> Input:
             raise DecodeError("witness count")
         witnesses = tuple(_read_witness(reader, profile) for _ in range(count))
         return Input(prev_txid, prev_index, sequence, flags, path_index, witnesses)
+    if flags == 2:
+        try:
+            count = reader.compact_size(max_value=1)
+        except DecodeError as exc:
+            if str(exc) == "declared length exceeds cap":
+                raise DecodeError("coinbase count") from exc
+            raise
+        data = reader.bytes_field(max_length=8192) if count == 1 else None
+        return Input(prev_txid, prev_index, sequence, flags, 0, (), data)
     if flags == 3:
         return Input(prev_txid, prev_index, sequence, flags, 0, (_read_witness(reader, profile),))
     raise DecodeError("input flags")
