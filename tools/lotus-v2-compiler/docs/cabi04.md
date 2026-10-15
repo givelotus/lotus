@@ -17,6 +17,8 @@ coverage, not complete CABI04 acceptance, transaction accounting or block accept
 | `output.branch(i)` / `.branch_count()` | OUTPUTBRANCH / OUTPUTBRANCHCOUNT |
 | `output.exclusive_branch(root)` | OUTPUTEXCLUSIVEBRANCH, Boolean |
 | `output.continues_branch(root)` | OUTPUTCONTINUESBRANCH, Boolean |
+| `this.coin.path_count()` / `input.coin.path_count()` / `output.path_count()` | UTXOPATHCOUNT / OUTPUTPATHCOUNT, Int |
+| `this.coin.path(i)` / `input.coin.path(i)` / `output.path(i)` | UTXOPATH / OUTPUTPATH, canonical path bytes bounded by 8192 |
 | `check_lock(kind, bound)` | CHECKLOCKTIMEVERIFY then true |
 | `check_sequence(kind, bound)` | CHECKSEQUENCEVERIFY then true |
 
@@ -157,12 +159,74 @@ test preserves the standalone script. `input.coin.requires_branch(root)` is also
 available via assigned UTXOREQUIRESBRANCH (`dd`); its every-path semantics remain
 distinct from the source's explicit branch-presence scan.
 
-A stateful allowance/spending-cap example remains unimplemented. Counter demonstrates
-authenticated numeric state, but it does not authorize a spender, bind a recipient,
-or decrement a committed allowance while preserving asset inventory. Completing
-that scenario requires its own source and signed transition/replay/substitution
-fixtures; it is not implied by the counter or partial-order results.
+Stateful allowance coverage is added in the separate packet below; no periodic
+reset, expiry or shared global budget semantics are implied.
 
 Partial-fill validation: the compiler suite passed 115 tests without skips; the
 subsequent multiple-required-witness preservation check and all CABI04 tests pass
 with the expanded helper. No existing fixture bytes or expectations were changed.
+
+
+## Stateful allowance application policy
+
+The compiler plan names stateful allowances as an open example without defining
+recipient selection, cap reset or expiry. StatefulAllowance makes explicit
+application choices: one delegated signing key, one fixed recipient policy, a
+positive per-call cap and a nonnegative total remaining budget. These constructor
+choices are committed in the code policy. They are not consensus parameters or a
+proposed general allowance standard. There is no automatic reset, expiry, clock,
+issuance or global balance query.
+
+The state coin stores code in branch 0 and `sha256(N(budget))` in unexecuted branch
+1. A positive signed spend cannot exceed the cap or remaining budget, and must
+leave positive inventory. Exactly two outputs exist: a successor carrying the
+same asset with inventory minus amount and state commitment for budget minus
+amount, and an exclusive fixed-recipient output carrying exactly amount units.
+Budget can reach zero; its successor remains present and rejects further positive
+spends. The spent inventory and committed budget are independent: exhausted budget
+need not imply exhausted inventory. Withdrawal/reset/termination methods require
+a separate policy design and are not implemented in this example.
+
+All input branches are scanned within the P03 cap of 16. Exactly one state-code
+root may occur, including optional and late-position roots. The code must be
+mandatory on its input; successor code must remain available without executing the
+data branch. Path count is exactly one, and canonical path bytes must equal the
+constructor-bound `expected_path = 0100` (Vec with one branch index 0), on both
+input and successor. This preserves exact `[[0]]` policy while updating only the
+separate state commitment; extra redundant paths also reject. Duplicate state
+inputs or output roles, missing successor/payment,
+recipient changes, asset substitutions and bypass/hostage paths reject.
+
+The fixture uses a native state coin of 100, budget 50 and cap 20. A spend pays
+20 to the recipient and leaves inventory 80 / budget 30. A later spend of 10
+consumes that exact successor and leaves inventory 70 / budget 20. A separate
+native input of 10 funds fees; both actual consuming invocations receive FULL
+signatures and execute independently. A token-inventory variant also executes,
+as does one-unit spending and exact budget exhaustion. Token rules beyond this
+example's code/state branches need their own policy layout and independent
+invocation fixtures; this is not an arbitrary token-policy migration tool.
+
+Tests reject unsigned/wrong-signer calls, stale budget replay against a successor,
+argument and output mutation, cap/budget violations, incorrect decrement, negative
+state, wrong amount/asset/recipient, duplicate and extra state inputs/outputs,
+branch substitutions and bypass paths. Negative covenant cases are signed again
+after mutation so their rejection is not merely a stale signature. Signing/VM
+checks do not enforce spent-outpoint replay protection; that remains the enclosing
+UTXO validator's responsibility. Exact source, artifacts, resolved coins,
+transactions, signatures, results, stacks and charges are exported to
+`/private/tmp/cabi04-results/stateful-allowance.json`.
+
+Path introspection is a frontend extension over existing assigned da/db/e5/e6
+instructions; no opcode or consensus definition changes. Path reads use the same
+receiver checks as branch reads, accept Int indices checked against actual path
+counts by the VM, and return bounded canonical byte strings. Dedicated negative
+tests cover bad argument types/arity, non-record receivers, negative/large/out-of-range
+indices, changed path arrays and redundant paths. Package and standalone allowance
+scripts match byte for byte. The test's expected path is explicit application schema
+binding, not a new policy encoding or network parameter.
+
+Allowance validation: the complete compiler suite passed 121 tests without skips.
+The allowance tests use the integrated expanded Python reference package, preserve
+existing golden fixtures unchanged, and introduce no reference or consensus source
+changes. Enclosing fee/resource floors, token/native accounting and block acceptance
+remain separate from these per-invocation results.

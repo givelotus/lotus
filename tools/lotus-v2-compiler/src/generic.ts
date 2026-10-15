@@ -328,7 +328,7 @@ type EVar = { kind: 'argument'; type: ValueType; index: number } | { kind:'local
 type Env = Map<string, EVar>;
 type Compiled = { script: Uint8Array; leaf: Uint8Array; map: MethodArtifact['sourceMap']; resources: MethodArtifact['staticResources'] };
 const OPCODES = { VERIFY: 0x65, IF: 0x61, ELSE: 0x63, ENDIF: 0x64, ENUMERATE_INPUTS:0x67, ENUMERATE_OUTPUTS:0x68, ENDENUMERATE:0x6a, DROP: 0x79, PICK: 0x7d, ROLL:0x7e,
-  UTXOREQUIRESBRANCH:0xdd, UTXOBRANCHCOUNT:0xd8, UTXOBRANCH:0xd9, OUTPUTBRANCHCOUNT:0xe3, OUTPUTBRANCH:0xe4, OUTPUTEXCLUSIVEBRANCH:0xe9, OUTPUTCONTINUESBRANCH:0xea, CHECKLOCKTIMEVERIFY:0xf3, CHECKSEQUENCEVERIFY:0xf4, SWAP:0x80, BRANCHROOT:0xf2, INPUTINDEX:0xd0, INPUTFLAGS:0xd1, UTXOVALUE:0xd6, UTXOTOKENID:0xd7, OUTPUTVALUE:0xe1, OUTPUTTOKENID:0xe2, OUTPUTREQUIRESBRANCH:0xe8, NUMEQUAL:0xa6, GREATERTHANOREQUAL:0xac,
+  UTXOPATHCOUNT:0xda, UTXOPATH:0xdb, OUTPUTPATHCOUNT:0xe5, OUTPUTPATH:0xe6, UTXOREQUIRESBRANCH:0xdd, UTXOBRANCHCOUNT:0xd8, UTXOBRANCH:0xd9, OUTPUTBRANCHCOUNT:0xe3, OUTPUTBRANCH:0xe4, OUTPUTEXCLUSIVEBRANCH:0xe9, OUTPUTCONTINUESBRANCH:0xea, CHECKLOCKTIMEVERIFY:0xf3, CHECKSEQUENCEVERIFY:0xf4, SWAP:0x80, BRANCHROOT:0xf2, INPUTINDEX:0xd0, INPUTFLAGS:0xd1, UTXOVALUE:0xd6, UTXOTOKENID:0xd7, OUTPUTVALUE:0xe1, OUTPUTTOKENID:0xe2, OUTPUTREQUIRESBRANCH:0xe8, NUMEQUAL:0xa6, GREATERTHANOREQUAL:0xac,
   EQUAL: 0x91, NOT: 0x9c, ADD: 0x9e, SUB: 0x9f, MUL: 0xa0, BOOLAND: 0xa4, BOOLOR: 0xa5,
   LESSTHAN: 0xa9, GREATERTHAN: 0xaa, SHA256: 0xb8, HASH256: 0xb9, BLAKE3: 0xba, CHECKSIG: 0xbb, CHECKSIGVERIFY: 0xbc, NEGATE: 0x9a } as const;
 class Emitter {
@@ -607,12 +607,12 @@ class Compiler {
           if (args.length !== 2 || args.some(arg => infer(arg, scope, active, frames) !== 'Int')) return this.problem('E0405', `${name} expects Int kind and bound`, expr.span, frames);
           return 'Bool';
         }
-        if (name.endsWith('.branch') || name.endsWith('.branch_count')) {
+        if (['.branch','.branch_count','.path','.path_count'].some(suffix => name.endsWith(suffix))) {
           const path = name.split('.'), current = path.slice(0,-1).join('.') === 'this.coin', receiver = scope.get(path[0]!);
-          if (current ? c.kind === 'token' : !(receiver?.kind === 'local' && ['InputIndex','OutputIndex'].includes(receiver.type) && (path.length === 2 || path.length === 3 && path[1] === 'coin' && receiver.type === 'InputIndex'))) return this.problem('E0412', 'branch read requires a spend coin or enumerated input/output', expr.span, frames);
-          const branch = name.endsWith('.branch');
-          if (args.length !== (branch ? 1 : 0) || branch && infer(args[0]!, scope, active, frames) !== 'Int') return this.problem('E0405', 'branch index must be Int; branch_count takes no arguments', expr.span, frames);
-          return branch ? 'Bytes32' : 'Int';
+          if (current ? c.kind === 'token' : !(receiver?.kind === 'local' && ['InputIndex','OutputIndex'].includes(receiver.type) && (path.length === 2 || path.length === 3 && path[1] === 'coin' && receiver.type === 'InputIndex'))) return this.problem('E0412', 'branch/path read requires a spend coin or enumerated input/output', expr.span, frames);
+          const branch = name.endsWith('.branch') || name.endsWith('.path'), pathRead = name.endsWith('.path') || name.endsWith('.path_count');
+          if (args.length !== (branch ? 1 : 0) || branch && infer(args[0]!, scope, active, frames) !== 'Int') return this.problem('E0405', 'branch/path index must be Int; count takes no arguments', expr.span, frames);
+          return branch ? (pathRead ? 'Bytes(8192)' : 'Bytes32') : 'Int';
         }
         if (name === 'leaf_hash') { if (args.length !== 1 || args[0]!.kind !== 'name' || args[0]!.value!.split('.').length !== 2) return this.problem('E0502', 'leaf_hash requires Contract.method', expr.span, frames); return 'MethodLeafHash'; }
         if (name === 'contract_root' || name === 'merkle_root') { if (args.length !== 1 || args[0]!.kind !== 'name' || args[0]!.value!.includes('.')) return this.problem('E0502', `${name} requires tree name`, expr.span, frames); return this.contract(args[0]!.value!, args[0]!.span).kind === 'token' ? 'TokenId' : 'ContractRootHash'; }
@@ -740,17 +740,18 @@ class Compiler {
           emitter.op(name === 'check_lock' ? 'CHECKLOCKTIMEVERIFY' : 'CHECKSEQUENCEVERIFY', expr.span, origin, -2);
           emitter.number(1n, expr.span, origin); return 'Bool';
         }
-        if (name.endsWith('.branch') || name.endsWith('.branch_count')) {
+        if (['.branch','.branch_count','.path','.path_count'].some(suffix => name.endsWith(suffix))) {
           const path = name.split('.'), current = path.slice(0,-1).join('.') === 'this.coin', receiver = scope.get(path[0]!);
-          if (current ? c.kind === 'token' : !(receiver?.kind === 'local' && ['InputIndex','OutputIndex'].includes(receiver.type) && (path.length === 2 || path.length === 3 && path[1] === 'coin' && receiver.type === 'InputIndex'))) return this.problem('E0412', 'branch read requires a spend coin or enumerated input/output', expr.span, frames);
-          const branch = name.endsWith('.branch');
-          if (args.length !== (branch ? 1 : 0)) return this.problem('E0405', 'branch expects one Int index; branch_count takes no arguments', expr.span, frames);
+          if (current ? c.kind === 'token' : !(receiver?.kind === 'local' && ['InputIndex','OutputIndex'].includes(receiver.type) && (path.length === 2 || path.length === 3 && path[1] === 'coin' && receiver.type === 'InputIndex'))) return this.problem('E0412', 'branch/path read requires a spend coin or enumerated input/output', expr.span, frames);
+          const branch = name.endsWith('.branch') || name.endsWith('.path'), pathRead = name.endsWith('.path') || name.endsWith('.path_count');
+          if (args.length !== (branch ? 1 : 0)) return this.problem('E0405', 'branch/path expects one Int index; count takes no arguments', expr.span, frames);
           if (current) emitter.op('INPUTINDEX', expr.span, origin, 1);
-          else { const v = receiver!; if (v.kind !== 'local') return this.problem('E0412', 'branch read requires a local index', expr.span, frames); emitter.number(BigInt(emitter.height - 1 - v.index), expr.span, origin); emitter.op('PICK', expr.span, origin); }
-          if (branch && expression(args[0]!, scope, origin, frames) !== 'Int') return this.problem('E0405', 'branch index must be Int', expr.span, frames);
+          else { const v = receiver!; if (v.kind !== 'local') return this.problem('E0412', 'branch/path read requires a local index', expr.span, frames); emitter.number(BigInt(emitter.height - 1 - v.index), expr.span, origin); emitter.op('PICK', expr.span, origin); }
+          if (branch && expression(args[0]!, scope, origin, frames) !== 'Int') return this.problem('E0405', 'branch/path index must be Int', expr.span, frames);
           const output = !current && receiver!.type === 'OutputIndex';
-          emitter.op(output ? (branch ? 'OUTPUTBRANCH' : 'OUTPUTBRANCHCOUNT') : (branch ? 'UTXOBRANCH' : 'UTXOBRANCHCOUNT'), expr.span, origin, branch ? -1 : 0);
-          return branch ? 'Bytes32' : 'Int';
+          const op = pathRead ? (output ? (branch ? 'OUTPUTPATH' : 'OUTPUTPATHCOUNT') : (branch ? 'UTXOPATH' : 'UTXOPATHCOUNT')) : (output ? (branch ? 'OUTPUTBRANCH' : 'OUTPUTBRANCHCOUNT') : (branch ? 'UTXOBRANCH' : 'UTXOBRANCHCOUNT'));
+          emitter.op(op, expr.span, origin, branch ? -1 : 0);
+          return branch ? (pathRead ? 'Bytes(8192)' : 'Bytes32') : 'Int';
         }
         if (name === 'leaf_hash') {
           if (args.length !== 1 || args[0]!.kind !== 'name') return this.problem('E0502', 'leaf_hash requires Contract.method name', expr.span, frames);
