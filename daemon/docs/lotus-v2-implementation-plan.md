@@ -905,3 +905,31 @@ Source review also checks bounded context output including escaped IDs/newline,
 quiescence and final identity/root rechecks. The standalone wallet client and
 interactive controller are not yet integrated or demonstrated against live
 nodes; this packet alone does not close that user-facing workflow gate.
+
+
+### Private-channel native wallet client (patches 171–172)
+
+A standalone POSIX `lotus-v2-wallet-client` uses the existing encrypted SQLite
+wallet and provider-backed PaymentEngine. The controller supplies one private
+socketpair for bounded `walletcontext` exchanges and a separate EOF-framed secret
+pipe. The client never opens the node database or handles secrets through public
+JSON. Pending/export recovery returns persisted canonical transaction bytes with
+native identity checks. Ambiguous signing or subsequent output failures report
+`outcome_unknown`; callers must recover explicitly without automatic re-signing.
+
+Fresh replay checked all 173 intermediate trees, preserving prior mailboxes,
+ending at tree `8ddc44ec9a7bde2a59d3f56dca26705b1ba5762b`.
+See `evidence/v2-series-replay-172.json`. Native source
+`c605e6e9f12d9fa80a50103d40973531dcdceb95` builds both targets with Chronik off.
+Daemon SHA256 `8b8a35603ae1c66c16635522c2a1069db967cb403ef369b73ecae5f8a3bb1de4`;
+wallet-client SHA256 `962dc9640e7246306f7513662c838ec0ddabc32383d84b4382dd12b6b5a95eef`.
+Build log: `/private/tmp/lotus-v2-wallet-client-full-build.log`.
+
+The exact client passes 21 private-channel boundary checks: encrypted creation,
+locked info/pending, strict JSON, secret limits/TTY refusal, malformed and oversized
+context replies, correlation, typed stale replies, EOF and a fixed trickle
+deadline. Closed stdout exits without SIGPIPE. Evidence is in
+`evidence/v2-wallet-client-172.json`, with scripts/logs under
+`/private/tmp/lotus-v2-wallet-cli-mock-20261015`. These mock checks do not demonstrate
+valid-context signing or an interactive live-node payment; that gate remains
+separate and pending.
