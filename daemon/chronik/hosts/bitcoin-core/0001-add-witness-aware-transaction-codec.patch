@@ -1,0 +1,582 @@
+From 67b6da6c690d3aa06b689bc116c0254049089d15 Mon Sep 17 00:00:00 2001
+From: Lotus contributors <build@givelotus.org>
+Date: Wed, 14 Oct 2026 17:50:24 -0700
+Subject: [PATCH] Add separate Bitcoin witness wire codec foundation
+
+Retain ABC/Lotus/Doged TxMut serialization and existing HTTP/protobuf contracts. Parse exact Core witness flags and canonical CompactSize, retain full wire bytes separately, distinguish stripped txid from wtxid, and report byte/weight sizes. Native Core f13ae519 serializers and hashes supply 161 acceptance/rejection fixtures, including full-witness block offsets. This optional source patch does not implement or enable a Bitcoin Core Chronik host bridge, indexer or provider profile.
+
+diff --git a/chronik/bitcoinsuite-core/src/tx/bitcoin.rs b/chronik/bitcoinsuite-core/src/tx/bitcoin.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..770f721c1bb7d34f7bc589d6073793f9002251eb
+--- /dev/null
++++ b/chronik/bitcoinsuite-core/src/tx/bitcoin.rs
+@@ -0,0 +1,222 @@
++// Copyright (c) 2026 The Lotus developers
++// Distributed under the MIT software license, see the accompanying
++// file COPYING or http://www.opensource.org/licenses/mit-license.php.
++
++//! Bitcoin Core's witness-aware wire format, separate from ABC's [`TxMut`].
++//!
++//! This codec parses bytes, not consensus or Script validity. It does not enable
++//! a Bitcoin Core Chronik host or change existing ABC/Lotus/Doged serializers.
++
++use bytes::Bytes;
++use thiserror::Error;
++
++use crate::{
++    bytes::read_bytes,
++    error::DataError,
++    hash::{Hashed, Sha256d},
++    script::Script,
++    ser::BitcoinSer,
++    tx::{OutPoint, Tx, TxId, TxInput, TxMut, TxOutput},
++};
++
++/// Parsing errors for the Bitcoin Core transaction wire format.
++#[derive(Clone, Debug, Error, Eq, PartialEq)]
++pub enum BitcoinTxError {
++    /// Fixed-width field or byte string exceeds remaining bytes.
++    #[error(transparent)]
++    Data(#[from] DataError),
++    /// CompactSize used more bytes than its value requires.
++    #[error("Non-canonical CompactSize")]
++    NonCanonicalCompactSize,
++    /// Core's default CompactSize limit was exceeded.
++    #[error("CompactSize exceeds MAX_SIZE")]
++    SizeLimit,
++    /// A vector count cannot fit in the remaining input.
++    #[error("Vector count exceeds remaining bytes")]
++    InvalidCount,
++    /// Optional transaction flags other than witness are unsupported by Core.
++    #[error("Unknown transaction optional data: {0:#x}")]
++    UnknownFlags(u8),
++    /// A witness marker was present, but all witness stacks were empty.
++    #[error("Superfluous witness record")]
++    SuperfluousWitness,
++    /// Bytes remained after the transaction locktime.
++    #[error("Trailing transaction bytes")]
++    TrailingBytes,
++}
++
++/// Immutable BTC wire transaction with separately identified stripped content.
++///
++/// Use [`Self::raw`] for broadcast/raw-tx responses. [`Self::stripped_tx`] is
++/// deliberately explicit: serializing it omits witness and must not be used for
++/// the full wire transaction or disk offsets. No implicit `Deref`/`BitcoinSer`
++/// conversion is provided, avoiding accidental witness stripping.
++#[derive(Clone, Debug, Eq, PartialEq)]
++pub struct BitcoinTx {
++    stripped: Tx,
++    raw: Bytes,
++    witness: Vec<Vec<Bytes>>,
++    wtxid: Sha256d,
++    stripped_size: usize,
++}
++
++impl BitcoinTx {
++    /// Parse exactly one Core-compatible transaction, rejecting trailing bytes.
++    pub fn from_raw(raw: Bytes) -> Result<Self, BitcoinTxError> {
++        let mut data = raw.clone();
++        let version = u32::deser(&mut data)?;
++        let mut inputs = read_inputs(&mut data)?;
++        let mut outputs = Vec::new();
++        let flags = if inputs.is_empty() {
++            let flags = u8::deser(&mut data)?;
++            if flags != 0 {
++                if flags != 1 {
++                    return Err(BitcoinTxError::UnknownFlags(flags));
++                }
++                inputs = read_inputs(&mut data)?;
++                outputs = read_outputs(&mut data)?;
++            }
++            flags
++        } else {
++            outputs = read_outputs(&mut data)?;
++            0
++        };
++        let mut witness = Vec::with_capacity(inputs.len());
++        for _ in &inputs {
++            witness.push(if flags == 1 {
++                let count = read_count(&mut data)?;
++                if count > data.len() {
++                    return Err(BitcoinTxError::InvalidCount);
++                }
++                let mut stack = Vec::with_capacity(count);
++                for _ in 0..count {
++                    stack.push(read_string(&mut data)?);
++                }
++                stack
++            } else {
++                Vec::new()
++            });
++        }
++        if flags == 1 && witness.iter().all(Vec::is_empty) {
++            return Err(BitcoinTxError::SuperfluousWitness);
++        }
++        let locktime = u32::deser(&mut data)?;
++        if !data.is_empty() {
++            return Err(BitcoinTxError::TrailingBytes);
++        }
++        let tx = TxMut {
++            version,
++            inputs,
++            outputs,
++            locktime,
++        };
++        let stripped = tx.ser();
++        // Explicit BTC SHA256d, independent of Lotus's merkleized TxId profile.
++        let txid = TxId::from(Sha256d::digest(&stripped));
++        let wtxid = Sha256d::digest(&raw);
++        Ok(Self {
++            stripped: Tx::with_txid(txid, tx),
++            raw,
++            witness,
++            wtxid,
++            stripped_size: stripped.len(),
++        })
++    }
++
++    /// Stripped transaction body, whose ID excludes marker/flags/witness.
++    pub fn stripped_tx(&self) -> &Tx {
++        &self.stripped
++    }
++
++    /// Full canonical wire bytes, including witness when present.
++    pub fn raw(&self) -> &Bytes {
++        &self.raw
++    }
++
++    /// One witness stack per input; legacy inputs have empty stacks.
++    pub fn witness(&self) -> &[Vec<Bytes>] {
++        &self.witness
++    }
++
++    /// Whether at least one input has a nonempty witness stack.
++    pub fn has_witness(&self) -> bool {
++        self.witness.iter().any(|stack| !stack.is_empty())
++    }
++
++    /// Witness transaction hash (SHA256d of full bytes), distinct from `TxId`.
++    pub fn wtxid(&self) -> Sha256d {
++        self.wtxid
++    }
++
++    /// Size of legacy serialization, excluding marker/flags/witness.
++    pub fn stripped_size(&self) -> usize {
++        self.stripped_size
++    }
++
++    /// BIP141 transaction weight, including marker/flags as witness bytes.
++    pub fn weight(&self) -> u64 {
++        3 * self.stripped_size as u64 + self.raw.len() as u64
++    }
++
++    /// Weight-based virtual size rounded up to a whole byte.
++    /// This is not Core's potentially sigop-adjusted mempool policy size.
++    pub fn vsize(&self) -> u64 {
++        self.weight().div_ceil(4)
++    }
++}
++
++// Core ReadCompactSize defaults to range_check=true and MAX_SIZE=0x02000000.
++// Check counts before allocating; raw byte lengths bound every vector allocation.
++fn read_count(data: &mut Bytes) -> Result<usize, BitcoinTxError> {
++    let marker = u8::deser(data)?;
++    let (value, minimum) = match marker {
++        0xfd => (u16::deser(data)? as u64, 0xfd),
++        0xfe => (u32::deser(data)? as u64, 0x10000),
++        0xff => (u64::deser(data)?, 0x100000000),
++        value => (value as u64, 0),
++    };
++    if value < minimum {
++        return Err(BitcoinTxError::NonCanonicalCompactSize);
++    }
++    if value > 0x02000000 {
++        return Err(BitcoinTxError::SizeLimit);
++    }
++    Ok(value as usize)
++}
++
++fn read_string(data: &mut Bytes) -> Result<Bytes, BitcoinTxError> {
++    let size = read_count(data)?;
++    Ok(read_bytes(data, size)?)
++}
++
++fn read_inputs(data: &mut Bytes) -> Result<Vec<TxInput>, BitcoinTxError> {
++    let count = read_count(data)?;
++    if count > data.len() / 41 {
++        return Err(BitcoinTxError::InvalidCount);
++    }
++    let mut inputs = Vec::with_capacity(count);
++    for _ in 0..count {
++        inputs.push(TxInput {
++            prev_out: OutPoint::deser(data)?,
++            script: Script::new(read_string(data)?),
++            sequence: u32::deser(data)?,
++            coin: None,
++        });
++    }
++    Ok(inputs)
++}
++
++fn read_outputs(data: &mut Bytes) -> Result<Vec<TxOutput>, BitcoinTxError> {
++    let count = read_count(data)?;
++    if count > data.len() / 9 {
++        return Err(BitcoinTxError::InvalidCount);
++    }
++    let mut outputs = Vec::with_capacity(count);
++    for _ in 0..count {
++        outputs.push(TxOutput {
++            sats: i64::deser(data)?,
++            script: Script::new(read_string(data)?),
++        });
++    }
++    Ok(outputs)
++}
+diff --git a/chronik/bitcoinsuite-core/src/tx/mod.rs b/chronik/bitcoinsuite-core/src/tx/mod.rs
+index 3d8faa64c61e141a969dc084bc1a435da956b264..0165c5b2c8579b654d845e3611acc1280e3cbaf4 100644
+--- a/chronik/bitcoinsuite-core/src/tx/mod.rs
++++ b/chronik/bitcoinsuite-core/src/tx/mod.rs
+@@ -4,9 +4,11 @@
+ 
+ //! Module for data referring to txs, e.g. [`TxId`].
+ 
++mod bitcoin;
+ #[allow(clippy::module_inception)]
+ mod tx;
+ mod txid;
+ 
++pub use self::bitcoin::*;
+ pub use self::tx::*;
+ pub use self::txid::*;
+diff --git a/chronik/bitcoinsuite-core/tests/bitcoin_codec.rs b/chronik/bitcoinsuite-core/tests/bitcoin_codec.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..2dc3cce1a4e790f7334969565d137ed9fd787b8c
+--- /dev/null
++++ b/chronik/bitcoinsuite-core/tests/bitcoin_codec.rs
+@@ -0,0 +1,151 @@
++// Copyright (c) 2026 The Lotus developers
++// Distributed under the MIT software license; see the repository COPYING.
++
++use bitcoinsuite_core::{hash::Hashed, ser::BitcoinSer, tx::BitcoinTx};
++use bytes::Bytes;
++use serde_json::Value;
++
++fn decode_segments(segments: &Value) -> Bytes {
++    let mut raw = Vec::new();
++    for segment in segments.as_array().unwrap() {
++        if let Some(hex) = segment.get("hex") {
++            raw.extend(hex::decode(hex.as_str().unwrap()).unwrap());
++        } else {
++            let byte = segment["byte"].as_u64().unwrap() as u8;
++            let count = segment["count"].as_u64().unwrap() as usize;
++            raw.resize(raw.len() + count, byte);
++        }
++    }
++    Bytes::from(raw)
++}
++
++fn fixtures() -> Value {
++    serde_json::from_str(include_str!("fixtures/bitcoin_core_wire.json")).unwrap()
++}
++
++#[test]
++fn matches_pinned_core_wire_oracle() {
++    let fixtures = fixtures();
++    assert_eq!(
++        fixtures["core_pin"],
++        "f13ae519de94394314cd63a27924b0998ac65d45"
++    );
++    for case in fixtures["cases"].as_array().unwrap() {
++        let name = case["name"].as_str().unwrap();
++        let raw = decode_segments(&case["raw"]);
++        let decoded = BitcoinTx::from_raw(raw.clone());
++        assert_eq!(
++            decoded.is_ok(),
++            case["core"]["accepted"],
++            "{name}: {decoded:?}"
++        );
++        if !case["core"]["accepted"].as_bool().unwrap() {
++            continue;
++        }
++        let tx = decoded.unwrap();
++        let core = &case["core"];
++        assert_eq!(tx.raw(), &raw, "{name}: full serialization");
++        assert_eq!(
++            tx.stripped_tx().ser(),
++            decode_segments(&core["stripped"]),
++            "{name}: stripped serialization"
++        );
++        assert_eq!(
++            tx.stripped_tx().txid().to_string(),
++            core["txid"],
++            "{name}: txid"
++        );
++        assert_eq!(tx.wtxid().hex_be(), core["wtxid"], "{name}: wtxid");
++        assert_eq!(
++            tx.raw().len() as u64,
++            core["size"].as_u64().unwrap(),
++            "{name}: size"
++        );
++        assert_eq!(
++            tx.stripped_size() as u64,
++            core["stripped_size"].as_u64().unwrap(),
++            "{name}: stripped size"
++        );
++        assert_eq!(
++            tx.weight(),
++            core["weight"].as_u64().unwrap(),
++            "{name}: weight"
++        );
++        assert_eq!(
++            tx.vsize(),
++            core["weight"].as_u64().unwrap().div_ceil(4),
++            "{name}: vsize"
++        );
++        assert_eq!(
++            tx.has_witness(),
++            core["has_witness"],
++            "{name}: witness presence"
++        );
++        assert_eq!(
++            tx.witness().len(),
++            tx.stripped_tx().inputs.len(),
++            "{name}: witness inputs"
++        );
++        // These offsets were measured by reading an actual Core-serialized
++        // two-transaction block, not inferred from Rust's stripped structure.
++        assert_eq!(core["first_tx_offset"], 81, "{name}: header+count");
++        assert_eq!(
++            core["second_tx_offset"].as_u64().unwrap(),
++            81 + tx.raw().len() as u64,
++            "{name}: disk offset"
++        );
++        if tx.has_witness() {
++            assert_ne!(
++                core["second_tx_offset"].as_u64().unwrap(),
++                81 + tx.stripped_size() as u64,
++                "{name}: stripped size must not advance disk position"
++            );
++        } else {
++            assert_eq!(
++                tx.stripped_tx().txid().to_bytes(),
++                *tx.wtxid().as_le_bytes(),
++                "{name}: legacy hash equality"
++            );
++        }
++    }
++}
++
++#[test]
++fn witness_mutation_keeps_txid_but_changes_wtxid_and_wire_bytes() {
++    let fixture = fixtures();
++    let cases = fixture["cases"].as_array().unwrap();
++    let find = |name| {
++        let case = cases.iter().find(|case| case["name"] == name).unwrap();
++        BitcoinTx::from_raw(decode_segments(&case["raw"])).unwrap()
++    };
++    let first = find("witness");
++    let second = find("witness_mutation_same_txid");
++    assert_eq!(first.stripped_tx(), second.stripped_tx());
++    assert_ne!(first.raw(), second.raw());
++    assert_ne!(first.wtxid(), second.wtxid());
++}
++
++#[test]
++fn existing_other_script_contract_preserves_btc_witness_programs() {
++    use bitcoinsuite_core::script::{ScriptType, ScriptVariant};
++    let fixture = fixtures();
++    for name in ["witness", "p2wsh_and_p2tr_outputs"] {
++        let case = fixture["cases"]
++            .as_array()
++            .unwrap()
++            .iter()
++            .find(|case| case["name"] == name)
++            .unwrap();
++        let tx = BitcoinTx::from_raw(decode_segments(&case["raw"])).unwrap();
++        for output in &tx.stripped_tx().outputs {
++            assert_eq!(
++                output.script.variant(),
++                ScriptVariant::Other(output.script.clone())
++            );
++            let variant =
++                ScriptVariant::from_type_and_payload(ScriptType::Other, output.script.bytecode())
++                    .unwrap();
++            assert_eq!(variant.to_script(), output.script);
++        }
++    }
++}
+diff --git a/chronik/bitcoinsuite-core/tests/fixtures/bitcoin_core_wire.json b/chronik/bitcoinsuite-core/tests/fixtures/bitcoin_core_wire.json
+new file mode 100644
+index 0000000000000000000000000000000000000000..747abcdeb51445c81c9df550635deda43cf1518d
+--- /dev/null
++++ b/chronik/bitcoinsuite-core/tests/fixtures/bitcoin_core_wire.json
+@@ -0,0 +1,168 @@
++{
++  "core_pin": "f13ae519de94394314cd63a27924b0998ac65d45",
++  "oracle_source_sha256": "df3901af43976f8012b879396e9dbceca7200d0fc3f76ed4471d9f48b6db2f02",
++  "scope": "Native transaction decoding/serialization/hashes and synthetic block offsets; not consensus validity or indexer behavior",
++  "cases": [
++    {"core": {"accepted": true, "first_tx_offset": 81, "has_witness": false, "second_tx_offset": 164, "size": 83, "stripped": [{"hex": "0200000001"}, {"byte": 17, "count": 32}, {"hex": "000000000151feffffff01a08601000000000016001422222222222222222222222222222222222222220a000000"}], "stripped_size": 83, "txid": "3e4d6975eb9fab78180ca079d71086de1e7ec3bd1a7a5bbf2a8f2acc65c01138", "weight": 332, "wtxid": "3e4d6975eb9fab78180ca079d71086de1e7ec3bd1a7a5bbf2a8f2acc65c01138"}, "name": "legacy", "raw": [{"hex": "0200000001"}, {"byte": 17, "count": 32}, {"hex": "000000000151feffffff01a08601000000000016001422222222222222222222222222222222222222220a000000"}]},
++    {"core": {"accepted": true, "first_tx_offset": 81, "has_witness": true, "second_tx_offset": 204, "size": 123, "stripped": [{"hex": "0200000001"}, {"byte": 17, "count": 32}, {"hex": "000000000151feffffff01a08601000000000016001422222222222222222222222222222222222222220a000000"}], "stripped_size": 83, "txid": "3e4d6975eb9fab78180ca079d71086de1e7ec3bd1a7a5bbf2a8f2acc65c01138", "weight": 372, "wtxid": "d38cd8dee9b9d71a4ef5849dbc641f95b96bb0c009bdbe51e2cbd7e034f9baa6"}, "name": "witness", "raw": [{"hex": "02000000000101"}, {"byte": 17, "count": 32}, {"hex": "000000000151feffffff01a0860100000000001600142222222222222222222222222222222222222222020230012102"}, {"byte": 51, "count": 32}, {"hex": "0a000000"}]},
++    {"core": {"accepted": true, "first_tx_offset": 81, "has_witness": true, "second_tx_offset": 204, "size": 123, "stripped": [{"hex": "0200000001"}, {"byte": 17, "count": 32}, {"hex": "000000000151feffffff01a08601000000000016001422222222222222222222222222222222222222220a000000"}], "stripped_size": 83, "txid": "3e4d6975eb9fab78180ca079d71086de1e7ec3bd1a7a5bbf2a8f2acc65c01138", "weight": 372, "wtxid": "99408434a52895cebb45569af685847f66a2db6ca3ea30ceef4690a742d39e77"}, "name": "witness_mutation_same_txid", "raw": [{"hex": "02000000000101"}, {"byte": 17, "count": 32}, {"hex": "000000000151feffffff01a0860100000000001600142222222222222222222222222222222222222222020230022102"}, {"byte": 51, "count": 32}, {"hex": "0a000000"}]},
++    {"core": {"accepted": true, "first_tx_offset": 81, "has_witness": true, "second_tx_offset": 211, "size": 130, "stripped": [{"hex": "0200000002"}, {"byte": 17, "count": 32}, {"hex": "000000000151feffffff"}, {"byte": 18, "count": 32}, {"hex": "010000000151feffffff01a08601000000000016001422222222222222222222222222222222222222220a000000"}], "stripped_size": 125, "txid": "c102ea57ee99dccaa7b9e82044afce42d29f101753dbf7d231dbf64f24f644ca", "weight": 505, "wtxid": "84a960498304e64a315d3810f7fbdd0b253fa1888ad23ae7839437adf333a8d3"}, "name": "mixed_empty_and_present_witness", "raw": [{"hex": "02000000000102"}, {"byte": 17, "count": 32}, {"hex": "000000000151feffffff"}, {"byte": 18, "count": 32}, {"hex": "010000000151feffffff01a08601000000000016001422222222222222222222222222222222222222220001000a000000"}]},
++    {"core": {"accepted": true, "first_tx_offset": 81, "has_witness": true, "second_tx_offset": 168, "size": 87, "stripped": [{"hex": "0200000001"}, {"byte": 17, "count": 32}, {"hex": "000000000151feffffff01a08601000000000016001422222222222222222222222222222222222222220a000000"}], "stripped_size": 83, "txid": "3e4d6975eb9fab78180ca079d71086de1e7ec3bd1a7a5bbf2a8f2acc65c01138", "weight": 336, "wtxid": "87ee232c0fc28192ad2376f399bb304101bc06c7fae74ccd6323661991608939"}, "name": "single_empty_witness_item", "raw": [{"hex": "02000000000101"}, {"byte": 17, "count": 32}, {"hex": "000000000151feffffff01a086010000000000160014222222222222222222222222222222222222222201000a000000"}]},
++    {"core": {"accepted": true, "first_tx_offset": 81, "has_witness": true, "second_tx_offset": 201, "size": 120, "stripped": [{"hex": "0200000001"}, {"byte": 0, "count": 32}, {"hex": "ffffffff020101feffffff01a08601000000000016001422222222222222222222222222222222222222220a000000"}], "stripped_size": 84, "txid": "b40f1a38fd3d2df48ded49b92ed86dce6bbbb34c10b70204f4c7a65b659b33ad", "weight": 372, "wtxid": "e8ac9aed2d895938c60a51bfafa10a5af1540f986a4a1b4a39b72f380188798f"}, "name": "coinbase_with_witness_reserved", "raw": [{"hex": "02000000000101"}, {"byte": 0, "count": 32}, {"hex": "ffffffff020101feffffff01a08601000000000016001422222222222222222222222222222222222222220120"}, {"byte": 0, "count": 32}, {"hex": "0a000000"}]},
++    {"core": {"accepted": true, "first_tx_offset": 81, "has_witness": false, "second_tx_offset": 165, "size": 84, "stripped": [{"hex": "0200000001"}, {"byte": 0, "count": 32}, {"hex": "ffffffff020101feffffff01a08601000000000016001422222222222222222222222222222222222222220a000000"}], "stripped_size": 84, "txid": "b40f1a38fd3d2df48ded49b92ed86dce6bbbb34c10b70204f4c7a65b659b33ad", "weight": 336, "wtxid": "b40f1a38fd3d2df48ded49b92ed86dce6bbbb34c10b70204f4c7a65b659b33ad"}, "name": "legacy_coinbase", "raw": [{"hex": "0200000001"}, {"byte": 0, "count": 32}, {"hex": "ffffffff020101feffffff01a08601000000000016001422222222222222222222222222222222222222220a000000"}]},
++    {"core": {"accepted": true, "first_tx_offset": 81, "has_witness": true, "second_tx_offset": 224, "size": 143, "stripped": [{"hex": "0200000001"}, {"byte": 17, "count": 32}, {"hex": "000000000151feffffff02a086010000000000220020"}, {"byte": 68, "count": 32}, {"hex": "a186010000000000225120"}, {"byte": 85, "count": 32}, {"hex": "0a000000"}], "stripped_size": 138, "txid": "c5cabfac08c0691df5d694ab5d1213d16ddf4f9c533664754a43c486aaac923d", "weight": 557, "wtxid": "3948a9b14e548d6def91703eab74047701d09c6d1523c82d6b4781a6e8eb1dce"}, "name": "p2wsh_and_p2tr_outputs", "raw": [{"hex": "02000000000101"}, {"byte": 17, "count": 32}, {"hex": "000000000151feffffff02a086010000000000220020"}, {"byte": 68, "count": 32}, {"hex": "a186010000000000225120"}, {"byte": 85, "count": 32}, {"hex": "0101010a000000"}]},
++    {"core": {"accepted": true, "first_tx_offset": 81, "has_witness": true, "second_tx_offset": 191, "size": 110, "stripped": [{"hex": "0000008001"}, {"byte": 17, "count": 32}, {"hex": "00000000171600146666666666666666666666666666666666666666feffffff01a08601000000000016001422222222222222222222222222222222222222220a000000"}], "stripped_size": 105, "txid": "09d201100764e710de385e2fa6c7fa284ad7f2f1ff32c153584cf1730762e2b5", "weight": 425, "wtxid": "b9d499027842be1dc5600d41cbad2b560192173fbf926899cca0f0dd24c71c10"}, "name": "nested_script_and_high_version", "raw": [{"hex": "00000080000101"}, {"byte": 17, "count": 32}, {"hex": "00000000171600146666666666666666666666666666666666666666feffffff01a08601000000000016001422222222222222222222222222222222222222220101510a000000"}]},
++    {"core": {"accepted": true, "first_tx_offset": 81, "has_witness": false, "second_tx_offset": 10750, "size": 10669, "stripped": [{"hex": "02000000fdfd00"}, {"byte": 17, "count": 32}, {"hex": "000000000151feffffff"}, {"byte": 18, "count": 32}, {"hex": "010000000151feffffff"}, {"byte": 19, "count": 32}, {"hex": "020000000151feffffff"}, {"byte": 20, "count": 32}, {"hex": "030000000151feffffff"}, {"byte": 21, "count": 32}, {"hex": "040000000151feffffff"}, {"byte": 22, "count": 32}, {"hex": "050000000151feffffff"}, {"byte": 23, "count": 32}, {"hex": "060000000151feffffff"}, {"byte": 24, "count": 32}, {"hex": "070000000151feffffff"}, {"byte": 25, "count": 32}, {"hex": "080000000151feffffff"}, {"byte": 26, "count": 32}, {"hex": "090000000151feffffff"}, {"byte": 27, "count": 32}, {"hex": "0a0000000151feffffff"}, {"byte": 28, "count": 32}, {"hex": "0b0000000151feffffff"}, {"byte": 29, "count": 32}, {"hex": "0c0000000151feffffff"}, {"byte": 30, "count": 32}, {"hex": "0d0000000151feffffff"}, {"byte": 31, "count": 32}, {"hex": "0e0000000151feffffff"}, {"byte": 32, "count": 32}, {"hex": "0f0000000151feffffff"}, {"byte": 33, "count": 32}, {"hex": "100000000151feffffff"}, {"byte": 34, "count": 32}, {"hex": "110000000151feffffff"}, {"byte": 35, "count": 32}, {"hex": "120000000151feffffff"}, {"byte": 36, "count": 32}, {"hex": "130000000151feffffff"}, {"byte": 37, "count": 32}, {"hex": "140000000151feffffff"}, {"byte": 38, "count": 32}, {"hex": "150000000151feffffff"}, {"byte": 39, "count": 32}, {"hex": "160000000151feffffff"}, {"byte": 40, "count": 32}, {"hex": "170000000151feffffff"}, {"byte": 41, "count": 32}, {"hex": "180000000151feffffff"}, {"byte": 42, "count": 32}, {"hex": "190000000151feffffff"}, {"byte": 43, "count": 32}, {"hex": "1a0000000151feffffff"}, {"byte": 44, "count": 32}, {"hex": "1b0000000151feffffff"}, {"byte": 45, "count": 32}, {"hex": "1c0000000151feffffff"}, {"byte": 46, "count": 32}, {"hex": "1d0000000151feffffff"}, {"byte": 47, "count": 32}, {"hex": "1e0000000151feffffff"}, {"byte": 48, "count": 32}, {"hex": "1f0000000151feffffff"}, {"byte": 49, "count": 32}, {"hex": "200000000151feffffff"}, {"byte": 50, "count": 32}, {"hex": "210000000151feffffff"}, {"byte": 51, "count": 32}, {"hex": "220000000151feffffff"}, {"byte": 52, "count": 32}, {"hex": "230000000151feffffff"}, {"byte": 53, "count": 32}, {"hex": "240000000151feffffff"}, {"byte": 54, "count": 32}, {"hex": "250000000151feffffff"}, {"byte": 55, "count": 32}, {"hex": "260000000151feffffff"}, {"byte": 56, "count": 32}, {"hex": "270000000151feffffff"}, {"byte": 57, "count": 32}, {"hex": "280000000151feffffff"}, {"byte": 58, "count": 32}, {"hex": "290000000151feffffff"}, {"byte": 59, "count": 32}, {"hex": "2a0000000151feffffff"}, {"byte": 60, "count": 32}, {"hex": "2b0000000151feffffff"}, {"byte": 61, "count": 32}, {"hex": "2c0000000151feffffff"}, {"byte": 62, "count": 32}, {"hex": "2d0000000151feffffff"}, {"byte": 63, "count": 32}, {"hex": "2e0000000151feffffff"}, {"byte": 64, "count": 32}, {"hex": "2f0000000151feffffff"}, {"byte": 65, "count": 32}, {"hex": "300000000151feffffff"}, {"byte": 66, "count": 32}, {"hex": "310000000151feffffff"}, {"byte": 67, "count": 32}, {"hex": "320000000151feffffff"}, {"byte": 68, "count": 32}, {"hex": "330000000151feffffff"}, {"byte": 69, "count": 32}, {"hex": "340000000151feffffff"}, {"byte": 70, "count": 32}, {"hex": "350000000151feffffff"}, {"byte": 71, "count": 32}, {"hex": "360000000151feffffff"}, {"byte": 72, "count": 32}, {"hex": "370000000151feffffff"}, {"byte": 73, "count": 32}, {"hex": "380000000151feffffff"}, {"byte": 74, "count": 32}, {"hex": "390000000151feffffff"}, {"byte": 75, "count": 32}, {"hex": "3a0000000151feffffff"}, {"byte": 76, "count": 32}, {"hex": "3b0000000151feffffff"}, {"byte": 77, "count": 32}, {"hex": "3c0000000151feffffff"}, {"byte": 78, "count": 32}, {"hex": "3d0000000151feffffff"}, {"byte": 79, "count": 32}, {"hex": "3e0000000151feffffff"}, {"byte": 80, "count": 32}, {"hex": "3f0000000151feffffff"}, {"byte": 81, "count": 32}, {"hex": "400000000151feffffff"}, {"byte": 82, "count": 32}, {"hex": "410000000151feffffff"}, {"byte": 83, "count": 32}, {"hex": "420000000151feffffff"}, {"byte": 84, "count": 32}, {"hex": "430000000151feffffff"}, {"byte": 85, "count": 32}, {"hex": "440000000151feffffff"}, {"byte": 86, "count": 32}, {"hex": "450000000151feffffff"}, {"byte": 87, "count": 32}, {"hex": "460000000151feffffff"}, {"byte": 88, "count": 32}, {"hex": "470000000151feffffff"}, {"byte": 89, "count": 32}, {"hex": "480000000151feffffff"}, {"byte": 90, "count": 32}, {"hex": "490000000151feffffff"}, {"byte": 91, "count": 32}, {"hex": "4a0000000151feffffff"}, {"byte": 92, "count": 32}, {"hex": "4b0000000151feffffff"}, {"byte": 93, "count": 32}, {"hex": "4c0000000151feffffff"}, {"byte": 94, "count": 32}, {"hex": "4d0000000151feffffff"}, {"byte": 95, "count": 32}, {"hex": "4e0000000151feffffff"}, {"byte": 96, "count": 32}, {"hex": "4f0000000151feffffff"}, {"byte": 97, "count": 32}, {"hex": "500000000151feffffff"}, {"byte": 98, "count": 32}, {"hex": "510000000151feffffff"}, {"byte": 99, "count": 32}, {"hex": "520000000151feffffff"}, {"byte": 100, "count": 32}, {"hex": "530000000151feffffff"}, {"byte": 101, "count": 32}, {"hex": "540000000151feffffff"}, {"byte": 102, "count": 32}, {"hex": "550000000151feffffff"}, {"byte": 103, "count": 32}, {"hex": "560000000151feffffff"}, {"byte": 104, "count": 32}, {"hex": "570000000151feffffff"}, {"byte": 105, "count": 32}, {"hex": "580000000151feffffff"}, {"byte": 106, "count": 32}, {"hex": "590000000151feffffff"}, {"byte": 107, "count": 32}, {"hex": "5a0000000151feffffff"}, {"byte": 108, "count": 32}, {"hex": "5b0000000151feffffff"}, {"byte": 109, "count": 32}, {"hex": "5c0000000151feffffff"}, {"byte": 110, "count": 32}, {"hex": "5d0000000151feffffff"}, {"byte": 111, "count": 32}, {"hex": "5e0000000151feffffff"}, {"byte": 112, "count": 32}, {"hex": "5f0000000151feffffff"}, {"byte": 113, "count": 32}, {"hex": "600000000151feffffff"}, {"byte": 114, "count": 32}, {"hex": "610000000151feffffff"}, {"byte": 115, "count": 32}, {"hex": "620000000151feffffff"}, {"byte": 116, "count": 32}, {"hex": "630000000151feffffff"}, {"byte": 17, "count": 32}, {"hex": "640000000151feffffff"}, {"byte": 18, "count": 32}, {"hex": "650000000151feffffff"}, {"byte": 19, "count": 32}, {"hex": "660000000151feffffff"}, {"byte": 20, "count": 32}, {"hex": "670000000151feffffff"}, {"byte": 21, "count": 32}, {"hex": "680000000151feffffff"}, {"byte": 22, "count": 32}, {"hex": "690000000151feffffff"}, {"byte": 23, "count": 32}, {"hex": "6a0000000151feffffff"}, {"byte": 24, "count": 32}, {"hex": "6b0000000151feffffff"}, {"byte": 25, "count": 32}, {"hex": "6c0000000151feffffff"}, {"byte": 26, "count": 32}, {"hex": "6d0000000151feffffff"}, {"byte": 27, "count": 32}, {"hex": "6e0000000151feffffff"}, {"byte": 28, "count": 32}, {"hex": "6f0000000151feffffff"}, {"byte": 29, "count": 32}, {"hex": "700000000151feffffff"}, {"byte": 30, "count": 32}, {"hex": "710000000151feffffff"}, {"byte": 31, "count": 32}, {"hex": "720000000151feffffff"}, {"byte": 32, "count": 32}, {"hex": "730000000151feffffff"}, {"byte": 33, "count": 32}, {"hex": "740000000151feffffff"}, {"byte": 34, "count": 32}, {"hex": "750000000151feffffff"}, {"byte": 35, "count": 32}, {"hex": "760000000151feffffff"}, {"byte": 36, "count": 32}, {"hex": "770000000151feffffff"}, {"byte": 37, "count": 32}, {"hex": "780000000151feffffff"}, {"byte": 38, "count": 32}, {"hex": "790000000151feffffff"}, {"byte": 39, "count": 32}, {"hex": "7a0000000151feffffff"}, {"byte": 40, "count": 32}, {"hex": "7b0000000151feffffff"}, {"byte": 41, "count": 32}, {"hex": "7c0000000151feffffff"}, {"byte": 42, "count": 32}, {"hex": "7d0000000151feffffff"}, {"byte": 43, "count": 32}, {"hex": "7e0000000151feffffff"}, {"byte": 44, "count": 32}, {"hex": "7f0000000151feffffff"}, {"byte": 45, "count": 32}, {"hex": "800000000151feffffff"}, {"byte": 46, "count": 32}, {"hex": "810000000151feffffff"}, {"byte": 47, "count": 32}, {"hex": "820000000151feffffff"}, {"byte": 48, "count": 32}, {"hex": "830000000151feffffff"}, {"byte": 49, "count": 32}, {"hex": "840000000151feffffff"}, {"byte": 50, "count": 32}, {"hex": "850000000151feffffff"}, {"byte": 51, "count": 32}, {"hex": "860000000151feffffff"}, {"byte": 52, "count": 32}, {"hex": "870000000151feffffff"}, {"byte": 53, "count": 32}, {"hex": "880000000151feffffff"}, {"byte": 54, "count": 32}, {"hex": "890000000151feffffff"}, {"byte": 55, "count": 32}, {"hex": "8a0000000151feffffff"}, {"byte": 56, "count": 32}, {"hex": "8b0000000151feffffff"}, {"byte": 57, "count": 32}, {"hex": "8c0000000151feffffff"}, {"byte": 58, "count": 32}, {"hex": "8d0000000151feffffff"}, {"byte": 59, "count": 32}, {"hex": "8e0000000151feffffff"}, {"byte": 60, "count": 32}, {"hex": "8f0000000151feffffff"}, {"byte": 61, "count": 32}, {"hex": "900000000151feffffff"}, {"byte": 62, "count": 32}, {"hex": "910000000151feffffff"}, {"byte": 63, "count": 32}, {"hex": "920000000151feffffff"}, {"byte": 64, "count": 32}, {"hex": "930000000151feffffff"}, {"byte": 65, "count": 32}, {"hex": "940000000151feffffff"}, {"byte": 66, "count": 32}, {"hex": "950000000151feffffff"}, {"byte": 67, "count": 32}, {"hex": "960000000151feffffff"}, {"byte": 68, "count": 32}, {"hex": "970000000151feffffff"}, {"byte": 69, "count": 32}, {"hex": "980000000151feffffff"}, {"byte": 70, "count": 32}, {"hex": "990000000151feffffff"}, {"byte": 71, "count": 32}, {"hex": "9a0000000151feffffff"}, {"byte": 72, "count": 32}, {"hex": "9b0000000151feffffff"}, {"byte": 73, "count": 32}, {"hex": "9c0000000151feffffff"}, {"byte": 74, "count": 32}, {"hex": "9d0000000151feffffff"}, {"byte": 75, "count": 32}, {"hex": "9e0000000151feffffff"}, {"byte": 76, "count": 32}, {"hex": "9f0000000151feffffff"}, {"byte": 77, "count": 32}, {"hex": "a00000000151feffffff"}, {"byte": 78, "count": 32}, {"hex": "a10000000151feffffff"}, {"byte": 79, "count": 32}, {"hex": "a20000000151feffffff"}, {"byte": 80, "count": 32}, {"hex": "a30000000151feffffff"}, {"byte": 81, "count": 32}, {"hex": "a40000000151feffffff"}, {"byte": 82, "count": 32}, {"hex": "a50000000151feffffff"}, {"byte": 83, "count": 32}, {"hex": "a60000000151feffffff"}, {"byte": 84, "count": 32}, {"hex": "a70000000151feffffff"}, {"byte": 85, "count": 32}, {"hex": "a80000000151feffffff"}, {"byte": 86, "count": 32}, {"hex": "a90000000151feffffff"}, {"byte": 87, "count": 32}, {"hex": "aa0000000151feffffff"}, {"byte": 88, "count": 32}, {"hex": "ab0000000151feffffff"}, {"byte": 89, "count": 32}, {"hex": "ac0000000151feffffff"}, {"byte": 90, "count": 32}, {"hex": "ad0000000151feffffff"}, {"byte": 91, "count": 32}, {"hex": "ae0000000151feffffff"}, {"byte": 92, "count": 32}, {"hex": "af0000000151feffffff"}, {"byte": 93, "count": 32}, {"hex": "b00000000151feffffff"}, {"byte": 94, "count": 32}, {"hex": "b10000000151feffffff"}, {"byte": 95, "count": 32}, {"hex": "b20000000151feffffff"}, {"byte": 96, "count": 32}, {"hex": "b30000000151feffffff"}, {"byte": 97, "count": 32}, {"hex": "b40000000151feffffff"}, {"byte": 98, "count": 32}, {"hex": "b50000000151feffffff"}, {"byte": 99, "count": 32}, {"hex": "b60000000151feffffff"}, {"byte": 100, "count": 32}, {"hex": "b70000000151feffffff"}, {"byte": 101, "count": 32}, {"hex": "b80000000151feffffff"}, {"byte": 102, "count": 32}, {"hex": "b90000000151feffffff"}, {"byte": 103, "count": 32}, {"hex": "ba0000000151feffffff"}, {"byte": 104, "count": 32}, {"hex": "bb0000000151feffffff"}, {"byte": 105, "count": 32}, {"hex": "bc0000000151feffffff"}, {"byte": 106, "count": 32}, {"hex": "bd0000000151feffffff"}, {"byte": 107, "count": 32}, {"hex": "be0000000151feffffff"}, {"byte": 108, "count": 32}, {"hex": "bf0000000151feffffff"}, {"byte": 109, "count": 32}, {"hex": "c00000000151feffffff"}, {"byte": 110, "count": 32}, {"hex": "c10000000151feffffff"}, {"byte": 111, "count": 32}, {"hex": "c20000000151feffffff"}, {"byte": 112, "count": 32}, {"hex": "c30000000151feffffff"}, {"byte": 113, "count": 32}, {"hex": "c40000000151feffffff"}, {"byte": 114, "count": 32}, {"hex": "c50000000151feffffff"}, {"byte": 115, "count": 32}, {"hex": "c60000000151feffffff"}, {"byte": 116, "count": 32}, {"hex": "c70000000151feffffff"}, {"byte": 17, "count": 32}, {"hex": "c80000000151feffffff"}, {"byte": 18, "count": 32}, {"hex": "c90000000151feffffff"}, {"byte": 19, "count": 32}, {"hex": "ca0000000151feffffff"}, {"byte": 20, "count": 32}, {"hex": "cb0000000151feffffff"}, {"byte": 21, "count": 32}, {"hex": "cc0000000151feffffff"}, {"byte": 22, "count": 32}, {"hex": "cd0000000151feffffff"}, {"byte": 23, "count": 32}, {"hex": "ce0000000151feffffff"}, {"byte": 24, "count": 32}, {"hex": "cf0000000151feffffff"}, {"byte": 25, "count": 32}, {"hex": "d00000000151feffffff"}, {"byte": 26, "count": 32}, {"hex": "d10000000151feffffff"}, {"byte": 27, "count": 32}, {"hex": "d20000000151feffffff"}, {"byte": 28, "count": 32}, {"hex": "d30000000151feffffff"}, {"byte": 29, "count": 32}, {"hex": "d40000000151feffffff"}, {"byte": 30, "count": 32}, {"hex": "d50000000151feffffff"}, {"byte": 31, "count": 32}, {"hex": "d60000000151feffffff"}, {"byte": 32, "count": 32}, {"hex": "d70000000151feffffff"}, {"byte": 33, "count": 32}, {"hex": "d80000000151feffffff"}, {"byte": 34, "count": 32}, {"hex": "d90000000151feffffff"}, {"byte": 35, "count": 32}, {"hex": "da0000000151feffffff"}, {"byte": 36, "count": 32}, {"hex": "db0000000151feffffff"}, {"byte": 37, "count": 32}, {"hex": "dc0000000151feffffff"}, {"byte": 38, "count": 32}, {"hex": "dd0000000151feffffff"}, {"byte": 39, "count": 32}, {"hex": "de0000000151feffffff"}, {"byte": 40, "count": 32}, {"hex": "df0000000151feffffff"}, {"byte": 41, "count": 32}, {"hex": "e00000000151feffffff"}, {"byte": 42, "count": 32}, {"hex": "e10000000151feffffff"}, {"byte": 43, "count": 32}, {"hex": "e20000000151feffffff"}, {"byte": 44, "count": 32}, {"hex": "e30000000151feffffff"}, {"byte": 45, "count": 32}, {"hex": "e40000000151feffffff"}, {"byte": 46, "count": 32}, {"hex": "e50000000151feffffff"}, {"byte": 47, "count": 32}, {"hex": "e60000000151feffffff"}, {"byte": 48, "count": 32}, {"hex": "e70000000151feffffff"}, {"byte": 49, "count": 32}, {"hex": "e80000000151feffffff"}, {"byte": 50, "count": 32}, {"hex": "e90000000151feffffff"}, {"byte": 51, "count": 32}, {"hex": "ea0000000151feffffff"}, {"byte": 52, "count": 32}, {"hex": "eb0000000151feffffff"}, {"byte": 53, "count": 32}, {"hex": "ec0000000151feffffff"}, {"byte": 54, "count": 32}, {"hex": "ed0000000151feffffff"}, {"byte": 55, "count": 32}, {"hex": "ee0000000151feffffff"}, {"byte": 56, "count": 32}, {"hex": "ef0000000151feffffff"}, {"byte": 57, "count": 32}, {"hex": "f00000000151feffffff"}, {"byte": 58, "count": 32}, {"hex": "f10000000151feffffff"}, {"byte": 59, "count": 32}, {"hex": "f20000000151feffffff"}, {"byte": 60, "count": 32}, {"hex": "f30000000151feffffff"}, {"byte": 61, "count": 32}, {"hex": "f40000000151feffffff"}, {"byte": 62, "count": 32}, {"hex": "f50000000151feffffff"}, {"byte": 63, "count": 32}, {"hex": "f60000000151feffffff"}, {"byte": 64, "count": 32}, {"hex": "f70000000151feffffff"}, {"byte": 65, "count": 32}, {"hex": "f80000000151feffffff"}, {"byte": 66, "count": 32}, {"hex": "f90000000151feffffff"}, {"byte": 67, "count": 32}, {"hex": "fa0000000151feffffff"}, {"byte": 68, "count": 32}, {"hex": "fb0000000151feffffff"}, {"byte": 69, "count": 32}, {"hex": "fc0000000151feffffff01a08601000000000016001422222222222222222222222222222222222222220a000000"}], "stripped_size": 10669, "txid": "01b4a81b747d4f85ccbd01f1ba30c4d3eaab86e07a45e8d3090a6986cb96783d", "weight": 42676, "wtxid": "01b4a81b747d4f85ccbd01f1ba30c4d3eaab86e07a45e8d3090a6986cb96783d"}, "name": "253_inputs", "raw": [{"hex": "02000000fdfd00"}, {"byte": 17, "count": 32}, {"hex": "000000000151feffffff"}, {"byte": 18, "count": 32}, {"hex": "010000000151feffffff"}, {"byte": 19, "count": 32}, {"hex": "020000000151feffffff"}, {"byte": 20, "count": 32}, {"hex": "030000000151feffffff"}, {"byte": 21, "count": 32}, {"hex": "040000000151feffffff"}, {"byte": 22, "count": 32}, {"hex": "050000000151feffffff"}, {"byte": 23, "count": 32}, {"hex": "060000000151feffffff"}, {"byte": 24, "count": 32}, {"hex": "070000000151feffffff"}, {"byte": 25, "count": 32}, {"hex": "080000000151feffffff"}, {"byte": 26, "count": 32}, {"hex": "090000000151feffffff"}, {"byte": 27, "count": 32}, {"hex": "0a0000000151feffffff"}, {"byte": 28, "count": 32}, {"hex": "0b0000000151feffffff"}, {"byte": 29, "count": 32}, {"hex": "0c0000000151feffffff"}, {"byte": 30, "count": 32}, {"hex": "0d0000000151feffffff"}, {"byte": 31, "count": 32}, {"hex": "0e0000000151feffffff"}, {"byte": 32, "count": 32}, {"hex": "0f0000000151feffffff"}, {"byte": 33, "count": 32}, {"hex": "100000000151feffffff"}, {"byte": 34, "count": 32}, {"hex": "110000000151feffffff"}, {"byte": 35, "count": 32}, {"hex": "120000000151feffffff"}, {"byte": 36, "count": 32}, {"hex": "130000000151feffffff"}, {"byte": 37, "count": 32}, {"hex": "140000000151feffffff"}, {"byte": 38, "count": 32}, {"hex": "150000000151feffffff"}, {"byte": 39, "count": 32}, {"hex": "160000000151feffffff"}, {"byte": 40, "count": 32}, {"hex": "170000000151feffffff"}, {"byte": 41, "count": 32}, {"hex": "180000000151feffffff"}, {"byte": 42, "count": 32}, {"hex": "190000000151feffffff"}, {"byte": 43, "count": 32}, {"hex": "1a0000000151feffffff"}, {"byte": 44, "count": 32}, {"hex": "1b0000000151feffffff"}, {"byte": 45, "count": 32}, {"hex": "1c0000000151feffffff"}, {"byte": 46, "count": 32}, {"hex": "1d0000000151feffffff"}, {"byte": 47, "count": 32}, {"hex": "1e0000000151feffffff"}, {"byte": 48, "count": 32}, {"hex": "1f0000000151feffffff"}, {"byte": 49, "count": 32}, {"hex": "200000000151feffffff"}, {"byte": 50, "count": 32}, {"hex": "210000000151feffffff"}, {"byte": 51, "count": 32}, {"hex": "220000000151feffffff"}, {"byte": 52, "count": 32}, {"hex": "230000000151feffffff"}, {"byte": 53, "count": 32}, {"hex": "240000000151feffffff"}, {"byte": 54, "count": 32}, {"hex": "250000000151feffffff"}, {"byte": 55, "count": 32}, {"hex": "260000000151feffffff"}, {"byte": 56, "count": 32}, {"hex": "270000000151feffffff"}, {"byte": 57, "count": 32}, {"hex": "280000000151feffffff"}, {"byte": 58, "count": 32}, {"hex": "290000000151feffffff"}, {"byte": 59, "count": 32}, {"hex": "2a0000000151feffffff"}, {"byte": 60, "count": 32}, {"hex": "2b0000000151feffffff"}, {"byte": 61, "count": 32}, {"hex": "2c0000000151feffffff"}, {"byte": 62, "count": 32}, {"hex": "2d0000000151feffffff"}, {"byte": 63, "count": 32}, {"hex": "2e0000000151feffffff"}, {"byte": 64, "count": 32}, {"hex": "2f0000000151feffffff"}, {"byte": 65, "count": 32}, {"hex": "300000000151feffffff"}, {"byte": 66, "count": 32}, {"hex": "310000000151feffffff"}, {"byte": 67, "count": 32}, {"hex": "320000000151feffffff"}, {"byte": 68, "count": 32}, {"hex": "330000000151feffffff"}, {"byte": 69, "count": 32}, {"hex": "340000000151feffffff"}, {"byte": 70, "count": 32}, {"hex": "350000000151feffffff"}, {"byte": 71, "count": 32}, {"hex": "360000000151feffffff"}, {"byte": 72, "count": 32}, {"hex": "370000000151feffffff"}, {"byte": 73, "count": 32}, {"hex": "380000000151feffffff"}, {"byte": 74, "count": 32}, {"hex": "390000000151feffffff"}, {"byte": 75, "count": 32}, {"hex": "3a0000000151feffffff"}, {"byte": 76, "count": 32}, {"hex": "3b0000000151feffffff"}, {"byte": 77, "count": 32}, {"hex": "3c0000000151feffffff"}, {"byte": 78, "count": 32}, {"hex": "3d0000000151feffffff"}, {"byte": 79, "count": 32}, {"hex": "3e0000000151feffffff"}, {"byte": 80, "count": 32}, {"hex": "3f0000000151feffffff"}, {"byte": 81, "count": 32}, {"hex": "400000000151feffffff"}, {"byte": 82, "count": 32}, {"hex": "410000000151feffffff"}, {"byte": 83, "count": 32}, {"hex": "420000000151feffffff"}, {"byte": 84, "count": 32}, {"hex": "430000000151feffffff"}, {"byte": 85, "count": 32}, {"hex": "440000000151feffffff"}, {"byte": 86, "count": 32}, {"hex": "450000000151feffffff"}, {"byte": 87, "count": 32}, {"hex": "460000000151feffffff"}, {"byte": 88, "count": 32}, {"hex": "470000000151feffffff"}, {"byte": 89, "count": 32}, {"hex": "480000000151feffffff"}, {"byte": 90, "count": 32}, {"hex": "490000000151feffffff"}, {"byte": 91, "count": 32}, {"hex": "4a0000000151feffffff"}, {"byte": 92, "count": 32}, {"hex": "4b0000000151feffffff"}, {"byte": 93, "count": 32}, {"hex": "4c0000000151feffffff"}, {"byte": 94, "count": 32}, {"hex": "4d0000000151feffffff"}, {"byte": 95, "count": 32}, {"hex": "4e0000000151feffffff"}, {"byte": 96, "count": 32}, {"hex": "4f0000000151feffffff"}, {"byte": 97, "count": 32}, {"hex": "500000000151feffffff"}, {"byte": 98, "count": 32}, {"hex": "510000000151feffffff"}, {"byte": 99, "count": 32}, {"hex": "520000000151feffffff"}, {"byte": 100, "count": 32}, {"hex": "530000000151feffffff"}, {"byte": 101, "count": 32}, {"hex": "540000000151feffffff"}, {"byte": 102, "count": 32}, {"hex": "550000000151feffffff"}, {"byte": 103, "count": 32}, {"hex": "560000000151feffffff"}, {"byte": 104, "count": 32}, {"hex": "570000000151feffffff"}, {"byte": 105, "count": 32}, {"hex": "580000000151feffffff"}, {"byte": 106, "count": 32}, {"hex": "590000000151feffffff"}, {"byte": 107, "count": 32}, {"hex": "5a0000000151feffffff"}, {"byte": 108, "count": 32}, {"hex": "5b0000000151feffffff"}, {"byte": 109, "count": 32}, {"hex": "5c0000000151feffffff"}, {"byte": 110, "count": 32}, {"hex": "5d0000000151feffffff"}, {"byte": 111, "count": 32}, {"hex": "5e0000000151feffffff"}, {"byte": 112, "count": 32}, {"hex": "5f0000000151feffffff"}, {"byte": 113, "count": 32}, {"hex": "600000000151feffffff"}, {"byte": 114, "count": 32}, {"hex": "610000000151feffffff"}, {"byte": 115, "count": 32}, {"hex": "620000000151feffffff"}, {"byte": 116, "count": 32}, {"hex": "630000000151feffffff"}, {"byte": 17, "count": 32}, {"hex": "640000000151feffffff"}, {"byte": 18, "count": 32}, {"hex": "650000000151feffffff"}, {"byte": 19, "count": 32}, {"hex": "660000000151feffffff"}, {"byte": 20, "count": 32}, {"hex": "670000000151feffffff"}, {"byte": 21, "count": 32}, {"hex": "680000000151feffffff"}, {"byte": 22, "count": 32}, {"hex": "690000000151feffffff"}, {"byte": 23, "count": 32}, {"hex": "6a0000000151feffffff"}, {"byte": 24, "count": 32}, {"hex": "6b0000000151feffffff"}, {"byte": 25, "count": 32}, {"hex": "6c0000000151feffffff"}, {"byte": 26, "count": 32}, {"hex": "6d0000000151feffffff"}, {"byte": 27, "count": 32}, {"hex": "6e0000000151feffffff"}, {"byte": 28, "count": 32}, {"hex": "6f0000000151feffffff"}, {"byte": 29, "count": 32}, {"hex": "700000000151feffffff"}, {"byte": 30, "count": 32}, {"hex": "710000000151feffffff"}, {"byte": 31, "count": 32}, {"hex": "720000000151feffffff"}, {"byte": 32, "count": 32}, {"hex": "730000000151feffffff"}, {"byte": 33, "count": 32}, {"hex": "740000000151feffffff"}, {"byte": 34, "count": 32}, {"hex": "750000000151feffffff"}, {"byte": 35, "count": 32}, {"hex": "760000000151feffffff"}, {"byte": 36, "count": 32}, {"hex": "770000000151feffffff"}, {"byte": 37, "count": 32}, {"hex": "780000000151feffffff"}, {"byte": 38, "count": 32}, {"hex": "790000000151feffffff"}, {"byte": 39, "count": 32}, {"hex": "7a0000000151feffffff"}, {"byte": 40, "count": 32}, {"hex": "7b0000000151feffffff"}, {"byte": 41, "count": 32}, {"hex": "7c0000000151feffffff"}, {"byte": 42, "count": 32}, {"hex": "7d0000000151feffffff"}, {"byte": 43, "count": 32}, {"hex": "7e0000000151feffffff"}, {"byte": 44, "count": 32}, {"hex": "7f0000000151feffffff"}, {"byte": 45, "count": 32}, {"hex": "800000000151feffffff"}, {"byte": 46, "count": 32}, {"hex": "810000000151feffffff"}, {"byte": 47, "count": 32}, {"hex": "820000000151feffffff"}, {"byte": 48, "count": 32}, {"hex": "830000000151feffffff"}, {"byte": 49, "count": 32}, {"hex": "840000000151feffffff"}, {"byte": 50, "count": 32}, {"hex": "850000000151feffffff"}, {"byte": 51, "count": 32}, {"hex": "860000000151feffffff"}, {"byte": 52, "count": 32}, {"hex": "870000000151feffffff"}, {"byte": 53, "count": 32}, {"hex": "880000000151feffffff"}, {"byte": 54, "count": 32}, {"hex": "890000000151feffffff"}, {"byte": 55, "count": 32}, {"hex": "8a0000000151feffffff"}, {"byte": 56, "count": 32}, {"hex": "8b0000000151feffffff"}, {"byte": 57, "count": 32}, {"hex": "8c0000000151feffffff"}, {"byte": 58, "count": 32}, {"hex": "8d0000000151feffffff"}, {"byte": 59, "count": 32}, {"hex": "8e0000000151feffffff"}, {"byte": 60, "count": 32}, {"hex": "8f0000000151feffffff"}, {"byte": 61, "count": 32}, {"hex": "900000000151feffffff"}, {"byte": 62, "count": 32}, {"hex": "910000000151feffffff"}, {"byte": 63, "count": 32}, {"hex": "920000000151feffffff"}, {"byte": 64, "count": 32}, {"hex": "930000000151feffffff"}, {"byte": 65, "count": 32}, {"hex": "940000000151feffffff"}, {"byte": 66, "count": 32}, {"hex": "950000000151feffffff"}, {"byte": 67, "count": 32}, {"hex": "960000000151feffffff"}, {"byte": 68, "count": 32}, {"hex": "970000000151feffffff"}, {"byte": 69, "count": 32}, {"hex": "980000000151feffffff"}, {"byte": 70, "count": 32}, {"hex": "990000000151feffffff"}, {"byte": 71, "count": 32}, {"hex": "9a0000000151feffffff"}, {"byte": 72, "count": 32}, {"hex": "9b0000000151feffffff"}, {"byte": 73, "count": 32}, {"hex": "9c0000000151feffffff"}, {"byte": 74, "count": 32}, {"hex": "9d0000000151feffffff"}, {"byte": 75, "count": 32}, {"hex": "9e0000000151feffffff"}, {"byte": 76, "count": 32}, {"hex": "9f0000000151feffffff"}, {"byte": 77, "count": 32}, {"hex": "a00000000151feffffff"}, {"byte": 78, "count": 32}, {"hex": "a10000000151feffffff"}, {"byte": 79, "count": 32}, {"hex": "a20000000151feffffff"}, {"byte": 80, "count": 32}, {"hex": "a30000000151feffffff"}, {"byte": 81, "count": 32}, {"hex": "a40000000151feffffff"}, {"byte": 82, "count": 32}, {"hex": "a50000000151feffffff"}, {"byte": 83, "count": 32}, {"hex": "a60000000151feffffff"}, {"byte": 84, "count": 32}, {"hex": "a70000000151feffffff"}, {"byte": 85, "count": 32}, {"hex": "a80000000151feffffff"}, {"byte": 86, "count": 32}, {"hex": "a90000000151feffffff"}, {"byte": 87, "count": 32}, {"hex": "aa0000000151feffffff"}, {"byte": 88, "count": 32}, {"hex": "ab0000000151feffffff"}, {"byte": 89, "count": 32}, {"hex": "ac0000000151feffffff"}, {"byte": 90, "count": 32}, {"hex": "ad0000000151feffffff"}, {"byte": 91, "count": 32}, {"hex": "ae0000000151feffffff"}, {"byte": 92, "count": 32}, {"hex": "af0000000151feffffff"}, {"byte": 93, "count": 32}, {"hex": "b00000000151feffffff"}, {"byte": 94, "count": 32}, {"hex": "b10000000151feffffff"}, {"byte": 95, "count": 32}, {"hex": "b20000000151feffffff"}, {"byte": 96, "count": 32}, {"hex": "b30000000151feffffff"}, {"byte": 97, "count": 32}, {"hex": "b40000000151feffffff"}, {"byte": 98, "count": 32}, {"hex": "b50000000151feffffff"}, {"byte": 99, "count": 32}, {"hex": "b60000000151feffffff"}, {"byte": 100, "count": 32}, {"hex": "b70000000151feffffff"}, {"byte": 101, "count": 32}, {"hex": "b80000000151feffffff"}, {"byte": 102, "count": 32}, {"hex": "b90000000151feffffff"}, {"byte": 103, "count": 32}, {"hex": "ba0000000151feffffff"}, {"byte": 104, "count": 32}, {"hex": "bb0000000151feffffff"}, {"byte": 105, "count": 32}, {"hex": "bc0000000151feffffff"}, {"byte": 106, "count": 32}, {"hex": "bd0000000151feffffff"}, {"byte": 107, "count": 32}, {"hex": "be0000000151feffffff"}, {"byte": 108, "count": 32}, {"hex": "bf0000000151feffffff"}, {"byte": 109, "count": 32}, {"hex": "c00000000151feffffff"}, {"byte": 110, "count": 32}, {"hex": "c10000000151feffffff"}, {"byte": 111, "count": 32}, {"hex": "c20000000151feffffff"}, {"byte": 112, "count": 32}, {"hex": "c30000000151feffffff"}, {"byte": 113, "count": 32}, {"hex": "c40000000151feffffff"}, {"byte": 114, "count": 32}, {"hex": "c50000000151feffffff"}, {"byte": 115, "count": 32}, {"hex": "c60000000151feffffff"}, {"byte": 116, "count": 32}, {"hex": "c70000000151feffffff"}, {"byte": 17, "count": 32}, {"hex": "c80000000151feffffff"}, {"byte": 18, "count": 32}, {"hex": "c90000000151feffffff"}, {"byte": 19, "count": 32}, {"hex": "ca0000000151feffffff"}, {"byte": 20, "count": 32}, {"hex": "cb0000000151feffffff"}, {"byte": 21, "count": 32}, {"hex": "cc0000000151feffffff"}, {"byte": 22, "count": 32}, {"hex": "cd0000000151feffffff"}, {"byte": 23, "count": 32}, {"hex": "ce0000000151feffffff"}, {"byte": 24, "count": 32}, {"hex": "cf0000000151feffffff"}, {"byte": 25, "count": 32}, {"hex": "d00000000151feffffff"}, {"byte": 26, "count": 32}, {"hex": "d10000000151feffffff"}, {"byte": 27, "count": 32}, {"hex": "d20000000151feffffff"}, {"byte": 28, "count": 32}, {"hex": "d30000000151feffffff"}, {"byte": 29, "count": 32}, {"hex": "d40000000151feffffff"}, {"byte": 30, "count": 32}, {"hex": "d50000000151feffffff"}, {"byte": 31, "count": 32}, {"hex": "d60000000151feffffff"}, {"byte": 32, "count": 32}, {"hex": "d70000000151feffffff"}, {"byte": 33, "count": 32}, {"hex": "d80000000151feffffff"}, {"byte": 34, "count": 32}, {"hex": "d90000000151feffffff"}, {"byte": 35, "count": 32}, {"hex": "da0000000151feffffff"}, {"byte": 36, "count": 32}, {"hex": "db0000000151feffffff"}, {"byte": 37, "count": 32}, {"hex": "dc0000000151feffffff"}, {"byte": 38, "count": 32}, {"hex": "dd0000000151feffffff"}, {"byte": 39, "count": 32}, {"hex": "de0000000151feffffff"}, {"byte": 40, "count": 32}, {"hex": "df0000000151feffffff"}, {"byte": 41, "count": 32}, {"hex": "e00000000151feffffff"}, {"byte": 42, "count": 32}, {"hex": "e10000000151feffffff"}, {"byte": 43, "count": 32}, {"hex": "e20000000151feffffff"}, {"byte": 44, "count": 32}, {"hex": "e30000000151feffffff"}, {"byte": 45, "count": 32}, {"hex": "e40000000151feffffff"}, {"byte": 46, "count": 32}, {"hex": "e50000000151feffffff"}, {"byte": 47, "count": 32}, {"hex": "e60000000151feffffff"}, {"byte": 48, "count": 32}, {"hex": "e70000000151feffffff"}, {"byte": 49, "count": 32}, {"hex": "e80000000151feffffff"}, {"byte": 50, "count": 32}, {"hex": "e90000000151feffffff"}, {"byte": 51, "count": 32}, {"hex": "ea0000000151feffffff"}, {"byte": 52, "count": 32}, {"hex": "eb0000000151feffffff"}, {"byte": 53, "count": 32}, {"hex": "ec0000000151feffffff"}, {"byte": 54, "count": 32}, {"hex": "ed0000000151feffffff"}, {"byte": 55, "count": 32}, {"hex": "ee0000000151feffffff"}, {"byte": 56, "count": 32}, {"hex": "ef0000000151feffffff"}, {"byte": 57, "count": 32}, {"hex": "f00000000151feffffff"}, {"byte": 58, "count": 32}, {"hex": "f10000000151feffffff"}, {"byte": 59, "count": 32}, {"hex": "f20000000151feffffff"}, {"byte": 60, "count": 32}, {"hex": "f30000000151feffffff"}, {"byte": 61, "count": 32}, {"hex": "f40000000151feffffff"}, {"byte": 62, "count": 32}, {"hex": "f50000000151feffffff"}, {"byte": 63, "count": 32}, {"hex": "f60000000151feffffff"}, {"byte": 64, "count": 32}, {"hex": "f70000000151feffffff"}, {"byte": 65, "count": 32}, {"hex": "f80000000151feffffff"}, {"byte": 66, "count": 32}, {"hex": "f90000000151feffffff"}, {"byte": 67, "count": 32}, {"hex": "fa0000000151feffffff"}, {"byte": 68, "count": 32}, {"hex": "fb0000000151feffffff"}, {"byte": 69, "count": 32}, {"hex": "fc0000000151feffffff01a08601000000000016001422222222222222222222222222222222222222220a000000"}]},
++    {"core": {"accepted": true, "first_tx_offset": 81, "has_witness": false, "second_tx_offset": 2665, "size": 2584, "stripped": [{"hex": "0200000001"}, {"byte": 17, "count": 32}, {"hex": "000000000151fefffffffdfd00a0860100000000000151a1860100000000000151a2860100000000000151a3860100000000000151a4860100000000000151a5860100000000000151a6860100000000000151a7860100000000000151a8860100000000000151a9860100000000000151aa860100000000000151ab860100000000000151ac860100000000000151ad860100000000000151ae860100000000000151af860100000000000151b0860100000000000151b1860100000000000151b2860100000000000151b3860100000000000151b4860100000000000151b5860100000000000151b6860100000000000151b7860100000000000151b8860100000000000151b9860100000000000151ba860100000000000151bb860100000000000151bc860100000000000151bd860100000000000151be860100000000000151bf860100000000000151c0860100000000000151c1860100000000000151c2860100000000000151c3860100000000000151c4860100000000000151c5860100000000000151c6860100000000000151c7860100000000000151c8860100000000000151c9860100000000000151ca860100000000000151cb860100000000000151cc860100000000000151cd860100000000000151ce860100000000000151cf860100000000000151d0860100000000000151d1860100000000000151d2860100000000000151d3860100000000000151d4860100000000000151d5860100000000000151d6860100000000000151d7860100000000000151d8860100000000000151d9860100000000000151da860100000000000151db860100000000000151dc860100000000000151dd860100000000000151de860100000000000151df860100000000000151e0860100000000000151e1860100000000000151e2860100000000000151e3860100000000000151e4860100000000000151e5860100000000000151e6860100000000000151e7860100000000000151e8860100000000000151e9860100000000000151ea860100000000000151eb860100000000000151ec860100000000000151ed860100000000000151ee860100000000000151ef860100000000000151f0860100000000000151f1860100000000000151f2860100000000000151f3860100000000000151f4860100000000000151f5860100000000000151f6860100000000000151f7860100000000000151f8860100000000000151f9860100000000000151fa860100000000000151fb860100000000000151fc860100000000000151fd860100000000000151fe860100000000000151ff860100000000000151008701000000000001510187010000000000015102870100000000000151038701000000000001510487010000000000015105870100000000000151068701000000000001510787010000000000015108870100000000000151098701000000000001510a8701000000000001510b8701000000000001510c8701000000000001510d8701000000000001510e8701000000000001510f870100000000000151108701000000000001511187010000000000015112870100000000000151138701000000000001511487010000000000015115870100000000000151168701000000000001511787010000000000015118870100000000000151198701000000000001511a8701000000000001511b8701000000000001511c8701000000000001511d8701000000000001511e8701000000000001511f870100000000000151208701000000000001512187010000000000015122870100000000000151238701000000000001512487010000000000015125870100000000000151268701000000000001512787010000000000015128870100000000000151298701000000000001512a8701000000000001512b8701000000000001512c8701000000000001512d8701000000000001512e8701000000000001512f870100000000000151308701000000000001513187010000000000015132870100000000000151338701000000000001513487010000000000015135870100000000000151368701000000000001513787010000000000015138870100000000000151398701000000000001513a8701000000000001513b8701000000000001513c8701000000000001513d8701000000000001513e8701000000000001513f870100000000000151408701000000000001514187010000000000015142870100000000000151438701000000000001514487010000000000015145870100000000000151468701000000000001514787010000000000015148870100000000000151498701000000000001514a8701000000000001514b8701000000000001514c8701000000000001514d8701000000000001514e8701000000000001514f870100000000000151508701000000000001515187010000000000015152870100000000000151538701000000000001515487010000000000015155870100000000000151568701000000000001515787010000000000015158870100000000000151598701000000000001515a8701000000000001515b8701000000000001515c8701000000000001515d8701000000000001515e8701000000000001515f870100000000000151608701000000000001516187010000000000015162870100000000000151638701000000000001516487010000000000015165870100000000000151668701000000000001516787010000000000015168870100000000000151698701000000000001516a8701000000000001516b8701000000000001516c8701000000000001516d8701000000000001516e8701000000000001516f870100000000000151708701000000000001517187010000000000015172870100000000000151738701000000000001517487010000000000015175870100000000000151768701000000000001517787010000000000015178870100000000000151798701000000000001517a8701000000000001517b8701000000000001517c8701000000000001517d8701000000000001517e8701000000000001517f870100000000000151808701000000000001518187010000000000015182870100000000000151838701000000000001518487010000000000015185870100000000000151868701000000000001518787010000000000015188870100000000000151898701000000000001518a8701000000000001518b8701000000000001518c8701000000000001518d8701000000000001518e8701000000000001518f870100000000000151908701000000000001519187010000000000015192870100000000000151938701000000000001519487010000000000015195870100000000000151968701000000000001519787010000000000015198870100000000000151998701000000000001519a8701000000000001519b8701000000000001519c8701000000000001510a000000"}], "stripped_size": 2584, "txid": "b238ac6240ebce0746aa86075c4a652fb4d29f37fe9159a5fad88fcbb4e24223", "weight": 10336, "wtxid": "b238ac6240ebce0746aa86075c4a652fb4d29f37fe9159a5fad88fcbb4e24223"}, "name": "253_outputs", "raw": [{"hex": "0200000001"}, {"byte": 17, "count": 32}, {"hex": "000000000151fefffffffdfd00a0860100000000000151a1860100000000000151a2860100000000000151a3860100000000000151a4860100000000000151a5860100000000000151a6860100000000000151a7860100000000000151a8860100000000000151a9860100000000000151aa860100000000000151ab860100000000000151ac860100000000000151ad860100000000000151ae860100000000000151af860100000000000151b0860100000000000151b1860100000000000151b2860100000000000151b3860100000000000151b4860100000000000151b5860100000000000151b6860100000000000151b7860100000000000151b8860100000000000151b9860100000000000151ba860100000000000151bb860100000000000151bc860100000000000151bd860100000000000151be860100000000000151bf860100000000000151c0860100000000000151c1860100000000000151c2860100000000000151c3860100000000000151c4860100000000000151c5860100000000000151c6860100000000000151c7860100000000000151c8860100000000000151c9860100000000000151ca860100000000000151cb860100000000000151cc860100000000000151cd860100000000000151ce860100000000000151cf860100000000000151d0860100000000000151d1860100000000000151d2860100000000000151d3860100000000000151d4860100000000000151d5860100000000000151d6860100000000000151d7860100000000000151d8860100000000000151d9860100000000000151da860100000000000151db860100000000000151dc860100000000000151dd860100000000000151de860100000000000151df860100000000000151e0860100000000000151e1860100000000000151e2860100000000000151e3860100000000000151e4860100000000000151e5860100000000000151e6860100000000000151e7860100000000000151e8860100000000000151e9860100000000000151ea860100000000000151eb860100000000000151ec860100000000000151ed860100000000000151ee860100000000000151ef860100000000000151f0860100000000000151f1860100000000000151f2860100000000000151f3860100000000000151f4860100000000000151f5860100000000000151f6860100000000000151f7860100000000000151f8860100000000000151f9860100000000000151fa860100000000000151fb860100000000000151fc860100000000000151fd860100000000000151fe860100000000000151ff860100000000000151008701000000000001510187010000000000015102870100000000000151038701000000000001510487010000000000015105870100000000000151068701000000000001510787010000000000015108870100000000000151098701000000000001510a8701000000000001510b8701000000000001510c8701000000000001510d8701000000000001510e8701000000000001510f870100000000000151108701000000000001511187010000000000015112870100000000000151138701000000000001511487010000000000015115870100000000000151168701000000000001511787010000000000015118870100000000000151198701000000000001511a8701000000000001511b8701000000000001511c8701000000000001511d8701000000000001511e8701000000000001511f870100000000000151208701000000000001512187010000000000015122870100000000000151238701000000000001512487010000000000015125870100000000000151268701000000000001512787010000000000015128870100000000000151298701000000000001512a8701000000000001512b8701000000000001512c8701000000000001512d8701000000000001512e8701000000000001512f870100000000000151308701000000000001513187010000000000015132870100000000000151338701000000000001513487010000000000015135870100000000000151368701000000000001513787010000000000015138870100000000000151398701000000000001513a8701000000000001513b8701000000000001513c8701000000000001513d8701000000000001513e8701000000000001513f870100000000000151408701000000000001514187010000000000015142870100000000000151438701000000000001514487010000000000015145870100000000000151468701000000000001514787010000000000015148870100000000000151498701000000000001514a8701000000000001514b8701000000000001514c8701000000000001514d8701000000000001514e8701000000000001514f870100000000000151508701000000000001515187010000000000015152870100000000000151538701000000000001515487010000000000015155870100000000000151568701000000000001515787010000000000015158870100000000000151598701000000000001515a8701000000000001515b8701000000000001515c8701000000000001515d8701000000000001515e8701000000000001515f870100000000000151608701000000000001516187010000000000015162870100000000000151638701000000000001516487010000000000015165870100000000000151668701000000000001516787010000000000015168870100000000000151698701000000000001516a8701000000000001516b8701000000000001516c8701000000000001516d8701000000000001516e8701000000000001516f870100000000000151708701000000000001517187010000000000015172870100000000000151738701000000000001517487010000000000015175870100000000000151768701000000000001517787010000000000015178870100000000000151798701000000000001517a8701000000000001517b8701000000000001517c8701000000000001517d8701000000000001517e8701000000000001517f870100000000000151808701000000000001518187010000000000015182870100000000000151838701000000000001518487010000000000015185870100000000000151868701000000000001518787010000000000015188870100000000000151898701000000000001518a8701000000000001518b8701000000000001518c8701000000000001518d8701000000000001518e8701000000000001518f870100000000000151908701000000000001519187010000000000015192870100000000000151938701000000000001519487010000000000015195870100000000000151968701000000000001519787010000000000015198870100000000000151998701000000000001519a8701000000000001519b8701000000000001519c8701000000000001510a000000"}]},
++    {"core": {"accepted": true, "first_tx_offset": 81, "has_witness": true, "second_tx_offset": 420, "size": 339, "stripped": [{"hex": "0200000001"}, {"byte": 17, "count": 32}, {"hex": "000000000151feffffff01a08601000000000016001422222222222222222222222222222222222222220a000000"}], "stripped_size": 83, "txid": "3e4d6975eb9fab78180ca079d71086de1e7ec3bd1a7a5bbf2a8f2acc65c01138", "weight": 588, "wtxid": "321fb61767e84763714a47850ff21d77f02bfa82d6d5e5a2cd1a69aabf91c2fd"}, "name": "witness_item_252", "raw": [{"hex": "02000000000101"}, {"byte": 17, "count": 32}, {"hex": "000000000151feffffff01a086010000000000160014222222222222222222222222222222222222222201fc"}, {"byte": 66, "count": 252}, {"hex": "0a000000"}]},
++    {"core": {"accepted": true, "first_tx_offset": 81, "has_witness": true, "second_tx_offset": 423, "size": 342, "stripped": [{"hex": "0200000001"}, {"byte": 17, "count": 32}, {"hex": "000000000151feffffff01a08601000000000016001422222222222222222222222222222222222222220a000000"}], "stripped_size": 83, "txid": "3e4d6975eb9fab78180ca079d71086de1e7ec3bd1a7a5bbf2a8f2acc65c01138", "weight": 591, "wtxid": "8d8aef2f5c7333c7f876126c78c1b8fc005a04d8137d33bc597d3f3fe6adf946"}, "name": "witness_item_253", "raw": [{"hex": "02000000000101"}, {"byte": 17, "count": 32}, {"hex": "000000000151feffffff01a086010000000000160014222222222222222222222222222222222222222201fdfd00"}, {"byte": 66, "count": 253}, {"hex": "0a000000"}]},
++    {"core": {"accepted": true, "first_tx_offset": 81, "has_witness": true, "second_tx_offset": 65705, "size": 65624, "stripped": [{"hex": "0200000001"}, {"byte": 17, "count": 32}, {"hex": "000000000151feffffff01a08601000000000016001422222222222222222222222222222222222222220a000000"}], "stripped_size": 83, "txid": "3e4d6975eb9fab78180ca079d71086de1e7ec3bd1a7a5bbf2a8f2acc65c01138", "weight": 65873, "wtxid": "30958a589a20d332b63d07df11c72fd9a6ead8d6f607e59eeed25eaeff6f78f2"}, "name": "witness_item_65535", "raw": [{"hex": "02000000000101"}, {"byte": 17, "count": 32}, {"hex": "000000000151feffffff01a086010000000000160014222222222222222222222222222222222222222201fdffff"}, {"byte": 66, "count": 65535}, {"hex": "0a000000"}]},
++    {"core": {"accepted": true, "first_tx_offset": 81, "has_witness": true, "second_tx_offset": 65708, "size": 65627, "stripped": [{"hex": "0200000001"}, {"byte": 17, "count": 32}, {"hex": "000000000151feffffff01a08601000000000016001422222222222222222222222222222222222222220a000000"}], "stripped_size": 83, "txid": "3e4d6975eb9fab78180ca079d71086de1e7ec3bd1a7a5bbf2a8f2acc65c01138", "weight": 65876, "wtxid": "1ce022bbfeedf70f45c98e8a06e2e09f2484669d8acb31798dec8d8963a31320"}, "name": "witness_item_65536", "raw": [{"hex": "02000000000101"}, {"byte": 17, "count": 32}, {"hex": "000000000151feffffff01a086010000000000160014222222222222222222222222222222222222222201fe00000100"}, {"byte": 66, "count": 65536}, {"hex": "0a000000"}]},
++    {"core": {"accepted": true, "first_tx_offset": 81, "has_witness": false, "second_tx_offset": 415, "size": 334, "stripped": [{"hex": "0200000001"}, {"byte": 17, "count": 32}, {"hex": "00000000fc"}, {"byte": 97, "count": 252}, {"hex": "feffffff01a08601000000000016001422222222222222222222222222222222222222220a000000"}], "stripped_size": 334, "txid": "117cd7eca24c694fc51d68a0de9020cb61d092f2c4974b6ef9d7d6c26d960133", "weight": 1336, "wtxid": "117cd7eca24c694fc51d68a0de9020cb61d092f2c4974b6ef9d7d6c26d960133"}, "name": "input_script_252", "raw": [{"hex": "0200000001"}, {"byte": 17, "count": 32}, {"hex": "00000000fc"}, {"byte": 97, "count": 252}, {"hex": "feffffff01a08601000000000016001422222222222222222222222222222222222222220a000000"}]},
++    {"core": {"accepted": true, "first_tx_offset": 81, "has_witness": false, "second_tx_offset": 394, "size": 313, "stripped": [{"hex": "0200000001"}, {"byte": 17, "count": 32}, {"hex": "000000000151feffffff01a086010000000000fc"}, {"byte": 97, "count": 252}, {"hex": "0a000000"}], "stripped_size": 313, "txid": "c754702bf77b6c1202af63cdbb2846ead8b96f5b0f99ce3ce8c6c17b0ece13f2", "weight": 1252, "wtxid": "c754702bf77b6c1202af63cdbb2846ead8b96f5b0f99ce3ce8c6c17b0ece13f2"}, "name": "output_script_252", "raw": [{"hex": "0200000001"}, {"byte": 17, "count": 32}, {"hex": "000000000151feffffff01a086010000000000fc"}, {"byte": 97, "count": 252}, {"hex": "0a000000"}]},
++    {"core": {"accepted": true, "first_tx_offset": 81, "has_witness": false, "second_tx_offset": 418, "size": 337, "stripped": [{"hex": "0200000001"}, {"byte": 17, "count": 32}, {"hex": "00000000fdfd00"}, {"byte": 97, "count": 253}, {"hex": "feffffff01a08601000000000016001422222222222222222222222222222222222222220a000000"}], "stripped_size": 337, "txid": "433ad3575ba577d966ff71ca8a9ca19a9b91771a256a21aae4bc809befa5779f", "weight": 1348, "wtxid": "433ad3575ba577d966ff71ca8a9ca19a9b91771a256a21aae4bc809befa5779f"}, "name": "input_script_253", "raw": [{"hex": "0200000001"}, {"byte": 17, "count": 32}, {"hex": "00000000fdfd00"}, {"byte": 97, "count": 253}, {"hex": "feffffff01a08601000000000016001422222222222222222222222222222222222222220a000000"}]},
++    {"core": {"accepted": true, "first_tx_offset": 81, "has_witness": false, "second_tx_offset": 397, "size": 316, "stripped": [{"hex": "0200000001"}, {"byte": 17, "count": 32}, {"hex": "000000000151feffffff01a086010000000000fdfd00"}, {"byte": 97, "count": 253}, {"hex": "0a000000"}], "stripped_size": 316, "txid": "ee4aedd7c2e949fbe742dde546ae16c703da37caebc110b7507211c77043c9f1", "weight": 1264, "wtxid": "ee4aedd7c2e949fbe742dde546ae16c703da37caebc110b7507211c77043c9f1"}, "name": "output_script_253", "raw": [{"hex": "0200000001"}, {"byte": 17, "count": 32}, {"hex": "000000000151feffffff01a086010000000000fdfd00"}, {"byte": 97, "count": 253}, {"hex": "0a000000"}]},
++    {"core": {"accepted": false}, "name": "superfluous_witness", "raw": [{"hex": "02000000000101"}, {"byte": 17, "count": 32}, {"hex": "000000000151feffffff01a0860100000000001600142222222222222222222222222222222222222222000a000000"}]},
++    {"core": {"accepted": false}, "name": "superfluous_witness_zero_inputs", "raw": [{"hex": "0200000000010001a08601000000000016001422222222222222222222222222222222222222220a000000"}]},
++    {"core": {"accepted": false}, "name": "unknown_flag_2", "raw": [{"hex": "02000000000201"}, {"byte": 17, "count": 32}, {"hex": "000000000151feffffff01a08601000000000016001422222222222222222222222222222222222222220101010a000000"}]},
++    {"core": {"accepted": false}, "name": "unknown_flag_3", "raw": [{"hex": "02000000000301"}, {"byte": 17, "count": 32}, {"hex": "000000000151feffffff01a08601000000000016001422222222222222222222222222222222222222220101010a000000"}]},
++    {"core": {"accepted": false}, "name": "unknown_flag_128", "raw": [{"hex": "02000000008001"}, {"byte": 17, "count": 32}, {"hex": "000000000151feffffff01a08601000000000016001422222222222222222222222222222222222222220101010a000000"}]},
++    {"core": {"accepted": true, "first_tx_offset": 81, "has_witness": false, "second_tx_offset": 91, "size": 10, "stripped": [{"hex": "01000000000000000000"}], "stripped_size": 10, "txid": "d21633ba23f70118185227be58a63527675641ad37967e2aa461559f577aec43", "weight": 40, "wtxid": "d21633ba23f70118185227be58a63527675641ad37967e2aa461559f577aec43"}, "name": "empty_legacy", "raw": [{"hex": "01000000000000000000"}]},
++    {"core": {"accepted": false}, "name": "trailing_byte", "raw": [{"hex": "02000000000101"}, {"byte": 17, "count": 32}, {"hex": "000000000151feffffff01a0860100000000001600142222222222222222222222222222222222222222020230012102"}, {"byte": 51, "count": 32}, {"hex": "0a00000000"}]},
++    {"core": {"accepted": false}, "name": "concatenated_transactions", "raw": [{"hex": "0200000001"}, {"byte": 17, "count": 32}, {"hex": "000000000151feffffff01a08601000000000016001422222222222222222222222222222222222222220a00000002000000000101"}, {"byte": 17, "count": 32}, {"hex": "000000000151feffffff01a0860100000000001600142222222222222222222222222222222222222222020230012102"}, {"byte": 51, "count": 32}, {"hex": "0a000000"}]},
++    {"core": {"accepted": false}, "name": "noncanonical_input_count", "raw": [{"hex": "02000000fd0100"}, {"byte": 17, "count": 32}, {"hex": "000000000151feffffff01a08601000000000016001422222222222222222222222222222222222222220a000000"}]},
++    {"core": {"accepted": false}, "name": "noncanonical_output_count", "raw": [{"hex": "0200000001"}, {"byte": 17, "count": 32}, {"hex": "000000000151fefffffffd0100a08601000000000016001422222222222222222222222222222222222222220a000000"}]},
++    {"core": {"accepted": false}, "name": "noncanonical_input_script", "raw": [{"hex": "0200000001"}, {"byte": 17, "count": 32}, {"hex": "00000000fd010051feffffff01a08601000000000016001422222222222222222222222222222222222222220a000000"}]},
++    {"core": {"accepted": false}, "name": "noncanonical_output_script", "raw": [{"hex": "0200000001"}, {"byte": 17, "count": 32}, {"hex": "000000000151feffffff01a086010000000000fd1600001422222222222222222222222222222222222222220a000000"}]},
++    {"core": {"accepted": false}, "name": "noncanonical_witness_count", "raw": [{"hex": "02000000000101"}, {"byte": 17, "count": 32}, {"hex": "000000000151feffffff01a0860100000000001600142222222222222222222222222222222222222222fd02000230012102"}, {"byte": 51, "count": 32}, {"hex": "0a000000"}]},
++    {"core": {"accepted": false}, "name": "noncanonical_witness_item", "raw": [{"hex": "02000000000101"}, {"byte": 17, "count": 32}, {"hex": "000000000151feffffff01a086010000000000160014222222222222222222222222222222222222222202fd020030012102"}, {"byte": 51, "count": 32}, {"hex": "0a000000"}]},
++    {"core": {"accepted": false}, "name": "invalid_count_fe00000002", "raw": [{"hex": "02000000fe00000002"}, {"byte": 17, "count": 32}, {"hex": "000000000151feffffff01a08601000000000016001422222222222222222222222222222222222222220a000000"}]},
++    {"core": {"accepted": false}, "name": "invalid_count_fe01000002", "raw": [{"hex": "02000000fe01000002"}, {"byte": 17, "count": 32}, {"hex": "000000000151feffffff01a08601000000000016001422222222222222222222222222222222222222220a000000"}]},
++    {"core": {"accepted": false}, "name": "invalid_count_ffffffffffffffffff", "raw": [{"hex": "02000000ffffffffffffffffff"}, {"byte": 17, "count": 32}, {"hex": "000000000151feffffff01a08601000000000016001422222222222222222222222222222222222222220a000000"}]},
++    {"core": {"accepted": false}, "name": "invalid_count_feffff0000", "raw": [{"hex": "02000000feffff0000"}, {"byte": 17, "count": 32}, {"hex": "000000000151feffffff01a08601000000000016001422222222222222222222222222222222222222220a000000"}]},
++    {"core": {"accepted": false}, "name": "invalid_count_ff0000010000000000", "raw": [{"hex": "02000000ff0000010000000000"}, {"byte": 17, "count": 32}, {"hex": "000000000151feffffff01a08601000000000016001422222222222222222222222222222222222222220a000000"}]},
++    {"core": {"accepted": false}, "name": "truncated_witness_0", "raw": []},
++    {"core": {"accepted": false}, "name": "truncated_witness_1", "raw": [{"hex": "02"}]},
++    {"core": {"accepted": false}, "name": "truncated_witness_2", "raw": [{"hex": "0200"}]},
++    {"core": {"accepted": false}, "name": "truncated_witness_3", "raw": [{"hex": "020000"}]},
++    {"core": {"accepted": false}, "name": "truncated_witness_4", "raw": [{"hex": "02000000"}]},
++    {"core": {"accepted": false}, "name": "truncated_witness_5", "raw": [{"hex": "0200000000"}]},
++    {"core": {"accepted": false}, "name": "truncated_witness_6", "raw": [{"hex": "020000000001"}]},
++    {"core": {"accepted": false}, "name": "truncated_witness_7", "raw": [{"hex": "02000000000101"}]},
++    {"core": {"accepted": false}, "name": "truncated_witness_8", "raw": [{"hex": "0200000000010111"}]},
++    {"core": {"accepted": false}, "name": "truncated_witness_9", "raw": [{"hex": "020000000001011111"}]},
++    {"core": {"accepted": false}, "name": "truncated_witness_10", "raw": [{"hex": "02000000000101111111"}]},
++    {"core": {"accepted": false}, "name": "truncated_witness_11", "raw": [{"hex": "0200000000010111111111"}]},
++    {"core": {"accepted": false}, "name": "truncated_witness_12", "raw": [{"hex": "020000000001011111111111"}]},
++    {"core": {"accepted": false}, "name": "truncated_witness_13", "raw": [{"hex": "02000000000101111111111111"}]},
++    {"core": {"accepted": false}, "name": "truncated_witness_14", "raw": [{"hex": "0200000000010111111111111111"}]},
++    {"core": {"accepted": false}, "name": "truncated_witness_15", "raw": [{"hex": "020000000001011111111111111111"}]},
++    {"core": {"accepted": false}, "name": "truncated_witness_16", "raw": [{"hex": "02000000000101111111111111111111"}]},
++    {"core": {"accepted": false}, "name": "truncated_witness_17", "raw": [{"hex": "0200000000010111111111111111111111"}]},
++    {"core": {"accepted": false}, "name": "truncated_witness_18", "raw": [{"hex": "020000000001011111111111111111111111"}]},
++    {"core": {"accepted": false}, "name": "truncated_witness_19", "raw": [{"hex": "02000000000101111111111111111111111111"}]},
++    {"core": {"accepted": false}, "name": "truncated_witness_20", "raw": [{"hex": "0200000000010111111111111111111111111111"}]},
++    {"core": {"accepted": false}, "name": "truncated_witness_21", "raw": [{"hex": "020000000001011111111111111111111111111111"}]},
++    {"core": {"accepted": false}, "name": "truncated_witness_22", "raw": [{"hex": "02000000000101111111111111111111111111111111"}]},
++    {"core": {"accepted": false}, "name": "truncated_witness_23", "raw": [{"hex": "0200000000010111111111111111111111111111111111"}]},
++    {"core": {"accepted": false}, "name": "truncated_witness_24", "raw": [{"hex": "020000000001011111111111111111111111111111111111"}]},
++    {"core": {"accepted": false}, "name": "truncated_witness_25", "raw": [{"hex": "02000000000101111111111111111111111111111111111111"}]},
++    {"core": {"accepted": false}, "name": "truncated_witness_26", "raw": [{"hex": "0200000000010111111111111111111111111111111111111111"}]},
++    {"core": {"accepted": false}, "name": "truncated_witness_27", "raw": [{"hex": "020000000001011111111111111111111111111111111111111111"}]},
++    {"core": {"accepted": false}, "name": "truncated_witness_28", "raw": [{"hex": "02000000000101111111111111111111111111111111111111111111"}]},
++    {"core": {"accepted": false}, "name": "truncated_witness_29", "raw": [{"hex": "0200000000010111111111111111111111111111111111111111111111"}]},
++    {"core": {"accepted": false}, "name": "truncated_witness_30", "raw": [{"hex": "020000000001011111111111111111111111111111111111111111111111"}]},
++    {"core": {"accepted": false}, "name": "truncated_witness_31", "raw": [{"hex": "02000000000101111111111111111111111111111111111111111111111111"}]},
++    {"core": {"accepted": false}, "name": "truncated_witness_32", "raw": [{"hex": "0200000000010111111111111111111111111111111111111111111111111111"}]},
++    {"core": {"accepted": false}, "name": "truncated_witness_33", "raw": [{"hex": "020000000001011111111111111111111111111111111111111111111111111111"}]},
++    {"core": {"accepted": false}, "name": "truncated_witness_34", "raw": [{"hex": "02000000000101111111111111111111111111111111111111111111111111111111"}]},
++    {"core": {"accepted": false}, "name": "truncated_witness_35", "raw": [{"hex": "0200000000010111111111111111111111111111111111111111111111111111111111"}]},
++    {"core": {"accepted": false}, "name": "truncated_witness_36", "raw": [{"hex": "020000000001011111111111111111111111111111111111111111111111111111111111"}]},
++    {"core": {"accepted": false}, "name": "truncated_witness_37", "raw": [{"hex": "02000000000101111111111111111111111111111111111111111111111111111111111111"}]},
++    {"core": {"accepted": false}, "name": "truncated_witness_38", "raw": [{"hex": "0200000000010111111111111111111111111111111111111111111111111111111111111111"}]},
++    {"core": {"accepted": false}, "name": "truncated_witness_39", "raw": [{"hex": "02000000000101"}, {"byte": 17, "count": 32}]},
++    {"core": {"accepted": false}, "name": "truncated_witness_40", "raw": [{"hex": "02000000000101"}, {"byte": 17, "count": 32}, {"hex": "00"}]},
++    {"core": {"accepted": false}, "name": "truncated_witness_41", "raw": [{"hex": "02000000000101"}, {"byte": 17, "count": 32}, {"hex": "0000"}]},
++    {"core": {"accepted": false}, "name": "truncated_witness_42", "raw": [{"hex": "02000000000101"}, {"byte": 17, "count": 32}, {"hex": "000000"}]},
++    {"core": {"accepted": false}, "name": "truncated_witness_43", "raw": [{"hex": "02000000000101"}, {"byte": 17, "count": 32}, {"hex": "00000000"}]},
++    {"core": {"accepted": false}, "name": "truncated_witness_44", "raw": [{"hex": "02000000000101"}, {"byte": 17, "count": 32}, {"hex": "0000000001"}]},
++    {"core": {"accepted": false}, "name": "truncated_witness_45", "raw": [{"hex": "02000000000101"}, {"byte": 17, "count": 32}, {"hex": "000000000151"}]},
++    {"core": {"accepted": false}, "name": "truncated_witness_46", "raw": [{"hex": "02000000000101"}, {"byte": 17, "count": 32}, {"hex": "000000000151fe"}]},
++    {"core": {"accepted": false}, "name": "truncated_witness_47", "raw": [{"hex": "02000000000101"}, {"byte": 17, "count": 32}, {"hex": "000000000151feff"}]},
++    {"core": {"accepted": false}, "name": "truncated_witness_48", "raw": [{"hex": "02000000000101"}, {"byte": 17, "count": 32}, {"hex": "000000000151feffff"}]},
++    {"core": {"accepted": false}, "name": "truncated_witness_49", "raw": [{"hex": "02000000000101"}, {"byte": 17, "count": 32}, {"hex": "000000000151feffffff"}]},
++    {"core": {"accepted": false}, "name": "truncated_witness_50", "raw": [{"hex": "02000000000101"}, {"byte": 17, "count": 32}, {"hex": "000000000151feffffff01"}]},
++    {"core": {"accepted": false}, "name": "truncated_witness_51", "raw": [{"hex": "02000000000101"}, {"byte": 17, "count": 32}, {"hex": "000000000151feffffff01a0"}]},
++    {"core": {"accepted": false}, "name": "truncated_witness_52", "raw": [{"hex": "02000000000101"}, {"byte": 17, "count": 32}, {"hex": "000000000151feffffff01a086"}]},
++    {"core": {"accepted": false}, "name": "truncated_witness_53", "raw": [{"hex": "02000000000101"}, {"byte": 17, "count": 32}, {"hex": "000000000151feffffff01a08601"}]},
++    {"core": {"accepted": false}, "name": "truncated_witness_54", "raw": [{"hex": "02000000000101"}, {"byte": 17, "count": 32}, {"hex": "000000000151feffffff01a0860100"}]},
++    {"core": {"accepted": false}, "name": "truncated_witness_55", "raw": [{"hex": "02000000000101"}, {"byte": 17, "count": 32}, {"hex": "000000000151feffffff01a086010000"}]},
++    {"core": {"accepted": false}, "name": "truncated_witness_56", "raw": [{"hex": "02000000000101"}, {"byte": 17, "count": 32}, {"hex": "000000000151feffffff01a08601000000"}]},
++    {"core": {"accepted": false}, "name": "truncated_witness_57", "raw": [{"hex": "02000000000101"}, {"byte": 17, "count": 32}, {"hex": "000000000151feffffff01a0860100000000"}]},
++    {"core": {"accepted": false}, "name": "truncated_witness_58", "raw": [{"hex": "02000000000101"}, {"byte": 17, "count": 32}, {"hex": "000000000151feffffff01a086010000000000"}]},
++    {"core": {"accepted": false}, "name": "truncated_witness_59", "raw": [{"hex": "02000000000101"}, {"byte": 17, "count": 32}, {"hex": "000000000151feffffff01a08601000000000016"}]},
++    {"core": {"accepted": false}, "name": "truncated_witness_60", "raw": [{"hex": "02000000000101"}, {"byte": 17, "count": 32}, {"hex": "000000000151feffffff01a0860100000000001600"}]},
++    {"core": {"accepted": false}, "name": "truncated_witness_61", "raw": [{"hex": "02000000000101"}, {"byte": 17, "count": 32}, {"hex": "000000000151feffffff01a086010000000000160014"}]},
++    {"core": {"accepted": false}, "name": "truncated_witness_62", "raw": [{"hex": "02000000000101"}, {"byte": 17, "count": 32}, {"hex": "000000000151feffffff01a08601000000000016001422"}]},
++    {"core": {"accepted": false}, "name": "truncated_witness_63", "raw": [{"hex": "02000000000101"}, {"byte": 17, "count": 32}, {"hex": "000000000151feffffff01a0860100000000001600142222"}]},
++    {"core": {"accepted": false}, "name": "truncated_witness_64", "raw": [{"hex": "02000000000101"}, {"byte": 17, "count": 32}, {"hex": "000000000151feffffff01a086010000000000160014222222"}]},
++    {"core": {"accepted": false}, "name": "truncated_witness_65", "raw": [{"hex": "02000000000101"}, {"byte": 17, "count": 32}, {"hex": "000000000151feffffff01a08601000000000016001422222222"}]},
++    {"core": {"accepted": false}, "name": "truncated_witness_66", "raw": [{"hex": "02000000000101"}, {"byte": 17, "count": 32}, {"hex": "000000000151feffffff01a0860100000000001600142222222222"}]},
++    {"core": {"accepted": false}, "name": "truncated_witness_67", "raw": [{"hex": "02000000000101"}, {"byte": 17, "count": 32}, {"hex": "000000000151feffffff01a086010000000000160014222222222222"}]},
++    {"core": {"accepted": false}, "name": "truncated_witness_68", "raw": [{"hex": "02000000000101"}, {"byte": 17, "count": 32}, {"hex": "000000000151feffffff01a08601000000000016001422222222222222"}]},
++    {"core": {"accepted": false}, "name": "truncated_witness_69", "raw": [{"hex": "02000000000101"}, {"byte": 17, "count": 32}, {"hex": "000000000151feffffff01a0860100000000001600142222222222222222"}]},
++    {"core": {"accepted": false}, "name": "truncated_witness_70", "raw": [{"hex": "02000000000101"}, {"byte": 17, "count": 32}, {"hex": "000000000151feffffff01a086010000000000160014222222222222222222"}]},
++    {"core": {"accepted": false}, "name": "truncated_witness_71", "raw": [{"hex": "02000000000101"}, {"byte": 17, "count": 32}, {"hex": "000000000151feffffff01a08601000000000016001422222222222222222222"}]},
++    {"core": {"accepted": false}, "name": "truncated_witness_72", "raw": [{"hex": "02000000000101"}, {"byte": 17, "count": 32}, {"hex": "000000000151feffffff01a0860100000000001600142222222222222222222222"}]},
++    {"core": {"accepted": false}, "name": "truncated_witness_73", "raw": [{"hex": "02000000000101"}, {"byte": 17, "count": 32}, {"hex": "000000000151feffffff01a086010000000000160014222222222222222222222222"}]},
++    {"core": {"accepted": false}, "name": "truncated_witness_74", "raw": [{"hex": "02000000000101"}, {"byte": 17, "count": 32}, {"hex": "000000000151feffffff01a08601000000000016001422222222222222222222222222"}]},
++    {"core": {"accepted": false}, "name": "truncated_witness_75", "raw": [{"hex": "02000000000101"}, {"byte": 17, "count": 32}, {"hex": "000000000151feffffff01a0860100000000001600142222222222222222222222222222"}]},
++    {"core": {"accepted": false}, "name": "truncated_witness_76", "raw": [{"hex": "02000000000101"}, {"byte": 17, "count": 32}, {"hex": "000000000151feffffff01a086010000000000160014222222222222222222222222222222"}]},
++    {"core": {"accepted": false}, "name": "truncated_witness_77", "raw": [{"hex": "02000000000101"}, {"byte": 17, "count": 32}, {"hex": "000000000151feffffff01a08601000000000016001422222222222222222222222222222222"}]},
++    {"core": {"accepted": false}, "name": "truncated_witness_78", "raw": [{"hex": "02000000000101"}, {"byte": 17, "count": 32}, {"hex": "000000000151feffffff01a0860100000000001600142222222222222222222222222222222222"}]},
++    {"core": {"accepted": false}, "name": "truncated_witness_79", "raw": [{"hex": "02000000000101"}, {"byte": 17, "count": 32}, {"hex": "000000000151feffffff01a086010000000000160014222222222222222222222222222222222222"}]},
++    {"core": {"accepted": false}, "name": "truncated_witness_80", "raw": [{"hex": "02000000000101"}, {"byte": 17, "count": 32}, {"hex": "000000000151feffffff01a08601000000000016001422222222222222222222222222222222222222"}]},
++    {"core": {"accepted": false}, "name": "truncated_witness_81", "raw": [{"hex": "02000000000101"}, {"byte": 17, "count": 32}, {"hex": "000000000151feffffff01a0860100000000001600142222222222222222222222222222222222222222"}]},
++    {"core": {"accepted": false}, "name": "truncated_witness_82", "raw": [{"hex": "02000000000101"}, {"byte": 17, "count": 32}, {"hex": "000000000151feffffff01a086010000000000160014222222222222222222222222222222222222222202"}]},
++    {"core": {"accepted": false}, "name": "truncated_witness_83", "raw": [{"hex": "02000000000101"}, {"byte": 17, "count": 32}, {"hex": "000000000151feffffff01a08601000000000016001422222222222222222222222222222222222222220202"}]},
++    {"core": {"accepted": false}, "name": "truncated_witness_84", "raw": [{"hex": "02000000000101"}, {"byte": 17, "count": 32}, {"hex": "000000000151feffffff01a0860100000000001600142222222222222222222222222222222222222222020230"}]},
++    {"core": {"accepted": false}, "name": "truncated_witness_85", "raw": [{"hex": "02000000000101"}, {"byte": 17, "count": 32}, {"hex": "000000000151feffffff01a086010000000000160014222222222222222222222222222222222222222202023001"}]},
++    {"core": {"accepted": false}, "name": "truncated_witness_86", "raw": [{"hex": "02000000000101"}, {"byte": 17, "count": 32}, {"hex": "000000000151feffffff01a08601000000000016001422222222222222222222222222222222222222220202300121"}]},
++    {"core": {"accepted": false}, "name": "truncated_witness_87", "raw": [{"hex": "02000000000101"}, {"byte": 17, "count": 32}, {"hex": "000000000151feffffff01a0860100000000001600142222222222222222222222222222222222222222020230012102"}]},
++    {"core": {"accepted": false}, "name": "truncated_witness_88", "raw": [{"hex": "02000000000101"}, {"byte": 17, "count": 32}, {"hex": "000000000151feffffff01a086010000000000160014222222222222222222222222222222222222222202023001210233"}]},
++    {"core": {"accepted": false}, "name": "truncated_witness_89", "raw": [{"hex": "02000000000101"}, {"byte": 17, "count": 32}, {"hex": "000000000151feffffff01a08601000000000016001422222222222222222222222222222222222222220202300121023333"}]},
++    {"core": {"accepted": false}, "name": "truncated_witness_90", "raw": [{"hex": "02000000000101"}, {"byte": 17, "count": 32}, {"hex": "000000000151feffffff01a0860100000000001600142222222222222222222222222222222222222222020230012102333333"}]},
++    {"core": {"accepted": false}, "name": "truncated_witness_91", "raw": [{"hex": "02000000000101"}, {"byte": 17, "count": 32}, {"hex": "000000000151feffffff01a086010000000000160014222222222222222222222222222222222222222202023001210233333333"}]},
++    {"core": {"accepted": false}, "name": "truncated_witness_92", "raw": [{"hex": "02000000000101"}, {"byte": 17, "count": 32}, {"hex": "000000000151feffffff01a08601000000000016001422222222222222222222222222222222222222220202300121023333333333"}]},
++    {"core": {"accepted": false}, "name": "truncated_witness_93", "raw": [{"hex": "02000000000101"}, {"byte": 17, "count": 32}, {"hex": "000000000151feffffff01a0860100000000001600142222222222222222222222222222222222222222020230012102333333333333"}]},
++    {"core": {"accepted": false}, "name": "truncated_witness_94", "raw": [{"hex": "02000000000101"}, {"byte": 17, "count": 32}, {"hex": "000000000151feffffff01a086010000000000160014222222222222222222222222222222222222222202023001210233333333333333"}]},
++    {"core": {"accepted": false}, "name": "truncated_witness_95", "raw": [{"hex": "02000000000101"}, {"byte": 17, "count": 32}, {"hex": "000000000151feffffff01a08601000000000016001422222222222222222222222222222222222222220202300121023333333333333333"}]},
++    {"core": {"accepted": false}, "name": "truncated_witness_96", "raw": [{"hex": "02000000000101"}, {"byte": 17, "count": 32}, {"hex": "000000000151feffffff01a0860100000000001600142222222222222222222222222222222222222222020230012102333333333333333333"}]},
++    {"core": {"accepted": false}, "name": "truncated_witness_97", "raw": [{"hex": "02000000000101"}, {"byte": 17, "count": 32}, {"hex": "000000000151feffffff01a086010000000000160014222222222222222222222222222222222222222202023001210233333333333333333333"}]},
++    {"core": {"accepted": false}, "name": "truncated_witness_98", "raw": [{"hex": "02000000000101"}, {"byte": 17, "count": 32}, {"hex": "000000000151feffffff01a08601000000000016001422222222222222222222222222222222222222220202300121023333333333333333333333"}]},
++    {"core": {"accepted": false}, "name": "truncated_witness_99", "raw": [{"hex": "02000000000101"}, {"byte": 17, "count": 32}, {"hex": "000000000151feffffff01a0860100000000001600142222222222222222222222222222222222222222020230012102333333333333333333333333"}]},
++    {"core": {"accepted": false}, "name": "truncated_witness_100", "raw": [{"hex": "02000000000101"}, {"byte": 17, "count": 32}, {"hex": "000000000151feffffff01a086010000000000160014222222222222222222222222222222222222222202023001210233333333333333333333333333"}]},
++    {"core": {"accepted": false}, "name": "truncated_witness_101", "raw": [{"hex": "02000000000101"}, {"byte": 17, "count": 32}, {"hex": "000000000151feffffff01a08601000000000016001422222222222222222222222222222222222222220202300121023333333333333333333333333333"}]},
++    {"core": {"accepted": false}, "name": "truncated_witness_102", "raw": [{"hex": "02000000000101"}, {"byte": 17, "count": 32}, {"hex": "000000000151feffffff01a0860100000000001600142222222222222222222222222222222222222222020230012102333333333333333333333333333333"}]},
++    {"core": {"accepted": false}, "name": "truncated_witness_103", "raw": [{"hex": "02000000000101"}, {"byte": 17, "count": 32}, {"hex": "000000000151feffffff01a086010000000000160014222222222222222222222222222222222222222202023001210233333333333333333333333333333333"}]},
++    {"core": {"accepted": false}, "name": "truncated_witness_104", "raw": [{"hex": "02000000000101"}, {"byte": 17, "count": 32}, {"hex": "000000000151feffffff01a08601000000000016001422222222222222222222222222222222222222220202300121023333333333333333333333333333333333"}]},
++    {"core": {"accepted": false}, "name": "truncated_witness_105", "raw": [{"hex": "02000000000101"}, {"byte": 17, "count": 32}, {"hex": "000000000151feffffff01a0860100000000001600142222222222222222222222222222222222222222020230012102333333333333333333333333333333333333"}]},
++    {"core": {"accepted": false}, "name": "truncated_witness_106", "raw": [{"hex": "02000000000101"}, {"byte": 17, "count": 32}, {"hex": "000000000151feffffff01a086010000000000160014222222222222222222222222222222222222222202023001210233333333333333333333333333333333333333"}]},
++    {"core": {"accepted": false}, "name": "truncated_witness_107", "raw": [{"hex": "02000000000101"}, {"byte": 17, "count": 32}, {"hex": "000000000151feffffff01a08601000000000016001422222222222222222222222222222222222222220202300121023333333333333333333333333333333333333333"}]},
++    {"core": {"accepted": false}, "name": "truncated_witness_108", "raw": [{"hex": "02000000000101"}, {"byte": 17, "count": 32}, {"hex": "000000000151feffffff01a0860100000000001600142222222222222222222222222222222222222222020230012102333333333333333333333333333333333333333333"}]},
++    {"core": {"accepted": false}, "name": "truncated_witness_109", "raw": [{"hex": "02000000000101"}, {"byte": 17, "count": 32}, {"hex": "000000000151feffffff01a086010000000000160014222222222222222222222222222222222222222202023001210233333333333333333333333333333333333333333333"}]},
++    {"core": {"accepted": false}, "name": "truncated_witness_110", "raw": [{"hex": "02000000000101"}, {"byte": 17, "count": 32}, {"hex": "000000000151feffffff01a08601000000000016001422222222222222222222222222222222222222220202300121023333333333333333333333333333333333333333333333"}]},
++    {"core": {"accepted": false}, "name": "truncated_witness_111", "raw": [{"hex": "02000000000101"}, {"byte": 17, "count": 32}, {"hex": "000000000151feffffff01a0860100000000001600142222222222222222222222222222222222222222020230012102333333333333333333333333333333333333333333333333"}]},
++    {"core": {"accepted": false}, "name": "truncated_witness_112", "raw": [{"hex": "02000000000101"}, {"byte": 17, "count": 32}, {"hex": "000000000151feffffff01a086010000000000160014222222222222222222222222222222222222222202023001210233333333333333333333333333333333333333333333333333"}]},
++    {"core": {"accepted": false}, "name": "truncated_witness_113", "raw": [{"hex": "02000000000101"}, {"byte": 17, "count": 32}, {"hex": "000000000151feffffff01a08601000000000016001422222222222222222222222222222222222222220202300121023333333333333333333333333333333333333333333333333333"}]},
++    {"core": {"accepted": false}, "name": "truncated_witness_114", "raw": [{"hex": "02000000000101"}, {"byte": 17, "count": 32}, {"hex": "000000000151feffffff01a0860100000000001600142222222222222222222222222222222222222222020230012102333333333333333333333333333333333333333333333333333333"}]},
++    {"core": {"accepted": false}, "name": "truncated_witness_115", "raw": [{"hex": "02000000000101"}, {"byte": 17, "count": 32}, {"hex": "000000000151feffffff01a086010000000000160014222222222222222222222222222222222222222202023001210233333333333333333333333333333333333333333333333333333333"}]},
++    {"core": {"accepted": false}, "name": "truncated_witness_116", "raw": [{"hex": "02000000000101"}, {"byte": 17, "count": 32}, {"hex": "000000000151feffffff01a08601000000000016001422222222222222222222222222222222222222220202300121023333333333333333333333333333333333333333333333333333333333"}]},
++    {"core": {"accepted": false}, "name": "truncated_witness_117", "raw": [{"hex": "02000000000101"}, {"byte": 17, "count": 32}, {"hex": "000000000151feffffff01a0860100000000001600142222222222222222222222222222222222222222020230012102333333333333333333333333333333333333333333333333333333333333"}]},
++    {"core": {"accepted": false}, "name": "truncated_witness_118", "raw": [{"hex": "02000000000101"}, {"byte": 17, "count": 32}, {"hex": "000000000151feffffff01a086010000000000160014222222222222222222222222222222222222222202023001210233333333333333333333333333333333333333333333333333333333333333"}]},
++    {"core": {"accepted": false}, "name": "truncated_witness_119", "raw": [{"hex": "02000000000101"}, {"byte": 17, "count": 32}, {"hex": "000000000151feffffff01a0860100000000001600142222222222222222222222222222222222222222020230012102"}, {"byte": 51, "count": 32}]},
++    {"core": {"accepted": false}, "name": "truncated_witness_120", "raw": [{"hex": "02000000000101"}, {"byte": 17, "count": 32}, {"hex": "000000000151feffffff01a0860100000000001600142222222222222222222222222222222222222222020230012102"}, {"byte": 51, "count": 32}, {"hex": "0a"}]},
++    {"core": {"accepted": false}, "name": "truncated_witness_121", "raw": [{"hex": "02000000000101"}, {"byte": 17, "count": 32}, {"hex": "000000000151feffffff01a0860100000000001600142222222222222222222222222222222222222222020230012102"}, {"byte": 51, "count": 32}, {"hex": "0a00"}]},
++    {"core": {"accepted": false}, "name": "truncated_witness_122", "raw": [{"hex": "02000000000101"}, {"byte": 17, "count": 32}, {"hex": "000000000151feffffff01a0860100000000001600142222222222222222222222222222222222222222020230012102"}, {"byte": 51, "count": 32}, {"hex": "0a0000"}]}
++  ]
++}
