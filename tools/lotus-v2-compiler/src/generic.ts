@@ -9,6 +9,8 @@ import { PromiseScheduler, type SchedulerEvent } from './scheduler.js';
 export type { SchedulerEvent } from './scheduler.js';
 
 export type ValueType = 'PublicKey' | 'Signature' | 'Bytes32' | `Bytes(${number})` | 'Int' | 'Amount' | 'TokenId' | 'Bool' | 'MethodLeafHash' | 'ContractRootHash' | 'InputIndex' | 'OutputIndex';
+/** Omitted/0 preserves legacy source and artifact bytes; 1 selects explicit LC-1 entries. */
+export type LanguageVersion = 0 | 1;
 export type BoundValue = string | boolean | bigint;
 type Token = { text: string; span: Span };
 export type Param = { name: string; type: ValueType; span: Span };
@@ -22,7 +24,7 @@ export type HelperStmt = { kind: 'let'; name: string; type: ValueType; expr: Exp
 /** `private` (default, module only), `package` (same package) or `export` (other packages via exported modules). */
 export type Visibility = 'private' | 'package' | 'export';
 export type Helper = { name: string; params: Param[]; result: ValueType; body: HelperStmt[]; span: Span; visibility: Visibility };
-export type Method = { name: string; params: Param[]; body: Stmt[]; span: Span };
+export type Method = { invocation?: 'spend' | 'mint'; name: string; params: Param[]; body: Stmt[]; span: Span };
 export type Contract = { name: string; kind: 'contract' | 'token'; params: Param[]; methods: Method[]; span: Span; visibility: Visibility };
 /** Compile-time link to a library contract. Not a VM call. Present only on package artifacts that commit to one. */
 export type LinkedContract = { name: string; kind: 'contract' | 'token'; package: string; module: string; packageDigest: string; root: string;
@@ -30,19 +32,19 @@ export type LinkedContract = { name: string; kind: 'contract' | 'token'; package
 /** `import TARGET::path::{a, b as c};` or `import TARGET::path as alias;`. TARGET is a dependency alias, `package`, or a quoted module selector (`"host/owner/repo@vX.Y.Z"`). */
 export type ImportDecl = { target: string; targetSpan: Span; path: string[]; pathSpan: Span; span: Span;
   items?: { name: string; local: string; span: Span }[]; moduleAlias?: { name: string; span: Span } };
-export type Program = { helpers: Map<string, Helper>; contracts: Map<string, Contract>; imports: ImportDecl[] };
+export type Program = { languageVersion?: LanguageVersion; helpers: Map<string, Helper>; contracts: Map<string, Contract>; imports: ImportDecl[] };
 type Binding = { type: ValueType; value: string | boolean };
 export type MethodArtifact = { name: string; args: { name: string; type: ValueType }[]; invocation?: 'spend' | 'mint'; mintAmountParam?: string; scriptHex: string; leaf: string; proof: string[]; root: string;
   sourceMap: { source: Span; expandedFrom?: Span; optimizedFrom?: { op: string; source: Span; expandedFrom?: Span }[]; byteStart: number; byteEnd: number; op: string }[];
   staticResources: { scriptBytes: number; opcodes: number; maxStackItems: number; helperExpansions: number; dynamicSignatureChecks: number } };
-export type ContractArtifact = { schema: 'lotus-v2/contract-artifact/2'; target: 'P01-P02-P03-candidate-2026-10-14'; contract: string; kind?: 'contract' | 'token';
+export type ContractArtifact = { languageVersion?: LanguageVersion; schema: 'lotus-v2/contract-artifact/2'; target: 'P01-P02-P03-candidate-2026-10-14'; contract: string; kind?: 'contract' | 'token';
   constructor: { name: string; type: ValueType }[]; bindings: { name: string; type: ValueType; value: string | boolean }[];
   methods: MethodArtifact[]; policy: { branches: [string]; paths: [[0]]; root: string; treeRecipe: 'sorted-leaves-largest-power-split-v1' };
   /** Present only for package builds (CABI-07); see packages.ts. */
   build?: import('./packages.js').BuildGraph;
   /** Library contracts this artifact commits to (CABI-08). Omitted when empty so single-file artifacts stay unchanged. */
   links?: LinkedContract[]; }
-export type CompileOptions = { contract: string; bindings: Record<string, Record<string, BoundValue>>; optimize?: boolean; target?: TargetId };
+export type CompileOptions = { languageVersion?: LanguageVersion; contract: string; bindings: Record<string, Record<string, BoundValue>>; optimize?: boolean; target?: TargetId };
 
 const MAX_SOURCE = 65536, MAX_SCRIPT = 8192, MAX_OPS = 4096, MAX_EXPANSIONS = 256, MAX_METHODS = 16;
 const MAX_INFERENCE_VISITS = 8192;
@@ -93,7 +95,7 @@ function lex(source: string, file: string, bag: DiagnosticBag): Token[] {
 }
 class Parser {
   private i = 0;
-  constructor(private readonly tokens: Token[], private readonly bag: DiagnosticBag) {}
+  constructor(private readonly tokens: Token[], private readonly bag: DiagnosticBag, private readonly languageVersion: LanguageVersion = 0) {}
   private peek(): Token { return this.tokens[this.i]!; }
   private fatal(code: string, message: string, span?: Span): never { this.bag.raise(code, message, span); }
   private take(expected?: string): Token {
@@ -254,7 +256,7 @@ class Parser {
         imports.push(this.importDecl(start)); continue;
       }
       let visibility: Visibility = 'private';
-      if (start.text === 'export' || start.text === 'package') {
+      if (start.text === 'export' || start.text === 'package' || (this.languageVersion === 1 && start.text === 'private')) {
         visibility = start.text;
         if (!['function', 'contract', 'token'].includes(this.peek().text)) this.fatal('E0114', `${start.text} applies only to a function, contract or token`, start.span);
         const modifier = start; start = this.take(); start = { text: start.text, span: cover(modifier.span, start.span) };
@@ -268,10 +270,16 @@ class Parser {
         const name = this.ident(); bindName(name.text, name.span, this.bag); const params = this.peek().text === '<' ? (this.take('<'), this.params('>')) : [];
         this.take('{'); const methods: Method[] = [];
         while (this.peek().text !== '}') {
-          this.take('function'); const method = this.ident(); bindName(method.text, method.span, this.bag); this.take('('); const args = this.params(')'); const body = this.statements();
+          const marker = this.take();
+          const invocation = start.text === 'token' ? 'mint' as const : 'spend' as const;
+          if (this.languageVersion === 1) {
+            const expected = invocation === 'mint' ? 'mint' : 'entry';
+            if (marker.text !== expected) this.fatal('E0130', `LC-1 ${start.text} methods require ${expected}; move utilities to a free helper`, marker.span);
+          } else if (marker.text !== 'function') this.fatal('E0101', 'expected function (entry/mint requires languageVersion 1)', marker.span);
+          const method = this.ident(); bindName(method.text, method.span, this.bag); this.take('('); const args = this.params(')'); const body = this.statements();
           if (!body.length || methods.some(x => x.name.toLowerCase() === method.text.toLowerCase())) this.fatal('E0203', `empty or duplicate method ${method.text}`, method.span);
           if (start.text === 'token' && (args[0]?.type !== 'Amount')) this.fatal('E0118', `token method ${method.text} first parameter must be Amount`, args[0]?.span ?? method.span);
-          methods.push({ name: method.text, params: args, body, span: cover(method.span, this.tokens[this.i - 1]!.span) });
+          methods.push({ ...(this.languageVersion === 1 ? { invocation } : {}), name: method.text, params: args, body, span: cover(method.span, this.tokens[this.i - 1]!.span) });
           if (methods.length > MAX_METHODS) this.fatal('E0117', 'more than 16 methods', method.span);
         }
         const end = this.take('}'); if (!methods.length || contracts.has(name.text)) this.fatal('E0204', `empty or duplicate contract ${name.text}`, name.span);
@@ -279,7 +287,7 @@ class Parser {
       } else this.fatal('E0101', 'expected contract or helper', start.span);
     }
     if (requireContract && !contracts.size) this.fatal('E0116', 'source has no contract', this.peek().span);
-    return { helpers, contracts, imports };
+    return { ...(this.languageVersion === 1 ? { languageVersion: 1 as const } : {}), helpers, contracts, imports };
   }
 }
 
@@ -328,7 +336,7 @@ type EVar = { kind: 'argument'; type: ValueType; index: number } | { kind:'local
   { kind: 'substitute'; type: ValueType; expr: Expr; env: Env; origin: Span; frames: Frame[] };
 type Env = Map<string, EVar>;
 type Compiled = { script: Uint8Array; leaf: Uint8Array; map: MethodArtifact['sourceMap']; resources: MethodArtifact['staticResources'] };
-const OPCODES = { VERIFY: 0x65, IF: 0x61, ELSE: 0x63, ENDIF: 0x64, ENUMERATE_INPUTS:0x67, ENUMERATE_OUTPUTS:0x68, ENDENUMERATE:0x6a, DROP: 0x79, PICK: 0x7d, ROLL:0x7e,
+const OPCODES = { INVOCATIONKIND: 0xf1, VERIFY: 0x65, IF: 0x61, ELSE: 0x63, ENDIF: 0x64, ENUMERATE_INPUTS:0x67, ENUMERATE_OUTPUTS:0x68, ENDENUMERATE:0x6a, DROP: 0x79, PICK: 0x7d, ROLL:0x7e,
   UTXOPATHCOUNT:0xda, UTXOPATH:0xdb, OUTPUTPATHCOUNT:0xe5, OUTPUTPATH:0xe6, UTXOREQUIRESBRANCH:0xdd, UTXOBRANCHCOUNT:0xd8, UTXOBRANCH:0xd9, OUTPUTBRANCHCOUNT:0xe3, OUTPUTBRANCH:0xe4, OUTPUTEXCLUSIVEBRANCH:0xe9, OUTPUTCONTINUESBRANCH:0xea, CHECKLOCKTIMEVERIFY:0xf3, CHECKSEQUENCEVERIFY:0xf4, SWAP:0x80, BRANCHROOT:0xf2, INPUTINDEX:0xd0, INPUTFLAGS:0xd1, UTXOVALUE:0xd6, UTXOTOKENID:0xd7, OUTPUTVALUE:0xe1, OUTPUTTOKENID:0xe2, OUTPUTREQUIRESBRANCH:0xe8, NUMEQUAL:0xa6, GREATERTHANOREQUAL:0xac,
   EQUAL: 0x91, NOT: 0x9c, ADD: 0x9e, SUB: 0x9f, MUL: 0xa0, BOOLAND: 0xa4, BOOLOR: 0xa5,
   LESSTHAN: 0xa9, GREATERTHAN: 0xaa, LESSTHANOREQUAL: 0xab, SHA256: 0xb8, HASH256: 0xb9, BLAKE3: 0xba, CHECKSIG: 0xbb, CHECKSIGVERIFY: 0xbc, NEGATE: 0x9a } as const;
@@ -390,7 +398,12 @@ class Compiler {
   private rootMemo = new Map<string, Tree>();
   private rootActive = new Set<string>();
   private bindingMemo = new Map<string, Map<string, { bytes: Uint8Array; binding: Binding }>>();
-  constructor(private readonly program: Program, private readonly options: CompileOptions, private readonly diag: DiagnosticBag) {}
+  constructor(private readonly program: Program, private readonly options: CompileOptions, private readonly diag: DiagnosticBag) {
+    if ((program.languageVersion ?? 0) !== (options.languageVersion ?? 0)) this.fatal('E0131', 'linked program languageVersion differs from compile options');
+    if (options.languageVersion === 1) for (const contract of program.contracts.values()) for (const method of contract.methods) {
+      if (method.invocation !== (contract.kind === 'token' ? 'mint' : 'spend')) this.fatal('E0130', 'LC-1 entry requires its declared invocation kind', method.span);
+    }
+  }
   /** Record a diagnostic, including the inline-expansion chain, and keep going until the cap. */
   private problem(code: string, message: string, span: Span | undefined, frames: Frame[] = [], extra: DiagnosticExtra = {}): 'Error' {
     const related = frames.slice(-MAX_INLINE_NOTES).reverse().map(frame => ({
@@ -528,6 +541,12 @@ class Compiler {
         env.set(p.name,{ kind: 'argument', type: p.type, index });
       }
       const emitter = new Emitter(stackParams.length, (code, message, span, frames) => this.fatal(code, message, span, frames));
+      if (this.options.languageVersion === 1) {
+        emitter.op('INVOCATIONKIND', method.span, undefined, 1);
+        emitter.number(method.invocation === 'mint' ? 3n : 1n, method.span);
+        emitter.op('NUMEQUAL', method.span, undefined, -1);
+        emitter.op('VERIFY', method.span, undefined, -1);
+      }
       const helperStack: string[] = [];
       let inferenceVisits = 0;
       const inferBlock = (body: HelperStmt[], scope: Env, active: string[], frames: Frame[], returning: boolean): Checked => {
@@ -959,7 +978,7 @@ class Compiler {
         args: (c.kind === 'token' ? m.params.slice(1) : m.params).map(p => ({ name:p.name,type:p.type })), scriptHex: hex(compiled.script), leaf: hex(compiled.leaf),
         proof: root.proofs.get(m.name)!.map(hex), root: hex(root.root), sourceMap: compiled.map, staticResources: compiled.resources };
     });
-    return { schema: 'lotus-v2/contract-artifact/2', target: 'P01-P02-P03-candidate-2026-10-14', contract: c.name, kind:c.kind,
+    return { ...(this.options.languageVersion === 1 ? { languageVersion: 1 as const } : {}), schema: 'lotus-v2/contract-artifact/2', target: 'P01-P02-P03-candidate-2026-10-14', contract: c.name, kind:c.kind,
       constructor: c.params.map(p => ({ name:p.name,type:p.type })), bindings: c.params.map(p => ({ name:p.name,...bound.get(p.name)!.binding })),
       methods, policy: { branches: [hex(root.root)], paths: [[0]], root: hex(root.root), treeRecipe: 'sorted-leaves-largest-power-split-v1' } };
   }
@@ -980,6 +999,7 @@ class Compiler {
 }
 
 function requireOptions(options: CompileOptions, bag: DiagnosticBag): void {
+  if (options?.languageVersion !== undefined && options.languageVersion !== 0 && options.languageVersion !== 1) bag.raise('E0132', 'unsupported languageVersion; expected 0 or 1');
   if (options?.target !== undefined) {
     try { resolveTarget(options.target); } catch (error) { bag.raise('E1200', (error as Error).message); }
     if (options.target !== 'lotus-v2') bag.raise('E1201', 'compileContract emits Lotus policies only; use compileTargetContract for an explicit eCash script artifact.');
@@ -990,24 +1010,25 @@ function openSource(source: string, file: string, sources = new SourceManager())
   if (!sources.get(file)) sources.add(file, source);
   return new DiagnosticBag(sources, file);
 }
-function singleModule(source: string, file: string, bag: DiagnosticBag): Program {
-  const program = new Parser(lex(source, file, bag), bag).parse();
+function singleModule(source: string, file: string, bag: DiagnosticBag, languageVersion: LanguageVersion = 0): Program {
+  const program = new Parser(lex(source, file, bag), bag, languageVersion).parse();
   if (program.imports.length) bag.raise('E0121', 'import requires a package build (compilePackage)', program.imports[0]!.span);
   bag.checkpoint();
   return program;
 }
 export function compileContract(source: string, options: CompileOptions, file = '<source>'): ContractArtifact {
   const bag = openSource(source, file); requireOptions(options, bag);
-  return new Compiler(singleModule(source, file, bag), options, bag).compile();
+  return new Compiler(singleModule(source, file, bag, options.languageVersion), options, bag).compile();
 }
 export async function compileContractAsync(source: string, options: CompileOptions, onEvent?: (event: SchedulerEvent) => void, file = '<source>'): Promise<ContractArtifact> {
   const bag = openSource(source, file); requireOptions(options, bag);
-  return new Compiler(singleModule(source, file, bag), options, bag).compileAsync(onEvent);
+  return new Compiler(singleModule(source, file, bag, options.languageVersion), options, bag).compileAsync(onEvent);
 }
 /** @internal Package linker entry: parse one module (declaration-only modules may omit contracts). */
-export function parseModuleSource(source: string, requireContract: boolean, file = '<source>', sources?: SourceManager): Program {
+export function parseModuleSource(source: string, requireContract: boolean, file = '<source>', sources?: SourceManager, languageVersion: LanguageVersion = 0): Program {
   const bag = openSource(source, file, sources);
-  const program = new Parser(lex(source, file, bag), bag).parse(requireContract);
+  if (languageVersion !== 0 && languageVersion !== 1) bag.raise('E0132', 'unsupported languageVersion; expected 0 or 1');
+  const program = new Parser(lex(source, file, bag), bag, languageVersion).parse(requireContract);
   bag.checkpoint();
   return program;
 }
