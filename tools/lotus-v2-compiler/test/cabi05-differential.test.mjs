@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { mkdtempSync,readFileSync,rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { corpus,signedCases,compare,saveReport,python,native,runCorpus } from './differential/harness.mjs';
+import { corpus,signedCases,linkedCases,compare,saveReport,python,native,runCorpus } from './differential/harness.mjs';
 test('versioned seeded corpus is reproducible and bounds generation',()=>{
  assert.deepEqual(corpus(123,2),corpus(123,2));
  assert.notDeepEqual(corpus(123,2),corpus(124,2));
@@ -27,7 +27,7 @@ test('disagreements survive exclusive artifact retention; unsupported is separat
 });
 test('compiled signed fixture accepts and single signature mutation rejects in Python',t=>{
  const cases=signedCases(); const results=cases.map(c=>python(c));
- if(results.some(r=>r.status==='tool-error')) {t.skip('set LOTUS_V2_PYTHON to reference venv');return;}
+ if(!process.env.LOTUS_V2_PYTHON && results.some(r=>r.status==='tool-error')) {t.skip('set LOTUS_V2_PYTHON to reference venv');return;}
  assert.deepEqual(results.map(r=>r.status),['accept','reject']);
  assert.equal(results[0].leaf,cases[0].artifact.methods[0].leaf);
  assert.equal(native(cases[0]).status,'unsupported');
@@ -35,5 +35,25 @@ test('compiled signed fixture accepts and single signature mutation rejects in P
   const n=cases.map(c=>native(c,process.env.LOTUS_V2_NATIVE_VM));
   assert.deepEqual(n.map(r=>r.status),['accept','reject']);
   for(let i=0;i<2;i++)assert.deepEqual(compare(results[i],n[i]),[]);
+ }
+});
+
+test('linked package fixtures derive signing contexts from exact wire and resolved coins', async t=>{
+ const cases=await linkedCases();
+ assert.equal(cases.length,8);
+ for(const c of cases) {
+  assert.equal(c.signing,undefined);
+  assert.equal(c.transaction_context.full_tx,c.native_context[0]);
+  assert.equal(c.transaction_context.coins[0],c.native_context[4]);
+  const r=python(c);
+  if(!process.env.LOTUS_V2_PYTHON && r.status==='tool-error') { t.skip('authenticated reference VM unavailable');return; }
+  assert.equal(r.status,c.expected,c.id);
+  const mismatched=structuredClone(c);mismatched.args=['00'.repeat(64)];
+  assert.equal(python(mismatched).status,'reject',`${c.id}: witness mismatch`);
+  if(process.env.LOTUS_V2_NATIVE_VM) {
+   const result=native(c,process.env.LOTUS_V2_NATIVE_VM);
+   assert.equal(result.status,c.expected,c.id);
+   assert.deepEqual(compare(r,result),[],c.id);
+  }
  }
 });

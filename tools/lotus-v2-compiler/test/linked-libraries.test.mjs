@@ -11,7 +11,7 @@ import { hex, unhex } from '../dist/compiler.js';
 import { compileContract } from '../dist/generic.js';
 import { generateContractPython, generateContractTypeScript } from '../dist/bindings.js';
 import { compilePackage, generateLock, updateLock } from '../dist/packages.js';
-import { prepareContractCall } from '../dist/call-runtime.js';
+import { linkedCases, python as differentialPython, native as differentialNative, compare } from './differential/harness.mjs';
 
 const fixture = fileURLToPath(new URL('../examples/packages/linked/', import.meta.url));
 const owner = '79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798';
@@ -264,79 +264,25 @@ contract Gate<id: TokenId> {
   assert.ok(gate.methods[0].scriptHex.includes(badge.policy.root));
 });
 
-function vmProfile() {
-  const opcodeCosts = {};
-  for (const [lo, hi] of [[0x00, 0x5d], [0x60, 0x6b], [0x70, 0x81], [0x88, 0x94], [0x98, 0xb4], [0xb8, 0xc2], [0xc8, 0xdd], [0xe0, 0xea], [0xf0, 0xf4]]) {
-    for (let op = lo; op <= hi; op++) opcodeCosts[op.toString(16).padStart(2, '0')] = (op === 0xbb || op === 0xbc) ? 1000 : 1;
-  }
-  return { max_script_bytes: 8192, max_arguments: 16, max_element_bytes: 8192, max_stack_items: 128,
-    max_altstack_items: 64, max_vm_bytes: 65536, max_ast_depth: 32, max_invocation_cost: 1000000,
-    structural_byte_cost: 1, opcode_costs: opcodeCosts };
-}
-function callContext(artifact) {
-  const output = { value: 1000n, branches: [artifact.policy.root], paths: [[0]] };
-  return { profile: artifact.target, chainId: '44'.repeat(32), prevTxid: '11'.repeat(32), prevIndex: 0,
-    sequence: 0xffffffff, coin: { value: 2000n, branches: [artifact.policy.root], paths: [[0]] }, outputs: [output] };
-}
-function signed(artifact, method) {
-  const plan = prepareContractCall(artifact, method, callContext(artifact), { sig: null });
-  const signature = schnorr.sign(unhex(plan.requests[0].digest), secret, new Uint8Array(32));
-  return { plan, signature: hex(signature) };
-}
-function invoke(method, args, signing) {
-  const run = spawnSync(python, ['-m', 'lotus_v2_reference.vm_runner'], {
-    input: JSON.stringify({ script: method.scriptHex, args, input_count: 1, output_count: 1, profile: vmProfile(), ...(signing ? { signing } : {}) }),
+test('authenticated Python and native contexts execute the same signed linked fixtures', async t => {
+  const cases = await linkedCases();
+  const probe = spawnSync(python, ['-c', 'import blake3, coincurve; from lotus_v2_reference.vm_context import authenticated_context'], {
     encoding: 'utf8', env: { ...process.env, PYTHONPATH: vmPackage },
   });
-  assert.ok(run.stdout, run.stderr);
-  return JSON.parse(run.stdout);
-}
-
-test('Python reference VM executes signed linked calls; native CHECKSIG is not a signing runner', async t => {
-  const probe = spawnSync(python, ['-c', 'import blake3, coincurve, lotus_v2_reference.vm_runner'], {
-    encoding: 'utf8', env: { ...process.env, PYTHONPATH: vmPackage },
-  });
-  const escrow = (await build(fixture, 'Escrow')).artifact;
-  const leaf = escrow.methods.find(m => m.name === 'spend').leaf;
-  const payer = (await build(fixture, 'Payer', { Payer: { owner, escrowRoot: escrow.policy.root, escrowLeaf: leaf } })).artifact;
-  const receiver = (await build(fixture, 'Receiver', { Receiver: { owner, escrowRoot: escrow.policy.root } })).artifact;
   if (probe.status !== 0) {
-    t.diagnostic(`Python reference VM was not run (${probe.stderr.trim() || 'import failed'})`);
-  } else {
-    const spend = escrow.methods.find(m => m.name === 'spend');
-    const good = signed(escrow, 'spend');
-    const signing = { selected_leaf_hash: spend.leaf, messages: { 0: good.plan.requests[0].digest }, invocation_kind: 'spend', input_index: 0, output_count: 1 };
-    const accepted = invoke(spend, [good.signature], signing);
-    assert.equal(accepted.accepted_invocation, true, JSON.stringify(accepted));
-    const badSig = `${good.signature.slice(0, 2) === '00' ? '01' : '00'}${good.signature.slice(2)}`;
-    const rejected = invoke(spend, [badSig], signing);
-    assert.equal(rejected.accepted_invocation, false, JSON.stringify(rejected));
-    for (const artifact of [payer, receiver]) {
-      const method = artifact.methods[0];
-      const call = signed(artifact, 'spend');
-      const context = { selected_leaf_hash: method.leaf, messages: { 0: call.plan.requests[0].digest }, invocation_kind: 'spend', input_index: 0, output_count: 1 };
-      const ok = invoke(method, [call.signature], context);
-      assert.equal(ok.accepted_invocation, true, `${artifact.contract} ${JSON.stringify(ok)}`);
-    }
-    const wrongRoot = escrow.policy.root.replace(/^../, escrow.policy.root.startsWith('00') ? '11' : '00');
-    const wrong = (await build(fixture, 'Payer', { Payer: { owner, escrowRoot: wrongRoot, escrowLeaf: leaf } })).artifact;
-    const wrongCall = signed(wrong, 'spend');
-    const wrongResult = invoke(wrong.methods[0], [wrongCall.signature], {
-      selected_leaf_hash: wrong.methods[0].leaf, messages: { 0: wrongCall.plan.requests[0].digest },
-      invocation_kind: 'spend', input_index: 0, output_count: 1,
-    });
-    assert.equal(wrongResult.accepted_invocation, false, JSON.stringify(wrongResult));
-    t.diagnostic('Python reference VM executed the signed Escrow, Payer and Receiver calls');
-  }
-  const native = process.env.LOTUS_V2_NATIVE_VM;
-  if (!native || !existsSync(native)) {
-    t.diagnostic('Native signed execution was not run (LOTUS_V2_NATIVE_VM unset)');
+    t.skip(`authenticated Python reference unavailable: ${probe.stderr.trim()}`);
     return;
   }
-  const call = signed(escrow, 'spend');
-  const run = spawnSync(native, [escrow.methods.find(m => m.name === 'spend').scriptHex, '1', '1', call.signature], { encoding: 'utf8' });
-  const status = (run.stdout || '').trim().slice(0, 1);
-  if (status === 'I') assert.fail(`native VM rejected a valid signature: ${run.stdout} ${run.stderr}`);
-  if (status === 'S' || status === 'A') t.diagnostic('Native VM executed and accepted the signed Escrow spend');
-  else t.diagnostic(`Native signed execution was not performed (runner status ${status || run.status}; this CLI has no signing context)`);
+  const executable = process.env.LOTUS_V2_NATIVE_VM;
+  for (const c of cases) {
+    const reference = differentialPython(c, { python, reference: vmPackage });
+    assert.equal(reference.status, c.expected, `${c.id}: ${JSON.stringify(reference)}`);
+    if (executable) {
+      const result = differentialNative(c, executable);
+      assert.equal(result.status, c.expected, `${c.id}: ${JSON.stringify(result)}`);
+      assert.deepEqual(compare(reference, result), [], c.id);
+    }
+  }
+  t.diagnostic('Python authenticated invocation stage: Escrow/Payer/Receiver accepted; signature and wrong-root mutations rejected');
+  t.diagnostic(executable ? 'Native --context authenticated invocation stage executed identical full transaction bytes and resolved coins; outer transaction/block acceptance remains separate' : 'Native authenticated invocation stage unavailable: LOTUS_V2_NATIVE_VM unset');
 });

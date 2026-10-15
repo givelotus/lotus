@@ -1,6 +1,8 @@
 import { spawnSync } from 'node:child_process';
 import { mkdirSync,writeFileSync,readFileSync } from 'node:fs';
 import { join,resolve } from 'node:path';
+import { schnorr } from '@noble/curves/secp256k1';
+import { compilePackage } from '../../dist/packages.js';
 import { compileContract } from '../../dist/generic.js';
 import { hex,unhex } from '../../dist/compiler.js';
 import { encodeOutput } from '../../dist/runtime.js';
@@ -32,16 +34,49 @@ export function signedCases() {
   const final=finalizeContractCall(plan,{signature});
   return {id:bad?'signed-bad-signature':'signed-payment',artifact:f.artifact,source:readFileSync(new URL('../../examples/gallery/payment.lotus',import.meta.url),'utf8'),script:f.artifact.methods[0].scriptHex,args:[hex(signature)],input_count:1,output_count:context.outputs.length,
    profile:{...profile,max_script_bytes:8192,max_arguments:1024,max_element_bytes:8192,max_stack_items:1024,max_altstack_items:1024,max_vm_bytes:1048576,max_ast_depth:16,max_invocation_cost:1000000000},
-   signing:{selected_leaf_hash:plan.requests[0].leaf,messages:{0:plan.requests[0].digest},invocation_kind:'spend',input_index:0,output_count:context.outputs.length},
+   transaction_context:transactionContext(final.wire,context),
    native_context:[hex(final.wire),context.chainId,'0','0',hex(encodeOutput(context.coin))]};
  });
+}
+export const contextProfile={...profile,max_script_bytes:8192,max_arguments:1024,max_element_bytes:8192,max_stack_items:1024,max_altstack_items:1024,max_vm_bytes:1048576,max_ast_depth:16,max_invocation_cost:1000000000};
+export function transactionContext(wire,context) {
+ return {full_tx:hex(wire),chain_id:context.chainId,input_index:0,witness_index:0,coins:[hex(encodeOutput(context.coin))],
+  profile:{max_inputs:65535,max_outputs:65535,max_mints:65535,max_script_bytes:8192,max_arguments:1024,max_argument_bytes:8192,max_branch_proof_depth:64}};
+}
+export async function linkedCases() {
+ const directory=resolve(import.meta.dirname,'../../examples/packages/linked');
+ const owner='79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798';
+ const secret=unhex('00'.repeat(31)+'01');
+ const build=async(contract,bindings={})=>(await compilePackage(directory,{contract,bindings:{Escrow:{owner},...bindings}})).artifact;
+ const escrow=await build('Escrow');
+ const leaf=escrow.methods.find(m=>m.name==='spend').leaf;
+ const payer=await build('Payer',{Payer:{owner,escrowRoot:escrow.policy.root,escrowLeaf:leaf}});
+ const receiver=await build('Receiver',{Receiver:{owner,escrowRoot:escrow.policy.root}});
+ const wrongRoot=escrow.policy.root.replace(/^../,escrow.policy.root.startsWith('00')?'11':'00');
+ const wrong=await build('Payer',{Payer:{owner,escrowRoot:wrongRoot,escrowLeaf:leaf}});
+ const cases=[];
+ const sources={main:readFileSync(join(directory,'src/main.lotus'),'utf8'),library:readFileSync(join(directory,'packages/policy/src/escrow.lotus'),'utf8')};
+ for(const artifact of [escrow,payer,receiver,wrong]) {
+  const context={profile:artifact.target,chainId:'44'.repeat(32),prevTxid:'11'.repeat(32),prevIndex:0,sequence:0xffffffff,
+   coin:{value:2000n,branches:[artifact.policy.root],paths:[[0]]},outputs:[{value:1000n,branches:[artifact.policy.root],paths:[[0]]}]};
+  const plan=prepareContractCall(artifact,'spend',context,{sig:null});
+  const signature=schnorr.sign(unhex(plan.requests[0].digest),secret,new Uint8Array(32));
+  for(const bad of [false,true]) {
+   const sig=signature.slice();if(bad)sig[0]^=1;
+   const final=finalizeContractCall(plan,{sig});
+   const method=artifact.methods.find(m=>m.name==='spend');
+   cases.push({id:`linked-${artifact.contract.toLowerCase()}-${artifact===wrong?'wrong-root-':''}${bad?'bad-signature':'valid'}`,expected:bad||artifact===wrong?'reject':'accept',artifact,source:sources,script:method.scriptHex,args:[hex(sig)],input_count:1,output_count:1,profile:contextProfile,
+    transaction_context:transactionContext(final.wire,context),native_context:[hex(final.wire),context.chainId,'0','0',hex(encodeOutput(context.coin))]});
+  }
+ }
+ return cases;
 }
 export function processResult(command,args,input,env=process.env) {
  const start=performance.now();const r=spawnSync(command,args,{input:input===undefined?undefined:JSON.stringify(input),encoding:'utf8',env,timeout:limits.timeout,maxBuffer:limits.maxBuffer});
  return {exit:r.status,signal:r.signal,error:r.error?.message,stdout:r.stdout,stderr:r.stderr,elapsed_ms:performance.now()-start};
 }
 export function python(c,o={}) {
- const env={...process.env,PYTHONPATH:o.reference??resolve(import.meta.dirname,'../../../lotus-v2-reference')};
+ const env={...process.env,PYTHONPATH:o.reference??process.env.LOTUS_V2_REFERENCE_PATH??resolve(import.meta.dirname,'../../../lotus-v2-reference')};
  const run=processResult(o.python??process.env.LOTUS_V2_PYTHON??'python3',[join(import.meta.dirname,'reference.py')],c,env);
  try{return {...JSON.parse(run.stdout),process:run};}catch{return {status:'tool-error',process:run};}
 }
@@ -62,7 +97,7 @@ export function runCorpus(input,o={}) {
  for(const c of input.cases) {
   if(!/^[a-zA-Z0-9_-]{1,100}$/.test(c.id)||typeof c.script!=='string'||! /^(?:[0-9a-f]{2})*$/.test(c.script)||c.script.length>16384||!Array.isArray(c.args)||c.args.length>1024||c.args.some(a=>typeof a!=='string'||! /^(?:[0-9a-f]{2})*$/.test(a)||a.length>16384))throw Error('invalid bounded case');
  }
- return {schema:'lotus-v2/differential-report/1',seed:input.seed,node:process.version,platform:process.platform,arch:process.arch,limits,cases:input.cases.map(c=>{const a=python(c,o),b=native(c,o.native);return {case:c,compiler:c.artifact?{status:'compiled',root:c.artifact.policy.root,leaf:c.artifact.methods[0].leaf}:null,python:a,native:b,discrepancies:compare(a,b)};})};
+ return {schema:'lotus-v2/differential-report/1',seed:input.seed,node:process.version,platform:process.platform,arch:process.arch,limits,cases:input.cases.map(c=>{const a=python(c,o),b=native(c,o.native);return {case:c,compiler:c.artifact?{status:'compiled',root:c.artifact.policy.root,leaf:c.artifact.methods.find(m=>m.scriptHex===c.script)?.leaf}:null,python:a,native:b,discrepancies:compare(a,b)};})};
 }
 export function saveReport(report,directory) {
  mkdirSync(directory,{recursive:true});writeFileSync(join(directory,'report.json'),JSON.stringify(report,null,2)+'\n',{flag:'wx'});

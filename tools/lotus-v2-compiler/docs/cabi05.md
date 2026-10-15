@@ -63,3 +63,30 @@ Native roots therefore are not an independent root equality gate. The committed
 corpus recorded 17 invocations without observed discrepancies using the extended
 runner; the default generator recorded 53. This finite evidence does not imply
 blanket equivalence.
+
+## Authenticated signed context followup
+
+New generated signed cases and `authenticated-corpus-v1.json` supply
+`transaction_context` to Python. Both engines receive identical full transaction
+bytes, ChainID, active input/witness indices and resolved coin frames. Python
+checks the explicit script/arguments against that witness, authenticates proofs
+and derives its signing messages; no trusted digest is supplied. The adapter
+requires the authenticated-context API, so an older reference cannot silently
+ignore the new field. Set `LOTUS_V2_REFERENCE_PATH` to the updated reference root;
+the linked-library tests additionally support `LOTUS_V2_VM_REFERENCE_PACKAGE`.
+
+The original `corpus-v1.json` is preserved as historical trusted-digest coverage.
+It does not provide the new signing derivation gate. Replay the new signed corpus:
+
+```sh
+node test/differential/run.mjs /tmp/cabi05-authenticated 79225 test/differential/authenticated-corpus-v1.json
+```
+
+The CLI now includes Escrow, Payer and Receiver compiled from the existing linked
+package fixture, including the unchanged compiler artifacts and original module
+sources. Valid calls, signature mutations and the existing wrong-root constraint
+are executed through Python authenticated contexts and native `--context`.
+Tests also reject explicit script-argument/witness disagreement. This replaces
+the obsolete linked-library test that invoked context-free native CHECKSIG and
+reported permanently unavailable signing. Full transaction and block acceptance
+remain separate stages. Earlier retained reports and corpora are not replaced.
