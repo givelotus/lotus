@@ -70,3 +70,35 @@ User requested Chronik indexing as part of the usable private testnet, including
 Before implementation, inspect which branch identities and positions are actually available from authenticated output serialization versus only from spending witnesses. An index must not claim knowledge of hidden branch preimages. Specify a versioned API with explicit positional AND/OR semantics, pagination, resource limits, and behavior when branch data is unavailable. Preserve existing V1 interfaces. Index active-chain transactions and UTXOs, reconcile mempool entries, and support atomic connect/disconnect, restart and catch-up. Any historical fork queries require their own retention and consistency contract.
 
 Scope an independent owner for the Chronik schema/index/query implementation and a separate test owner, with native bridge and build integration reserved to the root integrator. Do not change consensus to make indexing convenient. Record exact source revisions and test evidence before enabling Chronik on V2 nodes. Acceptance must demonstrate funding/payment discovery through the API, agreed branch-filter results against explicit fixtures, bounded pagination, restart, and reorg removal/restoration. Existing Chronik-OFF native evidence remains valid only for that configuration.
+
+## Candidate integration evidence (2026-10-15)
+
+The integrated daemon at `7232f91c3c89bee203f72ecd8bc19c5f95bedb3b`
+passed the native pool, history coordinator and relay checks. Its predecessor
+failed startup because pool initialization treated the manifest's absent
+candidate height as a live validation context. The correction validates static
+rules first and derives actual admission height/MTP from authenticated runtime
+state; the regression supplies the same context-free manifest rules.
+
+`daemon/docs/evidence/v2-private-relay-two-wallets-local.json` records 67 checks
+across ten cleanly stopped native process lifecycles: A submitted two persisted
+wallet payments, B relayed them, C selected both from its pool, and all nodes
+confirmed them. Independent sender and recipient SQLite wallets verified exact
+values and balances. Restart preserved signed bytes. A competing longer branch
+removed the original confirmation; one payment conflicted and the other returned
+to the pool, was re-mined, and reconciled in both wallets. The earlier, narrower
+run remains in `v2-private-relay-local.json`; neither evidence file is a golden
+regenerated to suppress a failure.
+
+These runs used loopback TCP on one machine. They do not demonstrate separate
+machine reachability, Avalanche quorum behavior, or Chronik indexing. Native
+candidate commits also still require ordered mailbox export and verification of
+every intermediate tree before promotion to the maintained series.
+
+The controller now uses native persisted wallet broadcast/status and pool mining;
+its tests include recovery of an inconclusive submission after signing. The
+controller-specific native scenario remains a separate gate from the direct
+three-node harness. Avalanche modules and durable runtime parking/finality are
+under integration. Chronik public models, bounded branch-query kernels and a
+separate RocksDB index have component tests; runtime, pending-overlay and HTTP
+integration remain outstanding. No private-testnet completion is asserted here.
