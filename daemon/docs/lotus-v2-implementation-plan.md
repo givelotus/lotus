@@ -6,9 +6,9 @@ Updated October 15, 2026. Development plan; no genesis parameters are frozen and
 
 ## Source foundation and current status
 
-The current executable [V2 series](../patches/v2/series) contains 115 patches,
-`000`–`114`, on ABC master `1fb7db17c176cdea8a2c60d887891589382ee4e3`.
-[Latest replay evidence](evidence/v2-series-replay-114.json) verifies every
+The current executable [V2 series](../patches/v2/series) contains 119 patches,
+`000`–`118`, on ABC master `1fb7db17c176cdea8a2c60d887891589382ee4e3`.
+[Latest replay evidence](evidence/v2-series-replay-118.json) verifies every
 intermediate tree. The exact clean daemon build and signed Payment pilot recorded
 below establish offline block acceptance, restart, disconnect and reconnect.
 Network activation, global fork selection, resumable reorgs and a usable peer
@@ -447,3 +447,48 @@ remain a separate pending pilot; these results do not establish wallet integrati
 implementation proposal. Per-block atomicity does not establish multi-block
 recovery. Network/profile adoption, socket tests and public testnet readiness
 remain pending.
+
+## Native wallet and bounded downloads (115–118)
+
+All 119 mailboxes replay with exact intermediate trees; final tree
+`b50c03f8522987ff230a1c1eceae2de0b8b4de85`. See
+[replay evidence](evidence/v2-series-replay-118.json). Earlier mailboxes remain
+byte-identical.
+
+The SQLite-only native Payment wallet owns a fresh encrypted key, binds its
+profile and exact compiled policy, resolves funding from authenticated chainstate,
+checks maturity and stale plans, validates FULL signatures and persists outgoing
+bytes/reservations before export. Failure injection verifies SQLite rollback and
+no export. Reconciliation preserves reservations across restart and disconnect;
+missing coins alone do not imply confirmation. Independent source review found
+no blocker in this caller-serialized offline scope. No legacy wallet.dat import,
+Berkeley DB dependency, broadcast or wallet RPC is added.
+
+The socket-free download coordinator bounds jobs, bytes, transaction slots,
+cache candidates and retained response guards. Full/compact fallback reserves
+the maximum allowance in advance. Deferred work retains its lease; cancellation,
+reorg and callback/allocation failure release heavy state while preserving stale
+response protection. Debug and ASan/UBSan checks pass, including quota boundaries
+and 220 allocation-failure positions. Independent review found and verified fixes
+for fallback reservations, temporary-object lifetime and callback reentry.
+Callbacks still own consensus/backend budgets and ambiguous-write reconciliation.
+
+Clean source `9f529da1c` in
+`/private/tmp/lotus-v2-daemon-wallet-download-exact-20261015` builds Debug lotusd
+and the wallet pilot helper with Chronik off. Full-build wallet, download and
+initializer checks pass; the wallet run reports 194 observed checks. Log:
+`/private/tmp/lotus-v2-wallet-download-build.log`. Root's Debug standalone download
+check also passes. Its separate Release attempt stops on the inherited
+`crypto/sha256.cpp` unused `SelfTest` warning under NDEBUG and Werror; retained log
+`/private/tmp/lotus-v2-download-root-check.log`. No upstream cryptography was changed
+to suppress that standalone build limitation.
+
+The compiler harness was integrated separately. Actual encrypted-wallet-produced
+Payment bytes pass independent Python and the exact daemon's complete-block checks,
+with matching roots and all seven charges, at
+`/private/tmp/lotus-v2-wallet-chain-root-exact-20261015`. Native immaturity/stale-plan
+refusal, changed-signature block rejection, restart, undo/reconnect and reservation
+persistence pass. See the [wallet pilot](../../tools/lotus-v2-compiler/docs/wallet-chain-pilot.md).
+The earlier mixed-header/library failure is preserved and the standalone helper
+configuration now refuses mismatched dependency roots. Networked wallet use,
+resumable fork recovery, selection and socket activation remain incomplete.
