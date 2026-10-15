@@ -26,6 +26,24 @@ class SignedChainPilot(unittest.TestCase):
         self.assertTrue(callable(module.main))
 
     @unittest.skipUnless(os.environ.get('LOTUS_V2_PILOT_MANIFEST') and os.environ.get('LOTUS_V2_PILOT_DAEMON'), 'explicit manifest and built daemon required')
+    def test_deferred_signing_requires_explicit_immature_probe(self):
+        module=load_pilot()
+        calls=[]
+        def compiler(mode,request):
+            calls.append(mode)
+            if mode=='artifact':
+                result=subprocess.run(['node',str(Path(__file__).with_name('payment.mjs')),'artifact'],input=json.dumps(request),capture_output=True,text=True,check=True)
+                return json.loads(result.stdout)
+            if mode=='immature':return {'accepted':False,'reason':'immature'}  # Deliberately lacks evidence.
+            self.fail('sign must not be reached without immature probe evidence')
+        with tempfile.TemporaryDirectory(prefix='lotus-v2-deferred-probe-') as base:
+            config=module.PilotConfig(Path(os.environ['LOTUS_V2_PILOT_MANIFEST']),Path(os.environ['LOTUS_V2_PILOT_DAEMON']),Path(base)/'run','explicit test daemon',sign_after_maturity=True)
+            with self.assertRaisesRegex(ValueError,'probe evidence required'):
+                module.run_pilot(config,compiler)
+            self.assertEqual(calls,['artifact','immature'])
+            self.assertTrue((config.output/'failure.json').exists())
+
+    @unittest.skipUnless(os.environ.get('LOTUS_V2_PILOT_MANIFEST') and os.environ.get('LOTUS_V2_PILOT_DAEMON'), 'explicit manifest and built daemon required')
     def test_configurable_method_source_options_arguments_and_helper(self):
         module=load_pilot()
         with tempfile.TemporaryDirectory(prefix='lotus-v2-pilot-api-') as base:

@@ -27,6 +27,7 @@ class PilotConfig:
     method: str = 'spend'
     arguments: dict | None = None
     signature_argument: str = 'signature'
+    sign_after_maturity: bool = False
     reference_negative_errors: tuple[str, ...] = ('CHECKSIGVERIFY',)
     native_negative_errors: tuple[str, ...] = ('CHECKSIGVERIFY',)
 
@@ -142,11 +143,18 @@ def run_pilot(a: PilotConfig, compiler=None):
         funding=next(c for c in coins.values() if c.creation_height==1)
         context=dict(chainId=chain.hex(),prevTxid=funding.tx_id.hex(),prevIndex=funding.index,sequence=0xffffffff,
             coin=dict(value=str(funding.value),branches=[policy.hex()],paths=[[0]]),outputs=[dict(value=str(funding.value-1000),branches=[policy.hex()],paths=[[0]])])
-        signed=node('sign',context);(root/'signed-payment.json').write_text(json.dumps(signed,indent=2)+'\n')
-        tx=decode_transaction(bytes.fromhex(signed['wire']),TX)
-        assert identity_digests(tx,TX,chain).txid.hex()==signed['txid']
-        assert identity_digests(tx,TX,chain).txhash.hex()==signed['txhash']
-        if maturity>1:
+        if a.sign_after_maturity:
+            if maturity<=1:raise ValueError('deferred signing requires an actual immature height')
+            probe=node('immature',context)
+            records.append(dict(label='immature-wallet-probe',probe=probe));save()
+            if not isinstance(probe,dict) or probe.get('accepted') is not False or probe.get('reason')!='immature' or not probe.get('evidence'):
+                raise ValueError('explicit rejected immature wallet probe evidence required')
+        else:
+            signed=node('sign',context);(root/'signed-payment.json').write_text(json.dumps(signed,indent=2)+'\n')
+            tx=decode_transaction(bytes.fromhex(signed['wire']),TX)
+            assert identity_digests(tx,TX,chain).txid.hex()==signed['txid']
+            assert identity_digests(tx,TX,chain).txhash.hex()==signed['txhash']
+        if maturity>1 and not a.sign_after_maturity:
             # A correctly framed/mined immature spend must fail before state-root checks.
             height=parent.height+1
             cb=Transaction(0,(Input(block_id(chain,parent.header),height,0xffffffff,2),),(Output(0,100000,None,(policy,),((0,),)),))
@@ -169,6 +177,11 @@ def run_pilot(a: PilotConfig, compiler=None):
             daemon('restart-after-immature',['status'])
         for _ in range(maturity-1):
             wire,charges=build();accept('maturity-'+str(parent.height+1),wire,charges)
+        if a.sign_after_maturity:
+            signed=node('sign',context);(root/'signed-payment.json').write_text(json.dumps(signed,indent=2)+'\n')
+            tx=decode_transaction(bytes.fromhex(signed['wire']),TX)
+            assert identity_digests(tx,TX,chain).txid.hex()==signed['txid']
+            assert identity_digests(tx,TX,chain).txhash.hex()==signed['txhash']
         before_parent=parent;before_history=list(history);before_coins=dict(coins);before_monetary=monetary
         wire,charges=build((tx,))
         # Signature changes full bytes/txhash, but never its core TxId or state effects.
@@ -224,6 +237,7 @@ def main(argv=None):
     p.add_argument('--node',default='node')
     p.add_argument('--daemon-source',required=True)
     p.add_argument('--compiler-helper',type=Path)
+    p.add_argument('--sign-after-maturity',action='store_true')
     p.add_argument('--source',type=Path,help='optional contract source file')
     p.add_argument('--options',type=Path,help='compiler options JSON')
     p.add_argument('--method',default='spend')
@@ -233,7 +247,7 @@ def main(argv=None):
     p.add_argument('--native-negative-error',action='append')
     args=p.parse_args(argv)
     config=PilotConfig(args.manifest,args.daemon,args.output,args.daemon_source,
-        node=args.node,compiler_helper=args.compiler_helper,
+        node=args.node,compiler_helper=args.compiler_helper,sign_after_maturity=args.sign_after_maturity,
         source=None if args.source is None else args.source.read_text(),
         options=None if args.options is None else json.loads(args.options.read_text()),
         method=args.method,arguments=None if args.arguments is None else json.loads(args.arguments.read_text()),
