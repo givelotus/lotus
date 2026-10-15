@@ -46,10 +46,14 @@ def load_exporter():
     return module
 
 
-def resolve_source(upstream: Path, requested: str, temp: Path, canonical_url: str) -> tuple[Path, str, str]:
+def resolve_source(upstream: Path | None, requested: str, temp: Path, canonical_url: str) -> tuple[Path, str, str]:
     """Fetch only the requested ABC commit/tree, avoiding a full working checkout."""
-    remote = (canonical_url if requested == "latest" else
-              run("git", "-C", str(upstream), "remote", "get-url", "origin").stdout.strip())
+    if requested == "latest":
+        remote = canonical_url
+    elif upstream is None:
+        raise ValueError("An ABC clone is required for explicit refs; omit --ref or use --ref latest")
+    else:
+        remote = run("git", "-C", str(upstream), "remote", "get-url", "origin").stdout.strip()
     clone = temp / "abc"
     clone.mkdir()
     run("git", "-C", str(clone), "init", "--quiet")
@@ -118,11 +122,11 @@ def abc_adapter_result(abc_source: Path, revision: str, output: Path) -> dict:
         shutil.rmtree(dest)
 
 
-def prepare(upstream: Path, requested: str, candidate: Path) -> dict:
+def prepare(upstream: Path | None, requested: str, candidate: Path) -> dict:
     candidate = candidate.absolute()
     if candidate.exists() or candidate.is_symlink():
         raise ValueError("Candidate destination already exists; choose a new directory")
-    if not upstream.is_dir():
+    if upstream is not None and not upstream.is_dir():
         raise ValueError(f"Upstream clone does not exist: {upstream}")
     candidate.parent.mkdir(parents=True, exist_ok=True)
     stage = Path(tempfile.mkdtemp(prefix=".chronik-refresh-", dir=candidate.parent))
@@ -198,7 +202,7 @@ def prepare(upstream: Path, requested: str, candidate: Path) -> dict:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--upstream", type=Path, required=True, help="Existing ABC clone; its origin is cloned into temporary storage")
+    parser.add_argument("--upstream", type=Path, help="Optional ABC clone; explicit refs use its origin. latest uses the canonical URL in source.json")
     parser.add_argument("--ref", default="latest", help="Origin default branch ('latest'), branch, tag, or exact commit")
     parser.add_argument("--candidate", type=Path, required=True, help="New output directory; never overwritten")
     args = parser.parse_args()

@@ -77,10 +77,12 @@ Both paths fetch into temporary storage and write a new directory only:
 
 ```sh
 make -C daemon refresh-chronik \
-  UPSTREAM=/path/to/bitcoin-abc \
-  REF=latest \
   CANDIDATE=/tmp/chronik-provider-candidate
 ```
+
+`REF=latest` is the default and needs no local ABC checkout. To inspect an
+explicit branch, tag, or commit from a particular ABC clone, pass both
+`UPSTREAM=/path/to/bitcoin-abc` and `REF=<branch-or-commit>`.
 
 The candidate contains `provider/source.json`, a source-verified `export/`, and
 `refresh-report.json`. Existing ABC, BCHN, and Bitcoin Core Chronik-source

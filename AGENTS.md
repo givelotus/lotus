@@ -71,8 +71,7 @@ make -C daemon build SERIES=v1
 make -C daemon refresh SERIES=v1 COMMIT=latest
 
 # Prepare a review-only shared Chronik provider refresh candidate:
-make -C daemon refresh-chronik UPSTREAM=/path/to/bitcoin-abc REF=latest \
-  CANDIDATE=/tmp/chronik-provider-candidate
+make -C daemon refresh-chronik CANDIDATE=/tmp/chronik-provider-candidate
 ```
 
 `COMMIT=latest` resolves the workspace remote's advertised default branch and
@@ -80,12 +79,16 @@ updates its selector only after the complete patch replay succeeds. It does not
 upgrade the independent Chronik provider pin or validate behavior; see
 `daemon/docs/adding-patches.md`.
 
-`refresh-chronik` clones the ABC remote into temporary storage, exports the
-requested immutable Chronik revision into a new candidate, and checks current
-ABC/BCHN/Bitcoin Core adapter patches for clean application. It never advances
-the active Chronik source pin, host profile hashes, release manifests, or
-workspaces. Clean patch application is not build or behavioral validation. See
+`refresh-chronik` fetches the canonical ABC default branch into temporary
+storage, exports the requested immutable Chronik revision into a new candidate,
+and checks current ABC/BCHN/Bitcoin Core adapter patches for clean application.
+It never advances the active Chronik source pin, host profile hashes, release
+manifests, or workspaces. Supply `UPSTREAM=<ABC clone> REF=<ref>` only for an
+explicit ref. Clean patch application is not build or behavioral validation. See
 `daemon/docs/shared-chronik-source-and-hosts.md` for review and promotion steps.
+There is no tracked Bitcoin ABC Git submodule in this repository; daemon
+workspaces are gitignored clones, while Chronik's canonical ABC URL and exact
+source commit are recorded in `daemon/chronik/source.json`.
 
 Default mainnet ports:
 - **P2P**: `10605`
