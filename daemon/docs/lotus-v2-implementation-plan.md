@@ -565,3 +565,50 @@ full-tree transport, session and download targets with Chronik off. Build log:
 `/private/tmp/lotus-v2-transport-build.log`. No full daemon rebuild or live socket
 behavior is claimed for this packet. Socket activation, adopted profile,
 candidate selection and typed permanent-invalidity evidence remain open gates.
+
+
+## Typed validation failures and unchanged recovery checkpoints (128–130)
+
+All 131 mailboxes replay with exact intermediate trees; final tree
+`2476329a3bef6711174c7d850de4a3aba704e948`. See
+[replay evidence](evidence/v2-series-replay-130.json). Existing mailboxes remain
+byte-identical. Patch 128 carries an attributed integration explanation for the
+original empty commit body, without changing its source diff.
+
+VM provider/allocation failures and local host-step exhaustion now remain
+operational; unsupported execution remains U. Ordinary/block validation returns
+Inconclusive for these paths. Only an opaque deterministic-failure token binds a
+fully authenticated body to its exact parent, validator profile and pre-block
+UTXO root. The storage validator fingerprint definition moved unchanged into the
+block transition layer. Early header failures retain their existing check order
+and conservatively emit no token; this is a documented evidence-coverage limit.
+
+Disk connectors clear optional proof output at entry. Recovery verifies all four
+token bindings before recording replacement-invalid diagnostics and never advances
+a journal checkpoint on Inconclusive. Wallet and offline command surfaces retain
+that distinction. The compiler differential adapter separately retains native E
+as operational-error, records inconclusive comparison evidence and exits nonzero.
+
+Focused Debug/Release VM checks cover injected SHA256/provider/allocation failures,
+healthy invalid signatures, host-work limits and structural-cost behavior.
+Ordinary, complete-block and signed-runner suites pass. A supplemental immutable
+reference-generated fork fixture uses an explicitly bound max_steps=1 host guard;
+existing fixture bytes and development defaults are unchanged. Its target is
+reference-valid and accepts under the ordinary native guard, while the restricted
+native run remains inconclusive with no token. Recovery retries across reopen
+preserve raw journal bytes, tip, root, money, touched coins, bodies and active
+index, and leave output progress untouched. Deterministic invalid-middle rollback
+still restores the source. Root standalone Debug recovery/disk suites pass.
+
+Clean native `e8914e477` at
+`/private/tmp/lotus-v2-daemon-typed-validation-exact-20261015` builds lotusd and the
+wallet helper with Chronik off. Full-tree recovery storage, real-fork, initializer
+and wallet checks pass (207 observed wallet checks; nonce-search counts vary).
+Log: `/private/tmp/lotus-v2-typed-build.log`. The actual native-wallet signed
+complete-block pilot also passes at
+`/private/tmp/lotus-v2-wallet-chain-typed-exact-20261015`.
+
+These results supersede the generic-Invalid classification warning for the tested
+paths above. Durable terminal receipts, persistent invalid-root propagation,
+candidate selection and network activation remain separate integration gates.
+No live peer synchronization or public testnet readiness is claimed.
