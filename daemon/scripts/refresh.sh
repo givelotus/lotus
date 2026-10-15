@@ -69,7 +69,7 @@ fi
 # ─── maintained Dogecoin series: require an explicitly refreshed provenance manifest ──
 if [[ "$SERIES" == "doged" ]]; then
     echo "Dogecoin's maintained series is pinned with per-patch provenance. Do not advance only the base pin." >&2
-    echo "Create and validate a new candidate with refreshed provenance, then update patches/doged/manifest.json and doged-version together." >&2
+    echo "Use make refresh-abc to replay all non-V1 ABC stacks and prepare the shared pin plus Dogecoin provenance together." >&2
     exit 1
 fi
 

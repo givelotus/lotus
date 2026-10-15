@@ -2,7 +2,7 @@
 # setup.sh — Create or replay a daemon build workspace.
 #
 # SERIES=v1 (default):           clone bitcoin-abc at bitcoin-abc-v1-version, apply V1 patch series (153 patches)
-# SERIES=doged:        clone pinned Bitcoin ABC and apply maintained Dogecoin patches
+# SERIES=doged:        clone the shared Bitcoin ABC pin and apply maintained Dogecoin patches
 # SERIES=doged-reference: clone the pinned historical doged-io/doged reference
 # SERIES=bchn/ecash:   pinned base only; experimental features require explicit review
 #
@@ -78,7 +78,7 @@ fi
 # ─── doged: current-ABC Dogecoin implementation ─────────────────────────────
 if [[ "$SERIES" == "doged" ]]; then
     WORKSPACE="$DAEMON_DIR/workspace-doged-abc"
-    VERSION_FILE="$DAEMON_DIR/doged-version"
+    VERSION_FILE="$DAEMON_DIR/bitcoin-abc-version"
     SERIES_FILE="$DAEMON_DIR/patches/doged/series"
     PATCHES_DIR="$DAEMON_DIR/patches/doged"
     REMOTE="${BITCOIN_ABC_REMOTE:-https://github.com/Bitcoin-ABC/bitcoin-abc.git}"

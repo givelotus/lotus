@@ -2,6 +2,8 @@
 
 This maintained Dogecoin series contains **174 mailbox patches** on immutable Bitcoin ABC **`1fb7db17c176cdea8a2c60d887891589382ee4e3`**, resolved from the primary upstream remote on 2026-10-14. It ports Tobias's Dogecoin implementation and retains current ABC/Chronik APIs. `SERIES=doged` selects this series. It builds and passes the recorded native checks; **full Dogecoin mainnet synchronization remains incomplete**. Production nodes, data, original workspaces and published releases were not modified.
 
+The shared non-V1 ABC selector is [`daemon/bitcoin-abc-version`](../../bitcoin-abc-version), also used by the eCash reference stack. The `base` field in `manifest.json` records which commit the Dogecoin mailbox was validated against; setup checks it against the shared selector.
+
 The old [23-patch candidate](../../candidates/doged-on-current-abc-initial/README.md) remains unchanged on `8c67fe1e85a602204a2ce65aa3b643469c2c3a1d`. The historical Doged source `9690833b8b6709b7a7837bc397f0d04bf3b885d1` remains available through `SERIES=doged-reference`.
 
 | Identity | Exact value |

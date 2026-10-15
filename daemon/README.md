@@ -148,6 +148,15 @@ curl -s http://127.0.0.1:8331/blockchain-info | xxd
 
 ## Developer Reference: Modifying or Rebasing Patches
 
+- **Prepare one coordinated non-V1 ABC update candidate**:
+  ```bash
+  make refresh-abc REF=latest CANDIDATE=/tmp/abc-update-candidate
+  ```
+  This uses one ABC commit for the eCash patch stack, maintained Dogecoin patch
+  stack, and Chronik source export. Candidate workspaces and a refreshed
+  Dogecoin provenance manifest are written only under the new directory.
+  Review patch application, then run builds and behavior tests separately.
+  Lotus V1 stays on its independently validated pin until intentionally rebased.
 - **Validate replay without changing a workspace**:
   ```bash
   python3 scripts/patch-series.py /tmp/isolated-abc patches/v1/series \

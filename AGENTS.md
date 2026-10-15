@@ -51,7 +51,7 @@ Workspaces (`daemon/workspace-*`) are **gitignored** local clones created by `ma
 |--------|------|-------------|-----------|---------|
 | `v1` | `bitcoin-abc` `8c67fe1e85` | `bitcoin-abc-v1-version` | `workspace-v1/` | **Lotus V1 mainnet (`v11.6.1`)** — 153 maintained patches (`000`–`247`) plus generated release metadata + in-process Chronik (`-DBUILD_CHRONIK=ON`) |
 | `ecash` | `bitcoin-abc` `1fb7db17` | `bitcoin-abc-version` | `workspace-ecash/` | Upstream reference patches |
-| `doged` | `bitcoin-abc` | `doged-version` | `workspace-doged-abc/` | Dogecoin implementation, 174-patch maintained series |
+| `doged` | `bitcoin-abc` | `bitcoin-abc-version` | `workspace-doged-abc/` | Dogecoin implementation, 174-patch maintained series |
 | `doged-reference` | `doged-io/doged` | `doged-reference-version` | `workspace-doged-reference/` | Historical Doged reference build |
 | `bchn` | BCHN `abd433abe0` (29.2.1) | `bchn-version` | `workspace-bchn/` | Current-tip Bitcoin Cash Node upstream candidates |
 
@@ -72,6 +72,9 @@ make -C daemon refresh SERIES=v1 COMMIT=latest
 
 # Prepare a review-only shared Chronik provider refresh candidate:
 make -C daemon refresh-chronik CANDIDATE=/tmp/chronik-provider-candidate
+
+# Rebase eCash, Dogecoin, and Chronik against one ABC commit:
+make -C daemon refresh-abc CANDIDATE=/tmp/abc-update-candidate
 ```
 
 `COMMIT=latest` resolves the workspace remote's advertised default branch and
@@ -89,6 +92,13 @@ explicit ref. Clean patch application is not build or behavioral validation. See
 There is no tracked Bitcoin ABC Git submodule in this repository; daemon
 workspaces are gitignored clones, while Chronik's canonical ABC URL and exact
 source commit are recorded in `daemon/chronik/source.json`.
+
+`make -C daemon refresh-abc CANDIDATE=<new-dir>` coordinates the non-V1 ABC
+update tracks on one exact commit: it replays eCash and maintained Dogecoin
+patches independently and prepares the Chronik export from that same source.
+`bitcoin-abc-version` is their shared selector; the Dogecoin manifest's base
+field verifies replay provenance. Lotus V1 remains on its separately validated
+pin until deliberately rebased. See `daemon/docs/abc-refresh.md`.
 
 Default mainnet ports:
 - **P2P**: `10605`

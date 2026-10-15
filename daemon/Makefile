@@ -1,15 +1,15 @@
 # daemon/Makefile — Lotus mainnet daemon build management
 #
 # SERIES=v1 (default) — Lotus mainnet, bitcoin-abc-v1-version, workspace-v1/
-# SERIES=ecash        — upstream candidates, bitcoin-abc-version, workspace-ecash/
-# SERIES=doged        — Dogecoin on pinned Bitcoin ABC, doged-version, workspace-doged-abc/
+# SERIES=ecash        — upstream candidates, shared bitcoin-abc-version, workspace-ecash/
+# SERIES=doged        — Dogecoin on shared Bitcoin ABC pin, workspace-doged-abc/
 # SERIES=doged-reference — pinned doged-io/doged reference, doged-reference-version/
 # SERIES=bchn         — BCHN candidates, bchn-version, workspace-bchn/
 
 SCRIPTS := $(dir $(abspath $(lastword $(MAKEFILE_LIST))))scripts
 SERIES  ?= v1
 
-.PHONY: setup build run mkpatch refresh refresh-chronik prepare-release prepare-component features clean help
+.PHONY: setup build run mkpatch refresh refresh-abc refresh-chronik prepare-release prepare-component features clean help
 
 help:
 	@echo "Lotus daemon build targets:"
@@ -20,6 +20,8 @@ help:
 	@echo "  make mkpatch NAME=<n>          Export committed HEAD with authorship and rationale"
 	@echo "  make refresh COMMIT=<sha|tag|latest> [SERIES=...]  Rebase patches, then advance the pin"
 	@echo "    COMMIT=latest resolves origin's advertised default branch; review every rebase/build result."
+	@echo "  make refresh-abc [REF=latest] CANDIDATE=<new-dir>  Replay eCash/Doged and Chronik on one ABC commit"
+	@echo "    Candidate-only; Lotus V1 is excluded. Clean replay does not mean build/behavior passed."
 	@echo "  make refresh-chronik [UPSTREAM=<ABC clone>] [REF=latest] CANDIDATE=<new-dir>"
 	@echo "    Prepare an isolated shared-Chronik source/export candidate and test adapter patch application."
 	@echo "    Does not change active provider pins, host profiles, workspaces, or releases."
@@ -123,6 +125,12 @@ ifndef CANDIDATE
 	$(error CANDIDATE must identify a new output directory)
 endif
 	python3 $(SCRIPTS)/prepare-chronik-refresh.py $(if $(UPSTREAM),--upstream "$(UPSTREAM)") --ref "$(or $(REF),latest)" --candidate "$(CANDIDATE)"
+
+refresh-abc:
+ifndef CANDIDATE
+	$(error CANDIDATE must identify a new review-candidate directory)
+endif
+	python3 $(SCRIPTS)/prepare-abc-refresh.py --ref "$(or $(REF),latest)" --candidate "$(CANDIDATE)"
 
 clean:
 	rm -rf workspace-ecash/build workspace-v1/build workspace-doged-abc/build workspace-doged-reference/build workspace-bchn/build workspace-bitcoin/build
