@@ -6,9 +6,8 @@
 #   Usage: SERIES=v1 ./scripts/refresh.sh <bitcoin-abc-commit> [description]
 # SERIES=ecash / SERIES=bchn — refresh the corresponding reference patch series
 #
-# SERIES=doged — update workspace-doged to a newer doged commit/tag
-#   Usage: SERIES=doged ./scripts/refresh.sh <doged-commit-or-tag> [description]
-#   Example: SERIES=doged ./scripts/refresh.sh v0.5.0 "doged v0.5.0"
+# SERIES=doged — rebase the maintained ABC patchset only after refreshing its provenance manifest
+# SERIES=doged-reference — update the pinned historical doged source reference
 
 set -euo pipefail
 
@@ -67,19 +66,23 @@ if [[ "$SERIES" == "v1" ]]; then
     exit 0
 fi
 
-# ─── doged: update workspace-doged to a newer commit/tag ─────────────────────
+# ─── maintained Dogecoin series: require an explicitly refreshed provenance manifest ──
 if [[ "$SERIES" == "doged" ]]; then
-    WORKSPACE="$DAEMON_DIR/workspace-doged"
-    VERSION_FILE="$DAEMON_DIR/doged-version"
+    echo "Dogecoin's maintained series is pinned with per-patch provenance. Do not advance only the base pin." >&2
+    echo "Create and validate a new candidate with refreshed provenance, then update patches/doged/manifest.json and doged-version together." >&2
+    exit 1
+fi
 
+# ─── historical Doged source reference ───────────────────────────────────────
+if [[ "$SERIES" == "doged-reference" ]]; then
+    WORKSPACE="$DAEMON_DIR/workspace-doged-reference"
+    VERSION_FILE="$DAEMON_DIR/doged-reference-version"
     OLD_REF=$(grep -v '^#' "$VERSION_FILE" | grep -v '^$' | head -1)
-    echo "Advancing doged: $OLD_REF → $NEW_REF ($DESCRIPTION)"
-
+    echo "Advancing historical Doged reference: $OLD_REF → $NEW_REF ($DESCRIPTION)"
     if [[ ! -d "$WORKSPACE" ]]; then
-        echo "workspace-doged not found — run: make setup SERIES=doged first"
+        echo "workspace-doged-reference not found — run: make setup SERIES=doged-reference first" >&2
         exit 1
     fi
-
     cd "$WORKSPACE"
     if [[ -n "$(git status --porcelain)" ]]; then
         echo "Workspace has uncommitted changes; refusing refresh" >&2
@@ -87,20 +90,12 @@ if [[ "$SERIES" == "doged" ]]; then
     fi
     git fetch origin --tags
     RESOLVED=$(git rev-parse --verify "$NEW_REF^{commit}")
-    python3 "$SCRIPT_DIR/patch-series.py" "$WORKSPACE" "$DAEMON_DIR/patches/doged/series" \
+    python3 "$SCRIPT_DIR/patch-series.py" "$WORKSPACE" "$DAEMON_DIR/patches/doged-reference/series" \
         --base "$RESOLVED" --allow-empty
-
     PIN_TEMP=$(mktemp "$VERSION_FILE.XXXXXX")
-    {
-        echo "$RESOLVED"
-        echo "# $DESCRIPTION"
-        echo "# Previous: $OLD_REF"
-    } > "$PIN_TEMP"
+    { echo "$RESOLVED"; echo "# $DESCRIPTION"; echo "# Previous: $OLD_REF"; } > "$PIN_TEMP"
     mv "$PIN_TEMP" "$VERSION_FILE"
-
-    echo ""
-    echo "doged workspace now at: $NEW_REF"
-    echo "Rebuild with: make build SERIES=doged"
+    echo "Build with: make build SERIES=doged-reference"
     exit 0
 fi
 
@@ -113,5 +108,5 @@ if [[ "$SERIES" == "bchn" ]]; then
     exit 0
 fi
 
-echo "Unsupported series: $SERIES (choose v1, ecash, doged, or bchn)" >&2
+echo "Unsupported series: $SERIES (choose v1, ecash, doged, doged-reference, or bchn)" >&2
 exit 1

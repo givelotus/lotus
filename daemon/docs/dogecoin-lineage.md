@@ -6,7 +6,7 @@ Observed on 2026-10-14. These are reference and candidate sources; this audit do
 
 | Source | Revision | Evidence |
 | --- | --- | --- |
-| [doged-io/doged](https://github.com/doged-io/doged) master | `9690833b8b6709b7a7837bc397f0d04bf3b885d1` | `git ls-remote`; now the immutable `daemon/doged-version` |
+| [doged-io/doged](https://github.com/doged-io/doged) master | `9690833b8b6709b7a7837bc397f0d04bf3b885d1` | `git ls-remote`; now the immutable `daemon/doged-reference-version` |
 | [Bitcoin ABC](https://github.com/Bitcoin-ABC/bitcoin-abc) master | `8c67fe1e85a602204a2ce65aa3b643469c2c3a1d` | `git ls-remote`; Lotus mainnet's existing base |
 | [Dogecoin Core](https://github.com/dogecoin/dogecoin) master | `47a303a449999314abcf83bd1fc7e77dd4540fcd` | `git ls-remote`; comparison reference, not built here |
 | Previous local doged checkout | `a640b3b427f03ae880720653fe9ab5f62e07ccec` | Left untouched; former version file was floating `master` |
@@ -14,7 +14,7 @@ Observed on 2026-10-14. These are reference and candidate sources; this audit do
 
 The Dogecoin Core README warns that master is an unstable integration branch. An exact observed tip is not a production recommendation.
 
-`SERIES=doged` directly checks out the doged repository. The previously empty local `series` now contains a test-only Apple arm64 compilation repair and an independent Chronik AuxPoW regression test. This is not an independently maintained Dogecoin consensus port patch series against the current ABC pin. Setup must apply that local series after checkout (see the accompanying setup changes).
+At the time of this reference audit, `SERIES=doged` directly checked out the pinned Doged repository and applied two compatibility/test patches. That historical selector has since been renamed `SERIES=doged-reference`; the maintained current-ABC Dogecoin patch series now occupies `SERIES=doged` and `daemon/patches/doged/`.
 
 ## Tobias's work is present
 
@@ -143,13 +143,13 @@ Evidence: `/tmp/lotus-doged-avalanche-before-20261014.log`, `/tmp/lotus-doged-av
 
 ## Completed current-ABC source candidate (2026-10-14 continuation)
 
-The continuation resolves immutable upstream ABC `1fb7db17c176cdea8a2c60d887891589382ee4e3`, distinct from the older `8c67fe1e85` base above. The [173-patch candidate](../candidates/doged-on-current-abc/README.md) preserves the initial segment and Tobias lineage while adapting current APIs. Exact mailbox replay verifies every intermediate tree and final `b019768499700c6cca14007f211358bd2b0aed82`; integration source is `2ddac16d140df1b9637ec489bffeba287669434e`. Metadata maintenance changes commit IDs without changing source trees.
+The continuation resolves immutable upstream ABC `1fb7db17c176cdea8a2c60d887891589382ee4e3`, distinct from the older `8c67fe1e85` base above. The [maintained Dogecoin series](../patches/doged/README.md) preserves the initial segment and Tobias lineage while adapting current APIs. Exact mailbox replay verifies every intermediate tree and final `2b378152efca0ea2c578433f348e71db367202b0`. Metadata maintenance changes commit IDs without changing source trees.
 
 The candidate retains consensus, wallet/mining and Chronik functionality, with independent repairs for canonical AuxPoW activation, historical Script behavior, fixed block-size consensus, sequential non-CTOR UTXOs, the first DigiShield header-presync transition and aggregate fees. Original authors/dates/messages, 414-entry disposition inventory, modern adaptation provenance and new correction rationale are retained alongside the patches. The old incomplete candidate remains unchanged as historical evidence.
 
 Application, builds, native/functional checks, Chronik parity and network synchronization are reported separately in the [current validation report](doged-current-abc-validation.md). A fresh isolated bounded download accepted **14,942** real mainnet blocks with test-only minimum work disabled; full-tip synchronization is **not** complete. Default-minimum-work observation accepted zero blocks while performing header presync. No earlier height-100 evidence is promoted to a full-sync claim.
 
-The new `getrawunsolvedblock` RPC and explicit Dogecoin OpenCL miner support direct Scrypt mining; actual M5 Max regtest submission succeeded. NNG and merged-mining work-construction RPC remain absent and explicitly documented in the [interface audit](doged-interface-compatibility.md). Optional Avalanche remains independent/default off, with no live-quorum claim. Existing `SERIES=doged` still selects the preserved reference, not this review candidate; production and releases are untouched.
+The new `getrawunsolvedblock` RPC and explicit Dogecoin OpenCL miner support direct Scrypt mining; actual M5 Max regtest submission succeeded. NNG and merged-mining work-construction RPC remain absent and explicitly documented in the [interface audit](doged-interface-compatibility.md). Optional Avalanche remains independent/default off, with no live-quorum claim. `SERIES=doged` selects this maintained current-ABC series; `SERIES=doged-reference` preserves the historical source; production nodes and published releases remain untouched.
 
 ## Headers-only AuxPoW restart correction (2026-10-15)
 

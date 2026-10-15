@@ -12,6 +12,7 @@ TARGETS = {
     'v1': {'chronik': 'BUILD_CHRONIK', 'nng': 'BUILD_BITCOIN_NNG', 'zmq': 'BUILD_ZMQ'},
     'ecash': {'chronik': 'BUILD_CHRONIK', 'zmq': 'BUILD_ZMQ'},
     'doged': {'chronik': 'BUILD_CHRONIK', 'zmq': 'BUILD_ZMQ'},
+    'doged-reference': {'chronik': 'BUILD_CHRONIK', 'zmq': 'BUILD_ZMQ'},
     'bchn': {'chronik': 'BUILD_CHRONIK', 'zmq': 'BUILD_BITCOIN_ZMQ'},
     'bitcoin': {'chronik': 'BUILD_CHRONIK', 'zmq': 'WITH_ZMQ'},
 }
@@ -81,6 +82,10 @@ def resolve(target, names, allow_experimental):
                              'warning': 'Optimizes optional consistency checking; no admission-policy change'})
         elif name == 'long-chain-container-test' and target == 'bchn':
             raise ValueError('BCHN historical 02 is not maintained at the current pin; use mempool-check for diagnostic coverage')
+        elif target == 'doged' and name == 'block-construction':
+            raise ValueError('No Dogecoin block-construction candidate is maintained; benchmark/audit first (issue #15)')
+        elif target == 'doged' and name in ('tx-chain-limit', 'long-chain-container-test'):
+            raise ValueError('No Dogecoin chain-limit candidate is maintained; complete the policy audit first (issue #14)')
         elif name == 'tx-chain-limit':
             raise ValueError('No standalone admission-policy change is implemented; patch 02 only calls addUnchecked')
         else:

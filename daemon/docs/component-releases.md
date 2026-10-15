@@ -22,7 +22,7 @@ versions are not bumped to impersonate a newer official upstream release.
 | `lotusd` | `v1` | Prepared Lotus numeric version | maintained | Existing in-process, ON |
 | `bitcoin-abc` | `ecash` | 0.34.1 | provider only | Shared Chronik source provider; no network release |
 | `bchn` | `bchn` | 29.2.1 | custom Chronik host | In-process ABC Chronik with BCHN adapter |
-| `doged` | `doged` | 0.4.0 | maintained compatibility/test patches | Existing in-process, ON |
+| `doged` | `doged-reference` | 0.4.0 | historical Doged compatibility/test patches | Existing in-process, ON |
 | `bitcoin-core` | `bitcoin` | 32.99.0 | custom Chronik host | In-process ABC Chronik with Core adapter |
 
 ABC/BCHN/Doged/Core pins currently represent development snapshots, not assertions

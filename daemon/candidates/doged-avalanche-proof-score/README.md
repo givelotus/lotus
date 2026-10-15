@@ -1,6 +1,6 @@
 # Optional Dogecoin Avalanche proof-score repair
 
-This independent candidate targets `doged-io/doged` commit `9690833b8b6709b7a7837bc397f0d04bf3b885d1`. It is deliberately outside the default `patches/doged/series`: Chronik and ordinary Dogecoin synchronization do not require enabling or changing Avalanche. It is not a port onto current Bitcoin ABC.
+This independent candidate targets `doged-io/doged` commit `9690833b8b6709b7a7837bc397f0d04bf3b885d1`. It is deliberately outside both the maintained current-ABC Dogecoin series and the historical reference series: Chronik and ordinary Dogecoin synchronization do not require enabling or changing Avalanche. It is not a port onto current Bitcoin ABC.
 
 The original score calculation multiplies satoshis by 100 before dividing by satoshis per coin. Above approximately 1.84 billion DOGE, the uint64 intermediate wraps, violating intended stake-score scaling. A 2-billion-DOGE amount produces `15532559262` instead of `200000000000`; MAX_MONEY produces `77662796314` instead of `1000000000000`. The original maximum-money test also evaluates an overflowing expression and misses this error.
 

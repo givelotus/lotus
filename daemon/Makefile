@@ -2,7 +2,8 @@
 #
 # SERIES=v1 (default) — Lotus mainnet, bitcoin-abc-v1-version, workspace-v1/
 # SERIES=ecash        — upstream candidates, bitcoin-abc-version, workspace-ecash/
-# SERIES=doged        — doged reference, doged-version, workspace-doged/
+# SERIES=doged        — Dogecoin on pinned Bitcoin ABC, doged-version, workspace-doged-abc/
+# SERIES=doged-reference — pinned doged-io/doged reference, doged-reference-version/
 # SERIES=bchn         — BCHN candidates, bchn-version, workspace-bchn/
 
 SCRIPTS := $(dir $(abspath $(lastword $(MAKEFILE_LIST))))scripts
@@ -12,10 +13,10 @@ SERIES  ?= v1
 
 help:
 	@echo "Lotus daemon build targets:"
-	@echo "  make setup [SERIES=v1|ecash|doged|bchn|bitcoin]      Clone workspace and apply patches"
+	@echo "  make setup [SERIES=v1|ecash|doged|doged-reference|bchn|bitcoin] Clone workspace and apply patches"
 	@echo "  Existing workspaces are preserved; move an old workspace aside before setup."
-	@echo "  make build [SERIES=v1|ecash|doged|bchn|bitcoin]      Build lotusd and lotus-cli (with Chronik on v1)"
-	@echo "  make run   [SERIES=v1|ecash|doged|bchn|bitcoin] ARGS=\"...\"  Run lotusd (sets ulimit -n 65536)"
+	@echo "  make build [SERIES=v1|ecash|doged|doged-reference|bchn|bitcoin] Build selected daemon and CLI"
+	@echo "  make run   [SERIES=v1|ecash|doged|doged-reference|bchn|bitcoin] ARGS=\"...\"  Run selected daemon"
 	@echo "  make mkpatch NAME=<n>          Export committed HEAD with authorship and rationale"
 	@echo "  make refresh COMMIT=<c>        Rebase onto new base commit or tag"
 	@echo "  Human patch workflow: daemon/docs/adding-patches.md"
@@ -45,7 +46,8 @@ help:
 	@echo ""
 	@echo "  SERIES=v1 (default): mainnet    — workspace-v1/     (bitcoin-abc 8c67fe1e85 + Chronik)"
 	@echo "  SERIES=ecash:        upstream   — workspace-ecash/  (bitcoin-abc 1fb7db17)"
-	@echo "  SERIES=doged:        doged      — workspace-doged/  (direct clone doged-io/doged)"
+	@echo "  SERIES=doged:        Dogecoin   — workspace-doged-abc/ (Bitcoin ABC + 174 maintained patches)"
+	@echo "  SERIES=doged-reference: doged   — workspace-doged-reference/ (pinned doged-io/doged reference)"
 	@echo "  SERIES=bchn:         BCHN       — workspace-bchn/   (exact current-tip pin in bchn-version)"
 	@echo "  eCash/BCHN defaults apply no candidates; experimental/placeholder patches are not validated features."
 	@echo "  Exact application/build/test evidence: daemon/docs/support-matrix.md"
@@ -113,4 +115,4 @@ else
 endif
 
 clean:
-	rm -rf workspace-ecash/build workspace-v1/build workspace-doged/build workspace-bchn/build workspace-bitcoin/build
+	rm -rf workspace-ecash/build workspace-v1/build workspace-doged-abc/build workspace-doged-reference/build workspace-bchn/build workspace-bitcoin/build

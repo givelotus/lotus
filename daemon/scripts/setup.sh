@@ -2,7 +2,8 @@
 # setup.sh — Create or replay a daemon build workspace.
 #
 # SERIES=v1 (default):           clone bitcoin-abc at bitcoin-abc-v1-version, apply V1 patch series (153 patches)
-# SERIES=doged:        clone pinned doged-io/doged and apply compatibility patches
+# SERIES=doged:        clone pinned Bitcoin ABC and apply maintained Dogecoin patches
+# SERIES=doged-reference: clone the pinned historical doged-io/doged reference
 # SERIES=bchn/ecash:   pinned base only; experimental features require explicit review
 #
 # Usage: ./scripts/setup.sh
@@ -74,19 +75,35 @@ if [[ "$SERIES" == "v1" ]]; then
     exit 0
 fi
 
-# ─── doged: direct clone of doged-io/doged at pinned version ─────────────────
+# ─── doged: current-ABC Dogecoin implementation ─────────────────────────────
 if [[ "$SERIES" == "doged" ]]; then
-    WORKSPACE="$DAEMON_DIR/workspace-doged"
+    WORKSPACE="$DAEMON_DIR/workspace-doged-abc"
     VERSION_FILE="$DAEMON_DIR/doged-version"
+    SERIES_FILE="$DAEMON_DIR/patches/doged/series"
+    PATCHES_DIR="$DAEMON_DIR/patches/doged"
+    REMOTE="${BITCOIN_ABC_REMOTE:-https://github.com/Bitcoin-ABC/bitcoin-abc.git}"
+    REF=$(grep -v '^#' "$VERSION_FILE" | grep -v '^$' | head -1)
+    echo "Dogecoin Bitcoin ABC ref: $REF"
+    clone_and_checkout "$WORKSPACE" "$REMOTE" "$REF" "doged-abc-work" "Dogecoin on Bitcoin ABC"
+    python3 "$SCRIPT_DIR/patch-series.py" "$PWD" "$SERIES_FILE" --base "$REF" \
+        --provenance "$PATCHES_DIR/manifest.json" --expect-tree 2b378152efca0ea2c578433f348e71db367202b0
+    echo ""
+    echo "Dogecoin workspace ready at: $WORKSPACE"
+    echo "Build with: make build SERIES=doged"
+    echo "Maintained 174-patch Dogecoin series on the immutable ABC pin."
+    exit 0
+fi
+
+# ─── historical doged source reference ───────────────────────────────────────
+if [[ "$SERIES" == "doged-reference" ]]; then
+    WORKSPACE="$DAEMON_DIR/workspace-doged-reference"
+    VERSION_FILE="$DAEMON_DIR/doged-reference-version"
     REMOTE="${DOGED_REMOTE:-https://github.com/doged-io/doged.git}"
     REF=$(grep -v '^#' "$VERSION_FILE" | grep -v '^$' | head -1)
-    echo "doged ref: $REF"
-    clone_and_checkout "$WORKSPACE" "$REMOTE" "$REF" "doged-work" "doged"
-    apply_patch_series "$DAEMON_DIR/patches/doged/series" "$DAEMON_DIR/patches/doged" base-only
-    echo ""
-    echo "doged workspace ready at: $WORKSPACE"
-    echo "Build with: make build SERIES=doged"
-    echo "Doged upstream plus the explicit compatibility series; no experimental mining patches."
+    echo "doged reference: $REF"
+    clone_and_checkout "$WORKSPACE" "$REMOTE" "$REF" "doged-reference-work" "historical Doged reference"
+    apply_patch_series "$DAEMON_DIR/patches/doged-reference/series" "$DAEMON_DIR/patches/doged-reference" base-only
+    echo "Build with: make build SERIES=doged-reference"
     exit 0
 fi
 
@@ -124,5 +141,5 @@ if [[ "$SERIES" == "ecash" ]]; then
     exit 0
 fi
 
-echo "Unsupported series: $SERIES (choose v1, ecash, doged, bchn, or bitcoin)" >&2
+echo "Unsupported series: $SERIES (choose v1, ecash, doged, doged-reference, bchn, or bitcoin)" >&2
 exit 1

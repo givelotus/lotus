@@ -72,6 +72,11 @@ class FeatureSelectionTests(unittest.TestCase):
         self.assertEqual(plan["cmake_args"], [])
         self.assertEqual(plan["features"][0]["requires"], [])
 
+    def test_doged_reference_keeps_independent_build_options(self):
+        plan = planner.resolve("doged-reference", ["chronik-off", "zeromq-on"], False)
+        self.assertEqual(plan["cmake_args"], ["-DBUILD_CHRONIK=OFF", "-DBUILD_ZMQ=ON"])
+        self.assertEqual(plan["patches"], [])
+
     def test_abc_derived_diagnostics_are_optional_independent_candidates(self):
         for target in ("v1", "ecash", "doged"):
             with self.assertRaises(ValueError):
@@ -82,6 +87,9 @@ class FeatureSelectionTests(unittest.TestCase):
                           plan["patches"][0])
             self.assertEqual(plan["features"][0]["requires"], [])
             self.assertEqual(plan["cmake_args"], ["-DBUILD_CHRONIK=ON"])
+        for feature in ("block-construction", "tx-chain-limit", "long-chain-container-test"):
+            with self.assertRaisesRegex(ValueError, "Dogecoin"):
+                planner.resolve("doged", [feature], True)
         with self.assertRaises(ValueError):
             planner.resolve("bitcoin", ["mempool-check"], True)
 

@@ -2,7 +2,8 @@
 # mkpatch.sh — Export the current committed change with its complete metadata.
 #
 # SERIES=v1 (default):           saves to patches/v1/<name>.patch    from workspace-v1/
-# SERIES=doged:        saves to patches/doged/<name>.patch from workspace-doged/
+# SERIES=doged:        saves to patches/doged/<name>.patch from workspace-doged-abc/
+# SERIES=doged-reference: saves to patches/doged-reference/<name>.patch
 # SERIES=ecash:        saves to patches/ecash/<name>.patch from workspace-ecash/
 #
 # Usage: ./scripts/mkpatch.sh <patch-name>
@@ -28,8 +29,12 @@ if [[ "$SERIES" == "v1" ]]; then
     PATCHES_DIR="$DAEMON_DIR/patches/v1"
     mkdir -p "$PATCHES_DIR"
 elif [[ "$SERIES" == "doged" ]]; then
-    WORKSPACE="$DAEMON_DIR/workspace-doged"
+    WORKSPACE="$DAEMON_DIR/workspace-doged-abc"
     PATCHES_DIR="$DAEMON_DIR/patches/doged"
+    mkdir -p "$PATCHES_DIR"
+elif [[ "$SERIES" == "doged-reference" ]]; then
+    WORKSPACE="$DAEMON_DIR/workspace-doged-reference"
+    PATCHES_DIR="$DAEMON_DIR/patches/doged-reference"
     mkdir -p "$PATCHES_DIR"
 elif [[ "$SERIES" == "ecash" ]]; then
     WORKSPACE="$DAEMON_DIR/workspace-ecash"
@@ -40,7 +45,7 @@ elif [[ "$SERIES" == "bchn" ]]; then
     PATCHES_DIR="$DAEMON_DIR/patches/bchn"
     mkdir -p "$PATCHES_DIR"
 else
-    echo "Unsupported series: $SERIES (choose v1, ecash, doged, or bchn)" >&2
+    echo "Unsupported series: $SERIES (choose v1, ecash, doged, doged-reference, or bchn)" >&2
     exit 1
 fi
 

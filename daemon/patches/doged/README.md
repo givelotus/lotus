@@ -1,8 +1,8 @@
 # Doged on current Bitcoin ABC
 
-This review candidate contains **174 maintained mailbox patches** on immutable Bitcoin ABC **`1fb7db17c176cdea8a2c60d887891589382ee4e3`**, resolved from the primary upstream remote on 2026-10-14. It ports Tobias's Dogecoin implementation and retains current ABC/Chronik APIs. It is a working build candidate; **full Dogecoin mainnet synchronization remains incomplete**. Production nodes, data, original workspaces and published releases were not modified.
+This maintained Dogecoin series contains **174 mailbox patches** on immutable Bitcoin ABC **`1fb7db17c176cdea8a2c60d887891589382ee4e3`**, resolved from the primary upstream remote on 2026-10-14. It ports Tobias's Dogecoin implementation and retains current ABC/Chronik APIs. `SERIES=doged` selects this series. It builds and passes the recorded native checks; **full Dogecoin mainnet synchronization remains incomplete**. Production nodes, data, original workspaces and published releases were not modified.
 
-The old [23-patch candidate](../doged-on-current-abc-initial/README.md) remains unchanged on `8c67fe1e85a602204a2ce65aa3b643469c2c3a1d`. The validated reference `SERIES=doged` still selects original Doged `9690833b8b6709b7a7837bc397f0d04bf3b885d1`; it does not silently select this new source.
+The old [23-patch candidate](../../candidates/doged-on-current-abc-initial/README.md) remains unchanged on `8c67fe1e85a602204a2ce65aa3b643469c2c3a1d`. The historical Doged source `9690833b8b6709b7a7837bc397f0d04bf3b885d1` remains available through `SERIES=doged-reference`.
 
 | Identity | Exact value |
 | --- | --- |
@@ -22,9 +22,9 @@ git clone https://github.com/Bitcoin-ABC/bitcoin-abc.git /tmp/doged-current-revi
 git -C /tmp/doged-current-review checkout --detach \
   1fb7db17c176cdea8a2c60d887891589382ee4e3
 python3 daemon/scripts/patch-series.py /tmp/doged-current-review \
-  daemon/candidates/doged-on-current-abc/series \
+  daemon/patches/doged/series \
   --base 1fb7db17c176cdea8a2c60d887891589382ee4e3 \
-  --provenance daemon/candidates/doged-on-current-abc/manifest.json \
+  --provenance daemon/patches/doged/manifest.json \
   --expect-tree 2b378152efca0ea2c578433f348e71db367202b0
 
 cmake -S /tmp/doged-current-review -B /tmp/doged-current-build -GNinja \
