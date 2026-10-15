@@ -1,5 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { writeFileSync, appendFileSync } from 'node:fs';
+import { resolveTarget } from '../dist/targets.js';
 import { createHash } from 'node:crypto';
 import { spawnSync } from 'node:child_process';
 import { compileEcash } from '../dist/ecash.js';
@@ -20,10 +22,15 @@ function rejected(input,message) {const result=compileEcash(input);assert.equal(
 
 // Only a configured exact ABC harness can establish execution evidence.
 const native=process.env.LOTUS_ECASH_NATIVE;
+const evidence=process.env.LOTUS_ECASH_EVIDENCE;
 function invoke(artifact,args) {
  const result=spawnSync(native,[artifact.scriptHex,...args],{encoding:'utf8',timeout:5000,maxBuffer:1048576});
+ if(evidence)appendFileSync(evidence,JSON.stringify({artifact,args,exit:result.status,stdout:result.stdout,stderr:result.stderr})+'\n');
  assert.equal(result.status,0,result.stderr||result.stdout);
- return JSON.parse(result.stdout);
+ const outcome=JSON.parse(result.stdout);
+ assert.ok(['accepted','rejected'].includes(outcome.status),JSON.stringify(outcome));
+ assert.equal(outcome.executed,true,JSON.stringify(outcome));
+ return outcome;
 }
 
 test('eCash artifact is distinct, pinned, source-mapped and deterministic',()=>{
@@ -64,7 +71,11 @@ test('pinned ABC executes hashlocks, branches, exact byte widths and clean stack
  const description=spawnSync(native,['--describe'],{encoding:'utf8',timeout:5000});
  assert.equal(description.status,0,description.stderr);
  const provenance=JSON.parse(description.stdout);
- assert.equal(provenance.revision,'1fb7db17c176cdea8a2c60d887891589382ee4e3');
+ const target=resolveTarget('ecash');
+ assert.equal(provenance.revision,target.revision);
+ assert.equal(provenance.tree,target.sourceTree);
+ assert.deepEqual(provenance.flags.map(flag=>flag.replace(/^SCRIPT_(VERIFY_|ENABLE_)?/,'')).sort(),[...target.evaluationFlags].sort());
+ if(evidence)writeFileSync(evidence,JSON.stringify({schema:'ecash-backend-native-evidence/1',native,provenance})+'\n',{flag:'wx'});
  for(const kind of ['sha256','hash256']) {
   const artifact=compile(hashlock(kind));
   const accepted=invoke(artifact,[preimage]);assert.equal(accepted.accepted,true,JSON.stringify(accepted));
