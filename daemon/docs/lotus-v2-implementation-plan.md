@@ -211,6 +211,35 @@ Eight corruption cases leave the current state unchanged. Debug and sanitizer
 checks pass for the repair, and both disk suites pass on the combined source.
 Opaque header/monetary metadata semantics remain validator-owned.
 
+## Rollover, clock admission and peer codecs (patches 084–092)
+
+All 93 mailboxes replay with exact intermediate trees, ending at
+`98de8af521031cec003a41372810a2ff90611c98`.
+See [replay evidence](evidence/v2-series-replay-092.json).
+
+Complete synthetic-funded blocks at heights 11 and 12 now test the eleven-header
+rollover, exact MTP, disconnect, reopen and reconnect. This closes the rollover
+coverage item above. Explicit caller clock/window arguments control reversible
+future-time deferral before state mutation. Boundary acceptance, backward clocks,
+u64 extremes and separate invalid/storage errors pass native disk tests.
+
+The parameterized TCP envelope and compact-block codec library is available in
+the full build. It preserves complete witness-specific transaction identities,
+bounds framing/allocation, and distinguishes malformed messages, capacity refusal,
+full-block fallback and unvalidated reconstruction. Review repaired low-limit
+handshake framing, prefilled-byte quota checks and stale-response ambiguity.
+Production-code Debug tests and standalone synthetic-collision sanitizer tests
+pass. A successful codec result is not chain acceptance. Socket lifecycle,
+handshake ordering/timeouts, bounded per-peer/global request guards, download
+scheduling and chain synchronization remain runtime integration work.
+
+Header profiles now support an exact genesis BlockID; storage fingerprint version
+2 includes it. Nonzero anchors reject another genesis despite matching time and
+target. Existing incompatible stores fail closed, without automatic migration.
+Zero anchors remain for synthetic module fixtures only: the forthcoming daemon
+initializer must require a nonzero manifest anchor and validate complete genesis,
+initial state and target/work agreement before opening usable chainstate.
+
 ## Next bounded work
 
 Wire the tested disk-backed complete-block boundary into a separate development
