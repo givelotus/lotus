@@ -35,8 +35,6 @@ def identity(component, version, revision):
         raise ValueError('Unknown daemon component')
     if not legacy.VERSION.fullmatch(version) or not re.fullmatch(r'[1-9][0-9]*', str(revision)):
         raise ValueError('Distributor version must be numeric x.y.z and patch revision a positive integer')
-    if component == 'lotusd' and int(version.split('.')[0]) < 12:
-        raise ValueError('Component-namespaced Lotus candidates start at 12.x; historical v11 releases are immutable')
     return f'{component}-v{version}'
 
 
@@ -105,8 +103,6 @@ def prepare(root, upstream, component, version, revision, profile=None, features
     unknown = set(features) - set(planner.FEATURES)
     if unknown:
         raise ValueError('Unknown features: '+', '.join(sorted(unknown)))
-    if component == 'bchn' and set(features).intersection(('nng','nng-off')):
-        raise ValueError('BCHN raw-publisher candidate is not the accepted Lotus/Tobias protocol; release selection is held pending compatible port')
     plan = planner.resolve(config['series'], list(features), experimental)
     if component == 'lotusd':
         # Delegate complete Arch/Docker/version/network preparation to the same

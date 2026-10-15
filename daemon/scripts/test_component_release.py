@@ -68,8 +68,7 @@ class ComponentTests(unittest.TestCase):
         for version in ('v1.0.0','01.0.0','1.0','1.0.0;echo x'):
             with self.assertRaises(ValueError):
                 release.identity('bitcoin-core',version,1)
-        with self.assertRaises(ValueError):
-            release.identity('lotusd','11.6.1',1)
+        self.assertEqual(release.identity('lotusd','11.6.2',1), 'lotusd-v11.6.2')
         self.assertFalse((self.root/'daemon/releases').exists())
 
     def test_drift_rejected_and_stock_cannot_silently_enable_candidates(self):

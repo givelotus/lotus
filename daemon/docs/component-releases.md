@@ -2,8 +2,9 @@
 
 This is reviewable build/release infrastructure. No component release has been
 published through it. Historical `v11.6.0` and `v11.6.1` tags/assets and their
-workflow remain immutable. Namespaced Lotus candidates start at `lotusd-v12.x`;
-preparing an example version does not schedule or authorize that release.
+workflow remain immutable. Namespaced tags do not require a major version bump;
+for example, a future reviewed maintenance candidate can use `lotusd-v11.6.2`.
+Preparing an example version does not schedule or authorize that release.
 
 `daemon/components.json` is the common registry for source pins, native targets,
 base build flags, toolchains and component names. The distribution release is
@@ -75,9 +76,11 @@ python3 daemon/scripts/component-release.py --component bitcoin-abc \
   --candidate /tmp/abc-chronik-review
 ```
 
-Chronik does not select mining/chain-limit/NNG/ZeroMQ-removal patches. The rejected
-BCHN raw NNG publisher cannot be selected for release while a compatible
-Lotus/Tobias protocol port is pending. BCHN/Core Chronik and Core NNG fail closed;
+Chronik does not select mining/chain-limit/NNG/ZeroMQ-removal patches. BCHN NNG
+selects the reviewed existing FlatBuffers compatibility port only with an explicit
+custom profile and experimental opt-in. Its native macOS checks do not establish
+Linux package validation; exact component artifact CI is required for publication.
+BCHN/Core Chronik and Core NNG fail closed;
 that is a temporary implementation boundary, not completion of the BTC Chronik goal.
 
 ## Validation and publication

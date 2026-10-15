@@ -7,8 +7,10 @@ It is one mailbox patch on exact BCHN pin
 
 Source commit: `875318a9be268a3e8ba5d81e82f78ee94ff21980`.
 Source tree: `471209a4bb2384e1764e2aaaa62622097fd7ad9d`.
-Independent mailbox replay retains that tree. The current MR2176 raw implementation
-is not validation of this replacement; no external push or MR edit is made here.
+Independent mailbox replay retains that tree. Root reviewed the candidate and
+pushed corrective commit `afb6a70da7b3dcb119ca3638218fa9d49ee3001d` to MR2176,
+whose final tree is identical. Its new pipeline `2948830422` is running; previous
+raw-protocol CI does not validate this replacement.
 
 
 `BUILD_BITCOIN_NNG` is OFF by default. This is a port of the maintained

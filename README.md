@@ -26,10 +26,11 @@ docs/           — Documentation and historical protocol specifications
 
 Prebuilt binaries for Linux (`x86_64`) and macOS (`arm64`) with the **in-process Chronik indexer** compiled in are published on the [GitHub Releases](https://github.com/givelotus/lotus/releases) page.
 
-Existing `v11.6.0` assets use the earlier ABC `252182e957` base. Current source and
-release candidates use `8c67fe1e85`; candidate builds do not replace published
-assets. [Release preparation](daemon/docs/release-preparation.md) produces a
-complete candidate for review before a new immutable version is published.
+[Release `v11.6.1`](https://github.com/givelotus/lotus/releases/tag/v11.6.1)
+provides Chronik-enabled Linux x86_64 and macOS arm64 binaries on ABC `8c67fe1e85`,
+including the corrected custom block assembler. Historical `v11.6.0` assets remain
+unchanged on the earlier `252182e957` base. [Component release preparation](daemon/docs/component-releases.md)
+produces complete review candidates for future component-prefixed releases.
 
 To start `lotusd` with Chronik enabled:
 

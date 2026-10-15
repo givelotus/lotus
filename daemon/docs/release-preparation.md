@@ -1,5 +1,10 @@
 # Preparing a Lotus mainnet release
 
+Published `v11.6.1` uses this legacy workflow. For future component-prefixed
+releases, use [component release preparation](component-releases.md), which
+reuses this version/Arch/Docker/network generator inside one atomic candidate.
+
+
 `daemon/scripts/prepare-release.py` assembles the daemon version, Arch recipes,
 container inputs, optional fixed seeds/checkpoints, and a source-tree manifest
 in one review candidate. Preparation never changes a running daemon, a datadir,
