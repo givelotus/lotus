@@ -736,6 +736,51 @@ def evaluate(script: bytes, args: tuple[bytes, ...], profile: VMProfile, *,
                     raise VMError("SPLIT index out of range")
                 push(data[:index])
                 push(data[index:])
+            elif op == 0x8a:
+                width, value = _numeric(pop()), _numeric(pop())
+                if not 0 <= width <= profile.max_element_bytes:
+                    raise VMError("NUM2BIN width")
+                if width == 0:
+                    if value != 0:
+                        raise VMError("NUM2BIN overflow")
+                    push(b"")
+                else:
+                    try:
+                        push(value.to_bytes(width, "little", signed=True))
+                    except OverflowError as exc:
+                        raise VMError("NUM2BIN overflow") from exc
+            elif op == 0x8b:
+                value = pop()
+                if len(value) > 16:
+                    raise VMError("BIN2NUM width")
+                push(number(int.from_bytes(value, "little", signed=True)))
+            elif op in (0x8d, 0x8e, 0x8f, 0x90):
+                right = pop()
+                if op == 0x8d:
+                    push(bytes(byte ^ 255 for byte in right))
+                else:
+                    left = pop()
+                    if len(left) != len(right):
+                        raise VMError("bitwise operand length mismatch")
+                    operation = {0x8e: lambda a, b: a & b, 0x8f: lambda a, b: a | b,
+                                 0x90: lambda a, b: a ^ b}[op]
+                    push(bytes(operation(a, b) for a, b in zip(left, right)))
+            elif op == 0x93:
+                right, left = pop(), pop()
+                low, high = sorted((left, right), key=lambda b: (int.from_bytes(b, "little"), len(b)))
+                push(low)
+                push(high)
+            elif op == 0x94:
+                shift, data = _numeric(pop()), pop()
+                width = 8 * len(data)
+                value = int.from_bytes(data, "little")
+                if not -width < shift < width:
+                    value = 0
+                elif shift >= 0:
+                    value = (value << shift) & ((1 << width) - 1)
+                else:
+                    value >>= -shift
+                push(value.to_bytes(len(data), "little"))
             elif op == 0x8c:
                 require(1)
                 push(number(len(stack[-1])))

@@ -14,6 +14,8 @@ CHAIN = bytes(range(32))
 
 
 def push(data):
+    if not data:
+        return b"\x4c\x00"
     return bytes([len(data)]) + data if len(data) <= 75 else b'\x4c' + bytes([len(data)]) + data
 
 
@@ -106,3 +108,20 @@ class Conformance(unittest.TestCase):
         for input_index, witness_index in ((-1, 0), (True, 0), (0, -1), (0, False), (1, 0), (0, 1)):
             with self.subTest(indices=(input_index, witness_index)), self.assertRaises(ValueError):
                 authenticated_context(tx, TP, CHAIN, (coin,), input_index, witness_index)
+
+    def test_byte_conversion_bitwise_and_shifts(self):
+        cases = ((n(-128)+n(1)+b"\x8a", b"\x80"),
+            (n(0)+n(0)+b"\x8a", b""), (push(b"\x80")+b"\x8b", number(-128)),
+            (push(b"\x01\x80")+b"\x8d", b"\xfe\x7f"),
+            (push(b"\x81")+push(b"\x01")+b"\x8e", b"\x01"),
+            (push(b"\x80")+push(b"\x01")+b"\x8f", b"\x81"),
+            (push(b"\x81")+push(b"\x01")+b"\x90", b"\x80"),
+            (push(b"\x01\x01")+n(8)+b"\x94", b"\x00\x01"),
+            (push(b"\x01\x01")+n(-8)+b"\x94", b"\x01\x00"),
+            (push(b"\xff")+n(-(1<<127))+b"\x94", b"\x00"),
+            (push(b"\x00\x00")+push(b"\x00")+b"\x93\x88", b"\x00\x00\x00"))
+        for body, expected in cases:
+            with self.subTest(body=body.hex()): self.assertTrue(self.execute(body, expected).success)
+        for body in (n(128)+n(1)+b"\x8a", push(bytes(17))+b"\x8b",
+                     push(b"x")+push(b"xx")+b"\x8e"):
+            with self.assertRaises(VMError): self.execute(body)
