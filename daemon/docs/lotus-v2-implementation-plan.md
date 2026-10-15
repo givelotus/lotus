@@ -12,7 +12,9 @@ The current executable [V2 series](../patches/v2/series) contains 173 patches,
 intermediate tree. Offline daemon acceptance, restart, disconnect/reconnect,
 resumable fork recovery, bounded selection and actual two-process TCP full/compact
 synchronization have separate evidence below. Native production of signed fixture-payment blocks also passes across two nodes.
-A usable live-wallet/controller workflow remains unfinished. Development profile adoption and public launch remain pending.
+The foreground local controller now completes a live-wallet payment and restart
+across two isolated nodes; see the current controller evidence below. Development
+profile adoption and public launch remain pending.
 
 ### Historical source milestones through 069
 
@@ -933,3 +935,51 @@ deadline. Closed stdout exits without SIGPIPE. Evidence is in
 `/private/tmp/lotus-v2-wallet-cli-mock-20261015`. These mock checks do not demonstrate
 valid-context signing or an interactive live-node payment; that gate remains
 separate and pending.
+
+
+### Interactive local wallet workflow
+
+The [local controller](../../tools/lotus-v2-devnet/README.md) and
+[offline setup guide](../../tools/lotus-v2-devnet/SETUP.md) provide a foreground
+playground using the existing checked-in test profile. Setup copies its exact
+manifest, pins supplied binaries and creates explicit loopback/ephemeral-port
+configuration. It does not start processes, choose production parameters or
+reuse existing chain homes. The guide includes a fresh standalone native build
+recipe and a two-wallet walkthrough.
+
+The controller keeps node databases owned by their running native processes.
+Wallet operations use private socketpairs and the authenticated provider;
+passphrases travel over separate private EOF-framed pipes. Policies are compiled
+by the shared compiler from the canonical Payment source. Funding and payment
+use native template construction, nonce search and normal block admission.
+Sign-result ambiguity preserves public recovery information and requires explicit
+pending/export recovery rather than automatic re-signing or abandonment.
+
+Independent process tests cover framing/correlation/deadlines, bounded events,
+secret transport and cleansing, directory containment, shutdown interruption,
+and recovery from lost persisted-signature results. The real-node gate creates
+two encrypted wallets, compiles their policies, funds and matures an input,
+pays 10000 atoms with a 1000-atom fee, observes the recipient on the other node,
+and reopens the newly created node/wallet homes with the same persisted state.
+A first 100-atom fee attempt was correctly rejected as below the byte floor;
+its evidence is preserved, with no consensus adjustment.
+
+This is an isolated local playground, not a public network launch. Peers exchange
+blocks over the current TCP/compact implementation; there is no transaction
+mempool relay, QUIC or commitment-based quicksync yet. Mainnet parameters remain
+open, Chronik is off, and no production workspace, live chain or release was
+modified. Prior module-level and independent reference execution evidence remains
+separate from this native wallet/controller integration gate.
+
+
+The final combined gate passes **19/19** tests (18 process tests and one real-node
+flow) in 25.820 seconds. Exact source/test/compiler/binary hashes, command, final
+roots and cleanup are recorded in
+[evidence/v2-interactive-wallet-172.json](evidence/v2-interactive-wallet-172.json).
+The integrated source and both test files match those tested hashes. All four
+native node processes, including the two reopened instances, exit 0 with streams
+closed and no cleanup errors. The gate also confirms immature-payment refusal
+without reservations and byte-identical outgoing export after restart. Final
+height is 3, tip `5a23b7500d8d08c50ead1ae8e895f920b80a1f3ea26d632324d982da164a3203`.
+Raw public exchanges and preserved earlier outcomes remain in the evidence paths
+recorded by that file. No daemon is left running by these checks.

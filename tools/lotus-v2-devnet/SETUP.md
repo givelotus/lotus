@@ -119,3 +119,32 @@ PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover \
 
 These use temporary inert executable files and check path aliases, fresh output
 and session preservation; no native binary is invoked.
+
+
+## Tested two-wallet walkthrough
+
+With the bundled fixture and a fresh session, enter these commands at the
+controller prompt. Choose wallet passphrases when prompted; the commands contain
+only public inputs. Node names `a` and `b` come from `prepare-local.py`.
+
+```text
+wallet create alice --node a
+wallet create bob --node b
+fund alice --claim 100000 --time 1792022640 --batches 16
+mature alice --max-blocks 3 --claim 100000 --time 1792022760 --batches 16
+pay alice --to bob --amount 10000 --fee 1000 --mine-to alice --claim 100000 --time 1792022880 --batches 16
+wallet reconcile bob
+status
+stop
+```
+
+The explicit timestamps belong to the checked-in local fixture. The amounts are
+atoms, and `claim` is a requested ceiling subject to native validation. This
+sequence produces funding, maturity and payment blocks; the recipient receives
+10000 atoms and the funding input returns 89000 atoms as change. A fee of 100 was
+rejected as below the transaction byte floor during validation; 1000 passed.
+Native wallet keys and signatures are newly generated, so your transaction IDs,
+roots and nonces will differ from recorded evidence. Later operations must use
+eligible timestamps and sufficient fees; they do not inherit this sequence's
+particular monetary results. See the README for explicit recovery if signing
+has an unknown outcome.
