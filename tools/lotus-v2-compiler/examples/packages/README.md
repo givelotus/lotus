@@ -28,3 +28,8 @@ builtin-shadowing names, private/package-scoped access, missing module/symbol,
 unknown alias, cycles, lock digest mismatch, `..`/absolute/symlink escapes, case and
 Unicode collisions, undeclared files, limits) are generated from copies of this
 fixture in temporary directories by `test/packages.test.mjs`.
+
+Git module paths (`github.com/acme/lotus-std@v1.2.0`, major suffix `/v2`, root
+`[replace]`, and `lotus-v2-package-fetch`) are covered by `test/packages-git.test.mjs`
+with local `file://` repositories. This diamond fixture stays a path-only schema-1 lock.
+There is no package registry.

@@ -4,13 +4,15 @@
  * Accepted (every accepted file is also valid TOML 1.0):
  * - UTF-8 text without BOM, LF or CRLF line endings, no tab characters or control bytes;
  * - blank lines and full-line or trailing `#` comments;
- * - `[table]` headers with a bare key (no dotted, quoted, array or inline tables);
+ * - `[table]` headers with a bare key (no dotted, array or inline tables);
  * - `key = "string"` and `key = ["a", "b"]` (single line, optional trailing comma);
- * - bare keys `[A-Za-z0-9_-]+`; basic strings without escapes, quotes or control characters.
+ * - bare keys `[A-Za-z0-9_-]+` or quoted basic-string keys (no escapes);
+ * - basic strings without escapes, quotes or control characters.
  *
  * Everything else (integers, booleans, escapes, multi-line values, dotted keys,
  * duplicate keys/tables, keys before the first table) is rejected rather than
  * approximated, so two parsers cannot disagree about an accepted manifest.
+ * Quoted keys are basic strings, which TOML already allows.
  */
 export type TomlValue = string | string[];
 export type TomlDocument = Map<string, Map<string, TomlValue>>;
@@ -38,8 +40,16 @@ export function parseTomlSubset(text: string, file: string): TomlDocument {
     }
     const eq = rest.indexOf('=');
     if (eq < 0) fail('expected key = value');
-    const key = rest.slice(0, eq).trim();
-    if (!KEY.test(key)) fail(`unsupported key ${JSON.stringify(key)} (bare keys only)`);
+    const rawKey = rest.slice(0, eq).trim();
+    let key: string;
+    if (rawKey.startsWith('"')) {
+      const quoted = STRING.exec(rawKey);
+      key = quoted?.[0].length === rawKey.length ? quoted[1] ?? '' : '';
+      if (!key) fail('unsupported key (quoted keys are basic strings without escapes)');
+    } else {
+      if (!KEY.test(rawKey)) fail(`unsupported key ${JSON.stringify(rawKey)} (bare keys only)`);
+      key = rawKey;
+    }
     if (!table) fail('key outside of a table');
     if (table!.has(key)) fail(`duplicate key ${key}`);
     rest = rest.slice(eq + 1).trim();
