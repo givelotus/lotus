@@ -1,15 +1,15 @@
 # Doged on current Bitcoin ABC
 
-This review candidate contains **173 maintained mailbox patches** on immutable Bitcoin ABC **`1fb7db17c176cdea8a2c60d887891589382ee4e3`**, resolved from the primary upstream remote on 2026-10-14. It ports Tobias's Dogecoin implementation and retains current ABC/Chronik APIs. It is a working build candidate; **full Dogecoin mainnet synchronization remains incomplete**. Production nodes, data, original workspaces and published releases were not modified.
+This review candidate contains **174 maintained mailbox patches** on immutable Bitcoin ABC **`1fb7db17c176cdea8a2c60d887891589382ee4e3`**, resolved from the primary upstream remote on 2026-10-14. It ports Tobias's Dogecoin implementation and retains current ABC/Chronik APIs. It is a working build candidate; **full Dogecoin mainnet synchronization remains incomplete**. Production nodes, data, original workspaces and published releases were not modified.
 
 The old [23-patch candidate](../doged-on-current-abc-initial/README.md) remains unchanged on `8c67fe1e85a602204a2ce65aa3b643469c2c3a1d`. The validated reference `SERIES=doged` still selects original Doged `9690833b8b6709b7a7837bc397f0d04bf3b885d1`; it does not silently select this new source.
 
 | Identity | Exact value |
 | --- | --- |
 | Upstream base | `1fb7db17c176cdea8a2c60d887891589382ee4e3` |
-| Tested integration commit | `2ddac16d140df1b9637ec489bffeba287669434e` |
-| Metadata-maintained export commit | `29472b1ee39663516050d5e2064cf7fee95245a5` |
-| Final source tree | `b019768499700c6cca14007f211358bd2b0aed82` |
+| Tested integration commit | `3047eec50b23b9ad0ceba53e507c034b73ec4efa` |
+| Metadata-maintained export commit | `59b343a4dcce4259fa8eec8562ec5f0cb2cb3da2` |
+| Final source tree | `2b378152efca0ea2c578433f348e71db367202b0` |
 | Doged lineage reference | `9690833b8b6709b7a7837bc397f0d04bf3b885d1` |
 | Official Dogecoin Core comparison | `47a303a449999314abcf83bd1fc7e77dd4540fcd` |
 
@@ -25,7 +25,7 @@ python3 daemon/scripts/patch-series.py /tmp/doged-current-review \
   daemon/candidates/doged-on-current-abc/series \
   --base 1fb7db17c176cdea8a2c60d887891589382ee4e3 \
   --provenance daemon/candidates/doged-on-current-abc/manifest.json \
-  --expect-tree b019768499700c6cca14007f211358bd2b0aed82
+  --expect-tree 2b378152efca0ea2c578433f348e71db367202b0
 
 cmake -S /tmp/doged-current-review -B /tmp/doged-current-build -GNinja \
   -DBUILD_CHRONIK=ON -DBUILD_QT=OFF -DBUILD_ZMQ=OFF \
@@ -50,6 +50,7 @@ Review identified additional defects in the inherited/adapted code and repaired 
 - Dogecoin's fixed 1 MB consensus limit applies even if local excessive-block policy is raised. Mining also respects that cap.
 - Without CTOR, transaction inputs become available in block order, preserving dependency validation and UTXO undo. A hidden regtest-only activation override exercises these rules without changing inherited regtest fixture defaults; mainnet/testnet are unaffected.
 - Optional finalized mining preserves its selected transaction set but orders parents before children when CTOR is disabled; radix/transaction-ID ordering alone would produce invalid Dogecoin templates. Regression explicitly forces a child ID lower than its parent and checks selection, dependency order and determinism.
+- Restarted mainnet header presync reconstructs only the stored 80-byte base fields from an AuxPoW header index when its full block is not on disk. It retains the actual AuxPoW proof requirement for validation, wire serialization, and full-header RPC.
 - Header presync checks the same candidate-height DigiShield rule as full validation, including the first mainnet transition at 145000.
 - Aggregate block fees may exceed the per-transaction 10-billion-DOGE limit. Accumulation/reward comparison uses saturation beyond signed int64; because a valid coinbase itself is bounded far below int64 maximum, this preserves the mathematical reward comparison. Optional fee-accounting output saturates beyond about 92.23 billion DOGE. Official Core uses unchecked signed addition at that edge, so equivalence to its undefined overflow behavior is **not claimed**.
 
@@ -71,11 +72,11 @@ Use an isolated datadir and explicit ports for review. Mainnet defaults are RPC 
 
 ## Evidence and remaining validation
 
-Exact build, native/functional test and mainnet evidence is recorded separately in [validation evidence](../../docs/evidence/doged-current-abc-validation-20261014.json), [replay/build/Rust evidence](../../docs/evidence/doged-current-abc-maintenance-20261014.json), and the [validation report](../../docs/doged-current-abc-validation.md). Successful replay alone establishes no runtime property.
+Exact build, native/functional test and mainnet evidence is recorded separately in [validation evidence](../../docs/evidence/doged-current-abc-validation-20261014.json), [replay/build/Rust evidence](../../docs/evidence/doged-current-abc-maintenance-20261014.json), and the [validation report](../../docs/doged-current-abc-validation.md) and [restart follow-up](../../docs/doged-current-abc-fullsync-followup.md). Successful replay alone establishes no runtime property.
 
-The real network tests used fresh isolated data. The default-minimum-work run reached header presync but accepted **zero blocks** during its bounded observation. A separate, explicitly test-only `-minimumchainwork=0` run accepted **14,942 blocks**, ending at hash `f04f18b14bec6bf450ae09f64fed9ce8b8014df8d6424973775c65d246690420`; it remained in IBD. Offline chainstate/Chronik replay checked these downloaded blocks at `cb3a8cfc15a683972a057ff6bd2d8a6fee555b8f`; the subsequent changes only correct optional finalized mining order and its tests. The final binary separately passes offline parity and `verifychain 4 1000`. Neither result is tip synchronization, and this real-block sample does not cross DigiShield or AuxPoW activation. Generated and historical boundary tests cover those rules separately.
+The real network tests used fresh isolated data. The default-minimum-work run reached header presync but accepted **zero blocks** during its bounded observation. A separate, explicitly test-only `-minimumchainwork=0` run accepted **14,942 blocks**, ending at hash `f04f18b14bec6bf450ae09f64fed9ce8b8014df8d6424973775c65d246690420`; it remained in IBD. Offline chainstate/Chronik replay checked these downloaded blocks at `cb3a8cfc15a683972a057ff6bd2d8a6fee555b8f`; subsequent commits correct optional finalized mining order and restarted AuxPoW header presync. The newest binary separately passes offline parity and `verifychain 4 1000`. A current default-work peer run has resumed presync beyond 918,000; accepted block height remains 14,942 at the recorded observation. Neither result is tip synchronization, and this real-block sample does not cross DigiShield or AuxPoW activation. Generated and historical boundary tests cover those rules separately.
 
-Not all inherited extended functional, GUI, SDK or deployed explorer integration suites have been executed. Inherited Electrum `blockchain.address.*` aliases still parse CashAddress; native Dogecoin consumers should use the standard `blockchain.scripthash.*` methods. GUI/platform packaging and deployment, every existing database migration, live Avalanche operation, full-tip synchronization, NNG and merged-mining work service remain explicit gaps. Historical logos, landing-page styles and documentation cleanup are not all reapplied; exact dispositions are retained in the inventory.
+Not all inherited extended functional, GUI, SDK or deployed explorer integration suites have been executed. Inherited Electrum `blockchain.address.*` aliases still parse CashAddress; native Dogecoin consumers should use the standard `blockchain.scripthash.*` methods. Full-header RPC for headers-only AuxPoW entries still needs a full proof source and returns an error before the block body arrives; active indexed blocks retain full-header RPC. GUI/platform packaging and deployment, every existing database migration, live Avalanche operation, full-tip synchronization, NNG and merged-mining work service remain explicit gaps. Historical logos, landing-page styles and documentation cleanup are not all reapplied; exact dispositions are retained in the inventory.
 
 ## Provenance
 
