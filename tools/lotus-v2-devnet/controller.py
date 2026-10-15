@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import collections
 import hashlib
+import http.client
+import importlib.util
 import ipaddress
 import json
 import os
@@ -23,6 +25,15 @@ import subprocess
 import threading
 import time
 import uuid
+import sys
+import urllib.parse
+
+_discovery_spec = importlib.util.spec_from_file_location(
+    "lotus_v2_controller_discovery", Path(__file__).with_name("chronik_discovery.py")
+)
+discovery_api = importlib.util.module_from_spec(_discovery_spec)
+sys.modules[_discovery_spec.name] = discovery_api
+_discovery_spec.loader.exec_module(discovery_api)
 
 
 class ControllerError(Exception):
@@ -88,6 +99,74 @@ def endpoint(value, listen=False):
     require(not address.is_multicast and (listen or not address.is_unspecified),
             "unicast endpoint required")
     integer(value["port"], 0 if listen else 1, 65535)
+
+
+def discovery_endpoint(value):
+    """Explicit public-only local service or SSH forward; avoid DNS delays."""
+    exact(value, ("url", "chain_id", "profile_id"))
+    hexadecimal(value["chain_id"])
+    hexadecimal(value["profile_id"])
+    url = urllib.parse.urlsplit(value["url"])
+    require(url.scheme == "http" and url.hostname is not None
+            and not url.username and not url.password and not url.query
+            and not url.fragment and url.path in ("", "/"),
+            "Chronik requires an explicit local HTTP origin")
+    address = ipaddress.ip_address(url.hostname)
+    require(address.is_loopback and str(address) == url.hostname,
+            "Chronik requires a numeric loopback host")
+    require(url.port is not None and 1 <= url.port <= 65535,
+            "Chronik requires an explicit port")
+    return url
+
+
+class DeadlineSocket(socket.socket):
+    """Check the same absolute deadline on every buffered HTTP socket read."""
+    def recv_into(self, buffer, *args):
+        self.settimeout(remaining(self.deadline))
+        return super().recv_into(buffer, *args)
+
+    def sendall(self, data, *args):
+        self.settimeout(remaining(self.deadline))
+        return super().sendall(data, *args)
+
+
+class DiscoveryTransport:
+    def __init__(self, binding, deadline):
+        self.url = discovery_endpoint(binding)
+        self.deadline = deadline
+
+    def __call__(self, path, payload):
+        remaining(self.deadline)
+        data = None if payload is None else encode_json(payload)
+        require(data is None or len(data) <= 32768,
+                "discovery request capacity", "capacity_refused")
+        connection = http.client.HTTPConnection(self.url.hostname, self.url.port)
+        family = socket.AF_INET6 if ":" in self.url.hostname else socket.AF_INET
+        channel = DeadlineSocket(family, socket.SOCK_STREAM)
+        channel.deadline = self.deadline
+        connection.sock = channel
+        response = None
+        try:
+            channel.settimeout(remaining(self.deadline))
+            channel.connect((self.url.hostname, self.url.port))
+            connection.request("GET" if payload is None else "POST", path,
+                               body=data, headers={"Content-Type": "application/json"})
+            response = connection.getresponse()
+            if response.status in (409, 503):
+                raise discovery_api.RetryDiscovery("Chronik snapshot unavailable")
+            require(response.status == 200, "Chronik HTTP failure", "discovery_failed")
+            raw = response.read(256 * 1024 + 1)
+            remaining(self.deadline)
+            require(len(raw) <= 256 * 1024, "Chronik response capacity", "capacity_refused")
+            return decode_json(raw)
+        except (TimeoutError, socket.timeout) as error:
+            raise ControllerError("timeout", "Chronik operation deadline expired") from error
+        except (OSError, http.client.HTTPException) as error:
+            raise ControllerError("discovery_failed", "Chronik transport failed") from error
+        finally:
+            if response is not None:
+                response.close()
+            connection.close()
 
 
 def decimal(value):
@@ -238,7 +317,10 @@ def _load_config(path):
     )
     names, homes, magic = set(), [], None
     for node in config["nodes"]:
-        exact(node, ("name", "home", "network", "connect_to"))
+        exact(node, ("name", "home", "network", "connect_to") +
+              (("chronik",) if "chronik" in node else ()))
+        if "chronik" in node:
+            discovery_endpoint(node["chronik"])
         require(
             isinstance(node["name"], str)
             and re.fullmatch(r"[A-Za-z][A-Za-z0-9_-]{0,31}", node["name"]),
@@ -854,6 +936,7 @@ class Controller:
         self.started = False
         self.closed = False
         self.cleanup_errors = []
+        self._operation_lock = threading.Lock()
 
     def deadline(self):
         return time.monotonic() + self.config["limits"]["deadline_ms"] / 1000
@@ -924,6 +1007,10 @@ class Controller:
                     "node profile identities differ",
                 )
                 identity = observed
+                if "chronik" in item:
+                    require((item["chronik"]["chain_id"], item["chronik"]["profile_id"])
+                            == (observed[0], observed[2]),
+                            "Chronik binding differs from native node")
             self._write_new(
                 self.session / "session.json",
                 encode_json(
@@ -1047,6 +1134,46 @@ class Controller:
         finally:
             if isinstance(password, bytearray):
                 password[:] = b"\0" * len(password)
+
+    def _discover(self, name, deadline):
+        """HTTP outpoints are hints; only native track/reconcile authenticate coins."""
+        node = self._wallet(name).node
+        item = next((item for item in self.config.get("nodes", [])
+                     if item["name"] == node.name), {})
+        binding = item.get("chronik")
+        if binding is None:
+            return self._invoke(name, "reconcile", {}, deadline)
+        info = self._invoke(name, "info", {}, deadline)
+        require(info.get("payment_policy_registered") is True,
+                "wallet compiled Payment not registered")
+        expected = (binding["chain_id"], binding["profile_id"])
+        require(expected == (hexadecimal(node.ready.get("chain_id")),
+                             hexadecimal(node.ready.get("profile_digest")))
+                and expected == (hexadecimal(info.get("chain_id")),
+                                 hexadecimal(info.get("profile_digest"))),
+                "wallet/node/Chronik binding mismatch", "discovery_failed")
+        try:
+            client = discovery_api.Client(DiscoveryTransport(binding, deadline), *expected)
+            discovery, state = discovery_api.discover_and_reconcile(
+                client, info["payment_output"]["branches"],
+                lambda point: self._invoke(name, "track", {
+                    "prev_txid": point.txid, "prev_index": point.index}, deadline),
+                lambda: self._invoke(name, "reconcile", {}, deadline))
+        except (discovery_api.DiscoveryError, KeyError, TypeError) as error:
+            raise ControllerError("discovery_failed", "confirmed discovery failed: " + str(error)) from error
+        # Keep the native result intact, including pending/reserved state.
+        return dict(state, confirmed_discovery={
+            "confirmed_only": True, "pool_indexed": False,
+            "tip": discovery.snapshot.tip, "height": str(discovery.snapshot.height),
+            "generation": str(discovery.generation),
+            "candidate_count": len(discovery.candidates)})
+
+    def _discover_if_configured(self, name, deadline):
+        node = self._wallet(name).node
+        if any(item["name"] == node.name and "chronik" in item
+               for item in self.config.get("nodes", [])):
+            return self._discover(name, deadline)
+        return None
 
     def _compile(self, owner, deadline):
         hexadecimal(owner)
@@ -1222,6 +1349,19 @@ class Controller:
         )
 
     def execute(self, line):
+        """Serialize discovery and native operations under one bounded deadline."""
+        deadline = self.deadline()
+        try:
+            require(self._operation_lock.acquire(timeout=remaining(deadline)),
+                    "controller operation busy", "timeout")
+        except ControllerError as error:
+            return {"ok": False, "result": error.code, "error": str(error)}
+        try:
+            return self._execute(line, deadline)
+        finally:
+            self._operation_lock.release()
+
+    def _execute(self, line, deadline):
         """Execute one public REPL command; no hidden retry of sign or abandon."""
         signing_wallet = None
         try:
@@ -1230,7 +1370,7 @@ class Controller:
             )
             words = shlex.split(line)
             require(words, "command required")
-            deadline = self.deadline()
+            remaining(deadline)
             if words == ["stop"]:
                 self.close()
                 return {
@@ -1262,6 +1402,8 @@ class Controller:
                         "register",
                         "info",
                         "reconcile",
+                        "balance",
+                        "discover",
                         "pending",
                         "export",
                         "abandon",
@@ -1301,9 +1443,16 @@ class Controller:
                         self._compile(info["public_key"], deadline),
                         deadline,
                     )
-                elif command in ("info", "reconcile", "pending"):
+                elif command in ("info", "reconcile", "balance", "discover", "pending"):
                     require(len(words) == 3, "wallet " + command + " NAME")
-                    value = self._invoke(name, command, {}, deadline)
+                    if command == "discover":
+                        node = self._wallet(name).node
+                        require(any(item["name"] == node.name and "chronik" in item
+                                    for item in self.config["nodes"]),
+                                "node Chronik discovery is not configured")
+                    value = (self._discover(name, deadline)
+                             if command in ("reconcile", "balance", "discover")
+                             else self._invoke(name, command, {}, deadline))
                 elif command in ("export", "abandon", "broadcast", "status"):
                     require(len(words) == 4, "wallet " + command + " NAME TXID")
                     request = {"txid": hexadecimal(words[3])}
@@ -1322,6 +1471,7 @@ class Controller:
                     recipient = dict(
                         info["payment_output"], value=decimal(options["amount"])
                     )
+                    self._discover_if_configured(name, deadline)
                     if command in ("sign", "pay"):
                         signing_wallet = name
                     value = self._invoke(
@@ -1359,6 +1509,7 @@ class Controller:
                 recipient = dict(
                     info["payment_output"], value=decimal(options["amount"])
                 )
+                self._discover_if_configured(words[1], deadline)
                 signing_wallet = words[1]
                 signed = self._invoke(
                     words[1],
