@@ -47,8 +47,13 @@ def prepare(args):
     for path in compiler_files:
         if not path.is_file():
             raise ValueError(f'missing built compiler input: {path}')
-    output = Path(args.output).expanduser().absolute()
-    session = Path(args.session).expanduser().absolute()
+    output_arg = Path(args.output).expanduser()
+    session_arg = Path(args.session).expanduser()
+    # Refuse leaf symlinks before resolving parent aliases and '..'.
+    if output_arg.is_symlink() or session_arg.is_symlink():
+        raise ValueError('output and session must not be symlinks')
+    output = output_arg.resolve(strict=False)
+    session = session_arg.resolve(strict=False)
     if output.exists() or output.is_symlink():
         raise ValueError('output must be a fresh directory')
     if session.exists() or session.is_symlink() or not session.parent.is_dir():

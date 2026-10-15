@@ -18,9 +18,15 @@ From this monorepo, set absolute paths for an **unused** native source directory
 and an installed Python interpreter, then run:
 
 ```sh
+(
+set -eu
 MONOREPO="$PWD"
 NATIVE=/absolute/unused/lotus-v2-native
 PYTHON=/absolute/path/to/python3.13
+if [ -e "$NATIVE" ] || [ -L "$NATIVE" ]; then
+  echo "Native destination already exists: $NATIVE" >&2
+  exit 1
+fi
 git clone https://github.com/Bitcoin-ABC/bitcoin-abc.git "$NATIVE"
 git -C "$NATIVE" checkout --detach 1fb7db17c176cdea8a2c60d887891589382ee4e3
 while IFS= read -r patch; do
@@ -29,8 +35,10 @@ while IFS= read -r patch; do
 done < "$MONOREPO/daemon/patches/v2/series"
 cmake -S "$NATIVE" -B "$NATIVE/build" -G Ninja \
   -DCMAKE_BUILD_TYPE=Debug -DBUILD_CHRONIK=OFF \
+  -DBUILD_QT=OFF -DBUILD_SEEDER=OFF -DBUILD_ZMQ=OFF \
   -DPython_EXECUTABLE="$PYTHON"
 cmake --build "$NATIVE/build" --target lotusd lotus-v2-wallet-client -j 6
+)
 ```
 
 Stop if patch application fails; preserve that clone and its diagnostics.
@@ -101,3 +109,13 @@ After reviewing the inputs, run the second command in generated `commands.txt`
 isolated processes. See [README.md](README.md) for interactive commands and
 wallet passphrase handling. The setup packet itself performs only offline
 validation; it makes no claim of public deployment readiness.
+
+Run the setup path-safety regressions offline with:
+
+```sh
+PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover \
+  -s tools/lotus-v2-devnet/fixtures -v
+```
+
+These use temporary inert executable files and check path aliases, fresh output
+and session preservation; no native binary is invoked.
