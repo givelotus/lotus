@@ -1,6 +1,6 @@
 # Lotus validation evidence
 
-This file records executed evidence, not planned acceptance. Updated October 9, 2026.
+This file records executed evidence, not planned acceptance. Updated October 14, 2026. Historical records retain their original scope; later records below supersede earlier NOT_RUN entries only for the stated slice.
 
 | Record | Scope | Result | Limits |
 | --- | --- | --- | --- |
@@ -12,10 +12,24 @@ This file records executed evidence, not planned acceptance. Updated October 9, 
 | V1-BASE | Compatible reference release and target chain | NOT_RUN / not pinned | Release-name and historical-height leads only |
 | V1-SYNC | Full clean live-network sync and stalled-state recovery | NOT_RUN | Requires faster hardware and incident evidence |
 | V1-RELEASE | Modern compatible daemon release | NOT_RUN | No validated-v1 commit selected |
-| V2-REFERENCE | Executable consensus/ABI corpus | NOT_RUN | Open decisions; examples currently pseudocode |
-| V2-DAEMON | Payment/block/undo and full feature conformance | NOT_RUN | Depends on validated v1 and accepted rules |
+| V2-REFERENCE | Executable consensus/ABI corpus | PARTIAL: Python reference and TypeScript compiler tests, executable signed payment/token fixtures, native differential checks | Full consensus and block conformance remain incomplete; see October 14 evidence below |
+| V2-DAEMON | Payment/block/undo and full feature conformance | PARTIAL: 26 reviewed native module patches replay exactly | Full daemon consensus wiring, block acceptance and persistent undo remain untested |
 | V2-PERFORMANCE | Storage, mining, VM, crypto and propagation measurements | NOT_RUN | No nanosecond/throughput/recovery guarantees |
-| V2-MONETARY | Exact recurrence and timestamp-incentive analysis | NOT_RUN | Economic objective and mechanism must be specified |
+| V2-MONETARY | Exact recurrence and timestamp-incentive analysis | PARTIAL: executable Python recurrence and accounting tests | Native integration, economic simulation and production parameter acceptance remain outstanding |
+
+## October 14 implementation evidence
+
+Canonical V2 commit `c91ab148` integrates the [26-patch native review packet](../candidates/v2-native-reviewed-20261014/README.md). Its manifest records the ABC base, each mailbox digest and intermediate tree; clean replay ends at `b0c32ae8ded2cdfa520bd91cf579d991c8dfa004`. Focused native framing, commitments, state, signing and VM checks passed. The packet records reproduction commands and exact coverage; these isolated modules are not a daemon that accepts V2 blocks.
+
+Compiler integration at `379a6882` passes 56 tests without skips, including 256 seeded optimized/unoptimized comparisons against the independent Python VM. The [pipeline demo](../../tools/lotus-v2-compiler/examples/compiler-pipeline/README.md) exercises promise-based semantic dependencies and the bounded symbolic optimizer. Its sample reduces 31 instructions to 11 and 95 bytes to 75. Parsing itself remains synchronous. The [gallery](../../tools/lotus-v2-compiler/examples/gallery/README.md) contains executable mint and transfer contracts.
+
+Native fixture integration `789798c2` executes all five signed mint/transfer witness invocations with charged native VM success, and rejects unauthorized signatures, a re-signed path bypass, and mint-context coin access. It independently checks identities, branch proofs and signatures. The explicit illustrative cost profile is not a frozen network schedule; no full transaction/block validity is inferred from this harness.
+
+Spec/reference correction `7af9277b` passes 44 Python reference tests and the structural fixture checker. It clarifies composed invocation caps, checked u128 intermediate arithmetic, and skipped BREAK behavior. The reviewed native VM agrees with Python on 298 execution and 477 static-cost cases at the 26-patch integration tree. Newer candidates require separate review and evidence before replacing these counts.
+
+Miner integration `41456528` has exact subtree `ade6e7c5c3a3d6cf13d8d44eeec570d37729bf8d`. Root reran 17 workspace tests, strict Clippy and formatting checks; all three OpenCL device tests passed on Apple M5 Max. The [miner packet](../candidates/v2-miner-20261014/README.md) preserves six ordered mailboxes and replay evidence. P04 CPU/GPU parity and startup rejection are tested; daemon mining jobs, submission and an accepted GPU-mined development block remain outstanding.
+
+The October 9 MODEL-01 hashes below identify that historical run. Current saved fixture digests are maintained in `docs/lotus-v2/examples/candidate-smoke-vectors.json`; do not use the historical hashes as current-file checksums.
 
 ## MODEL-01 reproduction
 

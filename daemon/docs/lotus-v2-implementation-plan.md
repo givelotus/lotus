@@ -73,7 +73,7 @@ V1 patches can contain unrelated historical changes. Review actual diff hunks, n
 
 ## Miner and pool contract (V2-06)
 
-Update the repository's [miner](../../miner), including its Rust block/template parser, CPU verifier, OpenCL kernels, library, CLI and GUI. The current SHA256-oriented source is a porting input. Merely updating the daemon's block assembler does not complete mining support.
+Update the repository's [miner](../../miner), including its Rust block/template parser, CPU verifier, OpenCL kernels, library, CLI and GUI. The V2 branch now includes the maintained V1 miner plus tested P04 CPU and OpenCL hashing, explicit protocol selection and fallible startup configuration. The [six-patch review packet](../candidates/v2-miner-20261014/README.md) records exact source trees and validation. V2 network mining remains disabled until daemon jobs and scheduling are integrated. Merely updating the daemon's block assembler does not complete mining support.
 
 The miner must preserve V1 mining while adding explicit protocol selection (proposed CLI `--protocol=v1|v2`, with an equivalent GUI setting and V1 as the default). Selection binds the template parser, header serialization, hash function, target interpretation and GPU kernel together; a raw kernel switch alone is insufficient. Reject a mismatched chain/job/profile and fail clearly if the chosen backend is unavailable. Until end-to-end V2 support is implemented, selecting V2 must report unsupported operation rather than run the V1 kernel. Use the newer maintained miner on `main` as the porting reference, preserving its packaging and toolchain fixes when integrating onto the older V2 branch.
 
