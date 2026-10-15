@@ -6,18 +6,20 @@
 //! little-endian bytes, not the reversed V1 RPC display order.
 //! Byte layout: `L2JB` || version `1` || job-id length `u8` || job id UTF-8
 //! || chain id (32) || target (32) || header (134).
-//! `submit` and `mine_network` refuse network mining. They do not connect,
-//! spawn a daemon, or search nonces.
+//! `mine_local` searches at most 256 nonces in-process. It does not open a
+//! socket, spawn a daemon, or submit a found header. `submit` and
+//! `mine_network` refuse network mining.
 
 use thiserror::Error;
 
-use crate::v2_header::{self, HEADER_LEN};
+use crate::v2_header::{self, HEADER_LEN, NONCE_OFFSET};
 
 const MAGIC: &[u8] = b"L2JB";
 const VERSION: u8 = 1;
 const JSON_FIELDS: [&str; 5] = ["protocol", "job_id", "chain_id", "header", "target"];
 const JOB_ID_MAX_LEN: usize = 128;
 const V1_HEADER_LEN: usize = 160;
+const MAX_LOCAL_ATTEMPTS: u64 = 256;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct V2Job {
@@ -39,6 +41,8 @@ pub enum V2JobError {
         "unsupported V2 network submission: daemon jobs and pool submission are not available"
     )]
     UnsupportedNetworkSubmission,
+    #[error("local nonce search accepts at most 256 attempts, requested {requested}")]
+    TooManyAttempts { requested: u64 },
     #[error("malformed V2 job: {0}")]
     Malformed(&'static str),
 }
@@ -191,14 +195,43 @@ impl V2Job {
         v2_header::hashes(&self.header, &self.chain_id)
     }
 
-    /// Refuses pool and lotusd submission. No socket, daemon, or nonce search.
+    /// Refuses pool and lotusd submission. No socket and no daemon.
     pub fn mine_network(&self) -> Result<(), V2JobError> {
         Err(V2JobError::UnsupportedNetworkSubmission)
     }
 
-    /// Refuses network submission of this job. No socket, daemon, or nonce search.
+    /// Refuses network submission of this job. No socket and no daemon.
     pub fn submit(&self) -> Result<(), V2JobError> {
         self.mine_network()
+    }
+
+    /// Local nonce search. At most 256 attempts, no socket, and no daemon.
+    /// On success, stores the first nonce at or above `start_nonce` whose
+    /// block id meets this job's target. On a miss, leaves the header
+    /// unchanged. More than 256 attempts fails before hashing. A found
+    /// header is not submitted.
+    pub fn mine_local(&mut self, start_nonce: u64, max_attempts: u64) -> Result<bool, V2JobError> {
+        if max_attempts > MAX_LOCAL_ATTEMPTS {
+            return Err(V2JobError::TooManyAttempts {
+                requested: max_attempts,
+            });
+        }
+        let original = self.header;
+        for offset in 0..max_attempts {
+            let Some(nonce) = start_nonce.checked_add(offset) else {
+                break;
+            };
+            let mut candidate = original;
+            candidate[NONCE_OFFSET..NONCE_OFFSET + 8].copy_from_slice(&nonce.to_le_bytes());
+            let block_id = v2_header::hashes(&candidate, &self.chain_id)
+                .map_err(|_| V2JobError::Malformed("header hash failed"))?
+                .2;
+            if v2_header::meets_target(&block_id, &self.target) {
+                self.header = candidate;
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 }
 
@@ -231,7 +264,27 @@ fn decode_hex(text: &str, invalid: &'static str) -> Result<Vec<u8>, V2JobError> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::v2_header::{hashes, NONCE_OFFSET};
+    use crate::v2_header::{hashes, meets_target, NONCE_OFFSET};
+
+    const TEMPLATE_JSON: &str = r#"{"protocol":"v2","job_id":"native-037-template","chain_id":"000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f","header":"2ba3f975fbc1840b9cb4acc6aa84a88539010eb2132cb06a43168b1cb6b66ae5ffff002178f1536500000000000000000000020000009001000000000000050000000000000033333333333333333333333333333333333333333333333333333333333333334444444444444444444444444444444444444444444444444444444444444444","target":"000000000000000000000000000000000000000000000000000000000000ffff"}"#;
+
+    fn header_nonce(header: &[u8; HEADER_LEN]) -> u64 {
+        let mut bytes = [0u8; 8];
+        bytes.copy_from_slice(&header[NONCE_OFFSET..NONCE_OFFSET + 8]);
+        u64::from_le_bytes(bytes)
+    }
+
+    fn subtract_one(mut value: [u8; 32]) -> Option<[u8; 32]> {
+        for byte in &mut value {
+            if *byte == 0 {
+                *byte = 0xff;
+            } else {
+                *byte -= 1;
+                return Some(value);
+            }
+        }
+        None
+    }
 
     const HEADER_HEX: &str = concat!(
         "202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f",
@@ -411,8 +464,7 @@ mod tests {
     fn parses_cpp_block_template_and_refuses_network_submission() {
         // Nonce-0 header from the native-037 BuildChildHeader fixture.
         // Digests are that process's BodyHash, WorkHash, and BlockId.
-        const JSON: &str = r#"{"protocol":"v2","job_id":"native-037-template","chain_id":"000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f","header":"2ba3f975fbc1840b9cb4acc6aa84a88539010eb2132cb06a43168b1cb6b66ae5ffff002178f1536500000000000000000000020000009001000000000000050000000000000033333333333333333333333333333333333333333333333333333333333333334444444444444444444444444444444444444444444444444444444444444444","target":"000000000000000000000000000000000000000000000000000000000000ffff"}"#;
-        let job = V2Job::from_json(JSON).unwrap();
+        let job = V2Job::from_json(TEMPLATE_JSON).unwrap();
         assert_eq!(job.job_id(), "native-037-template");
         assert_eq!(job.header().len(), HEADER_LEN);
         assert_eq!(job.chain_id().len(), 32);
@@ -440,6 +492,61 @@ mod tests {
             assert_eq!(err, V2JobError::UnsupportedNetworkSubmission);
             assert_eq!(err.to_string(), expected);
         }
+    }
+
+    #[test]
+    fn mine_local_finds_template_within_eight_attempts_without_submitting() {
+        let mut job = V2Job::from_json(TEMPLATE_JSON).unwrap();
+        let before = *job.header();
+        assert!(job.mine_local(0, 8).unwrap());
+        let nonce = header_nonce(job.header());
+        assert!(nonce < 8);
+        let (body, _work, block_id) = job.hashes().unwrap();
+        assert!(meets_target(&block_id, job.target()));
+        assert_eq!(body, hashes(&before, job.chain_id()).unwrap().0);
+        let expected =
+            "unsupported V2 network submission: daemon jobs and pool submission are not available";
+        for err in [job.submit().unwrap_err(), job.mine_network().unwrap_err()] {
+            assert_eq!(err, V2JobError::UnsupportedNetworkSubmission);
+            assert_eq!(err.to_string(), expected);
+        }
+    }
+
+    #[test]
+    fn mine_local_rejects_more_than_256_attempts_without_changing_header() {
+        let mut job = V2Job::from_json(TEMPLATE_JSON).unwrap();
+        let before = *job.header();
+        assert_eq!(
+            job.mine_local(9, 257).unwrap_err(),
+            V2JobError::TooManyAttempts { requested: 257 }
+        );
+        assert_eq!(job.header(), &before);
+        assert_eq!(
+            job.mine_network().unwrap_err(),
+            V2JobError::UnsupportedNetworkSubmission
+        );
+    }
+
+    #[test]
+    fn mine_local_misses_a_hard_target_within_four_attempts() {
+        let parsed = V2Job::from_json(TEMPLATE_JSON).unwrap();
+        let mut lowest: Option<[u8; 32]> = None;
+        for nonce in 0..4u64 {
+            let mut header = *parsed.header();
+            header[NONCE_OFFSET..NONCE_OFFSET + 8].copy_from_slice(&nonce.to_le_bytes());
+            let block_id = hashes(&header, parsed.chain_id()).unwrap().2;
+            lowest = Some(match lowest {
+                Some(best) if meets_target(&best, &block_id) => best,
+                _ => block_id,
+            });
+        }
+        let target = subtract_one(lowest.expect("four candidate ids")).expect("ids are not zero");
+        let mut json: serde_json::Value = serde_json::from_str(TEMPLATE_JSON).unwrap();
+        json["target"] = serde_json::Value::String(hex::encode(target));
+        let mut job = V2Job::from_json(&json.to_string()).unwrap();
+        let before = *job.header();
+        assert_eq!(job.mine_local(0, 4).unwrap(), false);
+        assert_eq!(job.header(), &before);
     }
 
     #[test]
