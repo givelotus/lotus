@@ -289,3 +289,22 @@ parsing and mainnet chainparams. Review the proposed development profile before
 adoption. Exercise signed mature spends and reorgs through the daemon path, then
 complete the compiler transaction/block pilot. QUIC remains a separately reviewed
 second networking milestone. No public testnet or mainnet parameter freeze is claimed.
+
+## Accepted-block cost diagnostics (patch 103)
+
+All 104 mailboxes replay with exact intermediate trees; final tree
+`1ab2e37d3cbcfc739e07d74db9416fb67a4b437a`. See
+[replay evidence](evidence/v2-series-replay-103.json). Independent review found no
+semantic change: diagnostics retain the authenticated effective costs passed to
+monetary validation and appear only after durable acceptance. Integer values use
+decimal strings to preserve precision.
+
+Fresh clean native source `dca9abe76` at
+`/private/tmp/lotus-v2-daemon-costs-exact-20261015` builds Debug lotusd and passes
+development-chain, disk and peer-codec checks with Chronik off. Log:
+`/private/tmp/lotus-v2-costs-exact-build-20261015.log`. The process-level verifier
+also passes at `/private/tmp/lotus-v2-costs-exact-evidence-20261015`: first-block
+accounting/enforcement totals both equal the independent Python value 46,362,
+and rejected submissions expose no accepted costs. Restart/undo/reconnect and
+malformed-input checks retain their prior scope. This enables full signed compiler
+block comparisons without changing schedules or adopting a network profile.
