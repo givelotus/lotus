@@ -2,7 +2,8 @@ import { blake3 } from '@noble/hashes/blake3';
 import { schnorr } from '@noble/curves/secp256k1';
 import { assertPortableName } from './names.js';
 
-export type Span = { start: number; end: number };
+/** UTF-8 (schema 2) or UTF-16 (schema 1) offsets. `module` is set only by package builds. */
+export type Span = { start: number; end: number; module?: string };
 type Token = { text: string; span: Span };
 export type PaymentAst = { kind: 'Payment'; name: string; ownerName: string; signatureName: string; span: Span; ownerSpan: Span; checkSpan: Span };
 export type PaymentIr = { kind: 'checksig'; signature: 'Signature'; publicKey: 'PublicKey'; stackBefore: ['Signature']; stackAfter: ['Boolean']; span: Span };

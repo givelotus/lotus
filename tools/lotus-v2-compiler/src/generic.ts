@@ -9,20 +9,27 @@ export type { SchedulerEvent } from './scheduler.js';
 export type ValueType = 'PublicKey' | 'Signature' | 'Bytes32' | `Bytes(${number})` | 'Int' | 'Amount' | 'TokenId' | 'Bool' | 'MethodLeafHash' | 'ContractRootHash' | 'InputIndex' | 'OutputIndex';
 export type BoundValue = string | boolean | bigint;
 type Token = { text: string; span: Span };
-type Param = { name: string; type: ValueType; span: Span };
-type Expr = { kind: 'name' | 'number' | 'bool' | 'call' | 'binary' | 'unary'; span: Span; value?: string; args?: Expr[]; left?: Expr; right?: Expr };
-type Stmt = { kind: 'require' | 'if' | 'for' | 'assign'; span: Span; expr?: Expr; then?: Stmt[]; otherwise?: Stmt[]; variable?: string; collection?: 'tx.inputs' | 'tx.outputs'; assignOp?: '=' | '+=' | '-=' };
-type Helper = { name: string; params: Param[]; result: ValueType; body: Expr; span: Span };
-type Method = { name: string; params: Param[]; body: Stmt[]; span: Span };
-type Contract = { name: string; kind: 'contract' | 'token'; params: Param[]; methods: Method[]; span: Span };
-type Program = { helpers: Map<string, Helper>; contracts: Map<string, Contract> };
+export type Param = { name: string; type: ValueType; span: Span };
+export type Expr = { kind: 'name' | 'number' | 'bool' | 'call' | 'binary' | 'unary'; span: Span; value?: string; args?: Expr[]; left?: Expr; right?: Expr };
+export type Stmt = { kind: 'require' | 'if' | 'for' | 'assign'; span: Span; expr?: Expr; then?: Stmt[]; otherwise?: Stmt[]; variable?: string; collection?: 'tx.inputs' | 'tx.outputs'; assignOp?: '=' | '+=' | '-=' };
+/** `private` (default, module only), `package` (same package) or `export` (other packages via exported modules). */
+export type Visibility = 'private' | 'package' | 'export';
+export type Helper = { name: string; params: Param[]; result: ValueType; body: Expr; span: Span; visibility: Visibility };
+export type Method = { name: string; params: Param[]; body: Stmt[]; span: Span };
+export type Contract = { name: string; kind: 'contract' | 'token'; params: Param[]; methods: Method[]; span: Span };
+/** `import TARGET::path::{a, b as c};` or `import TARGET::path as alias;` where TARGET is a dependency alias or `package`. */
+export type ImportDecl = { target: string; targetSpan: Span; path: string[]; pathSpan: Span; span: Span;
+  items?: { name: string; local: string; span: Span }[]; moduleAlias?: { name: string; span: Span } };
+export type Program = { helpers: Map<string, Helper>; contracts: Map<string, Contract>; imports: ImportDecl[] };
 type Binding = { type: ValueType; value: string | boolean };
 export type MethodArtifact = { name: string; args: { name: string; type: ValueType }[]; invocation?: 'spend' | 'mint'; mintAmountParam?: string; scriptHex: string; leaf: string; proof: string[]; root: string;
   sourceMap: { source: Span; expandedFrom?: Span; optimizedFrom?: { op: string; source: Span; expandedFrom?: Span }[]; byteStart: number; byteEnd: number; op: string }[];
   staticResources: { scriptBytes: number; opcodes: number; maxStackItems: number; helperExpansions: number; dynamicSignatureChecks: number } };
 export type ContractArtifact = { schema: 'lotus-v2/contract-artifact/2'; target: 'P01-P02-P03-candidate-2026-10-14'; contract: string; kind?: 'contract' | 'token';
   constructor: { name: string; type: ValueType }[]; bindings: { name: string; type: ValueType; value: string | boolean }[];
-  methods: MethodArtifact[]; policy: { branches: [string]; paths: [[0]]; root: string; treeRecipe: 'sorted-leaves-largest-power-split-v1' } };
+  methods: MethodArtifact[]; policy: { branches: [string]; paths: [[0]]; root: string; treeRecipe: 'sorted-leaves-largest-power-split-v1' };
+  /** Present only for package builds (CABI-07); see packages.ts. */
+  build?: import('./packages.js').BuildGraph };
 export type CompileOptions = { contract: string; bindings: Record<string, Record<string, BoundValue>>; optimize?: boolean };
 
 const MAX_SOURCE = 65536, MAX_SCRIPT = 8192, MAX_OPS = 4096, MAX_EXPANSIONS = 256, MAX_METHODS = 16;
@@ -32,7 +39,7 @@ function symbol(name: string): void { assertPortableName(name); }
 function utf8Offset(source: string, utf16: number): number { return new TextEncoder().encode(source.slice(0, utf16)).length; }
 function lex(source: string): Token[] {
   if (new TextEncoder().encode(source).length > MAX_SOURCE) throw new Error('source exceeds 65536 UTF-8 bytes');
-  const re = /\s+|\/\/[^\n]*|\/\*[\s\S]*?\*\/|==|!=|>=|<=|\+=|-=|&&|\|\||[A-Za-z_][A-Za-z_0-9]*|[0-9]+|[<>{}():;,.!+*\-=]/gy;
+  const re = /\s+|\/\/[^\n]*|\/\*[\s\S]*?\*\/|==|!=|>=|<=|\+=|-=|&&|\|\||::|[A-Za-z_][A-Za-z_0-9]*|[0-9]+|[<>{}():;,.!+*\-=]/gy;
   const out: Token[] = []; let pos = 0;
   while (pos < source.length) {
     re.lastIndex = pos; const m = re.exec(source);
@@ -76,6 +83,11 @@ class Parser {
     else if (start.text === 'true' || start.text === 'false') { this.take(); left = { kind: 'bool', value: start.text, span: start.span }; }
     else {
       const name = this.ident(); let value = name.text;
+      if (this.peek().text === '::') {
+        // Module-alias call `alias::helper(...)`; only meaningful in package builds.
+        this.take('::'); value += '::' + this.ident().text;
+        if (this.peek().text !== '(') throw new Error(`qualified name ${value} must be called at UTF-8 byte ${name.span.start}`);
+      }
       while (this.peek().text === '.') { this.take('.'); value += '.' + this.ident().text; }
       if (this.peek().text === '(') {
         this.take('('); const args: Expr[] = [];
@@ -104,15 +116,56 @@ class Parser {
     }
     this.take('}'); return out;
   }
-  parse(): Program {
-    const helpers = new Map<string, Helper>(); const contracts = new Map<string, Contract>();
+  private importDecl(start: Token): ImportDecl {
+    const target = this.take();
+    if (target.text !== 'package' && !/^[A-Za-z_][A-Za-z_0-9]*$/.test(target.text)) throw new Error(`expected dependency alias or package at UTF-8 byte ${target.span.start}`);
+    if (target.text !== 'package') symbol(target.text);
+    const path: string[] = []; let items: ImportDecl['items']; let pathEnd = target.span.end;
+    while (this.peek().text === '::') {
+      this.take('::');
+      if (this.peek().text === '{') {
+        this.take('{'); items = [];
+        while (this.peek().text !== '}') {
+          const name = this.ident(); symbol(name.text); let local = name;
+          if (this.peek().text === 'as') { this.take('as'); local = this.ident(); symbol(local.text); }
+          items.push({ name: name.text, local: local.text, span: { start: name.span.start, end: local.span.end } });
+          if (this.peek().text !== ',') break; this.take(',');
+        }
+        this.take('}');
+        if (!items.length) throw new Error(`empty import list at UTF-8 byte ${start.span.start}`);
+        break;
+      }
+      const segment = this.ident(); path.push(segment.text); pathEnd = segment.span.end;
+    }
+    if (!path.length) throw new Error(`import requires a module path at UTF-8 byte ${start.span.start}`);
+    let moduleAlias: ImportDecl['moduleAlias'];
+    if (!items) {
+      if (this.peek().text !== 'as') throw new Error(`import requires ::{names} or 'as alias' at UTF-8 byte ${this.peek().span.start}`);
+      this.take('as'); const alias = this.ident(); symbol(alias.text); moduleAlias = { name: alias.text, span: alias.span };
+    }
+    const end = this.take(';');
+    return { target: target.text, targetSpan: target.span, path, pathSpan: { start: target.span.start, end: pathEnd },
+      span: { start: start.span.start, end: end.span.end }, ...(items ? { items } : {}), ...(moduleAlias ? { moduleAlias } : {}) };
+  }
+  parse(requireContract = true): Program {
+    const helpers = new Map<string, Helper>(); const contracts = new Map<string, Contract>(); const imports: ImportDecl[] = [];
     while (this.peek().text !== '<eof>') {
-      const start = this.take();
+      let start = this.take();
+      if (start.text === 'import') {
+        if (helpers.size || contracts.size) throw new Error(`import must precede declarations at UTF-8 byte ${start.span.start}`);
+        imports.push(this.importDecl(start)); continue;
+      }
+      let visibility: Visibility = 'private';
+      if (start.text === 'export' || start.text === 'package') {
+        visibility = start.text;
+        if (this.peek().text !== 'function') throw new Error(`${start.text} applies only to helper functions at UTF-8 byte ${start.span.start}`);
+        const modifier = start; start = this.take(); start = { text: start.text, span: { start: modifier.span.start, end: start.span.end } };
+      }
       if (start.text === 'function') {
         const name = this.ident(); this.take('('); const params = this.params(')'); this.take(':'); const result = this.type(); this.take('{'); this.take('return'); const body = this.expression(); this.take(';'); const end = this.take('}');
         symbol(name.text);
         if (helpers.has(name.text)) throw new Error(`duplicate helper ${name.text}`);
-        helpers.set(name.text, { name: name.text, params, result, body, span: { start: start.span.start, end: end.span.end } });
+        helpers.set(name.text, { name: name.text, params, result, body, span: { start: start.span.start, end: end.span.end }, visibility });
       } else if (start.text === 'contract' || start.text === 'token') {
         const name = this.ident(); symbol(name.text); const params = this.peek().text === '<' ? (this.take('<'), this.params('>')) : [];
         this.take('{'); const methods: Method[] = [];
@@ -127,8 +180,8 @@ class Parser {
         contracts.set(name.text, { name: name.text, kind:start.text as 'contract'|'token', params, methods, span: { start: start.span.start, end: end.span.end } });
       } else throw new Error(`expected contract or helper at UTF-8 byte ${start.span.start}`);
     }
-    if (!contracts.size) throw new Error('source has no contract');
-    return { helpers, contracts };
+    if (requireContract && !contracts.size) throw new Error('source has no contract');
+    return { helpers, contracts, imports };
   }
 }
 
@@ -588,13 +641,27 @@ class Compiler {
   }
 }
 
+function singleModule(source: string): Program {
+  const program = new Parser(lex(source)).parse();
+  if (program.imports.length) throw new Error(`import at UTF-8 byte ${program.imports[0]!.span.start} requires a package build (compilePackage)`);
+  return program;
+}
 export function compileContract(source: string, options: CompileOptions): ContractArtifact {
   if (typeof options?.contract !== 'string' || !options.bindings || typeof options.bindings !== 'object') throw new Error('compile options require contract and bindings');
-  return new Compiler(new Parser(lex(source)).parse(), options).compile();
+  return new Compiler(singleModule(source), options).compile();
 }
 export async function compileContractAsync(source: string, options: CompileOptions, onEvent?: (event: SchedulerEvent) => void): Promise<ContractArtifact> {
   if (typeof options?.contract !== 'string' || !options.bindings || typeof options.bindings !== 'object') throw new Error('compile options require contract and bindings');
-  return new Compiler(new Parser(lex(source)).parse(), options).compileAsync(onEvent);
+  return new Compiler(singleModule(source), options).compileAsync(onEvent);
+}
+/** @internal Package linker entry: parse one module (declaration-only modules may omit contracts). */
+export function parseModuleSource(source: string, requireContract: boolean): Program {
+  return new Parser(lex(source)).parse(requireContract);
+}
+/** @internal Package linker entry: compile an already linked program through the promise scheduler. */
+export async function compileLinkedProgramAsync(program: Program, options: CompileOptions, onEvent?: (event: SchedulerEvent) => void): Promise<ContractArtifact> {
+  if (typeof options?.contract !== 'string' || !options.bindings || typeof options.bindings !== 'object') throw new Error('compile options require contract and bindings');
+  return new Compiler(program, options).compileAsync(onEvent);
 }
 export async function compileContractWithTrace(source: string, options: CompileOptions): Promise<{ artifact: ContractArtifact; trace: SchedulerEvent[] }> {
   const trace: SchedulerEvent[] = [];

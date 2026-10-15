@@ -1,0 +1,463 @@
+/**
+ * CABI-07: deterministic, offline package/module resolution for the contract compiler.
+ *
+ * Build-time only. Nothing here is consensus, VM, runtime or transaction code: the
+ * resolver reads declared local files, checks them against `lotus.lock`, parses each
+ * immutable module identity once, links explicit imports into one helper namespace and
+ * hands the linked program to the existing scheduler/compiler. There is no network,
+ * registry, clock or environment input.
+ */
+import { lstatSync, readdirSync, readFileSync, realpathSync, statSync, writeFileSync } from 'node:fs';
+import { join, relative, sep } from 'node:path';
+import { bytes, concat, cs, hex, tagged, type Span } from './compiler.js';
+import { compileLinkedProgramAsync, parseModuleSource, type CompileOptions, type Contract, type ContractArtifact, type Expr, type Helper,
+  type ImportDecl, type Method, type Param, type Program, type SchedulerEvent, type Stmt } from './generic.js';
+import { assertPortableName } from './names.js';
+import { PromiseScheduler } from './scheduler.js';
+import { parseTomlSubset, type TomlValue } from './toml-subset.js';
+
+export const COMPILER_NAME = '@lotus/v2-payment-compiler';
+export const COMPILER_VERSION = '0.1.0';
+export const MANIFEST_FILE = 'lotus.toml';
+export const LOCK_FILE = 'lotus.lock';
+export const LOCK_SCHEMA = 'lotus-v2/package-lock/1';
+export const BUILD_GRAPH_SCHEMA = 'lotus-v2/build-graph/1';
+const TARGET = 'P01-P02-P03-candidate-2026-10-14';
+const BUILTINS = new Set(['leaf_hash', 'contract_root', 'merkle_root', 'checksig', 'sha256', 'hash256', 'blake3']);
+const COMMITMENT_BUILTINS = new Set(['leaf_hash', 'contract_root', 'merkle_root']);
+const MAX_WALK_ENTRIES = 4096;
+
+export type PackageLimits = { maxPackages: number; maxModules: number; maxImportDepth: number; maxImportBindings: number; maxSourceBytes: number };
+export const DEFAULT_PACKAGE_LIMITS: PackageLimits = { maxPackages: 64, maxModules: 256, maxImportDepth: 32, maxImportBindings: 4096, maxSourceBytes: 4 * 1024 * 1024 };
+
+export type PackageErrorCode = 'manifest' | 'path-escape' | 'symlink-escape' | 'path-collision' | 'undeclared-file' | 'missing-module' | 'lock-missing' |
+  'lock-mismatch' | 'lock-stale' | 'version-conflict' | 'package-cycle' | 'parse' | 'unknown-alias' | 'not-exported' | 'missing-symbol' |
+  'visibility' | 'duplicate-name' | 'import-cycle' | 'declaration-only' | 'limit';
+
+/** Diagnostic with a project-relative file and an optional UTF-8 byte span (`file:start..end: message [code]`). */
+export class PackageError extends Error {
+  constructor(readonly code: PackageErrorCode, readonly detail: string, readonly file?: string, readonly span?: Span) {
+    super(`${file ? `${file}${span ? `:${span.start}..${span.end}` : ''}: ` : ''}${detail} [${code}]`);
+    this.name = 'PackageError';
+  }
+}
+
+export type Manifest = { name: string; version: string; kind: 'library' | 'contract'; source: string; modules: string[]; exports: string[]; entry?: string;
+  /** alias -> exact `name@version` */ dependencies: Map<string, string>;
+  /** Root-only package locators (`name -> project-relative path`). Ignored (never inherited) in dependencies. */ sources: Map<string, string> };
+type PackageFile = { path: string; digest: Uint8Array; content: Uint8Array };
+type PackageInfo = { id: string; manifest: Manifest; root: string; manifestFile: string; files: PackageFile[]; treeDigest: Uint8Array; isRoot: boolean };
+type ModuleNode = { id: string; pkg: PackageInfo; path: string; file: string; digest: Uint8Array; program: Program; isEntry: boolean; imports: { decl: ImportDecl; target: ModuleNode }[] };
+type LockPackage = { name: string; version: string; locator: { kind: 'path'; path: string }; root: string; dependencies: Record<string, string>; files: { path: string; digest: string }[]; treeDigest: string };
+export type LockFile = { schema: typeof LOCK_SCHEMA; root: { name: string; version: string; dependencies: Record<string, string> }; packages: LockPackage[] };
+
+export type BuildGraph = {
+  schema: typeof BUILD_GRAPH_SCHEMA;
+  compiler: { name: string; version: string; profile: 'optimized' | 'unoptimized' };
+  target: string;
+  root: { package: string; module: string };
+  lockDigest: string;
+  packages: { id: string; name: string; version: string; root: string; treeDigest: string; dependencies: Record<string, string> }[];
+  modules: { id: string; package: string; path: string; file: string; sourceDigest: string; interfaceDigest: string;
+    exports: { name: string; signature: string; digest: string }[]; imports: string[] }[];
+  digest: string;
+};
+export type PackageCompileOptions = CompileOptions & { limits?: Partial<PackageLimits> };
+export type PackageBuild = { artifact: ContractArtifact; trace: SchedulerEvent[]; parses: Record<string, number> };
+
+const utf8 = (text: string): Uint8Array => new TextEncoder().encode(text);
+const str = (text: string): Uint8Array => bytes(utf8(text));
+const fold = (text: string): string => text.normalize('NFKC').toUpperCase().toLowerCase().normalize('NFKC');
+const posix = (...parts: string[]): string => parts.filter(part => part !== '' && part !== '.').join('/') || '.';
+const sorted = (record: Map<string, string>): Record<string, string> => Object.fromEntries([...record].sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0));
+const byName = <T extends { name: string }>(a: T, b: T): number => a.name < b.name ? -1 : a.name > b.name ? 1 : 0;
+
+function decode(data: Uint8Array, file: string): string {
+  try { return new TextDecoder('utf-8', { fatal: true, ignoreBOM: false }).decode(data); }
+  catch { throw new PackageError('manifest', 'file is not valid UTF-8', file); }
+}
+
+/** Project/package-relative path: no absolute paths, traversal, empty or `.` segments, backslashes. */
+function relPath(value: string, what: string, file: string): string {
+  if (value.startsWith('/') || /^[A-Za-z]:/.test(value) || value.includes('\\')) throw new PackageError('path-escape', `${what} ${JSON.stringify(value)} must be a relative POSIX path`, file);
+  const parts = value.split('/');
+  if (parts.includes('..')) throw new PackageError('path-escape', `${what} ${JSON.stringify(value)} contains path traversal`, file);
+  for (const part of parts) if (!/^[A-Za-z0-9_][A-Za-z0-9_.-]*$/.test(part)) throw new PackageError('manifest', `${what} ${JSON.stringify(value)} is not a normalized relative path`, file);
+  return value;
+}
+
+function inside(child: string, parent: string): boolean { return child === parent || child.startsWith(parent.endsWith(sep) ? parent : parent + sep); }
+
+// ---------------------------------------------------------------------------
+// Manifest
+
+export function parseManifest(text: string, file: string): Manifest {
+  let doc;
+  try { doc = parseTomlSubset(text, file); } catch (error) { throw new PackageError('manifest', (error as Error).message.replace(`${file}:`, 'line '), file); }
+  for (const table of doc.keys()) if (!['package', 'dependencies', 'sources'].includes(table)) throw new PackageError('manifest', `unknown table [${table}]`, file);
+  const pkg = doc.get('package'); if (!pkg) throw new PackageError('manifest', 'missing [package] table', file);
+  for (const key of pkg.keys()) if (!['name', 'version', 'kind', 'source', 'modules', 'exports', 'entry'].includes(key)) throw new PackageError('manifest', `unknown package key ${key}`, file);
+  const string = (key: string, required = true): string | undefined => {
+    const value = pkg.get(key);
+    if (value === undefined) { if (required) throw new PackageError('manifest', `missing package.${key}`, file); return undefined; }
+    if (typeof value !== 'string') throw new PackageError('manifest', `package.${key} must be a string`, file);
+    return value;
+  };
+  const list = (key: string): string[] => {
+    const value: TomlValue | undefined = pkg.get(key);
+    if (value === undefined) return [];
+    if (!Array.isArray(value)) throw new PackageError('manifest', `package.${key} must be a string array`, file);
+    return value;
+  };
+  const name = string('name')!;
+  if (!/^[a-z_][a-z0-9_]{0,63}$/.test(name)) throw new PackageError('manifest', `package name ${JSON.stringify(name)} must match [a-z_][a-z0-9_]{0,63}`, file);
+  try { assertPortableName(name); } catch { throw new PackageError('manifest', `package name ${name} is reserved`, file); }
+  const version = string('version')!;
+  if (!/^(0|[1-9][0-9]{0,8})\.(0|[1-9][0-9]{0,8})\.(0|[1-9][0-9]{0,8})$/.test(version)) throw new PackageError('manifest', `version ${JSON.stringify(version)} must be exact MAJOR.MINOR.PATCH`, file);
+  const kind = string('kind')!;
+  if (kind !== 'library' && kind !== 'contract') throw new PackageError('manifest', 'package.kind must be "library" or "contract"', file);
+  const source = relPath(string('source')!, 'package.source', file);
+  const modules = list('modules');
+  if (!modules.length) throw new PackageError('manifest', 'package.modules must declare at least one module', file);
+  const folded = new Map<string, string>();
+  for (const module of modules) {
+    if (!/^[A-Za-z_][A-Za-z0-9_]*(\/[A-Za-z_][A-Za-z0-9_]*)*$/.test(module)) {
+      if (module.split('/').includes('..') || module.startsWith('/')) throw new PackageError('path-escape', `module path ${JSON.stringify(module)} escapes the source root`, file);
+      throw new PackageError('manifest', `module path ${JSON.stringify(module)} must be '/'-separated identifiers`, file);
+    }
+    const key = fold(module), prior = folded.get(key);
+    if (prior !== undefined) throw new PackageError(prior === module ? 'manifest' : 'path-collision', prior === module ? `duplicate module ${module}` : `module paths ${prior} and ${module} collide under case folding`, file);
+    folded.set(key, module);
+  }
+  const exports = list('exports');
+  for (const module of exports) if (!modules.includes(module)) throw new PackageError('manifest', `exported module ${module} is not declared in package.modules`, file);
+  if (new Set(exports).size !== exports.length) throw new PackageError('manifest', 'duplicate exported module', file);
+  const entry = string('entry', false);
+  if (kind === 'contract' && (entry === undefined || !modules.includes(entry))) throw new PackageError('manifest', 'contract packages require package.entry naming a declared module', file);
+  if (kind === 'library' && entry !== undefined) throw new PackageError('manifest', 'library packages are declaration-only and have no entry', file);
+  const table = (title: string): Map<string, string> => {
+    const out = new Map<string, string>();
+    for (const [key, value] of doc.get(title) ?? []) {
+      if (typeof value !== 'string') throw new PackageError('manifest', `[${title}] ${key} must be a string`, file);
+      out.set(key, value);
+    }
+    return out;
+  };
+  const dependencies = table('dependencies');
+  for (const [alias, target] of dependencies) {
+    try { assertPortableName(alias); } catch { throw new PackageError('manifest', `dependency alias ${alias} is reserved or invalid`, file); }
+    if (!/^[a-z_][a-z0-9_]{0,63}@(0|[1-9][0-9]{0,8})\.(0|[1-9][0-9]{0,8})\.(0|[1-9][0-9]{0,8})$/.test(target)) throw new PackageError('manifest', `dependency ${alias} must be an exact "name@MAJOR.MINOR.PATCH"`, file);
+    if (target.split('@')[0] === name) throw new PackageError('package-cycle', `package ${name} depends on itself`, file);
+  }
+  const sources = table('sources');
+  for (const [pkgName, path] of sources) {
+    if (!/^[a-z_][a-z0-9_]{0,63}$/.test(pkgName)) throw new PackageError('manifest', `[sources] key ${pkgName} must be a package name`, file);
+    relPath(path, `[sources] ${pkgName}`, file);
+  }
+  return { name, version, kind, source, modules, exports, ...(entry !== undefined ? { entry } : {}), dependencies, sources };
+}
+
+// ---------------------------------------------------------------------------
+// Package scanning: one immutable snapshot of each package's declared files.
+
+function scanPackage(project: string, locator: string, isRoot: boolean, budget: { bytes: number; limit: number }): PackageInfo {
+  const dir = locator === '.' ? project : join(project, ...locator.split('/'));
+  let real: string;
+  try { real = realpathSync(dir); } catch { throw new PackageError('manifest', `package directory ${locator} does not exist`, locator); }
+  if (!inside(real, project)) throw new PackageError('symlink-escape', `package directory ${locator} resolves outside the root project`, locator);
+  if (!isRoot && real === project) throw new PackageError('manifest', 'a dependency cannot be the root project', locator);
+  // The resolved package root (after any in-project symlinks) names the package in diagnostics, lock and build graph.
+  const root = relative(project, real).split(sep).join('/') || '.';
+  const manifestFile = posix(root, MANIFEST_FILE);
+  const readContained = (abs: string, display: string): Uint8Array => {
+    let st;
+    try { st = lstatSync(abs); } catch { throw new PackageError('missing-module', 'file not found', display); }
+    if (st.isSymbolicLink()) {
+      let target: string;
+      try { target = realpathSync(abs); } catch { throw new PackageError('symlink-escape', 'dangling symlink', display); }
+      if (!inside(target, real)) throw new PackageError('symlink-escape', 'symlink resolves outside the package root', display);
+      if (!statSync(target).isFile()) throw new PackageError('manifest', 'symlinked directories and special files are not supported', display);
+    } else if (!st.isFile()) throw new PackageError('manifest', 'expected a regular file', display);
+    const data = readFileSync(abs);
+    budget.bytes += data.length;
+    if (budget.bytes > budget.limit) throw new PackageError('limit', `total package source exceeds ${budget.limit} bytes`, display);
+    return Uint8Array.from(data);
+  };
+  const manifestBytes = readContained(join(real, MANIFEST_FILE), manifestFile);
+  const manifest = parseManifest(decode(manifestBytes, manifestFile), manifestFile);
+  const srcAbs = join(real, ...manifest.source.split('/'));
+  let srcReal: string;
+  try { srcReal = realpathSync(srcAbs); } catch { throw new PackageError('manifest', `source root ${manifest.source} does not exist`, manifestFile); }
+  if (!inside(srcReal, real) || srcReal === real) throw new PackageError('symlink-escape', `source root ${manifest.source} must resolve to a subdirectory inside the package`, manifestFile);
+  if (!statSync(srcReal).isDirectory()) throw new PackageError('manifest', `source root ${manifest.source} is not a directory`, manifestFile);
+  // Walk the source root with exact on-disk names (case-insensitive file systems
+  // cannot satisfy a differently cased declaration), rejecting undeclared files,
+  // escaping symlinks and case/Unicode-folding collisions.
+  const declared = new Map(manifest.modules.map(module => [`${module}.lotus`, module]));
+  const found = new Map<string, string>(); const folded = new Map<string, string>(); let entries = 0;
+  const walk = (abs: string, rel: string): void => {
+    for (const name of readdirSync(abs).sort()) {
+      if (++entries > MAX_WALK_ENTRIES) throw new PackageError('limit', `source root has more than ${MAX_WALK_ENTRIES} entries`, posix(root, manifest.source));
+      const childRel = rel ? `${rel}/${name}` : name, childAbs = join(abs, name), display = posix(root, manifest.source, childRel);
+      const key = fold(childRel), prior = folded.get(key);
+      if (prior !== undefined) throw new PackageError('path-collision', `${prior} and ${childRel} collide under case/Unicode folding`, display);
+      folded.set(key, childRel);
+      const st = lstatSync(childAbs);
+      if (st.isSymbolicLink()) {
+        let target: string;
+        try { target = realpathSync(childAbs); } catch { throw new PackageError('symlink-escape', 'dangling symlink', display); }
+        if (!inside(target, real)) throw new PackageError('symlink-escape', 'symlink resolves outside the package root', display);
+        if (!statSync(target).isFile()) throw new PackageError('manifest', 'symlinked directories are not supported', display);
+      } else if (st.isDirectory()) { walk(childAbs, childRel); continue; }
+      else if (!st.isFile()) throw new PackageError('manifest', 'unsupported file type', display);
+      if (!declared.has(childRel)) throw new PackageError('undeclared-file', 'file is not a declared module of this package', display);
+      found.set(childRel, childAbs);
+    }
+  };
+  walk(srcReal, '');
+  const files: PackageFile[] = [{ path: MANIFEST_FILE, content: manifestBytes, digest: tagged('package/file', bytes(manifestBytes)) }];
+  for (const [rel, module] of declared) {
+    const abs = found.get(rel), display = posix(root, manifest.source, rel);
+    if (!abs) throw new PackageError('missing-module', `declared module ${module} has no file (names are case-sensitive)`, display);
+    const content = readContained(abs, display);
+    decode(content, display);
+    files.push({ path: posix(manifest.source, rel), content, digest: tagged('package/file', bytes(content)) });
+  }
+  files.sort((a, b) => a.path < b.path ? -1 : a.path > b.path ? 1 : 0);
+  const treeDigest = tagged('package/tree', concat(str(manifest.name), str(manifest.version), cs(files.length), ...files.map(f => concat(str(f.path), f.digest))));
+  return { id: `${manifest.name}@${manifest.version}`, manifest, root, manifestFile, files, treeDigest, isRoot };
+}
+
+type Workspace = { project: string; root: PackageInfo; packages: Map<string, PackageInfo>; lockText: string };
+
+function resolveWorkspace(projectDir: string, limits: PackageLimits): Workspace {
+  let project: string;
+  try { project = realpathSync(projectDir); } catch { throw new PackageError('manifest', 'root project directory does not exist'); }
+  const budget = { bytes: 0, limit: limits.maxSourceBytes };
+  const root = scanPackage(project, '.', true, budget);
+  const packages = new Map<string, PackageInfo>();
+  const queue: { id: string; from: PackageInfo }[] = [...root.manifest.dependencies.values()].map(id => ({ id, from: root }));
+  while (queue.length) {
+    const { id, from } = queue.shift()!;
+    const [name, version] = id.split('@') as [string, string];
+    if (name === root.manifest.name) throw new PackageError('package-cycle', `${from.id} depends on the root package ${root.id}`, from.manifestFile);
+    const prior = packages.get(name);
+    if (prior) {
+      if (prior.manifest.version !== version) throw new PackageError('version-conflict', `${from.id} requires ${id} but ${prior.id} is already in the graph`, from.manifestFile);
+      continue;
+    }
+    // Locators come only from the root manifest; dependency [sources] are never inherited.
+    const locator = root.manifest.sources.get(name);
+    if (locator === undefined) throw new PackageError('manifest', `no [sources] locator for ${name} in the root manifest`, root.manifestFile);
+    if (packages.size >= limits.maxPackages) throw new PackageError('limit', `package graph exceeds ${limits.maxPackages} packages`, from.manifestFile);
+    const info = scanPackage(project, locator, false, budget);
+    if (info.id !== id) throw new PackageError('version-conflict', `locator ${locator} contains ${info.id}, expected ${id}`, info.manifestFile);
+    if (info.manifest.kind !== 'library') throw new PackageError('declaration-only', `dependency ${id} must be a library package`, info.manifestFile);
+    packages.set(name, info);
+    for (const dep of info.manifest.dependencies.values()) queue.push({ id: dep, from: info });
+  }
+  for (const name of root.manifest.sources.keys()) if (!packages.has(name)) throw new PackageError('manifest', `[sources] locator ${name} is not used by the dependency graph`, root.manifestFile);
+  // Package-level dependency cycles (module cycles are diagnosed separately with spans).
+  const state = new Map<string, 'active' | 'done'>();
+  const visit = (pkg: PackageInfo, chain: string[]): void => {
+    if (state.get(pkg.id) === 'done') return;
+    if (state.get(pkg.id) === 'active') throw new PackageError('package-cycle', `package dependency cycle: ${[...chain, pkg.id].join(' -> ')}`, pkg.manifestFile);
+    state.set(pkg.id, 'active');
+    for (const dep of pkg.manifest.dependencies.values()) visit(packages.get(dep.split('@')[0]!)!, [...chain, pkg.id]);
+    state.set(pkg.id, 'done');
+  };
+  for (const pkg of packages.values()) visit(pkg, []);
+  return { project, root, packages, lockText: renderLock(root, packages) };
+}
+
+function renderLock(root: PackageInfo, packages: Map<string, PackageInfo>): string {
+  const lock: LockFile = {
+    schema: LOCK_SCHEMA,
+    root: { name: root.manifest.name, version: root.manifest.version, dependencies: sorted(root.manifest.dependencies) },
+    packages: [...packages.values()].map(pkg => ({ name: pkg.manifest.name, version: pkg.manifest.version,
+      locator: { kind: 'path' as const, path: root.manifest.sources.get(pkg.manifest.name)! }, root: pkg.root,
+      dependencies: sorted(pkg.manifest.dependencies), files: pkg.files.map(f => ({ path: f.path, digest: hex(f.digest) })), treeDigest: hex(pkg.treeDigest) })).sort(byName),
+  };
+  return JSON.stringify(lock, null, 2) + '\n';
+}
+
+/** Compute the canonical lock text from local files only (no network). */
+export function generateLock(projectDir: string, limits: Partial<PackageLimits> = {}): string {
+  return resolveWorkspace(projectDir, { ...DEFAULT_PACKAGE_LIMITS, ...limits }).lockText;
+}
+/** Rewrite `lotus.lock` from local files. Returns the written text. */
+export function updateLock(projectDir: string, limits: Partial<PackageLimits> = {}): string {
+  const text = generateLock(projectDir, limits);
+  writeFileSync(join(projectDir, LOCK_FILE), text);
+  return text;
+}
+
+function verifyLock(ws: Workspace): Uint8Array {
+  let actual: Uint8Array;
+  try { actual = Uint8Array.from(readFileSync(join(ws.project, LOCK_FILE))); }
+  catch { throw new PackageError('lock-missing', `missing ${LOCK_FILE}; run lotus-v2-package-lock`, LOCK_FILE); }
+  const text = decode(actual, LOCK_FILE);
+  if (text !== ws.lockText) {
+    // Explain the first difference: a changed file digest is the common case.
+    let lock: LockFile | undefined;
+    try { lock = JSON.parse(text) as LockFile; } catch { /* reported below */ }
+    if (lock && Array.isArray(lock.packages)) for (const entry of lock.packages) {
+      const pkg = ws.packages.get(entry?.name);
+      if (!pkg || pkg.manifest.version !== entry.version || !Array.isArray(entry.files)) continue;
+      for (const file of pkg.files) {
+        const pinned = entry.files.find(x => x?.path === file.path);
+        if (pinned && pinned.digest !== hex(file.digest))
+          throw new PackageError('lock-mismatch', `source digest ${hex(file.digest)} of ${pkg.id} differs from locked ${String(pinned.digest)}; review the change and run lotus-v2-package-lock`, posix(pkg.root, file.path));
+      }
+    }
+    throw new PackageError('lock-stale', `${LOCK_FILE} does not match the manifests and local package files; run lotus-v2-package-lock`, LOCK_FILE);
+  }
+  return tagged('package/lock', bytes(actual));
+}
+
+// ---------------------------------------------------------------------------
+// Module graph, import resolution and linking.
+
+function signature(helper: Helper): string { return `${helper.name}(${helper.params.map(p => `${p.name}: ${p.type}`).join(', ')}): ${helper.result}`; }
+
+export async function compilePackage(projectDir: string, options: PackageCompileOptions): Promise<PackageBuild> {
+  if (typeof options?.contract !== 'string' || !options.bindings || typeof options.bindings !== 'object') throw new Error('compile options require contract and bindings');
+  const limits = { ...DEFAULT_PACKAGE_LIMITS, ...(options.limits ?? {}) };
+  const ws = resolveWorkspace(projectDir, limits);
+  const { root } = ws;
+  if (root.manifest.kind !== 'contract' || !root.manifest.entry) throw new PackageError('declaration-only', 'the root package must be a contract package with an entry module', root.manifestFile);
+  const lockDigest = verifyLock(ws);
+  const byId = new Map<string, PackageInfo>([[root.id, root], ...[...ws.packages.values()].map(pkg => [pkg.id, pkg] as const)]);
+  const modules = new Map<string, ModuleNode>(); const parses: Record<string, number> = {};
+  let bindings = 0;
+  const load = (pkg: PackageInfo, path: string, from?: { file: string; span: Span }): ModuleNode => {
+    const id = `${pkg.id}/${path}`;
+    const old = modules.get(id); if (old) return old;
+    if (modules.size >= limits.maxModules) throw new PackageError('limit', `module graph exceeds ${limits.maxModules} modules`, from?.file, from?.span);
+    const rel = posix(pkg.manifest.source, `${path}.lotus`), file = posix(pkg.root, rel);
+    const data = pkg.files.find(f => f.path === rel)!;
+    const isEntry = pkg.isRoot && path === pkg.manifest.entry;
+    let program: Program;
+    try { program = parseModuleSource(decode(data.content, file), isEntry); }
+    catch (error) { throw new PackageError('parse', (error as Error).message, file); }
+    parses[id] = (parses[id] ?? 0) + 1;
+    const node: ModuleNode = { id, pkg, path, file, digest: data.digest, program, isEntry, imports: [] };
+    modules.set(id, node);
+    if (!isEntry) for (const contract of program.contracts.values()) throw new PackageError('declaration-only', `${contract.kind} ${contract.name} must be declared in the root package entry module; ${pkg.manifest.kind === 'library' ? 'library' : 'non-entry'} modules are declaration-only`, file, contract.span);
+    return node;
+  };
+  const entry = load(root, root.manifest.entry);
+  // Depth-first import resolution with an explicit stack: cycles report every hop.
+  const done = new Set<string>();
+  const visit = (node: ModuleNode, stack: { node: ModuleNode; decl: ImportDecl }[]): void => {
+    if (done.has(node.id)) return;
+    if (stack.length > limits.maxImportDepth) { const last = stack.at(-1)!; throw new PackageError('limit', `import depth exceeds ${limits.maxImportDepth}`, last.node.file, last.decl.span); }
+    const active = stack.map(x => x.node.id);
+    for (const decl of node.program.imports) {
+      bindings += decl.items?.length ?? 1;
+      if (bindings > limits.maxImportBindings) throw new PackageError('limit', `import bindings exceed ${limits.maxImportBindings}`, node.file, decl.span);
+      let pkg: PackageInfo;
+      if (decl.target === 'package') pkg = node.pkg;
+      else {
+        const dep = node.pkg.manifest.dependencies.get(decl.target);
+        if (!dep) throw new PackageError('unknown-alias', `${decl.target} is not a dependency alias of ${node.pkg.id}`, node.file, decl.targetSpan);
+        pkg = byId.get(dep)!;
+      }
+      const path = decl.path.join('/');
+      if (!pkg.manifest.modules.includes(path)) throw new PackageError('missing-module', `module ${decl.target}::${decl.path.join('::')} does not exist in ${pkg.id}`, node.file, decl.pathSpan);
+      if (pkg !== node.pkg && !pkg.manifest.exports.includes(path)) throw new PackageError('not-exported', `module ${path} is not exported by ${pkg.id}`, node.file, decl.pathSpan);
+      const target = load(pkg, path, { file: node.file, span: decl.span });
+      const at = active.indexOf(target.id);
+      if (target === node || at >= 0) {
+        const hops = [...stack.slice(at < 0 ? stack.length : at), { node, decl }];
+        throw new PackageError('import-cycle', `import cycle: ${hops.map(h => `${h.node.id} (${h.node.file}:${h.decl.span.start}..${h.decl.span.end})`).join(' -> ')} -> ${target.id}`, node.file, decl.span);
+      }
+      node.imports.push({ decl, target });
+      visit(target, [...stack, { node, decl }]);
+    }
+    done.add(node.id);
+  };
+  visit(entry, []);
+  // One scheduler job per module identity; each job links its module after its imports.
+  const trace: SchedulerEvent[] = [];
+  const scheduler = new PromiseScheduler<void>(event => trace.push(event), { maxJobs: limits.maxModules });
+  const helpers = new Map<string, Helper>(); const contracts = new Map<string, Contract>();
+  const interfaces = new Map<string, { digest: Uint8Array; exports: { name: string; signature: string; digest: string }[] }>();
+  for (const node of modules.values())
+    scheduler.register(`module:${node.id}`, [...new Set(node.imports.map(x => `module:${x.target.id}`))], () => link(node));
+  const link = (node: ModuleNode): void => {
+    type Entry = { kind: 'helper'; canonical: string } | { kind: 'module'; target: ModuleNode } | { kind: 'contract' };
+    const scope = new Map<string, Entry>();
+    const declare = (name: string, entryValue: Entry, span: Span): void => {
+      if (BUILTINS.has(name)) throw new PackageError('duplicate-name', `${name} shadows a builtin`, node.file, span);
+      if (scope.has(name)) throw new PackageError('duplicate-name', `ambiguous local name ${name} (already declared or imported in this module)`, node.file, span);
+      scope.set(name, entryValue);
+    };
+    const canonical = (owner: ModuleNode, name: string): string => `${owner.id}::${name}`;
+    const access = (owner: ModuleNode, name: string, span: Span): string => {
+      const helper = owner.program.helpers.get(name);
+      if (!helper) throw new PackageError('missing-symbol', `${owner.id} has no function ${name}`, node.file, span);
+      if (helper.visibility === 'private') throw new PackageError('visibility', `${name} is private to module ${owner.id}`, node.file, span);
+      if (owner.pkg !== node.pkg && helper.visibility !== 'export') throw new PackageError('visibility', `${name} is package-scoped in ${owner.pkg.id}`, node.file, span);
+      return canonical(owner, name);
+    };
+    for (const helper of node.program.helpers.values()) declare(helper.name, { kind: 'helper', canonical: canonical(node, helper.name) }, helper.span);
+    for (const contract of node.program.contracts.values()) declare(contract.name, { kind: 'contract' }, contract.span);
+    for (const { decl, target } of node.imports) {
+      if (decl.moduleAlias) declare(decl.moduleAlias.name, { kind: 'module', target }, decl.moduleAlias.span);
+      for (const item of decl.items ?? []) declare(item.local, { kind: 'helper', canonical: access(target, item.name, item.span) }, item.span);
+    }
+    const span = (s: Span): Span => ({ start: s.start, end: s.end, module: node.id });
+    const expr = (e: Expr): Expr => {
+      let value = e.value;
+      if (e.kind === 'call' && value !== undefined && !BUILTINS.has(value) && !value.includes('.')) {
+        if (value.includes('::')) {
+          const [alias, member] = value.split('::') as [string, string];
+          const bound = scope.get(alias);
+          if (bound?.kind !== 'module') throw new PackageError('missing-symbol', `${alias} is not an imported module alias`, node.file, e.span);
+          value = access(bound.target, member, e.span);
+        } else {
+          const bound = scope.get(value);
+          if (!bound || bound.kind !== 'helper') throw new PackageError('missing-symbol', `unknown function ${value}`, node.file, e.span);
+          value = bound.canonical;
+        }
+      } else if (e.kind === 'call' && value !== undefined && COMMITMENT_BUILTINS.has(value) && !node.isEntry)
+        throw new PackageError('declaration-only', `${value} may only be used in the root package entry module`, node.file, e.span);
+      return { ...e, span: span(e.span), ...(value !== undefined ? { value } : {}),
+        ...(e.args ? { args: e.args.map(expr) } : {}), ...(e.left ? { left: expr(e.left) } : {}), ...(e.right ? { right: expr(e.right) } : {}) };
+    };
+    const stmt = (s: Stmt): Stmt => ({ ...s, span: span(s.span), ...(s.expr ? { expr: expr(s.expr) } : {}),
+      ...(s.then ? { then: s.then.map(stmt) } : {}), ...(s.otherwise ? { otherwise: s.otherwise.map(stmt) } : {}) });
+    const param = (p: Param): Param => ({ ...p, span: span(p.span) });
+    for (const helper of node.program.helpers.values()) {
+      const name = canonical(node, helper.name);
+      helpers.set(name, { ...helper, name, params: helper.params.map(param), body: expr(helper.body), span: span(helper.span) });
+    }
+    if (node.isEntry) for (const contract of node.program.contracts.values())
+      contracts.set(contract.name, { ...contract, params: contract.params.map(param), span: span(contract.span),
+        methods: contract.methods.map((m: Method) => ({ ...m, params: m.params.map(param), body: m.body.map(stmt), span: span(m.span) })) });
+    // Stable interface: exported signatures only (bodies affect sourceDigest, not interfaceDigest).
+    const exported = [...node.program.helpers.values()].filter(h => h.visibility === 'export').sort(byName).map(h => {
+      const digest = tagged('package/declaration', concat(str(h.name), cs(h.params.length), ...h.params.map(p => concat(str(p.name), str(p.type))), str(h.result)));
+      return { name: h.name, signature: signature(h), digest };
+    });
+    interfaces.set(node.id, { digest: tagged('package/interface', concat(str(node.pkg.manifest.name), str(node.path), cs(exported.length), ...exported.map(x => x.digest))),
+      exports: exported.map(x => ({ name: x.name, signature: x.signature, digest: hex(x.digest) })) });
+  };
+  await scheduler.run(`module:${entry.id}`);
+  const artifact = await compileLinkedProgramAsync({ helpers, contracts, imports: [] }, options, event => trace.push(event));
+  const graph: Omit<BuildGraph, 'digest'> = {
+    schema: BUILD_GRAPH_SCHEMA,
+    compiler: { name: COMPILER_NAME, version: COMPILER_VERSION, profile: options.optimize === false ? 'unoptimized' : 'optimized' },
+    target: TARGET,
+    root: { package: root.id, module: entry.id },
+    lockDigest: hex(lockDigest),
+    packages: [...byId.values()].map(pkg => ({ id: pkg.id, name: pkg.manifest.name, version: pkg.manifest.version, root: pkg.root, treeDigest: hex(pkg.treeDigest),
+      dependencies: sorted(pkg.manifest.dependencies) })).sort((a, b) => a.id < b.id ? -1 : 1),
+    modules: [...modules.values()].map(node => ({ id: node.id, package: node.pkg.id, path: node.path, file: node.file, sourceDigest: hex(node.digest),
+      interfaceDigest: hex(interfaces.get(node.id)!.digest), exports: interfaces.get(node.id)!.exports,
+      imports: [...new Set(node.imports.map(x => x.target.id))].sort() })).sort((a, b) => a.id < b.id ? -1 : 1),
+  };
+  const build: BuildGraph = { ...graph, digest: hex(tagged('build-graph', utf8(JSON.stringify(graph)))) };
+  return { artifact: { ...artifact, build }, trace, parses };
+}
