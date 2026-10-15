@@ -33,3 +33,14 @@ Git module paths (`github.com/acme/lotus-std@v1.2.0`, major suffix `/v2`, root
 `[replace]`, and `lotus-v2-package-fetch`) are covered by `test/packages-git.test.mjs`
 with local `file://` repositories. This diamond fixture stays a path-only schema-1 lock.
 There is no package registry.
+
+## Linked contracts (CABI-08)
+
+`linked/` is one library, `policy@1.0.0`, and two consumers in `pay@0.1.0`:
+
+```text
+pay@0.1.0 (src/main.lotus: Payer, Receiver)
+└── policy@1.0.0 (escrow: export function authorized, export contract Escrow)
+```
+
+`options.json` compiles `Escrow` (owner `79be…1798`). `Payer` and `Receiver` bind that contract's root, and `Payer` also binds `Escrow.spend`'s leaf. `lotus.lock` is the local tree digest of `packages/policy`. `test/linked-libraries.test.mjs` checks the link record, the one-byte semantic root change, private names, inlined script bytes and the signed Python VM calls.

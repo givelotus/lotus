@@ -1,5 +1,5 @@
 import type { PaymentArtifact } from './compiler.js';
-import type { ContractArtifact, ValueType } from './generic.js';
+import type { ContractArtifact, LinkedContract, ValueType } from './generic.js';
 import { assertPortableName } from './names.js';
 
 function safeName(name: string): string { return assertPortableName(name); }
@@ -23,6 +23,15 @@ export function generatePython(a: PaymentArtifact): string {
 }
 
 function tsType(t: ValueType): string { return t === 'Int' || t === 'Amount' ? 'bigint' : t === 'Bool' ? 'boolean' : t === 'Signature' ? 'null' : 'Uint8Array'; }
+function linkedRows(a: ContractArtifact): LinkedContract[] {
+  const links = a.links ?? [];
+  for (const link of links) {
+    if (!/^[0-9a-f]{64}$/.test(link.root) || !/^[0-9a-f]{64}$/.test(link.packageDigest)) throw new Error('linked contract root is not 32-byte hex');
+    safeName(link.name);
+    for (const method of link.methods) safeName(method.name);
+  }
+  return links;
+}
 export function generateContractTypeScript(a: ContractArtifact): string {
   const contract = safeName(a.contract);
   const lines = [
@@ -45,7 +54,15 @@ export function generateContractTypeScript(a: ContractArtifact): string {
     lines.push(`  prepare${name[0]!.toUpperCase()}${name.slice(1)}(context: CallContext, args: ${title}Args): CallPlan { return prepareContractCall(this.artifact, '${name}', context, args); }`,
       `  finalize${name[0]!.toUpperCase()}${name.slice(1)}(plan: CallPlan, signatures: ${title}Signatures): CallFinal { if (plan.methodName !== '${name}') throw new Error('method plan mismatch'); return finalizeContractCall(plan, signatures); }`);
   }
-  lines.push('}', ''); return lines.join('\n');
+  lines.push('}');
+  const links = linkedRows(a);
+  if (links.length) {
+    lines.push('', '/** Linked library contracts. Roots are compile-time commitments, not VM calls. */',
+      'export const linkedContracts = [',
+      ...links.map(link => `  { name: '${safeName(link.name)}', packageDigest: '${link.packageDigest}', root: '${link.root}', methods: [${link.methods.map(m => `'${safeName(m.name)}'`).join(', ')}] },`),
+      '] as const;');
+  }
+  lines.push(''); return lines.join('\n');
 }
 
 function pyType(t: ValueType): string { return t === 'Int' || t === 'Amount' ? 'int' : t === 'Bool' ? 'bool' : t === 'Signature' ? 'None' : 'bytes'; }
@@ -77,6 +94,12 @@ export function generateContractPython(a: ContractArtifact): string {
       `    def finalize${name[0]!.toUpperCase()}${name.slice(1)}(self, plan: CallPlan, signatures: ${title}Signatures) -> dict:`,
       `        if plan.method_name != '${name}':`, `            raise ValueError('method plan mismatch')`,
       `        return finalize_call(plan, signatures)`, '');
+  }
+  const links = linkedRows(a);
+  if (links.length) {
+    lines.push('LINKED_CONTRACTS = (',
+      ...links.map(link => `    {"name": "${safeName(link.name)}", "package_digest": "${link.packageDigest}", "root": "${link.root}", "methods": (${link.methods.map(m => `"${safeName(m.name)}"`).join(', ')},)},`),
+      ')');
   }
   return lines.join('\n');
 }

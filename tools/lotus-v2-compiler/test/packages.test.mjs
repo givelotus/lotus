@@ -44,6 +44,27 @@ contract Treasury<owner: PublicKey, digest: Bytes32, budget: Amount> {
     function reveal(preimage: Bytes32, value: Amount, fee: Amount) { require(opens(preimage, digest)); require(paid(value, fee, budget)); }
 }`;
 
+test('an imported statement helper inlines like the same flattened helper', async () => {
+  const { base, dir } = copy();
+  try {
+    const body = `package function authorized(sig: Signature, owner: PublicKey): Bool {
+    let ok: Bool = checksig(sig, owner);
+    require(ok);
+    return ok;
+}
+`;
+    edit(dir, 'src/policy.lotus', source => source.replace(/package function authorized[\s\S]*$/, body), true);
+    const artifact = (await compilePackage(dir, options)).artifact;
+    const flat = flattened.replace(
+      'function authorized(sig: Signature, owner: PublicKey): Bool { return checksig(sig, owner); }',
+      'function authorized(sig: Signature, owner: PublicKey): Bool { let ok: Bool = checksig(sig, owner); require(ok); return ok; }');
+    const single = compileContract(flat, options);
+    assert.deepEqual(artifact.methods.map(method => [method.name, method.scriptHex]), single.methods.map(method => [method.name, method.scriptHex]));
+    assert.ok(artifact.methods.find(method => method.name === 'spend').staticResources.helperExpansions > 0);
+    assert.ok(artifact.methods.find(method => method.name === 'spend').sourceMap.some(entry => entry.expandedFrom && entry.source.module === 'app@0.1.0/policy'));
+  } finally { rmSync(base, { recursive: true, force: true }); }
+});
+
 test('diamond package builds offline, parses each module identity once and matches a flattened single file', async () => {
   const { artifact, trace, parses } = await compilePackage(fixture, options);
   assert.deepEqual(Object.values(parses), Object.values(parses).map(() => 1));
@@ -148,7 +169,6 @@ test('imports diagnose duplicate names, visibility, missing modules/symbols and 
     ['packages/lib_a/src/limits.lotus', s => s.replace('{checkedAdd, atLeast}', '{checkedAdd, atLeast, bounded}'), 'visibility', 'packages/lib_a/src/limits.lotus', true],
     ['packages/lib_b/src/digests.lotus', s => s.replace('amounts::atLeast(', 'amounts::positive('), 'visibility', 'packages/lib_b/src/digests.lotus', true],
     ['packages/lib_a/src/limits.lotus', s => 'import core::internal::{nonNegative};\n' + s, 'not-exported', 'packages/lib_a/src/limits.lotus', true],
-    ['packages/core/src/amounts.lotus', s => s + '\ncontract Hidden { function f() { require(true); } }\n', 'declaration-only', 'packages/core/src/amounts.lotus', true],
   ];
   for (const [file, change, code, at, relock] of cases) {
     const { dir } = copy();
@@ -157,6 +177,20 @@ test('imports diagnose duplicate names, visibility, missing modules/symbols and 
   }
   assert.throws(() => compileContract('import lib::m::{f};\ncontract C { function f() { require(true); } }', { contract: 'C', bindings: {} }), /requires a package build/);
   assert.throws(() => compileContract('import "github.com/acme/lotus-std@v1.2.0"::amounts::{checkedAdd};\ncontract C { function f() { require(true); } }', { contract: 'C', bindings: {} }), /requires a package build/);
+});
+
+test('a private contract in a library module does not change helper bytecode and is not importable', async () => {
+  const { dir } = copy();
+  const before = (await compilePackage(dir, options)).artifact;
+  edit(dir, 'packages/core/src/amounts.lotus', s => s + '\ncontract Hidden { function f() { require(true); } }\n', true);
+  const after = (await compilePackage(dir, options)).artifact;
+  assert.deepEqual(after.methods.map(m => m.scriptHex), before.methods.map(m => m.scriptHex));
+  assert.equal(after.policy.root, before.policy.root);
+  assert.equal(after.links, undefined);
+  const amounts = id => after.build.modules.find(m => m.id === id);
+  assert.equal(amounts('core@1.0.0/amounts').interfaceDigest, before.build.modules.find(m => m.id === 'core@1.0.0/amounts').interfaceDigest);
+  edit(dir, 'packages/lib_a/src/limits.lotus', s => s.replace('{checkedAdd, atLeast}', '{checkedAdd, atLeast, Hidden}'), true);
+  await rejects(dir, 'visibility', e => e.file === 'packages/lib_a/src/limits.lotus');
 });
 
 test('import cycles report every hop with file spans', async () => {
