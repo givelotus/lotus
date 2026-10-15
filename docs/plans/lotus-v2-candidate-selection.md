@@ -76,8 +76,12 @@ writer path cannot leave an admitted header outside the inventory. No second dat
 
 Only an internal typed deterministic-validation result can create an invalid-root
 fact. Malformed supplied body bytes, root/size mismatch during compact recovery,
-missing inputs/parents, temporary clock eligibility, policy refusal, unsupported
-implementation, quota exhaustion and storage failure do not create one.
+unavailable parent/context/body data, lookup errors, temporary clock eligibility,
+policy refusal, unsupported implementation, quota exhaustion and storage failure
+do not create one. A definitive nonexistent or already-spent input in a complete,
+commitment-matching body checked against its authenticated exact parent state is
+deterministic consensus invalidity. Distinguish `CoinReadResult::Missing` in that
+resolved state from `CoinReadResult::Error` or unavailable validation context.
 `PrepareDevelopmentSwitch` returning InvalidBody can mean bad supplied framing or
 header binding; that result alone must not globally invalidate the named header.
 No diagnostic-string parsing or monetary `prev_work` ranking is permitted.
