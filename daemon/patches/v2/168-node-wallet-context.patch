@@ -1,0 +1,272 @@
+From e9785936a13c46c951f946a1c64f99312031c48f Mon Sep 17 00:00:00 2001
+From: Shammah Chancellor <shammah.chancellor@notvalid.com>
+Date: Thu, 15 Oct 2026 13:27:39 -0700
+Subject: [PATCH] Add bounded quiescent wallet context and authenticated coin
+ proof query
+
+---
+ src/lotus_v2/development_node_command.cpp | 192 +++++++++++++++++++++-
+ src/lotus_v2/development_node_command.h   |  13 ++
+ 2 files changed, 203 insertions(+), 2 deletions(-)
+
+diff --git a/src/lotus_v2/development_node_command.cpp b/src/lotus_v2/development_node_command.cpp
+index 4d72f66acfc50b3dae71e8fa74b450fcde6c9beb..3bb3b426cd97bd86f680d4f512fdb884878eaa10 100644
+--- a/src/lotus_v2/development_node_command.cpp
++++ b/src/lotus_v2/development_node_command.cpp
+@@ -443,6 +443,7 @@ namespace {
+                              bool *retained = nullptr);
+         UniValue MineBlock(const UniValue &);
+         UniValue ReadBlock(const UniValue &);
++        UniValue WalletContext(const UniValue &, size_t request_bytes);
+         UniValue Status();
+         void Track(const Hash &);
+         void CleanupBodies();
+@@ -933,15 +934,199 @@ namespace {
+             return answer;
+         }
+     }
++    UniValue Node::WalletContext(const UniValue &request,
++                                 size_t request_bytes) {
++        std::string phase = "invalid";
++        const auto failed = [&](const std::string &result,
++                                const std::string &error) {
++            UniValue answer(UniValue::VOBJ);
++            answer.pushKV("ok", false);
++            answer.pushKV("result", result);
++            answer.pushKV("error", error.substr(0, 1024));
++            return answer;
++        };
++        try {
++            Require(request_bytes <= 1024,
++                    "walletcontext request exceeds1024bytes");
++            Keys(request, {"id", "command", "tip", "outpoint"});
++            std::optional<Hash> expected;
++            if (!request["tip"].isNull()) expected = HashOf(request["tip"]);
++            std::optional<Outpoint> outpoint;
++            if (!request["outpoint"].isNull()) {
++                Keys(request["outpoint"], {"txid", "index"});
++                outpoint = Outpoint{
++                    HashOf(request["outpoint"]["txid"]),
++                    uint32_t(Number(request["outpoint"]["index"], UINT32_MAX))};
++            }
++            phase = "inconclusive";
++            const auto before = runtime->Snapshot();
++            const auto quiescent = [](const DevelopmentRuntimeSnapshot &s) {
++                return s.chain && !s.reopen_required && !s.execution_paused &&
++                       !s.chain->pending_journal && !s.chain->pending_receipt &&
++                       !s.chain->pending_propagation;
++            };
++            if (!quiescent(before))
++                throw ProducerFailure(
++                    "inconclusive",
++                    "authoritative quiescent wallet context unavailable");
++            if (before.chain->identity != network.profile.chain_id ||
++                before.chain->profile_digest != network.profile.profile_digest)
++                throw ProducerFailure("storage_error",
++                                      "runtime profile identity mismatch");
++            if (expected && *expected != before.chain->stable_tip)
++                throw ProducerFailure(
++                    "stale",
++                    "requested tip is not the authoritative stable tip");
++            const auto read_ok = [&](Result result, const std::string &error) {
++                if (result == Result::Progress) return;
++                // With a quiescent single owner, a new read fault/reopen means
++                // storage lost authority during this call. Existing
++                // unavailability was refused above; local capacity remains
++                // inconclusive.
++                throw ProducerFailure(
++                    result == Result::StorageError ||
++                            result == Result::ReopenRequired
++                        ? "storage_error"
++                        : "inconclusive",
++                    error.empty() ? "wallet context read unavailable" : error);
++            };
++            phase = "storage_error";
++            DiskStateMetadata metadata;
++            Hash root;
++            std::string error;
++            read_ok(runtime->ReadMetadata(16 * MiB, metadata, root, error),
++                    error);
++            phase = "storage_error";
++            Require(metadata.tip == before.chain->stable_tip &&
++                        root == before.chain->root,
++                    "wallet metadata disagrees with authoritative tip/root");
++            Header tip;
++            Require(metadata.header.size() == HEADER_SIZE &&
++                        ParseHeader(metadata.header.data(),
++                                    metadata.header.size(), tip),
++                    "malformed wallet tip header");
++            Hash computed_tip;
++            Require(BlockId(network.profile.chain_id, tip, computed_tip) &&
++                        computed_tip == metadata.tip,
++                    "wallet tip header identity mismatch");
++            Require(metadata.monetary.size() == 56,
++                    "wallet monetary state must be56bytes");
++            const auto money = DecodeMonetaryState(metadata.monetary);
++            Require(StateRoot(network.profile.chain_id, tip.height, root,
++                              money) == tip.state_root,
++                    "wallet state commitment mismatch");
++            UniValue history(UniValue::VARR);
++            Hash current = metadata.tip;
++            const auto history_count = std::min<uint64_t>(tip.height, 10) + 1;
++            uint64_t expected_height = tip.height;
++            for (uint64_t n = 0; n < history_count; ++n) {
++                std::optional<IndexedHeader> indexed;
++                read_ok(runtime->ReadHeader(current, indexed, error), error);
++                Require(bool(indexed),
++                        "missing authenticated wallet history header");
++                std::array<uint8_t, HEADER_SIZE> raw{};
++                Hash id;
++                Require(indexed->header.height == expected_height &&
++                            indexed->header.version == manifest.hp.version &&
++                            SerializeHeader(indexed->header, raw) &&
++                            BlockId(network.profile.chain_id, indexed->header,
++                                    id) &&
++                            id == current,
++                        "wallet history identity/height/version mismatch");
++                if (n == 0)
++                    Require(std::equal(raw.begin(), raw.end(),
++                                       metadata.header.begin()),
++                            "wallet history tip serialization mismatch");
++                if (expected_height == 0)
++                    Require(current == network.profile.genesis_id,
++                            "wallet history genesis mismatch");
++                history.push_back(Hex(raw));
++                current = indexed->header.prev_id;
++                if (expected_height) --expected_height;
++            }
++            UniValue proof;
++            if (outpoint) {
++                CoinProof value;
++                read_ok(runtime->ProveCoin(*outpoint, value, error), error);
++                Require(VerifyCoinProof(*outpoint, value, root),
++                        "wallet proof does not bind authoritative UTXO root");
++                proof = UniValue(UniValue::VOBJ);
++                proof.pushKV("presence", uint64_t(value.presence));
++                if (value.coin) {
++                    std::vector<uint8_t> encoded;
++                    Require(EncodeCoin(*value.coin, encoded) &&
++                                encoded.size() <= MAX_COIN_BYTES,
++                            "wallet proof coin encoding invalid");
++                    proof.pushKV("coin", Hex(encoded));
++                } else
++                    proof.pushKV("coin", UniValue());
++                proof.pushKV("bitmap", Hex(value.bitmap));
++                UniValue siblings(UniValue::VARR);
++                Require(value.siblings.size() <= 256,
++                        "wallet proof sibling capacity");
++                for (const auto &sibling : value.siblings)
++                    siblings.push_back(Hex(sibling));
++                proof.pushKV("siblings", siblings);
++            }
++            const auto after = runtime->Snapshot();
++            if (!quiescent(after))
++                throw ProducerFailure(
++                    "inconclusive",
++                    "wallet context authority changed during read");
++            if (after.chain->stable_tip != before.chain->stable_tip ||
++                after.chain->root != before.chain->root ||
++                after.chain->identity != before.chain->identity ||
++                after.chain->profile_digest != before.chain->profile_digest)
++                throw ProducerFailure(
++                    "stale",
++                    "wallet context tip/root/profile changed during read");
++            UniValue answer(UniValue::VOBJ);
++            answer.pushKV("ok", true);
++            answer.pushKV("chain_id", Hex(network.profile.chain_id));
++            answer.pushKV("genesis_id", Hex(network.profile.genesis_id));
++            answer.pushKV("profile_digest",
++                          Hex(network.profile.profile_digest));
++            answer.pushKV("tip", Hex(metadata.tip));
++            answer.pushKV("height", tip.height);
++            answer.pushKV("utxo_root", Hex(root));
++            answer.pushKV("state_root", Hex(tip.state_root));
++            answer.pushKV("monetary_bytes", Hex(metadata.monetary));
++            answer.pushKV("tip_header", Hex(metadata.header));
++            answer.pushKV("history", history);
++            answer.pushKV("proof", proof);
++            // Include the echoed id in the final wire-size check. No status or
++            // peer counters are added to this deliberately exact response.
++            answer.pushKV("id", request["id"].get_str());
++            if (answer.write().size() + 1 > 32768)
++                throw ProducerFailure("inconclusive",
++                                      "wallet context response capacity");
++            return answer;
++        } catch (const ProducerFailure &error) {
++            return failed(error.result, error.what());
++        } catch (const std::bad_alloc &) {
++            return failed("inconclusive",
++                          "wallet context allocation unavailable");
++        } catch (const std::length_error &) {
++            return failed("inconclusive", "wallet context allocation capacity");
++        } catch (const std::exception &error) {
++            return failed(phase, error.what());
++        }
++    }
+     bool Node::Command(const std::string &line) {
+         UniValue request, answer(UniValue::VOBJ);
+         std::string id;
+-        bool producer = false;
++        bool producer = false, wallet = false;
+         try {
+             Require(request.read(line) && request.isObject(),
+                     "invalid command JSON");
++            wallet = request["command"].isStr() &&
++                     request["command"].get_str() == "walletcontext";
++            if (wallet)
++                Require(line.size() <= 1024,
++                        "walletcontext request exceeds1024bytes");
+             Require(request["id"].isStr(), "command id required");
+             id = request["id"].get_str();
++            if (wallet && id.size() > 64) id.clear();
+             Require(!id.empty() && id.size() <= 64, "command id bound");
+             Require(request["command"].isStr(), "command name required");
+             const auto name = request["command"].get_str();
+@@ -958,6 +1143,8 @@ namespace {
+                 answer = MineBlock(request);
+             } else if (name == "readblock") {
+                 answer = ReadBlock(request);
++            } else if (name == "walletcontext") {
++                answer = WalletContext(request, line.size());
+             } else if (name == "blockstatus") {
+                 Keys(request, {"id", "command", "block_id"});
+                 const auto block = HashOf(request["block_id"]);
+@@ -1026,9 +1213,10 @@ namespace {
+         } catch (const std::exception &e) {
+             answer = UniValue(UniValue::VOBJ);
+             answer.pushKV("ok", false);
++            if (wallet) answer.pushKV("result", "invalid");
+             answer.pushKV("error", std::string(e.what()).substr(0, 1024));
+         }
+-        answer.pushKV("id", id);
++        if (!answer.exists("id")) answer.pushKV("id", id);
+         Queue(std::move(answer));
+         return producer;
+     }
+diff --git a/src/lotus_v2/development_node_command.h b/src/lotus_v2/development_node_command.h
+index 818e62e56f84109abb223139e92e678061908d1c..2e78ddbc84595880f2207a67e818f56af32f06a3 100644
+--- a/src/lotus_v2/development_node_command.h
++++ b/src/lotus_v2/development_node_command.h
+@@ -54,6 +54,19 @@ namespace lotus::v2 {
+ // eof and authoritative status. Offset==size is empty/eof; offset>size rejects.
+ // Each query may read/copy the whole body within manifest bodycap; returned
+ // chunk is <=64KiB. These are logical byte/work bounds, not RSS claims.
++// walletcontext exact request<=1024B:{id,command,tip:null|64lowerhex,
++// outpoint:null|{txid:64lowerhex,index:JSONu32}}. Refuses recovery/receipt/
++// propagation/reopen/paused authority. Optional tip mismatch is stale.
++// Exact success<=32768B:{id,ok:true,chain_id,genesis_id,profile_digest,tip,
++// height,utxo_root,state_root,monetary_bytes,tip_header,history,proof}.
++// History is exactly min(height+1,11) raw134B headers newest-first including
++// tip. Proof is null for snapshot, otherwise the existing coin proof object.
++// Exact failures:{id,ok:false,result:stale|inconclusive|storage_error|invalid,
++// error<=1024B}. Single-owner readonly query binds header/state/proof and
++// rechecks authoritative tip/root/profile before publication. This is a local
++// authenticated snapshot, not a full-chain proof or trust/profile adoption.
++// Storage metadata snapshots retain their separate creation-cap copy bounds;
++// the32KiB returned response bound is not an RSS or backend-read claim.
+ int RunDevelopmentNodeCommand(int argc, char *argv[]);
+ } // namespace lotus::v2
+ #endif
+-- 
+2.50.1 (Apple Git-155)
+
