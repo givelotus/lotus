@@ -90,3 +90,33 @@ Tests also reject explicit script-argument/witness disagreement. This replaces
 the obsolete linked-library test that invoked context-free native CHECKSIG and
 reported permanently unavailable signing. Full transaction and block acceptance
 remain separate stages. Earlier retained reports and corpora are not replaced.
+
+## Operational failures in the native runner
+
+The extended runner uses `E` for `VmStatus::OperationalError`, independently of
+`U` (unsupported) and `I` (consensus rejection). It retains exit 0 and the existing
+wire shape: `E ACCOUNTING_OR_DASH` for charge mode, or
+`E ACCOUNTING_OR_DASH ENFORCEMENT_OR_DASH [STACK...]` for context mode. Malformed
+arguments/protocol failures still exit nonzero and are classified as tool errors.
+
+The adapter records `status: "operational-error"`, a stage reason and the complete
+raw subprocess record, including stdout, stderr, exit status and signal. Any
+emitted charge values are retained as decimal-string `diagnostic_charges`; they
+are not exposed as valid accounting/enforcement results or used to infer an
+accept/reject verdict. No automatic-success or valid final-stack claim is made.
+
+Reports now add a `comparison` object with status `compared`, `disagreement` or
+`inconclusive`, both observed engine outcomes, explicit reasons and discrepancies.
+Only accept/reject outcomes are comparable. An operational failure, unsupported
+stage or tool error makes comparison inconclusive; this does not imply equality.
+Accept/reject and charge disagreements between comparable results remain visible
+in `discrepancies`. This is an additive report-schema-1 extension; corpus inputs
+and retained historical fixtures are unchanged.
+
+The CLI reports operational/tool-error and inconclusive counts separately and
+exits nonzero for operational errors, tool errors or comparable discrepancies.
+Operational/tool-error cases receive individual executable replay JSON alongside
+the full report, even when no consensus discrepancy can be established. Exclusive
+creation continues to preserve earlier evidence. Mock-runner tests exercise
+S/A/I/U/E, nonzero E/protocol failures, raw-output retention, inconclusive status,
+and actual CLI nonzero exit plus replayable retained operational evidence.

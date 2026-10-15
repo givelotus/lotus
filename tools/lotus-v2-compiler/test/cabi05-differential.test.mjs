@@ -1,9 +1,10 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync,readFileSync,rmSync } from 'node:fs';
+import { mkdtempSync,readFileSync,rmSync,writeFileSync } from 'node:fs';
+import { spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { corpus,signedCases,linkedCases,compare,saveReport,python,native,runCorpus } from './differential/harness.mjs';
+import { corpus,signedCases,linkedCases,compare,saveReport,python,native,runCorpus,comparison,reportFailed } from './differential/harness.mjs';
 test('versioned seeded corpus is reproducible and bounds generation',()=>{
  assert.deepEqual(corpus(123,2),corpus(123,2));
  assert.notDeepEqual(corpus(123,2),corpus(124,2));
@@ -56,4 +57,66 @@ test('linked package fixtures derive signing contexts from exact wire and resolv
    assert.deepEqual(compare(r,result),[],c.id);
   }
  }
+});
+
+function mockRunner(directory,name,output,exit=0) {
+ const file=join(directory,name);
+ writeFileSync(file,`#!/bin/sh\nprintf '%s\\n' '${output.replaceAll("'", "'\\''")}'\nexit ${exit}\n`,{mode:0o700});
+ return file;
+}
+test('native operational E remains distinct from consensus verdicts and protocol failures',()=>{
+ const dir=mkdtempSync(join(tmpdir(),'cabi05-status-'));
+ const c=corpus(1,0).cases[0];
+ try {
+  for(const [wire,status] of [['S 10','accept'],['A 0','accept'],['I -','reject'],['U -','unsupported'],['E -','operational-error'],['E 100 101 ab','operational-error']]) {
+   const runner=mockRunner(dir,'runner',wire);
+   const result=native(c,runner);
+   assert.equal(result.status,status,wire);
+   assert.equal(result.process.stdout,wire+'\n');
+   if(status==='operational-error') {
+    assert.equal(result.accounting_charge,undefined);
+    assert.equal(result.automatic_success,undefined);
+    const assessed=comparison({status:'accept',accounting_charge:100},result);
+    assert.equal(assessed.status,'inconclusive');
+    assert.deepEqual(assessed.outcomes,{python:'accept',native:'operational-error'});
+    assert.deepEqual(assessed.reasons,['native:operational-error']);
+   }
+  }
+  const failed=native(c,mockRunner(dir,'nonzero','E -',2));
+  assert.equal(failed.status,'tool-error');
+  assert.equal(failed.process.stdout,'E -\n');
+  assert.equal(native(c,mockRunner(dir,'invalid','not-a-protocol')).status,'tool-error');
+  assert.equal(comparison({status:'accept'},{status:'reject'}).status,'disagreement');
+  assert.deepEqual(compare({status:'accept'},{status:'reject'}),['status']);
+  assert.equal(comparison({status:'reject'},{status:'unsupported'}).status,'inconclusive');
+  for(const [status,expected] of [['tool-error',true],['operational-error',true],['unsupported',false]]) {
+   assert.equal(reportFailed({cases:[{python:{status:'accept'},native:{status},discrepancies:[]}]}),expected,status);
+  }
+  assert.equal(reportFailed({cases:[{python:{status:'accept'},native:{status:'reject'},discrepancies:['status']}]}),true);
+ }finally{rmSync(dir,{recursive:true});}
+});
+test('CLI retains executable operational failure evidence and exits nonzero',()=>{
+ const dir=mkdtempSync(join(tmpdir(),'cabi05-cli-operational-'));
+ try {
+  const nativeRunner=mockRunner(dir,'native','E 100 101');
+  const pythonRunner=mockRunner(dir,'python',JSON.stringify({status:'accept',accepted_invocation:true}));
+  const input=join(dir,'input.json');
+  const c=corpus(1,0);c.cases=c.cases.slice(0,1);
+  writeFileSync(input,JSON.stringify(c));
+  const output=join(dir,'output');
+  const run=spawnSync(process.execPath,[join(import.meta.dirname,'differential/run.mjs'),output,'1',input],{encoding:'utf8',env:{...process.env,LOTUS_V2_NATIVE_VM:nativeRunner,LOTUS_V2_PYTHON:pythonRunner}});
+  assert.equal(run.status,1,run.stderr);
+  const count=JSON.parse(run.stdout);
+  assert.equal(count.operational_errors,1);
+  assert.equal(count.inconclusive,1);
+  assert.equal(count.tool_errors,0);
+  const report=JSON.parse(readFileSync(join(output,'report.json'),'utf8'));
+  assert.equal(reportFailed(report),true);
+  assert.equal(report.cases[0].native.status,'operational-error');
+  assert.deepEqual(report.cases[0].native.diagnostic_charges,{accounting:'100',enforcement:'101'});
+  const retained=JSON.parse(readFileSync(join(output,c.cases[0].id+'.json'),'utf8'));
+  assert.deepEqual(retained.cases,[c.cases[0]]);
+  assert.equal(retained.evidence.native.process.stdout,'E 100 101\n');
+  assert.equal(retained.evidence.comparison.status,'inconclusive');
+ }finally{rmSync(dir,{recursive:true});}
 });

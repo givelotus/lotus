@@ -84,22 +84,33 @@ export function native(c,executable) {
  if(!executable)return {status:'unsupported',reason:'native executable not configured'};
  const args=c.native_context?['--context',...c.native_context]:['--charge',c.script,String(c.input_count),String(c.output_count),...c.args];
  const run=processResult(executable,args);
- const match=/^([SAIU]) (\d+|-)(?: (\d+|-))?(?: (.*?))?\s*$/.exec(run.stdout??'');
+ const match=/^([SAIUE]) (\d+|-)(?: (\d+|-))?(?: (.*?))?\s*$/.exec(run.stdout??'');
  if(!match||run.exit!==0)return {status:'tool-error',process:run};
+ if(match[1]==='E')return {status:'operational-error',reason:'native VM operational failure',
+  diagnostic_charges:{accounting:match[2]==='-'?null:match[2],enforcement:!match[3]||match[3]==='-'?null:match[3]},process:run};
  return {status:({S:'accept',A:'accept',I:'reject',U:'unsupported'})[match[1]],automatic_success:match[1]==='A',accounting_charge:match[2]==='-'?null:Number(match[2]),enforcement_charge:!match[3]||match[3]==='-'?null:Number(match[3]),final_stack:match[4]?match[4].split(' ').map(x=>x==='-'?'':x):null,leaf:methodRoot(c.script,[]),process:run};
 }
 export function compare(a,b) {
- if([a.status,b.status].some(s=>s==='unsupported'||s==='tool-error'))return [];
+ if([a.status,b.status].some(s=>!['accept','reject'].includes(s)))return [];
  return ['status','automatic_success','accounting_charge','enforcement_charge','final_stack','leaf'].filter(k=>a[k]!=null&&b[k]!=null&&JSON.stringify(a[k])!==JSON.stringify(b[k]));
+}
+export function comparison(a,b) {
+ const outcomes={python:a.status,native:b.status};
+ const reasons=Object.entries(outcomes).filter(([,status])=>!['accept','reject'].includes(status)).map(([engine,status])=>`${engine}:${status}`);
+ const discrepancies=compare(a,b);
+ return {status:reasons.length?'inconclusive':discrepancies.length?'disagreement':'compared',outcomes,reasons,discrepancies};
+}
+export function reportFailed(report) {
+ return report.cases.some(c=>c.discrepancies.length||[c.python.status,c.native.status].some(s=>['operational-error','tool-error'].includes(s)));
 }
 export function runCorpus(input,o={}) {
  if(input.schema!==schema||!Array.isArray(input.cases)||input.cases.length>limits.maxCases)throw Error('unsupported or oversized corpus');
  for(const c of input.cases) {
   if(!/^[a-zA-Z0-9_-]{1,100}$/.test(c.id)||typeof c.script!=='string'||! /^(?:[0-9a-f]{2})*$/.test(c.script)||c.script.length>16384||!Array.isArray(c.args)||c.args.length>1024||c.args.some(a=>typeof a!=='string'||! /^(?:[0-9a-f]{2})*$/.test(a)||a.length>16384))throw Error('invalid bounded case');
  }
- return {schema:'lotus-v2/differential-report/1',seed:input.seed,node:process.version,platform:process.platform,arch:process.arch,limits,cases:input.cases.map(c=>{const a=python(c,o),b=native(c,o.native);return {case:c,compiler:c.artifact?{status:'compiled',root:c.artifact.policy.root,leaf:c.artifact.methods.find(m=>m.scriptHex===c.script)?.leaf}:null,python:a,native:b,discrepancies:compare(a,b)};})};
+ return {schema:'lotus-v2/differential-report/1',seed:input.seed,node:process.version,platform:process.platform,arch:process.arch,limits,cases:input.cases.map(c=>{const a=python(c,o),b=native(c,o.native);return {case:c,compiler:c.artifact?{status:'compiled',root:c.artifact.policy.root,leaf:c.artifact.methods.find(m=>m.scriptHex===c.script)?.leaf}:null,python:a,native:b,discrepancies:compare(a,b),comparison:comparison(a,b)};})};
 }
 export function saveReport(report,directory) {
  mkdirSync(directory,{recursive:true});writeFileSync(join(directory,'report.json'),JSON.stringify(report,null,2)+'\n',{flag:'wx'});
- for(const c of report.cases.filter(c=>c.discrepancies.length))writeFileSync(join(directory,`${c.case.id}.json`),JSON.stringify({schema,seed:report.seed,cases:[c.case],evidence:c},null,2)+'\n',{flag:'wx'});
+ for(const c of report.cases.filter(c=>c.discrepancies.length||[c.python.status,c.native.status].some(s=>['operational-error','tool-error'].includes(s))))writeFileSync(join(directory,`${c.case.id}.json`),JSON.stringify({schema,seed:report.seed,cases:[c.case],evidence:c},null,2)+'\n',{flag:'wx'});
 }
