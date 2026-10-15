@@ -131,6 +131,12 @@ export const DIAGNOSTIC_CODES: Record<string, string> = {
   E0922: 'module not present in the offline cache',
   E0923: 'invalid git locator',
   E0924: 'git fetch failed',
+  E1200: 'unknown compiler target',
+  E1201: 'unsupported target capability',
+  E1202: 'invalid target entrypoint',
+  E1203: 'source feature not implemented for target',
+  E1204: 'invalid portable semantic program',
+  E1210: 'target script resource limit exceeded',
   E9001: 'internal compiler invariant failed',
 };
 

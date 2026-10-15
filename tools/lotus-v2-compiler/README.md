@@ -176,3 +176,64 @@ The existing binding generators append one deterministic dump when `links` is no
 `test/linked-libraries.test.mjs` sends the signed `Escrow`, `Payer` and `Receiver` spends to the Python reference VM when `LOTUS_V2_PYTHON` can import `blake3`, `coincurve` and `lotus_v2_reference`. The CABI-08 run did that: a valid signature was accepted, a mutated signature was rejected, and a Payer bound to a different escrow root was rejected. `LOTUS_V2_NATIVE_VM`, pointed at the current `lotus_v2_vm_runner` argv CLI, returned `U` for that CHECKSIG script. That runner has no signing context, so signed native execution was not performed. An unset variable records the same limit and does not fail the compiler tests.
 
 A proxy mirror, vanity-domain discovery, registries, trust policy and published-package compatibility are still unimplemented. Branch names and semver ranges resolve only through `lotus-v2-package-update`.
+
+## Explicit compiler targets
+
+The existing `compileContract` and package APIs emit Lotus V2 policies. Their
+output remains unchanged when `target` is omitted or set to `"lotus-v2"`.
+They reject other target values. Use `compileTargetContract` from
+`@lotus/v2-payment-compiler/target-compiler` for explicit source target selection:
+
+```ts
+import { compileTargetContract } from '@lotus/v2-payment-compiler/target-compiler';
+const artifact = compileTargetContract(
+  `contract Hashlock<expected: Bytes32> {
+     function main(preimage: Bytes32) {
+       require(sha256(preimage) == expected);
+     }
+   }`,
+  { target: 'ecash', contract: 'Hashlock',
+    bindings: { Hashlock: { expected: 'ab'.repeat(32) } } },
+);
+```
+
+The eCash result is `ecash/script-artifact/1`: a direct locking script with an
+ordered byte/Boolean argument ABI, source map and static resource bounds. It has
+no Lotus policy, branch root, transaction or signing wrapper. Its profile is
+pinned to ABC `1fb7db17c176cdea8a2c60d887891589382ee4e3`, using that pin's standard
+script verification flags plus the explicit research restriction MINIMALIF.
+Compilation does not establish standard relay admission, transaction validity or
+current network activation. The native test gate executes the direct script.
+
+Set `target` in the existing CLI options JSON. An eCash invocation writes only
+`artifact.json` and `script.hex`; use a fresh output directory. Default Lotus
+invocations still produce their existing artifact and TypeScript/Python clients.
+Unknown targets reject. eCash package mode and `--trace` reject explicitly.
+
+The initial source slice supports exact `Bytes32`, canonical `Bool`, constructor
+bindings of those types, `sha256`, `hash256`, same-type `==`, `require`, and `if`
+with `else`. Runtime byte widths and Boolean encodings are checked by the script.
+Source `Bytes(n)` means a maximum bound in Lotus, while the initial portable IR
+has exact lengths; eCash source compilation rejects `Bytes(n)` rather than narrow
+its accepted domain. The lower-level semantic IR API accepts explicit exact byte
+lengths and is exported separately as `/semantic-ir` with `/ecash` and `/targets`.
+
+A single-method contract selects that method automatically. For a contract with
+multiple methods, `method: 'main'` selects one explicitly; the artifact commits
+only that method's script and creates no combined dispatcher. Unselected method
+syntax still parses, but its capabilities are not lowered. Constructor types and
+bindings for the selected contract remain checked. Lotus method selection stays
+at its existing invocation layer; source compilation commits the complete policy.
+
+Selected helper calls, package imports, assignments, other Boolean operators,
+Lotus int128/Amount arithmetic, transaction signatures, reflection, enumeration
+and token contracts reject in this eCash source slice. Lotus helper/package
+inlining continues through the existing compiler. The eCash backend has no
+optimizer: omit `optimize` or use `false`; `optimize: true` rejects instead of
+applying Lotus rewrites to eCash bytes. No DEFINE/INVOKE lowering is introduced.
+
+Run the source integration tests against the independently built pinned ABC
+adapter by setting `LOTUS_ECASH_NATIVE` to its executable, then running
+`node --test test/target-integration.test.mjs` after `npm run build`. Without that
+variable the native execution test is explicitly skipped. Other tests cover
+source/CLI selection, rejection diagnostics and spans, and unchanged Lotus output.

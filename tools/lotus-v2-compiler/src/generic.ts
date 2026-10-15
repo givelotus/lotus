@@ -3,6 +3,7 @@ import { artifactSpan, bytes, concat, cs, hex, tagged, unhex, uint, type Span } 
 import { schnorr } from '@noble/curves/secp256k1';
 import { DiagnosticBag, SourceManager, suggest, type DiagnosticExtra } from './diagnostics.js';
 import { assertPortableName } from './names.js';
+import { resolveTarget, type TargetId } from './targets.js';
 import { optimizeInstructions, type Instruction } from './optimizer.js';
 import { PromiseScheduler, type SchedulerEvent } from './scheduler.js';
 export type { SchedulerEvent } from './scheduler.js';
@@ -41,7 +42,7 @@ export type ContractArtifact = { schema: 'lotus-v2/contract-artifact/2'; target:
   build?: import('./packages.js').BuildGraph;
   /** Library contracts this artifact commits to (CABI-08). Omitted when empty so single-file artifacts stay unchanged. */
   links?: LinkedContract[]; }
-export type CompileOptions = { contract: string; bindings: Record<string, Record<string, BoundValue>>; optimize?: boolean };
+export type CompileOptions = { contract: string; bindings: Record<string, Record<string, BoundValue>>; optimize?: boolean; target?: TargetId };
 
 const MAX_SOURCE = 65536, MAX_SCRIPT = 8192, MAX_OPS = 4096, MAX_EXPANSIONS = 256, MAX_METHODS = 16;
 const MAX_INFERENCE_VISITS = 8192;
@@ -979,6 +980,10 @@ class Compiler {
 }
 
 function requireOptions(options: CompileOptions, bag: DiagnosticBag): void {
+  if (options?.target !== undefined) {
+    try { resolveTarget(options.target); } catch (error) { bag.raise('E1200', (error as Error).message); }
+    if (options.target !== 'lotus-v2') bag.raise('E1201', 'compileContract emits Lotus policies only; use compileTargetContract for an explicit eCash script artifact.');
+  }
   if (typeof options?.contract !== 'string' || !options.bindings || typeof options.bindings !== 'object') bag.raise('E0601', 'compile options require contract and bindings');
 }
 function openSource(source: string, file: string, sources = new SourceManager()): DiagnosticBag {
