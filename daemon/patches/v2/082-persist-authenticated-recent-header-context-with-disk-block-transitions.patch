@@ -1,0 +1,205 @@
+From b59b4d4e5ea46b9de135532dec50bdaed65d518f Mon Sep 17 00:00:00 2001
+From: Shammah Chancellor <shammah.chancellor@notvalid.com>
+Date: Thu, 15 Oct 2026 09:19:16 -0700
+Subject: [PATCH] Persist authenticated recent header context with disk block
+ transitions
+
+Recover child height and MTP from bounded linked history after reopen and disconnect. Store the newest eleven headers and exact body bytes atomically with the state; reject malformed context as an operational error. The context reader binds body header and length, not full transaction validity. Explicit trusted initialization remains caller-owned. Standalone and full-tree disk suites pass; eleven-header rollover remains additional coverage to complete.
+---
+ src/lotus_v2/disk_block.cpp          | 67 +++++++++++++++++++++++++++-
+ src/lotus_v2/disk_block.h            | 16 +++++++
+ src/lotus_v2/test_block_complete.cpp | 33 ++++++++++++--
+ 3 files changed, 112 insertions(+), 4 deletions(-)
+
+diff --git a/src/lotus_v2/disk_block.cpp b/src/lotus_v2/disk_block.cpp
+index 85870b1bd1b449fc0c2bdf7e24b2f7ae9dc2ffd2..19a34a67fb53668ddab0481189d42ef64e33a6ec 100644
+--- a/src/lotus_v2/disk_block.cpp
++++ b/src/lotus_v2/disk_block.cpp
+@@ -2,6 +2,8 @@
+ #include "disk_block.h"
+ #include "vendor/blake3/blake3.h"
+ #include <stdexcept>
++#include <algorithm>
++#include <limits>
+ namespace lotus::v2 {
+ namespace {
+ class Adapter final : public BlockStateTransaction {
+@@ -31,6 +33,67 @@ public:
+     void Abort() noexcept override { tx.Abort(); }
+ };
+ } // namespace
++std::vector<uint8_t> EncodeDiskChainContext(const std::vector<Header> &history,
++                                          const std::vector<uint8_t> &block) {
++    if (history.empty() || history.size() > 11)
++        throw std::invalid_argument("disk history count");
++    std::vector<uint8_t> bytes{'L', 'V', '2', 'C', 1, uint8_t(history.size())};
++    for (const auto &header : history) {
++        std::array<uint8_t, HEADER_SIZE> encoded;
++        if (!SerializeHeader(header, encoded))
++            throw std::invalid_argument("disk history header");
++        bytes.insert(bytes.end(), encoded.begin(), encoded.end());
++    }
++    if (!block.empty() && (block.size() != history.front().size ||
++        block.size() < HEADER_SIZE ||
++        !std::equal(bytes.begin() + 6, bytes.begin() + 6 + HEADER_SIZE, block.begin())))
++        throw std::invalid_argument("disk history block binding");
++    bytes.insert(bytes.end(), block.begin(), block.end());
++    return bytes;
++}
++bool ReadDiskChainContext(const DiskStateMetadata &meta, const HeaderChainProfile &hp,
++                          std::vector<Header> &history, std::vector<uint8_t> &block,
++                          std::string &error) {
++    const auto &bytes = meta.auxiliary;
++    const std::vector<uint8_t> prefix{'L', 'V', '2', 'C', 1};
++    auto fail = [&]() { error = "stored chain history encoding or binding"; return false; };
++    if (bytes.size() < 6 || !std::equal(prefix.begin(), prefix.end(), bytes.begin()) ||
++        bytes[5] == 0 || bytes[5] > 11) return fail();
++    const size_t end = 6 + size_t(bytes[5]) * HEADER_SIZE;
++    if (bytes.size() < end) return fail();
++    std::vector<Header> decoded(bytes[5]);
++    for (size_t i = 0; i < decoded.size(); ++i)
++        if (!ParseHeader(bytes.data() + 6 + i * HEADER_SIZE, HEADER_SIZE, decoded[i])) return fail();
++    Header parent;
++    Hash id;
++    if (!ParseHeader(meta.header.data(), meta.header.size(), parent) ||
++        !BlockId(hp.chain_id, parent, id) || id != meta.tip ||
++        !ParentMedianTime(hp, parent, decoded)) return fail();
++    const size_t body_size = bytes.size() - end;
++    if (body_size && (body_size != parent.size || body_size < HEADER_SIZE ||
++        !std::equal(meta.header.begin(), meta.header.end(), bytes.begin() + end))) return fail();
++    std::vector<uint8_t> body(bytes.begin() + end, bytes.end());
++    history = std::move(decoded); block = std::move(body); error.clear(); return true;
++}
++CandidateCheckResult ConnectStoredDiskBlock(
++    const std::vector<uint8_t> &wire, const HeaderChainProfile &hp,
++    OrdinaryCandidateProfile op, const MonetaryProfile &mp, const BlockCostProfile &cp,
++    DiskStateStore &store, StagedBlockTransition &out, std::string &error) {
++    try {
++        std::vector<Header> history;
++        std::vector<uint8_t> block;
++        if (!ReadDiskChainContext(store.Metadata(), hp, history, block, error))
++            return CandidateCheckResult::StorageError;
++        if (history.front().height == std::numeric_limits<uint64_t>::max()) {
++            error = "stored chain height exhausted"; return CandidateCheckResult::StorageError;
++        }
++        op.candidate_height = history.front().height + 1;
++        op.parent_mtp = *ParentMedianTime(hp, history.front(), history);
++        return ConnectDiskBlock(wire, history, hp, op, mp, cp, store, out, error);
++    } catch (const std::exception &e) {
++        error = e.what(); return CandidateCheckResult::StorageError;
++    }
++}
+ Hash BlockValidationProfileDigest(const HeaderChainProfile &hp,
+     const OrdinaryCandidateProfile &op, const MonetaryProfile &mp,
+     const BlockCostProfile &cp) {
+@@ -118,7 +181,9 @@ CandidateCheckResult ConnectDiskBlock(
+         next.monetary.assign(money.begin(), money.end());
+         // Persist exact complete bytes with the same atomic state transition.
+         // Backend limits are operational; no partial/truncated block is stored.
+-        next.auxiliary = wire;
++        std::vector<Header> recent{staged.header};
++        recent.insert(recent.end(), history.begin(), history.begin() + std::min(size_t(10), history.size()));
++        next.auxiliary = EncodeDiskChainContext(recent, wire);
+         if (!tx.Commit(next, failure)) { error = failure.message; return Result::StorageError; }
+         out = std::move(staged);
+         error.clear();
+diff --git a/src/lotus_v2/disk_block.h b/src/lotus_v2/disk_block.h
+index eacc3272bcd531907def30b8c5df7a441ed0ec01..df8abbf74facecca14c807c1e418d6518843c054 100644
+--- a/src/lotus_v2/disk_block.h
++++ b/src/lotus_v2/disk_block.h
+@@ -9,6 +9,22 @@ namespace lotus::v2 {
+ // This is not the network manifest digest or a new consensus hash domain.
+ Hash BlockValidationProfileDigest(const HeaderChainProfile &,
+     const OrdinaryCandidateProfile &, const MonetaryProfile &, const BlockCostProfile &);
++// Versioned local metadata containing the newest-first header window and exact
++// block bytes. Empty bytes are permitted only for an explicitly trusted initial
++// state supplied by the enclosing genesis initializer; this does not validate it.
++std::vector<uint8_t> EncodeDiskChainContext(const std::vector<Header> &history,
++                                          const std::vector<uint8_t> &block);
++// Authenticates history against meta.tip and checks stored block header/length.
++// Does not revalidate the body transaction root or VM; body bytes remain local
++// previously validated data and must not be advertised as freshly revalidated.
++bool ReadDiskChainContext(const DiskStateMetadata &, const HeaderChainProfile &,
++                          std::vector<Header> &history, std::vector<uint8_t> &block,
++                          std::string &error);
++// Derives height and median time from persisted authenticated header context.
++CandidateCheckResult ConnectStoredDiskBlock(
++    const std::vector<uint8_t> &wire, const HeaderChainProfile &hp,
++    OrdinaryCandidateProfile op, const MonetaryProfile &mp, const BlockCostProfile &cp,
++    DiskStateStore &store, StagedBlockTransition &out, std::string &error);
+ // Caller serializes access to the store. History is authenticated chain ancestry
+ // ending at its stored tip; clock eligibility and best-chain selection are
+ // enclosing-node responsibilities. Success means one durable database batch.
+diff --git a/src/lotus_v2/test_block_complete.cpp b/src/lotus_v2/test_block_complete.cpp
+index 2ae5cf67c19c428599ff0dc85bbe7c68b49f5910..bac67ce85408e181a17982481b0cdb31a0f98041 100644
+--- a/src/lotus_v2/test_block_complete.cpp
++++ b/src/lotus_v2/test_block_complete.cpp
+@@ -354,11 +354,33 @@ void CompleteChecks() {
+         parent_meta.header.assign(header_bytes.begin(), header_bytes.end());
+         const auto monetary_bytes = EncodeMonetaryState(parent.monetary);
+         parent_meta.monetary.assign(monetary_bytes.begin(), monetary_bytes.end());
++        parent_meta.auxiliary = EncodeDiskChainContext({parent.header, genesis}, {});
++        std::vector<Header> recovered;
++        std::vector<uint8_t> recovered_wire;
++        Check(ReadDiskChainContext(parent_meta, hp, recovered, recovered_wire, error) &&
++                  recovered.size() == 2 && recovered_wire.empty(), "initial history recovery");
++        auto corrupt_meta = parent_meta;
++        corrupt_meta.auxiliary[6 + HEADER_SIZE + 4] ^= 1;
++        Check(!ReadDiskChainContext(corrupt_meta, hp, recovered, recovered_wire, error),
++              "corrupted ancestor history rejected");
++        corrupt_meta = parent_meta;
++        corrupt_meta.auxiliary[5] = 12;
++        Check(!ReadDiskChainContext(corrupt_meta, hp, recovered, recovered_wire, error),
++              "oversized history rejected before allocation");
++        corrupt_meta = parent_meta;
++        corrupt_meta.auxiliary.pop_back();
++        Check(!ReadDiskChainContext(corrupt_meta, hp, recovered, recovered_wire, error),
++              "truncated history rejected");
+         {
+             DiskStateTransaction seed;
+             Check(db.Begin(seed, failure) && seed.Insert(funding, failure) &&
+                       seed.Commit(parent_meta, failure), failure.message);
+         }
++        // The stored-context path derives these values; caller leftovers must
++        // neither select another spend clock nor prevent restart validation.
++        auto stale_context = profile;
++        stale_context.candidate_height = 999;
++        stale_context.parent_mtp = 999;
+         StagedBlockTransition durable;
+         auto wrong_cost = COST;
+         ++wrong_cost.hash_byte;
+@@ -366,15 +388,20 @@ void CompleteChecks() {
+                                DevelopmentGenesis, wrong_cost, db, durable, error)
+                   == CandidateCheckResult::StorageError && db.Metadata() == parent_meta,
+               "changed validator schedule cannot reuse stored profile");
+-        Check(ConnectDiskBlock(wire, {parent.header, genesis}, hp, profile,
++        Check(ConnectStoredDiskBlock(wire, hp, stale_context,
+                                DevelopmentGenesis, COST, db, durable, error)
+                   == CandidateCheckResult::Accepted, error);
+         Check(db.Root() == expected.Root() && db.Metadata().tip == durable.block_id &&
+-                  db.Metadata().auxiliary == wire, "atomic block bytes and tip");
++                  ReadDiskChainContext(db.Metadata(), hp, recovered, recovered_wire, error) &&
++                  recovered_wire == wire && recovered.size() == 3,
++              "atomic block bytes, history and tip");
+         db = DiskStateStore{};
+         Check(DiskStateStore::Open(directory, options, {}, db, failure), failure.message);
+         Check(db.Root() == expected.Root() && db.Metadata().tip == durable.block_id,
+               "reopened complete state");
++        Check(ReadDiskChainContext(db.Metadata(), hp, recovered, recovered_wire, error) &&
++                  recovered_wire == wire && recovered.size() == 3,
++              "reopened authenticated history and exact block bytes");
+         Check(db.Disconnect(durable.block_id, failure), failure.message);
+         Check(db.Root() == utxo.Root() && db.Metadata() == parent_meta,
+               "durable disconnect restores exact parent tuple");
+@@ -382,7 +409,7 @@ void CompleteChecks() {
+         Check(DiskStateStore::Open(directory, options, {}, db, failure), failure.message);
+         Check(db.Metadata() == parent_meta && db.Root() == utxo.Root(),
+               "reopened disconnected parent");
+-        Check(ConnectDiskBlock(wire, {parent.header, genesis}, hp, profile,
++        Check(ConnectStoredDiskBlock(wire, hp, stale_context,
+                                DevelopmentGenesis, COST, db, durable, error)
+                   == CandidateCheckResult::Accepted, error);
+     }
+-- 
+2.50.1 (Apple Git-155)
+
