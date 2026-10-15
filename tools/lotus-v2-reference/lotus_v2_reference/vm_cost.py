@@ -5,10 +5,12 @@ this pass never decides invocation validity.
 """
 
 from dataclasses import dataclass
-from typing import Mapping
+from typing import Mapping, Sequence
 
+from .encoding import Output, encode_output
 from .vm import (Conditional, Instruction, Loop, Node, UnsupportedFeature,
                  VMError, VMProfile, U128_MAX, _checked_cost)
+from .vm_context import InvocationContext
 
 
 @dataclass(frozen=True)
@@ -68,6 +70,96 @@ HASHES = frozenset((*range(0xb8, 0xbb), 0xbe, 0xbf, 0xc0, 0xc1, 0xc2,
 FIELD_READS = frozenset((0xdb, 0xdc, 0xe6, 0xe7, 0xf0))
 
 
+def _path_sizes(outputs: Sequence[Output]) -> tuple[int, ...]:
+    widths: list[int] = []
+    for output in outputs:
+        for slot, path in enumerate(output.paths):
+            encoded = 1 + len(path)
+            if slot >= len(widths):
+                widths.extend([0] * (slot + 1 - len(widths)))
+            widths[slot] = max(widths[slot], encoded)
+    return tuple(widths)
+
+
+def _output_size(output: Output, context: InvocationContext) -> int:
+    try:
+        return len(encode_output(output, context.output_profile))
+    except ValueError as exc:
+        raise VMError("field-size output encoding") from exc
+
+
+def derive_field_sizes(context: InvocationContext) -> dict[int, tuple[int, ...]]:
+    """Serialized sizes for UTXOPATH, UTXOOUTPUT, OUTPUTPATH and OUTPUTRECORD.
+
+    Path slots are ``1 + len(path)``, the bytes those opcodes push. An input
+    with no resolved coin contributes 0. Empty path vectors mean no path exists.
+    """
+    if not isinstance(context, InvocationContext):
+        raise TypeError("field sizes require an invocation context")
+    coins = tuple(item.coin for item in context.inputs if item.coin is not None)
+    coin_sizes = []
+    for item in context.inputs:
+        coin_sizes.append(0 if item.coin is None else _output_size(item.coin, context))
+    return {
+        0xdb: _path_sizes(coins),
+        0xdc: tuple(coin_sizes),
+        0xe6: _path_sizes(context.outputs),
+        0xe7: tuple(_output_size(output, context) for output in context.outputs),
+    }
+
+
+def _paths_uncovered(hint: tuple[int, ...], outputs: Sequence[Output]) -> bool:
+    if not hint:
+        return False
+    widest = max(hint)
+    for output in outputs:
+        for slot, path in enumerate(output.paths):
+            encoded = 1 + len(path)
+            if widest < encoded or (slot < len(hint) and hint[slot] < encoded):
+                return True
+    return False
+
+
+def bind_authenticated_field_sizes(
+    field_sizes: Mapping[int, tuple[int, ...]] | None,
+    context: InvocationContext | None,
+    *,
+    max_element_bytes: int | None = None,
+) -> dict[int, tuple[int, ...]]:
+    """Fill absent hints from ``context``. A larger hint stays; a smaller one errors.
+
+    With no context the caller hints are returned unchanged. An empty map means
+    the size pass keeps MAX_ELEMENT_BYTES. A derived size above the element cap
+    is capped, which matches the size pass and cannot under-charge a push.
+    """
+    merged = {op: tuple(sizes) for op, sizes in (field_sizes or {}).items()}
+    if context is None:
+        return merged
+    derived = derive_field_sizes(context)
+    coins = tuple(item.coin for item in context.inputs if item.coin is not None)
+    for op, hint in merged.items():
+        if not hint or op == 0xf0:
+            continue
+        if op in (0xe7, 0xdc):
+            expected = derived[op]
+            if len(hint) != len(expected):
+                raise VMError("field-size hint count")
+            if any(got < need for got, need in zip(hint, expected)):
+                raise VMError("field-size hint below authenticated field")
+        elif op in (0xdb, 0xe6):
+            sources = coins if op == 0xdb else context.outputs
+            if _paths_uncovered(hint, sources):
+                raise VMError("field-size hint below authenticated field")
+    for op, sizes in derived.items():
+        if not sizes or merged.get(op):
+            continue
+        if max_element_bytes is not None:
+            sizes = tuple(min(size, max_element_bytes) for size in sizes)
+        if sizes:
+            merged[op] = sizes
+    return merged
+
+
 def static_size_cost(ast: tuple[Node, ...], profile: VMProfile, *,
                      initial_sizes: tuple[int, ...], script_length: int,
                      input_count: int, output_count: int,
@@ -76,7 +168,9 @@ def static_size_cost(ast: tuple[Node, ...], profile: VMProfile, *,
 
     Cost functions receive `(operand_size_bounds, result_size_bounds)` and
     must be positive, monotone conservative upper bounds over those sizes.
-    Missing field-size vectors fall back to MAX_ELEMENT_BYTES.
+    Missing field-size vectors fall back to MAX_ELEMENT_BYTES. This function
+    does not read a transaction; bind_authenticated_field_sizes first when an
+    invocation context is present.
     """
     limit = profile.max_element_bytes
     fields = field_sizes or {}

@@ -143,10 +143,15 @@ def run_invocation(case: dict[str, Any]) -> dict[str, Any]:
             ast = decode(script, profile)
             trace.append("decoded")
             stage = "static_charge"
+            from .vm_cost import bind_authenticated_field_sizes
+            bound_fields = (bind_authenticated_field_sizes(
+                None, invocation, max_element_bytes=profile.max_element_bytes)
+                if invocation is not None else None)
             charge = static_cost(ast, profile, input_count=input_count,
                                  output_count=output_count,
                                  initial_sizes=tuple(map(len, initial)),
-                                 script_length=len(script))
+                                 script_length=len(script),
+                                 field_sizes=bound_fields)
             charge += len(script) * profile.structural_byte_cost
             if charge > profile.max_invocation_cost:
                 raise VMError("static cost exceeds bound")
