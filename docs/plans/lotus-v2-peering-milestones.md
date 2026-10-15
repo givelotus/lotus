@@ -43,6 +43,94 @@ The inspected ABC source has no QUIC implementation. `src/net_processing.cpp:684
 
 Public QUIC discovery/authentication and any removal of Avalanche application signatures require separate review. TLS encrypting a connection does not establish stake authority, consensus validity or independence from another peer. Preserve the working TCP transport throughout milestone 2.
 
+## Follow-on milestones — commitment-based state sync and hostile suppliers
+
+Maintainer request (2026-10-15): implement these after the existing V2 chain and
+local testnet work. They are important long-term synchronization capabilities,
+not prerequisites for the first working network. No snapshot protocol, proof
+encoding, default mode or Avalanche policy is selected by this plan.
+
+The primary threat here is **availability after selecting a tip and state root**:
+peers repeatedly send invalid UTXO subtrees or stall to prevent a new node from
+finishing synchronization. The proposed mode uses the enclosing PoW/Avalanche tip
+selection policy; specifying and implementing that policy remains separate. This
+plan does not claim that the current V2 runtime already implements Avalanche.
+
+### STATE-01: opt-in state bootstrap and historical backfill
+
+Provide an explicit, non-default mode that imports state authenticated to the
+selected header commitment and can then obtain earlier chain data in the
+background. Expose the exact selected BlockID/height/root and profile, source
+policy and current verification status. Review whether explicit supplier nodes
+are required or merely configurable; no implicit trusted supplier list is added.
+Snapshots must bind the complete required state, including coin metadata and the
+monetary envelope committed by the header, rather than UTXO values alone.
+
+Historical blocks may be downloaded backwards from the selected tip. Execution
+validation still follows parent-to-child dependencies from an authenticated
+starting state, with separate progress reporting. This is a secondary assurance
+track; it must not obscure the primary hostile-supplier availability goal.
+Persist verified state-import progress and provide explicit interruption,
+selected-root change and restart behavior without mixing roots or generations.
+
+### STATE-02: authenticated subtrees from multiple suppliers
+
+Use the existing authenticated UTXO tree commitment as the anchor. Review a
+bounded manifest/proof format that authenticates subtree hashes and key/prefix
+coverage to that fixed root, so request identity is independent of a supplier.
+It must detect omitted ranges, overlapping coverage, duplicate leaves and
+noncanonical encodings as well as changed coins. Do not silently change tree
+ordering, header roots or P02 proof formats to implement transport.
+
+Verify each bounded response before admitting it to the imported state. Retain
+verified subtrees across retries and restart; invalid responses cannot erase
+valid progress. Split requests among peers, cap outstanding work and proof
+processing, enforce fixed deadlines, and retry stalled or corrupt ranges with
+alternate suppliers. Peer rotation/reconnection must not reset global admission
+budgets or earn unlimited retries. A peer must not indefinitely own a range.
+Local capacity refusal remains operational and is not evidence of poisoned data.
+
+Multiple suppliers improve availability; their agreement is not the proof.
+Every accepted chunk must independently authenticate to the selected root.
+Resource bounds must include decoding, verification, queued bytes, disk writes
+and restart bookkeeping, with fair scheduling for honest responses during spam.
+Selection of a different tip must explicitly reconcile or retire the old import;
+reuse is permitted only where authenticated subtree hashes remain identical.
+
+### STATE-03: verifiable poison evidence and relay research
+
+Investigate compact evidence of a malformed response, invalid subtree or invalid
+claimed transition. Separate evidence about bytes from attribution to a supplier:
+an independently invalid payload alone does not prove which peer sent it. Review
+whether signed response commitments or another attribution mechanism is needed
+before any transferable accusation can affect peer selection. Do not add a
+broadcast message or automatic peer punishment until evidence encoding, verifier
+cost, replay scope, attribution and false-accusation resistance are specified.
+
+A timeout, unavailable subtree, local resource limit or unverifiable allegation
+is not a cryptographic poison proof. Evidence must identify the exact chain,
+selected root, requested subtree and offending claim, and recipients must verify
+it independently under bounded work. Proof gossip must itself resist flooding.
+Do not promise that every failure has a succinct transferable proof.
+
+### Acceptance evidence
+
+Demonstrate sync completion and continued verified progress with honest suppliers
+available while hostile peers send corrupt proofs/subtrees, withhold ranges,
+trickle bytes, reconnect and equivocate. Test mixed-root responses, malformed
+coverage, oversized/computationally expensive proofs, exhaustion and restart.
+Measure completion time, wasted bandwidth, verification CPU, peak retained memory
+and disk use under named hardware, chain-growth and adversarial-load conditions.
+State the honest-connectivity and resource assumptions; full eclipse or saturated
+resources cannot be treated as a successful availability test.
+
+Also measure sustained validation/import throughput against new-chain arrival
+rate. A fast initial snapshot alone does not establish that a node can keep up or
+finish historical backfill. The milestone must report which operating envelope
+allows catch-up and continued operation, rather than only a small static-fixture
+success. These requirements remain deferred while baseline node integration is
+completed.
+
 ## Required adversarial corpus and handoff
 
 Use independent serializers/reference fixtures for the 134-byte header, P01 TxID/TxHash, ordered block root, complete block framing, compact selector and receive-limit negotiation. Include valid baselines before each negative mutation. Exercise 252/253 CompactSize boundaries, exact limits, overflow and truncation, with no allocation based solely on an untrusted count. Compact tests must force collisions deterministically rather than wait for random collisions. Compare full-block fallback against independently validated bytes.
