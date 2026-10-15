@@ -29,6 +29,40 @@ Start under `tools/lotus-v2-compiler/`, with a machine-readable schema and fixtu
 
 Keep Python as an independent test/reference implementation and as one generated client target. **Python and TypeScript are equal first-release binding targets**, each with a contract-specific API and a small maintained runtime library generated/maintained against the same versioned ABI. The compiler does not run during every client call. Python is required only for the Python client and optional reference checks, not the compiler or TypeScript client. Changes in `~/repos/frank` require a separate scoped revision; this plan makes no changes there.
 
+## Shared library packages and module imports
+
+The compiler needs reusable, reviewable library packages. A contract author should be able to import a checked arithmetic helper, a token policy, or a standard signature utility once and share that source across contracts. This is a compiler/package feature: imported code is resolved and checked at build time, then inlined or compiled into ordinary P03 scripts. The VM gains no dynamic loader, runtime module lookup, or package authority.
+
+Use Finch's language specification as the design reference for module boundaries: module identities come from paths relative to the owning package root; dependency roots come from the root project's manifest/lockfile; imports are explicit; package visibility differs from public visibility; and repeated imports share one immutable module identity. Finch's large language surface is not the Lotus language design, and its implementation is not a dependency.
+
+The initial package model should have:
+
+- A `lotus.toml` manifest naming the package, its source root, its exported library interface, and exact dependencies. A checked-in `lotus.lock` records each dependency's immutable source locator, version/revision, content digest, and resolved package root. Compilation consumes already-resolved files and performs no network access. A root-only local path override may support development, but is never inherited from a dependency.
+- Stable module identity derived from `(package identity, normalized relative path)`. Reject path traversal, symlink escape, duplicate module identities, case/Unicode collisions, undeclared files, and source bytes whose digest disagrees with the lock. Do not guess modules through ambient include paths.
+- Declaration-only `library` modules. Top-level executable statements and implicit initialization are forbidden. Exported declarations have explicit types and stable interface digests; private helpers remain visible only in their module, while package-scoped declarations can be shared within the package.
+- Explicit imports with whole-module aliases, selective names, and renames. The eventual C-like surface can use syntax such as `import math::checked::{add as safeAdd};`; the import path identifies a module, while the manifest/lockfile decides which package owns that path. Exact spelling remains a language-design decision pending syntax fixtures.
+- One parsed AST and one promise-scheduler job per immutable module identity. The scheduler resolves imported declarations and their transitive dependencies, deduplicates diamond imports, diagnoses missing/ambiguous/private symbols and cycles with source spans, and enforces graph and expansion limits.
+- A sealed build graph in every artifact: root package/module identity, lockfile digest, direct and transitive module source digests, exported interface digests, compiler/optimizer version, target opcode/spec identity, and the compiled dependency graph. Two builds with the same manifest, lock, source bytes, compiler profile and options must produce byte-identical contract artifacts.
+
+Imported pure functions may be specialized and inlined under existing expansion limits. Imported contract methods retain their own policy root and ABI; a caller that commits to one uses an explicit linked-contract artifact binding, so recompiling or upgrading the library cannot silently retarget the commitment. Package versions alone are insufficient provenance: artifacts bind exact source and interface digests. A dependency update that changes emitted bytecode, method roots, witness layout, or resource bounds is a deliberate contract rebuild and produces a visible diff.
+
+The current compiler only parses one source string and shares helper declarations inside it; it has no module loader, import syntax, manifest, or lockfile. Add CABI-07 for deterministic package/module resolution and CABI-08 for end-to-end shared-library contracts, while preserving the current single-file API as a convenience wrapper over one in-memory module. CABI-07 acceptance requires a local multi-package fixture with a diamond dependency, a renamed selective import, duplicate and private-symbol rejection, cycle/missing-module diagnostics, lock/source digest mismatch rejection, path-escape rejection, deterministic artifact digests, and zero network access. CABI-08 compiles at least two gallery contracts through a shared package, executes their signed calls in Python and native VMs, and checks that a dependency change alters the expected artifact/contract root. Do not claim published package-registry compatibility until a registry and trust policy are separately specified.
+
+Proposed source shape (illustrative; the current parser rejects it):
+
+```lotus
+import lotus_std::amounts::{checkedAdd as safeAdd};
+
+contract Escrow<owner: PublicKey> {
+    function spend(amount: Amount, signature: Signature) {
+        require(safeAdd(amount, 1) > amount);
+        require(checksig(signature, owner));
+    }
+}
+```
+
+`lotus_std` is a dependency alias declared by the consuming package manifest. The remaining path selects a module within that package. `checkedAdd` is exported by the library, imported under a local name, type checked at the call site and inlined under the existing helper-expansion budget. A library that exports a contract/policy is imported as a typed artifact; its exact source/interface digest and resulting root are pinned when another contract commits to it. This separation lets libraries share helpers while making consensus-visible commitments explicit.
+
 The initial payment slice is implemented: real source parsing and type checks, bytecode/ABI emission, generated call construction, and an actual signed transaction under an explicit fixture profile. It must compare exact bytes and signing results with independent reference/native modules. Native modules cover framing/cryptography; the separate reference VM now also executes the gallery Payment, hashlock, helper and linked-commitment invocations. Neither establishes contextual or block validity. The first slice does not close all CABI-00–03 requirements.
 
 ## Finch specification influence and deliberately small scope
@@ -109,8 +143,10 @@ Each Python/TypeScript pair must reproduce identical constructor/script commitme
 | CABI-04 | Tokens, state and bounded covenants | CABI-02/03, needed VM/introspection and accounting | Execute mint/transfer rules, stateful counter, limit order, two-input merge and input × output loops; adversarial policy/state/asset substitutions reject |
 | CABI-05 | Differential/property/fuzz and stress harness | CABI-01 onward, expanded as validator support lands | Deterministic corpora and minimized discrepancies; correct accept/reject/results/roots/charges across independent engines; recorded stress measurements |
 | CABI-06 | Optimizer and application pilot | CABI-04/05, development-chain connect/undo | Optimized/unoptimized equivalence corpus; Frank application flow runs with generated bindings on disposable V2 chain; reorg/undo restores state |
+| CABI-07 | Deterministic package manifests, lockfiles, module resolution and import visibility | Current compiler parser/scheduler and artifact schema | Local two-package diamond builds offline; alias/selective imports, visibility, ambiguity, cycles, digest mismatch and path escape cases; deterministic sealed module graph in artifacts |
+| CABI-08 | Shared contract libraries and dependency-aware ABI/client generation | CABI-07, CABI-03/04 | Two contracts consume one versioned library; generated TypeScript/Python bindings preserve linked contract roots; source update changes expected commitments; Python/native VM fixture execution |
 
-CABI-00/01 can begin before consensus freeze or complete daemon integration. Schema/binding work and backend work can run independently after their interfaces are reviewed; the harness should start with the assembler and grow with supported features. Every behavior-changing draft revision increments the target profile and regenerates affected fixtures through explicit review. Final genesis pins a reviewed profile; it does not prevent earlier development.
+CABI-00/01 and CABI-07 can begin before consensus freeze or complete daemon integration. Schema/binding work and backend work can run independently after their interfaces are reviewed; the harness should start with the assembler and grow with supported features. Every behavior-changing draft revision increments the target profile and regenerates affected fixtures through explicit review. Final genesis pins a reviewed profile; it does not prevent earlier development.
 
 ## Dogfooding and stress corpus
 
