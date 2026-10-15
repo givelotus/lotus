@@ -240,12 +240,52 @@ Zero anchors remain for synthetic module fixtures only: the forthcoming daemon
 initializer must require a nonzero manifest anchor and validate complete genesis,
 initial state and target/work agreement before opening usable chainstate.
 
+## Explicit development initialization and offline daemon acceptance (093–102)
+
+All 103 mailboxes replay with exact intermediate trees, ending at
+`fb01e797cef82ffb3e8db6f89297817fb2390f7e`.
+See [replay evidence](evidence/v2-series-replay-102.json). Existing patches 000–092
+retain their exact bytes. Mailboxes with initially empty commit bodies carry
+explicitly attributed integration review notes; source trees are unchanged.
+
+Native commit `74ac986ec523f1990bce9d1e2732eb4753dbcbcd` was built from a
+fresh, clean clone at `/private/tmp/lotus-v2-daemon-command-exact-20261015`.
+Debug `lotusd`, `check-lotus-v2-development-chain`, `check-lotus-v2-disk` and
+`check-lotus-v2-peer-codec` pass with Chronik off. Build output is retained at
+`/private/tmp/lotus-v2-command-exact-build-20261015.log`.
+
+The initializer requires an explicit manifest, exact nonzero genesis identity,
+canonical target/work, zero genesis issuance, unchanged initial monetary state,
+valid VM schedules and authenticated genesis UTXO/state commitments. Restart
+checks retained history and body availability. Chain-aware disconnect validates
+restored predecessor metadata before atomic publication and refuses genesis undo.
+
+The separate `lotusd -lotusv2development MANIFEST DATADIR` command supports
+`status`, `submit BLOCK_FILE`, and `disconnect EXPECTED_TIP_HEX` before inherited
+chain initialization. It starts no sockets, RPC server or Chronik. A dedicated
+marked directory rejects legacy-looking data and profile mismatches. Namespace
+marker creation is not fsynced; interrupted namespace initialization requires
+explicit recovery. LevelDB state batches retain their synchronous write guarantee.
+
+The reproducible `src/lotus_v2/development_command_test/verify.py` process checks
+passed against that exact daemon. Evidence and all command results are retained
+at `/private/tmp/lotus-v2-command-exact-evidence-20261015/evidence.json`.
+Using the proposed profile as explicit offline input, the daemon accepted first
+block `a7edf76ddaacd6dd59023be9468e6d0724482fd6f794ebc473d1edd54d66af2b`
+with Python-reference state root
+`d3a19d0f6d0f7414bdf1ccaaf8eb38c46f28d2c3017ffedf71762fcc28900669`.
+Separate-process restart, disconnect to genesis, reconnect, genesis undo refusal,
+mutated-body rejection without state change, strict manifest failures and
+preservation of legacy-looking directories also pass. This demonstrates offline
+V2 daemon acceptance through the explicit development path. It does not demonstrate
+peer acceptance, signed mature spending, inherited ConnectTip integration or a
+public testnet. The proposed network profile has not been adopted.
+
 ## Next bounded work
 
-Wire the tested disk-backed complete-block boundary into a separate development
-chain daemon path, with authenticated history, clock eligibility and reorg state
-refresh. Preserve Bitcoin parsing and mainnet chainparams. Review the proposed
-development profile before adoption. Then finish the TCP/compact-block milestone,
-followed by separately reviewed QUIC work. Compiler stateful allowance fixtures
-now execute signed transitions; full transaction/block fixture execution remains
-open. No V2 daemon acceptance, public testnet or mainnet parameter freeze is claimed.
+Finish the TCP/compact-block runtime with handshake ordering/timeouts, bounded
+request retention, download scheduling and chain synchronization. Preserve Bitcoin
+parsing and mainnet chainparams. Review the proposed development profile before
+adoption. Exercise signed mature spends and reorgs through the daemon path, then
+complete the compiler transaction/block pilot. QUIC remains a separately reviewed
+second networking milestone. No public testnet or mainnet parameter freeze is claimed.
