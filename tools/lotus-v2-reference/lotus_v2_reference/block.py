@@ -125,12 +125,14 @@ class Coin:
     creation_height: int
     creation_parent_mtp: int
     coinbase: bool = False
+    output: Output | None = None
 
     def key(self) -> tuple[bytes, int]:
         return (self.tx_id, self.index)
 
     def encode(self) -> bytes:
-        output = encode_native_output(self.value, self.branch)
+        output = (encode_output(self.output, OUTPUT_PROFILE) if self.output is not None
+                  else encode_native_output(self.value, self.branch))
         body = (
             self.tx_id
             + self.index.to_bytes(4, "little")
@@ -559,3 +561,183 @@ def load_snapshot(blob: bytes) -> tuple[dict[tuple[bytes, int], Coin], MonetaryS
     if len(record) != 56:
         raise ValueError("snapshot monetary frame")
     return coins, MonetaryState.from_bytes(record)
+
+
+def _coin_output(coin: Coin) -> Output:
+    return coin.output or _payment_output(coin.value, coin.branch)
+
+
+def _complete_ordinary(tx, parent, coins, profile, *, height, mtp,
+                       maturity, vm_profile, tx_profile, block_cap):
+    """Authenticate full transaction effects; return monetary record and VM sum."""
+    from .vm_context import authenticated_context
+    from .signing import _prepare
+    from .monetary import U128, uint
+    raw = encode_transaction(tx, tx_profile)
+    spent, resolved = [], []
+    native_inputs, native_outputs = 0, 0
+    inputs, outputs = {}, {}
+    for inp in tx.inputs:
+        if inp.flags == 1:
+            coin = coins.get((inp.prev_txid, inp.prev_index))
+            if coin is None:
+                raise ValueError('unresolved spend')
+            coin.encode()
+            if height < coin.creation_height + (maturity if coin.coinbase else 0):
+                raise ValueError('coinbase maturity or future coin')
+            if inp.sequence != 0xffffffff:
+                delay = inp.sequence & 65535
+                if inp.sequence & 0x400000:
+                    if mtp < coin.creation_parent_mtp + delay*512:
+                        raise ValueError('relative time lock')
+                elif height < coin.creation_height + delay:
+                    raise ValueError('relative height lock')
+            output = _coin_output(coin)
+            spent.append(coin)
+            resolved.append(output)
+            if output.flags & 1:
+                inputs[output.token_id] = uint(inputs.get(output.token_id, 0)+output.value, U128, 'token inputs')
+            else:
+                native_inputs = uint(native_inputs+output.value, U128, 'native inputs')
+        else:
+            resolved.append(None)
+    kind, value = tx.lock & 255, tx.lock >> 8
+    if (kind == 1 and height < value) or (kind == 2 and mtp < value):
+        raise ValueError('absolute lock')
+    explicit_burn = token_count = 0
+    for output in tx.outputs:
+        if output.flags & 1:
+            token_count += 1
+            outputs[output.token_id] = uint(outputs.get(output.token_id, 0)+output.value, U128, 'token outputs')
+        else:
+            native_outputs = uint(native_outputs+output.value, U128, 'native outputs')
+            if output.flags & 2:
+                explicit_burn += output.value
+    if native_inputs < native_outputs:
+        raise ValueError('native inflation')
+    fee = native_inputs-native_outputs
+    if fee < len(raw) or fee < 2*profile.dust_limit*token_count:
+        raise ValueError('native fee below byte or token-output floor')
+    deltas = {key: amount-inputs.get(key, 0) for key, amount in outputs.items()
+              if amount > inputs.get(key, 0)}
+    mints = {inp.prev_txid for inp in tx.inputs if inp.flags == 3}
+    if mints != set(deltas):
+        raise ValueError('positive token delta/mint mismatch')
+    # Always authenticate every selected membership, including success-scan
+    # invocations. No digest supplied by a caller is used as authorization.
+    _prepare(tx, tx_profile, parent.chain_id, tuple(resolved))
+    cost = 0
+    for i, inp in enumerate(tx.inputs):
+        for j, witness in enumerate(inp.witnesses):
+            context, signing = authenticated_context(tx, tx_profile,
+                parent.chain_id, tuple(resolved), i, j)
+            result = evaluate(witness.script, witness.arguments, vm_profile,
+                              invocation=context, signing=signing)
+            if not result.success:
+                raise ValueError('witness VM invalid/unsupported')
+            cost = uint(cost+result.charged_cost, U128, 'invocation cost')
+            if cost > block_cap:
+                raise ValueError('block invocation cost over cap')
+    return OrdinaryTx(native_inputs, native_outputs, len(raw), token_count, explicit_burn), cost, spent
+
+
+def connect_complete_block(wire: bytes, parent: Parent, history, header_profile,
+                           coins: dict, monetary: MonetaryState,
+                           monetary_profile: MonetaryProfile, cost_profile, *,
+                           tx_profile=PAYMENT_TX_PROFILE, vm_profile=PAYMENT_VM,
+                           block_cap: int, coinbase_maturity: int = 2) -> Connected:
+    """Atomic full framed-block candidate validation, genesis opcode allocation.
+
+    Authenticated oldest history is the caller's responsibility. Development
+    copying is an oracle implementation, not a storage-I/O resource proof.
+    No persistent state is touched and this is not lotusd acceptance.
+    """
+    from .block_wire import decode_block_wire
+    from .block_cost import authenticated_transaction_costs, authenticated_envelope_cost
+    from .header_context import parent_median_time, validate_child_header
+    from .asert import compact_decode
+    from .monetary import U128, block_cost, uint
+    from .block_seal import block_id
+    if parent.header is None:
+        raise ValueError('parent header required')
+    from .block_seal import parse_header
+    claimed = parse_header(wire[:134])
+    header = parent.header
+    if (header_profile.chain_id != parent.chain_id or header.height != parent.height
+            or parent.state_root != header.state_root or monetary != parent.monetary):
+        raise ValueError('complete parent context')
+    mtp = parent_median_time(header_profile, header, history)
+    # Claimed roots pass the cheap header gate; their correctness follows from
+    # full frame decoding and the final state transition before committing.
+    validate_child_header(header_profile, header, history, claimed,
+        expected_tx_root=claimed.tx_root, expected_state_root=claimed.state_root,
+        expected_size=len(wire))
+    block = decode_block_wire(wire, tx_profile, parent.chain_id)
+    parent_work = (1 << 256)//(compact_decode(header.bits, header_profile.pow_limit)+1)
+    if monetary.prev_work != parent_work:
+        raise ValueError('parent monetary work does not match target')
+    height = header.height+1
+    if height > 0xffffffff:
+        raise ValueError('coinbase parent/height')
+    child_work = (1 << 256)//(compact_decode(block.header.bits, header_profile.pow_limit)+1)
+    before = utxo_root(coins)
+    if state_root(parent.chain_id, parent.height, before, monetary) != parent.state_root:
+        raise ValueError('parent state root')
+    undo = Undo(prior_monetary=monetary, prior_utxo_root=before,
+                prior_monetary_bytes=monetary.to_bytes())
+    staged = dict(coins)
+    accounted, account_linear, enforce_linear = [], [], []
+    total_vm = coinbase_outputs = coinbase_burn = coinbase_bytes = 0
+    for n, tx in enumerate(block.transactions):
+        spent, invocation = [], 0
+        if n == 0:
+            inp = tx.inputs[0]
+            if inp.prev_txid != block_id(parent.chain_id, header) or inp.prev_index != height:
+                raise ValueError('coinbase parent/height')
+            coinbase_bytes = len(encode_transaction(tx, tx_profile))
+            coinbase_outputs = sum(out.value for out in tx.outputs)
+            coinbase_burn = sum(out.value for out in tx.outputs if out.flags & 2)
+        else:
+            record, invocation, spent = _complete_ordinary(tx, parent, staged,
+                monetary_profile, height=height, mtp=mtp, maturity=coinbase_maturity,
+                vm_profile=vm_profile, tx_profile=tx_profile, block_cap=block_cap)
+            accounted.append(record)
+        charges = authenticated_transaction_costs(tx, tx_profile, staged, height,
+                                                  mtp, invocation, cost_profile)
+        account_linear.append(charges.account_linear)
+        enforce_linear.append(charges.enforce_linear)
+        total_vm = uint(total_vm+invocation, U128, 'invocation cost')
+        if total_vm > block_cap:
+            raise ValueError('block invocation cost over cap')
+        identity = identity_digests(tx, tx_profile, parent.chain_id)
+        created = []
+        for j, output in enumerate(tx.outputs):
+            if output.flags & 2:
+                continue
+            coin = Coin(identity.txid, j, output.value, output.branches[0], height,
+                        mtp, n == 0, output)
+            if coin.key() in staged:
+                raise ValueError('created outpoint already occupied')
+            created.append(coin)
+        for coin in spent:
+            del staged[coin.key()]
+            undo.steps.append(UndoStep(False, coin))
+        for coin in created:
+            staged[coin.key()] = coin
+            undo.steps.append(UndoStep(True, coin))
+    frames = sum(block.frame_prefix_bytes)
+    envelope = authenticated_envelope_cost(frames, len(block.transactions), cost_profile)
+    transition = advance(monetary_profile, monetary, work=child_work,
+        transactions=tuple(accounted), coinbase_native_outputs=coinbase_outputs,
+        coinbase_native_burn=coinbase_burn, coinbase_bytes=coinbase_bytes,
+        tx_frame_prefix_bytes=frames,
+        account_block_cost=block_cost(envelope, tuple(account_linear), monetary_profile),
+        enforce_block_cost=block_cost(envelope, tuple(enforce_linear), monetary_profile))
+    root = utxo_root(staged)
+    state = state_root(parent.chain_id, height, root, transition.state)
+    validate_child_header(header_profile, header, history, block.header,
+        expected_tx_root=block.header.tx_root, expected_state_root=state,
+        expected_size=len(wire))
+    coins.clear()
+    coins.update(staged)
+    return Connected(root, state, transition.state.to_bytes(), transition, undo, total_vm)
