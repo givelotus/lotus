@@ -5,6 +5,7 @@ p=argparse.ArgumentParser(); p.add_argument('native',type=pathlib.Path);p.add_ar
 a.native=a.native.resolve();a.output=a.output.resolve();a.output.mkdir(parents=True,exist_ok=True)
 b=a.native/'build-coverage';src=a.native/'src/lotus_v2';llvm=pathlib.Path(a.llvm)
 def run(cmd,**kw):
+    kw.setdefault('cwd',a.output)
     print(' '.join(map(str,cmd)),flush=True);return subprocess.run(list(map(str,cmd)),check=True,**kw)
 targets=re.findall(r'add_executable\((test_lotus_v2_\w+)',(src/'CMakeLists.txt').read_text())
 profiles=a.output/'profiles'

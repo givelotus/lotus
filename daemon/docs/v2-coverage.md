@@ -137,3 +137,9 @@ with 2383 added lines explicitly unmapped across 34 changed files. This conditio
 percentage omits unmapped code and is not overall new-code coverage.
 `new-modules-since-abc.json` separately inventories every added V2/wallet module line
 since ABC `1fb7db17`; its unmapped lines include test files and non-executable text.
+
+An instrumented secp256k1 build generator emitted a 248-byte default profile outside
+the test inventory. It was preserved separately at
+`/private/tmp/lotus-v2-coverage-build-tool-default-20261015.profraw`; build-generator
+execution is outside application coverage. Build/export commands and each test now
+use coverage-owned working directories. Production checkout status is clean.
