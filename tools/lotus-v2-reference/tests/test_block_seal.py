@@ -2,7 +2,7 @@
 
 import unittest
 
-from lotus_v2_reference.block import Connected, Undo, state_root
+from lotus_v2_reference.block import Connected, Undo, state_root, transaction_root
 from lotus_v2_reference.block_seal import (
     HEADER_SIZE, MAX_TIME, Header, block_id, decode_target, meets_target,
     parse_header, seal_child_header, serialize_header,
@@ -93,6 +93,41 @@ class BlockSealTests(unittest.TestCase):
                 break
         self.assertFalse(meets_target(child, bytes(below)))
         self.assertEqual(sealed.nonce, 0)
+
+    def test_transaction_root_seals_without_changing_state(self):
+        parent, connected, _supplied = _sample()
+        # Native leaf fill: tx_hash is i, tx_id is i+16.
+        identities = tuple(
+            (bytes([i]) * 32, bytes([i + 16]) * 32) for i in (1, 2)
+        )
+        empty = transaction_root(())
+        self.assertEqual(
+            empty.hex(),
+            "eebdd2bf2b0f92f1764c36eaef67a3ba72195a4206f2ea225db80605833beadb",
+        )
+        one = transaction_root(identities[:1])
+        two = transaction_root(identities)
+        self.assertNotEqual(one, empty)
+        self.assertNotEqual(two, one)
+        self.assertNotEqual(transaction_root((identities[1], identities[0])), two)
+        committed_state = state_root(
+            parent.chain_id, 100, connected.utxo_root, MONEY,
+        )
+        for root in (empty, one, two):
+            sealed = seal_child_header(
+                parent, connected, root, 2, 50120, 400, 0x1D00FFFF, POW_LIMIT,
+            )
+            raw = serialize_header(sealed)
+            self.assertEqual(len(raw), HEADER_SIZE)
+            self.assertEqual(len(raw), 134)
+            self.assertEqual(sealed.nonce, 0)
+            self.assertEqual(raw[42:50], bytes(8))
+            self.assertEqual(sealed.tx_root, root)
+            self.assertEqual(raw[70:102], root)
+            self.assertEqual(sealed.state_root, committed_state)
+            self.assertEqual(sealed.state_root, connected.state_root)
+            self.assertNotEqual(sealed.state_root, sealed.tx_root)
+            self.assertNotEqual(sealed.state_root, connected.utxo_root)
 
     def test_rejections_match_native_reasons(self):
         parent, connected, tx_root = _sample()
