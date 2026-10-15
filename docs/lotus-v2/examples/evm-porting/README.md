@@ -10,6 +10,8 @@ Status: **architecture candidate, not EVM compatibility or a contract release**.
 | [Escrow, 0x-style orders, Uniswap V2](markets.md) | Hash escrow claim/refund and lock operand checks; bounded swap arithmetic | Partial-fill roles, authenticated pool/reserve transitions, LP accounting; expiry/TWAP/callback differences |
 | [Proxy upgrade and calls](upgrade-and-calls.md) | Existing CABI-08 linked-library test gate | Explicit authorized state migration; no delegatecall or synchronous reentrancy |
 
+The [bootstrap correction](bootstrap.md) defines acyclic controller/authority/reserve/LP dependencies and external identity checks; it supersedes the original self-bound authority constructor. Its counterexamples are review obligations, not new executed cases.
+
 These are behavioral decompositions. A passing authorization slice does not prove its surrounding protocol. Every proposed conversion states which coins carry authority, which transitions must execute, and which original behavior is unavailable. Primary EIPs and exact upstream source revisions are linked beside the relevant claims; [sources.json](sources.json) records immutable commits and source SHA-256 values. Local designs and recommendations are our inference, not claims made by those projects. No upstream contract code is copied into the Lotus sources.
 
 ## Run the executable slices

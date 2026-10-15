@@ -26,35 +26,39 @@ The node supplies `delta`; it is absent from witness arguments. The [VM cases](e
 LC-1 sketch below uses proposed standard-library operations, not existing compiler syntax:
 
 ```text
-contract SupplyController<authority: TokenId, issuer: PublicKey, cap: Amount> {
+contract SupplyController<issuer: PublicKey, cap: Amount> {
     state separate {
         enrolled: Bool, asset: TokenId, issued: Amount,
         outstanding: Amount, nonce: Amount, revoked: Bool
     }
     entry enroll(asset: TokenId, sig: Signature) transition {
         require(!enrolled && checksig(sig, issuer));
-        require(singleton_input(this, authority));
+        require(controller_input_shape(this));
         next = { enrolled: true, asset: asset, issued: 0,
                  outstanding: 0, nonce: nonce + 1, revoked: false };
         successor controller at outputs[this.input_index]
+            asset = this.coin.token_id, value = 1,
             preserves this.policy with state = next;
     }
     entry account(sig: Signature) transition {
-        require(enrolled && !revoked && singleton_input(this, authority));
+        require(enrolled && !revoked && controller_input_shape(this));
         require(checksig(sig, issuer)); // Example mint administration.
         next.outstanding = outstanding + asset_net_spendable_delta(asset);
         require(0 <= next.outstanding && next.outstanding <= cap);
         next.issued = issued + asset_positive_mint_delta(asset);
         next.nonce = nonce + 1;
         successor controller at outputs[this.input_index]
+            asset = this.coin.token_id, value = 1,
             preserves this.policy with state = next;
     }
 }
 ```
 
-This sketch omits transfer-only authorization routing and codecs; they are required work, not implicit compiler magic. A production transfer entry must authorize burn/accounting updates without granting arbitrary mint authority. The target mint requires the issuer signature **and** the one-unit enrolled controller, independently checks its target asset equals the active mint root, and computes/checks the same successor state. It cannot assume which controller entry ran. Transfer rules on every holding require that controller and verify the same accounting transition independently. Enrollment is allowed only once; revocation is an explicit authorized terminal transition, or a retained revoked state with no issuance path.
+`controller_input_shape` checks a nonnative consumed asset, value exactly 1, authenticated old state and the exact controller policy. It does **not** assert that this is the authority asset for an externally named token. The code reads its own asset ID from the consumed coin and preserves that ID/quantity in the unique successor; it has no `authority: TokenId` constructor binding. A canonical tagged state codec distinguishes Unassigned, which omits `asset`, from Enrolled, which includes a nonzero TokenId; the sketch's field list describes the enrolled variant, not an invalid zero TokenId sentinel.
 
-Bootstrap uses a separate singleton authority token whose sole mint requires an explicitly named unique seed outpoint, delta 1, and an exact initial controller policy/state. Its generic controller code does not embed the future fungible token ID. Compile that authority first, compile the fungible mint from its ID and code root, then enroll the resulting fungible TokenId. No root depends recursively on itself. A fake controller output with correct code/state but zero authority value is rejected; the singleton asset's genesis and all transitions must preserve exactly one unit.
+This sketch omits transfer-only authorization routing and codecs; they are required work, not implicit compiler magic. A production transfer entry must authorize burn/accounting updates without granting arbitrary mint authority. The target mint and transfer rules bind the **expected external authority TokenId and controller code root**, then independently check the selected consumed coin has that asset, value 1, exact policy and authenticated enrolled state. Matching code and shape alone is insufficient. The target mint additionally requires the issuer signature, checks the enrolled target equals its active mint root, and computes/checks the same successor state. It cannot assume which controller entry ran. Transfer rules on every holding perform the corresponding checks for their consumed token ID. Enrollment is allowed only once; revocation is an explicit authorized terminal transition, or a retained revoked state with no issuance path.
+
+Bootstrap compiles the generic controller **first**, from issuer/cap/layout only. Then compile the singleton authority mint from an explicitly named unique seed outpoint, that controller code root and exact Unassigned state. Its sole mint enforces delta 1 and an exact initial controller output whose asset is the mint invocation's BRANCHROOT. Compile transfer rules from the resulting authority ID and controller root; those rules read the tracked token ID from their consumed coin. Finally compile the fungible mint from the authority ID, controller root and rules root, and enroll its resulting TokenId in controller **state**. Neither controller code nor its initial state embeds its own authority ID or the future fungible TokenId. The [explicit dependency graph and counterexamples](bootstrap.md) distinguish these compile-time commitments from runtime identity checks. The earlier `SupplyController<authority: TokenId>` sketch would have created a cycle and is superseded by this one.
 
 For each tracked asset define `I = sum(consumed values)`, `O = sum(all output values)`, `E = sum(values in IS_BURN outputs)`, and `D = max(O-I,0)`. Native accounting authorizes exactly `D`; the change in spendable token supply is `O-E-I`, not just `D`. Mixed mint/burn transactions require this full calculation: a positive mint can coexist with explicit burns. Track a signed delta with proven bounded arithmetic before checking the u64 cap. Read only spend inputs for coin fields. The controller and rules prohibit every bypass and require one matching controller successor. Unsolicited burn-output creation with this TokenId still requires either authorized spent tokens or its mint.
 
