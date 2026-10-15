@@ -6,15 +6,42 @@ Updated October 15, 2026. Development plan; no genesis parameters are frozen and
 
 ## Source foundation and current status
 
-The current executable [V2 series](../patches/v2/series) contains 173 patches,
-`000`–`172`, on ABC master `1fb7db17c176cdea8a2c60d887891589382ee4e3`.
-[Latest replay evidence](evidence/v2-series-replay-172.json) verifies every
+The current executable [V2 series](../patches/v2/series) contains 219 patches,
+`000`–`218`, on ABC master `1fb7db17c176cdea8a2c60d887891589382ee4e3`.
+[Latest replay evidence](evidence/v2-series-replay-218.json) verifies every
 intermediate tree. Offline daemon acceptance, restart, disconnect/reconnect,
 resumable fork recovery, bounded selection and actual two-process TCP full/compact
 synchronization have separate evidence below. Native production of signed fixture-payment blocks also passes across two nodes.
 The foreground local controller now completes a live-wallet payment and restart
 across two isolated nodes; see the current controller evidence below. Development
 profile adoption and public launch remain pending.
+
+### Private transaction integration through 218 (October 15)
+
+The complete 219-entry series replays with `git am --keep-non-patch` from the
+pinned ABC base. Every intermediate tree matches; final source tree is
+`028e4b47980e6d3e3f52c987b17f2df96f772313`. Mailboxes 000–172 remain byte-for-byte
+unchanged, including the binary literal in 033. The appended commits carry
+absolute genesis reward anchors, native wallet submission/status, bounded
+transaction pool/history/relay, pinned Avalanche adapters and runtime policy,
+and separate Chronik V2 output storage and branch-query foundations.
+
+[Three-node, two-wallet evidence](evidence/v2-private-relay-two-wallets-local.json)
+records 67 passing checks: A submits, B relays, C mines from its pool, both wallets
+reconcile, processes restart, and a fork detaches payments before valid pending
+work is mined again. All nodes used fresh isolated homes on one machine.
+[Controller evidence](evidence/v2-private-controller-local.json) records 12 passing
+tests including its native wallet payment/restart workflow. These runs do not
+prove separate-machine operation or an authenticated Avalanche quorum.
+
+The full native build at `b70441496` builds daemon and wallet client and passes
+transaction pool/coordinator/relay and Avalanche adapter/runtime checks with
+Chronik disabled. The actual Rust V2 database suite passes seven focused tests.
+Chronik's native bridge and HTTP router remain outside this series pending review
+fixes and node integration; live indexing, pending transaction indexing and
+wallet discovery are unfinished. Avalanche peer wire, persistence integration,
+node callbacks and a real quorum/fork demonstration also remain unfinished.
+Production parameters and public deployment remain open; QUIC is deferred.
 
 ### Historical source milestones through 069
 
