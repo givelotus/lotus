@@ -210,3 +210,23 @@ Go architecture on another host. PostGIS uses the repository's pinned amd64
 image through Docker emulation. Notifications stay disabled without provider
 credentials. Flutter currently has no backend registration/push setup; a running
 lab server alone does not establish native push delivery.
+
+### Native contacts fixture check
+
+`vase-client/tool/native_contacts_check.dart` exercises the production native
+contacts adapter on a **separate disposable simulator**. Build it with
+`tool/with_xcode.sh flutter build ios --simulator --debug --no-pub
+--target=tool/native_contacts_check.dart` (one command), install only on that
+simulator, and select Run fixture check. It requests contacts access through the
+native prompt, creates one uniquely identified temporary fixture, checks address
+write-back and preservation of its existing name/phone/email/website, checks
+idempotence and native change events, then edits/deletes only that fixture.
+It does not initialize wallet storage. Its cleanup uses only the ID returned by
+its own create operation. A denied read reports an empty directory without
+creating a fixture. Do not distribute this harness or install over a real wallet.
+
+On iOS 27, the native limited-access selection, full access, and denied access
+checks pass. Full/limited checks include address removal and deletion reflected
+by the production directory adapter. They do not establish Android behavior,
+cloud-provider synchronization, photo preservation, or an end-to-end native
+picker/confirmation-dialog round trip.
