@@ -1,17 +1,19 @@
 #!/usr/bin/env bash
 
 resolve_upstream_ref() {
-    local workspace="$1" requested="$2" remote_head branch
+    local workspace="$1" requested="$2" remote_head branch resolved
     git -C "$workspace" fetch --no-tags origin
     if [[ "$requested" != latest ]]; then
-        if git -C "$workspace" rev-parse --verify "$requested^{commit}" 2>/dev/null; then
-            return
+        if resolved=$(git -C "$workspace" rev-parse --verify "$requested^{commit}" 2>/dev/null); then
+            :
+        elif resolved=$(git -C "$workspace" rev-parse --verify "refs/remotes/origin/$requested^{commit}" 2>/dev/null); then
+            :
+        else
+            git -C "$workspace" fetch --no-tags origin "$requested"
+            resolved=$(git -C "$workspace" rev-parse --verify 'FETCH_HEAD^{commit}')
         fi
-        if git -C "$workspace" rev-parse --verify "refs/remotes/origin/$requested^{commit}" 2>/dev/null; then
-            return
-        fi
-        git -C "$workspace" fetch --no-tags origin "$requested"
-        git -C "$workspace" rev-parse --verify 'FETCH_HEAD^{commit}'
+        echo "Resolved upstream request '$requested' to $resolved" >&2
+        printf '%s\n' "$resolved"
         return
     fi
     remote_head=$(git -C "$workspace" ls-remote --symref origin HEAD)
@@ -21,5 +23,7 @@ resolve_upstream_ref() {
         return 1
     fi
     git -C "$workspace" fetch --no-tags origin "refs/heads/$branch"
-    git -C "$workspace" rev-parse --verify 'FETCH_HEAD^{commit}'
+    resolved=$(git -C "$workspace" rev-parse --verify 'FETCH_HEAD^{commit}')
+    echo "Resolved origin/$branch to $resolved" >&2
+    printf '%s\n' "$resolved"
 }

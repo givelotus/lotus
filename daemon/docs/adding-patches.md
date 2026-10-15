@@ -84,8 +84,10 @@ Use `SERIES=ecash` or `SERIES=doged-reference` for those reference stacks.
 `COMMIT=<sha-or-tag>` continues to select a specific reviewed upstream revision.
 The command does not resolve conflicts, edit patch contents, build, or claim
 behavioral compatibility; it leaves the replayed candidate workspace for an
-LLM or maintainer to repair and validate. It does not update component release
-manifests or the separate shared-Chronik provider pin. The maintained Dogecoin
+LLM or maintainer to repair and validate. If replay fails, the current selector
+stays unchanged and the exact resolved upstream SHA is printed for follow-up.
+It does not update component release manifests or the separate shared-Chronik
+provider pin. The maintained Dogecoin
 on-ABC series is intentionally rejected by this generic refresh because its
 per-patch provenance manifest must be regenerated with its new base.
 
