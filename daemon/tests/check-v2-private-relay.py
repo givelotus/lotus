@@ -134,7 +134,7 @@ def main(argv=None):
         answer = subprocess.run([args.node,'--input-type=module','-e',js,(compiler/'dist/generic.js').as_uri(),str(source),public_key], capture_output=True,text=True,timeout=args.timeout)
         require(answer.returncode == 0, answer.stderr)
         artifact = json.loads(answer.stdout)
-        (root/'payment-artifact.json').write_text(json.dumps(artifact,indent=2)+'\n')
+        (root/('payment-artifact-'+public_key+'.json')).write_text(json.dumps(artifact,indent=2)+'\n')
         return artifact['methods'][0]['scriptHex'], artifact['policy']['root']
     def mine(node, destination, peers=(), selected=None, branch=0):
         before = status(node)
@@ -164,6 +164,12 @@ def main(argv=None):
         script, policy = compile_payment(created['public_key'])
         call(a,wa,'register',dict(script=script,proof=[],root=policy))
         info = call(a,wa,'info'); destination = info['payment_output_hex']
+        wc = root/'wallet-c-recipient'
+        recipient_created = call(c,wc,'create')
+        recipient_script, recipient_root = compile_payment(recipient_created['public_key'])
+        call(c,wc,'register',dict(script=recipient_script,proof=[],root=recipient_root))
+        recipient_info = call(c,wc,'info')
+        require(recipient_info['public_key'] != info['public_key'], 'recipient must have an independent native wallet key')
         funding = []
         for _ in range(2):
             answer,_ = mine(a,destination,(b,c),0)
@@ -179,7 +185,7 @@ def main(argv=None):
         shutil.copytree(wa,root/'fork-wallet')
         c = launch('c-resume',root/'home-c',[b.ready['listen']])
         baseline = {n.label:status(n) for n in (a,b,c)}
-        recipient = dict(info['payment_output'],value='10000')
+        recipient = dict(recipient_info['payment_output'],value='10000')
         payments = [call(a,wa,'pay',dict(recipient=recipient,fee='1000')) for _ in range(2)]
         require(len({v['txid'] for v in payments}) == 2,'two distinct payments required')
         for payment in payments:
@@ -208,7 +214,22 @@ def main(argv=None):
             coin=a.request('coin',txid=payment['txid'],index=0)
             require(coin['coin'] is not None,'confirmed recipient output missing')
             check('confirmed-recipient-output',txid=payment['txid'],coin=coin)
-        call(a,wa,'reconcile')
+            call(c,wc,'track',dict(prev_txid=payment['txid'],prev_index=0))
+        def tracked(state, txid, index):
+            matches = [coin for coin in state['coins'] if coin['prev_txid'] == txid and int(coin['prev_index']) == index]
+            require(len(matches) == 1, 'wallet must track exactly one requested outpoint')
+            return matches[0]
+        def present_total(state):
+            return sum(int(coin['value']) for coin in state['coins'] if coin['present'])
+        sender_confirmed = call(a,wa,'reconcile')
+        recipient_confirmed = call(c,wc,'reconcile')
+        for payment in payments:
+            received = tracked(recipient_confirmed,payment['txid'],0)
+            change = tracked(sender_confirmed,payment['txid'],1)
+            require(received['present'] and received['mature'] and not received['reserved'] and received['value'] == '10000', 'recipient confirmed output/value differs')
+            require(change['present'] and change['mature'] and not change['reserved'] and int(change['value']) in [int(coin['coinbase_value'])-11000 for coin in funding], 'sender confirmed change/value differs')
+        require(present_total(recipient_confirmed) == 20000 and present_total(sender_confirmed) == sum(int(coin['coinbase_value']) for coin in funding)-22000, 'independent wallet confirmed balance arithmetic differs')
+        check('independent-wallet-confirmed-balances',sender=sender_confirmed,recipient=recipient_confirmed)
         # Partition at the saved common ancestor. The competing wallet signs a
         # real conflicting spend; C mines it from its pool, never supplied wires.
         for node in (a,b,c): node.stop()
@@ -225,16 +246,44 @@ def main(argv=None):
         require(detached.get('ever_connected') is True and detached.get('is_active_tip') is False,'original confirmation block lacks native detach evidence')
         check('confirmation-block-detached',response=detached)
         states=[]
+        detached_pending=[]
         for payment in payments:
             observed=eventually(lambda:a.request('transactionstatus',txid=payment['txid'],txhash=payment['txhash'],wire=payment['wire']),lambda s:s.get('state') in ('pending','conflicted'),'detached transaction reconciliation')
             wallet_state=call(a,wa,'status',dict(txid=payment['txid']))
             require(wallet_state['state']==observed['state'],'wallet/node reorg status mismatch')
             states.append(observed['state'])
+            if observed['state'] == 'pending': detached_pending.append(payment)
             check('detached-payment',response=observed,wallet=wallet_state)
         require('conflicted' in states,'competing confirmed spend did not conflict original payment')
         txstatus(a,conflict,'confirmed')
-        call(a,wa,'reconcile')
-        record['passed']=True; record['final']=fork; save()
+        sender_detached = call(a,wa,'reconcile')
+        recipient_detached = call(c,wc,'reconcile')
+        require(present_total(recipient_detached) == 0, 'recipient retained detached received balance')
+        for payment in payments:
+            require(not tracked(recipient_detached,payment['txid'],0)['present'], 'detached recipient output remains present')
+            require(not tracked(sender_detached,payment['txid'],1)['present'], 'detached sender change remains present')
+        require(present_total(sender_detached) in [int(coin['coinbase_value']) for coin in funding], 'sender reorg balance did not restore unspent original funding')
+        require(len(detached_pending) == 1, 'one valid detached payment must remain pending')
+        remine_payment = detached_pending[0]
+        txstatus(c,remine_payment,'pending')
+        remined,remined_state = mine(c,destination,(a,b),selected=1,branch=1)
+        for node in (a,b,c):
+            confirmed_again=txstatus(node,remine_payment,'confirmed')
+            require(confirmed_again['block_id'] == remined['block_id'], 'detached payment did not confirm in new native pool block')
+        require(call(a,wa,'status',dict(txid=remine_payment['txid']))['state'] == 'confirmed', 'sender wallet failed to observe re-mined confirmation')
+        sender_remined = call(a,wa,'reconcile')
+        recipient_remined = call(c,wc,'reconcile')
+        received = tracked(recipient_remined,remine_payment['txid'],0)
+        change = tracked(sender_remined,remine_payment['txid'],1)
+        require(received['present'] and received['mature'] and not received['reserved'] and received['value'] == '10000', 'recipient wallet failed to restore re-mined received output')
+        require(change['present'] and change['mature'] and not change['reserved'] and int(change['value']) == present_total(sender_detached)-11000, 'sender wallet failed to restore re-mined change')
+        require(present_total(recipient_remined) == 10000 and present_total(sender_remined) == present_total(sender_detached)-11000, 're-mined independent wallet balance arithmetic differs')
+        for payment in payments:
+            if payment not in detached_pending:
+                require(call(a,wa,'status',dict(txid=payment['txid']))['state'] == 'conflicted', 'conflicting original payment lost its conflict status')
+                require(not tracked(recipient_remined,payment['txid'],0)['present'], 'conflicting original recipient output reappeared')
+        check('detached-payment-remined-wallet-balances',block_id=remined['block_id'],sender=sender_remined,recipient=recipient_remined)
+        record['passed']=True; record['final']=remined_state; save()
     except Exception as error:
         record['failure']=dict(kind=type(error).__name__,error=str(error)); raise
     finally:
