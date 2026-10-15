@@ -373,3 +373,25 @@ selection, bounded downloads/reorg recovery and body serving. Profile adoption
 and isolated socket tests remain pending. The six-case compiler optimizer block
 pilot is integrated separately; its retained cost-cap discrepancies preclude a
 general equivalence claim. No public testnet or QUIC readiness is claimed.
+
+## Scoped signing-secret cleanup (109–110)
+
+All 111 mailboxes replay with exact intermediate trees; final tree
+`5d2c403287a8783b47e7bb3c140e62093a08cbb1`. See
+[replay evidence](evidence/v2-series-replay-110.json). Earlier mailboxes remain
+byte-identical. Patch 109 has an explicitly attributed integration note because
+the original source commit had no body; its source payload is unchanged.
+
+The local BIP340 signing keypair is now scoped and cleansed on successful signing
+and exception exits using ABC's existing memory cleansing primitive. Caller-owned
+secret and auxiliary input buffers remain the caller's responsibility. Full-tree
+validation links the crypto target; standalone signing consumers compile the same
+cleansing source. This adds no wallet format or consensus change.
+
+Root review rebuilt exact source `0e9d9fefc` signing tests in Release at
+`/private/tmp/lotus-v2-signer-root-check-20261015`: both the signing-vector and
+instrumented cleanup suites pass, including allocation-failure paths. The Release
+VM suite and runner build also pass at
+`/private/tmp/lotus-v2-vm-cleanse-integration-20261015`. A fresh full daemon build
+at `/private/tmp/lotus-v2-daemon-signer-cleanup-20261015` is still pending at this
+record's creation; these targeted checks do not establish that broader result.
