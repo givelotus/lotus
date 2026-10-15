@@ -22,7 +22,7 @@ versions are not bumped to impersonate a newer official upstream release.
 | `lotusd` | `v1` | Prepared Lotus numeric version | maintained | Existing in-process, ON |
 | `bitcoin-abc` | `ecash` | 0.34.1 | provider only | Shared Chronik source provider; no network release |
 | `bchn` | `bchn` | 29.2.1 | custom Chronik host | In-process ABC Chronik with BCHN adapter |
-| `doged` | `doged-reference` | 0.4.0 | historical Doged compatibility/test patches | Existing in-process, ON |
+| `doged` | `doged` | 0.34.1 at ABC `1fb7db17` | maintained 174-patch Dogecoin port | Existing in-process, ON |
 | `bitcoin-core` | `bitcoin` | 32.99.0 | custom Chronik host | In-process ABC Chronik with Core adapter |
 
 ABC/BCHN/Doged/Core pins currently represent development snapshots, not assertions
@@ -146,7 +146,7 @@ The legacy `v*` workflow remains for Lotus V1. The component workflow publishes
 only `lotusd-v*`, `bchn-v*`, `doged-v*`, and `bitcoin-core-v*`. Bitcoin ABC is
 the pinned source provider for the BCHN/Core Chronik adapters and is deliberately
 excluded from network release tags. Prepared candidates are `lotusd-v11.6.1`,
-`bchn-v29.2.1`, `doged-v0.4.0`, and `bitcoin-core-v32.99.0`; tags are immutable,
+`bchn-v29.2.1`, `doged-v0.4.1`, and `bitcoin-core-v32.99.0`; tags are immutable,
 so use a new distributor version if a candidate changes. No component release
 has been published by this workflow. Run artifact-only CI first; successful
 artifact-only runs are a useful preflight, but tag CI itself remains the final

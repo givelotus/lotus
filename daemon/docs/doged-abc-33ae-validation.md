@@ -32,12 +32,11 @@ Native test results:
 
 This does not establish full Dogecoin mainnet-tip synchronization, a complete
 reindex, live Avalanche quorum behavior, or bit-for-bit reproducible binaries.
-The checked-in release workflow and component manifest still select the
-historical Doged source; do not publish this candidate as `doged-v0.4.1` until
-the source selector/manifest is deliberately prepared and reviewed. ABC's
-inherited Guix machinery has not yet been adapted and run for this Doged
-candidate. Current reproducible-binary evidence applies to the Lotus Guix
-workflow only.
+The prepared Doged `v0.4.1` release candidate selects the maintained ABC-derived
+series at the existing shared pin `1fb7db17`; it does not select this newer
+`33ae885a` candidate. ABC's inherited Guix machinery has not yet been adapted
+and run for either Doged candidate. Current reproducible-binary evidence applies
+to the Lotus Guix workflow only.
 
 The source replay and export candidate are retained under
 `/tmp/lotus-abc-refresh-final-20261015`; the native build and test trees are

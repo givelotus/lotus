@@ -1,10 +1,10 @@
-# doged-v0.4.0
+# doged-v0.4.1
 
-Distributor build from https://github.com/doged-io/doged.git commit `9690833b8b6709b7a7837bc397f0d04bf3b885d1`.
-Upstream native version: `0.4.0`; built native version: `0.4.0`.
+Distributor build from https://github.com/Bitcoin-ABC/bitcoin-abc.git commit `1fb7db17c176cdea8a2c60d887891589382ee4e3`.
+Upstream native version: `0.34.1`; built native version: `0.34.1`.
 Distributor patch revision: `1`; profile: `maintained`; channel: `development-snapshot`.
 Explicit features: `registry defaults`.
-Source tree: `aa2cf0c54f0af532001489a6defbff679b2b5f47`.
+Source tree: `7704b2eafb0df479e0c7459192ab794925e94442`.
 The in-process Chronik indexer is compiled in; run the documented runtime enable option.
 
 This is a givelotus distribution, not an official upstream release.
