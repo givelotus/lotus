@@ -1,0 +1,2236 @@
+From 42b40b6ff40639eef2a46e12e90463af6f8495fc Mon Sep 17 00:00:00 2001
+From: Shammah Chancellor <shammah.chancellor@notvalid.com>
+Date: Thu, 15 Oct 2026 10:55:35 -0700
+Subject: [PATCH] Add bounded socket-free V2 block download coordinator
+
+Track requested peer/BlockID lifecycles through full, compact, missing and deferred recovery. Preserve typed capacity, consensus and operational outcomes; reserve bounded cache and simultaneous fallback staging before copies, and retain bounded connection tombstones until disconnect.
+
+Standalone Debug and AddressSanitizer/UndefinedBehaviorSanitizer CTest pass, including real full/compact byte parity, per-peer/global quotas, deferred recovery, callback/destructor reentry and 220 allocation-failure positions with exact lease cleanup. No sockets, profile adoption, shared build edits or consensus-serving claims.
+---
+ src/lotus_v2/peer_download.cpp                | 950 ++++++++++++++++++
+ src/lotus_v2/peer_download.h                  | 168 ++++
+ .../peer_download_test/CMakeLists.txt         |  26 +
+ src/lotus_v2/peer_download_test/README.md     | 159 +++
+ src/lotus_v2/test_peer_download.cpp           | 879 ++++++++++++++++
+ 5 files changed, 2182 insertions(+)
+ create mode 100644 src/lotus_v2/peer_download.cpp
+ create mode 100644 src/lotus_v2/peer_download.h
+ create mode 100644 src/lotus_v2/peer_download_test/CMakeLists.txt
+ create mode 100644 src/lotus_v2/peer_download_test/README.md
+ create mode 100644 src/lotus_v2/test_peer_download.cpp
+
+diff --git a/src/lotus_v2/peer_download.cpp b/src/lotus_v2/peer_download.cpp
+new file mode 100644
+index 000000000..39ab92e2c
+--- /dev/null
++++ b/src/lotus_v2/peer_download.cpp
+@@ -0,0 +1,950 @@
++// Copyright (c) 2026 The Lotus developers
++#include "peer_download.h"
++#include <algorithm>
++#include <exception>
++#include <limits>
++#include <map>
++#include <set>
++#include <stdexcept>
++#include <utility>
++namespace lotus::v2::peer {
++bool NextPeerHandle(uint64_t previous, PeerHandle &out) {
++    if (previous == UINT64_MAX) return false;
++    out = {previous + 1};
++    return true;
++}
++namespace {
++    using Key = std::pair<PeerHandle, Hash>;
++    DownloadEvent Event(DownloadResult r, PeerHandle peer = {}, Hash id = {},
++                        std::string why = {}) {
++        DownloadEvent e;
++        e.result = r;
++        e.peer = peer;
++        e.block_id = id;
++        e.diagnostic = std::move(why);
++        return e;
++    }
++    bool DeferredHeader(HeaderDisposition d) {
++        return d == HeaderDisposition::Deferred ||
++               d == HeaderDisposition::MissingParent;
++    }
++    class ControlReader {
++    public:
++        explicit ControlReader(std::span<const uint8_t> b) : bytes(b) {}
++        size_t Left() const { return bytes.size() - pos; }
++        bool Int(unsigned width, uint64_t &n) {
++            if (width > Left()) return false;
++            n = 0;
++            for (unsigned i = 0; i < width; ++i)
++                n |= uint64_t(bytes[pos++]) << (8 * i);
++            return true;
++        }
++        bool Compact(uint64_t &n) {
++            uint64_t lead;
++            if (!Int(1, lead)) return false;
++            if (lead < 253)
++                n = lead;
++            else {
++                unsigned width = lead == 253 ? 2 : lead == 254 ? 4 : 8;
++                if (!Int(width, n) || n < (width == 2   ? 253ULL
++                                           : width == 4 ? 65536ULL
++                                                        : 4294967296ULL))
++                    return false;
++            }
++            return n <= 50000;
++        }
++        bool HashValue(Hash &h) {
++            if (Left() < 32) return false;
++            std::copy_n(bytes.begin() + pos, 32, h.begin());
++            pos += 32;
++            return true;
++        }
++
++    private:
++        std::span<const uint8_t> bytes;
++        size_t pos = 0;
++    };
++    enum class CacheSize { Valid, Capacity, Invalid };
++    CacheSize CacheWireBytes(std::span<const Transaction> txs,
++                             const TxProfile &p, uint64_t cap,
++                             uint64_t &total) {
++        total = 0;
++        auto add = [&](uint64_t n) {
++            if (n > cap - total) return false;
++            total += n;
++            return true;
++        };
++        auto bytes = [&](size_t n) {
++            return add(CompactSizeWidth(n)) && add(n);
++        };
++        auto witness = [&](const BranchWitness &w) {
++            if (w.script.size() > p.max_script_bytes ||
++                w.siblings.size() > p.max_branch_proof_depth ||
++                w.arguments.size() > p.max_arguments)
++                return CacheSize::Invalid;
++            if (!bytes(w.script.size()) ||
++                !add(CompactSizeWidth(w.siblings.size())) ||
++                !add(uint64_t(w.siblings.size()) * 32) ||
++                !add(CompactSizeWidth(w.arguments.size())))
++                return CacheSize::Capacity;
++            for (const auto &a : w.arguments) {
++                if (a.size() > p.max_argument_bytes) return CacheSize::Invalid;
++                if (!bytes(a.size())) return CacheSize::Capacity;
++            }
++            return CacheSize::Valid;
++        };
++        for (const auto &tx : txs) {
++            if (tx.inputs.empty() || tx.inputs.size() > p.max_inputs ||
++                tx.outputs.size() > p.max_outputs)
++                return CacheSize::Invalid;
++            if (!add(16)) return CacheSize::Capacity;
++            for (const auto &in : tx.inputs) {
++                if (!add(41)) return CacheSize::Capacity;
++                if (in.flags == 1) {
++                    if (in.witnesses.size() > MAX_OUTPUT_BRANCHES)
++                        return CacheSize::Invalid;
++                    if (!add(CompactSizeWidth(in.path_index)) ||
++                        !add(CompactSizeWidth(in.witnesses.size())))
++                        return CacheSize::Capacity;
++                    for (const auto &w : in.witnesses) {
++                        auto r = witness(w);
++                        if (r != CacheSize::Valid) return r;
++                    }
++                } else if (in.flags == 2) {
++                    if (!add(1) || (in.has_coinbase_data &&
++                                    !bytes(in.coinbase_data.size())))
++                        return CacheSize::Capacity;
++                } else if (in.flags == 3) {
++                    if (in.witnesses.size() != 1) return CacheSize::Invalid;
++                    auto r = witness(in.witnesses[0]);
++                    if (r != CacheSize::Valid) return r;
++                } else
++                    return CacheSize::Invalid;
++            }
++            for (const auto &out : tx.outputs) {
++                if (out.branches.size() > MAX_OUTPUT_BRANCHES ||
++                    out.paths.size() > MAX_OUTPUT_PATHS)
++                    return CacheSize::Invalid;
++                if (!add(9 + (out.HasToken() ? 32 : 0)) ||
++                    !add(CompactSizeWidth(out.branches.size())) ||
++                    !add(uint64_t(out.branches.size()) * 32) ||
++                    !add(CompactSizeWidth(out.paths.size())))
++                    return CacheSize::Capacity;
++                for (const auto &path : out.paths) {
++                    if (path.size() > MAX_OUTPUT_BRANCHES)
++                        return CacheSize::Invalid;
++                    if (!add(CompactSizeWidth(path.size())))
++                        return CacheSize::Capacity;
++                    for (auto index : path)
++                        if (!add(CompactSizeWidth(index)))
++                            return CacheSize::Capacity;
++                }
++            }
++        }
++        return CacheSize::Valid;
++    }
++} // namespace
++struct DownloadManager::Impl {
++    enum class Phase { Full, Compact, Missing, DeferredRequest, DeferredBody };
++    struct Peer {
++        uint32_t limit;
++        uint32_t jobs = 0, slots = 0;
++        uint64_t bytes = 0;
++        std::set<Hash> guards;
++        bool disabled = false;
++    };
++    struct Job {
++        Key key;
++        Header header;
++        DownloadMode mode;
++        Phase phase = Phase::Full;
++        uint64_t generation = 0, deadline = 0, lifecycle = 0, retry = 0;
++        bool full_requested = false, charged = false;
++        ResourceNeed need{};
++        std::unique_ptr<DownloadReservation> lease;
++        std::unique_ptr<CompactReconstruction> reconstruction;
++        Bytes body;
++    };
++    DownloadConfig config;
++    DownloadCallbacks callbacks;
++    std::map<PeerHandle, Peer> peers;
++    std::map<Key, std::unique_ptr<Job>> jobs;
++    DownloadStats stats;
++    uint64_t previous_handle = 0, last_ms = 0;
++    bool clock_started = false, callback_active = false,
++         operation_active = false;
++    struct OperationScope {
++        Impl &owner;
++        PeerHandle peer;
++        bool abort_on_unwind;
++        int exceptions = std::uncaught_exceptions();
++        OperationScope(Impl &s, PeerHandle p, bool abort = true)
++            : owner(s), peer(p), abort_on_unwind(abort) {
++            owner.operation_active = true;
++        }
++        ~OperationScope() {
++            if (abort_on_unwind && std::uncaught_exceptions() > exceptions)
++                owner.AbortWork(peer);
++            owner.operation_active = false;
++        }
++    };
++    struct CallbackScope {
++        bool &active;
++        explicit CallbackScope(bool &flag) : active(flag) { active = true; }
++        ~CallbackScope() { active = false; }
++    };
++    Impl(DownloadConfig c, DownloadCallbacks f)
++        : config(std::move(c)), callbacks(std::move(f)) {
++        const auto &l = config.limits;
++        const auto &n = config.network;
++        if (!callbacks.check_header || !callbacks.reserve ||
++            !callbacks.cached_transactions || !callbacks.admit_body)
++            throw std::invalid_argument("download callbacks required");
++        if (!n.receive_limit || n.receive_limit > MAX_RECEIVE_LIMIT ||
++            !n.max_reconstruction_transactions ||
++            n.max_reconstruction_bytes < HEADER_SIZE + 4 + 17)
++            throw std::invalid_argument(
++                "download network capacity configuration");
++        if (!l.peers || !l.jobs_per_peer || !l.jobs_global ||
++            l.jobs_per_peer > l.jobs_global || !l.tombstones_per_peer ||
++            !l.tombstones_global ||
++            l.tombstones_per_peer > l.tombstones_global ||
++            l.jobs_per_peer > l.tombstones_per_peer ||
++            l.jobs_global > l.tombstones_global || !l.deferred_jobs_global ||
++            l.deferred_jobs_global > l.jobs_global || !l.cache_candidates ||
++            !l.cache_bytes || l.cache_candidates == UINT32_MAX ||
++            l.cache_bytes == UINT64_MAX || l.peers == UINT32_MAX ||
++            l.jobs_global == UINT32_MAX || l.tombstones_global == UINT32_MAX ||
++            l.staging_bytes_global == UINT64_MAX ||
++            l.transaction_slots_global == UINT32_MAX ||
++            !l.staging_bytes_per_peer ||
++            l.staging_bytes_per_peer > l.staging_bytes_global ||
++            !l.transaction_slots_per_peer ||
++            l.transaction_slots_per_peer > l.transaction_slots_global ||
++            !l.request_timeout_ms || !l.deferred_timeout_ms ||
++            !l.retry_interval_ms || l.request_timeout_ms == UINT64_MAX ||
++            l.deferred_timeout_ms == UINT64_MAX ||
++            l.lifecycle_timeout_ms == UINT64_MAX ||
++            l.retry_interval_ms > l.deferred_timeout_ms ||
++            l.lifecycle_timeout_ms <
++                std::max(l.request_timeout_ms, l.deferred_timeout_ms))
++            throw std::invalid_argument("download quota/time configuration");
++        // Permit at least one worst-case job locally. Quotas are explicit
++        // serialized staging/slot allowances, not claims about equal peak RAM.
++        if (n.max_reconstruction_bytes > UINT64_MAX / 4 ||
++            n.max_reconstruction_transactions > UINT32_MAX / 4 ||
++            l.cache_bytes > l.staging_bytes_per_peer ||
++            uint64_t(n.receive_limit) * 2 >
++                l.staging_bytes_per_peer - l.cache_bytes ||
++            n.max_reconstruction_bytes * 4 >
++                l.staging_bytes_per_peer - l.cache_bytes -
++                    uint64_t(n.receive_limit) * 2 ||
++            n.max_reconstruction_transactions * 4 >
++                l.transaction_slots_per_peer ||
++            uint64_t(n.receive_limit) * 4 > l.staging_bytes_per_peer ||
++            (n.receive_limit / 17) * 4 > l.transaction_slots_per_peer)
++            throw std::invalid_argument(
++                "download quota cannot reserve one job");
++    }
++    ~Impl() {
++        operation_active = true;
++        while (!jobs.empty())
++            Erase(jobs.begin()->first);
++    }
++    bool IsDeferred(const Job &j) const {
++        return j.phase == Phase::DeferredRequest ||
++               j.phase == Phase::DeferredBody;
++    }
++    bool Time(uint64_t now, DownloadEvent &e) {
++        if (clock_started && now < last_ms) {
++            e = Event(DownloadResult::OperationalFailure, {}, {},
++                      "monotonic clock moved backwards");
++            return false;
++        }
++        last_ms = now;
++        clock_started = true;
++        return true;
++    }
++    uint64_t Until(const Job &j, uint64_t now, uint64_t interval) const {
++        return now + std::min(interval, j.lifecycle - now);
++    }
++    void Release(Job &j) {
++        j.reconstruction.reset();
++        Bytes{}.swap(j.body);
++        if (j.charged) {
++            auto &p = peers.at(j.key.first);
++            p.bytes -= j.need.staging_bytes;
++            p.slots -= j.need.transaction_slots;
++            stats.staging_bytes -= j.need.staging_bytes;
++            stats.transaction_slots -= j.need.transaction_slots;
++            j.charged = false;
++        }
++        j.lease.reset();
++    }
++    void Erase(const Key &key) {
++        auto it = jobs.find(key);
++        if (it == jobs.end()) return;
++        auto &j = *it->second;
++        if (IsDeferred(j)) --stats.deferred_jobs;
++        Release(j);
++        --peers.at(key.first).jobs;
++        --stats.jobs;
++        jobs.erase(it);
++    }
++    void AbortWork(PeerHandle peer) noexcept {
++        for (auto it = jobs.begin(); it != jobs.end();) {
++            if (!peer.value || it->first.first == peer) {
++                auto key = it->first;
++                ++it;
++                Erase(key);
++            } else
++                ++it;
++        }
++        for (auto &entry : peers)
++            if (!peer.value || entry.first == peer)
++                entry.second.disabled = true;
++    }
++    DownloadEvent End(Job &j, DownloadResult r, std::string why = {}) {
++        auto e = Event(r, j.key.first, j.key.second, std::move(why));
++        auto key = j.key;
++        Erase(key);
++        return e;
++    }
++    HeaderDecision HeaderCheck(const Job &j) {
++        try {
++            CallbackScope scope(callback_active);
++            return callbacks.check_header(j.header, j.generation);
++        } catch (...) {
++            return {HeaderDisposition::OperationalError, std::nullopt,
++                    "header callback exception"};
++        }
++    }
++    DownloadEvent HeaderFailure(Job &j, const HeaderDecision &h) {
++        if (h.disposition == HeaderDisposition::ConsensusInvalid)
++            return End(j, DownloadResult::ConsensusRejected, h.diagnostic);
++        if (h.disposition == HeaderDisposition::Unsupported)
++            return End(j, DownloadResult::Unsupported, h.diagnostic);
++        return End(j, DownloadResult::OperationalFailure, h.diagnostic);
++    }
++    bool Reserve(Job &j, DownloadEvent &failure) {
++        if (j.charged) return true;
++        auto &p = peers.at(j.key.first);
++        const auto &l = config.limits;
++        const uint64_t full_bytes = uint64_t(p.limit) * 4;
++        const uint32_t full_slots = (p.limit / 17) * 4;
++        j.need =
++            j.mode == DownloadMode::Compact
++                ? ResourceNeed{std::max(
++                                   full_bytes,
++                                   uint64_t(p.limit) * 2 +
++                                       config.network.max_reconstruction_bytes *
++                                           4 +
++                                       config.limits.cache_bytes),
++                               std::max(
++                                   full_slots,
++                                   config.network
++                                           .max_reconstruction_transactions *
++                                       4)}
++                : ResourceNeed{full_bytes, full_slots};
++        if (j.need.staging_bytes > l.staging_bytes_per_peer - p.bytes ||
++            j.need.staging_bytes >
++                l.staging_bytes_global - stats.staging_bytes ||
++            j.need.transaction_slots > l.transaction_slots_per_peer - p.slots ||
++            j.need.transaction_slots >
++                l.transaction_slots_global - stats.transaction_slots) {
++            failure = End(j, DownloadResult::CapacityRefused,
++                          "download reservation quota");
++            return false;
++        }
++        ReservationResult result;
++        try {
++            CallbackScope scope(callback_active);
++            result = callbacks.reserve(j.key.first, j.need);
++        } catch (...) {
++            failure = End(j, DownloadResult::OperationalFailure,
++                          "reservation callback exception");
++            return false;
++        }
++        if (result.disposition != ReservationDisposition::Granted ||
++            !result.lease) {
++            auto disposition =
++                result.disposition == ReservationDisposition::CapacityRefused &&
++                        !result.lease
++                    ? DownloadResult::CapacityRefused
++                    : DownloadResult::OperationalFailure;
++            failure = End(j, disposition,
++                          result.diagnostic.empty() ? "reservation not granted"
++                                                    : result.diagnostic);
++            return false;
++        }
++        j.lease = std::move(result.lease);
++        j.charged = true;
++        p.bytes += j.need.staging_bytes;
++        p.slots += j.need.transaction_slots;
++        stats.staging_bytes += j.need.staging_bytes;
++        stats.transaction_slots += j.need.transaction_slots;
++        return true;
++    }
++    bool SetDeferred(Job &j, Phase phase, uint64_t now,
++                     DownloadEvent &failure) {
++        if (!IsDeferred(j)) {
++            if (stats.deferred_jobs >= config.limits.deferred_jobs_global) {
++                failure = End(j, DownloadResult::CapacityRefused,
++                              "deferred job quota");
++                return false;
++            }
++            ++stats.deferred_jobs;
++            j.deadline = Until(j, now, config.limits.deferred_timeout_ms);
++        }
++        j.phase = phase;
++        j.retry = Until(j, now, config.limits.retry_interval_ms);
++        return true;
++    }
++    DownloadEvent DeferHeader(Job &j, const HeaderDecision &h, uint64_t now) {
++        if (h.disposition == HeaderDisposition::MissingParent &&
++            !h.missing_parent)
++            return End(j, DownloadResult::OperationalFailure,
++                       "missing-parent callback omitted parent ID");
++        // A compact already in flight cannot safely be requested again under a
++        // new nonce. After parent recovery continue with one full-body
++        // fallback.
++        if (peers.at(j.key.first).guards.count(j.key.second))
++            j.mode = DownloadMode::Full;
++        DownloadEvent failure;
++        if (!SetDeferred(j, Phase::DeferredRequest, now, failure))
++            return failure;
++        j.reconstruction.reset();
++        j.body.clear();
++        auto e = Event(h.disposition == HeaderDisposition::MissingParent
++                           ? DownloadResult::NeedHeaders
++                           : DownloadResult::Deferred,
++                       j.key.first, j.key.second, h.diagnostic);
++        e.missing_parent = h.missing_parent;
++        return e;
++    }
++    DownloadEvent Issue(Job &j, uint64_t now) {
++        auto &p = peers.at(j.key.first);
++        if (j.mode == DownloadMode::Compact &&
++            j.header.size > config.network.max_reconstruction_bytes)
++            j.mode = DownloadMode::Full;
++        if (p.limit < 37 ||
++            (j.mode == DownloadMode::Full && j.header.size > p.limit))
++            return End(j, DownloadResult::CapacityRefused,
++                       "peer cannot carry requested full object/request");
++        if (j.mode == DownloadMode::Full && j.full_requested)
++            return End(j, DownloadResult::RetryElsewhere,
++                       "full-body fallback already requested");
++        const bool new_guard = !p.guards.count(j.key.second);
++        if (new_guard &&
++            (p.guards.size() >= config.limits.tombstones_per_peer ||
++             stats.tombstones >= config.limits.tombstones_global))
++            return End(j, DownloadResult::CapacityRefused,
++                       "connection lifecycle tombstone quota");
++        DownloadEvent failure;
++        if (!Reserve(j, failure)) return failure;
++        Inventory item{j.mode == DownloadMode::Full ? 2U : 4U, j.key.second};
++        Bytes payload;
++        std::string error;
++        if (!EncodeInventory(std::span(&item, 1), p.limit, payload, error))
++            return End(j, DownloadResult::CapacityRefused, error);
++        if (new_guard) {
++            p.guards.insert(j.key.second);
++            ++stats.tombstones;
++        }
++        if (IsDeferred(j)) --stats.deferred_jobs;
++        j.phase = j.mode == DownloadMode::Full ? Phase::Full : Phase::Compact;
++        if (j.mode == DownloadMode::Full) j.full_requested = true;
++        j.deadline = Until(j, now, config.limits.request_timeout_ms);
++        auto e = Event(DownloadResult::Requested, j.key.first, j.key.second);
++        e.outbound = Message{"getdata", std::move(payload)};
++        return e;
++    }
++    DownloadEvent
++    Fallback(Job &j, uint64_t now, std::string why,
++             FallbackReason cause = FallbackReason::Reconstruction) {
++        j.reconstruction.reset();
++        j.body.clear();
++        j.mode = DownloadMode::Full;
++        if (j.header.size > peers.at(j.key.first).limit || j.full_requested) {
++            auto e = End(j, DownloadResult::RetryElsewhere, std::move(why));
++            e.fallback = cause;
++            return e;
++        }
++        auto e = Issue(j, now);
++        if (e.diagnostic.empty()) e.diagnostic = std::move(why);
++        e.fallback = cause;
++        return e;
++    }
++    DownloadEvent Admit(Job &j, std::span<const uint8_t> wire, uint64_t now) {
++        BodyDecision result;
++        try {
++            CallbackScope scope(callback_active);
++            result = callbacks.admit_body(wire, j.generation);
++        } catch (...) {
++            return End(j, DownloadResult::OperationalFailure,
++                       "body admission callback exception");
++        }
++        if (result.disposition == BodyDisposition::MissingParent ||
++            result.disposition == BodyDisposition::Deferred) {
++            if (result.disposition == BodyDisposition::MissingParent &&
++                !result.missing_parent)
++                return End(j, DownloadResult::OperationalFailure,
++                           "missing-parent admission omitted parent ID");
++            DownloadEvent failure;
++            if (!SetDeferred(j, Phase::DeferredBody, now, failure))
++                return failure;
++            if (wire.data() != j.body.data() || wire.size() != j.body.size())
++                j.body.assign(wire.begin(), wire.end());
++            j.reconstruction.reset();
++            auto e = Event(result.disposition == BodyDisposition::MissingParent
++                               ? DownloadResult::NeedHeaders
++                               : DownloadResult::Deferred,
++                           j.key.first, j.key.second, result.diagnostic);
++            e.admission = result.disposition;
++            e.missing_parent = result.missing_parent;
++            return e;
++        }
++        DownloadResult kind;
++        switch (result.disposition) {
++            case BodyDisposition::Accepted:
++                kind = DownloadResult::Accepted;
++                break;
++            case BodyDisposition::MalformedBody:
++                kind = DownloadResult::PeerMessageInvalid;
++                break;
++            case BodyDisposition::ConsensusInvalid:
++                kind = DownloadResult::ConsensusRejected;
++                break;
++            case BodyDisposition::CapacityRefused:
++                kind = DownloadResult::CapacityRefused;
++                break;
++            case BodyDisposition::Unsupported:
++                kind = DownloadResult::Unsupported;
++                break;
++            case BodyDisposition::StorageError:
++                kind = DownloadResult::OperationalFailure;
++                break;
++            case BodyDisposition::ContextChanged:
++                kind = DownloadResult::RetryElsewhere;
++                break;
++            default:
++                return End(j, DownloadResult::OperationalFailure,
++                           "invalid admission disposition");
++        }
++        auto e = End(j, kind, result.diagnostic);
++        e.admission = result.disposition;
++        return e;
++    }
++    DownloadEvent Complete(Job &j, uint64_t now) {
++        std::string error;
++        bool found = false, encoded = false;
++        {
++            FramedBlock b;
++            found = j.reconstruction && j.reconstruction->TakeComplete(b);
++            if (found) {
++                Bytes wire;
++                encoded =
++                    EncodeBlockWire(b.header, b.transactions,
++                                    config.network.transaction, wire, error);
++                if (encoded) j.body = std::move(wire);
++            }
++        } // Release decoded/serialization temporaries while lease is live.
++        if (!found)
++            return End(j, DownloadResult::OperationalFailure,
++                       "missing completed reconstruction");
++        if (!encoded) return Fallback(j, now, error);
++        j.reconstruction.reset();
++        auto h = HeaderCheck(j);
++        if (DeferredHeader(h.disposition)) {
++            if (h.disposition == HeaderDisposition::MissingParent &&
++                !h.missing_parent)
++                return End(j, DownloadResult::OperationalFailure,
++                           "missing parent ID");
++            DownloadEvent failure;
++            if (!SetDeferred(j, Phase::DeferredBody, now, failure))
++                return failure;
++            auto e = Event(h.disposition == HeaderDisposition::MissingParent
++                               ? DownloadResult::NeedHeaders
++                               : DownloadResult::Deferred,
++                           j.key.first, j.key.second, h.diagnostic);
++            e.missing_parent = h.missing_parent;
++            return e;
++        }
++        if (h.disposition != HeaderDisposition::Eligible)
++            return HeaderFailure(j, h);
++        return Admit(j, j.body, now);
++    }
++    DownloadEvent Compact(Job &j, std::span<const uint8_t> payload,
++                          uint64_t now) {
++        if (j.phase != Phase::Compact)
++            return Event(DownloadResult::Ignored, j.key.first, j.key.second,
++                         "late or duplicate compact response");
++        auto h = HeaderCheck(j);
++        if (DeferredHeader(h.disposition)) return DeferHeader(j, h, now);
++        if (h.disposition != HeaderDisposition::Eligible)
++            return HeaderFailure(j, h);
++        std::string error;
++        ReconstructionStatus status = ReconstructionStatus::NeedFullBlock;
++        uint32_t count = 0;
++        DownloadResult preflight_failure = DownloadResult::Idle;
++        {
++            CompactBlock compact;
++            auto decoded =
++                DecodeCompact(payload, config.network,
++                              peers.at(j.key.first).limit, compact, error);
++            if (decoded == CompactDecodeStatus::CapacityRefused)
++                return Fallback(j, now, error, FallbackReason::CompactCapacity);
++            if (decoded == CompactDecodeStatus::InvalidPeerMessage)
++                return End(j, DownloadResult::PeerMessageInvalid, error);
++            count = uint32_t(uint64_t(compact.short_ids.size()) +
++                             compact.prefilled.size());
++            j.reconstruction =
++                std::make_unique<CompactReconstruction>(config.network);
++            try {
++                CachedTransactions cache;
++                {
++                    CallbackScope scope(callback_active);
++                    cache = callbacks.cached_transactions(j.header);
++                }
++                if (cache.transactions.size() >
++                        config.limits.cache_candidates ||
++                    cache.complete_wire_bytes > config.limits.cache_bytes) {
++                    error = "cache candidate/byte quota";
++                    preflight_failure = DownloadResult::CapacityRefused;
++                } else {
++                    uint64_t actual_bytes;
++                    auto size = CacheWireBytes(
++                        cache.transactions, config.network.transaction,
++                        config.limits.cache_bytes, actual_bytes);
++                    if (size == CacheSize::Capacity) {
++                        error = "cache byte quota";
++                        preflight_failure = DownloadResult::CapacityRefused;
++                    } else if (size == CacheSize::Invalid ||
++                               actual_bytes != cache.complete_wire_bytes) {
++                        error = "invalid/stale validated-cache metadata";
++                        preflight_failure = DownloadResult::OperationalFailure;
++                    } else
++                        status = j.reconstruction->Start(
++                            compact, cache.transactions, error);
++                }
++            } catch (...) {
++                error = "cache/reconstruction exception";
++                preflight_failure = DownloadResult::OperationalFailure;
++            }
++        } // No decoded compact/prefilled copy survives a lease release.
++        if (preflight_failure == DownloadResult::CapacityRefused)
++            return Fallback(j, now, error, FallbackReason::CacheCapacity);
++        if (preflight_failure == DownloadResult::OperationalFailure)
++            return End(j, preflight_failure, error);
++        if (status == ReconstructionStatus::NeedFullBlock)
++            return Fallback(j, now, error);
++        if (status == ReconstructionStatus::InvalidPeerMessage)
++            return End(j, DownloadResult::PeerMessageInvalid, error);
++        if (status == ReconstructionStatus::CompleteUnvalidated)
++            return Complete(j, now);
++        if (status != ReconstructionStatus::NeedTransactions)
++            return End(j, DownloadResult::OperationalFailure,
++                       "unexpected reconstruction lifecycle");
++        Bytes request;
++        if (!EncodeMissingRequest(j.reconstruction->Request(), uint32_t(count),
++                                  peers.at(j.key.first).limit, request, error))
++            return Fallback(j, now, error,
++                            FallbackReason::MissingRequestCapacity);
++        j.phase = Phase::Missing;
++        j.deadline = Until(j, now, config.limits.request_timeout_ms);
++        auto e =
++            Event(DownloadResult::NeedTransactions, j.key.first, j.key.second);
++        e.outbound = Message{"getblocktxn", std::move(request)};
++        return e;
++    }
++    DownloadEvent Full(Job &j, std::span<const uint8_t> payload, uint64_t now) {
++        if (IsDeferred(j))
++            return Event(DownloadResult::Ignored, j.key.first, j.key.second,
++                         "late full response while deferred");
++        if (payload.size() != j.header.size)
++            return End(j, DownloadResult::PeerMessageInvalid,
++                       "complete body/header size mismatch");
++        auto h = HeaderCheck(j);
++        if (DeferredHeader(h.disposition)) {
++            if (h.disposition == HeaderDisposition::MissingParent &&
++                !h.missing_parent)
++                return End(j, DownloadResult::OperationalFailure,
++                           "missing parent ID");
++            DownloadEvent failure;
++            if (!SetDeferred(j, Phase::DeferredBody, now, failure))
++                return failure;
++            j.body.assign(payload.begin(), payload.end());
++            j.reconstruction.reset();
++            auto e = Event(h.disposition == HeaderDisposition::MissingParent
++                               ? DownloadResult::NeedHeaders
++                               : DownloadResult::Deferred,
++                           j.key.first, j.key.second, h.diagnostic);
++            e.missing_parent = h.missing_parent;
++            return e;
++        }
++        if (h.disposition != HeaderDisposition::Eligible)
++            return HeaderFailure(j, h);
++        return Admit(j, payload, now);
++    }
++    DownloadEvent Missing(Job &j, std::span<const uint8_t> payload,
++                          uint64_t now) {
++        if (j.phase != Phase::Missing || !j.reconstruction)
++            return Event(DownloadResult::Ignored, j.key.first, j.key.second,
++                         "late or unsolicited blocktxn");
++        std::string error;
++        ReconstructionStatus result;
++        {
++            MissingResponse response;
++            if (!DecodeMissingResponse(
++                    payload, config.network,
++                    uint32_t(j.reconstruction->Request().indices.size()),
++                    peers.at(j.key.first).limit, response, error))
++                return End(j, DownloadResult::PeerMessageInvalid, error);
++            result = j.reconstruction->Apply(response, error);
++        }
++        if (result == ReconstructionStatus::CompleteUnvalidated)
++            return Complete(j, now);
++        if (result == ReconstructionStatus::NeedFullBlock)
++            return Fallback(j, now, error);
++        if (result == ReconstructionStatus::InvalidPeerMessage)
++            return End(j, DownloadResult::PeerMessageInvalid, error);
++        return End(j, DownloadResult::OperationalFailure,
++                   "unexpected missing-response result");
++    }
++    DownloadEvent NotFound(PeerHandle peer, std::span<const uint8_t> payload) {
++        ControlReader r(payload);
++        uint64_t count;
++        if (!r.Compact(count) || count > r.Left() / 36 ||
++            count * 36 != r.Left())
++            return Event(DownloadResult::PeerMessageInvalid, peer, {},
++                         "notfound count/bytes");
++        // Stack-only parsing, retaining at most the already bounded peer jobs.
++        std::set<Hash> found;
++        for (uint64_t i = 0; i < count; ++i) {
++            uint64_t type;
++            Hash id;
++            if (!r.Int(4, type) || !r.HashValue(id))
++                return Event(DownloadResult::PeerMessageInvalid, peer, {},
++                             "notfound item");
++            auto it = jobs.find({peer, id});
++            if (it == jobs.end() || IsDeferred(*it->second)) continue;
++            if (type == 2 || (type == 4 && it->second->phase == Phase::Compact))
++                found.insert(id);
++        }
++        auto e = Event(
++            found.empty() ? DownloadResult::Ignored
++                          : DownloadResult::RetryElsewhere,
++            peer, {}, "notfound: absence/capacity reason not supplied on wire");
++        for (const auto &id : found) {
++            e.affected.push_back(id);
++            Erase({peer, id});
++        }
++        return e;
++    }
++};
++DownloadManager::DownloadManager(DownloadConfig c, DownloadCallbacks f)
++    : impl_(std::make_unique<Impl>(std::move(c), std::move(f))) {}
++DownloadManager::~DownloadManager() = default;
++DownloadEvent DownloadManager::RegisterPeer(uint32_t limit) {
++    auto &s = *impl_;
++    if (s.callback_active || s.operation_active)
++        return Event(DownloadResult::OperationalFailure);
++    Impl::OperationScope operation(s, {}, false);
++    if (!limit || limit > s.config.network.receive_limit)
++        return Event(DownloadResult::OperationalFailure, {}, {},
++                     "invalid negotiated peer capacity");
++    if (s.stats.peers >= s.config.limits.peers)
++        return Event(DownloadResult::CapacityRefused, {}, {}, "peer quota");
++    PeerHandle handle;
++    if (!NextPeerHandle(s.previous_handle, handle))
++        return Event(DownloadResult::OperationalFailure, {}, {},
++                     "peer handle exhausted");
++    s.peers.emplace(handle, Impl::Peer{limit, 0, 0, 0, {}});
++    s.previous_handle = handle.value;
++    ++s.stats.peers;
++    return Event(DownloadResult::Registered, handle);
++}
++DownloadEvent DownloadManager::RequestBlock(PeerHandle peer,
++                                            const Header &header,
++                                            DownloadMode mode, uint64_t now) {
++    auto &s = *impl_;
++    if (s.callback_active || s.operation_active)
++        return Event(DownloadResult::OperationalFailure);
++    Impl::OperationScope operation(s, peer);
++    DownloadEvent failure;
++    if (!s.Time(now, failure)) return failure;
++    auto p = s.peers.find(peer);
++    if (p == s.peers.end())
++        return Event(DownloadResult::Ignored, peer, {},
++                     "disconnected/unknown peer handle");
++    if (p->second.disabled)
++        return Event(DownloadResult::OperationalFailure, peer, {},
++                     "peer disabled after operational failure");
++    Hash id;
++    if (header.version != 2 || !BlockId(s.config.network.chain_id, header, id))
++        return Event(DownloadResult::PeerMessageInvalid, peer, {},
++                     "header structure");
++    Key key{peer, id};
++    if (s.jobs.count(key))
++        return Event(DownloadResult::Busy, peer, id, "download already active");
++    if (p->second.guards.count(id))
++        return Event(DownloadResult::RetryElsewhere, peer, id,
++                     "retired connection/BlockID lifecycle");
++    if (s.stats.jobs >= s.config.limits.jobs_global ||
++        p->second.jobs >= s.config.limits.jobs_per_peer)
++        return Event(DownloadResult::CapacityRefused, peer, id,
++                     "download job quota");
++    if (s.config.limits.lifecycle_timeout_ms > UINT64_MAX - now)
++        return Event(DownloadResult::OperationalFailure, peer, id,
++                     "download deadline overflow");
++    auto job = std::make_unique<Impl::Job>();
++    job->key = key;
++    job->header = header;
++    job->mode = mode;
++    job->generation = s.config.context_generation;
++    job->lifecycle = now + s.config.limits.lifecycle_timeout_ms;
++    job->deadline = job->lifecycle;
++    auto &j = *job;
++    s.jobs.emplace(key, std::move(job));
++    ++s.stats.jobs;
++    ++p->second.jobs;
++    auto h = s.HeaderCheck(j);
++    if (DeferredHeader(h.disposition)) return s.DeferHeader(j, h, now);
++    if (h.disposition != HeaderDisposition::Eligible)
++        return s.HeaderFailure(j, h);
++    return s.Issue(j, now);
++}
++DownloadEvent DownloadManager::OnMessage(PeerHandle peer,
++                                         const Message &message, uint64_t now) {
++    auto &s = *impl_;
++    if (s.callback_active || s.operation_active)
++        return Event(DownloadResult::OperationalFailure);
++    Impl::OperationScope operation(s, peer);
++    DownloadEvent failure;
++    if (!s.Time(now, failure)) return failure;
++    auto p = s.peers.find(peer);
++    if (p == s.peers.end())
++        return Event(DownloadResult::Ignored, peer, {},
++                     "disconnected/unknown peer handle");
++    if (p->second.disabled)
++        return Event(DownloadResult::OperationalFailure, peer, {},
++                     "peer disabled after operational failure");
++    if (message.payload.size() > p->second.limit)
++        return Event(DownloadResult::PeerMessageInvalid, peer, {},
++                     "payload exceeds negotiated limit");
++    if (message.command == "notfound") return s.NotFound(peer, message.payload);
++    Hash id;
++    if (message.command == "block" || message.command == "cmpctblock") {
++        Header h;
++        if (message.payload.size() < HEADER_SIZE ||
++            !ParseHeader(message.payload.data(), HEADER_SIZE, h) ||
++            h.version != 2 || !BlockId(s.config.network.chain_id, h, id))
++            return Event(DownloadResult::PeerMessageInvalid, peer, {},
++                         "response header structure");
++    } else if (message.command == "blocktxn") {
++        if (message.payload.size() < 32)
++            return Event(DownloadResult::PeerMessageInvalid, peer, {},
++                         "blocktxn identity prefix");
++        std::copy_n(message.payload.begin(), 32, id.begin());
++    } else
++        return Event(DownloadResult::Ignored, peer);
++    auto it = s.jobs.find({peer, id});
++    if (it == s.jobs.end())
++        return Event(DownloadResult::Ignored, peer, id,
++                     "unsolicited/retired response");
++    auto &j = *it->second;
++    if (now >= j.deadline)
++        return s.End(j, DownloadResult::RetryElsewhere, "download timeout");
++    if (message.command == "block") return s.Full(j, message.payload, now);
++    if (message.command == "cmpctblock")
++        return s.Compact(j, message.payload, now);
++    return s.Missing(j, message.payload, now);
++}
++DownloadEvent DownloadManager::PollTimeout(uint64_t now) {
++    auto &s = *impl_;
++    if (s.callback_active || s.operation_active)
++        return Event(DownloadResult::OperationalFailure);
++    Impl::OperationScope operation(s, {});
++    DownloadEvent failure;
++    if (!s.Time(now, failure)) return failure;
++    for (auto &entry : s.jobs) {
++        auto &j = *entry.second;
++        if (now >= j.deadline)
++            return s.End(j, DownloadResult::RetryElsewhere, "download timeout");
++    }
++    for (auto &entry : s.jobs) {
++        auto &j = *entry.second;
++        if (!s.IsDeferred(j) || now < j.retry) continue;
++        auto h = s.HeaderCheck(j);
++        if (DeferredHeader(h.disposition)) {
++            if (h.disposition == HeaderDisposition::MissingParent &&
++                !h.missing_parent)
++                return s.End(j, DownloadResult::OperationalFailure,
++                             "missing parent ID");
++            j.retry = s.Until(j, now, s.config.limits.retry_interval_ms);
++            auto e = Event(h.disposition == HeaderDisposition::MissingParent
++                               ? DownloadResult::NeedHeaders
++                               : DownloadResult::Deferred,
++                           j.key.first, j.key.second, h.diagnostic);
++            e.missing_parent = h.missing_parent;
++            return e;
++        }
++        if (h.disposition != HeaderDisposition::Eligible)
++            return s.HeaderFailure(j, h);
++        if (j.phase == Impl::Phase::DeferredBody)
++            return s.Admit(j, j.body, now);
++        return s.Issue(j, now);
++    }
++    return {};
++}
++DownloadEvent DownloadManager::Cancel(PeerHandle peer, const Hash &id) {
++    auto &s = *impl_;
++    if (s.callback_active || s.operation_active)
++        return Event(DownloadResult::OperationalFailure);
++    Impl::OperationScope operation(s, peer);
++    auto it = s.jobs.find({peer, id});
++    if (it == s.jobs.end()) return Event(DownloadResult::Ignored, peer, id);
++    return s.End(*it->second, DownloadResult::Cancelled, "download cancelled");
++}
++DownloadEvent DownloadManager::OnReorg(uint64_t generation) {
++    auto &s = *impl_;
++    if (s.callback_active || s.operation_active)
++        return Event(DownloadResult::OperationalFailure);
++    Impl::OperationScope operation(s, {});
++    if (generation <= s.config.context_generation)
++        return Event(DownloadResult::OperationalFailure, {}, {},
++                     "context generation must advance");
++    auto e = Event(DownloadResult::Cancelled, {}, {}, "chain context changed");
++    while (!s.jobs.empty()) {
++        e.affected.push_back(s.jobs.begin()->first.second);
++        s.Erase(s.jobs.begin()->first);
++    }
++    s.config.context_generation = generation;
++    return e;
++}
++DownloadEvent DownloadManager::OnDisconnect(PeerHandle peer) {
++    auto &s = *impl_;
++    if (s.callback_active || s.operation_active)
++        return Event(DownloadResult::OperationalFailure);
++    Impl::OperationScope operation(s, peer);
++    auto p = s.peers.find(peer);
++    if (p == s.peers.end()) return Event(DownloadResult::Ignored, peer);
++    auto e = Event(DownloadResult::Cancelled, peer, {}, "peer disconnected");
++    for (auto it = s.jobs.begin(); it != s.jobs.end();) {
++        if (it->first.first == peer) {
++            auto key = it->first;
++            ++it;
++            e.affected.push_back(key.second);
++            s.Erase(key);
++        } else
++            ++it;
++    }
++    s.stats.tombstones -= uint32_t(p->second.guards.size());
++    s.peers.erase(p);
++    --s.stats.peers;
++    return e;
++}
++DownloadStats DownloadManager::Stats() const {
++    return impl_->stats;
++}
++} // namespace lotus::v2::peer
+diff --git a/src/lotus_v2/peer_download.h b/src/lotus_v2/peer_download.h
+new file mode 100644
+index 000000000..288ddb543
+--- /dev/null
++++ b/src/lotus_v2/peer_download.h
+@@ -0,0 +1,168 @@
++// Copyright (c) 2026 The Lotus developers
++#ifndef LOTUS_V2_PEER_DOWNLOAD_H
++#define LOTUS_V2_PEER_DOWNLOAD_H
++#include "peer_codec.h"
++#include <functional>
++#include <memory>
++namespace lotus::v2::peer {
++struct PeerHandle {
++    uint64_t value = 0;
++    auto operator<=>(const PeerHandle &) const = default;
++};
++bool NextPeerHandle(uint64_t previous, PeerHandle &out);
++enum class DownloadMode { Full, Compact };
++enum class HeaderDisposition {
++    Eligible,
++    MissingParent,
++    Deferred,
++    ConsensusInvalid,
++    Unsupported,
++    OperationalError
++};
++struct HeaderDecision {
++    HeaderDisposition disposition;
++    std::optional<Hash> missing_parent;
++    std::string diagnostic;
++};
++enum class BodyDisposition {
++    Accepted,
++    MalformedBody,
++    ConsensusInvalid,
++    MissingParent,
++    Deferred,
++    CapacityRefused,
++    Unsupported,
++    StorageError,
++    ContextChanged
++};
++struct BodyDecision {
++    BodyDisposition disposition;
++    std::optional<Hash> missing_parent;
++    std::string diagnostic;
++};
++struct ResourceNeed {
++    uint64_t staging_bytes;
++    uint32_t transaction_slots;
++};
++class DownloadReservation {
++public:
++    virtual ~DownloadReservation() = default; // implementation must not throw
++};
++enum class ReservationDisposition {
++    Granted,
++    CapacityRefused,
++    OperationalError
++};
++struct ReservationResult {
++    ReservationDisposition disposition;
++    std::unique_ptr<DownloadReservation> lease;
++    std::string diagnostic;
++};
++struct DownloadLimits {
++    uint32_t peers, jobs_per_peer, jobs_global;
++    uint32_t tombstones_per_peer, tombstones_global;
++    uint32_t deferred_jobs_global;
++    uint32_t cache_candidates;
++    uint64_t cache_bytes;
++    uint64_t staging_bytes_per_peer, staging_bytes_global;
++    uint32_t transaction_slots_per_peer, transaction_slots_global;
++    uint64_t request_timeout_ms, deferred_timeout_ms, retry_interval_ms;
++    uint64_t lifecycle_timeout_ms;
++};
++struct DownloadConfig {
++    NetworkProfile network;
++    DownloadLimits limits;
++    uint64_t context_generation;
++};
++struct CachedTransactions {
++    std::span<const Transaction> transactions;
++    uint64_t complete_wire_bytes; // canonical total, independently preflighted
++};
++struct DownloadCallbacks {
++    std::function<HeaderDecision(const Header &, uint64_t)> check_header;
++    std::function<ReservationResult(PeerHandle, const ResourceNeed &)> reserve;
++    // Borrowed complete validated transactions, stable until Start returns.
++    // Called only after a lease is granted; no pointer is retained afterward.
++    std::function<CachedTransactions(const Header &)> cached_transactions;
++    // Synchronous, borrowed full bytes under a live lease. Accepted must mean
++    // the enclosing validator's intended atomic admission completed. No pointer
++    // survives this callback unless the enclosing runtime separately owns it.
++    std::function<BodyDecision(std::span<const uint8_t>, uint64_t)> admit_body;
++};
++enum class DownloadResult {
++    Idle,
++    Registered,
++    Requested,
++    NeedTransactions,
++    NeedHeaders,
++    Deferred,
++    Accepted,
++    ConsensusRejected,
++    PeerMessageInvalid,
++    CapacityRefused,
++    Unsupported,
++    OperationalFailure,
++    RetryElsewhere,
++    Cancelled,
++    Ignored,
++    Busy
++};
++enum class FallbackReason {
++    Reconstruction,
++    CompactCapacity,
++    CacheCapacity,
++    MissingRequestCapacity
++};
++struct DownloadEvent {
++    DownloadResult result = DownloadResult::Idle;
++    PeerHandle peer;
++    Hash block_id{};
++    std::optional<Hash> missing_parent;
++    std::optional<Message> outbound; // at most one bounded application message
++    std::optional<BodyDisposition> admission;
++    std::optional<FallbackReason> fallback;
++    // Batched notfound/reorg/disconnect notices, bounded by configured jobs.
++    std::vector<Hash> affected;
++    std::string diagnostic;
++};
++struct DownloadStats {
++    uint32_t peers = 0, jobs = 0, tombstones = 0, deferred_jobs = 0;
++    uint64_t staging_bytes = 0;
++    uint32_t transaction_slots = 0;
++};
++// Single-owner, socket-free block coordinator. Callbacks/lease destructors must
++// not reenter mutating methods; attempted reentry returns OperationalFailure.
++// Configuration is explicit;
++// inconsistent/zero limits throw invalid_argument. No permanent-invalid cache,
++// best-chain selection, profile adoption, serving or service advertising.
++// Allocation exceptions propagate after aborting the peer's work (all work for
++// a global operation), releasing leases and disabling the peer(s). Tombstones
++// survive until runtime closes sessions and calls OnDisconnect. Backend storage
++// and validator caches need separate budgets. An admission exception/storage
++// failure may follow an external commit: reconcile authoritative tip; no
++// rollback or no-mutation promise is made by this coordinator. Session framing
++// buffers and event queues are enclosing-runtime resources.
++class DownloadManager {
++public:
++    DownloadManager(DownloadConfig, DownloadCallbacks);
++    ~DownloadManager();
++    DownloadManager(const DownloadManager &) = delete;
++    DownloadManager &operator=(const DownloadManager &) = delete;
++    DownloadEvent
++    RegisterPeer(uint32_t negotiated_limit); // activated session only
++    DownloadEvent RequestBlock(PeerHandle, const Header &, DownloadMode,
++                               uint64_t monotonic_ms);
++    DownloadEvent OnMessage(PeerHandle, const Message &, uint64_t monotonic_ms);
++    DownloadEvent PollTimeout(uint64_t monotonic_ms); // one due job per call
++    DownloadEvent Cancel(PeerHandle, const Hash &block_id);
++    DownloadEvent
++    OnReorg(uint64_t new_context_generation); // immediate bounded cleanup
++    DownloadEvent OnDisconnect(PeerHandle);
++    DownloadStats Stats() const;
++
++private:
++    struct Impl;
++    std::unique_ptr<Impl> impl_;
++};
++} // namespace lotus::v2::peer
++#endif
+diff --git a/src/lotus_v2/peer_download_test/CMakeLists.txt b/src/lotus_v2/peer_download_test/CMakeLists.txt
+new file mode 100644
+index 000000000..8e348a8c2
+--- /dev/null
++++ b/src/lotus_v2/peer_download_test/CMakeLists.txt
+@@ -0,0 +1,26 @@
++cmake_minimum_required(VERSION 3.18)
++project(lotus_v2_peer_download_review LANGUAGES C CXX)
++set(CMAKE_CXX_STANDARD 20)
++set(CMAKE_CXX_STANDARD_REQUIRED ON)
++get_filename_component(LOTUS_SRC "${CMAKE_CURRENT_SOURCE_DIR}/../.." ABSOLUTE)
++if(NOT DEFINED LOTUS_SECP_LIBRARY OR NOT EXISTS "${LOTUS_SECP_LIBRARY}")
++    message(FATAL_ERROR "Set LOTUS_SECP_LIBRARY to a locally built ABC libsecp256k1.a")
++endif()
++add_library(download_blake3 STATIC ../vendor/blake3/blake3.c
++    ../vendor/blake3/blake3_dispatch.c ../vendor/blake3/blake3_portable.c)
++target_compile_definitions(download_blake3 PRIVATE BLAKE3_NO_SSE2 BLAKE3_NO_SSE41
++    BLAKE3_NO_AVX2 BLAKE3_NO_AVX512 BLAKE3_USE_NEON=0)
++add_executable(lotus_v2_peer_download_test ../peer_download.cpp ../test_peer_download.cpp
++    ../peer_codec.cpp ../header.cpp ../block_wire.cpp ../transaction.cpp ../output.cpp
++    ../commitment.cpp ../signing.cpp ../tagged_hash.cpp
++    ../../crypto/sha256.cpp ../../crypto/siphash.cpp ../../support/cleanse.cpp)
++target_include_directories(lotus_v2_peer_download_test PRIVATE "${LOTUS_SRC}"
++    "${LOTUS_SRC}/secp256k1/include")
++target_link_libraries(lotus_v2_peer_download_test PRIVATE download_blake3 "${LOTUS_SECP_LIBRARY}")
++target_compile_options(lotus_v2_peer_download_test PRIVATE -Wall -Wextra -Wpedantic -Werror)
++if(LOTUS_SANITIZE)
++    target_compile_options(lotus_v2_peer_download_test PRIVATE -fsanitize=address,undefined -fno-omit-frame-pointer)
++    target_link_options(lotus_v2_peer_download_test PRIVATE -fsanitize=address,undefined)
++endif()
++enable_testing()
++add_test(NAME lotus_v2_peer_download_test COMMAND lotus_v2_peer_download_test)
+diff --git a/src/lotus_v2/peer_download_test/README.md b/src/lotus_v2/peer_download_test/README.md
+new file mode 100644
+index 000000000..fb1c46f3f
+--- /dev/null
++++ b/src/lotus_v2/peer_download_test/README.md
+@@ -0,0 +1,159 @@
++# Socket-free bounded block download coordinator
++
++This candidate coordinates explicitly requested V2 blocks using the existing
++native peer codecs. It selects no network/profile, opens no sockets, changes no
++shared CMake/dispatcher, advertises no service and owns no persistent chain index.
++It is a single-owner scheduler; enclosing code serializes all calls.
++
++## API and callbacks
++
++Construct `DownloadManager` with explicit `DownloadConfig` and all four required
++callbacks. Zero/inconsistent limits and unbounded sentinel values reject with
++`invalid_argument`. There are no local policy or network defaults. Register only
++sessions that have completed V2 negotiation, using their negotiated limit.
++Registration returns checked monotonically allocated handles; a disconnected
++handle is never reused. Runtime registers each physical connection exactly once
++and retains that handle; registering the same connection again would bypass its
++lifecycle guards. `NextPeerHandle` exposes the checked boundary primitive.
++
++`RequestBlock` takes the exact expected native header and full/compact choice.
++It derives BlockID and checks contextual header eligibility before requesting
++body data. Missing parents produce `NeedHeaders` with the parent ID. Deferred
++requests are bounded jobs holding a fixed header, not peer body buffers.
++
++`OnMessage` borrows a complete, bounded Session application message. Full blocks,
++compact blocks, missing responses and notfound are associated with registered
++peer handle and requested BlockID. Unsolicited/late responses create no jobs and
++cannot modify another request. Compact requests permit a complete-block reply.
++The manager's only outbound records are single-item getdata and getblocktxn;
++the enclosing runtime encodes their TCP envelopes and owns a bounded send queue.
++
++`PollTimeout` processes at most one due job. Call it until Idle under a bounded
++runtime work budget. Deadlines use injected monotonic milliseconds and checked
++arithmetic. Duplicate/unknown traffic does not extend deadlines. Missing-index
++and full fallback phases get their configured phase deadline, capped by the
++original lifecycle deadline. Deferred retry never extends its expiry.
++
++`Cancel`, `OnReorg` and `OnDisconnect` release work. Reorg advances the caller's
++context generation and immediately clears every job, with a bounded affected-ID
++list and no hidden retry queue. Disconnect also releases that connection's
++retired guards. The manager does not select branches or mutate active-tip state.
++
++Callback outcomes are typed, never inferred from diagnostic strings:
++
++- Header: Eligible, MissingParent, Deferred, ConsensusInvalid, Unsupported,
++  OperationalError.
++- Body: Accepted, MalformedBody, ConsensusInvalid, MissingParent, Deferred,
++  CapacityRefused, Unsupported, StorageError, ContextChanged.
++- Reservation: Granted, CapacityRefused, OperationalError.
++
++Full and reconstructed complete bytes enter the same synchronous admission
++callback under a live reservation. Accepted means whatever atomic admission
++contract the enclosing validator explicitly supplies. The coordinator itself
++implements no VM, monetary transition, disk publication or rollback. In
++particular, an admission exception or StorageError can occur after an external
++commit: reconcile the authoritative tip/context before continuing. An operational
++failure is not proof that chain state stayed unchanged.
++
++Missing-parent/deferred complete bodies remain under their existing lease in a
++bounded deferred job. Retry rechecks header eligibility and calls admission
++again; timeout, reorg, cancellation and disconnect discard them. Header/body
++unsupported and operational outcomes remain distinct from consensus rejection.
++The manager has no permanent-invalid cache and emits ConsensusRejected only for
++an explicit corresponding callback result. Bad compact root/size/matching never
++produces that result by itself.
++
++## Reservations, cache and lifecycle bounds
++
++Explicit limits bound registered peers, jobs per peer/globally, deferred jobs,
++retired lifecycle guards per peer/globally, serialized staging bytes, transaction
++slots, cache candidates/cache bytes and all deadlines. Configuration must permit
++at least one worst-case job. Input Session buffers, output/event queues,
++validator scratch/UTXO backend caches and disk overlays have separate enclosing
++runtime budgets.
++
++A reservation is acquired before decoding transactions, reading cache candidates
++or retaining body copies. `ResourceNeed` is a conservative serialized staging
++and transaction-slot allowance, not a measured equal resident-memory ceiling:
++
++- Full mode reserves `4 * peer_payload_limit` staging bytes and
++  `4 * floor(peer_payload_limit / 17)` transaction slots. Seventeen bytes is the
++  existing full codec's conservative minimum framed transaction bound.
++- Compact mode reserves the maximum of that full allowance and
++  `4 * max_reconstruction_bytes + 2 * peer_payload_limit + cache_bytes`, with
++  the maximum of the full slots and `4 * max_reconstruction_transactions`.
++  Thus both an immediate full reply and later full fallback fit the original
++  lease. The bound covers simultaneously retained serialization/decoded copies;
++  it never allocates from an unchecked advertised Header.size.
++
++`CachedTransactions` supplies a borrowed flat span and its canonical total wire
++bytes. The callback must supply an already validated, bounded cache snapshot,
++not an unbounded query that allocates a new cache. Its span and transaction
++contents remain stable until `CompactReconstruction::Start` returns. The manager
++checks candidate count/declared bytes before scanning, then performs a bounded,
++allocation-free size/count preflight and verifies that metadata. Oversized cache
++views fall back to full retrieval; invalid/stale local metadata is operational,
++never a peer or consensus invalidity. No cache pointer survives Start.
++
++Granted leases are move-only RAII objects whose destructors must not throw.
++Whole-operation guards reject mutating reentry from callbacks or lease
++destructors with OperationalFailure. Allocation/length exceptions outside
++callback catches propagate after the unwinding guard aborts the peer's jobs,
++releases leases and disables further work on that handle. A global-operation
++unwind aborts all jobs. Retired guards survive; the enclosing runtime closes
++sessions and calls OnDisconnect (or destroys the manager). It must not reinterpret
++allocation failure as bad consensus data. Large temporary objects are released
++before their job lease; reserved counters release exactly once on terminal paths.
++
++Every issued peer/BlockID lifecycle retains a small guard until that connection
++disconnects. Timeout/cancel/reorg/completion drop heavy state but never permit a
++second missing request for that connection/ID. Compact-to-full is one transition
++within the existing job, and full retrieval is attempted at most once. Repeated
++compact/new-nonce responses cannot replace its request list. At guard quotas,
++refuse new lifecycles or rotate/disconnect the connection; do not evict guards
++and reuse the same connection/ID. Guard maps are explicitly bounded globally.
++
++Capacity refusal is recoverable. Tiny valid negotiated limits may not fit the
++37-byte single-item getdata. Compact resource/collision/root failures produce
++one full fallback where the complete body fits, otherwise RetryElsewhere.
++Typed fallback causes distinguish compact/cache/request capacity from generic
++reconstruction fallback. No vector is truncated. `notfound` carries no remote
++absence-versus-capacity reason, so the manager reports alternate-peer recovery
++without inventing one. Batched notices are bounded by existing job quotas.
++
++## Validation evidence and scope
++
++Standalone target:
++
++```sh
++cmake -S src/lotus_v2/peer_download_test -B /tmp/v2-peer-download-build -GNinja \
++  -DCMAKE_BUILD_TYPE=Debug \
++  -DLOTUS_SECP_LIBRARY=/absolute/path/to/libsecp256k1.a
++cmake --build /tmp/v2-peer-download-build
++ctest --test-dir /tmp/v2-peer-download-build --output-on-failure
++```
++
++Add `-DLOTUS_SANITIZE=ON` for AddressSanitizer/UndefinedBehaviorSanitizer. The
++standalone target compiles inherited SHA256/SipHash, native codecs/signing and
++`support/cleanse.cpp`; Chronik and synthetic hashing overrides are absent.
++
++Debug and sanitizer checks pass in the isolated 2026-10-15 packet. Tests use
++real native full/compact framing and independently instrumented scheduling,
++reservation and admission callbacks. The test admission adapter checks complete
++framing/ordered roots; it is explicitly not native VM/state/monetary acceptance.
++Coverage includes exact full/compact bytes, peer/BlockID association, partial
++cache overlap, missing indices, duplicate-short-ID fallback and valid full-body
++recovery, cache count refusal before scanning invalid entries, capacity/size
++mismatch, every typed outcome, deadlines, cancellation/reorg, missing-parent and
++deferred-body recovery, per-peer/global job/byte/slot/guard/deferred quotas,
++notfound batches, callback/release reentry, handle/deadline overflow, exact lease
++cleanup and 220 deterministic allocator fault positions through compact work.
++Global reorg allocation failure also releases all queued jobs immediately.
++
++Remaining integration is explicit: activated-session ownership, actual peer
++selection/diversity, header synchronization and authenticated eligibility,
++validated body availability/serving, full-TxHash transaction relay, near-tip and
++anti-amplification policy, persistent index/atomic admission adapters, resource
++measurements, runtime retries/connection rotation, sockets, RPC and reviewed
++network/profile adoption. No public readiness, universal P05 delivery or daemon
++acceptance claim follows from this coordinator packet.
+diff --git a/src/lotus_v2/test_peer_download.cpp b/src/lotus_v2/test_peer_download.cpp
+new file mode 100644
+index 000000000..d000d205e
+--- /dev/null
++++ b/src/lotus_v2/test_peer_download.cpp
+@@ -0,0 +1,879 @@
++// Copyright (c) 2026 The Lotus developers
++#include "peer_download.h"
++#include <cstdlib>
++#include <iostream>
++#include <new>
++#include <stdexcept>
++// Standalone deterministic allocator fault injection. Disabled except during
++// the specific unwinding test; no production allocation seam is compiled.
++static int fail_allocation_after = -1;
++void *operator new(std::size_t n) {
++    if (fail_allocation_after == 0) {
++        fail_allocation_after = -1;
++        throw std::bad_alloc();
++    }
++    if (fail_allocation_after > 0) --fail_allocation_after;
++    if (void *p = std::malloc(n ? n : 1)) return p;
++    throw std::bad_alloc();
++}
++void operator delete(void *p) noexcept {
++    std::free(p);
++}
++void *operator new[](std::size_t n) {
++    return ::operator new(n);
++}
++void operator delete[](void *p) noexcept {
++    ::operator delete(p);
++}
++void operator delete(void *p, std::size_t) noexcept {
++    ::operator delete(p);
++}
++void operator delete[](void *p, std::size_t) noexcept {
++    ::operator delete(p);
++}
++using namespace lotus::v2;
++using namespace lotus::v2::peer;
++#define CHECK(c)                                                               \
++    do {                                                                       \
++        if (!(c))                                                              \
++            throw std::runtime_error("line " + std::to_string(__LINE__) +      \
++                                     ": " #c);                                 \
++    } while (false)
++namespace {
++DownloadConfig Config() {
++    DownloadConfig c{};
++    auto &p = c.network;
++    p.magic = {0x12, 0x34, 0x56, 0x78}; // arbitrary synthetic profile
++    p.chain_id[0] = 1;
++    p.genesis_id[0] = 2;
++    p.profile_digest[0] = 3;
++    p.receive_limit = 4096;
++    p.transaction = {8, 8, 2, 8192, 8, 8192, 64};
++    p.max_reconstruction_transactions = 16;
++    p.max_reconstruction_bytes = 4096;
++    auto &l = c.limits;
++    l.peers = 3;
++    l.jobs_per_peer = 2;
++    l.jobs_global = 4;
++    l.tombstones_per_peer = 3;
++    l.tombstones_global = 6;
++    l.deferred_jobs_global = 2;
++    l.cache_candidates = 16;
++    l.cache_bytes = 4096;
++    l.staging_bytes_per_peer = 65536;
++    l.staging_bytes_global = 131072;
++    l.transaction_slots_per_peer = 2048;
++    l.transaction_slots_global = 8192;
++    l.request_timeout_ms = 100;
++    l.deferred_timeout_ms = 500;
++    l.retry_interval_ms = 10;
++    l.lifecycle_timeout_ms = 1000;
++    c.context_generation = 7;
++    return c;
++}
++Transaction Spend(uint8_t id) {
++    Transaction tx;
++    Input i;
++    i.prev_txid[0] = id;
++    i.flags = 1;
++    i.sequence = UINT32_MAX;
++    i.witnesses.push_back({{0x51}, {}, {{7}}});
++    tx.inputs.push_back(i);
++    Output o;
++    o.value = 100;
++    o.branches.push_back(Hash{});
++    o.paths = {{0}};
++    tx.outputs.push_back(o);
++    return tx;
++}
++FramedBlock Block(const DownloadConfig &c, uint64_t nonce = 1) {
++    FramedBlock b;
++    b.header.version = 2;
++    b.header.time = 12345;
++    b.header.bits = 0x207fffff;
++    b.header.nonce = nonce;
++    b.header.height = 1;
++    auto cb = Spend(0);
++    cb.inputs[0].flags = 2;
++    cb.inputs[0].witnesses.clear();
++    b.transactions = {cb, Spend(1), Spend(2)};
++    std::string e;
++    CHECK(CompleteTransactionRoot(b.transactions, c.network.transaction,
++                                  c.network.chain_id, b.header.tx_root, e));
++    b.header.size = HEADER_SIZE + 4;
++    for (const auto &tx : b.transactions) {
++        Bytes wire;
++        CHECK(EncodeTransaction(tx, c.network.transaction, wire, e));
++        b.header.size += wire.size() + CompactSizeWidth(wire.size());
++    }
++    return b;
++}
++Hash Id(const DownloadConfig &c, const Header &h) {
++    Hash id;
++    CHECK(BlockId(c.network.chain_id, h, id));
++    return id;
++}
++Message Full(const DownloadConfig &c, const FramedBlock &b) {
++    Bytes wire;
++    std::string e;
++    CHECK(EncodeBlockWire(b.header, b.transactions, c.network.transaction, wire,
++                          e));
++    return {"block", std::move(wire)};
++}
++Message Compact(const DownloadConfig &c, const FramedBlock &b) {
++    CompactBlock compact;
++    std::string e;
++    const uint32_t first[] = {0};
++    CHECK(MakeCompact(b, c.network, 999, first, compact, e));
++    Bytes wire;
++    CHECK(EncodeCompact(compact, c.network, c.network.receive_limit, wire, e));
++    return {"cmpctblock", std::move(wire)};
++}
++struct Harness {
++    Harness() { trace.reserve(512); } // release hooks must not allocate
++    DownloadConfig config = Config();
++    HeaderDisposition header = HeaderDisposition::Eligible;
++    BodyDisposition body = BodyDisposition::Accepted;
++    ReservationDisposition reservation = ReservationDisposition::Granted;
++    bool throw_header = false, throw_reserve = false, throw_cache = false,
++         throw_body = false;
++    bool bad_lease = false, bad_cache_bytes = false;
++    size_t reserves = 0, releases = 0, live = 0, admissions = 0,
++           cache_calls = 0;
++    uint64_t last_generation = 0;
++    ResourceNeed last_need{};
++    std::function<void()> on_release;
++    std::vector<std::string> trace;
++    std::vector<Transaction> cache;
++    std::vector<Bytes> admitted;
++    struct Lease : DownloadReservation {
++        Harness &h;
++        explicit Lease(Harness &x) : h(x) { ++h.live; }
++        ~Lease() override {
++            --h.live;
++            ++h.releases;
++            h.trace.push_back("release");
++            if (h.on_release) h.on_release();
++        }
++    };
++    DownloadCallbacks Callbacks() {
++        return {
++            [&](const Header &h, uint64_t generation) {
++                trace.push_back("header");
++                last_generation = generation;
++                if (throw_header) throw std::runtime_error("header");
++                return HeaderDecision{header,
++                                      header == HeaderDisposition::MissingParent
++                                          ? std::optional<Hash>(h.prev_id)
++                                          : std::nullopt,
++                                      "header diagnostic"};
++            },
++            [&](PeerHandle, const ResourceNeed &need) {
++                trace.push_back("reserve");
++                ++reserves;
++                CHECK(need.staging_bytes > 0);
++                last_need = need;
++                if (throw_reserve) throw std::runtime_error("reserve");
++                ReservationResult r{reservation, nullptr,
++                                    "reservation diagnostic"};
++                if (reservation == ReservationDisposition::Granted &&
++                    !bad_lease)
++                    r.lease = std::make_unique<Lease>(*this);
++                return r;
++            },
++            [&](const Header &) {
++                trace.push_back("cache");
++                ++cache_calls;
++                CHECK(live > 0);
++                if (throw_cache) throw std::runtime_error("cache");
++                uint64_t bytes = 0;
++                // A deliberately over-count cache must be refused before
++                // manager scans invalid elements; return its bounded-view
++                // metadata directly.
++                if (cache.size() > config.limits.cache_candidates)
++                    return CachedTransactions{cache, 0};
++                for (const auto &tx : cache) {
++                    Bytes raw;
++                    std::string e;
++                    CHECK(EncodeTransaction(tx, config.network.transaction, raw,
++                                            e));
++                    bytes += raw.size();
++                }
++                return CachedTransactions{cache,
++                                          bytes + (bad_cache_bytes ? 1 : 0)};
++            },
++            [&](std::span<const uint8_t> wire, uint64_t generation) {
++                trace.push_back("admit");
++                CHECK(live > 0);
++                ++admissions;
++                last_generation = generation;
++                if (throw_body) throw std::runtime_error("body");
++                // Test admission adapter checks real full framing/roots only.
++                // It is deliberately not a claim of VM/state/monetary consensus
++                // evidence.
++                FramedBlock parsed;
++                std::string e;
++                CHECK(DecodeBlockWire(Bytes(wire.begin(), wire.end()),
++                                      config.network.transaction,
++                                      config.network.chain_id, parsed, e));
++                admitted.emplace_back(wire.begin(), wire.end());
++                return BodyDecision{
++                    body,
++                    body == BodyDisposition::MissingParent
++                        ? std::optional<Hash>(parsed.header.prev_id)
++                        : std::nullopt,
++                    "body diagnostic"};
++            }};
++    }
++    PeerHandle Peer(DownloadManager &m, uint32_t limit = 4096) {
++        auto e = m.RegisterPeer(limit);
++        CHECK(e.result == DownloadResult::Registered);
++        return e.peer;
++    }
++    void Clean(DownloadManager &m) {
++        CHECK(m.Stats().jobs == 0 && m.Stats().staging_bytes == 0 &&
++              m.Stats().transaction_slots == 0 &&
++              m.Stats().deferred_jobs == 0 && live == 0 &&
++              releases == reserves);
++    }
++};
++void FullAndAssociation() {
++    Harness h;
++    DownloadManager m(h.config, h.Callbacks());
++    auto p = h.Peer(m), other = h.Peer(m);
++    auto b = Block(h.config);
++    auto id = Id(h.config, b.header);
++    auto e = m.RequestBlock(p, b.header, DownloadMode::Full, 0);
++    CHECK(e.result == DownloadResult::Requested &&
++          e.outbound->command == "getdata");
++    std::vector<Inventory> items;
++    std::string error;
++    CHECK(DecodeInventory(e.outbound->payload, 4096, items, error) &&
++          items.size() == 1 && items[0].type == 2 && items[0].hash == id);
++    CHECK(m.RequestBlock(p, b.header, DownloadMode::Full, 1).result ==
++              DownloadResult::Busy &&
++          h.reserves == 1);
++    CHECK(m.OnMessage(other, Full(h.config, b), 2).result ==
++              DownloadResult::Ignored &&
++          m.Stats().jobs == 1);
++    auto wrong = Block(h.config, 2);
++    CHECK(m.OnMessage(p, Full(h.config, wrong), 3).result ==
++              DownloadResult::Ignored &&
++          m.Stats().jobs == 1);
++    CHECK(m.OnMessage(p, Full(h.config, b), 4).result ==
++              DownloadResult::Accepted &&
++          h.admissions == 1);
++    CHECK(h.admitted[0] == Full(h.config, b).payload);
++    h.Clean(m);
++    CHECK(m.Stats().tombstones == 1);
++    CHECK(m.RequestBlock(p, b.header, DownloadMode::Full, 5).result ==
++          DownloadResult::RetryElsewhere);
++    CHECK(m.OnMessage(p, Full(h.config, b), 6).result ==
++          DownloadResult::Ignored);
++    CHECK(m.OnDisconnect(p).result == DownloadResult::Cancelled &&
++          m.Stats().tombstones == 0);
++    auto fresh = h.Peer(m);
++    CHECK(fresh.value > other.value);
++    CHECK(m.RequestBlock(fresh, b.header, DownloadMode::Full, 7).result ==
++          DownloadResult::Requested);
++    m.Cancel(fresh, id);
++    h.Clean(m);
++}
++void CompactPaths() {
++    for (unsigned overlap : {0U, 1U, 2U}) {
++        Harness h;
++        auto b = Block(h.config);
++        if (overlap) h.cache.push_back(b.transactions[1]);
++        if (overlap == 2) h.cache.push_back(b.transactions[2]);
++        DownloadManager m(h.config, h.Callbacks());
++        auto p = h.Peer(m);
++        auto request = m.RequestBlock(p, b.header, DownloadMode::Compact, 0);
++        CHECK(request.result == DownloadResult::Requested);
++        auto e = m.OnMessage(p, Compact(h.config, b), 1);
++        if (overlap < 2) {
++            CHECK(e.result == DownloadResult::NeedTransactions &&
++                  e.outbound->command == "getblocktxn");
++            MissingRequest q;
++            std::string error;
++            CHECK(DecodeMissingRequest(e.outbound->payload, 3, 3, 4096, q,
++                                       error));
++            CHECK(q.indices == (overlap ? std::vector<uint32_t>{2}
++                                        : std::vector<uint32_t>{1, 2}));
++            MissingResponse r{q.block_id, {}};
++            for (auto idx : q.indices)
++                r.transactions.push_back(b.transactions[idx]);
++            Bytes raw;
++            CHECK(EncodeMissingResponse(r, h.config.network, 4096, raw, error));
++            CHECK(m.OnMessage(p, {"blocktxn", raw}, 2).result ==
++                  DownloadResult::Accepted);
++            CHECK(m.OnMessage(p, {"blocktxn", raw}, 3).result ==
++                  DownloadResult::Ignored);
++        } else
++            CHECK(e.result == DownloadResult::Accepted);
++        CHECK(h.admitted[0] == Full(h.config, b).payload);
++        CHECK(h.trace.front() == "header");
++        auto reserved = std::find(h.trace.begin(), h.trace.end(), "reserve"),
++             cached = std::find(h.trace.begin(), h.trace.end(), "cache"),
++             admitted = std::find(h.trace.begin(), h.trace.end(), "admit");
++        CHECK(reserved < cached && cached < admitted);
++        h.Clean(m);
++    }
++    Harness h;
++    auto b = Block(h.config);
++    h.cache = b.transactions;
++    DownloadManager m(h.config, h.Callbacks());
++    auto p = h.Peer(m);
++    m.RequestBlock(p, b.header, DownloadMode::Compact, 0);
++    auto c = Compact(h.config, b);
++    c.payload.push_back(0);
++    CHECK(m.OnMessage(p, c, 1).result == DownloadResult::PeerMessageInvalid &&
++          h.admissions == 0);
++    h.Clean(m);
++}
++void FallbackAndCacheBounds() {
++    Harness h;
++    auto b = Block(h.config);
++    h.cache = b.transactions;
++    auto bad = b;
++    bad.header.tx_root[0] ^= 1;
++    DownloadManager m(h.config, h.Callbacks());
++    auto p = h.Peer(m);
++    CHECK(m.RequestBlock(p, bad.header, DownloadMode::Compact, 0).result ==
++          DownloadResult::Requested);
++    auto e = m.OnMessage(p, Compact(h.config, bad), 1);
++    CHECK(e.result == DownloadResult::Requested &&
++          e.outbound->command == "getdata");
++    // A wrong committed root triggers retrieval without a consensus-invalid
++    // verdict. Cancel this artificial root; valid-body recovery is below.
++    m.Cancel(p, Id(h.config, bad.header));
++    h.Clean(m);
++    // A duplicate compact short ID allows valid full-body recovery unchanged.
++    Harness recovery;
++    auto valid = Block(recovery.config);
++    DownloadManager r(recovery.config, recovery.Callbacks());
++    auto peer = recovery.Peer(r);
++    r.RequestBlock(peer, valid.header, DownloadMode::Compact, 0);
++    CompactBlock compact;
++    const uint32_t first[] = {0};
++    std::string error;
++    CHECK(MakeCompact(valid, recovery.config.network, 999, first, compact,
++                      error));
++    compact.short_ids[1] = compact.short_ids[0];
++    Bytes raw;
++    CHECK(EncodeCompact(compact, recovery.config.network, 4096, raw, error));
++    CHECK(r.OnMessage(peer, {"cmpctblock", raw}, 1).result ==
++          DownloadResult::Requested);
++    CHECK(r.OnMessage(peer, {"cmpctblock", raw}, 2).result ==
++          DownloadResult::Ignored);
++    CHECK(r.OnMessage(peer, Full(recovery.config, valid), 3).result ==
++          DownloadResult::Accepted);
++    recovery.Clean(r);
++    Harness huge;
++    huge.cache.resize(huge.config.limits.cache_candidates + 1);
++    DownloadManager bounded(huge.config, huge.Callbacks());
++    auto hp = huge.Peer(bounded);
++    bounded.RequestBlock(hp, b.header, DownloadMode::Compact, 0);
++    CHECK(bounded.OnMessage(hp, Compact(huge.config, b), 1).result ==
++              DownloadResult::Requested &&
++          huge.admissions ==
++              0); // fallback, no invalid empty cache entries scanned
++    CHECK(bounded.OnMessage(hp, Full(huge.config, b), 2).result ==
++          DownloadResult::Accepted);
++    huge.Clean(bounded);
++    Harness stale;
++    stale.cache = {b.transactions[1]};
++    stale.bad_cache_bytes = true;
++    DownloadManager stale_manager(stale.config, stale.Callbacks());
++    auto sp = stale.Peer(stale_manager);
++    stale_manager.RequestBlock(sp, b.header, DownloadMode::Compact, 0);
++    CHECK(stale_manager.OnMessage(sp, Compact(stale.config, b), 1).result ==
++              DownloadResult::OperationalFailure &&
++          stale.admissions == 0);
++    stale.Clean(stale_manager);
++}
++void TimeCancelReorg() {
++    Harness h;
++    DownloadManager m(h.config, h.Callbacks());
++    auto p = h.Peer(m);
++    auto b = Block(h.config), other = Block(h.config, 2);
++    auto id = Id(h.config, b.header);
++    m.RequestBlock(p, b.header, DownloadMode::Compact, 0);
++    CHECK(m.OnMessage(p, {"unknown", {}}, 99).result ==
++          DownloadResult::Ignored);
++    CHECK(m.RequestBlock(p, b.header, DownloadMode::Compact, 99).result ==
++          DownloadResult::Busy);
++    CHECK(m.PollTimeout(100).result == DownloadResult::RetryElsewhere);
++    h.Clean(m);
++    CHECK(m.OnMessage(p, Compact(h.config, b), 100).result ==
++          DownloadResult::Ignored);
++    CHECK(m.RequestBlock(p, b.header, DownloadMode::Compact, 100).result ==
++          DownloadResult::RetryElsewhere);
++    m.RequestBlock(p, other.header, DownloadMode::Full, 101);
++    CHECK(m.Cancel(p, Id(h.config, other.header)).result ==
++          DownloadResult::Cancelled);
++    h.Clean(m);
++    auto third = Block(h.config, 3);
++    m.RequestBlock(p, third.header, DownloadMode::Compact, 102);
++    auto event = m.OnReorg(8);
++    CHECK(event.result == DownloadResult::Cancelled &&
++          event.affected.size() == 1);
++    h.Clean(m);
++    CHECK(m.Stats().tombstones == 3);
++    CHECK(m.RequestBlock(p, third.header, DownloadMode::Compact, 103).result ==
++          DownloadResult::RetryElsewhere);
++    CHECK(m.OnMessage(p, Compact(h.config, third), 103).result ==
++          DownloadResult::Ignored);
++    CHECK(m.OnReorg(8).result == DownloadResult::OperationalFailure);
++    m.OnDisconnect(p);
++    auto fresh = h.Peer(m);
++    CHECK(m.RequestBlock(fresh, b.header, DownloadMode::Full, 104).result ==
++              DownloadResult::Requested &&
++          h.last_generation == 8);
++    m.Cancel(fresh, id);
++    h.Clean(m);
++    CHECK(m.PollTimeout(103).result == DownloadResult::OperationalFailure);
++}
++void DeferredRecovery() {
++    Harness h;
++    h.header = HeaderDisposition::MissingParent;
++    DownloadManager m(h.config, h.Callbacks());
++    auto p = h.Peer(m);
++    auto b = Block(h.config);
++    CHECK(m.RequestBlock(p, b.header, DownloadMode::Compact, 0).result ==
++              DownloadResult::NeedHeaders &&
++          h.reserves == 0 && m.Stats().deferred_jobs == 1);
++    CHECK(m.PollTimeout(9).result == DownloadResult::Idle);
++    CHECK(m.PollTimeout(10).result == DownloadResult::NeedHeaders &&
++          h.reserves == 0);
++    h.header = HeaderDisposition::Eligible;
++    CHECK(m.PollTimeout(20).result == DownloadResult::Requested &&
++          h.reserves == 1 && m.Stats().deferred_jobs == 0);
++    h.body = BodyDisposition::Deferred;
++    CHECK(m.OnMessage(p, Full(h.config, b), 21).result ==
++              DownloadResult::Deferred &&
++          h.live == 1 && m.Stats().deferred_jobs == 1);
++    h.body = BodyDisposition::Accepted;
++    CHECK(m.PollTimeout(31).result == DownloadResult::Accepted &&
++          h.admitted.size() == 2);
++    h.Clean(m);
++    Harness pending;
++    pending.body = BodyDisposition::MissingParent;
++    DownloadManager body(pending.config, pending.Callbacks());
++    auto peer = pending.Peer(body);
++    body.RequestBlock(peer, b.header, DownloadMode::Full, 0);
++    CHECK(body.OnMessage(peer, Full(pending.config, b), 1).result ==
++          DownloadResult::NeedHeaders);
++    pending.body = BodyDisposition::Accepted;
++    CHECK(body.PollTimeout(11).result == DownloadResult::Accepted);
++    pending.Clean(body);
++    Harness expire;
++    expire.header = HeaderDisposition::Deferred;
++    DownloadManager deferred(expire.config, expire.Callbacks());
++    auto ep = expire.Peer(deferred);
++    deferred.RequestBlock(ep, b.header, DownloadMode::Full, 0);
++    for (uint64_t now = 10; now < 500; now += 10)
++        CHECK(deferred.PollTimeout(now).result == DownloadResult::Deferred);
++    CHECK(deferred.PollTimeout(500).result == DownloadResult::RetryElsewhere &&
++          expire.reserves == 0);
++    CHECK(deferred.Stats().jobs == 0);
++}
++void OutcomesAndExceptions() {
++    for (auto disposition :
++         {BodyDisposition::Accepted, BodyDisposition::MalformedBody,
++          BodyDisposition::ConsensusInvalid, BodyDisposition::CapacityRefused,
++          BodyDisposition::Unsupported, BodyDisposition::StorageError,
++          BodyDisposition::ContextChanged}) {
++        Harness h;
++        h.body = disposition;
++        DownloadManager m(h.config, h.Callbacks());
++        auto p = h.Peer(m);
++        auto b = Block(h.config);
++        m.RequestBlock(p, b.header, DownloadMode::Full, 0);
++        auto e = m.OnMessage(p, Full(h.config, b), 1);
++        CHECK(e.admission == disposition);
++        DownloadResult expected =
++            disposition == BodyDisposition::Accepted ? DownloadResult::Accepted
++            : disposition == BodyDisposition::MalformedBody
++                ? DownloadResult::PeerMessageInvalid
++            : disposition == BodyDisposition::ConsensusInvalid
++                ? DownloadResult::ConsensusRejected
++            : disposition == BodyDisposition::CapacityRefused
++                ? DownloadResult::CapacityRefused
++            : disposition == BodyDisposition::Unsupported
++                ? DownloadResult::Unsupported
++            : disposition == BodyDisposition::StorageError
++                ? DownloadResult::OperationalFailure
++                : DownloadResult::RetryElsewhere;
++        CHECK(e.result == expected);
++        h.Clean(m);
++    }
++    for (auto disposition :
++         {HeaderDisposition::ConsensusInvalid, HeaderDisposition::Unsupported,
++          HeaderDisposition::OperationalError}) {
++        Harness h;
++        h.header = disposition;
++        DownloadManager m(h.config, h.Callbacks());
++        auto p = h.Peer(m);
++        auto e =
++            m.RequestBlock(p, Block(h.config).header, DownloadMode::Full, 0);
++        CHECK(e.result == (disposition == HeaderDisposition::ConsensusInvalid
++                               ? DownloadResult::ConsensusRejected
++                           : disposition == HeaderDisposition::Unsupported
++                               ? DownloadResult::Unsupported
++                               : DownloadResult::OperationalFailure));
++        CHECK(h.reserves == 0 && m.Stats().jobs == 0);
++    }
++    for (unsigned failure = 0; failure < 4; ++failure) {
++        Harness h;
++        h.throw_header = failure == 0;
++        h.throw_reserve = failure == 1;
++        h.throw_cache = failure == 2;
++        h.throw_body = failure == 3;
++        DownloadManager m(h.config, h.Callbacks());
++        auto p = h.Peer(m);
++        auto b = Block(h.config);
++        auto e = m.RequestBlock(
++            p, b.header,
++            failure == 2 ? DownloadMode::Compact : DownloadMode::Full, 0);
++        if (failure >= 2)
++            e = m.OnMessage(
++                p, failure == 2 ? Compact(h.config, b) : Full(h.config, b), 1);
++        CHECK(e.result == DownloadResult::OperationalFailure &&
++              m.Stats().jobs == 0 && m.Stats().staging_bytes == 0 &&
++              h.live == 0);
++    }
++    Harness denied;
++    denied.reservation = ReservationDisposition::CapacityRefused;
++    DownloadManager m(denied.config, denied.Callbacks());
++    auto p = denied.Peer(m);
++    CHECK(m.RequestBlock(p, Block(denied.config).header, DownloadMode::Full, 0)
++                  .result == DownloadResult::CapacityRefused &&
++          m.Stats().tombstones == 0 && denied.live == 0);
++    Harness invalid;
++    invalid.bad_lease = true;
++    DownloadManager bad(invalid.config, invalid.Callbacks());
++    auto peer = invalid.Peer(bad);
++    CHECK(bad.RequestBlock(peer, Block(invalid.config).header,
++                           DownloadMode::Full, 0)
++                  .result == DownloadResult::OperationalFailure &&
++          bad.Stats().jobs == 0);
++}
++void QuotasAndControl() {
++    Harness h;
++    DownloadManager m(h.config, h.Callbacks());
++    auto p = h.Peer(m), other = h.Peer(m), third = h.Peer(m);
++    CHECK(m.RegisterPeer(4096).result == DownloadResult::CapacityRefused);
++    auto b = Block(h.config), b2 = Block(h.config, 2), b3 = Block(h.config, 3),
++         b4 = Block(h.config, 4);
++    m.RequestBlock(p, b.header, DownloadMode::Full, 0);
++    m.RequestBlock(p, b2.header, DownloadMode::Full, 0);
++    CHECK(m.RequestBlock(p, b3.header, DownloadMode::Full, 0).result ==
++          DownloadResult::CapacityRefused);
++    m.RequestBlock(other, b3.header, DownloadMode::Full, 0);
++    m.RequestBlock(other, b4.header, DownloadMode::Full, 0);
++    CHECK(m.RequestBlock(third, b.header, DownloadMode::Full, 0).result ==
++          DownloadResult::CapacityRefused);
++    Inventory absent[] = {{2, Id(h.config, b.header)},
++                          {2, Id(h.config, b2.header)},
++                          {99, Id(h.config, b3.header)}};
++    Bytes wire;
++    std::string error;
++    CHECK(EncodeInventory(absent, 4096, wire, error));
++    auto event = m.OnMessage(p, {"notfound", wire}, 1);
++    CHECK(event.result == DownloadResult::RetryElsewhere &&
++          event.affected.size() == 2 && m.Stats().jobs == 2);
++    m.OnDisconnect(other);
++    m.OnDisconnect(third);
++    h.Clean(m);
++    CHECK(m.RequestBlock(p, b3.header, DownloadMode::Full, 2).result ==
++          DownloadResult::Requested);
++    m.Cancel(p, Id(h.config, b3.header));
++    CHECK(m.Stats().tombstones == 3);
++    CHECK(m.RequestBlock(p, b4.header, DownloadMode::Full, 3).result ==
++              DownloadResult::CapacityRefused &&
++          m.Stats().jobs == 0);
++    m.OnDisconnect(p);
++    CHECK(m.Stats().tombstones == 0);
++    auto tiny = h.Peer(m, 1);
++    CHECK(m.RequestBlock(tiny, b.header, DownloadMode::Full, 4).result ==
++              DownloadResult::CapacityRefused &&
++          m.Stats().jobs == 0 && m.Stats().tombstones == 0);
++    CHECK(m.OnMessage(tiny, {"block", Full(h.config, b).payload}, 5).result ==
++          DownloadResult::PeerMessageInvalid);
++    CHECK(m.RegisterPeer(0).result == DownloadResult::OperationalFailure &&
++          m.RegisterPeer(4097).result == DownloadResult::OperationalFailure);
++    PeerHandle next{17};
++    CHECK(!NextPeerHandle(UINT64_MAX, next) && next.value == 17);
++    CHECK(NextPeerHandle(UINT64_MAX - 1, next) && next.value == UINT64_MAX);
++    CHECK(m.RequestBlock(tiny, b.header, DownloadMode::Full, UINT64_MAX - 1)
++              .result == DownloadResult::OperationalFailure);
++}
++void CapacityFallbackAndInvalidResponses() {
++    Harness h;
++    h.config.network.max_reconstruction_transactions = 1;
++    DownloadManager m(h.config, h.Callbacks());
++    auto p = h.Peer(m);
++    auto normal = Config();
++    auto b = Block(normal);
++    CHECK(m.RequestBlock(p, b.header, DownloadMode::Compact, 0).result ==
++          DownloadResult::Requested);
++    CHECK(h.last_need.transaction_slots >= (4096 / 17) * 4 &&
++          h.last_need.staging_bytes >= 4096 * 4);
++    auto event = m.OnMessage(p, Compact(normal, b), 1);
++    CHECK(event.result == DownloadResult::Requested &&
++          event.fallback == FallbackReason::CompactCapacity);
++    CHECK(m.OnMessage(p, Full(normal, b), 2).result ==
++          DownloadResult::Accepted);
++    h.Clean(m);
++    Harness small;
++    DownloadManager limited(small.config, small.Callbacks());
++    auto peer = small.Peer(limited, 300);
++    CHECK(Compact(small.config, b).payload.size() <= 300 &&
++          Full(small.config, b).payload.size() > 300);
++    CHECK(
++        limited.RequestBlock(peer, b.header, DownloadMode::Compact, 0).result ==
++        DownloadResult::Requested);
++    CompactBlock c;
++    const uint32_t first[] = {0};
++    std::string error;
++    CHECK(MakeCompact(b, small.config.network, 999, first, c, error));
++    c.short_ids[1] = c.short_ids[0];
++    Bytes raw;
++    CHECK(EncodeCompact(c, small.config.network, 300, raw, error));
++    CHECK(limited.OnMessage(peer, {"cmpctblock", raw}, 1).result ==
++          DownloadResult::RetryElsewhere);
++    small.Clean(limited);
++    Harness invalid;
++    DownloadManager invalid_manager(invalid.config, invalid.Callbacks());
++    auto ip = invalid.Peer(invalid_manager);
++    invalid_manager.RequestBlock(ip, b.header, DownloadMode::Compact, 0);
++    CHECK(invalid_manager.OnMessage(ip, Compact(invalid.config, b), 1).result ==
++          DownloadResult::NeedTransactions);
++    MissingResponse response{Id(invalid.config, b.header), {b.transactions[1]}};
++    CHECK(EncodeMissingResponse(response, invalid.config.network, 4096, raw,
++                                error));
++    CHECK(invalid_manager.OnMessage(ip, {"blocktxn", raw}, 2).result ==
++              DownloadResult::PeerMessageInvalid &&
++          invalid.admissions == 0);
++    invalid.Clean(invalid_manager);
++    Harness size;
++    DownloadManager sizes(size.config, size.Callbacks());
++    auto sp = size.Peer(sizes);
++    sizes.RequestBlock(sp, b.header, DownloadMode::Full, 0);
++    auto wrong = Full(size.config, b);
++    wrong.payload.push_back(0);
++    CHECK(sizes.OnMessage(sp, wrong, 1).result ==
++              DownloadResult::PeerMessageInvalid &&
++          size.admissions == 0);
++    size.Clean(sizes);
++}
++void ReentryAndAllocationUnwind() {
++    Harness h;
++    DownloadManager m(h.config, h.Callbacks());
++    auto p = h.Peer(m);
++    auto b = Block(h.config);
++    bool blocked = false;
++    h.on_release = [&] {
++        blocked =
++            m.OnDisconnect(p).result == DownloadResult::OperationalFailure;
++    };
++    m.RequestBlock(p, b.header, DownloadMode::Full, 0);
++    CHECK(m.Cancel(p, Id(h.config, b.header)).result ==
++              DownloadResult::Cancelled &&
++          blocked && m.Stats().peers == 1);
++    h.Clean(m);
++    size_t propagated = 0;
++    for (int fault = 0; fault < 220; ++fault) {
++        Harness inject;
++        inject.cache = b.transactions;
++        DownloadManager manager(inject.config, inject.Callbacks());
++        auto peer = inject.Peer(manager);
++        CHECK(manager.RequestBlock(peer, b.header, DownloadMode::Compact, 0)
++                  .result == DownloadResult::Requested);
++        auto message = Compact(inject.config, b);
++        bool threw = false;
++        fail_allocation_after = fault;
++        try {
++            manager.OnMessage(peer, message, 1);
++        } catch (const std::bad_alloc &) {
++            threw = true;
++        }
++        fail_allocation_after = -1;
++        CHECK(manager.Stats().jobs == 0 && manager.Stats().staging_bytes == 0 &&
++              manager.Stats().transaction_slots == 0 && inject.live == 0);
++        if (threw) {
++            ++propagated;
++            CHECK(manager
++                      .RequestBlock(peer, Block(inject.config, 2).header,
++                                    DownloadMode::Full, 2)
++                      .result == DownloadResult::OperationalFailure);
++        }
++        manager.OnDisconnect(peer);
++        CHECK(manager.Stats().tombstones == 0);
++    }
++    CHECK(propagated > 0);
++    Harness reorg;
++    DownloadManager pending(reorg.config, reorg.Callbacks());
++    auto a = reorg.Peer(pending), c = reorg.Peer(pending);
++    pending.RequestBlock(a, b.header, DownloadMode::Full, 0);
++    pending.RequestBlock(c, b.header, DownloadMode::Full, 0);
++    bool failed = false;
++    fail_allocation_after = 0;
++    try {
++        pending.OnReorg(8);
++    } catch (const std::bad_alloc &) {
++        failed = true;
++    }
++    fail_allocation_after = -1;
++    CHECK(failed && pending.Stats().jobs == 0 &&
++          pending.Stats().staging_bytes == 0 && reorg.live == 0 &&
++          pending.Stats().tombstones == 2);
++    CHECK(pending
++              .RequestBlock(a, Block(reorg.config, 2).header,
++                            DownloadMode::Full, 1)
++              .result == DownloadResult::OperationalFailure);
++    pending.OnDisconnect(a);
++    pending.OnDisconnect(c);
++    CHECK(pending.Stats().tombstones == 0);
++}
++void ResourceAndGlobalBounds() {
++    auto template_config = Config();
++    auto b = Block(template_config);
++    // Exercise bytes and slots independently of job-count admission.
++    for (unsigned resource = 0; resource < 3; ++resource) {
++        Harness h;
++        if (resource == 0) h.config.limits.staging_bytes_per_peer = 28672;
++        if (resource == 1) {
++            h.config.limits.staging_bytes_per_peer = 28672;
++            h.config.limits.staging_bytes_global = 28672;
++        }
++        if (resource == 2) {
++            h.config.limits.transaction_slots_per_peer = 960;
++            h.config.limits.transaction_slots_global = 960;
++        }
++        DownloadManager m(h.config, h.Callbacks());
++        auto p = h.Peer(m), q = h.Peer(m);
++        CHECK(m.RequestBlock(p, b.header, DownloadMode::Compact, 0).result ==
++              DownloadResult::Requested);
++        auto second = resource == 0 ? p : q;
++        auto other = Block(h.config, 2);
++        CHECK(m.RequestBlock(second, other.header, DownloadMode::Compact, 1)
++                  .result == DownloadResult::CapacityRefused);
++        CHECK(m.Stats().jobs == 1 && h.reserves == 1 && h.live == 1);
++        m.Cancel(p, Id(h.config, b.header));
++        h.Clean(m);
++        CHECK(m.RequestBlock(second, other.header, DownloadMode::Compact, 2)
++                  .result == DownloadResult::Requested);
++        m.Cancel(second, Id(h.config, other.header));
++        h.Clean(m);
++    }
++    Harness guards;
++    guards.config.limits.jobs_per_peer = 1;
++    guards.config.limits.jobs_global = 2;
++    guards.config.limits.tombstones_per_peer = 2;
++    guards.config.limits.tombstones_global = 2;
++    DownloadManager tombstones(guards.config, guards.Callbacks());
++    auto p = guards.Peer(tombstones), q = guards.Peer(tombstones),
++         r = guards.Peer(tombstones);
++    tombstones.RequestBlock(p, b.header, DownloadMode::Full, 0);
++    tombstones.Cancel(p, Id(guards.config, b.header));
++    tombstones.RequestBlock(q, b.header, DownloadMode::Full, 1);
++    tombstones.Cancel(q, Id(guards.config, b.header));
++    CHECK(tombstones.Stats().tombstones == 2);
++    CHECK(tombstones.RequestBlock(r, b.header, DownloadMode::Full, 2).result ==
++          DownloadResult::CapacityRefused);
++    tombstones.OnDisconnect(p);
++    CHECK(tombstones.RequestBlock(r, b.header, DownloadMode::Full, 3).result ==
++          DownloadResult::Requested);
++    tombstones.Cancel(r, Id(guards.config, b.header));
++    guards.Clean(tombstones);
++    Harness pending;
++    pending.header = HeaderDisposition::MissingParent;
++    DownloadManager deferred(pending.config, pending.Callbacks());
++    auto a = pending.Peer(deferred), d = pending.Peer(deferred);
++    CHECK(deferred.RequestBlock(a, b.header, DownloadMode::Full, 0).result ==
++          DownloadResult::NeedHeaders);
++    auto b2 = Block(pending.config, 2), b3 = Block(pending.config, 3);
++    CHECK(deferred.RequestBlock(a, b2.header, DownloadMode::Full, 0).result ==
++          DownloadResult::NeedHeaders);
++    CHECK(deferred.RequestBlock(d, b3.header, DownloadMode::Full, 0).result ==
++          DownloadResult::CapacityRefused);
++    CHECK(deferred.Stats().deferred_jobs == 2 && pending.reserves == 0);
++    CHECK(deferred.OnReorg(8).affected.size() == 2 &&
++          deferred.Stats().deferred_jobs == 0 && deferred.Stats().jobs == 0);
++    Harness changed;
++    DownloadManager current(changed.config, changed.Callbacks());
++    auto cp = changed.Peer(current);
++    current.RequestBlock(cp, b.header, DownloadMode::Compact, 0);
++    changed.header = HeaderDisposition::Unsupported;
++    CHECK(current.OnMessage(cp, Compact(changed.config, b), 1).result ==
++              DownloadResult::Unsupported &&
++          changed.cache_calls == 0 && changed.admissions == 0);
++    changed.Clean(current);
++}
++void Configuration() {
++    Harness h;
++    auto callbacks = h.Callbacks();
++    auto rejects = [&](DownloadConfig c) {
++        bool failed = false;
++        try {
++            DownloadManager manager(c, callbacks);
++        } catch (const std::invalid_argument &) {
++            failed = true;
++        }
++        CHECK(failed);
++    };
++    auto c = h.config;
++    c.limits.jobs_global = 0;
++    rejects(c);
++    c = h.config;
++    c.limits.cache_candidates = 0;
++    rejects(c);
++    c = h.config;
++    c.limits.cache_bytes = 0;
++    rejects(c);
++    c = h.config;
++    c.limits.tombstones_global = 1;
++    rejects(c);
++    c = h.config;
++    c.limits.staging_bytes_per_peer = 1;
++    rejects(c);
++    c = h.config;
++    c.limits.retry_interval_ms = 501;
++    rejects(c);
++    c = h.config;
++    c.limits.lifecycle_timeout_ms = 1;
++    rejects(c);
++    c = h.config;
++    c.limits.staging_bytes_global = UINT64_MAX;
++    rejects(c);
++    c = h.config;
++    c.limits.lifecycle_timeout_ms = UINT64_MAX;
++    rejects(c);
++    c = h.config;
++    c.network.max_reconstruction_bytes = UINT64_MAX;
++    rejects(c);
++    callbacks.reserve = {};
++    bool failed = false;
++    try {
++        DownloadManager manager(h.config, callbacks);
++    } catch (const std::invalid_argument &) {
++        failed = true;
++    }
++    CHECK(failed);
++}
++} // namespace
++int main() {
++    FullAndAssociation();
++    CompactPaths();
++    FallbackAndCacheBounds();
++    TimeCancelReorg();
++    DeferredRecovery();
++    OutcomesAndExceptions();
++    QuotasAndControl();
++    Configuration();
++    CapacityFallbackAndInvalidResponses();
++    ReentryAndAllocationUnwind();
++    ResourceAndGlobalBounds();
++    std::cout << "V2 bounded socket-free download coordinator checks pass\n";
++}
+-- 
+2.50.1 (Apple Git-155)
+
