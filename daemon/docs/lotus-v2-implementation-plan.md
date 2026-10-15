@@ -492,3 +492,8 @@ persistence pass. See the [wallet pilot](../../tools/lotus-v2-compiler/docs/wall
 The earlier mixed-header/library failure is preserved and the standalone helper
 configuration now refuses mismatched dependency roots. Networked wallet use,
 resumable fork recovery, selection and socket activation remain incomplete.
+
+The registered Boost wallet test also passes syntax compilation using its actual
+`test_bitcoin` compile command from exact `9f529da1c`. This checks registration and
+fixture compatibility; it is not a claim that the complete inherited test binary
+has been built or executed for this packet.

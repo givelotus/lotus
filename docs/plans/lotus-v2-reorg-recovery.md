@@ -75,7 +75,8 @@ bytes merely because journal phase/cursors differ.
 The versioned, canonical journal contains:
 
 - ChainID, exact genesis ID, validator storage fingerprint and journal schema.
-- A unique local attempt ID, revision and immutable plan digest. The digest covers
+- A deterministic local plan/attempt ID, revision and immutable plan digest. The ID
+  identifies plan content; it is not a fresh authorization token. The digest covers
   all plan fields with explicit framing under a local storage-only domain.
 - Source, target and fork IDs; their exact indexed heights, cumulative work and
   maximum ancestor timestamps; the source's complete metadata/root snapshot.
@@ -203,7 +204,7 @@ further ahead. `now` and `window` remain explicit arguments; no skew constant or
 clock source is introduced here.
 
 Before the first active mutation, ineligibility yields Deferred and retains the
-source. After mutation has started, ineligibility or caller cancellation transitions
+source. After mutation has started, ineligibility transitions
 to restoration of the source rather than leaving an indefinite partially selected
 branch waiting for time. Mandatory rollback/restoration is a recovery action and
 uses deterministic validation without applying the new clock gate to original
@@ -213,6 +214,12 @@ under the current clock; report this separately and defer normal forward admissi
 Do not automatically detach an already stable active chain merely because the local
 clock moves backward. These choices need explicit maintainer review before node
 integration and do not redefine deterministic consensus.
+
+The first coordinator exposes preparation, stepping and reading; explicit caller
+cancellation remains unimplemented. The API sketch below retains that future
+requirement without claiming it is present. Completion clears its journal; a later
+candidate selector needs a durable failure receipt or atomic invalid-root record
+before relying on returned failure metadata across crashes.
 
 An in-progress attempt is fenced to its original plan. Higher-work arrivals are
 queued for later planning; ties never replace the stable source. Re-evaluate later
