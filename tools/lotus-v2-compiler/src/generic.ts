@@ -328,7 +328,7 @@ type EVar = { kind: 'argument'; type: ValueType; index: number } | { kind:'local
 type Env = Map<string, EVar>;
 type Compiled = { script: Uint8Array; leaf: Uint8Array; map: MethodArtifact['sourceMap']; resources: MethodArtifact['staticResources'] };
 const OPCODES = { VERIFY: 0x65, IF: 0x61, ELSE: 0x63, ENDIF: 0x64, ENUMERATE_INPUTS:0x67, ENUMERATE_OUTPUTS:0x68, ENDENUMERATE:0x6a, DROP: 0x79, PICK: 0x7d, ROLL:0x7e,
-  SWAP:0x80, BRANCHROOT:0xf2, INPUTINDEX:0xd0, INPUTFLAGS:0xd1, UTXOVALUE:0xd6, UTXOTOKENID:0xd7, OUTPUTVALUE:0xe1, OUTPUTTOKENID:0xe2, OUTPUTREQUIRESBRANCH:0xe8, NUMEQUAL:0xa6, GREATERTHANOREQUAL:0xac,
+  UTXOBRANCHCOUNT:0xd8, UTXOBRANCH:0xd9, OUTPUTBRANCHCOUNT:0xe3, OUTPUTBRANCH:0xe4, OUTPUTEXCLUSIVEBRANCH:0xe9, OUTPUTCONTINUESBRANCH:0xea, CHECKLOCKTIMEVERIFY:0xf3, CHECKSEQUENCEVERIFY:0xf4, SWAP:0x80, BRANCHROOT:0xf2, INPUTINDEX:0xd0, INPUTFLAGS:0xd1, UTXOVALUE:0xd6, UTXOTOKENID:0xd7, OUTPUTVALUE:0xe1, OUTPUTTOKENID:0xe2, OUTPUTREQUIRESBRANCH:0xe8, NUMEQUAL:0xa6, GREATERTHANOREQUAL:0xac,
   EQUAL: 0x91, NOT: 0x9c, ADD: 0x9e, SUB: 0x9f, MUL: 0xa0, BOOLAND: 0xa4, BOOLOR: 0xa5,
   LESSTHAN: 0xa9, GREATERTHAN: 0xaa, SHA256: 0xb8, HASH256: 0xb9, BLAKE3: 0xba, CHECKSIG: 0xbb, CHECKSIGVERIFY: 0xbc, NEGATE: 0x9a } as const;
 class Emitter {
@@ -403,7 +403,7 @@ class Compiler {
   }
   private hint(name: string, scope?: Env): DiagnosticExtra {
     const best = suggest(name, [...(scope ? scope.keys() : []), ...this.program.helpers.keys(), ...this.program.contracts.keys(),
-      'checksig', 'sha256', 'hash256', 'blake3', 'leaf_hash', 'contract_root', 'merkle_root']);
+      'checksig', 'sha256', 'hash256', 'blake3', 'leaf_hash', 'contract_root', 'merkle_root', 'num_bytes', 'check_lock', 'check_sequence']);
     return best ? { help: `did you mean '${best}'?` } : {};
   }
   private contract(name: string, span?: Span): Contract { const c = this.program.contracts.get(name); if (!c) this.fatal(span ? 'E0303' : 'E0605', `unknown contract ${name}`, span ?? this.program.contracts.values().next().value?.span); return c; }
@@ -599,9 +599,25 @@ class Compiler {
         }
         if (expr.kind !== 'call') return this.problem('E9001', 'unknown expression', expr.span, frames);
         const name = expr.value!, args = expr.args ?? [];
+        if (name === 'num_bytes') {
+          if (args.length !== 1 || infer(args[0]!, scope, active, frames) !== 'Int') return this.problem('E0405', 'num_bytes expects Int', expr.span, frames);
+          return 'Bytes(16)';
+        }
+        if (name === 'check_lock' || name === 'check_sequence') {
+          if (args.length !== 2 || args.some(arg => infer(arg, scope, active, frames) !== 'Int')) return this.problem('E0405', `${name} expects Int kind and bound`, expr.span, frames);
+          return 'Bool';
+        }
+        if (name.endsWith('.branch') || name.endsWith('.branch_count')) {
+          const path = name.split('.'), current = path.slice(0,-1).join('.') === 'this.coin', receiver = scope.get(path[0]!);
+          if (current ? c.kind === 'token' : !(receiver?.kind === 'local' && ['InputIndex','OutputIndex'].includes(receiver.type) && (path.length === 2 || path.length === 3 && path[1] === 'coin' && receiver.type === 'InputIndex'))) return this.problem('E0412', 'branch read requires a spend coin or enumerated input/output', expr.span, frames);
+          const branch = name.endsWith('.branch');
+          if (args.length !== (branch ? 1 : 0) || branch && infer(args[0]!, scope, active, frames) !== 'Int') return this.problem('E0405', 'branch index must be Int; branch_count takes no arguments', expr.span, frames);
+          return branch ? 'Bytes32' : 'Int';
+        }
         if (name === 'leaf_hash') { if (args.length !== 1 || args[0]!.kind !== 'name' || args[0]!.value!.split('.').length !== 2) return this.problem('E0502', 'leaf_hash requires Contract.method', expr.span, frames); return 'MethodLeafHash'; }
         if (name === 'contract_root' || name === 'merkle_root') { if (args.length !== 1 || args[0]!.kind !== 'name' || args[0]!.value!.includes('.')) return this.problem('E0502', `${name} requires tree name`, expr.span, frames); return this.contract(args[0]!.value!, args[0]!.span).kind === 'token' ? 'TokenId' : 'ContractRootHash'; }
-        if (name.endsWith('.requires_branch')) {
+        if (name.endsWith('.requires_branch') || name.endsWith('.exclusive_branch') || name.endsWith('.continues_branch')) {
+          if (name.split('.').length !== 2) return this.problem('E0412', 'branch predicate requires an enumerated output receiver', expr.span, frames);
           if (args.length !== 1) return this.problem('E0412', 'requires_branch expects output and contract root', expr.span, frames);
           const arg = infer(args[0]!, scope, active, frames); if (arg === 'Error') return 'Error';
           if (arg !== 'ContractRootHash' || scope.get(name.split('.')[0]!)?.type !== 'OutputIndex') return this.problem('E0412', 'requires_branch expects output and contract root', expr.span, frames);
@@ -708,6 +724,32 @@ class Compiler {
         if (expr.kind !== 'call') return this.problem('E9001', 'unknown expression', expr.span, frames);
         const args = expr.args ?? [];
         const name = expr.value!;
+        if (name === 'num_bytes') {
+          if (args.length !== 1) return this.problem('E0405', 'num_bytes expects Int', expr.span, frames);
+          if (expression(args[0]!, scope, origin, frames) !== 'Int') return this.problem('E0405', 'num_bytes expects Int', expr.span, frames);
+          // Numeric ADD validates an adversarial witness as canonical P03 N.
+          emitter.number(0n, expr.span, origin); emitter.op('ADD', expr.span, origin, -1);
+          return 'Bytes(16)';
+        }
+        if (name === 'check_lock' || name === 'check_sequence') {
+          if (args.length !== 2) return this.problem('E0405', `${name} expects Int kind and bound`, expr.span, frames);
+          const kind = expression(args[0]!, scope, origin, frames), bound = expression(args[1]!, scope, origin, frames);
+          if (kind !== 'Int' || bound !== 'Int') return this.problem('E0405', `${name} expects Int kind and bound`, expr.span, frames);
+          emitter.op(name === 'check_lock' ? 'CHECKLOCKTIMEVERIFY' : 'CHECKSEQUENCEVERIFY', expr.span, origin, -2);
+          emitter.number(1n, expr.span, origin); return 'Bool';
+        }
+        if (name.endsWith('.branch') || name.endsWith('.branch_count')) {
+          const path = name.split('.'), current = path.slice(0,-1).join('.') === 'this.coin', receiver = scope.get(path[0]!);
+          if (current ? c.kind === 'token' : !(receiver?.kind === 'local' && ['InputIndex','OutputIndex'].includes(receiver.type) && (path.length === 2 || path.length === 3 && path[1] === 'coin' && receiver.type === 'InputIndex'))) return this.problem('E0412', 'branch read requires a spend coin or enumerated input/output', expr.span, frames);
+          const branch = name.endsWith('.branch');
+          if (args.length !== (branch ? 1 : 0)) return this.problem('E0405', 'branch expects one Int index; branch_count takes no arguments', expr.span, frames);
+          if (current) emitter.op('INPUTINDEX', expr.span, origin, 1);
+          else { const v = receiver!; if (v.kind !== 'local') return this.problem('E0412', 'branch read requires a local index', expr.span, frames); emitter.number(BigInt(emitter.height - 1 - v.index), expr.span, origin); emitter.op('PICK', expr.span, origin); }
+          if (branch && expression(args[0]!, scope, origin, frames) !== 'Int') return this.problem('E0405', 'branch index must be Int', expr.span, frames);
+          const output = !current && receiver!.type === 'OutputIndex';
+          emitter.op(output ? (branch ? 'OUTPUTBRANCH' : 'OUTPUTBRANCHCOUNT') : (branch ? 'UTXOBRANCH' : 'UTXOBRANCHCOUNT'), expr.span, origin, branch ? -1 : 0);
+          return branch ? 'Bytes32' : 'Int';
+        }
         if (name === 'leaf_hash') {
           if (args.length !== 1 || args[0]!.kind !== 'name') return this.problem('E0502', 'leaf_hash requires Contract.method name', expr.span, frames);
           const path = args[0]!.value!.split('.'); if (path.length !== 2) return this.problem('E0502', 'leaf_hash requires Contract.method name', expr.span, frames);
@@ -717,14 +759,15 @@ class Compiler {
           if (args.length !== 1 || args[0]!.kind !== 'name' || args[0]!.value!.includes('.')) return this.problem('E0502', 'contract_root requires Contract name', expr.span, frames);
           const other = this.contract(args[0]!.value!, args[0]!.span); emitter.push(this.root(other.name).root, expr.span, origin); return other.kind === 'token' ? 'TokenId' : 'ContractRootHash';
         }
-        if (name.endsWith('.requires_branch')) {
+        if (name.endsWith('.requires_branch') || name.endsWith('.exclusive_branch') || name.endsWith('.continues_branch')) {
+          if (name.split('.').length !== 2) return this.problem('E0412', 'branch predicate requires an enumerated output receiver', expr.span, frames);
           const v = scope.get(name.split('.')[0]!);
           if (!v || v.kind !== 'local' || v.type !== 'OutputIndex' || args.length !== 1) return this.problem('E0412', 'requires_branch requires output index and one root', expr.span, frames);
           emitter.number(BigInt(emitter.height - 1 - v.index), expr.span, origin); emitter.op('PICK', expr.span, origin);
           const t = expression(args[0]!, scope, origin, frames);
           if (t === 'Error') return 'Error';
           if (t !== 'ContractRootHash') return this.problem('E0412', 'requires_branch requires ContractRootHash', args[0]!.span, frames);
-          emitter.op('OUTPUTREQUIRESBRANCH', expr.span, origin, -1); return 'Bool';
+          emitter.op(name.endsWith('.exclusive_branch') ? 'OUTPUTEXCLUSIVEBRANCH' : name.endsWith('.continues_branch') ? 'OUTPUTCONTINUESBRANCH' : 'OUTPUTREQUIRESBRANCH', expr.span, origin, -1); return 'Bool';
         }
         if (name === 'checksig') {
           if (args.length !== 2) return this.problem('E0502', 'checksig needs signature and PublicKey', expr.span, frames);

@@ -39,6 +39,8 @@ for(const fixture of fixtures.executed) test(`CABI04 ${fixture.file}: reference 
   if(mutation==='missing')c.invocation.outputs=[];
   if(mutation==='duplicate')c.invocation.outputs.push(structuredClone(c.invocation.outputs[0]));
   if(mutation==='counterpart')c.invocation.inputs[1].coin.token_id=wrong;
+  if(mutation==='counterpart-policy')c.invocation.inputs[1].coin.branches=[wrong];
+  if(mutation==='hostage'){c.invocation.outputs[0].branches.push(wrong);c.invocation.outputs[0].paths=[[0,1]];}
   run(mutation,c,false);
  }
 });

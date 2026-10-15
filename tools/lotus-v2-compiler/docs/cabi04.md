@@ -1,59 +1,111 @@
-# CABI04 executable covenant packet
+# CABI04 executable state, recovery and covenant packet
 
-This packet is partial CABI04 coverage, not completion of its acceptance gate.
-It adds five independently compiled ordinary invocation examples. Existing mint
-and transfer examples remain the token coverage. No transaction, accounting,
-block acceptance, signature authorization or native VM claim follows from these
-invocation tests.
+This packet executes compiled covenant scripts in the Python P03 reference VM.
+It covers a committed counter, signed owner continuation and guardian recovery,
+full-fill order settlement, two-input merge and input × output enumeration.
+Existing mint/transfer fixtures remain the token coverage. This is invocation
+coverage, not complete CABI04 acceptance, transaction accounting or block acceptance.
 
-| Example | Executed behavior | Remaining scope |
-| --- | --- | --- |
-| Counter | One same-policy, same-asset successor with value decremented by one | This is a token-amount countdown, not arbitrary committed application state |
-| Vault | Exactly one successor preserves amount, asset and required branch | Owner authorization and recovery lock |
-| Limit order | Exactly one quote output pays the fixed amount to a required seller policy | Partial fill arithmetic, offered-asset delivery, authorization and transaction conservation |
-| Merge | Exactly two spend inputs of the same asset, one same-policy output with their sum | Both invocations run independently; transaction validator must resolve distinct outpoints and check every input policy |
-| Cartesian | Every input/output pair preserves asset and required branch; nonempty inputs/outputs | Authorization, conservation and performance measurements |
+## Frontend primitives
 
-The counter requires a positive current value and disallows missing or duplicate
-successors. It consumes an asset unit; accounting/burn semantics require a
-separate transaction-level fixture. Its amount representation must not be
-mistaken for an arbitrary state branch commitment. Vault continuation itself
-provides no recovery authorization. LimitOrder deliberately constrains only
-quote settlement, so other asset outputs need transaction/application checks.
+| Source operation | P03 lowering / result |
+| --- | --- |
+| `num_bytes(n: Int)` | ADD zero validates canonical signed 16-byte N; returns `Bytes(16)` |
+| `this.coin.branch(i)` / `.branch_count()` | INPUTINDEX then UTXOBRANCH / UTXOBRANCHCOUNT |
+| `input.coin.branch(i)` / `.branch_count()` | Enumerated input's UTXOBRANCH / UTXOBRANCHCOUNT |
+| `input.branch(i)` / `.branch_count()` | Same input reads |
+| `output.branch(i)` / `.branch_count()` | OUTPUTBRANCH / OUTPUTBRANCHCOUNT |
+| `output.exclusive_branch(root)` | OUTPUTEXCLUSIVEBRANCH, Boolean |
+| `output.continues_branch(root)` | OUTPUTCONTINUESBRANCH, Boolean |
+| `check_lock(kind, bound)` | CHECKLOCKTIMEVERIFY then true |
+| `check_sequence(kind, bound)` | CHECKSEQUENCEVERIFY then true |
 
-The companion `examples/gallery/cabi04-scenarios.json` supplies explicit cases.
-The test runs seven positive invocation contexts (including both merge inputs)
-and 25 adversarial contexts: amount/state-encoding substitution, asset swaps,
-missing/duplicate successors, weaker successor policy and wrong merge counterpart.
-Every negative must fail at execution; an unsupported VM feature fails the test
-and is never counted as a rejection. Expected source behavior is a manually
-specified oracle, not an independent source-language interpreter.
+Indices and locks require Int operands; policy predicates require ContractRootHash.
+Branch reads return Bytes32; counts return Int. Branch indices are checked by the
+VM against actual branch counts, including negative and large indices. A failed
+lock check errors even if its Boolean result is subsequently combined with other
+expressions. There is no current-block height or clock read. These functions also
+compile through the package frontend, with parity tests against standalone builds.
+Existing golden artifact/script tests continue to pass unchanged.
 
-Three additional source intents must produce compiler diagnostics: arbitrary
-stateful continuation, recovery lock checking, and explicit successor path
-checking. These are unsupported frontend behaviors, not rejected transactions.
-Recovery immediately before/at its lock boundary remains unexecuted until the
-frontend and reference context support the existing P03 lock operations.
+## Counter representation and successor obligations
 
-Run from the compiler directory:
+Counter stores `sha256(N(counter))` in branch 1 of a two-branch token coin.
+Branch 0 is its code root. The data branch is unexecuted: the ordinary selected
+path is `[[0]]`, not `[[0,1]]`. The method authenticates the supplied counter by
+reading the old data branch, then requires exactly one successor with unchanged
+asset/value/code branch and state commitment `sha256(N(counter + 1))`.
+OUTPUTEXCLUSIVEBRANCH permits the code-only spend path and rejects a policy which
+makes the unexecuted data branch mandatory. Exact branch count and index checks
+prevent extra/reordered/substituted commitments. Nonnegative counters are required;
+int128 overflow rejects. This is genuine authenticated branch state, with no
+fictitious UTXO state field and no token amount consumed to represent a step.
+
+Tests execute counter 0, 9 and maximum-minus-one transitions and reject stale or
+skipped state, forged old state, negative counter, overflow, asset/value changes,
+missing/duplicate successors, code substitution, branch reordering and policies
+that add a hostage branch or bypass code. State hash encoding is independently
+constructed with Node's SHA256 over exact little-endian 16-byte integers.
+
+## Vault, order, merge and enumeration
+
+Vault's owner method verifies its signature and preserves exact branches/paths,
+amount and asset. A data branch remains unexecuted and unchanged. Recovery verifies
+the guardian signature and requires absolute height lock kind 1 with bound 100.
+Tests independently sign transactions with locks 99, 100 and 101; 99 rejects and
+100/101 accept. Wrong kind, disabled lock, owner impersonating guardian and an
+output mutation after signing reject. These are transaction lock-operand checks;
+actual candidate height/MTP maturity is an outer node obligation, not executed here.
+Relative check_sequence boundaries 4/5/6 with required delay 5 also execute.
+All keys are deterministic public test fixtures, never wallet secrets.
+
+LimitOrder constrains exactly one quote settlement output, its fixed amount, and
+an exclusive seller policy so an extra mandatory branch cannot hold settlement hostage.
+It is a full-fill guard; offered-asset delivery, partial fills, authorization and
+conservation still need transaction/application integration. Merge requires exactly
+two spend inputs carrying the same asset and sole code branch, sums their values,
+and requires one exclusive same-policy successor. Both invocations execute
+independently. Wrong counterpart policy/asset and hostage successors reject.
+Outpoint uniqueness and execution of every other required branch remain transaction
+validator responsibilities. Cartesian preserves asset and mandatory code policy for
+every input/output pair and rejects vacuous empty enumeration; it does not enforce
+amount conservation or exclusive ownership.
+
+Two diagnostic fixtures remain explicitly unsupported: fictitious `this.state`
+access (use real branch commitments), and arbitrary `requires_path` syntax.
+Unsupported VM execution fails the tests and never counts as a negative rejection.
+Expected source behavior is a manually specified oracle, not an independent
+source-language interpreter. No performance measurement or native execution claim
+is made.
+
+## Reproduction and retained evidence
+
+From the compiler directory:
 
 ```sh
 npm ci --ignore-scripts
 npm run build
 LOTUS_V2_PYTHON=/path/to/reference-venv/bin/python \
+LOTUS_V2_VM_REFERENCE_PACKAGE=/path/to/expanded/lotus-v2-reference \
 LOTUS_V2_CABI04_RESULTS=/tmp/cabi04-results \
-node --test test/cabi04-gallery.test.mjs
+node --test test/cabi04-*.test.mjs
 ```
 
-The Python environment needs the reference package dependencies. Optional
-`LOTUS_V2_VM_REFERENCE_PACKAGE` selects another reference package checkout.
-Results preserve source, complete compiler artifact (including bytecode), exact
-invocation/profile, source expectation and reference verdict after every case,
-including a mismatch before the assertion fails. No fixture regeneration changes
-expected outcomes. Local verification used the provided review Python environment;
-eight tests passed, without skips. Results are at `/private/tmp/cabi04-results`.
+The frontend tests depend on expanded reference commit `b37414dc` (or its
+successor), specifically authenticated_context and branch/lock instructions.
+Local runs used the root integration worktree's reference package and the provided
+review Python environment. `cabi04-reference.py` derives signing messages and VM
+context from exact transaction, resolved coin and branch proof. Its results retain
+full transaction bytes, TxID, TxHash, digest, stack and abstract charge. Signature
+attachment uses public fixture keys in Node and reference verification in Python.
+Both use established secp256k1 implementations; this is not independent native
+execution. No complete transaction accounting validation runs in this helper.
 
-Next frontend work must define byte encodings and authentication for state rather
-than introducing a fictitious UTXO state field. Runtime state branch commitment
-checks and successor branch/path constraints need typed syntax. Recovery needs
-lowering to existing P03 lock opcodes plus contextual lock fixtures at the boundary.
+Optional result export writes source, compiler artifact/bytecode, source expectation,
+exact invocation/transaction and reference result after each case, before an
+assertion can fail. Failures are retained rather than regenerated into passing
+expectations. Original first-packet amount-counter/vault behavior was deliberately
+superseded by the branch-state counter and signed vault in a separate commit.
+Local evidence is at `/private/tmp/cabi04-results`. The complete compiler suite
+passed all 111 tests without skips; the final settlement-policy fixture refinement
+then passed all 12 CABI04 tests. Existing golden files were unchanged.

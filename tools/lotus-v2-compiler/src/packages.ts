@@ -29,7 +29,7 @@ export const LOCK_FILE = 'lotus.lock';
 export const LOCK_SCHEMA = 'lotus-v2/package-lock/1';
 export const BUILD_GRAPH_SCHEMA = 'lotus-v2/build-graph/1';
 const TARGET = 'P01-P02-P03-candidate-2026-10-14';
-const BUILTINS = new Set(['leaf_hash', 'contract_root', 'merkle_root', 'checksig', 'sha256', 'hash256', 'blake3']);
+const BUILTINS = new Set(['leaf_hash', 'contract_root', 'merkle_root', 'checksig', 'sha256', 'hash256', 'blake3', 'num_bytes', 'check_lock', 'check_sequence']);
 const COMMITMENT_BUILTINS = new Set(['leaf_hash', 'contract_root', 'merkle_root']);
 const MAX_WALK_ENTRIES = 4096;
 
