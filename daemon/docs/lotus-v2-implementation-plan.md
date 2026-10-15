@@ -6,8 +6,18 @@ Updated October 15, 2026. Development plan; no genesis parameters are frozen and
 
 ## Source foundation and current status
 
-The current executable [V2 series](../patches/v2/series) contains 70 patches,
-`000`–`069`, on ABC master `1fb7db17c176cdea8a2c60d887891589382ee4e3`.
+The current executable [V2 series](../patches/v2/series) contains 111 patches,
+`000`–`110`, on ABC master `1fb7db17c176cdea8a2c60d887891589382ee4e3`.
+[Latest replay evidence](evidence/v2-series-replay-110.json) verifies every
+intermediate tree. The exact clean daemon build and signed Payment pilot recorded
+below establish offline block acceptance, restart, disconnect and reconnect.
+Network activation, global fork selection, resumable reorgs and a usable peer
+network remain incomplete. Development profile adoption is still pending.
+
+### Historical source milestones through 069
+
+The following records describe the named earlier source trees; later evidence
+sections supersede their then-current implementation and acceptance limitations.
 The [review packet](../candidates/v2-native-reviewed-20261014/README.md) records
 intermediate replay trees and focused validation through patch 032. That reviewed source tree is
 `507c91e64c205df7b38e77abff6ebe02fb99bffe`. It includes transaction framing,
@@ -54,7 +64,7 @@ mismatch remain visible in their reports.
 The [separate development profile](../../docs/lotus-v2/development-profile.md)
 is proposed only. Its embedded generator reproduces complete genesis and first
 block bytes, reference acceptance, overclaim rejection and undo. Existing genesis
-fixtures remain unchanged. No daemon has accepted a V2 block. Next gates are
+fixtures remain unchanged. At the 069 milestone, no daemon had accepted a V2 block. Its next gates were
 atomic persistent chainstate/undo with restart and crash evidence, a daemon path
 calling the tested complete connector, and reviewed development profile/peering
 integration. Absolute reward scheduling is under separate research; the stored
