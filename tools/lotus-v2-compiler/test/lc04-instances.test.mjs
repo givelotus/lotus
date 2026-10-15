@@ -93,3 +93,9 @@ test('LC04 malformed unused explicit bindings and self-root aliases also reject'
     'import lib::wallet::{Wallet as Alias}; contract Main { entry spend() { require(true); } }',
     'export contract Wallet { entry spend() { require(contract_root(Wallet) == contract_root(Wallet)); } }');
 });
+
+
+test('LC04 helper aliases cannot conceal a template self-root cycle', async () => withProject(async dir => {
+  await assert.rejects(compilePackage(dir, { languageVersion: 1, contract: 'looped', bindings: {}, instances: { looped: { template: 'Alias', bindings: {} } } }), e => e.code === 'root-cycle');
+}, 'import lib::wallet::{Wallet as Alias}; contract Main { entry spend() { require(true); } }',
+'function hidden(): ContractRootHash { return contract_root(Wallet); } export contract Wallet { entry spend(x: ContractRootHash) { require(x == hidden()); } }'));

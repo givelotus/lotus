@@ -404,6 +404,7 @@ function bindInstances(contracts: Map<string, Contract>, templates: Map<string, 
   const instances = options.instances ?? {};
   if (!instances || typeof instances !== 'object' || Array.isArray(instances)) fail('instances must be a named map');
   const inputs: Record<string, Record<string, ProgramBinding>> = { ...options.bindings };
+  const templateNames = new Map<string, string>();
   const rewrite = (e: Expr, from: string, to: string): Expr => ({ ...e,
     ...(e.kind === 'name' && (e.value === from || e.value?.startsWith(from + '.')) ? { value: to + e.value!.slice(from.length) } : {}),
     ...(e.args ? { args: e.args.map(a => rewrite(a, from, to)) } : {}),
@@ -418,6 +419,7 @@ function bindInstances(contracts: Map<string, Contract>, templates: Map<string, 
     const key = resolve(instance.template), template = templates.get(key);
     if (!template) fail(`unresolved template ${instance.template}`);
     const c = template!.contract;
+    templateNames.set(name, c.name);
     contracts.set(name, { ...c, name, methods: c.methods.map(m => ({ ...m, body: statements(m.body, c.name, name) })) });
     owners.set(name, { pkg: template!.owner.pkg, moduleId: template!.owner.id, kind: c.kind });
     inputs[name] = instance.bindings;
@@ -426,6 +428,7 @@ function bindInstances(contracts: Map<string, Contract>, templates: Map<string, 
   for (const [name, c] of contracts) {
     const owner = owners.get(name)!;
     const canonical = `${owner.moduleId}::${name}`;
+    if (!templateNames.has(name)) templateNames.set(name, canonical);
     if (!Object.hasOwn(instances, name)) contracts.set(name, { ...c, methods: c.methods.map(m => ({ ...m, body: statements(m.body, canonical, name) })) });
   }
   const references = new Map<string, [string, { name: string; method?: string }][]>();
@@ -457,10 +460,13 @@ function bindInstances(contracts: Map<string, Contract>, templates: Map<string, 
   }
   for (const name of Object.keys(options.bindings)) if (!contracts.has(name)) fail(`binding names unbound template ${name}`);
   // Include source/helper root dependencies, so constructor edges cannot hide mixed cycles.
+  let scanningName = '';
   const scanExpr = (e: Expr, edges: Set<string>, seen: Set<string>): void => {
     if (e.kind === 'call') {
       if (COMMITMENT_BUILTINS.has(e.value!) && e.args?.[0]?.kind === 'name') {
-        const target = e.args[0].value!.split('.')[0]!;
+        const text = e.args[0].value!;
+        const reference = e.value === 'leaf_hash' ? text.slice(0, text.lastIndexOf('.')) : text;
+        const target = reference === templateNames.get(scanningName) ? scanningName : reference;
         if (!contracts.has(target)) fail(`root reference ${target} requires an explicit bound instance`);
         edges.add(target);
       } else if (!seen.has(e.value!)) {
@@ -475,7 +481,7 @@ function bindInstances(contracts: Map<string, Contract>, templates: Map<string, 
   const scanBody = (body: (Stmt | HelperStmt)[], edges: Set<string>, seen: Set<string>): void => {
     for (const s of body) { if (s.expr) scanExpr(s.expr, edges, seen); if ('then' in s && s.then) scanBody(s.then, edges, seen); if ('otherwise' in s && s.otherwise) scanBody(s.otherwise, edges, seen); }
   };
-  for (const [name, c] of contracts) for (const m of c.methods) scanBody(m.body, deps.get(name)!, new Set());
+  for (const [name, c] of contracts) { scanningName = name; for (const m of c.methods) scanBody(m.body, deps.get(name)!, new Set()); }
   const active: string[] = [], done = new Set<string>(), order: string[] = [];
   const visit = (name: string): void => {
     if (done.has(name)) return;
