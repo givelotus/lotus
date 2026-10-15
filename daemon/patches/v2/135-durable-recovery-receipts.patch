@@ -1,0 +1,501 @@
+From 5a2a66967f2e4093ff1e913033790dfb0a173dc3 Mon Sep 17 00:00:00 2001
+From: Shammah Chancellor <shammah.chancellor@notvalid.com>
+Date: Thu, 15 Oct 2026 11:55:30 -0700
+Subject: [PATCH] Persist V4 recovery evidence and atomic terminal receipts
+
+Integration note (2026-10-15): the original source commit had no message body.
+This explanation is supplied by the series integrator; source diff bytes are unchanged.
+
+Preserve V3 journals while adding V4 fixed-size evidence slots, historical-parent binding and atomic terminal receipts. Gate dispatch on pending terminal work and invalid ancestry; unknown or deferred outcomes never create invalidity facts.
+
+Validation scope and exact-source evidence are recorded in the implementation plan.
+
+---
+ src/lotus_v2/reorg_recovery.cpp            | 248 ++++++++++++++++++++-
+ src/lotus_v2/reorg_recovery.h              |   3 +-
+ src/lotus_v2/reorg_recovery_test/README.md |  46 +++-
+ 3 files changed, 277 insertions(+), 20 deletions(-)
+
+diff --git a/src/lotus_v2/reorg_recovery.cpp b/src/lotus_v2/reorg_recovery.cpp
+index 32893ec34..2052bfdc8 100644
+--- a/src/lotus_v2/reorg_recovery.cpp
++++ b/src/lotus_v2/reorg_recovery.cpp
+@@ -6,6 +6,34 @@
+ #include <limits>
+ #include <stdexcept>
+ namespace lotus::v2 {
++// The only raw-fact reconstruction authority. The canonical journal decoder
++// checks checksum/mode/phase before calling this historical checkpoint fence.
++struct CandidateFailureJournalAccess {
++    static CandidateFailureFact
++    Restore(const std::array<Hash, 4> &e, const Header &failed_header,
++            const IndexedHeader &parent, const RetainedDiskState &checkpoint,
++            const HeaderChainProfile &hp, const Hash &profile) {
++        Hash block{}, parent_id{};
++        Header stored_parent;
++        if (e[2] != profile || failed_header.prev_id != e[1] ||
++            !BlockId(hp.chain_id, failed_header, block) || block != e[0] ||
++            !BlockId(hp.chain_id, parent.header, parent_id) ||
++            parent_id != e[1] || parent.stage != HeaderStage::Connected ||
++            checkpoint.metadata.tip != e[1] || checkpoint.root != e[3] ||
++            !ParseHeader(checkpoint.metadata.header.data(),
++                         checkpoint.metadata.header.size(), stored_parent))
++            throw std::runtime_error("recovery evidence checkpoint binding");
++        std::array<uint8_t, HEADER_SIZE> a{}, b{};
++        if (!SerializeHeader(parent.header, a) ||
++            !SerializeHeader(stored_parent, b) || a != b ||
++            StateRoot(hp.chain_id, parent.header.height, checkpoint.root,
++                      DecodeMonetaryState(checkpoint.metadata.monetary)) !=
++                parent.header.state_root)
++            throw std::runtime_error(
++                "recovery evidence authenticated parent root");
++        return CandidateFailureFact(e[0], e[1], e[2], e[3]);
++    }
++};
+ namespace {
+     using Bytes = std::vector<uint8_t>;
+     // Fixed local journal slot, not a network/consensus parameter. Reservation
+@@ -43,6 +71,16 @@ namespace {
+         blake3_hasher_finalize(&hasher, hash.data(), hash.size());
+         return hash;
+     }
++    Hash JournalChecksum(const Bytes &bytes, size_t length) {
++        blake3_hasher hasher;
++        blake3_hasher_init(&hasher);
++        constexpr char domain[] = "Lotus/v2/local-recovery-journal";
++        blake3_hasher_update(&hasher, domain, sizeof(domain));
++        blake3_hasher_update(&hasher, bytes.data(), length);
++        Hash hash{};
++        blake3_hasher_finalize(&hasher, hash.data(), hash.size());
++        return hash;
++    }
+     struct Reader {
+         const Bytes &bytes;
+         size_t at{};
+@@ -102,6 +140,12 @@ namespace {
+         Bytes wire;
+         DiskRecoveryUndoInfo undo; // Used only for source bodies.
+     };
++    enum class TerminalCause : uint64_t {
++        None,
++        Deferred,
++        SourceOperational,
++        Deterministic
++    };
+     struct Journal {
+         Hash profile{}, genesis{}, source{}, target{}, fork{}, source_root{},
+             attempt{};
+@@ -109,7 +153,9 @@ namespace {
+         ChainWork target_work{};
+         uint64_t max_time{}, revision{}, detached{}, connected{}, restored{};
+         ReorgPhase phase{ReorgPhase::DisconnectSource};
+-        bool invalid{};
++        bool invalid{}, receipts{}, has_evidence{};
++        TerminalCause cause{TerminalCause::None};
++        std::array<Hash, 4> evidence{};
+         Hash failed{}, source_failed{};
+         Bytes source_error;
+         std::vector<PinnedBody> source_bodies, target_bodies;
+@@ -159,7 +205,7 @@ namespace {
+     }
+     Bytes Encode(const Journal &j, const ReorgLimits &limits) {
+         Bytes immutable = Immutable(j);
+-        Bytes out{'L', 'V', '2', 'R', 1};
++        Bytes out{'L', 'V', '2', 'R', uint8_t(j.receipts ? 2 : 1)};
+         PutBlob(out, immutable);
+         PutHash(out, j.attempt);
+         Put(out, j.revision);
+@@ -174,6 +220,16 @@ namespace {
+                 "recovery diagnostic length");
+         PutBlob(out, j.source_error);
+         out.insert(out.end(), DIAGNOSTIC_SIZE - j.source_error.size(), 0);
++        if (j.receipts) {
++            // Reserved even before failure: every mutable receipt field has a
++            // fixed width, preserving the exact preparation capacity.
++            Put(out, 1); // Evidence codec version.
++            Put(out, j.has_evidence);
++            for (const auto &hash : j.evidence)
++                PutHash(out, hash);
++            Put(out, uint64_t(j.cause));
++            PutHash(out, JournalChecksum(out, out.size()));
++        }
+         if (out.size() > limits.max_journal_bytes)
+             throw Stop{ReorgResult::CapacityRefused};
+         return out;
+@@ -254,6 +310,37 @@ namespace {
+                         j.detached && j.detached < j.source_bodies.size() &&
+                         j.source_failed == j.source_bodies[j.detached].id,
+                     "recovery source failure phase");
++        if (j.receipts) {
++            Require(j.has_evidence == j.invalid,
++                    "recovery evidence discriminant");
++            Require((j.cause == TerminalCause::Deterministic) == j.has_evidence,
++                    "recovery deterministic outcome evidence");
++            if (!j.has_evidence)
++                Require(j.evidence == std::array<Hash, 4>{},
++                        "unexpected recovery evidence bytes");
++            if (j.source_failed != Hash{})
++                Require(j.cause == TerminalCause::SourceOperational,
++                        "recovery operational outcome");
++            if (j.has_evidence) {
++                Require(j.evidence[0] == j.failed && j.evidence[2] == j.profile,
++                        "recovery evidence identity/profile");
++                const auto failed =
++                    std::find_if(j.target_bodies.begin(), j.target_bodies.end(),
++                                 [&](const PinnedBody &body) {
++                                     return body.id == j.failed;
++                                 });
++                Require(failed != j.target_bodies.end() &&
++                            BodyHeader(*failed, p.header).prev_id ==
++                                j.evidence[1],
++                        "recovery evidence target parent");
++                Require((j.phase == ReorgPhase::RollbackTarget ||
++                         j.phase == ReorgPhase::RestoreSource) &&
++                            j.detached == j.source_bodies.size() &&
++                            j.connected <=
++                                size_t(failed - j.target_bodies.begin()),
++                        "recovery evidence execution phase");
++            }
++        }
+         Hash cursor = j.source;
+         uint64_t height = history.front().height;
+         Hash root = j.source_root;
+@@ -280,15 +367,24 @@ namespace {
+         Require(cursor == j.target, "recovery target identity");
+     }
+     Journal Decode(const Bytes &bytes, const ReorgLimits &limits,
+-                   const ReorgProfiles &p) {
++                   const ReorgProfiles &p, bool receipts) {
+         Require(bytes.size() >= 5 &&
+-                    std::equal(
+-                        bytes.begin(), bytes.begin() + 5,
+-                        std::array<uint8_t, 5>{'L', 'V', '2', 'R', 1}.begin()),
++                    std::equal(bytes.begin(), bytes.begin() + 5,
++                               std::array<uint8_t, 5>{'L', 'V', '2', 'R',
++                                                      uint8_t(receipts ? 2 : 1)}
++                                   .begin()),
+                 "recovery journal version");
++        if (receipts) {
++            Require(bytes.size() >= 32, "recovery journal checksum framing");
++            const auto checksum = JournalChecksum(bytes, bytes.size() - 32);
++            Require(
++                std::equal(checksum.begin(), checksum.end(), bytes.end() - 32),
++                "recovery journal checksum");
++        }
+         Reader outer{bytes, 5};
+         Bytes immutable = outer.Blob(limits.max_journal_bytes);
+         Journal j;
++        j.receipts = receipts;
+         j.attempt = outer.HashValue();
+         Require(j.attempt == Digest(immutable), "recovery plan digest");
+         j.revision = outer.Number();
+@@ -312,6 +408,19 @@ namespace {
+                             [](uint8_t byte) { return byte == 0; }),
+                 "recovery diagnostic padding");
+         outer.at += padding;
++        if (receipts) {
++            Require(outer.Number() == 1, "recovery evidence version");
++            const auto present = outer.Number();
++            Require(present <= 1, "recovery evidence presence");
++            j.has_evidence = present;
++            for (auto &hash : j.evidence)
++                hash = outer.HashValue();
++            const auto cause = outer.Number();
++            Require(cause <= uint64_t(TerminalCause::Deterministic),
++                    "recovery terminal cause");
++            j.cause = TerminalCause(cause);
++            (void)outer.HashValue(); // Already authenticated before allocation.
++        }
+         Require(outer.at == bytes.size(), "trailing recovery bytes");
+         Reader r{immutable};
+         j.profile = r.HashValue();
+@@ -499,6 +608,37 @@ namespace {
+                     "recovery indexed replacement changed");
+         }
+     }
++    CandidateFailureFact RestoreEvidence(const Journal &j,
++                                         const ReorgProfiles &p,
++                                         const DiskStateStore &store,
++                                         ReadBudget &budget) {
++        if (!j.receipts || !j.has_evidence) return {};
++        const auto failed = std::find_if(
++            j.target_bodies.begin(), j.target_bodies.end(),
++            [&](const PinnedBody &body) { return body.id == j.failed; });
++        Require(failed != j.target_bodies.end(),
++                "recovery failed body unavailable");
++        std::optional<IndexedHeader> parent;
++        std::optional<RetainedDiskState> checkpoint;
++        DiskStateError failure;
++        Require(budget.Read(3,
++                            [&] {
++                                return store.ReadIndexedHeader(j.evidence[1],
++                                                               parent, failure);
++                            }) &&
++                    parent,
++                "recovery evidence parent unavailable");
++        Require(budget.Read(2,
++                            [&] {
++                                return store.ReadRetainedState(
++                                    j.evidence[1], checkpoint, failure);
++                            }) &&
++                    checkpoint,
++                "recovery evidence checkpoint unavailable");
++        return CandidateFailureJournalAccess::Restore(
++            j.evidence, BodyHeader(*failed, p.header), *parent, *checkpoint,
++            p.header, j.profile);
++    }
+     bool Future(uint64_t maximum, uint64_t now, uint64_t window) {
+         return maximum > now && maximum - now > window;
+     }
+@@ -541,6 +681,16 @@ ReorgResult PrepareDevelopmentSwitch(const Hash &source, const Hash &target,
+             End(ReorgResult::StaleTip, error, "recovery already pending");
+         if (store.Metadata().tip != source)
+             End(ReorgResult::StaleTip, error, "recovery source changed");
++        if (store.CandidatesEnabled()) {
++            CandidateView view;
++            if (!budget.Read(CANDIDATE_VIEW_MAX_READS, [&] {
++                    return store.ReadCandidateView(view, failure);
++                }))
++                return StorageFailure(failure, error);
++            if (view.pending_receipt || view.pending_propagation)
++                End(ReorgResult::Inconclusive, error,
++                    "candidate terminal work pending");
++        }
+         ForkPlan plan;
+         auto fork_limits = limits.fork;
+         fork_limits.max_reads = budget.Remaining();
+@@ -565,6 +715,7 @@ ReorgResult PrepareDevelopmentSwitch(const Hash &source, const Hash &target,
+                 return StorageFailure(failure, error);
+         }
+         Journal j;
++        j.receipts = store.CandidatesEnabled();
+         j.profile = BlockValidationProfileDigest(p.header, p.ordinary,
+                                                  p.monetary, p.cost);
+         j.genesis = p.header.genesis_id;
+@@ -692,6 +843,32 @@ ReorgResult PrepareDevelopmentSwitch(const Hash &source, const Hash &target,
+             End(ReorgResult::StaleTip, error,
+                 "recovery source changed during preparation");
+         if (Future(j.max_time, now, window)) return ReorgResult::Deferred;
++        if (j.receipts) {
++            // Header records and public choices do not confer eligibility.
++            const auto check = [&](const Hash &id) {
++                std::optional<Hash> causal_root;
++                if (!budget.Read(CANDIDATE_INVALIDITY_MAX_READS, [&] {
++                        return store.ReadCandidateInvalidity(id, causal_root,
++                                                             failure);
++                    }))
++                    return StorageFailure(failure, error);
++                if (causal_root)
++                    End(ReorgResult::ExcludedTarget, error,
++                        "target has deterministic invalid ancestry");
++                return ReorgResult::Progress;
++            };
++            const auto common = check(j.fork);
++            if (common != ReorgResult::Progress) return common;
++            for (const auto &body : j.target_bodies) {
++                const auto eligible = check(body.id);
++                if (eligible != ReorgResult::Progress) return eligible;
++            }
++        }
++        if (j.receipts && !budget.Read(CANDIDATE_CAPACITY_MAX_READS, [&] {
++                return store.CheckCandidateRecoveryCapacity(
++                    j.source_bodies.size(), failure);
++            }))
++            return StorageFailure(failure, error);
+         const auto update = Update(std::nullopt, bytes, store, source);
+         if (!store.WriteRecoveryJournal(update, failure))
+             return StorageFailure(failure, error);
+@@ -718,12 +895,14 @@ ReorgResult ReadDevelopmentSwitch(const ReorgLimits &limits,
+             error.clear();
+             return ReorgResult::Idle;
+         }
+-        const auto journal = Decode(*bytes, limits, p);
++        const auto journal =
++            Decode(*bytes, limits, p, store.CandidatesEnabled());
+         budget.Read(7, [&] {
+             CheckCurrent(journal, p, store);
+             return 0;
+         });
+         VerifyIndexes(journal, p, store, budget);
++        (void)RestoreEvidence(journal, p, store, budget);
+         out = Progress(journal);
+         error.clear();
+         return ReorgResult::Progress;
+@@ -747,12 +926,14 @@ ReorgResult StepDevelopmentSwitch(uint64_t now, uint64_t window,
+             error.clear();
+             return ReorgResult::Idle;
+         }
+-        const Journal old = Decode(*bytes, limits, p);
++        const Journal old =
++            Decode(*bytes, limits, p, store.CandidatesEnabled());
+         budget.Read(7, [&] {
+             CheckCurrent(old, p, store);
+             return 0;
+         });
+         VerifyIndexes(old, p, store, budget);
++        const auto fact = RestoreEvidence(old, p, store, budget);
+         Journal next = old;
+         const auto publish = [&](Journal &journal) {
+             Advance(journal);
+@@ -767,7 +948,38 @@ ReorgResult StepDevelopmentSwitch(uint64_t now, uint64_t window,
+         const auto finish = [&](ReorgResult result) {
+             const auto update =
+                 Update(bytes, std::nullopt, store, CurrentTip(old));
+-            if (!store.WriteRecoveryJournal(update, failure))
++            if (old.receipts) {
++                CandidateTerminalClaim claim;
++                claim.attempt = old.attempt;
++                claim.source = old.source;
++                claim.target = old.target;
++                claim.revision = old.revision;
++                if (result == ReorgResult::CompleteTarget) {
++                    Require(!old.has_evidence &&
++                                old.cause == TerminalCause::None,
++                            "completed target has failure evidence");
++                    claim.outcome = CandidateTerminalOutcome::CompletedTarget;
++                } else if (result == ReorgResult::Deferred ||
++                           old.cause == TerminalCause::Deferred) {
++                    Require(!old.has_evidence,
++                            "deferred outcome has failure evidence");
++                    claim.outcome =
++                        CandidateTerminalOutcome::RestoredSourceDeferred;
++                } else if (old.cause == TerminalCause::Deterministic) {
++                    Require(old.invalid && fact.Valid(),
++                            "deterministic terminal evidence unavailable");
++                    claim.outcome =
++                        CandidateTerminalOutcome::RestoredSourceDeterministic;
++                    claim.failure = fact;
++                } else {
++                    Require(!old.has_evidence,
++                            "unknown outcome has failure evidence");
++                    claim.outcome =
++                        CandidateTerminalOutcome::RestoredSourceUnknown;
++                }
++                if (!store.FinishCandidateRecovery(update, claim, failure))
++                    return StorageFailure(failure, error);
++            } else if (!store.WriteRecoveryJournal(update, failure))
+                 return StorageFailure(failure, error);
+             out = Progress(old);
+             error.clear();
+@@ -780,6 +992,7 @@ ReorgResult StepDevelopmentSwitch(uint64_t now, uint64_t window,
+             Future(old.max_time, now, window)) {
+             if (!old.detached && !old.connected)
+                 return finish(ReorgResult::Deferred);
++            if (next.receipts) next.cause = TerminalCause::Deferred;
+             next.phase = old.connected ? ReorgPhase::RollbackTarget
+                                        : ReorgPhase::RestoreSource;
+             return publish(next);
+@@ -803,6 +1016,8 @@ ReorgResult StepDevelopmentSwitch(uint64_t now, uint64_t window,
+                     error.empty() ? "source detach operational failure" : error;
+                 Journal restore = old;
+                 restore.phase = ReorgPhase::RestoreSource;
++                if (restore.receipts)
++                    restore.cause = TerminalCause::SourceOperational;
+                 restore.source_failed = source.id;
+                 restore.source_error.assign(
+                     cause.begin(),
+@@ -843,10 +1058,21 @@ ReorgResult StepDevelopmentSwitch(uint64_t now, uint64_t window,
+                 if (!failure.Valid() || failure.BlockId() != body.id ||
+                     failure.ParentId() != store.Metadata().tip ||
+                     failure.ParentRoot() != store.Root() ||
+-                    failure.ProfileDigest() != BlockValidationProfileDigest(
+-                        p.header, p.ordinary, p.monetary, p.cost))
++                    failure.ProfileDigest() !=
++                        BlockValidationProfileDigest(p.header, p.ordinary,
++                                                     p.monetary, p.cost))
+                     return ReorgResult::Inconclusive;
+                 next = old;
++                if (next.receipts) {
++                    CandidateFailureFact fact;
++                    if (!CandidateFailureFact::FromValidation(failure, fact) ||
++                        !fact.Valid())
++                        return ReorgResult::Inconclusive;
++                    next.has_evidence = true;
++                    next.evidence = {fact.BlockId(), fact.ParentId(),
++                                     fact.ProfileDigest(), fact.ParentRoot()};
++                    next.cause = TerminalCause::Deterministic;
++                }
+                 next.invalid = true;
+                 next.failed = body.id;
+                 next.phase = ReorgPhase::RollbackTarget;
+diff --git a/src/lotus_v2/reorg_recovery.h b/src/lotus_v2/reorg_recovery.h
+index 9d8ecee7b..2de952c48 100644
+--- a/src/lotus_v2/reorg_recovery.h
++++ b/src/lotus_v2/reorg_recovery.h
+@@ -51,7 +51,8 @@ enum class ReorgResult {
+     CapacityRefused,
+     StaleTip,
+     StorageError,
+-    Inconclusive
++    Inconclusive,
++    ExcludedTarget
+ };
+ // Requires a fresh indexed home with explicitly configured recovery creation
+ // caps. J embeds all pinned bodies; its total cap bounds repeated
+diff --git a/src/lotus_v2/reorg_recovery_test/README.md b/src/lotus_v2/reorg_recovery_test/README.md
+index 51997aca2..b61d33e9c 100644
+--- a/src/lotus_v2/reorg_recovery_test/README.md
++++ b/src/lotus_v2/reorg_recovery_test/README.md
+@@ -4,8 +4,10 @@
+ uses the existing full block connector and chain-aware undo callbacks; it does
+ not select a global best candidate, perform networking or change consensus.
+ 
+-The store must have an exact indexed profile and explicitly supplied V3 recovery
+-creation caps. Older homes fail closed. Prepare checks the bounded fork plan,
++The store must have an exact indexed profile and explicitly supplied recovery
++creation caps. Existing V3 homes retain Jv1 behavior. V4 candidate-enabled homes
++use Jv2 evidence and terminal receipts. Store-mode/journal-version mismatches fail
++closed; neither format is silently migrated. Prepare checks the bounded fork plan,
+ pins exact source and replacement bodies, probes/pins source undo digests, and
+ records a canonical plan journal. Source bodies must already be retained;
+ replacement bodies arrive through the caller's bounded nonmutating body source.
+@@ -83,12 +85,40 @@ can produce the same identity. It is not a fresh authorization token or a global
+ attempt counter. Exact journal CAS and the single-writer contract fence progress.
+ There is no explicit cancellation API in this packet.
+ 
+-Terminal clearing is a separate journal-only batch after verified source/target
+-completion. The terminal caller receives failure diagnostics in `ReorgProgress`.
+-After clearing and restarting, the query returns Idle and does not retain a durable
+-failure receipt. A future candidate selector must add a typed terminal receipt and
+-atomic acknowledgment before relying on durable invalid-root bookkeeping; this
+-packet implements no permanent invalid cache.
++In V3, terminal clearing remains the existing journal-only batch after verified
++source/target completion. The caller receives diagnostics in `ReorgProgress`, but
++after clearing/restart there is no durable terminal receipt or invalid-root fact.
++
++V4 Jv2 reserves an additional fixed 184 bytes at preparation: evidence version,
++presence discriminant, four binding hashes, termination cause and whole-journal
++checksum. Diagnostic/evidence transitions cannot grow a prepared journal. Checksums
++and exact mode/version are checked before decoding its immutable payload. Local
++database/journal integrity is trusted apart from detectable corruption: the
++checksum is not a MAC or a remote proof of VM rejection, and arbitrary adversarial
++disk rewriting is outside this contract. Only an
++opaque `DeterministicBlockFailure` from full execution can introduce evidence.
++Invalid supplied bytes or Inconclusive results never establish that fact and never
++advance recovery cursors.
++
++The sole trusted journal reconstruction helper checks the failed pinned target,
++its indexed parent, exact validator fingerprint and historical authenticated parent
++UTXO root. The parent checkpoint's monetary bytes and root must reproduce the
++parent header's state commitment, and its header must be ever connected. This root
++is the pre-failure UTXO root, which can differ from the restored source's terminal
++root. Missing/corrupt historical evidence fails operationally; it never downgrades
++malformed evidence into an unknown outcome or creates a replacement fact.
++
++V4 completion atomically removes J and publishes the typed durable terminal receipt
++through `FinishCandidateRecovery`. CompletedTarget, RestoredSourceUnknown and
++RestoredSourceDeferred carry no failure fact. RestoredSourceDeterministic requires
++the verified fact. Source operational failure and clock deferral remain distinct
++from deterministic replacement failure. Receipt acknowledgment/invalid-descendant
++propagation belong to the candidate storage/selector owner; the coordinator does
++not rank globally or acknowledge its own receipt. V4 preparation rechecks inventory
++capacity at the serialized handoff before publishing J. It also fences pending
++receipt/propagation work and explicitly checks causal invalidity for the target's
++planned ancestors; a retained header or public selector choice grants no admission
++authority. `ExcludedTarget` reports that refusal without creating a journal.
+ 
+ ## Verification scope
+ 
+-- 
+2.50.1 (Apple Git-155)
+
