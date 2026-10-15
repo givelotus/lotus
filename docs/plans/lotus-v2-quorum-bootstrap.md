@@ -67,3 +67,46 @@ Use any Python environment containing the reference package's dependencies (`bla
 | Manifest SHA256 | `ff076ce72db2055f2d115082c29039ae89a6214f79215b18aa0e9bc58a3a171d` |
 
 Changing the proposed parameters requires a new versioned name, regenerated ChainID/genesis/state/profile digest and fresh datadirs. Do not transplant this manifest into an existing home or change `prepare-local.py`'s current fixture selection. Native loader/digest parity, nine participant funding, proof maturity rejection/acceptance, default quorum establishment and persistence/restart remain root verification gates before adoption.
+
+## Actual native stake preparation evidence (2026-10-15)
+
+The separate development candidate completed a real single-node native run
+through height 2,024. An independent read-only audit checked every produced
+block body against its recorded SHA256, every consecutive authoritative height
+and tip change, and each header's parent link, actual ASERT target, PoW, MTP and
+complete transaction root. All 2,024 blocks contain only their native-mined
+coinbase; funding was not inserted through synthetic blocks or state roots.
+The native child stopped cleanly with exit 0. This completes native stake
+preparation, while peer proof registration, connected quorum, polling and
+finality remain separate gates.
+
+Portable [native evidence](../../daemon/docs/evidence/v2-quorum-bootstrap-native.json) preserves
+the complete native summary, nine exact funding records, both coin/proof
+milestones, source pins, binary/artifact digests, raw process-log/ledger hashes,
+and individual hashes for all 2,024 produced bodies. The original run remains
+at `/private/tmp/lotus-v2-quorum-bootstrap-native-20261015-a`; its `evidence.json`
+SHA256 is `25a973aa13334af0c3de37f488ae3873784fb93b8fda343065fcde63ddbc04b6`.
+
+The daemon source is `40d66a7d93b268957ca6b20b703d321a00f522b1`; its checked
+executable SHA256 is
+`6065e9fdd8db763a2d58fa87a7891e4cf03e317b940c5eef84b3328c3249cb54`.
+The generator source is `7b495b0fa49640a6d95eaf8197520e6b991e6610`.
+The manifest, ChainID, genesis and profile digest match the candidate above.
+
+Actual funding amounts match all nine proposed net payouts exactly, totaling
+`6,151,488,031,678` base units. The minimum total after excluding any one output
+is `5,051,975,404,144`, above the unchanged `1,000,000,000,000` threshold. Native
+coin/proof responses at heights 2,023 and 2,024 retain exact produced coin bytes
+and creation metadata. The ninth output crosses from 2,015 to 2,016
+confirmations. Independently reconstructed UTXO roots and state commitments
+match both native milestones. The audit checked membership proof coin bytes and
+bitmap/sibling shape; it did not independently reverify the proof paths or the
+entire monetary transition series.
+
+This automated preparation deliberately uses **public deterministic test keys
+with known scalars 1–9**, unlike the participant-operated sequence above. These
+funds are disposable fixtures. The maturity flags recorded by the harness are
+confirmation arithmetic; they do not establish native Avalanche proof
+acceptance. The run has no connected peers and provides no quorum or finality
+evidence. Existing local-test/production profiles and their homes were not
+adopted or replaced by this preparation.
