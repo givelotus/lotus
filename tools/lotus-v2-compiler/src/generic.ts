@@ -13,9 +13,14 @@ type Token = { text: string; span: Span };
 export type Param = { name: string; type: ValueType; span: Span };
 export type Expr = { kind: 'name' | 'number' | 'bool' | 'call' | 'binary' | 'unary'; span: Span; value?: string; args?: Expr[]; left?: Expr; right?: Expr };
 export type Stmt = { kind: 'require' | 'if' | 'for' | 'assign'; span: Span; expr?: Expr; then?: Stmt[]; otherwise?: Stmt[]; variable?: string; collection?: 'tx.inputs' | 'tx.outputs'; assignOp?: '=' | '+=' | '-=' };
+/** Statement-bodied helper. `return` is only legal as the function body's last statement. */
+export type HelperStmt = { kind: 'let'; name: string; type: ValueType; expr: Expr; nameSpan: Span; span: Span }
+  | { kind: 'require'; expr: Expr; span: Span }
+  | { kind: 'if'; expr: Expr; then: HelperStmt[]; otherwise: HelperStmt[]; span: Span }
+  | { kind: 'return'; expr: Expr; span: Span };
 /** `private` (default, module only), `package` (same package) or `export` (other packages via exported modules). */
 export type Visibility = 'private' | 'package' | 'export';
-export type Helper = { name: string; params: Param[]; result: ValueType; body: Expr; span: Span; visibility: Visibility };
+export type Helper = { name: string; params: Param[]; result: ValueType; body: HelperStmt[]; span: Span; visibility: Visibility };
 export type Method = { name: string; params: Param[]; body: Stmt[]; span: Span };
 export type Contract = { name: string; kind: 'contract' | 'token'; params: Param[]; methods: Method[]; span: Span; visibility: Visibility };
 /** Compile-time link to a library contract. Not a VM call. Present only on package artifacts that commit to one. */
@@ -55,6 +60,15 @@ function utf8Offset(source: string, utf16: number): number { return new TextEnco
 function spanAt(file: string, start: number, end: number): Span { return { start, end, file }; }
 function cover(start: Span, end: Span): Span {
   return { start: start.start, end: end.end, ...(start.file !== undefined ? { file: start.file } : {}), ...(start.module !== undefined ? { module: start.module } : {}) };
+}
+/** Top-level `&&` only. Nested `||` stays intact so it is not rewritten as `require`. */
+function conjuncts(expr: Expr): Expr[] {
+  if (expr.kind === 'binary' && expr.value === '&&' && expr.left && expr.right) return [...conjuncts(expr.left), ...conjuncts(expr.right)];
+  return [expr];
+}
+function helperReturn(body: HelperStmt[]): Extract<HelperStmt, { kind: 'return' }> | undefined {
+  const stmt = body.find(item => item.kind === 'return');
+  return stmt?.kind === 'return' ? stmt : undefined;
 }
 function lex(source: string, file: string, bag: DiagnosticBag): Token[] {
   const encoded = new TextEncoder().encode(source);
@@ -160,6 +174,40 @@ class Parser {
     }
     this.take('}'); return out;
   }
+  /**
+   * Helper statements. `for` is rejected: inlining it into a method loop would
+   * nest past the consensus cap of two without a second loop implementation.
+   * `return` is only the last statement of the function body, not of an `if`.
+   */
+  private helperBody(depth = 0, nested = false): HelperStmt[] {
+    if (depth > 16) this.fatal('E0106', 'control nesting depth exceeded', this.peek().span);
+    this.take('{'); const out: HelperStmt[] = [];
+    while (this.peek().text !== '}') {
+      if (out.at(-1)?.kind === 'return') this.fatal('E0123', 'statement after return', this.peek().span);
+      const start = this.peek();
+      if (start.text === 'let') {
+        this.take(); const name = this.ident(); bindName(name.text, name.span, this.bag); this.take(':'); const type = this.type(); this.take('=');
+        const expr = this.expression(); const end = this.take(';');
+        out.push({ kind: 'let', name: name.text, type, expr, nameSpan: name.span, span: cover(start.span, end.span) });
+      } else if (start.text === 'require') {
+        this.take(); this.take('('); const expr = this.expression(); this.take(')'); const end = this.take(';');
+        out.push({ kind: 'require', expr, span: cover(start.span, end.span) });
+      } else if (start.text === 'if') {
+        this.take(); const expr = this.expression(); const then = this.helperBody(depth + 1, true);
+        const otherwise = this.peek().text === 'else' ? (this.take('else'), this.helperBody(depth + 1, true)) : [];
+        out.push({ kind: 'if', expr, then, otherwise, span: cover(start.span, this.tokens[this.i - 1]!.span) });
+      } else if (start.text === 'for') this.fatal('E0122', 'for is not allowed inside a helper', start.span);
+      else if (start.text === 'return') {
+        if (nested) this.fatal('E0123', 'return must be the final statement of the helper', start.span);
+        this.take(); const expr = this.expression(); const end = this.take(';');
+        out.push({ kind: 'return', expr, span: cover(start.span, end.span) });
+      } else this.fatal('E0111', `unsupported statement ${this.take().text}`, start.span);
+      if (out.length > 256) this.fatal('E0107', 'statement budget exceeded', start.span);
+    }
+    const end = this.take('}');
+    if (!nested && out.at(-1)?.kind !== 'return') this.fatal('E0123', 'helper must end with return', end.span);
+    return out;
+  }
   private importDecl(start: Token): ImportDecl {
     const target = this.take();
     let targetText = target.text;
@@ -211,10 +259,10 @@ class Parser {
         const modifier = start; start = this.take(); start = { text: start.text, span: cover(modifier.span, start.span) };
       }
       if (start.text === 'function') {
-        const name = this.ident(); this.take('('); const params = this.params(')'); this.take(':'); const result = this.type(); this.take('{'); this.take('return'); const body = this.expression(); this.take(';'); const end = this.take('}');
+        const name = this.ident(); this.take('('); const params = this.params(')'); this.take(':'); const result = this.type(); const body = this.helperBody();
         bindName(name.text, name.span, this.bag);
         if (helpers.has(name.text)) this.fatal('E0202', `duplicate helper ${name.text}`, name.span);
-        helpers.set(name.text, { name: name.text, params, result, body, span: cover(start.span, end.span), visibility });
+        helpers.set(name.text, { name: name.text, params, result, body, span: cover(start.span, this.tokens[this.i - 1]!.span), visibility });
       } else if (start.text === 'contract' || start.text === 'token') {
         const name = this.ident(); bindName(name.text, name.span, this.bag); const params = this.peek().text === '<' ? (this.take('<'), this.params('>')) : [];
         this.take('{'); const methods: Method[] = [];
@@ -312,7 +360,7 @@ class Emitter {
     else this.push(encodedInt(n), span, origin, true);
   }
   op(name: keyof typeof OPCODES, span: Span, origin?: Span, delta = 0): void { this.append(Uint8Array.of(OPCODES[name]), name, span, origin, delta); if (name === 'CHECKSIG') this.signatureChecks++; }
-  control(name: 'IF'|'ELSE'|'ENDIF', span: Span): void { this.op(name, span, undefined, name === 'IF' ? -1 : 0); }
+  control(name: 'IF'|'ELSE'|'ENDIF', span: Span, origin?: Span): void { this.op(name, span, origin, name === 'IF' ? -1 : 0); }
   finish(optimize: boolean): { script: Uint8Array; map: MethodArtifact['sourceMap']; resources: Pick<MethodArtifact['staticResources'], 'scriptBytes'|'opcodes'|'maxStackItems'> } {
     const entries = optimize ? optimizeInstructions(this.instructions, this.args) : this.instructions;
     const structured = entries.some(entry => ['IF','ELSE','ENDIF','ENUMERATE_INPUTS','ENUMERATE_OUTPUTS','ENDENUMERATE'].includes(entry.map.op));
@@ -378,6 +426,12 @@ class Compiler {
   }
   private dependencies(method: Method): string[] {
     const found = new Set<string>();
+    const scanHelper = (body: HelperStmt[], target: Set<string>, helpers: string[]): void => {
+      for (const stmt of body) {
+        if (stmt.kind === 'if') { scan(stmt.expr, target, helpers); scanHelper(stmt.then, target, helpers); scanHelper(stmt.otherwise, target, helpers); }
+        else scan(stmt.expr, target, helpers);
+      }
+    };
     const scan = (expr: Expr, target: Set<string>, helpers: string[]): void => {
       if (++this.dependencyVisits > MAX_DEPENDENCY_VISITS) this.fatal('E0705', 'dependency scan visit budget exceeded', expr.span);
       if (expr.kind === 'call') {
@@ -397,7 +451,7 @@ class Compiler {
             if (!dependencies) {
               if (helpers.length >= 16) this.fatal('E0706', 'helper dependency depth exceeded', expr.span);
               const inner = new Set<string>();
-              scan(helper.body, inner, [...helpers, helper.name]);
+              scanHelper(helper.body, inner, [...helpers, helper.name]);
               dependencies = [...inner];
               this.helperDependencies.set(helper.name, dependencies);
             }
@@ -475,6 +529,38 @@ class Compiler {
       const emitter = new Emitter(stackParams.length, (code, message, span, frames) => this.fatal(code, message, span, frames));
       const helperStack: string[] = [];
       let inferenceVisits = 0;
+      const inferBlock = (body: HelperStmt[], scope: Env, active: string[], frames: Frame[], returning: boolean): Checked => {
+        const introduced: string[] = [];
+        try {
+          for (const stmt of body) {
+            if (stmt.kind === 'let') {
+              if (scope.has(stmt.name)) return this.problem('E0208', `let ${stmt.name} shadows a binding`, stmt.nameSpan, frames);
+              const t = infer(stmt.expr, scope, active, frames);
+              if (t === 'Error') return 'Error';
+              if (t !== stmt.type) return this.problem('E0414', `let ${stmt.name} expects ${stmt.type}, got ${t}`, stmt.expr.span, frames);
+              scope.set(stmt.name, { kind: 'local', type: stmt.type, index: -1 });
+              introduced.push(stmt.name);
+            } else if (stmt.kind === 'require') {
+              for (const part of conjuncts(stmt.expr)) {
+                const t = infer(part, scope, active, frames);
+                if (t === 'Error') return 'Error';
+                if (t !== 'Bool') return this.problem('E0404', `require requires Bool, got ${t}`, part.span, frames);
+              }
+            } else if (stmt.kind === 'if') {
+              const t = infer(stmt.expr, scope, active, frames);
+              if (t === 'Error') return 'Error';
+              if (t !== 'Bool') return this.problem('E0404', `if requires Bool, got ${t}`, stmt.expr.span, frames);
+              if (inferBlock(stmt.then, scope, active, frames, false) === 'Error') return 'Error';
+              if (inferBlock(stmt.otherwise, scope, active, frames, false) === 'Error') return 'Error';
+            } else {
+              if (!returning) return this.problem('E0123', 'return must be the final statement of the helper', stmt.span, frames);
+              return infer(stmt.expr, scope, active, frames);
+            }
+          }
+          if (returning) return this.problem('E0123', 'helper must end with return', body.at(-1)?.span, frames);
+          return 'Bool';
+        } finally { for (const name of introduced) scope.delete(name); }
+      };
       const infer = (expr: Expr, scope: Env, active: string[] = [], frames: Frame[] = []): Checked => {
         if (++inferenceVisits > MAX_INFERENCE_VISITS) this.fatal('E0704', 'type inference visit budget exceeded', expr.span, frames);
         if (expr.kind === 'number') { const n = BigInt(expr.value!); if (n < INT_MIN || n >= INT_MAX) return this.problem('E0413', INT_RANGE, expr.span, frames); return 'Int'; }
@@ -540,11 +626,12 @@ class Compiler {
           if (actual !== p.type) return this.problem('E0406', `helper ${name}.${p.name} expects ${p.type}, got ${actual}`, args[i]!.span, frames);
           inner.set(p.name, { kind:'substitute', type:p.type, expr:args[i]!, env:scope, origin:expr.span, frames });
         }
-        const result = infer(helper.body, inner, [...active, name], next);
+        const result = inferBlock(helper.body, inner, [...active, name], next, true);
         if (result === 'Error') return 'Error';
-        if (result !== helper.result) return this.problem('E0407', `helper ${name} returns ${result}, declared ${helper.result}`, helper.body.span, next);
+        if (result !== helper.result) return this.problem('E0407', `helper ${name} returns ${result}, declared ${helper.result}`, helperReturn(helper.body)?.expr.span ?? helper.span, next);
         return result;
       };
+      let emitBlock!: (body: HelperStmt[], scope: Env, origin: Span | undefined, frames: Frame[], returning: boolean) => Checked;
       const expression = (expr: Expr, scope: Env, origin?: Span, frames: Frame[] = []): Checked => {
         emitter.frames = frames;
         if (expr.kind === 'number') {
@@ -672,11 +759,77 @@ class Compiler {
         const next = [...frames, { name: helper.name, at: expr.span }];
         helperStack.push(name);
         try {
-          const result = expression(helper.body, inner, expr.span, next);
+          const result = emitBlock(helper.body, inner, expr.span, next, true);
           if (result === 'Error') return 'Error';
-          if (result !== helper.result) return this.problem('E0407', `helper ${name} returns ${result}, declared ${helper.result}`, helper.body.span, next);
+          if (result !== helper.result) return this.problem('E0407', `helper ${name} returns ${result}, declared ${helper.result}`, helperReturn(helper.body)?.expr.span ?? helper.span, next);
           return result;
         } finally { helperStack.pop(); }
+      };
+      // Split only a require operand. Each conjunct is verified immediately, so
+      // CHECKSIG/EQUAL sit next to VERIFY. `||` is left as a short-circuit.
+      const emitRequire = (expr: Expr, scope: Env, origin: Span | undefined, frames: Frame[], span: Span): void => {
+        for (const part of conjuncts(expr)) {
+          const t = expression(part, scope, origin, frames);
+          if (t === 'Error') continue;
+          if (t !== 'Bool') {
+            this.problem('E0404', `require requires Bool, got ${t}`, part.span, frames);
+            emitter.op('DROP', part.span, origin, -1);
+            continue;
+          }
+          emitter.op('VERIFY', span, origin, -1);
+        }
+      };
+      emitBlock = (body, scope, origin, frames, returning) => {
+        const introduced: string[] = [];
+        const forget = (): void => { for (const name of introduced) scope.delete(name); introduced.length = 0; };
+        const dropTop = (span: Span): void => {
+          for (let n = introduced.length; n > 0; n--) emitter.op('DROP', span, origin, -1);
+          forget();
+        };
+        // Locals sit under the return value. ROLL 1 brings each one to the top.
+        const buryReturn = (span: Span): void => {
+          for (let n = introduced.length; n > 0; n--) {
+            emitter.number(1n, span, origin); emitter.op('ROLL', span, origin, -1); emitter.op('DROP', span, origin, -1);
+          }
+          forget();
+        };
+        try {
+          for (const stmt of body) {
+            if (stmt.kind === 'let') {
+              if (scope.has(stmt.name)) { this.problem('E0208', `let ${stmt.name} shadows a binding`, stmt.nameSpan, frames); continue; }
+              const t = expression(stmt.expr, scope, origin, frames);
+              if (t === 'Error') continue;
+              if (t !== stmt.type) {
+                this.problem('E0414', `let ${stmt.name} expects ${stmt.type}, got ${t}`, stmt.expr.span, frames);
+                emitter.op('DROP', stmt.span, origin, -1); continue;
+              }
+              scope.set(stmt.name, { kind: 'local', type: t, index: emitter.height - 1 });
+              introduced.push(stmt.name);
+            } else if (stmt.kind === 'require') emitRequire(stmt.expr, scope, origin, frames, stmt.span);
+            else if (stmt.kind === 'if') {
+              const t = expression(stmt.expr, scope, origin, frames);
+              if (t === 'Error') continue;
+              if (t !== 'Bool') { this.problem('E0404', `if requires Bool, got ${t}`, stmt.expr.span, frames); emitter.op('DROP', stmt.span, origin, -1); continue; }
+              emitter.control('IF', stmt.span, origin);
+              const before = emitter.height;
+              if (emitBlock(stmt.then, scope, origin, frames, false) === 'Error') return 'Error';
+              if (emitter.height !== before) this.fatal('E9001', 'then stack mismatch', stmt.span, frames);
+              emitter.control('ELSE', stmt.span, origin);
+              if (emitBlock(stmt.otherwise, scope, origin, frames, false) === 'Error') return 'Error';
+              if (emitter.height !== before) this.fatal('E9001', 'else stack mismatch', stmt.span, frames);
+              emitter.control('ENDIF', stmt.span, origin);
+            } else {
+              if (!returning) return this.problem('E0123', 'return must be the final statement of the helper', stmt.span, frames);
+              const t = expression(stmt.expr, scope, origin, frames);
+              if (t === 'Error') return 'Error';
+              buryReturn(stmt.span);
+              return t;
+            }
+          }
+          if (returning) return this.problem('E0123', 'helper must end with return', body.at(-1)?.span ?? frames.at(-1)?.at, frames);
+          dropTop(body.at(-1)?.span ?? frames.at(-1)?.at ?? { start: 0, end: 0 });
+          return 'Bool';
+        } finally { for (const name of introduced) scope.delete(name); }
       };
       const statements = (body: Stmt[], nested = false): void => {
         for (const stmt of body) {
@@ -714,11 +867,11 @@ class Compiler {
             }
             continue;
           }
+          if (stmt.kind === 'require') { emitRequire(stmt.expr!, env, undefined, [], stmt.span); continue; }
           const t = expression(stmt.expr!,env);
           if (t === 'Error') continue;
-          if (t !== 'Bool') { this.problem('E0404', `${stmt.kind} requires Bool, got ${t}`, stmt.expr?.span ?? stmt.span); continue; }
-          if (stmt.kind === 'require') emitter.op('VERIFY',stmt.span,undefined,-1);
-          else {
+          if (t !== 'Bool') { this.problem('E0404', `${stmt.kind} requires Bool, got ${t}`, stmt.expr?.span ?? stmt.span); emitter.op('DROP', stmt.span, undefined, -1); continue; }
+          {
             emitter.control('IF',stmt.span);
             const before = emitter.height;
             statements(stmt.then!,true);

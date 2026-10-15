@@ -2,10 +2,13 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { compileContract, methodLeafHash, contractRootHash } from '../dist/generic.js';
 import { unhex } from '../dist/compiler.js';
+import { schnorr } from '@noble/curves/secp256k1';
 import { generateContractPython, generateContractTypeScript } from '../dist/bindings.js';
 import { optimizeInstructions } from '../dist/optimizer.js';
-import { readFileSync } from 'node:fs';
+import { CompileError } from '../dist/diagnostics.js';
+import { readFileSync, existsSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
+import { join } from 'node:path';
 
 const key3 = 'f9308a019258c31049344f85f89d5229b531c845836f99b08601f113bce036f9';
 const key4 = 'e493dbf1c10d80f3581e4904930b1404cc6c13900ee0758474fa94abe8c4cd13';
@@ -221,6 +224,119 @@ test('signed Int minimum parses as one literal and out-of-range values reject', 
   assert.throws(() => compileContract(`contract C { function m() { require(${underflow} == 0); } }`, { contract: 'C', bindings: {} }), /signed 128-bit range/);
   const overflow = 1n << 127n;
   assert.throws(() => compileContract(`contract C { function m() { require(${overflow} == 0); } }`, { contract: 'C', bindings: {} }), /signed 128-bit range/);
+});
+
+test('a single-return helper matches the direct expression and statement helpers inline', () => {
+  const bindings = { C: { owner: key3, other: key4 } };
+  const via = `function id(x: Bytes32): Bytes32 { return sha256(x); }
+    contract C<owner: PublicKey, other: PublicKey> { function m(x: Bytes32) { require(id(x) == id(x)); } }`;
+  const direct = `contract C<owner: PublicKey, other: PublicKey> { function m(x: Bytes32) { require(sha256(x) == sha256(x)); } }`;
+  assert.equal(compileContract(via, { contract: 'C', bindings }).methods[0].scriptHex,
+    compileContract(direct, { contract: 'C', bindings }).methods[0].scriptHex);
+  const source = `function authorized(sig: Signature, owner: PublicKey): Bool {
+      let ok: Bool = checksig(sig, owner);
+      require(ok);
+      return ok;
+    }
+    contract C<owner: PublicKey, other: PublicKey> {
+      function spend(sig: Signature) { require(authorized(sig, owner)); }
+    }`;
+  const plain = compileContract(source, { contract: 'C', bindings, optimize: false }).methods[0];
+  const optimized = compileContract(source, { contract: 'C', bindings }).methods[0];
+  assert.equal(plain.staticResources.helperExpansions, 1);
+  assert.equal(plain.scriptHex, `007d20${key3}bb007d65007d4e7e7965794e`);
+  assert.equal(optimized.scriptHex.includes(key3), true);
+  assert.ok(plain.sourceMap.some(entry => entry.op === 'CHECKSIG' && entry.expandedFrom));
+  assert.equal(plain.sourceMap.some(entry => entry.op === 'IF'), false);
+  const ops = optimized.sourceMap.map(entry => entry.op);
+  assert.ok(ops.includes('CHECKSIG') || ops.includes('CHECKSIGVERIFY'));
+  assert.equal(ops.includes('ROLL') || ops.includes('DUP'), true);
+});
+
+test('errors inside a statement helper point at the helper and note the call', () => {
+  const source = `function gate(x: Int): Bool {\n  let ok: Bool = missing;\n  return ok;\n}\ncontract C { function m() { require(gate(1)); } }`;
+  const error = (() => { try { compileContract(source, { contract: 'C', bindings: {} }); } catch (caught) { return caught; } })();
+  assert.ok(error instanceof CompileError);
+  assert.equal(error.diagnostics[0].code, 'E0301');
+  assert.equal(error.diagnostics[0].primary.span.start, source.indexOf('missing'));
+  assert.equal(error.diagnostics[0].related[0].message, 'in expansion of helper gate called here');
+  const mismatch = `function gate(x: Int): Bool {\n  let ok: Bool = x;\n  return true;\n}\ncontract C { function m() { require(gate(1)); } }`;
+  assert.throws(() => compileContract(mismatch, { contract: 'C', bindings: {} }), /let ok expects Bool, got Int/);
+  const shadowed = 'function f(x: Int): Int { let x: Int = 1; return x; } contract C { function m() { require(f(1) == 1); } }';
+  assert.throws(() => compileContract(shadowed, { contract: 'C', bindings: {} }), /let x shadows a binding/);
+  const loop = 'function f(): Bool { for i in tx.inputs { require(true); } return true; } contract C { function m() { require(f()); } }';
+  const rejected = (() => { try { compileContract(loop, { contract: 'C', bindings: {} }); } catch (caught) { return caught; } })();
+  assert.ok(rejected instanceof CompileError);
+  assert.equal(rejected.diagnostics[0].code, 'E0122');
+  assert.equal(rejected.diagnostics[0].primary.span.start, loop.indexOf('for'));
+  assert.equal(rejected.diagnostics[0].primary.span.end, loop.indexOf('for') + 3);
+  assert.throws(() => compileContract('function f(): Bool { return true; require(false); } contract C { function m() { require(f()); } }', { contract: 'C', bindings: {} }), /statement after return/);
+  assert.throws(() => compileContract('function f(x: Bool): Bool { if (x) { return true; } else { return false; } } contract C { function m(x: Bool) { require(f(x)); } }', { contract: 'C', bindings: {} }), /return must be the final statement/);
+  assert.throws(() => compileContract('function f(): Bool { require(true); } contract C { function m() { require(f()); } }', { contract: 'C', bindings: {} }), /helper must end with return/);
+  const branched = `function pick(flag: Bool): Bool { if (flag) { require(true); } else { require(false); } return true; }
+    contract C { function m(flag: Bool) { require(pick(flag)); } }`;
+  const branchedOps = compileContract(branched, { contract: 'C', bindings: {}, optimize: false }).methods[0].sourceMap.map(entry => entry.op);
+  assert.ok(branchedOps.includes('IF') && branchedOps.includes('ELSE') && branchedOps.includes('ENDIF'));
+  assert.throws(() => compileContract('function a(x: Bool): Bool { let y: Bool = b(x); return y; } function b(x: Bool): Bool { let y: Bool = a(x); return y; } contract C { function m() { require(a(true)); } }', { contract: 'C', bindings: {} }), /recursive helper/);
+});
+
+test('require of && becomes one verifying conjunct and || stays short-circuit', t => {
+  const source = `contract Pay<a: PublicKey, b: PublicKey> {
+    function spend(s: Signature, t: Signature) { require(checksig(s, a) && checksig(t, b)); }
+    function either(s: Signature, t: Signature) { require(checksig(s, a) || checksig(t, b)); }
+    function nested(s: Signature, t: Signature, u: Signature) { require((checksig(s, a) && checksig(t, b)) && checksig(u, a)); }
+    function single(s: Signature) { require(checksig(s, a)); }
+  }`;
+  const bindings = { Pay: { a: key3, b: key4 } };
+  const plain = compileContract(source, { contract: 'Pay', bindings, optimize: false });
+  const optimized = compileContract(source, { contract: 'Pay', bindings });
+  const ops = (artifact, name) => artifact.methods.find(method => method.name === name).sourceMap.map(entry => entry.op);
+  assert.deepEqual(ops(plain, 'spend'), ['N(1)', 'PICK', 'PUSH_32', 'CHECKSIG', 'VERIFY', 'ZERO', 'PICK', 'PUSH_32', 'CHECKSIG', 'VERIFY', 'DROP', 'DROP', 'N(1)']);
+  assert.deepEqual(ops(optimized, 'spend'), ['N(1)', 'PICK', 'PUSH_32', 'CHECKSIGVERIFY', 'DUP', 'PUSH_32', 'CHECKSIGVERIFY', 'DROP', 'DROP', 'N(1)']);
+  assert.equal(ops(plain, 'spend').includes('IF'), false);
+  assert.deepEqual(ops(optimized, 'nested').filter(op => op === 'CHECKSIGVERIFY'), ['CHECKSIGVERIFY', 'CHECKSIGVERIFY', 'CHECKSIGVERIFY']);
+  assert.equal(ops(optimized, 'nested').includes('IF'), false);
+  assert.deepEqual(ops(optimized, 'single'), ['PUSH_32', 'CHECKSIGVERIFY', 'N(1)']);
+  assert.ok(ops(plain, 'either').includes('IF') && ops(optimized, 'either').includes('IF'));
+  assert.equal(ops(optimized, 'either').includes('CHECKSIGVERIFY'), false);
+  const sign = secret => Buffer.from(schnorr.sign(new Uint8Array(32), unhex(`00`.repeat(31) + secret), new Uint8Array(32))).toString('hex');
+  const valid = sign('03'), other = sign('04');
+  const reference = process.env.LOTUS_V2_REFERENCE_PATH ?? join(import.meta.dirname, '../../lotus-v2-reference');
+  const python = process.env.LOTUS_V2_PYTHON ?? 'python3';
+  const vmReady = existsSync(join(reference, 'lotus_v2_reference/vm.py')) &&
+    spawnSync(python, ['-c', 'import blake3, coincurve'], { encoding: 'utf8' }).status === 0;
+  if (!vmReady) {
+    t.diagnostic('reference VM was not run');
+    return;
+  }
+  const sameBindings = { Pay: { a: key3, b: key3 } };
+  const samePlain = compileContract(source, { contract: 'Pay', bindings: sameBindings, optimize: false }).methods.find(method => method.name === 'spend').scriptHex;
+  const sameOptimized = compileContract(source, { contract: 'Pay', bindings: sameBindings }).methods.find(method => method.name === 'spend').scriptHex;
+  const spendBefore = plain.methods.find(method => method.name === 'spend').scriptHex;
+  const spendAfter = optimized.methods.find(method => method.name === 'spend').scriptHex;
+  const helper = `function authorized(sig: Signature, owner: PublicKey): Bool {
+      let ok: Bool = checksig(sig, owner);
+      require(ok);
+      return ok;
+    }
+    contract H<owner: PublicKey> { function spend(sig: Signature) { require(authorized(sig, owner)); } }`;
+  const helperOptions = { contract: 'H', bindings: { H: { owner: key3 } } };
+  const helperBefore = compileContract(helper, { ...helperOptions, optimize: false }).methods[0].scriptHex;
+  const helperAfter = compileContract(helper, helperOptions).methods[0].scriptHex;
+  const fixtures = [
+    { name: 'both signatures valid', before: samePlain, after: sameOptimized, args: [valid, valid], signing: true, expected: 'ok' },
+    { name: 'first signature invalid', before: samePlain, after: sameOptimized, args: ['00' + valid.slice(2), valid], signing: true, expected: 'error' },
+    { name: 'distinct keys accept', before: spendBefore, after: spendAfter, args: [valid, other], signing: true, expected: 'ok' },
+    { name: 'second signature rejects', before: spendBefore, after: spendAfter, args: [valid, valid], signing: true, expected: 'error' },
+    { name: 'let helper accepts', before: helperBefore, after: helperAfter, args: [valid], signing: true, expected: 'ok' },
+    { name: 'let helper rejects', before: helperBefore, after: helperAfter, args: ['00' + valid.slice(2)], signing: true, expected: 'error' },
+  ];
+  const run = spawnSync(python, [new URL('./optimizer-vm.py', import.meta.url).pathname], {
+    encoding: 'utf8', input: JSON.stringify(fixtures),
+    env: { ...process.env, PYTHONPATH: [reference, process.env.PYTHONPATH].filter(Boolean).join(':') },
+  });
+  assert.equal(run.status, 0, run.stderr || run.stdout);
+  assert.match(run.stdout, /differential passed/);
 });
 
 test('portable identifiers and case-folded method entrypoints avoid generated binding collisions', () => {
