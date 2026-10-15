@@ -25,7 +25,7 @@ test('portable requirements pass and Lotus obligations reject precisely on eCash
  const errors=checkCapabilities(ecash,requirements);
  assert.equal(errors.length,5);assert.deepEqual(errors.map(e=>e.capability),specialized);
  for(let i=0;i<errors.length;i++){
-  assert.equal(errors[i].code,'E0801');assert.deepEqual(errors[i].span,requirements[i].span);
+  assert.equal(errors[i].code,'E1201');assert.deepEqual(errors[i].span,requirements[i].span);
   assert.notEqual(errors[i].span,requirements[i].span);assert.ok(errors[i].message.includes(ECASH_REVISION));
  }
  assert.match(errors[0].message,/sixteen-byte signed int128/);
@@ -39,20 +39,27 @@ test('semantic models and entrypoints cannot inherit Lotus policy assumptions',(
  const ecash=resolveTarget('ecash'),lotus=resolveTarget('lotus-v2');
  assert.equal(ecash.revision,'1fb7db17c176cdea8a2c60d887891589382ee4e3');
  assert.equal(ecash.profile,'ecash-script-minimal-cleanstack-1fb7db17');
+ assert.equal(ecash.evaluationFlagPolicy,'standard-plus-minimalif-research');
+ assert.equal(ecash.sourceTree,'b2e4a0a9f57c593129028352d5dbb0c4ff294cdb');
+ assert.deepEqual(ecash.evaluationFlags,['P2SH','STRICTENC','SIGHASH_FORKID','LOW_S','NULLFAIL','MINIMALDATA',
+  'SCHNORR_MULTISIG','ENFORCE_SIGCHECKS','DERSIG','SIGPUSHONLY','DISCOURAGE_UPGRADABLE_NOPS',
+  'CLEANSTACK','CHECKLOCKTIMEVERIFY','CHECKSEQUENCEVERIFY','DISALLOW_SEGWIT_RECOVERY','INPUT_SIGCHECKS','MINIMALIF']);
  assert.deepEqual(ecash.limits,{maxScriptBytes:10000,maxElementBytes:520,maxStackItems:1000,maxOps:201});
  assert.equal(lotus.limits.maxStackItems,null);
  assert.equal(lotus.semantics.booleanEncoding,'canonical-int128-le');
  assert.equal(lotus.semantics.booleanConsumers,'canonical-zero-or-one');
  assert.equal(ecash.semantics.booleanEncoding,'minimal-scriptnum');
- assert.equal(ecash.semantics.booleanConsumers,'script-truthiness');
+ assert.equal(ecash.semantics.booleanConsumers,'script-truthiness-with-minimalif');
  assert.equal(ecash.semantics.signatureModel,'not-supported-by-compiler');
  assert.equal(ecash.semantics.commitmentModel,'external-script-wrapper-required');
  assert.equal(lotus.semantics.commitmentModel,'lotus-branches-and-paths');
  assert.deepEqual(checkEntrypoint(ecash,1),[]);assert.deepEqual(checkEntrypoint(lotus,2),[]);
+ assert.deepEqual(checkEntrypoint(lotus,16),[]);
+ assert.match(checkEntrypoint(lotus,17)[0].message,/at most 16 methods/);
  const span={start:4,end:20},[error]=checkEntrypoint(ecash,2,span);
- assert.equal(error.code,'E0802');assert.deepEqual(error.span,span);
+ assert.equal(error.code,'E1202');assert.deepEqual(error.span,span);
  assert.match(error.message,/explicit selector\/dispatch ABI/);
- for(const n of [0,-1,1.5,NaN,Infinity,Number.MAX_SAFE_INTEGER+1])assert.equal(checkEntrypoint(lotus,n)[0].code,'E0802');
+ for(const n of [0,-1,1.5,NaN,Infinity,Number.MAX_SAFE_INTEGER+1])assert.equal(checkEntrypoint(lotus,n)[0].code,'E1202');
 });
 
 test('unknown runtime capabilities fail closed; repeated obligations retain locations',()=>{

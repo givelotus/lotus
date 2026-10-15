@@ -16,14 +16,17 @@ export type TargetDescriptor = {
   readonly limitsScope: 'compiler' | 'vm-consensus';
   readonly semantics: Readonly<{
     booleanEncoding: 'canonical-int128-le' | 'minimal-scriptnum';
-    booleanConsumers: 'canonical-zero-or-one' | 'script-truthiness';
+    booleanConsumers: 'canonical-zero-or-one' | 'script-truthiness-with-minimalif';
     integerModel: 'signed-int128' | 'not-supported-by-compiler';
     signatureModel: 'lotus-p01' | 'not-supported-by-compiler';
     entrypoint: 'merkle-branch-per-method' | 'single-method-script';
     commitmentModel: 'lotus-branches-and-paths' | 'external-script-wrapper-required';
   }>;
-  /** Explicit evaluation flags for the proposed eCash test profile only. */
+  /** Exact pin's STANDARD_SCRIPT_VERIFY_FLAGS plus MINIMALIF; research profile, not network defaults. */
   readonly evaluationFlags: readonly string[];
+  readonly maxMethods: number;
+  readonly evaluationFlagPolicy: 'caller-invocation-profile' | 'standard-plus-minimalif-research';
+  readonly sourceTree?: string;
 };
 
 export const ECASH_REVISION = '1fb7db17c176cdea8a2c60d887891589382ee4e3';
@@ -37,16 +40,20 @@ const lotus: TargetDescriptor = Object.freeze({
   semantics: Object.freeze({ booleanEncoding: 'canonical-int128-le', booleanConsumers: 'canonical-zero-or-one',
     integerModel: 'signed-int128', signatureModel: 'lotus-p01', entrypoint: 'merkle-branch-per-method',
     commitmentModel: 'lotus-branches-and-paths' }),
-  evaluationFlags: Object.freeze([]),
+  evaluationFlags: Object.freeze([]), maxMethods: 16, evaluationFlagPolicy: 'caller-invocation-profile',
 });
 const ecash: TargetDescriptor = Object.freeze({
   id: 'ecash', revision: ECASH_REVISION, profile: 'ecash-script-minimal-cleanstack-1fb7db17',
   capabilities: Object.freeze([...portable]), capabilityScope: 'compiler-implemented', limitsScope: 'vm-consensus',
   limits: Object.freeze({ maxScriptBytes: 10000, maxElementBytes: 520, maxStackItems: 1000, maxOps: 201 }),
-  semantics: Object.freeze({ booleanEncoding: 'minimal-scriptnum', booleanConsumers: 'script-truthiness',
+  semantics: Object.freeze({ booleanEncoding: 'minimal-scriptnum', booleanConsumers: 'script-truthiness-with-minimalif',
     integerModel: 'not-supported-by-compiler', signatureModel: 'not-supported-by-compiler',
     entrypoint: 'single-method-script', commitmentModel: 'external-script-wrapper-required' }),
-  evaluationFlags: Object.freeze(['P2SH', 'STRICTENC', 'MINIMALDATA', 'NULLFAIL', 'CLEANSTACK', 'ENABLE_SIGHASH_FORKID']),
+  maxMethods: 1, evaluationFlagPolicy: 'standard-plus-minimalif-research',
+  sourceTree: 'b2e4a0a9f57c593129028352d5dbb0c4ff294cdb',
+  evaluationFlags: Object.freeze(['P2SH', 'STRICTENC', 'SIGHASH_FORKID', 'LOW_S', 'NULLFAIL', 'MINIMALDATA',
+    'SCHNORR_MULTISIG', 'ENFORCE_SIGCHECKS', 'DERSIG', 'SIGPUSHONLY', 'DISCOURAGE_UPGRADABLE_NOPS',
+    'CLEANSTACK', 'CHECKLOCKTIMEVERIFY', 'CHECKSEQUENCEVERIFY', 'DISALLOW_SEGWIT_RECOVERY', 'INPUT_SIGCHECKS', 'MINIMALIF']),
 });
 
 /** Exact identifiers only: aliases and inherited defaults are caller policy. */
@@ -68,20 +75,23 @@ const ecashReasons: Readonly<Record<typeof lotusOnly[number], string>> = Object.
 export function checkCapabilities(target: TargetDescriptor, requirements: readonly CapabilityRequirement[]): TargetDiagnostic[] {
   return requirements.flatMap(requirement => {
     if (target.capabilities.includes(requirement.capability)) return [];
-    const reason = target.id === 'ecash' && requirement.capability in ecashReasons
+    const reason = target.id === 'ecash' && Object.hasOwn(ecashReasons, requirement.capability)
       ? ecashReasons[requirement.capability as keyof typeof ecashReasons]
       : `Capability ${JSON.stringify(requirement.capability)} is not implemented by target ${target.id}.`;
-    return [{ code: 'E0801', message: `${target.id} (${target.revision}): ${reason}`,
+    return [{ code: 'E1201', message: `${target.id} (${target.revision}): ${reason}`,
       ...(requirement.span ? { span: { ...requirement.span } } : {}), capability: requirement.capability }];
   });
 }
 
 /** eCash method dispatch must be designed explicitly, never inherited from Lotus. */
 export function checkEntrypoint(target: TargetDescriptor, methodCount: number, span?: SourceSpan): TargetDiagnostic[] {
-  if (!Number.isSafeInteger(methodCount) || methodCount < 1) return [{ code: 'E0802',
+  if (!Number.isSafeInteger(methodCount) || methodCount < 1) return [{ code: 'E1202',
     message: 'A target entrypoint requires a positive safe integer method count.', ...(span ? { span: { ...span } } : {}) }];
-  if (target.semantics.entrypoint === 'single-method-script' && methodCount !== 1) return [{ code: 'E0802',
+  if (target.semantics.entrypoint === 'single-method-script' && methodCount !== 1) return [{ code: 'E1202',
     message: `${target.id} emits one method script; ${methodCount} methods require an explicit selector/dispatch ABI, which is not implemented. Lotus branch proofs cannot select eCash entrypoints.`,
+    ...(span ? { span: { ...span } } : {}) }];
+  if (methodCount > target.maxMethods) return [{ code: 'E1202',
+    message: `${target.id} compiler supports at most ${target.maxMethods} methods; received ${methodCount}.`,
     ...(span ? { span: { ...span } } : {}) }];
   return [];
 }
