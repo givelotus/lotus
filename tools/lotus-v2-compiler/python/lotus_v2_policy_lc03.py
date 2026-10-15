@@ -16,6 +16,14 @@ def hash32(value):
     if not isinstance(value, str) or not re.fullmatch('[0-9a-f]{64}', value): fail('policy hash')
 
 
+METADATA_KEYS = ('target', 'targetDigest', 'profileDigest', 'compilerRevision', 'optimizerMode', 'constructor', 'bindings', 'provenance')
+BRANCH_KEYS = ('name', 'index', 'kind', 'root', 'artifactDigest')
+
+
+def fields(value, allowed):
+    if any(key not in allowed for key in value): fail('policy unknown field')
+
+
 def canonical_policy_json(value):
     if value is None or type(value) is bool: return json.dumps(value)
     if isinstance(value, str):
@@ -37,12 +45,21 @@ def program_artifact_digest(artifact):
 
 
 def build_policy(spec, metadata):
+    fields(spec, ('name', 'branches', 'paths'))
+    fields(metadata, METADATA_KEYS)
     name(spec['name'])
     if type(spec['branches']) is not list or not 1 <= len(spec['branches']) <= 16 or type(spec['paths']) is not list or not 1 <= len(spec['paths']) <= 16: fail('policy branch/path count')
     hash32(metadata.get('targetDigest')); hash32(metadata.get('profileDigest'))
     if any(type(metadata.get(k)) is not str or not metadata[k] for k in ('target', 'compilerRevision', 'optimizerMode')): fail('policy metadata')
     if type(metadata.get('constructor')) is not list or type(metadata.get('bindings')) is not dict or type(metadata.get('provenance')) is not dict: fail('policy metadata')
     canonical_policy_json(metadata)
+    for branch in spec['branches']:
+        if type(branch) is not dict: fail('policy artifact structure')
+        fields(branch, BRANCH_KEYS)
+        if type(branch.get('index')) is not int or not 0 <= branch['index'] <= 15: fail('policy slots')
+    for path in spec['paths']:
+        if type(path) is not dict: fail('policy artifact structure')
+        fields(path, ('name', 'branches'))
     branches = sorted((dict(b) for b in spec['branches']), key=lambda b: b['index'])
     names, roots = set(), set()
     for i, b in enumerate(branches):
@@ -80,6 +97,9 @@ def build_policy(spec, metadata):
 
 def assert_policy_artifact(artifact):
     if type(artifact) is not dict or type(artifact.get('branches')) is not list or type(artifact.get('paths')) is not list or any(type(b) is not dict for b in artifact['branches']) or any(type(p) is not dict or type(p.get('slots')) is not list or any(type(i) is not int for i in p['slots']) for p in artifact['paths']): fail('policy artifact structure')
+    fields(artifact, (*METADATA_KEYS, 'schema', 'languageVersion', 'name', 'branches', 'paths', 'policyEncoding', 'policyDigest'))
+    for branch in artifact['branches']: fields(branch, BRANCH_KEYS)
+    for path in artifact['paths']: fields(path, ('name', 'pathIndex', 'slots'))
     if artifact.get('schema') != 'lotus-v2/policy-artifact/1' or type(artifact.get('languageVersion')) is not int or artifact['languageVersion'] != 1: fail('unsupported policy artifact')
     metadata = {k: v for k, v in artifact.items() if k not in ('schema', 'languageVersion', 'name', 'branches', 'paths', 'policyEncoding', 'policyDigest')}
     branches = artifact['branches']

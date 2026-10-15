@@ -4,9 +4,7 @@ import {spawnSync} from 'node:child_process';
 import {compileContract} from '../dist/generic.js';
 import {buildPolicy,assertPolicyArtifact,selectPolicyWitnesses,selectMintWitness,programArtifactDigest,canonicalPolicyJson,spendPolicyBranch,requireEveryPath} from '../dist/policy.js';
 const metadata={target:'P01-P02-P03-candidate-2026-10-14',targetDigest:'11'.repeat(32),profileDigest:'22'.repeat(32),compilerRevision:'lc03-test',optimizerMode:'off',constructor:[],bindings:{},provenance:{}};
-// At this ticket's exact base the frontend is legacy. Invocation metadata is
-// supplied explicitly for boundary tests; LC02 integration tests cover guards.
-function program(n){const a=compileContract(`contract A { function run() { require(${n} == ${n}); } }`,{contract:'A',bindings:{},optimize:false});a.languageVersion=1;a.methods.forEach(m=>m.invocation='spend');return a;}
+function program(n){return compileContract(`contract A { entry run() { require(${n} == ${n}); } }`,{contract:'A',bindings:{},optimize:false,languageVersion:1});}
 const a=program(1),b=program(2);
 const branch=(name,index,a)=>({name,index,kind:'spend',root:a.policy.root,artifactDigest:programArtifactDigest(a)});
 const spec={name:'Escrow',branches:[branch('owner',0,a),branch('rules',1,b),{name:'state',index:2,kind:'data',root:'33'.repeat(32)}],paths:[{name:'all',branches:['rules','owner']},{name:'ownerOnly',branches:['owner']}]};
@@ -17,7 +15,7 @@ test('LC03 canonical policy bytes and named paths ignore declaration order',()=>
 test('LC03 invalid slots roots paths data and bounds reject identically',()=>{const mutate=fn=>{const s=structuredClone(spec);fn(s);return s;};parityError(mutate(s=>s.branches[2].index=3),'policy slots');parityError(mutate(s=>s.branches[2].index=1),'policy slots');parityError(mutate(s=>s.branches[2].root=s.branches[0].root),'duplicate branch root');parityError(mutate(s=>s.paths[0].branches=['state']),'data branch in path');parityError(mutate(s=>s.paths[0].branches=['owner','owner']),'duplicate path slot');parityError(mutate(s=>s.paths[0].branches=['owner']),'duplicate path');parityError(mutate(s=>s.paths=[]),'policy branch/path count');parityError(mutate(s=>s.branches=Array(17).fill(s.branches[0])),'policy branch/path count');parityError(mutate(s=>s.paths=Array(17).fill(s.paths[0])),'policy branch/path count');});
 test('LC03 named witnesses exact membership and canonical branch order',()=>{const p=buildPolicy(spec,metadata),ws=[witness('rules',b),witness('owner',a)],result=selectPolicyWitnesses(p,'all',ws);assert.deepEqual(result.witnesses.map(w=>w.branchIndex),[0,1]);assert.deepEqual(py('select',{artifact:p,path:'all',witnesses:ws}),{ok:result});for(const [w,error] of [[[ws[0]],'policy witness membership'],[[...ws,witness('extra',a)],'policy witness membership'],[[ws[0],ws[0]],'duplicate named witness']]){assert.throws(()=>selectPolicyWitnesses(p,'all',w),{message:error});assert.deepEqual(py('select',{artifact:p,path:'all',witnesses:w}),{error});}});
 test('LC03 loaded artifacts and witness proofs/identities/kinds are checked',()=>{const p=buildPolicy(spec,metadata);const cases=[['proof',w=>w.artifact.methods[0].proof=['44'.repeat(32)],'policy program artifact'],['root',w=>w.artifact=b,'policy program identity'],['kind',w=>w.artifact.methods[0].invocation='mint','policy invocation kind'],['method',w=>w.methodName='missing','policy method'],['args',w=>w.arguments.extra=true,'policy arguments']];for(const [label,mutate,error] of cases){const w=structuredClone(witness('owner',a));mutate(w);assert.throws(()=>selectPolicyWitnesses(p,'ownerOnly',[w]),{message:error},label);assert.deepEqual(py('select',{artifact:p,path:'ownerOnly',witnesses:[w]}),{error});}for(const mutate of [p=>p.policyEncoding='00',p=>p.policyDigest='00'.repeat(32),p=>p.paths[0].pathIndex=9,p=>p.branches.reverse()]){const q=structuredClone(p);mutate(q);assert.throws(()=>assertPolicyArtifact(q));assert.ok(py('load',{artifact:q}).error);}});
-test('LC03 mint has no output slot/path and rejects spend programs',()=>{const mint=structuredClone(a);mint.kind='token';mint.methods[0].invocation='mint';mint.methods[0].mintAmountParam='delta';const w={artifact:mint,methodName:'run',arguments:{}};const result=selectMintWitness(w);assert.equal(result.tokenId,mint.policy.root);assert.equal('branchIndex' in result,false);assert.equal('pathIndex' in result,false);assert.deepEqual(py('mint',{witness:w}),{ok:result});assert.throws(()=>selectMintWitness(witness('owner',a)),{message:'policy invocation kind'});});
+test('LC03 mint has no output slot/path and rejects spend programs',()=>{const mint=compileContract('token A { mint run(delta: Amount) { require(delta > 0); } }',{contract:'A',bindings:{},languageVersion:1});const w={artifact:mint,methodName:'run',arguments:{}};const result=selectMintWitness(w);assert.equal(result.tokenId,mint.policy.root);assert.equal('branchIndex' in result,false);assert.equal('pathIndex' in result,false);assert.deepEqual(py('mint',{witness:w}),{ok:result});assert.throws(()=>selectMintWitness(witness('owner',a)),{message:'policy invocation kind'});});
 test('LC03 canonical JSON rejects ambiguous diagnostic encodings',()=>{assert.equal(canonicalPolicyJson({b:1,a:'x'}),'{"a":"x","b":1}');for(const value of [1.5,Number.MAX_SAFE_INTEGER+1])assert.throws(()=>canonicalPolicyJson(value),{message:'policy JSON number'});assert.throws(()=>canonicalPolicyJson('é'),{message:'policy JSON string'});});
 
 test('LC03 exact 16 branch/path bound and declaration permutations',()=>{
@@ -30,16 +28,40 @@ test('LC03 exact 16 branch/path bound and declaration permutations',()=>{
 });
 test('LC03 typed spend branch rejects mint and mandatory branch assertion is explicit',()=>{
  assert.deepEqual(spendPolicyBranch('owner',0,a),spec.branches[0]);
- const mint=structuredClone(a);mint.kind='token';mint.methods[0].invocation='mint';assert.throws(()=>spendPolicyBranch('mint',0,mint),{message:'policy invocation kind'});
+ const mint=compileContract('token A { mint run(delta: Amount) { require(delta > 0); } }',{contract:'A',bindings:{},languageVersion:1});assert.throws(()=>spendPolicyBranch('mint',0,mint),{message:'policy invocation kind'});
  const p=buildPolicy(spec,metadata);requireEveryPath(p,'owner');for(const n of ['rules','state','unknown'])assert.throws(()=>requireEveryPath(p,n),{message:'policy every path'});
 });
 
 test('LC03 named argument encoding/order and malformed loaded artifacts parity',()=>{
- const artifact=compileContract('contract Args { function run(n: Int, z: Bytes32) { require(n == n); require(z == z); } }',{contract:'Args',bindings:{},optimize:false});artifact.languageVersion=1;artifact.methods[0].invocation='spend';
+ const artifact=compileContract('contract Args { entry run(n: Int, z: Bytes32) { require(n == n); require(z == z); } }',{contract:'Args',bindings:{},optimize:false,languageVersion:1});
  const policy=buildPolicy({name:'Args',branches:[spendPolicyBranch('args',0,artifact)],paths:[{name:'call',branches:['args']}]},metadata);
  const w={branchName:'args',artifact,methodName:'run',arguments:{z:new Uint8Array(32),n:123n}};
  const result=selectPolicyWitnesses(policy,'call',[w]);assert.deepEqual(result.witnesses[0].argumentNames,['n','z']);assert.equal(result.witnesses[0].argumentOrder[0],'7b'+'00'.repeat(15));assert.deepEqual(py('select',{artifact:policy,path:'call',witnesses:[w]}),{ok:result});
  w.arguments.z=new Uint8Array(31);assert.throws(()=>selectPolicyWitnesses(policy,'call',[w]),{message:'policy argument value'});assert.deepEqual(py('select',{artifact:policy,path:'call',witnesses:[w]}),{error:'policy argument value'});
  for(const malformed of [null,{}, {...policy,paths:[{name:'x',slots:[false]}]}]){assert.throws(()=>assertPolicyArtifact(malformed),{message:'policy artifact structure'});assert.deepEqual(py('load',{artifact:malformed}),{error:'policy artifact structure'});}
- const mint=structuredClone(a);mint.kind='token';mint.methods[0].invocation='mint';mint.methods[0].mintAmountParam='delta';const mw={artifact:mint,methodName:'run',arguments:{},branchIndex:0};assert.throws(()=>selectMintWitness(mw),{message:'mint policy selector'});assert.deepEqual(py('mint',{witness:mw}),{error:'mint policy selector'});
+ const mint=compileContract('token A { mint run(delta: Amount) { require(delta > 0); } }',{contract:'A',bindings:{},languageVersion:1});const mw={artifact:mint,methodName:'run',arguments:{},branchIndex:0};assert.throws(()=>selectMintWitness(mw),{message:'mint policy selector'});assert.deepEqual(py('mint',{witness:mw}),{error:'mint policy selector'});
+});
+
+test('LC03 malformed index types reject before sorting with exact peer errors',()=>{
+ for(const index of [null,true,'0',0.5,-1,16]) {const invalid=structuredClone(spec);invalid.branches[1].index=index;parityError(invalid,'policy slots');}
+});
+test('LC03 closed schema rejects unknown fields at builder and loader boundaries',()=>{
+ for(const mutate of [s=>s.extra=1,s=>s.branches[0].extra=1,s=>s.paths[0].extra=1]) {const invalid=structuredClone(spec);mutate(invalid);parityError(invalid,'policy unknown field');}
+ const policy=buildPolicy(spec,metadata);
+ for(const mutate of [p=>p.extra=1,p=>p.branches[0].extra=1,p=>p.paths[0].extra=1]) {const invalid=structuredClone(policy);mutate(invalid);assert.throws(()=>assertPolicyArtifact(invalid),{message:'policy unknown field'});assert.deepEqual(py('load',{artifact:invalid}),{error:'policy unknown field'});}
+ const extra={...metadata,extra:1};assert.throws(()=>buildPolicy(spec,extra),{message:'policy unknown field'});assert.deepEqual(py('build',{spec,metadata:extra}),{error:'policy unknown field'});
+});
+test('LC03 real LC02 guard artifacts select and independently execute under both invocation kinds',()=>{
+ const fixtures=[];
+ for(const optimize of [false,true]) {
+  const spend=compileContract('contract C { entry use(x: Int) { require(x > 0); } }',{contract:'C',bindings:{},languageVersion:1,optimize});
+  const mint=compileContract('token C { mint issue(delta: Amount, x: Int) { require(x > 0); require(delta > 0); } }',{contract:'C',bindings:{},languageVersion:1,optimize});
+  const policy=buildPolicy({name:'RealGuard',branches:[spendPolicyBranch('spend',0,spend)],paths:[{name:'call',branches:['spend']}]},metadata);
+  const witnesses=[{branchName:'spend',artifact:spend,methodName:'use',arguments:{x:1n}}];
+  const result=selectPolicyWitnesses(policy,'call',witnesses);assert.deepEqual(py('select',{artifact:policy,path:'call',witnesses}),{ok:result});
+  const witness={artifact:mint,methodName:'issue',arguments:{x:1n}};assert.deepEqual(py('mint',{witness}),{ok:selectMintWitness(witness)});
+  for(const [kind,artifact] of [['spend',spend],['mint',mint]]) {assert.equal(artifact.methods[0].sourceMap[0].op,'INVOCATIONKIND');fixtures.push({kind,method:artifact.methods[0]});}
+ }
+ const run=spawnSync(process.env.LOTUS_V2_PYTHON??'python3',[new URL('./lc02-vm.py',import.meta.url).pathname],{input:JSON.stringify(fixtures),encoding:'utf8',env:{...process.env,PYTHONPATH:new URL('../../lotus-v2-reference',import.meta.url).pathname}});
+ assert.equal(run.status,0,run.stderr||run.stdout);assert.match(run.stdout,/16 cases passed/);
 });

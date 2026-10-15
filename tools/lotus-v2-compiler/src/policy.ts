@@ -52,6 +52,11 @@ function name(v: unknown) { if (typeof v !== 'string' || !/^[A-Za-z_][A-Za-z_0-9
     fail('policy name'); }
 function hash(v: unknown) { if (typeof v !== 'string' || !/^[0-9a-f]{64}$/.test(v))
     fail('policy hash'); }
+const metadataKeys = ['target', 'targetDigest', 'profileDigest', 'compilerRevision', 'optimizerMode', 'constructor', 'bindings', 'provenance'];
+const branchKeys = ['name', 'index', 'kind', 'root', 'artifactDigest'];
+function fields(value: object, allowed: string[]): void {
+    if (Object.keys(value).some(key => !allowed.includes(key))) fail('policy unknown field');
+}
 /** Sorted ASCII keys/strings and safe integral numbers, identically encoded in Python. */
 export function canonicalPolicyJson(v: unknown): string {
     if (v === null || typeof v === 'boolean')
@@ -77,6 +82,8 @@ function compare(a: number[], b: number[]): number { for (let i = 0; i < Math.mi
     if (a[i] !== b[i])
         return a[i]! - b[i]!; return a.length - b.length; }
 export function buildPolicy(spec: PolicySpec, metadata: PolicyMetadata): PolicyArtifact {
+    fields(spec, ['name', 'branches', 'paths']);
+    fields(metadata, metadataKeys);
     name(spec.name);
     if (!Array.isArray(spec.branches) || spec.branches.length < 1 || spec.branches.length > 16 || !Array.isArray(spec.paths) || spec.paths.length < 1 || spec.paths.length > 16)
         fail('policy branch/path count');
@@ -88,6 +95,15 @@ export function buildPolicy(spec: PolicySpec, metadata: PolicyMetadata): PolicyA
     if (!Array.isArray(metadata.constructor) || !metadata.bindings || Object.getPrototypeOf(metadata.bindings) !== Object.prototype || !metadata.provenance || Object.getPrototypeOf(metadata.provenance) !== Object.prototype)
         fail('policy metadata');
     canonicalPolicyJson(metadata);
+    for (const branch of spec.branches) {
+        if (!branch || typeof branch !== 'object' || Array.isArray(branch)) fail('policy artifact structure');
+        fields(branch, branchKeys);
+        if (!Number.isInteger(branch.index) || branch.index < 0 || branch.index > 15) fail('policy slots');
+    }
+    for (const path of spec.paths) {
+        if (!path || typeof path !== 'object' || Array.isArray(path)) fail('policy artifact structure');
+        fields(path, ['name', 'branches']);
+    }
     const branches = spec.branches.map(b => ({ ...b })).sort((a, b) => a.index - b.index), names = new Set<string>(), roots = new Set<string>();
     branches.forEach((b, i) => { name(b.name); hash(b.root); if (!Number.isInteger(b.index) || b.index !== i)
         fail('policy slots'); if (names.has(b.name.toLowerCase()))
@@ -110,8 +126,11 @@ export function buildPolicy(spec: PolicySpec, metadata: PolicyMetadata): PolicyA
     return { ...metadata, schema: 'lotus-v2/policy-artifact/1', languageVersion: 1, name: spec.name, branches, paths, policyEncoding: hex(encoding), policyDigest: hex(tagged('app/policy/1', encoding)) };
 }
 export function assertPolicyArtifact(a: PolicyArtifact): void {
-    if (!a || typeof a !== 'object' || !Array.isArray(a.branches) || !Array.isArray(a.paths) || a.branches.some(b => !b || typeof b !== 'object') || a.paths.some(p => !p || typeof p !== 'object' || !Array.isArray(p.slots) || p.slots.some(i => !Number.isInteger(i))))
+    if (!a || typeof a !== 'object' || !Array.isArray(a.branches) || !Array.isArray(a.paths) || a.branches.some(b => !b || typeof b !== 'object' || Array.isArray(b)) || a.paths.some(p => !p || typeof p !== 'object' || Array.isArray(p) || !Array.isArray(p.slots) || p.slots.some(i => !Number.isInteger(i))))
         fail('policy artifact structure');
+    fields(a, [...metadataKeys, 'schema', 'languageVersion', 'name', 'branches', 'paths', 'policyEncoding', 'policyDigest']);
+    for (const branch of a.branches) fields(branch, branchKeys);
+    for (const path of a.paths) fields(path, ['name', 'pathIndex', 'slots']);
     if (a.schema !== 'lotus-v2/policy-artifact/1' || a.languageVersion !== 1)
         fail('unsupported policy artifact');
     const { schema: _s, languageVersion: _l, name: n, branches, paths, policyEncoding: _e, policyDigest: _d, ...metadata } = a;
