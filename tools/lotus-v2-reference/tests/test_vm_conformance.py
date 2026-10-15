@@ -98,3 +98,11 @@ class Conformance(unittest.TestCase):
         tx = Transaction(0, (Input(bytes(32), 0, 0xffffffff, 1, 0, (Witness(script),)),), ())
         with self.assertRaisesRegex(SigningError, 'membership'):
             authenticated_context(tx, TP, CHAIN, (coin,), 0, 0)
+
+    def test_factory_rejects_noncanonical_indices(self):
+        script = b"\x4e"
+        coin = Output(0, 1, None, (branch_leaf_hash(script),), ((0,),))
+        tx = Transaction(0, (Input(bytes(32), 0, 0xffffffff, 1, 0, (Witness(script),)),), ())
+        for input_index, witness_index in ((-1, 0), (True, 0), (0, -1), (0, False), (1, 0), (0, 1)):
+            with self.subTest(indices=(input_index, witness_index)), self.assertRaises(ValueError):
+                authenticated_context(tx, TP, CHAIN, (coin,), input_index, witness_index)

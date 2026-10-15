@@ -160,6 +160,10 @@ def authenticated_context(tx, profile, chain_id: bytes, resolved: tuple,
     from .signing import _prepare, identity_digests, signing_message, _branch_leaf
     from .vm import SigningContext
     _prepare(tx, profile, chain_id, resolved)
+    if type(input_index) is not int or not 0 <= input_index < len(tx.inputs):
+        raise ValueError("invocation input index out of range")
+    if type(witness_index) is not int or not 0 <= witness_index < len(tx.inputs[input_index].witnesses):
+        raise ValueError("invocation witness index out of range")
     active = tx.inputs[input_index]
     witness = active.witnesses[witness_index]
     mint = active.flags == 3
