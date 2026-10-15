@@ -17,7 +17,7 @@ export type Visibility = 'private' | 'package' | 'export';
 export type Helper = { name: string; params: Param[]; result: ValueType; body: Expr; span: Span; visibility: Visibility };
 export type Method = { name: string; params: Param[]; body: Stmt[]; span: Span };
 export type Contract = { name: string; kind: 'contract' | 'token'; params: Param[]; methods: Method[]; span: Span };
-/** `import TARGET::path::{a, b as c};` or `import TARGET::path as alias;` where TARGET is a dependency alias or `package`. */
+/** `import TARGET::path::{a, b as c};` or `import TARGET::path as alias;`. TARGET is a dependency alias, `package`, or a quoted module selector (`"host/owner/repo@vX.Y.Z"`). */
 export type ImportDecl = { target: string; targetSpan: Span; path: string[]; pathSpan: Span; span: Span;
   items?: { name: string; local: string; span: Span }[]; moduleAlias?: { name: string; span: Span } };
 export type Program = { helpers: Map<string, Helper>; contracts: Map<string, Contract>; imports: ImportDecl[] };
@@ -39,7 +39,7 @@ function symbol(name: string): void { assertPortableName(name); }
 function utf8Offset(source: string, utf16: number): number { return new TextEncoder().encode(source.slice(0, utf16)).length; }
 function lex(source: string): Token[] {
   if (new TextEncoder().encode(source).length > MAX_SOURCE) throw new Error('source exceeds 65536 UTF-8 bytes');
-  const re = /\s+|\/\/[^\n]*|\/\*[\s\S]*?\*\/|==|!=|>=|<=|\+=|-=|&&|\|\||::|[A-Za-z_][A-Za-z_0-9]*|[0-9]+|[<>{}():;,.!+*\-=]/gy;
+  const re = /\s+|\/\/[^\n]*|\/\*[\s\S]*?\*\/|==|!=|>=|<=|\+=|-=|&&|\|\||::|"[^"\\\n]*"|[A-Za-z_][A-Za-z_0-9]*|[0-9]+|[<>{}():;,.!+*\-=]/gy;
   const out: Token[] = []; let pos = 0;
   while (pos < source.length) {
     re.lastIndex = pos; const m = re.exec(source);
@@ -118,8 +118,13 @@ class Parser {
   }
   private importDecl(start: Token): ImportDecl {
     const target = this.take();
-    if (target.text !== 'package' && !/^[A-Za-z_][A-Za-z_0-9]*$/.test(target.text)) throw new Error(`expected dependency alias or package at UTF-8 byte ${target.span.start}`);
-    if (target.text !== 'package') symbol(target.text);
+    let targetText = target.text;
+    if (targetText.startsWith('"')) {
+      if (targetText.length < 2 || !targetText.endsWith('"')) throw new Error(`unterminated import path at UTF-8 byte ${target.span.start}`);
+      targetText = targetText.slice(1, -1);
+      if (!targetText) throw new Error(`empty import path at UTF-8 byte ${target.span.start}`);
+    } else if (targetText !== 'package' && !/^[A-Za-z_][A-Za-z_0-9]*$/.test(targetText)) throw new Error(`expected dependency alias, package, or quoted module path at UTF-8 byte ${target.span.start}`);
+    if (!targetText.startsWith('"') && targetText !== 'package' && !targetText.includes('/')) symbol(targetText);
     const path: string[] = []; let items: ImportDecl['items']; let pathEnd = target.span.end;
     while (this.peek().text === '::') {
       this.take('::');
@@ -144,7 +149,7 @@ class Parser {
       this.take('as'); const alias = this.ident(); symbol(alias.text); moduleAlias = { name: alias.text, span: alias.span };
     }
     const end = this.take(';');
-    return { target: target.text, targetSpan: target.span, path, pathSpan: { start: target.span.start, end: pathEnd },
+    return { target: targetText, targetSpan: target.span, path, pathSpan: { start: target.span.start, end: pathEnd },
       span: { start: start.span.start, end: end.span.end }, ...(items ? { items } : {}), ...(moduleAlias ? { moduleAlias } : {}) };
   }
   parse(requireContract = true): Program {
