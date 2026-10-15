@@ -11,10 +11,10 @@ import 'package:vase/utils/currency.dart';
 import 'package:vase/features/wallet/wallet_model.dart';
 
 class RequestPage extends HookWidget {
-  const RequestPage({Key? key, this.initialAmount}) : super(key: key);
+  const RequestPage({Key? key, this.initialAmount, this.onBack})
+    : super(key: key);
 
   final BigInt? initialAmount;
-
   String _createAddressUri(String address, String amount) {
     // Can't mutate the URI, so need a way to add query strings.
     final parsedAddress = Uri.parse(address);
@@ -25,6 +25,8 @@ class RequestPage extends HookWidget {
       queryParameters: {'amount': '$amountSats'},
     ).toString();
   }
+
+  final VoidCallback? onBack;
 
   @override
   Widget build(BuildContext context) {
@@ -47,7 +49,7 @@ class RequestPage extends HookWidget {
         elevation: 0,
         leading: IconButton(
           splashRadius: AppTheme.splashRadius,
-          onPressed: () => context.pop(),
+          onPressed: onBack ?? () => context.pop(),
           icon: const Icon(Icons.navigate_before),
         ),
         title: const Text('Request'),

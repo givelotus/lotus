@@ -6,17 +6,17 @@ import 'package:provider/provider.dart';
 import 'package:sentry_flutter/sentry_flutter.dart';
 import 'package:vase/chronik-client/client.dart';
 import 'package:vase/config/theme.dart';
-import 'package:vase/features/home/home_page.dart';
+import 'package:vase/features/home/wallet_pager.dart';
 import 'package:vase/features/numpad/numpad_model.dart';
-import 'package:vase/features/request/request_page.dart';
 import 'package:vase/features/send/send_model.dart';
 import 'package:vase/features/send/send_page.dart';
-import 'package:vase/features/settings/settings_page.dart';
 import 'package:vase/features/wallet/wallet_lifecycle_watcher.dart';
 import 'package:vase/features/wallet/wallet_model.dart';
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
+  // All app routes have direct-linkable paths, including pushed detail pages.
+  GoRouter.optionURLReflectsImperativeAPIs = true;
   await SentryFlutter.init(
     (options) {
       options.dsn =
@@ -50,14 +50,7 @@ class VaseApp extends StatelessWidget {
 
   final router = GoRouter(
     routes: [
-      GoRoute(path: '/', builder: (ctx, state) => const HomePage()),
-      GoRoute(path: '/settings', builder: (ctx, state) => const SettingsPage()),
-      GoRoute(
-        path: '/request',
-        builder: (ctx, state) => RequestPage(
-          initialAmount: state.extra is BigInt ? state.extra as BigInt : null,
-        ),
-      ),
+      ...walletPageRoutes(),
       GoRoute(path: '/send', builder: (ctx, state) => const SendPage()),
     ],
   );

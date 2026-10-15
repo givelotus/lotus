@@ -96,3 +96,137 @@ show an error instead of silently rounding a payment.
 Closing the editor discards its draft. Done commits the amount once; reopening
 starts from that amount. Receive requests can exceed your current balance and
 remain separate from Send. QR codes and copied requests carry base-unit amounts.
+
+### iOS simulator development
+
+Use a dedicated simulator for wallet previews so existing app/keychain data stays
+separate. With full Xcode installed, scope its developer directory to each command
+instead of changing the system `xcode-select` setting:
+
+```sh
+cd wallets/vase/vase-client
+DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer tool/with_xcode.sh flutter pub get
+DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer tool/with_xcode.sh flutter build ios --simulator --debug --no-pub
+```
+
+Run `pub get` with the same developer directory: otherwise generated plugin
+metadata can incorrectly report Swift Package Manager unavailable. The wrapper
+also preserves that selection for Dart native build hooks, which filter ordinary
+environment variables but forward PATH. It creates a temporary `xcrun` wrapper
+and removes it after the command; it does not change system tool configuration.
+
+Current Sentry requires SwiftPM; the app enables it in its project configuration.
+All current iOS plugins support SwiftPM, and the old iOS CocoaPods integration
+has been removed. The first build fetches native framework dependencies and may
+take several minutes. Simulator builds do not need an Apple developer account;
+signing/distribution and physical-device checks are separate. Xcode 27 / iOS 27
+simulator builds pass; camera, push notifications and existing-wallet keychain
+migration still require separate device checks.
+
+For a local simulator preview, point the existing Chronik override at a running
+local Lotus node (the simulator shares the Mac's loopback network):
+
+```sh
+tool/with_xcode.sh flutter build ios --simulator --debug --no-pub \
+  --dart-define=CHRONIK_URL=http://127.0.0.1:19331
+```
+
+Use the port of your own isolated node. This changes the preview build only;
+it does not provide an automatic fallback or change release defaults. A backend
+balance error is displayed separately from failure to open wallet storage.
+The iOS simulator has no physical camera, so scanner availability must be tested
+on an actual device.
+
+### Isolated funded wallet tests
+
+The normal preview at port 19331 uses mainnet. Instant mining is available only
+on regtest; do not switch an existing wallet to a different chain to manufacture
+funds. `vase-client/tool/regtest_wallet_test.dart` exercises the actual wallet
+signing/HTTP/WebSocket code with public fixture keys and no secure-storage access.
+It requires a **fresh** regtest chain, checks the RPC chain and matching Chronik
+genesis before mining, matures the coinbase, sends exactly 1.000001 XPI, verifies
+raw bytes/merkleized TxIds and balances, confirms it, sends a reply, and runs
+`verifychain`. These are test coins with no mainnet value.
+
+From `wallets/vase/vase-client`, using your validated local Lotus binaries:
+
+```sh
+export VASE_REGTEST_DATADIR=$(mktemp -d /tmp/vase-regtest.XXXXXX)
+/path/to/lotusd -datadir="$VASE_REGTEST_DATADIR" -regtest \
+  -rpcport=22604 -port=22605 -listen=0 -connect=0 -dnsseed=0 \
+  -avalanche=0 -chronik=1 -chronikbind=127.0.0.1:22331 -daemon
+# Wait until this succeeds and reports chain=regtest:
+/path/to/lotus-cli -datadir="$VASE_REGTEST_DATADIR" -regtest -rpcport=22604 getblockchaininfo
+tool/with_xcode.sh flutter test --no-pub tool/regtest_wallet_test.dart
+```
+
+The test defaults to RPC 22604 and Chronik 22331; optional
+`VASE_REGTEST_RPC_PORT`/`VASE_REGTEST_CHRONIK_PORT` overrides remain loopback-only.
+It skips without the explicit datadir environment variable. Never point it at an
+existing production datadir. Shut down only your test node using its exact
+datadir, `-regtest -rpcport=22604 stop` when finished.
+
+For manual payment-confirmation tests, build `tool/regtest_preview.dart` and
+install it **only on a separate disposable simulator**, never over an existing
+wallet preview. It uses the real Send screen and confirmation slider, an orange
+REGTEST banner, public in-memory keys, and a fixed loopback Chronik on 22331.
+It checks the Lotus regtest genesis and refuses other chains; it neither
+initializes telemetry nor reads/writes wallet secure storage. It starts with a
+1.000001-XPI payment to a second fixture key. Run the funded test above first.
+
+```sh
+tool/with_xcode.sh flutter build ios --simulator --debug --no-pub \
+  --target=tool/regtest_preview.dart
+# Install Runner.app only on the new dedicated test simulator's UDID.
+```
+
+The ordinary app remains `lib/main.dart`; build it with the mainnet Chronik URL
+when updating Lotus Preview again. Do not distribute a fixture build.
+
+### Backend lab
+
+`tool/backend-lab.compose.yaml` runs isolated PostGIS and a registration server,
+with loopback HTTP 28080 and database 25432. It never mounts an existing database.
+Its password/token values are disposable test fixtures, not deployment secrets.
+Set `VASE_LAB_BIN` to an absolute directory containing Linux `server` and
+`migrate` binaries, then run Compose with a unique `-p` project name:
+
+```sh
+VASE_LAB_BIN=/absolute/lab/bin docker compose -p vase-my-lab \
+  -f tool/backend-lab.compose.yaml up -d --wait database
+VASE_LAB_BIN=/absolute/lab/bin docker compose -p vase-my-lab \
+  -f tool/backend-lab.compose.yaml run --rm migrate
+VASE_LAB_BIN=/absolute/lab/bin docker compose -p vase-my-lab \
+  -f tool/backend-lab.compose.yaml up -d server
+```
+
+For the 2026-10-14 lab, server sources were extracted from the existing reviewed
+notifications candidate `30da8ced` into a private temporary directory using
+`git archive`, without changing its worktree or merging it into this branch.
+Build both binaries from that extracted `wallets/vase/vase-server` directory
+with `CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build` (use `.` for server and
+`./migrate` for migrate). The tested Docker host is arm64; select the matching
+Go architecture on another host. PostGIS uses the repository's pinned amd64
+image through Docker emulation. Notifications stay disabled without provider
+credentials. Flutter currently has no backend registration/push setup; a running
+lab server alone does not establish native push delivery.
+
+### Native contacts fixture check
+
+`vase-client/tool/native_contacts_check.dart` exercises the production native
+contacts adapter on a **separate disposable simulator**. Build it with
+`tool/with_xcode.sh flutter build ios --simulator --debug --no-pub
+--target=tool/native_contacts_check.dart` (one command), install only on that
+simulator, and select Run fixture check. It requests contacts access through the
+native prompt, creates one uniquely identified temporary fixture, checks address
+write-back and preservation of its existing name/phone/email/website, checks
+idempotence and native change events, then edits/deletes only that fixture.
+It does not initialize wallet storage. Its cleanup uses only the ID returned by
+its own create operation. A denied read reports an empty directory without
+creating a fixture. Do not distribute this harness or install over a real wallet.
+
+On iOS 27, the native limited-access selection, full access, and denied access
+checks pass. Full/limited checks include address removal and deletion reflected
+by the production directory adapter. They do not establish Android behavior,
+cloud-provider synchronization, photo preservation, or an end-to-end native
+picker/confirmation-dialog round trip.

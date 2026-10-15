@@ -11,9 +11,20 @@ typedef ScannerBuilder = Widget Function(ValueChanged<String?> onScanResult);
 
 /// The scanner is the starting point; payment details stay on their own route.
 class HomePage extends StatefulWidget {
-  const HomePage({super.key, this.scannerBuilder});
+  const HomePage({
+    super.key,
+    this.scannerBuilder,
+    this.active = true,
+    this.onSettings,
+    this.onReceive,
+    this.onContacts,
+  });
 
   final ScannerBuilder? scannerBuilder;
+  final bool active;
+  final VoidCallback? onSettings;
+  final VoidCallback? onReceive;
+  final VoidCallback? onContacts;
 
   @override
   State<HomePage> createState() => _HomePageState();
@@ -21,6 +32,7 @@ class HomePage extends StatefulWidget {
 
 class _HomePageState extends State<HomePage> {
   bool _detailsOpen = false;
+  double _verticalDrag = 0;
 
   Future<void> _openPage(String path) async {
     if (_detailsOpen) return;
@@ -33,7 +45,12 @@ class _HomePageState extends State<HomePage> {
   }
 
   void _onScan(String? result) {
-    if (_detailsOpen || result == null || result.trim().isEmpty) return;
+    if (!widget.active ||
+        _detailsOpen ||
+        result == null ||
+        result.trim().isEmpty) {
+      return;
+    }
     try {
       final payment = parseSendURI(result);
       if (payment.address.isEmpty || payment.amount < BigInt.zero) {
@@ -54,89 +71,119 @@ class _HomePageState extends State<HomePage> {
     final balance = context.select<WalletModel, BigInt?>(
       (wallet) => wallet.balance?.balance,
     );
+    final initialized = context.select<WalletModel, bool>(
+      (wallet) => wallet.initialized,
+    );
     final walletError = context.select<WalletModel, Object?>(
       (wallet) => wallet.balance?.error,
     );
     return Scaffold(
-      body: Stack(
-        fit: StackFit.expand,
-        children: [
-          // Unmount the camera while another page is open, then resume on return.
-          if (!_detailsOpen)
-            widget.scannerBuilder?.call(_onScan) ??
-                QRView(onScanResult: _onScan)
-          else
-            const ColoredBox(color: Colors.black),
-          Center(
-            child: IgnorePointer(
-              child: Container(
-                width: MediaQuery.sizeOf(context).width * 0.8,
-                height: MediaQuery.sizeOf(context).width * 0.8,
-                decoration: BoxDecoration(
-                  border: Border.all(color: Colors.green, width: 4),
-                  borderRadius: BorderRadius.circular(10),
+      body: GestureDetector(
+        onVerticalDragStart: (_) => _verticalDrag = 0,
+        onVerticalDragUpdate: (details) => _verticalDrag += details.delta.dy,
+        onVerticalDragEnd: (_) {
+          if (widget.active && !_detailsOpen && _verticalDrag >= 64) {
+            _openPage('/settings');
+          }
+          _verticalDrag = 0;
+        },
+        child: Stack(
+          fit: StackFit.expand,
+          children: [
+            // Unmount the camera while another page is open, then resume on return.
+            if (widget.active && !_detailsOpen)
+              widget.scannerBuilder?.call(_onScan) ??
+                  QRView(onScanResult: _onScan)
+            else
+              const ColoredBox(color: Colors.black),
+            Center(
+              child: IgnorePointer(
+                child: Container(
+                  width: MediaQuery.sizeOf(context).width * 0.8,
+                  height: MediaQuery.sizeOf(context).width * 0.8,
+                  decoration: BoxDecoration(
+                    border: Border.all(color: Colors.green, width: 4),
+                    borderRadius: BorderRadius.circular(10),
+                  ),
                 ),
               ),
             ),
-          ),
-          SafeArea(
-            child: Column(
-              children: [
-                Container(
-                  margin: const EdgeInsets.all(16),
-                  padding: const EdgeInsets.symmetric(
-                    horizontal: 16,
-                    vertical: 8,
+            SafeArea(
+              child: Column(
+                children: [
+                  Container(
+                    margin: const EdgeInsets.all(16),
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 16,
+                      vertical: 8,
+                    ),
+                    decoration: BoxDecoration(
+                      color: Colors.black54,
+                      borderRadius: BorderRadius.circular(12),
+                    ),
+                    child: Text(
+                      balance == null
+                          ? (walletError == null
+                                ? 'Loading balance…'
+                                : initialized
+                                ? 'Balance unavailable'
+                                : 'Wallet unavailable')
+                          : formatAmount(amount: balance),
+                      style: const TextStyle(color: Colors.white, fontSize: 24),
+                    ),
                   ),
-                  decoration: BoxDecoration(
-                    color: Colors.black54,
-                    borderRadius: BorderRadius.circular(12),
+                  const Spacer(),
+                  Padding(
+                    padding: const EdgeInsets.all(20),
+                    child: Row(
+                      mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                      crossAxisAlignment: CrossAxisAlignment.end,
+                      children: [
+                        Row(
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            IconButton(
+                              tooltip: 'Settings',
+                              icon: const Icon(Icons.settings),
+                              iconSize: 28,
+                              onPressed:
+                                  widget.onSettings ??
+                                  () => _openPage('/settings'),
+                            ),
+                            if (widget.onContacts != null)
+                              IconButton(
+                                tooltip: 'Contacts',
+                                icon: const Icon(Icons.contacts),
+                                iconSize: 40,
+                                onPressed: widget.onContacts,
+                              ),
+                          ],
+                        ),
+                        IconButton(
+                          tooltip: 'Send',
+                          icon: const Icon(Icons.send),
+                          iconSize: 80,
+                          onPressed: () {
+                            if (_detailsOpen) return;
+                            context.read<SendModel>().clear();
+                            _openPage('/send');
+                          },
+                        ),
+                        IconButton(
+                          tooltip: 'Receive',
+                          icon: const Icon(Icons.save_alt),
+                          iconSize: 48,
+                          onPressed:
+                              widget.onReceive ?? () => _openPage('/request'),
+                        ),
+                      ],
+                    ),
                   ),
-                  child: Text(
-                    balance == null
-                        ? (walletError == null
-                              ? 'Loading balance…'
-                              : 'Wallet unavailable')
-                        : formatAmount(amount: balance),
-                    style: const TextStyle(color: Colors.white, fontSize: 24),
-                  ),
-                ),
-                const Spacer(),
-                Padding(
-                  padding: const EdgeInsets.all(20),
-                  child: Row(
-                    mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                    crossAxisAlignment: CrossAxisAlignment.end,
-                    children: [
-                      IconButton(
-                        tooltip: 'Settings',
-                        icon: const Icon(Icons.settings),
-                        iconSize: 48,
-                        onPressed: () => _openPage('/settings'),
-                      ),
-                      IconButton(
-                        tooltip: 'Send',
-                        icon: const Icon(Icons.send),
-                        iconSize: 80,
-                        onPressed: () {
-                          if (_detailsOpen) return;
-                          context.read<SendModel>().clear();
-                          _openPage('/send');
-                        },
-                      ),
-                      IconButton(
-                        tooltip: 'Receive',
-                        icon: const Icon(Icons.save_alt),
-                        iconSize: 48,
-                        onPressed: () => _openPage('/request'),
-                      ),
-                    ],
-                  ),
-                ),
-              ],
+                ],
+              ),
             ),
-          ),
-        ],
+          ],
+        ),
       ),
     );
   }

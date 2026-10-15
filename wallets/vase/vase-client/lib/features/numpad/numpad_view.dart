@@ -2,7 +2,7 @@ import 'dart:math';
 
 import 'package:flutter/material.dart';
 import 'package:flutter_hooks/flutter_hooks.dart';
-import 'package:flutter_vibrate/flutter_vibrate.dart';
+import 'package:flutter/services.dart';
 import 'package:go_router/go_router.dart';
 import 'package:provider/provider.dart';
 import 'package:vase/config/colors.dart';
@@ -79,19 +79,25 @@ class NumpadView extends HookWidget {
                               ),
                             ),
                           ),
-                          if (numpadModel.error != null)
-                            Flexible(
-                              child: FittedBox(
-                                fit: BoxFit.scaleDown,
-                                child: Text(
-                                  numpadModel.error!,
-                                  key: const ValueKey('calculator-error'),
-                                  style: const TextStyle(
-                                    color: Colors.redAccent,
+                          // Reserve the same flex slot for validation in every
+                          // editing state so amount entry never jumps on errors.
+                          Expanded(
+                            child: Semantics(
+                              liveRegion: true,
+                              child: Center(
+                                child: FittedBox(
+                                  fit: BoxFit.scaleDown,
+                                  child: Text(
+                                    numpadModel.error ?? '',
+                                    key: const ValueKey('calculator-error'),
+                                    style: const TextStyle(
+                                      color: Colors.redAccent,
+                                    ),
                                   ),
                                 ),
                               ),
                             ),
+                          ),
                         ],
                       ),
                     );
@@ -305,9 +311,7 @@ Future<bool> isValid(
       amount <= BigInt.zero ||
       (requireBalance && (balance == null || balance <= amount))) {
     controller.forward(from: 0);
-    if (await Vibrate.canVibrate) {
-      Vibrate.feedback(FeedbackType.heavy);
-    }
+    await HapticFeedback.heavyImpact();
     return false;
   }
 
