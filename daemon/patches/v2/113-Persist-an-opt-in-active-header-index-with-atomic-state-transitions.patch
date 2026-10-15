@@ -1,0 +1,1189 @@
+From 3ff0801ef6362a3fc1cecec4b3c181a9a1d47019 Mon Sep 17 00:00:00 2001
+From: Shammah Chancellor <shammah.chancellor@notvalid.com>
+Date: Thu, 15 Oct 2026 10:48:32 -0700
+Subject: [PATCH] Persist an opt-in active header index with atomic state
+ transitions
+
+Integration review note (2026-10-15; original source commit had no body):
+Add indexed initialization and header-admission regressions, including schema
+refusal, active-index preservation, historical header stages and malformed
+header rejection. This test-only change does not implement fork activation.
+
+---
+ src/lotus_v2/chain_index.cpp                 | 162 +++++++++
+ src/lotus_v2/chain_index.h                   | 104 ++++++
+ src/lotus_v2/chain_index_test/CMakeLists.txt |  13 +
+ src/lotus_v2/chain_index_test/README.md      | 104 ++++++
+ src/lotus_v2/disk_state.cpp                  | 283 +++++++++++++++-
+ src/lotus_v2/disk_state.h                    |  16 +
+ src/lotus_v2/test_chain_index.cpp            | 326 +++++++++++++++++++
+ 7 files changed, 1003 insertions(+), 5 deletions(-)
+ create mode 100644 src/lotus_v2/chain_index.cpp
+ create mode 100644 src/lotus_v2/chain_index.h
+ create mode 100644 src/lotus_v2/chain_index_test/CMakeLists.txt
+ create mode 100644 src/lotus_v2/chain_index_test/README.md
+ create mode 100644 src/lotus_v2/test_chain_index.cpp
+
+diff --git a/src/lotus_v2/chain_index.cpp b/src/lotus_v2/chain_index.cpp
+new file mode 100644
+index 000000000..4ce9ee840
+--- /dev/null
++++ b/src/lotus_v2/chain_index.cpp
+@@ -0,0 +1,162 @@
++// Copyright (c) 2026 The Lotus developers
++#include "chain_index.h"
++#include "disk_state.h"
++#include <algorithm>
++#include <limits>
++#include <new>
++#include <stdexcept>
++namespace lotus::v2 {
++namespace {
++struct Stop { ChainIndexResult result; };
++[[noreturn]] void End(ChainIndexResult result) { throw Stop{result}; }
++[[noreturn]] void Corrupt(DiskStateError &error, const char *message) {
++    error = {DiskStateErrorCode::Corruption, message}; End(ChainIndexResult::StorageError);
++}
++template <typename F> ChainIndexResult Run(DiskStateError &error, F &&f) {
++    error = {};
++    try { f(); return ChainIndexResult::Complete; }
++    catch (const Stop &stop) { return stop.result; }
++    catch (const std::bad_alloc &) { error = {DiskStateErrorCode::Resource, "index query allocation"}; }
++    catch (const std::length_error &) { error = {DiskStateErrorCode::Resource, "index query length"}; }
++    return ChainIndexResult::StorageError;
++}
++std::optional<ActiveChainIndex> Active(const DiskStateStore &store, const Hash &expected, DiskStateError &error) {
++    std::optional<ActiveChainIndex> active;
++    if (!store.ReadActiveIndex(active, error)) End(ChainIndexResult::StorageError);
++    if (!active) End(ChainIndexResult::Missing);
++    if (active->tip != expected) End(ChainIndexResult::StaleTip);
++    return active;
++}
++IndexedHeader HeaderFor(const DiskStateStore &store, const Hash &id, DiskStateError &error) {
++    std::optional<IndexedHeader> header;
++    if (!store.ReadIndexedHeader(id, header, error)) End(ChainIndexResult::StorageError);
++    if (!header) Corrupt(error, "missing required indexed header");
++    return *header;
++}
++Hash IdAt(const DiskStateStore &store, uint64_t height, DiskStateError &error) {
++    std::optional<Hash> id;
++    if (!store.ReadActiveId(height, id, error)) End(ChainIndexResult::StorageError);
++    if (!id) Corrupt(error, "missing required active height");
++    return *id;
++}
++class Budget {
++    const DiskStateStore &store;
++    DiskStateError &error;
++    uint64_t remaining;
++public:
++    Budget(const DiskStateStore &s, DiskStateError &e, uint64_t reads) : store(s), error(e), remaining(reads) {}
++    template <typename F> auto Read(uint64_t maximum_gets, F &&f) {
++        // Authorize the worst-case Gets before entering any storage call.
++        // Actual consumption is measured; unused reservation remains available.
++        if (maximum_gets > remaining) End(ChainIndexResult::CapacityRefused);
++        const auto before = store.LastStats().database_reads;
++        auto value = f();
++        const auto used = store.LastStats().database_reads - before;
++        if (used > maximum_gets) Corrupt(error, "index read budget bound changed");
++        remaining -= used; return value;
++    }
++};
++// These include the current-S fence and local parent/active binding checks in
++// DiskStateStore. Tests verify actual Get bounds, including refused operations.
++constexpr uint64_t ACTIVE_GETS = 7, HEADER_GETS = 3, HEIGHT_GETS = 11;
++} // namespace
++ChainIndexResult BuildActiveLocator(const DiskStateStore &store, const Hash &expected_tip,
++                                    size_t max_ids, std::vector<Hash> &out, DiskStateError &error) {
++    return Run(error, [&] {
++        if (!max_ids) End(ChainIndexResult::CapacityRefused);
++        const auto active = Active(store, expected_tip, error);
++        std::vector<Hash> result; uint64_t height = active->height, step = 1;
++        while (true) {
++            if (result.size() >= max_ids) End(ChainIndexResult::CapacityRefused);
++            result.push_back(IdAt(store, height, error));
++            if (!height) break;
++            if (result.size() > 10)
++                step = step > std::numeric_limits<uint64_t>::max() / 2
++                           ? std::numeric_limits<uint64_t>::max() : step * 2;
++            height = height > step ? height - step : 0;
++        }
++        (void)Active(store, expected_tip, error); out = std::move(result);
++    });
++}
++ChainIndexResult ReadActiveHeaders(const DiskStateStore &store, const Hash &expected_tip,
++    std::span<const Hash> locator, const Hash &stop, size_t max_locator,
++    size_t max_headers, std::vector<Header> &out, DiskStateError &error) {
++    return Run(error, [&] {
++        if (locator.size() > max_locator || !max_headers) End(ChainIndexResult::CapacityRefused);
++        const auto active = Active(store, expected_tip, error);
++        std::vector<Header> result;
++        if (locator.empty()) {
++            // Empty locator asks for the explicit stop header only, matching
++            // getheaders semantics. It never enumerates an entire chain.
++            if (stop != Hash{}) {
++                std::optional<IndexedHeader> header;
++                if (!store.ReadIndexedHeader(stop, header, error)) End(ChainIndexResult::StorageError);
++                if (header && header->header.height <= active->height &&
++                    IdAt(store, header->header.height, error) == stop) result.push_back(header->header);
++            }
++        } else {
++            uint64_t common = 0; // Unknown locators fall back to anchored genesis.
++            for (const Hash &id : locator) {
++                std::optional<IndexedHeader> header;
++                if (!store.ReadIndexedHeader(id, header, error)) End(ChainIndexResult::StorageError);
++                if (header && header->header.height <= active->height &&
++                    IdAt(store, header->header.height, error) == id) {
++                    common = header->header.height; break;
++                }
++            }
++            uint64_t height = common;
++            while (height < active->height && result.size() < max_headers) {
++                ++height;
++                const Hash id = IdAt(store, height, error);
++                result.push_back(HeaderFor(store, id, error).header);
++                if (id == stop) break;
++            }
++        }
++        (void)Active(store, expected_tip, error); out = std::move(result);
++    });
++}
++ChainIndexResult PlanHeaderFork(const DiskStateStore &store, const Hash &expected_tip,
++    const Hash &target, const ForkLimits &limits, uint64_t now, uint64_t future_window,
++    ForkPlan &out, DiskStateError &error) {
++    return Run(error, [&] {
++        Budget budget(store, error, limits.max_reads);
++        const auto active = budget.Read(ACTIVE_GETS, [&] { return Active(store, expected_tip, error); });
++        std::optional<IndexedHeader> candidate;
++        budget.Read(HEADER_GETS, [&] {
++            if (!store.ReadIndexedHeader(target, candidate, error)) End(ChainIndexResult::StorageError);
++            return 0;
++        });
++        if (!candidate) End(ChainIndexResult::Missing);
++        if (CompareChainWork(candidate->chain_work, active->chain_work) <= 0) End(ChainIndexResult::NotHeavier);
++        if (candidate->max_ancestor_time > now && candidate->max_ancestor_time - now > future_window)
++            End(ChainIndexResult::Deferred);
++        IndexedHeader left = budget.Read(HEADER_GETS, [&] { return HeaderFor(store, expected_tip, error); });
++        IndexedHeader right = *candidate;
++        if ((left.header.height > right.header.height && left.header.height - right.header.height > limits.max_disconnect) ||
++            (right.header.height > left.header.height && right.header.height - left.header.height > limits.max_connect))
++            End(ChainIndexResult::CapacityRefused);
++        ForkPlan plan; plan.source = expected_tip; plan.target = target;
++        Hash left_id = expected_tip, right_id = target;
++        while (left_id != right_id) {
++            if (left.header.height >= right.header.height) {
++                if (!left.header.height) Corrupt(error, "header forks have different genesis");
++                if (plan.disconnect.size() >= limits.max_disconnect) End(ChainIndexResult::CapacityRefused);
++                const Hash mapped = budget.Read(HEIGHT_GETS, [&] { return IdAt(store, left.header.height, error); });
++                if (mapped != left_id) Corrupt(error, "fork source is not active");
++                plan.disconnect.push_back(left_id); left_id = left.header.prev_id;
++                left = budget.Read(HEADER_GETS, [&] { return HeaderFor(store, left_id, error); });
++            } else {
++                if (!right.header.height) Corrupt(error, "header forks have different genesis");
++                if (plan.connect.size() >= limits.max_connect) End(ChainIndexResult::CapacityRefused);
++                plan.connect.push_back(right_id); right_id = right.header.prev_id;
++                right = budget.Read(HEADER_GETS, [&] { return HeaderFor(store, right_id, error); });
++            }
++        }
++        const Hash mapped = budget.Read(HEIGHT_GETS, [&] { return IdAt(store, left.header.height, error); });
++        if (mapped != left_id) Corrupt(error, "fork point is not active");
++        plan.fork = left_id; std::reverse(plan.connect.begin(), plan.connect.end());
++        (void)budget.Read(ACTIVE_GETS, [&] { return Active(store, expected_tip, error); });
++        out = std::move(plan);
++    });
++}
++} // namespace lotus::v2
+diff --git a/src/lotus_v2/chain_index.h b/src/lotus_v2/chain_index.h
+new file mode 100644
+index 000000000..488716b72
+--- /dev/null
++++ b/src/lotus_v2/chain_index.h
+@@ -0,0 +1,104 @@
++// Copyright (c) 2026 The Lotus developers
++#ifndef LOTUS_V2_CHAIN_INDEX_H
++#define LOTUS_V2_CHAIN_INDEX_H
++#include "header_context.h"
++#include <array>
++#include <span>
++#include <vector>
++namespace lotus::v2 {
++// Positive targets and a uint64 height bound the cumulative sum by 2^319.
++// Fixed little-endian u320; never reuse MonetaryState.prev_work as chainwork.
++using ChainWork = std::array<uint8_t, 40>;
++inline int CompareChainWork(const ChainWork &left, const ChainWork &right) {
++    for (size_t i = left.size(); i-- > 0;)
++        if (left[i] != right[i]) return left[i] < right[i] ? -1 : 1;
++    return 0;
++}
++inline bool AddChainWork(const ChainWork &left, const ChainWork &right, ChainWork &out) {
++    ChainWork result{}; unsigned carry{};
++    for (size_t i = 0; i < result.size(); ++i) {
++        const unsigned sum = unsigned(left[i]) + right[i] + carry;
++        result[i] = uint8_t(sum); carry = sum >> 8;
++    }
++    if (carry) return false;
++    out = result; return true;
++}
++inline bool HeaderWork(const Hash &positive_target, ChainWork &out) {
++    bool positive{};
++    std::array<uint8_t, 33> denominator{}, remainder{};
++    for (size_t i = 0; i < positive_target.size(); ++i) {
++        denominator[i] = positive_target[i]; positive |= positive_target[i] != 0;
++    }
++    if (!positive) return false;
++    unsigned carry = 1;
++    for (auto &byte : denominator) {
++        const unsigned sum = unsigned(byte) + carry; byte = uint8_t(sum); carry = sum >> 8;
++    }
++    ChainWork quotient{};
++    // Divide the 257-bit integer 2^256 by (target+1), without u256 wrap.
++    for (int bit = 256; bit >= 0; --bit) {
++        unsigned shift = bit == 256 ? 1 : 0;
++        for (auto &byte : remainder) {
++            const unsigned value = (unsigned(byte) << 1) | shift;
++            byte = uint8_t(value); shift = value >> 8;
++        }
++        int comparison{};
++        for (size_t i = remainder.size(); i-- > 0;)
++            if (remainder[i] != denominator[i]) {
++                comparison = remainder[i] < denominator[i] ? -1 : 1; break;
++            }
++        if (comparison < 0) continue;
++        unsigned borrow{};
++        for (size_t i = 0; i < remainder.size(); ++i) {
++            const unsigned sub = unsigned(denominator[i]) + borrow;
++            const unsigned old = remainder[i]; remainder[i] = uint8_t(old - sub);
++            borrow = old < sub;
++        }
++        quotient[unsigned(bit) / 8] |= uint8_t(1 << (unsigned(bit) % 8));
++    }
++    out = quotient; return true;
++}
++enum class HeaderStage : uint8_t { HeaderChecked = 0, Connected = 1 };
++struct IndexedHeader {
++    Header header;
++    ChainWork chain_work{};
++    uint64_t max_ancestor_time{};
++    HeaderStage stage{HeaderStage::HeaderChecked}; // Connected means ever connected.
++};
++struct ActiveChainIndex {
++    Hash tip{};
++    uint64_t height{};
++    ChainWork chain_work{};
++    uint64_t max_ancestor_time{};
++};
++struct ForkLimits {
++    uint64_t max_disconnect{};
++    uint64_t max_connect{};
++    uint64_t max_reads{}; // Includes all underlying database Gets.
++};
++struct ForkPlan {
++    Hash source{}, target{}, fork{};
++    std::vector<Hash> disconnect; // Current tip down, excludes fork.
++    std::vector<Hash> connect; // Fork child up to target.
++};
++enum class ChainIndexResult {
++    Complete, Missing, NotHeavier, Deferred, CapacityRefused, StaleTip, StorageError
++};
++class DiskStateStore;
++struct DiskStateError;
++// Caller serializes store access. Outputs change only on Complete. Quotas are
++// operational and never classify a header as consensus-invalid. No mutation,
++// body availability guarantee, best-chain activation or whole-reorg atomicity.
++ChainIndexResult BuildActiveLocator(const DiskStateStore &, const Hash &expected_tip,
++    size_t max_ids, std::vector<Hash> &out, DiskStateError &);
++ChainIndexResult ReadActiveHeaders(const DiskStateStore &, const Hash &expected_tip,
++    std::span<const Hash> locator, const Hash &stop, size_t max_locator,
++    size_t max_headers, std::vector<Header> &out, DiskStateError &);
++// Plans a strictly heavier header candidate, which still needs full block/state
++// execution unless already connected. Exact ties retain the active tip. Future
++// eligibility is explicit and checks the maximum timestamp of all ancestors.
++ChainIndexResult PlanHeaderFork(const DiskStateStore &, const Hash &expected_tip,
++    const Hash &target, const ForkLimits &, uint64_t now, uint64_t future_window,
++    ForkPlan &out, DiskStateError &);
++} // namespace lotus::v2
++#endif
+diff --git a/src/lotus_v2/chain_index_test/CMakeLists.txt b/src/lotus_v2/chain_index_test/CMakeLists.txt
+new file mode 100644
+index 000000000..48e0c60c9
+--- /dev/null
++++ b/src/lotus_v2/chain_index_test/CMakeLists.txt
+@@ -0,0 +1,13 @@
++# Standalone index/storage checks; full-tree integration remains root-owned.
++cmake_minimum_required(VERSION 3.18)
++project(lotus_v2_chain_index LANGUAGES C CXX)
++set(CMAKE_CXX_STANDARD 20)
++set(CMAKE_CXX_STANDARD_REQUIRED ON)
++enable_testing()
++add_subdirectory(../disk_state_test disk_state)
++find_path(LOTUS_CHAIN_BOOST_INCLUDE boost/multiprecision/cpp_int.hpp PATHS /opt/homebrew/opt/boost/include REQUIRED)
++add_executable(chain_index_test ../test_chain_index.cpp ../chain_index.cpp ../sparse_state.cpp ../output.cpp ../header.cpp ../tagged_hash.cpp)
++target_include_directories(chain_index_test SYSTEM PRIVATE "${LOTUS_CHAIN_BOOST_INCLUDE}")
++target_link_libraries(chain_index_test PRIVATE lotus_v2_disk_state blake3)
++target_compile_options(chain_index_test PRIVATE -Wall -Wextra -Wpedantic -Werror)
++add_test(NAME chain_index_test COMMAND chain_index_test)
+diff --git a/src/lotus_v2/chain_index_test/README.md b/src/lotus_v2/chain_index_test/README.md
+new file mode 100644
+index 000000000..4162f54f3
+--- /dev/null
++++ b/src/lotus_v2/chain_index_test/README.md
+@@ -0,0 +1,104 @@
++# Indexed development storage review
++
++This packet adds an explicitly selected development database format through
++`DiskStateOptions.header_index = hp`. The exact header profile is bound into
++schema `V` version 2; absent options retain the generic version 1 format.
++Existing generic homes and indexed homes opened in generic mode fail closed.
++There is no automatic migration, reset, or in-place index reconstruction. To
++move development data, use a separate new home and explicit validated genesis
++and block replay, preserving the old home. Previously disconnected bodies do
++not migrate implicitly.
++
++## Records and atomic updates
++
++| Key | Value |
++| --- | --- |
++| `H` + BlockID | version, stage, canonical 134-byte header, LE u320 cumulative work, maximum ancestor timestamp |
++| `A` + height u64be | active BlockID |
++| `I` | version and optional active tip, height, cumulative work and maximum ancestor timestamp |
++
++Existing S/U head encoding remains version 1 inside the new database envelope.
++No coin/tree or complete-body format changes are introduced. Bodies remain in
++current/retained state metadata and immutable undo, with the existing whole-U
++read allocation limitation. This packet introduces no candidate body archive,
++pruning, availability promise, peer serving, or network parameters.
++
++`PutCheckedHeader` is a capability for an enclosing validator that has already
++checked contextual ASERT/MTP rules against authenticated history. It verifies
++canonical identity, manifest genesis, configured version/target/PoW and parent
++height, and derives cumulative work and maximum ancestor time. It does not
++execute block transactions or write active A/I mappings. The untrusted-header
++entry point must be the enclosing contextual admission wrapper.
++
++`Commit(metadata, header, error)` binds exact header bytes/BlockID to metadata,
++requires active-parent extension, and writes H (upgraded to Connected), A and I
++in the same sync LevelDB batch as S, coins, nodes, identity and undo. The legacy
++commit refuses indexed mode; the header overload also supports generic mode.
++Indexed disconnect removes only the old active height and restores predecessor
++I in the same state/undo batch. H survives and Connected means **ever fully
++connected**, not active. Indexed genesis cannot be disconnected.
++
++Open and indexed queries verify S/I/header/tip-height binding and fixed local
++parent/work/time consistency. Requested active heights verify their header and
++adjacent parent mapping. These are bounded mechanical integrity checks, not a
++full index scan or a cryptographic proof of every historical aggregate. LevelDB
++checksums protect record reads; a full adversarial database rewrite is not
++validated as a new consensus history by these accessors.
++
++Per-block work uses `floor(2^256/(target+1))` with a 257-bit division numerator.
++A positive target bounds one block by 2^255; uint64 height bounds the sum,
++including genesis, by 2^319. Fixed u320 encoding therefore represents every
++such chain without wrapping. Monetary `prev_work` remains per-block work.
++
++## Bounded queries and fork planning
++
++Locator membership is an indexed H lookup followed by A at its height. Header
++replies read successive active heights, so cost is proportional to the bounded
++locator and response sizes, independently of total height. Local locators sample
++exponentially spaced A heights and end at genesis. An empty locator asks for
++only an explicit active stop header; nonempty unknown locators fall back to
++anchored genesis and replies contain successors, inclusive of a matched stop.
++All operations fence the expected active tip and preserve output on refusal.
++
++`PlanHeaderFork` compares one requested candidate with the active tip. It plans
++only strictly greater work; equal work retains the current tip. Its parent walk
++and output lists are limited by caller-supplied disconnect/connect quotas.
++Before each storage call it reserves a conservative maximum of actual Gets
++(7 for active index, 3 for H, 11 for A), then charges actual usage. Insufficient
++read budget refuses before the call. Quotas are operational, not consensus.
++
++The maximum ancestor timestamp is `max(parent.maximum, header.time)`, allowing
++eligibility of the entire candidate ancestry to be checked without a chain
++walk: if maximum > now, require maximum - now <= the explicit future window.
++Clock rollback can defer a candidate without invalidating it. This helper is
++not a global eligibility-aware selector when the current tip itself becomes
++ineligible, nor a persistent candidate queue or chain activation executor.
++HeaderChecked candidates still need bodies and full state execution. A plan
++proves neither body/undo availability nor recoverable whole-reorg execution.
++Only each individual connect/disconnect batch is atomic; durable multi-block
++reorg intent/recovery remains a separate task.
++
++## Checks
++
++```sh
++cmake -S src/lotus_v2/chain_index_test -B build-chain-index -GNinja -DCMAKE_BUILD_TYPE=Debug
++cmake --build build-chain-index -j4
++ctest --test-dir build-chain-index --output-on-failure
++```
++
++This target also runs existing generic disk-state checks. Index tests compare
++work with independent Boost mathematical division for minimum/maximum/power
++of two/random/canonical compact targets; exercise overflow and aliasing; build
++128 active heights and a retained header fork; assert locator/reply read bounds
++and per-plan actual Get budgets; test future ancestors, clock rollback, equal
++work, stale tips, quota refusal, re-open, disconnected Connected status and
++immutable undo reuse. Injected real LevelDB WAL Append/Sync failures check
++atomic H/A/I/S/coin recovery for commit/disconnect and header-only publication.
++Corrupted H work/time/stage/header, A mapping, I record and profile/mode mismatch
++fail operationally without mutation.
++
++Synthetic headers are mined at an easy caller-supplied target. Direct backend
++fixtures intentionally exercise the trusted-storage capability rather than
++assert contextual ASERT, body, monetary or VM acceptance. Enclosing admission
++and initializer tests belong to their own validator packet. Artifacts remain
++on failures; no goldens are regenerated.
+diff --git a/src/lotus_v2/disk_state.cpp b/src/lotus_v2/disk_state.cpp
+index 3f2de3d72..5cceae76f 100644
+--- a/src/lotus_v2/disk_state.cpp
++++ b/src/lotus_v2/disk_state.cpp
+@@ -221,6 +221,94 @@ Head ParseHead(const Bytes &bytes, const DiskStateOptions &options) {
+     Copy(result.metadata.header); Copy(result.metadata.monetary); Copy(result.metadata.auxiliary);
+     r.End(); CheckMetadata(result.metadata, options.max_metadata_bytes); return result;
+ }
++Bytes StorageSchema(const DiskStateOptions &options) {
++    Bytes bytes = Schema(options);
++    if (!options.header_index) return bytes;
++    bytes[12] = 2; // Explicit indexed development home; v1 binaries fail closed.
++    const auto &p = *options.header_index;
++    PutHash(bytes, p.chain_id); PutHash(bytes, p.genesis_id); Put(bytes, p.version, 4);
++    Put(bytes, p.genesis_time); Put(bytes, p.genesis_bits, 4); PutHash(bytes, p.pow_limit);
++    Put(bytes, uint64_t(p.half_life_seconds)); Put(bytes, uint64_t(p.spacing_seconds));
++    return bytes;
++}
++void CheckIndexOptions(const DiskStateOptions &options) {
++    if (!options.header_index) return;
++    const auto &p = *options.header_index; Hash target;
++    if (p.chain_id != options.identity || p.genesis_id == Hash{} || p.genesis_time > MAX_TIME ||
++        p.half_life_seconds <= 0 || p.spacing_seconds <= 0 ||
++        !DecodeTarget(p.genesis_bits, p.pow_limit, target))
++        Fail(DiskStateErrorCode::ProfileMismatch, "invalid explicit header index profile");
++}
++Bytes HeaderKey(const Hash &id) { Bytes bytes(1, 'H'); PutHash(bytes, id); return bytes; }
++Bytes ActiveKey(uint64_t height) {
++    Bytes bytes(1, 'A');
++    for (unsigned i = 8; i-- > 0;) bytes.push_back(static_cast<char>(height >> (8 * i)));
++    return bytes;
++}
++Bytes HashBytes(const Hash &hash) { Bytes bytes; PutHash(bytes, hash); return bytes; }
++Hash ParseHash(const Bytes &bytes) { Reader r{bytes}; const Hash hash = r.Digest(); r.End(); return hash; }
++void PutWork(Bytes &bytes, const ChainWork &work) {
++    bytes.append(reinterpret_cast<const char *>(work.data()), work.size());
++}
++ChainWork GetWork(Reader &r) {
++    ChainWork work{}; for (auto &byte : work) byte = r.Int(1); return work;
++}
++Bytes HeaderBytes(const Header &header) {
++    std::array<uint8_t, HEADER_SIZE> encoded;
++    Require(SerializeHeader(header, encoded), "indexed header encoding");
++    return Bytes(reinterpret_cast<const char *>(encoded.data()), encoded.size());
++}
++ChainWork CheckOwnHeader(const Header &header, const Hash &id, const HeaderChainProfile &p) {
++    Hash actual, target;
++    Require(header.version == p.version && header.time <= MAX_TIME && header.size >= HEADER_SIZE + 4 &&
++            BlockId(p.chain_id, header, actual) && actual == id &&
++            DecodeTarget(header.bits, p.pow_limit, target) && MeetsTarget(id, target),
++            "indexed header identity/profile/target/proof mismatch");
++    if (header.height == 0)
++        Require(id == p.genesis_id && header.prev_id == Hash{} && header.time == p.genesis_time &&
++                header.bits == p.genesis_bits, "indexed genesis anchor mismatch");
++    else Require(header.prev_id != Hash{}, "indexed non-genesis parent");
++    ChainWork work{}; Require(HeaderWork(target, work), "indexed positive work"); return work;
++}
++Bytes EncodeIndexedHeader(const IndexedHeader &entry) {
++    Bytes bytes; Put(bytes, 1, 1); Put(bytes, uint8_t(entry.stage), 1);
++    bytes += HeaderBytes(entry.header); PutWork(bytes, entry.chain_work); Put(bytes, entry.max_ancestor_time);
++    return bytes;
++}
++IndexedHeader ParseIndexedHeader(const Bytes &bytes, const Hash &id, const HeaderChainProfile &p) {
++    Require(bytes.size() == 2 + HEADER_SIZE + 40 + 8, "indexed header record size");
++    Reader r{bytes}; Require(r.Int(1) == 1, "indexed header record version");
++    const auto stage = r.Int(1); Require(stage <= 1, "indexed header stage");
++    IndexedHeader entry; entry.stage = HeaderStage(stage);
++    Require(ParseHeader(reinterpret_cast<const uint8_t *>(bytes.data() + r.at), HEADER_SIZE, entry.header),
++            "indexed header parse"); r.at += HEADER_SIZE;
++    entry.chain_work = GetWork(r); entry.max_ancestor_time = r.Int(); r.End();
++    Require(entry.chain_work != ChainWork{} && entry.max_ancestor_time >= entry.header.time &&
++            entry.max_ancestor_time <= MAX_TIME, "indexed work/time range");
++    (void)CheckOwnHeader(entry.header, id, p);
++    Require(EncodeIndexedHeader(entry) == bytes, "noncanonical indexed header"); return entry;
++}
++Bytes EncodeActiveIndex(const std::optional<ActiveChainIndex> &index) {
++    Bytes bytes; Put(bytes, 1, 1); Put(bytes, index.has_value(), 1);
++    if (index) {
++        PutHash(bytes, index->tip); Put(bytes, index->height); PutWork(bytes, index->chain_work);
++        Put(bytes, index->max_ancestor_time);
++    }
++    return bytes;
++}
++std::optional<ActiveChainIndex> ParseActiveIndex(const Bytes &bytes) {
++    Reader r{bytes}; Require(r.Int(1) == 1, "active index record version");
++    const auto present = r.Int(1); Require(present <= 1, "active index presence");
++    std::optional<ActiveChainIndex> index;
++    if (present) {
++        ActiveChainIndex value; value.tip = r.Digest(); value.height = r.Int();
++        value.chain_work = GetWork(r); value.max_ancestor_time = r.Int(); index = value;
++    }
++    r.End(); return index;
++}
++ActiveChainIndex ActiveFrom(const Hash &id, const IndexedHeader &entry) {
++    return {id, entry.header.height, entry.chain_work, entry.max_ancestor_time};
++}
+ struct Change { Value before; Value after; };
+ using Changes = std::map<Bytes, Change>;
+ void PutValue(Bytes &out, const Value &value) {
+@@ -260,6 +348,73 @@ struct DiskStateStore::Impl {
+         if (status.IsNotFound()) return std::nullopt;
+         CheckStatus(status); return value;
+     }
++    void Indexed() const {
++        Usable(); if (!options.header_index) Fail(DiskStateErrorCode::ProfileMismatch, "header index disabled");
++    }
++    void CheckCachedHead() const {
++        const Value value = Read("S");
++        Require(value && *value == EncodeHead(head, options), "persisted/cached indexed head mismatch");
++    }
++    std::optional<IndexedHeader> RawHeader(const Hash &id) const {
++        const Value value = Read(HeaderKey(id));
++        if (!value) return std::nullopt;
++        return ParseIndexedHeader(*value, id, *options.header_index);
++    }
++    std::optional<IndexedHeader> CheckedHeader(const Hash &id) const {
++        auto entry = RawHeader(id); if (!entry) return std::nullopt;
++        const ChainWork own = CheckOwnHeader(entry->header, id, *options.header_index);
++        ChainWork expected = own; uint64_t maximum = entry->header.time;
++        if (entry->header.height) {
++            const auto parent = RawHeader(entry->header.prev_id);
++            Require(parent.has_value(), "missing indexed header parent");
++            Require(parent->header.height != std::numeric_limits<uint64_t>::max() &&
++                    parent->header.height + 1 == entry->header.height, "indexed parent height");
++            Require(AddChainWork(parent->chain_work, own, expected), "indexed cumulative work overflow");
++            maximum = std::max(maximum, parent->max_ancestor_time);
++            Require(entry->stage != HeaderStage::Connected || parent->stage == HeaderStage::Connected,
++                    "connected header has unconnected parent");
++        }
++        Require(entry->chain_work == expected && entry->max_ancestor_time == maximum,
++                "indexed work/time aggregate mismatch"); return entry;
++    }
++    IndexedHeader PrepareHeader(const Header &header, HeaderStage stage) const {
++        Hash id; Require(BlockId(options.identity, header, id), "prepared header identity");
++        IndexedHeader entry{header, CheckOwnHeader(header, id, *options.header_index), header.time, stage};
++        if (header.height) {
++            const auto parent = CheckedHeader(header.prev_id);
++            if (!parent) Fail(DiskStateErrorCode::Missing, "checked header parent unavailable");
++            Require(parent->header.height != std::numeric_limits<uint64_t>::max() &&
++                    parent->header.height + 1 == header.height, "prepared header parent height");
++            Require(stage != HeaderStage::Connected || parent->stage == HeaderStage::Connected,
++                    "prepared connected parent stage");
++            ChainWork total{}; Require(AddChainWork(parent->chain_work, entry.chain_work, total), "prepared work overflow");
++            entry.chain_work = total; entry.max_ancestor_time = std::max(header.time, parent->max_ancestor_time);
++        }
++        return entry;
++    }
++    std::optional<ActiveChainIndex> CheckedActive() const {
++        Indexed(); CheckCachedHead();
++        const Value value = Read("I"); Require(value.has_value(), "missing active index");
++        auto index = ParseActiveIndex(*value);
++        if (!index) {
++            Require(head.metadata == DiskStateMetadata{} && head.root.kind == 0 && !Read(ActiveKey(0)),
++                    "uninitialized index/state mismatch"); return index;
++        }
++        const auto entry = CheckedHeader(index->tip); Require(entry.has_value(), "missing indexed active header");
++        Require(entry->stage == HeaderStage::Connected && index->tip == head.metadata.tip &&
++                HeaderBytes(entry->header) == Bytes(head.metadata.header.begin(), head.metadata.header.end()) &&
++                index->height == entry->header.height && index->chain_work == entry->chain_work &&
++                index->max_ancestor_time == entry->max_ancestor_time, "active index/head binding");
++        const Value active = Read(ActiveKey(index->height));
++        Require(active && ParseHash(*active) == index->tip, "active tip height mapping");
++        if (index->height) {
++            const Value parent = Read(ActiveKey(index->height - 1));
++            Require(parent && ParseHash(*parent) == entry->header.prev_id, "active parent height mapping");
++        }
++        if (index->height != std::numeric_limits<uint64_t>::max())
++            Require(!Read(ActiveKey(index->height + 1)), "active mapping above tip");
++        return index;
++    }
+     void Write(leveldb::WriteBatch &batch) {
+         Usable(); leveldb::WriteOptions write; write.sync = true;
+         const auto status = db->Write(write, &batch);
+@@ -510,6 +665,9 @@ bool DiskStateStore::Open(const std::string &directory, const DiskStateOptions &
+         if (options.cache_bytes == 0 || options.write_buffer_bytes < (64 << 10) ||
+             options.max_pending_bytes == 0 || options.max_metadata_bytes == 0)
+             Fail(DiskStateErrorCode::Resource, "invalid storage limits");
++        CheckIndexOptions(options);
++        if (options.header_index && initial != DiskStateMetadata{})
++            Fail(DiskStateErrorCode::ProfileMismatch, "indexed development initialization requires empty state");
+         auto impl = std::make_shared<Impl>(); impl->options = options;
+         impl->cache.reset(leveldb::NewLRUCache(options.cache_bytes));
+         leveldb::Options dboptions;
+@@ -525,10 +683,12 @@ bool DiskStateStore::Open(const std::string &directory, const DiskStateOptions &
+             iterator->SeekToFirst(); CheckStatus(iterator->status());
+             Require(!iterator->Valid(), "nonempty database without schema");
+             impl->head.metadata = initial;
+-            leveldb::WriteBatch batch; batch.Put("V", Schema(options)); batch.Put("S", EncodeHead(impl->head, options));
++            leveldb::WriteBatch batch; batch.Put("V", StorageSchema(options)); batch.Put("S", EncodeHead(impl->head, options));
++            if (options.header_index) batch.Put("I", EncodeActiveIndex(std::nullopt));
+             impl->Write(batch);
+         } else {
+-            if (*schema != Schema(options)) Fail(DiskStateErrorCode::ProfileMismatch, "database identity/profile/schema mismatch");
++            if (*schema != StorageSchema(options))
++                Fail(DiskStateErrorCode::ProfileMismatch, "database identity/profile/schema mismatch; indexed development needs a fresh home");
+             Require(head.has_value(), "missing head"); impl->head = ParseHead(*head, options);
+         }
+         const Value node = impl->Read(Path{}.Key());
+@@ -540,6 +700,7 @@ bool DiskStateStore::Open(const std::string &directory, const DiskStateOptions &
+                 Require(coin && *coin == CoinBytes(*root.coin), "singleton root coin mismatch");
+             }
+         } else Require(!node, "unexpected root node");
++        if (options.header_index) (void)impl->CheckedActive();
+         out.impl_ = std::move(impl);
+     });
+ }
+@@ -598,6 +759,57 @@ bool DiskStateStore::Prove(const Outpoint &query, CoinProof &out, DiskStateError
+         impl_->Usable(); ::lotus::v2::Prove([&](const Bytes &key) { return impl_->Read(key); }, impl_->head, query, out);
+     });
+ }
++bool DiskStateStore::PutCheckedHeader(const Header &header, DiskStateError &error) {
++    return Guard(error, [&] {
++        if (!impl_) Fail(DiskStateErrorCode::Closed, "closed store");
++        impl_->Indexed();
++        if (impl_->active) Fail(DiskStateErrorCode::TransactionAborted, "active transaction");
++        const uint64_t reads = impl_->stats.database_reads;
++        (void)impl_->CheckedActive();
++        const IndexedHeader prepared = impl_->PrepareHeader(header, HeaderStage::HeaderChecked);
++        Hash id; Require(BlockId(impl_->options.identity, header, id), "checked header identity");
++        const auto existing = impl_->CheckedHeader(id);
++        if (existing) {
++            Require(HeaderBytes(existing->header) == HeaderBytes(header) && existing->chain_work == prepared.chain_work &&
++                    existing->max_ancestor_time == prepared.max_ancestor_time, "immutable checked header mismatch");
++            return; // Never downgrade Connected, never change active mappings.
++        }
++        leveldb::WriteBatch batch; DiskStateStats stats;
++        AddBatch(batch, HeaderKey(id), EncodeIndexedHeader(prepared), stats);
++        stats.database_reads = impl_->stats.database_reads - reads;
++        impl_->Write(batch); impl_->stats = stats;
++    });
++}
++bool DiskStateStore::ReadIndexedHeader(const Hash &id, std::optional<IndexedHeader> &out,
++                                       DiskStateError &error) const {
++    return Guard(error, [&] {
++        if (!impl_) Fail(DiskStateErrorCode::Closed, "closed store");
++        impl_->Indexed(); impl_->CheckCachedHead();
++        auto entry = impl_->CheckedHeader(id); out = std::move(entry);
++    });
++}
++bool DiskStateStore::ReadActiveIndex(std::optional<ActiveChainIndex> &out, DiskStateError &error) const {
++    return Guard(error, [&] {
++        if (!impl_) Fail(DiskStateErrorCode::Closed, "closed store");
++        auto index = impl_->CheckedActive(); out = std::move(index);
++    });
++}
++bool DiskStateStore::ReadActiveId(uint64_t height, std::optional<Hash> &out, DiskStateError &error) const {
++    return Guard(error, [&] {
++        if (!impl_) Fail(DiskStateErrorCode::Closed, "closed store");
++        const auto index = impl_->CheckedActive();
++        if (!index || height > index->height) { out.reset(); return; }
++        const Value value = impl_->Read(ActiveKey(height)); Require(value.has_value(), "missing active height");
++        const Hash id = ParseHash(*value); const auto entry = impl_->CheckedHeader(id);
++        Require(entry && entry->stage == HeaderStage::Connected && entry->header.height == height,
++                "active height/header mismatch");
++        if (height) {
++            const Value parent = impl_->Read(ActiveKey(height - 1));
++            Require(parent && ParseHash(*parent) == entry->header.prev_id, "active height parent mismatch");
++        }
++        out = id;
++    });
++}
+ bool DiskStateStore::Begin(DiskStateTransaction &out, DiskStateError &error) {
+     return Guard(error, [&] {
+         if (!impl_) Fail(DiskStateErrorCode::Closed, "closed store");
+@@ -648,20 +860,60 @@ bool DiskStateTransaction::Erase(const Outpoint &outpoint, DiskStateError &error
+ }
+ void DiskStateTransaction::Abort() { impl_.reset(); }
+ bool DiskStateTransaction::Commit(const DiskStateMetadata &next, DiskStateError &error) {
++    return CommitImpl(next, nullptr, error);
++}
++bool DiskStateTransaction::Commit(const DiskStateMetadata &next, const Header &fully_connected,
++                                  DiskStateError &error) {
++    return CommitImpl(next, &fully_connected, error);
++}
++bool DiskStateTransaction::CommitImpl(const DiskStateMetadata &next, const Header *fully_connected,
++                                      DiskStateError &error) {
+     return Guard(error, [&] {
+         if (!impl_) Fail(DiskStateErrorCode::Closed, "closed transaction");
+         impl_->Usable(); auto &store = *impl_->store;
++        const uint64_t commit_reads_before = store.stats.database_reads;
+         if (next.tip == store.head.metadata.tip) Fail(DiskStateErrorCode::UndoMismatch, "commit must advance tip identity");
++        if (fully_connected) {
++            Hash id;
++            Require(HeaderBytes(*fully_connected) == Bytes(next.header.begin(), next.header.end()) &&
++                    BlockId(store.options.identity, *fully_connected, id) && id == next.tip,
++                    "connected header/metadata binding");
++        }
++        std::optional<IndexedHeader> prepared;
++        if (store.options.header_index) {
++            if (!fully_connected) Fail(DiskStateErrorCode::ProfileMismatch, "indexed commit requires connected header");
++            const auto active = store.CheckedActive();
++            if (active) {
++                Require(active->height != std::numeric_limits<uint64_t>::max() &&
++                        fully_connected->height == active->height + 1 && fully_connected->prev_id == active->tip,
++                        "connected header does not extend active index");
++            } else Require(fully_connected->height == 0 && next.tip == store.options.header_index->genesis_id,
++                           "first indexed commit must be configured genesis");
++            prepared = store.PrepareHeader(*fully_connected, HeaderStage::Connected);
++            const auto existing = store.CheckedHeader(next.tip);
++            if (existing)
++                Require(HeaderBytes(existing->header) == HeaderBytes(*fully_connected) &&
++                        existing->chain_work == prepared->chain_work &&
++                        existing->max_ancestor_time == prepared->max_ancestor_time, "connected immutable header mismatch");
++            Require(!store.Read(ActiveKey(fully_connected->height)), "occupied next active height");
++        }
+         Head next_head = impl_->head; next_head.metadata = next;
+         const Bytes before = EncodeHead(store.head, store.options), after = EncodeHead(next_head, store.options);
+         const Bytes undo = EncodeUndo(before, after, impl_->changes);
+         const Bytes undo_key = UndoKey(next.tip);
+         const Value prior = store.Read(undo_key);
+         if (prior && *prior != undo) Fail(DiskStateErrorCode::UndoMismatch, "immutable undo differs for existing tip");
+-        auto stats = impl_->Stats(); ++stats.database_reads; leveldb::WriteBatch batch;
++        auto stats = impl_->Stats();
++        stats.database_reads += store.stats.database_reads - commit_reads_before;
++        leveldb::WriteBatch batch;
+         for (const auto &[key, change] : impl_->changes) AddBatch(batch, key, change.after, stats);
+-        AddBatch(batch, "S", after, stats); AddBatch(batch, "V", Schema(store.options), stats);
++        AddBatch(batch, "S", after, stats); AddBatch(batch, "V", StorageSchema(store.options), stats);
+         if (!prior) AddBatch(batch, undo_key, undo, stats);
++        if (prepared) {
++            AddBatch(batch, HeaderKey(next.tip), EncodeIndexedHeader(*prepared), stats);
++            AddBatch(batch, ActiveKey(prepared->header.height), HashBytes(next.tip), stats);
++            AddBatch(batch, "I", EncodeActiveIndex(ActiveFrom(next.tip, *prepared)), stats);
++        }
+         store.Write(batch); store.head = std::move(next_head); store.stats = stats; impl_->End();
+     });
+ }
+@@ -676,11 +928,28 @@ bool DiskStateStore::Disconnect(const Hash &expected_tip, const DiskStateMetadat
+         if (impl_->active) Fail(DiskStateErrorCode::TransactionAborted, "active transaction");
+         if (impl_->head.metadata.tip != expected_tip) Fail(DiskStateErrorCode::UndoMismatch, "disconnect tip mismatch");
+         const uint64_t reads_before = impl_->stats.database_reads;
++        std::optional<ActiveChainIndex> indexed_active;
++        if (impl_->options.header_index) {
++            indexed_active = impl_->CheckedActive();
++            Require(indexed_active && indexed_active->tip == expected_tip, "indexed disconnect active tip");
++            if (indexed_active->height == 0) Fail(DiskStateErrorCode::UndoMismatch, "cannot disconnect indexed genesis");
++        }
+         const Value undo = impl_->Read(UndoKey(expected_tip));
+         if (!undo) Fail(DiskStateErrorCode::Missing, "missing undo");
+         Reader r{*undo}; const Bytes before = r.Blob(), after = r.Blob();
+         Require(after == EncodeHead(impl_->head, impl_->options), "undo successor mismatch");
+         Head previous = ParseHead(before, impl_->options);
++        std::optional<ActiveChainIndex> indexed_previous;
++        if (indexed_active) {
++            const auto parent = impl_->CheckedHeader(previous.metadata.tip);
++            Require(parent && parent->stage == HeaderStage::Connected &&
++                    parent->header.height == indexed_active->height - 1 &&
++                    HeaderBytes(parent->header) == Bytes(previous.metadata.header.begin(), previous.metadata.header.end()),
++                    "indexed undo predecessor binding");
++            const auto child = impl_->CheckedHeader(expected_tip);
++            Require(child && child->header.prev_id == previous.metadata.tip, "indexed undo parent identity");
++            indexed_previous = ActiveFrom(previous.metadata.tip, *parent);
++        }
+         const uint64_t count = r.Int(); Require(count <= undo->size() / 10, "undo count");
+         leveldb::WriteBatch batch; DiskStateStats stats;
+         std::map<Bytes, Value> restored;
+@@ -738,7 +1007,11 @@ bool DiskStateStore::Disconnect(const Hash &expected_tip, const DiskStateMetadat
+                                                          : callback_error.message);
+             }
+         }
+-        AddBatch(batch, "S", before, stats); AddBatch(batch, "V", Schema(impl_->options), stats);
++        AddBatch(batch, "S", before, stats); AddBatch(batch, "V", StorageSchema(impl_->options), stats);
++        if (indexed_active) {
++            AddBatch(batch, ActiveKey(indexed_active->height), std::nullopt, stats);
++            AddBatch(batch, "I", EncodeActiveIndex(indexed_previous), stats);
++        }
+         // Undo records are immutable and retained across disconnect/reorg.
+         stats.database_reads = impl_->stats.database_reads - reads_before;
+         impl_->Write(batch); impl_->head = std::move(previous); impl_->stats = stats;
+diff --git a/src/lotus_v2/disk_state.h b/src/lotus_v2/disk_state.h
+index 65f591c7d..d78150052 100644
+--- a/src/lotus_v2/disk_state.h
++++ b/src/lotus_v2/disk_state.h
+@@ -3,6 +3,7 @@
+ #define LOTUS_V2_DISK_STATE_H
+ 
+ #include "sparse_state.h"
++#include "chain_index.h"
+ 
+ #include <functional>
+ #include <memory>
+@@ -25,6 +26,9 @@ struct DiskStateError {
+ struct DiskStateOptions {
+     Hash identity{};
+     Hash profile_digest{};
++    // Explicit indexed development format. Generic mode remains schema v1;
++    // indexed mode requires a fresh home and rejects generic existing stores.
++    std::optional<HeaderChainProfile> header_index;
+     size_t cache_bytes{8 << 20};
+     size_t write_buffer_bytes{4 << 20}; // LevelDB's minimum is 64 KiB.
+     // Limits retained overlay key/value payload, not total RAM. Map overhead,
+@@ -92,6 +96,13 @@ public:
+                            DiskStateError &) const;
+     bool ReadCoin(const Outpoint &, std::optional<Coin> &, DiskStateError &) const;
+     bool Prove(const Outpoint &, CoinProof &, DiskStateError &) const;
++    // Enclosing validator has already checked contextual header rules. This
++    // mechanically binds identity/PoW/parent/height and derives work/time itself.
++    // HeaderChecked never writes active-height mappings or Connected status.
++    bool PutCheckedHeader(const Header &, DiskStateError &);
++    bool ReadIndexedHeader(const Hash &, std::optional<IndexedHeader> &, DiskStateError &) const;
++    bool ReadActiveId(uint64_t height, std::optional<Hash> &, DiskStateError &) const;
++    bool ReadActiveIndex(std::optional<ActiveChainIndex> &, DiskStateError &) const;
+     bool Begin(DiskStateTransaction &, DiskStateError &);
+     bool Disconnect(const Hash &expected_tip, DiskStateError &);
+     bool Disconnect(const Hash &expected_tip, const DiskStateMetadataValidator &validate,
+@@ -120,10 +131,15 @@ public:
+     // immutable undo keyed by next.tip. A failed write poisons the store until
+     // reopen because a failed sync can have an ambiguous durability outcome.
+     bool Commit(const DiskStateMetadata &next, DiskStateError &);
++    // Required in indexed mode; upgrades H and writes A/I atomically with S and
++    // coins/nodes/undo. In generic mode binds the header then uses legacy commit.
++    bool Commit(const DiskStateMetadata &next, const Header &fully_connected,
++                DiskStateError &);
+     void Abort();
+ private:
+     struct Impl;
+     std::unique_ptr<Impl> impl_;
++    bool CommitImpl(const DiskStateMetadata &, const Header *, DiskStateError &);
+     friend class DiskStateStore;
+ };
+ } // namespace lotus::v2
+diff --git a/src/lotus_v2/test_chain_index.cpp b/src/lotus_v2/test_chain_index.cpp
+new file mode 100644
+index 000000000..90a8312ba
+--- /dev/null
++++ b/src/lotus_v2/test_chain_index.cpp
+@@ -0,0 +1,326 @@
++// Copyright (c) 2026 The Lotus developers
++#include "chain_index.h"
++#include "disk_state.h"
++#include <boost/multiprecision/cpp_int.hpp>
++#include <leveldb/db.h>
++#include <leveldb/env.h>
++#include <algorithm>
++#include <cstdlib>
++#include <filesystem>
++#include <iostream>
++#include <limits>
++#include <memory>
++#include <random>
++#include <string>
++using namespace lotus::v2;
++using boost::multiprecision::cpp_int;
++namespace {
++void Check(bool ok, const std::string &message) {
++    if (!ok) { std::cerr << "V2 chain index: " << message << '\n'; std::exit(1); }
++}
++void Ok(bool ok, const DiskStateError &error, const char *message) {
++    Check(ok, std::string(message) + ": " + error.message);
++}
++Hash Tag(uint32_t value) {
++    Hash hash{}; for (unsigned i = 0; i < 4; ++i) hash[i] = value >> (8 * i); return hash;
++}
++template <size_t N> cpp_int Integer(const std::array<uint8_t, N> &bytes) {
++    cpp_int value{}; for (size_t i = bytes.size(); i-- > 0;) { value <<= 8; value += bytes[i]; } return value;
++}
++void WorkCases() {
++    ChainWork work{}; work.fill(0x5a); const auto unchanged = work;
++    Check(!HeaderWork(Hash{}, work) && work == unchanged, "zero target rejects without output mutation");
++    auto CompareOracle = [&](const Hash &target) {
++        ChainWork result{}; Check(HeaderWork(target, result), "positive target work");
++        Check(Integer(result) == (cpp_int(1) << 256) / (Integer(target) + 1), "independent mathematical work oracle");
++    };
++    Hash maximum; maximum.fill(255); CompareOracle(maximum); CompareOracle(Tag(1));
++    for (unsigned bit = 0; bit < 256; ++bit) {
++        Hash target{}; target[bit / 8] = uint8_t(1 << (bit % 8)); CompareOracle(target);
++        if (bit) { for (unsigned below = 0; below < bit; ++below) target[below / 8] |= uint8_t(1 << (below % 8)); CompareOracle(target); }
++    }
++    std::mt19937_64 random(0x79af1324);
++    for (unsigned n = 0; n < 512; ++n) {
++        Hash target{}; for (auto &byte : target) byte = random(); if (target == Hash{}) target[0] = 1;
++        CompareOracle(target);
++        const cpp_int integer = Integer(target);
++        unsigned width = (boost::multiprecision::msb(integer) + 8) / 8;
++        const cpp_int shifted = width <= 3 ? cpp_int(integer << (8 * (3 - width)))
++                                           : cpp_int(integer >> (8 * (width - 3)));
++        uint32_t mantissa = shifted.convert_to<uint32_t>();
++        if (mantissa & 0x00800000U) { mantissa >>= 8; ++width; }
++        Hash canonical; Check(DecodeTarget((width << 24) | mantissa, maximum, canonical), "canonical compact target");
++        CompareOracle(canonical);
++    }
++    for (uint32_t bits : {0x01010000U, 0x02008000U, 0x03008000U, 0x1d00ffffU, 0x207fffffU, 0x2100ffffU}) {
++        Hash target; Check(DecodeTarget(bits, maximum, target), "fixed compact oracle target"); CompareOracle(target);
++    }
++    ChainWork one{}, wide{}, total{}; one[0] = 1; wide.fill(255); total.fill(0x71);
++    const auto preserved = total;
++    Check(!AddChainWork(wide, one, total) && total == preserved, "u320 overflow rejects unchanged output");
++    ChainWork high{}; Check(HeaderWork(Tag(1), high) && AddChainWork(high, high, total) && Integer(total) == (cpp_int(1) << 256),
++                            "cumulative sum crosses u256 without wrapping");
++    Check(CompareChainWork(total, high) > 0 && CompareChainWork(high, total) < 0 && CompareChainWork(high, high) == 0,
++          "u320 ordering");
++    Check(AddChainWork(one, one, one) && Integer(one) == 2, "aliased addition");
++}
++struct Fixture {
++    HeaderChainProfile profile;
++    DiskStateOptions options;
++    Header genesis;
++    Fixture() {
++        profile.chain_id = Tag(0x1234); profile.version = 2; profile.genesis_time = 1000;
++        profile.genesis_bits = 0x207fffff; profile.half_life_seconds = 172800; profile.spacing_seconds = 120;
++        Hash limit; limit.fill(255); Check(DecodeTarget(profile.genesis_bits, limit, profile.pow_limit), "fixture target");
++        genesis.version = profile.version; genesis.bits = profile.genesis_bits; genesis.time = profile.genesis_time;
++        genesis.size = HEADER_SIZE + 4; genesis.tx_root = Tag(1); genesis.state_root = Tag(2);
++        Mine(genesis); profile.genesis_id = Id(genesis);
++        options.identity = profile.chain_id; options.profile_digest = Tag(0x5678); options.header_index = profile;
++        options.cache_bytes = 1024; options.write_buffer_bytes = 64 << 10;
++    }
++    Hash Id(const Header &header) const {
++        Hash id; Check(BlockId(profile.chain_id, header, id), "fixture block identity"); return id;
++    }
++    void Mine(Header &header) const {
++        Hash target; Check(DecodeTarget(header.bits, profile.pow_limit, target), "fixture mine target");
++        while (!MeetsTarget(Id(header), target)) ++header.nonce;
++    }
++    Header Child(const Header &parent, uint32_t tag, uint64_t time = 0) const {
++        Header header; header.prev_id = Id(parent); header.height = parent.height + 1; header.version = profile.version;
++        header.bits = profile.genesis_bits; header.time = time ? time : parent.time + 120;
++        header.size = HEADER_SIZE + 4; header.tx_root = Tag(tag); header.state_root = Tag(tag ^ 0xabcdef);
++        Mine(header); return header;
++    }
++    DiskStateMetadata Meta(const Header &header) const {
++        DiskStateMetadata metadata; metadata.tip = Id(header); std::array<uint8_t, HEADER_SIZE> bytes;
++        Check(SerializeHeader(header, bytes), "fixture serialize"); metadata.header.assign(bytes.begin(), bytes.end());
++        metadata.monetary = {1, 2, 3}; metadata.auxiliary = {4, 5, 6}; return metadata;
++    }
++    void Open(const std::string &path, DiskStateStore &store) const {
++        DiskStateError error; Ok(DiskStateStore::Open(path, options, {}, store, error), error, "indexed open");
++    }
++    void Commit(DiskStateStore &store, const Header &header) const {
++        DiskStateError error; DiskStateTransaction tx; Ok(store.Begin(tx, error), error, "indexed begin");
++        Ok(tx.Commit(Meta(header), header, error), error, "indexed commit");
++    }
++};
++std::string HKey(const Hash &id) {
++    std::string key(1, 'H'); key.append(reinterpret_cast<const char *>(id.data()), 32); return key;
++}
++std::string AKey(uint64_t height) {
++    std::string key(1, 'A'); for (unsigned i = 8; i-- > 0;) key.push_back(height >> (8 * i)); return key;
++}
++std::optional<std::string> Raw(const std::string &path, const std::string &key,
++                               bool write = false, const std::optional<std::string> &value = std::nullopt) {
++    leveldb::Options options; leveldb::DB *raw{}; auto status = leveldb::DB::Open(options, path, &raw);
++    Check(status.ok(), "raw index open: " + status.ToString()); std::unique_ptr<leveldb::DB> db(raw);
++    if (write) {
++        leveldb::WriteOptions sync; sync.sync = true; status = value ? db->Put(sync, key, *value) : db->Delete(sync, key);
++        Check(status.ok(), "raw index mutation"); return std::nullopt;
++    }
++    std::string bytes; status = db->Get(leveldb::ReadOptions{}, key, &bytes);
++    if (status.IsNotFound()) return std::nullopt;
++    Check(status.ok(), "raw index read"); return bytes;
++}
++void CheckActive(const Fixture &f, const DiskStateStore &store, const Header &header) {
++    DiskStateError error; std::optional<ActiveChainIndex> active;
++    Ok(store.ReadActiveIndex(active, error), error, "active index read");
++    Check(active && active->tip == f.Id(header) && active->height == header.height &&
++          Integer(active->chain_work) == cpp_int(2) * (cpp_int(header.height) + 1), "active height/work binding");
++    std::optional<Hash> id; Ok(store.ReadActiveId(header.height, id, error), error, "active height lookup");
++    Check(id && *id == f.Id(header), "active ID");
++    std::optional<IndexedHeader> indexed; Ok(store.ReadIndexedHeader(*id, indexed, error), error, "active H lookup");
++    Check(indexed && indexed->stage == HeaderStage::Connected && indexed->chain_work == active->chain_work,
++          "active header ever connected");
++}
++void IndexAndQueries(const std::string &path) {
++    Fixture f; DiskStateStore store; f.Open(path, store); DiskStateError error;
++    std::optional<ActiveChainIndex> active; Ok(store.ReadActiveIndex(active, error), error, "blank index"); Check(!active, "blank has no active tip");
++    Ok(store.PutCheckedHeader(f.genesis, error), error, "header-only genesis");
++    std::optional<IndexedHeader> indexed; Ok(store.ReadIndexedHeader(f.profile.genesis_id, indexed, error), error, "header-only genesis read");
++    Check(indexed && indexed->stage == HeaderStage::HeaderChecked && Integer(indexed->chain_work) == 2, "checked stage/work only");
++    Ok(store.ReadActiveIndex(active, error), error, "header-only active check"); Check(!active, "header-only never activates");
++    DiskStateTransaction tx; Ok(store.Begin(tx, error), error, "raw indexed begin");
++    Check(!tx.Commit(f.Meta(f.genesis), error) && error.code == DiskStateErrorCode::ProfileMismatch, "raw commit refuses indexed mode");
++    Ok(tx.Commit(f.Meta(f.genesis), f.genesis, error), error, "retry connected genesis"); tx.Abort(); CheckActive(f, store, f.genesis);
++    std::vector<Header> chain{f.genesis};
++    for (unsigned height = 1; height <= 128; ++height) {
++        chain.push_back(f.Child(chain.back(), height + 10)); f.Commit(store, chain.back());
++    }
++    CheckActive(f, store, chain.back());
++    const auto cached = store.Metadata(); Ok(store.PutCheckedHeader(chain.back(), error), error, "duplicate checked header");
++    Ok(store.ReadIndexedHeader(f.Id(chain.back()), indexed, error), error, "duplicate keeps stage");
++    Check(indexed->stage == HeaderStage::Connected && store.Metadata() == cached, "checked call cannot downgrade or activate");
++    Header fork = chain[120]; std::vector<Header> branch;
++    for (unsigned n = 0; n < 10; ++n) {
++        fork = f.Child(fork, 10000 + n, n == 0 ? 100000 : 16000 + n);
++        Ok(store.PutCheckedHeader(fork, error), error, "fork header admission"); branch.push_back(fork);
++    }
++    Ok(store.ReadIndexedHeader(f.Id(branch.back()), indexed, error), error, "fork work/time read");
++    Check(indexed && indexed->stage == HeaderStage::HeaderChecked && indexed->max_ancestor_time == 100000 &&
++          Integer(indexed->chain_work) == 262, "fork aggregates derived from whole ancestry");
++    CheckActive(f, store, chain.back());
++    std::vector<Hash> locator{Tag(999999)}; const auto old_locator = locator;
++    Check(BuildActiveLocator(store, f.Id(chain.back()), 1, locator, error) == ChainIndexResult::CapacityRefused && locator == old_locator,
++          "locator quota preserves output");
++    auto reads = store.LastStats().database_reads;
++    Check(BuildActiveLocator(store, f.Id(chain.back()), 76, locator, error) == ChainIndexResult::Complete &&
++          locator.front() == f.Id(chain.back()) && locator.back() == f.Id(f.genesis) && locator.size() < 30,
++          "exponential direct-height locator");
++    Check(store.LastStats().database_reads - reads <= 14 + 11 * locator.size(), "locator Gets bounded by locator length");
++    std::vector<Header> headers{f.genesis}; const auto unchanged = headers;
++    const std::vector<Hash> request{Tag(99999), f.Id(branch[2]), f.Id(chain[10]), f.Id(f.genesis)};
++    reads = store.LastStats().database_reads;
++    Check(ReadActiveHeaders(store, f.Id(chain.back()), request, f.Id(chain[13]), 4, 20, headers, error) == ChainIndexResult::Complete &&
++          headers.size() == 3 && f.Id(headers.front()) == f.Id(chain[11]) && f.Id(headers.back()) == f.Id(chain[13]),
++          "first active locator, ordered stop-inclusive reply");
++    Check(store.LastStats().database_reads - reads <= 14 + 14 * (request.size() + headers.size()), "headers Gets independent of chain height");
++    headers = unchanged;
++    Check(ReadActiveHeaders(store, f.Id(chain.back()), request, Hash{}, 3, 20, headers, error) == ChainIndexResult::CapacityRefused &&
++          headers.size() == unchanged.size() && f.Id(headers[0]) == f.Id(unchanged[0]), "locator input quota before growth");
++    Check(ReadActiveHeaders(store, Tag(999), request, Hash{}, 4, 2, headers, error) == ChainIndexResult::StaleTip, "headers snapshot tip fence");
++    Check(ReadActiveHeaders(store, f.Id(chain.back()), {}, f.Id(chain[99]), 0, 1, headers, error) == ChainIndexResult::Complete &&
++          headers.size() == 1 && f.Id(headers[0]) == f.Id(chain[99]), "empty locator explicit stop only");
++    ForkPlan plan; plan.source = Tag(999);
++    const ForkLimits generous{8, 10, 1000};
++    Check(PlanHeaderFork(store, f.Id(chain.back()), f.Id(branch.back()), generous, 99999, 0, plan, error) == ChainIndexResult::Deferred &&
++          plan.source == Tag(999), "future ancestor defers without output mutation");
++    Check(PlanHeaderFork(store, f.Id(chain.back()), f.Id(branch[7]), generous, 200000, 0, plan, error) == ChainIndexResult::NotHeavier,
++          "equal-work fork retains active tip");
++    Check(PlanHeaderFork(store, f.Id(chain.back()), Tag(999), generous, 200000, 0, plan, error) == ChainIndexResult::Missing, "unknown target");
++    Check(PlanHeaderFork(store, Tag(999), f.Id(branch.back()), generous, 200000, 0, plan, error) == ChainIndexResult::StaleTip, "plan stale tip");
++    Check(PlanHeaderFork(store, f.Id(chain.back()), f.Id(branch.back()), ForkLimits{7, 10, 1000}, 200000, 0, plan, error) == ChainIndexResult::CapacityRefused,
++          "disconnect quota before ninth entry");
++    Check(PlanHeaderFork(store, f.Id(chain.back()), f.Id(branch.back()), ForkLimits{8, 9, 1000}, 200000, 0, plan, error) == ChainIndexResult::CapacityRefused,
++          "connect quota before tenth entry");
++    for (uint64_t budget : {0ULL, 6ULL, 7ULL, 9ULL, 12ULL, 20ULL, 40ULL, 100ULL, 200ULL, 500ULL}) {
++        reads = store.LastStats().database_reads; ForkPlan limited; limited.source = Tag(999);
++        const auto result = PlanHeaderFork(store, f.Id(chain.back()), f.Id(branch.back()), {8, 10, budget}, 99999, 1, limited, error);
++        Check(store.LastStats().database_reads - reads <= budget, "actual Gets never exceed authorized budget");
++        Check(result == ChainIndexResult::Complete || (result == ChainIndexResult::CapacityRefused && limited.source == Tag(999)),
++              "budget refusal preserves output");
++    }
++    Check(PlanHeaderFork(store, f.Id(chain.back()), f.Id(branch.back()), generous, 99999, 1, plan, error) == ChainIndexResult::Complete &&
++          plan.source == f.Id(chain.back()) && plan.target == f.Id(branch.back()) && plan.fork == f.Id(chain[120]) &&
++          plan.disconnect.size() == 8 && plan.connect.size() == 10 && plan.disconnect.front() == f.Id(chain.back()) &&
++          plan.disconnect.back() == f.Id(chain[121]) && plan.connect.front() == f.Id(branch[0]) && plan.connect.back() == f.Id(branch.back()),
++          "bounded fork list directions and exact common ancestor");
++    Check(PlanHeaderFork(store, f.Id(chain.back()), f.Id(branch.back()), generous, 99000, 0, plan, error) == ChainIndexResult::Deferred,
++          "clock rollback does not mark header invalid");
++    Ok(store.Disconnect(f.Id(chain.back()), error), error, "indexed disconnect"); CheckActive(f, store, chain[127]);
++    Ok(store.ReadIndexedHeader(f.Id(chain.back()), indexed, error), error, "disconnected H retained");
++    Check(indexed && indexed->stage == HeaderStage::Connected, "Connected persists after disconnect");
++    std::optional<Hash> id; Ok(store.ReadActiveId(128, id, error), error, "above tip mapping"); Check(!id, "old active height removed");
++    store = {}; f.Open(path, store); CheckActive(f, store, chain[127]);
++    f.Commit(store, chain.back()); CheckActive(f, store, chain.back()); // Immutable undo reused.
++    store = {};
++    // Historical fork record corruption is lazy and never changes active state.
++    const auto fork_key = HKey(f.Id(branch.back())); const auto original = Raw(path, fork_key); Check(original.has_value(), "raw fork H");
++    for (size_t offset : {size_t(1), size_t(136), size_t(176), size_t(2)}) {
++        auto altered = *original; altered[offset] ^= offset == 1 ? 3 : 1; Raw(path, fork_key, true, altered);
++        f.Open(path, store); indexed = IndexedHeader{}; indexed->max_ancestor_time = 777;
++        Check(!store.ReadIndexedHeader(f.Id(branch.back()), indexed, error) && error.code == DiskStateErrorCode::Corruption &&
++              indexed->max_ancestor_time == 777, "corrupt H rejects without output mutation"); store = {};
++    }
++    Raw(path, fork_key, true, original);
++    const auto active_key = AKey(10); const auto active_original = Raw(path, active_key);
++    Raw(path, active_key, true, std::string(reinterpret_cast<const char *>(f.profile.genesis_id.data()), 32));
++    f.Open(path, store); id = Tag(777);
++    Check(!store.ReadActiveId(10, id, error) && error.code == DiskStateErrorCode::Corruption && *id == Tag(777), "corrupt active height binding"); store = {};
++    Raw(path, active_key, true, active_original);
++    const auto marker = Raw(path, "I"); Raw(path, "I", true, std::nullopt);
++    Check(!DiskStateStore::Open(path, f.options, {}, store, error) && error.code == DiskStateErrorCode::Corruption, "missing I fails reopen");
++    Raw(path, "I", true, marker);
++    auto changed = f.options; ++changed.header_index->spacing_seconds;
++    Check(!DiskStateStore::Open(path, changed, {}, store, error) && error.code == DiskStateErrorCode::ProfileMismatch, "exact header profile pinned");
++    changed = f.options; changed.header_index.reset();
++    Check(!DiskStateStore::Open(path, changed, {}, store, error) && error.code == DiskStateErrorCode::ProfileMismatch, "generic reader refuses indexed home");
++    f.Open(path, store); CheckActive(f, store, chain.back());
++}
++class FaultEnv : public leveldb::EnvWrapper {
++public:
++    enum class Fault { None, Append, Sync } fault{Fault::None};
++    FaultEnv() : EnvWrapper(leveldb::Env::Default()) {}
++    class File : public leveldb::WritableFile {
++        FaultEnv &env; std::unique_ptr<leveldb::WritableFile> file;
++    public:
++        File(FaultEnv &owner, leveldb::WritableFile *raw) : env(owner), file(raw) {}
++        std::string GetName() const override { return file->GetName(); }
++        leveldb::Status Append(const leveldb::Slice &bytes) override {
++            return env.fault == Fault::Append ? leveldb::Status::IOError("index WAL append") : file->Append(bytes);
++        }
++        leveldb::Status Sync() override { return env.fault == Fault::Sync ? leveldb::Status::IOError("index WAL sync") : file->Sync(); }
++        leveldb::Status Flush() override { return file->Flush(); }
++        leveldb::Status Close() override { return file->Close(); }
++    };
++    leveldb::Status NewWritableFile(const std::string &name, leveldb::WritableFile **out) override {
++        auto status = target()->NewWritableFile(name, out);
++        if (status.ok() && name.ends_with(".log")) *out = new File(*this, *out); return status;
++    }
++    leveldb::Status NewAppendableFile(const std::string &name, leveldb::WritableFile **out) override {
++        auto status = target()->NewAppendableFile(name, out);
++        if (status.ok() && name.ends_with(".log")) *out = new File(*this, *out); return status;
++    }
++};
++Coin CoinAt(uint32_t n) {
++    Coin coin; coin.outpoint = {Tag(n), n}; coin.output.value = n;
++    coin.output.branches = {Tag(1)}; coin.output.paths = {{0}}; return coin;
++}
++void AtomicAndModeCases(const std::string &base) {
++    Fixture f; DiskStateError error;
++    DiskStateStore generic; auto generic_options = f.options; generic_options.header_index.reset();
++    Ok(DiskStateStore::Open(base + "-generic", generic_options, {}, generic, error), error, "generic mode open"); generic = {};
++    const auto preserved = Raw(base + "-generic", "V");
++    Check(!DiskStateStore::Open(base + "-generic", f.options, {}, generic, error) && error.code == DiskStateErrorCode::ProfileMismatch,
++          "existing generic home refuses silent migration"); Check(Raw(base + "-generic", "V") == preserved, "migration refusal preserves old schema");
++    for (auto fault : {FaultEnv::Fault::Append, FaultEnv::Fault::Sync}) {
++        const std::string path = base + (fault == FaultEnv::Fault::Append ? "-append" : "-sync");
++        FaultEnv env; auto options = f.options; options.env = &env; DiskStateStore store;
++        Ok(DiskStateStore::Open(path, options, {}, store, error), error, "fault index open");
++        DiskStateTransaction tx; Ok(store.Begin(tx, error), error, "fault genesis begin");
++        Ok(tx.Insert(CoinAt(1), error), error, "fault genesis coin");
++        Ok(tx.Commit(f.Meta(f.genesis), f.genesis, error), error, "fault genesis commit"); tx.Abort(); const Hash before_root = store.Root();
++        const Header child = f.Child(f.genesis, 2);
++        Ok(store.Begin(tx, error), error, "fault child begin"); Ok(tx.Insert(CoinAt(2), error), error, "fault child coin");
++        const Hash after_root = tx.Root(); env.fault = fault;
++        Check(!tx.Commit(f.Meta(child), child, error) && error.code == DiskStateErrorCode::Database && !store.IsOpen(), "indexed failed write operational/poisoned");
++        tx.Abort(); store = {}; env.fault = FaultEnv::Fault::None;
++        Ok(DiskStateStore::Open(path, options, {}, store, error), error, "index reopen after write failure");
++        const bool child_won = store.Metadata().tip == f.Id(child);
++        Check(store.Metadata().tip == f.Id(f.genesis) || child_won, "one complete commit recovered");
++        if (fault == FaultEnv::Fault::Append) Check(!child_won, "first failed append publishes no index/state");
++        CheckActive(f, store, child_won ? child : f.genesis);
++        Check(store.Root() == (child_won ? after_root : before_root), "root/index same recovered batch");
++        std::optional<IndexedHeader> header; Ok(store.ReadIndexedHeader(f.Id(child), header, error), error, "failed write H availability");
++        Check(header.has_value() == child_won, "H presence matches published state");
++        std::optional<Coin> coin; Ok(store.ReadCoin(CoinAt(2).outpoint, coin, error), error, "failed write C availability"); Check(coin.has_value() == child_won, "C presence matches index");
++        if (!child_won) { f.Commit(store, child); CheckActive(f, store, child); }
++        env.fault = fault;
++        Check(!store.Disconnect(f.Id(child), error) && error.code == DiskStateErrorCode::Database, "failed indexed disconnect");
++        store = {}; env.fault = FaultEnv::Fault::None;
++        Ok(DiskStateStore::Open(path, options, {}, store, error), error, "index reopen after disconnect failure");
++        const bool disconnected = store.Metadata().tip == f.Id(f.genesis);
++        if (fault == FaultEnv::Fault::Append) Check(!disconnected, "failed disconnect append leaves active height");
++        CheckActive(f, store, disconnected ? f.genesis : child);
++        Ok(store.ReadIndexedHeader(f.Id(child), header, error), error, "disconnect retains H");
++        Check(header && header->stage == HeaderStage::Connected, "disconnect never deletes connected knowledge");
++        if (!disconnected) Ok(store.Disconnect(f.Id(child), error), error, "complete indexed disconnect");
++        Check(!store.Disconnect(f.Id(f.genesis), error) && error.code == DiskStateErrorCode::UndoMismatch, "indexed genesis cannot disconnect");
++        // Header-only failed publication also leaves S/A/I intact.
++        const Header other = f.Child(f.genesis, 999); env.fault = FaultEnv::Fault::Append;
++        Check(!store.PutCheckedHeader(other, error) && error.code == DiskStateErrorCode::Database, "failed header-only admission");
++        store = {}; env.fault = FaultEnv::Fault::None;
++        Ok(DiskStateStore::Open(path, options, {}, store, error), error, "header-only failure reopen"); CheckActive(f, store, f.genesis);
++        Ok(store.ReadIndexedHeader(f.Id(other), header, error), error, "header-only failure H"); Check(!header, "failed header-only H absent");
++        store = {};
++    }
++}
++} // namespace
++int main() {
++    const auto path = (std::filesystem::temp_directory_path() / ("lotus-v2-chain-index-" + std::to_string(std::random_device{}()))).string();
++    Check(std::filesystem::create_directory(path), "temporary index directory");
++    std::cout << "chain index test artifacts: " << path << '\n';
++    WorkCases(); IndexAndQueries(path + "/indexed"); AtomicAndModeCases(path + "/atomic");
++    std::filesystem::remove_all(path);
++    std::cout << "V2 chain index work oracle, bounded queries, fork plans, atomicity and corruption cases passed\n";
++}
+-- 
+2.50.1 (Apple Git-155)
+
