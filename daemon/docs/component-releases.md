@@ -20,10 +20,10 @@ versions are not bumped to impersonate a newer official upstream release.
 | Component | Existing series | Native version at current pin | Default profile | Chronik |
 |---|---|---|---|---|
 | `lotusd` | `v1` | Prepared Lotus numeric version | maintained | Existing in-process, ON |
-| `bitcoin-abc` | `ecash` | 0.34.1 | stock | Existing in-process, explicit opt-in |
-| `bchn` | `bchn` | 29.2.1 | stock | Optional host candidate exists; release profile is not yet packaged |
-| `doged` | `doged` | 0.4.0 | maintained compatibility/test patches | Existing in-process; release manifest still needs preparation |
-| `bitcoin-core` | `bitcoin` | 32.99.0 | stock | Optional host candidate exists; current stock manifest has Chronik OFF and is refused for publication |
+| `bitcoin-abc` | `ecash` | 0.34.1 | provider only | Shared Chronik source provider; no network release |
+| `bchn` | `bchn` | 29.2.1 | custom Chronik host | In-process ABC Chronik with BCHN adapter |
+| `doged` | `doged` | 0.4.0 | maintained compatibility/test patches | Existing in-process, ON |
+| `bitcoin-core` | `bitcoin` | 32.99.0 | custom Chronik host | In-process ABC Chronik with Core adapter |
 
 ABC/BCHN/Doged/Core pins currently represent development snapshots, not assertions
 that upstream released those exact commits as stable versions. A future stable
@@ -66,25 +66,27 @@ labels; it is not a consensus change. Source construction verifies native `git a
 replay, retains its complete history on local `replayed-patches`, then selects the
 fixed-epoch source commit used by both archives and binary build labels.
 
-Default stock-policy ABC/BCHN/Core profiles select no experimental policy patches;
+Default stock-policy profiles select no experimental policy patches;
 only the generated build-label adapter changes their source. Doged's maintained
 profile includes its existing build/test compatibility series. Custom features
 require `--profile custom`; policy candidates additionally need
 `--allow-experimental`. Chronik, NNG, mining and ZeroMQ remain independent. For example:
 
 ```sh
-python3 daemon/scripts/component-release.py --component bitcoin-abc \
-  --upstream /path/to/abc --version 1.0.0 --profile custom --features chronik \
-  --candidate /tmp/abc-chronik-review
+python3 daemon/scripts/component-release.py --component bchn \
+  --upstream /path/to/bchn --version 29.2.1 --patch-revision 1 \
+  --profile custom --features chronik --candidate /tmp/bchn-chronik-review
 ```
 
 Chronik does not select mining/chain-limit/NNG/ZeroMQ-removal patches. BCHN NNG
 selects the reviewed existing FlatBuffers compatibility port only with an explicit
 custom profile and experimental opt-in. Its native macOS checks do not establish
 Linux package validation; exact component artifact CI is required for publication.
-BCHN/Core Chronik host adapters exist as separately validated candidates, but
-the release builder does not yet bundle their pinned shared export and host
-profiles. The tag workflow refuses manifests without Chronik enabled.
+BCHN/Core Chronik host adapters are selected as explicit features. Their
+manifests pin the host profile and ABC provider export; release CI exports that
+source, verifies the host profile, applies the adapter and runs fresh regtest
+behavior checks before packaging. ABC remains the provider and is not a network
+release target. The tag workflow refuses manifests without Chronik enabled.
 
 ## Validation and publication
 
@@ -112,7 +114,7 @@ Source archives/checksums are deterministic for source identity; binary
 reproducibility, synchronization and host-specific behavior require separate evidence.
 
 After the reviewed manifest and all required source changes reach `origin/main`,
-create and push its exact component tag (for example `bitcoin-abc-v0.34.2`). The
+create and push its exact component tag (for example `bchn-v29.2.2`). The
 tag workflow verifies manifest/tag identity, confirms the tagged commit is
 reachable from `main`, and refuses a release unless the manifest explicitly
 builds Chronik. It builds/tests Linux x86_64 and macOS arm64, smoke-tests the
@@ -128,15 +130,15 @@ tag pushes use the same build/test gates and publish only after those gates pass
 
 ## Current tag readiness
 
-The legacy `v*` workflow publishes Lotus V1 binaries with in-process Chronik.
-The component workflow recognizes `lotusd-v*`, `bitcoin-abc-v*`, `bchn-v*`,
-`doged-v*`, and `bitcoin-core-v*`; it publishes only when that exact tag has a
-reviewed manifest on `main` whose final `BUILD_CHRONIK` setting is ON. At this
-revision, Bitcoin ABC has a prepared Chronik manifest. Lotus's namespaced
-manifest and Doged's release manifest still need preparation. BCHN and Bitcoin
-Core host adapters still need their shared Chronik export/profile carried through
-source archives and artifact builds; their current manifests cannot pass the
-Chronik gate. Do not create release tags for those unready profiles.
+The legacy `v*` workflow remains for Lotus V1. The component workflow publishes
+only `lotusd-v*`, `bchn-v*`, `doged-v*`, and `bitcoin-core-v*`. Bitcoin ABC is
+the pinned source provider for the BCHN/Core Chronik adapters and is deliberately
+excluded from network release tags. Prepared candidates are `lotusd-v11.6.1`,
+`bchn-v29.2.1`, `doged-v0.4.0`, and `bitcoin-core-v32.99.0`; tags are immutable,
+so use a new distributor version if a candidate changes. No component release
+has been published by this workflow. Run artifact-only CI first; successful
+artifact-only runs are a useful preflight, but tag CI itself remains the final
+publication gate.
 
 ## Build-label audit and Guix boundary
 
@@ -173,25 +175,20 @@ conflicts, reorg/restart and WebSocket events; it does not claim semantic
 token indexing. Exact limits and commands are in the [Core](../chronik/hosts/bitcoin-core/HOST.md)
 and [BCHN](../chronik/hosts/bchn/README.md) host records.
 
-The component release builder still materializes only the upstream node source
-and its current release manifest patches. It does not yet bundle the verified
-ABC Chronik export, apply the host mailboxes or pass the provider/profile pins
-through artifact CI. Therefore these profiles are reviewable integration
-candidates, not selectable release features. The publishing workflow rejects a
-tag whose reviewed component manifest does not explicitly enable Chronik. Keep
-default release manifests stock until source archive, artifact CI and host-specific
-release evidence are
-added and pass. No Linux/Windows, mainnet sync, long-running load or reproducible
-binary claim follows from the macOS regtest results.
+The host profiles have passed local macOS regtest checks. Tag CI additionally
+builds both Linux x86_64 and macOS arm64 from the exact manifest, runs each
+host's fresh regtest behavior suite and packages the verified ABC Chronik export
+with the source and binaries. Successful tag CI is required before publication;
+local host tests do not establish Linux/Windows, mainnet sync, long-running load
+or reproducible binary behavior.
 
 ## Shared-source provider packaging
 
 The CMake provider verifies the exact pinned Chronik export, native host inputs,
 ordered source mailboxes and resulting source hashes before building in a private
-copy. Component release archives must include those verified files and lockfile;
-a remote pin alone is insufficient. Release tooling still needs to carry the
-export manifest digest, host profile and adapter hashes through the reviewed
-manifest and artifact validation before these host profiles can be published.
+copy. Component release archives include those verified files and lockfile. The
+reviewed manifest records the export digest, host profile and adapter hash, and
+artifact CI checks them against the pinned provider before building.
 
 ## Component-specific Rust selection
 

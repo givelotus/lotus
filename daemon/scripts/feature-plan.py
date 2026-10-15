@@ -12,8 +12,8 @@ TARGETS = {
     'v1': {'chronik': 'BUILD_CHRONIK', 'nng': 'BUILD_BITCOIN_NNG', 'zmq': 'BUILD_ZMQ'},
     'ecash': {'chronik': 'BUILD_CHRONIK', 'zmq': 'BUILD_ZMQ'},
     'doged': {'chronik': 'BUILD_CHRONIK', 'zmq': 'BUILD_ZMQ'},
-    'bchn': {'zmq': 'BUILD_BITCOIN_ZMQ'},
-    'bitcoin': {'zmq': 'WITH_ZMQ'},
+    'bchn': {'chronik': 'BUILD_CHRONIK', 'zmq': 'BUILD_BITCOIN_ZMQ'},
+    'bitcoin': {'chronik': 'BUILD_CHRONIK', 'zmq': 'WITH_ZMQ'},
 }
 FEATURES = ('chronik', 'chronik-off', 'nng', 'nng-off', 'zeromq-on', 'zeromq-off', 'zeromq-default-off', 'zeromq-remove',
             'block-construction', 'tx-chain-limit', 'long-chain-container-test', 'mempool-check')

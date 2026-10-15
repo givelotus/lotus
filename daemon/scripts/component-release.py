@@ -84,6 +84,23 @@ def path_for(root, component):
     return root / 'daemon/releases' / component
 
 
+CHRONIK_HOSTS = {'bchn': 'bchn', 'bitcoin-core': 'bitcoin-core'}
+
+
+def chronik_host_manifest(root, component, features):
+    if 'chronik' not in features or component not in CHRONIK_HOSTS:
+        return None
+    profile = CHRONIK_HOSTS[component]
+    profile_path = root / 'daemon/chronik/hosts' / profile / 'profile.json'
+    provider = json.loads((root / 'daemon/chronik/source.json').read_text())
+    return {
+        'profile': profile,
+        'profile_sha256': hashlib.sha256(profile_path.read_bytes()).hexdigest(),
+        'provider_upstream_commit': provider['upstream_commit'],
+        'export_manifest_sha256': provider['export_manifest_sha256'],
+    }
+
+
 def prepare(root, upstream, component, version, revision, profile=None, features=(), experimental=False,
             check=False, archive=None, network=None, allow_network_rpc=False):
     config = registry(root)[component]
@@ -113,6 +130,10 @@ def prepare(root, upstream, component, version, revision, profile=None, features
         raise ValueError('Verified network-input preparation currently supports Lotus only')
     selected = entries(root, config['series']) if profile != 'stock' else []
     selected += [root / 'daemon' / Path(path).relative_to(planner.DAEMON) for path in plan['patches']]
+    chronik_host = chronik_host_manifest(root, component, features)
+    if chronik_host:
+        native = root / 'daemon/chronik/hosts' / chronik_host['profile'] / 'node/0001-wire-chronik-lifecycle-and-native-storage.patch'
+        selected.append(native)
     selected = list(dict.fromkeys(selected))
     flags = config['cmake_args'] + plan['cmake_args']
     # Preserve native upstream versions, even for patched distribution builds.
@@ -156,12 +177,22 @@ def prepare(root, upstream, component, version, revision, profile=None, features
                     'source_archive': f'{tag}-source.tar.gz', 'source_archive_sha256': source_sha256, 'source_date_epoch': 1000684800,
                     'publication_workflow': 'Daemon component artifacts and releases',
                     'validation_scope': 'prepared source identity only; CI/native and behavioral results are separate'}
+        if chronik_host:
+            manifest['chronik_host'] = chronik_host
+        if chronik_host:
+            chronik_description = (f'Chronik is built in-process from ABC `{chronik_host["provider_upstream_commit"]}` '
+                                   f'using the `{chronik_host["profile"]}` host adapter. Tag CI runs fresh host regtest.\n')
+        elif any(flag == '-DBUILD_CHRONIK=ON' for flag in flags):
+            chronik_description = 'The in-process Chronik indexer is compiled in; run the documented runtime enable option.\n'
+        else:
+            chronik_description = 'Chronik is not enabled in this build.\n'
         notes = (f'# {tag}\n\nDistributor build from {config["remote"]} commit `{base}`.\n'
                  f'Upstream native version: `{upstream_version}`; built native version: `{native}`.\n'
                  f'Distributor patch revision: `{revision}`; profile: `{profile}`; channel: `{config["channel"]}`.\n'
-                 f'Explicit features: `{",".join(features) or "registry defaults"}`.\nSource tree: `{tree}`.\n\n'
+                 f'Explicit features: `{",".join(features) or "registry defaults"}`.\nSource tree: `{tree}`.\n'
+                 f'{chronik_description}\n'
                  'This is a givelotus distribution, not an official upstream release.\n'
-                 'Build checks do not establish mainnet synchronization, consensus parity, or a Chronik host port.\n'
+                 'Build and regtest checks do not establish full mainnet synchronization or complete consensus parity.\n'
                  'No production deployment or container-registry push is performed.\n')
         docker = '''FROM ubuntu:24.04
 ARG RELEASE_ARCHIVE

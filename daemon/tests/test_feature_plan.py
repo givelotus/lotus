@@ -11,7 +11,7 @@ spec.loader.exec_module(planner)
 
 class FeatureSelectionTests(unittest.TestCase):
     def test_chronik_has_no_policy_dependencies(self):
-        for target in ("v1", "ecash", "doged"):
+        for target in ("v1", "ecash", "doged", "bchn", "bitcoin"):
             plan = planner.resolve(target, ["chronik"], False)
             self.assertEqual(plan["patches"], [])
             self.assertEqual(plan["cmake_args"], ["-DBUILD_CHRONIK=ON"])
@@ -27,12 +27,19 @@ class FeatureSelectionTests(unittest.TestCase):
                 planner.resolve("v1", names, False)
 
     def test_unimplemented_ports_and_policy_are_rejected(self):
-        for target, name in (("bitcoin", "chronik"), ("bitcoin", "nng"),
+        for target, name in (("bitcoin", "nng"),
                              ("ecash", "tx-chain-limit"), ("v1", "tx-chain-limit"),
                              ("bchn", "long-chain-container-test"),
                              ("doged", "zeromq-remove")):
             with self.assertRaises(ValueError):
                 planner.resolve(target, [name], True)
+
+    def test_native_chronik_host_profiles_are_independent_features(self):
+        for target in ("bchn", "bitcoin"):
+            plan = planner.resolve(target, ["chronik"], False)
+            self.assertEqual(plan["patches"], [])
+            self.assertEqual(plan["cmake_args"], ["-DBUILD_CHRONIK=ON"])
+            self.assertEqual(plan["features"][0]["requires"], [])
 
     def test_v1_custom_assembler_is_integrated(self):
         plan = planner.resolve("v1", ["block-construction"], False)

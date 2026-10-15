@@ -62,7 +62,7 @@ class ComponentTests(unittest.TestCase):
         self.assertEqual(self.git('status','--porcelain'),b'')
 
     def test_unsupported_features_and_bad_identity_fail_before_writes(self):
-        for feature in ('chronik','nng','tx-chain-limit','unknown'):
+        for feature in ('nng','tx-chain-limit','unknown'):
             with self.assertRaises(ValueError):
                 self.prepare(profile='custom',features=[feature],experimental=True)
         for version in ('v1.0.0','01.0.0','1.0','1.0.0;echo x'):
@@ -70,6 +70,21 @@ class ComponentTests(unittest.TestCase):
                 release.identity('bitcoin-core',version,1)
         self.assertEqual(release.identity('lotusd','11.6.2',1), 'lotusd-v11.6.2')
         self.assertFalse((self.root/'daemon/releases').exists())
+
+    def test_core_chronik_selects_the_reviewed_host_adapter(self):
+        (self.root/'daemon/chronik/hosts/bitcoin-core/node').mkdir(parents=True)
+        (self.root/'daemon/chronik/hosts/bitcoin-core').mkdir(exist_ok=True)
+        (self.root/'daemon/chronik/hosts/bitcoin-core/profile.json').write_text('{"name":"fixture"}\n')
+        (self.root/'daemon/chronik/hosts/bitcoin-core/node/0001-wire-chronik-lifecycle-and-native-storage.patch').write_text(
+            'diff --git a/CMakeLists.txt b/CMakeLists.txt\n--- a/CMakeLists.txt\n+++ b/CMakeLists.txt\n@@ -1,3 +1,4 @@\n set(CLIENT_VERSION_MAJOR 32)\n+ # fixture adapter\n set(CLIENT_VERSION_MINOR 99)\n set(CLIENT_VERSION_BUILD 0)\n')
+        (self.root/'daemon/chronik/source.json').write_text(json.dumps({
+            'upstream_commit':'a'*40, 'export_manifest_sha256':'b'*64})+'\n')
+        self.prepare(profile='custom',features=['chronik'])
+        manifest=self.manifest()
+        self.assertEqual(manifest['features'],['chronik'])
+        self.assertEqual(manifest['chronik_host']['profile'],'bitcoin-core')
+        self.assertEqual(manifest['patches'][0]['path'],
+                         'daemon/chronik/hosts/bitcoin-core/node/0001-wire-chronik-lifecycle-and-native-storage.patch')
 
     def test_drift_rejected_and_stock_cannot_silently_enable_candidates(self):
         self.prepare()
