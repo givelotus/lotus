@@ -4,14 +4,19 @@
  * Build-time only. Nothing here is consensus, VM, runtime or transaction code.
  * Local path packages and `compilePackage` read declared files, `lotus.lock` and
  * (for module paths) the project cache or `vendor/` tree. They do not spawn git
- * or use the network. `lotus-v2-package-fetch` is the networked entry.
+ * or use the network. `lotus-v2-package-fetch` is the networked entry. The resolver
+ * parses each immutable module identity once, links explicit imports into one helper
+ * namespace and hands the linked program to the existing scheduler/compiler. Library
+ * contracts are compiled into the same program so `contract_root` / `leaf_hash` /
+ * `merkle_root` pin their bytecode roots; helpers stay inlined. There is no registry,
+ * clock, VM call (`OP_DEFINE` / `OP_INVOKE`) or environment input.
  */
 import { lstatSync, readdirSync, readFileSync, realpathSync, statSync, writeFileSync } from 'node:fs';
 import { join, relative, sep } from 'node:path';
 import { bytes, concat, cs, hex, tagged, type Span } from './compiler.js';
 import { CompileError, SourceManager, diagnostic } from './diagnostics.js';
 import { compileLinkedProgramAsync, parseModuleSource, type CompileOptions, type Contract, type ContractArtifact, type Expr, type Helper,
-  type ImportDecl, type Method, type Param, type Program, type SchedulerEvent, type Stmt } from './generic.js';
+  type ImportDecl, type LinkedContract, type Method, type Param, type Program, type SchedulerEvent, type Stmt } from './generic.js';
 import { assertPortableName } from './names.js';
 import { assertGitLocator, classifyRequirement, isGitLocator, isModulePath, resolveDistributedSources, type FetchOptions } from './package-sources.js';
 import { PromiseScheduler } from './scheduler.js';
@@ -405,7 +410,6 @@ export async function compilePackage(projectDir: string, options: PackageCompile
     parses[id] = (parses[id] ?? 0) + 1;
     const node: ModuleNode = { id, pkg, path, file, digest: data.digest, program, isEntry, imports: [] };
     modules.set(id, node);
-    if (!isEntry) for (const contract of program.contracts.values()) throw new PackageError('declaration-only', `${contract.kind} ${contract.name} must be declared in the root package entry module; ${pkg.manifest.kind === 'library' ? 'library' : 'non-entry'} modules are declaration-only`, file, contract.span);
     return node;
   };
   const entry = load(root, root.manifest.entry);
@@ -454,11 +458,12 @@ export async function compilePackage(projectDir: string, options: PackageCompile
   const trace: SchedulerEvent[] = [];
   const scheduler = new PromiseScheduler<void>(event => trace.push(event), { maxJobs: limits.maxModules });
   const helpers = new Map<string, Helper>(); const contracts = new Map<string, Contract>();
+  const owners = new Map<string, { pkg: PackageInfo; moduleId: string; kind: Contract['kind'] }>();
   const interfaces = new Map<string, { digest: Uint8Array; exports: { name: string; signature: string; digest: string }[] }>();
   for (const node of modules.values())
     scheduler.register(`module:${node.id}`, [...new Set(node.imports.map(x => `module:${x.target.id}`))], () => link(node));
   const link = (node: ModuleNode): void => {
-    type Entry = { kind: 'helper'; canonical: string } | { kind: 'module'; target: ModuleNode } | { kind: 'contract' };
+    type Entry = { kind: 'helper'; canonical: string } | { kind: 'module'; target: ModuleNode } | { kind: 'contract'; programName: string; owner: ModuleNode };
     const scope = new Map<string, Entry>();
     const declare = (name: string, entryValue: Entry, span: Span): void => {
       if (BUILTINS.has(name)) throw new PackageError('duplicate-name', `${name} shadows a builtin`, node.file, span);
@@ -466,37 +471,85 @@ export async function compilePackage(projectDir: string, options: PackageCompile
       scope.set(name, entryValue);
     };
     const canonical = (owner: ModuleNode, name: string): string => `${owner.id}::${name}`;
-    const access = (owner: ModuleNode, name: string, span: Span): string => {
+    // Helpers and contracts share a module namespace. Visibility matches helpers: private to the module,
+    // package within the package, export only from another package (and only via an exported module).
+    const lookup = (owner: ModuleNode, name: string, span: Span): { kind: 'helper'; canonical: string } | { kind: 'contract'; programName: string } => {
       const helper = owner.program.helpers.get(name);
-      if (!helper) throw new PackageError('missing-symbol', `${owner.id} has no function ${name}`, node.file, span);
-      if (helper.visibility === 'private') throw new PackageError('visibility', `${name} is private to module ${owner.id}`, node.file, span);
-      if (owner.pkg !== node.pkg && helper.visibility !== 'export') throw new PackageError('visibility', `${name} is package-scoped in ${owner.pkg.id}`, node.file, span);
-      return canonical(owner, name);
+      const contract = owner.program.contracts.get(name);
+      if (helper && contract) throw new PackageError('duplicate-name', `${owner.id} declares both a function and a contract named ${name}`, node.file, span);
+      if (!helper && !contract) throw new PackageError('missing-symbol', `${owner.id} has no function or contract ${name}`, node.file, span);
+      const visibility = helper ? helper.visibility : contract!.visibility;
+      if (owner !== node) {
+        if (visibility === 'private') throw new PackageError('visibility', `${name} is private to module ${owner.id}`, node.file, span);
+        if (owner.pkg !== node.pkg && visibility !== 'export') throw new PackageError('visibility', `${name} is package-scoped in ${owner.pkg.id}`, node.file, span);
+      }
+      return helper ? { kind: 'helper', canonical: canonical(owner, helper.name) } : { kind: 'contract', programName: contract!.name };
     };
     for (const helper of node.program.helpers.values()) declare(helper.name, { kind: 'helper', canonical: canonical(node, helper.name) }, helper.span);
-    for (const contract of node.program.contracts.values()) declare(contract.name, { kind: 'contract' }, contract.span);
+    for (const contract of node.program.contracts.values()) declare(contract.name, { kind: 'contract', programName: contract.name, owner: node }, contract.span);
     for (const { decl, target } of node.imports) {
       if (decl.moduleAlias) declare(decl.moduleAlias.name, { kind: 'module', target }, decl.moduleAlias.span);
-      for (const item of decl.items ?? []) declare(item.local, { kind: 'helper', canonical: access(target, item.name, item.span) }, item.span);
+      for (const item of decl.items ?? []) {
+        const symbol = lookup(target, item.name, item.span);
+        if (symbol.kind === 'helper') declare(item.local, { kind: 'helper', canonical: symbol.canonical }, item.span);
+        else declare(item.local, { kind: 'contract', programName: symbol.programName, owner: target }, item.span);
+      }
     }
     const span = (s: Span): Span => ({ start: s.start, end: s.end, module: node.id, ...(s.file !== undefined ? { file: s.file } : {}) });
+    // Rewrite commitment arguments to the contract's declared name. The compiler then pins that bytecode root.
+    const rewriteContractRef = (text: string, at: Span, expectMethod: boolean): string => {
+      let owner = node, body = text;
+      if (text.includes('::')) {
+        const parts = text.split('::');
+        if (parts.length !== 2) throw new PackageError('missing-symbol', `invalid contract reference ${text}`, node.file, at);
+        const alias = parts[0]!, rest = parts[1]!;
+        const bound = scope.get(alias);
+        if (bound?.kind !== 'module') throw new PackageError('missing-symbol', `${alias} is not an imported module alias`, node.file, at);
+        owner = bound.target; body = rest;
+      }
+      const dot = body.split('.');
+      if (dot.length > 2 || !dot[0]) throw new PackageError('missing-symbol', `invalid contract reference ${text}`, node.file, at);
+      const method = dot[1];
+      if (expectMethod !== (method !== undefined)) throw new PackageError('missing-symbol', expectMethod ? 'leaf_hash requires Contract.method' : `${text} must name a contract`, node.file, at);
+      let programName: string, home: ModuleNode;
+      if (text.includes('::')) {
+        const symbol = lookup(owner, dot[0]!, at);
+        if (symbol.kind !== 'contract') throw new PackageError('missing-symbol', `${dot[0]} is not a contract`, node.file, at);
+        programName = symbol.programName; home = owner;
+      } else {
+        const bound = scope.get(dot[0]!);
+        if (bound?.kind !== 'contract') throw new PackageError('missing-symbol', `${dot[0]} is not a contract in scope`, node.file, at);
+        programName = bound.programName; home = bound.owner;
+      }
+      const contract = home.program.contracts.get(programName);
+      if (method && !contract?.methods.some(m => m.name === method)) throw new PackageError('missing-symbol', `${programName} has no method ${method}`, node.file, at);
+      return method ? `${programName}.${method}` : programName;
+    };
     const expr = (e: Expr): Expr => {
-      let value = e.value;
-      if (e.kind === 'call' && value !== undefined && !BUILTINS.has(value) && !value.includes('.')) {
+      let value = e.value, args = e.args;
+      if (e.kind === 'call' && value !== undefined && COMMITMENT_BUILTINS.has(value)) {
+        const arg = args?.[0];
+        if (args?.length === 1 && arg?.kind === 'name' && arg.value !== undefined)
+          args = [{ ...arg, span: span(arg.span), value: rewriteContractRef(arg.value, arg.span, value === 'leaf_hash') }];
+        else if (args) args = args.map(expr);
+      } else if (e.kind === 'call' && value !== undefined && !BUILTINS.has(value) && !value.includes('.')) {
         if (value.includes('::')) {
           const [alias, member] = value.split('::') as [string, string];
           const bound = scope.get(alias);
           if (bound?.kind !== 'module') throw new PackageError('missing-symbol', `${alias} is not an imported module alias`, node.file, e.span);
-          value = access(bound.target, member, e.span);
+          const symbol = lookup(bound.target, member, e.span);
+          if (symbol.kind !== 'helper') throw new PackageError('missing-symbol', `${member} is not a function`, node.file, e.span);
+          value = symbol.canonical;
         } else {
           const bound = scope.get(value);
-          if (!bound || bound.kind !== 'helper') throw new PackageError('missing-symbol', `unknown function ${value}`, node.file, e.span);
+          if (bound?.kind === 'contract') throw new PackageError('missing-symbol', `${value} is a contract, not a function`, node.file, e.span);
+          if (bound?.kind !== 'helper') throw new PackageError('missing-symbol', `unknown function ${value}`, node.file, e.span);
           value = bound.canonical;
         }
-      } else if (e.kind === 'call' && value !== undefined && COMMITMENT_BUILTINS.has(value) && !node.isEntry)
-        throw new PackageError('declaration-only', `${value} may only be used in the root package entry module`, node.file, e.span);
+        if (args) args = args.map(expr);
+      } else if (args) args = args.map(expr);
       return { ...e, span: span(e.span), ...(value !== undefined ? { value } : {}),
-        ...(e.args ? { args: e.args.map(expr) } : {}), ...(e.left ? { left: expr(e.left) } : {}), ...(e.right ? { right: expr(e.right) } : {}) };
+        ...(args ? { args } : {}), ...(e.left ? { left: expr(e.left) } : {}), ...(e.right ? { right: expr(e.right) } : {}) };
     };
     const stmt = (s: Stmt): Stmt => ({ ...s, span: span(s.span), ...(s.expr ? { expr: expr(s.expr) } : {}),
       ...(s.then ? { then: s.then.map(stmt) } : {}), ...(s.otherwise ? { otherwise: s.otherwise.map(stmt) } : {}) });
@@ -505,19 +558,36 @@ export async function compilePackage(projectDir: string, options: PackageCompile
       const name = canonical(node, helper.name);
       helpers.set(name, { ...helper, name, params: helper.params.map(param), body: expr(helper.body), span: span(helper.span) });
     }
-    if (node.isEntry) for (const contract of node.program.contracts.values())
-      contracts.set(contract.name, { ...contract, params: contract.params.map(param), span: span(contract.span),
-        methods: contract.methods.map((m: Method) => ({ ...m, params: m.params.map(param), body: m.body.map(stmt), span: span(m.span) })) });
-    // Stable interface: exported signatures only (bodies affect sourceDigest, not interfaceDigest).
-    const exported = [...node.program.helpers.values()].filter(h => h.visibility === 'export').sort(byName).map(h => {
+    for (const contract of node.program.contracts.values()) {
+      if (contracts.has(contract.name)) throw new PackageError('duplicate-name', `contract ${contract.name} is already declared in ${owners.get(contract.name)!.moduleId}`, node.file, contract.span);
+      const linked = { ...contract, params: contract.params.map(param), span: span(contract.span),
+        methods: contract.methods.map((m: Method) => ({ ...m, params: m.params.map(param), body: m.body.map(stmt), span: span(m.span) })) };
+      owners.set(contract.name, { pkg: node.pkg, moduleId: node.id, kind: contract.kind });
+      contracts.set(contract.name, linked);
+    }
+    // Stable interface: exported helper signatures, then exported contract/token signatures.
+    // Helper declaration bytes stay exactly as before so helper-only modules keep their digest.
+    const helperExports = [...node.program.helpers.values()].filter(h => h.visibility === 'export').sort(byName).map(h => {
       const digest = tagged('package/declaration', concat(str(h.name), cs(h.params.length), ...h.params.map(p => concat(str(p.name), str(p.type))), str(h.result)));
       return { name: h.name, signature: signature(h), digest };
     });
+    const contractExports = [...node.program.contracts.values()].filter(c => c.visibility === 'export').sort(byName).map(c => {
+      const head = c.params.length ? `${c.kind} ${c.name}<${c.params.map(p => `${p.name}: ${p.type}`).join(', ')}>` : `${c.kind} ${c.name}`;
+      const methods = c.methods.map(m => `${m.name}(${m.params.map(p => `${p.name}: ${p.type}`).join(', ')})`).join('; ');
+      const digest = tagged('package/contract', concat(str(c.kind), str(c.name), cs(c.params.length), ...c.params.map(p => concat(str(p.name), str(p.type))),
+        cs(c.methods.length), ...c.methods.flatMap(m => [str(m.name), cs(m.params.length), ...m.params.map(p => concat(str(p.name), str(p.type)))])));
+      return { name: c.name, signature: `${head} { ${methods} }`, digest };
+    });
+    const exported = [...helperExports, ...contractExports];
     interfaces.set(node.id, { digest: tagged('package/interface', concat(str(node.pkg.manifest.name), str(node.path), cs(exported.length), ...exported.map(x => x.digest))),
       exports: exported.map(x => ({ name: x.name, signature: x.signature, digest: hex(x.digest) })) });
   };
   await scheduler.run(`module:${entry.id}`);
-  const artifact = await compileLinkedProgramAsync({ helpers, contracts, imports: [] }, options, event => trace.push(event), sources);
+  const { artifact, roots } = await compileLinkedProgramAsync({ helpers, contracts, imports: [] }, options, event => trace.push(event), sources);
+  const links: LinkedContract[] = roots.filter(item => item.name !== artifact.contract && owners.get(item.name)?.pkg.id !== root.id).map(item => {
+    const owner = owners.get(item.name)!;
+    return { name: item.name, kind: owner.kind, package: owner.pkg.id, module: owner.moduleId, packageDigest: hex(owner.pkg.treeDigest), root: item.root, methods: item.methods };
+  }).sort(byName);
   const graph: Omit<BuildGraph, 'digest'> = {
     schema: BUILD_GRAPH_SCHEMA,
     compiler: { name: COMPILER_NAME, version: COMPILER_VERSION, profile: options.optimize === false ? 'unoptimized' : 'optimized' },
@@ -531,5 +601,5 @@ export async function compilePackage(projectDir: string, options: PackageCompile
       imports: [...new Set(node.imports.map(x => x.target.id))].sort() })).sort((a, b) => a.id < b.id ? -1 : 1),
   };
   const build: BuildGraph = { ...graph, digest: hex(tagged('build-graph', utf8(JSON.stringify(graph)))) };
-  return { artifact: { ...artifact, build }, trace, parses };
+  return { artifact: links.length ? { ...artifact, links, build } : { ...artifact, build }, trace, parses };
 }
