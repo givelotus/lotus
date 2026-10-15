@@ -1,12 +1,12 @@
 # Worked contract examples
 
-Status: semantic examples for review. These programs are pseudocode, not executable bytecode. Candidate byte/commitment/signature semantics now exist in P01–P03; generated signatures and complete execution results still await the reference assembler/evaluator; no illustrative hash is presented as a computed result.
+Status: semantic examples for review. Listings on this page mix implemented source concepts with historical pseudocode and symbolic assembly; they are not a conformance suite. The [current compiler gallery](../../../tools/lotus-v2-compiler/examples/gallery/README.md) contains executable programs, artifacts and reference/native evidence with explicit stage limits. The [EVM conversion suite](evm-porting/README.md) adds runnable threshold, escrow, mint-limit and AMM arithmetic slices, retained negative outcomes, and proposed ERC20/ERC721/stateful designs. No illustrative hash on this page is presented as a computed result.
 
 The separately generated [structural fixtures](candidate-smoke-vectors.json) cover framing, hashing, trees and selected integer algorithms. Their [generator and scope](../tools/README.md) are explicit: they do not execute these contracts or verify a signed payment.
 
 ## Language conventions used here
 
-The source language below is illustrative. No grammar, compiler or ABI file format is specified anywhere; the listings show how the opcodes of [P03](../decisions/vm-semantics.md) are meant to be used. Assembly uses symbolic opcode names, `<x>` for a push of constant `x`, and stack comments with the top on the right.
+The [script ABI](../script-abi.md) distinguishes today's schema-2 compiler grammar from the proposed LC-1 entrypoint, named-policy and state-effect language. The older listings below show how [P03](../decisions/vm-semantics.md) operations can be used; unsupported syntax such as `state`, `paired output`, `Blocks`, and `ends` must not be pasted into the current compiler as working code. Assembly uses symbolic opcode names, `<x>` for a push of constant `x`, and stack comments with the top on the right.
 
 - **`contract`** declares a tree of spend methods. Its root appears on outputs as a branch. **`token`** declares a tree of mint methods. Its root is the token ID. Consensus hashes both the same way and does not tell a mint script from a spend script, so the two kinds must be kept in separate trees (P02).
 - **Template parameters** are written in angle brackets after the name. Each must be given a constant value at compile time and is written into the script bytes, so it changes the root. A template has no root until every parameter is filled in.
@@ -14,6 +14,8 @@ The source language below is illustrative. No grammar, compiler or ABI file form
 - **`merkle_root(X)`** is evaluated at compile time: the compiler builds `X`'s scripts and writes their root into the calling script as a 32-byte constant. `this.root` is the running script's own root, read with BRANCHROOT, since a script cannot contain its own hash.
 - **`state { ... }`** declares fields a contract keeps between spends. They are stored by P02's data-leaf convention; example 5 shows the compiled form. In a contract with state, a method not marked **`ends`** must leave a successor. A contract without state never requires one, so its methods carry no marker.
 - **`paired output`** refers to the output at the same position as the input the script is running for. Pairing by position stops two inputs from both claiming one output.
+
+For new language work use [LC-1's explicit entry and policy proposal](../script-abi.md#composition-proposal-lc-1-not-implemented): methods select leaves within a program, while named paths select the AND of required branch slots. Imports have no deployment effect. Mint identity is independent of holder policy branch order. A bound program root does not identify a complete output policy. The [work plan](../../plans/lotus-v2-language-composition.md) gives versioning, implementation owners and acceptance gates.
 
 ## 1. Ordinary payment
 
@@ -255,7 +257,7 @@ contract Counter<owner: PublicKey> {
 }
 ```
 
-The wallet supplies the current value and `M` as two hidden leading arguments. `increment`:
+This historical state-lowering sketch proposes that the wallet supply the current value and `M` as two hidden leading arguments. A complete implementation must also prove that the active method belongs to `M`, authenticate the instance where history matters, and check successor asset/value. The root calculation alone below is not that complete implementation. `increment`:
 
 ```text
 ; witness args: n (a 16-byte number), M (32 bytes)
@@ -337,7 +339,7 @@ function merge(other: input Counter) {
 }
 ```
 
-Both coins are spent, so both run a script. The compiler generates two from the one method: `merge` for the coin that survives and `absorbed` for the one that does not. Neither can see which method the other ran, so each makes its own checks, and positions do the rest: the survivor is at input `i`, the absorbed coin at input `i+1`, and the merged coin is output `i`, which must be the last output.
+Both coins are spent, so both run a script. This historical proposal uses two manually specified methods: `merge` for the coin that survives and `absorbed` for the one that does not. The current compiler does not generate these from the sketch, and LC-1 does not silently add an `absorbed` entry. Neither can see which method the other ran, so each must make its own checks. In this particular layout the survivor is at input `i`, the absorbed coin at input `i+1`, and the merged coin is output `i`, which must be the last output. This demonstration assumes a sole-branch policy; a general merge must explicitly define how companion rules and paths survive.
 
 A transaction merging coin A (`n = 5`) and coin B (`n = 7`), with an XPI input for the fee:
 
@@ -372,7 +374,7 @@ Other outputs, such as change, sit at positions before the survivor's, opposite 
 
 Two limits. The merge is only as trustworthy as the coins fed to it: anyone can create a coin whose root is a `Counter` with any `n`, so a contract that must not accept forged state has to check that the other coin carries its token, as described above. And a quantity that must never be duplicated is better held as a token amount, which consensus conserves, than as state.
 
-One shape is not defined: a method that both continues the contract and pays someone. Both want the output at the input's position.
+LC-1 proposes explicit distinct successor/payout roles (for example `2*i` and `2*i+1`) for a method that continues and pays someone. Those checks are not implemented by this older paired-output sketch. The compiler must enforce nonoverlap in script; a builder allocation alone cannot prevent two inputs from counting the same output.
 
 ## 6. Cost of loops
 
