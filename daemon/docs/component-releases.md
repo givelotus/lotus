@@ -145,30 +145,38 @@ Guix `lotus-vVERSION` filenames are not component publication assets; adopting t
 registry/archive names there requires coordinated wrapper/archive lookup work
 and completed Guix validation. No binary reproducibility claim is added here.
 
-## Bitcoin Core Chronik work remaining
+## Optional BCHN and Bitcoin Core Chronik hosts
 
-The pinned Core source genuinely builds BTC `bitcoind`/`bitcoin-cli`, but contains
-no Chronik CMake target/bridge. Modern ABC's Rust `TxMut` lacks Bitcoin witness
-data, and Chronik's protobuf lacks witness/wtxid fields. A real Core integration
-needs SegWit-aware transaction parsing/serialization, distinct txid/wtxid handling,
-script indexing and native validation/storage/reorg/mempool adapters. Optional
-in-process Chronik extracted from pinned ABC source is the current direction;
-NNG is independent and is not its dependency. See the
-[host-boundary audit](shared-chronik-source-and-hosts.md) for shared source/lifetime
-obligations; its earlier standalone-NNG recommendation is historical and has
-been superseded by the user's in-process direction.
+The pinned ABC Chronik source now has separately hashed, offline host overlays
+for BCHN `abd433abe04f74780744b9eac06731f3690ce68a` and Bitcoin Core
+`f13ae519de94394314cd63a27924b0998ac65d45`. Their native patches adapt each
+node's block/undo storage and validation lifecycle while keeping Chronik inside
+the daemon. They are independent of NNG and mining or mempool policy patches.
 
-## Optional extracted-source provider extension
+Both candidates build and pass fresh macOS regtest behavior. Core covers native
+witness bytes/IDs, XOR block and undo storage, reorg/restart/crash recovery and
+shutdown. BCHN covers full-script history, opaque CashTokens bytes, spent coins,
+conflicts, reorg/restart and WebSocket events; it does not claim semantic
+token indexing. Exact limits and commands are in the [Core](../chronik/hosts/bitcoin-core/HOST.md)
+and [BCHN](../chronik/hosts/bchn/README.md) host records.
 
-The current implementation builds the host's embedded Chronik, whose complete
-source is already in the exact source archive. The separate pinned extraction
-candidate is not silently enabled by these release profiles. When integrated,
-the component manifest must additionally identify provider revision/tree,
-export-manifest SHA256, host-adapter patch hashes and chain profile. Its verified
-exported sources and lockfile must be included in the offline source archive;
-a remote pin alone is insufficient. `CHRONIK_SOURCE_DIR` and
-`CHRONIK_PROVIDER_MODULE` must then resolve only to those verified local inputs.
-Keep unsupported host profiles closed until their real bridge is validated.
+The component release builder still materializes only the upstream node source
+and its current release manifest patches. It does not yet bundle the verified
+ABC Chronik export, apply the host mailboxes or pass the provider/profile pins
+through artifact CI. Therefore these profiles are reviewable integration
+candidates, not selectable release features. Keep default release manifests
+stock until source archive, artifact CI and host-specific release evidence are
+added and pass. No Linux/Windows, mainnet sync, long-running load or reproducible
+binary claim follows from the macOS regtest results.
+
+## Shared-source provider packaging
+
+The CMake provider verifies the exact pinned Chronik export, native host inputs,
+ordered source mailboxes and resulting source hashes before building in a private
+copy. Component release archives must include those verified files and lockfile;
+a remote pin alone is insufficient. Release tooling still needs to carry the
+export manifest digest, host profile and adapter hashes through the reviewed
+manifest and artifact validation before these host profiles can be published.
 
 ## Component-specific Rust selection
 

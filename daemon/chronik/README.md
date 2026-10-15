@@ -64,12 +64,13 @@ candidate. Existing live nodes and published releases remain untouched.
 
 ## Host boundaries and publication
 
-ABC remains the unchanged extraction proof. An optional exact-pin [Bitcoin Core
-host profile](hosts/bitcoin-core/HOST.md) now has native macOS regtest evidence,
-including witness storage, events and restart recovery. Other profiles require
-independent reviewed adapters; CMake fails closed when their profile is absent.
-Lotus and Doged retain their embedded forks. This does not enable Core Chronik
-in default component releases or establish mainnet/cross-platform support.
+ABC remains the unchanged extraction proof. Optional exact-pin [Bitcoin Core](hosts/bitcoin-core/HOST.md)
+and [BCHN](hosts/bchn/README.md) profiles now have native macOS regtest evidence,
+including witness storage for Core and CashTokens byte preservation for BCHN.
+Both CMake profiles fail closed unless their host pin and hashed adapter files
+match. Lotus and Doged retain their embedded forks. These candidates are not yet
+selectable in component release manifests; neither is enabled by default, and
+mainnet or cross-platform support is not established.
 
 A separate shared-source repository can later receive these deterministic
 exports, with original licenses/provenance and exact export pins. This candidate

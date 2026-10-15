@@ -475,3 +475,11 @@ Upstream Bitcoin ABC's in-process Chronik (`chronik/`) assumes standard 80-byte 
 ## Component macOS compiler candidate (2026-10-14)
 
 - First artifact-only Core run38660106111 failed macOS configuration because macos-14 selected AppleClang15, which lacks the required aggregate CTAD feature. Exact pinned Core documentation requires Xcode Command Line Tools16.2 or newer; preserve its feature check. Candidate generic component CI uses macos-15 with explicit Xcode16.4, matching the official runner-image inventory (https://github.com/actions/runner-images/blob/main/images/macos/macos-15-arm64-Readme.md). This changes no daemon source or published legacy release workflow. The replacement compiler build remains pending until actual CI passes.
+
+
+## Optional BCHN and Bitcoin Core Chronik integration (2026-10-15)
+
+- Shared verified overlay tooling is integrated once. Optional Bitcoin Core host files are from reviewed candidate0b03bcf2; BCHN files are from e4379942. Keep native node mailboxes distinct from offline ABC-source overlays. Provider checks pins, ordered patch hashes, native input hashes and resulting source hashes on configure; changed inputs trigger revalidation. Do not enable these profiles by default.
+- Core exact pinf13ae519de94394314cd63a27924b0998ac65d45 and BCHN abd433abe04f74780744b9eac06731f3690ce68a now have macOS native builds and isolated regtest evidence. Core includes witness and XOR storage/recovery; BCHN preserves complete opaque CashTokens scripts but has no semantic token index. Both preserve ABC source/profile regression tests. Mainnet, Linux/Windows, load and reproducible binary coverage remain outstanding.
+- Release candidate metadata/manifests were prepared for ABC v0.34.1 with Chronik and Bitcoin Core32.99.0 stock. Artifact runs38661920638 (ABC) and38660429807 (Core) passed their exact review commits. They are not component publications. The current component packager does not carry the shared export/host overlays, so BCHN/Core Chronik cannot yet be selected for release artifact CI.
+- Guix candidate fixes now avoid exporting the target toolchain into native generators and GNU make recipes; corrected run38672796277 passed preflight and is still building/provisioning Guix replicas. No Guix binary or reproducibility claim until both complete archive builds match.

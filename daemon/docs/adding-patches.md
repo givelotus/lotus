@@ -98,13 +98,13 @@ Chronik-side overlays against the exact shared source export. Keep each host's
 changes independent of NNG and unrelated policy features. Never modify the
 verified pristine export in place; use a separate copy for development.
 
-The ABC shared-source provider is documented in [the Chronik guide](../chronik/README.md).
-BCHN/Core adapter and verified-overlay tooling are still being validated in
-isolated branches. Their final profile-manifest generation/replay commands will
-be documented with integration; current compilation evidence is not permission
-to enable an unfinished profile. Until then, use ordinary committed source
-changes and metadata-preserving exports, with separate exact tree evidence for
-both sides of the adapter.
+The ABC shared-source provider and optional [Bitcoin Core](../chronik/hosts/bitcoin-core/HOST.md)
+and [BCHN](../chronik/hosts/bchn/README.md) adapters are documented with exact
+pins, offline overlay manifests and build/regtest commands. The node-side mailbox
+and Chronik-side source overlays are separate commits; the CMake provider verifies
+both before compiling. Keep profiles outside default patch series. The component
+release builder does not yet package or select the BCHN/Core overlays, so these
+native candidates cannot be selected for a component release yet.
 
 See [patch metadata and provenance](patch-metadata.md) for historical recovery
 and audit details, and [the support matrix](support-matrix.md) for selectable
