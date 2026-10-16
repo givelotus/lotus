@@ -112,8 +112,9 @@ def main(argv=None):
         ctl=controller.Controller(dict(nodes=[dict(name=node.label,chronik=binding)],limits=limits),root,
             secret_prompt=lambda *_:bytearray(b'isolated-public-test-passphrase'))
         ctl.started=True
+        ctl.wallet_nodes={'wallet':node.label,'recipient':node.label}
         adapter=Adapter(node)
-        ctl._wallet=lambda name: controller.WalletProcess(wallet,root/'manifest.json',wc if name=='recipient' else home,adapter,limits)
+        ctl._wallet=lambda name,allow_new=False: controller.WalletProcess(wallet,root/'manifest.json',wc if name=='recipient' else home,adapter,limits)
         deadline=ctl.deadline()
         if command in ('reconcile','discover','prepare','sign','pay'):
             if command in ('reconcile','discover'):
