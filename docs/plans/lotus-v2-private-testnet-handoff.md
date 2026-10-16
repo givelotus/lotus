@@ -64,17 +64,17 @@ First consolidation boundary is constructed: draft
 conflicts. Builder commit `0cd41d68`,8tiny Git-fixture checks pass. Independent
 builder/tree review passed: independent replay matched all 64 intermediate
 unit trees and blobs and the final tree. Boundary compilation and registered
-behavior tests have NOT run. Builder is not integrated into the monorepo yet.
+behavior tests have NOT run. Builder is integrated into the monorepo as `c9fc434a`; the maintained series is unchanged.
 
 ## Authoritative repositories and exact pins
 
 | Purpose | Path / state at snapshot |
 | --- | --- |
-| User monorepo | `/private/tmp/lotus-v2-repo`, branch `lotus-v2`, `321a1b66` before this handoff update |
+| User monorepo | `/private/tmp/lotus-v2-repo`, branch `lotus-v2`, `c9fc434a` before this handoff update |
 | Root monorepo integration | `/private/tmp/lotus-v2-integration-owner-20261015`, branch `v2-integration-owner-20261015`, same content; root alone integrates |
 | Root native integration | `/private/tmp/lotus-v2-native-integration-20261015`, `307570da46f9bae7c4425085eb6ed6ddaf591b5a`, tracked clean |
 | Native shared Git | `/private/tmp/lotus-v2-native-slice-review/.git` |
-| Real-.git full-build clone | `/private/tmp/lotus-v2-daemon-runtime-staging-20261015`, `cd8d5140ec7fce7da9a4e2a5a8b5d803ed4dc3f5`, tracked clean |
+| Real-.git full-build clone | `/private/tmp/lotus-v2-daemon-runtime-staging-20261015`, `307570da46f9bae7c4425085eb6ed6ddaf591b5a`, tracked clean; build outputs still older cd8 |
 | Maintained mailboxes | `daemon/patches/v2/series`,318patches000–317; ABCbase `1fb7db17c176cdea8a2c60d887891589382ee4e3` |
 
 The maintained series ends at native `cd8d5140ec`, tree
@@ -164,7 +164,8 @@ and `final-artifacts.json` bind source/three binaries. The negative control remo
 the postStatus fence and fails stale-publication; restored fence passes. Adapter
 does not execute full actual Node::Status/whole node. A separate NodeStatus
 serializer has passed its scoped compile and JSON test (session 24450, exit 0,
-1/1 in 0.42s). Independent review and a separate source commit remain pending;
+1/1 in 0.42s; strengthened JSON wire-roundtrip/type regression also passed
+session 25475, 1/1 in 0.34s). Independent review and a separate source commit remain pending;
 recheck dirty files before taking ownership. This test executes extracted actual
 helpers, not the whole node. It checks field mappings, UINT64_MAX, null versus
 zero confidence, disconnect causes, and nonmutation. No owned build remains.
