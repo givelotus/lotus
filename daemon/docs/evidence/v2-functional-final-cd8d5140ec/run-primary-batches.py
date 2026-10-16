@@ -177,6 +177,13 @@ def main():
             except BaseException as error:
                 failure = failure or str(error)
                 receipt['failure'] = failure
+            receipt['retained_log_receipts'] = []
+            receipt['actual_port_settings'] = []
+            for path in sorted(target.rglob('*')):
+                if path.is_file() and (path.name.endswith('.log') or path.name in ('bitcoin.conf', 'results.xml')):
+                    receipt['retained_log_receipts'].append({'path': str(path), 'bytes': path.stat().st_size, 'sha256': digest(path)})
+                    if path.name == 'bitcoin.conf':
+                        receipt['actual_port_settings'].append({'path': str(path), 'settings': [line for line in path.read_text().splitlines() if line.startswith(('port=', 'rpcport=', 'bind=', 'rpcbind=', 'chronikbind='))]})
             write(output, receipt)
         print(json.dumps({'batch': batch['id'], 'failure': failure, 'receipt': str(output)}), flush=True)
         if failure:
