@@ -1,0 +1,193 @@
+From 574365ca3588db0afe3e26f45874f2c889af2725 Mon Sep 17 00:00:00 2001
+From: Shammah Chancellor <shammah.chancellor@notvalid.com>
+Date: Thu, 15 Oct 2026 18:54:04 -0700
+Subject: [PATCH] fix(wallet): restore inherited client stream flags on exit
+
+Scope stdin and stdout nonblocking flags with an RAII guard that restores their complete original F_GETFL flags, including through input and output exceptions. Standard streams share open file descriptions with their controller, so process exit alone does not undo O_NONBLOCK changes.
+
+An actual-binary pipe regression reproduces leaked flags in the previous client and passes all 12 cases after the fix: create/info, malformed JSON, setup refusal, input deadline and closed output, with initially blocking/nonblocking streams and O_APPEND retained.
+---
+ src/wallet/v2_wallet_client.cpp               | 22 ++++-
+ src/wallet/v2_wallet_client_test/README.md    | 20 ++++
+ .../v2_wallet_client_test/test_fd_flags.py    | 95 +++++++++++++++++++
+ 3 files changed, 135 insertions(+), 2 deletions(-)
+ create mode 100644 src/wallet/v2_wallet_client_test/README.md
+ create mode 100644 src/wallet/v2_wallet_client_test/test_fd_flags.py
+
+diff --git a/src/wallet/v2_wallet_client.cpp b/src/wallet/v2_wallet_client.cpp
+index f272536efa95970629eda083895bccd95ba0863a..3e88f358c7ed4426b06ec8fa2e4e947b8bde7322 100644
+--- a/src/wallet/v2_wallet_client.cpp
++++ b/src/wallet/v2_wallet_client.cpp
+@@ -259,6 +259,24 @@ void Nonblocking(int fd) {
+     Require(flags >= 0 && fcntl(fd, F_SETFL, flags | O_NONBLOCK) >= 0,
+             "wallet client FD setup failed");
+ }
++// Standard streams are borrowed from the controller. Their open file
++// descriptions can be shared across processes, so restore every original flag
++// on success and on exceptions before returning control to the caller.
++class ScopedNonblocking {
++public:
++    explicit ScopedNonblocking(int fd) : fd_(fd), flags_(fcntl(fd, F_GETFL)) {
++        Require(flags_ >= 0 && fcntl(fd_, F_SETFL, flags_ | O_NONBLOCK) >= 0,
++                "wallet client FD setup failed");
++    }
++    ScopedNonblocking(const ScopedNonblocking &) = delete;
++    ScopedNonblocking &operator=(const ScopedNonblocking &) = delete;
++    ~ScopedNonblocking() {
++        while (fcntl(fd_, F_SETFL, flags_) < 0 && errno == EINTR) {}
++    }
++private:
++    const int fd_;
++    const int flags_;
++};
+ void NodeSocket(int fd) {
+     int type = 0;
+     socklen_t length = sizeof(type);
+@@ -308,7 +326,7 @@ void Write(int fd, std::string_view bytes, const Deadline &deadline,
+ std::string PublicRequest(const Deadline &deadline) {
+     std::string input;
+     std::array<char, 4096> chunk{};
+-    Nonblocking(STDIN_FILENO);
++    const ScopedNonblocking nonblocking(STDIN_FILENO);
+     while (true) {
+         Wait(STDIN_FILENO, POLLIN, deadline);
+         const auto n = read(
+@@ -753,7 +771,7 @@ int main(int argc, char **argv) {
+     // was durably reserved. The controller must treat a lost result as unknown
+     // and recover via pending/export, never infer that signing did not happen.
+     try {
+-        Nonblocking(STDOUT_FILENO);
++        const ScopedNonblocking nonblocking(STDOUT_FILENO);
+         Write(STDOUT_FILENO, answer.write() + "\n", deadline);
+     } catch (...) {
+         return sign_outcome_ambiguous ? 5 : 4;
+diff --git a/src/wallet/v2_wallet_client_test/README.md b/src/wallet/v2_wallet_client_test/README.md
+new file mode 100644
+index 0000000000000000000000000000000000000000..49c90e4e937873bdc3963ca548a9d50aceb85d78
+--- /dev/null
++++ b/src/wallet/v2_wallet_client_test/README.md
+@@ -0,0 +1,20 @@
++# Inherited stream flag regression
++
++Run against an actual built client and a valid development manifest:
++
++```sh
++python3 src/wallet/v2_wallet_client_test/test_fd_flags.py \
++  /absolute/path/to/lotus-v2-wallet-client \
++  /absolute/path/to/manifest.json
++```
++
++The test creates temporary encrypted wallets and private Unix socketpairs. It
++starts no nodes and sends no node requests. Parent-owned pipe descriptors share
++the child's stdin/stdout open file descriptions, allowing exact `F_GETFL`
++comparisons after the child exits.
++
++Both initially blocking and initially nonblocking streams retain an additional
++`O_APPEND` flag. Each mode exercises successful create/info, malformed JSON,
++argument setup failure, an input deadline and a closed output pipe. The macOS
++kernel exposes a sticky written flag through `F_GETFL`; a preliminary output
++write establishes that flag before taking the baseline snapshot.
+diff --git a/src/wallet/v2_wallet_client_test/test_fd_flags.py b/src/wallet/v2_wallet_client_test/test_fd_flags.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..c2b07ac3d8d3f889dee2931d7f0a1e996a61c7d6
+--- /dev/null
++++ b/src/wallet/v2_wallet_client_test/test_fd_flags.py
+@@ -0,0 +1,95 @@
++#!/usr/bin/env python3
++"""Exercise inherited stream flag restoration against an actual wallet client.
++
++Usage: python3 test_fd_flags.py /path/to/lotus-v2-wallet-client /path/to/manifest.json
++The manifest must describe a valid development profile. No node is launched.
++"""
++import argparse
++import fcntl
++import json
++import os
++from pathlib import Path
++import socket
++import subprocess
++import tempfile
++
++
++def check_run(binary, manifest, home, command, payload, flags, *,
++              timeout=False, output_failure=False, argument_failure=False):
++    input_read, input_write = os.pipe()
++    output_read, output_write = os.pipe()
++    secret_read, secret_write = os.pipe()
++    local, remote = socket.socketpair()
++    try:
++        # macOS exposes a sticky kernel "has written" bit via F_GETFL.
++        # Set it before the snapshot so the comparison isolates client edits.
++        os.write(output_write, b"\n")
++        os.read(output_read, 1)
++        for fd in (input_read, output_write):
++            original = fcntl.fcntl(fd, fcntl.F_GETFL)
++            fcntl.fcntl(fd, fcntl.F_SETFL, original | flags)
++        before = {fd: fcntl.fcntl(fd, fcntl.F_GETFL)
++                  for fd in (input_read, output_write)}
++        if payload:
++            os.write(input_write, payload)
++        if not timeout:
++            os.close(input_write)
++            input_write = -1
++        os.write(secret_write, b"test passphrase\n")
++        os.close(secret_write)
++        secret_write = -1
++        if output_failure:
++            os.close(output_read)
++            output_read = -1
++        argv = [binary, manifest, str(home), command,
++                f"--node-fd={local.fileno()}", "--timeout-ms=1000"]
++        if command == "create":
++            argv.append(f"--passphrase-fd={secret_read}")
++        if timeout:
++            argv[-1] = "--timeout-ms=100"
++        if argument_failure:
++            argv.append("--invalid-option")
++        child = subprocess.run(argv, stdin=input_read, stdout=output_write,
++                               stderr=subprocess.PIPE,
++                               pass_fds=(local.fileno(), secret_read), timeout=10)
++        after = {fd: fcntl.fcntl(fd, fcntl.F_GETFL) for fd in before}
++        assert after == before, (command, flags, before, after, child.stderr)
++        if output_failure or timeout:
++            assert child.returncode != 0
++        else:
++            response = json.loads(os.read(output_read, 65536))
++            if argument_failure or payload != b"{}":
++                assert child.returncode != 0 and response["result"] == "setup_error", response
++            else:
++                assert child.returncode == 0 and response["result"] == "success", response
++    finally:
++        local.close()
++        remote.close()
++        for fd in (input_read, input_write, output_read, output_write,
++                   secret_read, secret_write):
++            if fd >= 0:
++                os.close(fd)
++
++
++def main():
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument("binary", type=lambda value: str(Path(value).resolve()))
++    parser.add_argument("manifest", type=lambda value: str(Path(value).resolve()))
++    args = parser.parse_args()
++    with tempfile.TemporaryDirectory(prefix="lotus-v2-client-flags-") as directory:
++        for i, flags in enumerate((os.O_APPEND, os.O_APPEND | os.O_NONBLOCK)):
++            home = Path(directory) / str(i)
++            check_run(args.binary, args.manifest, home, "create", b"{}", flags)
++            check_run(args.binary, args.manifest, home, "info", b"{}", flags)
++            check_run(args.binary, args.manifest, home, "info", b"invalid", flags)
++            check_run(args.binary, args.manifest, home, "info", b"{}", flags,
++                      argument_failure=True)
++            check_run(args.binary, args.manifest, home, "info", b"", flags,
++                      timeout=True)
++            check_run(args.binary, args.manifest, home, "info", b"{}", flags,
++                      output_failure=True)
++    print("wallet client inherited FD flags: 12 cases passed")
++
++
++if __name__ == "__main__":
++    main()
+-- 
+2.50.1 (Apple Git-155)
+
