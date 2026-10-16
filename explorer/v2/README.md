@@ -23,7 +23,9 @@ The command prints its ephemeral **127.0.0.1** browser URL. Open that URL; its
 `api` query configures the same-origin loopback proxy. Supply an explicit fixed
 local `--port` if required. The server refuses a missing port and refuses a
 non-loopback proxy target. Stop with Ctrl-C. It serves only the small static
-allowlist and proxies only the new explorer namespace. Nothing is deployed.
+allowlist and proxies only the new explorer namespace. Nothing is deployed. Incoming proxy request bodies and upstream requests have
+absolute 15-second deadlines; status and data responses are read incrementally
+under the same 256 KiB byte cap.
 
 Run the separately built native Chronik service with explorer schema 3 and a
 fresh isolated index according to its integration instructions. This frontend
@@ -37,7 +39,7 @@ browser origin through CORS. No fallback to old routes exists.
 The first data response pins the complete screen. Every following detail,
 page, witness and wire request carries its opaque snapshot token. Epoch,
 generation, chain/profile, anchor and token must agree before rendering.
-Navigating cancels earlier requests. A 409 clears pages and retries the whole
+Navigating cancels earlier requests. A 409 from initial composition or continuation clears pages and retries the whole
 screen once; repeated changes require a manual reload. A 503 retains the prior
 observation, marks it stale and disables its continuation buttons. A 404 means
 only absence from covered canonical history. Empty work-limited pages keep their
@@ -51,13 +53,15 @@ scripts or ownership. Script/witness data is escaped hex, never executed.
 ## Validation boundaries
 
 Runtime responses have bounded reads and explicit envelope, identity, integer,
-coverage and route checks. Rendering uses DOM text nodes, never HTML insertion.
+coverage and route checks, including full frozen creations, witness table counts,
+route identity matching, wire ranges, status anchors/capabilities and cursor limits. Rendering uses DOM text nodes, never HTML insertion.
 Tests use clearly synthetic contract fixtures under `tests/`; fixtures are not
 served by the dev server and the live adapter has no mock-data fallback.
 
 `npm test` checks identity order, maximum u64/u128 decimal rendering, malformed
 responses, snapshot restart/generation mixtures, branch POST/token semantics,
-wire bounds, request cancellation, malicious field escaping, screen navigation
+wire bounds, malformed primitive mutations for every route, request cancellation,
+malicious field escaping, a real stalled incoming socket deadline, screen navigation
 and stale states. Fixture success establishes client behavior only. Actual
 native API screen validation remains a separate integration gate and must name
 the exact native service revision and observed chain/profile.

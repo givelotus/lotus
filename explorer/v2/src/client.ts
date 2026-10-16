@@ -48,20 +48,15 @@ export class Client {
  async request(route:string, signal:AbortSignal, token?:string, body?:ObjectValue):Promise<Envelope> {
    if(token&&token.length>2048)throw new Error('Snapshot token limit'); const encoded=body?JSON.stringify(body):undefined;if(encoded&&new TextEncoder().encode(encoded).length>32768)throw new Error('Request body limit'); const url=new URL(this.base+'/v2/explorer/v1'+route); if(token) url.searchParams.set('snapshot_token',token);
    if(new TextEncoder().encode(url.search).length>32768)throw new Error('Query limit'); const response=await this.fetcher(url,{signal,cache:'no-store',method:body?'POST':'GET',headers:body?{'Content-Type':'application/json'}:{},body:encoded});
-   const reader=response.body?.getReader(); let bytes=0; const chunks:Uint8Array[]=[];
-   if(!reader) throw new Error('Missing response body');
-   while(true) { const {done,value}=await reader.read(); if(done) break; bytes+=value.byteLength; if(bytes>262144) {await reader.cancel(); throw new Error('Response exceeds 256 KiB');} chunks.push(value); }
-   const all=new Uint8Array(bytes);let offset=0;for(const chunk of chunks){all.set(chunk,offset);offset+=chunk.length;}
-   const parsed=JSON.parse(new TextDecoder('utf-8',{fatal:true}).decode(all));
-   if(!response.ok) { const error=object(object(parsed).error); if(typeof error.code!=='string'||typeof error.meaning!=='string') throw new Error('Malformed API error'); throw new ApiError(response.status,error.code,error.meaning); }
+   const parsed=await readJson(response).catch(e=>{if(response.status===503)throw new ApiError(503,'index_unavailable','Unavailable service sent an invalid response: '+String(e));throw e;});
+   if(!response.ok) { try{validateError(parsed,response.status);}catch(e){if(response.status===503)throw new ApiError(503,'index_unavailable','Unavailable service sent an invalid error envelope');throw e;} const error=object(object(parsed).error); throw new ApiError(response.status,String(error.code),String(error.meaning)); }
    const envelope=validateEnvelope(parsed); validateRoute(route,envelope.data); return envelope;
  }
  async status(signal:AbortSignal):Promise<ObjectValue> {
    const response=await this.fetcher(this.base+'/v2/explorer/v1/status',{signal,cache:'no-store'});
-   const body=await response.text();if(body.length>262144) throw new Error('Status exceeds limit');
-   if(!response.ok) throw new ApiError(response.status,'index_unavailable','Status unavailable');
-   const parsed=JSON.parse(body); validateTree(parsed); const o=object(parsed);
-   if(o.api_version!=='1'||typeof o.ready!=='boolean'||typeof o.reason!=='string') throw new Error('Invalid status'); object(o.capabilities); return o;
+   const parsed=await readJson(response).catch(e=>{if(response.status===503)throw new ApiError(503,'index_unavailable','Unavailable service sent an invalid response: '+String(e));throw e;});
+   if(!response.ok) {try{validateError(parsed,response.status);}catch(e){if(response.status===503)throw new ApiError(503,'index_unavailable','Unavailable service sent an invalid error envelope');throw e;}const e=object(object(parsed).error);throw new ApiError(response.status,String(e.code),String(e.meaning));}
+   return validateStatus(parsed);
  }
 }
 export class PinnedView {
@@ -74,28 +69,60 @@ export class PinnedView {
  }
 }
 
-function required(o:ObjectValue,fields:string[]){for(const f of fields)if(!(f in o))throw new Error('Missing response field: '+f);}
-function confirmed(o:ObjectValue){if(o.status!=='confirmed')throw new Error('Unsupported confirmation status');}
-function block(o:ObjectValue){required(o,['block_id','prev_id','height','time','size','tx_count','status','confirmations']);confirmed(o);}
-function tx(o:ObjectValue){required(o,['txid','txhash','location','status','confirmations','input_count','output_count','wire_size']);confirmed(o);location(object(o.location));}
-function location(o:ObjectValue){required(o,['block_id','height','tx_index']);}
-function output(o:ObjectValue){required(o,['txid','out_idx','flags','value','has_token','token_id','is_burn','branches','paths','creation','spend']);if(typeof o.has_token!=='boolean'||typeof o.is_burn!=='boolean'||!Array.isArray(o.branches)||!Array.isArray(o.paths))throw new Error('Invalid output');location(object(o.creation));if(o.spend!==null)object(o.spend);}
-function asset(o:ObjectValue){required(o,['token_id','first_seen','event_count','output_count','metadata','supply']);location(object(o.first_seen));if(object(o.metadata).availability!=='unknown'||object(o.supply).availability!=='unknown')throw new Error('Unsupported metadata/supply claim');}
-function ref(o:Json|undefined){required(object(o),['offset','length']);}
+const U8=255n,U32=4294967295n,U64=18446744073709551615n;
+function requireFields(o:ObjectValue,fields:string[]){for(const f of fields)if(!(f in o))throw new Error('Missing response field: '+f);}
+function bool(v:unknown){if(typeof v!=='boolean')throw new Error('Expected boolean');}
+function literal(v:unknown,want:string|boolean|null){if(v!==want)throw new Error('Expected '+String(want));}
+function text(v:unknown,max=2048){if(typeof v!=='string'||!v||v.length>max)throw new Error('Expected bounded nonempty string');}
+function hex(v:unknown,bytes?:number){if(typeof v!=='string'|| !/^(?:[0-9a-f]{2})*$/.test(v)||(bytes!==undefined&&v.length!==bytes*2))throw new Error('Invalid exact hex bytes');}
+function array(v:unknown,max=4096):Json[]{if(!Array.isArray(v)||v.length>max)throw new Error('Expected bounded array');return v as Json[];}
+function fields(o:ObjectValue,hashes:string[]=[],integers:Record<string,bigint>={}){for(const k of hashes)hash(o[k]);for(const [k,max] of Object.entries(integers))decimal(o[k],max);}
+function location(v:unknown,full=false){const o=object(v);fields(o,['block_id'],{height:U64,tx_index:U32});if(full)fields(o,['txid','txhash']);return o;}
+function binding(v:unknown){const o=object(v);fields(o,['chain_id','genesis','profile_id']);return o;}
+function snapshot(v:unknown){const o=binding(v);hash(o.tip);u64(o.height);u64(o.generation);text(o.service_epoch);return o;}
+function coverage(v:unknown,complete?:boolean){const o=object(v);literal(o.from_height,'0');u64(o.through_height);bool(o.complete);if(complete!==undefined)literal(o.complete,complete);literal(o.scope,'canonical_confirmed');return o;}
+function anchorValue(v:unknown){if(v===null)return null;const o=object(v);hash(o.block_id);u64(o.height);return o;}
+function block(o:ObjectValue,detail=false){fields(o,['block_id','prev_id'],{height:U64,time:281474976710655n,size:U64,tx_count:U32,confirmations:U64});literal(o.status,'confirmed');if(o.confirmations==='0')throw new Error('Confirmed block without confirmations');if(detail){hex(o.header_wire,134);literal(o.body_availability,'complete');literal(o.finality,'unknown');const h=object(o.header);fields(h,['prev_id','tx_root','state_root'],{bits:U32,time:281474976710655n,nonce:U64,version:U32,size:U64,height:U64});for(const k of ['prev_id','height','time','size'])if(h[k]!==o[k])throw new Error('Contradictory block header');}}
+function transaction(o:ObjectValue,detail=false){fields(o,['txid','txhash'],{confirmations:U64,input_count:U32,output_count:U32,wire_size:U64});location(o.location);literal(o.status,'confirmed');if(o.confirmations==='0')throw new Error('Confirmed transaction without confirmations');if(detail){u64(o.lock);for(const k of ['core_available','witness_available','wire_available'])literal(o[k],true);literal(o.finality,'unknown');literal(object(o.accounting).availability,'unknown');}}
+function output(v:unknown,frozen=false){const o=object(v);fields(o,['txid','token_id'],{out_idx:U32,flags:U8});decimal(o.value);bool(o.has_token);bool(o.is_burn);const branches=array(o.branches);branches.forEach(hash);for(const path of array(o.paths)){for(const position of array(path)){decimal(position,U8);if(BigInt(String(position))>=BigInt(branches.length))throw new Error('Path references absent branch');}}location(o.creation,true);
+ if(frozen){if('spend' in o)throw new Error('Frozen creation cannot contain spend state');}
+ else {requireFields(o,['spend']);if(o.spend!==null){const s=object(o.spend);location(s.transaction,true);decimal(s.input_index,U32);}}
+ return o;
+}
+function byteRef(v:unknown){const o=object(v);u64(o.offset);u64(o.length);if(BigInt(String(o.offset))+BigInt(String(o.length))>U64)throw new Error('Byte range overflow');}
+function input(o:ObjectValue){fields(o,['prev_txid'],{input_index:U32,flags:U8,prev_index:U32,sequence:U32,witness_count:U32});const expected={spend:'1',coinbase:'2',mint:'3'};if(typeof o.kind!=='string'||!(o.kind in expected)||o.flags!==expected[o.kind as keyof typeof expected])throw new Error('Contradictory input kind/flags');
+ const resolved=object(o.resolved_coin);if(o.kind==='spend'){decimal(o.path_index,U8);literal(resolved.availability,'complete');const prior=output(resolved.output,true);if(prior.txid!==o.prev_txid||prior.out_idx!==o.prev_index)throw new Error('Resolved creation does not match spend');}else{literal(o.path_index,null);literal(resolved.availability,'not_applicable');if('output' in resolved)throw new Error('Non-spend has resolved coin');}
+ const data=object(o.coinbase_data);bool(data.present);if(data.present===true)byteRef(data.wire_ref);else literal(data.wire_ref,null);
+}
+function witness(o:ObjectValue){decimal(o.witness_index,U32);byteRef(o.script);for(const k of ['siblings','arguments']){const table=object(o[k]);decimal(table.count,U32);byteRef(table.table_ref);requireFields(table,['inline']);if(table.inline!==null){const entries=array(table.inline);if(BigInt(entries.length)!==BigInt(String(table.count)))throw new Error('Incomplete inline witness table');for(const entry of entries){if(k==='siblings')hash(entry);else byteRef(entry);}}}}
+function asset(o:ObjectValue){hash(o.token_id);location(o.first_seen,true);fields(o,[],{event_count:U64,output_count:U64});const metadata=object(o.metadata);literal(metadata.availability,'unknown');for(const k of ['name','symbol','decimals','issuer','mint_cap'])literal(metadata[k],null);literal(object(o.supply).availability,'unknown');}
+function event(o:ObjectValue){hash(o.token_id);location(o.location,true);for(const k of ['spent_units','output_units','explicit_burn_units','minted_units','implicit_burn_units'])decimal(o[k]);bool(o.has_mint_input);}
+function wire(o:ObjectValue,query:URLSearchParams){fields(o,['txid','txhash'],{total_bytes:U64,offset:U64});hex(o.bytes_hex);const length=BigInt(String(o.bytes_hex).length/2),offset=BigInt(String(o.offset)),total=BigInt(String(o.total_bytes));const requestedOffset=BigInt(decimal(query.get('offset')??'0',U64)),requestedLength=BigInt(decimal(query.get('length')??'32768',32768n));if(requestedLength===0n||offset!==requestedOffset||offset>total||length>requestedLength||offset+length>total)throw new Error('Invalid wire range');if(offset+length===total)literal(o.next_offset,null);else{u64(o.next_offset);if(length===0n||BigInt(String(o.next_offset))!==offset+length)throw new Error('Invalid wire continuation');}}
+function list(data:ObjectValue){const entries=array(data.items,100).map(object);bool(data.exhausted);requireFields(data,['next_cursor']);if(data.next_cursor!==null)text(data.next_cursor);if((data.exhausted===true)!==(data.next_cursor===null))throw new Error('Contradictory list exhaustion');return entries;}
 export function validateRoute(route:string,data:ObjectValue){
- const path=route.split('?')[0]!;
- const list=path==='/blocks'||path==='/assets'||/\/(transactions|inputs|outputs|witnesses|events|utxos)$/.test(path);
- let entries:ObjectValue[]=[data];
- if(list){required(data,['items','next_cursor','exhausted']);if(!Array.isArray(data.items)||data.items.length>100||typeof data.exhausted!=='boolean'||!(data.next_cursor===null||typeof data.next_cursor==='string')||(!data.exhausted&&data.next_cursor===null))throw new Error('Invalid bounded list');entries=data.items.map(object);}
- for(const o of entries){
-  if(path==='/blocks'||/^\/blocks\/(by-height\/)?[^/]+$/.test(path)){block(o);if(path!=='/blocks'){required(o,['header_wire','header','body_availability','finality']);if(o.body_availability!=='complete'||o.finality!=='unknown')throw new Error('Unsupported block availability');}}
-  else if(/\/blocks\/[^/]+\/transactions$/.test(path)||/^\/transactions\/by-(id|hash)\/[^/]+$/.test(path)){tx(o);if(path.startsWith('/transactions')){required(o,['lock','core_available','witness_available','wire_available','finality','accounting']);if(o.core_available!==true||o.witness_available!==true||o.wire_available!==true||o.finality!=='unknown'||object(o.accounting).availability!=='unknown')throw new Error('Invalid transaction availability');}}
-  else if(path.endsWith('/inputs')){required(o,['input_index','flags','kind','prev_txid','prev_index','sequence','path_index','witness_count','coinbase_data','resolved_coin']);if(!['spend','coinbase','mint'].includes(String(o.kind)))throw new Error('Invalid input kind');const coin=object(o.resolved_coin);if(coin.availability!==(o.kind==='spend'?'complete':'not_applicable'))throw new Error('Invalid resolved input');const data=object(o.coinbase_data);if(typeof data.present!=='boolean')throw new Error('Invalid coinbase presence');if(data.present)ref(data.wire_ref);else if(data.wire_ref!==null)throw new Error('Absent coinbase data reference');}
-  else if(path.endsWith('/witnesses')){required(o,['witness_index','script','siblings','arguments']);ref(o.script);for(const k of ['siblings','arguments']){const t=object(o[k]);required(t,['count','table_ref','inline']);ref(t.table_ref);if(t.inline!==null&&!Array.isArray(t.inline))throw new Error('Invalid witness table');}}
-  else if(path.endsWith('/wire')){required(o,['txid','txhash','total_bytes','offset','bytes_hex','next_offset']);}
-  else if(path.startsWith('/branches/')){required(o,['record','matching_positions']);output(object(o.record));if(!Array.isArray(o.matching_positions))throw new Error('Invalid matching positions');}
-  else if(path.startsWith('/outputs/')||path.endsWith('/outputs'))output(o);
-  else if(path==='/assets'||/^\/assets\/[^/]+$/.test(path))asset(o);
-  else if(path.endsWith('/events')){required(o,['token_id','location','spent_units','output_units','explicit_burn_units','minted_units','implicit_burn_units','has_mint_input']);location(object(o.location));if(typeof o.has_mint_input!=='boolean')throw new Error('Invalid mint indicator');}
- }
+ const url=new URL(route,'http://local'),path=url.pathname;let match:RegExpMatchArray|null;
+ if(path==='/blocks'){for(const o of list(data))block(o);}
+ else if((match=path.match(/^\/blocks\/(by-height\/)?([^/]+)$/))){block(data,true);if(match[1]){if(data.height!==match[2])throw new Error('Wrong block height');}else if(data.block_id!==match[2])throw new Error('Wrong block identity');}
+ else if((match=path.match(/^\/blocks\/([^/]+)\/transactions$/))){for(const o of list(data)){transaction(o);if(object(o.location).block_id!==match[1])throw new Error('Wrong transaction block');}}
+ else if((match=path.match(/^\/transactions\/by-(id|hash)\/([^/]+)$/))){transaction(data,true);if(data[match[1]==='id'?'txid':'txhash']!==match[2])throw new Error('Wrong transaction identity');}
+ else if((match=path.match(/^\/transactions\/by-id\/([^/]+)\/(inputs|outputs|witnesses|wire)$/))){const id=match[1],kind=match[2];if(kind==='wire'){wire(data,url.searchParams);if(data.txid!==id)throw new Error('Wrong wire identity');}else for(const o of list(data)){if(kind==='inputs')input(o);else if(kind==='witnesses')witness(o);else {output(o);if(o.txid!==id)throw new Error('Wrong output transaction');}}}
+ else if((match=path.match(/^\/outputs\/([^/]+)\/([^/]+)$/))){output(data);if(data.txid!==match[1]||data.out_idx!==match[2])throw new Error('Wrong outpoint');}
+ else if(path==='/assets'){for(const o of list(data))asset(o);}
+ else if((match=path.match(/^\/assets\/([^/]+)(?:\/(events|outputs))?$/))){if(!match[2]){asset(data);if(data.token_id!==match[1])throw new Error('Wrong asset identity');}else for(const o of list(data)){if(match[2]==='events')event(o);else{output(o);literal(o.has_token,true);if(url.searchParams.get('view')==='unspent'&&(o.spend!==null||o.is_burn!==false))throw new Error('Nonspendable output in unspent view');}if(o.token_id!==match[1])throw new Error('Wrong asset occurrence');}}
+ else if(path==='/branches/outputs'||path==='/branches/utxos'){for(const o of list(data)){output(o.record);for(const p of array(o.matching_positions)){decimal(p,U8);if(BigInt(String(p))>=BigInt(array(object(o.record).branches).length))throw new Error('Invalid matching branch position');}if(path.endsWith('/utxos')){const r=object(o.record);literal(r.spend,null);literal(r.is_burn,false);}}u64(data.posting_reads);u64(data.work);}
+ else throw new Error('Unknown explorer route');
+}
+export function validateStatus(value:unknown):ObjectValue{
+ validateTree(value);const o=object(value);literal(o.api_version,'1');bool(o.ready);if(typeof o.reason!=='string'||!['ready','initializing','catching_up','authority_unknown','recovery','busy','schema_incomplete','index_error'].includes(o.reason))throw new Error('Unknown readiness reason');
+ const indexed=anchorValue(o.indexed_anchor),authority=anchorValue(o.authoritative_anchor);text(o.service_epoch);if(o.generation!==null)u64(o.generation);binding(o.binding);const c=o.coverage===null?null:coverage(o.coverage);const caps=object(o.capabilities);
+ for(const k of ['blocks','transactions','transaction_wire','outputs','assets','asset_events','branches','accepted_pool','detached_history','finality'])bool(caps[k]);for(const k of ['accepted_pool','detached_history','finality'])literal(caps[k],false);
+ const limits=object(o.limits);for(const [k,max] of Object.entries({request_bytes:32768n,response_bytes:262144n,page_size:100n,cursor_bytes:2048n,wire_chunk_bytes:32768n,examined_records:1024n,key_reads:4096n})){decimal(limits[k],max);if(limits[k]==='0')throw new Error('Invalid zero service limit');}
+ if(o.ready){literal(o.reason,'ready');if(!indexed||!authority||!c||o.generation===null||indexed.block_id!==authority.block_id||indexed.height!==authority.height||c.through_height!==indexed.height||c.complete!==true)throw new Error('Contradictory ready observation');for(const k of ['blocks','transactions','transaction_wire','outputs','assets','asset_events','branches'])literal(caps[k],true);}
+ else if(o.reason==='ready'||c?.complete===true)throw new Error('Contradictory unavailable observation');return o;
+}
+function validateError(value:unknown,status:number){validateTree(value);const o=object(value);literal(o.api_version,'1');const e=object(o.error);text(e.code,64);text(e.meaning,4096);const codes:Record<string,number>={invalid_request:400,invalid_limits:400,invalid_cursor:400,stale_cursor:409,stale_snapshot:409,request_limit:413,record_limit:413,invalid_range:416,index_unavailable:503,not_in_covered_chain:404};if(typeof e.code!=='string'||codes[e.code]!==status)throw new Error('Invalid API error code/status');if(o.snapshot!==null)snapshot(o.snapshot);if(o.coverage!==null)coverage(o.coverage);if([404,409].includes(status)&&(o.snapshot===null||o.coverage===null))throw new Error('Missing fenced error observation');}
+async function readJson(response:Response):Promise<unknown>{
+ const reader=response.body?.getReader();if(!reader)throw new Error('Missing response body');let size=0;const chunks:Uint8Array[]=[];
+ try{while(true){const {done,value}=await reader.read();if(done)break;size+=value.byteLength;if(size>262144)throw new Error('Response exceeds 256 KiB');chunks.push(value);}}catch(e){await reader.cancel().catch(()=>{});throw e;}finally{reader.releaseLock();}
+ const bytes=new Uint8Array(size);let offset=0;for(const c of chunks){bytes.set(c,offset);offset+=c.byteLength;}return JSON.parse(new TextDecoder('utf-8',{fatal:true}).decode(bytes));
 }

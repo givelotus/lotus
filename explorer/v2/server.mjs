@@ -13,7 +13,9 @@ const server=http.createServer(async(req,res)=>{
  const incoming=new URL(req.url,'http://127.0.0.1');
  if(incoming.pathname.startsWith('/v2/explorer/v1/')&&api){
   if(!['GET','POST'].includes(req.method)){res.writeHead(405).end();return;}
-  let bytes=0;const chunks=[];for await(const chunk of req){bytes+=chunk.length;if(bytes>32768){res.writeHead(413).end();return;}chunks.push(chunk);}
+  let bytes=0;const chunks=[];const deadline=setTimeout(()=>{if(!res.headersSent)res.writeHead(503,{'Content-Type':'application/json'});res.end(JSON.stringify({api_version:'1',error:{code:'index_unavailable',meaning:'Private proxy incoming body deadline exceeded'},snapshot:null,coverage:null}));req.destroy();},15000);deadline.unref();
+  try{for await(const chunk of req){bytes+=chunk.length;if(bytes>32768){res.writeHead(413).end();return;}chunks.push(chunk);}}finally{clearTimeout(deadline);}
+  if(req.destroyed||res.writableEnded)return;
   if(req.url.length>32768){res.writeHead(413).end();return;}
   const abort=new AbortController();req.on('aborted',()=>abort.abort());res.on('close',()=>abort.abort());
   const remote=await fetch(new URL(incoming.pathname+incoming.search,api),{method:req.method,headers:{'Content-Type':'application/json'},body:req.method==='POST'?Buffer.concat(chunks):undefined,signal:AbortSignal.any([abort.signal,AbortSignal.timeout(15000)]),redirect:'error'});
@@ -23,6 +25,6 @@ const server=http.createServer(async(req,res)=>{
  if(req.method!=='GET'){res.writeHead(405).end();return;}
  const entry=files.get(incoming.pathname);if(!entry){res.writeHead(404).end();return;}
  const bytes=await readFile(fileURLToPath(new URL(entry[0],root)));res.writeHead(200,{'Content-Type':entry[1]}).end(bytes);
- }catch(e){if(!res.headersSent)res.writeHead(503,{'Content-Type':'application/json'});res.end(JSON.stringify({api_version:'1',error:{code:'index_unavailable',meaning:'Private proxy unavailable'},snapshot:null,coverage:null}));}
+ }catch(e){if(res.writableEnded)return;if(!res.headersSent)res.writeHead(503,{'Content-Type':'application/json'});res.end(JSON.stringify({api_version:'1',error:{code:'index_unavailable',meaning:'Private proxy unavailable'},snapshot:null,coverage:null}));}
 });
 server.listen(Number(args[portIndex+1]),'127.0.0.1',()=>{const address=server.address();console.log(`Private explorer: http://127.0.0.1:${address.port}/${api?'?api='+encodeURIComponent('http://127.0.0.1:'+address.port):''}`);});

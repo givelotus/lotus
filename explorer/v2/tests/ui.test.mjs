@@ -4,8 +4,9 @@ const h='12'.repeat(32),x='34'.repeat(32),token='56'.repeat(32),root='78'.repeat
 const location={block_id:h,height:'0',tx_index:'0'};
 const block={block_id:h,prev_id:'00'.repeat(32),height:'0',time:'1',size:'134',tx_count:'1',status:'confirmed',confirmations:'1'};
 const tx={txid:h,txhash:x,location,status:'confirmed',confirmations:'1',input_count:'1',output_count:'1',wire_size:'2',lock:'0',core_available:true,witness_available:true,wire_available:true,finality:'unknown',accounting:{availability:'unknown'}};
-const output={txid:h,out_idx:'0',flags:'1',value:'340282366920938463463374607431768211455',has_token:true,token_id:token,is_burn:false,branches:[root],paths:[['0']],creation:location,spend:null};
-const asset={token_id:token,first_seen:location,event_count:'1',output_count:'1',metadata:{availability:'unknown',name:null,symbol:null,decimals:null,issuer:null,mint_cap:null},supply:{availability:'unknown'}};
+const fullLocation={...location,txid:h,txhash:x};
+const output={txid:h,out_idx:'0',flags:'1',value:'340282366920938463463374607431768211455',has_token:true,token_id:token,is_burn:false,branches:[root],paths:[['0']],creation:fullLocation,spend:null};
+const asset={token_id:token,first_seen:fullLocation,event_count:'1',output_count:'1',metadata:{availability:'unknown',name:null,symbol:null,decimals:null,issuer:null,mint_cap:null},supply:{availability:'unknown'}};
 const page=items=>({items,next_cursor:null,exhausted:true});
 const env=data=>({api_version:'1',snapshot_token:'test-snapshot',snapshot:{chain_id:h,genesis:h,profile_id:h,tip:h,height:'0',service_epoch:'synthetic-epoch',generation:'1'},coverage:{from_height:'0',through_height:'0',complete:true,scope:'canonical_confirmed'},data});
 test('DOM screens, explicit navigation, exact units, escaping, witnesses, wire and stale states',async()=>{
@@ -15,10 +16,10 @@ test('DOM screens, explicit navigation, exact units, escaping, witnesses, wire a
  globalThis.fetch=async(url,options)=>{
   const u=new URL(url),path=u.pathname.replace('/v2/explorer/v1','');calls.push({path,url:String(url),options});
   if(fail)return Response.json({api_version:'1',error:{code:'index_unavailable',meaning:'Busy'},snapshot:null,coverage:null},{status:503});
-  if(stale>0){stale--;return Response.json({api_version:'1',error:{code:'stale_snapshot',meaning:'Changed'},snapshot:null,coverage:null},{status:409});}
-  if(path==='/status')return Response.json({api_version:'1',ready:true,reason:'ready',capabilities:{accepted_pool:false,finality:false}});
+  if(stale>0){stale--;return Response.json({api_version:'1',error:{code:'stale_snapshot',meaning:'Changed'},snapshot:env({}).snapshot,coverage:env({}).coverage},{status:409});}
+  if(path==='/status')return Response.json({api_version:'1',ready:true,reason:'ready',indexed_anchor:{block_id:h,height:'0'},authoritative_anchor:{block_id:h,height:'0'},service_epoch:'synthetic-epoch',generation:'1',binding:{chain_id:h,genesis:h,profile_id:h},coverage:env({}).coverage,capabilities:{blocks:true,transactions:true,transaction_wire:true,outputs:true,assets:true,asset_events:true,branches:true,accepted_pool:false,detached_history:false,finality:false},limits:{request_bytes:'32768',response_bytes:'262144',page_size:'100',cursor_bytes:'2048',wire_chunk_bytes:'32768',examined_records:'1024',key_reads:'4096'}});
   if(path==='/blocks')return Response.json(env(page([block])));
-  if(path==='/blocks/'+h)return Response.json(env({...block,header_wire:'00'.repeat(134),header:{...block},body_availability:'complete',finality:'unknown'}));
+  if(path==='/blocks/'+h)return Response.json(env({...block,header_wire:'00'.repeat(134),header:{prev_id:block.prev_id,bits:'0',time:block.time,nonce:'0',version:'0',size:block.size,height:block.height,tx_root:h,state_root:h},body_availability:'complete',finality:'unknown'}));
   if(path.endsWith('/transactions'))return Response.json(env(page([tx])));
   if(path==='/transactions/by-id/'+h||path==='/transactions/by-hash/'+x)return Response.json(env({...tx,note:'<img src=x onerror=alert(1)>'}));
   if(path.endsWith('/inputs'))return Response.json(env(page([{input_index:'0',flags:'3',kind:'mint',prev_txid:token,prev_index:'0',sequence:'0',path_index:null,witness_count:'1',coinbase_data:{present:false,wire_ref:null},resolved_coin:{availability:'not_applicable'}}])));
@@ -26,7 +27,7 @@ test('DOM screens, explicit navigation, exact units, escaping, witnesses, wire a
   if(path.endsWith('/wire'))return Response.json(env({txid:h,txhash:x,total_bytes:'2',offset:'0',bytes_hex:'00ff',next_offset:null}));
   if(path==='/assets')return Response.json(env(page([asset])));
   if(path==='/assets/'+token)return Response.json(env(asset));
-  if(path.endsWith('/events'))return Response.json(env(page([{token_id:token,location,spent_units:'0',output_units:'1',explicit_burn_units:'0',minted_units:'1',implicit_burn_units:'0',has_mint_input:true}])));
+  if(path.endsWith('/events'))return Response.json(env(page([{token_id:token,location:fullLocation,spent_units:'0',output_units:'1',explicit_burn_units:'0',minted_units:'1',implicit_burn_units:'0',has_mint_input:true}])));
   if(path.startsWith('/branches/'))return Response.json(env({...page([{record:output,matching_positions:['0']}]),posting_reads:'1',work:'1'}));
   if(path.endsWith('/outputs'))return Response.json(env(page([output])));
   throw new Error('Unexpected route '+path);

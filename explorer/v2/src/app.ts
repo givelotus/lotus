@@ -22,7 +22,7 @@ function error(e:unknown){
  }else notice.textContent='Invalid or unavailable response: '+String(e);
  notice.append(button('Reload screen',()=>void navigate(current,body)));
 }
-async function extra(fn:()=>Promise<unknown>){try{await fn();}catch(e){if(!controller.signal.aborted)error(e);}}
+async function extra(fn:()=>Promise<unknown>){const own=controller;try{await fn();}catch(e){if(own.signal.aborted)return;if(e instanceof ApiError&&e.status===409){own.abort();results.replaceChildren();anchor.replaceChildren();await navigate(current,body,1);}else error(e);}}
 async function section(title:string,route:string,payload?:ObjectValue){
  const pinned=view,signal=controller.signal;const env=await pinned.get(route,payload);signal.throwIfAborted();observation(env);
  const s=node('section');s.append(node('h3',title),render(env.data));results.append(s);
