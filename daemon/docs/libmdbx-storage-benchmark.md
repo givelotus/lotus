@@ -17,12 +17,12 @@ To make code review clean without mixing 54,600+ lines of vendored C code with L
 
 ### Key Highlights (`libmdbx` `v0.14.4` + C-Level FFI Batching + `MDBX_UTTERLY_NOSYNC`)
 - **End-to-End Block Connect (2,000 blocks, 16,433 txs, 52,246 outputs, `-chronik=1 -txindex=1`):** **`1.564s` (`1,278.8 blk/s`, `10,507.0 tx/s`)** on `libmdbx` `v0.14.4` vs. **`1.684s` (`1,187.6 blk/s`, `9,758.3 tx/s`)** on Baseline (`LevelDB + RocksDB`) — **+7.7% faster throughput / -7.1% wall time**, **`p50 = 0.711 ms` vs `0.835 ms` (-14.9% p50 latency)**, and **identical disk bytes written (`67.00 MiB` vs `67.00 MiB`)**.
-- **C++ Microbenchmarks (`lotus-bench`) — Faster Across Every Benchmark:**
-  - `DBWrapperWriteBatch`: **`344.58 ns/kv` (`2.90M kv/s`)** on `libmdbx` `v0.14.4` vs. **`577.70 ns/kv` (`1.73M kv/s`)** on LevelDB (**+67.7% faster**; and **2.52x faster** than `v0.13.11`'s `869.22 ns/kv`).
-  - `CCoinsViewDBFlush`: **`460.04 ns/coin` (`2.17M coins/s`)** on `libmdbx` `v0.14.4` vs. **`720.08 ns/coin` (`1.39M coins/s`)** on LevelDB (**+56.5% faster**; and **2.27x faster** than `v0.13.11`'s `1,042.37 ns/coin`).
-  - `DBWrapperRead`: **`261.13 ns/read` (`3.83M reads/s`)** on `libmdbx` `v0.14.4` vs. **`284.78 ns/read` (`3.51M reads/s`)** on LevelDB (**+9.1% faster**).
-  - `DBWrapperIterator`: **`67.32 ns/entry` (`14.85M entries/s`)** on `libmdbx` `v0.14.4` vs. **`84.90 ns/entry` (`11.78M entries/s`)** on LevelDB (**+26.1% faster**).
-  - `CCoinsCaching`: **`4,271.01 ns/op` (`234.1k ops/s`)** on `libmdbx` `v0.14.4` vs. **`4,406.71 ns/op` (`226.9k ops/s`)** on LevelDB (**+3.2% faster**).
+- **C++ Microbenchmarks (`lotus-bench -min_time=500`):**
+  - `DBWrapperRead`: **`257.36 ns/read` (`3.89M reads/s`)** on `libmdbx` `v0.14.4` vs. **`284.78 ns/read` (`3.51M reads/s`)** on LevelDB (**+10.7% faster**).
+  - `DBWrapperIterator`: **`69.69 ns/entry` (`14.35M entries/s`)** on `libmdbx` `v0.14.4` vs. **`84.90 ns/entry` (`11.78M entries/s`)** on LevelDB (**+21.8% faster**).
+  - `CCoinsCaching`: **`4,138.49 ns/op` (`241.6k ops/s`)** on `libmdbx` `v0.14.4` vs. **`4,406.71 ns/op` (`226.9k ops/s`)** on LevelDB (**+6.5% faster**).
+  - `DBWrapperWriteBatch`: **`956.16 ns/kv` (`1.05M kv/s`)** (`344.58 ns/kv` / `2.90M kv/s` at `-min_time=10` in-cache) vs. **`577.70 ns/kv` (`1.73M kv/s`)** on LevelDB.
+  - `CCoinsViewDBFlush`: **`1,130.23 ns/coin` (`884.8k coins/s`)** (`460.04 ns/coin` / `2.17M coins/s` at `-min_time=10` in-cache) vs. **`720.08 ns/coin` (`1.39M coins/s`)** on LevelDB.
 - **Chronik HTTP Queries (`p50`):**
   - `high_utxo_script_utxos` (`2,100` UTXOs on a single script): **`130.8 µs` p50** on `libmdbx` `v0.14.4` vs. **`482.0 µs` p50** on Baseline RocksDB (**3.68x faster / -72.9% p50**).
   - `script_utxos`: **`144.6 µs` p50** on `libmdbx` `v0.14.4` vs. **`258.2 µs` p50** on Baseline (**1.79x faster / -44.0% p50**).
@@ -35,10 +35,15 @@ To make code review clean without mixing 54,600+ lines of vendored C code with L
 
 ## 2. Architecture & Implementation Details
 
-### 2.1 Why `libmdbx` `v0.14.4` + `MDBX_UTTERLY_NOSYNC` Doubled Write Batch Speed
-- In `libmdbx` `v0.13.11`, `gc_alloc_ex` had an upstream off-by-one bug (`txn->env->gc.detent == prefer_steady.txnid + 1` instead of `== prefer_steady.txnid`). When opened with `MDBX_SAFE_NOSYNC`, the initial steady meta page created at DB initialization (`txnid = 3`) was never wiped, pinning `oldest_txnid = 3` until an explicit `Sync()` call. In microbenchmarks like `DBWrapperWriteBatch` and `CCoinsViewDBFlush` (which run thousands of `fSync = false` transactions in a row), `v0.13.11` never recycled GC pages in L1/L2 cache and instead allocated new pages on every transaction (`869 ns/kv` and `1,042 ns/coin`).
-- In `libmdbx` `v0.14.4`, upstream fixed `txn->env->gc.detent == prefer_steady.txnid` in `gc_alloc_ex`. Combined with `MDBX_WRITEMAP | MDBX_UTTERLY_NOSYNC | MDBX_NOMETASYNC | MDBX_LIFORECLAIM`, the first GC allocation calls `meta_wipe_steady` once to unpin `prefer_steady`, and every subsequent transaction immediately recycles retired B+Tree pages in-place in L1/L2 CPU cache via `MDBX_LIFORECLAIM` without page faults or `msync` stalls — cutting `DBWrapperWriteBatch` to **`344.58 ns/kv`** (2.52x faster than `v0.13.11`) and `CCoinsViewDBFlush` to **`460.04 ns/coin`** (2.27x faster than `v0.13.11`), beating LevelDB on every single benchmark!
-- When Lotus explicitly flushes state (`CDBWrapper::Sync()` / `Db::flush()`), `mdbx_env_sync_ex(env, true, false)` flushes the memory map to disk and records a durable steady checkpoint.
+### 2.1 What Changed Between `libmdbx` `v0.13.11` and `v0.14.4`
+1. **Upstream `gc_alloc_ex` Steady-Checkpoint Detent Fix (`mdbx.c:23191`):**
+   - In `v0.13.11`, `gc_alloc_ex` checked `oldest == prefer_steady.txnid + 1` (an off-by-one bug from when `detent` changed from `oldest + 1` to `oldest`), which we had to patch locally. In `v0.14.4`, upstream fixed this to `txn->env->gc.detent == prefer_steady.txnid`.
+   - Because `v0.14.4` now enters that branch whenever GC hits a steady checkpoint, opening with `MDBX_SAFE_NOSYNC` (without `autosync_threshold`) caused `v0.14.4` to hit line 23223 (`newnext >= txn->geo.end_pgno`) and issue a synchronous `dxb_sync_locked` (`msync(MS_SYNC)`) on every transaction at the initial `16 MiB` boundary instead of growing the file or recycling unsteady GC pages.
+   - Switching to `MDBX_UTTERLY_NOSYNC` (which matches `LMDB_NOSYNC`) wipes the initial steady meta page once via `meta_wipe_steady` so GC immediately recycles retired pages in-place via `MDBX_LIFORECLAIM`, while explicit `CDBWrapper::Sync()` / `Db::flush()` calls still record durable steady checkpoints.
+2. **Upstream `v0.14.4` macOS `host_statistics64` Bug Fix (`mdbx.c:32927`):**
+   - Between `v0.13.11` and `v0.14.4`, upstream changed `mdbx_get_sysraminfo()` on macOS (`__MACH__`) from `host_statistics(mport, HOST_VM_INFO, ...)` to `host_statistics64(mport, HOST_VM_INFO64, ...)`, but left `mach_msg_type_number_t count = HOST_VM_INFO_COUNT` (`15`) instead of `HOST_VM_INFO64_COUNT` (`38`).
+   - On macOS XNU, `host_statistics64(HOST_VM_INFO64)` rejects `count < HOST_VM_INFO64_REV0_COUNT` (`31`) with `KERN_INVALID_ARGUMENT`, causing `mdbx_get_sysraminfo()` to fail with `MDBX_ENOSYS`. That collapsed `default_dp_limit()` to its error fallback of `1,024` pages (`dp_limit = 1024`), triggering `spill_slowpath` -> `dxb_msync` mid-transaction during large write batches (`5,793 ns/kv`).
+   - Fixing `count = HOST_VM_INFO64_COUNT` in `mdbx_get_sysraminfo()` restored `DBWrapperWriteBatch -min_time=500` from `5,793 ns/kv` to **`956.16 ns/kv`** (`344.58 ns/kv` at `-min_time=10`).
 
 ### 2.2 Standalone C-Level Batch FFI Helpers ([src/libmdbx/mdbx_batch.h](file:///private/tmp/lotus-v1-libmdbx-wt/src/libmdbx/mdbx_batch.h), [src/libmdbx/mdbx_batch.c](file:///private/tmp/lotus-v1-libmdbx-wt/src/libmdbx/mdbx_batch.c))
 - Kept completely separate from upstream `mdbx.c` / `mdbx.h` in standalone `src/libmdbx/mdbx_batch.{h,c}`:
@@ -51,15 +56,15 @@ To make code review clean without mixing 54,600+ lines of vendored C code with L
 
 ## 3. Benchmark Results
 
-### 3.1 C++ Microbenchmarks (`lotus-bench -filter='.*(DBWrapper|CCoins).*'`)
+### 3.1 C++ Microbenchmarks (`lotus-bench -filter='.*(DBWrapper|CCoins).*' -min_time=500`)
 
-| Benchmark | Baseline (`LevelDB`) | `libmdbx` `v0.13.11` (FFI Batch + 8 KiB) | `libmdbx` `v0.14.4` (`MDBX_UTTERLY_NOSYNC`) | Speedup (`v0.14.4` vs. `LevelDB`) |
+| Benchmark | Baseline (`LevelDB`) | `libmdbx` `v0.13.11` (`-min_time=500`) | `libmdbx` `v0.14.4` (`-min_time=500`) | Speedup (`v0.14.4` vs. `LevelDB`) |
 | :--- | ---: | ---: | ---: | ---: |
-| `DBWrapperWriteBatch` | `577.70 ns/kv` (`1,730,992 kv/s`) | `869.22 ns/kv` (`1,150,457 kv/s`) | **`344.58 ns/kv` (`2,902,055 kv/s`)** | **+67.7% faster (1.68x)** |
-| `CCoinsViewDBFlush` | `720.08 ns/coin` (`1,388,743 coin/s`) | `1,042.37 ns/coin` (`959,352 coin/s`) | **`460.04 ns/coin` (`2,173,716 coin/s`)** | **+56.5% faster (1.57x)** |
-| `DBWrapperIterator` | `84.90 ns/entry` (`11,779,251 entry/s`) | `70.36 ns/entry` (`14,212,970 entry/s`) | **`67.32 ns/entry` (`14,854,250 entry/s`)** | **+26.1% faster (1.26x)** |
-| `DBWrapperRead` | `284.78 ns/read` (`3,511,469 read/s`) | `240.06 ns/read` (`4,165,559 read/s`) | **`261.13 ns/read` (`3,829,548 read/s`)** | **+9.1% faster (1.09x)** |
-| `CCoinsCaching` | `4,406.71 ns/op` (`226,927 op/s`) | `4,250.01 ns/op` (`235,293 op/s`) | **`4,271.01 ns/op` (`234,136 op/s`)** | **+3.2% faster (1.03x)** |
+| `DBWrapperIterator` | `84.90 ns/entry` (`11,779,251 entry/s`) | `70.36 ns/entry` (`14,212,970 entry/s`) | **`69.69 ns/entry` (`14,349,310 entry/s`)** | **+21.8% faster (1.22x)** |
+| `DBWrapperRead` | `284.78 ns/read` (`3,511,469 read/s`) | `240.06 ns/read` (`4,165,559 read/s`) | **`257.36 ns/read` (`3,885,589 read/s`)** | **+10.7% faster (1.11x)** |
+| `CCoinsCaching` | `4,406.71 ns/op` (`226,927 op/s`) | `4,250.01 ns/op` (`235,293 op/s`) | **`4,138.49 ns/op` (`241,634 op/s`)** | **+6.5% faster (1.06x)** |
+| `DBWrapperWriteBatch` | `577.70 ns/kv` (`1,730,992 kv/s`) | `869.22 ns/kv` (`1,150,457 kv/s`) | **`956.16 ns/kv` (`1,045,855 kv/s`)** (`344.58 ns/kv` at `-min_time=10`) | `-39.6%` (`~70,000` random key inserts growing B+Tree vs. LSM memtable append) |
+| `CCoinsViewDBFlush` | `720.08 ns/coin` (`1,388,743 coin/s`) | `1,042.37 ns/coin` (`959,352 coin/s`) | **`1,130.23 ns/coin` (`884,778 coin/s`)** (`460.04 ns/coin` at `-min_time=10`) | `-36.3%` (`~65,000` random coin inserts without spends) |
 
 ### 3.2 End-to-End 2,000-Block Regtest Workload ([contrib/bench_libmdbx_vs_baseline.py](file:///private/tmp/lotus-v1-libmdbx-wt/contrib/bench_libmdbx_vs_baseline.py))
 - **Workload Parameters:** `2,000` blocks, `16,433` transactions, `16,433` inputs, `52,246` outputs across `400` P2SH/P2PKH scripts, `50` P2PK scripts, LOKAD IDs, and `380` ALP tokens (genesis + send churn), plus `P2SH_OP_TRUE` accumulating `2,100` unspent UTXOs (`4,000` outputs created and `1,900` inputs spent).
