@@ -24,17 +24,22 @@ The immutable repaired daemon recovered a NEW COPY of failed seed `/private/tmp/
 
 Agent `native_quorum_acceptance` owns isolated harness worktree `/private/tmp/lotus-v2-native-quorum-acceptance-20261015`; commits through `26caab8f` are not integrated. Actual run `/private/tmp/lotus-v2-native-quorum-c0ddb9cf30-20261015-a` recovered pending height1738 with exact ledger state and is importing the suffix. Original failed homes remain unchanged. New gate tests nonempty funded public proof persistence across pending stop and same-home recovery as an observer. Then finish bootstrap2024, nine real proofs/full mesh, actual quorum/finality/parking/conflicting forks/restart. Ask owner for ordered owned commits before integrating.
 
-### Explorer availability
+### Explorer availability — resolved in scoped live acceptance
 
-Frontend and API implemented. Actual run `/private/tmp/lotus-v2-explorer-live-acceptance-20261015-e` FAILED because repeated transient503 responses exhausted explicit UI reloads. Preserve this evidence. Snapshot-token correctness repairs are integrated; durable generation remained stable. No complete wallet/explorer reorg acceptance claim.
-
-`explorer_frontend` now owns a NEW isolated frontend repair: bounded idempotent read503 retry under original deadline, same snapshot token, navigation cancellation, no409/mutation retry, bounded visible failure. `explorer_frontend_review` reviews independently. Do not raise harness reload budget or retry until green. Prior harness `d5ea1f7b` and failure documentation `a21e2d6b` in `/private/tmp/lotus-v2-explorer-live-20261015` are not integrated. Ask ordered commit list later.
+Reviewed frontend `40c3191a` is integrated as `6b2f9972`; harness commits through
+`8e8d43d6` are integrated through root `a8cecc18`. Passing run f evidence is
+integrated as `d96efee6` in `daemon/docs/v2-explorer-live-acceptance-20261015.md`.
+Independent audit verified42artifacthashes,78nativewalletchecks,153explorerchecks,
+19actualDOMruns, same-home confirmed5→detached7→remined8 membership, and ten clean
+native exits. Request-local retries recovered81transient503 with zero manual
+reloads. Failed run e remains preserved. This gate is complete for native
+currency at its exact documented pins; assets retain their separate gate.
 
 ## Validation status
 
 Exact8cd inherited aggregates completed:305/305 runners (147default,147upgrade-named,11Avalanche). Evidence integrated as `9df84e01`, `daemon/docs/v2-final-unit-8cd36091ba.md` and its evidence directory. Independent reviewer rehashed all305 retained logs and both binaries, verified terminal success and exact source. These results precede lifecycle repair; upgrade names do not force distinct activation.
 
-`avalanche_node_integration` now owns a bounded unchanged functional smoke at c0ddb9cf30 (8scripts/10variants), fresh isolated docs/evidence. It must preflight generated config, CLI/wallet-tool provenance and coordinate resources with quorum/explorer owners; no broad reruns or source edits. Status is requested/preflight, not yet passed.
+`avalanche_node_integration` now owns a bounded unchanged functional smoke at c0ddb9cf30 (8scripts/10variants), fresh isolated docs/evidence. It must preflight generated config, CLI/wallet-tool provenance and coordinate resources with quorum/explorer owners; no broad reruns or source edits. Execution passed all ten variants, without failures/skips, in32.49seconds; scoped evidence commit is being finalized.
 
 ## Completed scoped evidence; do not repeat broad work
 
@@ -47,11 +52,11 @@ Exact8cd inherited aggregates completed:305/305 runners (147default,147upgrade-n
 
 ## Finish order
 
-1. Fix explorer availability and finish live acceptance with independent review.
+1. Preserve the completed reviewed explorer gate; integrate pending functional smoke evidence.
 2. Complete the running suffix bootstrap and genuine funded quorum/persistence/fork/restart gates; copied-home startup recovery has passed.
 3. Integrate owned reviewed commits; export new native mailboxes only after fresh complete intermediate-tree replay. Update plan immediately after series commit.
 4. Validate final integrated revision across applicable functional/native/compiler/wallet/Chronik gates; update coverage for changed scope and preserve failures.
-5. Prepare reproducible build/profile/peer/funding/mining/wallet/explorer runbook. Request separate-host access when local prerequisites are ready; no unspecified infrastructure authorization.
+5. Prepare reproducible build/profile/peer/funding/mining/wallet/explorer runbook. Separate-host OS/architecture/SSH aliases and permission for fresh test directories/listeners have been requested asynchronously. No unspecified infrastructure is authorized.
 6. Demonstrate separate-machine workflow and audit every goal requirement before declaring completion.
 
 Full objectives remain in `/Users/shammah/.codex/attachments/ff8ddba3-095c-47ec-a423-9fa916a72fa4/pasted-text-1.txt` and its referenced predecessor. This handoff does not reduce their scope.

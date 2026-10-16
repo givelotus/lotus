@@ -16,6 +16,26 @@ The foreground local controller now completes a live-wallet payment and restart
 across two isolated nodes; see the current controller evidence below. Development
 profile adoption and public launch remain pending.
 
+### Integrated wallet and explorer acceptance (October 15)
+
+The [live explorer gate](v2-explorer-live-acceptance-20261015.md) now passes on
+native `c0ddb9cf30` and reviewed frontend `40c3191a` (integrated as `6b2f9972`).
+Independent review verified all 42 recorded artifact hashes, source pins, raw
+confirmed → detached → re-mined transitions and cleanup. The run has 78 native
+wallet/controller checks, 153 explorer checks and 19 actual DOM runs. All ten
+native processes exited cleanly. Request-local bounded retries recovered 81
+transient 503 responses without manual screen reloads; earlier failures remain.
+This is native currency and automated DOM acceptance, not a browser usability
+study, accepted-pool indexing, Avalanche finality or separate-machine evidence.
+Native token indexing retains its separately reviewed asset gate above/below.
+
+The bounded exact-c0ddb inherited functional smoke completed all ten registered
+variants of eight scripts without failures/skips; its detailed evidence is being
+finalized separately. Full applicable functional execution remains outstanding.
+Funded quorum acceptance is still running after copied-home startup recovery.
+Separate test-host access has been requested; no remote deployment is authorized
+until the user identifies the test infrastructure and permitted actions.
+
 ### Reviewed lifecycle repair through 305 (October 15)
 
 All 306 intermediate trees verify in a fresh replay. Source `c0ddb9cf30`
