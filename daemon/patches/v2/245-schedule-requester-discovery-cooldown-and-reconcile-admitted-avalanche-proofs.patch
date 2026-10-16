@@ -1,0 +1,202 @@
+From 21950c2c42d61a2f2fc3441ff0dd96debfa93ab3 Mon Sep 17 00:00:00 2001
+From: Shammah Chancellor <shammah.chancellor@notvalid.com>
+Date: Thu, 15 Oct 2026 15:55:21 -0700
+Subject: [PATCH] Schedule requester discovery cooldown and reconcile admitted
+ Avalanche proofs
+
+---
+ src/lotus_v2/avalanche_driver.cpp            | 41 +++++++++++++++++---
+ src/lotus_v2/avalanche_driver.h              |  3 +-
+ src/lotus_v2/avalanche_driver_test/README.md | 11 ++++--
+ src/lotus_v2/test_avalanche_driver.cpp       | 34 ++++++++++++++++
+ 4 files changed, 79 insertions(+), 10 deletions(-)
+
+diff --git a/src/lotus_v2/avalanche_driver.cpp b/src/lotus_v2/avalanche_driver.cpp
+index f19a3f8986124c0ee465c47cfcbb33728f5cd2d6..9704d5e5c9f0493a9befdf73453ff23441a904d1 100644
+--- a/src/lotus_v2/avalanche_driver.cpp
++++ b/src/lotus_v2/avalanche_driver.cpp
+@@ -47,6 +47,7 @@ bool AvalancheDriver::Refresh(ChainSnapshot &s,std::string &e) {
+     if(!validated_ || validated_->tip!=s.tip || validated_->generation!=s.generation) {
+         CoinLookup lookup=[this](const Outpoint &o,std::optional<Coin> &c,std::string &err){return runtime_.ReadCoin(o,c,err)==DevelopmentRuntimeResult::Progress;};
+         if(!quorum_.Revalidate(s,lookup,wall_seconds_,[this]{return ReadSnapshot();},e))return false;
++        if(!ReconcileProofs(e))return false;
+         validated_=s;
+         for(auto it=envelopes_.begin();it!=envelopes_.end();)if(!quorum_.Known(it->first))it=envelopes_.erase(it);else ++it;
+     }
+@@ -74,7 +75,17 @@ bool AvalancheDriver::Register(const ProofEnvelope &p, std::string &e) {
+         if(!EncodeProofEnvelope(it->second,config_.limits,a,err) || !EncodeProofEnvelope(p,config_.limits,b,err) || a!=b) return Fail(e,"proof-envelope-mismatch");
+     }
+     for(auto old=envelopes_.begin();old!=envelopes_.end();)if(!quorum_.Known(old->first))old=envelopes_.erase(old);else ++old;
+-    envelopes_.insert_or_assign(p.proof->getId(),p); e.clear(); return true;
++    envelopes_.insert_or_assign(p.proof->getId(),p);
++    if(!ReconcileProofs(e)){failed_=true;return false;}
++    e.clear(); return true;
++}
++bool AvalancheDriver::ReconcileProofs(std::string &e) {
++    for(const auto &id:quorum_.Proofs()) {
++        if(!quorum_.Pollable(id))continue;
++        Hash hash{};std::copy(id.begin(),id.end(),hash.begin());
++        if(!polls_.Reconcile({ItemKind::Proof,hash},quorum_.Vote(id)==0,e))return false;
++    }
++    return true;
+ }
+ bool AvalancheDriver::Apply(const std::vector<BlockUpdate> &updates,std::string &e) {
+     std::vector<RuntimeBlockUpdate> mapped; mapped.reserve(updates.size());
+@@ -129,6 +140,7 @@ DriverResult AvalancheDriver::Start(bool ibd,int64_t wall) {
+         for(const auto &entry:valid)envelopes_.insert_or_assign(entry.envelope.proof->getId(),entry.envelope);
+     }
+     if(config_.local_proof.proof && !Register(config_.local_proof,e)){failed_=true;return Error(DriverCode::InvalidConfiguration,e);}
++    if(!ReconcileProofs(e)){failed_=true;return Error(DriverCode::ProtocolFailure,e);}
+     validated_=s;started_=true;return {};
+ }
+ DriverResult AvalancheDriver::Tick(bool ibd,int64_t ms,int64_t wall) {
+@@ -137,8 +149,14 @@ DriverResult AvalancheDriver::Tick(bool ibd,int64_t ms,int64_t wall) {
+     now_ms_=ms;wall_seconds_=wall;initial_download_=ibd;
+     ChainSnapshot s;std::string e;if(!Snapshot(s,e))return Error(DriverCode::NotReady,e);
+     if(!Refresh(s,e))return Error(DriverCode::NotReady,e);
+-    for(auto id:connections_) {
+-        auto r=peer_.Discover(id,static_cast<uint64_t>(ms),e);
++    for(auto &[id,due]:discovery_due_) {
++        const auto now=static_cast<uint64_t>(ms);
++        if(now<due)continue;
++        auto r=peer_.Discover(id,now,e);
++        if(r==PeerResult::Accepted) {
++            const auto interval=std::max<uint64_t>(60000,config_.limits.discovery_interval_ms);
++            due=interval>std::numeric_limits<uint64_t>::max()-now?std::numeric_limits<uint64_t>::max():now+interval;
++        }
+         if(r==PeerResult::LocalFailure || r==PeerResult::Rejected)return Error(DriverCode::ProtocolFailure,e);
+     }
+     peer_.Tick(static_cast<uint64_t>(ms));peer_.Pump(static_cast<uint64_t>(ms));
+@@ -155,14 +173,25 @@ DriverResult AvalancheDriver::Tick(bool ibd,int64_t ms,int64_t wall) {
+ PeerResult AvalancheDriver::Activate(peer::ConnectionId id,std::string &e) {
+     if(!Ready()){e="driver-not-started";return PeerResult::LocalFailure;}
+     auto r=peer_.Activate(id,e);if(r!=PeerResult::Accepted)return r;
+-    connections_.insert(id);
++    discovery_due_.try_emplace(id,0);
+     return config_.local_proof.proof ? peer_.Hello(id,config_.delegation,e) : PeerResult::Accepted;
+ }
+ PeerResult AvalancheDriver::Handle(const peer::DispatcherNotice &n,uint64_t ms,std::string &e) {
+     if(!Ready() || ms>uint64_t(std::numeric_limits<int64_t>::max()) || ms<uint64_t(now_ms_)){e="driver-unavailable-or-invalid-clock";return PeerResult::LocalFailure;}
+-    now_ms_=static_cast<int64_t>(ms);ChainSnapshot s;if(!Refresh(s,e))return PeerResult::LocalFailure;return peer_.Handle(n,ms,e);
++    now_ms_=static_cast<int64_t>(ms);ChainSnapshot s;if(!Refresh(s,e))return PeerResult::LocalFailure;
++    const auto result=peer_.Handle(n,ms,e);
++    // Anchor successful discovery cooldown after the remote processed our
++    // request, so differing transport delays cannot race its receive-side gate.
++    if(result==PeerResult::Accepted && n.application && n.application->command=="avaproofs") {
++        auto it=discovery_due_.find(n.connection);
++        if(it!=discovery_due_.end()) {
++            const auto interval=std::max<uint64_t>(60000,config_.limits.discovery_interval_ms);
++            it->second=interval>std::numeric_limits<uint64_t>::max()-ms?std::numeric_limits<uint64_t>::max():ms+interval;
++        }
++    }
++    return result;
+ }
+-void AvalancheDriver::Disconnect(peer::ConnectionId id) {connections_.erase(id);peer_.Disconnect(id);}
++void AvalancheDriver::Disconnect(peer::ConnectionId id) {discovery_due_.erase(id);peer_.Disconnect(id);}
+ bool AvalancheDriver::Reconcile(const PollItem &p,bool accepted,std::string &e) {return Ready() && polls_.Reconcile(p,accepted,e);}
+ DriverResult AvalancheDriver::Save() {
+     if(!Ready())return Error(DriverCode::NotReady,"driver-not-started");
+diff --git a/src/lotus_v2/avalanche_driver.h b/src/lotus_v2/avalanche_driver.h
+index d345a844459ed9247507d33ab18319a56a091db0..58a83c451607f5e8916e73cfb4ad233e0d1f05c3 100644
+--- a/src/lotus_v2/avalanche_driver.h
++++ b/src/lotus_v2/avalanche_driver.h
+@@ -40,6 +40,7 @@ private:
+     bool Refresh(ChainSnapshot &, std::string &);
+     ChainSnapshot ReadSnapshot();
+     bool Register(const ProofEnvelope &, std::string &);
++    bool ReconcileProofs(std::string &);
+     std::optional<ProofEnvelope> Proof(const ::avalanche::ProofId &) const;
+     bool Apply(const std::vector<BlockUpdate> &, std::string &);
+     PeerCallbacks Callbacks();
+@@ -53,7 +54,7 @@ private:
+     int64_t now_ms_{}, wall_seconds_{};
+     std::optional<ChainSnapshot> validated_;
+     std::optional<OutgoingPoll> pending_poll_;
+-    std::set<peer::ConnectionId> connections_;
++    std::map<peer::ConnectionId, uint64_t> discovery_due_;
+     std::map<::avalanche::ProofId, ProofEnvelope> envelopes_;
+ };
+ }
+diff --git a/src/lotus_v2/avalanche_driver_test/README.md b/src/lotus_v2/avalanche_driver_test/README.md
+index dbfc1d64b6afb4aad0599aa7110c8d6efb5e9678..f59fa068de2907e84fac660140441c6747f786d6 100644
+--- a/src/lotus_v2/avalanche_driver_test/README.md
++++ b/src/lotus_v2/avalanche_driver_test/README.md
+@@ -15,14 +15,18 @@ Application notices before Handle. Retain a notice on Backpressure. Retry
+ Activate on Backpressure (including Hello enqueue pressure). Tick retains the
+ same allocated OutgoingPoll on peer Backpressure and pumps outbound actions;
+ never allocate a replacement poll to retry that enqueue. All methods and runtime
+-mutations run on one owner with no callback reentry. Discovery is tick-driven.
++mutations run on one owner with no callback reentry. Discovery is tick-driven, with a bounded per-connection requester deadline of at
++least60seconds. Successful responses re-anchor that deadline after remote request
++processing; backpressure preserves the pending retry.
+ Call Reconcile for authoritative blocks/proofs the node elects to reconcile.
+ No HTTP or index publication is performed here.
+ 
+ Runtime snapshots require authoritative idle storage, authenticate up to eleven
+ indexed ancestors for median time, and fence tip/context generation/revision.
+ Real tip/context changes revalidate all quorum proofs before application input,
+-polling, or persistence. Each block status maps by name to the runtime enum.
++polling, or persistence. Pollable proofs automatically enter polling at admission, restoration, and
++revalidation; initial acceptance comes from the current quorum vote. Existing
++records retain their accumulated vote confidence. Each block status maps by name to the runtime enum.
+ The runtime still atomically checks every update tip/generation. Restore screens
+ records against actual native coins, skips stale records individually, then uses
+ Quorum's validated atomic restore to retain registered metadata. Store framing,
+@@ -44,7 +48,8 @@ Standalone checks use actual Session/Transport/Dispatcher handshake, actual
+ DevelopmentRuntime genesis/header storage, signed absent-coin proof envelopes,
+ and actual atomic PeerStore files in fresh private temporary directories. They
+ cover observer lifecycle, native profile fencing, explicit IBD/monotonic inputs,
+-strict maturity policy, stale restored proof screening, typed storage failure,
++strict maturity policy, repeated completed discovery/requester cooldown and
++expiry, stale restored proof screening, typed storage failure,
+ and rejection of a configured proof whose coin does not exist. They do not
+ claim a mature funded quorum, successful finalization, or live networking.
+ 
+diff --git a/src/lotus_v2/test_avalanche_driver.cpp b/src/lotus_v2/test_avalanche_driver.cpp
+index a245ca85743a8e150a633a897c4f07df031ab3fb..d524fe05bbdef8ed472a877eb7926248252394ef 100644
+--- a/src/lotus_v2/test_avalanche_driver.cpp
++++ b/src/lotus_v2/test_avalanche_driver.cpp
+@@ -38,6 +38,40 @@ int main() {
+         Check(bool(observer.Save()),"real public peer store saved");
+         PeerStore store(config.peer_file,config.profile);std::vector<PersistedPeer> loaded;
+         Check(bool(store.Load(loaded)) && loaded.empty(),"observer persists no invented peers or secrets");
++        AvalancheDriver remote(*pair.b.runtime,*pair.b.dispatcher,Configuration(pair.b));
++        Check(bool(remote.Start(false,1700000000)),"remote observer starts");
++        Check(remote.Activate(pair.b.connection,e)==PeerResult::Accepted,"remote activation");
++        pair.ms=102;unsigned requests=0;
++        for(unsigned cycle=0;cycle<1000;++cycle) {
++            pair.Cycle();
++            for(auto *node:{&pair.a,&pair.b}) {
++                auto &driver=node==&pair.a?observer:remote;
++                for(const auto &notice:node->notices)if(notice.kind==DispatcherNoticeKind::Application) {
++                    if(node==&pair.b && notice.application->command=="getavaproofs")++requests;
++                    Check(driver.Handle(notice,pair.ms,e)==PeerResult::Accepted,"repeated driver ticks accept discovery: "+e);
++                }
++                node->notices.clear();
++            }
++            Check(bool(observer.Tick(false,pair.ms,1700000001)),"requester tick after discovery completion");
++            Check(bool(remote.Tick(false,pair.ms,1700000001)),"responder tick after discovery completion");
++        }
++        Check(requests==1,"requester waits60seconds after completed discovery");
++        pair.ms=62000;
++        for(unsigned cycle=0;cycle<200;++cycle) {
++            pair.Cycle();
++            for(auto *node:{&pair.a,&pair.b}) {
++                auto &driver=node==&pair.a?observer:remote;
++                for(const auto &notice:node->notices)if(notice.kind==DispatcherNoticeKind::Application) {
++                    if(node==&pair.b && notice.application->command=="getavaproofs")++requests;
++                    Check(driver.Handle(notice,pair.ms,e)==PeerResult::Accepted,"discovery resumes after60seconds: "+e);
++                }
++                node->notices.clear();
++            }
++            Check(bool(observer.Tick(false,pair.ms,1700000063)),"requester cooldown expiry tick");
++            Check(bool(remote.Tick(false,pair.ms,1700000063)),"responder cooldown expiry tick");
++        }
++        Check(requests==2,"exactly one new request after cooldown expires");
++        remote.Disconnect(pair.b.connection);
+         observer.Disconnect(pair.a.connection);
+         auto lowered=Configuration(pair.b);lowered.profile.stake_confirmations=1;
+         AvalancheDriver bad(*pair.b.runtime,*pair.b.dispatcher,lowered);
+-- 
+2.50.1 (Apple Git-155)
+

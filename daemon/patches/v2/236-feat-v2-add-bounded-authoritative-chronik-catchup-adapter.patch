@@ -1,0 +1,544 @@
+From 8b2b72285297fd621b62d7295abc6bd1d9848d8a Mon Sep 17 00:00:00 2001
+From: Shammah Chancellor <shammah.chancellor@notvalid.com>
+Date: Thu, 15 Oct 2026 15:49:26 -0700
+Subject: [PATCH] feat(v2): add bounded authoritative Chronik catchup adapter
+
+---
+ src/lotus_v2/chronik_sync.cpp                 | 195 ++++++++++++++++++
+ src/lotus_v2/chronik_sync.h                   |  87 ++++++++
+ src/lotus_v2/chronik_sync_test/CMakeLists.txt |  20 ++
+ src/lotus_v2/chronik_sync_test/README.md      |  39 ++++
+ src/lotus_v2/test_chronik_sync.cpp            | 152 ++++++++++++++
+ 5 files changed, 493 insertions(+)
+ create mode 100644 src/lotus_v2/chronik_sync.cpp
+ create mode 100644 src/lotus_v2/chronik_sync.h
+ create mode 100644 src/lotus_v2/chronik_sync_test/CMakeLists.txt
+ create mode 100644 src/lotus_v2/chronik_sync_test/README.md
+ create mode 100644 src/lotus_v2/test_chronik_sync.cpp
+
+diff --git a/src/lotus_v2/chronik_sync.cpp b/src/lotus_v2/chronik_sync.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..6aac713379c87ef059d11820d914df1211275548
+--- /dev/null
++++ b/src/lotus_v2/chronik_sync.cpp
+@@ -0,0 +1,195 @@
++// Copyright (c) 2026 The Lotus developers
++#include "chronik_sync.h"
++#include "signing.h"
++#include <exception>
++namespace lotus::v2 {
++bool MakeChronikBlock(const std::vector<uint8_t> &wire, const ChainId &chain,
++                      const TxProfile &profile, const ChronikAnchor &anchor,
++                      ChronikBlock &out, std::string &error) {
++    FramedBlock decoded;
++    Hash id{}, root{};
++    if (!DecodeBlockWire(wire, profile, chain, decoded, error) ||
++        !BlockId(chain, decoded.header, id) || id != anchor.block_id ||
++        decoded.header.height != anchor.height ||
++        !CompleteTransactionRoot(decoded.transactions, profile, chain, root,
++                                 error) ||
++        root != decoded.header.tx_root) {
++        error = "Chronik connected body authentication";
++        return false;
++    }
++    ChronikBlock block;
++    block.anchor = anchor;
++    block.parent = {decoded.header.prev_id,
++                    anchor.height ? anchor.height - 1 : 0};
++    for (size_t n = 0; n < decoded.transactions.size(); ++n) {
++        const auto &tx = decoded.transactions[n];
++        IdentityDigests identity;
++        if (n > UINT32_MAX || tx.inputs.size() > UINT32_MAX ||
++            !ComputeIdentities(tx, profile, chain, identity, error))
++            return false;
++        ChronikTransaction record;
++        record.txid = identity.txid;
++        record.txhash = identity.txhash;
++        record.index = uint32_t(n);
++        for (size_t i = 0; i < tx.inputs.size(); ++i)
++            if (tx.inputs[i].flags == 1)
++                record.inputs.push_back({tx.inputs[i].prev_txid,
++                                         tx.inputs[i].prev_index, uint32_t(i)});
++        for (const auto &output : tx.outputs) {
++            std::vector<uint8_t> bytes;
++            if (!EncodeOutput(output, bytes, error)) return false;
++            record.outputs.push_back(std::move(bytes));
++        }
++        block.transactions.push_back(std::move(record));
++    }
++    out = std::move(block);
++    error.clear();
++    return true;
++}
++ChronikSync::ChronikSync(DevelopmentRuntime &runtime, ChronikSink &sink,
++                         ChainId chain, TxProfile profile, uint64_t max_bytes)
++    : runtime_(runtime), sink_(sink), chain_(chain), profile_(profile),
++      max_bytes_(max_bytes) {}
++ChronikSyncResult ChronikSync::Step(std::string &error) {
++    error.clear();
++    try {
++        const auto snapshot = runtime_.Snapshot();
++        if (!max_bytes_ || !snapshot.chain || snapshot.reopen_required ||
++            snapshot.execution_paused || snapshot.chain->pending_journal ||
++            snapshot.chain->pending_receipt ||
++            snapshot.chain->pending_propagation) {
++            have_fence_ = false;
++            cursor_.reset();
++            child_.reset();
++            return ChronikSyncResult::Unavailable;
++        }
++        const auto indexed = sink_.Checkpoint();
++        const auto tip = snapshot.chain->stable_tip;
++        if (!have_fence_ || tip != tip_ ||
++            snapshot.context_generation != generation_ ||
++            indexed != checkpoint_) {
++            tip_ = tip;
++            generation_ = snapshot.context_generation;
++            checkpoint_ = indexed;
++            have_fence_ = true;
++            cursor_.reset();
++            child_.reset();
++        }
++        auto read = [&](const Hash &id, std::optional<IndexedHeader> &header) {
++            return runtime_.ReadHeader(id, header, error) ==
++                       DevelopmentRuntimeResult::Progress &&
++                   header && header->stage == HeaderStage::Connected;
++        };
++        if (!cursor_ && !read(tip, cursor_)) {
++            error = "Chronik authoritative tip unavailable";
++            return ChronikSyncResult::Error;
++        }
++        const uint64_t target = indexed ? indexed->height : 0;
++        if (cursor_->header.height > target) {
++            child_ = cursor_;
++            const auto parent = cursor_->header.prev_id;
++            if (!read(parent, cursor_)) {
++                error = "Chronik active ancestry unavailable";
++                return ChronikSyncResult::Error;
++            }
++            return ChronikSyncResult::Progress;
++        }
++        Hash cursor_id{};
++        if (!BlockId(chain_, cursor_->header, cursor_id)) {
++            error = "Chronik ancestry identity";
++            return ChronikSyncResult::Error;
++        }
++        if (indexed && (cursor_->header.height != indexed->height ||
++                        cursor_id != indexed->block_id)) {
++            if (!indexed->height) {
++                error = "Chronik genesis checkpoint mismatch";
++                return ChronikSyncResult::Error;
++            }
++            sink_.Disconnect(*indexed);
++            cursor_.reset();
++            child_.reset();
++            return ChronikSyncResult::Progress;
++        }
++        if (indexed && cursor_id == tip) return ChronikSyncResult::Ready;
++        const auto &next = indexed ? child_ : cursor_;
++        if (!next) {
++            error = "Chronik active child unavailable";
++            return ChronikSyncResult::Error;
++        }
++        ChronikAnchor anchor;
++        anchor.height = next->header.height;
++        if (!BlockId(chain_, next->header, anchor.block_id))
++            return ChronikSyncResult::Error;
++        std::vector<uint8_t> wire;
++        ChronikBlock block;
++        if (runtime_.ReadConnectedBody(anchor.block_id, max_bytes_, wire,
++                                       error) !=
++                DevelopmentRuntimeResult::Progress ||
++            !MakeChronikBlock(wire, chain_, profile_, anchor, block, error))
++            return ChronikSyncResult::Error;
++        if (indexed)
++            sink_.Connect(block);
++        else
++            sink_.Initialize(block);
++        cursor_.reset();
++        child_.reset();
++        return ChronikSyncResult::Progress;
++    } catch (const std::exception &e) {
++        error = e.what();
++        return ChronikSyncResult::Error;
++    }
++}
++} // namespace lotus::v2
++
++#ifdef LOTUS_V2_CHRONIK_CXX
++namespace lotus::v2 {
++namespace {
++    chronik_v2::Anchor BridgeAnchor(const ChronikAnchor &a) {
++        chronik_v2::Anchor out;
++        out.block_id = a.block_id;
++        out.height = a.height;
++        return out;
++    }
++    chronik_v2::NativeBlock BridgeBlock(const ChronikBlock &b) {
++        chronik_v2::NativeBlock out;
++        out.anchor = BridgeAnchor(b.anchor);
++        out.parent = BridgeAnchor(b.parent);
++        for (const auto &tx : b.transactions) {
++            chronik_v2::NativeTx record;
++            record.txid = tx.txid;
++            record.txhash = tx.txhash;
++            record.index = tx.index;
++            for (const auto &input : tx.inputs) {
++                chronik_v2::Input i;
++                i.txid = input.txid;
++                i.out_idx = input.out_idx;
++                i.input_index = input.input_index;
++                record.inputs.push_back(std::move(i));
++            }
++            for (const auto &wire : tx.outputs) {
++                chronik_v2::NativeOutput output;
++                for (const auto byte : wire)
++                    output.wire.push_back(byte);
++                record.outputs.push_back(std::move(output));
++            }
++            out.transactions.push_back(std::move(record));
++        }
++        return out;
++    }
++} // namespace
++std::optional<ChronikAnchor> CxxChronikSink::Checkpoint() {
++    const auto status = service_.status(BridgeAnchor({}));
++    if (!status.initialized) return std::nullopt;
++    return ChronikAnchor{status.indexed.block_id, status.indexed.height};
++}
++void CxxChronikSink::Initialize(const ChronikBlock &b) {
++    service_.initialize_genesis(BridgeBlock(b));
++}
++void CxxChronikSink::Connect(const ChronikBlock &b) {
++    service_.connect_block(BridgeBlock(b));
++}
++void CxxChronikSink::Disconnect(const ChronikAnchor &a) {
++    service_.disconnect_block(BridgeAnchor(a));
++}
++} // namespace lotus::v2
++#endif
+diff --git a/src/lotus_v2/chronik_sync.h b/src/lotus_v2/chronik_sync.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..75170441980d370e66e1fbac696c1177e3b68337
+--- /dev/null
++++ b/src/lotus_v2/chronik_sync.h
+@@ -0,0 +1,87 @@
++// Copyright (c) 2026 The Lotus developers
++#ifndef LOTUS_V2_CHRONIK_SYNC_H
++#define LOTUS_V2_CHRONIK_SYNC_H
++#include "development_runtime.h"
++namespace lotus::v2 {
++struct ChronikAnchor {
++    Hash block_id{};
++    uint64_t height{};
++    bool operator==(const ChronikAnchor &) const = default;
++};
++struct ChronikInput {
++    Hash txid{};
++    uint32_t out_idx{}, input_index{};
++};
++struct ChronikTransaction {
++    Hash txid{}, txhash{};
++    uint32_t index{};
++    std::vector<ChronikInput> inputs;
++    std::vector<std::vector<uint8_t>> outputs;
++};
++struct ChronikBlock {
++    ChronikAnchor anchor, parent;
++    std::vector<ChronikTransaction> transactions;
++};
++// Checkpoint must come from durable index state, including after restart.
++// Implementations throw on errors. Successful operations are durable/atomic.
++class ChronikSink {
++public:
++    virtual ~ChronikSink() = default;
++    virtual std::optional<ChronikAnchor> Checkpoint() = 0;
++    virtual void Initialize(const ChronikBlock &) = 0;
++    virtual void Connect(const ChronikBlock &) = 0;
++    virtual void Disconnect(const ChronikAnchor &) = 0;
++};
++enum class ChronikSyncResult { Progress, Ready, Unavailable, Error };
++// Single owner; caller serializes runtime, sync and sink. Invalidate HTTP
++// BEFORE any runtime transition, and publish AFTER Step returns Ready, tied to
++// the runtime context generation and stable tip. Never retain readiness across
++// a runtime mutation. Index errors only affect query availability. Each Step
++// reads <=2 headers, one creation-capped runtime snapshot, at most one
++// max_body_bytes body, and performs <=1 durable index operation. Ancestry
++// traversal retains two headers, never a full path. Deep catchup may take many
++// steps. Runtime/sink lifetimes exceed this object. Genesis bytes are served
++// through ReadConnectedBody, never from an unauthenticated caller buffer.
++class ChronikSync {
++public:
++    ChronikSync(DevelopmentRuntime &, ChronikSink &, ChainId, TxProfile,
++                uint64_t max_body_bytes);
++    ChronikSyncResult Step(std::string &error);
++
++private:
++    DevelopmentRuntime &runtime_;
++    ChronikSink &sink_;
++    ChainId chain_;
++    TxProfile profile_;
++    uint64_t max_bytes_;
++    std::optional<IndexedHeader> cursor_, child_;
++    std::optional<ChronikAnchor> checkpoint_;
++    Hash tip_{};
++    uint64_t generation_{};
++    bool have_fence_{};
++};
++// Structural conversion additionally authenticates the exact native block id
++// and ordered transaction root. Includes every output, including burns; only
++// spend inputs enter the index, preserving their original input ordinals.
++bool MakeChronikBlock(const std::vector<uint8_t> &, const ChainId &,
++                      const TxProfile &, const ChronikAnchor &, ChronikBlock &,
++                      std::string &);
++} // namespace lotus::v2
++#ifdef LOTUS_V2_CHRONIK_CXX
++#include "chronik_lib/src/v2_ffi.rs.h"
++namespace lotus::v2 {
++class CxxChronikSink final : public ChronikSink {
++public:
++    explicit CxxChronikSink(const chronik_v2::V2Service &service)
++        : service_(service) {}
++    std::optional<ChronikAnchor> Checkpoint() override;
++    void Initialize(const ChronikBlock &) override;
++    void Connect(const ChronikBlock &) override;
++    void Disconnect(const ChronikAnchor &) override;
++
++private:
++    const chronik_v2::V2Service &service_;
++};
++} // namespace lotus::v2
++#endif
++#endif
+diff --git a/src/lotus_v2/chronik_sync_test/CMakeLists.txt b/src/lotus_v2/chronik_sync_test/CMakeLists.txt
+new file mode 100644
+index 0000000000000000000000000000000000000000..ab96633b535df1667bcc69bdd61515e736b2515b
+--- /dev/null
++++ b/src/lotus_v2/chronik_sync_test/CMakeLists.txt
+@@ -0,0 +1,20 @@
++cmake_minimum_required(VERSION 3.18)
++project(lotus_v2_chronik_sync LANGUAGES C CXX)
++add_subdirectory(../development_runtime_test runtime)
++find_package(OpenSSL REQUIRED COMPONENTS Crypto)
++
++get_target_property(runtime_sources development_runtime_test SOURCES)
++set(sync_sources)
++foreach(source IN LISTS runtime_sources)
++    if(NOT source MATCHES "test_development_runtime.cpp$")
++        get_filename_component(absolute "${source}" ABSOLUTE BASE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../development_runtime_test")
++        list(APPEND sync_sources "${absolute}")
++    endif()
++endforeach()
++add_executable(chronik_sync_test ../chronik_sync.cpp ../test_chronik_sync.cpp ${sync_sources})
++target_compile_features(chronik_sync_test PRIVATE cxx_std_20)
++target_include_directories(chronik_sync_test PRIVATE ../.. ../../secp256k1/include "${LOTUS_BOOST_INCLUDE}" ../vendor/blake3)
++target_link_libraries(chronik_sync_test PRIVATE lotus_v2_disk_state blake3 OpenSSL::Crypto "${LOTUS_SECP_LIBRARY}")
++target_compile_options(chronik_sync_test PRIVATE -Wall -Wextra -Wpedantic -Werror)
++enable_testing()
++add_test(NAME chronik_sync_test COMMAND chronik_sync_test)
+diff --git a/src/lotus_v2/chronik_sync_test/README.md b/src/lotus_v2/chronik_sync_test/README.md
+new file mode 100644
+index 0000000000000000000000000000000000000000..6e04225eb0a2f9b9bcb495a19de0bcd2c6040a8b
+--- /dev/null
++++ b/src/lotus_v2/chronik_sync_test/README.md
+@@ -0,0 +1,39 @@
++# Native V2 confirmed indexing adapter
++
++`ChronikSync(runtime, sink, chain_id, transaction_profile, max_body_bytes)`
++performs bounded `Step(error)` calls until `Ready`. `Progress` requires another
++step. `Unavailable` means native authority is recovering, paused, or unknown;
++`Error` means query availability must stay disabled. No result mutates consensus.
++
++The caller serializes all runtime/index operations. Before **every runtime
++mutation**, call `V2Service::invalidate_authority`. Publish the stable native
++anchor with `publish_authority` only after `Step` returns `Ready`, with no runtime
++mutation between observation and publication. Native tip/context changes restart
++ancestry traversal. Recovery journal, receipt, and propagation fences suppress
++indexing. The sink's durable indexed checkpoint is mandatory, including restart.
++
++Define `LOTUS_V2_CHRONIK_CXX` and provide generated CXX include directories and
++Rust library linkage to enable `CxxChronikSink`, which directly calls the real
++V2 service. The isolated test uses a recording sink and the actual native
++DevelopmentRuntime, LevelDB storage, complete-connect fixtures, and wire codec.
++It checks complete genesis (including burn), catchup, restart checkpoint,
++ancestry-based two-block divergent suffix removal, replacement child connection,
++index-error consensus isolation, authenticated transaction/output conversion,
++nonzero spend ordinals with a preceding mint input, and tamper rejection.
++
++Each step retains only two headers, reads at most two headers and one body,
++and changes at most one indexed block. Runtime snapshots/store internals have
++their existing creation limits; this is not a bound on LevelDB internal work.
++Traversal may revisit ancestors between indexed blocks, trading catchup speed
++for fixed memory. No candidate or invalid body is indexed: only stable active
++ancestry and `ReadConnectedBody` bytes enter conversion.
++
++Build:
++
++```
++cmake -S src/lotus_v2/chronik_sync_test -B build-chronik-sync -G Ninja \
++  -DLOTUS_SECP_LIBRARY=/path/to/libsecp256k1.a \
++  -DLOTUS_BOOST_INCLUDE=/path/to/boost/include
++cmake --build build-chronik-sync --target chronik_sync_test
++ctest --test-dir build-chronik-sync -R '^chronik_sync_test$' --output-on-failure
++```
+diff --git a/src/lotus_v2/test_chronik_sync.cpp b/src/lotus_v2/test_chronik_sync.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..fdba2326fbf21222aed79b3821936a2c05456f00
+--- /dev/null
++++ b/src/lotus_v2/test_chronik_sync.cpp
+@@ -0,0 +1,152 @@
++// Copyright (c) 2026 The Lotus developers
++#include "chronik_sync.h"
++#include "development_runtime_test/fixtures.h"
++#include <iostream>
++using namespace lotus::v2;
++using namespace runtime_fixture;
++DevelopmentRuntimeConfig Config(Home &home) {
++    DevelopmentRuntimeConfig config;
++    config.directory = home.path;
++    config.genesis_wire = Bytes(genesis_wire);
++    config.profiles = home.p;
++    config.initial_money = DecodeMonetaryState(Bytes(initial_money));
++    config.storage.cache_bytes = 1024;
++    config.storage.write_buffer_bytes = 64 << 10;
++    config.storage.recovery = DiskRecoveryOptions{32 << 20, 4 << 20};
++    config.storage.candidates = CandidateStoreOptions{64, 64, 8};
++    config.storage.env = home.env;
++    config.bodies = {3, 1 << 20, 3 << 20, 3, 3 << 20, 64};
++    config.initial_body_epoch = 1;
++    config.initial_context_generation = 1;
++    return config;
++}
++
++struct Sink : ChronikSink {
++    std::vector<ChronikBlock> chain;
++    size_t disconnects{};
++    bool fail{};
++    std::optional<ChronikAnchor> Checkpoint() override {
++        if (fail) throw std::runtime_error("sink failure");
++        return chain.empty() ? std::nullopt
++                             : std::optional(chain.back().anchor);
++    }
++    void Initialize(const ChronikBlock &b) override {
++        Check(chain.empty() && b.anchor.height == 0, "genesis");
++        chain.push_back(b);
++    }
++    void Connect(const ChronikBlock &b) override {
++        Check(!chain.empty() && b.parent == chain.back().anchor,
++              "parent exact");
++        chain.push_back(b);
++    }
++    void Disconnect(const ChronikAnchor &a) override {
++        Check(chain.back().anchor == a && a.height > 0, "disconnect exact");
++        chain.pop_back();
++        ++disconnects;
++    }
++};
++void Run(Home &home, Sink &sink) {
++    home.store = {};
++    std::unique_ptr<DevelopmentRuntime> runtime;
++    std::string error;
++    Check(DevelopmentRuntime::Open(Config(home), runtime, error), error);
++    ChronikSync sync(*runtime, sink, home.p.header.chain_id,
++                     home.p.ordinary.transaction, 1 << 20);
++    size_t count{};
++    for (;;) {
++        const auto result = sync.Step(error);
++        Check(result == ChronikSyncResult::Progress ||
++                  result == ChronikSyncResult::Ready,
++              error);
++        Check(++count < 100, "bounded progress");
++        if (result == ChronikSyncResult::Ready) break;
++    }
++    const auto original = runtime->Snapshot();
++    sink.fail = true;
++    Check(sync.Step(error) == ChronikSyncResult::Error,
++          "index error unavailable");
++    Check(runtime->Snapshot().chain->stable_tip == original.chain->stable_tip,
++          "consensus untouched");
++    sink.fail = false;
++}
++int main() {
++    try {
++        Sink sink;
++        Home source;
++        for (size_t n : {0, 1, 2, 3}) {
++            source.Connect(n);
++            source.Open();
++        }
++        Run(source, sink);
++        Check(sink.chain.size() == 5, "full genesis catchup");
++        bool burn{};
++        for (const auto &tx : sink.chain.front().transactions)
++            for (const auto &wire : tx.outputs) {
++                Output output;
++                std::string error;
++                Check(DecodeOutput(wire, output, error), error);
++                burn |= output.IsBurn();
++            }
++        Check(burn, "genesis burn indexed");
++        Run(source, sink); // persisted checkpoint, new synchronizer and runtime
++        Home target;
++        for (size_t n : {0, 1, 4, 5, 6}) {
++            target.Connect(n);
++            target.Open();
++        }
++        Run(target, sink);
++        Check(sink.disconnects == 2 && sink.chain.size() == 6 &&
++                  sink.chain.back().anchor.block_id == H(V(6).id),
++              "actual ancestry reorg");
++        const auto &spend = sink.chain[3].transactions.back();
++        Check(!spend.inputs.empty() && spend.inputs.front().input_index == 0,
++              "actual spend ordinal");
++        // A codec-authenticated mixed mint/spend frame preserves input slot 1.
++        FramedBlock framed;
++        std::string error;
++        const auto profile = target.p.ordinary.transaction;
++        Check(DecodeBlockWire(Bytes(V(4).wire), profile,
++                              target.p.header.chain_id, framed, error),
++              error);
++        auto &tx = framed.transactions.back();
++        auto mint = tx.inputs.front();
++        mint.flags = 3;
++        mint.prev_txid[0] ^= 1;
++        mint.prev_index = 0;
++        mint.sequence = UINT32_MAX;
++        tx.inputs.insert(tx.inputs.begin(), mint);
++        Check(CompleteTransactionRoot(framed.transactions, profile,
++                                      target.p.header.chain_id,
++                                      framed.header.tx_root, error),
++              error);
++        std::vector<uint8_t> wire;
++        framed.header.size = HEADER_SIZE + 4;
++        for (const auto &transaction : framed.transactions) {
++            std::vector<uint8_t> frame;
++            Check(EncodeTransaction(transaction, profile, frame, error), error);
++            framed.header.size += CompactSizeWidth(frame.size()) + frame.size();
++        }
++        Check(EncodeBlockWire(framed.header, framed.transactions, profile, wire,
++                              error),
++              error);
++        ChronikAnchor anchor;
++        anchor.height = framed.header.height;
++        Check(BlockId(target.p.header.chain_id, framed.header, anchor.block_id),
++              "mixed block id");
++        ChronikBlock converted;
++        Check(MakeChronikBlock(wire, target.p.header.chain_id, profile, anchor,
++                               converted, error),
++              error);
++        Check(converted.transactions.back().inputs.size() == 1 &&
++                  converted.transactions.back().inputs.front().input_index == 1,
++              "nonzero native input ordinal");
++        wire.back() ^= 1;
++        Check(!MakeChronikBlock(wire, target.p.header.chain_id, profile, anchor,
++                                converted, error),
++              "changed body rejected");
++        std::cout << "chronik sync checks passed\n";
++    } catch (const std::exception &e) {
++        std::cerr << e.what() << '\n';
++        return 1;
++    }
++}
+-- 
+2.50.1 (Apple Git-155)
+

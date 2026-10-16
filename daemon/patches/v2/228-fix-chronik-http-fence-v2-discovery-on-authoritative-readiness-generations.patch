@@ -1,0 +1,336 @@
+From a14e279d9fbc9249118ebb6344197bf42f486d77 Mon Sep 17 00:00:00 2001
+From: Shammah Chancellor <shammah.chancellor@notvalid.com>
+Date: Thu, 15 Oct 2026 15:43:49 -0700
+Subject: [PATCH] fix(chronik-http): fence V2 discovery on authoritative
+ readiness generations
+
+---
+ chronik/chronik-http/src/v2.rs | 191 +++++++++++++++++++++++++++++----
+ 1 file changed, 173 insertions(+), 18 deletions(-)
+
+diff --git a/chronik/chronik-http/src/v2.rs b/chronik/chronik-http/src/v2.rs
+index 8b8dc5540580e462af7b28364e2c6c81470cb069..3ce24d4e6a37cbfdd482849ead9f40660cdcaed4 100644
+--- a/chronik/chronik-http/src/v2.rs
++++ b/chronik/chronik-http/src/v2.rs
+@@ -24,14 +24,26 @@ use std::sync::{Arc, Mutex};
+ 
+ const BODY_CAP: usize = 32 * 1024;
+ const JSON_CAP: usize = 256 * 1024;
++/// Coherent authoritative node observation for fencing confirmed reads.
++/// Publishers must advance generation on every transition and recovery boundary,
++/// including an anchor ABA, and must never wrap or reuse generations. Unknown or
++/// recovering state has no anchor. Publication must be atomic and nonblocking.
++#[derive(Clone, Copy, Debug, Eq, PartialEq)]
++pub struct AuthoritativeState {
++    /// Monotonic, never reused publication generation.
++    pub generation: u64,
++    /// Authoritative committed tip; absent while unknown or recovering.
++    pub anchor: Option<Anchor>,
++}
+ /// State shared with the authoritative V2 adapter, independent of legacy Chronik.
+ #[derive(Clone)]
+ pub struct V2HttpState {
+     /// Confirmed database; lock is held through a bounded immutable snapshot read.
+     pub db: Arc<Mutex<V2Db>>,
+-    /// Current authoritative node anchor; None means unknown/recovering.
+-    /// This provider must be fast and must not lock `db` itself.
+-    pub node_anchor: Option<Arc<dyn Fn() -> Option<Anchor> + Send + Sync>>,
++    /// Coherent stamped node observation, absent when authority is unavailable.
++    /// Must not lock the DB, block on its owner, or reenter this router. The
++    /// generation contract on `AuthoritativeState` is required for ABA safety.
++    pub node_anchor: Option<Arc<dyn Fn() -> AuthoritativeState + Send + Sync>>,
+ }
+ /// Construct a versioned router without opening a port or enabling V2 implicitly.
+ pub fn router(state: V2HttpState) -> Router {
+@@ -175,18 +187,44 @@ fn decode_cursor(s: &str) -> Result<Cursor, ()> {
+         last_key,
+     })
+ }
++fn observe(s: &V2HttpState) -> Option<AuthoritativeState> {
++    s.node_anchor.as_ref().map(|provider| provider())
++}
++fn ready(stamp: Option<AuthoritativeState>, anchor: Anchor) -> bool {
++    stamp.is_some_and(|stamp| stamp.anchor == Some(anchor))
++}
++// The final observation is the response's linearization point. Encoding is
++// completed before this fence; no success survives a transition or recovery.
++fn fenced(
++    s: &V2HttpState,
++    stamp: Option<AuthoritativeState>,
++    result: Response,
++) -> Response {
++    if observe(s) == stamp {
++        result
++    } else {
++        internal()
++    }
++}
+ async fn status(State(s): State<V2HttpState>) -> Response {
+-    let node = s.node_anchor.as_ref().and_then(|p| p());
++    let stamp = observe(&s);
+     let Ok(db) = s.db.lock() else {
+         return internal();
+     };
+     let Ok(view) = db.snapshot() else {
+         return internal();
+     };
+-    response(
++    let current = observe(&s);
++    let is_ready = stamp == current && ready(current, view.anchor);
++    let result = response(
+         StatusCode::OK,
+-        json!({"version":2,"confirmed_only":true,"pool_indexed":false,"ready":node==Some(view.anchor),"snapshot":snapshot_json(snapshot(&view))}),
+-    )
++        json!({"version":2,"confirmed_only":true,"pool_indexed":false,"ready":is_ready,"generation":current.map(|s|s.generation.to_string()),"snapshot":snapshot_json(snapshot(&view))}),
++    );
++    if observe(&s) == current {
++        result
++    } else {
++        internal()
++    }
+ }
+ async fn utxos(State(s): State<V2HttpState>, body: Body) -> Response {
+     branches(s, body, false).await
+@@ -243,12 +281,20 @@ async fn branches(s: V2HttpState, body: Body, history: bool) -> Response {
+         Ok(c) => c,
+         Err(()) => return fail(StatusCode::BAD_REQUEST, "invalid_cursor"),
+     };
++    let stamp = observe(&s);
++    if stamp.is_none_or(|stamp| stamp.anchor.is_none()) {
++        return internal();
++    }
+     let Ok(db) = s.db.lock() else {
+         return internal();
+     };
+     let Ok(view) = db.snapshot() else {
+         return internal();
+     };
++    if observe(&s) != stamp || !ready(stamp, view.anchor) {
++        return internal();
++    }
++
+     let kind = if history {
+         QueryKind::History {
+             include_burn: r.include_burn,
+@@ -257,7 +303,7 @@ async fn branches(s: V2HttpState, body: Body, history: bool) -> Response {
+         QueryKind::Utxos
+     };
+     let source = Source(view);
+-    match query::query(
++    let result = match query::query(
+         &source,
+         &filter,
+         kind,
+@@ -269,7 +315,7 @@ async fn branches(s: V2HttpState, body: Body, history: bool) -> Response {
+     ) {
+         Ok(p) => response(
+             StatusCode::OK,
+-            json!({"version":2,"confirmed_only":true,"snapshot":snapshot_json(p.snapshot),"outputs":p.matches.iter().map(|m|json!({"record":record(&m.record),"matching_positions":m.matching_positions})).collect::<Vec<_>>(),"cursor":p.continuation.map(encode_cursor),"posting_reads":p.posting_reads,"work":p.work}),
++            json!({"version":2,"confirmed_only":true,"snapshot":snapshot_json(p.snapshot),"outputs":p.matches.iter().map(|m|json!({"record":record(&m.record),"matching_positions":m.matching_positions})).collect::<Vec<_>>(),"cursor":p.continuation.map(encode_cursor),"generation":stamp.map(|s|s.generation.to_string()),"posting_reads":p.posting_reads,"work":p.work}),
+         ),
+         Err(QueryError::StaleCursor) => {
+             fail(StatusCode::CONFLICT, "stale_cursor")
+@@ -281,7 +327,8 @@ async fn branches(s: V2HttpState, body: Body, history: bool) -> Response {
+             fail(StatusCode::PAYLOAD_TOO_LARGE, "record_limit")
+         }
+         Err(QueryError::Source(_)) => internal(),
+-    }
++    };
++    fenced(&s, stamp, result)
+ }
+ async fn utxo(
+     State(s): State<V2HttpState>,
+@@ -293,23 +340,32 @@ async fn utxo(
+     if index != out_idx.to_string() {
+         return fail(StatusCode::BAD_REQUEST, "invalid_outpoint");
+     }
++    let stamp = observe(&s);
++    if stamp.is_none_or(|stamp| stamp.anchor.is_none()) {
++        return internal();
++    }
+     let Ok(db) = s.db.lock() else {
+         return internal();
+     };
+     let Ok(view) = db.snapshot() else {
+         return internal();
+     };
+-    match view.utxo(OutPoint {
++    if observe(&s) != stamp || !ready(stamp, view.anchor) {
++        return internal();
++    }
++
++    let result = match view.utxo(OutPoint {
+         txid: TxId(txid),
+         out_idx,
+     }) {
+         Ok(Some(r)) => response(
+             StatusCode::OK,
+-            json!({"version":2,"confirmed_only":true,"snapshot":snapshot_json(snapshot(&view)),"record":record(&r)}),
++            json!({"version":2,"confirmed_only":true,"snapshot":snapshot_json(snapshot(&view)),"record":record(&r),"generation":stamp.map(|s|s.generation.to_string())}),
+         ),
+         Ok(None) => fail(StatusCode::NOT_FOUND, "utxo_not_found"),
+         Err(_) => internal(),
+-    }
++    };
++    fenced(&s, stamp, result)
+ }
+ 
+ impl std::fmt::Debug for V2HttpState {
+@@ -358,7 +414,13 @@ mod tests {
+             Self {
+                 state: V2HttpState {
+                     db: Arc::new(Mutex::new(db)),
+-                    node_anchor: None,
++                    node_anchor: Some(Arc::new(|| AuthoritativeState {
++                        generation: 1,
++                        anchor: Some(Anchor {
++                            block_id: [2; 32],
++                            height: 0,
++                        }),
++                    })),
+                 },
+                 path,
+             }
+@@ -398,7 +460,7 @@ mod tests {
+     }
+     #[tokio::test]
+     async fn actual_db_output_paging_spends_reorg_and_stale_cursor() {
+-        let f = Fixture::new();
++        let mut f = Fixture::new();
+         let p = value(branches(f.state.clone(), request(1, None), true).await)
+             .await;
+         assert_eq!(p["outputs"].as_array().unwrap().len(), 1);
+@@ -438,6 +500,10 @@ mod tests {
+                 }],
+             })
+             .unwrap();
++        f.state.node_anchor = Some(Arc::new(move || AuthoritativeState {
++            generation: 2,
++            anchor: Some(child),
++        }));
+         assert_eq!(
+             branches(f.state.clone(), request(1, Some(cursor)), true)
+                 .await
+@@ -453,20 +519,30 @@ mod tests {
+                 .await;
+         assert_eq!(coins["outputs"].as_array().unwrap().len(), 1);
+         f.state.db.lock().unwrap().disconnect(child).unwrap();
++        f.state.node_anchor = Some(Arc::new(move || AuthoritativeState {
++            generation: 3,
++            anchor: Some(parent),
++        }));
+         let coins =
+             value(branches(f.state.clone(), request(100, None), false).await)
+                 .await;
+         assert_eq!(coins["outputs"].as_array().unwrap().len(), 2);
+         let status = value(status(State(f.state.clone())).await).await;
+-        assert_eq!(status["ready"], false);
++        assert_eq!(status["ready"], true);
+         let mut ready_state = f.state.clone();
+-        ready_state.node_anchor = Some(Arc::new(move || Some(parent)));
++        ready_state.node_anchor = Some(Arc::new(move || AuthoritativeState {
++            generation: 1,
++            anchor: Some(parent),
++        }));
+         assert_eq!(
+             value(super::status(State(ready_state.clone())).await).await
+                 ["ready"],
+             true
+         );
+-        ready_state.node_anchor = Some(Arc::new(move || Some(child)));
++        ready_state.node_anchor = Some(Arc::new(move || AuthoritativeState {
++            generation: 2,
++            anchor: Some(child),
++        }));
+         assert_eq!(
+             value(super::status(State(ready_state)).await).await["ready"],
+             false
+@@ -543,6 +619,85 @@ mod tests {
+             .unwrap();
+         assert_eq!(value(result).await["outputs"].as_array().unwrap().len(), 2);
+     }
++    #[tokio::test]
++    async fn readiness_fences_unknown_recovery_behind_and_aba() {
++        let mut f = Fixture::new();
++        let parent = Anchor {
++            block_id: [2; 32],
++            height: 0,
++        };
++        let child = Anchor {
++            block_id: [6; 32],
++            height: 1,
++        };
++        f.state.node_anchor = None;
++        assert_eq!(
++            branches(f.state.clone(), request(100, None), true)
++                .await
++                .status(),
++            StatusCode::SERVICE_UNAVAILABLE
++        );
++        for anchor in [None, Some(child)] {
++            f.state.node_anchor = Some(Arc::new(move || AuthoritativeState {
++                generation: 2,
++                anchor,
++            }));
++            assert_eq!(
++                branches(f.state.clone(), request(100, None), false)
++                    .await
++                    .status(),
++                StatusCode::SERVICE_UNAVAILABLE
++            );
++            assert_eq!(
++                utxo(
++                    State(f.state.clone()),
++                    Path((hex::encode([4; 32]), "0".into()))
++                )
++                .await
++                .status(),
++                StatusCode::SERVICE_UNAVAILABLE
++            );
++        }
++        // The third observation occurs after result construction/encoding.
++        // Changing generation while retaining the same anchor models an ABA
++        // or recovery boundary that bare anchor comparison cannot detect.
++        for point_lookup in [false, true] {
++            for changed_anchor in [Some(parent), Some(child), None] {
++                let calls = Arc::new(AtomicU64::new(0));
++                f.state.node_anchor = Some(Arc::new(move || {
++                    let changed = calls.fetch_add(1, Ordering::SeqCst) >= 2;
++                    AuthoritativeState {
++                        generation: if changed { 5 } else { 3 },
++                        anchor: if changed {
++                            changed_anchor
++                        } else {
++                            Some(parent)
++                        },
++                    }
++                }));
++                let result = if point_lookup {
++                    utxo(
++                        State(f.state.clone()),
++                        Path((hex::encode([4; 32]), "0".into())),
++                    )
++                    .await
++                } else {
++                    branches(f.state.clone(), request(100, None), true).await
++                };
++                assert_eq!(result.status(), StatusCode::SERVICE_UNAVAILABLE);
++            }
++        }
++        f.state.node_anchor = Some(Arc::new(move || AuthoritativeState {
++            generation: 6,
++            anchor: Some(parent),
++        }));
++        assert_eq!(
++            branches(f.state.clone(), request(100, None), true)
++                .await
++                .status(),
++            StatusCode::OK
++        );
++    }
+     #[test]
+     fn cursor_fixed_encoding_and_binding() {
+         let c = Cursor {
+-- 
+2.50.1 (Apple Git-155)
+

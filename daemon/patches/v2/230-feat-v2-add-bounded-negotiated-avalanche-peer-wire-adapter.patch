@@ -1,0 +1,1803 @@
+From ffec9d28f164b7f8fe4aea78805d42b8038f5f1a Mon Sep 17 00:00:00 2001
+From: Shammah Chancellor <shammah.chancellor@notvalid.com>
+Date: Thu, 15 Oct 2026 15:44:34 -0700
+Subject: [PATCH] feat(v2): add bounded negotiated Avalanche peer wire adapter
+
+---
+ src/lotus_v2/avalanche_peer.cpp               | 389 ++++++++++++++
+ src/lotus_v2/avalanche_peer.h                 |  82 +++
+ .../avalanche_peer_test/CMakeLists.txt        |  42 ++
+ src/lotus_v2/avalanche_peer_test/README.md    |  68 +++
+ src/lotus_v2/avalanche_peer_test/fixtures.h   | 476 ++++++++++++++++++
+ .../avalanche_peer_test/runtime_fixtures.h    | 358 +++++++++++++
+ src/lotus_v2/peer_codec.cpp                   |   2 +-
+ src/lotus_v2/peer_codec.h                     |   1 +
+ src/lotus_v2/peer_dispatcher.cpp              |  29 +-
+ src/lotus_v2/peer_dispatcher.h                |   3 +-
+ src/lotus_v2/peer_session.cpp                 |  12 +-
+ src/lotus_v2/peer_session.h                   |  10 +
+ src/lotus_v2/peer_transport.cpp               |   6 +
+ src/lotus_v2/peer_transport.h                 |   1 +
+ src/lotus_v2/test_avalanche_peer.cpp          | 109 ++++
+ 15 files changed, 1577 insertions(+), 11 deletions(-)
+ create mode 100644 src/lotus_v2/avalanche_peer.cpp
+ create mode 100644 src/lotus_v2/avalanche_peer.h
+ create mode 100644 src/lotus_v2/avalanche_peer_test/CMakeLists.txt
+ create mode 100644 src/lotus_v2/avalanche_peer_test/README.md
+ create mode 100644 src/lotus_v2/avalanche_peer_test/fixtures.h
+ create mode 100644 src/lotus_v2/avalanche_peer_test/runtime_fixtures.h
+ create mode 100644 src/lotus_v2/test_avalanche_peer.cpp
+
+diff --git a/src/lotus_v2/avalanche_peer.cpp b/src/lotus_v2/avalanche_peer.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..1a238dab50eab8c3b0ae5c6523b0cada38673b33
+--- /dev/null
++++ b/src/lotus_v2/avalanche_peer.cpp
+@@ -0,0 +1,389 @@
++// Copyright (c) 2026 The Lotus developers
++#include "avalanche_peer.h"
++#include <avalanche/compactproofs.h>
++#include <crypto/siphash.h>
++#include <streams.h>
++#include <algorithm>
++#include <limits>
++#include <stdexcept>
++namespace lotus::v2::ava {
++namespace {
++bool Fail(std::string &e, const char *s) { e = s; return false; }
++struct Cursor {
++    std::span<const uint8_t> bytes;
++    size_t pos{};
++    bool Skip(uint64_t n) { if (n > bytes.size() - pos) return false; pos += size_t(n); return true; }
++    bool Integer(unsigned width, uint64_t &v) {
++        if (width > bytes.size() - pos) return false;
++        v = 0; for (unsigned i = 0; i < width; ++i) v |= uint64_t(bytes[pos++]) << (8 * i);
++        return true;
++    }
++    bool Count(uint64_t cap, uint64_t &v) {
++        uint64_t tag; if (!Integer(1, tag)) return false;
++        if (tag < 253) v = tag;
++        else {
++            if (!Integer(tag == 253 ? 2 : tag == 254 ? 4 : 8, v)) return false;
++            if (v < (tag == 253 ? 253ULL : tag == 254 ? 65536ULL : 4294967296ULL)) return false;
++        }
++        return v <= cap;
++    }
++    bool Blob(uint64_t cap) { uint64_t n; return Count(cap, n) && Skip(n); }
++    bool End() const { return pos == bytes.size(); }
++};
++// Check every variable count before ABC's generic vector deserialization can
++// allocate. Fixed-width stake elements still carry bounded pubkey vectors.
++bool ScanProof(Cursor &c, const PeerLimits &l, uint64_t &stakes) {
++    if (!c.Skip(16) || !c.Blob(65) || !c.Count(l.max_stakes, stakes)) return false;
++    for (uint64_t i = 0; i < stakes; ++i)
++        if (!c.Skip(48) || !c.Blob(65) || !c.Skip(64)) return false;
++    return c.Blob(l.max_payout_script) && c.Skip(64);
++}
++bool ScanHello(Cursor &c) {
++    uint64_t levels;
++    if (!c.Skip(32) || !c.Blob(65) || !c.Count(::avalanche::MAX_DELEGATION_LEVELS, levels)) return false;
++    for (uint64_t i = 0; i < levels; ++i) if (!c.Blob(65) || !c.Skip(64)) return false;
++    return c.Skip(68) && c.End();
++}
++template<typename... T> peer::Bytes WireBytes(const T &...v) {
++    DataStream s; (s << ... << v);
++    auto p = reinterpret_cast<const uint8_t *>(s.data());
++    return {p, p + s.size()};
++}
++DataStream Stream(std::span<const uint8_t> b) { return DataStream{Span<const uint8_t>{b.data(), b.size()}}; }
++Hash HashOf(const uint256 &id) { Hash h; std::copy(id.begin(), id.end(), h.begin()); return h; }
++::avalanche::ProofId ProofIdOf(const Hash &h) { uint256 v; std::copy(h.begin(), h.end(), v.begin()); return ::avalanche::ProofId{v}; }
++uint64_t Deadline(uint64_t now, uint64_t interval) { return now > UINT64_MAX - interval ? UINT64_MAX : now + interval; }
++}
++bool DecodeProofEnvelope(std::span<const uint8_t> b, const PeerLimits &l, ProofEnvelope &out, std::string &e) {
++    if (b.size() > l.max_payload) return Fail(e, "proof-envelope-capacity");
++    Cursor c{b}; uint64_t stakes, locks;
++    if (!ScanProof(c, l, stakes) || !c.Count(l.max_stakes, locks) || locks != stakes)
++        return Fail(e, "proof-envelope-count");
++    for (uint64_t i = 0; i < locks; ++i) {
++        uint64_t n; if (!c.Count(35, n) || n != 35 || !c.Skip(n)) return Fail(e, "payment-lock-size");
++    }
++    if (!c.End()) return Fail(e, "proof-envelope-trailing-bytes");
++    try {
++        auto s = Stream(b); ProofEnvelope p; s >> p.proof >> p.payment_locks;
++        if (!s.empty() || !p.proof) return Fail(e, "invalid-proof-envelope");
++        for (const auto &lock : p.payment_locks)
++            if (lock[0] != 32 || lock[33] != 0xbc || lock[34] != 0x4e) return Fail(e, "invalid-payment-lock");
++        out = std::move(p); e.clear(); return true;
++    } catch (const std::ios_base::failure &) { return Fail(e, "invalid-proof-envelope"); }
++}
++bool EncodeProofEnvelope(const ProofEnvelope &p, const PeerLimits &l, peer::Bytes &out, std::string &e) {
++    if (!p.proof || p.proof->getStakes().size() > l.max_stakes || p.payment_locks.size() != p.proof->getStakes().size())
++        return Fail(e, "proof-envelope-count");
++    if (p.proof->getPayoutScript().size() > l.max_payout_script) return Fail(e, "payout-script-capacity");
++    for (const auto &lock : p.payment_locks)
++        if (lock.size() != 35 || lock[0] != 32 || lock[33] != 0xbc || lock[34] != 0x4e) return Fail(e, "invalid-payment-lock");
++    auto bytes = WireBytes(p.proof, p.payment_locks);
++    if (bytes.size() > l.max_payload) return Fail(e, "proof-envelope-capacity");
++    out = std::move(bytes); e.clear(); return true;
++}
++AvalanchePeer::AvalanchePeer(peer::PeerDispatcher &d, PeerLimits l, PeerCallbacks c)
++    : dispatcher_(d), limits_(l), callbacks_(std::move(c)) {
++    if (!l.max_peers || !l.max_payload || !l.max_stakes || l.max_stakes > AVALANCHE_MAX_PROOF_STAKES ||
++        !l.max_elements || l.max_elements > 1024 || !l.max_proofs || !l.max_actions ||
++        l.max_actions < l.max_proofs || l.max_action_bytes < uint64_t(l.max_proofs) * l.max_payload || !l.discovery_interval_ms || !l.request_timeout_ms || !l.proof_request_interval_ms || !l.poll_cooldown_ms ||
++        !callbacks_.register_proof || !callbacks_.bind || !callbacks_.disconnect ||
++        !callbacks_.sent_proof_inventory || !callbacks_.respond || !callbacks_.receive || !callbacks_.proof || !callbacks_.proofs ||
++        !callbacks_.sign_hello || !callbacks_.discovery_keys || !callbacks_.local_session_key.IsFullyValid())
++        throw std::invalid_argument("invalid-avalanche-peer-configuration");
++}
++bool AvalanchePeer::Room(uint32_t n, uint64_t bytes) const {
++    return n <= limits_.max_actions - actions_.size() && bytes <= limits_.max_action_bytes - action_bytes_;
++}
++bool AvalanchePeer::Queue(peer::ConnectionId id, peer::Message m, std::string &e) {
++    if (m.payload.size() > limits_.max_payload || !Room(1, m.payload.size())) return Fail(e, "avalanche-action-backpressure");
++    const auto limit = dispatcher_.ActiveLimit(id);
++    if (!limit || m.payload.size() > *limit) return Fail(e, "avalanche-negotiated-capacity");
++    action_bytes_ += m.payload.size(); actions_.push_back({id, std::move(m)}); return true;
++}
++PeerResult AvalanchePeer::Activate(peer::ConnectionId id, std::string &e) {
++    if (peers_.contains(id)) return PeerResult::Accepted;
++    auto f = dispatcher_.ActiveFeatures(id); auto t = dispatcher_.Transcript(id);
++    if (!f || !(*f & REQUIRED_CAPABILITY) || !t) { e = "avalanche-not-negotiated"; return PeerResult::Rejected; }
++    if (peers_.size() >= limits_.max_peers || next_node_ == std::numeric_limits<NodeId>::max()) return PeerResult::Backpressure;
++    State state; state.node = next_node_++;
++    state.incoming = {t->remote_nonce, t->local_nonce, t->remote_entropy, t->local_entropy};
++    peers_.emplace(id, std::move(state)); e.clear(); return PeerResult::Accepted;
++}
++PeerResult AvalanchePeer::Hello(peer::ConnectionId id, const ::avalanche::Delegation &delegation, std::string &e) {
++    if (!peers_.contains(id)) return PeerResult::UnknownPeer;
++    if (!Room(1, limits_.max_payload)) return PeerResult::Backpressure;
++    auto t = dispatcher_.Transcript(id); if (!t) return PeerResult::UnknownPeer;
++    SchnorrSig sig;
++    if (!callbacks_.sign_hello(HelloDigest(delegation, {t->local_nonce, t->remote_nonce, t->local_entropy, t->remote_entropy}), sig))
++        return PeerResult::LocalFailure;
++    AuthenticatedHello checked;
++    if (!AuthenticateHello(delegation, sig, {t->local_nonce, t->remote_nonce, t->local_entropy, t->remote_entropy}, limits_.max_elements, checked, e))
++        return PeerResult::LocalFailure;
++    auto b = WireBytes(delegation, sig, limits_.max_elements);
++    return Queue(id, {"avahello", std::move(b)}, e) ? PeerResult::Accepted : PeerResult::Backpressure;
++}
++std::optional<NodeId> AvalanchePeer::Node(peer::ConnectionId id) const {
++    auto p = peers_.find(id); if (p == peers_.end() || !p->second.authenticated) return std::nullopt;
++    return p->second.node;
++}
++void AvalanchePeer::Disconnect(peer::ConnectionId id) {
++    auto p = peers_.find(id); if (p != peers_.end()) { callbacks_.disconnect(p->second.node); peers_.erase(p); }
++    for (auto a = actions_.begin(); a != actions_.end();) {
++        if (a->connection == id) { action_bytes_ -= a->message.payload.size(); a = actions_.erase(a); } else ++a;
++    }
++}
++peer::DispatcherResult AvalanchePeer::Pump(uint64_t now) {
++    if (actions_.empty()) return peer::DispatcherResult::Progress;
++    const auto &a = actions_.front(); auto r = dispatcher_.SendApplication(a.connection, a.message, now);
++    if (r == peer::DispatcherResult::Queued) {
++        if (a.message.command == "avaproofs") {
++            auto p = peers_.find(a.connection);
++            if (p != peers_.end()) callbacks_.sent_proof_inventory(p->second.node);
++        }
++        action_bytes_ -= a.message.payload.size(); actions_.pop_front();
++    }
++    // Terminal failures retain the action until driver disconnects explicitly.
++    return r;
++}
++PeerResult AvalanchePeer::Poll(const OutgoingPoll &p, std::string &e) {
++    for (const auto &[id, state] : peers_) if (state.node == p.node && state.authenticated) {
++        if (p.items.size() > std::min(limits_.max_elements, state.authenticated->max_elements)) { e = "poll-count"; return PeerResult::LocalFailure; }
++        std::vector<CInv> invs; invs.reserve(p.items.size());
++        for (const auto &i : p.items) { uint256 hash; std::copy(i.id.begin(), i.id.end(), hash.begin()); invs.emplace_back(i.kind == ItemKind::Block ? MSG_BLOCK : MSG_AVA_PROOF, hash); }
++        return Queue(id, {"avapoll", WireBytes(p.round, invs)}, e) ? PeerResult::Accepted : PeerResult::Backpressure;
++    }
++    return PeerResult::UnknownPeer;
++}
++PeerResult AvalanchePeer::Discover(peer::ConnectionId id, uint64_t now, std::string &e) {
++    Tick(now);
++    if (!peers_.contains(id)) return PeerResult::UnknownPeer;
++    if (peers_.at(id).discovery_outstanding || peers_.at(id).discovery_expected) return PeerResult::Backpressure;
++    if (!Queue(id, {"getavaproofs", {}}, e)) return PeerResult::Backpressure;
++    peers_.at(id).discovery_outstanding = true;
++    peers_.at(id).discovery_deadline = Deadline(now, limits_.request_timeout_ms);
++    return PeerResult::Accepted;
++}
++void AvalanchePeer::Tick(uint64_t now) {
++    for (auto &[id, state] : peers_) {
++        (void)id;
++        for (auto r = state.requested.begin(); r != state.requested.end();)
++            if (now >= r->second) r = state.requested.erase(r); else ++r;
++        if (now >= state.discovery_deadline) {
++            state.discovery_outstanding = false; state.discovery_expected = 0;
++            state.discovery_received.clear(); state.discovery_shortids.clear();
++        }
++    }
++}
++PeerResult AvalanchePeer::Handle(const peer::DispatcherNotice &notice, uint64_t now, std::string &e) {
++    auto found = peers_.find(notice.connection);
++    if (found == peers_.end()) return PeerResult::UnknownPeer;
++    if (notice.kind != peer::DispatcherNoticeKind::Application || !notice.application) return PeerResult::Rejected;
++    auto &state = found->second; const auto &m = *notice.application; const auto id = notice.connection;
++    const auto &b = m.payload;
++    if (b.size() > limits_.max_payload) { e = "avalanche-payload-capacity"; return PeerResult::Rejected; }
++    // Reserve worst-case action count/bytes before callbacks or state changes.
++    // This is bounded logical staging; it does not promise allocator success.
++    uint32_t reserve_actions = 1;
++    if (m.command == "avaproofsreq" || m.command == "getdata") {
++        Cursor count_cursor{b}; uint64_t count;
++        if (!count_cursor.Count(limits_.max_proofs, count)) { e = "avalanche-request-count"; return PeerResult::Rejected; }
++        reserve_actions = uint32_t(count);
++    }
++    if (!Room(reserve_actions, uint64_t(reserve_actions) * limits_.max_payload)) return PeerResult::Backpressure;
++    Tick(now);
++    if ((m.command == "getdata" || m.command == "avaproofsreq") && now < state.next_proof_request) {
++        e = "proof-request-cooldown"; return PeerResult::Rejected;
++    }
++    try {
++        if (m.command == "avahello") {
++            if (state.authenticated || state.delegation) { e = "duplicate-avahello"; return PeerResult::Rejected; }
++            Cursor c{b}; if (!ScanHello(c)) { e = "avahello-framing"; return PeerResult::Rejected; }
++            auto s = Stream(b); ::avalanche::Delegation d; SchnorrSig sig; uint32_t count;
++            s >> d >> sig >> count;
++            AuthenticatedHello h;
++            if (!AuthenticateHello(d, sig, state.incoming, count, h, e)) return PeerResult::Rejected;
++            state.delegation = d; state.hello_signature = sig; state.hello_elements = count;
++            if (callbacks_.proof(h.proof_id)) {
++                if (!callbacks_.bind(state.node, d, sig, state.incoming, count, e)) return PeerResult::Rejected;
++                state.authenticated = h;
++            } else {
++                state.requested[h.proof_id] = Deadline(now, limits_.request_timeout_ms);
++                peer::Bytes bytes;
++                const peer::Inventory request{peer::PROOF_INVENTORY_TYPE, HashOf(h.proof_id)};
++                if (!peer::EncodeInventory(std::span{&request, 1}, limits_.max_payload, bytes, e) ||
++                    !Queue(id, {"getdata", std::move(bytes)}, e)) return PeerResult::LocalFailure;
++            }
++            return PeerResult::Accepted;
++        }
++        if (m.command == "avaproof") {
++            ProofEnvelope p; if (!DecodeProofEnvelope(b, limits_, p, e)) return PeerResult::Rejected;
++            // Only responses to bounded announced proof requests are admitted.
++            if (!state.requested.contains(p.proof->getId()) && (!state.discovery_expected || state.discovery_received.contains(p.proof->getId()))) { e = "unsolicited-avaproof"; return PeerResult::Rejected; }
++            const bool direct_request = state.requested.contains(p.proof->getId());
++            const uint64_t shortid = SipHashUint256(state.discovery_k0, state.discovery_k1, p.proof->getId()) & 0xffffffffffffULL;
++            auto slot = std::find(state.discovery_shortids.begin(), state.discovery_shortids.end(), shortid);
++            if (!direct_request && slot == state.discovery_shortids.end()) { e = "unannounced-discovery-proof"; return PeerResult::Rejected; }
++            if (!callbacks_.register_proof(p, e)) return PeerResult::Rejected;
++            if (!state.requested.erase(p.proof->getId())) {
++                --state.discovery_expected; state.discovery_received.insert(p.proof->getId());
++                state.discovery_shortids.erase(slot);
++            }
++            if (state.delegation && !state.authenticated && state.delegation->getProofId() == p.proof->getId()) {
++                // The cryptographically authenticated hello was retained while
++                // native UTXO/payment-lock admission completed.
++                AuthenticatedHello h;
++                if (!AuthenticateHello(*state.delegation, state.hello_signature, state.incoming, state.hello_elements, h, e) ||
++                    !callbacks_.bind(state.node, *state.delegation, state.hello_signature, state.incoming, state.hello_elements, e))
++                    return PeerResult::Rejected;
++                state.authenticated = h;
++            }
++            return PeerResult::Accepted;
++        }
++        if (m.command == "avapoll") {
++            if (!state.authenticated) { e = "unauthenticated-poll"; return PeerResult::Rejected; }
++            const bool cooling = now < state.next_poll;
++            state.next_poll = Deadline(now, limits_.poll_cooldown_ms);
++            if (cooling) return PeerResult::Accepted; // pinned ABC ignores repeated polls
++            Cursor c{b}; uint64_t round, count;
++            if (!c.Integer(8, round) || !c.Count(limits_.max_elements, count) || !c.Skip(count * 36) || !c.End()) { e = "poll-framing"; return PeerResult::Rejected; }
++            auto s = Stream(b); std::vector<CInv> invs; s >> round >> invs;
++            OutgoingPoll poll{state.node, round, {}}; poll.items.reserve(invs.size());
++            for (const auto &inv : invs) {
++                if (inv.type != MSG_BLOCK && inv.type != MSG_AVA_PROOF) { e = "poll-inventory-type"; return PeerResult::Rejected; }
++                PollItem item{inv.type == MSG_BLOCK ? ItemKind::Block : ItemKind::Proof, HashOf(inv.hash)};
++                if (std::find_if(poll.items.begin(), poll.items.end(), [&](const auto &i) { return i.kind == item.kind && i.id == item.id; }) != poll.items.end()) { e = "duplicate-poll-item"; return PeerResult::Rejected; }
++                poll.items.push_back(item);
++            }
++            SignedResponse response;
++            if (!callbacks_.respond(poll, response, e)) return PeerResult::LocalFailure;
++            if (response.response.getRound() != round || response.response.GetVotes().size() != invs.size() ||
++                !AuthenticateResponse(callbacks_.local_session_key, response, e)) { e = "invalid-local-response"; return PeerResult::LocalFailure; }
++            for (size_t i = 0; i < invs.size(); ++i)
++                if (response.response.GetVotes()[i].GetHash() != invs[i].hash) { e = "local-response-order"; return PeerResult::LocalFailure; }
++            return Queue(id, {"avaresponse", WireBytes(response.response, response.signature)}, e) ? PeerResult::Accepted : PeerResult::LocalFailure;
++        }
++        if (m.command == "avaresponse") {
++            if (!state.authenticated) { e = "unauthenticated-response"; return PeerResult::Rejected; }
++            Cursor c{b}; uint64_t n;
++            if (!c.Skip(12) || !c.Count(limits_.max_elements, n) || !c.Skip(n * 36 + 64) || !c.End()) { e = "response-framing"; return PeerResult::Rejected; }
++            auto s = Stream(b); SignedResponse response; s >> response.response >> response.signature;
++            if (!AuthenticateResponse(state.authenticated->session_key, response, e) || !callbacks_.receive(state.node, response, e)) return PeerResult::Rejected;
++            return PeerResult::Accepted;
++        }
++        if (m.command == "getavaproofs") {
++            if (!b.empty()) { e = "getavaproofs-framing"; return PeerResult::Rejected; }
++            if (now < state.next_discovery) { e = "discovery-cooldown"; return PeerResult::Rejected; }
++            auto proofs = callbacks_.proofs();
++            if (proofs.size() > limits_.max_proofs) { e = "local-proof-list-capacity"; return PeerResult::LocalFailure; }
++            uint64_t k0, k1; if (!callbacks_.discovery_keys(k0, k1)) return PeerResult::LocalFailure;
++            DataStream s; s << k0 << k1; WriteCompactSize(s, proofs.size());
++            for (const auto &proof : proofs) {
++                auto shortid = SipHashUint256(k0, k1, proof);
++                for (unsigned i = 0; i < 6; ++i) { uint8_t octet = uint8_t(shortid >> (8 * i)); s << octet; }
++            }
++            WriteCompactSize(s, 0); // No prefills: every proof travels with native binding.
++            auto ptr = reinterpret_cast<const uint8_t *>(s.data()); peer::Bytes bytes(ptr, ptr + s.size());
++            if (!Queue(id, {"avaproofs", std::move(bytes)}, e)) return PeerResult::LocalFailure;
++            state.advertised = std::move(proofs); state.next_discovery = Deadline(now, limits_.discovery_interval_ms);
++            return PeerResult::Accepted;
++        }
++        if (m.command == "avaproofs") {
++            if (!state.discovery_outstanding) { e = "unsolicited-avaproofs"; return PeerResult::Rejected; }
++            Cursor c{b}; uint64_t count, prefilled, k0, k1;
++            if (!c.Integer(8, k0) || !c.Integer(8, k1) || !c.Count(limits_.max_proofs, count)) { e = "avaproofs-count"; return PeerResult::Rejected; }
++            std::vector<uint64_t> shortids; shortids.reserve(size_t(count));
++            for (uint64_t i = 0; i < count; ++i) {
++                uint64_t shortid; if (!c.Integer(6, shortid)) { e = "avaproofs-shortids"; return PeerResult::Rejected; }
++                shortids.push_back(shortid);
++            }
++            if (!c.Count(limits_.max_proofs - count, prefilled)) { e = "avaproofs-count"; return PeerResult::Rejected; }
++            std::vector<std::pair<uint32_t, ProofEnvelope>> prefills;
++            prefills.reserve(size_t(prefilled)); uint64_t index = 0;
++            for (uint64_t i = 0; i < prefilled; ++i) {
++                uint64_t diff, stakes, locks;
++                if (!c.Count(UINT32_MAX, diff) || diff > UINT32_MAX - index || index + diff >= count + prefilled) {
++                    e = "avaproofs-prefill-index"; return PeerResult::Rejected;
++                }
++                index += diff; const size_t start = c.pos;
++                if (!ScanProof(c, limits_, stakes) || !c.Count(limits_.max_stakes, locks) || locks != stakes) {
++                    e = "avaproofs-prefill-binding-count"; return PeerResult::Rejected;
++                }
++                for (uint64_t j = 0; j < locks; ++j) {
++                    uint64_t n; if (!c.Count(35, n) || n != 35 || !c.Skip(n)) { e = "avaproofs-prefill-lock"; return PeerResult::Rejected; }
++                }
++                ProofEnvelope envelope;
++                if (!DecodeProofEnvelope(std::span{b}.subspan(start, c.pos - start), limits_, envelope, e)) return PeerResult::Rejected;
++                prefills.emplace_back(uint32_t(index), std::move(envelope)); ++index;
++            }
++            if (!c.End()) { e = "avaproofs-trailing-bytes"; return PeerResult::Rejected; }
++            // Conservative collision-safe fallback requests every non-prefilled
++            // slot. Full signed proofs/native bindings determine admission.
++            ::avalanche::ProofsRequest request; request.indices.reserve(size_t(count));
++            size_t filled = 0;
++            for (uint32_t i = 0; i < count + prefilled; ++i) {
++                if (filled < prefills.size() && prefills[filled].first == i) ++filled;
++                else request.indices.push_back(i);
++            }
++            for (const auto &p : prefills) if (!callbacks_.register_proof(p.second, e)) return PeerResult::Rejected;
++            if (state.delegation && !state.authenticated && callbacks_.proof(state.delegation->getProofId())) {
++                AuthenticatedHello h;
++                if (!AuthenticateHello(*state.delegation, state.hello_signature, state.incoming, state.hello_elements, h, e) ||
++                    !callbacks_.bind(state.node, *state.delegation, state.hello_signature, state.incoming, state.hello_elements, e)) return PeerResult::Rejected;
++                state.authenticated = h;
++            }
++            if (!Queue(id, {"avaproofsreq", WireBytes(request)}, e)) return PeerResult::LocalFailure;
++            state.discovery_outstanding = false; state.discovery_expected = uint32_t(count);
++            state.discovery_received.clear(); state.discovery_deadline = Deadline(now, limits_.request_timeout_ms);
++            state.discovery_k0 = k0; state.discovery_k1 = k1; state.discovery_shortids = std::move(shortids);
++            return PeerResult::Accepted;
++        }
++        if (m.command == "avaproofsreq") {
++            Cursor c{b}; uint64_t count, diff, index = 0;
++            if (!c.Count(limits_.max_proofs, count)) { e = "proof-request-count"; return PeerResult::Rejected; }
++            std::vector<uint32_t> indices; indices.reserve(size_t(count));
++            for (uint64_t i = 0; i < count; ++i) {
++                if (!c.Count(UINT32_MAX, diff) || diff > UINT32_MAX - index || index + diff >= state.advertised.size()) { e = "proof-request-index"; return PeerResult::Rejected; }
++                index += diff; indices.push_back(uint32_t(index)); ++index;
++            }
++            if (!c.End()) { e = "proof-request-trailing-bytes"; return PeerResult::Rejected; }
++            std::vector<peer::Message> responses; responses.reserve(indices.size());
++            for (auto i : indices) { auto proof = callbacks_.proof(state.advertised[i]); peer::Bytes bytes;
++                if (!proof || !EncodeProofEnvelope(*proof, limits_, bytes, e)) return PeerResult::LocalFailure;
++                responses.push_back({"avaproof", std::move(bytes)});
++            }
++            for (auto &message : responses) if (!Queue(id, std::move(message), e)) return PeerResult::LocalFailure;
++            state.advertised.clear(); state.next_proof_request = Deadline(now, limits_.proof_request_interval_ms);
++            return PeerResult::Accepted;
++        }
++        if (m.command == "inv" || m.command == "getdata" || m.command == "notfound") {
++            Cursor c{b}; uint64_t count;
++            if (!c.Count(limits_.max_proofs, count) || !c.Skip(count * 36) || !c.End()) { e = "proof-inventory-framing"; return PeerResult::Rejected; }
++            std::vector<peer::Inventory> invs;
++            if (!peer::DecodeInventory(b, limits_.max_payload, invs, e)) return PeerResult::Rejected;
++            for (const auto &inv : invs) if (inv.type != peer::PROOF_INVENTORY_TYPE) { e = "non-proof-application-inventory"; return PeerResult::Rejected; }
++            std::vector<peer::Inventory> requests;
++            std::vector<peer::Message> responses;
++            for (const auto &inv : invs) {
++                const auto proofid = ProofIdOf(inv.hash);
++                if (m.command == "inv") {
++                    if (!callbacks_.proof(proofid) && !state.requested.contains(proofid)) requests.push_back(inv);
++                } else if (m.command == "notfound") state.requested.erase(proofid);
++                else {
++                    auto p = callbacks_.proof(proofid); peer::Bytes bytes;
++                    if (p) { if (!EncodeProofEnvelope(*p, limits_, bytes, e)) return PeerResult::LocalFailure; responses.push_back({"avaproof", std::move(bytes)}); }
++                    else { if (!peer::EncodeInventory(std::span{&inv, 1}, limits_.max_payload, bytes, e)) return PeerResult::LocalFailure; responses.push_back({"notfound", std::move(bytes)}); }
++                }
++            }
++            if (state.requested.size() + requests.size() > limits_.max_proofs) return PeerResult::Backpressure;
++            if (!requests.empty()) {
++                peer::Bytes bytes; if (!peer::EncodeInventory(requests, limits_.max_payload, bytes, e) || !Queue(id, {"getdata", std::move(bytes)}, e)) return PeerResult::LocalFailure;
++                for (const auto &inv : requests) state.requested.emplace(ProofIdOf(inv.hash), Deadline(now, limits_.request_timeout_ms));
++            }
++            for (auto &message : responses) if (!Queue(id, std::move(message), e)) return PeerResult::LocalFailure;
++            if (m.command == "getdata") state.next_proof_request = Deadline(now, limits_.proof_request_interval_ms);
++            return PeerResult::Accepted;
++        }
++    } catch (const std::ios_base::failure &) { e = "invalid-avalanche-serialization"; return PeerResult::Rejected; }
++    e = "unsupported-avalanche-command"; return PeerResult::Rejected;
++}
++} // namespace lotus::v2::ava
+diff --git a/src/lotus_v2/avalanche_peer.h b/src/lotus_v2/avalanche_peer.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..d122e6d50ce51ff33ae6d008b25c0d0230a6a61a
+--- /dev/null
++++ b/src/lotus_v2/avalanche_peer.h
+@@ -0,0 +1,82 @@
++// Copyright (c) 2026 The Lotus developers
++#ifndef LOTUS_V2_AVALANCHE_PEER_H
++#define LOTUS_V2_AVALANCHE_PEER_H
++#include "avalanche_poll.h"
++#include "peer_dispatcher.h"
++#include <deque>
++#include <map>
++#include <set>
++namespace lotus::v2::ava {
++struct PeerLimits {
++    uint32_t max_peers{64}, max_payload{256000}, max_stakes{1000}, max_payout_script{10000};
++    uint32_t max_elements{1024}, max_proofs{64}, max_actions{128};
++    uint64_t max_action_bytes{16 * 1024 * 1024}, discovery_interval_ms{60000}, request_timeout_ms{10000}, proof_request_interval_ms{100}, poll_cooldown_ms{AVALANCHE_DEFAULT_COOLDOWN};
++};
++// V2 avaproof extends the exact pinned ABC proof bytes with CompactSize lock
++// count and CompactSize byte vectors. These bindings are mandatory, ordered
++// with stakes, and never inferred from an upstream proof or dropped on relay.
++bool EncodeProofEnvelope(const ProofEnvelope &, const PeerLimits &, peer::Bytes &, std::string &);
++bool DecodeProofEnvelope(std::span<const uint8_t>, const PeerLimits &, ProofEnvelope &, std::string &);
++struct PeerCallbacks {
++    CPubKey local_session_key;
++    std::function<bool(const ProofEnvelope &, std::string &)> register_proof;
++    std::function<bool(NodeId, const ::avalanche::Delegation &, const SchnorrSig &,
++                       const ConnectionTranscript &, uint32_t, std::string &)> bind;
++    std::function<void(NodeId)> disconnect;
++    std::function<void(NodeId)> sent_proof_inventory;
++    std::function<bool(const OutgoingPoll &, SignedResponse &, std::string &)> respond;
++    std::function<bool(NodeId, const SignedResponse &, std::string &)> receive;
++    std::function<std::optional<ProofEnvelope>(const ::avalanche::ProofId &)> proof;
++    std::function<std::vector<::avalanche::ProofId>()> proofs;
++    std::function<bool(uint64_t &, uint64_t &)> discovery_keys;
++    // Root retains the secret; callback must sign this actual connection digest.
++    std::function<bool(const uint256 &, SchnorrSig &)> sign_hello;
++};
++enum class PeerResult { Accepted, Backpressure, Rejected, LocalFailure, UnknownPeer };
++// Single owner; use the existing dispatcher's Application notices. The caller
++// retains a notice on Backpressure. All outbound actions stay charged until
++// SendApplication returns Queued. Pump must run independently of stdout.
++// No callback may reenter this object. Disconnect clears volatile peer state.
++class AvalanchePeer {
++public:
++    AvalanchePeer(peer::PeerDispatcher &, PeerLimits, PeerCallbacks);
++    PeerResult Activate(peer::ConnectionId, std::string &);
++    PeerResult Hello(peer::ConnectionId, const ::avalanche::Delegation &, std::string &);
++    PeerResult Handle(const peer::DispatcherNotice &, uint64_t now_ms, std::string &);
++    PeerResult Poll(const OutgoingPoll &, std::string &);
++    PeerResult Discover(peer::ConnectionId, uint64_t now_ms, std::string &);
++    void Tick(uint64_t now_ms);
++    peer::DispatcherResult Pump(uint64_t now_ms);
++    void Disconnect(peer::ConnectionId);
++    std::optional<NodeId> Node(peer::ConnectionId) const;
++    size_t PendingActions() const { return actions_.size(); }
++    uint64_t PendingBytes() const { return action_bytes_; }
++private:
++    struct State {
++        NodeId node{};
++        std::optional<AuthenticatedHello> authenticated;
++        std::optional<::avalanche::Delegation> delegation;
++        SchnorrSig hello_signature{};
++        ConnectionTranscript incoming;
++        std::map<::avalanche::ProofId, uint64_t> requested;
++        std::vector<::avalanche::ProofId> advertised;
++        uint32_t hello_elements{}, discovery_expected{};
++        bool discovery_outstanding{};
++        uint64_t discovery_deadline{}, next_discovery{}, next_proof_request{}, next_poll{};
++        std::set<::avalanche::ProofId> discovery_received;
++        uint64_t discovery_k0{}, discovery_k1{};
++        std::vector<uint64_t> discovery_shortids;
++    };
++    struct Action { peer::ConnectionId connection; peer::Message message; };
++    bool Room(uint32_t count, uint64_t bytes) const;
++    bool Queue(peer::ConnectionId, peer::Message, std::string &);
++    peer::PeerDispatcher &dispatcher_;
++    PeerLimits limits_;
++    PeerCallbacks callbacks_;
++    std::map<peer::ConnectionId, State> peers_;
++    std::deque<Action> actions_;
++    uint64_t action_bytes_{};
++    NodeId next_node_{};
++};
++}
++#endif
+diff --git a/src/lotus_v2/avalanche_peer_test/CMakeLists.txt b/src/lotus_v2/avalanche_peer_test/CMakeLists.txt
+new file mode 100644
+index 0000000000000000000000000000000000000000..129a4658c9982dc2d1afd10c6a290d84ccf5a1a6
+--- /dev/null
++++ b/src/lotus_v2/avalanche_peer_test/CMakeLists.txt
+@@ -0,0 +1,42 @@
++cmake_minimum_required(VERSION 3.18)
++project(lotus_v2_peer_dispatcher_review LANGUAGES C CXX)
++set(CMAKE_CXX_STANDARD 20)
++set(CMAKE_CXX_STANDARD_REQUIRED ON)
++if(LOTUS_SANITIZE)
++    add_compile_options(-fsanitize=address,undefined -fno-omit-frame-pointer)
++    add_link_options(-fsanitize=address,undefined)
++endif()
++add_subdirectory(../disk_state_test disk_state)
++find_package(OpenSSL REQUIRED COMPONENTS Crypto)
++if(NOT DEFINED LOTUS_SECP_LIBRARY OR NOT EXISTS "${LOTUS_SECP_LIBRARY}")
++    message(FATAL_ERROR "Set LOTUS_SECP_LIBRARY to ABC libsecp256k1.a")
++endif()
++get_filename_component(LOTUS_SRC "${CMAKE_CURRENT_SOURCE_DIR}/../.." ABSOLUTE)
++add_executable(avalanche_peer_test
++    ../peer_tcp.cpp ../peer_dispatcher.cpp ../peer_download.cpp ../peer_transport.cpp ../peer_session.cpp ../peer_codec.cpp
++    ../../crypto/sha256.cpp ../../crypto/siphash.cpp
++    ../../support/cleanse.cpp
++    ../header_admission.cpp ../disk_body.cpp ../development_chain.cpp ../disk_block.cpp ../block_transition.cpp ../block_assembler.cpp ../block_template.cpp ../test_avalanche_peer.cpp ../avalanche_peer.cpp ../avalanche_protocol.cpp ../development_runtime.cpp ../candidate_selection.cpp ../candidate_body_pool.cpp ../reorg_recovery.cpp ../chain_index.cpp
++    ../output.cpp ../transaction.cpp ../commitment.cpp ../tagged_hash.cpp
++    ../signing.cpp ../vm.cpp ../field_size.cpp ../sparse_state.cpp
++    ../incremental_utxo.cpp ../ordinary_validation.cpp ../monetary.cpp
++    ../block.cpp ../block_wire.cpp ../block_cost.cpp ../header_context.cpp
++    ../asert_candidate.cpp ../header.cpp ../persistent_utxo.cpp ../persistent_monetary.cpp)
++target_include_directories(avalanche_peer_test PRIVATE "${LOTUS_SRC}" "${LOTUS_SRC}/secp256k1/include"
++    "${LOTUS_BOOST_INCLUDE}" ../vendor/blake3)
++target_link_libraries(avalanche_peer_test PRIVATE lotus_v2_disk_state blake3
++    OpenSSL::Crypto "${LOTUS_SECP_LIBRARY}")
++target_compile_definitions(avalanche_peer_test PRIVATE HAVE_CONFIG_H)
++target_include_directories(avalanche_peer_test PRIVATE "${LOTUS_ABC_BUILD}/src")
++target_link_libraries(avalanche_peer_test PRIVATE
++ "${LOTUS_ABC_BUILD}/src/libserver.a" "${LOTUS_ABC_BUILD}/src/libcommon.a"
++ "${LOTUS_ABC_BUILD}/src/libbitcoinconsensus.a" "${LOTUS_ABC_BUILD}/src/libscript.a" "${LOTUS_ABC_BUILD}/src/libutil.a"
++ "${LOTUS_ABC_BUILD}/src/crypto/libcrypto.a" "${LOTUS_ABC_BUILD}/src/univalue/libunivalue.a")
++if(APPLE)
++ target_link_options(avalanche_peer_test PRIVATE -Wl,-dead_strip)
++else()
++ target_link_options(avalanche_peer_test PRIVATE -Wl,--gc-sections)
++endif()
++target_compile_options(avalanche_peer_test PRIVATE -Wall -Wextra -Wpedantic -Werror -Wno-unused-parameter -Wno-unused-function -ffunction-sections -fdata-sections)
++enable_testing()
++add_test(NAME avalanche_peer_test COMMAND avalanche_peer_test)
+diff --git a/src/lotus_v2/avalanche_peer_test/README.md b/src/lotus_v2/avalanche_peer_test/README.md
+new file mode 100644
+index 0000000000000000000000000000000000000000..3cf6bd60dece8a30b760ed683f2d05b17b1cd30d
+--- /dev/null
++++ b/src/lotus_v2/avalanche_peer_test/README.md
+@@ -0,0 +1,68 @@
++# V2 bounded Avalanche wire review
++
++Based on native worktree `42793b5f2`. The pinned ABC `src/net_processing.cpp`
++version handler reads sender nonce and trailing extra entropy (absent values are
++1); avahello signs delegation id, sender nonce, receiver nonce, sender entropy,
++receiver entropy in that order. Session retains those actual exchanged fields.
++The immutable active transcript is exposed through Transport and Dispatcher.
++No shared nonce or caller-supplied authentication transcript is accepted by the
++adapter. Root supplies the local version entropy and secret-key signing callback.
++
++Only an explicit profile supporting capability 16 enables Avalanche application
++messages. Profiles with mandatory features 7 and transaction relay 8 retain their
++existing behavior. A profile requiring Avalanche sets required_features |= 16.
++Without 16, incoming Avalanche commands remain bounded ignored optional commands;
++Transport/Dispatcher refuse outgoing Avalanche commands.
++
++ABC's proof, delegation, hello digest, poll, signed response digest/signature,
++Block inventory type 2, Proof inventory type 0x1f000001, compact proof shortids and
++differential request indices retain pinned formats/cryptography. V2 avaproof
++extends ABC proof serialization with a CompactSize vector of native Payment lock
++byte vectors, ordered one per signed stake. Each lock must be 35 bytes with
++PUSH32 and the native Payment suffix. V2 avaproofs uses the same compact keys,
++6-byte shortids and differential prefill indices; each prefill is that same V2
++ProofEnvelope rather than an unbound ABC proof. This negotiated extension is
++necessary because native lock commitments are absent from upstream proofs.
++Every variable count (stakes, payout script, pubkeys, delegation levels, polls,
++responses, prefills, lock vectors, inventory and requests) is scanned before ABC
++container deserialization. Full payload/frame caps remain independent.
++
++Discovery currently emits zero prefills and requests every non-prefilled slot.
++This conservative collision fallback does not infer proof identity from a shortid
++and does not measure a discovery bandwidth optimization. Native prefills are
++accepted and admitted. Root callbacks perform native proof/UTXO validation,
++quorum binding, real fenced chain observation and poll-engine vote application.
++The adapter never creates voting policy or chain decisions. sent_proof_inventory
++is called only after Dispatcher accepts an avaproofs action.
++
++Drain Application notices independently of diagnostic output. Demultiplex mixed
++type-1/type-Proof Application inventories before delivering proof-only messages
++to this adapter. Deliver activation, call Activate, send Hello, and deliver all
++Avalanche Application notices to Handle. Retain the notice when it returns
++Backpressure. Call Tick to expire bounded requests and Pump to retry the front
++outbound action. Busy/capacity/terminal dispatcher results retain the action;
++explicit Disconnect releases it and invokes runtime quorum/query disconnection.
++Poll Backpressure requires retaining the original OutgoingPoll; do not allocate
++a replacement query. Root supplies one stable local session public key and owns
++its matching private key. Callbacks must not reenter the single-owner adapter.
++
++The standalone test uses actual Session/Transport/Dispatcher framing through
++fragmented bounded memory byte streams and an isolated temporary runtime home.
++No daemon, live network, production data, wallet, Chronik or published assets are
++used. The corpus fixture was copied from peer_dispatcher_test at the base; only
++explicit initial monetary anchors were added for current runtime compatibility.
++
++```sh
++cmake -S src/lotus_v2/avalanche_peer_test -B /tmp/v2-ava-peer -G Ninja \
++  -DLOTUS_ABC_BUILD=/path/to/pinned/abc/build \
++  -DLOTUS_SECP_LIBRARY=/path/to/pinned/abc/build/src/secp256k1/libsecp256k1.a \
++  -DLOTUS_BOOST_INCLUDE=/path/to/boost/include
++cmake --build /tmp/v2-ava-peer --target avalanche_peer_test
++/tmp/v2-ava-peer/avalanche_peer_test
++```
++
++Checks include actual negotiated nonce/entropy orientation, authenticated hello,
++unauthenticated poll rejection, typed block poll and real Schnorr response,
++invalid signature isolation, compact discovery/native envelope relay, native
++prefill admission, proof truncation/trailing/oversized count rejection, mandatory
++native binding and action retention under dispatcher Busy.
+diff --git a/src/lotus_v2/avalanche_peer_test/fixtures.h b/src/lotus_v2/avalanche_peer_test/fixtures.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..1719f07d22cb684e3f87595befca5fa606a785ee
+--- /dev/null
++++ b/src/lotus_v2/avalanche_peer_test/fixtures.h
+@@ -0,0 +1,476 @@
++// Fixture helpers copied from test_peer_dispatcher.cpp at 42793b5f2.
++// Copyright (c) 2026 The Lotus developers
++#include "../development_runtime.h"
++#include "../peer_dispatcher.h"
++#include "runtime_fixtures.h"
++#include "../peer_tcp.h"
++#include <chrono>
++#include <deque>
++#include <iostream>
++#include <leveldb/env.h>
++#include <set>
++#include <thread>
++using namespace lotus::v2;
++using namespace lotus::v2::peer;
++namespace {
++using runtime_fixture::Check;
++using runtime_fixture::H;
++using runtime_fixture::HeaderOf;
++using runtime_fixture::V;
++struct Home {
++    std::string path;
++    leveldb::Env *env;
++    explicit Home(leveldb::Env *environment = nullptr) : env(environment) {
++        char name[] = "/private/tmp/lotus-v2-peer-dispatcher-XXXXXX";
++        Check(mkdtemp(name) != nullptr, "fresh temporary V4 home");
++        path = name;
++    }
++    ~Home() {
++        if (std::uncaught_exceptions())
++            std::cerr << "retained failed fixture home: " << path << '\n';
++        else
++            std::filesystem::remove_all(path);
++    }
++};
++DevelopmentRuntimeConfig RuntimeConfig(const Home &home) {
++    DevelopmentRuntimeConfig c;
++    c.directory = home.path;
++    c.genesis_wire = runtime_fixture::Bytes(runtime_fixture::genesis_wire);
++    c.profiles = runtime_fixture::Profiles();
++    c.initial_money = DecodeMonetaryState(
++        runtime_fixture::Bytes(runtime_fixture::initial_money));
++    c.storage.env = home.env;
++    c.storage.cache_bytes = 1024;
++    c.storage.write_buffer_bytes = 64 << 10;
++    c.storage.recovery = DiskRecoveryOptions{32 << 20, 4 << 20};
++    c.storage.candidates = CandidateStoreOptions{64, 64, 8};
++    c.bodies = {16, 1 << 20, 16 << 20, 16, 16 << 20, 64};
++    c.initial_body_epoch = 1;
++    c.initial_context_generation = 1;
++    return c;
++}
++std::unique_ptr<DevelopmentRuntime> Open(const Home &home) {
++    std::unique_ptr<DevelopmentRuntime> out;
++    std::string error;
++    Check(DevelopmentRuntime::Open(RuntimeConfig(home), out, error) && out,
++          "open real runtime: " + error);
++    return out;
++}
++DevelopmentTickLimits TickLimits() {
++    DevelopmentTickLimits l;
++    l.selection.query = {64, 20000, 20000, 1 << 20};
++    l.selection.fork = {8, 8, 1000};
++    l.selection.max_probe_calls = 128;
++    l.selection.max_probe_bytes = 1 << 20;
++    l.selection.max_missing_bodies = 8;
++    l.selection.max_resident_bytes = 1 << 20;
++    l.recovery = runtime_fixture::Limits();
++    l.propagation = {1, 1000, 1000, 1 << 20};
++    return l;
++}
++void Seed(DevelopmentRuntime &r, const std::vector<size_t> &path) {
++    std::string error;
++    for (size_t n : path) {
++        HeaderAdmission h = HeaderAdmission::Invalid;
++        Check(r.AdmitHeader(HeaderOf(V(n)), h, error) ==
++                  DevelopmentRuntimeResult::Progress,
++              "seed real contextual header: " + error);
++        Check(h == HeaderAdmission::Stored || h == HeaderAdmission::Known,
++              "seed stored/known header");
++        CandidateBodyStatus b = CandidateBodyStatus::Malformed;
++        Check(r.RetainBody(H(V(n).id), runtime_fixture::Bytes(V(n).wire), b,
++                           error) == DevelopmentRuntimeResult::Progress,
++              "seed authenticated body: " + error);
++    }
++    for (unsigned calls = 0; calls < 300; ++calls) {
++        const auto t = r.Tick(UINT64_MAX, 0, TickLimits());
++        Check(t.result != DevelopmentRuntimeResult::StorageError,
++              "seed tick storage: " + t.diagnostic);
++        const auto s = r.Snapshot();
++        if (s.chain && s.chain->stable_tip == H(V(path.back()).id) &&
++            !s.chain->pending_journal && !s.chain->pending_receipt &&
++            !s.chain->pending_propagation)
++            return;
++    }
++    throw std::runtime_error("seed did not reach reference tip");
++}
++void Match(DevelopmentRuntime &r, size_t n) {
++    const auto &v = V(n);
++    DiskStateMetadata m;
++    lotus::v2::Hash root;
++    std::string error;
++    Check(r.ReadMetadata(1 << 20, m, root, error) ==
++              DevelopmentRuntimeResult::Progress,
++          "authoritative metadata: " + error);
++    Check(m.tip == H(v.id) && root == H(v.root) &&
++              m.monetary == runtime_fixture::Bytes(v.monetary),
++          "exact reference tip/state root/monetary bytes");
++    const auto wire = runtime_fixture::Bytes(v.wire);
++    Check(m.header == Bytes(wire.begin(), wire.begin() + HEADER_SIZE),
++          "exact reference header");
++    Bytes body;
++    Check(r.ReadConnectedBody(m.tip, 1 << 20, body, error) ==
++                  DevelopmentRuntimeResult::Progress &&
++              body == wire,
++          "accepted connected full body persisted");
++    std::map<Outpoint, Bytes, OutpointLess> expected, all;
++    for (const auto &encoded : v.coins) {
++        auto b = runtime_fixture::Bytes(encoded);
++        expected.emplace(runtime_fixture::Key(b), b);
++    }
++    for (const auto &row : runtime_fixture::vectors)
++        for (const auto &encoded : row.coins) {
++            auto b = runtime_fixture::Bytes(encoded);
++            all.emplace(runtime_fixture::Key(b), b);
++        }
++    for (const auto &[key, ignored] : all) {
++        (void)ignored;
++        std::optional<Coin> coin;
++        Check(r.ReadCoin(key, coin, error) ==
++                  DevelopmentRuntimeResult::Progress,
++              "authoritative coin read");
++        const auto wanted = expected.find(key);
++        Check(bool(coin) == (wanted != expected.end()),
++              "all touched reference coin presence");
++        if (coin) {
++            Bytes encoded;
++            Check(EncodeCoin(*coin, encoded) && encoded == wanted->second,
++                  "exact reference CoinEntry");
++        }
++        CoinProof proof;
++        Check(r.ProveCoin(key, proof, error) ==
++                      DevelopmentRuntimeResult::Progress &&
++                  VerifyCoinProof(key, proof, root),
++              "reference touched coin proof");
++    }
++}
++// Memory endpoints exercise real framing, Session and Transport while bounding
++// stream capacity and each short Read/Write. They implement no chain decisions.
++struct Pipe {
++    std::deque<uint8_t> bytes;
++    size_t capacity = 1 << 20;
++    bool closed = false;
++};
++class MemoryStream final : public ByteStream {
++public:
++    Pipe &in, &out;
++    size_t fragment = 31, write_allowance = SIZE_MAX;
++    bool block_write = false;
++    unsigned closes = 0;
++    MemoryStream(Pipe &i, Pipe &o) : in(i), out(o) {}
++    StreamResult Read(std::span<uint8_t> dst) override {
++        if (in.bytes.empty())
++            return {in.closed ? StreamStatus::Eof : StreamStatus::WouldBlock};
++        const auto n = std::min({dst.size(), fragment, in.bytes.size()});
++        for (size_t k = 0; k < n; ++k) {
++            dst[k] = in.bytes.front();
++            in.bytes.pop_front();
++        }
++        return {StreamStatus::Progress, n};
++    }
++    StreamResult Write(std::span<const uint8_t> src) override {
++        if (out.closed) return {StreamStatus::Error};
++        if (block_write || !write_allowance || out.bytes.size() == out.capacity)
++            return {StreamStatus::WouldBlock};
++        const auto n =
++            std::min({src.size(), fragment, out.capacity - out.bytes.size(),
++                      write_allowance});
++        out.bytes.insert(out.bytes.end(), src.begin(), src.begin() + n);
++        write_allowance -= n;
++        return {StreamStatus::Progress, n};
++    }
++    void Close() noexcept override {
++        ++closes;
++        out.closed = true;
++    }
++};
++NetworkProfile Network(DevelopmentRuntime &r,
++                       uint32_t reconstruction_limit = 64) {
++    NetworkProfile p{};
++    const auto c = runtime_fixture::Profiles();
++    p.magic = {0x31, 0x43, 0x57,
++               0x69}; // explicit fixture bytes, no network allocation
++    p.chain_id = c.header.chain_id;
++    p.genesis_id = c.header.genesis_id;
++    const auto snapshot = r.Snapshot();
++    Check(bool(snapshot.chain), "runtime has authoritative profile");
++    p.profile_digest = snapshot.chain->profile_digest;
++    p.receive_limit = 4096;
++    p.transaction = c.ordinary.transaction;
++    p.max_reconstruction_transactions = reconstruction_limit;
++    p.max_reconstruction_bytes = 1 << 20;
++    return p;
++}
++SessionConfig SessionSettings(const NetworkProfile &p, uint64_t nonce, bool relay = true) {
++    SessionConfig c{};
++    c.network = p;
++    if (relay) c.supported_features |= TRANSACTION_RELAY_FEATURE;
++    c.supported_features |= AVALANCHE_FEATURE;
++    c.required_features |= AVALANCHE_FEATURE;
++    c.handshake_timeout_ms = 1000;
++    c.local_version.sender = VersionSender{VersionAddress{}, nonce};
++    c.local_version.user_agent = {'t', 'e', 's', 't'};
++    c.local_version.starting_height = 0;
++    c.local_version.relay = true;
++    c.local_version.extra_entropy = nonce + 1;
++    return c;
++}
++TransportLimits TransportSettings() {
++    return {4096, 2 << 20, 32, 1000, 1000};
++}
++TransportBudget TransportStep() {
++    return {100, 65536, 65536};
++}
++
++struct Allowance {
++    uint64_t live_bytes = 0, peak_bytes = 0, cap = 64 << 20;
++    uint32_t live_slots = 0, peak_slots = 0, slots = 16384;
++    uint64_t grants = 0, releases = 0;
++    struct Lease final : DownloadReservation {
++        Allowance &owner;
++        ResourceNeed need;
++        Lease(Allowance &o, ResourceNeed n) : owner(o), need(n) {}
++        ~Lease() override {
++            owner.live_bytes -= need.staging_bytes;
++            owner.live_slots -= need.transaction_slots;
++            ++owner.releases;
++        }
++    };
++    ReservationResult Reserve(const ResourceNeed &n) {
++        if (n.staging_bytes > cap - live_bytes ||
++            n.transaction_slots > slots - live_slots)
++            return {ReservationDisposition::CapacityRefused, nullptr,
++                    "explicit test staging cap"};
++        auto lease = std::make_unique<Lease>(*this, n);
++        live_bytes += n.staging_bytes;
++        live_slots += n.transaction_slots;
++        ++grants;
++        peak_bytes = std::max(peak_bytes, live_bytes);
++        peak_slots = std::max(peak_slots, live_slots);
++        return {ReservationDisposition::Granted, std::move(lease), {}};
++    }
++};
++DownloadConfig DownloadSettings(const NetworkProfile &p) {
++    DownloadConfig c{};
++    c.network = p;
++    c.context_generation = 1;
++    auto &l = c.limits;
++    l.peers = 2;
++    l.jobs_per_peer = 8;
++    l.jobs_global = 16;
++    l.tombstones_per_peer = 16;
++    l.tombstones_global = 32;
++    l.deferred_jobs_global = 8;
++    l.cache_candidates = 64;
++    l.cache_bytes = 1 << 20;
++    l.staging_bytes_per_peer = 32 << 20;
++    l.staging_bytes_global = 64 << 20;
++    l.transaction_slots_per_peer = 8192;
++    l.transaction_slots_global = 16384;
++    l.request_timeout_ms = 200;
++    l.deferred_timeout_ms = 1000;
++    l.retry_interval_ms = 10;
++    l.lifecycle_timeout_ms = 5000;
++    return c;
++}
++DispatcherConfig DispatcherSettings(const NetworkProfile &p) {
++    DispatcherConfig c{};
++    c.network = p;
++    c.initial_fetch_epoch = 1;
++    auto &l = c.limits;
++    l.max_peers = 2;
++    l.max_notices = 128;
++    l.max_inventory_items = 16;
++    l.max_header_items = 2;
++    l.max_payload_bytes = 1 << 20;
++    l.max_pending_message_bytes = 1 << 20;
++    l.max_serving_transactions = 64;
++    l.max_compact_guards_per_peer = 32;
++    l.max_serving_body_bytes = 1 << 20;
++    l.compact_near_tip_depth = 8;
++    l.header_timeout_ms = 1000;
++    l.output_timeout_ms = 500;
++    l.serving_timeout_ms = 1000;
++    l.serving_window_ms = 1000;
++    l.serving_requests_per_window = 100;
++    l.serving_bytes_per_window = 16 << 20;
++    return c;
++}
++DispatcherBudget DispatcherStep() {
++    return {100, TransportStep(), 100, 8, 1 << 20};
++}
++struct Node {
++    Home home;
++    std::unique_ptr<DevelopmentRuntime> runtime{Open(home)};
++    NetworkProfile network;
++    Allowance staging, serving;
++    std::unique_ptr<DownloadManager> manager;
++    Transport transport;
++    std::unique_ptr<PeerDispatcher> dispatcher;
++    ConnectionId connection;
++    std::vector<DispatcherNotice> notices;
++    uint64_t nonce = 100, admissions = 0;
++    DispatcherBudget budget{DispatcherStep()};
++    explicit Node(ByteStream &stream, uint64_t identity,
++                  uint32_t reconstruction_limit = 64,
++                  leveldb::Env *env = nullptr, bool relay = true)
++        : home(env), network(Network(*runtime, reconstruction_limit)),
++          transport(stream, SessionSettings(network, identity, relay),
++                    TransportSettings()) {
++        manager = std::make_unique<DownloadManager>(DownloadSettings(network),
++                                                    Callbacks());
++        dispatcher = std::make_unique<PeerDispatcher>(
++            *runtime, *manager, DispatcherSettings(network),
++            DispatcherCallbacks{[this](PeerHandle, const ResourceNeed &n) {
++                                    return serving.Reserve(n);
++                                },
++                                [this](uint64_t &out) {
++                                    out = ++nonce;
++                                    return true;
++                                }});
++        Check(dispatcher->Attach(transport, connection) ==
++                  DispatcherResult::Queued,
++              "attach real transport");
++    }
++    DownloadCallbacks Callbacks() {
++        return {
++            [this](const Header &h, uint64_t epoch) {
++                std::string e;
++                lotus::v2::Hash id;
++                std::optional<IndexedHeader> indexed;
++                std::optional<lotus::v2::Hash> invalid;
++                const auto snap = runtime->Snapshot();
++                if (!snap.chain || snap.reopen_required ||
++                    snap.chain->profile_digest != network.profile_digest ||
++                    epoch != dispatcher->FetchEpoch())
++                    return HeaderDecision{HeaderDisposition::OperationalError,
++                                          {},
++                                          "authority/epoch unavailable"};
++                if (!BlockId(network.chain_id, h, id))
++                    return HeaderDecision{HeaderDisposition::Unsupported,
++                                          {},
++                                          "unencodable header"};
++                if (runtime->ReadHeader(id, indexed, e) !=
++                        DevelopmentRuntimeResult::Progress ||
++                    runtime->ReadInvalidity(id, invalid, e) !=
++                        DevelopmentRuntimeResult::Progress)
++                    return HeaderDecision{
++                        HeaderDisposition::OperationalError, {}, e};
++                if (invalid)
++                    return HeaderDecision{HeaderDisposition::ConsensusInvalid,
++                                          {},
++                                          "excluded by durable invalidity"};
++                if (!indexed)
++                    return HeaderDecision{HeaderDisposition::MissingParent,
++                                          h.prev_id,
++                                          "header not authenticated"};
++                std::array<uint8_t, HEADER_SIZE> a{}, b{};
++                Check(SerializeHeader(h, a) &&
++                          SerializeHeader(indexed->header, b) && a == b,
++                      "exact indexed header binding");
++                return HeaderDecision{HeaderDisposition::Eligible, {}, {}};
++            },
++            [this](PeerHandle, const ResourceNeed &n) {
++                return staging.Reserve(n);
++            },
++            [](const Header &) { return CachedTransactions{{}, 0}; },
++            [this](std::span<const uint8_t> bytes, uint64_t epoch) {
++                ++admissions;
++                const auto snap = runtime->Snapshot();
++                if (!snap.chain || snap.reopen_required ||
++                    epoch != dispatcher->FetchEpoch())
++                    return BodyDecision{BodyDisposition::ContextChanged,
++                                        {},
++                                        "authority/epoch unavailable"};
++                Header h;
++                lotus::v2::Hash id;
++                std::string e;
++                std::optional<lotus::v2::Hash> invalid;
++                if (!ParseHeader(bytes.data(),
++                                 std::min(bytes.size(), HEADER_SIZE), h) ||
++                    !BlockId(network.chain_id, h, id))
++                    return BodyDecision{BodyDisposition::MalformedBody,
++                                        {},
++                                        "invalid body header"};
++                if (runtime->ReadInvalidity(id, invalid, e) !=
++                    DevelopmentRuntimeResult::Progress)
++                    return BodyDecision{BodyDisposition::StorageError, {}, e};
++                if (invalid)
++                    return BodyDecision{BodyDisposition::ConsensusInvalid,
++                                        {},
++                                        "excluded by durable invalidity"};
++                CandidateBodyStatus out = CandidateBodyStatus::Malformed;
++                const auto r = runtime->RetainBody(
++                    id, Bytes(bytes.begin(), bytes.end()), out, e);
++                if (r == DevelopmentRuntimeResult::Progress &&
++                    (out == CandidateBodyStatus::RetainedAuthenticated ||
++                     out == CandidateBodyStatus::Duplicate))
++                    return BodyDecision{
++                        BodyDisposition::RetainedAuthenticated, {}, {}};
++                if (r == DevelopmentRuntimeResult::CapacityRefused)
++                    return BodyDecision{
++                        BodyDisposition::CapacityRefused, {}, e};
++                if (r == DevelopmentRuntimeResult::MissingHeader)
++                    return BodyDecision{BodyDisposition::MissingParent,
++                                        h.prev_id, e};
++                if (r == DevelopmentRuntimeResult::MalformedBody)
++                    return BodyDecision{BodyDisposition::MalformedBody, {}, e};
++                return BodyDecision{BodyDisposition::StorageError, {}, e};
++            }};
++    }
++    DispatcherUsage Poll(uint64_t ms) {
++        auto u = dispatcher->Tick(ms, UINT64_MAX, 0, budget);
++        const auto b = budget;
++        Check(u.actions <= b.max_actions &&
++                  u.transport_actions <= b.transport.max_actions &&
++                  u.read_bytes + u.written_bytes <= b.transport.max_io_bytes &&
++                  u.fed_bytes <= b.transport.max_feed_bytes &&
++                  u.runtime_queries <= b.max_runtime_queries &&
++                  u.header_admissions <= b.max_header_admissions &&
++                  u.served_bytes <= b.max_served_bytes,
++              "dispatcher aggregate budgets");
++        while (auto n = dispatcher->TakeNotice())
++            notices.push_back(std::move(*n));
++        return u;
++    }
++    bool Active() const {
++        return transport.State() == SessionState::Active &&
++               bool(dispatcher->Handle(connection));
++    }
++    bool Stable(size_t n) const {
++        const auto s = runtime->Snapshot();
++        return s.chain && s.chain->stable_tip == H(V(n).id) &&
++               !s.chain->pending_journal && !s.chain->pending_receipt &&
++               !s.chain->pending_propagation;
++    }
++};
++struct Pair {
++    Pipe ab, ba;
++    MemoryStream sa{ba, ab}, sb{ab, ba};
++    Node a, b;
++    uint64_t ms = 1;
++    explicit Pair(uint32_t reconstruction_limit = 64,
++                  leveldb::Env *env = nullptr)
++        : a(sa, 41, reconstruction_limit, env), b(sb, 51) {
++        Check(a.dispatcher->Open(a.connection, ms) == DispatcherResult::Queued,
++              "open first connection");
++        Check(b.dispatcher->Open(b.connection, ms) == DispatcherResult::Queued,
++              "open second connection");
++        for (unsigned n = 0; n < 1000 && (!a.Active() || !b.Active()); ++n)
++            Cycle();
++        Check(a.Active() && b.Active(),
++              "actual Session handshake activates both runtimes");
++    }
++    void Cycle() {
++        a.Poll(ms);
++        b.Poll(ms);
++        ++ms;
++    }
++    void Headers() {
++        Check(a.dispatcher->StartHeaders(a.connection, lotus::v2::Hash{}, ms) ==
++                  DispatcherResult::Queued,
++              "request header pages");
++    }
++};
++
++} // namespace
+diff --git a/src/lotus_v2/avalanche_peer_test/runtime_fixtures.h b/src/lotus_v2/avalanche_peer_test/runtime_fixtures.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..e2f87c6f2f042836f6a6b7ba7ad0cc8f1ff32f93
+--- /dev/null
++++ b/src/lotus_v2/avalanche_peer_test/runtime_fixtures.h
+@@ -0,0 +1,358 @@
++// Copyright (c) 2026 The Lotus developers
++// Minimal immutable fork corpus and profile copied from runtime fixtures,
++// originally copied from
++// test_reorg_recovery.cpp at f93ea73fd. Existing corpus bytes remain unchanged.
++// Original corpus reference: 82e7135016aaf6b6d6d191a7422348016f72984f.
++// Manifest SHA256:
++// 33d84853403b2eaa686a5ad4fdd799daffc8fc9c712b0f8662d914a29f11d720. Generator
++// SHA256: 37bc9714485cd8f82fb569e7d59a710ae54a2626a065acedea416efa12fddc95. The
++// supplemental host-guard provenance appears beside its corpus entries.
++#ifndef LOTUS_V2_PEER_DISPATCHER_TEST_FIXTURES_H
++#define LOTUS_V2_PEER_DISPATCHER_TEST_FIXTURES_H
++#include "../development_chain.h"
++#include "../header_admission.h"
++#include "../reorg_recovery.h"
++#include <algorithm>
++#include <cstdlib>
++#include <filesystem>
++#include <map>
++#include <stdexcept>
++#include <utility>
++namespace runtime_fixture {
++using namespace lotus::v2;
++void Check(bool value, const std::string &why) {
++    if (!value) throw std::runtime_error(why);
++}
++std::vector<uint8_t> Bytes(const std::string &hex) {
++    Check(hex.size() % 2 == 0, "hex length");
++    std::vector<uint8_t> out;
++    for (size_t i = 0; i < hex.size(); i += 2)
++        out.push_back(uint8_t(std::stoul(hex.substr(i, 2), nullptr, 16)));
++    return out;
++}
++lotus::v2::Hash H(const std::string &hex) {
++    const auto bytes = Bytes(hex);
++    Check(bytes.size() == 32, "hash length");
++    lotus::v2::Hash out{};
++    std::copy(bytes.begin(), bytes.end(), out.begin());
++    return out;
++}
++struct Vector {
++    std::string name, wire, id, root, monetary;
++    std::vector<std::string> coins;
++};
++const std::vector<Vector> vectors{
++    {"common1",
++     "9dc4d2fa9803bad48ae38ec24027bf55abff952f7e549a738986112848fab629ffff7f20f"
++     "817d06a0000000000000000000002000000f200000000000000010000000000000066c44a"
++     "c9bff9494dcc4ffa8f3c2559d258dd3d8cc37068f3a1cbabb0d53189a189816244452d59f"
++     "24f315f64a4b308b6f0fe77e75bdb956116c479f637c816eb010000006707000000000000"
++     "0000000000010001009dc4d2fa9803bad48ae38ec24027bf55abff952f7e549a738986112"
++     "848fab62901000000ffffffff020000a08601000000000001a88cef369f758aec3e594eaa"
++     "4e8d08c9f12ef3f11bea972ec53a416a148f0605010100",
++     "f33bc70aa43244b2d7adac2f0b1b7aade87f9aaac3bb79bd9812720b9e1df07c",
++     "45d8bf67b93879dd6d31423c7a1424b676fda698ffa3f106369a7cd7ec91bdba",
++     "c0bdf023f400000040420f000000000002000000000000000000000000000000000000000"
++     "00000000000000000000000edff000000000000",
++     {"c3a9501b9a870d7106c78831baf4fd6ca383f5bf8c06d3d7a0e2c3289d5fde3500000000"
++      "2d00a08601000000000001a88cef369f758aec3e594eaa4e8d08c9f12ef3f11bea972ec5"
++      "3a416a148f060501010001000000000000008017d06a0000000001"}},
++    {"common2",
++     "f33bc70aa43244b2d7adac2f0b1b7aade87f9aaac3bb79bd9812720b9e1df07cffff7f207"
++     "018d06a0000000000000000000002000000f20000000000000002000000000000009f4419"
++     "7e0a97be712d695f8590e4953b246c67382961aa7c771e7adea17ec1e62cbcd908306d928"
++     "9ad6fb8a7dcb4d593804f4894558adb968b1bdf0685842904010000006707000000000000"
++     "000000000001000100f33bc70aa43244b2d7adac2f0b1b7aade87f9aaac3bb79bd9812720"
++     "b9e1df07c02000000ffffffff020000a08601000000000001a88cef369f758aec3e594eaa"
++     "4e8d08c9f12ef3f11bea972ec53a416a148f0605010100",
++     "baba410deeb8099d04e0ea78763db46127e598c6528dd80a1cabbfbe4ff5f378",
++     "f0b8729421620fc461a0697bc0790cddcbea43e63f13b4c26ace01a545a98385",
++     "817be123f400000040420f000000000002000000000000000000000000000000000000000"
++     "00000000000000000000000dbff000000000000",
++     {"c3a9501b9a870d7106c78831baf4fd6ca383f5bf8c06d3d7a0e2c3289d5fde3500000000"
++      "2d00a08601000000000001a88cef369f758aec3e594eaa4e8d08c9f12ef3f11bea972ec5"
++      "3a416a148f060501010001000000000000008017d06a0000000001",
++      "83afaedaf64d3ee726c3e7a875a0393b1874b363eb2cb78b7f3a50392741144400000000"
++      "2d00a08601000000000001a88cef369f758aec3e594eaa4e8d08c9f12ef3f11bea972ec5"
++      "3a416a148f06050101000200000000000000f817d06a0000000001"}},
++    {"source1",
++     "baba410deeb8099d04e0ea78763db46127e598c6528dd80a1cabbfbe4ff5f378ffff7f20e"
++     "818d06a00000000000000000000020000005f010000000000000300000000000000604bbd"
++     "4c610226dd533473889a1d638a9ae53a076aee792c4a307dfb16f3d3ad6cc2f86f269c409"
++     "05170c56f0252e83f43e37d05ee1a9d59b2098fe1d22ee31b020000006707000000000000"
++     "000000000001000100baba410deeb8099d04e0ea78763db46127e598c6528dd80a1cabbfb"
++     "e4ff5f37803000000ffffffff020000a08601000000000001a88cef369f758aec3e594eaa"
++     "4e8d08c9f12ef3f11bea972ec53a416a148f06050101006c0700000000000000000000000"
++     "1000100c3a9501b9a870d7106c78831baf4fd6ca383f5bf8c06d3d7a0e2c3289d5fde3500"
++     "000000ffffffff010001014e000000b88201000000000001a88cef369f758aec3e594eaa4"
++     "e8d08c9f12ef3f11bea972ec53a416a148f0605010100",
++     "59572fa921a7157edc12d88bb3845bb351d5985656d658b3c5319378fbddde6f",
++     "33dee9ed5f17cd7e785d9b977a75b61e26ee48cea3f77da3b4fb71b22cacfd5c",
++     "4339d223f400000040420f000000000002000000000000000000000000000000000000000"
++     "000000000000000000000003300010000000000",
++     {"83afaedaf64d3ee726c3e7a875a0393b1874b363eb2cb78b7f3a50392741144400000000"
++      "2d00a08601000000000001a88cef369f758aec3e594eaa4e8d08c9f12ef3f11bea972ec5"
++      "3a416a148f06050101000200000000000000f817d06a0000000001",
++      "78efe866b735659e41276bfb10652b1ef571ea59eb4ea60b284cd5cdbed98a4400000000"
++      "2d00a08601000000000001a88cef369f758aec3e594eaa4e8d08c9f12ef3f11bea972ec5"
++      "3a416a148f06050101000300000000000000f817d06a0000000001",
++      "1486a1bf778ac923c742c190a20db3c4a07ed28f082767c5e903047eee887e2c00000000"
++      "2d00b88201000000000001a88cef369f758aec3e594eaa4e8d08c9f12ef3f11bea972ec5"
++      "3a416a148f06050101000300000000000000f817d06a0000000000"}},
++    {"source2",
++     "59572fa921a7157edc12d88bb3845bb351d5985656d658b3c5319378fbddde6fffff7f206"
++     "019d06a00000000000000000000020000005f01000000000000040000000000000037c2e0"
++     "889b8c8d8d8bd2ee97fec49d2cdf21856bc6c43675838dd03505afd3aa7765566ffd0784f"
++     "00f02b08716288fdc6316c9463799f3b1f8be8da56695aa83020000006707000000000000"
++     "00000000000100010059572fa921a7157edc12d88bb3845bb351d5985656d658b3c531937"
++     "8fbddde6f04000000ffffffff020000a08601000000000001a88cef369f758aec3e594eaa"
++     "4e8d08c9f12ef3f11bea972ec53a416a148f06050101006c0700000000000000000000000"
++     "10001001486a1bf778ac923c742c190a20db3c4a07ed28f082767c5e903047eee887e2c00"
++     "000000ffffffff010001014e000000d07e01000000000001a88cef369f758aec3e594eaa4"
++     "e8d08c9f12ef3f11bea972ec53a416a148f0605010100",
++     "7fb8139809ad5379efe2c6115b85b858d057cb1c95ae03b683847b2963c1db58",
++     "1f4f143925cffbe1953a9757ea70b152cc1b4db8d804909281f507188fa5281d",
++     "06f7c223f400000040420f000000000002000000000000000000000000000000000000000"
++     "000000000000000000000008a00010000000000",
++     {"83afaedaf64d3ee726c3e7a875a0393b1874b363eb2cb78b7f3a50392741144400000000"
++      "2d00a08601000000000001a88cef369f758aec3e594eaa4e8d08c9f12ef3f11bea972ec5"
++      "3a416a148f06050101000200000000000000f817d06a0000000001",
++      "78efe866b735659e41276bfb10652b1ef571ea59eb4ea60b284cd5cdbed98a4400000000"
++      "2d00a08601000000000001a88cef369f758aec3e594eaa4e8d08c9f12ef3f11bea972ec5"
++      "3a416a148f06050101000300000000000000f817d06a0000000001",
++      "49bd6cdaf950271b65450006c62fac78566a7843071a49e9ad8f945529e3055b00000000"
++      "2d00a08601000000000001a88cef369f758aec3e594eaa4e8d08c9f12ef3f11bea972ec5"
++      "3a416a148f060501010004000000000000007018d06a0000000001",
++      "346af818b5487956605beb9d831668e99fd7703464b8cd385ab3c21082c8e86f00000000"
++      "2d00d07e01000000000001a88cef369f758aec3e594eaa4e8d08c9f12ef3f11bea972ec5"
++      "3a416a148f060501010004000000000000007018d06a0000000000"}},
++    {"target1",
++     "baba410deeb8099d04e0ea78763db46127e598c6528dd80a1cabbfbe4ff5f378ffff7f20d"
++     "01cd06a00000000000000000000020000005f01000000000000030000000000000064b139"
++     "26e49756125ea0b4dfc6cf69d812e9eccdd7f769cf00452b25a2303794684c40418c1b976"
++     "6b4e074e491545a50f51205d3d38ccd7d29b1274747d4f3e1020000006707000000000000"
++     "000000000001000100baba410deeb8099d04e0ea78763db46127e598c6528dd80a1cabbfb"
++     "e4ff5f37803000000ffffffff020000a08601000000000001a88cef369f758aec3e594eaa"
++     "4e8d08c9f12ef3f11bea972ec53a416a148f06050101006c0700000000000000000000000"
++     "1000100c3a9501b9a870d7106c78831baf4fd6ca383f5bf8c06d3d7a0e2c3289d5fde3500"
++     "000000ffffffff010001014e000000d07e01000000000001a88cef369f758aec3e594eaa4"
++     "e8d08c9f12ef3f11bea972ec53a416a148f0605010100",
++     "b9a94477fc2604f68a23bf121bac6a8888aee9f53f1e39b45718def934f05e4e",
++     "7c7258dd6f91ef99644a210879cf75fdf26ba9f6ce7ab8a35c99594f392e4e4a",
++     "4339d223f400000040420f000000000002000000000000000000000000000000000000000"
++     "000000000000000000000003300010000000000",
++     {"83afaedaf64d3ee726c3e7a875a0393b1874b363eb2cb78b7f3a50392741144400000000"
++      "2d00a08601000000000001a88cef369f758aec3e594eaa4e8d08c9f12ef3f11bea972ec5"
++      "3a416a148f06050101000200000000000000f817d06a0000000001",
++      "78efe866b735659e41276bfb10652b1ef571ea59eb4ea60b284cd5cdbed98a4400000000"
++      "2d00a08601000000000001a88cef369f758aec3e594eaa4e8d08c9f12ef3f11bea972ec5"
++      "3a416a148f06050101000300000000000000f817d06a0000000001",
++      "d21b60ac31dfc685c710ee20a49fb7db3e5c826c8a0568a9e83e76abcbd0719400000000"
++      "2d00d07e01000000000001a88cef369f758aec3e594eaa4e8d08c9f12ef3f11bea972ec5"
++      "3a416a148f06050101000300000000000000f817d06a0000000000"}},
++    {"target2",
++     "b9a94477fc2604f68a23bf121bac6a8888aee9f53f1e39b45718def934f05e4effff7f206"
++     "019d06a00000100000000000000020000005f010000000000000400000000000000f65a9d"
++     "ba3f295f7af2fce74aa2d06bff180e4f84e2f4bd48499c5ee5c7f5a6728e66abc131bf507"
++     "99218f7b4632d51df18be69aa9e3203c446bbb28566c62846020000006707000000000000"
++     "000000000001000100b9a94477fc2604f68a23bf121bac6a8888aee9f53f1e39b45718def"
++     "934f05e4e04000000ffffffff020000a08601000000000001a88cef369f758aec3e594eaa"
++     "4e8d08c9f12ef3f11bea972ec53a416a148f06050101006c0700000000000000000000000"
++     "1000100d21b60ac31dfc685c710ee20a49fb7db3e5c826c8a0568a9e83e76abcbd0719400"
++     "000000ffffffff010001014e000000007701000000000001a88cef369f758aec3e594eaa4"
++     "e8d08c9f12ef3f11bea972ec53a416a148f0605010100",
++     "a419666d81dad8b7c1329fb21c421048ecf3874277169b1c243e3d9328f1783f",
++     "78ad498b1b48554ebbb4ec6d86d289e89e453414159b4589306e068b35160af8",
++     "06f7c223f400000040420f000000000002000000000000000000000000000000000000000"
++     "000000000000000000000008a00010000000000",
++     {"83afaedaf64d3ee726c3e7a875a0393b1874b363eb2cb78b7f3a50392741144400000000"
++      "2d00a08601000000000001a88cef369f758aec3e594eaa4e8d08c9f12ef3f11bea972ec5"
++      "3a416a148f06050101000200000000000000f817d06a0000000001",
++      "78efe866b735659e41276bfb10652b1ef571ea59eb4ea60b284cd5cdbed98a4400000000"
++      "2d00a08601000000000001a88cef369f758aec3e594eaa4e8d08c9f12ef3f11bea972ec5"
++      "3a416a148f06050101000300000000000000f817d06a0000000001",
++      "31887c3eb9cd56dfb5e334b94f71f42b1acb38c4f02d4e3f5bec65ee16a6265d00000000"
++      "2d00a08601000000000001a88cef369f758aec3e594eaa4e8d08c9f12ef3f11bea972ec5"
++      "3a416a148f060501010004000000000000007018d06a0000000001",
++      "a652d85b184682f4f9b58b232c5c0ffa489058a5ba4c1c6ee9f4df774cdfd8ee00000000"
++      "2d00007701000000000001a88cef369f758aec3e594eaa4e8d08c9f12ef3f11bea972ec5"
++      "3a416a148f060501010004000000000000007018d06a0000000000"}},
++    {"target3",
++     "a419666d81dad8b7c1329fb21c421048ecf3874277169b1c243e3d9328f1783fffff7f20d"
++     "819d06a0000010000000000000002000000f20000000000000005000000000000004de441"
++     "880b2be91fd3795bfab4ff3ca923d5baa23d1c5e4d9ecceefe2d517ef28183fb6596bf798"
++     "44c90e38a793af9ff1bd9e2389bba1561923a7c8e79f9c000010000006707000000000000"
++     "000000000001000100a419666d81dad8b7c1329fb21c421048ecf3874277169b1c243e3d9"
++     "328f1783f05000000ffffffff020000a08601000000000001a88cef369f758aec3e594eaa"
++     "4e8d08c9f12ef3f11bea972ec53a416a148f0605010100",
++     "b0e588ca2c5a384bc276a97ecffd2d1afbb8fe2ffc54659008deeda948c91506",
++     "415db3cb33fe202c5a735835b774b2d221f03cc84f2cc9d27066f8ee77f612ce",
++     "cab4b323f400000040420f000000000002000000000000000000000000000000000000000"
++     "000000000000000000000007700010000000000",
++     {"83afaedaf64d3ee726c3e7a875a0393b1874b363eb2cb78b7f3a50392741144400000000"
++      "2d00a08601000000000001a88cef369f758aec3e594eaa4e8d08c9f12ef3f11bea972ec5"
++      "3a416a148f06050101000200000000000000f817d06a0000000001",
++      "78efe866b735659e41276bfb10652b1ef571ea59eb4ea60b284cd5cdbed98a4400000000"
++      "2d00a08601000000000001a88cef369f758aec3e594eaa4e8d08c9f12ef3f11bea972ec5"
++      "3a416a148f06050101000300000000000000f817d06a0000000001",
++      "31887c3eb9cd56dfb5e334b94f71f42b1acb38c4f02d4e3f5bec65ee16a6265d00000000"
++      "2d00a08601000000000001a88cef369f758aec3e594eaa4e8d08c9f12ef3f11bea972ec5"
++      "3a416a148f060501010004000000000000007018d06a0000000001",
++      "a652d85b184682f4f9b58b232c5c0ffa489058a5ba4c1c6ee9f4df774cdfd8ee00000000"
++      "2d00007701000000000001a88cef369f758aec3e594eaa4e8d08c9f12ef3f11bea972ec5"
++      "3a416a148f060501010004000000000000007018d06a0000000000",
++      "c984cbb3c1de7dc364fd5f4e984b9a43866b77c6618203c873fa5c2da0c8253300000000"
++      "2d00a08601000000000001a88cef369f758aec3e594eaa4e8d08c9f12ef3f11bea972ec5"
++      "3a416a148f060501010005000000000000007018d06a0000000001"}},
++    {"invalid2",
++     "b9a94477fc2604f68a23bf121bac6a8888aee9f53f1e39b45718def934f05e4effff7f206"
++     "019d06a00000100000000000000020000005f010000000000000400000000000000ffca31"
++     "f57c9e34b7689300c8acb75df4f067c9107dec558ec82deed913d6a8168e66abc131bf507"
++     "99218f7b4632d51df18be69aa9e3203c446bbb28566c62846020000006707000000000000"
++     "000000000001000100b9a94477fc2604f68a23bf121bac6a8888aee9f53f1e39b45718def"
++     "934f05e4e04000000ffffffff020000a08601000000000001a88cef369f758aec3e594eaa"
++     "4e8d08c9f12ef3f11bea972ec53a416a148f06050101006c0700000000000000000000000"
++     "1000100717171717171717171717171717171717171717171717171717171717171717100"
++     "000000ffffffff010001014e000000007701000000000001a88cef369f758aec3e594eaa4"
++     "e8d08c9f12ef3f11bea972ec53a416a148f0605010100",
++     "78ec0e726d6ba28484d1dbf603467edaf483982c796e1f2b7ae4c5ccf9aae32e",
++     "",
++     "",
++     {}},
++    {"invalid3",
++     "78ec0e726d6ba28484d1dbf603467edaf483982c796e1f2b7ae4c5ccf9aae32effff7f20d"
++     "819d06a0000010000000000000002000000f200000000000000050000000000000036fcc7"
++     "053e19e48438a9de1876e0b6f4b026deefe50dfb92e0fa314333e020f98183fb6596bf798"
++     "44c90e38a793af9ff1bd9e2389bba1561923a7c8e79f9c000010000006707000000000000"
++     "00000000000100010078ec0e726d6ba28484d1dbf603467edaf483982c796e1f2b7ae4c5c"
++     "cf9aae32e05000000ffffffff020000a08601000000000001a88cef369f758aec3e594eaa"
++     "4e8d08c9f12ef3f11bea972ec53a416a148f0605010100",
++     "67d9da0207a8a5207b7e3b6e7e52bf3d712a6b9111eabd4ed0f8b56e0e2a5756",
++     "",
++     "",
++     {}},
++};
++const std::string genesis_wire =
++    "0000000000000000000000000000000000000000000000000000000000000000ffff7f2080"
++    "17d06a0000000000000000000002000000f0000000000000000000000000000000fbcbdc90"
++    "3ed556474f951ad2ffb14053eeadd3f3451ec53308b44654be79916334e7e326e15b8deb99"
++    "d092ac6ec1fa9c866b43933e18beda3e45550df4857d8a0100000065070000000000000000"
++    "00000001000100000000000000000000000000000000000000000000000000000000000000"
++    "000000000000ffffffff02000200000000000000000119bb83be3bee6d8f041e8e0923a87e"
++    "9289c30ad8d13e48e72a8d5db3f260d03c00";
++const std::string initial_money =
++    "00000024f400000040420f0000000000020000000000000000000000000000000000000000"
++    "00000000000000000000000000010000000000";
++ReorgProfiles Profiles() {
++    ReorgProfiles p;
++    p.header = {
++        H("63b5ddca6f75cbc64df5ff128cadd35e8658905595afc290b7698b2419b9745c"),
++        2,
++        1792022400,
++        0x207fffff,
++        H("0000000000000000000000000000000000000000000000000000000000ffff7f"),
++        172800,
++        120};
++    p.header.genesis_id =
++        H("9dc4d2fa9803bad48ae38ec24027bf55abff952f7e549a738986112848fab629");
++    p.ordinary.transaction = {256, 256, 256, 8192, 64, 8192, 64};
++    p.ordinary.vm = {8192, 64, 8192, 256, 256, 1048576, 64, 100000000};
++    p.ordinary.vm_cost.max_invocation_cost = 100000000;
++    p.ordinary.vm_cost.structural_byte_cost = 1;
++    p.ordinary.vm_cost.opcode = {
++        {{1, 1, 1},     {1, 1, 1},     {1, 1, 1},    {1, 1, 1},
++         {1, 1, 1},     {1, 1, 1},     {1, 1, 1},    {1, 1, 1},
++         {1, 1, 1},     {1, 1, 1},     {1, 1, 1},    {1, 1, 1},
++         {1, 1, 1},     {1, 1, 1},     {1, 1, 1},    {1, 1, 1},
++         {1, 1, 1},     {1, 1, 1},     {1, 1, 1},    {1, 1, 1},
++         {1, 1, 1},     {1, 1, 1},     {1, 1, 1},    {1, 1, 1},
++         {1, 1, 1},     {1, 1, 1},     {1, 1, 1},    {1, 1, 1},
++         {1, 1, 1},     {1, 1, 1},     {1, 1, 1},    {1, 1, 1},
++         {1, 1, 1},     {1, 1, 1},     {1, 1, 1},    {1, 1, 1},
++         {1, 1, 1},     {1, 1, 1},     {1, 1, 1},    {1, 1, 1},
++         {1, 1, 1},     {1, 1, 1},     {1, 1, 1},    {1, 1, 1},
++         {1, 1, 1},     {1, 1, 1},     {1, 1, 1},    {1, 1, 1},
++         {1, 1, 1},     {1, 1, 1},     {1, 1, 1},    {1, 1, 1},
++         {1, 1, 1},     {1, 1, 1},     {1, 1, 1},    {1, 1, 1},
++         {1, 1, 1},     {1, 1, 1},     {1, 1, 1},    {1, 1, 1},
++         {1, 1, 1},     {1, 1, 1},     {1, 1, 1},    {1, 1, 1},
++         {1, 1, 1},     {1, 1, 1},     {1, 1, 1},    {1, 1, 1},
++         {1, 1, 1},     {1, 1, 1},     {1, 1, 1},    {1, 1, 1},
++         {1, 1, 1},     {1, 1, 1},     {1, 1, 1},    {1, 1, 1},
++         {1, 1, 1},     {1, 1, 1},     {1, 1, 1},    {1, 1, 1},
++         {1, 1, 1},     {1, 1, 1},     {1, 1, 1},    {1, 1, 1},
++         {1, 1, 1},     {1, 1, 1},     {1, 1, 1},    {1, 1, 1},
++         {1, 1, 1},     {1, 1, 1},     {1, 1, 1},    {1, 1, 1},
++         {1, 1, 1},     {1, 1, 1},     {0, 0, 0},    {0, 0, 0},
++         {1, 1, 1},     {1, 1, 1},     {1, 1, 1},    {1, 1, 1},
++         {1, 1, 1},     {1, 1, 1},     {1, 1, 1},    {1, 1, 1},
++         {1, 1, 1},     {1, 1, 1},     {1, 1, 1},    {1, 1, 1},
++         {0, 0, 0},     {0, 0, 0},     {0, 0, 0},    {0, 0, 0},
++         {1, 1, 1},     {1, 1, 1},     {1, 1, 1},    {1, 1, 1},
++         {1, 1, 1},     {1, 1, 1},     {1, 1, 1},    {1, 1, 1},
++         {1, 1, 1},     {1, 1, 1},     {1, 1, 1},    {1, 1, 1},
++         {1, 1, 1},     {1, 1, 1},     {1, 1, 1},    {1, 1, 1},
++         {1, 1, 1},     {1, 1, 1},     {0, 0, 0},    {0, 0, 0},
++         {0, 0, 0},     {0, 0, 0},     {0, 0, 0},    {0, 0, 0},
++         {1, 1, 1},     {1, 1, 1},     {1, 1, 1},    {1, 1, 1},
++         {1, 1, 1},     {1, 1, 1},     {1, 1, 1},    {1, 1, 1},
++         {1, 1, 1},     {1, 1, 1},     {1, 1, 1},    {1, 1, 1},
++         {1, 1, 1},     {0, 0, 0},     {0, 0, 0},    {0, 0, 0},
++         {1000, 1, 1},  {1000, 1, 1},  {1000, 1, 1}, {1000, 1, 1},
++         {1000, 1, 1},  {1000, 1, 1},  {1000, 1, 1}, {1000, 1, 1},
++         {1000, 1, 1},  {1000, 1, 1},  {1000, 1, 1}, {1000, 1, 1},
++         {1000, 1, 1},  {1000, 1, 1},  {1000, 1, 1}, {1000, 1, 1},
++         {1000, 1, 1},  {1000, 1, 1},  {1000, 1, 1}, {1000, 1, 1},
++         {1000, 1, 1},  {1000, 1, 1},  {1000, 1, 1}, {1000, 1, 1},
++         {1000, 1, 1},  {1000, 1, 1},  {1000, 1, 1}, {10000, 1, 1},
++         {1000, 1, 1},  {0, 0, 0},     {0, 0, 0},    {0, 0, 0},
++         {1, 1, 1},     {64, 1, 1},    {1, 1, 1},    {50000, 1, 1},
++         {50000, 1, 1}, {50000, 1, 1}, {64, 1, 1},   {64, 1, 1},
++         {1, 1, 1},     {1, 1, 1},     {256, 1, 1},  {0, 0, 0},
++         {0, 0, 0},     {0, 0, 0},     {0, 0, 0},    {0, 0, 0},
++         {1, 1, 1},     {1, 1, 1},     {1, 1, 1},    {1, 1, 1},
++         {1, 1, 1},     {1, 1, 1},     {1, 1, 1},    {1, 1, 1},
++         {1, 1, 1},     {1, 1, 1},     {1, 1, 1},    {1, 1, 1},
++         {1, 1, 1},     {1, 1, 1},     {1, 1, 1},    {1, 1, 1},
++         {1, 1, 1},     {1, 1, 1},     {1, 1, 1},    {1, 1, 1},
++         {1, 1, 1},     {1, 1, 1},     {0, 0, 0},    {0, 0, 0},
++         {1, 1, 1},     {1, 1, 1},     {1, 1, 1},    {1, 1, 1},
++         {1, 1, 1},     {1, 1, 1},     {1, 1, 1},    {1, 1, 1},
++         {1, 1, 1},     {1, 1, 1},     {1, 1, 1},    {0, 0, 0},
++         {0, 0, 0},     {0, 0, 0},     {0, 0, 0},    {0, 0, 0},
++         {1, 1, 1},     {1, 1, 1},     {1, 1, 1},    {1, 1, 1},
++         {1, 1, 1},     {0, 0, 0},     {0, 0, 0},    {0, 0, 0},
++         {0, 0, 0},     {0, 0, 0},     {0, 0, 0},    {0, 0, 0},
++         {0, 0, 0},     {0, 0, 0},     {0, 0, 0},    {0, 0, 0}}};
++    p.ordinary.coinbase_maturity = 2;
++    p.ordinary.dust_limit = 546;
++    p.ordinary.max_total_invocation_cost = ~VmCostUnits(0);
++    p.monetary = {20, 17, 10, 65536, 64, 32, 1000000, 1000000000, 546, 1000, 0, {}};
++    const auto initial = DecodeMonetaryState(Bytes(initial_money));
++    p.monetary.genesis_tail = initial.tail_subsidy;
++    p.monetary.genesis_work = initial.prev_work;
++    p.cost = {1, 1, 1, 1};
++    return p;
++}
++const Vector &V(size_t n) {
++    return vectors.at(n);
++}
++Outpoint Key(const std::vector<uint8_t> &raw) {
++    Check(raw.size() >= 36, "coin entry length");
++    Outpoint out;
++    std::copy_n(raw.begin(), 32, out.tx_id.begin());
++    for (unsigned i = 0; i < 4; ++i)
++        out.index |= uint32_t(raw[32 + i]) << (8 * i);
++    return out;
++}
++Header HeaderOf(const Vector &v) {
++    const auto raw = Bytes(v.wire);
++    Header h;
++    Check(ParseHeader(raw.data(), HEADER_SIZE, h), "fixture header");
++    return h;
++}
++ReorgLimits Limits() {
++    return {{8, 8, 100000}, 1 << 20, 16 << 20, 32 << 20, 4 << 20, 32 << 20};
++}
++} // namespace runtime_fixture
++#endif
+diff --git a/src/lotus_v2/peer_codec.cpp b/src/lotus_v2/peer_codec.cpp
+index 43ccf574bad7748a1a1ef8a5cd1888749c3810f0..d2a77e72faa0dca53c93a139bc18f21b5cbb6670 100644
+--- a/src/lotus_v2/peer_codec.cpp
++++ b/src/lotus_v2/peer_codec.cpp
+@@ -350,7 +350,7 @@ FeedStatus EnvelopeDecoder::Feed(std::span<const uint8_t> b, size_t &used,
+     return FeedStatus::MessageReady;
+ }
+ bool KnownInventoryType(uint32_t t) {
+-    return t == 1 || t == 2 || t == 4;
++    return t == 1 || t == 2 || t == 4 || t == PROOF_INVENTORY_TYPE;
+ }
+ bool EncodeInventory(std::span<const Inventory> v, uint32_t limit, Bytes &out,
+                      std::string &e) {
+diff --git a/src/lotus_v2/peer_codec.h b/src/lotus_v2/peer_codec.h
+index 3f1c03b828ef467c4f6ed2e804a033b2e072cf1e..2f7f38fd0f812e10d14d640a2c16653778a1f3dd 100644
+--- a/src/lotus_v2/peer_codec.h
++++ b/src/lotus_v2/peer_codec.h
+@@ -68,6 +68,7 @@ private:
+     Message pending_;
+     bool failed_ = false;
+ };
++constexpr uint32_t PROOF_INVENTORY_TYPE = 0x1f000001;
+ struct Inventory {
+     uint32_t type;
+     Hash hash;
+diff --git a/src/lotus_v2/peer_dispatcher.cpp b/src/lotus_v2/peer_dispatcher.cpp
+index 71f9c689c69020b142c7d66fab27d5bdf0dfe5ae..080da01843a9ddf1adb39af0995e5cd86a1c5991 100644
+--- a/src/lotus_v2/peer_dispatcher.cpp
++++ b/src/lotus_v2/peer_dispatcher.cpp
+@@ -460,6 +460,13 @@ struct PeerDispatcher::Impl {
+             Download(id, peer, std::move(event), now);
+             return true;
+         }
++        if (AvalancheCommand(command)) {
++            if (!(peer.transport->ActiveFeatures() & AVALANCHE_FEATURE)) {
++                ClosePeer(id, peer); return true;
++            }
++            notices.push_back({DispatcherNoticeKind::Application, id, {}, {}, {}, std::move(message)});
++            peer.input.reset(); return true;
++        }
+         if (command == "tx") {
+             if (!(peer.transport->ActiveFeatures() & TRANSACTION_RELAY_FEATURE)) {
+                 ClosePeer(id, peer);
+@@ -518,11 +525,11 @@ struct PeerDispatcher::Impl {
+             }
+             std::vector<Inventory> transactions, blocks;
+             for (const auto &item : peer.inventory)
+-                (item.type == 1 ? transactions : blocks).push_back(item);
++                (item.type == 1 || item.type == PROOF_INVENTORY_TYPE ? transactions : blocks).push_back(item);
+             if (!transactions.empty()) {
+-                if (!(peer.transport->ActiveFeatures() & TRANSACTION_RELAY_FEATURE)) {
+-                    ClosePeer(id, peer);
+-                    return true;
++                for (const auto &item : transactions) {
++                    const uint64_t required = item.type == PROOF_INVENTORY_TYPE ? AVALANCHE_FEATURE : TRANSACTION_RELAY_FEATURE;
++                    if (!(peer.transport->ActiveFeatures() & required)) { ClosePeer(id, peer); return true; }
+                 }
+                 Bytes payload;
+                 if (!EncodeInventory(transactions, limit, payload, error)) {
+@@ -894,14 +901,16 @@ DispatcherResult PeerDispatcher::SendApplication(ConnectionId id, Message messag
+     auto &p = found->second;
+     if (s.stopped || p.closed || !p.handle ||
+         p.transport->State() != SessionState::Active) return DispatcherResult::Closed;
+-    if (!(p.transport->ActiveFeatures() & TRANSACTION_RELAY_FEATURE))
++    const bool avalanche = AvalancheCommand(message.command);
++    const bool inventory = message.command == "inv" || message.command == "getdata" || message.command == "notfound";
++    if (!(p.transport->ActiveFeatures() & (avalanche ? AVALANCHE_FEATURE : inventory ? (TRANSACTION_RELAY_FEATURE | AVALANCHE_FEATURE) : TRANSACTION_RELAY_FEATURE)))
+         return DispatcherResult::CapacityRefused;
+     if (p.output) return DispatcherResult::Busy;
+     if (message.payload.size() > s.config.limits.max_pending_message_bytes ||
+         message.payload.size() > p.transport->ActiveLimit())
+         return DispatcherResult::CapacityRefused;
+     try {
+-        if (message.command != "tx") {
++        if (!avalanche && message.command != "tx") {
+             if (message.command != "inv" && message.command != "getdata" &&
+                 message.command != "notfound") return DispatcherResult::CapacityRefused;
+             std::vector<Inventory> items;
+@@ -910,7 +919,7 @@ DispatcherResult PeerDispatcher::SendApplication(ConnectionId id, Message messag
+                                  36ULL * s.config.limits.max_inventory_items;
+             if (message.payload.size() > cap ||
+                 !DecodeInventory(message.payload, p.transport->ActiveLimit(), items, error) ||
+-                std::any_of(items.begin(), items.end(), [](const auto &i) { return i.type != 1; }))
++                std::any_of(items.begin(), items.end(), [&](const auto &i) { return !((i.type == 1 && (p.transport->ActiveFeatures() & TRANSACTION_RELAY_FEATURE)) || (i.type == PROOF_INVENTORY_TYPE && (p.transport->ActiveFeatures() & AVALANCHE_FEATURE))); }))
+                 return DispatcherResult::CapacityRefused;
+         }
+         if (s.have_time && now < s.last_ms) return DispatcherResult::Closed;
+@@ -1096,3 +1105,9 @@ DispatcherUsage PeerDispatcher::Tick(uint64_t now, uint64_t wall,
+     return used;
+ }
+ } // namespace lotus::v2::peer
++
++std::optional<lotus::v2::peer::NegotiatedTranscript> lotus::v2::peer::PeerDispatcher::Transcript(ConnectionId id) const {
++    const auto p = impl_->peers.find(id);
++    if (p == impl_->peers.end() || p->second.closed) return std::nullopt;
++    return p->second.transport->Transcript();
++}
+diff --git a/src/lotus_v2/peer_dispatcher.h b/src/lotus_v2/peer_dispatcher.h
+index 6898ad09323336322e2a3bef33cf0da6fe450540..7a56d497775d23bb45518d286f8ae1d6963afd52 100644
+--- a/src/lotus_v2/peer_dispatcher.h
++++ b/src/lotus_v2/peer_dispatcher.h
+@@ -134,7 +134,8 @@ public:
+     std::optional<PeerHandle> Handle(ConnectionId) const;
+     std::optional<uint64_t> ActiveFeatures(ConnectionId) const;
+     std::optional<uint32_t> ActiveLimit(ConnectionId) const;
+-    // Only tx and type-1 inv/getdata/notfound; requires negotiated relay.
++    std::optional<NegotiatedTranscript> Transcript(ConnectionId) const;
++    // Negotiated Avalanche messages, or tx and type-1 inv/getdata/notfound; requires negotiated relay.
+     // Busy preserves the existing pending output; caller retains its action.
+     DispatcherResult SendApplication(ConnectionId, Message, uint64_t monotonic_ms);
+ 
+diff --git a/src/lotus_v2/peer_session.cpp b/src/lotus_v2/peer_session.cpp
+index e00c09c10098784a3aa30714de4548310099e4e2..8d3208682b8b8aaaa71a1ba37975fcdae65aadca 100644
+--- a/src/lotus_v2/peer_session.cpp
++++ b/src/lotus_v2/peer_session.cpp
+@@ -83,6 +83,10 @@ namespace {
+                            [&](const char *known) { return c == known; });
+     }
+ } // namespace
++bool AvalancheCommand(const std::string &c) {
++    return c == "avaproof" || c == "avahello" || c == "avapoll" ||
++           c == "avaresponse" || c == "getavaproofs" || c == "avaproofs" || c == "avaproofsreq";
++}
+ bool EncodeVersion(const VersionMessage &v, Bytes &out, std::string &e) {
+     if (v.version < MIN_V2_PEER_VERSION)
+         return Fail(e, "obsolete peer version");
+@@ -330,10 +334,14 @@ SessionEvent Session::Handle(Message message) {
+     if (state_ != SessionState::Active)
+         return Stop(SessionResult::PeerRejected,
+                     "application before activation");
+-    // Explicit allowlist keeps inherited Bloom, filters, Avalanche, snapshots,
++    // Explicit allowlist keeps inherited Bloom, filters, snapshots,
+     // package/mempool enumeration and feefilter handlers unavailable. Unknown
+     // optional commands are ignored after bounded envelope verification.
+-    if (!ApplicationCommand(command)) {
++    if (!ApplicationCommand(command) && !AvalancheCommand(command)) {
++        event.result = SessionResult::Ignored;
++        return event;
++    }
++    if (AvalancheCommand(command) && !(active_features_ & AVALANCHE_FEATURE)) {
+         event.result = SessionResult::Ignored;
+         return event;
+     }
+diff --git a/src/lotus_v2/peer_session.h b/src/lotus_v2/peer_session.h
+index 0d85f59bdc5904cfc1f310fb04f0d0b846a32282..3d7e96176c99b4e13e89b6c02e217c15cb5d0d40 100644
+--- a/src/lotus_v2/peer_session.h
++++ b/src/lotus_v2/peer_session.h
+@@ -6,6 +6,11 @@
+ #include <optional>
+ namespace lotus::v2::peer {
+ constexpr uint64_t TRANSACTION_RELAY_FEATURE = 8;
++constexpr uint64_t AVALANCHE_FEATURE = 16;
++bool AvalancheCommand(const std::string &);
++struct NegotiatedTranscript {
++    uint64_t local_nonce, remote_nonce, local_entropy, remote_entropy;
++};
+ constexpr int32_t MIN_V2_PEER_VERSION = 70017;
+ constexpr size_t MAX_VERSION_USER_AGENT = 256;
+ struct VersionAddress {
+@@ -104,6 +109,11 @@ public:
+     uint64_t ActiveFeatures() const {
+         return state_ == SessionState::Active ? active_features_ : 0;
+     }
++    std::optional<NegotiatedTranscript> Transcript() const {
++        if (state_ != SessionState::Active || !peer_version_) return std::nullopt;
++        return NegotiatedTranscript{config_.local_version.Nonce(), peer_version_->Nonce(),
++                                    config_.local_version.ExtraEntropy(), peer_version_->ExtraEntropy()};
++    }
+     bool PeerWantsAddressV2() const { return wants_address_v2_; }
+ 
+ private:
+diff --git a/src/lotus_v2/peer_transport.cpp b/src/lotus_v2/peer_transport.cpp
+index 9565c8a72dea9142a2ab39bc3cc65fba48a0ae53..4f6621df3d15db7c0eab2e696643993db41dde28 100644
+--- a/src/lotus_v2/peer_transport.cpp
++++ b/src/lotus_v2/peer_transport.cpp
+@@ -139,6 +139,8 @@ QueueResult Transport::QueueMessage(const Message &message, uint64_t now) {
+     Guard guard(busy_);
+     if (!Time(now)) return QueueResult::Closed;
+     if (State() != SessionState::Active) return QueueResult::NotActive;
++    if (AvalancheCommand(message.command) && !(ActiveFeatures() & AVALANCHE_FEATURE))
++        return QueueResult::InvalidMessage;
+     // Preflight checked 24-byte overhead before the codec copies or allocates.
+     if (message.payload.size() > std::numeric_limits<size_t>::max() - 24)
+         return QueueResult::Backpressure;
+@@ -314,3 +316,7 @@ TransportPoll Transport::Poll(uint64_t now, const TransportBudget &budget) {
+ uint64_t lotus::v2::peer::Transport::ActiveFeatures() const {
+     return session_ ? session_->ActiveFeatures() : 0;
+ }
++
++std::optional<lotus::v2::peer::NegotiatedTranscript> lotus::v2::peer::Transport::Transcript() const {
++    return session_ ? session_->Transcript() : std::nullopt;
++}
+diff --git a/src/lotus_v2/peer_transport.h b/src/lotus_v2/peer_transport.h
+index 7e1c881c0777192f6d4cad6882bc741b9314a9cf..761a85aa6f679e36416eed4ffe3807cdfc243c6f 100644
+--- a/src/lotus_v2/peer_transport.h
++++ b/src/lotus_v2/peer_transport.h
+@@ -102,6 +102,7 @@ public:
+     size_t BufferedReadBytes() const { return read_end_ - read_begin_; }
+     uint32_t ActiveLimit() const;
+     uint64_t ActiveFeatures() const;
++    std::optional<NegotiatedTranscript> Transcript() const;
+ 
+ private:
+     struct Frame {
+diff --git a/src/lotus_v2/test_avalanche_peer.cpp b/src/lotus_v2/test_avalanche_peer.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..3a76dbce4d62c1820c4cc5b5e89e04484cdb1405
+--- /dev/null
++++ b/src/lotus_v2/test_avalanche_peer.cpp
+@@ -0,0 +1,109 @@
++// Copyright (c) 2026 The Lotus developers
++#include "avalanche_peer.h"
++#include "avalanche_peer_test/fixtures.h"
++#include <avalanche/proofbuilder.h>
++#include <avalanche/delegationbuilder.h>
++#include <streams.h>
++using namespace lotus::v2::ava;
++namespace {
++PeerCallbacks Callbacks(CKey &key, ProofEnvelope &proof, unsigned &registered, unsigned &bound, unsigned &received) {
++    PeerCallbacks c;
++    c.local_session_key = key.GetPubKey();
++    c.register_proof = [&](const ProofEnvelope &p, std::string &) { ++registered; return p.payment_locks == proof.payment_locks; };
++    c.bind = [&](NodeId, const ::avalanche::Delegation &, const SchnorrSig &, const ConnectionTranscript &, uint32_t, std::string &) { ++bound; return true; };
++    c.disconnect = [](NodeId) {};
++    c.sent_proof_inventory = [](NodeId) {};
++    c.respond = [&](const OutgoingPoll &p, SignedResponse &r, std::string &) {
++        std::vector<::avalanche::Vote> votes;
++        for (const auto &i : p.items) { uint256 h; std::copy(i.id.begin(), i.id.end(), h.begin()); votes.emplace_back(0, h); }
++        r.response = ::avalanche::Response{p.round, 0, std::move(votes)};
++        return key.SignSchnorr(ResponseDigest(r.response), r.signature);
++    };
++    c.receive = [&](NodeId, const SignedResponse &, std::string &) { ++received; return true; };
++    c.proof = [&](const ::avalanche::ProofId &id) -> std::optional<ProofEnvelope> { return proof.proof->getId() == id ? std::optional(proof) : std::nullopt; };
++    c.proofs = [&] { return std::vector<::avalanche::ProofId>{proof.proof->getId()}; };
++    c.sign_hello = [&](const uint256 &h, SchnorrSig &s) { return key.SignSchnorr(h, s); };
++    c.discovery_keys = [](uint64_t &a, uint64_t &b) { a = 2; b = 3; return true; };
++    return c;
++}
++void Deliver(Node &node, AvalanchePeer &adapter, uint64_t now) {
++    std::string e;
++    for (auto i = node.notices.begin(); i != node.notices.end();) {
++        if (i->kind == DispatcherNoticeKind::Application) {
++            const auto r = adapter.Handle(*i, now, e);
++            Check(r == PeerResult::Accepted, "adapter accepts application: " + e);
++        }
++        i = node.notices.erase(i);
++    }
++}
++}
++int main() {
++    ECC_Start();
++    try {
++        CKey key; key.MakeNewKey(true); const auto pub = key.GetPubKey();
++        std::vector<uint8_t> lock{32}; lock.insert(lock.end(), pub.begin() + 1, pub.end()); lock.push_back(0xbc); lock.push_back(0x4e);
++        ::avalanche::ProofBuilder builder(1, 0, key, CScript{} << OP_TRUE);
++        Check(builder.addUTXO(COutPoint{TxId{uint256::ONE}, 0}, int64_t(10000000000ULL) * SATOSHI, 1, false, key), "build signed proof");
++        ProofEnvelope proof{builder.build(), {lock}};
++        PeerLimits limits; limits.max_payload = 4096; limits.max_action_bytes = 1 << 20;
++        std::string e; Bytes encoded; ProofEnvelope decoded;
++        Check(EncodeProofEnvelope(proof, limits, encoded, e), "encode native envelope: " + e);
++        Check(DecodeProofEnvelope(encoded, limits, decoded, e), "decode native envelope: " + e);
++        Check(decoded.proof->getId() == proof.proof->getId() && decoded.payment_locks == proof.payment_locks, "exact proof and native binding");
++        for (size_t i = 0; i < encoded.size(); ++i)
++            Check(!DecodeProofEnvelope(std::span{encoded}.first(i), limits, decoded, e), "truncation rejected");
++        auto trailing = encoded; trailing.push_back(0);
++        Check(!DecodeProofEnvelope(trailing, limits, decoded, e), "trailing bytes rejected");
++        auto unbound = proof; unbound.payment_locks.clear();
++        Check(!EncodeProofEnvelope(unbound, limits, trailing, e), "upstream proof cannot drop native lock");
++        auto huge = encoded; huge[50] = 255;
++        Check(!DecodeProofEnvelope(huge, limits, decoded, e), "oversized signed stake count rejected before allocation");
++        Pair pair; unsigned registered = 0, bound = 0, received = 0;
++        AvalanchePeer a(*pair.a.dispatcher, limits, Callbacks(key, proof, registered, bound, received));
++        AvalanchePeer b(*pair.b.dispatcher, limits, Callbacks(key, proof, registered, bound, received));
++        Check(a.Activate(pair.a.connection, e) == PeerResult::Accepted && b.Activate(pair.b.connection, e) == PeerResult::Accepted, "negotiated adapter admission");
++        auto ta = pair.a.dispatcher->Transcript(pair.a.connection); auto tb = pair.b.dispatcher->Transcript(pair.b.connection);
++        Check(ta && tb && ta->local_nonce == tb->remote_nonce && ta->local_entropy == tb->remote_entropy, "real immutable version transcript");
++        DataStream unsigned_poll; unsigned_poll << uint64_t(1) << std::vector<CInv>{};
++        auto unsigned_ptr = reinterpret_cast<const uint8_t *>(unsigned_poll.data());
++        DispatcherNotice unauthenticated{DispatcherNoticeKind::Application, pair.a.connection, {}, {}, {},
++            Message{"avapoll", Bytes(unsigned_ptr, unsigned_ptr + unsigned_poll.size())}};
++        Check(a.Handle(unauthenticated, pair.ms, e) == PeerResult::Rejected && e == "unauthenticated-poll", "poll bound to authenticated connection");
++        auto delegation = ::avalanche::DelegationBuilder(*proof.proof).build();
++        Check(a.Hello(pair.a.connection, delegation, e) == PeerResult::Accepted && b.Hello(pair.b.connection, delegation, e) == PeerResult::Accepted, "sign actual connection hello");
++        for (unsigned i = 0; i < 100; ++i) { a.Pump(pair.ms); b.Pump(pair.ms); pair.Cycle(); Deliver(pair.a, a, pair.ms); Deliver(pair.b, b, pair.ms); }
++        Check(bound == 2 && a.Node(pair.a.connection) && b.Node(pair.b.connection), "authenticate both actual connection hellos");
++        OutgoingPoll poll{*a.Node(pair.a.connection), 9, {{ItemKind::Block, lotus::v2::Hash{}}}};
++        Check(a.Poll(poll, e) == PeerResult::Accepted, "queue typed block poll");
++        for (unsigned i = 0; i < 100; ++i) { a.Pump(pair.ms); b.Pump(pair.ms); pair.Cycle(); Deliver(pair.a, a, pair.ms); Deliver(pair.b, b, pair.ms); }
++        Check(received == 1, "exact signed poll response dispatched");
++        SignedResponse corrupt; corrupt.response = ::avalanche::Response{10, 0, {}};
++        Check(key.SignSchnorr(ResponseDigest(corrupt.response), corrupt.signature), "sign response fixture");
++        corrupt.signature[0] ^= 1;
++        DataStream bad_response; bad_response << corrupt.response << corrupt.signature;
++        auto badptr = reinterpret_cast<const uint8_t *>(bad_response.data());
++        DispatcherNotice tampered{DispatcherNoticeKind::Application, pair.a.connection, {}, {}, {},
++            Message{"avaresponse", Bytes(badptr, badptr + bad_response.size())}};
++        Check(a.Handle(tampered, pair.ms, e) == PeerResult::Rejected && received == 1, "invalid signature never reaches runtime vote callback");
++        Check(a.Discover(pair.a.connection, pair.ms, e) == PeerResult::Accepted, "queue discovery");
++        for (unsigned i = 0; i < 100; ++i) { a.Pump(pair.ms); b.Pump(pair.ms); pair.Cycle(); Deliver(pair.a, a, pair.ms); Deliver(pair.b, b, pair.ms); }
++        Check(registered == 1, "compact discovery requests signed native envelope");
++        // Bounded queue retains its front action when dispatcher is occupied.
++        Check(a.Poll(poll, e) == PeerResult::Accepted && a.Poll(poll, e) == PeerResult::Accepted, "stage two actions");
++        Check(a.Pump(pair.ms) == DispatcherResult::Queued, "dispatcher accepts first action");
++        const auto retained = a.PendingBytes();
++        Check(a.Pump(pair.ms) == DispatcherResult::Busy && a.PendingActions() == 1 && a.PendingBytes() == retained, "busy retains action and bytes");
++        // A V2 compact prefill carries the complete native envelope inline.
++        Check(a.Discover(pair.a.connection, pair.ms, e) == PeerResult::Accepted, "stage second discovery");
++        DataStream prefill; prefill << uint64_t(10) << uint64_t(20);
++        WriteCompactSize(prefill, 0); WriteCompactSize(prefill, 1); WriteCompactSize(prefill, 0);
++        prefill.write(AsBytes(Span<const uint8_t>{encoded.data(), encoded.size()}));
++        auto prefptr = reinterpret_cast<const uint8_t *>(prefill.data());
++        DispatcherNotice prefilled{DispatcherNoticeKind::Application, pair.a.connection, {}, {}, {},
++                                  Message{"avaproofs", Bytes(prefptr, prefptr + prefill.size())}};
++        Check(a.Handle(prefilled, pair.ms, e) == PeerResult::Accepted && registered == 2, "bounded native prefilled proof admitted: " + e);
++        a.Disconnect(pair.a.connection); Check(!a.PendingActions() && !a.Node(pair.a.connection), "disconnect releases peer actions");
++        std::cout << "Avalanche bounded peer wire checks passed\n";
++    } catch (const std::exception &e) { std::cerr << e.what() << '\n'; ECC_Stop(); return 1; }
++    ECC_Stop(); return 0;
++}
+-- 
+2.50.1 (Apple Git-155)
+
