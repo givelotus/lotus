@@ -1229,17 +1229,67 @@ Making the reconciliation messages **generalized Merklix mempool-reconciliation 
 
 ---
 
-#### Step 3.1 (Phase 3A): Generalized Wire Messages in `src/protocol.h` and `MSG_AVA_OVERLAY` in `avalanche::Processor`
+#### Step 3.1 (Phase 3A): Typed `CInv` & `AnyVoteItem` Dispatch in `avalanche::Processor` + Generalized Merklix Wire Messages
 
 - **Files:** `src/protocol.h`, `src/protocol.cpp`, `src/avalanche/processor.h:103–158`, `src/net_processing.cpp:6758–6831`.
-- **Exact Additions to `src/protocol.h`:**
-  1. Add `MSG_AVA_OVERLAY = 0x20000005` to `enum GetDataMsg` (`src/protocol.h:395`) so `avapoll` / `avaresponse` can vote on 32-byte `OverlayID` (and dirty bucket) hashes using the existing 36-byte `CInv` / `avalanche::Vote` wire format.
-  2. Add five **generalized Merklix mempool reconciliation** message types to `namespace NetMsgType` (`src/protocol.h:160`):
-     - `NetMsgType::MERKLIXSYNC    = "merklixsync"` (top-level `(count, root, s1, s3)` + sparse dirty-bucket `BucketSyndrome` announcement)
-     - `NetMsgType::GETMERKLIXBUCK = "getmerklixbuck"` (request child Merklix bisection at depth $d+2$ or leaf `short_id`s for buckets where $|\Delta_s| \ge 3$)
-     - `NetMsgType::MERKLIXBUCK    = "merklixbuck"` (response carrying child `BucketSyndrome`s or bounded leaf `short_id`s)
-     - `NetMsgType::GETSHORTTX     = "getshorttx"` (fetch full transactions by 64-bit `short_id` when missing from local `CTxMemPool`)
-     - `NetMsgType::SHORTTX        = "shorttx"` (response delivering serialized `CTransaction`s matching requested 64-bit `short_id`s)
+- **How Nodes Know What Kind of Item They Are Voting On (`CInv::type` $\leftrightarrow$ `AnyVoteItem`):**
+  In `lotusd`, `avapoll` (`src/avalanche/protocol.h:54`) carries `std::vector<CInv> invs`, where each `CInv` is `{ uint32_t type; uint256 hash; }`. In `PeerManagerImpl::ProcessMessage` (`src/net_processing.cpp:6796`), the receiver switches on `inv.type` to route the vote query to the appropriate subsystem, while `avalanche::Processor` stores active items in `VoteMap` keyed by the `std::variant` `AnyVoteItem` (`src/avalanche/processor.h:103`) so incoming `avaresponse` updates are dispatched by variant type (`src/net_processing.cpp:6957`).
+  We extend `GetDataMsg` (`src/protocol.h:395`) and `AnyVoteItem` (`src/avalanche/processor.h:103`) with two explicit item types so every vote domain has dedicated machinery:
+
+| `CInv::type` (`src/protocol.h`) | `AnyVoteItem` Variant (`src/avalanche/processor.h:103`) | What `inv.hash` Identifies | Unknown-Hash Resolution Machinery (`avapoll` $\to$ `getdata` $\to$ Payload) |
+| :--- | :--- | :--- | :--- |
+| `MSG_AVA_PROOF` (`0x20000001`) | `const ProofRef` | `ProofId`: Stake proof | Vote `-1`, send `getdata(MSG_AVA_PROOF)` $\to$ peer replies with `avaproof` |
+| `MSG_BLOCK` (`2`) | `const CBlockIndex *` | `BlockHash`: PoW block (unpark / park / finalize) | Vote `-1` (or `-2` if header known), send `getdata(MSG_CMPCT_BLOCK / MSG_BLOCK)` |
+| `MSG_AVA_STAKE_CONTENDER` (`0x20000004`) | `const StakeContenderId` | `StakeContenderId = H(prevblockhash, proofid)`: Staker coinbase winner (`~25%` reward share) | Derived locally in `StakeContenderCache::promoteToBlock` from known finalized proofs |
+| **`MSG_AVA_TREASURY_CONTENDER` (`0x20000005`)** *(new)* | **`const TreasuryContenderId`** | `TreasuryContenderId = H(prevblockhash, payout_script_hash)`: Staker-voted treasury payout script (`~25%` reward share) | Derived from staker proof endorsements in `TreasuryContenderCache`, or fetched via `getdata(MSG_AVA_TREASURY_CONTENDER)` $\to$ `avatreasury` |
+| **`MSG_AVA_MEMPOOL_BATCH` (`0x20000006`)** *(new)* | **`const MempoolBatchVoteItem`** | `MempoolBatchId = H("Lotus/v2/ava/batch", tip_block_id \|\| epoch \|\| depth \|\| prefix \|\| count \|\| root_32B)` | If `batch_id` matches local `MerklixOverlayManager`, vote `0` immediately! If unknown/differing, vote `-2` and send `getdata(MSG_AVA_MEMPOOL_BATCH, batch_id)` $\to$ peer replies with `merklixsync` (`ReconScope::PRECONSENSUS_EPOCH`)! |
+| `MSG_TX` (`1`) | `const CTransactionRef` | `TxId`: Individual double-spend conflict loser/winner fallback | Vote `-1` if unknown, `getdata(MSG_TX)` $\to$ `tx` |
+
+- **Exact `avapoll` Dispatch Addition in `src/net_processing.cpp:6796`:**
+  ```cpp
+  switch (inv.type) {
+      case MSG_BLOCK: {
+          vote = WITH_LOCK(cs_main, return GetAvalancheVoteForBlock(BlockHash(inv.hash)));
+      } break;
+      case MSG_AVA_PROOF: {
+          vote = getAvalancheVoteForProof(*m_avalanche, avalanche::ProofId(inv.hash));
+      } break;
+      case MSG_AVA_STAKE_CONTENDER: {
+          if (fStakingPreconsensus) {
+              vote = m_avalanche->getStakeContenderStatus(avalanche::StakeContenderId(inv.hash));
+          }
+      } break;
+      case MSG_AVA_TREASURY_CONTENDER: {
+          if (fTreasuryPreconsensus) {
+              vote = m_avalanche->getTreasuryContenderStatus(avalanche::TreasuryContenderId(inv.hash));
+              if (vote == -1) {
+                  vGetData.emplace_back(MSG_AVA_TREASURY_CONTENDER, inv.hash);
+              }
+          }
+      } break;
+      case MSG_AVA_MEMPOOL_BATCH: {
+          if (fPreconsensus) {
+              vote = GetAvalancheVoteForMempoolBatch(*m_avalanche, inv.hash, pfrom);
+              // If inv.hash is not yet in m_verified_candidates, returns -2 (reconciling)
+              // and requests getdata(MSG_AVA_MEMPOOL_BATCH, inv.hash) -> peer sends MERKLIXSYNC!
+          }
+      } break;
+      case MSG_TX: {
+          if (fPreconsensus) {
+              vote = GetAvalancheVoteForTx(*m_avalanche, TxId(inv.hash));
+          }
+      } break;
+  }
+  ```
+
+- **Exact Additions to `namespace NetMsgType` (`src/protocol.h:160`):**
+  - Five **generalized Merklix mempool reconciliation** message types:
+    - `NetMsgType::MERKLIXSYNC    = "merklixsync"` (also sent in response to `getdata(MSG_AVA_MEMPOOL_BATCH, batch_id)`: carries `(tip, epoch, depth, prefix, count, root_32B, s1, s3)` + sparse dirty-bucket `BucketSyndrome`s)
+    - `NetMsgType::GETMERKLIXBUCK = "getmerklixbuck"` (request child Merklix bisection at depth $d+2$ or leaf `short_id`s for buckets where $|\Delta_s| \ge 3$)
+    - `NetMsgType::MERKLIXBUCK    = "merklixbuck"` (response carrying child `BucketSyndrome`s or bounded leaf `short_id`s)
+    - `NetMsgType::GETSHORTTX     = "getshorttx"` (fetch full transactions by 64-bit `short_id` when missing from local `CTxMemPool`)
+    - `NetMsgType::SHORTTX        = "shorttx"` (response delivering serialized `CTransaction`s matching requested 64-bit `short_id`s)
+  - Plus `NetMsgType::AVATREASURY = "avatreasury"` (delivers `(prevblockhash, CScript treasuryPayoutScript)` in response to `getdata(MSG_AVA_TREASURY_CONTENDER, id)`).
 
 ```text
 # Generalized Scope Header shared by all 5 Merklix reconciliation messages:
@@ -1249,7 +1299,7 @@ ReconContext = scope:u8                  # 0x01 = PRECONSENSUS_EPOCH, 0x02 = LIV
 
 # 1. Sent when a peer's Merklix root differs (either after an avapoll mismatch or during Tier 0 periodic mempool sync):
 merklixsync    = ReconContext
-                 || candidate_root:h32                  # OverlayID(L_e) (scope 0x01) or L_spec.subtree_a_root (scope 0x02)
+                 || candidate_root:h32                  # MempoolBatchId (scope 0x01) or L_spec.subtree_a_root (scope 0x02)
                  || total_count:u32
                  || s1_root:u64 || s3_root:u64
                  || adaptive_depth:u8                   # k in [0, 2..8] (0 if only top-level sent)
@@ -1423,9 +1473,19 @@ struct PendingCandidateEntry {
 
 ---
 
-### 6.5 Phase 4: Overhaul `BlockAssembler::CreateNewBlock` (`src/node/miner.cpp`) to $O(1)$ Overlay Assembly
+### 6.5 Phase 4: $O(1)$ Overlay `BlockAssembler` + Avalanche Coinbase Reward Split (`50% Miner / 25% Staker / 25% Staker-Voted Treasury`) & Soft Block Parking
 
-**Goal:** Transform `BlockAssembler::CreateNewBlock` (`src/node/miner.cpp:98–259`) from an $O(N \log N)$ transaction-scanning, block-serializing, UTXO-re-executing bottleneck into an **$O(1)$ microsecond read** of the active `MempoolOverlayLayer` ($L_e$ in Tier 2, or $L_{\text{spec}}$ in Tier 0/1).
+> [!IMPORTANT]
+> **Maintainer Direction on Coinbase Reward Split & Soft Block Parking:**
+> 1. **No Need to Grind the Coinbase:** Because the 134-byte Lotus V2 header has a full **64-bit `nonce`** (plus `timestamp`), miners have $2^{64}$ hashes per header without ever mutating `vtx[0]` (`CoinbaseTx`). Thus `CreateNewBlock` builds `vtx[0]` once and computes `header.tx_root` and `header.state_root` once ($O(1)$, 2 BLAKE3 hashes).
+> 2. **Avalanche Coinbase Split (`~50% Miner / ~25% Staker / ~25% Staker-Voted Treasury`, exact ratios configurable):**
+>    - **Hard Consensus vs. Soft Avalanche Parking Policy:** Hard consensus (`src/lotus_v2/validation.cpp`) only enforces that total coinbase output value $\le S_n + \text{fees} - \text{mandatory\_burn}$ (never hardcoding any address or split so the chain works seamlessly in Tier 0 without Avalanche).
+>    - When Avalanche is active, **soft block-parking policies** in `Chainstate::ConnectTip` (`src/validation.cpp:3008`, restored from `000-decouple-avalanche-consensus.patch`) enforce three policies before accepting a block as the active tip:
+>      1. **`StakingRewardsPolicy` (`src/policy/block/stakingrewards.cpp`):** Requires `vtx[0]` to pay at least `STAKER_REWARD_RATIO` (e.g. **25%** of net claimable block reward) to the finalized `MSG_AVA_STAKE_CONTENDER` winner(s) for `pindexPrev->GetBlockHash()`.
+>      2. **`TreasuryPolicy` (replaces hardcoded `MinerFundPolicy` in `src/policy/block/minerfund.cpp`):** Instead of a hardcoded address whitelist, requires `vtx[0]` to pay at least `TREASURY_REWARD_RATIO` (e.g. **25%** of net claimable block reward) to the finalized **`MSG_AVA_TREASURY_CONTENDER`** payout script voted on by stakers for `pindexPrev->GetBlockHash()`.
+>      3. **`PreConsensusPolicy` (`src/policy/block/preconsensus.cpp`):** Requires the block to match a finalized overlay $L_k$ (or contain zero conflicts with finalized transactions).
+>    - If a block violates any of these three soft rules, `ConnectTip` **parks the block (`pindexNew->nStatus.withParked()`)** and the node votes `Rejected` (`1`) on `MSG_BLOCK` in Avalanche!
+> 3. **Zero Impact on `Subtree A` or `UtxoRoot` in $L_k$:** Because all three payouts (`50% Miner`, `25% Staker`, `25% Treasury`) are outputs of `vtx[0]` (`CoinbaseTx`), and `vtx[0]`'s outputs are pipelined into `UtxoRoot` at Block $h+2$ ([P02](../lotus-v2/decisions/commitments-and-state.md)), **adding the Staker and Treasury outputs to `vtx[0]` changes ZERO bytes of `L_k->subtree_a_root` and ZERO bytes of `L_k->utxo_root`!** And when `tmplblock` (`Header || CoinbaseTx`) arrives on the wire, the receiving node has the entire 3-output `CoinbaseTx` right in `tmplblock` to verify `StakingRewardsPolicy` and `TreasuryPolicy` in $< 1\text{ }\mu\text{s}$!
 
 #### Step 4.1: Add `m_overlay_id` to `CBlockTemplate` (`src/node/miner.h`)
 - **File:** `src/node/miner.h` (in `struct CBlockTemplate`, around line 35).
@@ -1441,7 +1501,7 @@ struct PendingCandidateEntry {
 
 #### Step 4.2: Replace the Body of `BlockAssembler::CreateNewBlock` in `src/node/miner.cpp:140–258`
 - **File:** `src/node/miner.cpp` (lines 140–258).
-- **Exact Side-by-Side Comparison (Old `miner.cpp` vs. New $O(1)$ Overlay `miner.cpp`):**
+- **Exact Side-by-Side Comparison (Old `miner.cpp` vs. New $O(1)$ Overlay `miner.cpp` with `50/25/25` Coinbase Split):**
 
 ```cpp
 // NEW src/node/miner.cpp (replaces lines 140-258 of BlockAssembler::CreateNewBlock):
@@ -1465,11 +1525,20 @@ const uint64_t total_cu   = overlay ? overlay->total_cost_units : 0;
 const uint64_t burned_tx  = overlay ? overlay->total_burned_atoms : 0;
 const uint64_t burn_floor = overlay ? overlay->required_burn_floor_atoms : 0;
 
-// 2. Construct CoinbaseTx (vtx[0]) claiming subsidy + total_fees - mandatory P05 burn delta:
+// 2. Construct CoinbaseTx (vtx[0]) with 50% Miner / 25% Staker Winner / 25% Treasury Winner:
 const uint64_t extra_coinbase_burn = (burn_floor > burned_tx) ? (burn_floor - burned_tx) : 0;
 CMutableTransaction coinbaseTx = BuildV2CoinbaseTx(
     scriptPubKeyIn, pindexPrev, nHeight, consensusParams,
     total_fees - Amount(int64_t(extra_coinbase_burn)), m_avalanche);
+// Inside BuildV2CoinbaseTx:
+//   - If IsStakingRewardsActivated && m_avalanche->getStakingRewardWinners(prevHash, stakerWinners):
+//       stakerShare = (netClaimableReward * STAKER_REWARD_RATIO) / 100;   // default 25%
+//       coinbaseTx.vout.push_back(CTxOut(stakerShare, stakerWinners[0]));
+//   - If IsTreasuryGovernanceActivated && m_avalanche->getTreasuryWinner(prevHash, treasuryScript):
+//       treasuryShare = (netClaimableReward * TREASURY_REWARD_RATIO) / 100; // default 25%
+//       coinbaseTx.vout.push_back(CTxOut(treasuryShare, treasuryScript));
+//   - minerShare = netClaimableReward - stakerShare - treasuryShare;      // default 50%
+//   - coinbaseTx.vout[0] = CTxOut(minerShare, scriptPubKeyIn);
 
 CTransactionRef coinbaseRef = MakeTransactionRef(std::move(coinbaseTx));
 if (overlay && overlay->cached_block) {
@@ -1512,7 +1581,7 @@ return std::move(pblocktemplate);
 
 ### 6.6 Phase 5: Wire Transaction-Free Block Relay (`tmplblock`), the Candidate Root Match Stage (`TryConnectFromCandidateOverlays`), and Direct Overlay-to-`libmdbx` Commit
 
-**Goal:** Add the ~284-byte transaction-free `TemplateBlockAnnounce` (`tmplblock` = `Header || CoinbaseTx`) and the **Candidate Root Match Stage (`TryConnectFromCandidateOverlays`)** to `src/net_processing.cpp`, automatically falling back to standard `getdata(MSG_CMPCT_BLOCK)` or `getdata(MSG_BLOCK)` if no local candidate overlay matches, and commit matched overlays directly to `DiskStateStore` (`src/lotus_v2/disk_state.cpp`).
+**Goal:** Add the ~284-byte transaction-free `TemplateBlockAnnounce` (`tmplblock` = `Header || CoinbaseTx`) and the **Candidate Root Match Stage (`TryConnectFromCandidateOverlays`)** to `src/net_processing.cpp`, verifying `StakingRewardsPolicy` (`25%`) and `TreasuryPolicy` (`25%`) directly against `tmplblock.coinbase_tx`, automatically falling back to standard `getdata(MSG_CMPCT_BLOCK)` or `getdata(MSG_BLOCK)` if no local candidate overlay matches, and committing matched overlays directly to `DiskStateStore` (`src/lotus_v2/disk_state.cpp`).
 
 #### Step 5.1: Add `TemplateBlockAnnounce` (`tmplblock`) Serialization (`src/blockencodings.h/.cpp`, `src/protocol.h`)
 - **Files:** `src/protocol.h` (add `NetMsgType::TMPLBLOCK = "tmplblock"`), `src/blockencodings.h/.cpp`.
@@ -1520,7 +1589,7 @@ return std::move(pblocktemplate);
   ```cpp
   struct TemplateBlockAnnounce {
       CBlockHeader header;         // 134-byte Lotus V2 header
-      CTransactionRef coinbase_tx; // Miner's vtx[0] (~150-250 bytes)
+      CTransactionRef coinbase_tx; // Miner's vtx[0] (~150-250 bytes, including Miner/Staker/Treasury outputs)
 
       SERIALIZE_METHODS(TemplateBlockAnnounce, obj) {
           READWRITE(obj.header, obj.coinbase_tx);
@@ -1559,13 +1628,16 @@ return std::move(pblocktemplate);
           // Exact 256-bit match on BOTH header.tx_root AND header.state_root!
           // matched_overlay->cached_block ALREADY has vtx[1..n-1] pre-populated from when L_k finalized
           // (the exact same snapshot that feeds getblocktemplate!).
-          // We simply slot in header and vtx[0] = coinbase_tx in O(1), relay tmplblock, and commit L_k!
+          // We simply slot in header and vtx[0] = coinbase_tx in O(1)!
           std::shared_ptr<CBlock> pblock = matched_overlay->cached_block;
           static_cast<CBlockHeader &>(*pblock) = header;
           pblock->vtx[0] = coinbase_tx;
 
-          RelayTemplateBlockAnnounce(header, coinbase_tx);
-          m_chainman.ConnectMatchedOverlayBlock(pindexHeader, pblock, matched_overlay);
+          // Note: ConnectMatchedOverlayBlock runs StakingRewardsPolicy (25%) and TreasuryPolicy (25%)
+          // on pblock->vtx[0]; if violated, it parks pindexHeader instead of relaying/activating!
+          if (m_chainman.ConnectMatchedOverlayBlock(pindexHeader, pblock, matched_overlay)) {
+              RelayTemplateBlockAnnounce(header, coinbase_tx);
+          }
           return;
       }
   }
@@ -1589,16 +1661,33 @@ return std::move(pblocktemplate);
 
 ---
 
-### 6.7 Summary Implementation File & Dependency Matrix
+### 6.7 Modular Component Architecture & 12-Commit Incremental Staging Roadmap (`Patches 023–034`)
 
-| Phase | Target Files in Repository | Key Classes / Functions Modified or Added | Complexity & Latency Improvement |
-| :--- | :--- | :--- | :--- |
-| **Phase 1: Un-Decouple Pre-Consensus** | `src/validation.cpp`<br/>`src/policy/block/preconsensus.h/.cpp` | `MemPoolAccept::PreChecks` (`:629`)<br/>`Chainstate::ConnectTip` (`:2997`)<br/>`PreConsensusPolicy::operator()` | Restores `finalized-tx-conflict` + adds Cohort Seniority & $O(1)$ overlay fast-path in `ConnectTip` |
-| **Phase 2: Merklix Overlay Mempool** | `src/lotus_v2/mempool_overlay.h/.cpp` *(new)*<br/>`src/txmempool.h/.cpp`<br/>`src/txmempoolentry.h` | `MerklixOverlayManager`, `TxOverlayArena`, `UtxoOverlayArena`<br/>`CTxMemPool::addUnchecked` (`:147`)<br/>Replaces `setAvalancheFinalized` (`:563`) | Eliminates $O(N^2)$ per-tx ancestor walks; updates `Subtree A` & `UtxoRoot` in $\sim 2\text{ ms}$ per epoch |
-| **Phase 3A: Adaptive Merklix Polling** | `src/avalanche/protocol.h`<br/>`src/avalanche/processor.h/.cpp`<br/>`src/net_processing.cpp` (`:6796, :7160`) | `MSG_AVA_OVERLAY`, `OverlayVoteItem`<br/>Replaces legacy `BlockAssembler` per-tx poll loop (`:7169`) | $1.0\times$ bandwidth parity at $\Delta N = 1$ tx; **$100\times\text{–}5{,}000\times$ less bandwidth** at scale |
-| **Phase 3B: Generalized Merklix Sync (`net_processing.cpp`)** | `src/protocol.h/.cpp`<br/>`src/net_processing.cpp` (`:6828–7435`)<br/>`src/lotus_v2/mempool_overlay.h/.cpp` | `MERKLIXSYNC`, `GETMERKLIXBUCK`, `MERKLIXBUCK`, `GETSHORTTX`, `SHORTTX`<br/>`PendingCandidateTracker`, `AbortStaleEpochsBelow` | Unified across Tier 0/1/2; $0\text{ RTT}$ local promotion; single-step cumulative jump $L_{N-1} \to L_M$ |
-| **Phase 4: $O(1)$ `BlockAssembler`** | `src/node/miner.h`<br/>`src/node/miner.cpp` (`:98–259`) | `BlockAssembler::CreateNewBlock`<br/>`ComputeV2TxRootFromSubtreeA`<br/>`ComputeV2StateRootFromOverlay` | Reduces `CreateNewBlock` ($100\text{k}$ txs) from **$\sim 600\text{ ms}$ to $< 2\text{ }\mu\text{s}$ ($O(1)$)** |
-| **Phase 5: `tmplblock` Candidate Match & Fallback** | `src/protocol.h`, `src/blockencodings.h/.cpp`<br/>`src/net_processing.cpp`<br/>`src/lotus_v2/disk_state.h/.cpp` | `TemplateBlockAnnounce` (`tmplblock`)<br/>`MatchCandidateOverlay` $\to$ `MSG_CMPCT_BLOCK` / `MSG_BLOCK`<br/>`DiskStateStore::CommitFinalizedOverlay` | **$\sim 284\text{ B}$** tx-free block relay + **$< 5\text{ }\mu\text{s}$** root-match connect + auto `cmpctblock` / `block` fallback |
+> [!IMPORTANT]
+> **Why Incremental Staging Matters (No Monolithic Commits):**
+> Implementing overlay arenas, $GF(2^{64})$ syndromes, mempool hooks, $O(1)$ block assembly, `tmplblock` relay, staking/treasury voting, and Avalanche batch polling in one giant commit would be impossible to review or bisect.
+> Below is the **12-commit incremental patch roadmap (`023`–`034`)** broken into **6 decoupled stages**, where **every single commit compiles cleanly, passes 100% of existing unit + functional tests, and includes its own isolated test suite before the next commit is stacked on top.**
+
+| Patch # | Patch Name | Component & Scope | Files Modified / Added | Standalone Verification Gate |
+| :--- | :--- | :--- | :--- | :--- |
+| **Stage A** | **Pure Offline Primitives (Zero Mempool, P2P, or Consensus Coupling)** | | | |
+| **`023`** | `023-add-v2-merklix-overlay-arenas.patch` | Pure in-memory `TxOverlayArena`, `UtxoOverlayArena`, `MempoolOverlayLayer` ($L_0 \dots L_k$), sort-merge batch path-copying, by-value `libmdbx` clean sibling/coin copy (`ResetReadTxn()`), and in-place epoch folding ($L_{e-3} \to L_{\text{base}}$). | `src/lotus_v2/mempool_overlay.h/.cpp` *(new)*<br/>`src/lotus_v2/test/mempool_overlay_tests.cpp` *(new)* | `mempool_overlay_tests`: prove $L_0 \to L_1 \to L_2$ produces byte-identical `SubtreeA` & `UtxoRoot` to `ApplyBlock`. |
+| **`024`** | `024-add-v2-gf64-minisketch-syndromes.patch` | Pure $GF(2^{64})$ power-sum syndrome (`s1, s3`) encoder + quadratic root solver for $|\Delta| \in \{1, 2\}$, plus per-epoch keyed `SipHash-2-4(TxHash)` 64-bit `short_id` derivation. | `src/lotus_v2/set_reconciliation.h/.cpp` *(new)*<br/>`src/lotus_v2/test/set_reconciliation_tests.cpp` *(new)* | `set_reconciliation_tests`: exhaustive 1-tx, 2-tx, and $\ge 3$-tx collision/aliasing property tests. |
+| **`025`** | `025-add-disk-state-commit-finalized-overlay.patch` | Add `DiskStateStore::CommitFinalizedOverlay` to flush a `MempoolOverlayLayer`'s dirty `C`/`N` entries directly to `libmdbx` in one sorted batch. | `src/lotus_v2/disk_state.h/.cpp`<br/>`src/lotus_v2/test/disk_state_overlay_tests.cpp` *(new)* | Prove `CommitFinalizedOverlay` + disconnect/undo produces the exact same `libmdbx` database state as `ApplyBlock`. |
+| **Stage B** | **Local Speculative Mempool Overlay & $O(1)$ Block Assembly (Works in Tier 0 Without Avalanche!)** | | | |
+| **`026`** | `026-wire-txmempool-speculative-merklix-overlay.patch` | Attach `MerklixOverlayManager` to `CTxMemPool`. Hook `addUnchecked`, `removeUnchecked`, and `ConnectBlockReset` to maintain $L_0$ (with delayed coinbase insertion) and live speculative overlay $L_{\text{spec}}$ + `cached_block`. | `src/txmempool.h/.cpp`<br/>`src/txmempoolentry.h`<br/>`src/test/txmempool_overlay_tests.cpp` *(new)* | All 303 functional tests + new unit tests verifying `L_spec.subtree_a_root` and `L_spec.utxo_root` after mempool adds/evictions/reorgs. |
+| **`027`** | `027-overhaul-miner-to-o1-overlay-assembly.patch` | Update `BlockAssembler::CreateNewBlock` to read `GetMiningOverlay()` ($L_{\text{spec}}$ in Tier 0), slot `vtx[0] = coinbaseRef` into `overlay->cached_block`, and compute `hashMerkleRoot` and `hashStateRoot` in $O(1)$ (2 BLAKE3 hashes). | `src/node/miner.h/.cpp`<br/>`src/test/miner_tests.cpp` | `miner_tests` + `mining_basic.py`, `feature_block.py`: verify $O(1)$ template assembly produces consensus-valid blocks in $< 5\text{ }\mu\text{s}$. |
+| **Stage C** | **Transaction-Free Block Relay (`tmplblock`) & Candidate Root Match Stage** | | | |
+| **`028`** | `028-add-tmplblock-relay-and-candidate-root-match.patch` | Add `NetMsgType::TMPLBLOCK` (`Header \|\| CoinbaseTx`), Stage 1 `MatchCandidateOverlay` (`{L_k, L_{k-1}, L_{k-2}, L_0, L_spec}`), `ConnectMatchedOverlayBlock`, and Stage 2 automatic fallback to `getdata(MSG_CMPCT_BLOCK / MSG_BLOCK)`. | `src/protocol.h/.cpp`<br/>`src/blockencodings.h/.cpp`<br/>`src/net_processing.cpp`<br/>`src/validation.h/.cpp`<br/>`test/functional/p2p_tmplblock_relay.py` *(new)* | Functional test proving synced nodes connect blocks via 284-byte `tmplblock` in 0 RTT, while lagging/unsynced nodes fall back to `cmpctblock` / `block`. |
+| **Stage D** | **Generalized P2P Merklix Mempool Reconciliation (`merklixsync` / `merklixbuck` / `shorttx`)** | | | |
+| **`029`** | `029-add-generalized-merklix-reconciliation-protocol.patch` | Add `merklixsync`, `getmerklixbuck`, `merklixbuck`, `getshorttx`, `shorttx` and `PendingCandidateTracker` (`ProcessTransaction` $\to$ `addUnchecked` $\to$ `OnMempoolTxAdded`). | `src/protocol.h/.cpp`<br/>`src/net_processing.cpp`<br/>`src/lotus_v2/mempool_overlay.h/.cpp`<br/>`test/functional/p2p_merklix_mempool_sync.py` *(new)* | Test `ReconScope::LIVE_MEMPOOL_SYNC (0x02)` in Tier 0 (no Avalanche): prove two nodes with differing mempools reconcile via `(s1, s3)` and child bisection. |
+| **Stage E** | **Avalanche Block Parking, Staking Rewards (`25%`), and Staker-Voted Treasury (`25%`)** | | | |
+| **`030`** | `030-restore-avalanche-block-parking-and-staking-rewards.patch` | Un-decouple `ParkBlock`/`UnparkBlock` in `ConnectTip` (`src/validation.cpp`) and `avaresponse` (`src/net_processing.cpp`). Enable `StakingRewardsPolicy` (`STAKER_REWARD_RATIO = 25%`, configurable) for V2 blocks. | `src/validation.cpp`<br/>`src/net_processing.cpp`<br/>`src/policy/block/stakingrewards.h/.cpp`<br/>`test/functional/abc_p2p_avalanche_staking_rewards.py` | Existing + V2 staking rewards functional tests pass: blocks omitting finalized staker payout are parked; compliant blocks connect. |
+| **`031`** | `031-add-avalanche-treasury-contender-voting-and-policy.patch` | Add `MSG_AVA_TREASURY_CONTENDER`, `NetMsgType::AVATREASURY`, `TreasuryContenderCache`, and `TreasuryPolicy` (`TREASURY_REWARD_RATIO = 25%`, leaving `50%` to Miner). Update `BuildV2CoinbaseTx` in `src/node/miner.cpp` to emit the `50% / 25% / 25%` split. | `src/protocol.h/.cpp`<br/>`src/avalanche/treasurycontendercache.h/.cpp` *(new)*<br/>`src/avalanche/processor.h/.cpp`<br/>`src/policy/block/treasurypolicy.h/.cpp` *(new)*<br/>`src/node/miner.cpp`<br/>`test/functional/avalanche_treasury_voting.py` *(new)* | Functional test proving stakers converge on a treasury payout script via `MSG_AVA_TREASURY_CONTENDER`, `getblocktemplate` pays `50/25/25`, and violating blocks are parked. |
+| **Stage F** | **Avalanche Bulk Mempool Batch Voting (`MSG_AVA_MEMPOOL_BATCH`) & Epoch Pipeline** | | | |
+| **`032`** | `032-add-avalanche-mempool-batch-voting.patch` | Add `MSG_AVA_MEMPOOL_BATCH` (`0x20000006`) and `MempoolBatchVoteItem` to `AnyVoteItem`. Wire `avapoll`/`avaresponse` to `PendingCandidateTracker` (`ReconScope::PRECONSENSUS_EPOCH`) and `CommitFinalizedEpoch(e, R*)`. | `src/protocol.h`<br/>`src/avalanche/processor.h/.cpp`<br/>`src/net_processing.cpp`<br/>`src/test/avalanche_batch_voting_tests.cpp` *(new)* | Unit + functional tests verifying adaptive top-down Merklix bucket polling, `getdata(MSG_AVA_MEMPOOL_BATCH)` $\to$ `merklixsync`, and `L_e` finalization. |
+| **`033`** | `033-enable-causal-epoch-pipeline-and-preconsensus-policy.patch` | Enable the 3-stage `Ingest -> Mature -> Vote` logical epoch clock, `AbortStaleEpochsBelow(M)` cumulative jump $L_{N-1} \to L_M$, `finalized-tx-conflict` in `MemPoolAccept::PreChecks`, and `PreConsensusPolicy` parking in `ConnectTip`. | `src/lotus_v2/mempool_overlay.h/.cpp`<br/>`src/validation.cpp`<br/>`src/policy/block/preconsensus.h/.cpp`<br/>`test/functional/abc_p2p_avalanche_preconsensus.py` | Full pre-consensus functional test suite: double-spend rejection, lagging-node cumulative catch-up $L_{N-1} \to L_M$, and rogue block parking. |
+| **`034`** | `034-retire-legacy-per-tx-radix-preconsensus.patch` | Remove superseded per-tx `finalizedTxs` (`RadixTree<const CTxMemPoolEntry>`) and legacy `BlockAssembler` per-tx poll loop (`src/net_processing.cpp:7169`). | `src/txmempool.h/.cpp`<br/>`src/net_processing.cpp` | Full CTest + 300+ functional test suite pass with zero legacy per-tx radix overhead. |
 
 ---
 
@@ -1608,18 +1697,14 @@ return std::move(pblocktemplate);
    - Adopt `TxRoot = H_txroot(0x03 || CoinbaseLeaf || SubtreeA)` where `Subtree A` is a 256-bit `TxID`-keyed single-leaf-collapsed Merklix tree with branch counts `(count_L, root_L, count_R, root_R)`.
    - Adopt `OutpointKey = txid || vout` prefix preservation in `UtxoRoot`.
    - Adopt delayed/pipelined coinbase UTXO insertion (Block $h$'s coinbase outputs enter `UtxoRoot` in $L_0$ of Block $h+1$).
-2. **Leaderless Pipelined Avalanche Logical Clock (`Ingest -> Mature -> Vote`), Intra-Epoch Bucket Vector $\mathbf{B}_e$, & Overlapping-Epoch Prevention:**
-   - Extend `avapoll`/`avaresponse` with a piggybacked **Lamport Logical Epoch Clock $e$** and stamp P2P transactions locally upon validation (`local_cohort(T) = e_local`, zero wire-tag trust), driving a 3-stage causal pipeline: **Stage 1 (Local Ingest at Cohort $c = e$)** $\to$ **Stage 2 (Maturation Barrier during Epoch $e+1$ polling while Cohort $c = e$ finishes P2P propagation)** $\to$ **Stage 3 (Adaptive Top-Down Merklix Vote at Epoch $e+2$)**.
-   - Reconcile dirty `Subtree A` prefix buckets in parallel via $\mathbf{B}_e$ using **full 32-byte Merklix bucket roots** + **inline 16-byte $GF(2^{64})$ power-sum syndromes `(s1, s3)`** (keyed on per-epoch `SipHash(TxHash)` and guarded by the **Strict 256-Bit Root-Verification Gate**), then commit all 256 `UtxoRoot` shards at the **Global Atomic Epoch Barrier $L_{e-1} \to L_e$**.
-   - Prevent overlapping epoch reconciliation via **completion-clocked single-flight epochs** + a **6-round per-bucket poll cap ($\le 1.5\text{s}$)**, and recover lagging local nodes via **`AbortStaleEpochsBelow(M)` preemption** and a **single-step cumulative Merklix fast-forward ($L_{N-1} \to L_M$)**.
-3. **In-Memory Persistent Merklix Overlay Engine (`MerklixOverlayArena`):**
-   - Maintain a copy-on-write 64-byte-node radix trie arena for `Subtree A` and `UtxoRoot` using by-value `libmdbx` sibling/coin copies (`ResetReadTxn()` after each ~0.45 ms read pass), zero `UtxoOverlayArena` allocation for unfinalized peer polls, in-place epoch folding ($L_{e-3} \to L_{\text{base}}$), and `libmdbx` staged spillover for ultra-large blocks so maximum block size is never constrained by RAM.
-   - Use sort-merge batch path-copying across the 256 horizontal prefix shards to update both roots in ~1–2 ms per epoch.
-4. **Transaction-Free Block Relay (`tmplblock = Header || CoinbaseTx`), Candidate Root Match Stage, & Automatic `cmpctblock` / `block` Fallback:**
-   - Keep the 134-byte `Header` 100% free of pre-consensus metadata so block validity is invariant to Avalanche participation.
-   - Announce newly mined blocks with the ~284-byte transaction-free **`tmplblock` (`Header || CoinbaseTx`)**. In **Stage 1 (`MatchCandidateOverlay`)**, nodes check `H_txroot(0x03 || CoinbaseLeaf || L.subtree_a_root) == Header.tx_root` and `Header.state_root` against their local candidate overlays $\{L_k, L_{k-1}, L_{k-2}, L_0, L_{\text{spec}}\}$ and connect matching blocks in **$< 5\text{ }\mu\text{s}$** with zero transactions or short IDs sent on the wire.
-   - In **Stage 2 (Automatic Fallback)**, if no local candidate overlay matches (e.g., 0 Avalanche nodes in Tier 0, a custom miner template, or a lagging node), the node immediately sends `getdata(MSG_CMPCT_BLOCK, BlockID)` (pulling transactions from its mempool and validating via $O(|B \triangle L_{\text{spec}}| \log N)$ Merklix symmetric diff) or `getdata(MSG_BLOCK, BlockID)` (full block transfer).
-5. **5-Phase C++ Implementation Plan (`validation.cpp`, `txmempool.cpp`, `avalanche/processor.cpp`, `net_processing.cpp`, `node/miner.cpp`, `disk_state.cpp`):**
-   - Execute the 5-phase engineering blueprint in Section 6 to un-decouple Avalanche pre-consensus from `CTxMemPool` and `ConnectTip`, replace `finalizedTxs` (`src/radix.h`) and per-tx `setAvalancheFinalized` with `MerklixOverlayManager`, wire the generalized `merklixsync` / `getmerklixbuck` / `merklixbuck` / `getshorttx` / `shorttx` reconciliation protocol and `PendingCandidateTracker` callback pipeline, overhaul `BlockAssembler::CreateNewBlock` into an $O(1)$ microsecond operation, and add `tmplblock` + `MatchCandidateOverlay` + `CommitFinalizedOverlay`.
+2. **Typed Avalanche Polling (`CInv` & `AnyVoteItem`) + Generalized Merklix Reconciliation:**
+   - Distinguish every vote domain via explicit `CInv::type` and `AnyVoteItem` variants: `MSG_AVA_PROOF` (proofs), `MSG_BLOCK` (blocks), `MSG_AVA_STAKE_CONTENDER` (25% staker reward winner), **`MSG_AVA_TREASURY_CONTENDER`** (25% staker-voted treasury payout script), and **`MSG_AVA_MEMPOOL_BATCH`** (pre-consensus epoch/bucket Merklix roots).
+   - Keep set reconciliation generalized (`merklixsync`, `getmerklixbuck`, `merklixbuck`, `getshorttx`, `shorttx` with `ReconScope`) so it works both when an `avapoll` encounters an unknown `MSG_AVA_MEMPOOL_BATCH` and in Tier 0 live mempool sync without Avalanche.
+3. **Avalanche Staking Rewards (`25%`), Staker-Voted Treasury (`25%`), Miner Share (`50%`), and Soft Block Parking:**
+   - Keep the 50% / 25% / 25% coinbase split as an Avalanche soft block-parking policy (`StakingRewardsPolicy` + `TreasuryPolicy` in `ConnectTip`) rather than a hard consensus rule, and construct all three outputs in `vtx[0]` once inside `CreateNewBlock` (no coinbase grinding needed thanks to the 64-bit header `nonce`, and zero impact on `L_k.subtree_a_root` or `L_k.utxo_root`).
+4. **In-Memory Persistent Merklix Overlay Engine (`MerklixOverlayArena`) & `tmplblock` Relay:**
+   - Pre-populate `L_e->cached_block` (`vtx[1..N_e]` in CTOR order) once when snapshot $L_e$ finalizes so both `getblocktemplate` and incoming ~284-byte `tmplblock` (`Header || CoinbaseTx`) announcements simply slot in `vtx[0] = coinbase_tx` in $O(1)$, falling back automatically to `cmpctblock` / `block` if no local candidate overlay matches.
+5. **12-Commit Modular Implementation Roadmap (`Patches 023–034`):**
+   - Execute the work in 6 cleanly isolated stages (`023`–`034`)—from pure offline overlay arenas (`023`–`025`), to local speculative overlays and $O(1)$ mining (`026`–`027`), `tmplblock` relay (`028`), generalized Merklix sync (`029`), staking + treasury soft policies (`030`–`031`), and Avalanche batch pre-consensus (`032`–`034`).
 
 
