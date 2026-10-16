@@ -110,9 +110,9 @@ def main():
         credentials=[];homes=[]
         for i,funding in enumerate(original['funding']):
             home=root/('node-'+str(i+1)+'-home');shutil.copytree(root/'seed-home',home);homes.append(home)
-            scalar=funding['public_fixture_scalar'];key=format(scalar,'064x')
+            scalar=funding['public_fixture_scalar'];key=format(scalar,'064x');session_key=format(scalar%9+1,'064x')
             # All keys below are the explicitly public fixture scalars 1..9.
-            request=dict(schema=1,sequence=1,expiration=0,master_key=key,session_key=key,payout_script='51',stakes=[dict(tx_id=funding['txid'],index=0,amount=int(funding['value']),height=funding['creation_height'],coinbase=True,key=key,payment_lock=funding['script'])])
+            request=dict(schema=1,sequence=1,expiration=0,master_key=key,session_key=session_key,payout_script='76a914'+'11'*20+'88ac',stakes=[dict(tx_id=funding['txid'],index=0,amount=int(funding['value']),height=funding['creation_height'],coinbase=True,key=key,payment_lock=funding['script'])])
             private=root/('node-'+str(i+1)+'.private.json');fd=os.open(private,os.O_WRONLY|os.O_CREAT|os.O_EXCL,0o600)
             with os.fdopen(fd,'w') as out:json.dump(request,out)
             credential=root/('node-'+str(i+1)+'.credentials.json')
