@@ -5,7 +5,7 @@ nothing. Current native source is `63c51499441ded6d0fe34d87ff43d53a14b1398f`.
 The earlier c0ddb wallet/explorer lifecycle remains
 [recorded evidence](v2-explorer-live-acceptance-20261015.md). The independent
 controller-session gate passed at operator `f5a72c4c` / native `e775de1363`;
-its evidence packet is being authored. Neither result establishes separate-host
+its [reviewed evidence](v2-operator-workflow-acceptance.md) is archived. Neither result establishes separate-host
 operation or finality. Current controller implementation includes `80da829b`
 and `f2abf45a`; the [workflow contract](../../docs/plans/lotus-v2-operator-workflow.md)
 describes the implemented public commands and their limits.
