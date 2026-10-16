@@ -6,15 +6,34 @@ Updated October 15, 2026. Development plan; no genesis parameters are frozen and
 
 ## Source foundation and current status
 
-The current executable [V2 series](../patches/v2/series) contains 306 patches,
-`000`–`305`, on ABC master `1fb7db17c176cdea8a2c60d887891589382ee4e3`.
-[Latest replay evidence](evidence/v2-series-replay-305.json) verifies every
+The current executable [V2 series](../patches/v2/series) contains 307 patches,
+`000`–`306`, on ABC master `1fb7db17c176cdea8a2c60d887891589382ee4e3`.
+[Latest replay evidence](evidence/v2-series-replay-306.json) verifies every
 intermediate tree. Offline daemon acceptance, restart, disconnect/reconnect,
 resumable fork recovery, bounded selection and actual two-process TCP full/compact
 synchronization have separate evidence below. Native production of signed fixture-payment blocks also passes across two nodes.
 The foreground local controller now completes a live-wallet payment and restart
 across two isolated nodes; see the current controller evidence below. Development
 profile adoption and public launch remain pending.
+
+### Reviewed initial-download latch through 306 (October 15)
+
+All 307 intermediate trees verify in a fresh replay. Source `e775de1363`
+has tree `5dd4b465f2b84eb56320825819cb5d4afb171ccc`; mailboxes000–305
+remain byte-identical. The series commit parents `0923f47d`, the then-current
+`lotus-v2` tip, followed immediately by this plan update.
+
+The c0ddb nine-node run reached eight authenticated eligible peers per node but
+failed its quorum-readiness deadline. Routine header refreshes repeatedly
+reopened native IBD, unlike pinned ABC's one-way initial catchup latch. Patch306
+preserves every initial check and latches completion per process. Independent
+review and two focused tests pass, including real pending-journal refusal by the
+driver even after IBD is false. Full Debug Chronik build passes; immutable daemon
+SHA256 `5d2ba8f0a2b5bb84de31a2e76860f8b6ef947ddf611b72bb9f03fb10635c59b0`.
+The earlier failed run and clean2024seed remain preserved. Funded-cache pending
+stop/recovery passed independently at c0ddb; full quorum/finality/fork/restart
+acceptance is being repeated using a new seed copy and explicit pre-finality
+parking assertions. No threshold or consensus change is made.
 
 ### Integrated wallet and explorer acceptance (October 15)
 
