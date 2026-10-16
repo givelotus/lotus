@@ -43,6 +43,29 @@ The inspected ABC source has no QUIC implementation. `src/net_processing.cpp:684
 
 Public QUIC discovery/authentication and any removal of Avalanche application signatures require separate review. TLS encrypting a connection does not establish stake authority, consensus validity or independence from another peer. Preserve the working TCP transport throughout milestone 2.
 
+## Milestone 1.5 — Progressive Merklix Mempool Overlays, `tmplblock` Relay, and Avalanche Bulk Pre-Consensus (`Patches 023–034`)
+
+Following the consolidated baseline (`000`–`021`) and Merklix sharding upgrade (`022`), the [bulk pre-consensus and mempool overlays plan](lotus-v2-bulk-preconsensus-and-mempool-overlays.md) specifies a **6-stage, 12-commit incremental implementation sequence (`Patches 023–034`)** that decouples each subsystem into an independently testable patch:
+
+- **Stage A (`023`–`025`): Pure Offline Overlay & Syndrome Primitives:**
+  - `023`: In-memory persistent `TxOverlayArena` & `UtxoOverlayArena` (`MempoolOverlayLayer` $L_0 \dots L_k$, sort-merge batch path-copying, by-value `libmdbx` clean sibling/coin copy + `ResetReadTxn()`, in-place epoch folding).
+  - `024`: $GF(2^{64})$ power-sum syndromes `(s1, s3)` + per-epoch keyed `SipHash-2-4(TxHash)` 64-bit `short_id` helper.
+  - `025`: `DiskStateStore::CommitFinalizedOverlay` direct sorted batch commit to `libmdbx`.
+- **Stage B (`026`–`027`): Local Speculative Mempool Overlays & $O(1)$ Block Assembly (Tier 0):**
+  - `026`: Attach `MerklixOverlayManager` to `CTxMemPool` (`addUnchecked`, `removeUnchecked`, `ConnectBlockReset`) maintaining $L_0$ and live $L_{\text{spec}}$ + pre-populated `cached_block`.
+  - `027`: Overhaul `BlockAssembler::CreateNewBlock` (`src/node/miner.cpp`) to slot `vtx[0] = coinbaseRef` into `overlay->cached_block` and compute `hashMerkleRoot` and `hashStateRoot` in 2 BLAKE3 hashes ($< 2\text{ }\mu\text{s}$).
+- **Stage C (`028`): Transaction-Free Block Relay (`tmplblock`) & Candidate Root Match Stage:**
+  - `028`: Add `NetMsgType::TMPLBLOCK` (`Header || CoinbaseTx`, ~284 bytes), Stage 1 `MatchCandidateOverlay` (`{L_k, L_{k-1}, L_{k-2}, L_0, L_spec}`), `ConnectMatchedOverlayBlock`, and Stage 2 automatic fallback to `getdata(MSG_CMPCT_BLOCK / MSG_BLOCK)`.
+- **Stage D (`029`): Generalized P2P Merklix Mempool Reconciliation:**
+  - `029`: Add `merklixsync`, `getmerklixbuck`, `merklixbuck`, `getshorttx`, `shorttx` (`ReconScope`) and `PendingCandidateTracker`, verified standalone in Tier 0 live mempool sync (`ReconScope::LIVE_MEMPOOL_SYNC`).
+- **Stage E (`030`–`031`): Avalanche Block Parking, Staking Rewards (`25%`), and Staker-Voted Treasury (`25%`):**
+  - `030`: Restore `ParkBlock`/`UnparkBlock` in `ConnectTip` and `avaresponse`, and enable `StakingRewardsPolicy` (`STAKER_REWARD_RATIO = 25%` via `MSG_AVA_STAKE_CONTENDER`).
+  - `031`: Add `MSG_AVA_TREASURY_CONTENDER`, `NetMsgType::AVATREASURY`, `TreasuryContenderCache`, `TreasuryPolicy` (`TREASURY_REWARD_RATIO = 25%`), and the `50% Miner / 25% Staker / 25% Treasury` coinbase split in `BuildV2CoinbaseTx`.
+- **Stage F (`032`–`034`): Avalanche Bulk Mempool Batch Voting (`MSG_AVA_MEMPOOL_BATCH`) & Causal Epoch Pipeline:**
+  - `032`: Add `MSG_AVA_MEMPOOL_BATCH` (`0x20000006`) and `MempoolBatchVoteItem` to `AnyVoteItem`, wiring `avapoll`/`avaresponse` to `PendingCandidateTracker` and `CommitFinalizedEpoch(e, R*)`.
+  - `033`: Enable the 3-stage `Ingest -> Mature -> Vote` logical epoch clock, `AbortStaleEpochsBelow(M)` cumulative jump $L_{N-1} \to L_M$, `finalized-tx-conflict` in `MemPoolAccept::PreChecks`, and `PreConsensusPolicy` in `ConnectTip`.
+  - `034`: Retire superseded per-tx `finalizedTxs` (`RadixTree`) and legacy `BlockAssembler` per-tx poll loop.
+
 ## Follow-on milestones — commitment-based state sync and hostile suppliers
 
 Maintainer request (2026-10-15): implement these after the existing V2 chain and

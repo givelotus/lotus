@@ -85,6 +85,10 @@ Block  = Header || transaction_count:u32 || Bytes(Tx)[transaction_count]
 | `MSG_TX = 1` | P01 **TxHash**, committing to complete arguments/signatures | `tx`, subject to negotiated receive limit |
 | `MSG_BLOCK = 2` | P04 BlockID | `block`, subject to negotiated receive limit |
 | `MSG_CMPCT_BLOCK = 4` | P04 BlockID | `cmpctblock` profile 2, or full-block fallback |
+| `MSG_AVA_PROOF = 0x20000001` | Avalanche `ProofId` | `avaproof` |
+| `MSG_AVA_STAKE_CONTENDER = 0x20000004` | `StakeContenderId = H(prevblockhash, proofid)` (~25% staker share) | Derived locally in `StakeContenderCache` |
+| `MSG_AVA_TREASURY_CONTENDER = 0x20000005` | `TreasuryContenderId = H(prevblockhash, script_hash)` (~25% treasury share) | `avatreasury` (`prevblockhash \|\| CScript`) |
+| `MSG_AVA_MEMPOOL_BATCH = 0x20000006` | `MempoolBatchId` (pre-consensus epoch/bucket Merklix root) | `merklixsync` (`ReconScope::PRECONSENSUS_EPOCH`) |
 
 `inv`, `getdata` and `notfound` retain `CS(count) || (type:u32 || hash:h32)[count]` and the upstream maximum 50,000 entries, also subject to the negotiated message cap. Split inventory announcements/requests into smaller complete batches when needed; never send a count whose payload exceeds that cap. A full-TxHash response must match the requested hash exactly. `MSG_TX` gets this changed meaning only after V2 identity negotiation; there is no legacy peer fallback or ambiguous TxID interpretation.
 
@@ -94,7 +98,27 @@ The mempool may retain one fully validated representative per TxID under local r
 
 Every relayed transaction contains all witnesses and arguments. Stripped data is a commitment projection, not an executable or relayable transaction format. Run P01 signature modes, resolved-coin binding, P03 VM semantics, locks, asset accounting and P05 costs normally. A transport session or compact short ID never substitutes for these checks.
 
-## 5. Compact-block profile 2 (N04)
+## 5. Transaction-free template block relay (`tmplblock`) and compact-block profile 2 (N04)
+
+### 5.1 Transaction-free template block announcement (`tmplblock`) and Candidate Overlay Root Match Stage
+
+As specified in the [bulk pre-consensus & mempool overlays plan](../plans/lotus-v2-bulk-preconsensus-and-mempool-overlays.md), because `TxRoot = H_txroot(0x03 || CoinbaseLeaf || SubtreeA)` separates `CoinbaseTx` (`vtx[0]`) from the `TxID`-keyed Merklix `SubtreeA` (`vtx[1..n-1]`) and `vtx[0]`'s outputs are pipelined into `UtxoRoot` in Block $h+1$, each finalized pre-consensus overlay snapshot $L_k$ (and the local speculative mempool overlay $L_{\text{spec}}$) already holds a pre-populated candidate `CBlock` (`cached_block`, with `vtx[1..n-1]` in CTOR order), `subtree_a_root`, and `utxo_root`.
+
+When a miner finds valid PoW on a candidate block, it announces a ~284-byte transaction-free **`tmplblock`** message:
+
+```text
+tmplblock = Header (134 bytes) || Bytes(CoinbaseTx) (~150-250 bytes)
+```
+
+Receivers process `tmplblock` in a two-stage pipeline:
+1. **Stage 1 — Candidate Overlay Root Match (`MatchCandidateOverlay`, $< 5\text{ }\mu\text{s}$):**
+   - Verify the 134-byte `Header` PoW (`BlockID <= target`) and timestamp/size bounds **before** parsing `CoinbaseTx`, then parse `CoinbaseTx` ($\le 10\text{ KB}$) and compute `CoinbaseLeaf = H_txroot(0x00 || coinbase_txid || coinbase_txhash)`.
+   - Test `H_txroot(0x03 || CoinbaseLeaf || L.subtree_a_root) == Header.tx_root` and `H_state(0x00 || ChainID || height || L.utxo_root || 0x38 || MonetaryState) == Header.state_root` against the local candidate ring buffer $\{L_k, L_{k-1}, L_{k-2}, L_0, L_{\text{spec}}\}$ (at most 5 BLAKE3 evaluations).
+   - If a candidate overlay $L$ matches, slot `Header` and `vtx[0] = CoinbaseTx` into `L->cached_block` in $O(1)$, evaluate soft Avalanche parking policies (`StakingRewardsPolicy` `25%`, `TreasuryPolicy` `25%`, `PreConsensusPolicy`), relay `tmplblock`, and commit $L$'s pre-staged UTXO/SMT diff directly to `libmdbx` (`CommitFinalizedOverlay`).
+2. **Stage 2 — Automatic `cmpctblock` / `block` Fallback:**
+   - If no local candidate overlay matches `Header.tx_root` and `Header.state_root` (e.g., the node is in Tier 0 without a converged overlay, the miner included custom unfinalized transactions, or the node is catching up), the receiver immediately requests **`getdata(MSG_CMPCT_BLOCK, BlockID)`** (if at tip) or **`getdata(MSG_BLOCK, BlockID)`** (if behind tip).
+
+### 5.2 Compact-block profile 2 fallback
 
 Retain ABC's `sendcmpct` layout, `announce:u8 || version:u64`, with `announce` exactly 0 or 1. Propose **version 2 within the isolated Lotus V2 network**. It is not a claim of Bitcoin BIP152 witness-version-2 compatibility. Versions other than 2 are ignored without enabling compact relay. Do not emit unsolicited high-bandwidth compact blocks until the peer requests `sendcmpct(1,2)`; reuse upstream bounded peer selection/in-flight scheduling and near-tip applicability. Older history uses full blocks.
 
@@ -119,7 +143,7 @@ Reconstruction proceeds as follows:
 2. Index validated mempool/recent complete transactions by full TxHash and short ID. A short ID with multiple possible complete transactions is ambiguous. Request every ambiguous or missing position; do not choose by TxID or silently attach local signatures. Duplicate compact short IDs may instead trigger immediate full-block fallback.
 3. After missing transactions arrive, recompute each TxID and TxHash, reject duplicate TxIDs, recompute P02's ordered count-bound transaction root and exact P04 block size, and compare both with the header.
 4. If locally matched candidates fail the root or size, discard that reconstruction and request the complete block once. Short-ID collision or a mempool variant is not proof that the announced header or peer is malicious. Do not permanently mark the BlockID invalid from a failed compact reconstruction.
-5. Validate the complete transaction sequence, all signatures, coinbase, resources, monetary transition and state root through the same atomic V2 block-validation path as full-block download. Only a completely retrieved and independently invalid body justifies a consensus-invalid result; use existing distinctions between malformed transport and invalid consensus data.
+5. Validate the complete transaction sequence, all signatures, coinbase, resources, monetary transition and state root through the same atomic V2 block-validation path as full-block download (or via $O(|B \triangle L_{\text{spec}}| \log N)$ Merklix symmetric diff against $L_{\text{spec}}$ when every transaction in $B \cap L_{\text{spec}}$ is already signature- and VM-verified). Only a completely retrieved and independently invalid body justifies a consensus-invalid result; use existing distinctions between malformed transport and invalid consensus data.
 
 If compact encoding itself would exceed the negotiated cap, announce the BlockID with `inv` or `headers`; answer compact requests with full-block data when it fits, otherwise `notfound(MSG_BLOCK, BlockID)`. Never truncate a compact vector to fit. Full-block fallback is required for objects within the negotiated capacity; section 6 states the larger-object limitation.
 
@@ -133,13 +157,17 @@ Before claiming general network usability, separately review how to deliver and 
 
 Retain bounded per-peer/global download queues, progress timeouts and alternate-peer retries from upstream, adapting byte/cost accounting for V2. Tests must distinguish capacity refusal from invalidity and demonstrate clean recovery. Tune quotas from measured workloads before deployment; a peer's declared block size never authorizes allocating that many bytes.
 
-## 7. Validation boundary and optional coordination (N06)
+## 7. Validation boundary, generalized Merklix set reconciliation, and Avalanche coordination (N06)
 
-TCP/QUIC, full/compact transfer and disk import must enter one V2 validation interface. Transport may reject malformed messages or refuse local resources, but cannot invent block entitlement, use upstream transaction hashes, relax a missing opcode implementation, choose an ASERT anchor, skip signatures, or reinterpret a state-root mismatch. Unknown VM operations must follow the reviewed V2 implementation and C02/P03 contract; no OP_DEFINE/OP_INVOKE is introduced.
+TCP/QUIC, `tmplblock`, full/compact transfer and disk import must enter one V2 validation interface. Transport may reject malformed messages or refuse local resources, but cannot invent block entitlement, use upstream transaction hashes, relax a missing opcode implementation, choose an ASERT anchor, skip signatures, or reinterpret a state-root mismatch. Unknown VM operations must follow the reviewed V2 implementation and C02/P03 contract; no OP_DEFINE/OP_INVOKE is introduced.
 
 Use greatest accumulated valid work under P04 and the explicitly chosen eligibility profile. Header work is not permission to mark an unvalidated state root trusted. Preserve bounded header presynchronization, reorg handling, download-stall recovery and distinct invalid/missing/context-ineligible results. Crash consistency and atomic undo must be established before peer-supplied blocks can change persistent state.
 
-Avalanche is unavailable in the first development peering profile. Future adaptation must map proof stake outpoints to V2 TxIDs, V2 coins and native amounts, preserve application signatures until their replacement is separately reviewed, and implement P06/D11 winner/payout coordination without altering consensus issuance or allowing polling state into deterministic validity. QUIC encryption alone does not authorize dropping Avalanche signatures or bind a TLS key to an Avalanche proof.
+### Generalized Merklix mempool reconciliation & Avalanche coordination (`Patches 023–034`)
+
+Following the [bulk pre-consensus and mempool overlays specification](../plans/lotus-v2-bulk-preconsensus-and-mempool-overlays.md):
+- **Generalized Merklix Set Reconciliation (`merklixsync`, `getmerklixbuck`, `merklixbuck`, `getshorttx`, `shorttx`):** Set reconciliation over `Subtree A` prefix buckets uses full 32-byte Merklix bucket roots paired with 16-byte $GF(2^{64})$ power-sum syndromes `(s1, s3)` over per-epoch keyed `SipHash-2-4(TxHash)` 64-bit `short_id`s, prefixed by a 1-byte `ReconScope` (`0x01 = PRECONSENSUS_EPOCH`, `0x02 = LIVE_MEMPOOL_SYNC`). Every decoded candidate is gated by the **Strict 256-Bit Root-Verification Gate** (`recomputed_root_32B == peer_root_32B`) and full `MemPoolAccept` (`ProcessTransaction`) validation before `avalanche::Processor` can vote `0` (`ACCEPT`) on the candidate root.
+- **Typed Avalanche Vote Items & Soft Coinbase Split (`50% Miner / 25% Staker / 25% Staker-Voted Treasury`):** `avapoll` and `avaresponse` dispatch across `MSG_AVA_PROOF` (proofs), `MSG_BLOCK` (block finality/parking), `MSG_AVA_STAKE_CONTENDER` (`StakingRewardsPolicy`, ~25% staker coinbase share), `MSG_AVA_TREASURY_CONTENDER` (`TreasuryPolicy`, ~25% staker-voted treasury script share), and `MSG_AVA_MEMPOOL_BATCH` (`PreConsensusPolicy`, epoch/bucket Merklix roots) without altering deterministic consensus validity (`C16`) or removing application signatures over TCP/QUIC.
 
 ## 8. QUIC milestone candidate (N07)
 
