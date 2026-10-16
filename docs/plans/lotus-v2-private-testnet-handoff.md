@@ -8,12 +8,11 @@ One root integrates. Use new isolated worktrees and disjoint files; implementati
 
 ## Authoritative state
 
-- Monorepo: `/private/tmp/lotus-v2-integration-owner-20261015`, baseline `4d65f14b` before this handoff.
-- User branch: `/private/tmp/lotus-v2-repo`, `lotus-v2`; verify HEAD and cleanliness before fast-forward.
-- Native integration: `/private/tmp/lotus-v2-native-integration-20261015`. Baseline `8cd36091ba9da0665ceab621ce42306963fcbfd9`; reviewed lifecycle repair now cherry-picked as `1c8428c91b`, followed by peer-cache documentation correction. These additions are not yet exported into mailboxes or fully built.
-- Maintained series: 304 patches, 000–303, final tree `497041ae23601156327363373a5aa983c22242a5`. Every intermediate tree verified. Evidence: `daemon/docs/evidence/v2-series-replay-303.json`. Preserve existing bytes, including binary patch033. Next series commit must parent current lotus-v2 tip, immediately followed by implementation-plan update.
-- Immutable tested daemon: `/private/tmp/lotus-v2-node-build-8cd36091ba/lotusd`, SHA256 `635d7c5a6512b686e7af5add1daa29c8252eb5f77db5dcae4fd49f0dd84b2d0d`. Does not include lifecycle repair.
-- Real-.git build clone: `/private/tmp/lotus-v2-daemon-runtime-staging-20261015`, `build-chronik-v2`. Unit agent holds exclusive build-only window until released. Do not change source/config or overlap builds. Approximately 7.6 GiB disk free; avoid new full clones.
+- Monorepo: `/private/tmp/lotus-v2-integration-owner-20261015`; user branch `/private/tmp/lotus-v2-repo` is fast-forwarded through `9df84e01` before this update. Verify cleanliness and HEAD before further integration.
+- Native integration: `/private/tmp/lotus-v2-native-integration-20261015`, `c0ddb9cf307a97a43309b72cffef383c29e559e8`. Reviewed lifecycle repair `1c8428c91b` and documentation correction are integrated, built, and exported.
+- Maintained series:306 patches000–305, final tree `2f8ada7e076b9c4e529bc8348834823785029fcd`. Every intermediate tree verified. Evidence `daemon/docs/evidence/v2-series-replay-305.json`. Prior000–303 byte-identical. Series commit `293e9249` parents then-current user tip `2fed44c7`; immediate plan commit `15c87074`.
+- Immutable current daemon `/private/tmp/lotus-v2-node-build-c0ddb9cf30/lotusd`, SHA256 `5c05a1acf36a91c690505ca08bd291d9fd2e985fd483f9db08386c712c1f8bfa`; provenance alongside. Full Debug Chronik build passed. Dependency macOS deployment warnings retained; no portability claim.
+- Real-.git build clone `/private/tmp/lotus-v2-daemon-runtime-staging-20261015`, `build-chronik-v2`, now c0ddb9cf30. Unit build window released. No further source changes during current acceptance runs. Approximately8GiB free; avoid full clones and costly parallel jobs.
 
 ## Two critical acceptance gaps
 
@@ -21,9 +20,9 @@ One root integrates. Use new isolated worktrees and disjoint files; implementati
 
 Agent `avalanche_provisioning` implemented `a4e9aeb100` in `/private/tmp/lotus-v2-native-avalanche-lifecycle-20261015`; independent reviewer passed source and focused real journal reopen/deadline/persistence-failure tests. Root integrated it as above. Startup recovers pending durable work before driver/listener; stop persists last admitted public cache without claiming current eligibility. Load still revalidates.
 
-Next: after build window release, build immutable daemon and validate a NEW COPY of failed seed `/private/tmp/lotus-v2-native-quorum-enabled-seed-20261015-a`. Original failed at height1737 with pending journal; preserve it. Old binary recovery probe also failed before readiness. Do not relabel original clean or restart existing homes casually.
+The immutable repaired daemon recovered a NEW COPY of failed seed `/private/tmp/lotus-v2-native-quorum-enabled-seed-20261015-a`. Original failed at height1737 with pending journal; preserve it. Old binary recovery probe also failed before readiness. Do not relabel original clean or restart existing homes casually.
 
-Agent `native_quorum_acceptance` owns isolated harness worktree `/private/tmp/lotus-v2-native-quorum-acceptance-20261015`; commits through `26caab8f` are not integrated. All its processes stopped awaiting fixed binary. New gate tests nonempty funded public proof persistence across pending stop and same-home recovery as an observer. Then finish bootstrap2024, nine real proofs/full mesh, actual quorum/finality/parking/conflicting forks/restart. Ask owner for ordered owned commits before integrating.
+Agent `native_quorum_acceptance` owns isolated harness worktree `/private/tmp/lotus-v2-native-quorum-acceptance-20261015`; commits through `26caab8f` are not integrated. Actual run `/private/tmp/lotus-v2-native-quorum-c0ddb9cf30-20261015-a` recovered pending height1738 with exact ledger state and is importing the suffix. Original failed homes remain unchanged. New gate tests nonempty funded public proof persistence across pending stop and same-home recovery as an observer. Then finish bootstrap2024, nine real proofs/full mesh, actual quorum/finality/parking/conflicting forks/restart. Ask owner for ordered owned commits before integrating.
 
 ### Explorer availability
 
@@ -31,9 +30,11 @@ Frontend and API implemented. Actual run `/private/tmp/lotus-v2-explorer-live-ac
 
 `explorer_frontend` now owns a NEW isolated frontend repair: bounded idempotent read503 retry under original deadline, same snapshot token, navigation cancellation, no409/mutation retry, bounded visible failure. `explorer_frontend_review` reviews independently. Do not raise harness reload budget or retry until green. Prior harness `d5ea1f7b` and failure documentation `a21e2d6b` in `/private/tmp/lotus-v2-explorer-live-20261015` are not integrated. Ask ordered commit list later.
 
-## Running validation
+## Validation status
 
-`avalanche_node_integration` runs exact8cd Debug Chronik-ON inherited aggregates, session89467, 305 registered checks (313 Ninja steps), last231 steps without errors. Query actual handle/owner before treating it terminal. Build succeeded. Owner releases shared build window after results/logs captured; docs live in `/private/tmp/lotus-v2-final-unit-docs-8cd36091ba-20261015`. Upgrade-named runners do not prove distinct activation. These results precede lifecycle repair.
+Exact8cd inherited aggregates completed:305/305 runners (147default,147upgrade-named,11Avalanche). Evidence integrated as `9df84e01`, `daemon/docs/v2-final-unit-8cd36091ba.md` and its evidence directory. Independent reviewer rehashed all305 retained logs and both binaries, verified terminal success and exact source. These results precede lifecycle repair; upgrade names do not force distinct activation.
+
+`avalanche_node_integration` now owns a bounded unchanged functional smoke at c0ddb9cf30 (8scripts/10variants), fresh isolated docs/evidence. It must preflight generated config, CLI/wallet-tool provenance and coordinate resources with quorum/explorer owners; no broad reruns or source edits. Status is requested/preflight, not yet passed.
 
 ## Completed scoped evidence; do not repeat broad work
 
@@ -47,7 +48,7 @@ Frontend and API implemented. Actual run `/private/tmp/lotus-v2-explorer-live-ac
 ## Finish order
 
 1. Fix explorer availability and finish live acceptance with independent review.
-2. Release unit build window, build lifecycle repair, execute copied-home recovery and genuine funded quorum gates.
+2. Complete the running suffix bootstrap and genuine funded quorum/persistence/fork/restart gates; copied-home startup recovery has passed.
 3. Integrate owned reviewed commits; export new native mailboxes only after fresh complete intermediate-tree replay. Update plan immediately after series commit.
 4. Validate final integrated revision across applicable functional/native/compiler/wallet/Chronik gates; update coverage for changed scope and preserve failures.
 5. Prepare reproducible build/profile/peer/funding/mining/wallet/explorer runbook. Request separate-host access when local prerequisites are ready; no unspecified infrastructure authorization.
