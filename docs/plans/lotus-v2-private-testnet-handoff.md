@@ -2,6 +2,39 @@
 
 The goal remains active: a reviewed private network on separate machines, including wallet payments relayed A→B and mined from C’s mempool, restart/reorg reconciliation, explorer and authenticated Avalanche. Component passes do not establish completion. QUIC/public deployment deferred.
 
+## Current continuation — supersedes earlier status below
+
+- Reviewed operator source integrated as `80da829b` and `f2abf45a`. Root's
+  integrated unittest run passed 65 tests with two explicit native-gate skips;
+  log `/private/tmp/lotus-v2-operator-integrated-f2abf45a-20261015.log`.
+  Separate actual native gate passed at operator `f5a72c4c`, native e775:
+  `/private/tmp/lotus-v2-operator-native-gate-20261015/evidence.json`.
+  Independent review verified 58 public commands, recipient exchange, payment
+  without mining, independent receiver mining, both clean resumes, reorg and
+  original-wire reconfirmation. All children reaped. Same host, Avalanche OFF;
+  no separate-machine/finality claim. Owner is preparing tracked evidence.
+- Python reference evidence committed `391e2a0f`: all95tests passed at a69d576d;
+  `daemon/docs/evidence/v2-python-reference-a69d576d/`. Exact source hashes and
+  raw log retained; this is not full final integrated validation.
+- Peer lifecycle repair `5eddad1c15` independently reviewed and integrated native
+  `63c51499441ded6d0fe34d87ff43d53a14b1398f`. Focused peer/driver tests and full
+  Debug Chronik daemon build pass. Immutable binary
+  `/private/tmp/lotus-v2-node-build-63c5149944/lotusd`, SHA256
+  `7d86468e24d457eaf2bbac541cc33ddd422e8a481fee96c8e5b6c07e70de7d0e`.
+  Build log `/private/tmp/lotus-v2-peer-lifecycle-integrated-build-20261015.log`.
+  Real-.git staging is this exact native revision. Build no longer running.
+- Series308patches000–307 replayed with every intermediate tree checked;
+  final `b148281abc3b8a7b599182219835bfc41e2b7ba8`. Prior000–306 unchanged.
+  Series commit `9a767a72` parents then-current user tip `391e2a0f`; immediate
+  plan commit `b96abff9`. Replay evidence `v2-series-replay-307.json`.
+- Quorum owner launched NEW run
+  `/private/tmp/lotus-v2-native-quorum-63c5149944-20261015-a`, exec session81970.
+  Same reviewed harness/defaults/deadlines, copied clean2024seed. Verify actual
+  process status before assuming it remains running. No finality claim yet.
+- Runbook owner `explorer_frontend` is updating only its document for integrated
+  operator commands and latest source/build pins. Separate-host information
+  remains unanswered. Broader final-revision suites and updated coverage remain.
+
 ## Latest continuation — supersedes older in-flight notes below
 
 - Monorepo/user branch reached `a5b9d3f4`; native integration and real-.git staging
