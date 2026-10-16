@@ -211,9 +211,10 @@ def main(argv=None):
                 require(next_offset==str(len(raw)) and int(next_offset)>int(offset),'wire did not advance');offset=next_offset
             raise AssertionError('transaction wire exceeded local bound')
         def context(self):
-            deadline=time.monotonic()+self.timeout
+            deadline=getattr(self,'audit_deadline',time.monotonic()+self.timeout)
             while True:
-                native=self.raw('status');status=self.http('/status')
+                require(time.monotonic()<deadline,'context fence exceeded whole-observation deadline')
+                native=self.raw('status',wait_timeout=max(.01,deadline-time.monotonic()));status=self.http('/status',budget=max(.01,deadline-time.monotonic()))
                 if status['ready'] and status['indexed_anchor']['block_id']==native.get('tip') and status['authoritative_anchor']['block_id']==native.get('tip'):return dict(native=native,http=status)
                 require(time.monotonic()<deadline,'context fence did not reach coherent ready observation')
                 time.sleep(.025)
@@ -239,7 +240,7 @@ def main(argv=None):
         def audit(self, force=False):
             nonlocal lifecycle_failed
             if self.auditing or self.base is None:return
-            self.auditing=True;started=time.monotonic();deadline=started+self.timeout;attempt=0
+            self.auditing=True;started=time.monotonic();deadline=started+self.timeout;self.audit_deadline=deadline;attempt=0
             try:
                 while True:
                     attempt+=1;self.audit_context=None
@@ -263,9 +264,10 @@ def main(argv=None):
         def audit_once(self, force):
             require(all(local.digest(reference/p)==digest for p,digest in evidence['reference_sha256'].items()),'reference source changed during acceptance')
             require(all(local.digest(frontend/p)==digest for p,digest in evidence['frontend_sha256'].items()),'frontend changed during acceptance')
-            deadline=time.monotonic()+self.timeout
+            deadline=getattr(self,'audit_deadline',time.monotonic()+self.timeout)
             while True:
-                native=self.raw('status');status=self.http('/status')
+                require(time.monotonic()<deadline,'context fence exceeded whole-observation deadline')
+                native=self.raw('status',wait_timeout=max(.01,deadline-time.monotonic()));status=self.http('/status',budget=max(.01,deadline-time.monotonic()))
                 if status['ready'] and status['indexed_anchor']['block_id']==native.get('tip') and native.get('mempool_ready') is True and not any(native.get(k) for k in ('pending_journal','pending_receipt','pending_propagation','execution_paused','reopen_required')):break
                 require(time.monotonic()<deadline,'explorer/native did not converge');time.sleep(.025)
             self.audit_tip=native['tip'];self.audit_context=dict(native=native,http=status);identity=(native['tip'],status['service_epoch'],status['generation'])
@@ -338,8 +340,8 @@ def main(argv=None):
                 native_tx=self.raw('transactionstatus',txid=txid,txhash=payment['txhash'],wire=payment['wire'])
                 if native_tx.get('state') in ('pending','conflicted'):
                     missing=self.http('/transactions/by-id/'+txid,token,expected=404);require(missing['error']['code']=='not_in_covered_chain','miss asserted pending/rejected');record('pending-distinct-from-confirmed',node=self.label,txid=txid,native_state=native_tx['state'],snapshot=snapshot)
-            final=self.http('/status');
-            if not final['ready'] or final['service_epoch']!=snapshot['service_epoch'] or final['generation']!=snapshot['generation']:raise Changed()
+            final=self.context()['http'];
+            if final['service_epoch']!=snapshot['service_epoch'] or final['generation']!=snapshot['generation']:raise Changed()
             proxy=self.http('/blocks?page_size=1',token,proxy=True);require(proxy==envelope,'private proxy changed exact envelope')
             if plan and (self.label.startswith('a') or self.label=='c-fork'):
                 plan['root']=next((root for root in roots if any(root in i['record']['branches'] for i in history)),None);plan['assets']=sorted(expected_assets)

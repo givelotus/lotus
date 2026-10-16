@@ -104,3 +104,12 @@ exercises at most three explicit reloads per screen, preserving every transient
 notice/status in its evidence. Context fences wait for coherent ready status
 before comparing durable stamps, so temporary null anchors do not authorize a
 whole-observation restart. Neither change retries a 409 inside the idle probe.
+
+Run `/private/tmp/lotus-v2-explorer-live-acceptance-20261015-d` reached actual
+three-node funding/maturity history, thirty checks and 555 HTTP responses. Live
+DOM block/transaction/outpoint/typed-search/branch checks and native wire parity
+passed those observations. Its final status fence encountered a temporary
+`ready:false`; the later coherent context was unchanged, so the harness refused
+to classify it as a legitimate publication and stopped. The final fence now
+uses the same coherent-ready bounded wait as the other context reads, sharing
+the whole-observation deadline. The run and original failure remain retained.
