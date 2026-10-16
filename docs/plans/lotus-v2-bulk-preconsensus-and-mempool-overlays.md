@@ -970,12 +970,95 @@ If a node is behind the chain tip (`header.prev_id != ActiveTip()`) or its mempo
 | **Stage 1: Candidate Root Match (`tmplblock`)** | **Full Pre-Consensus** (Block matches $L_k, L_{k-1}, L_{k-2}, L_0,$ or $L_{\text{spec}}$) | **$O(1)$ ($< 2\text{ }\mu\text{s}$)** | **$\sim 284\text{–}380\text{ bytes}$ (`Header \|\| CoinbaseTx`)** (0 txs, 0 short IDs!) | **$O(1)$ ($< 5\text{ }\mu\text{s}$: 3 BLAKE3 hashes + coinbase check!)** |
 | **Stage 2A: `cmpctblock` + Merklix Diff Fallback** | **0 Avalanche nodes (Tier 0)** or **Miner modified template (Tier 1)** | **$O(1)$ ($< 2\text{ }\mu\text{s}$)** from $L_{\text{spec}}$ | $\sim 600\text{ KiB}$ (`cmpctblock` 6B short IDs, pulled from mempool) | **$O(\|B \triangle L_{\text{base}}\| \log N)$ ($\sim 0.2\text{–}2\text{ ms}$)** via Merklix diff vs. $L_k$ or $L_{\text{spec}}$ |
 | **Stage 2B: Full `block` Fallback** | **Node is behind tip / IBD / cold mempool** | N/A | Full block transfer (`MSG_BLOCK`) | Standard parallel batch block validation |
+| **Stage 3: Fast UTXO Shard Sync + Reverse Peeling (`utxoroots` / `utxoshard` / `blockundo`)** | **New Node Bootstrap (`-fastsync=1`)** | **Online at Tip in $< 15\text{–}30\text{s}$** | $8.5\text{ KB}$ `utxoroots` + parallel depth-8..16 `utxoshard` streams ($\le 1\text{ MiB}$ each) | **Instant tip availability** + background **bijective reverse peeling ($B_P \to B_0$)** against `Header_{h-1}.state_root` |
+
+---
+
+### 4.4 Instant Node Availability: Parallel Merklix UTXO Shard Sync & Cryptographic Reverse Block Peeling (`Stage I`)
+
+New nodes joining the network need to become **immediately available at the chain tip** (serving wallets, validating live transactions, building Merklix mempool overlays, voting in Avalanche, and mining) without waiting hours to replay historical blocks from Genesis (`height = 0`), while still achieving **100% trustless full-consensus verification** of chain history.
+
+#### A. Why Lotus V2 Can Perform True Bijective Reverse Sync (Unlike Bitcoin `AssumeUTXO` or Ethereum `snap/1`)
+
+1. **Bitcoin / BCH (`AssumeUTXO`) Limitation:** Bitcoin headers do not commit to a UTXO state root, forcing `AssumeUTXO` to hardcode a trusted snapshot hash at a stale release height in C++ source code, download an out-of-band file, and maintain *two* parallel `Chainstate` databases in RAM/disk while replaying from Genesis forwards.
+2. **Ethereum (`snap/1` in Geth / Erigon / Reth) Limitation:** While Ethereum headers commit to `stateRoot`, EVM state transitions (`SSTORE` overwrites, `SELFDESTRUCT`) are not algebraically invertible, and its 2-level RLP Merkle Patricia Trie mutates intermediate nodes faster than flat ranges can be downloaded—requiring complex multi-round "trie healing" (`GetTrieNodes`) and forward execution from Genesis.
+3. **Lotus V2's Bijective (Invertible) Merklix Advantage:**
+   - Every 134-byte Lotus V2 header at height $h$ commits to the exact 56-byte `MonetaryState` and the 256-bit single-leaf-collapsed Merklix `UtxoRoot`:
+     $$\text{StateRoot}_h = H_{\text{state}}(\texttt{0x00} \parallel \text{ChainID} \parallel \text{u64}(h) \parallel \text{UtxoRoot}_h \parallel \texttt{0x38} \parallel \text{MonetaryState}_h)$$
+   - Because `OutpointKey`-addressed Merklix insertion (`SmtInsert`) and erasure (`SmtErase`) are **strictly order-independent (commutative) and exact algebraic inverses**, every block $B_h$ with net created spendable outputs $O_h^{\text{net}}$ and prior-block spent input coins $I_h^{\text{prior}}$ satisfies the exact bijective identity:
+     $$\text{UtxoRoot}_h = (\text{UtxoRoot}_{h-1} \setminus I_h^{\text{prior}}) \cup O_h^{\text{net}} \iff \text{UtxoRoot}_{h-1} = (\text{UtxoRoot}_h \setminus O_h^{\text{net}}) \cup I_h^{\text{prior}}$$
+   - Consequently, once a node syncs the active UTXO set at a finalized pivot block $B_P$ and goes online at the tip, a background cursor can download blocks **strictly backwards ($B_P \to B_{P-1} \to \dots \to B_0$)**, verify every transaction's VM scripts, signatures, and P05 costs, **peel** $B_h$ in reverse ($\text{SmtErase}(O_h^{\text{net}})$ + $\text{SmtInsert}(I_h^{\text{prior}})$), and verify that the resulting root hashes to **`Header_{h-1}.state_root` in the already-authenticated header chain**!
+
+```mermaid
+flowchart TD
+    subgraph Phase1["Phase 1: Header Chain + Dual-Authenticated Pivot Selection (< 2s)"]
+        H1["Sync 134-byte Header Chain 0 .. H_tip<br/>Verify pure BLAKE3 PoW + ASERT targets + MTP"]
+        H2["Select Pivot Block B_P (H_tip - k):<br/>Must be Avalanche-Finalized OR buried by >= 100 PoW blocks<br/>+ cross-confirmed across >= 3 distinct /16 peer netgroups"]
+        H1 --> H2
+    end
+
+    subgraph Phase2["Phase 2: Parallel Merklix Prefix-Shard UTXO Sync (< 15-30s)"]
+        S1["Fetch utxoroots(B_P): 56B MonetaryState_P + 256 depth-8<br/>(cardinality_tag, shard_root[0..255]) (~8.5 KB)<br/>Verify fold(shard_root[0..255]) + MonetaryState_P == B_P.state_root!"]
+        S2["Download 256 prefix shards in parallel across peers via getutxoshard / utxoshard<br/>(Adaptive depth k in [8..16], <= 4,096 coins / <= 1 MiB per self-authenticating chunk)"]
+        S3["Verify each shard's Merklix subtree root in RAM == shard_root[s],<br/>commit to DiskStateStore, and forward-connect B_{P+1} .. B_{tip}!"]
+        S4["NODE IS 100% ONLINE AT TIP!<br/>Validates mempool txs, builds Merklix overlays L_0..L_k,<br/>votes in Avalanche, mines blocks, & serves all tip RPCs!"]
+        S1 --> S2 --> S3 --> S4
+    end
+
+    subgraph Phase3["Phase 3: Background Bijective Reverse Block Peeling (B_P -> B_{P-1} -> ... -> B_0)"]
+        R1["For h = P down to 1: Fetch Block B_h + BlockUndo_h<br/>(I_h^prior spent Coins + MonetaryState_{h-1})"]
+        R2["Partition B_h inputs into Intra-Block Spends (I_h^intra, resolved from B_h)<br/>and Prior-Block Spends (I_h^prior, from BlockUndo_h)"]
+        R3["Peel Merklix State Backwards:<br/>UtxoRoot'_{h-1} = SmtInsert(SmtErase(UtxoRoot_h, O_h^net), I_h^prior)<br/>Verify H_state(ChainID, h-1, UtxoRoot'_{h-1}, MonetaryState_{h-1}) == Header_{h-1}.state_root!"]
+        R4["Run full V2 signature, VM script, & P05/P06 monetary verification on B_h,<br/>write blk/rev/index to disk, and decrement earliest_verified_height = h - 1!"]
+        R1 --> R2 --> R3 --> R4
+    end
+
+    H2 --> S1
+    S4 --> R1
+```
+
+#### B. Wire Protocol Messages for Fast UTXO Shard Sync & Reverse Peeling (Handled by `V2PeerProtocolHandler`)
+
+All four request/response pairs are encapsulated inside `lotus::v2::net::V2PeerProtocolHandler` (`src/net/v2_protocol_handler.h/.cpp`) and gated by capability bit `0x08` (`V2_CAP_UTXO_FASTSYNC`) in `v2hello`:
+
+```text
+# 1. Request/Response for Depth-8 Merklix Prefix Roots + 56-Byte MonetaryState at Pivot Block B_P:
+getutxoroots = pivot_block_id:h32
+
+utxoroots    = pivot_block_id:h32
+               || height:u64
+               || monetary_state:Bytes56
+               || ShardRootEntry[256]                     # 256 * 33B = 8,448 bytes (8.53 KB total)
+
+ShardRootEntry = cardinality_tag:u8                       # 0 = EmptyRoot, 1 = SingleLeaf (collapsed), 2 = InteriorNode (>=2 leaves)
+                 || subtree_root:h32                      # If tag==1, also followed by single_leaf_key:h32 so collapse above depth 8 is exact
+
+# 2. Request/Response for a Self-Authenticating Prefix Shard (or Sub-Shard at depth k in [8..16]):
+getutxoshard = pivot_block_id:h32
+               || prefix_depth:u8                         # k in [8..16] (default 8; >8 if shard has > 4,096 coins)
+               || prefix_bits:u16                         # Little-endian k-bit OutpointKey prefix
+
+utxoshard    = pivot_block_id:h32
+               || prefix_depth:u8
+               || prefix_bits:u16
+               || boundary_siblings:h32[prefix_depth - 8] # Empty if prefix_depth == 8; proves sub-shard against depth-8 ShardRootEntry!
+               || CS(coin_count)                          # MUST be <= 4,096 (<= 1 MiB)
+               || Bytes(Coin)[coin_count]                 # Sorted strictly ascending by OutpointKey(coin.outpoint)
+
+# 3. Request/Response for Reverse Block Peeling Undo Package (B_h -> B_{h-1}):
+getblockundo = block_id:h32
+
+blockundo    = block_id:h32
+               || parent_monetary_state:Bytes56           # Exact 56-byte MonetaryState_{h-1}
+               || CS(prior_spent_coin_count)              # Exactly |I_h^prior| (excludes intra-block spends!)
+               || Bytes(Coin)[prior_spent_coin_count]     # In canonical prior-spend input order of B_h
+```
 
 ---
 
 ## Section 5: Adversarial Threat Model, Attack Mitigations, and Protocol Hardening
 
-To ensure the protocol is resilient against Byzantine peers, cryptographic grinding, P2P eclipse/churn manipulation, economic fee-burn griefing, and resource exhaustion, this section systematically catalogs **nine red-team attack surfaces** and the normative protocol defenses baked into Sections 1–4.
+To ensure the protocol is resilient against Byzantine peers, cryptographic grinding, P2P eclipse/churn manipulation, economic fee-burn griefing, resource exhaustion, and fast-sync spoofing, this section systematically catalogs **16 red-team attack surfaces** (Holes 1–10 for Bulk Pre-Consensus & Merklix Overlays, plus Holes 11–16 for Fast UTXO Shard Sync & Reverse Block Peeling) and the normative protocol defenses baked into the specification.
 
 ---
 
@@ -1063,7 +1146,72 @@ To ensure the protocol is resilient against Byzantine peers, cryptographic grind
 
 ---
 
-### 5.11 Summary Matrix of Red-Team Vulnerabilities and Normative Mitigations
+### 5.11 Hole 11 — Fast-Sync Prefix-Shard Boundary Injection & Non-Canonical Single-Leaf Collapse Spoofing (`utxoroots` / `utxoshard`)
+- **Attack Vector:**
+  1. *Cross-Shard Smuggling:* During Phase 2 of Fast UTXO Shard Sync (`utxoshard`), a Byzantine peer serving shard $s \in [0..255]$ includes a fabricated `Coin` whose `OutpointKey(coin.outpoint)` has first byte $s' \ne s$, or sends duplicate `OutpointKey`s, or sends a burn output (`(flags & 0x02) != 0`, violating `C17`). If the receiver wrote coins to `DiskStateStore` before checking that every key belongs to shard $s$, the attacker could inject unauthenticated UTXOs into other shards!
+  2. *Sparse Single-Leaf Collapse Mismatch Above Depth 8:* In a single-leaf-collapsed Merklix tree ([`commitments-and-state.md:148–152`](../lotus-v2/decisions/commitments-and-state.md)), if an ancestor subtree at depth $d < 8$ has only 1 leaf total across all its descendants, it collapses above depth 8 without hashing `UtxoNode(d, leaf, EmptyRoot)`. A naive depth-8 array of 32-byte hashes without cardinality tags (`Empty = 0`, `SingleLeaf = 1`, `Interior = 2`) would fail to fold to `UtxoRoot_P` on sparse subtrees or allow a peer to spoof a collapsed leaf as an interior node.
+- **Normative Protocol Defense (Section 4.4):**
+  1. **Annotated Depth-8 `ShardRootEntry` (`cardinality_tag: u8 || subtree_root: h32`):** When folding the 256 `ShardRootEntry` records from depth $d = 7$ down to $d = 0$ against `B_P.state_root`, the verifier applies the exact P02 single-leaf collapse rule (`0 + 0 -> 0`, `1 + 0 -> 1` with zero `UtxoNode` hash, $\ge 2 \to \text{UtxoNode}(d, l, r)$) and rejects any `utxoroots` message whose folded root + `MonetaryState_P` does not equal `B_P.state_root`.
+  2. **Strict In-Memory Per-Shard Verification Before Disk Commit:** For every `Coin` in `utxoshard`:
+     - Recompute `key = OutpointKey(coin.outpoint)` locally (never trust a wire key).
+     - Require `prefix_bits(key, k) == requested_prefix`, strictly ascending `key` order (zero duplicates), `(coin.output.flags & 0x02) == 0` (`C17` spendable only), `coin.creation_height <= P`, and valid output structure.
+     - Reconstruct the shard's Merklix subtree in RAM and verify `(cardinality_tag, root) == verified_shard_root[s]` **before** writing a single coin to `DiskStateStore`!
+
+---
+
+### 5.12 Hole 12 — Intra-Block Spend (`O_h \cap I_h`) Confusion & Fake `BlockUndo` Spoofing During Reverse Block Peeling
+- **Attack Vector:**
+  - During Phase 3 (Reverse Block Peeling from $h = P$ down to $h = 1$), the node is at verified state $(\text{UtxoRoot}_h, \text{MonetaryState}_h)$ and downloads `(B_h, BlockUndo_h)` to step backwards to $h - 1$.
+  - Suppose block $B_h$ contains an **intra-block parent-child spend**: transaction $T_{\text{parent}} \in B_h$ creates outpoint `op_ephem`, and transaction $T_{\text{child}} \in B_h$ spends `op_ephem` in the same block.
+  - Because `op_ephem` was created and consumed inside $B_h$, `op_ephem` exists in **neither** $\text{UtxoRoot}_{h-1}$ **nor** $\text{UtxoRoot}_h$! If the reverse peeling logic failed to separate intra-block spends ($I_h^{\text{intra}}$) from prior-block spends ($I_h^{\text{prior}}$) and inserted `op_ephem` into $\text{UtxoRoot}'_{h-1}$ (or allowed `BlockUndo_h` to supply a fake `Coin` for `op_ephem`), $\text{UtxoRoot}'_{h-1}$ would be corrupted or `T_child` would be validated against a spoofed `Coin`!
+- **Normative Protocol Defense (Section 4.4):**
+  1. **Exact Partition of $O_h^{\text{net}}$, $I_h^{\text{intra}}$, and $I_h^{\text{prior}}$:**
+     - From $B_h$ and the validated header chain (`creation_height = h`, `creation_parent_mtp = MTP(h-1)`), construct the map $O_h^{\text{all}}$ of all spendable outputs created in $B_h$.
+     - Partition every spent input outpoint `op` in $B_h$ (`vtx[1..n-1]`):
+       - If $\text{op} \in O_h^{\text{all}}$, it is an **intra-block spend** ($I_h^{\text{intra}}$): its `Coin` is resolved **100% locally from $O_h^{\text{all}}$** (never read from `BlockUndo_h`), and `op` is removed from $O_h^{\text{all}}$ to yield the net surviving outputs $O_h^{\text{net}} = O_h^{\text{all}} \setminus I_h^{\text{intra}}$.
+       - If $\text{op} \notin O_h^{\text{all}}$, it is a **prior-block spend** ($I_h^{\text{prior}}$): its `Coin` is consumed from `BlockUndo_h`, which MUST have `coin.creation_height < h`.
+  2. **Pre-Execution Bijective `StateRoot` Gate:**
+     - Verify every coin in $O_h^{\text{net}}$ exists with identical bytes in $\text{UtxoRoot}_h$, and no outpoint in $I_h^{\text{prior}}$ exists in $\text{UtxoRoot}_h$.
+     - Compute $\text{UtxoRoot}'_{h-1} = \text{SmtInsertBatch}(\text{SmtEraseBatch}(\text{UtxoRoot}_h, O_h^{\text{net}}), I_h^{\text{prior}})$ and verify:
+       $$H_{\text{state}}(\texttt{0x00} \parallel \text{ChainID} \parallel (h-1) \parallel \text{UtxoRoot}'_{h-1} \parallel \texttt{0x38} \parallel \text{MonetaryState}_{h-1}) == \text{Header}_{h-1}.\text{state\_root}$$
+       Because `Header_{h-1}.state_root` is already fixed in the PoW-authenticated header chain, a peer **cannot forge a single bit** of any `Coin` in $I_h^{\text{prior}}$ or $\text{MonetaryState}_{h-1}$.
+     - Finally, run full V2 transaction, signature, VM script, and P05/P06 monetary transition validation on $B_h$ against $I_h^{\text{prior}} \cup I_h^{\text{intra}}$.
+
+---
+
+### 5.13 Hole 13 — Unfinalized / Shallow-Fork Pivot Spoofing During Fast Sync
+- **Attack Vector:** An eclipse or minority-hashrate attacker mines a 1-block private fork $B_{\text{fake}}$ with an invalid state transition (minting arbitrary coins in `B_fake.state_root`) and tries to make a newly booting node fast-sync to $B_{\text{fake}}$.
+- **Normative Protocol Defense (Section 4.4):**
+  - **Dual Pivot Authentication Gate:** A node only accepts a fast-sync pivot $B_P$ if:
+    1. The active header chain satisfies `ChainWork(Tip) >= nMinimumChainWork`, **AND**
+    2. **Either** $B_P$ is confirmed finalized by the live Avalanche stake quorum (`isQuorumEstablished() && isFinalized(B_P)`), **OR** $B_P$ is buried by at least `kFastSyncPivotFinalityDepth = 100` valid-PoW headers on the best header chain and its header is confirmed by $\ge 3$ outbound peers across distinct `/16` netgroups.
+  - Furthermore, because Phase 3 (Reverse Block Peeling) peels every block from $B_P$ down to Genesis (`height = 0`), any historical invalid state transition is deterministically caught when the reverse cursor reaches that block.
+
+---
+
+### 5.14 Hole 14 — Tip Reorg Below Pivot $B_P$ Before Reverse Peeling Has Downloaded Undo Data
+- **Attack Vector:** If a node fast-synced directly to the unfinalized tip $B_{\text{tip}}$ without undo data for $B_{\text{tip}}$, and a 2-block reorg arrived 1 second later before Reverse Block Peeling had downloaded `BlockUndo_{tip}`, `DisconnectTip()` would lack the undo record needed to roll back $B_{\text{tip}}$.
+- **Normative Protocol Defense (Section 4.4):**
+  - **Pivot Safety Cushion + Immediate Top-Window Forward Connect:** Pivot $B_P$ is selected at an Avalanche-finalized block (which cannot be reorged under Avalanche finality) or at `P = H_tip - kPivotSafetyBlocks` ($k = 10$), and during Phase 2 the node forward-connects the top $k$ full blocks $B_{P+1} \dots B_{\text{tip}}$ (generating local `BlockUndo` records for the entire reorg-eligible tip window before going online), while Reverse Peeling immediately downloads and verifies $B_P, B_{P-1}, \dots$ in descending order.
+
+---
+
+### 5.15 Hole 15 — Oversized Shard Streaming & Unverified Pagination RAM Exhaustion in `utxoshard`
+- **Attack Vector:** If a single depth-8 shard $s$ grew to $500{,}000$ coins (~50 MB, exceeding the 2–16 MiB `v2hello` message cap) and had to be streamed across 50 unverified pagination chunks, a malicious peer could feed 49 chunks of garbage (~49 MB) before the victim discovered at chunk 50 that the depth-8 Merklix root failed to match.
+- **Normative Protocol Defense (Section 4.4):**
+  - **Self-Authenticating Adaptive Depth-$k$ Sub-Shards (`k in [8..16]`, $\le 4{,}096$ Coins / $\le 1\text{ MiB}$):** Every `utxoshard` message is capped at `kMaxUtxoShardLeaves = 4,096` coins ($\le 1\text{ MiB}$). Whenever a depth-8 shard exceeds 4,096 coins, it is requested at deeper prefix depth $k \in [9..16]$ and carries the $(k - 8)$ 32-byte Merklix boundary siblings ($\le 256\text{ B}$) linking that sub-shard's root directly to `ShardRootEntry[s]`. Thus **every single $\le 1\text{ MiB}$ `utxoshard` packet is 100% self-authenticating on arrival with zero multi-packet unverified RAM buffering**.
+
+---
+
+### 5.16 Hole 16 — Historical RPC & Indexer Queries During Active Reverse Peeling
+- **Attack Vector:** While the node is online at $H_{\text{tip}}$ and Reverse Peeling is at height $h_{\text{peel}} \in (0, P]$, a client queries `getblock` or transaction history for an older block at height $h < h_{\text{peel}}$ that has not yet been peeled.
+- **Normative Protocol Defense (Section 4.4):**
+  - `Chainstate` and lock-free `ChainAndMempoolSnapshot` track `earliest_verified_height` atomically (initialized to $P$ at the end of Phase 2, decremented as each block $h$ is reverse-peeled down to `0`).
+  - `getblockchaininfo` exposes `"fast_sync_active"`, `"pivot_height"`, and `"earliest_verified_height"`. Tip RPCs, UTXO lookups (`gettxout`), `getblocktemplate`, `submitrawtxbatch`, and block queries for $h \ge \text{earliest\_verified\_height}$ are served at full speed; block body queries for $h < \text{earliest\_verified\_height}$ return a clear `"block-pending-reverse-sync"` status until `earliest_verified_height` reaches `0`.
+
+---
+
+### 5.17 Summary Matrix of Red-Team Vulnerabilities and Normative Mitigations
 
 | # | Vulnerability / Attack Vector | Severity (Unmitigated) | Normative Protocol Mitigation | Spec Section |
 | :--- | :--- | :--- | :--- | :--- |
@@ -1077,6 +1225,12 @@ To ensure the protocol is resilient against Byzantine peers, cryptographic grind
 | **8** | **Long-lived `MDBX_TXN_RDONLY` pinning & dangling `mmap` `string_view`s** | High (`SIGSEGV` / `MDBX_MAP_FULL`) | Copy 33B sibling summaries & `Coin` bytes **by value** into arenas during ~0.45ms read pass and immediately call **`ResetReadTxn()`** | §3.3.2, §3.4, §5.8 |
 | **9** | **Speculative poll arena OOM vs. artificial cap on P05 elastic block size** | High (OOM or Artificial Block Cap) | **0 Bytes allocated in `UtxoOverlayArena` for peer polls** + **In-Place Epoch Folding ($L_{e-3} \to L_{\text{base}}$)** + **`libmdbx` Staged Checkpoint Spillover** (zero block size limit!) | §3.5.B, §5.9 |
 | **10** | **Overlapping epoch reconciliation & 10-second lagging-node pileup** | High (State Corruption / Queue Explosion) | **Completion-clocked single-flight epochs** + **6-round bucket cap ($\le 1.5\text{s}$)** + **`AbortStaleEpochsBelow(M)` preemption** & **1-step cumulative jump ($L_{N-1} \to L_M$)** | §2.7, §5.10, §6.4 |
+| **11** | **Fast-sync cross-shard key smuggling & sparse collapse spoofing** | Critical (UTXO State Corruption) | **Annotated Depth-8 `ShardRootEntry`** (preserving P02 single-leaf collapse) + **strict per-shard prefix/canonicality check & in-memory root verification before disk write** | §4.4, §5.11 |
+| **12** | **Intra-block spend ($O_h \cap I_h$) confusion & `BlockUndo` spoofing in reverse peel** | Critical (Consensus Bypass in Reverse Sync) | **Partition $I_h^{\text{intra}}$ (resolved from $B_h$) vs. $I_h^{\text{prior}}$ (from `BlockUndo_h`)** + **bijective `Header_{h-1}.state_root` verification before disk commit** | §4.4, §5.12 |
+| **13** | **Unfinalized / shallow-fork pivot spoofing during fast sync** | High (Fake Pivot State Acceptance) | **Dual Pivot Authentication Gate** (Avalanche-finalized OR buried by $\ge 100$ valid-PoW blocks across $\ge 3$ `/16` netgroups) + full reverse peel down to Genesis | §4.4, §5.13 |
+| **14** | **Tip reorg below pivot $B_P$ before undo data is downloaded** | High (Unclean Reorg / Crash) | **Pivot Safety Cushion ($P = H_{\text{tip}} - 10$)** + forward-connecting top 10 blocks with local undo data before going online | §4.4, §5.14 |
+| **15** | **Oversized shard streaming & unverified pagination RAM DoS** | High (Memory Exhaustion DoS) | **Adaptive Depth-$k$ Sub-Shards ($k \in [8..16]$, $\le 4{,}096$ coins / $\le 1\text{ MiB}$)** with $(k-8)$ boundary siblings so every single packet is self-authenticating on arrival | §4.4, §5.15 |
+| **16** | **RPC / indexer queries for unpeeled blocks ($h < h_{\text{peel}}$)** | Medium (Misleading RPC Responses) | Atomic **`earliest_verified_height`** in `ChainAndMempoolSnapshot` + explicit `"fast_sync_active"` / `"earliest_verified_height"` reporting in `getblockchaininfo` | §4.4, §5.16 |
 
 ---
 
@@ -1850,6 +2004,9 @@ However, the legacy intervals in `src/net_processing.cpp` were tuned for **600-s
 | **Stage H** | **Pre-`1.0.0` `inv` Queue Deduplication, Quorum/Relative-Stake Activation, BLAKE3 SIMD, & Fuzz Targets** | | | |
 | **`037`** | `037-tune-inv-queue-and-quorum-relative-stake-activation.patch` | Tune `inv` queue intervals (`INBOUND_INVENTORY_BROADCAST_INTERVAL = 500ms`, per-outbound-peer `OUTBOUND_INVENTORY_BROADCAST_INTERVAL = 150ms` for `m_tx_inventory_known_filter` deduplication, `nonpref_peer_delay = 200ms`, `INVENTORY_BROADCAST_PER_SECOND = 250`) and gate `PreConsensusPolicy`, `StakingRewardsPolicy`, and `TreasuryPolicy` on `Processor::isQuorumEstablished()` (minimum online Avalanche nodes + `minQuorumSupplyRatio` of live circulating supply, with zero block-height magic numbers). | `src/net_processing.cpp`<br/>`src/avalanche/processor.h/.cpp`<br/>`src/node/miner.cpp`<br/>`test/functional/p2p_v2_relay_and_quorum_bootstrap.py` *(new)* | Functional test proving Genesis cold-start mines in Tier 0 until online Avalanche node count and relative staked coin ratio establish quorum, then transitions seamlessly to `50/25/25` + pre-consensus. |
 | **`038`** | `038-enable-blake3-simd-and-add-v2-fuzz-targets.patch` | Enable hardware SIMD acceleration (`NEON` on ARM64, `SSE2`/`SSE4.1`/`AVX2`/`AVX512` on x86_64) in `lotus_v2_blake3` (`src/lotus_v2/CMakeLists.txt`) and register pre-`1.0.0` libFuzzer targets for V2 transactions/VM/1KB BigInts, `merklixsync`/$GF(2^{64})$ syndromes, and `tmplblock`/`cmpctblock`. | `src/lotus_v2/CMakeLists.txt`<br/>`src/test/fuzz/v2_vm_and_tx.cpp` *(new)*<br/>`src/test/fuzz/v2_merklix_sync.cpp` *(new)*<br/>`src/test/fuzz/v2_tmplblock.cpp` *(new)* | Verify 3x–6x BLAKE3 throughput speedup with identical digest vectors across portable/NEON/AVX2 + clean libFuzzer execution under ASan/UBSan. |
+| **Stage I** | **Fast UTXO Shard Sync & Cryptographic Reverse Block Peeling (Sequenced After Stages A–H Complete)** | | | |
+| **`039`** | `039-add-fast-utxo-shard-sync-protocol.patch` | Add `getutxoroots`/`utxoroots` (56B `MonetaryState_P` + 256 annotated depth-8 `ShardRootEntry`s) and `getutxoshard`/`utxoshard` (adaptive depth $k \in [8..16]$, $\le 4{,}096$ coins / $\le 1\text{ MiB}$ self-authenticating sub-shards) to `V2PeerProtocolHandler`. Implement Dual Pivot Authentication Gate (Holes 11, 13, 14, 15). | `src/net/v2_protocol_handler.h/.cpp`<br/>`src/protocol.h/.cpp`<br/>`src/lotus_v2/disk_state.h/.cpp`<br/>`src/primitives/block.h/.cpp`<br/>`src/test/fast_sync_shard_tests.cpp` *(new)* | Unit + functional tests proving parallel 256-shard UTXO sync reconstructs `UtxoRoot_P`, rejects cross-shard smuggled keys (Hole 11), and brings a new node online at the tip in seconds. |
+| **`040`** | `040-add-bijective-reverse-block-peeling.patch` | Add `getblockundo`/`blockundo` and background `ReverseBlockPeeler` ($B_P \to B_{P-1} \to \dots \to B_0$): partition $I_h^{\text{intra}}$ vs. $I_h^{\text{prior}}$ (Hole 12), peel $\text{UtxoRoot}_h \to \text{UtxoRoot}_{h-1}$ via `SmtErase`/`SmtInsert`, verify `Header_{h-1}.state_root` + full V2 VM/signature execution, and expose `earliest_verified_height` in `ChainAndMempoolSnapshot` / `getblockchaininfo` (Hole 16). | `src/validation.h/.cpp`<br/>`src/node/snapshot.h/.cpp`<br/>`src/rpc/blockchain.cpp`<br/>`test/functional/p2p_v2_fast_sync_and_reverse_peel.py` *(new)* | Prove end-to-end fast sync at pivot $B_P$ + reverse block peeling down to Genesis (`height = 0`), catching any corrupted `BlockUndo` or intra-block spend manipulation via `Header_{h-1}.state_root`. |
 
 ---
 
@@ -1869,8 +2026,8 @@ However, the legacy intervals in `src/net_processing.cpp` were tuned for **600-s
 5. **Upstreamable C++20 `Boost.Asio` Coroutine RPC Engine (`Stage G1`) + Lotus V2 Lock-Free RCU Snapshots, True $O(1)$ `getblocktemplate`, and Atomic Batch RPCs (`Stage G2`, see [`lotus-v2-rpc-coroutines-and-lockfree-snapshots.md`](./lotus-v2-rpc-coroutines-and-lockfree-snapshots.md)):**
    - First, replace the legacy 4-thread blocking `WorkQueue` and static globals in `src/httpserver.cpp` and OS-thread-parking `wait_until` long-polls (`waitfornewblock`, `getblocktemplate` `longpollid`) with `NodeContext`-injected C++20 `boost::asio::awaitable` coroutines in two standalone, upstreamable ABC patches (`032`–`033`).
    - Second, add `ChainAndMempoolSnapshot` (`std::atomic<std::shared_ptr<const ChainAndMempoolSnapshot>>`) + `ScopedMdbxReadTxn` (`034`), true $O(1)$ overlay `getblocktemplate` + `submittemplateblock` (`035`), and lock-free atomic batch validation (`testrawtxbatch`) + two-phase all-or-nothing batch submission (`submitrawtxbatch`, `036`).
-6. **19-Commit Modular Implementation Roadmap (`Patches 020–038`):**
-   - Execute the work in 8 cleanly isolated stages (`020`–`038`) on top of `019-swap-chronik-bridge-to-v2-headers-and-outputs.patch` (`2587132166`)—ending with Stage H (`037`–`038`) to tune `inv` queue deduplication, enforce quorum/relative-stake activation, enable BLAKE3 hardware SIMD (`NEON`/`AVX2`), and add dedicated libFuzzer suites before `1.0.0`.
+6. **21-Commit Modular Implementation Roadmap (`Patches 020–040`):**
+   - Execute Stages A–H (`020`–`038`) in parallel across isolated worktrees on top of `019-swap-chronik-bridge-to-v2-headers-and-outputs.patch` (`2587132166`), and then sequence **Stage I (`Patches 039–040`: Fast UTXO Shard Sync & Cryptographic Reverse Block Peeling)** on top once the `SmtNode` overlay, `V2PeerProtocolHandler`, and `SnapshotPublisher` machinery from `020`–`038` are integrated.
 
 
 
