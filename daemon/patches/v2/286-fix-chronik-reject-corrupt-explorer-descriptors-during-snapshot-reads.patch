@@ -1,0 +1,503 @@
+From 331962ff6a2853e5cd8d9e7a7752f3c61c1409c2 Mon Sep 17 00:00:00 2001
+From: Shammah Chancellor <shammah.chancellor@notvalid.com>
+Date: Thu, 15 Oct 2026 17:14:57 -0700
+Subject: [PATCH] fix(chronik): reject corrupt explorer descriptors during
+ snapshot reads
+
+---
+ chronik/chronik-db/src/v2_explorer.rs         | 215 +++++++++++++++++-
+ .../chronik-db/src/v2_explorer_model_tests.rs |  93 ++++++++
+ .../chronik-indexer/src/query/v2_explorer.rs  |  28 ++-
+ .../src/query/v2_explorer_query_tests.rs      |   6 +-
+ 4 files changed, 320 insertions(+), 22 deletions(-)
+
+diff --git a/chronik/chronik-db/src/v2_explorer.rs b/chronik/chronik-db/src/v2_explorer.rs
+index 9666bbba0ff57c56c0673e191cb96e8d036e4e8c..b6ab823d605ada681d0adca853144891ccb7d85b 100644
+--- a/chronik/chronik-db/src/v2_explorer.rs
++++ b/chronik/chronik-db/src/v2_explorer.rs
+@@ -319,6 +319,72 @@ pub fn preflight_explorer_block(block: &CommittedBlock) -> Result<usize> {
+     }
+     Ok(size)
+ }
++/// Validate a bounded stored input before exposing any field. This checks the
++/// native descriptor shape, not script execution or transaction consensus.
++pub fn validate_input_meta(input: &InputMeta, wire_size: u64) -> Result<()> {
++    input
++        .coinbase_data
++        .validate(wire_size)
++        .map_err(|_| Error::Corrupt)?;
++    if !input.has_coinbase_data && input.coinbase_data != WireRange::default() {
++        return Err(Error::Corrupt);
++    }
++    let valid = match input.flags {
++        1 => {
++            !input.has_coinbase_data
++                && input.path_index < 16
++                && (1..=16).contains(&input.witness_count)
++                && (input.sequence == u32::MAX || input.sequence & !0x40ffff == 0)
++                && input.resolved_creation.as_ref().is_some_and(|coin| {
++                    coin.outpoint.txid.0 .0 == input.prev_txid
++                        && coin.outpoint.out_idx == input.prev_index
++                        && coin.creation.txid == coin.outpoint.txid
++                        && !coin.output.is_burn()
++                        && coin.output.validate().is_ok()
++                })
++        }
++        2 => {
++            input.path_index == 0
++                && input.sequence == u32::MAX
++                && input.witness_count == 0
++                && input.resolved_creation.is_none()
++                && (!input.has_coinbase_data || (1..=8192).contains(&input.coinbase_data.length))
++        }
++        3 => {
++            input.path_index == 0
++                && input.sequence == u32::MAX
++                && input.witness_count == 1
++                && input.prev_index == 0
++                && input.prev_txid != [0; 32]
++                && !input.has_coinbase_data
++                && input.resolved_creation.is_none()
++        }
++        _ => false,
++    };
++    if !valid {
++        return Err(Error::Corrupt);
++    }
++    Ok(())
++}
++/// Check witness ranges without allocating scripts, arguments or proofs.
++pub fn validate_witness_fact(witness: &WitnessFact, wire_size: u64) -> Result<()> {
++    for range in [
++        witness.script,
++        witness.siblings_table,
++        witness.arguments_table,
++    ] {
++        range.validate(wire_size).map_err(|_| Error::Corrupt)?;
++    }
++    if witness.siblings_count > 64
++        || witness.arguments_count > 65535
++        || witness.siblings_table.length == 0
++        || witness.arguments_table.length == 0
++        || u64::from(witness.arguments_count) > witness.arguments_table.length - 1
++    {
++        return Err(Error::Corrupt);
++    }
++    Ok(())
++}
+ fn validate_input(input: &InputFact, size: u64) -> Result<()> {
+     if !matches!(input.flags, 1..=3) {
+         return Err(Error::Invalid("input flags"));
+@@ -464,6 +530,18 @@ impl ReadSnapshot<'_> {
+         if u64::from_le_bytes(meta.header_wire[62..70].try_into().unwrap()) != meta.anchor.height {
+             return Err(Error::Corrupt);
+         }
++        if meta.anchor.height == 0 {
++            if meta.header_wire[..32] != [0; 32] {
++                return Err(Error::Corrupt);
++            }
++        } else if self
++            .inner
++            .get(height_key(meta.anchor.height - 1))?
++            .as_deref()
++            != Some(&meta.header_wire[..32])
++        {
++            return Err(Error::Corrupt);
++        }
+         Ok(Some(meta))
+     }
+     pub fn explorer_block_at_height(&self, height: u64) -> Result<Option<BlockMeta>> {
+@@ -484,6 +562,13 @@ impl ReadSnapshot<'_> {
+         };
+         let meta: TxMeta = decode_record(&bytes)?;
+         let loc = meta.location;
++        if meta.input_count > 65535
++            || meta.output_count > 65535
++            || meta.wire_size == 0
++            || meta.wire_size > MAX_BATCH_BYTES as u64
++        {
++            return Err(Error::Corrupt);
++        }
+         if loc.txid != id || self.transaction(id)? != Some(loc) {
+             return Err(Error::Corrupt);
+         }
+@@ -524,21 +609,133 @@ impl ReadSnapshot<'_> {
+             .transpose()
+     }
+     pub fn explorer_input(&self, id: TxId, index: u32) -> Result<Option<InputMeta>> {
+-        self.inner
+-            .get(input_key(id, index))?
+-            .map(|bytes| decode_record(&bytes))
+-            .transpose()
++        let Some(tx) = self.explorer_tx(id)? else {
++            return Ok(None);
++        };
++        let Some(bytes) = self.inner.get(input_key(id, index))? else {
++            return if index < tx.input_count {
++                Err(Error::Corrupt)
++            } else {
++                Ok(None)
++            };
++        };
++        if index >= tx.input_count {
++            return Err(Error::Corrupt);
++        }
++        let input: InputMeta = decode_record(&bytes)?;
++        validate_input_meta(&input, tx.wire_size)?;
++        if let Some(coin) = &input.resolved_creation {
++            let historical = self.output(coin.outpoint)?.ok_or(Error::Corrupt)?;
++            if historical.output != coin.output
++                || historical.creation != coin.creation
++                || historical.spend.as_ref().is_none_or(|spend| {
++                    spend.transaction != tx.location || spend.input_index != index
++                })
++                || self
++                    .explorer_tx(coin.creation.txid)?
++                    .as_ref()
++                    .is_none_or(|creation_tx| {
++                        creation_tx.location != coin.creation
++                            || coin.outpoint.out_idx >= creation_tx.output_count
++                    })
++                || (coin.creation.height, coin.creation.tx_index)
++                    >= (tx.location.height, tx.location.tx_index)
++            {
++                return Err(Error::Corrupt);
++            }
++        }
++        Ok(Some(input))
+     }
+     pub fn explorer_witness(
+         &self,
+         id: TxId,
+-        input: u32,
++        input_index: u32,
+         index: u32,
+     ) -> Result<Option<WitnessFact>> {
+-        self.inner
+-            .get(witness_key(id, input, index))?
+-            .map(|bytes| decode_record(&bytes))
+-            .transpose()
++        let Some(input) = self.explorer_input(id, input_index)? else {
++            return Ok(None);
++        };
++        let Some(bytes) = self.inner.get(witness_key(id, input_index, index))? else {
++            return if index < input.witness_count {
++                Err(Error::Corrupt)
++            } else {
++                Ok(None)
++            };
++        };
++        if index >= input.witness_count {
++            return Err(Error::Corrupt);
++        }
++        let tx = self.explorer_tx(id)?.ok_or(Error::Corrupt)?;
++        let witness: WitnessFact = decode_record(&bytes)?;
++        validate_witness_fact(&witness, tx.wire_size)?;
++        let (siblings, count_bytes) =
++            self.explorer_table_count(id, tx.wire_size, witness.siblings_table)?;
++        let (arguments, _) =
++            self.explorer_table_count(id, tx.wire_size, witness.arguments_table)?;
++        if siblings != u64::from(witness.siblings_count)
++            || arguments != u64::from(witness.arguments_count)
++            || siblings
++                .checked_mul(32)
++                .and_then(|n| n.checked_add(count_bytes))
++                != Some(witness.siblings_table.length)
++        {
++            return Err(Error::Corrupt);
++        }
++        Ok(Some(witness))
++    }
++    // Read only the <=9 count bytes, from at most two fixed wire chunks. No
++    // arbitrary table allocation or second native transaction parser is needed.
++    fn explorer_table_count(
++        &self,
++        id: TxId,
++        wire_size: u64,
++        range: WireRange,
++    ) -> Result<(u64, u64)> {
++        range.validate(wire_size).map_err(|_| Error::Corrupt)?;
++        if range.length == 0 {
++            return Err(Error::Corrupt);
++        }
++        let needed = range.length.min(9) as usize;
++        let mut bytes = [0u8; 9];
++        let mut copied = 0usize;
++        while copied < needed {
++            let offset = range.offset + copied as u64;
++            let index =
++                u32::try_from(offset / WIRE_CHUNK_BYTES as u64).map_err(|_| Error::Corrupt)?;
++            let chunk = self.explorer_wire_chunk(id, index)?.ok_or(Error::Corrupt)?;
++            let chunk_start = u64::from(index) * WIRE_CHUNK_BYTES as u64;
++            let expected = (wire_size - chunk_start).min(WIRE_CHUNK_BYTES as u64) as usize;
++            if chunk.len() != expected {
++                return Err(Error::Corrupt);
++            }
++            let local = (offset - chunk_start) as usize;
++            let take = (needed - copied).min(expected - local);
++            if take == 0 {
++                return Err(Error::Corrupt);
++            }
++            bytes[copied..copied + take].copy_from_slice(&chunk[local..local + take]);
++            copied += take;
++        }
++        let (value, width) = match bytes[0] {
++            0..=252 => (u64::from(bytes[0]), 1),
++            253 if needed >= 3 => (
++                u64::from(u16::from_le_bytes(bytes[1..3].try_into().unwrap())),
++                3,
++            ),
++            254 if needed >= 5 => (
++                u64::from(u32::from_le_bytes(bytes[1..5].try_into().unwrap())),
++                5,
++            ),
++            255 if needed >= 9 => (u64::from_le_bytes(bytes[1..9].try_into().unwrap()), 9),
++            _ => return Err(Error::Corrupt),
++        };
++        if (width == 3 && value < 253)
++            || (width == 5 && value <= u16::MAX as u64)
++            || (width == 9 && value <= u32::MAX as u64)
++        {
++            return Err(Error::Corrupt);
++        }
++        Ok((value, width))
+     }
+     pub fn explorer_wire_chunk(&self, id: TxId, index: u32) -> Result<Option<Vec<u8>>> {
+         let bytes = self.inner.get(wire_key(id, index))?;
+diff --git a/chronik/chronik-db/src/v2_explorer_model_tests.rs b/chronik/chronik-db/src/v2_explorer_model_tests.rs
+index 0ce2770963cdd052230627f4f0bfd43978cb6c09..e9c371f47528c645fc850cf8b245e35a38669e18 100644
+--- a/chronik/chronik-db/src/v2_explorer_model_tests.rs
++++ b/chronik/chronik-db/src/v2_explorer_model_tests.rs
+@@ -158,3 +158,96 @@ fn reservation_and_metadata_bounds_reject_oversize() {
+     assert!(preflight_explorer_block(&block).is_err());
+     assert!(decode_record::<TxMeta>(&vec![0; MAX_RECORD_BYTES + 1]).is_err());
+ }
++
++#[test]
++fn valid_postcard_corrupt_input_fields_are_rejected_at_read_validation() {
++    let input = InputMeta {
++        prev_txid: [2; 32],
++        prev_index: 1,
++        sequence: u32::MAX,
++        flags: 2,
++        path_index: 0,
++        has_coinbase_data: true,
++        coinbase_data: WireRange {
++            offset: 20,
++            length: 3,
++        },
++        witness_count: 0,
++        resolved_creation: None,
++    };
++    validate_input_meta(&input, 100).unwrap();
++    let mut bad = input.clone();
++    bad.flags = 255;
++    let bad: InputMeta = decode_record(&encode_record(&bad).unwrap()).unwrap();
++    assert!(matches!(
++        validate_input_meta(&bad, 100),
++        Err(Error::Corrupt)
++    ));
++    let mut bad = input.clone();
++    bad.coinbase_data = WireRange {
++        offset: u64::MAX,
++        length: 1,
++    };
++    let bad: InputMeta = decode_record(&encode_record(&bad).unwrap()).unwrap();
++    assert!(matches!(
++        validate_input_meta(&bad, 100),
++        Err(Error::Corrupt)
++    ));
++    let mut bad = input.clone();
++    bad.witness_count = 1;
++    assert!(matches!(
++        validate_input_meta(&bad, 100),
++        Err(Error::Corrupt)
++    ));
++    let mut bad = input;
++    bad.flags = 1;
++    bad.has_coinbase_data = false;
++    bad.coinbase_data = WireRange::default();
++    bad.witness_count = 1;
++    assert!(matches!(
++        validate_input_meta(&bad, 100),
++        Err(Error::Corrupt)
++    ));
++}
++#[test]
++fn valid_postcard_corrupt_witness_tables_are_rejected_at_read_validation() {
++    let witness = WitnessFact {
++        script: WireRange {
++            offset: 5,
++            length: 3,
++        },
++        siblings_table: WireRange {
++            offset: 9,
++            length: 1,
++        },
++        siblings_count: 0,
++        arguments_table: WireRange {
++            offset: 10,
++            length: 1,
++        },
++        arguments_count: 0,
++    };
++    validate_witness_fact(&witness, 20).unwrap();
++    let mut bad = witness.clone();
++    bad.arguments_table = WireRange {
++        offset: u64::MAX,
++        length: 1,
++    };
++    let bad: WitnessFact = decode_record(&encode_record(&bad).unwrap()).unwrap();
++    assert!(matches!(
++        validate_witness_fact(&bad, 20),
++        Err(Error::Corrupt)
++    ));
++    let mut bad = witness.clone();
++    bad.siblings_table.length = 0;
++    assert!(matches!(
++        validate_witness_fact(&bad, 20),
++        Err(Error::Corrupt)
++    ));
++    let mut bad = witness;
++    bad.arguments_count = 1;
++    assert!(matches!(
++        validate_witness_fact(&bad, 20),
++        Err(Error::Corrupt)
++    ));
++}
+diff --git a/chronik/chronik-indexer/src/query/v2_explorer.rs b/chronik/chronik-indexer/src/query/v2_explorer.rs
+index b6bac6104e89f63d022add14949cce03fecd9cbc..a7fee0f05cdd384a7683688c3ab9a2fd2dd08e61 100644
+--- a/chronik/chronik-indexer/src/query/v2_explorer.rs
++++ b/chronik/chronik-indexer/src/query/v2_explorer.rs
+@@ -64,6 +64,8 @@ pub struct Page<T> {
+     pub next_index: Option<u64>,
+     pub exhausted: bool,
+     pub examined: usize,
++    /// Physical key-read reservation, including all canonical and frozen-coin joins.
++    /// Optional/missing records can consume fewer reads than this ceiling.
+     pub key_reads: usize,
+ }
+ /// Exact byte chunk, at most 32768 bytes without reading the full frame.
+@@ -100,6 +102,7 @@ fn ordinal_page<T>(
+     count: u32,
+     after: Option<u64>,
+     size: usize,
++    initial_reads: usize,
+     reads_per_item: usize,
+     mut load: impl FnMut(u32) -> Result<(T, usize)>,
+ ) -> Result<Page<T>> {
+@@ -117,7 +120,9 @@ fn ordinal_page<T>(
+     let mut examined = 0usize;
+     while index < u64::from(count) && items.len() < size {
+         // Reserve reads and examination before the storage call.
+-        if examined + 1 > MAX_EXAMINED || (examined + 1) * reads_per_item > MAX_KEY_READS {
++        if examined + 1 > MAX_EXAMINED
++            || initial_reads + (examined + 1) * reads_per_item > MAX_KEY_READS
++        {
+             break;
+         }
+         examined += 1;
+@@ -148,7 +153,7 @@ fn ordinal_page<T>(
+         },
+         exhausted,
+         examined,
+-        key_reads: examined * reads_per_item,
++        key_reads: initial_reads + examined * reads_per_item,
+     })
+ }
+ /// Descending canonical blocks; before is exclusive (a cursor is another before).
+@@ -187,7 +192,7 @@ pub fn blocks_page(
+         items,
+         exhausted,
+         examined,
+-        key_reads: examined * 3,
++        key_reads: examined * 4,
+     })
+ }
+ /// Native block transaction order, with both typed identities.
+@@ -197,10 +202,11 @@ pub fn block_transactions_page(
+     after: Option<u64>,
+     size: usize,
+ ) -> Result<Option<Page<TxMeta>>> {
++    page_size(size)?;
+     let Some(meta) = source.block(block)? else {
+         return Ok(None);
+     };
+-    ordinal_page(meta.tx_count, after, size, 9, |index| {
++    ordinal_page(meta.tx_count, after, size, 3, 7, |index| {
+         let (id, hash) = required(source.block_transaction(block, index)?)?;
+         let tx = required(source.transaction(id)?)?;
+         if tx.location.txhash != hash
+@@ -221,11 +227,13 @@ pub fn inputs_page(
+     after: Option<u64>,
+     size: usize,
+ ) -> Result<Option<Page<InputMeta>>> {
++    page_size(size)?;
+     let Some(tx) = source.transaction(id)? else {
+         return Ok(None);
+     };
+-    ordinal_page(tx.input_count, after, size, 1, |index| {
++    ordinal_page(tx.input_count, after, size, 6, 14, |index| {
+         let input = required(source.input(id, index)?)?;
++        chronik_db::v2_explorer::validate_input_meta(&input, tx.wire_size)?;
+         let bytes = 256
+             + input.resolved_creation.as_ref().map_or(0, |coin| {
+                 812 + 128 + coin.output.paths.iter().map(Vec::len).sum::<usize>()
+@@ -241,10 +249,11 @@ pub fn outputs_page(
+     after: Option<u64>,
+     size: usize,
+ ) -> Result<Option<Page<OutputRecord>>> {
++    page_size(size)?;
+     let Some(tx) = source.transaction(id)? else {
+         return Ok(None);
+     };
+-    ordinal_page(tx.output_count, after, size, 1, |index| {
++    ordinal_page(tx.output_count, after, size, 6, 1, |index| {
+         let output = required(source.output(OutPoint {
+             txid: id,
+             out_idx: index,
+@@ -270,6 +279,7 @@ pub fn witnesses_page(
+     after: Option<u64>,
+     size: usize,
+ ) -> Result<Option<Page<WitnessFact>>> {
++    page_size(size)?;
+     let Some(tx) = source.transaction(id)? else {
+         return Ok(None);
+     };
+@@ -277,11 +287,9 @@ pub fn witnesses_page(
+         return Ok(None);
+     }
+     let input = required(source.input(id, input_index)?)?;
+-    ordinal_page(input.witness_count, after, size, 1, |index| {
++    ordinal_page(input.witness_count, after, size, 20, 25, |index| {
+         let witness = required(source.witness(id, input_index, index)?)?;
+-        witness.script.validate(tx.wire_size)?;
+-        witness.siblings_table.validate(tx.wire_size)?;
+-        witness.arguments_table.validate(tx.wire_size)?;
++        chronik_db::v2_explorer::validate_witness_fact(&witness, tx.wire_size)?;
+         Ok((witness, 128))
+     })
+     .map(Some)
+diff --git a/chronik/chronik-indexer/src/query/v2_explorer_query_tests.rs b/chronik/chronik-indexer/src/query/v2_explorer_query_tests.rs
+index 6f2b14eb7a05ed1c8dd668777d02fa8749778f39..2f59c49782064637e074aef9fa17e0f7ce5551d0 100644
+--- a/chronik/chronik-indexer/src/query/v2_explorer_query_tests.rs
++++ b/chronik/chronik-indexer/src/query/v2_explorer_query_tests.rs
+@@ -176,12 +176,12 @@ fn pages_advance_and_reorg_removes_canonical_objects() {
+ }
+ #[test]
+ fn oversize_indivisible_record_errors_without_stuck_cursor() {
+-    assert!(ordinal_page(1, None, 1, 1, |_| Ok(((), MAX_PAGE_BYTES + 1))).is_err());
+-    let page = ordinal_page(3, None, 3, 1, |i| Ok((i, MAX_PAGE_BYTES / 2))).unwrap();
++    assert!(ordinal_page(1, None, 1, 0, 1, |_| Ok(((), MAX_PAGE_BYTES + 1))).is_err());
++    let page = ordinal_page(3, None, 3, 0, 1, |i| Ok((i, MAX_PAGE_BYTES / 2))).unwrap();
+     assert_eq!(page.items, vec![0, 1]);
+     assert_eq!(page.examined, 3);
+     assert_eq!(page.key_reads, 3);
+     assert_eq!(page.next_index, Some(1));
+     assert!(!page.exhausted);
+-    assert!(ordinal_page::<()>(2, Some(2), 1, 1, |_| Ok(((), 1))).is_err());
++    assert!(ordinal_page::<()>(2, Some(2), 1, 0, 1, |_| Ok(((), 1))).is_err());
+ }
+-- 
+2.50.1 (Apple Git-155)
+

@@ -1,0 +1,514 @@
+From 379a7dcf84633dbe1edfbc71c928223a91ecb216 Mon Sep 17 00:00:00 2001
+From: Shammah Chancellor <shammah.chancellor@notvalid.com>
+Date: Thu, 15 Oct 2026 16:57:22 -0700
+Subject: [PATCH] Add private offline native Avalanche proof and session
+ provisioning
+
+---
+ src/lotus_v2/avalanche_provision.cpp          | 214 ++++++++++++++++++
+ src/lotus_v2/avalanche_provision.h            |  45 ++++
+ .../avalanche_provision_test/CMakeLists.txt   |  25 ++
+ .../avalanche_provision_test/README.md        |  94 ++++++++
+ src/lotus_v2/test_avalanche_provision.cpp     |  84 +++++++
+ 5 files changed, 462 insertions(+)
+ create mode 100644 src/lotus_v2/avalanche_provision.cpp
+ create mode 100644 src/lotus_v2/avalanche_provision.h
+ create mode 100644 src/lotus_v2/avalanche_provision_test/CMakeLists.txt
+ create mode 100644 src/lotus_v2/avalanche_provision_test/README.md
+ create mode 100644 src/lotus_v2/test_avalanche_provision.cpp
+
+diff --git a/src/lotus_v2/avalanche_provision.cpp b/src/lotus_v2/avalanche_provision.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..e3cfe854e59c8b94c738b32a3b97b7642b3587dc
+--- /dev/null
++++ b/src/lotus_v2/avalanche_provision.cpp
+@@ -0,0 +1,214 @@
++// Copyright (c) 2026 The Lotus developers
++#include "avalanche_provision.h"
++#include "avalanche_peer.h"
++#include "development_command.h"
++#include "development_runtime.h"
++#include <iostream>
++#include <avalanche/proofbuilder.h>
++#include <avalanche/delegationbuilder.h>
++#include <avalanche/validation.h>
++#include <streams.h>
++#include <univalue.h>
++#include <util/strencodings.h>
++#include <algorithm>
++#include <charconv>
++#include <limits>
++#include <set>
++#include <fcntl.h>
++#include <sys/stat.h>
++#include <unistd.h>
++namespace lotus::v2::ava {
++namespace {
++bool Fail(std::string &e, const char *s) { e=s; return false; }
++bool KeyValid(const CKey &key) { return key.IsValid() && key.IsCompressed(); }
++std::vector<uint8_t> PaymentLock(const CKey &key) {
++    const auto pub=key.GetPubKey();
++    std::vector<uint8_t> lock{0x20}; lock.insert(lock.end(),pub.begin()+1,pub.end());
++    lock.push_back(0xbc); lock.push_back(0x4e); return lock;
++}
++bool Fields(const UniValue &v, std::initializer_list<const char *> names) {
++    if(!v.isObject() || v.size()!=names.size()) return false;
++    std::set<std::string> actual(v.getKeys().begin(),v.getKeys().end());
++    if(actual.size()!=v.size()) return false;
++    for(const auto *n:names) if(!actual.contains(n)) return false;
++    return true;
++}
++bool Hex(const UniValue &v, std::vector<uint8_t> &out, size_t bytes=0) {
++    if(!v.isStr()) return false;
++    const auto &s=v.get_str();
++    if(s.size()%2 || (bytes && s.size()!=2*bytes) ||
++       !std::all_of(s.begin(),s.end(),[](char c){return (c>='0'&&c<='9')||(c>='a'&&c<='f');})) return false;
++    out=ParseHex(s); return true;
++}
++bool Key(const UniValue &v, CKey &out) {
++    std::vector<uint8_t> bytes;
++    if(!Hex(v,bytes,32)) return false;
++    out.Set(bytes.begin(),bytes.end(),true); return KeyValid(out);
++}
++template<class T> bool Integer(const UniValue &v, T &out) {
++    if(!v.isNum()) return false;
++    const auto &s=v.getValStr();
++    auto r=std::from_chars(s.data(),s.data()+s.size(),out);
++    return r.ec==std::errc{} && r.ptr==s.data()+s.size();
++}
++bool ParseRequest(const UniValue &json, ProvisionRequest &out) {
++    if(!Fields(json,{"schema","sequence","expiration","master_key","session_key","payout_script","stakes"})) return false;
++    unsigned schema{}; std::vector<uint8_t> payout;
++    if(!Integer(json["schema"],schema) || schema!=1 || !Integer(json["sequence"],out.sequence) ||
++       !Integer(json["expiration"],out.expiration) || !Key(json["master_key"],out.master_key) ||
++       !Key(json["session_key"],out.session_key) || !Hex(json["payout_script"],payout) ||
++       payout.size()>10000 || !json["stakes"].isArray() || json["stakes"].size()>1000) return false;
++    out.payout_script=CScript(payout.begin(),payout.end());
++    for(const auto &v:json["stakes"].getValues()) {
++        if(!Fields(v,{"tx_id","index","amount","height","coinbase","key","payment_lock"})) return false;
++        ProvisionStake s; std::vector<uint8_t> tx;
++        if(!Hex(v["tx_id"],tx,32) || !Integer(v["index"],s.outpoint.index) ||
++           !Integer(v["amount"],s.amount) || !Integer(v["height"],s.height) ||
++           !v["coinbase"].isBool() || !Key(v["key"],s.key) || !Hex(v["payment_lock"],s.payment_lock,35)) return false;
++        std::copy(tx.begin(),tx.end(),s.outpoint.tx_id.begin()); s.coinbase=v["coinbase"].get_bool();
++        out.stakes.push_back(std::move(s));
++    }
++    return true;
++}
++struct File { int fd{-1}; ~File(){if(fd>=0) close(fd);} };
++bool ReadPrivate(const std::filesystem::path &path, std::string &data) {
++    File f{open(path.c_str(),O_RDONLY|O_NOFOLLOW|O_NONBLOCK|O_CLOEXEC)}; struct stat st{};
++    if(f.fd<0 || fstat(f.fd,&st)!=0 || !S_ISREG(st.st_mode) || st.st_uid!=geteuid() ||
++       (st.st_mode&0777)!=0600 || st.st_nlink!=1 || st.st_size<0 || st.st_size>1048576) return false;
++    data.resize(size_t(st.st_size)); size_t offset=0;
++    while(offset<data.size()) { auto n=read(f.fd,data.data()+offset,data.size()-offset); if(n<=0)return false; offset+=size_t(n); }
++    char extra; return read(f.fd,&extra,1)==0;
++}
++bool WritePrivate(const std::filesystem::path &path, const std::string &data) {
++    File f{open(path.c_str(),O_WRONLY|O_CREAT|O_EXCL|O_NOFOLLOW|O_CLOEXEC,0600)};
++    if(f.fd<0) return false;
++    if(fchmod(f.fd,0600)!=0) {unlink(path.c_str());return false;}
++    size_t offset=0;
++    while(offset<data.size()) { auto n=write(f.fd,data.data()+offset,data.size()-offset); if(n<=0){unlink(path.c_str());return false;} offset+=size_t(n); }
++    if(fsync(f.fd)!=0) {unlink(path.c_str());return false;} return true;
++}
++}
++bool BuildProvisionedCredentials(const ProvisionRequest &r, const Profile &p,
++    const ChainSnapshot &snapshot, const CoinLookup &lookup, const SnapshotReader &read,
++    ProvisionedCredentials &out, std::string &e) {
++    if(!ValidateProfile(p,e)) return false;
++    if(!KeyValid(r.master_key) || !KeyValid(r.session_key)) return Fail(e,"invalid-provision-key");
++    if(r.stakes.empty() || r.stakes.size()>1000 || r.payout_script.size()>10000 || r.expiration<0)
++        return Fail(e,"invalid-provision-request");
++    ::avalanche::ProofBuilder builder(r.sequence,r.expiration,r.master_key,r.payout_script);
++    for(const auto &s:r.stakes) {
++        if(s.height>0x7fffffffU) return Fail(e,"invalid-provision-height");
++        if(!KeyValid(s.key) || s.payment_lock!=PaymentLock(s.key)) return Fail(e,"invalid-provision-payment-lock");
++        if(s.amount>uint64_t(std::numeric_limits<int64_t>::max()) || !MoneyRange(int64_t(s.amount)*SATOSHI))
++            return Fail(e,"invalid-provision-amount");
++        uint256 id; std::copy(s.outpoint.tx_id.begin(),s.outpoint.tx_id.end(),id.begin());
++        if(!builder.addUTXO(COutPoint(TxId(id),s.outpoint.index),int64_t(s.amount)*SATOSHI,s.height,s.coinbase,s.key))
++            return Fail(e,"duplicate-or-invalid-provision-stake");
++    }
++    ProvisionedCredentials result; result.session_key=r.session_key; result.envelope.proof=builder.build();
++    if(!result.envelope.proof) return Fail(e,"provision-proof-signing-failed");
++    // ABC sorts signed stakes by stake id, independently of the input order.
++    for(const auto &signed_stake:result.envelope.proof->getStakes()) {
++        const auto &pub=signed_stake.getStake().getPubkey();
++        std::vector<uint8_t> lock{0x20}; lock.insert(lock.end(),pub.begin()+1,pub.end());
++        lock.push_back(0xbc); lock.push_back(0x4e); result.envelope.payment_locks.push_back(std::move(lock));
++    }
++    AdmittedProof admitted;
++    if(!AdmitProof(p,snapshot,lookup,result.envelope,admitted,read,e)) return false;
++    ::avalanche::DelegationBuilder delegation(*result.envelope.proof);
++    if(!delegation.addLevel(r.master_key,r.session_key.GetPubKey())) return Fail(e,"provision-delegation-signing-failed");
++    result.delegation=delegation.build(); ::avalanche::DelegationState state; CPubKey auth;
++    if(!result.delegation.verify(state,auth) || auth!=r.session_key.GetPubKey() ||
++       result.delegation.getProofId()!=result.envelope.proof->getId()) return Fail(e,"provision-delegation-invalid");
++    out=std::move(result); e.clear(); return true;
++}
++bool ProvisionCredentialsFromFile(const std::filesystem::path &input,
++    const std::filesystem::path &output, const Profile &p, const ChainSnapshot &snapshot,
++    const CoinLookup &lookup, const SnapshotReader &read, std::string &e) {
++    std::string data; if(!ReadPrivate(input,data)) return Fail(e,"provision-input-file-invalid");
++    ProvisionRequest request; UniValue json;
++    try { if(!json.read(data) || !ParseRequest(json,request)) return Fail(e,"provision-input-invalid"); }
++    catch(const std::exception &) {return Fail(e,"provision-input-invalid");}
++    ProvisionedCredentials result;
++    if(!BuildProvisionedCredentials(request,p,snapshot,lookup,read,result,e)) return false;
++    peer::Bytes proof; if(!EncodeProofEnvelope(result.envelope,PeerLimits{},proof,e)) return false;
++    DataStream delegation; delegation<<result.delegation;
++    UniValue credentials(UniValue::VOBJ); credentials.pushKV("schema",1);
++    credentials.pushKV("session_key",HexStr(result.session_key)); credentials.pushKV("proof",HexStr(proof));
++    credentials.pushKV("delegation",HexStr(delegation));
++    if(!WritePrivate(output,credentials.write()+"\n")) return Fail(e,"provision-output-file-failed");
++    e.clear(); return true;
++}
++int RunAvalancheProvisionCommand(int argc, char *argv[]) {
++    // This branch runs before normal daemon initialization. No key material is
++    // accepted in argv, and no raw exception/manifest/runtime text is logged.
++    if(argc!=6) { std::cerr<<"usage: lotusd -lotusv2provision MANIFEST EXISTING_HOME PRIVATE_REQUEST OUTPUT_CREDENTIALS\n"; return 1; }
++    struct EccScope { EccScope(){ECC_Start();} ~EccScope(){ECC_Stop();} };
++    try {
++        EccScope ecc;
++        namespace fs=std::filesystem;
++        const fs::path home(argv[3]), marker=home/"lotus-v2-development.identity", database=home/"chainstate-v2";
++        auto regular=[](const fs::path &p){return !fs::is_symlink(p) && fs::is_regular_file(p);};
++        if(fs::is_symlink(home) || !fs::is_directory(home) || !regular(marker) ||
++           fs::is_symlink(database) || !fs::is_directory(database) || !regular(database/"CURRENT")) {
++            std::cerr<<"provision-existing-home-required\n"; return 1;
++        }
++        DevelopmentManifest m; std::string e, directory;
++        if(!LoadDevelopmentManifest(argv[2],m,e)) {std::cerr<<"provision-manifest-invalid\n";return 1;}
++        if(!PrepareDevelopmentHomeDirectory(m,home.string(),directory,e)) {std::cerr<<"provision-home-identity-invalid\n";return 1;}
++        constexpr uint64_t MiB=uint64_t{1}<<20;
++        DevelopmentRuntimeConfig config;
++        config.directory=directory; config.genesis_wire=m.genesis; config.profiles={m.hp,m.op,m.mp,m.cp};
++        config.initial_money=m.initial; config.storage.avalanche=true; config.storage.recovery=DiskRecoveryOptions{128*MiB,16*MiB};
++        config.storage.candidates=CandidateStoreOptions{4096,4096,128};
++        config.storage.max_metadata_bytes=16*MiB; config.storage.max_pending_bytes=64*MiB;
++        config.bodies={32,m.block_read_limit,64*MiB,32,64*MiB,65536};
++        config.initial_body_epoch=1; config.initial_context_generation=1;
++        // LevelDB's existing exclusive database lock is acquired by Open. A
++        // running node on the same home therefore prevents offline provisioning.
++        std::unique_ptr<DevelopmentRuntime> runtime;
++        if(!DevelopmentRuntime::Open(std::move(config),runtime,e)) {std::cerr<<"provision-runtime-open-failed\n";return 1;}
++        Profile profile; profile.chain_id=m.hp.chain_id; profile.genesis_id=m.hp.genesis_id;
++        profile.validation_digest=BlockValidationProfileDigest(m.hp,m.op,m.mp,m.cp);
++        auto capture=[&](ChainSnapshot &out)->bool {
++            const auto before=runtime->Snapshot();
++            if(!before.chain || before.reopen_required || before.execution_paused ||
++               before.chain->identity!=profile.chain_id || before.chain->profile_digest!=profile.validation_digest ||
++               before.chain->pending_journal || before.chain->pending_receipt || before.chain->pending_propagation) return false;
++            ChainSnapshot snap; snap.tip=before.chain->stable_tip; snap.generation=before.context_generation;
++            Hash id=snap.tip; std::vector<uint64_t> times;
++            for(size_t i=0;i<11;++i) {
++                std::optional<IndexedHeader> h;
++                if(runtime->ReadHeader(id,h,e)!=DevelopmentRuntimeResult::Progress || !h || h->stage!=HeaderStage::Connected) return false;
++                if(i==0) snap.height=h->header.height;
++                times.push_back(h->header.time); if(h->header.height==0) break; id=h->header.prev_id;
++            }
++            std::sort(times.begin(),times.end()); snap.median_time_past=times[times.size()/2];
++            const auto after=runtime->Snapshot();
++            if(!after.chain || after.reopen_required || after.execution_paused || after.context_generation!=before.context_generation ||
++               after.chain->stable_tip!=snap.tip || after.chain->root!=before.chain->root || after.chain->revision!=before.chain->revision) return false;
++            out=snap; return true;
++        };
++        ChainSnapshot snapshot;
++        if(!capture(snapshot)) {std::cerr<<"provision-runtime-not-authoritative\n";return 1;}
++        CoinLookup lookup=[&](const Outpoint &point,std::optional<Coin> &out,std::string &error) {
++            const auto before=runtime->Snapshot();
++            if(!before.chain) return Fail(error,"provision-runtime-not-authoritative");
++            CoinProof proof;
++            if(runtime->ProveCoin(point,proof,error)!=DevelopmentRuntimeResult::Progress ||
++               !VerifyCoinProof(point,proof,before.chain->root)) return Fail(error,"provision-native-coin-proof-invalid");
++            const auto after=runtime->Snapshot();
++            if(!after.chain || after.chain->root!=before.chain->root || after.chain->revision!=before.chain->revision)
++                return Fail(error,"provision-runtime-snapshot-changed");
++            out=proof.coin; return true;
++        };
++        SnapshotReader read=[&]{ChainSnapshot result; if(!capture(result)){result.generation=UINT64_MAX;result.initial_download=true;}return result;};
++        if(!ProvisionCredentialsFromFile(argv[4],argv[5],profile,snapshot,lookup,read,e)) {
++            // Never forward supplied callback or parser content to stderr.
++            std::cerr<<"provision-credentials-failed\n"; return 1;
++        }
++        std::cout<<"provisioned\n"; return 0;
++    } catch(const std::exception &) {std::cerr<<"provision-command-failed\n"; return 1;}
++}
++
++}
+diff --git a/src/lotus_v2/avalanche_provision.h b/src/lotus_v2/avalanche_provision.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..68a2015b5974705c3e135c5bfa9dc6842e2f188a
+--- /dev/null
++++ b/src/lotus_v2/avalanche_provision.h
+@@ -0,0 +1,45 @@
++// Copyright (c) 2026 The Lotus developers
++#ifndef LOTUS_V2_AVALANCHE_PROVISION_H
++#define LOTUS_V2_AVALANCHE_PROVISION_H
++#include "avalanche_proof.h"
++#include <avalanche/delegation.h>
++#include <key.h>
++#include <filesystem>
++namespace lotus::v2::ava {
++struct ProvisionStake {
++    Outpoint outpoint{};
++    uint64_t amount{};
++    uint32_t height{};
++    bool coinbase{};
++    CKey key;
++    std::vector<uint8_t> payment_lock;
++};
++struct ProvisionRequest {
++    uint64_t sequence{};
++    int64_t expiration{};
++    CKey master_key, session_key;
++    CScript payout_script;
++    std::vector<ProvisionStake> stakes;
++};
++struct ProvisionedCredentials {
++    CKey session_key;
++    ProofEnvelope envelope;
++    ::avalanche::Delegation delegation;
++};
++// Caller owns ECC initialization and supplies the authoritative offline chain
++// view. All stake fields and maturity are checked through AdmitProof; no coins
++// or confirmation counts are inferred from keys or JSON input.
++bool BuildProvisionedCredentials(const ProvisionRequest &, const Profile &,
++    const ChainSnapshot &, const CoinLookup &, const SnapshotReader &,
++    ProvisionedCredentials &, std::string &);
++// Input and output must be local owner-only regular files. Input is opened
++// without following symlinks; output is created exclusively, never replaced.
++// The only serialized secret in output is the session key. Errors are fixed
++// identifiers and never contain input or key material.
++bool ProvisionCredentialsFromFile(const std::filesystem::path &input,
++    const std::filesystem::path &output, const Profile &, const ChainSnapshot &,
++    const CoinLookup &, const SnapshotReader &, std::string &);
++// Offline argv: lotusd -lotusv2provision MANIFEST EXISTING_HOME PRIVATE_REQUEST OUTPUT_CREDENTIALS
++int RunAvalancheProvisionCommand(int argc, char *argv[]);
++}
++#endif
+diff --git a/src/lotus_v2/avalanche_provision_test/CMakeLists.txt b/src/lotus_v2/avalanche_provision_test/CMakeLists.txt
+new file mode 100644
+index 0000000000000000000000000000000000000000..d746b3a2c805ca2904d4d00034934dd9e28d70c2
+--- /dev/null
++++ b/src/lotus_v2/avalanche_provision_test/CMakeLists.txt
+@@ -0,0 +1,25 @@
++cmake_minimum_required(VERSION 3.18)
++project(lotus_v2_avalanche_provision_review LANGUAGES C CXX)
++set(CMAKE_CXX_STANDARD 20)
++set(CMAKE_CXX_STANDARD_REQUIRED ON)
++if(NOT EXISTS "${LOTUS_ABC_BUILD}/src/config/bitcoin-config.h")
++ message(FATAL_ERROR "Set LOTUS_ABC_BUILD to a configured pinned ABC build")
++endif()
++get_filename_component(LOTUS_SRC "${CMAKE_CURRENT_SOURCE_DIR}/../.." ABSOLUTE)
++add_library(blake3 STATIC ../vendor/blake3/blake3.c ../vendor/blake3/blake3_dispatch.c ../vendor/blake3/blake3_portable.c)
++target_compile_definitions(blake3 PRIVATE BLAKE3_NO_SSE2 BLAKE3_NO_SSE41 BLAKE3_NO_AVX2 BLAKE3_NO_AVX512 BLAKE3_USE_NEON=0)
++add_executable(avalanche_provision_test ../test_avalanche_provision.cpp ../avalanche_provision.cpp ../avalanche_peer.cpp ../avalanche_proof.cpp ../avalanche_protocol.cpp ../commitment.cpp ../tagged_hash.cpp)
++target_compile_definitions(avalanche_provision_test PRIVATE HAVE_CONFIG_H)
++target_include_directories(avalanche_provision_test PRIVATE "${LOTUS_SRC}" "${LOTUS_SRC}/univalue/include" "${LOTUS_ABC_BUILD}/src" "${LOTUS_BOOST_INCLUDE}" ../vendor/blake3)
++target_compile_options(avalanche_provision_test PRIVATE -Wall -Wextra -Wpedantic -Werror -Wno-unused-parameter -ffunction-sections -fdata-sections)
++target_link_libraries(avalanche_provision_test PRIVATE blake3
++ "${LOTUS_ABC_BUILD}/src/libserver.a" "${LOTUS_ABC_BUILD}/src/libcommon.a"
++ "${LOTUS_ABC_BUILD}/src/libbitcoinconsensus.a" "${LOTUS_ABC_BUILD}/src/libscript.a" "${LOTUS_ABC_BUILD}/src/libutil.a"
++ "${LOTUS_ABC_BUILD}/src/crypto/libcrypto.a" "${LOTUS_ABC_BUILD}/src/univalue/libunivalue.a" "${LOTUS_ABC_BUILD}/src/secp256k1/libsecp256k1.a")
++if(APPLE)
++ target_link_options(avalanche_provision_test PRIVATE -Wl,-dead_strip)
++else()
++ target_link_options(avalanche_provision_test PRIVATE -Wl,--gc-sections)
++endif()
++enable_testing()
++add_test(NAME avalanche_provision_test COMMAND avalanche_provision_test)
+diff --git a/src/lotus_v2/avalanche_provision_test/README.md b/src/lotus_v2/avalanche_provision_test/README.md
+new file mode 100644
+index 0000000000000000000000000000000000000000..69393328af574ea869436d14864c52adfaa415c3
+--- /dev/null
++++ b/src/lotus_v2/avalanche_provision_test/README.md
+@@ -0,0 +1,94 @@
++# Offline native Avalanche provisioning
++
++`avalanche_provision.h` exposes `BuildProvisionedCredentials` for in-memory
++keys and `ProvisionCredentialsFromFile` for a command accepting private file
++paths. The embedding command initializes ABC ECC, opens the authoritative
++native offline runtime, derives the Avalanche profile from that runtime, and
++supplies `ChainSnapshot`, `CoinLookup`, and `SnapshotReader`. It must not accept
++coin facts or confirmation overrides as substitutes for the runtime lookup.
++`ava::RunAvalancheProvisionCommand(argc, argv)` supplies this integration:
++
++```sh
++lotusd -lotusv2provision MANIFEST EXISTING_HOME PRIVATE_REQUEST OUTPUT_CREDENTIALS
++```
++
++It refuses absent homes, markers or LevelDB CURRENT files before opening,
++requires the explicitly Avalanche-enabled storage schema (disabled homes are
++refused without migration), validates namespace/profile identity, acquires the runtime database exclusive
++lock, derives the authoritative stable connected tip and median time, and
++verifies each native sparse coin proof against the runtime root. Pending
++recovery and unknown authority are refused. It never ticks or mines the chain.
++No network or running node is needed. A command should print only success or
++stable error identifiers, and never input, credentials, or secret key material.
++
++Input is UTF-8 JSON in an owner-owned regular file with exactly mode `0600` and
++one hard link; symlinks are rejected. Its exact fields are:
++
++```json
++{
++  "schema": 1,
++  "sequence": 1,
++  "expiration": 0,
++  "master_key": "<64 lowercase hex digits>",
++  "session_key": "<64 lowercase hex digits>",
++  "payout_script": "<lowercase hex ABC proof payout metadata script>",
++  "stakes": [
++    {
++      "tx_id": "<64 lowercase hex digits, native transaction-ID byte order>",
++      "index": 0,
++      "amount": 1099512627534,
++      "height": 1,
++      "coinbase": true,
++      "key": "<64 lowercase hex digits>",
++      "payment_lock": "<70 lowercase hex digits>"
++    }
++  ]
++}
++```
++
++Numeric values are JSON integers, without decimals or exponent notation.
++`tx_id` uses the native serialized ID byte order, as in bootstrap evidence,
++without ABC display reversal. `payment_lock` must be exactly `20` followed by
++the stake key's 32-byte x-only public key followed by `bc4e`. The authoritative
++coin must bind the same outpoint, amount, creation height, coinbase flag and
++single native Payment branch. ABC proof verification and native maturity run
++through `AdmitProof`, retaining the profile's 2016-confirmation default and
++1,000,000,000,000-unit quorum default. Provisioning does not claim quorum
++establishment, peer authentication on a live connection, or finality.
++
++The output path must not exist. The helper creates a regular file with mode
++`0600`, including under restrictive umasks, flushes it before success, and
++removes incomplete writes. It contains exactly:
++
++```json
++{"schema":1,"session_key":"<64 lowercase hex digits>","proof":"<EncodeProofEnvelope lowercase hex>","delegation":"<ABC serialized delegation lowercase hex>"}
++```
++
++The proof contains actual ABC Schnorr signatures, native Payment bindings in
++signed-stake order, and a master-signed delegation to the supplied session key.
++The master and stake private keys are excluded from the output.
++
++## Independent build and checks
++
++```sh
++cmake -S src/lotus_v2/avalanche_provision_test \
++  -B build-avalanche-provision-review \
++  -DLOTUS_ABC_BUILD=/private/tmp/lotus-v2-daemon-runtime-staging-20261015/build \
++  -DLOTUS_BOOST_INCLUDE=/opt/homebrew/include
++cmake --build build-avalanche-provision-review -j4
++ctest --test-dir build-avalanche-provision-review --output-on-failure
++```
++
++The focused target compiles the CLI function but discards it at link time;
++full daemon linkage and existing-home CLI checks are an additional integration
++gate. The executable uses explicitly public fixture scalars 1, 2, 8 and 9, never
++production secrets. Funding outpoints, values, heights and Payment locks for
++scalars 1 and 2 are copied from
++`/private/tmp/lotus-v2-quorum-bootstrap-native-20261015-a/evidence.json`, whose
++separate native harness accepted 2024 blocks. This focused test uses an
++in-memory authoritative callback containing those recorded coins; it does not
++replay those blocks or independently authenticate that evidence. It verifies
++signed proof and delegation round trips, session hello authentication,
++transcript/signature/proof/lock tamper rejection, coin field and missing-coin
++rejection, exact maturity, expiry, duplicate stake rejection, reordered-stake
++binding, private file modes, symlink rejection and refusal to replace output.
+diff --git a/src/lotus_v2/test_avalanche_provision.cpp b/src/lotus_v2/test_avalanche_provision.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..ab0da1e7cd96d1c396735ea1050a2b78369d8d6b
+--- /dev/null
++++ b/src/lotus_v2/test_avalanche_provision.cpp
+@@ -0,0 +1,84 @@
++// Copyright (c) 2026 The Lotus developers
++#include "avalanche_provision.h"
++#include "avalanche_peer.h"
++#include "commitment.h"
++#include <streams.h>
++#include <univalue.h>
++#include <util/strencodings.h>
++#include <util/translation.h>
++#include <fstream>
++#include <iostream>
++#include <stdexcept>
++#include <sys/stat.h>
++#include <unistd.h>
++using namespace lotus::v2;
++using namespace lotus::v2::ava;
++const std::function<std::string(const char *)> G_TRANSLATION_FUN=nullptr;
++#define CHECK(x) do { if(!(x)) throw std::runtime_error(#x); } while(0)
++static CKey PublicFixture(unsigned n) { std::array<uint8_t,32> bytes{}; bytes.back()=uint8_t(n); CKey k; k.Set(bytes.begin(),bytes.end(),true); return k; }
++int main() {
++ ECC_Start();
++ try {
++  Profile profile; profile.chain_id[0]=1; profile.genesis_id[0]=2; profile.validation_digest[0]=3;
++  CHECK(profile.stake_confirmations==2016); CHECK(profile.min_quorum_stake==1000000000000LL*SATOSHI);
++  ChainSnapshot snapshot; snapshot.tip[0]=4; snapshot.height=2024; snapshot.median_time_past=1792023000;
++  ProvisionRequest request; request.sequence=1; request.master_key=PublicFixture(8); request.session_key=PublicFixture(9);
++  request.payout_script=CScript{} << OP_DUP << OP_HASH160 << std::vector<uint8_t>(20,1) << OP_EQUALVERIFY << OP_CHECKSIG;
++  // Published development fixture scalar 1; exact accepted funding bytes from
++  // quorum-bootstrap-native evidence (not generated funding or production keys).
++  ProvisionStake stake; stake.key=PublicFixture(1); stake.amount=1099512627534ULL; stake.height=1; stake.coinbase=true;
++  auto id=ParseHex("9bddfc72684b0a2739ef1e5be1b36351d8666cd346108c288f01284e79c3bc4f"); std::copy(id.begin(),id.end(),stake.outpoint.tx_id.begin());
++  stake.payment_lock=ParseHex("2079be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798bc4e"); request.stakes.push_back(stake);
++  Coin coin; coin.outpoint=stake.outpoint; coin.output.value=stake.amount; coin.output.branches={BranchLeaf(stake.payment_lock)}; coin.output.paths={{0}}; coin.creation_height=1; coin.creation_parent_mtp=1792022400; coin.coinbase=true;
++  auto read=[&]{return snapshot;};
++  CoinLookup lookup=[&](const Outpoint &p,std::optional<Coin> &out,std::string &){out=p==coin.outpoint?std::optional<Coin>(coin):std::nullopt;return true;};
++  std::string error; ProvisionedCredentials credentials;
++  CHECK(BuildProvisionedCredentials(request,profile,snapshot,lookup,read,credentials,error));
++  peer::Bytes bytes; CHECK(EncodeProofEnvelope(credentials.envelope,PeerLimits{},bytes,error));
++  ProofEnvelope decoded; CHECK(DecodeProofEnvelope(bytes,PeerLimits{},decoded,error));
++  auto corrupted=bytes; corrupted[0]^=1; ProofEnvelope corrupt_proof; CHECK(DecodeProofEnvelope(corrupted,PeerLimits{},corrupt_proof,error));
++  AdmittedProof invalid_proof; CHECK(!AdmitProof(profile,snapshot,lookup,corrupt_proof,invalid_proof,read,error));
++  AdmittedProof admitted; CHECK(AdmitProof(profile,snapshot,lookup,decoded,admitted,read,error));
++  DataStream encoded; encoded<<credentials.delegation;
++  ::avalanche::Delegation delegation; encoded>>delegation; CHECK(encoded.empty());
++  ConnectionTranscript transcript{1,2,3,4}; SchnorrSig sig;
++  CHECK(credentials.session_key.SignSchnorr(HelloDigest(delegation,transcript),sig));
++  AuthenticatedHello hello; CHECK(AuthenticateHello(delegation,sig,transcript,16,hello,error));
++  CHECK(hello.proof_id==decoded.proof->getId()); CHECK(hello.session_key==request.session_key.GetPubKey());
++  auto bad_transcript=transcript; ++bad_transcript.sender_nonce; CHECK(!AuthenticateHello(delegation,sig,bad_transcript,16,hello,error));
++  sig[0]^=1; CHECK(!AuthenticateHello(delegation,sig,transcript,16,hello,error));
++  auto tampered=decoded; tampered.payment_locks[0][1]^=1; CHECK(!AdmitProof(profile,snapshot,lookup,tampered,admitted,read,error));
++  coin.creation_height=2; CHECK(!BuildProvisionedCredentials(request,profile,snapshot,lookup,read,credentials,error)); CHECK(error=="height-mismatch"); coin.creation_height=1;
++  CoinLookup absent=[](const Outpoint &,std::optional<Coin> &out,std::string &){out.reset();return true;};
++  CHECK(!BuildProvisionedCredentials(request,profile,snapshot,absent,read,credentials,error)); CHECK(error=="utxo-missing-or-spent");
++  request.expiration=int64_t(snapshot.median_time_past); CHECK(!BuildProvisionedCredentials(request,profile,snapshot,lookup,read,credentials,error)); CHECK(error=="expired-proof"); request.expiration=0;
++  ++coin.output.value; CHECK(!BuildProvisionedCredentials(request,profile,snapshot,lookup,read,credentials,error)); CHECK(error=="amount-mismatch"); --coin.output.value;
++  coin.coinbase=false; CHECK(!BuildProvisionedCredentials(request,profile,snapshot,lookup,read,credentials,error)); CHECK(error=="coinbase-mismatch"); coin.coinbase=true;
++  snapshot.height=2015; CHECK(!BuildProvisionedCredentials(request,profile,snapshot,lookup,read,credentials,error)); CHECK(error=="immature-utxo"); snapshot.height=2024;
++  request.stakes[0].payment_lock[1]^=1; CHECK(!BuildProvisionedCredentials(request,profile,snapshot,lookup,read,credentials,error)); request.stakes[0]=stake;
++  request.stakes[0].height=0x80000000U; CHECK(!BuildProvisionedCredentials(request,profile,snapshot,lookup,read,credentials,error)); CHECK(error=="invalid-provision-height"); request.stakes[0]=stake;
++  request.stakes.push_back(stake); CHECK(!BuildProvisionedCredentials(request,profile,snapshot,lookup,read,credentials,error)); request.stakes.pop_back();
++  ProvisionStake second; second.key=PublicFixture(2); second.amount=962073674062ULL; second.height=2; second.coinbase=true;
++  auto second_id=ParseHex("4caa6f9883e9580c9934febde87d078538cd9843345f422925b43c3802718780"); std::copy(second_id.begin(),second_id.end(),second.outpoint.tx_id.begin());
++  second.payment_lock=ParseHex("20c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5bc4e");
++  Coin coin2; coin2.outpoint=second.outpoint; coin2.creation_height=2; coin2.coinbase=true; coin2.output.value=second.amount; coin2.output.branches={BranchLeaf(second.payment_lock)}; coin2.output.paths={{0}};
++  CoinLookup two=[&](const Outpoint &p,std::optional<Coin> &out,std::string &){out=p==coin.outpoint?std::optional<Coin>(coin):p==coin2.outpoint?std::optional<Coin>(coin2):std::nullopt;return true;};
++  request.stakes.insert(request.stakes.begin(),second); CHECK(BuildProvisionedCredentials(request,profile,snapshot,two,read,credentials,error));
++  CHECK(credentials.envelope.payment_locks.size()==2); CHECK(AdmitProof(profile,snapshot,two,credentials.envelope,admitted,read,error));
++  std::reverse(request.stakes.begin(),request.stakes.end()); ProvisionedCredentials reverse; CHECK(BuildProvisionedCredentials(request,profile,snapshot,two,read,reverse,error));
++  CHECK(reverse.envelope.proof->getId()==credentials.envelope.proof->getId()); CHECK(reverse.envelope.payment_locks==credentials.envelope.payment_locks); request.stakes={stake};
++  UniValue json(UniValue::VOBJ); json.pushKV("schema",1); json.pushKV("sequence",1); json.pushKV("expiration",0); json.pushKV("master_key",HexStr(request.master_key)); json.pushKV("session_key",HexStr(request.session_key)); json.pushKV("payout_script",HexStr(request.payout_script));
++  UniValue funding(UniValue::VOBJ); funding.pushKV("tx_id",HexStr(stake.outpoint.tx_id)); funding.pushKV("index",0); funding.pushKV("amount",stake.amount); funding.pushKV("height",stake.height); funding.pushKV("coinbase",true); funding.pushKV("key",HexStr(stake.key)); funding.pushKV("payment_lock",HexStr(stake.payment_lock));
++  UniValue stakes(UniValue::VARR); stakes.push_back(funding); json.pushKV("stakes",stakes);
++  char path[]="/tmp/lotus-v2-provision-test-XXXXXX"; CHECK(mkdtemp(path)); const std::filesystem::path dir(path),input=dir/"input.json",output=dir/"credentials.json";
++  {std::ofstream file(input); file<<json.write();} CHECK(chmod(input.c_str(),0600)==0);
++  mode_t old_umask=umask(0777); const bool written=ProvisionCredentialsFromFile(input,output,profile,snapshot,lookup,read,error); umask(old_umask); CHECK(written);
++  struct stat st{}; CHECK(lstat(output.c_str(),&st)==0); CHECK(S_ISREG(st.st_mode)); CHECK((st.st_mode&0777)==0600);
++  std::ifstream file(output); std::string text((std::istreambuf_iterator<char>(file)),{}); UniValue saved; CHECK(saved.read(text)); CHECK(saved.size()==4); CHECK(saved["session_key"].get_str()==HexStr(request.session_key));
++  CHECK(!ProvisionCredentialsFromFile(input,output,profile,snapshot,lookup,read,error));
++  std::filesystem::remove(output); CHECK(chmod(input.c_str(),0644)==0); CHECK(!ProvisionCredentialsFromFile(input,output,profile,snapshot,lookup,read,error)); CHECK(!std::filesystem::exists(output));
++  CHECK(chmod(input.c_str(),0600)==0); auto link=dir/"link"; std::filesystem::create_symlink(input,link); CHECK(!ProvisionCredentialsFromFile(link,output,profile,snapshot,lookup,read,error));
++  std::filesystem::remove_all(dir); std::cout<<"avalanche provisioning checks passed\n";
++ } catch(const std::exception &e) { std::cerr<<e.what()<<'\n'; ECC_Stop(); return 1; }
++ ECC_Stop(); return 0;
++}
+-- 
+2.50.1 (Apple Git-155)
+
