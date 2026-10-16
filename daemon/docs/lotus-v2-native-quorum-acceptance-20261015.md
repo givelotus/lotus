@@ -45,3 +45,35 @@ be pinned before making that stronger claim.
 This document describes the harness and its gates. Recorded execution evidence
 is required before claiming any gate passed. Seed preparation alone is never a
 quorum, polling, fork or recovery acceptance result.
+
+## Actual bounded import and recovery blocker
+
+The first enabled observer run hit its 1800-second deadline with stable height
+1737 and a pending journal for the next submitted block. The observer still had
+zero proofs, zero authenticated peers, no quorum and no finalized tip. Its
+requested graceful stop exited **1**, reporting `Avalanche peer save:
+runtime-not-authoritative`. This is a failed import run, rather than a clean
+completed seed.
+
+A fresh copy of that stopped enabled home was opened with source
+`09e36f683003db0cc487fd59ed54622bb1f02195`, binary SHA256
+`07a295e559de393f304ce1ed311ba2fdc415908b5a88f4eb27ce95f568b55600`.
+That process also exited **1**, before readiness, reporting `Avalanche startup:
+runtime-not-authoritative`. The native runtime had not drained the pending
+journal before the driver required an authoritative snapshot. Both owned
+processes are stopped; the original stopped home and all JSONL traces remain
+preserved. The queued quorum launcher was stopped before any quorum home or
+proof credentials were created.
+
+[Failure evidence](evidence/v2-native-quorum-recovery-blocker-20261015.json)
+records both exact binaries, commands, exit statuses, the last pending snapshot
+and hashes/paths for the retained raw traces. Quorum, polling, parking and fork
+restart gates have **not run** at this point.
+
+The harness distinguishes `--resume-seed` after a clean bounded timeout from
+`--recover-seed --resume-seed` for this exact failed shutdown. Explicit recovery
+keeps the old failure evidence, copies only the stopped enabled home, requires
+the known shutdown error and exit code, and checks the recovered authoritative
+native state against the accepted ledger before importing the remaining suffix.
+A native lifecycle correction must be independently reviewed and pinned before
+using the latter path. It never clears or edits the journal itself.
