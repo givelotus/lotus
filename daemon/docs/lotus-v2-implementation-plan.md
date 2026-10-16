@@ -6,15 +6,38 @@ Updated October 15, 2026. Development plan; no genesis parameters are frozen and
 
 ## Source foundation and current status
 
-The current executable [V2 series](../patches/v2/series) contains 308 patches,
-`000`–`307`, on ABC master `1fb7db17c176cdea8a2c60d887891589382ee4e3`.
-[Latest replay evidence](evidence/v2-series-replay-307.json) verifies every
+The current executable [V2 series](../patches/v2/series) contains 318 patches,
+`000`–`317`, on ABC master `1fb7db17c176cdea8a2c60d887891589382ee4e3`.
+[Latest replay evidence](evidence/v2-series-replay-317.json) verifies every
 intermediate tree. Offline daemon acceptance, restart, disconnect/reconnect,
 resumable fork recovery, bounded selection and actual two-process TCP full/compact
 synchronization have separate evidence below. Native production of signed fixture-payment blocks also passes across two nodes.
 The foreground local controller now completes a live-wallet payment and restart
 across two isolated nodes; see the current controller evidence below. Development
 profile adoption and public launch remain pending.
+
+### Reviewed audit repairs through 317 (October 15)
+
+Series commit `dfd493fe793752bb7ac32eacc7bfa626d0da1d17` appends ten reviewed repairs to the
+previous series, preserving mailboxes 000–307 byte-for-byte. All 318 trees
+verify in a new replay; final native source `cd8d5140ec` has tree
+`a14a946342d31ee07ee8851906500746800b0c46`. This plan update immediately follows the series commit.
+
+Repairs cover signed late Avalanche responses with pinned ABC abuse policy,
+FIFO relay inventory, application-frame retention across authority changes,
+portable temporary fixtures, prepared-VM ownership, early mempool resource
+checks, wallet descriptor restoration, valid monetary fixtures, and inherited
+Lotus branding expectations. Independent focused checks passed. Combined Debug
+Chronik-enabled daemon, wallet client, CLI and wallet-tool builds passed.
+The linker reports dependencies built for macOS 26.5 while targeting 26.0;
+compatibility with older deployment versions has not been demonstrated.
+
+The previous nine-node run established the authenticated default quorum but
+failed its unchanged finality deadline. That failure remains preserved; these
+repairs have not yet passed a new quorum/finality run. Full final-revision suites,
+Linux execution, updated coverage and separate-machine acceptance remain open.
+The audit consolidation is a separate reviewed candidate, not yet promoted;
+see the Argon consensus and consolidation review in docs/plans.
 
 ### Reviewed peer lifecycle repair through 307 (October 15)
 
