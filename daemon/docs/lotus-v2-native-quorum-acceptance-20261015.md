@@ -1,13 +1,13 @@
 # Native default-policy quorum acceptance
 
-Current result: diagnostic source `bf4ddad652` passed the actual nine-node
-authenticated quorum gate, and four of nine nodes (nodes 6, 7, 8 and 9) finalized
-the seed tip, while the unchanged 300-second all-nine finality gate failed with
-remaining tip confidences 105–127 against the 128 threshold. Fork/parking and
-nine-node restart gates remain unexecuted. All twelve owned processes exited
-cleanly and their PIDs are absent. The heavy execution window was released; no
-retry followed. See the
-[latest evidence](evidence/v2-native-quorum-bf4d-finality-deadline-20261015.json).
+Current result: **PASSED** (`passed=true`, `seed_passed=true`, `quorum_passed=true`,
+`restart_passed=true`, `remaining=null`, 107 recorded checks across all 25 stages)
+on reviewed source `f39a373cb57b9cd0bf8964ea4cbe88ef1020c703` (mailbox `324`,
+daemon SHA256 `a5e4e780c9b84832c6b6347eedfdd90bb69b7f854f7cceb668da92ba724ecacc`)
+with `--require-block-observation` and unchanged default quorum, stake, maturity,
+confidence (`128`), and 300-second finality deadlines. All 22 owned child processes
+exited 0 and their PIDs were confirmed absent. See the
+[passing acceptance evidence](evidence/v2-native-quorum-acceptance-f39a373cb5-20261015.json).
 
 `daemon/tests/check-v2-native-quorum.py` runs real isolated node processes with
 caller-pinned daemon source and binary SHA256. It accepts an existing bootstrap
@@ -232,3 +232,51 @@ reviewed repair to proof-discovery shortid matching, already-known proof
 registration and per-connection outbound queue draining is required before the
 next acceptance run.
 
+## Reviewed source `f39a373cb5`: full nine-node quorum, finality, fork-parking, and restart acceptance passed
+
+Reviewed native source `f39a373cb57b9cd0bf8964ea4cbe88ef1020c703` (mailbox `324`,
+tree `4529940707bea972c7a6f4cd299af27aec2e7666`, immutable daemon SHA256
+`a5e4e780c9b84832c6b6347eedfdd90bb69b7f854f7cceb668da92ba724ecacc`) fences
+`DevelopmentRuntime` block policy and Avalanche block observation caches on
+`SameDevelopmentBodyAuthority`, latches completed `Node::ReconcileCandidates` scans
+per `(body_epoch, context_generation, stable_tip, revision)` anchor, skips
+temporarily `Busy` peer dispatch slots in `AvalanchePeer::Pump` while preserving
+per-connection FIFO order and surfacing terminal errors, drains ready peer actions
+in `AvalancheDriver::Pump`, caches 11-header `(height, median_time_past)` snapshots
+in `AvalancheDriver::Snapshot`, and fast-paths duplicate valid proof registrations
+in `AvalancheDriver::Register` after byte-equality and authority verification.
+
+In the initial run (`/private/tmp/lotus-v2-native-quorum-f39a373cb5-20261015-a`),
+the 2,024-block enabled seed import, all nine native proof provisions, funded
+pending-stop recovery, observer readmission, `authenticated-default-quorum`, and
+`real-polled-seed-finality` across all nine nodes passed (`quorum_passed=true`).
+The harness then stopped at line 182 where `readblock` passed `length=2097152`
+instead of the `1..65536` chunk bound enforced by `ReadConnectedBodyChunk` since
+patch `321`. Preserving `/private/tmp/lotus-v2-native-quorum-f39a373cb5-20261015-a`
+untouched and updating `readblock` `length` on line 182 of
+`daemon/tests/check-v2-native-quorum.py` to `65536`, the full acceptance run in
+`/private/tmp/lotus-v2-native-quorum-f39a373cb5-20261015-b` (`--require-block-observation`)
+passed every gate with unchanged defaults and deadlines:
+
+- `resumed-enabled-seed-ledger-prefix` and `seed-stopped-before-copy` (`seed_passed=true`)
+- `native-offline-provision` across all 9 public fixture scalars (mode `0600`)
+- `funded-proof-admitted-before-pending-stop`, `actual-funded-pending-stop`,
+  `funded-pending-stop-public-store`, and `funded-public-record-readmitted-after-pending-recovery`
+- `authenticated-default-quorum` and `real-polled-seed-finality` across all 9 nodes (`quorum_passed=true`)
+- `native-mined-competing-2025`, `native-mined-competing-2026`, `native-mined-selected-2025`,
+  and `selected-block-network-propagation`
+- `selected-block-before-rival-submission`, `competing-fork-submitted-before-finality`,
+  and `real-polled-competing-fork-parked-before-finality` (all 9 nodes observed
+  `parked=true`, `active=false`, `finalized=false`, `conflicting_finalized=false`
+  before selected-block finality)
+- `selected-block-real-finality`, `competing-child-submitted-after-finality`,
+  `higher-work-competing-fork-excluded`, and `competing-fork-retained` (all 9 nodes
+  observed `parked=true`, `conflicting_finalized=true` on both `competing-2025` and
+  `competing-2026`)
+- `stopped-peer-proof-store`, `restart-initial-proof-count` (9 proofs reloaded from
+  disk before peer reconnect), `restart-authenticated-default-quorum`,
+  `restart-real-finality`, and `restart-competing-fork-retained` (`restart_passed=true`,
+  `passed=true`, `remaining=null`)
+- All 22 owned child processes exited 0 and their PIDs were confirmed absent.
+- See [passing evidence](evidence/v2-native-quorum-acceptance-f39a373cb5-20261015.json)
+  (SHA256 `3faac1cf807247cd1e89f666f265d8803d37acfefe4773d257364fbd4583af4f`).

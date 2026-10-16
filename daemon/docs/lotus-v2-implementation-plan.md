@@ -39,9 +39,17 @@ seven standalone Avalanche/runtime unit test suites and independent review passe
 The combined Debug, Chronik-enabled, wallet-enabled daemon (`lotusd` SHA256
 `a5e4e780c9b84832c6b6347eedfdd90bb69b7f854f7cceb668da92ba724ecacc`), CLI, wallet
 tool, and V2 wallet client build passed; see
-[evidence](evidence/v2-native-build-f39a373cb5.json). Unchanged nine-node quorum,
-finality, pre-finality parking, competing-fork refusal, and restart acceptance is
-next.
+[evidence](evidence/v2-native-build-f39a373cb5.json).
+
+With `readblock` chunk length aligned to `65536` in
+`daemon/tests/check-v2-native-quorum.py`, the unchanged nine-node quorum,
+seed-finality, pre-finality rival parking (`real-polled-competing-fork-parked-before-finality`),
+selected-block finality, higher-work competing-fork exclusion (`conflicting_finalized=true`),
+disk proof-store persistence, and nine-node restart quorum/finality acceptance run
+(`--require-block-observation`) **passed all 107 checks across all 25 stages** with
+all 22 owned child processes exiting 0; see
+[quorum acceptance](lotus-v2-native-quorum-acceptance-20261015.md) and
+[passing evidence](evidence/v2-native-quorum-acceptance-f39a373cb5-20261015.json).
 
 ### Reviewed cache and diagnostic integration through 323 (October 15)
 

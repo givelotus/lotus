@@ -179,7 +179,7 @@ def main():
             before,answer=find_candidate(node,tag,timestamp)
             until=min(end,time.monotonic()+a.timeout)
             while status(node)['tip']!=answer['block_id']:require(time.monotonic()<until,'mined block failed to connect')
-            read=node.request('readblock',block_id=answer['block_id'],offset=0,length=2097152)
+            read=node.request('readblock',block_id=answer['block_id'],offset=0,length=65536)
             require(read.get('ok') and read['eof'],'mined body read incomplete')
             path=root/(tag+'.block');path.write_bytes(bytes.fromhex(read['data']))
             check('native-mined-'+tag,result=answer,status=status(node),body_sha256=local.digest(path))
