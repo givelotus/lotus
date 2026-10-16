@@ -6,6 +6,38 @@ This is preparation for a handoff, not evidence that current Codex workers have
 stopped. Before taking ownership, inspect actual processes and coordinate the
 transfer. Do not edit files concurrently with their listed owner.
 
+## Ownership transfer requested now
+
+The user requested immediate handoff to Gemini Argon 4 because Codex quota is low.
+Codex is stopping new work. Resume from this document and inspect processes first.
+
+1. **Preserve the running acceptance test.** Last verified harness PID56690 was
+   live at elapsed5:17, exec session85355. Do not restart or kill it. Its unchanged
+   harness automatically cleans up owned children on exit. Read terminal
+   `evidence.json` and adjacent `.log` in the run path below; independently confirm
+   exit/cleanup. All-nine authenticated quorum passed; finality outcome is pending.
+   Source/binary/harness pins remain the current checkpoint below.
+2. **Functional preparation candidate, not integrated:** commit `281eec19` in
+   `/private/tmp/lotus-v2-functional-final-bf4ddad652-docs-20261015`, based on97d3eb93.
+   Frozen inputs `/private/tmp/lotus-v2-functional-final-bf4ddad652-20261015`.
+   All319variants are NOTRUN. Independent reviewer `/root/explorer_storage_review`
+   was asked to save current findings and stop. Review before integrating or
+   executing. Do not transfer old cd8 test passes to bf4.
+3. **Read-only rejection findings:**
+   `/private/tmp/lotus-v2-bf4-rejection-review-20261015.md` records exact source and
+   log lines. Observed Other application rejections were not avaresponse rejects.
+   Expired/duplicate discovery data and authentication ordering remain hypotheses;
+   the counters cannot prove which. No fix is implemented or authorized by that
+   inference alone.
+4. **Read-only serialization audit:** `/root/audit_safety_repairs` was asked to save
+   current notes under `/private/tmp/lotus-v2-identity-reuse-audit-bf4ddad652` and stop.
+   Check whether the report exists; no optimization implementation/build started.
+5. **Queued consolidation build:** preparation paths below remain valid. Do not
+   overlap heavy builds with acceptance. Draft boundary still lacks build gates.
+
+All other completed workers are idle. No new Codex tasks or acceptance retries
+should be assumed. Main/production protection and no-push rules remain unchanged.
+
 ## Current checkpoint — supersedes older snapshot details below
 
 - Monorepo: `839ebc09` before this handoff update. Series commit `f070f095`
