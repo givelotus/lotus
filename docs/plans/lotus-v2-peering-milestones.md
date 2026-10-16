@@ -71,7 +71,7 @@ Following the consolidated baseline (`000`–`021`) and Merklix sharding upgrade
 - **Stage G2 (`037`–`039`, Lotus V2): Lock-Free RCU `ChainAndMempoolSnapshot`, True $O(1)$ `getblocktemplate`, and Atomic Batch RPCs (see [`lotus-v2-rpc-coroutines-and-lockfree-snapshots.md`](./lotus-v2-rpc-coroutines-and-lockfree-snapshots.md)):**
   - `037`: Add `ChainAndMempoolSnapshot`, `SnapshotPublisher` (`std::atomic<std::shared_ptr<const ChainAndMempoolSnapshot>>`), and `ScopedMdbxReadTxn` (`MDBX_TXN_RDONLY`) so read RPCs (`getblockchaininfo`, `getblockheader`, `gettxout`, `getmempoolinfo`, `getrawmempool`) run with zero `cs_main` or `mempool.cs` locks.
   - `038`: Eliminate the legacy $O(N)$ `EncodeHexTx(tx)` loop in `getblocktemplate` (`src/rpc/mining.cpp:1115–1137`), returning $O(1)$ V2 overlay commitment fields (`overlay_id`, `subtree_a_root`, `utxo_root`, `stateroot`, and `50/25/25` `coinbasetxn`) in $< 5\text{ }\mu\text{s}$ and pairing with `submittemplateblock(header_hex, coinbase_tx_hex)`.
-  - `039`: Add `testtxbatch` (lock-free atomic dry-run validation of arbitrary DAG topologies over `BatchCoinsView` + `ChainAndMempoolSnapshot`) and `submittxbatch` / `submitpackage(..., atomic=true)` (two-phase all-or-nothing validation + atomic mempool/epoch commit with zero partial commits).
+  - `039`: Add `submitrawtxbatch` (two-phase all-or-nothing atomic DAG validation + mempool/epoch commit with zero partial commits and detailed per-tx rejection diagnostics) and `testrawtxbatch` (Phase 1 lock-free dry-run wrapper over `BatchCoinsView` + `ChainAndMempoolSnapshot`).
 
 
 ## Follow-on milestones — commitment-based state sync and hostile suppliers
