@@ -17,16 +17,16 @@ In the inherited Bitcoin Core / Bitcoin ABC daemon architecture (`src/httpserver
 
 Because `src/CMakeLists.txt` **already** enables **C++20** (`set(CMAKE_CXX_STANDARD 20)`, line 5) and links **header-only Boost** (`link_boost_headers_only(util)`, line 492), we can solve all three problems in pure C++20 without requiring the opt-in Rust/Chronik toolchain (`Option A`), cleanly separated into two tracks:
 
-- **Track 1 — Upstreamable ABC C++20 `Boost.Asio` Coroutine HTTP/RPC Engine (`Patches 035–036`, Zero Lotus V2 Coupling):**
+- **Track 1 — Upstreamable ABC C++20 `Boost.Asio` Coroutine HTTP/RPC Engine (`Patches 032–033`, Zero Lotus V2 Coupling):**
   - Replace the blocking `WorkQueue<HTTPClosure>` in `src/httpserver.cpp` with a `boost::asio::thread_pool` + C++20 stackless coroutines (`boost::asio::awaitable`), and convert `waitfornewblock`, `waitforblock`, `waitforblockheight`, and `getblocktemplate` `longpollid` from blocking OS-thread `wait_until` calls to non-blocking `co_await` suspension.
-- **Track 2 — Lotus V2 Lock-Free RCU `ChainAndMempoolSnapshot` & True $O(1)$ `getblocktemplate` (`Patches 037–038`):**
+- **Track 2 — Lotus V2 Lock-Free RCU `ChainAndMempoolSnapshot` & True $O(1)$ `getblocktemplate` (`Patches 034–036`):**
   - Combine Lotus V2's immutable `MempoolOverlayLayer` ($L_0 \dots L_k, L_{\text{spec}}$) and `libmdbx` wait-free MVCC read transactions (`MDBX_TXN_RDONLY`) behind an atomic RCU `std::shared_ptr<const ChainAndMempoolSnapshot>`, eliminating `cs_main` and `mempool.cs` from read RPCs and making `getblocktemplate` genuinely **$O(1)$ in both CPU time ($< 5\text{ }\mu\text{s}$) and payload size ($\sim 1\text{ KB}$)** over pre-consensus templates.
 
 ---
 
-## 2. Track 1: Upstreamable ABC C++20 `Boost.Asio` Coroutine HTTP/RPC Engine (`Patches 035–036`)
+## 2. Track 1: Upstreamable ABC C++20 `Boost.Asio` Coroutine HTTP/RPC Engine (`Patches 032–033`)
 
-### 2.1 Replacing `WorkQueue<HTTPClosure>` with `boost::asio::thread_pool` + `boost::asio::awaitable` (`Patch 035`)
+### 2.1 Replacing `WorkQueue<HTTPClosure>` with `boost::asio::thread_pool` + `boost::asio::awaitable` (`Patch 032`)
 
 - **Zero New Build Dependencies:**
   - Uses `<coroutine>` (C++20 standard library) + header-only `<boost/asio/thread_pool.hpp>`, `<boost/asio/awaitable.hpp>`, `<boost/asio/co_spawn.hpp>`, `<boost/asio/strand.hpp>`, and `<boost/asio/steady_timer.hpp>`.
@@ -58,7 +58,7 @@ Because `src/CMakeLists.txt` **already** enables **C++20** (`set(CMAKE_CXX_STAND
     ```
   - Bounded admission control (`-rpcworkqueue`, default 64 or 1024 for coroutines) is enforced via an atomic in-flight counter so memory remains strictly bounded under flood conditions.
 
-### 2.2 Non-Blocking Coroutine Long-Polling (`waitfornewblock`, `waitforblock`, `getblocktemplate` `longpollid`) (`Patch 036`)
+### 2.2 Non-Blocking Coroutine Long-Polling (`waitfornewblock`, `waitforblock`, `getblocktemplate` `longpollid`) (`Patch 033`)
 
 - **`AsyncBlockChangeWaiter` (`src/rpc/async_waiter.h`):**
   - Maintains a list of suspended coroutine timers (`boost::asio::steady_timer`) protected by a `boost::asio::strand`.
@@ -78,11 +78,11 @@ Because `src/CMakeLists.txt` **already** enables **C++20** (`set(CMAKE_CXX_STAND
 
 ---
 
-## 3. Track 2: Lotus V2 Lock-Free RCU Snapshots & True $O(1)$ `getblocktemplate` (`Patches 037–038`)
+## 3. Track 2: Lotus V2 Lock-Free RCU Snapshots & True $O(1)$ `getblocktemplate` (`Patches 034–036`)
 
 ### 3.1 Why `getblocktemplate` Was Still $O(N)$ in `src/rpc/mining.cpp` — and How V2 Makes It True $O(1)$
 
-In [`docs/plans/lotus-v2-bulk-preconsensus-and-mempool-overlays.md`](file:///private/tmp/lotus-v2-repo/docs/plans/lotus-v2-bulk-preconsensus-and-mempool-overlays.md#L1502-L1579), we made `BlockAssembler::CreateNewBlock` $O(1)$ ($< 2\text{ }\mu\text{s}$) by reusing `L_e->cached_block` and computing `hashMerkleRoot` and `hashStateRoot` in 2 BLAKE3 hashes.
+In [`docs/plans/lotus-v2-bulk-preconsensus-and-mempool-overlays.md`](file:///private/tmp/lotus-v2-repo/docs/plans/lotus-v2-bulk-preconsensus-and-mempool-overlays.md#L1502-L1579), we made `BlockAssembler::CreateNewBlock` $O(1)$ ($< 5\text{ }\mu\text{s}$) by reusing `L_e->cached_block` and computing `hashMerkleRoot` and `hashStateRoot` in $O(1)$.
 
 However, look at what `getblocktemplate` in `src/rpc/mining.cpp:1115–1137` does *after* `CreateNewBlock` returns:
 ```cpp
@@ -107,8 +107,8 @@ At $N = 100{,}000$ transactions, that loop takes **$\sim 180\text{ ms}$ of CPU**
      $$\text{TxRoot} = H_{\text{txroot}}(\texttt{0x03} \parallel \text{CoinbaseLeaf} \parallel \text{SubtreeA\_Root})$$
      where $\text{SubtreeA\_Root}$ (`L_e->subtree_a_root`) is a **single 32-byte hash** committing to all $N$ non-coinbase transactions!
    - And `StateRoot` is:
-     $$\text{StateRoot} = H_{\text{state}}(\texttt{0x02} \parallel \text{UtxoRoot} \parallel \text{MonetaryState}_h)$$
-     where $\text{UtxoRoot}$ (`L_e->utxo_root`) is **100% invariant to `vtx[0]` (`CoinbaseTx`)** because coinbase outputs are pipelined into `UtxoRoot` at Block $h+1$!
+     $$\text{StateRoot} = H_{\text{state}}(\texttt{0x02} \parallel \text{ChainId} \parallel u64(h) \parallel \text{UtxoRoot} \parallel \text{MonetaryState}_h)$$
+     where `UtxoRoot` is obtained in $O(1)$ (~27 BLAKE3 hashes, $< 3\text{ }\mu\text{s}$) by path-copying `vtx[0]`'s 1–3 outputs onto `L_e->utxo_root` (since all outputs of `vtx[0]` share the same 224-bit `OutpointKey` prefix and Merklix insertion is commutative)!
 2. **True $O(1)$ Compact Template Mode (`"template_mode": "v2_overlay"` / `-simplegbt`):**
    - To construct `vtx[0]` (`CoinbaseTx` with `50% Miner / 25% Staker / 25% Treasury`), compute the 134-byte header (`tx_root` and `state_root`), grind the 64-bit `nonce`, and submit a winning block via `submittemplateblock` (or `submitblock`), a miner/pool **only needs $O(1)$ data (~1 KB JSON)**:
      - `overlay_id`: `L_e->overlay_id` (32B hex)
@@ -130,7 +130,7 @@ flowchart LR
 
     subgraph Reader["C++20 Boost.Asio Coroutine RPC Worker (ZERO Locks)"]
         Req["HTTP POST / (getblocktemplate)"] --> Load["snap = g_snapshot_publisher.Load()\natomic load(acquire) (~2 ns)"]
-        Load --> CB["BuildV2CoinbaseTx (50/25/25)\n+ 2 BLAKE3 hashes (tx_root, state_root)"]
+        Load --> CB["BuildV2CoinbaseTx (50/25/25)\n+ O(1) BLAKE3 hashes (tx_root, state_root)"]
         CB --> Resp["Return O(1) JSON (~1 KB):\nheader + coinbasetxn + overlay_id +\nsubtree_a_root + utxo_root + stateroot\nTotal time: < 5 us!"]
     end
 
@@ -139,7 +139,7 @@ flowchart LR
 
 ---
 
-### 3.2 Lock-Free RCU `ChainAndMempoolSnapshot` & `ScopedMdbxReadTxn` (`Patch 037`)
+### 3.2 Lock-Free RCU `ChainAndMempoolSnapshot` & `ScopedMdbxReadTxn` (`Patch 034`)
 
 #### Exact Snapshot Structure (`src/node/snapshot.h`):
 ```cpp
@@ -159,7 +159,7 @@ struct ChainAndMempoolSnapshot {
     uint256 tip_hash{};
     int64_t median_time_past{0};
     uint32_t next_nBits{0};
-    lotus::v2::HeaderView tip_header{};
+    lotus::v2::Header tip_header{};
     lotus::v2::MonetaryState tip_monetary_state{};
     uint64_t mdbx_committed_txnid{0};
 
@@ -257,13 +257,14 @@ sequenceDiagram
 
 ---
 
-## 4. Modular Patch Breakdown (`Patches 035–039`)
+## 4. Modular Patch Breakdown (`Patches 032–036`, on top of `000`–`031`)
 
 | Patch # | Track | Patch Name | Scope & Files | Verification Gate |
 | :--- | :--- | :--- | :--- | :--- |
-| **`035`** | **Track 1 (Upstreamable ABC)** | `035-rpc-asio-cpp20-coroutine-http-dispatcher.patch` | Replace `WorkQueue<HTTPClosure>` in `src/httpserver.cpp` with `boost::asio::thread_pool` + C++20 `boost::asio::awaitable` coroutines; add optional `AsyncActor` to `CRPCCommand` (`src/rpc/server.h`). | `httpserver_tests` + all existing `rpc_*.py` tests pass unchanged. |
-| **`036`** | **Track 1 (Upstreamable ABC)** | `036-rpc-async-longpoll-waitforblock-and-gbt.patch` | Add `AsyncBlockChangeWaiter` (`boost::asio::steady_timer` strand) and convert `waitfornewblock`, `waitforblock`, `waitforblockheight`, and `getblocktemplate` `longpollid` from blocking OS-thread `wait_until` to `co_await`. | `rpc_longpoll_coroutines.py`: 200 concurrent long-polls with `-rpcthreads=4` never block concurrent RPCs. |
-| **`037`** | **Track 2 (Lotus V2)** | `037-v2-rcu-snapshot-and-lockfree-rpc-queries.patch` | Add `ChainAndMempoolSnapshot`, `SnapshotPublisher`, and `ScopedMdbxReadTxn`. Migrate `getblockchaininfo`, `getblockheader`, `gettxout`, `getmempoolinfo`, and `getrawmempool` to wait-free RCU + `libmdbx` `MDBX_TXN_RDONLY` reads (zero `cs_main` / `mempool.cs`). | `snapshot_rcu_tests`: 64 concurrent reader coroutines + continuous `ConnectTip` / mempool writes with zero lock contention. |
-| **`038`** | **Track 2 (Lotus V2)** | `038-v2-o1-getblocktemplate-and-submittemplateblock.patch` | Make `getblocktemplate` read `SnapshotPublisher::Load()` with zero locks, return $O(1)$ V2 overlay commitment fields (`overlay_id`, `subtree_a_root`, `utxo_root`, `stateroot`, `coinbasetxn` with `50/25/25` split) in $< 5\text{ }\mu\text{s}$, cache `cached_gbt_txs` on `MempoolOverlayLayer` for legacy callers, wake long-polls on new finalized epoch $L_e$, and add `submittemplateblock(header_hex, coinbase_tx_hex)`. | `mining_v2_o1_gbt.py`: verify $O(1)$ `< 5 us` `getblocktemplate` + `submittemplateblock` at 100k mempool txs with zero `cs_main` lock acquisition. |
-| **`039`** | **Track 1 & 2 (Upstreamable + V2 Overlay)** | `039-add-atomic-testrawtxbatch-and-submitrawtxbatch-rpc.patch` | Add `testrawtxbatch` (lock-free atomic dry-run validation of arbitrary DAG topologies over `BatchCoinsView` + `ChainAndMempoolSnapshot`) and `submitrawtxbatch` / `submitpackage(..., atomic=true)` (two-phase all-or-nothing validation + atomic mempool/epoch commit with zero partial commits). | `rpc_atomic_tx_batch.py`: prove multi-hop Stamp/Signet chains ($T_1 \to T_2 \to T_3$) and fan-out batches commit all-or-nothing (0 partial commits when $T_k$ fails or races). |
+| **`032`** | **Track 1 (Upstreamable ABC)** | `032-rpc-asio-cpp20-coroutine-http-dispatcher.patch` | Replace `WorkQueue<HTTPClosure>` in `src/httpserver.cpp` with `boost::asio::thread_pool` + C++20 `boost::asio::awaitable` coroutines; add optional `AsyncActor` to `CRPCCommand` (`src/rpc/server.h`). | `httpserver_tests` + all existing `rpc_*.py` tests pass unchanged. |
+| **`033`** | **Track 1 (Upstreamable ABC)** | `033-rpc-async-longpoll-waitforblock-and-gbt.patch` | Add `AsyncBlockChangeWaiter` (`boost::asio::steady_timer` strand) and convert `waitfornewblock`, `waitforblock`, `waitforblockheight`, and `getblocktemplate` `longpollid` from blocking OS-thread `wait_until` to `co_await`. | `rpc_longpoll_coroutines.py`: 200 concurrent long-polls with `-rpcthreads=4` never block concurrent RPCs. |
+| **`034`** | **Track 2 (Lotus V2)** | `034-v2-rcu-snapshot-and-lockfree-rpc-queries.patch` | Add `ChainAndMempoolSnapshot`, `SnapshotPublisher`, and `ScopedMdbxReadTxn`. Migrate `getblockchaininfo`, `getblockheader`, `gettxout`, `getmempoolinfo`, and `getrawmempool` to wait-free RCU + `libmdbx` `MDBX_TXN_RDONLY` reads (zero `cs_main` / `mempool.cs`). | `snapshot_rcu_tests`: 64 concurrent reader coroutines + continuous `ConnectTip` / mempool writes with zero lock contention. |
+| **`035`** | **Track 2 (Lotus V2)** | `035-v2-o1-getblocktemplate-and-submittemplateblock.patch` | Make `getblocktemplate` read `SnapshotPublisher::Load()` with zero locks, return $O(1)$ V2 overlay commitment fields (`overlay_id`, `subtree_a_root`, `utxo_root`, `stateroot`, `coinbasetxn` with `50/25/25` split) in $< 5\text{ }\mu\text{s}$, cache `cached_gbt_txs` on `MempoolOverlayLayer` for legacy callers, wake long-polls on new finalized epoch $L_e$, and add `submittemplateblock(header_hex, coinbase_tx_hex)`. | `mining_v2_o1_gbt.py`: verify $O(1)$ `< 5 us` `getblocktemplate` + `submittemplateblock` at 100k mempool txs with zero `cs_main` lock acquisition. |
+| **`036`** | **Track 1 & 2 (Upstreamable + V2 Overlay)** | `036-add-atomic-testrawtxbatch-and-submitrawtxbatch-rpc.patch` | Add `testrawtxbatch` (lock-free atomic dry-run validation of arbitrary DAG topologies over `BatchCoinsView` + `ChainAndMempoolSnapshot`) and `submitrawtxbatch` / `submitpackage(..., atomic=true)` (two-phase all-or-nothing validation + atomic mempool/epoch commit with zero partial commits). | `rpc_atomic_tx_batch.py`: prove multi-hop Stamp/Signet chains ($T_1 \to T_2 \to T_3$) and fan-out batches commit all-or-nothing (0 partial commits when $T_k$ fails or races). |
+
 
