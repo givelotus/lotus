@@ -77,3 +77,43 @@ the known shutdown error and exit code, and checks the recovered authoritative
 native state against the accepted ledger before importing the remaining suffix.
 A native lifecycle correction must be independently reviewed and pinned before
 using the latter path. It never clears or edits the journal itself.
+
+## Repaired recovery and actual nine-node readiness failure
+
+With reviewed lifecycle source `c0ddb9cf307a97a43309b72cffef383c29e559e8`
+(binary SHA256 `5c05a1acf36a91c690505ca08bd291d9fd2e985fd483f9db08386c712c1f8bfa`),
+a new copy recovered the interrupted journal to height 1738 and matched the
+accepted ledger's complete native state. Its remaining suffix reached 2024 and
+stopped with exit 0. All nine existing-only native proof provisions passed with
+mode 0600 credentials.
+
+The funded pending-stop check passed separately: an actual admitted proof was
+present during a pending journal, graceful stop exited 0, and its 487-byte public
+cache was retained. Reopening the same home **as an observer without local proof
+credentials** recovered the mined block at 2025 and loaded one proof with zero
+authenticated peers and no quorum. That observer also stopped with exit 0.
+
+The nine-node mesh then reached eight authenticated and eligible peers and nine
+proofs per node. The readiness gate nevertheless failed at its unchanged
+180-second deadline. During unchanged height-2024 snapshots with no download
+jobs or pending recovery, each node repeatedly reentered initial download mode:
+14–36 transitions occurred per node. Only one node reported an established
+quorum in the retained samples. All twelve owned native processes exited 0.
+
+[Ordered readiness evidence](evidence/v2-native-quorum-ibd-oscillation-20261015.json)
+retains each native response and raw-trace hashes. It has no invented timestamps.
+The source mechanism is `Node::Headers`, which starts header refreshes every
+1000 ms and adds `pending_headers`, combined with `Node::InitialDownload`, which
+rechecks that set every time. `Quorum::SentProofInventory` ignores inventories
+sent while that initial-download flag is true. The pinned ABC implementation
+uses a one-way catch-up latch. Its reviewed restoration is a separate source
+change; no proof, voting, confidence, neighbor or cooldown default is weakened.
+
+This run did not reach finality or fork checks. Future fork acceptance requires
+requested-block observations before **each** rival submission and after it, with
+the selected block still active and unfinalized. All nine nodes must then report
+the known, valid, data-bearing rival parked while `conflicting_finalized=false`
+and selected finality remains false. Any crossed finality boundary fails with
+its original snapshots. The production park-write path is exclusively signed
+poll response handling through `PollEngine::Receive`, `AvalancheDriver::Apply`
+and `DevelopmentRuntime::ApplyAvalancheUpdates`.
