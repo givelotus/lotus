@@ -6,9 +6,9 @@ Updated October 15, 2026. Development plan; no genesis parameters are frozen and
 
 ## Source foundation and current status
 
-The current executable [V2 series](../patches/v2/series) contains 301 patches,
-`000`–`300`, on ABC master `1fb7db17c176cdea8a2c60d887891589382ee4e3`.
-[Latest replay evidence](evidence/v2-series-replay-300.json) verifies every
+The current executable [V2 series](../patches/v2/series) contains 304 patches,
+`000`–`303`, on ABC master `1fb7db17c176cdea8a2c60d887891589382ee4e3`.
+[Latest replay evidence](evidence/v2-series-replay-303.json) verifies every
 intermediate tree. Offline daemon acceptance, restart, disconnect/reconnect,
 resumable fork recovery, bounded selection and actual two-process TCP full/compact
 synchronization have separate evidence below. Native production of signed fixture-payment blocks also passes across two nodes.
@@ -16,7 +16,41 @@ The foreground local controller now completes a live-wallet payment and restart
 across two isolated nodes; see the current controller evidence below. Development
 profile adoption and public launch remain pending.
 
-### Reviewed integration through 300 (October 15)
+### Reviewed repairs through 303 (October 15)
+
+All 304 mailboxes replay in a fresh worktree, verifying every intermediate tree.
+Source `8cd36091ba` has tree `497041ae23601156327363373a5aa983c22242a5`.
+Mailboxes 000–300 remain byte-identical. Series commit `075f8de3` has parent
+`36303480`, the then-current `lotus-v2` tip; this plan update follows immediately.
+
+Patch 301 fixes overlapping Avalanche update batches exhausting the unchanged
+read budget; [before/after evidence](v2-avalanche-update-batch.md) and independent
+review cover ordered staging, bounds and corruption behavior. Patches 302–303
+separate transient HTTP request fencing from durable explorer snapshot versions.
+Idle turns preserve continuation tokens; actual context changes, recovery and
+ABA still invalidate them. The repaired service/HTTP suites pass 29 tests and
+the combined Chronik-enabled daemon builds.
+
+The independently reviewed [native asset gate](v2-explorer-assets-live-acceptance.md)
+passes mint/transfer/explicit and implicit burns, exact indexed/native facts,
+longer-fork rollback, all four detached outpoints, exact-wire mempool re-mining,
+and persisted locations after restart. Five processes exit cleanly. It uses
+public native TRUE/MINT test scripts, not a secure token issuance contract or
+compiler acceptance fixture. Idle ready observations retain their generation;
+brief suspended/unavailable observations are explicitly recorded and bounded.
+
+The funded quorum bootstrap exposed a subsequent lifecycle defect: graceful
+shutdown during a pending journal fails peer persistence, and reopening that
+home fails before runtime recovery can run. The original data and failure traces
+are preserved; a repair and copied-home recovery gate are in progress. No quorum
+or finality claim follows from the existing bootstrap. Wallet/explorer DOM
+acceptance, exact-revision aggregate tests and separate-machine acceptance remain
+unfinished. [Coverage](../../docs/plans/lotus-v2-explorer-coverage.md) identifies
+mapped denominators and excludes these newer authority branches from its older
+baseline. [Functional inventory](v2-functional-acceptance-matrix.md) distinguishes
+execution evidence from still-unrun registered tests.
+
+### Historical reviewed integration through 300 (October 15)
 
 All 301 mailboxes replayed in a fresh worktree with `git am --keep-non-patch`,
 verifying every intermediate tree. Final native source `86201398e3` has tree
