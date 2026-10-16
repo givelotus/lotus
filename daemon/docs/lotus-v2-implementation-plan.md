@@ -6,15 +6,35 @@ Updated October 15, 2026. Development plan; no genesis parameters are frozen and
 
 ## Source foundation and current status
 
-The current executable [V2 series](../patches/v2/series) contains 307 patches,
-`000`–`306`, on ABC master `1fb7db17c176cdea8a2c60d887891589382ee4e3`.
-[Latest replay evidence](evidence/v2-series-replay-306.json) verifies every
+The current executable [V2 series](../patches/v2/series) contains 308 patches,
+`000`–`307`, on ABC master `1fb7db17c176cdea8a2c60d887891589382ee4e3`.
+[Latest replay evidence](evidence/v2-series-replay-307.json) verifies every
 intermediate tree. Offline daemon acceptance, restart, disconnect/reconnect,
 resumable fork recovery, bounded selection and actual two-process TCP full/compact
 synchronization have separate evidence below. Native production of signed fixture-payment blocks also passes across two nodes.
 The foreground local controller now completes a live-wallet payment and restart
 across two isolated nodes; see the current controller evidence below. Development
 profile adoption and public launch remain pending.
+
+### Reviewed peer lifecycle repair through 307 (October 15)
+
+All 308 intermediate trees verify in a fresh replay. Source `63c5149944`
+has tree `b148281abc3b8a7b599182219835bfc41e2b7ba8`; mailboxes000–306
+remain byte-identical. Series commit `9a767a72` parents `391e2a0f`, the
+then-current `lotus-v2` tip, followed immediately by this plan update.
+
+The e775 nine-node run terminated one node on a stale peer capacity path;
+its failing evidence remains preserved. Patch307 treats dead connections and
+permanent negotiated-size rejection as peer outcomes, retries temporary queue
+pressure, and preserves genuine local failures. Atomic response preflight avoids
+partial batch enqueue. Disconnect releases queued actions, authentication,
+discovery and polls while allowing healthy peers to progress. Independent source
+review and both focused peer/driver executables pass, including real retained
+notices after removal and transport closure. Full Debug Chronik daemon build
+passes; immutable daemon SHA256
+`7d86468e24d457eaf2bbac541cc33ddd422e8a481fee96c8e5b6c07e70de7d0e`.
+Full quorum/finality/fork/restart acceptance remains outstanding. No quorum,
+stake, maturity, confidence, consensus or network defaults change.
 
 ### Reviewed initial-download latch through 306 (October 15)
 
