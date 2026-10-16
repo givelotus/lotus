@@ -142,3 +142,44 @@ terminated. The raw explorer evidence SHA256 is
 Independent review found no remaining concrete harness false-failure in this
 attempt. Reorg/re-mining and a complete usable DOM lifecycle remain pending;
 asset accounting remains the separately owned native asset gate.
+
+## Completed native currency explorer/DOM gate
+
+Run `/private/tmp/lotus-v2-explorer-live-acceptance-20261015-f` **passed** with
+immutable native `c0ddb9cf307a97a43309b72cffef383c29e559e8`, binary SHA256
+`5c05a1acf36a91c690505ca08bd291d9fd2e985fd483f9db08386c712c1f8bfa`.
+The actual frontend was reviewed commit
+`40c3191a902aca2fbff3058e7917d1e2578d7b00`; its request reads use at most four
+attempts under one five-second deadline, preserving token/body and cancellation.
+Harness bytes were commit `8e8d43d6`; explicit screen reload budgets were unchanged.
+
+The unchanged wallet driver passed 78 checks with real funding, controller
+prepare/pay, private FD relay, native pool mining, persisted restart, competing
+confirmation and re-mining. Explorer checks totalled 153: 42 native parity
+snapshots, 19 actual frontend DOM runs, 30 stale-token checks, 27 stale-cursor
+checks and 21 native-pending versus confirmed-history misses. Two whole-view
+restarts retained their verified context-change traces. The independent idle
+probe passed without changing its durable generation.
+
+Native byte parity covered actual 134-byte headers, ordered distinct TxID and
+TxHash identities, full transaction frames, input selectors, frozen spend coins,
+outputs/branches/paths and exact witness script/proof/argument sections. All
+seven explicit search modes and historical outpoint details ran against live
+HTTP through the real private proxy. Same-home membership for payment
+`91d21276f574d56ddb64c255c614666f25d5847c09912bb33a1e45a46ea308f4` was
+confirmed at height 5, removed after the competing chain at height 7, and restored
+by native pool re-mining at height 8.
+
+There were 4,315 wrapper HTTP responses: 4,088 success, 147 transient unavailable,
+59 expected stale and 21 covered-history misses. Separately, actual DOM fetches
+encountered 81 transient 503 responses. The bounded request retries recovered;
+**zero manual stale-screen reloads** were required across all nineteen DOM runs.
+This is observed usability for this fixture, not a performance benchmark.
+
+All ten owned native starts exited zero and all ten private proxies were stopped.
+The checked summary and hashes of raw traces/bodies are in
+[`evidence/v2-explorer-live-acceptance-20261015.json`](evidence/v2-explorer-live-acceptance-20261015.json).
+Earlier failed directories a–e remain retained. Native assets/accounting have a
+separate acceptance owner; this gate proves native-currency wallet/explorer
+behavior. DOM execution is not manual browser, public hosting, finality, accepted
+pool indexing or retained detached-history evidence.
