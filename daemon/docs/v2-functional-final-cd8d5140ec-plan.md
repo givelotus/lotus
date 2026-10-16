@@ -89,3 +89,20 @@ retains exact hashes/JUnit/logs and actual port mapping. The supervisor took
 Disk and seed0 port checks now fail closed within the supervisor before
 launch. The original batch failure remains preserved. Remaining five
 failfast-unrun identities were not launched; no further batch is authorized.
+
+### Remaining five result
+
+All five previously unrun batch002 variants **passed** on unchanged frozen
+cd8 scripts/binaries, in10.03seconds supervisor elapsed.
+[Remaining-five receipt](evidence/v2-functional-final-cd8d5140ec/batch-002-remaining-five/results.json)
+records exact identities, script/binary/config hashes, JUnit, retained raw logs
+and actual ports. Its same-process supervisor failed closed on4GiB launch
+disk and framework seed0..4/node0..7 port checks, with2GiB floor/scratch cap
+and1800second deadline. No signals/refusal occurred; process group29075
+was empty. Prior two passes and reviewed fixture were not rerun.
+
+The final-cd8 batch002 identities now pass across scoped receipts:7with
+unchanged fixtures and1with the reviewed fixture candidate. The original
+branding failure is preserved;311of319variants remain notrun at this pin.
+Historical63c passes remain separate. No broader batch has been launched
+or authorized; complete functional acceptance remains outstanding.
