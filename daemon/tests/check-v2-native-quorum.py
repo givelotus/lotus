@@ -68,6 +68,16 @@ def main():
     def stop(node):
         node.stop();evidence['cleanup'].append(dict(label=node.label,pid=node.process.pid,exit=node.process.poll()));save()
         require(node.process.poll()==0,'unclean node exit')
+    def find_candidate(node,tag,timestamp):
+        before=status(node);nonce='0'
+        for _ in range(4096):
+            require(time.monotonic()<end,'mining overall deadline expired')
+            answer=node.request('minepool',expected_parent=before['tip'],time=timestamp,max_claim='100000',coinbase_output=original['funding'][0]['coinbase_output'],coinbase_data=tag.encode().hex(),start_nonce=nonce,max_attempts=256)
+            require(answer.get('ok'),'native mining failed '+str(answer))
+            if answer.get('found'):return before,answer
+            require(answer.get('result')=='nonce_exhausted' and answer.get('next_nonce') is not None,'invalid mining continuation')
+            nonce=answer['next_nonce']
+        raise AssertionError('bounded mining exhausted')
     try:
         if a.seed:
             previous=a.seed.resolve(); prior=json.loads((previous/'evidence.json').read_text())
@@ -126,6 +136,30 @@ def main():
             require(result.returncode==0,'native provision failed node '+str(i+1))
             require(credential.stat().st_mode&0o777==0o600,'credential mode differs')
             credentials.append(credential)
+        pending_home=root/'funded-pending-stop-home';shutil.copytree(root/'seed-home',pending_home)
+        funded=start('funded-pending-stop',pending_home,credentials=credentials[0])
+        admitted=status(funded)
+        require(admitted['avalanche']['proof_count']==1 and admitted['avalanche']['authenticated_peer_count']==0 and not admitted['avalanche']['quorum_established'],'isolated funded admission differs')
+        check('funded-proof-admitted-before-pending-stop',status=admitted)
+        before,pending_mining=find_candidate(funded,'funded-pending-stop-block',ledger[-1]['time']+1)
+        until=min(end,time.monotonic()+a.timeout)
+        while time.monotonic()<until:
+            pending=funded.request('status')
+            if any(pending.get(k) for k in ('pending_journal','pending_receipt','pending_propagation')):break
+            require(pending['tip']!=pending_mining['block_id'],'missed actual pending recovery window')
+        else:raise AssertionError('mined funded node never exposed pending recovery')
+        check('actual-funded-pending-stop',mining=pending_mining,status=pending)
+        stop(funded)
+        public_store=pending_home/'chainstate-v2'/'avalanche-peers.dat'
+        require(public_store.stat().st_size>0,'funded public cache missing after pending stop')
+        check('funded-pending-stop-public-store',sha256=local.digest(public_store),bytes=public_store.stat().st_size)
+        # Observer mode supplies no local proof: this record must load from disk.
+        recovered=start('funded-pending-recovery',pending_home)
+        restored=status(recovered)
+        require(restored['tip']==pending_mining['block_id'] and restored['height']==2025,'funded pending block did not recover')
+        require(restored['avalanche']['observer'] and restored['avalanche']['proof_count']==1 and restored['avalanche']['authenticated_peer_count']==0 and not restored['avalanche']['quorum_established'],'disk-only funded proof failed native readmission')
+        check('funded-public-record-readmitted-after-pending-recovery',status=restored)
+        stop(recovered)
         active=[];endpoints=[]
         for i in range(9):
             node=start('quorum-'+str(i+1),homes[i],endpoints,credentials=credentials[i]);active.append(node);endpoints.append(node.ready['listen'])
@@ -142,15 +176,7 @@ def main():
         forkhome=root/'fork-producer-home';shutil.copytree(root/'seed-home',forkhome)
         producer=start('fork-producer',forkhome)
         def mine(node,tag,timestamp):
-            before=status(node);nonce='0'
-            for _ in range(4096):
-                require(time.monotonic()<end,'mining overall deadline expired')
-                answer=node.request('minepool',expected_parent=before['tip'],time=timestamp,max_claim='100000',coinbase_output=original['funding'][0]['coinbase_output'],coinbase_data=tag.encode().hex(),start_nonce=nonce,max_attempts=256)
-                require(answer.get('ok'),'native mining failed '+str(answer))
-                if answer.get('found'):break
-                require(answer.get('result')=='nonce_exhausted' and answer.get('next_nonce') is not None,'invalid mining continuation')
-                nonce=answer['next_nonce']
-            require(answer.get('found'),'bounded mining exhausted')
+            before,answer=find_candidate(node,tag,timestamp)
             until=min(end,time.monotonic()+a.timeout)
             while status(node)['tip']!=answer['block_id']:require(time.monotonic()<until,'mined block failed to connect')
             read=node.request('readblock',block_id=answer['block_id'],offset=0,length=2097152)
