@@ -55,3 +55,9 @@ After targeted reruns, all 147 default Boost runners have executed: 146 pass and
 The `upgrade-activated` CMake runners presently supply only a different test-suite name and logger configuration; they do not supply an activation override. Their results establish execution of those registered runners, not a distinct activation scenario.
 
 The coherent daemon supplied to the functional audit was built at `0fce47dc21`, before subsequent test-only commits; its passing startup result has that exact source provenance. No production behavior was changed by fixture repairs. Rust crate tests and a controlled pristine-ABC attribution comparison remain NOT RUN.
+
+## Final aggregate gate
+
+The final test-only correction `b900dcd579` scopes privacy checking to each captured `Command-line arg:` payload. Existing public/masked-value assertions remain; adversarial controls accept `/private/tmp` metadata and reject secret leaks in the first or a later payload line. Independent review accepted this scope. Both exact getarg runners pass with Debug source logging active and no runtime override.
+
+A subsequent full aggregate invocation at native audit HEAD `4d6bfea595` completed with exit **0**: `check-bitcoin` **147/147 PASSED**, `check-bitcoin-upgrade-activated` **147/147 PASSED**, and `check-avalanche` **11/11 PASSED**. [Final command log](evidence/v2-abc-unit-audit/final-aggregates.log) and [runner inventory](evidence/v2-abc-unit-audit/final-suite-results.json) preserve this result. Earlier failed runs remain historical evidence. The activation-scope limitation above still applies.
