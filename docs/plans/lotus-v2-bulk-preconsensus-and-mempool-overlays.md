@@ -76,6 +76,47 @@ EmptyTxMerklixRoot                   = H_txroot(0x02)
 
 *(Note: For a depth-$d$ subtree with count $c = c_L + c_R$, the canonical node summary is `(count: u32, root: h32)` = 36 bytes).*
 
+#### How Buckets Are Sized and Why Single-Leaf Collapse Never Breaks Cross-Node Bucket Correspondence
+
+> [!IMPORTANT]
+> **Maintainer Question & Mathematical Proof:**
+> *"How are buckets sized? Is it based on total mempool transaction count? How do we know that buckets across nodes correspond to a particular Merklix subtree that's shared? If it's a collapsed tree, it seems like that could be a problem."*
+
+1. **Buckets Are Fixed $k$-Bit Key-Space Prefixes of `TxID` — NEVER Count-Based Array Slices:**
+   - A bucket at depth $k$ is **never** sized or partitioned by dividing the node's total mempool count $N$ into equal-sized array chunks (which would shift boundaries whenever a single transaction is added or missing!).
+   - Instead, because `Subtree A` is a **radix trie over the 256-bit `TxID` key space $[0, 2^{256}-1)$**, a bucket at depth $k$ is defined strictly by the **first $k$ bits of the transaction's 256-bit `TxID`**:
+     $$\text{Bucket}(k, p) \;=\; \left\{\, tx \;\middle|\; \text{first } k \text{ bits of } tx.\text{TxID} == p \,\right\}, \qquad p \in [0, 2^k - 1]$$
+   - For example, at depth $k = 8$ ($2^8 = 256$ buckets, `0x00`..`0xFF`), bucket `0x4a` is the set of all transactions whose `TxID` begins with byte `0x4a`.
+   - Because `TxID` is a uniform 256-bit BLAKE3 hash:
+     - **Deterministic Cross-Node Correspondence:** A transaction with `TxID = 0x4a...` **always** belongs to bucket `0x4a` at depth 8 (and bucket `0x4` at depth 4, bucket `0x4a3` at depth 12) on **every node in the network**, regardless of whether Node A has 10 transactions and Node B has 100,000 transactions!
+     - **Statistical Balance Without Dynamic Re-Slicing:** By the uniform hash property of BLAKE3, if a block/epoch contains $N$ transactions, each depth-$k$ prefix bucket naturally receives $\text{Binomial}(N, 2^{-k}) \approx N / 2^k$ transactions without ever moving bucket boundaries.
+
+2. **Why Single-Leaf Collapse (`src/lotus_v2/sparse_state.cpp:54–69`) Never Breaks Depth-$k$ Subtree Sharing:**
+   - A natural concern with a collapsed trie is: *"What if Bucket `0x4a` has only 1 transaction (so it collapses), or what if a sibling bucket `0x4b` is empty on Node P (`count = 0`) so Bucket `0x4a`'s single leaf collapses upward to depth 7 on Node P, whereas on Node Q Bucket `0x4b` is non-empty (`count = 1`) so an internal branch node exists at depth 7? Doesn't that change Bucket `0x4a`'s hash?"*
+   - **No!** Look at the exact Merklix recursion in `src/lotus_v2/sparse_state.cpp:54–69`:
+     ```cpp
+     // Exact Lotus V2 Single-Leaf-Collapsed Merklix recursion (sparse_state.cpp:54-69):
+     Hash RootOf(std::span<const LeafEntry> entries, uint16_t depth) {
+         if (entries.empty())        return EmptyTxMerklixRoot();          // count == 0: 0x02 (depth-independent!)
+         if (entries.size() == 1)    return entries.front().leaf_hash;     // count == 1: 0x00 || TxID || TxHash (depth-independent!)
+         // count >= 2: split entries by bit `depth` into left (bit=0) and right (bit=1):
+         return TxMerklixNode(depth, left.size(), RootOf(left, depth + 1),
+                                     right.size(), RootOf(right, depth + 1)); // 0x01 || u16(depth) || ...
+     }
+     ```
+   - Notice two fundamental algebraic properties of `RootOf(E_p, k)` for any $k$-bit prefix bucket $E_p = \text{Bucket}(k, p)$:
+     1. **Locality Theorem (`RootOf(E_p, k)` Depends ONLY on $E_p$):**
+        - If $|E_p| = 0$: ` (count[p], root[p]) = (0, EmptyTxMerklixRoot) ` (`H_txroot(0x02)`).
+        - If $|E_p| = 1$: ` (count[p], root[p]) = (1, TxLeaf(tx)) ` (`H_txroot(0x00 || TxID || TxHash)` — **notice `TxLeaf` does NOT hash `depth`!**).
+        - If $|E_p| \ge 2$: ` (count[p], root[p]) = (|E_p|, TxMerklixNode(k, |E_{p||0}|, RootOf(E_{p||0}, k+1), |E_{p||1}|, RootOf(E_{p||1}, k+1))) ` (which hashes internal branches strictly at depths $\ge k$).
+        - In all three cases (`count == 0`, `count == 1`, `count >= 2`), **`(count[p], root[p])` at depth $k$ is a pure function of $(k, E_p)$ and is 100% independent of every other bucket $p' \ne p$ in the tree!**
+     2. **Exact Upward Rollup Theorem (`CombineSubtrees` from Depth $k \to 0$):**
+        - How do the $2^k$ bucket summaries `(count[p], root[p])` at depth $k$ roll up to the global `SubtreeA_Root = RootOf(AllTxs, 0)` even when some buckets have `count == 0` or `count == 1`?
+        - At each parent level $d = k-1$ down to $0$, combining left child `(c_L, root_L)` and right child `(c_R, root_R)` applies the **exact same single-leaf collapse rule**:
+          $$\text{CombineSubtrees}(d, (c_L, r_L), (c_R, r_R)) = \begin{cases} (0,\; \text{EmptyTxMerklixRoot}) & \text{if } c_L + c_R = 0 \\ (1,\; r_L) & \text{if } c_L = 1 \text{ and } c_R = 0 \;\text{(singleton collapses upward untouched!)} \\ (1,\; r_R) & \text{if } c_L = 0 \text{ and } c_R = 1 \;\text{(singleton collapses upward untouched!)} \\ (c_L + c_R,\; \text{TxMerklixNode}(d, c_L, r_L, c_R, r_R)) & \text{if } c_L + c_R \ge 2 \end{cases}$$
+        - Because a singleton leaf's hash `TxLeaf(tx)` does not depend on depth, collapsing `(1, TxLeaf(tx))` upward from depth $k$ to depth $d < k$ when sibling buckets are empty produces the **bit-for-bit identical 32-byte hash** as evaluating `RootOf(AllTxs, 0)` from the top!
+   - **Conclusion:** Any two nodes that have the same transactions starting with $k$-bit prefix `p` are **mathematically guaranteed** to have the exact same `(count[p], root[p])` at depth $k$, regardless of single-leaf collapsing or what exists in any other bucket $p' \ne p$.
+
 #### How Depth-$k$ Merklix Prefix Exchange Isolates Differences
 Suppose Node $P$ and Node $Q$ hold candidate transaction sets $A$ and $B$ (or epoch batch sets) of size $N \approx 100{,}000$, and their top-level `(count, SubtreeA_Root)` differs.
 
@@ -431,6 +472,63 @@ When two conflicting transactions $T_A$ and $T_B$ ($\text{TxID}_A \ne \text{TxID
 
 ---
 
+### 2.7 Preventing Overlapping Epoch Reconciliation & Single-Step Cumulative Fast-Forward (`L_{N-1} -> L_M`)
+
+> [!IMPORTANT]
+> **Maintainer Question & Failure Mode Analysis:**
+> *"Also, I have concerns about overlapping reconciliation for an epoch. Let's say epoch $N$ takes 10 seconds to reconcile due to whatever reason, and epoch $N+1$ is somehow started, what happens?"*
+
+If a node ever tried to reconcile Epoch $N$ and Epoch $N+1$ concurrently, three things would immediately break:
+1. **Undefined Parent State:** Epoch $N+1$'s candidate transactions depend on which UTXOs were created or spent in $L_N$, and Epoch $N+1$'s P05 parabolic fee-burn floor $\Delta\text{Burn}(E_n, C_{N}, C_{N} + \Delta C_{N+1})$ depends on $L_N$'s cumulative block cost $C_N$.
+2. **Undefined SipHash Key:** Epoch $N+1$'s syndrome key $(k_0^{(N+1)}, k_1^{(N+1)})$ is cryptographically derived from `L_N.overlay_id`.
+3. **Bandwidth & Waiter Multiplication:** Concurrent `GETSHORTTX` / `GETMERKLIXBUCK` queues for overlapping epochs would fetch the same missing transactions twice and corrupt `PendingCandidateTracker`.
+
+Lotus V2 eliminates overlapping epoch reconciliation entirely through **two orthogonal guarantees**—one for the **network-wide quorum** and one for a **locally lagging node**:
+
+#### Guarantee 1: Network-Wide Strict Single-Flight Epoch Invariant (Completion-Clocked, Never Timer-Clocked)
+1. **No Wall-Clock Timer Triggers Epoch $N+1$:**
+   - Epochs are **never** started by a periodic wall-clock timer (e.g., *"start a new epoch every 1 second"*). The `~0.5–1.0s` epoch cadence is an **emergent property** of completion, not a clock trigger.
+   - Epoch $N+1$ is causally defined on top of $L_N$: its `CausalEpochHeader` commits to `parent_overlay_id = L_N.overlay_id`, and its SipHash key is derived from `L_N.overlay_id`. Therefore, **it is cryptographically and structurally impossible for the network to start polling or reconciling Epoch $N+1$ before $L_N$ has finalized**.
+   - While Epoch $N$ is still reconciling/polling, newly arriving P2P transactions simply continue accumulating in the open Stage-1 Ingest buffer (`MempoolTxStore`).
+2. **Hard Per-Bucket Poll Cap (`kMaxBucketPollRounds = 6`, $\le 1.5\text{ s}$ Ceiling) Prevents Network-Wide 10-Second Stalls:**
+   - Why would Epoch $N$ ever try to take 10 seconds across the network? Only if a dirty bucket $s \in [0..255]$ suffered sustained contention or slow `GETSHORTTX` fetches across many peers.
+   - By the **Bounded Per-Bucket Poll Cap** (Section 2.3), any bucket $s$ that has not reached `AVALANCHE_FINALIZATION_SCORE` within **`kMaxBucketPollRounds = 6` ($\sim 1.2\text{–}1.5\text{ s}$)** deterministically **carries forward its already-finalized parent bucket root $L_{N-1}[s]$** into $L_N$ (deferring bucket $s$'s delta to Epoch $N+1$).
+   - Consequently, **network-wide**, Epoch $N$ is mathematically guaranteed to finalize $L_N$ within $\le 1.5\text{ s}$ even if individual buckets fail to reconcile in time.
+
+#### Guarantee 2: Local Node Preemption & Single-Step Cumulative Fast-Forward (`L_{N-1} -> L_M`) When a Local Node Lags
+What if the network quorum finalized $L_N$ in $0.8\text{ s}$ and moved on to Epoch $N+1$ (or even $M = N + 8$ after 10 seconds), while **our local node** got stuck for 10 seconds trying to reconcile Epoch $N$ (for example, waiting on a dead peer's `SHORTTX` or recovering from a local network stall)?
+
+```mermaid
+sequenceDiagram
+    participant Net as Quorum Peers (Already at Epoch M+1)
+    participant Node as Lagging Local Node (Stuck Reconciling Epoch N on top of L_{N-1})
+    participant Trk as PendingCandidateTracker & MerklixOverlayManager
+
+    Note over Node,Trk: Node is at L_{N-1}, stuck for 10s waiting on GETSHORTTX for Epoch N
+    Net->>Node: 1. avapoll / avaresponse with CausalEpochHeader:<br/>finalized_epoch = M (M >= N), finalized_overlay_id = OverlayID(L_M),<br/>now polling Epoch M+1!
+    Note over Node,Trk: RULE 1: Immediate Preemption (AbortStaleEpochsBelow(M))<br/>Node NEVER reconciles Epoch N and Epoch M concurrently!
+    Node->>Trk: 2. AbortStaleEpochsBelow(M):<br/>Immediately cancel & purge all PendingCandidateEntry,<br/>m_waiters_by_short_id, and inflight GETSHORTTX for Epochs <= M!
+    Note over Node,Trk: RULE 2: Single-Step Cumulative Merklix Fast-Forward (L_{N-1} -> L_M)<br/>Every overlay L_M commits to the CUMULATIVE Subtree A & UtxoRoot since L_0!<br/>Node skips intermediate layers L_N .. L_{M-1} completely!
+    Node->>Net: 3. Request 1 cumulative merklixsync for L_M (against local L_{N-1} / L_spec)
+    Net-->>Node: 4. merklixsync(L_M): 99%+ of txs in L_M \ L_{N-1} are ALREADY in local L_spec!
+    Node->>Trk: 5. Apply 1 single cumulative batch path-copy: L_{N-1} -> L_M (~2-3 ms)<br/>Verify recomputed OverlayID == OverlayID(L_M)!
+    Note over Node,Trk: Node is now 100% caught up at L_M and joins Epoch M+1 polling!
+```
+
+1. **Strict Single-Active-Epoch Preemption (`AbortStaleEpochsBelow(M)`):**
+   - Each node maintains **at most ONE active pre-consensus reconciliation context (`m_active_recon_epoch`)**.
+   - The instant a node observes via `CausalEpochHeader` from a quorum of peers that epoch $M \ge N$ has already finalized with `finalized_overlay_id = OverlayID(L_M)` (and the network is now polling Epoch $M+1$), the node **immediately aborts Epoch $N$ reconciliation**:
+     - Calls `PendingCandidateTracker::AbortStaleEpochsBelow(M)` to purge all `PendingCandidateEntry` records, `m_waiters_by_short_id` entries, and in-flight `GETSHORTTX` / `GETMERKLIXBUCK` requests for all epochs $\le M$.
+     - Any late-arriving `merklixsync`, `merklixbuck`, or `shorttx` message carrying `ctx.epoch < m_active_recon_epoch` is **dropped in $O(1)$ at the top of `ProcessMessage`** (`src/net_processing.cpp`).
+2. **Single-Step Cumulative Jump (`L_{N-1} -> L_M` — Zero Sequential Epoch Replay):**
+   - A critical advantage of our **cumulative Merklix overlay architecture** is that $L_M$ is **not** an unapplied log of diffs $\Delta_N, \Delta_{N+1}, \dots, \Delta_M$—$L_M$ is the **complete, self-contained 256-bit `TxID`-keyed Merklix `Subtree A` and `UtxoRoot` of all finalized transactions from $L_0$ through Epoch $M$**!
+   - Therefore, a node lagging at $L_{N-1}$ when $L_M$ is finalized **never replays Epochs $N, N+1, \dots, M$ sequentially**.
+   - Instead, it switches `m_active_recon_epoch` directly to `M`, runs **one single cumulative `merklixsync` reconciliation** between its local state ($L_{N-1}$ + validated transactions already sitting in its local speculative mempool $L_{\text{spec}}$) and $L_M$:
+     - Because P2P transaction relay continues in parallel with Avalanche polling, 99%+ of the transactions in $L_M \setminus L_{N-1}$ are **already validated in the lagging node's local `CTxMemPool` (`L_spec`)**!
+     - Once any remaining missing `short_id`s are resolved, `MerklixOverlayManager` executes **one single sort-merge batch path-copy directly from $L_{N-1} \to L_M$** ($\sim 2\text{–}3\text{ ms}$), verifies `recomputed_overlay_id == OverlayID(L_M)`, sets `m_active_mining_overlay = L_M`, and immediately joins the live network poll for Epoch $M+1$.
+
+---
+
 ## Problem 3: Progressively Overlayed Mempools with Low-Cost Merklix `TxRoot` and `UtxoRoot` Updates
 
 ### 3.1 Why Key-Addressed Merklix Trees Are $O(\Delta \log N)$ While Positional Merkle Trees Are $O(N)$
@@ -701,11 +799,21 @@ Each internal Merklix node hash is a single-chunk (67-byte or 75-byte) tagged BL
 
 ---
 
-### 3.6 $O(1)$ Block Receipt, Validation, and `libmdbx` Commit When PoW Arrives
+### 3.6 $O(1)$ Block Receipt via the Candidate Root Match Stage (`tmplblock = Header || CoinbaseTx`) & Automatic `cmpctblock` / `block` Fallback
 
-Because every node has already pre-validated all transactions in $L_k$ and pre-computed `L_k.subtree_a_root`, `L_k.utxo_root`, `L_k.total_body_bytes`, `L_k.total_cost_units`, `L_k.total_fee_atoms`, and `L_k.required_burn_floor_atoms`:
+> [!IMPORTANT]
+> **Maintainer Question & Architectural Simplification:**
+> *"Is there block relay messages that don't include txns? I thought the node streamed the whole block or if it supported compact blocks, it did that and then those pulled out of the mempool. Is there a stage in the state where a block's header can simply check the roots against the candidate blocks? If not that needs to be added, if so, then nodes that are behind or whatever can simply fallback to compact blocks or full block transfer?"*
 
-#### 1. How a Miner Constructs a Block Header from $L_k$ in $O(1)$
+#### 1. What Exists in `lotusd` Today vs. What Must Be Added
+Today, `lotusd` (`src/net_processing.cpp`, `src/blockencodings.cpp`) only has three block-relay paths, **none** of which can connect a non-empty block without transmitting a per-transaction list:
+1. `headers` (`NetMsgType::HEADERS`): Transmits only the 134-byte `Header`. Because `Header.tx_root = H_txroot(0x03 || CoinbaseLeaf || SubtreeA_Root)` combines the miner's `CoinbaseTx` (`vtx[0]`) with `Subtree A` (`vtx[1..n-1]`), a node receiving only `Header` **lacks `CoinbaseTx`** and therefore cannot even test whether `Header.tx_root` matches its local pre-consensus overlay $L_k$!
+2. `cmpctblock` (`NetMsgType::CMPCTBLOCK`): Transmits `Header + nonce + 6-byte short_id for EVERY transaction + prefilled CoinbaseTx`. For a $100{,}000$-transaction block, `cmpctblock` still transmits **$6\text{ B} \times 100{,}000 = 600\text{ KB}$ of short IDs** and forces the receiver to allocate and match a $100{,}000$-entry table!
+3. `block` (`NetMsgType::BLOCK`): Streams the full multi-megabyte serialized block.
+
+**What We Add:** We introduce a **Transaction-Free Block Announcement (`tmplblock` = `Header || CoinbaseTx`, ~284 bytes total)** and a **Stage 1 Candidate Root Match Stage (`TryConnectFromCandidateOverlays`)** in `src/net_processing.cpp` that checks `Header.tx_root` and `Header.state_root` directly against the node's in-memory ring buffer of candidate overlays $\{L_k, L_{k-1}, L_{k-2}, L_{\text{spec}}\}$ in **$< 5\text{ }\mu\text{s}$**—and if no candidate overlay matches (because the node is behind, has Avalanche disabled, or the miner included custom unfinalized transactions), **automatically falls back to standard `getdata(MSG_CMPCT_BLOCK)` or `getdata(MSG_BLOCK)`**!
+
+#### 2. How a Miner Constructs a Block Header from $L_k$ (or $L_{\text{spec}}$) in $O(1)$
 When `getblocktemplate` runs (or whenever $L_k$ advances):
 1. The miner constructs its own coinbase transaction `vtx[0]` claiming up to `S_n + L_k.total_fee_atoms - max(0, required_burn - L_k.total_burned_atoms)` ([P05/P06](../lotus-v2/decisions/commitments-and-state.md)) and computes `CoinbaseLeaf = H_txroot(0x00 || coinbase_txid || coinbase_txhash)`.
 2. The miner computes `header.tx_root` in **1 single BLAKE3 hash ($O(1)$, ~65 ns)** without touching any shard:
@@ -715,61 +823,64 @@ When `getblocktemplate` runs (or whenever $L_k$ advances):
    $$\text{header.state\_root} = H_{\text{state}}(\texttt{0x00} \parallel \text{ChainID} \parallel \text{u64}(h+1) \parallel L_k.\text{utxo\_root} \parallel \texttt{0x38} \parallel \text{MonetaryState}_{n+1})$$
 5. `header.size` is simply $134 + 4 + \text{framed\_len}(\text{vtx}[0]) + L_k.\text{total\_body\_bytes}$.
 
-#### 2. Hardened Wire Format: `CompactTemplateBlock` (`cmpcttmpl`)
-When the winning miner finds a valid 64-bit PoW `nonce` for `Header`, it broadcasts a tiny **`CompactTemplateBlock`** message over TCP/QUIC:
+#### 3. Wire Format: `TemplateBlockAnnounce` (`tmplblock` — ~284 Bytes, Zero Transactions, Zero Short IDs!)
+When the winning miner finds a valid 64-bit PoW `nonce` for `Header`, it broadcasts a tiny, transaction-free **`TemplateBlockAnnounce` (`tmplblock`)** message over TCP/QUIC:
 
 ```text
-CompactTemplateBlock = Header (134 bytes)
-                       || overlay_id:h32 (32 bytes, identifying L_k; or 0x00^32 if empty L_0)
-                       || Bytes(CoinbaseTx) (~150-300 bytes)
-                       || CS(removed_count)
-                       || CS(removed_delta_index)[removed_count]  # Differential CTOR indices in L_k removed by miner (0 in Tier 2!)
-                       || CS(added_tail_count)
-                       || short_id:u48[added_tail_count]          # Added tail txs Δ_add beyond L_k (0 in Tier 2!)
-                       || CS(prefilled_tail_count)
-                       || PrefilledTx[prefilled_tail_count]
+TemplateBlockAnnounce ("tmplblock") = Header (134 bytes)
+                                      || Bytes(CoinbaseTx) (~150-250 bytes)
 ```
 
-**Three Normative Security & Completeness Rules for `CompactTemplateBlock`:**
-1. **Strict Pre-Allocation Header PoW & Bounds Gate (Anti-DoS):**
-   - Upon receiving the first 134 bytes (`Header`) of a `CompactTemplateBlock`, a node **MUST verify `Header` PoW (`BlockID <= ASERT_Target`), timestamp bounds, and `Header.size` sanity BEFORE parsing or allocating memory for `removed_count`, `added_tail_count`, or `PrefilledTx`**!
-   - Furthermore, `removed_count <= L_k.total_tx_count` and `added_tail_count <= Header.size / kMinTxBytes` are enforced before any vector reservation, completely eliminating unauthenticated pre-PoW memory exhaustion DoS.
-2. **Zero-Byte Deterministic `short_id` SipHash Key Derivation:**
-   - Every 48-bit `short_id:u48` in `added_tail_count` is computed via `SipHash-2-4(k0_blk, k1_blk, TxHash) & 0xFFFFFFFFFFFF`, where the 128-bit key is derived deterministically from the PoW-verified `Header.BlockID` itself:
-     $$(k_{0, \text{blk}}, k_{1, \text{blk}}) = \text{BLAKE3\_Keyed\_128}(\texttt{"Lotus/v2/cmpcttmpl/sipkey"},\; \text{Header.BlockID})$$
-   - Because `Header.BlockID` depends on the winning PoW `nonce`, **no attacker or miner can pre-grind `TxHash` collisions against `(k0_blk, k1_blk)` prior to finding a valid PoW block**, and it requires **0 extra bytes on the wire**!
-3. **Full Bidirectional Delta Support (`removed_delta_index` + `added_tail_count`):**
-   - Including `CS(removed_count) || CS(removed_delta_index)[removed_count]` (differentially encoded CTOR indices into $L_k$) allows a Tier 1 miner to both **remove** transactions from $L_k$ (e.g., if a miner applies custom local policy) and **add** recent tail transactions (`added_tail_count`), while in standard Tier 2 operation both `removed_count == 0` and `added_tail_count == 0` (2 bytes total: `0x00 0x00`).
-- When the miner mined against finalized overlay $L_k$ (`removed_count == 0, added_tail_count == 0`), the **entire block announcement for a 100,000-transaction (~25 MB) block is ~450 bytes** and fits inside a **single UDP datagram / single QUIC packet**!
+- **Why `overlay_id` and Delta Arrays Are Not Needed on the Wire:**
+  - Every node holds at most a tiny ring buffer of recent candidate overlays in RAM: the last 3 finalized epoch overlays $\{L_k, L_{k-1}, L_{k-2}\}$, the empty base layer $L_0$, and the local speculative overlay $L_{\text{spec}}$ (**at most 5 candidate `subtree_a_root`s total**!).
+  - Once the receiver hashes `CoinbaseTx` once to obtain `CoinbaseLeaf` ($65\text{ ns}$), checking whether `H_txroot(0x03 || CoinbaseLeaf || L.subtree_a_root) == Header.tx_root` across all 5 local candidate overlays takes at most **$5 \times 65\text{ ns} \approx 325\text{ nanoseconds}$**!
+  - And if the miner modified the template with custom unfinalized transactions so none of $\{L_k, L_{k-1}, L_{k-2}, L_0, L_{\text{spec}}\}$ match `Header.tx_root`, we don't need a custom delta-block format at all—the receiver already has `cmpctblock` (`MSG_CMPCT_BLOCK`) and `block` (`MSG_BLOCK`) built into the protocol!
+- **Strict Pre-Allocation Header PoW & Coinbase Size Gate (Anti-DoS):**
+  - Upon receiving `tmplblock`, the node **verifies the 134-byte `Header` PoW (`BlockID <= ASERT_Target`), timestamp bounds, and `Header.size` sanity BEFORE parsing `CoinbaseTx`**, and bounds `CoinbaseTx` deserialization to `kMaxCoinbaseBytes` ($\le 10\text{ KB}$).
+- **Result:** The entire block announcement for a 100,000-transaction (~25 MB) block is **~284–380 bytes** and fits comfortably inside a **single UDP datagram / single QUIC packet**!
 
-#### 3. Microsecond Validation & Commit Path on Receiving `CompactTemplateBlock`
+#### 4. Two-Stage Receiver State Machine: Candidate Root Match ($\le 5\text{ }\mu\text{s}$) $\to$ `cmpctblock` / `block` Fallback
 
 ```mermaid
 sequenceDiagram
     participant Net as Peer Network (TCP/QUIC)
-    participant Val as Validator Coordinator
-    participant Arena as MerklixOverlayArena (L_k)
+    participant Val as PeerManagerImpl (net_processing.cpp)
+    participant Arena as Candidate Overlays {L_k, L_{k-1}, L_{k-2}, L_0, L_spec}
     participant MDBX as libmdbx DiskStateStore
 
-    Net->>Val: Receive CompactTemplateBlock (~450 bytes: Header || overlay_id || CoinbaseTx || 0x00 || 0x00)
-    Note over Val: 1. PRE-ALLOCATION GATE: Verify 134B Header PoW (BlockID <= target) (~100 ns)<br/>2. Lookup overlay_id -> L_k in RAM (O(1))<br/>3. Validate CoinbaseTx framing, entitlement <= S_n + L_k.total_fee_atoms,<br/>   and P05 fee-burn floor against L_k.required_burn_floor_atoms (~1.5 us)<br/>4. Verify H_txroot(0x03 || CoinbaseLeaf || L_k.subtree_a_root) == Header.tx_root (~65 ns)<br/>5. Verify H_state(... || L_k.utxo_root || MonetaryState) == Header.state_root (~100 ns)
-    Val->>Net: Immediately Relay CompactTemplateBlock & Advance Mining Template to L_0(B_{h+1})! (Total latency < 5 us!)
-    Val->>Arena: Extract net dirty C/N keys from L_k vs L_0 + materialize flat blk/rev segment
-    Arena->>MDBX: Commit single sorted MdbxWriteBatch (dbi_coins + dbi_smt_nodes + head S)
+    Net->>Val: Receive tmplblock (~284 bytes: Header || CoinbaseTx)
+    Note over Val: 1. PRE-ALLOCATION GATE: Verify 134B Header PoW (BlockID <= target) (~100 ns)<br/>2. Parse & validate CoinbaseTx; compute CoinbaseLeaf = H_txroot(0x00 || txid || txhash) (~1 us)
+    Val->>Arena: 3. STAGE 1 (Candidate Root Check):<br/>Test H_txroot(0x03 || CoinbaseLeaf || L.subtree_a_root) == Header.tx_root<br/>for L in {L_k, L_{k-1}, L_{k-2}, L_0, L_spec} (~65-325 ns)
+    alt Match Found! (99.9% of Blocks when Pre-Consensus Active)
+        Note over Val,Arena: 4a. Verify Header.size == 138 + len(CoinbaseTx) + L.total_body_bytes<br/>5a. Verify Coinbase entitlement <= S_n + L.total_fee_atoms & P05 burn floor<br/>6a. Verify H_state(... || L.utxo_root || MonetaryState) == Header.state_root (~100 ns)
+        Val->>Net: Immediately Relay tmplblock & Advance Mining Template to L_0(B_{h+1})! (< 5 us!)
+        Val->>MDBX: Commit L's pre-staged dirty C/N keys directly to libmdbx!
+    else No Candidate Overlay Matches (Node is Behind / Non-Avalanche / Miner Added Custom Txs)
+        Note over Val,Net: 4b. STAGE 2 (Automatic Fallback):<br/>Accept valid Header into BlockIndex & immediately request:<br/>- getdata(MSG_CMPCT_BLOCK, BlockID) (if near tip -> pulls from mempool & diffs vs L_spec!)<br/>- OR getdata(MSG_BLOCK, BlockID) (if syncing / IBD -> full block transfer!)
+        Val->>Net: PushMessage(pfrom, NetMsgType::GETDATA, MSG_CMPCT_BLOCK / MSG_BLOCK)
+    end
 ```
 
-1. **Instantaneous Header + Root Verification ($< 5\text{ }\mu\text{s}$):**
-   - Verify 134-byte `Header` PoW (`BodyHash`, `WorkHash`, `BlockID <= target`) in $\sim 100\text{ ns}$ *before* parsing the body.
-   - Look up `overlay_id` in the local overlay table to obtain $L_k$ (and if `removed_count > 0` or `added_tail_count > 0`, apply the delta on top of $L_k$ via `ApplyBatch`).
-   - Validate `CoinbaseTx` (`vtx[0]`) syntax, check `header.size == 138 + framed_len(CoinbaseTx) + L_k.total_body_bytes`, verify coinbase output claims against $S_n + L_k.\text{total\_fee\_atoms}$, and check P05 mandatory fee burn against `L_k.required_burn_floor_atoms`.
-   - Compute `TxRoot = H_txroot(0x03 || CoinbaseLeaf || L_k.subtree_a_root)` (1 hash) and compare with `header.tx_root`.
-   - Compute `StateRoot` from `L_k.utxo_root` and `MonetaryState` (1 hash) and compare with `header.state_root`.
-   - **Total verification time before relaying the block and switching miners to Block $h+2$'s $L_0$: $< 5\text{ microseconds}$!**
-2. **Flattening $L_k$ to `libmdbx` (`dbi_coins` and `dbi_smt_nodes`):**
-   - Only the net difference between $L_0$ and $L_k$ needs to be written to `libmdbx`:
-     - Any node in `UtxoOverlayArena` reachable from `L_k.utxo_root` with `epoch_born >= 1` is emitted as a `Put('N' || bit_rev_prefix || depth_u16le, EncodeNode(node))` into `MdbxWriteBatch`.
-     - Any node in $L_0$ that was replaced or collapsed in $L_1 \dots L_k$ without a survivor at its `Path::Key()` is emitted as a `Delete('N' || ...)`.
-     - All net created coins in $L_1 \dots L_k$ are emitted as `Put('C' || txid || vout, CoinBytes)` and all spent coins from $L_0$ as `Delete('C' || ...)`.
+1. **Stage 1 — Candidate Root Match (`TryConnectFromCandidateOverlays` in $< 5\text{ }\mu\text{s}$):**
+   - Verify 134-byte `Header` PoW (`BodyHash`, `WorkHash`, `BlockID <= target`) in $\sim 100\text{ ns}$ *before* parsing `CoinbaseTx`.
+   - Validate `CoinbaseTx` (`vtx[0]`) syntax and compute `CoinbaseLeaf = H_txroot(0x00 || coinbase_txid || coinbase_txhash)`.
+   - Loop over the local candidate overlays $L \in \{L_k, L_{k-1}, L_{k-2}, L_0, L_{\text{spec}}\}$ (testing the latest finalized $L_k$ first):
+     - Compute `candidate_tx_root = H_txroot(0x03 || CoinbaseLeaf || L.subtree_a_root)` (1 BLAKE3 hash).
+     - If `candidate_tx_root == header.tx_root`:
+       - Verify `header.size == 138 + framed_len(CoinbaseTx) + L.total_body_bytes`, verify coinbase output claims against $S_n + L.\text{total\_fee\_atoms}$, and check P05 mandatory fee burn against `L.required_burn_floor_atoms`.
+       - Compute `candidate_state_root` from `L.utxo_root` and `MonetaryState` (1 BLAKE3 hash) and verify `candidate_state_root == header.state_root`.
+       - **By 256-bit BLAKE3 collision resistance, $L$'s pre-validated transaction vector IS the exact body `vtx[1..n-1]` of the block!**
+       - Materialize `CBlock` from `(CoinbaseTx, L)`, immediately relay `tmplblock` to peers, switch miners to Block $h+2$'s $L_0$, and flush $L$'s dirty `C`/`N` entries to `libmdbx`!
+2. **Stage 2 — Automatic Fallback to `cmpctblock` or Full `block` When Behind or Mismatched:**
+   - If **no** local candidate overlay $L \in \{L_k, L_{k-1}, L_{k-2}, L_0, L_{\text{spec}}\}$ produces `header.tx_root`:
+     - Because `Header` has already passed full PoW verification, the node indexes `Header` in `m_blockman` (`AcceptBlockHeader`) and caches the verified `CoinbaseTx` for `BlockID`.
+     - If the node's active tip is `header.prev_id` (the node is at the tip, e.g., in Tier 0 without Avalanche, or the miner included unfinalized tail transactions not in $L_k$), it immediately requests **`getdata(MSG_CMPCT_BLOCK, BlockID)`**, reconstructs the block from its mempool via compact block short IDs, and validates it using the **$O(|\text{Block} \triangle L_{\text{spec}}| \log N)$ symmetric-diff engine** against its local $L_{\text{spec}}$!
+     - If the node is behind (`header.prev_id != ActiveTip()`, e.g., catching up or in IBD), it requests **`getdata(MSG_BLOCK, BlockID)`** (or `MSG_CMPCT_BLOCK`) via the standard block download scheduler.
+3. **Flattening Matched Overlay $L$ to `libmdbx` (`dbi_coins` and `dbi_smt_nodes`):**
+   - Only the net difference between $L_0$ and $L$ needs to be written to `libmdbx`:
+     - Any node in `UtxoOverlayArena` reachable from `L.utxo_root` with `epoch_born >= 1` is emitted as a `Put('N' || bit_rev_prefix || depth_u16le, EncodeNode(node))` into `MdbxWriteBatch`.
+     - Any node in $L_0$ that was replaced or collapsed in $L$ without a survivor at its `Path::Key()` is emitted as a `Delete('N' || ...)`.
+     - All net created coins in $L$ are emitted as `Put('C' || txid || vout, CoinBytes)` and all spent coins from $L_0$ as `Delete('C' || ...)`.
    - Because `OutpointKey = txid || vout` and `Path::Key()` (`'N' || bit_reversed_prefix || depth_u16le`) sort in the **exact same lexicographic prefix order** as `dbi_coins` and `dbi_smt_nodes`, the batch writes stream sequentially into `libmdbx` B+Tree leaf pages with minimal page splits.
 
 ---
@@ -796,76 +907,64 @@ Header = prev_id:h32 || bits:u32 || time:u48 || nonce:u64
 
 ---
 
-### 4.2 The 3-Tier Graceful Fallback Architecture (`Tier 0 -> Tier 1 -> Tier 2`)
+### 4.2 The 3-Tier Graceful Fallback Architecture (`Candidate Root Match -> cmpctblock -> Full Block`)
 
 ```mermaid
 flowchart TD
-    subgraph Tier0["Tier 0: No Avalanche Quorum (Early Chain Blocks 0..2016 / Regtest / Solo)"]
-        T0_Pool["Nodes maintain Base L_0 + Local Mutable Merklix Overlay L_spec<br/>(Incrementally updates Subtree A & UtxoRoot as P2P txs arrive)"]
-        T0_Mine["getblocktemplate: O(1) instant read of L_spec.subtree_a_root & L_spec.utxo_root!"]
-        T0_Prop["Block Relay: Standard cmpctblock (6B short IDs).<br/>Receiver diffs Block vs local L_spec: Δ = Block Δ L_spec!<br/>Unstages (L_spec \\ Block) and inserts (Block \\ L_spec) in O(|Δ| log N)!"]
-        T0_Pool --> T0_Mine & T0_Prop
+    subgraph FastPath["Tier 2 (Fast Path): Candidate Overlay Root Match (tmplblock = Header || CoinbaseTx)"]
+        F1["Receive tmplblock (~284 bytes: Header || CoinbaseTx)<br/>Verify Header PoW & compute CoinbaseLeaf (1 hash)"]
+        F2{"Does H_txroot(0x03 || CoinbaseLeaf || L.subtree_a_root)<br/>== Header.tx_root for any local<br/>L in {L_k, L_{k-1}, L_{k-2}, L_0, L_spec}?"}
+        F3["O(1) Instant Connect (< 5 us)!<br/>Verify Header.state_root against L.utxo_root,<br/>assemble CBlock from L.txs in RAM,<br/>relay tmplblock & commit L to libmdbx!"]
+        F1 --> F2
+        F2 -->|"YES (Matches L_k or L_spec!)"| F3
     end
 
-    subgraph Tier1["Tier 1: Hybrid Pre-Consensus + Unfinalized Tail (Partial / Mixed Network)"]
-        T1_Mine["Miner mines finalized L_e + optional recent delta (removed_indices, added_short_ids)"]
-        T1_Prop["Wire: CompactTemplateBlock (OverlayID(L_e) - removed_indices + added_short_ids).<br/>Peers with L_e apply tiny Δ_tail in < 0.2 ms.<br/>Non-Avalanche / newly joined peers request standard cmpctblock (Tier 0)!"]
-        T1_Mine --> T1_Prop
+    subgraph Fallback1["Tier 0 / Tier 1 Fallback: Standard Compact Block (cmpctblock) + L_spec Symmetric Diff"]
+        C1["Node is at tip (header.prev_id == Tip),<br/>but no local candidate root matched<br/>(e.g., 0 Avalanche nodes, or miner added tail txs)"]
+        C2["Send getdata(MSG_CMPCT_BLOCK, BlockID)<br/>Pull txs from CTxMemPool via 6B short IDs"]
+        C3["Validate via Merklix Symmetric Diff against L_spec:<br/>Unstage (L_spec \\ Block) & insert (Block \\ L_spec)<br/>in O(|Block Δ L_spec| log N) (~1-2 ms)!"]
+        C1 --> C2 --> C3
     end
 
-    subgraph Tier2["Tier 2: Full Avalanche Pre-Consensus (Quorum Established)"]
-        T2_Mine["Miner mines exact finalized overlay L_e (removed = 0, added = 0)"]
-        T2_Prop["Wire: ~318-450 byte CompactTemplateBlock (Header || OverlayID(L_e) || CoinbaseTx || 0 || 0).<br/>O(1) verification in < 5 microseconds (3 BLAKE3 hashes)!"]
-        T2_Mine --> T2_Prop
+    subgraph Fallback2["Lagging / IBD Fallback: Full Block Transfer (block)"]
+        B1["Node is behind tip (header.prev_id != Tip)<br/>or missing many mempool transactions"]
+        B2["Send getdata(MSG_BLOCK, BlockID)<br/>Stream full serialized block & validate"]
+        B1 --> B2
     end
 
-    Tier0 -->|"Stake proofs mature (>= 2,016 blocks)<br/>isQuorumEstablished() == true"| Tier1
-    Tier1 -->|"Miner uses pure finalized L_e"| Tier2
-    Tier2 -.->|"Peer missing OverlayID(L_e)<br/>getdata(MSG_CMPCT_BLOCK)"| Tier0
+    F2 -->|"NO (At Tip: Tier 0 / Custom Miner Template)"| C1
+    F2 -->|"NO (Behind Tip / IBD)"| B1
 ```
 
-#### Tier 0: Zero Avalanche Nodes (`isQuorumEstablished() == false`, Bootstrap Blocks 0–2,016, Regtest, Solo Mining)
-As specified in [quorum bootstrap](lotus-v2-quorum-bootstrap.md), stake proofs require `AVALANCHE_STAKE_MATURITY = 2,016` confirmations (~2.8 days from genesis) before an Avalanche quorum can even form. Furthermore, early testnets or private networks may run with zero Avalanche nodes.
+#### 1. Steady-State Pre-Consensus Path (`Candidate Overlay Root Match` on `tmplblock`, $\sim 284\text{ Bytes}$, $< 5\text{ }\mu\text{s}$)
+When Avalanche pre-consensus is active (or whenever a node's local $L_{\text{spec}}$ happens to match the miner's transaction set, such as an empty block $L_0$ or a converged mempool):
+- The miner broadcasts `tmplblock = Header (134 B) || Bytes(CoinbaseTx) (~150 B)` ($\sim 284\text{ bytes}$ total, **zero transaction IDs and zero short IDs on the wire**).
+- The receiving node runs **Stage 1 (`TryConnectFromCandidateOverlays`)**: it hashes `CoinbaseTx` once (`CoinbaseLeaf`) and checks `H_txroot(0x03 || CoinbaseLeaf || L.subtree_a_root) == Header.tx_root` against $\{L_k, L_{k-1}, L_{k-2}, L_0, L_{\text{spec}}\}$.
+- On match, it verifies `Header.state_root` against `L.utxo_root` in 1 hash, connects the block in **$< 5\text{ }\mu\text{s}$**, relays `tmplblock`, and flushes $L$ to `libmdbx`.
 
-Even with **zero Avalanche nodes**, the Persistent Merklix Overlay (`MerklixOverlayArena`) provides two huge performance wins over traditional nodes:
+#### 2. Tier 0 / Tier 1 Fallback: Standard Compact Block (`cmpctblock`) + $O(|\text{Block} \triangle L_{\text{spec}}| \log N)$ Symmetric Diff
+As specified in [quorum bootstrap](lotus-v2-quorum-bootstrap.md), stake proofs require `AVALANCHE_STAKE_MATURITY = 2,016` confirmations (~2.8 days from genesis) before an Avalanche quorum can form. Similarly, a miner might mine a block with custom unfinalized tail transactions not in $L_k$, or a node might have Avalanche disabled.
 
+Even when **zero Avalanche nodes exist** (or when `TryConnectFromCandidateOverlays` misses at the tip), the Persistent Merklix Overlay (`MerklixOverlayArena`) still delivers two massive wins without requiring any special delta-block wire message:
 1. **Instant $O(1)$ `getblocktemplate` (Mining Without Avalanche):**
-   - With `isQuorumEstablished() == false`, the finalized overlay stack stops at $L_0$ (the base UTXO state of Tip Block $B_h$ plus $B_h$'s pipelined coinbase outputs).
-   - However, as transactions arrive in the local mempool over P2P or RPC, the node **still maintains the live Merklix overlay $L_{\text{spec}}$ on top of $L_0$** (coalescing updates every 100–250 ms across the 256 prefix shards while enforcing the P05 marginal fee-burn gate of Section 3.4).
-   - Consequently, whenever a miner calls `getblocktemplate` in Tier 0, **`L_spec.subtree_a_root`, `L_spec.utxo_root`, `L_spec.total_fee_atoms`, and `L_spec.total_cost_units` are ALREADY pre-computed in RAM**! Constructing a mining template in Tier 0 is still an **$O(1)$ microsecond operation** (1 hash for `TxRoot` + 1 hash for `StateRoot`).
-2. **$O(|\text{Block} \triangle L_{\text{spec}}| \log N)$ Fast Block Validation via Symmetric Diff Against Local $L_{\text{spec}}$:**
-   - In Tier 0, miners announce newly mined blocks using Compact Block Profile 2 (`cmpctblock`, [N04](../lotus-v2/peering.md)), listing the 6-byte `SipHash(TxHash)` short IDs of the block's transactions.
-   - A traditional node receiving `cmpctblock` must apply all $N$ transactions in the block from scratch starting at $L_0$ ($O(N \log N)$ work).
-   - A Lotus V2 node already has its own local mempool overlay $L_{\text{spec}}$ (containing, say, $98\%$ of the same transactions as the miner's block) pre-applied in `MerklixOverlayArena`!
-   - Instead of rebuilding `Subtree A` and `UtxoRoot` from $L_0$, the receiving node computes the **symmetric difference between the block's transaction set $B$ and its local overlay $L_{\text{spec}}$**:
+   - With `isQuorumEstablished() == false`, the node continuously maintains its local speculative Merklix overlay $L_{\text{spec}}$ on top of $L_0$ as P2P transactions arrive (coalescing updates every 100–250 ms across the 256 prefix shards while enforcing the P05 marginal fee-burn gate).
+   - When `getblocktemplate` is called, **`L_spec.subtree_a_root` and `L_spec.utxo_root` are ALREADY pre-computed in RAM** ($< 2\text{ }\mu\text{s}$ template creation!).
+2. **Automatic Fallback to `cmpctblock` + $O(|\text{Block} \triangle L_{\text{spec}}| \log N)$ Symmetric-Diff Validation:**
+   - When a node at the tip receives `tmplblock` and sees that none of $\{L_k, L_{k-1}, L_{k-2}, L_0, L_{\text{spec}}\}$ match `Header.tx_root` (or receives a `cmpctblock` directly), it immediately requests **`getdata(MSG_CMPCT_BLOCK, BlockID)`**.
+   - Upon reconstructing the block's transaction list $B$ from its mempool using the standard 6-byte `cmpctblock` short IDs (plus `getblocktxn` for any missing tail txs), the node does **not** re-execute all $N$ transactions from $L_0$!
+   - Instead, it computes the **symmetric difference between the block's transaction set $B$ and its local overlay $L_{\text{spec}}$**:
      - **Extra local mempool txs ($L_{\text{spec}} \setminus B$):** Erased/unstaged from the copy-on-write overlay (`EraseBatch`).
      - **Missing block txs ($B \setminus L_{\text{spec}}$):** Validated and inserted into the copy-on-write overlay (`InsertBatch`).
-   - Because key-addressed Merklix trees (`Subtree A` and `UtxoRoot`) are **100% insertion/deletion-order independent**, starting from $L_{\text{spec}}$ and applying only the small symmetric difference $B \triangle L_{\text{spec}}$ (typically $1\text{–}3\%$ of the block!) produces the **exact same `SubtreeA` root and `UtxoRoot`** in **$O(|B \triangle L_{\text{spec}}| \log N)$ time ($\sim 50\times$ faster than full block validation, even with zero Avalanche nodes on the network!)**.
+   - Because key-addressed Merklix trees (`Subtree A` and `UtxoRoot`) are **100% insertion/deletion-order independent**, starting from $L_{\text{spec}}$ (or from $L_k$ if the miner merely added 50 tail transactions on top of $L_k$!) and applying only the small symmetric difference produces the **exact same `SubtreeA` root and `UtxoRoot`** in **$O(|B \triangle L_{\text{base}}| \log N)$ time ($\sim 50\times$ faster than full block validation!)**.
 
----
+#### 3. Lagging-Node / IBD Fallback: Full Block Transfer (`MSG_BLOCK`)
+If a node is behind the chain tip (`header.prev_id != ActiveTip()`) or its mempool is cold (e.g., right after startup or during Initial Block Download), `TryConnectFromCandidateOverlays` misses and the node seamlessly falls back to standard **`getdata(MSG_BLOCK, BlockID)`** full-block transfer. No node is ever forked off or stalled for lacking pre-consensus overlays.
 
-#### Tier 1: Hybrid Pre-Consensus + Bidirectional Delta (`OverlayID(L_e) - Δ_rem + Δ_add`, Mixed / Transitioning Networks)
-When Avalanche is active (or partially deployed across a subset of nodes):
-1. **Miner With Unfinalized Tail or Custom Removal:** Suppose Avalanche has finalized overlay $L_e$, and the miner wants to include 50 brand-new high-fee transactions from its local $L_{\text{spec}}$ that arrived in the last 300 ms (`added_tail_count = 50`) or remove 2 transactions (`removed_count = 2`).
-   - The miner sends `CompactTemplateBlock` referencing `OverlayID(L_e)` plus `removed_delta_index[2]` and `short_id[50]`.
-   - Peers holding $L_e$ verify `Header` PoW first, then apply the 2 removals and 50 additions on top of $L_e$ in **$< 0.1\text{ ms}$** and verify the header roots immediately.
-2. **Seamless Fallback for Non-Avalanche or Newly Connected Peers:**
-   - What if a peer receiving `CompactTemplateBlock` just booted up, is syncing near tip, or has Avalanche disabled, and therefore does not recognize `OverlayID(L_e)`?
-   - That peer simply replies with standard `getdata(MSG_CMPCT_BLOCK, BlockID)` (or `getdata(MSG_BLOCK, BlockID)`), receives the standard [N04](../lotus-v2/peering.md) `cmpctblock`, and validates it via **Tier 0** (diffing against its local $L_{\text{spec}}$)!
-   - No node is ever forked off or stalled for lacking pre-consensus state.
-
----
-
-#### Tier 2: Full Pre-Consensus (`OverlayID(L_e)` Only, $\sim 318\text{–}450\text{ Bytes}$, $O(1)$ Microsecond Receipt)
-In steady-state operation with an active Avalanche quorum, miners mine directly against the latest finalized overlay $L_e$ (`removed_count == 0, added_tail_count == 0`):
-- The entire block announcement (`CompactTemplateBlock`) is just **`Header (134 B) || OverlayID (32 B) || CoinbaseTx (~150-250 B) || 0x00 || 0x00`** ($\sim 318\text{–}450\text{ bytes}$ total, regardless of whether the block contains $1{,}000$ or $1{,}000{,}000$ transactions).
-- Every peer holding $L_e$ validates the entire block in **$< 5\text{ }\mu\text{s}$** (1 header PoW check + 1 coinbase check + 1 `TxRoot` BLAKE3 hash + 1 `StateRoot` BLAKE3 hash), immediately relays the block, advances its mining template to Block $h+1$'s $L_0$, and commits the net dirty `C`/`N` entries to `libmdbx`.
-
-| Tier | Network Condition | `getblocktemplate` Cost | Wire Announcement Size ($N = 100{,}000$ txs) | Receiver Block Validation Cost |
+| Path / Scenario | Network Condition | `getblocktemplate` Cost | Wire Announcement Size ($N = 100{,}000$ txs) | Receiver Block Validation Cost |
 | :--- | :--- | :--- | :--- | :--- |
-| **Tier 0** | **0 Avalanche nodes** (Bootstrap $< 2{,}016$ blocks, regtest, solo) | **$O(1)$ ($< 2\text{ }\mu\text{s}$)** from local $L_{\text{spec}}$ | $\sim 600\text{ KiB}$ (`cmpctblock` 6B short IDs) | **$O(\|B \triangle L_{\text{spec}}\| \log N)$ ($\sim 1\text{–}2\text{ ms}$)** via Merklix diff against local $L_{\text{spec}}$ |
-| **Tier 1** | **Hybrid** (Finalized $L_e$ $\pm$ $m_{\text{tail}}$ txs, or mixed peers) | **$O(1)$ ($< 2\text{ }\mu\text{s}$)** | $\sim 450\text{ B} + 6\text{ B} \times m_{\text{tail}}$ | **$O(m_{\text{tail}} \log N)$ ($\sim 0.1\text{ ms}$)** on top of $L_e$ (or Tier 0 fallback if `OverlayID` unknown) |
-| **Tier 2** | **Full Pre-Consensus** (Miner mines exact finalized $L_e$) | **$O(1)$ ($< 2\text{ }\mu\text{s}$)** | **$\sim 318\text{–}450\text{ bytes}$ total** (1 UDP/QUIC packet!) | **$O(1)$ ($< 5\text{ }\mu\text{s}$: 3 BLAKE3 hashes + coinbase check!)** |
+| **Stage 1: Candidate Root Match (`tmplblock`)** | **Full Pre-Consensus** (Block matches $L_k, L_{k-1}, L_{k-2}, L_0,$ or $L_{\text{spec}}$) | **$O(1)$ ($< 2\text{ }\mu\text{s}$)** | **$\sim 284\text{–}380\text{ bytes}$ (`Header \|\| CoinbaseTx`)** (0 txs, 0 short IDs!) | **$O(1)$ ($< 5\text{ }\mu\text{s}$: 3 BLAKE3 hashes + coinbase check!)** |
+| **Stage 2A: `cmpctblock` + Merklix Diff Fallback** | **0 Avalanche nodes (Tier 0)** or **Miner modified template (Tier 1)** | **$O(1)$ ($< 2\text{ }\mu\text{s}$)** from $L_{\text{spec}}$ | $\sim 600\text{ KiB}$ (`cmpctblock` 6B short IDs, pulled from mempool) | **$O(\|B \triangle L_{\text{base}}\| \log N)$ ($\sim 0.2\text{–}2\text{ ms}$)** via Merklix diff vs. $L_k$ or $L_{\text{spec}}$ |
+| **Stage 2B: Full `block` Fallback** | **Node is behind tip / IBD / cold mempool** | N/A | Full block transfer (`MSG_BLOCK`) | Standard parallel batch block validation |
 
 ---
 
@@ -925,15 +1024,13 @@ To ensure the protocol is resilient against Byzantine peers, cryptographic grind
 
 ---
 
-### 5.7 Hole 7 — `CompactTemplateBlock` Pre-PoW Allocation DoS, Short-ID Grinding, and Missing Removals
+### 5.7 Hole 7 — `TemplateBlockAnnounce` (`tmplblock`) Pre-PoW Allocation DoS & Candidate Root Miss Handling
 - **Attack Vector:**
-  1. Sending a fake `CompactTemplateBlock` with an invalid PoW header and `added_tail_count = 10,000,000` to trigger a multi-gigabyte vector allocation before PoW is checked.
-  2. Grinding `TxHash`es that collide under a predictable 48-bit `short_id` SipHash key to stall Tier 1 block reconstruction.
-  3. Inability of a Tier 1 miner to exclude a transaction from $L_k$ if `CompactTemplateBlock` only encodes additions.
-- **Normative Protocol Defense (Section 3.6.2):**
-  1. **Strict Pre-Allocation Header PoW Gate:** Nodes verify the 134-byte `Header` PoW (`BlockID <= target`) and `Header.size` bounds **before** parsing or allocating memory for any trailing fields of `CompactTemplateBlock`.
-  2. **PoW-Bound SipHash Key (`0` Wire Bytes):** `(k0_blk, k1_blk) = BLAKE3_Keyed_128("Lotus/v2/cmpcttmpl/sipkey", Header.BlockID)`. Because `Header.BlockID` depends on the winning PoW nonce, short-ID collisions cannot be pre-ground before finding PoW.
-  3. **Bidirectional Delta Encoding:** `CompactTemplateBlock` includes `CS(removed_count) || CS(removed_delta_index)[removed_count]` alongside `added_tail_count`, supporting both removals and additions relative to $L_k$.
+  1. Sending a fake `tmplblock` (`Header || CoinbaseTx`) with an invalid PoW header and a multi-megabyte bogus `CoinbaseTx` payload to trigger memory allocation or hashing work before PoW is checked.
+  2. A node that is lagging behind, has Avalanche disabled, or receives a block mined by a miner with custom unfinalized transactions does not have a matching candidate overlay root in $\{L_k, L_{k-1}, L_{k-2}, L_0, L_{\text{spec}}\}$.
+- **Normative Protocol Defense (Section 3.6 & Section 4.2):**
+  1. **Strict Pre-Allocation Header PoW & Coinbase Size Gate:** Nodes verify the 134-byte `Header` PoW (`BlockID <= target`) and `Header.size` bounds **before** parsing `CoinbaseTx`, and cap `CoinbaseTx` deserialization at `kMaxCoinbaseBytes` ($\le 10\text{ KB}$).
+  2. **Two-Stage Candidate Root Check $\to$ Automatic `cmpctblock` / `block` Fallback:** `TryConnectFromCandidateOverlays` checks `H_txroot(0x03 || CoinbaseLeaf || L.subtree_a_root) == Header.tx_root` across $\{L_k, L_{k-1}, L_{k-2}, L_0, L_{\text{spec}}\}$ in $< 5\text{ }\mu\text{s}$. If no local candidate overlay matches, the node accepts the PoW-verified `Header` into `BlockIndex` and immediately sends standard **`getdata(MSG_CMPCT_BLOCK, BlockID)`** (pulling transactions from the mempool and validating via symmetric diff against $L_{\text{spec}}$) or **`getdata(MSG_BLOCK, BlockID)`** (full block transfer when behind tip).
 
 ---
 
@@ -953,19 +1050,28 @@ To ensure the protocol is resilient against Byzantine peers, cryptographic grind
 
 ---
 
-### 5.10 Summary Matrix of Red-Team Vulnerabilities and Normative Mitigations
+### 5.10 Hole 10 — Overlapping Epoch Reconciliation & Lagging-Node State Pileup (10-Second Stall Scenario)
+- **Failure / Attack Vector:** What happens if Epoch $N$ takes 10 seconds to reconcile on a node (due to slow `GETSHORTTX` responses, heavy packet loss, or adversarial delay), while Epoch $N+1$ (or $M > N$) is started? Concurrent reconciliation across overlapping epochs would corrupt parent UTXO / P05 burn-floor assumptions, use undefined SipHash keys, and multiply in-flight fetch queues.
+- **Normative Protocol Defense (Section 2.7 & Section 6.4):**
+  1. **Network-Wide Completion-Clocked Single-Flight Invariant + 6-Round Bucket Cap (`<= 1.5s`):** Epochs are **never** started by a wall-clock timer; Epoch $N+1$ requires `parent_overlay_id = L_N.overlay_id` and derives its SipHash key from `L_N.overlay_id`, so the quorum cannot start Epoch $N+1$ until $L_N$ finalizes. Furthermore, `kMaxBucketPollRounds = 6` (~1.2–1.5s) forces any non-converged bucket $s$ to carry forward $L_{N-1}[s]$ into $L_N$, preventing Epoch $N$ from ever stalling network-wide.
+  2. **Local Preemption (`AbortStaleEpochsBelow(M)`) + Single-Step Cumulative Fast-Forward ($L_{N-1} \to L_M$):** Each node maintains at most **one** active reconciliation epoch (`m_active_recon_epoch`). If a lagging local node stuck at $L_{N-1}$ sees via `CausalEpochHeader` that the quorum has already finalized $L_M$ ($M \ge N$), it immediately aborts and purges all pending reconciliation state for Epoch $N$ (`AbortStaleEpochsBelow(M)`), performs **one single cumulative `merklixsync` diff directly between $L_{N-1}$ and $L_M$** (resolving 99%+ of transactions from its local `L_spec`), commits $L_{N-1} \to L_M$ in a single batch path-copy, and joins Epoch $M+1$!
+
+---
+
+### 5.11 Summary Matrix of Red-Team Vulnerabilities and Normative Mitigations
 
 | # | Vulnerability / Attack Vector | Severity (Unmitigated) | Normative Protocol Mitigation | Spec Section |
 | :--- | :--- | :--- | :--- | :--- |
 | **1** | **64-bit `root64` birthday collision ($2^{32}$) & syndrome spoofing** | Critical (Consensus / Template Split) | Full 32-byte `root[s]: h32` on dirty buckets + per-epoch keyed SipHash + **Strict 256-Bit Root-Verification Gate** before accepting any syndrome decode | §1.2, §1.3, §1.5, §5.1 |
 | **2** | **Backdated / future-dated `cohort` tag spoofing on P2P** | Critical (Candidate Set Split) | Remove wire `cohort` tag; stamp **`local_cohort(T) = e_local`** at local validation time + 1-epoch Maturation Barrier | §2.2, §5.2 |
-| **3** | **Cross-shard UTXO input deletion vs. async bucket vector clocks** | Critical (`UtxoRoot` Divergence) | **Cross-Bucket Dependency Invariant** + parallel intra-epoch `Subtree A` vector $\mathbf{B}_e$ (with 8-round deferral cap) + **atomic epoch barrier $L_{e-1} \to L_e$** | §2.3, §5.3 |
+| **3** | **Cross-shard UTXO input deletion vs. async bucket vector clocks** | Critical (`UtxoRoot` Divergence) | **Cross-Bucket Dependency Invariant** + parallel intra-epoch `Subtree A` vector $\mathbf{B}_e$ (with 6-round deferral cap) + **atomic epoch barrier $L_{e-1} \to L_e$** | §2.3, §5.3 |
 | **4** | **Drip-feed superset liveness stall during bucket polling** | High (Pre-Consensus Liveness Stall) | **Pre-Cutoff Eligibility Gate** (`local_cohort <= e + 1`) + **Confidence Lock-In Ceiling** (`kSupersetLockConfidence = 3`) | §2.4, §5.4 |
 | **5** | **Zero-cost late double-spend `ConflictSet[o]` censorship grief** | High (Zero-Fee Tx Censorship) | **Cohort Seniority Lock**: once Cohort $e$ closes Stage 1, later conflicts (`local_cohort >= e + 1`) cannot withhold or displace $T_A \in \text{Cohort } e$ | §2.6.B, §5.5 |
 | **6** | **P05 parabolic fee-burn floor / negative marginal miner revenue** | High (Miner Template Abandonment) | **Dynamic P05 Marginal Fee-Rate Gate**: admit txs sorted by `effective_fee_per_cu` only while $\text{fee} + \text{burn} \ge \Delta\text{Burn}(E_n, C, C+\Delta C)$ | §3.4, §5.6 |
-| **7** | **`CompactTemplateBlock` pre-PoW allocation DoS, short-ID grinding, & missing removals** | High (Memory DoS / Tier 1 Failure) | **Pre-Allocation Header PoW Gate** + PoW-derived SipHash key from `Header.BlockID` + `removed_delta_index` array | §3.6.2, §4.2, §5.7 |
+| **7** | **`tmplblock` pre-PoW allocation DoS & candidate root miss** | High (Memory DoS / Behind-Node Failure) | **Pre-Allocation Header PoW Gate** + **Stage 1 Candidate Root Check** ($\{L_k, L_{k-1}, L_{k-2}, L_0, L_{\text{spec}}\}$) + **Stage 2 Auto-Fallback** to `getdata(MSG_CMPCT_BLOCK)` / `MSG_BLOCK` | §3.6, §4.2, §5.7 |
 | **8** | **Long-lived `MDBX_TXN_RDONLY` pinning & dangling `mmap` `string_view`s** | High (`SIGSEGV` / `MDBX_MAP_FULL`) | Copy 33B sibling summaries & `Coin` bytes **by value** into arenas during ~0.45ms read pass and immediately call **`ResetReadTxn()`** | §3.3.2, §3.4, §5.8 |
 | **9** | **Speculative poll arena OOM vs. artificial cap on P05 elastic block size** | High (OOM or Artificial Block Cap) | **0 Bytes allocated in `UtxoOverlayArena` for peer polls** + **In-Place Epoch Folding ($L_{e-3} \to L_{\text{base}}$)** + **`libmdbx` Staged Checkpoint Spillover** (zero block size limit!) | §3.5.B, §5.9 |
+| **10** | **Overlapping epoch reconciliation & 10-second lagging-node pileup** | High (State Corruption / Queue Explosion) | **Completion-clocked single-flight epochs** + **6-round bucket cap ($\le 1.5\text{s}$)** + **`AbortStaleEpochsBelow(M)` preemption** & **1-step cumulative jump ($L_{N-1} \to L_M$)** | §2.7, §5.10, §6.4 |
 
 ---
 
@@ -1046,9 +1152,9 @@ flowchart LR
 - **Files:** `src/validation.cpp` (`Chainstate::ConnectTip`, around line 2997) and `src/policy/block/preconsensus.h/.cpp`.
 - **Exact Change:**
   1. Re-include `<policy/block/preconsensus.h>` in `src/validation.cpp`.
-  2. In `Chainstate::ConnectTip`, before executing the full per-transaction `ConnectBlock` loop, check if the incoming block carries a matched `OverlayID(L_e)` (from `CompactTemplateBlock`) or matches the latest finalized overlay $L_e$ / local $L_{\text{spec}}$:
-     - **Fast Path (Tier 2 Exact Overlay Match):** If `m_mempool->GetOverlayManager().FindFinalizedOverlay(block.m_overlay_id)` returns $L_e$ on top of `pindexNew->pprev->GetBlockHash()`, verify `CoinbaseTx`, `hashMerkleRoot`, `hashStateRoot`, and P05 `required_burn_floor_atoms` in **$< 5\text{ }\mu\text{s}$** ($O(1)$) and flush $L_e$'s dirty `C`/`N` records directly to `DiskStateStore`!
-     - **Symmetric-Diff Path (Tier 0 / Tier 1 Block):** Compute $\Delta_{\text{rem}} = L_{\text{base}} \setminus \text{Block}$ and $\Delta_{\text{add}} = \text{Block} \setminus L_{\text{base}}$, validate only the newly added transactions $\Delta_{\text{add}}$, check `PreConsensusPolicy` to ensure no finalized transaction was double-spent by $\Delta_{\text{add}}$, and update `MerklixOverlayArena` in $O(|\text{Block} \triangle L_{\text{base}}| \log N)$ time!
+  2. In `Chainstate::ConnectTip`, before executing the full per-transaction `ConnectBlock` loop, check if the incoming block matched one of the node's candidate overlays $L \in \{L_k, L_{k-1}, L_{k-2}, L_0, L_{\text{spec}}\}$ during the Candidate Root Match Stage:
+     - **Fast Path (Candidate Overlay Root Match):** If `m_mempool->GetOverlayManager().MatchCandidateOverlay(block.hashMerkleRoot, *block.vtx[0])` returns a pre-validated overlay $L$ on top of `pindexNew->pprev->GetBlockHash()`, verify `CoinbaseTx`, `hashMerkleRoot`, `hashStateRoot`, and P05 `required_burn_floor_atoms` in **$< 5\text{ }\mu\text{s}$** ($O(1)$) and flush $L$'s dirty `C`/`N` records directly to `DiskStateStore`!
+     - **Symmetric-Diff Path (`cmpctblock` Fallback):** Compute $\Delta_{\text{rem}} = L_{\text{base}} \setminus \text{Block}$ and $\Delta_{\text{add}} = \text{Block} \setminus L_{\text{base}}$ against $L_k$ or $L_{\text{spec}}$, validate only the newly added transactions $\Delta_{\text{add}}$, check `PreConsensusPolicy` to ensure no finalized transaction was double-spent by $\Delta_{\text{add}}$, and update `MerklixOverlayArena` in $O(|\text{Block} \triangle L_{\text{base}}| \log N)$ time!
 
 ---
 
@@ -1088,7 +1194,7 @@ flowchart LR
   1. `FreezeCandidateCohort(uint32_t target_epoch, uint64_t ema_block_cost)`:
      - Selects all transactions in `MempoolTxStore` with `local_cohort_epoch <= target_epoch` that are not yet in $L_{e-1}$ and whose spent outpoints all exist in $L_{e-1}$ (**Cross-Bucket Dependency Invariant**, Hole 3) and are not in a same-cohort `ConflictSet[o]` (**Cohort Seniority**, Hole 5).
      - Sorts candidates by descending `effective_fee_per_cu` and admits them while $\text{fee} + \text{burn} \ge \Delta\text{Burn}(E_n, C, C + \Delta C)$ (**Dynamic P05 Marginal Fee-Rate Gate**, Hole 6).
-     - Computes theper-epoch SipHash key $(k_0^{(e)}, k_1^{(e)}) = \text{BLAKE3\_Keyed\_128}(\texttt{"Lotus/v2/preconsensus/sipkey"}, B_h.\text{BlockID} \parallel e \parallel L_{e-1}.\text{overlay\_id})$ (Hole 1) and builds the candidate `Subtree A` bucket roots `(count[s], root_32B[s], s1[s], s3[s])` in `TxOverlayArena` (without touching `UtxoOverlayArena` yet, per Hole 9!).
+     - Computes the per-epoch SipHash key $(k_0^{(e)}, k_1^{(e)}) = \text{BLAKE3\_Keyed\_128}(\texttt{"Lotus/v2/preconsensus/sipkey"}, B_h.\text{BlockID} \parallel e \parallel L_{e-1}.\text{overlay\_id})$ (Hole 1) and builds the candidate `Subtree A` bucket roots `(count[s], root_32B[s], s1[s], s3[s])` in `TxOverlayArena` (without touching `UtxoOverlayArena` yet, per Hole 9!).
   2. `CommitFinalizedEpoch(uint32_t epoch_e, std::span<const uint32_t> finalized_pool_indices)`:
      - Executes parallel sort-merge batch path-copying (`ApplyTxBatchRecursive` and `ApplyUtxoBatchRecursive`) across the 256 prefix shards to produce immutable `MempoolOverlayLayer` $L_e$ (`subtree_a_root`, `utxo_root`, `overlay_id`, `total_fee_atoms`, `total_cost_units`, `required_burn_floor_atoms`) in **$\sim 2.05\text{ ms}$**.
      - Acquires short-lived `MDBX_TXN_RDONLY`, copies newly touched 33B sibling summaries and spent `Coin` records by value into `CleanSummaryArena` / `CoinRecordArena`, and calls `ResetReadTxn()` immediately (Hole 8).
@@ -1096,177 +1202,218 @@ flowchart LR
 
 ---
 
-### 6.4 Phase 3: Upgrade `avalanche::Processor` & `net_processing.cpp` to Adaptive Top-Down Merklix Polling
+### 6.4 Phase 3: Generalized Merklix Set-Reconciliation Messages & Internal Plumbing to the Voting Coordinator
 
-**Goal:** Replace per-transaction `CTransactionRef` polling in `src/avalanche/processor.h:103` and `src/net_processing.cpp:6758–7435` with Adaptive Top-Down Merklix Overlay polling (`MSG_AVA_OVERLAY`) and a complete **Post-Vote Set Reconciliation State Machine** in `PeerManagerImpl::ProcessMessage` (`src/net_processing.cpp`).
+> [!IMPORTANT]
+> **Maintainer Architectural Questions:**
+> 1. *"Would those be AVA messages, or some other type of thing like a mempool reconciliation messages, or do you imagine this being more generalized?"*
+> 2. *"I'm also wondering how data from these messages makes it back to whatever voting coordinator and mempool processing needs to happen to create proper overlays."*
+> 3. *"Also, I have concerns about overlapping reconciliation for an epoch. Let's say epoch N takes 10 seconds to reconcile due to whatever reason, and epoch N+1 is somehow started, what happens?"*
 
-#### Step 3.1 (Phase 3A): Extend `CInv`, `avalanche::AnyVoteItem`, and `AVAPOLL` (`src/protocol.h`, `src/avalanche/processor.h`, `src/net_processing.cpp:6796`)
-- **Files:** `src/protocol.h`, `src/avalanche/protocol.h`, `src/avalanche/processor.h:103–158`, `src/net_processing.cpp:6758–6831`.
-- **Why `AVAPOLL` / `AVARESPONSE` Alone Are Not Enough:**
-  In `src/net_processing.cpp:6782–6830`, `AVAPOLL` reads a list of `CInv(type, hash:u256)` items, and `AVARESPONSE` (`net_processing.cpp:6834–6860`) returns a Schnorr-signed `avalanche::Response(round, cooldown, vector<Vote>)` where each `avalanche::Vote` is only `(uint32_t status, uint256 hash)` (36 bytes).
-  - When a peer has the **exact same** 32-byte `OverlayID(L_e)` (or bucket root), `Vote(0 = ACCEPT, overlay_id)` in `AVARESPONSE` is 100% sufficient!
-  - **However, what happens after a vote when the peer's candidate `OverlayID` differs (`Vote != ACCEPT`)?**
-    1. `avalanche::Vote` has no field to carry the peer's `(count, s1, s3)` syndromes or dirty-bucket bitmaps!
-    2. Even after `(Δs1, Δs3)` algebraically decodes a 64-bit `short_id` $x = \text{SipHash-2-4}(k_0^{(e)}, k_1^{(e)}, \text{TxHash})$, if that transaction is **missing** from the local node's mempool, standard `getdata(MSG_TX, hash)` **cannot** be used because `getdata` requires a **32-byte `TxId`/`TxHash`**, whereas the node only knows the **8-byte `short_id` $x$**!
-    3. And if a specific bucket $s$ has $|\Delta_s| \ge 3$ differing transactions, the node needs a lightweight P2P round-trip to bisect bucket $s$'s children in `Subtree A`!
+#### Why Set Reconciliation Messages Should Be Generalized Mempool / Merklix Messages (NOT `ava*`-Specific)
 
-- **Exact Additions to `src/protocol.h` and `src/avalanche/processor.h`:**
-  1. Add inventory type `MSG_AVA_OVERLAY = 0x20000005` to `GetDataMsg` in `src/protocol.h`.
-  2. Add five dedicated post-vote reconciliation P2P message types in `src/protocol.h` / `src/protocol.cpp`:
-     - `NetMsgType::AVASYNDROME = "avasyndrome"` (post-vote top-level + sparse dirty-bucket syndrome announcement)
-     - `NetMsgType::AVAGETBUCK  = "avagetbuck"` (request child Merklix bisection or leaf `short_id`s for buckets with $|\Delta_s| \ge 3$)
-     - `NetMsgType::AVABUCK     = "avabuck"` (response carrying child bucket syndromes or bounded leaf `short_id`s)
-     - `NetMsgType::AVAGETSHORTTX = "avagetshorttx"` (fetch full transactions by 64-bit `short_id` when missing from local `L_spec`)
-     - `NetMsgType::AVASHORTTX  = "avashorttx"` (response delivering serialized transactions matching requested 64-bit `short_id`s)
-  3. Add `const OverlayVoteItem` to `avalanche::AnyVoteItem` (`src/avalanche/processor.h:103`) and handle `case MSG_AVA_OVERLAY:` in `PeerManagerImpl::ProcessMessage` (`src/net_processing.cpp:6796`).
-
-#### Step 3.2 (Phase 3A): Remove the Legacy `BlockAssembler` Poll Loop in `net_processing.cpp:7160–7192`
-- **File:** `src/net_processing.cpp` (lines 7160–7192).
-- **What Exists Today (Bottleneck in `net_processing.cpp:7169–7191`):**
-  Today, when a block finalizes in `net_processing.cpp:7169`, the code instantiates a `node::BlockAssembler`, runs `blockAssembler.addTxs(m_mempool)` to build a full block template in RAM, and then loops over `blockTemplate->entries` calling `m_avalanche->addToReconcile(templateEntry.tx)` on **every individual transaction**!
-- **Exact Replacement:**
-  Replace lines 7160–7192 in `src/net_processing.cpp` with a single call to trigger Epoch $e = 1$ on `MerklixOverlayManager`:
-  ```cpp
-  // src/net_processing.cpp:7160:
-  if (fPreconsensus && newlyFinalized) {
-      LOCK(m_mempool.cs);
-      m_mempool.GetOverlayManager().OnTipBlockFinalized(pindex);
-      // Triggers Stage 3 Root-First Poll (d = 0) if Cohort c = 0 has ΔN >= 1 txs:
-      if (auto rootPollItem = m_mempool.GetOverlayManager().BeginNextEpochPoll()) {
-          m_avalanche->addToReconcile(*rootPollItem);
-      }
-  }
-  ```
+Making the reconciliation messages **generalized Merklix mempool-reconciliation messages** (`merklixsync`, `getmerklixbuck`, `merklixbuck`, `getshorttx`, `shorttx`) rather than `ava*`-specific messages provides two major architectural advantages:
+1. **Strict Separation of Concerns (`avalanche::Processor` Stays a Pure Hash-Voting Engine):**
+   - `avalanche::Processor` (`src/avalanche/processor.h/.cpp`) remains strictly a cryptographic voting and confidence engine over 32-byte hashes (`avapoll` / `avaresponse`). It **never** parses transactions, finite-field syndromes, or Merklix radix trees.
+   - All set reconciliation, `short_id` decoding, transaction fetching, and Merklix tree construction live in `CTxMemPool` / `MerklixOverlayManager` (`src/lotus_v2/mempool_overlay.h/.cpp`) and `PeerManagerImpl` (`src/net_processing.cpp`).
+2. **One Unified Reconciliation Protocol Across Both Pre-Consensus Overlays and Live Mempool Sync (Including Tier 0 Without Avalanche!):**
+   - By prefixing every reconciliation message with a 1-byte **`ReconScope`** tag, the **exact same 5 messages and C++ handlers** power both pre-consensus and general P2P mempool synchronization:
+     - `ReconScope::PRECONSENSUS_EPOCH (0x01)`: Reconciling a candidate epoch overlay `(tip_block_id, epoch)` when an `avapoll` / `avaresponse` vote reveals a difference (or performing a single-step cumulative jump $L_{N-1} \to L_M$ when catching up!).
+     - `ReconScope::LIVE_MEMPOOL_SYNC (0x02)`: Periodic Erlay-style low-bandwidth P2P mempool synchronization against `L_spec` **even in Tier 0 when zero Avalanche nodes exist on the network** (e.g., bootstrap blocks $0 \dots 2{,}016$, regtest, or newly connected peers syncing their mempools in 1 RTT without flooding `inv`s)!
 
 ---
 
-#### Step 3.3 (Phase 3B): Post-Vote Set Reconciliation Wire Messages & Exact `PeerManagerImpl::ProcessMessage` State Machine in `src/net_processing.cpp`
+#### Step 3.1 (Phase 3A): Generalized Wire Messages in `src/protocol.h` and `MSG_AVA_OVERLAY` in `avalanche::Processor`
 
-```mermaid
-sequenceDiagram
-    participant P as Node P (Poller, net_processing.cpp)
-    participant Q as Node Q (Responder, net_processing.cpp)
-
-    P->>Q: 1. avapoll(round, [CInv(MSG_AVA_OVERLAY, OverlayID_P)])
-    alt Case 1: Q has exact same 32B OverlayID_P (95%+ of polls)
-        Q->>P: 2a. avaresponse(round, [Vote(ACCEPT, OverlayID_P)], sig)
-        Note over P: registerVotes() increments confidence -> Finalizes L_e at 64 votes!
-    else Case 2: Q has a different candidate OverlayID_Q for Epoch e
-        Q->>P: 2b. avaresponse(round, [Vote(CONTENDED_EPOCH, OverlayID_P)], sig)<br/>+ avasyndrome(round, B_h, epoch e, OverlayID_Q, count_Q, s1_root_Q, s3_root_Q, dirty_depth, sparse_buckets[])
-        Note over P: PeerManagerImpl::ProcessMessage("avasyndrome"):<br/>Computes Δs1_root = s1_P ^ s1_Q, Δs3_root = s3_P ^ s3_Q
-        alt Subcase 2A: |Δ_global| in {1, 2} (or per-bucket |Δ_s| in {1, 2}) AND tx is in P's L_spec
-            Note over P: LookupByShortId(k0, k1, x) finds tx in P's local mempool (0 RTT)!<br/>Verifies Pre-Cutoff Gate + 32B Merklix root == root_Q -> Promotes tx!
-        else Subcase 2B: Decoded 64-bit short_id x is MISSING from P's local mempool
-            P->>Q: 3a. avagetshorttx(B_h, epoch e, [x_1, x_2])
-            Q->>P: 4a. avashorttx(B_h, epoch e, [Tx_1, Tx_2])
-            Note over P: ProcessMessage("avashorttx") validates Tx_1, Tx_2 via AcceptToMemoryPool,<br/>verifies 32B Merklix root == root_Q, and updates candidate bucket root!
-        else Subcase 2C: Bucket s has |Δ_s| >= 3 (quadratic does not factor or 32B root mismatch)
-            P->>Q: 3b. avagetbuck(B_h, epoch e, depth d+2, prefixes[s_0..s_3])
-            Q->>P: 4b. avabuck(B_h, epoch e, child_syndromes_or_short_ids[])
-            Note over P: ProcessMessage("avabuck") decodes child differences (or fetches via avagetshorttx)<br/>and verifies 32B Merklix root!
-        end
-    end
-```
-
-##### 1. Exact Wire Payloads for Post-Vote Reconciliation (`src/avalanche/protocol.h`)
+- **Files:** `src/protocol.h`, `src/protocol.cpp`, `src/avalanche/processor.h:103–158`, `src/net_processing.cpp:6758–6831`.
+- **Exact Additions to `src/protocol.h`:**
+  1. Add `MSG_AVA_OVERLAY = 0x20000005` to `enum GetDataMsg` (`src/protocol.h:395`) so `avapoll` / `avaresponse` can vote on 32-byte `OverlayID` (and dirty bucket) hashes using the existing 36-byte `CInv` / `avalanche::Vote` wire format.
+  2. Add five **generalized Merklix mempool reconciliation** message types to `namespace NetMsgType` (`src/protocol.h:160`):
+     - `NetMsgType::MERKLIXSYNC    = "merklixsync"` (top-level `(count, root, s1, s3)` + sparse dirty-bucket `BucketSyndrome` announcement)
+     - `NetMsgType::GETMERKLIXBUCK = "getmerklixbuck"` (request child Merklix bisection at depth $d+2$ or leaf `short_id`s for buckets where $|\Delta_s| \ge 3$)
+     - `NetMsgType::MERKLIXBUCK    = "merklixbuck"` (response carrying child `BucketSyndrome`s or bounded leaf `short_id`s)
+     - `NetMsgType::GETSHORTTX     = "getshorttx"` (fetch full transactions by 64-bit `short_id` when missing from local `CTxMemPool`)
+     - `NetMsgType::SHORTTX        = "shorttx"` (response delivering serialized `CTransaction`s matching requested 64-bit `short_id`s)
 
 ```text
-# 1. Sent alongside avaresponse whenever a peer's candidate for Epoch e differs from the polled OverlayID:
-avasyndrome = poll_round:u64
-              || tip_block_id:h32
-              || epoch:u32
-              || peer_overlay_id:h32
-              || peer_total_count:u32
-              || s1_root:u64 || s3_root:u64
-              || adaptive_depth:u8                        # k in [0, 2..8] (0 if only top-level sent)
-              || dirty_bitmap:bitfield[(1 << k) / 8]      # 1 bit per bucket at depth k
-              || BucketSyndrome[popcount(dirty_bitmap)]   # Only dirty buckets!
+# Generalized Scope Header shared by all 5 Merklix reconciliation messages:
+ReconContext = scope:u8                  # 0x01 = PRECONSENSUS_EPOCH, 0x02 = LIVE_MEMPOOL_SYNC
+               || context_hash:h32       # tip_block_id (for 0x01/0x02)
+               || epoch_or_nonce:u64     # epoch_id (for 0x01) or peer_salt (for 0x02)
+
+# 1. Sent when a peer's Merklix root differs (either after an avapoll mismatch or during Tier 0 periodic mempool sync):
+merklixsync    = ReconContext
+                 || candidate_root:h32                  # OverlayID(L_e) (scope 0x01) or L_spec.subtree_a_root (scope 0x02)
+                 || total_count:u32
+                 || s1_root:u64 || s3_root:u64
+                 || adaptive_depth:u8                   # k in [0, 2..8] (0 if only top-level sent)
+                 || dirty_bitmap:bitfield[(1 << k) / 8] # 1 bit per bucket at depth k
+                 || BucketSyndrome[popcount(dirty_bitmap)]
 
 BucketSyndrome = count:u32 || root_32B:h32 || s1:u64 || s3:u64   # 52 bytes per dirty bucket
 
-# 2. Sent by Poller when a specific bucket s has |Δ_s| >= 3 (cannot be solved by degree-2 quadratic):
-avagetbuck  = tip_block_id:h32 || epoch:u32
-              || target_depth:u8                          # e.g., d + 2 (4-way child split)
-              || CS(prefix_count)                         # Max 64 prefixes per request
-              || bucket_prefix:u16[prefix_count]
-              || want_leaf_short_ids:u8                   # 1 if bucket count <= 16 (send short_ids directly)
+# 2. Request child bisection when a bucket s has |Δ_s| >= 3:
+getmerklixbuck = ReconContext
+                 || target_depth:u8                     # e.g., d + 2 (4-way child split)
+                 || CS(prefix_count)                    # Max 64 prefixes per request
+                 || bucket_prefix:u16[prefix_count]
+                 || want_leaf_short_ids:u8              # 1 if bucket count <= 16 (send short_ids directly)
 
-# 3. Response to avagetbuck:
-avabuck     = tip_block_id:h32 || epoch:u32
-              || target_depth:u8
-              || CS(entry_count)
-              || (BucketSyndrome[entry_count] OR BucketShortIdList[entry_count])
+# 3. Response to getmerklixbuck:
+merklixbuck    = ReconContext
+                 || target_depth:u8
+                 || CS(entry_count)
+                 || (BucketSyndrome[entry_count] OR BucketShortIdList[entry_count])
 
-# 4. Sent by Poller when (Δs1, Δs3) or avabuck yields 64-bit short_id(s) NOT in local mempool:
-avagetshorttx = tip_block_id:h32 || epoch:u32
-                || CS(short_id_count)                     # Max 128 short_ids per request
-                || short_id:u64[short_id_count]
+# 4. Request full transactions by 64-bit short_id (solves getdata(MSG_TX) needing a 32-byte TxHash!):
+getshorttx     = ReconContext
+                 || CS(short_id_count)                  # Max 128 short_ids per request
+                 || short_id:u64[short_id_count]
 
-# 5. Response to avagetshorttx (delivers full serialized transactions, bounded like blocktxn):
-avashorttx  = tip_block_id:h32 || epoch:u32
-              || CS(tx_count)
-              || Bytes(CTransaction)[tx_count]
+# 5. Deliver full transactions for requested short_ids:
+shorttx        = ReconContext
+                 || CS(tx_count)
+                 || Bytes(CTransaction)[tx_count]
 ```
 
-##### 2. Step-by-Step Handler Changes in `PeerManagerImpl::ProcessMessage` (`src/net_processing.cpp`)
+---
 
-1. **In `NetMsgType::AVAPOLL` (`src/net_processing.cpp:6796`):**
-   - Add `case MSG_AVA_OVERLAY:`:
-     ```cpp
-     case MSG_AVA_OVERLAY: {
-         if (fPreconsensus) {
-             LOCK(m_mempool.cs);
-             auto match = m_mempool.GetOverlayManager().EvaluatePolledOverlay(
-                 inv.hash, round, pfrom.GetId(), pendingSyndromeMsg);
-             vote = match.vote_code; // 0 = ACCEPT, 1 = CONTENDED_EPOCH, -1 = UNKNOWN_TIP
-         }
-     } break;
-     ```
-   - Right after `m_avalanche->sendResponse(&pfrom, ...)` (`src/net_processing.cpp:6828`), if `pendingSyndromeMsg.has_value()` (meaning the peer polled an `OverlayID` for our current `tip_block_id` and `epoch`, and our local candidate `OverlayID` differs), immediately push `NetMsgType::AVASYNDROME` to `pfrom`:
-     ```cpp
-     if (pendingSyndromeMsg.has_value()) {
-         m_connman.PushMessage(&pfrom, CNetMsgMaker(pfrom.GetCommonVersion())
-             .Make(NetMsgType::AVASYNDROME, *pendingSyndromeMsg));
-     }
-     ```
+#### Step 3.2 (Phase 3B): Internal Plumbing — How Data from Reconciliation Messages Flows Through `MemPoolAccept` & `MerklixOverlayManager` Back to `avalanche::Processor`
 
-2. **New Handler `if (msg_type == NetMsgType::AVASYNDROME)` in `src/net_processing.cpp`:**
-   - **Pre-Checks & Rate-Limiting:** Verify `m_avalanche` is active and that `avasyndrome.poll_round` matches an active in-flight query sent to `pfrom.GetId()` in `m_avalanche->queries` (rejecting unsolicited `avasyndrome` messages with `Misbehaving`). Verify `avasyndrome.tip_block_id == ActiveTip()->GetBlockHash()` and `adaptive_depth <= 8`.
-   - **Step A — Try Top-Level `(Δs1_root, Δs3_root)` $O(1)$ Decode First:**
-     - Compute $\Delta s_1 = s_{1,\text{local}} \oplus \text{msg.s1\_root}$ and $\Delta s_3 = s_{3,\text{local}} \oplus \text{msg.s3\_root}$.
-     - Call `SolveGF2_64_Degree1Or2(delta_s1, delta_s3, candidate_short_ids)`.
-     - If 1 or 2 roots $x_i \in GF(2^{64})$ are found:
-       - Query `m_mempool.GetOverlayManager().LookupByShortId(epoch, x_i)`:
-         - **All found locally in `MempoolTxStore` (`0 RTT`):** Check the **Pre-Cutoff Eligibility Gate** (`local_cohort <= e + 1`) and recompute the 32-byte `OverlayID`. If `recomputed_overlay_id == msg.peer_overlay_id` (**Strict 256-Bit Root-Verification Gate**), promote the 1–2 transactions if `msg.peer_total_count > local_count` (and `confidence < 3`) and return—**reconciled in 0 extra RTTs!**
-         - **1 or 2 `short_id`s missing from local mempool:** Send `NetMsgType::AVAGETSHORTTX` to `pfrom` requesting those 1–2 `short_id`s (recording a pending reconciliation callback for `(pfrom.GetId(), epoch)`).
-   - **Step B — Per-Bucket Syndrome Decode on Sparse Dirty Buckets (`msg.buckets`):**
-     - If $|\Delta_{\text{global}}| \ge 3$, iterate over each dirty bucket $s$ in `msg.dirty_bitmap` where `msg.buckets[s].root_32B != local_bucket_root[s]`:
-       - Compute per-bucket $(\Delta s_1[s], \Delta s_3[s])$.
-       - If degree-1 or degree-2 decode succeeds:
-         - Resolve known `short_id`s from `MempoolTxStore` (verifying `recomputed_root_32B[s] == msg.buckets[s].root_32B` if all are local), and batch any unknown `short_id`s into a single `AVAGETSHORTTX` message to `pfrom`.
-       - If $|\Delta_s| \ge 3$ (quadratic has 0 roots or 32-byte bucket root check fails after applying local matches):
-         - Append bucket prefix $s$ to `bisect_prefixes` and send a single `NetMsgType::AVAGETBUCK` message to `pfrom` requesting depth $d + 2$ child summaries (or direct leaf `short_id`s if `msg.buckets[s].count <= 16`).
+This is the critical systems question: **when `merklixsync`, `merklixbuck`, or `shorttx` arrives in `src/net_processing.cpp`, how does that data flow through transaction validation (`MemPoolAccept`), build candidate Merklix overlays in `CTxMemPool`, and notify the voting coordinator (`avalanche::Processor`) so it knows which `OverlayID` / bucket root to vote for?**
 
-3. **New Handler `if (msg_type == NetMsgType::AVAGETBUCK)` & `if (msg_type == NetMsgType::AVABUCK)` in `src/net_processing.cpp`:**
-   - **`AVAGETBUCK` (Responder):** Enforce `prefix_count <= 64` and `target_depth <= 16`. Read the requested internal `TxOverlayNode` child summaries (or leaf `short_id`s if `want_leaf_short_ids == 1 && count <= 16`) from `TxOverlayArena` in $O(1)$ per prefix and reply with `NetMsgType::AVABUCK`.
-   - **`AVABUCK` (Poller):** Verify an `AVAGETBUCK` request was in-flight to `pfrom`. For each returned child bucket, run the exact same `(Δs1, Δs3)` solver + 32-byte `root_32B` verification, batching any missing `short_id`s into `AVAGETSHORTTX`. (In the $2^{-64}$ edge case where two distinct `TxHash`es collide on the same 64-bit `short_id` inside a leaf bucket, `AVAGETBUCK` at `want_leaf_short_ids == 2` returns the full 32-byte `TxHash`es for that $\le 16$-tx sub-bucket).
+##### A. End-to-End Internal Data Flow & Lock Hierarchy
+To prevent deadlocks between networking, mempool validation, and Avalanche voting, all callbacks obey the existing strict lock order:
+$$\texttt{cs\_main} \;\prec\; \texttt{m\_mempool.cs} \;\prec\; \texttt{m\_overlay\_mgr.cs} \;\prec\; \texttt{m\_avalanche->cs}$$
 
-4. **New Handler `if (msg_type == NetMsgType::AVAGETSHORTTX)` & `if (msg_type == NetMsgType::AVASHORTTX)` in `src/net_processing.cpp`:**
-   - **`AVAGETSHORTTX` (Responder):**
-     - Enforce `short_id_count <= 128`.
-     - Look up each 64-bit `short_id` in `m_mempool.GetOverlayManager().GetEpochShortIdIndex(msg.epoch)` (an $O(1)$ flat hash table mapping `SipHash(k0_e, k1_e, TxHash) -> pool_tx_idx`).
-     - Serialize the matching `CTransaction` objects into `NetMsgType::AVASHORTTX` and push to `pfrom`.
-   - **`AVASHORTTX` (Poller):**
-     - Verify an `AVAGETSHORTTX` request was in-flight to `pfrom` and `tx_count <= requested_count`.
-     - For each received `CTransactionRef tx`:
-       - Compute `x = SipHash-2-4(k0_e, k1_e, tx->GetHash())` and verify `x` was actually requested in the in-flight `AVAGETSHORTTX` set (if not, `Misbehaving(*peer, "unsolicited-avashorttx")`!).
-       - Validate `tx` through `m_chainman.ProcessTransaction(tx)` (`MemPoolAccept`), which inserts `tx` into `CTxMemPool` and `MempoolTxStore`.
-     - Once all requested transactions in the batch are validated, call `m_mempool.GetOverlayManager().OnReconciledTxsArrived(epoch, peer_candidate_roots)`:
-       - Recompute the 32-byte `TxMerklixNode` bucket root `recomputed_root_32B[s]`, verify exact 32-byte equality `recomputed_root_32B[s] == peer_root_32B[s]`, and update the local bucket candidate!
+```mermaid
+sequenceDiagram
+    participant Net as PeerManagerImpl (net_processing.cpp)
+    participant Ava as Voting Coordinator (avalanche::Processor)
+    participant Trk as PendingCandidateTracker (MerklixOverlayManager)
+    participant ATMP as MemPoolAccept (validation.cpp)
+    participant Pool as CTxMemPool (txmempool.cpp)
 
-5. **In `NetMsgType::AVARESPONSE` (`src/net_processing.cpp:7233`):**
-   - When `OverlayVoteItem` reaches `avalanche::VoteStatus::Finalized`:
-     - Lock `cs_main` and `m_mempool.cs`, call `m_mempool.GetOverlayManager().CommitFinalizedEpoch(e)`, which atomically advances $L_{e-1} \to L_e$ across `TxOverlayArena` and `UtxoOverlayArena` in $\sim 2\text{ ms}$, and immediately enqueue the `MSG_AVA_OVERLAY` poll for Epoch $e + 1$!
+    Note over Net,Ava: STAGE 1: Unverified Candidate Discovered via Poll/Response + merklixsync
+    Net->>Ava: 1. registerVotes() / EvaluatePoll(R_Q)
+    Note over Ava: R_Q is unknown locally -> Insert VoteRecord(R_Q, state = UNVERIFIED).<br/>(Processor NEVER votes YES on an UNVERIFIED root!)
+    Net->>Trk: 2. ProcessMessage("merklixsync") -> RegisterOrResolveCandidate(ctx, bucket, R_Q, count_Q, s1_Q, s3_Q)
+
+    Note over Trk: STAGE 2: Algebraic Syndrome Decode (Δs1, Δs3) vs Local Bucket
+    Trk->>Trk: 3. SolveGF2_64(Δs1, Δs3) -> recovers 64-bit short_ids {x_1, ..., x_m}
+
+    alt Fast Path (99%): All {x_i} are ALREADY in CTxMemPool (L_spec)
+        Trk->>Trk: 4a. Tentatively apply {tx(x_i)} to Subtree A bucket -> recompute 32B root
+        Trk->>Trk: 5a. Verify recomputed_root_32B == R_Q! Store VerifiedCandidateDelta[R_Q]
+        Trk->>Ava: 6a. OnCandidateVerified(R_Q, count_Q, all_pre_cutoff)
+        Note over Ava: Transitions VoteRecord(R_Q) from UNVERIFIED -> VERIFIED_VALID!<br/>If R_Q passes Superset Gate (count_Q > count_self, conf < 3), switches preferred vote to R_Q!
+    else Slow Path (1%): Short_id x_k is MISSING from CTxMemPool
+        Trk->>Trk: 4b. Create PendingCandidateEntry(R_Q, waiting_on = {x_k})<br/>Register m_waiters_by_short_id[x_k].push_back(R_Q)
+        Trk-->>Net: 5b. Return MissingShortIds{x_k}
+        Net->>Net: 6b. PushMessage(pfrom, NetMsgType::GETSHORTTX, ctx, {x_k})
+
+        Note over Net,Pool: STAGE 3: Asynchronous Transaction Arrival & Validation via SHORTTX
+        Net->>ATMP: 7. ProcessMessage("shorttx") -> m_chainman.ProcessTransaction(tx) (MemPoolAccept)
+        alt Tx is Consensus/Policy INVALID or Conflicts with Finalized L_e
+            ATMP-->>Net: 8a. Rejects tx (TxValidationState::Invalid)
+            Net->>Trk: 9a. OnShortTxRejected(ctx, x_k, tx)
+            Trk->>Ava: 10a. OnCandidateInvalidated(R_Q) -> VoteRecord(R_Q) = VERIFIED_INVALID!
+        else Tx is Valid!
+            ATMP->>Pool: 8b. CTxMemPool::addUnchecked(entry) (txmempool.cpp:147)
+            Pool->>Trk: 9b. m_overlay_mgr->OnMempoolTxAdded(entry)
+            Note over Trk: Computes entry's short_id x_k -> wakes m_waiters_by_short_id[x_k]!<br/>waiting_on becomes empty -> Recomputes 32B Merklix root == R_Q!<br/>Promotes PendingCandidateEntry -> VerifiedCandidateDelta[R_Q]!
+            Trk->>Ava: 10b. OnCandidateVerified(R_Q, count_Q, all_pre_cutoff)
+            Note over Ava: VoteRecord(R_Q) transitions UNVERIFIED -> VERIFIED_VALID!
+        end
+    end
+
+    Note over Net,Pool: STAGE 4: Avalanche Finalization -> Atomic Overlay Commit L_{e-1} -> L_e
+    Ava-->>Net: 11. registerVotes() returns VoteItemUpdate(R*, VoteStatus::Finalized)
+    Net->>Trk: 12. CommitFinalizedEpoch(epoch e, winning_root R*)
+    Note over Trk: Looks up VerifiedCandidateDelta[R*], applies sort-merge batch path-copy<br/>to TxOverlayArena & UtxoOverlayArena (L_{e-1} -> L_e) in ~2ms,<br/>updates m_active_mining_overlay = L_e, and starts Epoch e+1!
+```
+
+##### B. The 4-State Lifecycle of a Candidate Root in `avalanche::VoteRecord` and `PendingCandidateTracker` (Plus Overlapping-Epoch Preemption)
+
+To ensure `avalanche::Processor` **never** votes `YES` on an unvalidated hash, `MerklixOverlayManager` **always** has the exact validated transactions needed to build $L_e$ the microsecond a vote finalizes, and **no two pre-consensus epochs ever reconcile concurrently**, `PendingCandidateTracker` enforces a strict single-active-epoch state machine:
+
+```cpp
+// In src/lotus_v2/mempool_overlay.h:
+enum class CandidateVerificationState : uint8_t {
+    UNVERIFIED       = 0, // Seen in avapoll/merklixsync, waiting on missing short_ids or child bisection
+    VERIFIED_VALID   = 1, // All txs in CTxMemPool + 32-byte Merklix root verified == R_Q!
+    VERIFIED_INVALID = 2, // Contains an invalid/conflicting tx or failed 32-byte root check
+    COMMITTED_EPOCH  = 3, // Finalized by Avalanche quorum and committed as immutable layer L_e
+};
+
+struct VerifiedCandidateDelta {
+    uint32_t epoch{0};
+    uint16_t depth{0};
+    uint16_t bucket_prefix{0};
+    uint256  merklix_root{};                   // Verified 32-byte root R_Q
+    uint32_t total_count{0};
+    bool     all_txs_pre_cutoff{true};         // True iff all txs had local_cohort <= e + 1 (Hole 4 Gate)
+    std::vector<uint32_t> added_pool_indices;  // Validated MempoolTxStore indices added vs self
+    std::vector<uint32_t> removed_pool_indices;// Validated MempoolTxStore indices omitted vs self
+};
+
+struct PendingCandidateEntry {
+    ReconContext ctx;
+    uint16_t depth{0};
+    uint16_t bucket_prefix{0};
+    uint256  target_root{};                    // Unverified 32B root R_Q claimed by peer
+    uint32_t claimed_count{0};
+    NodeId   source_peer{NO_NODE};
+    std::unordered_set<uint64_t> missing_short_ids; // Remaining 64-bit short_ids being fetched via GETSHORTTX
+    std::vector<uint32_t> resolved_pool_indices;    // Tx indices resolved so far
+};
+```
+
+1. **State 1 (`UNVERIFIED` — Registered When `merklixsync` or `avapoll` Arrives):**
+   - When Peer Q polls or responds with a candidate root $R_Q \ne R_{\text{self}}$, `avalanche::Processor` inserts $R_Q$ with `CandidateVerificationState::UNVERIFIED`.
+   - **Voting Rule:** While $R_Q$ is `UNVERIFIED`, if another peer polls us on $R_Q$, `avalanche::Processor` responds `CONTENDED_EPOCH` (neutral/defer)—it **never** votes `ACCEPT` on an `UNVERIFIED` root.
+   - `PeerManagerImpl::ProcessMessage` (`src/net_processing.cpp`) passes the `merklixsync` payload to `m_mempool.GetOverlayManager().RegisterOrResolveCandidate(...)`.
+
+2. **State 2 (`Fast-Path Local Resolution` — All Decoded `short_id`s Already in `CTxMemPool`):**
+   - `RegisterOrResolveCandidate` computes $\Delta s_1 = s_{1, P} \oplus s_{1, Q}$ and $\Delta s_3 = s_{3, P} \oplus s_{3, Q}$ and solves the degree-1 or degree-2 polynomial over $GF(2^{64})$ to obtain $\{x_1, x_2\}$.
+   - It looks up each $x_i$ in `m_epoch_shortid_index` (which indexes every transaction currently in `CTxMemPool` under $(k_0^{(e)}, k_1^{(e)})$).
+   - **In 99% of cases, all $\{x_i\}$ are already in `CTxMemPool`!**
+   - `MerklixOverlayManager` tentatively computes the 32-byte Merklix bucket root with `{tx(x_i)}` applied:
+     - Verify `recomputed_root_32B == R_Q` (**Strict 256-Bit Root-Verification Gate**, Hole 1).
+     - Verify every added transaction satisfies the **Cross-Bucket Dependency Invariant** (inputs exist in $L_{e-1}$, Hole 3), **Cohort Seniority** (Hole 5), and the **P05 Marginal Fee-Burn Gate** (Hole 6).
+     - Save `VerifiedCandidateDelta` in `m_verified_candidates[R_Q]` and immediately invoke **`m_avalanche->OnCandidateVerified(R_Q, count_Q, all_pre_cutoff)`**!
+     - Inside `avalanche::Processor`, `VoteRecord(R_Q)` transitions to **`VERIFIED_VALID`**. If $R_Q$ has a higher transaction count than our current preference, `all_txs_pre_cutoff == true`, and current confidence `< 3` (Hole 4), `avalanche::Processor` atomically switches its preferred root for bucket $s$ to $R_Q$!
+
+3. **State 3 (`Slow-Path Missing Transaction Fetch` — `GETSHORTTX` $\to$ `SHORTTX` $\to$ `MemPoolAccept` $\to$ `addUnchecked` Hook):**
+   - What if $x_k \in \{x_1, x_2\}$ is **not** in `CTxMemPool` yet?
+     1. `RegisterOrResolveCandidate` creates a `PendingCandidateEntry` for $R_Q$ with `missing_short_ids = {x_k}`, registers `m_waiters_by_short_id[x_k].push_back(R_Q)`, and returns `MissingShortIds{x_k}` to `net_processing.cpp`.
+     2. `net_processing.cpp` sends `NetMsgType::GETSHORTTX(ctx, {x_k})` to `pfrom`.
+     3. When `NetMsgType::SHORTTX` arrives in `PeerManagerImpl::ProcessMessage` (`src/net_processing.cpp`):
+        - For each serialized `CTransactionRef tx` in `shorttx`:
+          - Verify `x = SipHash-2-4(k0_e, k1_e, tx->GetHash())` was requested in `m_inflight_shorttx[pfrom.GetId()]`.
+          - Call **`m_chainman.ProcessTransaction(tx)`** (`MemPoolAccept::AcceptSingleTransaction` in `src/validation.cpp`).
+          - **Case 3A (`MemPoolAccept` Rejects `tx` as Invalid or Finalized-Conflict):**
+            - `net_processing.cpp` calls `m_mempool.GetOverlayManager().OnShortTxRejected(ctx, x, state)`:
+            - Every `PendingCandidateEntry` waiting on `x` is immediately marked **`VERIFIED_INVALID`**, and `m_avalanche->OnCandidateInvalidated(R_Q)` is called so `avalanche::Processor` permanently rejects $R_Q$!
+          - **Case 3B (`MemPoolAccept` Accepts `tx` into `CTxMemPool`):**
+            - `MemPoolAccept::Finalize` calls `CTxMemPool::addUnchecked(entry)` (`src/txmempool.cpp:147`).
+            - At the end of `CTxMemPool::addUnchecked(entry)` (`src/txmempool.cpp:198`), `addUnchecked` calls **`m_overlay_mgr->OnMempoolTxAdded(entry)`**!
+            - *(Note: Even if the missing transaction arrived via standard P2P `tx` relay 2 ms before `SHORTTX` arrived, `addUnchecked` still calls `OnMempoolTxAdded(entry)` and wakes the exact same waiter!)*
+            - `OnMempoolTxAdded(entry)` computes `entry`'s 64-bit `short_id` $x$, removes $x$ from every waiting `PendingCandidateEntry` in `m_waiters_by_short_id[x]`, and as soon as `pending.missing_short_ids.empty()` becomes true:
+              - Recomputes the 32-byte Merklix root `recomputed_root_32B`.
+              - If `recomputed_root_32B == R_Q` and Cohort/P05 invariants pass, promotes `PendingCandidateEntry` to `VerifiedCandidateDelta[R_Q]` and calls **`m_avalanche->OnCandidateVerified(R_Q, ...)`**!
+              - If `recomputed_root_32B != R_Q` (Peer Q lied in its syndrome or had $\ge 3$ differences that aliased a quadratic), `PendingCandidateEntry` is discarded, `Misbehaving` is incremented if Q sent a bogus single-tx syndrome, and `net_processing.cpp` sends `GETMERKLIXBUCK` to bisect bucket $s$'s 4 children!
+
+4. **State 4 (`COMMITTED_EPOCH` — Finalization Callback from `avalanche::Processor` to `MerklixOverlayManager`):**
+   - In `PeerManagerImpl::ProcessMessage` (`src/net_processing.cpp:7233`, handling `NetMsgType::AVARESPONSE`), when `m_avalanche->registerVotes(...)` reports `VoteStatus::Finalized` for `OverlayVoteItem(epoch e, winning_root R*)`:
+     - Because `R*` is already in `m_verified_candidates[R*]` (`VERIFIED_VALID`), `m_mempool.GetOverlayManager().CommitFinalizedEpoch(e, R*)` already has the exact vector of validated `MempoolTxStore` indices (`added_pool_indices`, `removed_pool_indices`) sitting in RAM!
+     - `CommitFinalizedEpoch(e, R*)` executes the sort-merge batch path-copy in `TxOverlayArena` and `UtxoOverlayArena` ($L_{e-1} \to L_e$) in **$\sim 2.05\text{ ms}$**, atomically updates `m_active_mining_overlay = L_e`, folds $L_{e-3} \to L_{\text{base}}$, and starts Epoch $e + 1$!
+
+5. **Rule 5 (`AbortStaleEpochsBelow(M)` & Single-Step Cumulative Fast-Forward $L_{N-1} \to L_M$ — Zero Overlapping Epochs):**
+   - What if our local node stalls for 10 seconds while reconciling Epoch $N$, and a quorum of peers announces via `CausalEpochHeader` that Epoch $M \ge N$ (`OverlayID(L_M)`) is already finalized?
+   - `PendingCandidateTracker` enforces `m_active_recon_epoch`:
+     - Any incoming `merklixsync`, `merklixbuck`, or `shorttx` with `ctx.epoch < m_active_recon_epoch` is **dropped in $O(1)$**.
+     - Upon observing quorum finalization of `OverlayID(L_M)` ($M \ge N$), `MerklixOverlayManager::AbortStaleEpochsBelow(M)` immediately clears all `PendingCandidateEntry`, `m_waiters_by_short_id`, and `m_inflight_shorttx` state for Epoch $N$, sets `m_active_recon_epoch = M`, reconciles $L_{N-1}$ directly against $L_M$ in **one single cumulative `merklixsync` pass** (skipping intermediate epochs $N \dots M-1$), commits $L_{N-1} \to L_M$ in one batch path-copy, and joins Epoch $M+1$!
 
 ---
 
@@ -1357,45 +1504,77 @@ return std::move(pblocktemplate);
 
 ---
 
-### 6.6 Phase 5: Wire `CompactTemplateBlock` (`cmpcttmpl`) & Direct Overlay-to-`libmdbx` Commit
+### 6.6 Phase 5: Wire Transaction-Free Block Relay (`tmplblock`), the Candidate Root Match Stage (`TryConnectFromCandidateOverlays`), and Direct Overlay-to-`libmdbx` Commit
 
-**Goal:** Add `MSG_CMPCT_TMPL_BLOCK` (`cmpcttmpl`) to the P2P layer and connect `MerklixOverlayArena` directly to `DiskStateStore` (`src/lotus_v2/disk_state.cpp`) so block relay and database commit operate in microseconds.
+**Goal:** Add the ~284-byte transaction-free `TemplateBlockAnnounce` (`tmplblock` = `Header || CoinbaseTx`) and the **Candidate Root Match Stage (`TryConnectFromCandidateOverlays`)** to `src/net_processing.cpp`, automatically falling back to standard `getdata(MSG_CMPCT_BLOCK)` or `getdata(MSG_BLOCK)` if no local candidate overlay matches, and commit matched overlays directly to `DiskStateStore` (`src/lotus_v2/disk_state.cpp`).
 
-#### Step 5.1: Add `CompactTemplateBlock` Serialization (`src/blockencodings.h/.cpp`, `src/protocol.h`)
-- **Files:** `src/protocol.h` (add `NetMsgType::CMPCTTMPLBLOCK = "cmpcttmpl"`), `src/blockencodings.h/.cpp`.
-- **Exact Struct:**
+#### Step 5.1: Add `TemplateBlockAnnounce` (`tmplblock`) Serialization (`src/blockencodings.h/.cpp`, `src/protocol.h`)
+- **Files:** `src/protocol.h` (add `NetMsgType::TMPLBLOCK = "tmplblock"`), `src/blockencodings.h/.cpp`.
+- **Exact Struct (Zero Transaction List, Zero Short-ID List):**
   ```cpp
-  struct CompactTemplateBlock {
-      CBlockHeader header;                           // 134-byte Lotus V2 header
-      uint256 overlay_id;                            // 32B OverlayID(L_e)
-      CTransactionRef coinbase_tx;                   // Miner's vtx[0]
-      std::vector<uint32_t> removed_delta_indices;   // Differential CTOR indices removed from L_e (0 in Tier 2)
-      std::vector<uint64_t> added_short_ids;         // 48-bit SipHash(k_blk, TxHash) added beyond L_e (0 in Tier 2)
-      std::vector<PrefilledTransaction> prefilled_txs;
+  struct TemplateBlockAnnounce {
+      CBlockHeader header;         // 134-byte Lotus V2 header
+      CTransactionRef coinbase_tx; // Miner's vtx[0] (~150-250 bytes)
+
+      SERIALIZE_METHODS(TemplateBlockAnnounce, obj) {
+          READWRITE(obj.header, obj.coinbase_tx);
+      }
   };
   ```
 
-#### Step 5.2: Enforce Pre-Allocation PoW Check & Fast Reconstruction in `src/net_processing.cpp`
-- **File:** `src/net_processing.cpp` (handler for `NetMsgType::CMPCTTMPLBLOCK`).
-- **Exact Steps:**
-  1. Deserialize `header` (first 134 bytes) **only** and call `CheckBlockHeader(header, state, chainParams.GetConsensus())` + `header.nSize` sanity check **before** deserializing `removed_delta_indices` or `added_short_ids` (Hole 7 fix).
-  2. Look up `overlay_id` in `m_mempool.GetOverlayManager().FindOverlay(overlay_id)`:
-     - **If found ($L_e$) and `removed_delta_indices.empty() && added_short_ids.empty()` (Tier 2):**
-       - Verify `ComputeV2TxRootFromSubtreeA(*coinbase_tx, L_e->subtree_a_root) == header.hashMerkleRoot` (1 BLAKE3 hash).
-       - Verify `ComputeV2StateRootFromOverlay(..., L_e->utxo_root, ...) == header.hashStateRoot` (1 BLAKE3 hash).
-       - Verify coinbase value against `GetBlockSubsidy(...) + L_e->total_fee_atoms` and P05 `L_e->required_burn_floor_atoms`.
-       - **Immediately relay `CompactTemplateBlock` to peers (`< 5 us` total latency)** and pass `(block, L_e)` to `ActivateBestChain`!
-     - **If found ($L_e$) with non-empty delta (Tier 1):**
-       - Derive `(k0_blk, k1_blk) = BLAKE3_Keyed_128("Lotus/v2/cmpcttmpl/sipkey", header.GetBlockHash())` (Hole 7 fix).
-       - Resolve `added_short_ids` from `m_mempool`, apply `(removed_delta_indices, added_txs)` on top of $L_e$ via `ApplyBatch`, verify both roots, and commit.
-     - **If `overlay_id` is unknown (Newly joined / Non-Avalanche Peer — Tier 0 Fallback):**
-       - Request `getdata(MSG_CMPCT_BLOCK, header.GetBlockHash())` and validate via symmetric diff $\text{Block} \triangle L_{\text{spec}}$ in $O(|\text{Block} \triangle L_{\text{spec}}| \log N)$!
+#### Step 5.2: Implement the Candidate Root Match Stage (`TryConnectFromCandidateOverlays`) & Automatic `cmpctblock` / `block` Fallback in `src/net_processing.cpp`
+- **File:** `src/net_processing.cpp` (handler for `NetMsgType::TMPLBLOCK`, plus hook at the top of `NetMsgType::CMPCTBLOCK`).
+- **Exact Two-Stage Handler:**
+  ```cpp
+  // In PeerManagerImpl::ProcessMessage (src/net_processing.cpp) for NetMsgType::TMPLBLOCK:
+  CBlockHeader header;
+  vRecv >> header;
+
+  // 1. Pre-Allocation PoW & Header Gate (Hole 7 fix):
+  BlockValidationState state;
+  CBlockIndex *pindexHeader = nullptr;
+  if (!m_chainman.AcceptBlockHeader(header, state, &pindexHeader)) {
+      if (state.IsInvalid()) Misbehaving(pfrom.GetId(), state);
+      return;
+  }
+
+  // 2. Bounded CoinbaseTx Deserialization (<= kMaxCoinbaseBytes):
+  CTransactionRef coinbase_tx;
+  vRecv >> coinbase_tx;
+  if (!coinbase_tx || !coinbase_tx->IsCoinBase()) {
+      Misbehaving(pfrom.GetId(), 100, "invalid-tmplblock-coinbase");
+      return;
+  }
+
+  // 3. STAGE 1 — Candidate Overlay Root Check (checks {L_k, L_{k-1}, L_{k-2}, L_0, L_spec} in < 5 us!):
+  if (pindexHeader->pprev == m_chainman.ActiveChain().Tip() && m_mempool) {
+      if (auto matched_overlay = m_mempool->GetOverlayManager().MatchCandidateOverlay(
+              header, *coinbase_tx, m_chainman.GetConsensus())) {
+          // Exact 256-bit match on BOTH header.tx_root AND header.state_root!
+          // Assemble CBlock in RAM from (coinbase_tx, matched_overlay->txs), relay tmplblock,
+          // and connect tip via the O(1) CommitFinalizedOverlay fast path!
+          RelayTemplateBlockAnnounce(header, coinbase_tx);
+          m_chainman.ConnectMatchedOverlayBlock(pindexHeader, header, coinbase_tx, matched_overlay);
+          return;
+      }
+  }
+
+  // 4. STAGE 2 — Automatic Fallback to Compact Block (if at tip) or Full Block (if behind):
+  if (pindexHeader->pprev == m_chainman.ActiveChain().Tip()) {
+      // Node is at tip (e.g., Tier 0 without Avalanche, or miner added custom unfinalized txs):
+      // Pull from mempool via standard compact block & validate via Merklix diff against L_spec!
+      PushMessage(pfrom, NetMsgType::GETDATA, std::vector<CInv>{{MSG_CMPCT_BLOCK, header.GetBlockHash()}});
+  } else {
+      // Node is behind tip / catching up: request full block (or compact block via block scheduler):
+      PushMessage(pfrom, NetMsgType::GETDATA, std::vector<CInv>{{MSG_BLOCK, header.GetBlockHash()}});
+  }
+  ```
 
 #### Step 5.3: Direct Sorted Batch Commit from `MerklixOverlayArena` to `DiskStateStore` (`src/lotus_v2/disk_state.cpp`)
 - **Files:** `src/lotus_v2/disk_state.h`, `src/lotus_v2/disk_state.cpp` (`ApplyBlock` / new `CommitOverlayLayer`).
 - **Exact Method:**
-  - Add `DiskStateStore::CommitFinalizedOverlay(const MempoolOverlayLayer &L_e, const BlockUndoOutput &undo)` to `src/lotus_v2/disk_state.cpp`:
-    - Instead of re-running `SparseStateTree` over the block's transactions in `ApplyBlock`, `CommitFinalizedOverlay` extracts the net modified `dbi_coins` (`'C' || txid || vout`) and `dbi_smt_nodes` (`'N' || bit_rev_prefix || depth`) directly from $L_e$'s `UtxoOverlayArena` (plus any staged spillover in `dbi_staged_coins` / `dbi_staged_smt`), writes them in sorted prefix order in a single `MDBX_TXN_RDWR` batch, updates tip metadata `'S'`, and initializes Block $(h+1)$'s base layer $L_0$ by inserting `block.vtx[0]`'s spendable coinbase outputs!
+  - Add `DiskStateStore::CommitFinalizedOverlay(const MempoolOverlayLayer &L, const BlockUndoOutput &undo)` to `src/lotus_v2/disk_state.cpp`:
+    - Instead of re-running `SparseStateTree` over the block's transactions in `ApplyBlock`, `CommitFinalizedOverlay` extracts the net modified `dbi_coins` (`'C' || txid || vout`) and `dbi_smt_nodes` (`'N' || bit_rev_prefix || depth`) directly from $L$'s `UtxoOverlayArena` (plus any staged spillover in `dbi_staged_coins` / `dbi_staged_smt`), writes them in sorted prefix order in a single `MDBX_TXN_RDWR` batch, updates tip metadata `'S'`, and initializes Block $(h+1)$'s base layer $L_0$ by inserting `block.vtx[0]`'s spendable coinbase outputs!
 
 ---
 
@@ -1406,9 +1585,9 @@ return std::move(pblocktemplate);
 | **Phase 1: Un-Decouple Pre-Consensus** | `src/validation.cpp`<br/>`src/policy/block/preconsensus.h/.cpp` | `MemPoolAccept::PreChecks` (`:629`)<br/>`Chainstate::ConnectTip` (`:2997`)<br/>`PreConsensusPolicy::operator()` | Restores `finalized-tx-conflict` + adds Cohort Seniority & $O(1)$ overlay fast-path in `ConnectTip` |
 | **Phase 2: Merklix Overlay Mempool** | `src/lotus_v2/mempool_overlay.h/.cpp` *(new)*<br/>`src/txmempool.h/.cpp`<br/>`src/txmempoolentry.h` | `MerklixOverlayManager`, `TxOverlayArena`, `UtxoOverlayArena`<br/>`CTxMemPool::addUnchecked` (`:147`)<br/>Replaces `setAvalancheFinalized` (`:563`) | Eliminates $O(N^2)$ per-tx ancestor walks; updates `Subtree A` & `UtxoRoot` in $\sim 2\text{ ms}$ per epoch |
 | **Phase 3A: Adaptive Merklix Polling** | `src/avalanche/protocol.h`<br/>`src/avalanche/processor.h/.cpp`<br/>`src/net_processing.cpp` (`:6796, :7160`) | `MSG_AVA_OVERLAY`, `OverlayVoteItem`<br/>Replaces legacy `BlockAssembler` per-tx poll loop (`:7169`) | $1.0\times$ bandwidth parity at $\Delta N = 1$ tx; **$100\times\text{–}5{,}000\times$ less bandwidth** at scale |
-| **Phase 3B: Post-Vote Reconciliation (`net_processing.cpp`)** | `src/protocol.h/.cpp`<br/>`src/avalanche/protocol.h`<br/>`src/net_processing.cpp` (`:6828–7435`) | `AVASYNDROME`, `AVAGETBUCK`, `AVABUCK`, `AVAGETSHORTTX`, `AVASHORTTX`<br/>`PeerManagerImpl::ProcessMessage` handlers | $0\text{ RTT}$ local `short_id` promotion; $1\text{ RTT}$ missing-tx fetch by 64b `short_id` or child bucket bisection |
+| **Phase 3B: Generalized Merklix Sync (`net_processing.cpp`)** | `src/protocol.h/.cpp`<br/>`src/net_processing.cpp` (`:6828–7435`)<br/>`src/lotus_v2/mempool_overlay.h/.cpp` | `MERKLIXSYNC`, `GETMERKLIXBUCK`, `MERKLIXBUCK`, `GETSHORTTX`, `SHORTTX`<br/>`PendingCandidateTracker`, `AbortStaleEpochsBelow` | Unified across Tier 0/1/2; $0\text{ RTT}$ local promotion; single-step cumulative jump $L_{N-1} \to L_M$ |
 | **Phase 4: $O(1)$ `BlockAssembler`** | `src/node/miner.h`<br/>`src/node/miner.cpp` (`:98–259`) | `BlockAssembler::CreateNewBlock`<br/>`ComputeV2TxRootFromSubtreeA`<br/>`ComputeV2StateRootFromOverlay` | Reduces `CreateNewBlock` ($100\text{k}$ txs) from **$\sim 600\text{ ms}$ to $< 2\text{ }\mu\text{s}$ ($O(1)$)** |
-| **Phase 5: `cmpcttmpl` & MDBX Commit** | `src/protocol.h`, `src/blockencodings.h/.cpp`<br/>`src/net_processing.cpp`<br/>`src/lotus_v2/disk_state.h/.cpp` | `CompactTemplateBlock` (`cmpcttmpl`)<br/>`DiskStateStore::CommitFinalizedOverlay` | **$\sim 318\text{–}450\text{ B}$** block relay (1 QUIC packet) + **$< 5\text{ }\mu\text{s}$** block validation |
+| **Phase 5: `tmplblock` Candidate Match & Fallback** | `src/protocol.h`, `src/blockencodings.h/.cpp`<br/>`src/net_processing.cpp`<br/>`src/lotus_v2/disk_state.h/.cpp` | `TemplateBlockAnnounce` (`tmplblock`)<br/>`MatchCandidateOverlay` $\to$ `MSG_CMPCT_BLOCK` / `MSG_BLOCK`<br/>`DiskStateStore::CommitFinalizedOverlay` | **$\sim 284\text{ B}$** tx-free block relay + **$< 5\text{ }\mu\text{s}$** root-match connect + auto `cmpctblock` / `block` fallback |
 
 ---
 
@@ -1418,17 +1597,18 @@ return std::move(pblocktemplate);
    - Adopt `TxRoot = H_txroot(0x03 || CoinbaseLeaf || SubtreeA)` where `Subtree A` is a 256-bit `TxID`-keyed single-leaf-collapsed Merklix tree with branch counts `(count_L, root_L, count_R, root_R)`.
    - Adopt `OutpointKey = txid || vout` prefix preservation in `UtxoRoot`.
    - Adopt delayed/pipelined coinbase UTXO insertion (Block $h$'s coinbase outputs enter `UtxoRoot` in $L_0$ of Block $h+1$).
-2. **Leaderless Pipelined Avalanche Logical Clock (`Ingest -> Mature -> Vote`), Intra-Epoch Bucket Vector $\mathbf{B}_e$, & Set Reconciliation:**
+2. **Leaderless Pipelined Avalanche Logical Clock (`Ingest -> Mature -> Vote`), Intra-Epoch Bucket Vector $\mathbf{B}_e$, & Overlapping-Epoch Prevention:**
    - Extend `avapoll`/`avaresponse` with a piggybacked **Lamport Logical Epoch Clock $e$** and stamp P2P transactions locally upon validation (`local_cohort(T) = e_local`, zero wire-tag trust), driving a 3-stage causal pipeline: **Stage 1 (Local Ingest at Cohort $c = e$)** $\to$ **Stage 2 (Maturation Barrier during Epoch $e+1$ polling while Cohort $c = e$ finishes P2P propagation)** $\to$ **Stage 3 (Adaptive Top-Down Merklix Vote at Epoch $e+2$)**.
    - Reconcile dirty `Subtree A` prefix buckets in parallel via $\mathbf{B}_e$ using **full 32-byte Merklix bucket roots** + **inline 16-byte $GF(2^{64})$ power-sum syndromes `(s1, s3)`** (keyed on per-epoch `SipHash(TxHash)` and guarded by the **Strict 256-Bit Root-Verification Gate**), then commit all 256 `UtxoRoot` shards at the **Global Atomic Epoch Barrier $L_{e-1} \to L_e$**.
-   - Enforce **Pre-Cutoff Eligibility + Confidence Lock-In (`kSupersetLockConfidence = 3`)** on superset tie-breaking, **Cohort Seniority** on double-spend conflicts, and the **Dynamic P05 Marginal Fee-Burn Gate** on cohort admission.
+   - Prevent overlapping epoch reconciliation via **completion-clocked single-flight epochs** + a **6-round per-bucket poll cap ($\le 1.5\text{s}$)**, and recover lagging local nodes via **`AbortStaleEpochsBelow(M)` preemption** and a **single-step cumulative Merklix fast-forward ($L_{N-1} \to L_M$)**.
 3. **In-Memory Persistent Merklix Overlay Engine (`MerklixOverlayArena`):**
    - Maintain a copy-on-write 64-byte-node radix trie arena for `Subtree A` and `UtxoRoot` using by-value `libmdbx` sibling/coin copies (`ResetReadTxn()` after each ~0.45 ms read pass), zero `UtxoOverlayArena` allocation for unfinalized peer polls, in-place epoch folding ($L_{e-3} \to L_{\text{base}}$), and `libmdbx` staged spillover for ultra-large blocks so maximum block size is never constrained by RAM.
-   - Use sort-merge batch path-copying across the 256 horizontal prefix shards to update both roots in ~1–2 ms per epoch and validate newly mined PoW blocks (`CompactTemplateBlock`) in $< 5\text{ }\mu\text{s}$.
-4. **Zero-Consensus-Coupling & 3-Tier Graceful Fallback (`Tier 0 -> Tier 1 -> Tier 2`):**
+   - Use sort-merge batch path-copying across the 256 horizontal prefix shards to update both roots in ~1–2 ms per epoch.
+4. **Transaction-Free Block Relay (`tmplblock = Header || CoinbaseTx`), Candidate Root Match Stage, & Automatic `cmpctblock` / `block` Fallback:**
    - Keep the 134-byte `Header` 100% free of pre-consensus metadata so block validity is invariant to Avalanche participation.
-   - In **Tier 0** (0 Avalanche nodes / first 2,016 bootstrap blocks), use the local $L_{\text{spec}}$ Merklix overlay for $O(1)$ `getblocktemplate` and $O(|B \triangle L_{\text{spec}}| \log N)$ symmetric-diff validation of standard `cmpctblock` messages, upgrading seamlessly to **Tier 1** (`OverlayID - Δ_rem + Δ_add`) and **Tier 2** ($O(1)$ ~318–450 byte `CompactTemplateBlock`) whenever an Avalanche quorum is active.
+   - Announce newly mined blocks with the ~284-byte transaction-free **`tmplblock` (`Header || CoinbaseTx`)**. In **Stage 1 (`MatchCandidateOverlay`)**, nodes check `H_txroot(0x03 || CoinbaseLeaf || L.subtree_a_root) == Header.tx_root` and `Header.state_root` against their local candidate overlays $\{L_k, L_{k-1}, L_{k-2}, L_0, L_{\text{spec}}\}$ and connect matching blocks in **$< 5\text{ }\mu\text{s}$** with zero transactions or short IDs sent on the wire.
+   - In **Stage 2 (Automatic Fallback)**, if no local candidate overlay matches (e.g., 0 Avalanche nodes in Tier 0, a custom miner template, or a lagging node), the node immediately sends `getdata(MSG_CMPCT_BLOCK, BlockID)` (pulling transactions from its mempool and validating via $O(|B \triangle L_{\text{spec}}| \log N)$ Merklix symmetric diff) or `getdata(MSG_BLOCK, BlockID)` (full block transfer).
 5. **5-Phase C++ Implementation Plan (`validation.cpp`, `txmempool.cpp`, `avalanche/processor.cpp`, `net_processing.cpp`, `node/miner.cpp`, `disk_state.cpp`):**
-   - Execute the 5-phase engineering blueprint in Section 6 to un-decouple Avalanche pre-consensus from `CTxMemPool` and `ConnectTip`, replace `finalizedTxs` (`src/radix.h`) and per-tx `setAvalancheFinalized` with `MerklixOverlayManager`, upgrade `avalanche::Processor` and `PeerManagerImpl::ProcessMessage` (`src/net_processing.cpp`) with the `avasyndrome` / `avagetbuck` / `avabuck` / `avagetshorttx` / `avashorttx` post-vote reconciliation state machine, and overhaul `BlockAssembler::CreateNewBlock` and `ConnectBlock` into $O(1)$ microsecond overlay operations.
+   - Execute the 5-phase engineering blueprint in Section 6 to un-decouple Avalanche pre-consensus from `CTxMemPool` and `ConnectTip`, replace `finalizedTxs` (`src/radix.h`) and per-tx `setAvalancheFinalized` with `MerklixOverlayManager`, wire the generalized `merklixsync` / `getmerklixbuck` / `merklixbuck` / `getshorttx` / `shorttx` reconciliation protocol and `PendingCandidateTracker` callback pipeline, overhaul `BlockAssembler::CreateNewBlock` into an $O(1)$ microsecond operation, and add `tmplblock` + `MatchCandidateOverlay` + `CommitFinalizedOverlay`.
 
 
