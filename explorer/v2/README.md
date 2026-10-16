@@ -40,8 +40,13 @@ The first data response pins the complete screen. Every following detail,
 page, witness and wire request carries its opaque snapshot token. Epoch,
 generation, chain/profile, anchor and token must agree before rendering.
 Navigating cancels earlier requests. A 409 from initial composition or continuation clears pages and retries the whole
-screen once; repeated changes require a manual reload. A 503 retains the prior
-observation, marks it stale and disables its continuation buttons. A 404 means
+screen once; repeated changes require a manual reload. For temporary 503 responses,
+read requests retry at most three times within one five-second deadline, including
+response-body reads. Retries keep the exact snapshot token and request body;
+navigation cancels them. Only GET and the two read-only branch query POST routes
+retry. A 409, network failure or other POST is not retried by this request policy.
+If the retry budget or deadline expires, the prior observation is retained,
+marked stale, and its continuation buttons are disabled. A 404 means
 only absence from covered canonical history. Empty work-limited pages keep their
 continuation button; no holdings or supply are calculated from a page.
 
@@ -62,6 +67,7 @@ served by the dev server and the live adapter has no mock-data fallback.
 responses, snapshot restart/generation mixtures, branch POST/token semantics,
 wire bounds, malformed primitive mutations for every route, request cancellation,
 malicious field escaping, a real stalled incoming socket deadline, screen navigation
-and stale states. Fixture success establishes client behavior only. Actual
+and stale states, bounded 503 retries, cancellation during backoff/body reads,
+and preservation of snapshot tokens across retries. Fixture success establishes client behavior only. Actual
 native API screen validation remains a separate integration gate and must name
 the exact native service revision and observed chain/profile.
