@@ -119,6 +119,7 @@ def main(argv=None):
     snapshots = []
     payments = {}
     proxies = []
+    lifecycle_failed = False
     def save():
         if output.exists(): (output/'explorer-evidence.json').write_text(json.dumps(evidence,indent=2)+'\n')
     def record(name, **fields):
@@ -228,6 +229,7 @@ def main(argv=None):
                 require(page==envelope,'idle pinned data changed');rounds+=1;time.sleep(.1)
             record('http-only-idle-authority-probe',node=self.label,seconds=time.monotonic()-started,rounds=rounds,not_ready_observations=busy,baseline=baseline,request_range=[first_request,len(evidence['requests'])])
         def audit(self, force=False):
+            nonlocal lifecycle_failed
             if self.auditing or self.base is None:return
             self.auditing=True;started=time.monotonic();deadline=started+self.timeout;attempt=0
             try:
@@ -246,6 +248,7 @@ def main(argv=None):
                         record('whole-observation-restart',node=self.label,attempt=attempt,max_attempts=4,elapsed=time.monotonic()-started,deadline_seconds=self.timeout,error=str(error),error_context=getattr(error,'context',None),old_snapshot=getattr(self,'audit_envelope',None),before=before,after=after)
                         require(attempt<4 and time.monotonic()<deadline,'whole observation kept changing beyond bounded retries')
             except Exception:
+                lifecycle_failed=True
                 self.failed=True
                 raise
             finally:self.auditing=False
@@ -343,8 +346,10 @@ def main(argv=None):
             if command=='status' and result.get('tip_known') and result.get('mempool_ready') and not self.auditing:self.audit()
             return result
         def stop(self):
+            nonlocal lifecycle_failed
+            if sys.exc_info()[0] is not None:lifecycle_failed=True
             try:
-                if self.process.poll() is None and self.base and not self.failed:self.audit(force=True)
+                if self.process.poll() is None and self.base and not self.failed and not lifecycle_failed:self.audit(force=True)
             finally:
                 super().stop()
                 if self.proxy and self.proxy.poll() is None:
