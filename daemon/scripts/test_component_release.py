@@ -68,6 +68,7 @@ class ComponentTests(unittest.TestCase):
         data=self.manifest()
         dockerfile=(self.root/'daemon/releases/bitcoin-core/Dockerfile').read_text()
         self.assertIn('libatomic1',dockerfile)
+        self.assertIn('libgmpxx4ldbl',dockerfile)
         self.assertEqual(data['tag'],'bitcoin-core-v1.0.0')
         self.assertEqual(data['upstream_version'],'32.99.0')
         self.assertEqual(data['native_version'],'32.99.0')
