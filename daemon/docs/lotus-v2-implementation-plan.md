@@ -6,15 +6,42 @@ Updated October 15, 2026. Development plan; no genesis parameters are frozen and
 
 ## Source foundation and current status
 
-The current executable [V2 series](../patches/v2/series) contains 324 patches,
-`000`–`323`, on ABC master `1fb7db17c176cdea8a2c60d887891589382ee4e3`.
-[Latest replay evidence](evidence/v2-series-replay-323.json) verifies every
+The current executable [V2 series](../patches/v2/series) contains 325 patches,
+`000`–`324`, on ABC master `1fb7db17c176cdea8a2c60d887891589382ee4e3`.
+[Latest replay evidence](evidence/v2-series-replay-324.json) verifies every
 intermediate tree. Offline daemon acceptance, restart, disconnect/reconnect,
 resumable fork recovery, bounded selection and actual two-process TCP full/compact
 synchronization have separate evidence below. Native production of signed fixture-payment blocks also passes across two nodes.
 The foreground local controller now completes a live-wallet payment and restart
 across two isolated nodes; see the current controller evidence below. Development
 profile adoption and public launch remain pending.
+
+### Reviewed Avalanche runtime observation fencing and multi-peer dispatch through 324 (October 15)
+
+Series commit `de966c541436680e3869779c132376f14d21b9a3` appends reviewed mailbox
+`324-perf-v2-fence-avalanche-runtime-observations-and-multi-p.patch` with all prior
+`000`–`323` mailbox bytes unchanged. A new replay in
+`/private/tmp/lotus-v2-series-replay-324-20261015` verifies all 325 intermediate
+trees; native source `f39a373cb57b9cd0bf8964ea4cbe88ef1020c703` ends at tree
+`4529940707bea972c7a6f4cd299af27aec2e7666`. This plan commit immediately follows
+that series commit, whose parent was the then-current Lotus V2 tip
+(`0f3b47cfe85f3f98787ee6be674d29df1609fcff`).
+
+Changes fence `DevelopmentRuntime` block policy and Avalanche block observation
+caches on `SameDevelopmentBodyAuthority`, latch completed `Node::ReconcileCandidates`
+scans per `(body_epoch, context_generation, stable_tip, revision)` anchor, skip
+temporarily `Busy` peer dispatch slots in `AvalanchePeer::Pump` while preserving
+per-connection FIFO order and surfacing terminal errors, drain ready peer actions in
+`AvalancheDriver::Pump`, cache 11-header `(height, median_time_past)` snapshots in
+`AvalancheDriver::Snapshot`, and fast-path duplicate valid proof registrations in
+`AvalancheDriver::Register` after byte-equality and authority verification. All
+seven standalone Avalanche/runtime unit test suites and independent review passed.
+The combined Debug, Chronik-enabled, wallet-enabled daemon (`lotusd` SHA256
+`a5e4e780c9b84832c6b6347eedfdd90bb69b7f854f7cceb668da92ba724ecacc`), CLI, wallet
+tool, and V2 wallet client build passed; see
+[evidence](evidence/v2-native-build-f39a373cb5.json). Unchanged nine-node quorum,
+finality, pre-finality parking, competing-fork refusal, and restart acceptance is
+next.
 
 ### Reviewed cache and diagnostic integration through 323 (October 15)
 
