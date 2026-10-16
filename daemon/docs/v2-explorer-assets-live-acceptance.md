@@ -58,8 +58,8 @@ python3 daemon/tests/check-v2-explorer-assets-live.py \
 ## Passing native lifecycle
 
 The final run at
-`/private/tmp/lotus-v2-explorer-assets-native-live-20261015-g/evidence.json`
-passes all four complete asset observations. At height 3 the summary has one
+`/private/tmp/lotus-v2-explorer-assets-native-live-20261015-h/evidence.json`
+passes all five complete asset observations. At height 3 the summary has one
 event/two token outputs; height 4 has two events/four outputs; height 5 has
 three events/four outputs and no live token UTXO. The mint's zero burn remains
 in history. The transfer reports 250 explicit plus 150 implicit burned units;
@@ -67,16 +67,23 @@ the final input-only event reports another 600 implicit burned units.
 
 A competing native chain forks from height 2 and becomes canonical at height 6.
 The original asset and its transactions return fenced 404, the registry is empty,
-and the original mined funding coin is restored. The same three transaction
+and the original mined funding coin is restored. Each of the four former token
+outpoints independently returns fenced `/outputs` 404 and has no native coin
+before any re-mining occurs. The same three transaction
 frames re-enter the real pool and are selected by `minepool`, then confirm in
 height 7 at transaction indexes 1/2/3. The asset's first occurrence and every
 creation/spend/event location move to this new block. Counters return to three
 events/four outputs; both burn modes and an empty token UTXO set still match.
+A same-home restart then repeats the complete asset audit: the new height-7
+creation, spend, event and first-occurrence locations persist, while the service
+epoch renews.
 
 The idle HTTP-only probe keeps generation `3` at unchanged genesis for all ten
 ready samples. The final evidence includes every native and HTTP request,
 accepted body hashes and all process exit codes; every owned child exits cleanly.
-The earlier passing run `f` remains available independently. Native consensus,
+The earlier passing runs `f` and `g` remain available independently. The recorded
+interpreter was `/private/tmp/lotus-v2-review-venv/bin/python`, with `blake3`
+installed for the checked reference encoding and identity calculations. Native consensus,
 wallet token support and compiler contracts were not changed by this test.
 
 ## Initial live finding (preserved failure)

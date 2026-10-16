@@ -244,14 +244,31 @@ def main(argv=None):
         listing=http(a,'/assets');require(listing['data']['items']==[] and listing['data']['exhausted'],'registry survived full asset undo')
         for tx in active:
             http(a,'/transactions/by-id/'+tx['txid'],expected=404)
+        detached_outputs=[]
+        for tx in active:
+            for index,out in enumerate(tx['outputs']):
+                if not out.flags&1: continue
+                missing_output=http(a,'/outputs/'+tx['txid']+'/'+str(index),dict(snapshot_token=listing['snapshot_token']),expected=404)
+                native_coin=a.request('coin',txid=tx['txid'],index=index)
+                require(native_coin['tip']==fork['tip'] and native_coin['coin'] is None,'detached token output retained a native coin')
+                detached_outputs.append(dict(txid=tx['txid'],out_idx=str(index),http=missing_output,native=native_coin))
+        require(len(detached_outputs)==4,'all former asset outpoints must be checked')
         restored=a.request('coin',txid=funding['coinbase_txid'],index=0);require(restored['coin'] is not None,'reorg did not restore real funding coin')
         detached=a.request('blockstatus',block_id=original['tip']);require(detached['ever_connected'] and not detached['is_active_tip'],'native detach evidence missing')
-        check('native-competing-fork-asset-undo',common=common,old_tip=original,fork=fork,absent=absent,listing=listing,restored_funding=restored,detached=detached)
+        check('native-competing-fork-asset-undo',common=common,old_tip=original,fork=fork,absent=absent,listing=listing,restored_funding=restored,detached=detached,detached_outputs=detached_outputs)
         # Re-submit exact accepted bytes in dependency order. A pool may retain
         # detached valid transactions; duplicate is explicitly accepted above.
         for tx in active: submit(a,tx)
         _,remine=mine(a,3); audit(a,active,remine,'original-wire-remined-after-undo')
         require(remine[mint['txid']]['block_id']!=locations[mint['txid']]['block_id'],'re-mining reused detached location')
+        before_restart=record['checks'][-1]['snapshot']
+        a.stop(); b.stop(); a=launch('a-remine-restart',root/'home-a')
+        audit(a,active,remine,'remined-locations-persist-after-restart')
+        after_restart=record['checks'][-1]['snapshot']
+        require(before_restart['tip']==after_restart['tip'] and before_restart['service_epoch']!=after_restart['service_epoch'],
+            'same-home restart did not preserve tip or renew service epoch')
+        check('same-home-restart-preserves-remined-asset-locations',before=before_restart,after=after_restart,locations=remine)
+
         record['passed']=True; save()
     except Exception as error:
         record['failure']=dict(type=type(error).__name__,message=str(error));save();raise
