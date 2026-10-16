@@ -2,22 +2,47 @@
 
 The goal remains active: a reviewed private network on separate machines, including wallet payments relayed A→B and mined from C’s mempool, restart/reorg reconciliation, explorer and authenticated Avalanche. Component passes do not establish completion. QUIC/public deployment deferred.
 
-## Latest acceptance result
+## Current status — supersedes historical continuations below
 
-Native63c run `/private/tmp/lotus-v2-native-quorum-63c5149944-20261015-a`
-passed authenticated default quorum on all9nodes, then failed
-`real-polled-seed-finality deadline expired` after300seconds. All12owned children
-exited0; mesh PIDs are absent. No finality/fork/restart acceptance claim.
-`avalanche_provisioning` and `avalanche_provision_review` are independently
-investigating source/traces without changing thresholds or deadline. Harness
-owner is archiving failure evidence. No new run is authorized before diagnosis.
+Series `000`–`317` is integrated: series commit `dfd493fe`, immediate plan
+commit `9ab0c7c7`. All 318 intermediate replay trees match. Native source
+`cd8d5140ec7fce7da9a4e2a5a8b5d803ed4dc3f5`, tree
+`a14a946342d31ee07ee8851906500746800b0c46`. Earlier mailbox bytes are unchanged.
+Combined Debug Chronik-enabled daemon, CLI, wallet tool and V2 wallet client
+build passed. macOS deployment-target linker warnings remain disclosed in the
+implementation plan; no Linux or older macOS compatibility claim.
 
-Operator acceptance evidence is integrated `93d479b3`; updated runbook commits
-`4dcfe652`/`0a36c6f6` document implemented commands and exact source distinctions.
-The functional owner has authorization for scoped CLI/wallet/protobuf builds at
-63c and an isolated Python3.13 dependency environment, but no functional node
-runs yet. Remaining inventory is292scripts/319variants. Disk5.2GiB does not meet
-long-pruning8GiBminimum; retain that as incomplete. Full goal remains active.
+Frozen binaries: `/private/tmp/lotus-v2-node-build-cd8d5140ec/`.
+[Build provenance](../../daemon/docs/evidence/v2-native-build-cd8d5140ec.json)
+records exact binary and build-log hashes. Daemon SHA256:
+`5767c34242f939f5d6fb0fa7f740f87b0c829d179717a58eb4df5cb84c88f7d9`.
+
+A fresh quorum run was launched by `native_quorum_acceptance` in
+`/private/tmp/lotus-v2-native-quorum-cd8d5140ec-20261015-a`, session47425,
+harness PID17347. Verify actual live process state before treating these as
+current. Uses copied clean 2024-block seed and unchanged defaults/deadlines.
+The prior63c run passed nine-node authentication but failed300s finality;
+its evidence remains preserved. New finality/fork/restart success is unproven.
+Quorum owns the sole heavy execution window.
+
+First eight inherited functional identities passed across documented63c runs,
+including a separately reviewed branding fixture repair; original failure kept.
+311 variants remain unrun. These are not final-cd8 full-suite results. Updated
+coverage, complete final-revision suites and separate-host acceptance remain.
+
+Audit repairs cover FIFO relay inventory, authority-fenced application retention,
+prepared-VM ownership, early pool resource checks, descriptor flag restoration,
+valid monetary fixtures and portable temporary paths. Independent focused checks
+passed. Consensus cost calibration and branch-root semantics are separately
+reviewed in `lotus-v2-argon-consensus-and-consolidation-review.md`; do not alter
+consensus while squashing. Consolidation ledger work is docs-only in a new
+isolated worktree. Inventory fairness investigation owns a separate native
+worktree, not the acceptance source. Repeated retained-block reads and repeated
+transaction encoding remain open performance findings.
+
+Operator same-host acceptance remains integrated at `93d479b3`; separate-host
+access is still unspecified. No public deployment, goal completion or finality
+claim. Prior continuations below are historical evidence only.
 
 ## Current continuation — supersedes earlier status below
 
