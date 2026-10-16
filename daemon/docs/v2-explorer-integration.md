@@ -10,4 +10,6 @@ The native node now opens schema 3 in `chronik-v2-explorer-v1` under its explici
 
 [Retained integration evidence](evidence/v2-explorer-integration-20261015) includes native test/build output, Rust service results and binary provenance. Full daemon build output is retained locally at `/private/tmp/lotus-v2-explorer-integrated-build-20261015.log`.
 
+The same combined binary also passed the actual Avalanche observer process harness, including genesis/unknown-block policy observations, two observer peers, IBD gates and malformed private credential rejection. Temporary nodes were cleaned; public traces are retained under `observer-process`. This does not establish funded quorum or explorer HTTP behavior.
+
 Actual native explorer screen, token lifecycle, restart and reorg acceptance are still pending. The native candidate has not yet been appended to the maintained ABC mailbox series; complete replay of every intermediate tree is required before that integration. This report is not private-testnet completion evidence.
