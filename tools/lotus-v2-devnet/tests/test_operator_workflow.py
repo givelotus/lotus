@@ -292,3 +292,17 @@ class OperatorTests(ControllerCase):
         for url in ('http://127.0.0.1:0', 'http://127.0.0.1:65536', 'http://localhost:29331',
                     'http://127.999.0.1:29331', 'http://user@127.0.0.1:29331'):
             self.assertFalse(re.fullmatch(pattern, url))
+
+    def test_recipient_compilation_refuses_running_compiler_drift_before_secret(self):
+        ctl, path = self.make_controller()
+        descriptor = self.root / 'received.json'
+        descriptor.write_text(json.dumps(self.descriptor()))
+        entry = Path(ctl.config['compiler']['directory']) / 'dist/generic.js'
+        entry.write_text('modified while controller runs')
+        prompts = []
+        ctl.secret_prompt = lambda *args: prompts.append(args)
+        result = ctl.execute(f'recipient import remote --file {descriptor}')
+        self.assertFalse(result['ok'])
+        self.assertIn('compiler changed', result['error'])
+        self.assertEqual(prompts, [])
+        self.assertFalse((ctl.session / 'public/recipients/remote.json').exists())

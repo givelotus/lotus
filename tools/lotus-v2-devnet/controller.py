@@ -1409,6 +1409,10 @@ class Controller:
     def _compile(self, owner, deadline):
         hexadecimal(owner)
         compiler = self.config["compiler"]
+        if self._record is not None:
+            current = self._metadata()
+            for key in ("compiler_sha256", "payment_source_sha256", "node_sha256"):
+                require(current[key] == self._record[key], "pinned Payment compiler changed")
         argv = [
             compiler["node"],
             str(Path(__file__).with_name("compile-payment.mjs")),

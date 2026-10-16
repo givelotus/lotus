@@ -92,10 +92,20 @@ class NativeOperatorFlowTests(unittest.TestCase):
                     return
                 self.assertLess(time.monotonic(), end, reason)
                 time.sleep(.05)
+        def observed_transaction(ctl, txid):
+            # Read-only native relay evidence, without substituting any controller
+            # behavior or using a native command to submit/sign/mine the payment.
+            node = ctl.nodes[ctl.config['nodes'][0]['name']]
+            observed = node.request(dict(command='transactionstatus', txid=txid), ctl.deadline())
+            evidence.setdefault('native_relay_observations', []).append(dict(session=str(ctl.session), response=observed))
+            save()
+            self.assertTrue(observed.get('ok'), observed)
+            return observed
         def mine(ctl, wallet):
             height = status(ctl)['height']
             clock = manifest['header']['time'] + (int(height) + 1) * manifest['header']['spacing']
             return execute(ctl, f'mine 1 --to {wallet} --claim 100000 --time {clock} --batches 16')['mined'][0]
+        primary_error = None
         try:
             sender, receiver = start('sender'), start('receiver')
             wait(lambda: status(sender)['peer_active'] >= 1 and status(receiver)['peer_active'] >= 1,
@@ -119,6 +129,8 @@ class NativeOperatorFlowTests(unittest.TestCase):
             self.assertFalse((sender.session / 'wallets/bob-remote').exists())
             # Stop the sender at the common ancestor. The receiver independently mines
             # the relayed payment, while its native pool remains live.
+            wait(lambda: observed_transaction(receiver, txid).get('state') == 'pending',
+                 'recipient node did not observe P2P payment relay')
             execute(sender, 'stop')
             confirmation = mine(receiver, 'miner')
             self.assertEqual(confirmation['pool_selected'], 1)
@@ -149,6 +161,8 @@ class NativeOperatorFlowTests(unittest.TestCase):
             evidence['winning_tip'] = winning_tip
             # Rebroadcast the original persisted transaction and independently mine.
             execute(sender, 'wallet broadcast alice ' + txid)
+            wait(lambda: observed_transaction(receiver, txid).get('state') == 'pending',
+                 'recipient node did not observe original-wire rebroadcast')
             execute(sender, 'stop')
             remine = mine(receiver, 'miner')
             self.assertEqual(remine['pool_selected'], 1)
@@ -158,11 +172,27 @@ class NativeOperatorFlowTests(unittest.TestCase):
             execute(receiver, 'stop')
             evidence['reconfirmation_block'] = remine['block_id']
             evidence['passed'] = True
+        except BaseException as error:
+            primary_error = error
+            evidence['failure'] = dict(type=type(error).__name__, message=str(error))
+            raise
         finally:
+            cleanup_errors = []
             for ctl in reversed(controllers):
-                ctl.close()
-                self.assertFalse(ctl.cleanup_errors, ctl.cleanup_errors)
-                for child in ctl.nodes.values():
-                    self.assertIsNotNone(child.process.poll())
-            evidence['sessions'] = {name: json.loads((root / (name + '-session/session.json')).read_bytes()) for name in ports}
+                try:
+                    ctl.close()
+                    if ctl.cleanup_errors:
+                        cleanup_errors.append(dict(session=str(ctl.session), errors=ctl.cleanup_errors))
+                    for child in ctl.nodes.values():
+                        if child.process is not None and child.process.poll() is None:
+                            cleanup_errors.append(dict(session=str(ctl.session), child=child.name, live=True))
+                except BaseException as error:
+                    cleanup_errors.append(dict(session=str(ctl.session), error=type(error).__name__))
+            evidence['cleanup_errors'] = cleanup_errors
+            evidence['sessions'] = {name: json.loads((root / (name + '-session/session.json')).read_bytes())
+                                    for name in ports if (root / (name + '-session/session.json')).is_file()}
+            if cleanup_errors:
+                evidence['passed'] = False
             save()
+            if primary_error is None:
+                self.assertFalse(cleanup_errors, cleanup_errors)
