@@ -91,7 +91,13 @@ item returns an error instead of a nonadvancing cursor.
 
 ## Exact routes
 
-All paths below are relative to `/v2/explorer/v1`. All are `GET`. Reject unknown
+All paths below are relative to `/v2/explorer/v1`. They are `GET` except the two
+explicit `POST` branch routes. Every data route accepts the common optional
+query parameter `snapshot_token`; the table lists only additional parameters,
+so `none` means no additional parameters. `/status` accepts no parameters and
+does not issue a snapshot token. Every successful data envelope issues its exact
+snapshot's token; the first ready list or detail request is the token source for
+subsequent requests composing that screen. Reject unknown
 query parameters, duplicate parameters, noncanonical decimal/hex encodings and
 overlong values before reading storage. `page_size` defaults to `25`, maximum
 `100`; `cursor` is optional. A cursor includes the entire normalized query and
@@ -115,6 +121,21 @@ snapshot binding. Parameters supplied with it must agree.
 | `/assets/:token_id` | none | Asset detail and truthful metadata availability. |
 | `/assets/:token_id/events` | `page_size`, `cursor` | One aggregate event per touched transaction, ordered by `(height, tx_index)` ascending. |
 | `/assets/:token_id/outputs` | `view=history\|unspent`, `page_size`, `cursor` | Output records ordered by `(creation_height, tx_index, out_idx)`. History includes burns; unspent excludes them. |
+| `POST /branches/outputs` | JSON body: `any_branch`, `positions`, `page_size`, `cursor`, `include_burn` | Existing branch history predicate/order, with the new envelope and restart-safe cursor wrapper. |
+| `POST /branches/utxos` | JSON body: `any_branch`, `positions`, `page_size`, `cursor` | Existing branch UTXO predicate/order, with the new envelope and restart-safe cursor wrapper. |
+
+The branch bodies preserve the existing field names and filter algebra, using
+decimal strings for `page_size` and positional `position` under this new schema.
+Branch `page_size` defaults to `25`, matching the new schema; omitted filter
+fields use the existing engine defaults. These two handlers call
+the existing branch query engine and convert its bounded record model; they do
+not implement a second branch index or predicate evaluator. The new cursor
+wrapper contains the existing engine continuation plus the common new cursor
+bindings. An old-route cursor is not valid in a new-route request.
+Branch list items are `{record:OutputRecord,matching_positions:[<u8-string>...]}`;
+their `data` additionally includes `posting_reads` and `work` as decimal strings.
+Use the existing engine's continuation to distinguish exhaustion from an empty
+work-limited page, then wrap it with the new snapshot bindings.
 
 Register static `by-height`, `by-id` and `by-hash` paths without ambiguity with
 dynamic IDs. A block's first transaction page is sufficient for navigation;
@@ -160,7 +181,7 @@ selector fields even when their meaning changes by kind:
 
 | Kind | Presentation and contextual fields |
 | --- | --- |
-| `spend` (`flags=1`) | `path_index` is the selected path. `resolved_coin` has `availability:"complete"` and the exact prior output/creation location, obtained before applying this spend. A broken reference within complete coverage is an index error, not an unknown zero-valued coin. |
+| `spend` (`flags=1`) | `path_index` is the selected path. `resolved_coin` has `availability:"complete"` and the exact prior output/creation location, obtained before applying this spend. This is a frozen creation fact, without a mutable historical record's current `spend` member. A broken reference within complete coverage is an index error, not an unknown zero-valued coin. |
 | `coinbase` (`flags=2`) | `path_index:null`, `resolved_coin:{availability:"not_applicable"}`; show actual parent/height selector bytes with their native interpretation. |
 | `mint` (`flags=3`) | `path_index:null`, `resolved_coin:{availability:"not_applicable"}`; label `prev_txid` as the token/mint-root identity, never as a spent transaction. Link to the asset page. |
 
@@ -208,6 +229,69 @@ Keep the existing spend subset and output wires for compatibility and branch
 indexing. Add bounded metadata types in new `v2_explorer` modules; do not copy
 the native consensus engine into Rust or JavaScript.
 
+Reserve these exact bridge additions before implementation. CXX names below are
+in the existing `chronik_v2` namespace; the C++ producer uses equivalent types
+prefixed `Chronik`. `NativeTx.inputs` remains the existing spend subset and
+`NativeTx.outputs` remains the existing output-wire vector:
+
+```text
+WireRange { offset: u64, length: u64 }
+NativeWitness {
+  script: WireRange,
+  siblings_table: WireRange, siblings_count: u32,
+  arguments_table: WireRange, arguments_count: u32
+}
+NativeFullInput {
+  prev_txid: [u8;32], prev_index: u32, sequence: u32, flags: u8,
+  path_index: u8, has_coinbase_data: bool, coinbase_data: WireRange,
+  witnesses: Vec<NativeWitness>
+}
+NativeTx += { wire: Vec<u8>, lock: u64, full_inputs: Vec<NativeFullInput> }
+NativeBlock += { header_wire: [u8;134] }
+```
+
+Every range is relative to the full transaction frame. Script and coinbase ranges
+address payload bytes only. Each table range begins at its native count field
+and includes the complete count and element framing, matching the exact source
+frame; table count must equal the exported count. Empty payload ranges preserve
+their actual offset; absent coinbase data uses `{offset:0,length:0}` and
+`has_coinbase_data:false`. Preserve raw `path_index` in transport and map it to
+JSON null for non-spends. The native profile must bound witness counts before
+constructing CXX vectors. Optional HTTP inline tables may be null in the minimum
+implementation; the exact referenced bytes remain available. These DTOs carry
+native-decoded facts, not claims that a Rust parser revalidated consensus.
+
+In `chronik-db/src/v2_explorer.rs`, reserve Rust public persisted/model names
+`WireRange`, `WitnessFact`, `InputFact` with fields corresponding exactly to the
+three bridge types above (`InputFact` also has
+`resolved_creation: Option<ResolvedCreation>`).
+`ResolvedCreation {outpoint: OutPoint, output: Output, creation: TxLocation}`
+contains no spend state. `ExplorerTxFacts {wire: Vec<u8>, lock:u64,
+inputs:Vec<InputFact>}` and `ExplorerBlockFacts {header_wire:[u8;134]}` are the
+required transition additions:
+`ConfirmedTx.explorer: ExplorerTxFacts` and
+`CommittedBlock.explorer: ExplorerBlockFacts`. They are mandatory in schema 3,
+never an optional incomplete-success path. Persist transaction fixed metadata
+as `TxMeta {location:TxLocation, lock:u64, input_count:u32, output_count:u32,
+wire_size:u64}` and block metadata as
+`BlockMeta {anchor:Anchor, header_wire:[u8;134], tx_count:u32}`. Large wire and
+descriptor vectors are split into the records below rather than serialized into
+`TxMeta`. Name the persisted input descriptor `InputMeta`: it has every
+`InputFact` field except `witnesses`, replaced by `witness_count:u32`.
+Modules may use bounded internal serde representations where existing
+public types lack serde support, without changing these logical field shapes.
+
+The DB owner alone resolves `resolved_creation` before staging each spend;
+the bridge supplies no caller-authoritative coin values. Its conversion sets
+this field to None, then DB staging requires/resolves it for spend inputs and
+leaves it None for coinbase/mint. Reject caller-supplied conflicting values.
+The native service `initialize_genesis(NativeBlock)` already receives the block,
+but currently passes only its transactions to DB initialization. Change
+`V2Db::initialize_genesis` to accept the complete `CommittedBlock` and retain
+header/full facts. Require genesis anchor/self-parent convention there, while
+persisting the exact header's zero predecessor. Update all genesis fixtures;
+an empty synthetic header is not a compatible explorer fixture.
+
 Capture frame ranges from native decoding of the authenticated connected body.
 Prefer a V2-only optional frame-location output in the existing block/transaction
 codec over a second parser. If an implementation initially re-encodes a decoded
@@ -218,22 +302,34 @@ Offsets must be checked against frame bounds before allocation or persistence.
 mint selectors. It must not accept partial record population as a successful
 explorer block. No second runtime read is needed for each HTTP request.
 
-Within the same DB batch, add these distinct key families (the DB owner reserves
-actual prefix bytes and proves no collision with existing `b/t/o/u`/postings):
+Within the same DB batch, reserve these exact ASCII prefix families. Existing
+single-byte `b/t/o/u/p` keys and singletons `v2-binding`, `tip`, `disconnected`
+remain owned by `v2_branch.rs`. Every explorer family starts with `e`, which
+does not overlap them; concatenated fields below have fixed widths:
 
 | Family | Key and value |
 | --- | --- |
-| Canonical height | `height_be64 → block_id` |
-| Block | `block_id → header_wire, tx_count` plus fixed metadata |
-| Block transaction | `(block_id, tx_index_be32) → txid, txhash` |
-| Transaction | existing `txid` location extended or joined to fixed explorer metadata; no duplicate competing location authority |
-| Full identity | `txhash → txid` (reject conflicting reuse) |
-| Input | `(txid,input_index_be32) → bounded descriptor and resolved creation reference` |
-| Witness | `(txid,input_index,witness_index) → bounded byte references` |
-| Transaction wire | `(txid,chunk_index_be32) → at most 32 KiB` |
-| Asset registry | `token_id → first covered occurrence, counters availability` |
-| Asset event | `(token_id,height_be64,tx_index_be32) → bounded event` |
-| Asset output | `(token_id,height_be64,tx_index_be32,out_idx_be32) → outpoint` |
+| Canonical height | `eH + height_be64 → block_id` |
+| Block | `eB + block_id → BlockMeta` |
+| Block transaction | `eO + block_id + tx_index_be32 → txid, txhash` |
+| Transaction | `eT + txid → TxMeta`, joined with existing `t + txid` location; equality required, no competing location authority |
+| Full identity | `eX + txhash → txid` (reject conflicting reuse) |
+| Input | `eI + txid + input_index_be32 → InputMeta` |
+| Witness | `eW + txid + input_index_be32 + witness_index_be32 → WitnessFact` |
+| Transaction wire | `eR + txid + chunk_index_be32 → at most 32 KiB` |
+| Asset registry | `eA + token_id → AssetSummary` |
+| Asset event | `eE + token_id + height_be64 + tx_index_be32 → AssetEvent` |
+| Asset output | `eP + token_id + height_be64 + tx_index_be32 + out_idx_be32 → outpoint` |
+
+Expose these snapshot methods from the model/query modules through the shared
+`ReadSnapshot`: `explorer_block(id)`, `explorer_block_at_height(height)`,
+`explorer_tx(txid)`, `explorer_tx_by_hash(txhash)`, `explorer_input(txid,index)`,
+`explorer_witness(txid,input_index,witness_index)`,
+`explorer_wire_chunk(txid,chunk_index)`, `asset_summary(token_id)`, plus bounded
+exclusive-key iterators for the page families. Return `Result<Option<T>>` for
+point reads and `Result<Option<(key,T)>>` for next-key reads. Query modules own
+page budgeting/cursors; DB methods own key-prefix and stored-record validation.
+These helpers use the existing snapshot handle rather than opening storage.
 
 Existing historical output records provide spend resolution even after the coin
 has been consumed. Resolve against the current batch's staged state first, so
@@ -244,9 +340,22 @@ Receipt equality for idempotent replay must bind every new explorer fact,
 including wire bytes, all inputs and header. Undo must cover every new key and
 old aggregate value. Extend `validate_undo` to validate exactly the expected key
 set and ownership; merely adding writes will currently make disconnect fail.
+Handle exact-tip replay before resolving new spends against current spend state:
+authenticate incoming complete native facts against the stored receipt and its
+frozen resolved creations, then return the idempotent result. Coins spent by
+that already-committed block must not cause an otherwise identical replay to
+fail as a double spend. A changed frame, selector, descriptor or header fails
+the receipt comparison before any mutation.
+Recompute the expected canonical-height, block-order, full-identity, frame-chunk
+and descriptor entries from receipt facts, and compare their current values
+before undo. Validate asset events/postings against the receipt's resolved
+inputs/outputs/mints and validate aggregate old/new counter arithmetic and
+`first_seen` preservation. A correct prefix/key length alone cannot authorize
+restoring an arbitrary value or deleting another block's key. Include the exact
+derived explorer/asset facts in the versioned receipt equality contract.
 No mutable explorer cursor/snapshot state is stored in that batch.
 
-Use a new V2 DB schema version for these required records. Existing schema-2
+Set `SCHEMA_VERSION = 3` for these required records. Existing schema-2
 directories fail with a clear schema mismatch; no implicit migration, reset or
 deletion. Prepare a separately named explorer index directory and replay native
 retained history when runtime work is authorized. On a missing historical body,
@@ -257,14 +366,19 @@ reconciliation and complete explorer coverage permit publication.
 
 ## Asset semantics and independent implementation hook
 
-For each token ID actually present under `HAS_TOKEN`, an event records
+Take the union of token IDs in `HAS_TOKEN` outputs, resolved `HAS_TOKEN` spend
+coins, and all mint-input selectors. Emit one event for each union member, even
+when it occurs only in inputs and is fully burned implicitly. An event records
 `{token_id,location,spent_units,output_units,explicit_burn_units,
 minted_units,implicit_burn_units,has_mint_input}`. All amounts are exact unsigned
 decimal strings. Compute checked u128 totals over the authenticated transaction
 and resolved spend coins: `I = spent_units`, `O = output_units` including burn
 outputs, `B = explicit_burn_units`; `minted_units=max(O-I,0)` and
-`implicit_burn_units=max(I-O,0)`. Positive delta must match the native mint input
-for that token; disagreement is a transition error. An event can contain mint,
+`implicit_burn_units=max(I-O,0)`. Require a bijection between positive token
+deltas and mint inputs: exactly one matching mint input for each positive delta,
+no mint input without a positive delta, and no duplicate mint selectors.
+Disagreement is a transition error, matching native ordinary-validation shape
+checks. An event can contain mint,
 transfer and burn effects simultaneously; do not force it into one category.
 Explicit burns are additional to implicit burns. Live UTXO unit change is
 `O - B - I`; burns never become spendable asset outputs.
@@ -285,12 +399,27 @@ Frontend presents integer units, never an assumed decimal precision or sums of
 one page as total holdings/supply. Native currency is displayed separately.
 
 Asset work consumes an immutable per-transaction view:
-`AssetTxView {location, outputs, resolved_spends, mint_token_ids}`. A pure
-`derive_asset_events(view) -> Result<Vec<AssetEvent>>` lives in the new asset
+`AssetTxView<'a> {location:TxLocation, outputs:&'a [Output],
+resolved_spends:&'a [ResolvedCreation], mint_token_ids:&'a [Hash32]}`. The mint
+slice retains one entry per mint input, so duplicates cannot disappear before
+validation. In `v2_asset.rs` reserve
+`AssetEvent {token_id:Hash32, location:TxLocation, spent_units:u128,
+output_units:u128, explicit_burn_units:u128, minted_units:u128,
+implicit_burn_units:u128, has_mint_input:bool}` and
+`AssetSummary {token_id:Hash32, first_seen:TxLocation, event_count:u64,
+output_count:u64}`. A pure
+`derive_asset_events(view: AssetTxView<'_>) -> Result<Vec<AssetEvent>>` lives in the new asset
 module; it performs no writes and has no runtime/HTTP dependency. The DB owner
 invokes it while staging each transaction and incorporates its posting/counter
 mutations and undo in the existing batch. Queries consume the same ReadSnapshot.
-This is the parallel implementation seam; a second DB writer is forbidden.
+Return events sorted by native token bytes. `event_count` counts touched
+transactions; `output_count` counts every created token output, including burns
+and zero values, never a transaction's native outputs. `first_seen` is the first
+covered canonical transaction occurrence and is removed if undo removes the
+last event. This is the parallel implementation seam; a second DB writer is
+forbidden. Only the integration owner exposes any crate-private snapshot/staging
+access needed by the sibling modules; neither asset nor explorer helpers open a
+second RocksDB handle or bypass the parent's batch.
 
 ## Fences, absence, reorg and limits
 
@@ -309,10 +438,22 @@ normalized filter digest and exclusive last key. Decode to bounded fixed fields;
 validate membership/key shape before iteration. Clients treat them as opaque.
 They need not be signatures: hostile cursor contents cannot bypass key prefixes,
 binding checks or work limits. Any new publication invalidates previous cursors,
-even when the anchor returns to the same block. Snapshot tokens use the same
-binding without a last key. All point/detail/list routes accept optional
+even when the anchor returns to the same block. Snapshot tokens contain only
+token version, epoch, generation, chain/genesis/profile binding and anchor;
+they exclude route kind, filter and last key so one token composes different
+routes at one observation. All point/detail/list routes accept optional
 `snapshot_token`; successful responses expose the matching token so the UI can
 pin a multi-request page. On mismatch return `409 stale_snapshot`.
+
+These restart/ABA cursor guarantees apply to the new explorer schema, including
+its two branch wrappers. The four existing `/v2` routes retain their previous
+snapshot-only cursor contract; those cursors do not carry service epoch or
+authority generation. Their per-response authority fence remains useful but
+does not make an old branch cursor restart-safe. The explorer UI uses only the
+new branch wrappers when composing pinned views. Do not mix an existing-route
+branch response into a new-schema snapshot or claim that a before/after status
+poll closes that race. This preserves old clients without silently weakening
+the new UI's consistency contract.
 
 Confirmed means canonical indexed membership in this ready snapshot.
 Confirmations are checked `tip.height - location.height + 1`, calculated only
@@ -365,7 +506,7 @@ four rows are relative to the native tree; frontend paths are monorepo paths.
 | Block/transaction model and query | New `chronik-db/src/v2_explorer.rs`, `chronik-indexer/src/query/v2_explorer.rs`, corresponding tests | Bounded records/key planning/read methods consumed by DB owner. No independent service or DB. |
 | Asset model and query | New `chronik-db/src/v2_asset.rs`, `chronik-indexer/src/query/v2_assets.rs`, corresponding tests | Pure event derivation and bounded query helpers; no edits to shared `v2_branch.rs`, bridges, router or frontend. |
 | Native integration / HTTP owner | Existing `chronik-lib/src/v2{,_ffi,_server}.rs`, `chronik-db/src/v2_branch.rs`, existing `chronik-http/src/v2.rs`, new `chronik-http/src/v2_explorer.rs`, module/build registrations | Owns schema bump, one atomic batch/undo, service epoch, new route registration, budgets and all cross-module interfaces. Integrates producer/model commits sequentially. |
-| Frontend | New monorepo `explorer/v2/` only, including client types, fixtures, navigation and tests | Typed API adapter with separate existing branch client; consumes reviewed contract fixtures. No native or shared docs edits. |
+| Frontend | New monorepo `explorer/v2/` only, including client types, fixtures, navigation and tests | Typed new-schema API adapter, including branch wrappers; consumes reviewed contract fixtures. No native or shared docs edits. |
 | Review/evidence | Dedicated validation/evidence files assigned after implementation | Independent contract/identity/reorg/bounds review, then isolated runtime evidence when authorized. No patch/export or deployment action implied. |
 
 The frontend includes overview/status, canonical block list and detail,
