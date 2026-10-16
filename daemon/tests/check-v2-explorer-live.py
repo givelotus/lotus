@@ -47,27 +47,26 @@ const {Window}=await import(pathToFileURL(packagePath+'/node_modules/happy-dom/l
 const win=new Window({url:base+'/?api='+encodeURIComponent(base)});
 win.document.write(await readFile(packagePath+'/index.html','utf8'));
 for(const k of ['window','document','location','sessionStorage'])globalThis[k]=k==='window'?win:win[k];
-const fetchReal=globalThis.fetch;const requests=[];
-globalThis.fetch=async(...args)=>{requests.push(String(args[0]));return fetchReal(...args);};
+const fetchReal=globalThis.fetch;const requests=[],reloads=[];
+globalThis.fetch=async(...args)=>{const response=await fetchReal(...args);requests.push({url:String(args[0]),status:response.status});return response;};
 await import(pathToFileURL(packagePath+'/dist/app.js'));
-async function ready(){const end=Date.now()+15000;while(Date.now()<end){const n=win.document.querySelector('#notice').textContent;if(n.startsWith('Observation loaded.'))return;if(n.startsWith('Invalid or unavailable')||n.startsWith('Absent')||n.startsWith('Index unavailable'))throw new Error(n);await new Promise(r=>setTimeout(r,20));}throw new Error('DOM screen deadline');}
+async function reload(notice){if(!win.document.querySelector('#results').classList.contains('stale'))throw new Error('503 content was not marked stale');const button=[...win.document.querySelectorAll('#notice button')].find(b=>b.textContent==='Reload screen');if(!button)throw new Error('503 reload action missing');reloads.push({notice,monotonic:performance.now()});console.error('TRANSIENT_UI_RELOAD '+JSON.stringify(reloads.at(-1)));await new Promise(r=>setTimeout(r,50));button.click();}
+async function ready(){const end=Date.now()+15000;let retries=0;while(Date.now()<end){const n=win.document.querySelector('#notice').textContent;if(n.startsWith('Observation loaded.'))return;if(n.startsWith('Index unavailable')&&retries++<3){await reload(n);continue;}if(n.startsWith('Invalid or unavailable')||n.startsWith('Absent')||n.startsWith('Index unavailable'))throw new Error(n);await new Promise(r=>setTimeout(r,20));}throw new Error('DOM screen deadline');}
 await ready();const screens=[];
 async function screen(route,expected){win.document.querySelector('#notice').textContent='';win.location.hash=route;win.dispatchEvent(new win.HashChangeEvent('hashchange'));await ready();const content=win.document.querySelector('#results').textContent;if(expected&&!content.includes(expected))throw new Error('Expected native fact missing from DOM: '+expected);screens.push({route,text:content});}
 await screen('/blocks',plan.block_id);await screen('/blocks/'+plan.block_id,plan.txid);
 await screen('/transactions/by-id/'+plan.txid,plan.txhash);
-const witness=[...win.document.querySelectorAll('#results button')].find(b=>b.textContent.startsWith('Witnesses:'));
-async function contains(text){const end=Date.now()+15000;while(Date.now()<end){if(win.document.querySelector('#results').textContent.includes(text))return;const n=win.document.querySelector('#notice').textContent;if(n.startsWith('Index unavailable')||n.startsWith('Invalid or unavailable')||n.startsWith('Snapshot changed'))throw new Error(n);await new Promise(r=>setTimeout(r,20));}throw new Error('DOM detail deadline: '+text);}
-if(witness){witness.click();await contains('Public witnesses');}
-const wire=[...win.document.querySelectorAll('#results button')].find(b=>b.textContent==='Inspect exact transaction wire');wire.click();await contains(plan.wire_prefix);
+async function extra(label,text,optional=false){for(let attempt=0;attempt<4;attempt++){const button=[...win.document.querySelectorAll('#results button')].find(b=>b.textContent.startsWith(label));if(!button){if(optional)return;throw new Error('Missing extra action '+label);}button.click();const end=Date.now()+15000;while(Date.now()<end){if(win.document.querySelector('#results').textContent.includes(text))return;const n=win.document.querySelector('#notice').textContent;if(n.startsWith('Index unavailable')){await reload(n);await ready();break;}if(n.startsWith('Invalid or unavailable')||n.startsWith('Snapshot changed'))throw new Error(n);await new Promise(r=>setTimeout(r,20));}}throw new Error('DOM detail deadline '+text);}
+await extra('Witnesses:','Public witnesses',true);await extra('Inspect exact transaction wire',plan.wire_prefix);
 await screen('/transactions/by-hash/'+plan.txhash,plan.txid);await screen('/outputs/'+plan.txid+'/0',plan.output_value);await screen('/assets');
-async function search(kind,value,expected,missing=false){win.document.querySelector('#notice').textContent='';win.document.querySelector('#kind').value=kind;win.document.querySelector('#query').value=value;win.document.querySelector('#search').dispatchEvent(new win.Event('submit',{cancelable:true}));if(missing){const end=Date.now()+15000;while(Date.now()<end&&!win.document.querySelector('#notice').textContent.startsWith('Absent'))await new Promise(r=>setTimeout(r,20));if(!win.document.querySelector('#notice').textContent.startsWith('Absent'))throw new Error('Unknown asset search must show covered-history absence');}else{await ready();if(expected&&!win.document.querySelector('#results').textContent.includes(expected))throw new Error('Typed search missing native fact '+kind);}screens.push({search_kind:kind,value,text:win.document.querySelector('#results').textContent,notice:win.document.querySelector('#notice').textContent});}
+async function search(kind,value,expected,missing=false){win.document.querySelector('#notice').textContent='';win.document.querySelector('#kind').value=kind;win.document.querySelector('#query').value=value;win.document.querySelector('#search').dispatchEvent(new win.Event('submit',{cancelable:true}));if(missing){const end=Date.now()+15000;let retries=0;while(Date.now()<end&&!win.document.querySelector('#notice').textContent.startsWith('Absent')){const n=win.document.querySelector('#notice').textContent;if(n.startsWith('Index unavailable')&&retries++<3)await reload(n);await new Promise(r=>setTimeout(r,20));}if(!win.document.querySelector('#notice').textContent.startsWith('Absent'))throw new Error('Unknown asset search must show covered-history absence');}else{await ready();if(expected&&!win.document.querySelector('#results').textContent.includes(expected))throw new Error('Typed search missing native fact '+kind);}screens.push({search_kind:kind,value,text:win.document.querySelector('#results').textContent,notice:win.document.querySelector('#notice').textContent});}
 await search('height',plan.height,plan.block_id);await search('block',plan.block_id,plan.block_id);await search('txid',plan.txid,plan.txhash);await search('txhash',plan.txhash,plan.txid);await search('outpoint',plan.txid+':0',plan.output_value);
 await search('asset',plan.assets[0]??'00'.repeat(32),plan.assets[0],plan.assets.length===0);
 if(plan.root)await search('branch',plan.root,plan.root);
 for(const id of plan.assets)await screen('/assets/'+id,id);
 if(plan.root){win.document.querySelector('#notice').textContent='';win.document.querySelector('#roots').value=plan.root;win.document.querySelector('#positions').value=JSON.stringify([{position:'0',roots:[plan.root]}]);win.document.querySelector('#branches').dispatchEvent(new win.Event('submit',{cancelable:true}));await ready();if(!win.document.querySelector('#results').textContent.includes(plan.root))throw new Error('Actual branch root missing from DOM');screens.push({route:'POST /branches/outputs',text:win.document.querySelector('#results').textContent});}
 if(!win.document.querySelector('#anchor').textContent.includes(plan.tip))throw new Error('DOM anchor differs from authenticated native tip');
-console.log(JSON.stringify({scope:'actual frontend DOM/live fetch, not manual browser evidence',screens,requests}));
+console.log(JSON.stringify({scope:'actual frontend DOM/live fetch, not manual browser evidence',screens,requests,reloads}));
 await win.happyDOM.abort();
 """
 
@@ -212,7 +211,12 @@ def main(argv=None):
                 require(next_offset==str(len(raw)) and int(next_offset)>int(offset),'wire did not advance');offset=next_offset
             raise AssertionError('transaction wire exceeded local bound')
         def context(self):
-            return dict(native=self.raw('status'),http=self.http('/status'))
+            deadline=time.monotonic()+self.timeout
+            while True:
+                native=self.raw('status');status=self.http('/status')
+                if status['ready'] and status['indexed_anchor']['block_id']==native.get('tip') and status['authoritative_anchor']['block_id']==native.get('tip'):return dict(native=native,http=status)
+                require(time.monotonic()<deadline,'context fence did not reach coherent ready observation')
+                time.sleep(.025)
         @staticmethod
         def stamp(context):
             n=context['native'];h=context['http']

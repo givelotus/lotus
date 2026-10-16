@@ -95,3 +95,12 @@ Idle-probe failures use a dedicated nonretryable exception, and successful DOM
 and native parity audits have an additional final context fence before evidence
 publication. This retained harness failure establishes no frontend defect or
 completed explorer lifecycle acceptance.
+
+Run `/private/tmp/lotus-v2-explorer-live-acceptance-20261015-c` is also retained.
+Its idle probe passed; a live DOM navigation then received an intentional brief
+503 during the native owner's authority suspend and correctly marked content
+stale with a Reload screen action. The DOM driver now verifies that state and
+exercises at most three explicit reloads per screen, preserving every transient
+notice/status in its evidence. Context fences wait for coherent ready status
+before comparing durable stamps, so temporary null anchors do not authorize a
+whole-observation restart. Neither change retries a 409 inside the idle probe.
