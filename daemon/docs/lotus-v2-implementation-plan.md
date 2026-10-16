@@ -6,9 +6,9 @@ Updated October 15, 2026. Development plan; no genesis parameters are frozen and
 
 ## Source foundation and current status
 
-The current executable [V2 series](../patches/v2/series) contains 304 patches,
-`000`–`303`, on ABC master `1fb7db17c176cdea8a2c60d887891589382ee4e3`.
-[Latest replay evidence](evidence/v2-series-replay-303.json) verifies every
+The current executable [V2 series](../patches/v2/series) contains 306 patches,
+`000`–`305`, on ABC master `1fb7db17c176cdea8a2c60d887891589382ee4e3`.
+[Latest replay evidence](evidence/v2-series-replay-305.json) verifies every
 intermediate tree. Offline daemon acceptance, restart, disconnect/reconnect,
 resumable fork recovery, bounded selection and actual two-process TCP full/compact
 synchronization have separate evidence below. Native production of signed fixture-payment blocks also passes across two nodes.
@@ -16,7 +16,33 @@ The foreground local controller now completes a live-wallet payment and restart
 across two isolated nodes; see the current controller evidence below. Development
 profile adoption and public launch remain pending.
 
-### Reviewed repairs through 303 (October 15)
+### Reviewed lifecycle repair through 305 (October 15)
+
+All 306 intermediate trees verify in a fresh replay. Source `c0ddb9cf30`
+has tree `2f8ada7e076b9c4e529bc8348834823785029fcd`; mailboxes 000–303
+remain byte-identical. The series commit parents `2fed44c7`, the then-current
+`lotus-v2` tip, and this plan update follows immediately.
+
+Patch 304 recovers existing pending durable work before Avalanche startup and
+saves the last admitted public peer cache during orderly stop. Restored records
+still require current-chain validation. Independent focused tests pass journal
+reopen/recovery, bounded deadlines, startup gating and real persistence failures.
+Patch 305 corrects the driver documentation. The full Debug Chronik-enabled
+daemon builds; immutable binary SHA256 is
+`5c05a1acf36a91c690505ca08bd291d9fd2e985fd483f9db08386c712c1f8bfa`.
+The new copied-home acceptance run reports recovery of the previously pending
+height1738 with exact accepted-ledger state; suffix import is still running in
+`/private/tmp/lotus-v2-native-quorum-c0ddb9cf30-20261015-a`. Funded cache
+retention, actual quorum/finality and restart acceptance remain outstanding.
+
+The preceding exact `8cd36091ba` inherited unit run passed all 305 registered
+runners (147 default, 147 upgrade-named, 11 Avalanche). Those runners precede
+this lifecycle change and do not prove native funded quorum behavior. Explorer
+live run e retains a real repeated-503 availability failure; a bounded frontend
+read-retry repair is under independent review. Separate-machine acceptance and
+remaining applicable functional gates remain unfinished.
+
+### Historical reviewed repairs through 303 (October 15)
 
 All 304 mailboxes replay in a fresh worktree, verifying every intermediate tree.
 Source `8cd36091ba` has tree `497041ae23601156327363373a5aa983c22242a5`.
