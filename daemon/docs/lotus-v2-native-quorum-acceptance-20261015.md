@@ -1,5 +1,12 @@
 # Native default-policy quorum acceptance
 
+Current result: source `cd8d5140ec` passed the actual nine-node authenticated
+quorum gate, but the unchanged 300-second all-nine finality gate failed. Only
+node eight finalized in the last snapshot. Fork/parking and nine-node restart
+gates remain unexecuted. All twelve owned processes exited cleanly and their
+PIDs are absent. The heavy execution window was released; no retry followed.
+See the [latest evidence](evidence/v2-native-quorum-cd8d-finality-deadline-20261015.json).
+
 `daemon/tests/check-v2-native-quorum.py` runs real isolated node processes with
 caller-pinned daemon source and binary SHA256. It accepts an existing bootstrap
 corpus only when its native evidence records all 2024 blocks accepted and hashes
@@ -168,3 +175,26 @@ This demonstrates actual authentication and quorum formation; it does not pass
 the all-nine finality requirement or establish that finalization is universally
 impossible. Fork, parking and nine-node restart gates were not reached. The
 failure remains preserved, with no longer deadline or blind retry.
+
+
+## Late-response policy repair: bounded actual run
+
+The fresh run used native source `cd8d5140ec7fce7da9a4e2a5a8b5d803ed4dc3f5`,
+immutable binary SHA256
+`5767c34242f939f5d6fb0fa7f740f87b0c829d179717a58eb4df5cb84c88f7d9`,
+and the unchanged reviewed harness. It copied the clean enabled 2024-block seed
+into a new artifact directory; all previous homes and failures remain preserved.
+Actual native provisioning, funded pending-stop recovery and all-nine authenticated
+default quorum passed. The unchanged 300-second seed-finality deadline expired,
+with only node eight finalized in the last gate snapshot. No fork, parking or
+nine-node restart gate was reached.
+
+The [recorded failure](evidence/v2-native-quorum-cd8d-finality-deadline-20261015.json)
+contains the exact last gate statuses, the passed authenticated-quorum checkpoint,
+each node's complete observed activation trajectory with stdout line and response
+ID, final stdout statuses, input and raw-trace hashes, and all twelve clean exit
+codes. The trajectories record reconnect activity; they do not identify its cause
+or distinguish response handling from slow policy reads. All owned PIDs were
+confirmed absent after terminal session exit 1, and the heavy execution window
+was released. Further diagnosis and a reviewed repair pin are required before
+another run; defaults and deadlines were not changed.
