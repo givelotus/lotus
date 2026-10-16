@@ -16,8 +16,15 @@ The goal remains active: a reviewed private network on separate machines, includ
 - Old c0 quorum run reached2024 and nine funded proofs, passed nonempty public
   cache pending-stop/observer-recovery, then failed readiness deadline amid IBD
   oscillation. All12owned children exited0; original failure and clean seed remain.
-  NEW run `/private/tmp/lotus-v2-native-quorum-e775de1363-20261015-a` is active
-  against a copy of that completed seed, with no reimport. It requires explicit
+  NEW run `/private/tmp/lotus-v2-native-quorum-e775de1363-20261015-a` stopped
+  after quorum7 exited1 with `avalanche-negotiated-capacity`; other11children
+  exited0. IBD remained false, but finality was not reached. Raw failing command
+  and missing-versus-zero ActiveLimit were not logged. The configured2MiB live
+  limit exceeds the earlier256000-byte local guard, supporting a stale/dead peer
+  diagnosis rather than oversized live traffic. All failed homes remain intact.
+  Sol owner `avalanche_provisioning` now implements typed peer-local outcomes
+  and atomic queue batches in new `/private/tmp/lotus-v2-native-peer-lifecycle-20261016`,
+  based on e775, with independent review. No blind rerun is authorized. It requires explicit
   selected-block-not-finalized and rival parked/not-conflicting-finalized checks.
   Owner `native_quorum_acceptance`; reviewer `avalanche_provision_review`.
 - Exact c0 functional smoke evidence integrated `a06ef593`:
