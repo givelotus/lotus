@@ -5,7 +5,13 @@ export interface BlockSummary {block_id:string;prev_id:string;height:string;time
 export interface TxSummary {txid:string;txhash:string;location:ObjectValue;status:'confirmed';confirmations:string;input_count:string;output_count:string;wire_size:string}
 export interface ByteRef {offset:string;length:string}
 export type Envelope = {api_version:'1'; snapshot_token:string; snapshot:Snapshot; coverage:ObjectValue; data:ObjectValue};
-export class ApiError extends Error { constructor(public status:number, public code:string, message:string) { super(message); } }
+export class ApiError extends Error {
+ attempts:RequestAttempt[]=[];
+ constructor(public status:number, public code:string, message:string) { super(message); }
+}
+export type RequestAttempt={attempt:number;status:number|null;code:string|null;meaning:string|null;elapsed_ms:number;retry_in_ms:number|null};
+export type RequestTrace={url:string;method:string;attempts:RequestAttempt[];outcome:'success'|'error'|'cancelled'|'deadline'};
+export type RetryPolicy={deadlineMs?:number;backoffMs?:readonly number[]};
 export const decimal = (value:unknown, max:bigint=340282366920938463463374607431768211455n):string => {
   if(typeof value !== 'string' || !/^(0|[1-9][0-9]*)$/.test(value) || value.length>39 || (max!==undefined && BigInt(value)>max)) throw new Error('Invalid canonical unsigned integer');
   return value;
@@ -44,21 +50,68 @@ export function searchRoute(kind:SearchKind,value:string):string {
  const id=hash(value); return ({block:'/blocks/',txid:'/transactions/by-id/',txhash:'/transactions/by-hash/',asset:'/assets/',branch:'/branches/outputs?root='} as const)[kind]+id;
 }
 export class Client {
- constructor(public base:string, private fetcher:typeof fetch=fetch) { const url=new URL(base); if(!['http:','https:'].includes(url.protocol)||url.username||url.password||url.search||url.hash) throw new Error('Use an HTTP API base without credentials/query/fragment'); this.base=base.replace(/\/$/,''); }
- async request(route:string, signal:AbortSignal, token?:string, body?:ObjectValue):Promise<Envelope> {
-   if(token&&token.length>2048)throw new Error('Snapshot token limit'); const encoded=body?JSON.stringify(body):undefined;if(encoded&&new TextEncoder().encode(encoded).length>32768)throw new Error('Request body limit'); const url=new URL(this.base+'/v2/explorer/v1'+route); if(token) url.searchParams.set('snapshot_token',token);
-   if(new TextEncoder().encode(url.search).length>32768)throw new Error('Query limit'); const response=await this.fetcher(url,{signal,cache:'no-store',method:body?'POST':'GET',headers:body?{'Content-Type':'application/json'}:{},body:encoded});
-   const parsed=await readJson(response).catch(e=>{if(response.status===503)throw new ApiError(503,'index_unavailable','Unavailable service sent an invalid response: '+String(e));throw e;});
-   if(!response.ok) { try{validateError(parsed,response.status);}catch(e){if(response.status===503)throw new ApiError(503,'index_unavailable','Unavailable service sent an invalid error envelope');throw e;} const error=object(object(parsed).error); throw new ApiError(response.status,String(error.code),String(error.meaning)); }
-   const envelope=validateEnvelope(parsed); validateRoute(route,envelope.data); return envelope;
+ readonly requestTraces:RequestTrace[]=[];
+ private deadlineMs:number;
+ private backoffMs:readonly number[];
+ constructor(public base:string, private fetcher:typeof fetch=fetch,policy:RetryPolicy={}) {
+   const url=new URL(base);if(!['http:','https:'].includes(url.protocol)||url.username||url.password||url.search||url.hash)throw new Error('Use an HTTP API base without credentials/query/fragment');this.base=base.replace(/\/$/,'');
+   this.deadlineMs=policy.deadlineMs??5000;this.backoffMs=Object.freeze([...(policy.backoffMs??[137,293,617])]);
+   if(!Number.isInteger(this.deadlineMs)||this.deadlineMs<1||this.deadlineMs>15000||this.backoffMs.length>3||this.backoffMs.some(ms=>!Number.isInteger(ms)||ms<1||ms>1000))throw new Error('Invalid bounded request retry policy');
  }
- async status(signal:AbortSignal):Promise<ObjectValue> {
-   const response=await this.fetcher(this.base+'/v2/explorer/v1/status',{signal,cache:'no-store'});
-   const parsed=await readJson(response).catch(e=>{if(response.status===503)throw new ApiError(503,'index_unavailable','Unavailable service sent an invalid response: '+String(e));throw e;});
-   if(!response.ok) {try{validateError(parsed,response.status);}catch(e){if(response.status===503)throw new ApiError(503,'index_unavailable','Unavailable service sent an invalid error envelope');throw e;}const e=object(object(parsed).error);throw new ApiError(response.status,String(e.code),String(e.meaning));}
-   return validateStatus(parsed);
+ private async read<T>(url:URL,signal:AbortSignal,init:RequestInit,retryable:boolean,parse:(response:Response,signal:AbortSignal)=>Promise<T>):Promise<T>{
+   const started=performance.now(),control=new AbortController(),attempts:RequestAttempt[]=[];let outcome:RequestTrace['outcome']='error';
+   const cancel=()=>control.abort(signal.reason);signal.addEventListener('abort',cancel,{once:true});if(signal.aborted)cancel();
+   const timer=setTimeout(()=>control.abort(new DOMException('Request deadline exceeded','TimeoutError')),this.deadlineMs);
+   try {
+     for(let attempt=1;;attempt++){
+       let response:Response|undefined;
+       try {
+         control.signal.throwIfAborted();
+         response=await abortable(this.fetcher(url,{...init,signal:control.signal,cache:'no-store'}),control.signal);
+         const value=await parse(response,control.signal);control.signal.throwIfAborted();
+         attempts.push({attempt,status:response.status,code:null,meaning:null,elapsed_ms:performance.now()-started,retry_in_ms:null});outcome='success';return value;
+       } catch(error) {
+         const pause=retryable&&error instanceof ApiError&&error.status===503&&!control.signal.aborted?this.backoffMs[attempt-1]:undefined;
+         attempts.push({attempt,status:response?.status??null,code:error instanceof ApiError?error.code:null,meaning:error instanceof Error?error.message:String(error),elapsed_ms:performance.now()-started,retry_in_ms:pause??null});
+         if(control.signal.aborted)throw control.signal.reason;
+         if(pause===undefined)throw error;
+         await delay(pause,control.signal);
+       }
+     }
+   } catch(error) {
+     if(signal.aborted){outcome='cancelled';throw signal.reason;}
+     if(control.signal.aborted){outcome='deadline';const unavailable=new ApiError(503,'index_unavailable','Request deadline exceeded before a coherent response');unavailable.attempts=attempts.slice();throw unavailable;}
+     if(error instanceof ApiError)error.attempts=attempts.slice();throw error;
+   } finally {
+     clearTimeout(timer);signal.removeEventListener('abort',cancel);
+     this.requestTraces.push({url:String(url),method:init.method??'GET',attempts:attempts.slice(),outcome});if(this.requestTraces.length>32)this.requestTraces.shift();
+   }
+ }
+ async request(route:string,signal:AbortSignal,token?:string,body?:ObjectValue):Promise<Envelope>{
+   if(token&&token.length>2048)throw new Error('Snapshot token limit');const encoded=body?JSON.stringify(body):undefined;if(encoded&&new TextEncoder().encode(encoded).length>32768)throw new Error('Request body limit');
+   const url=new URL(this.base+'/v2/explorer/v1'+route);if(token)url.searchParams.set('snapshot_token',token);if(new TextEncoder().encode(url.search).length>32768)throw new Error('Query limit');
+   // These POST endpoints are explicitly read-only query wrappers. Every other
+   // POST is sent once; only GET and these exact routes may retry a 503.
+   const readonlyBranch=body!==undefined&&['/v2/explorer/v1/branches/outputs','/v2/explorer/v1/branches/utxos'].includes(url.pathname);
+   return this.read(url,signal,{method:body?'POST':'GET',headers:body?{'Content-Type':'application/json'}:{},body:encoded},body===undefined||readonlyBranch,async(response,attemptSignal)=>{
+     const parsed=await responseJson(response,attemptSignal);const envelope=validateEnvelope(parsed);validateRoute(route,envelope.data);return envelope;
+   });
+ }
+ async status(signal:AbortSignal):Promise<ObjectValue>{
+   return this.read(new URL(this.base+'/v2/explorer/v1/status'),signal,{method:'GET'},true,async(response,attemptSignal)=>validateStatus(await responseJson(response,attemptSignal)));
  }
 }
+function abortable<T>(promise:Promise<T>,signal:AbortSignal):Promise<T>{
+ return new Promise((resolve,reject)=>{const abort=()=>{signal.removeEventListener('abort',abort);reject(signal.reason);};signal.addEventListener('abort',abort,{once:true});promise.then(value=>{signal.removeEventListener('abort',abort);resolve(value);},error=>{signal.removeEventListener('abort',abort);reject(error);});if(signal.aborted){signal.removeEventListener('abort',abort);reject(signal.reason);}});
+}
+function delay(ms:number,signal:AbortSignal):Promise<void>{
+ return new Promise((resolve,reject)=>{let timer:ReturnType<typeof setTimeout>;const abort=()=>{clearTimeout(timer);signal.removeEventListener('abort',abort);reject(signal.reason);};signal.addEventListener('abort',abort,{once:true});timer=setTimeout(()=>{signal.removeEventListener('abort',abort);resolve();},ms);if(signal.aborted)abort();});
+}
+async function responseJson(response:Response,signal:AbortSignal):Promise<unknown>{
+ const parsed=await readJson(response,signal).catch(error=>{signal.throwIfAborted();if(response.status===503)throw new ApiError(503,'index_unavailable','Unavailable service sent an invalid response: '+String(error));throw error;});
+ if(!response.ok){try{validateError(parsed,response.status);}catch(error){if(response.status===503)throw new ApiError(503,'index_unavailable','Unavailable service sent an invalid error envelope');throw error;}const error=object(object(parsed).error);throw new ApiError(response.status,String(error.code),String(error.meaning));}return parsed;
+}
+
 export class PinnedView {
  envelope?:Envelope;
  constructor(public client:Client,public signal:AbortSignal){}
@@ -121,8 +174,8 @@ export function validateStatus(value:unknown):ObjectValue{
  else if(o.reason==='ready'||c?.complete===true)throw new Error('Contradictory unavailable observation');return o;
 }
 function validateError(value:unknown,status:number){validateTree(value);const o=object(value);literal(o.api_version,'1');const e=object(o.error);text(e.code,64);text(e.meaning,4096);const codes:Record<string,number>={invalid_request:400,invalid_limits:400,invalid_cursor:400,stale_cursor:409,stale_snapshot:409,request_limit:413,record_limit:413,invalid_range:416,index_unavailable:503,not_in_covered_chain:404};if(typeof e.code!=='string'||codes[e.code]!==status)throw new Error('Invalid API error code/status');if(o.snapshot!==null)snapshot(o.snapshot);if(o.coverage!==null)coverage(o.coverage);if([404,409].includes(status)&&(o.snapshot===null||o.coverage===null))throw new Error('Missing fenced error observation');}
-async function readJson(response:Response):Promise<unknown>{
+async function readJson(response:Response,signal:AbortSignal):Promise<unknown>{
  const reader=response.body?.getReader();if(!reader)throw new Error('Missing response body');let size=0;const chunks:Uint8Array[]=[];
- try{while(true){const {done,value}=await reader.read();if(done)break;size+=value.byteLength;if(size>262144)throw new Error('Response exceeds 256 KiB');chunks.push(value);}}catch(e){await reader.cancel().catch(()=>{});throw e;}finally{reader.releaseLock();}
+ try{while(true){const {done,value}=await abortable(reader.read(),signal);if(done)break;size+=value.byteLength;if(size>262144)throw new Error('Response exceeds 256 KiB');chunks.push(value);}}catch(e){void reader.cancel().catch(()=>{});throw e;}finally{reader.releaseLock();}
  const bytes=new Uint8Array(size);let offset=0;for(const c of chunks){bytes.set(c,offset);offset+=c.byteLength;}return JSON.parse(new TextDecoder('utf-8',{fatal:true}).decode(bytes));
 }

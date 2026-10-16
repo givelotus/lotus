@@ -34,7 +34,7 @@ test('DOM screens, explicit navigation, exact units, escaping, witnesses, wire a
  };
  await import('../dist/app.js?dom-test');
  const wait=async()=>{for(let i=0;i<20;i++)await new Promise(r=>setTimeout(r,1));};
- const go=async route=>{win.location.hash=route;win.dispatchEvent(new win.HashChangeEvent('hashchange'));await wait();};
+ const go=async route=>{win.location.hash=route;await wait();};
  await wait();assert.match(win.document.querySelector('#results').textContent,/ready/);
  await go('/blocks');assert.match(win.document.querySelector('#results').textContent,/Canonical blocks/);assert.ok(win.document.querySelector('a[href="#/blocks/'+h+'"]'));
  await go('/blocks/'+h);assert.match(win.document.querySelector('#results').textContent,/Transactions/);
@@ -44,8 +44,8 @@ test('DOM screens, explicit navigation, exact units, escaping, witnesses, wire a
  for(const c of calls.filter(c=>/\/(inputs|outputs|witnesses|wire)$/.test(c.path)))assert.match(c.url,/snapshot_token=test-snapshot/);
  await go('/assets/'+token);assert.match(content.textContent,/mint cap and supply unknown/);assert.match(content.textContent,/Output history including burns/);
  win.document.querySelector('#roots').value=root;win.document.querySelector('#positions').value=JSON.stringify([{position:'0',roots:[root]}]);win.document.querySelector('#branches').dispatchEvent(new win.Event('submit',{cancelable:true}));await wait();assert.match(content.textContent,/Public branch \/ path inspector/);assert.equal(calls.at(-1).options.method,'POST');
- const previous=content.textContent;fail=1;await go('/blocks');assert.equal(content.textContent,previous);assert.ok(content.classList.contains('stale'));assert.match(win.document.querySelector('#notice').textContent,/stale/);for(const b of content.querySelectorAll('button'))assert.ok(b.disabled);
- fail=0;stale=20;const start=calls.length;await go('/blocks');assert.ok(calls.length-start<=4);assert.match(win.document.querySelector('#notice').textContent,/Snapshot changed/);assert.equal(content.textContent,'');
+ const previous=content.textContent;fail=1;await go('/blocks');for(let i=0;i<150&&!win.document.querySelector('#notice').textContent.startsWith('Index unavailable');i++)await new Promise(r=>setTimeout(r,10));assert.equal(content.textContent,previous);assert.ok(content.classList.contains('stale'));assert.match(win.document.querySelector('#notice').textContent,/stale/);for(const b of content.querySelectorAll('button'))assert.ok(b.disabled);
+ fail=0;stale=20;const start=calls.length;win.document.querySelector('#notice button').click();await wait();assert.ok(calls.length-start<=4);assert.match(win.document.querySelector('#notice').textContent,/Snapshot changed/);assert.equal(content.textContent,'');
  for(const input of win.document.querySelectorAll('input,select,textarea'))assert.ok(input.getAttribute('aria-label')||win.document.querySelector('label[for="'+input.id+'"]')||input.closest('label'));
  assert.ok(win.document.querySelector('[role="status"][aria-live="polite"]'));assert.ok(win.document.querySelector('.skip'));
  win.happyDOM.abort();
