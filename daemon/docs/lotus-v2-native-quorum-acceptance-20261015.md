@@ -1,11 +1,13 @@
 # Native default-policy quorum acceptance
 
-Current result: source `cd8d5140ec` passed the actual nine-node authenticated
-quorum gate, but the unchanged 300-second all-nine finality gate failed. Only
-node eight finalized in the last snapshot. Fork/parking and nine-node restart
-gates remain unexecuted. All twelve owned processes exited cleanly and their
-PIDs are absent. The heavy execution window was released; no retry followed.
-See the [latest evidence](evidence/v2-native-quorum-cd8d-finality-deadline-20261015.json).
+Current result: diagnostic source `bf4ddad652` passed the actual nine-node
+authenticated quorum gate, and four of nine nodes (nodes 6, 7, 8 and 9) finalized
+the seed tip, while the unchanged 300-second all-nine finality gate failed with
+remaining tip confidences 105–127 against the 128 threshold. Fork/parking and
+nine-node restart gates remain unexecuted. All twelve owned processes exited
+cleanly and their PIDs are absent. The heavy execution window was released; no
+retry followed. See the
+[latest evidence](evidence/v2-native-quorum-bf4d-finality-deadline-20261015.json).
 
 `daemon/tests/check-v2-native-quorum.py` runs real isolated node processes with
 caller-pinned daemon source and binary SHA256. It accepts an existing bootstrap
@@ -198,3 +200,35 @@ or distinguish response handling from slow policy reads. All owned PIDs were
 confirmed absent after terminal session exit 1, and the heavy execution window
 was released. Further diagnosis and a reviewed repair pin are required before
 another run; defaults and deadlines were not changed.
+
+## Passive-diagnostic source `bf4ddad652`: bounded actual run
+
+The diagnostic run in `/private/tmp/lotus-v2-native-quorum-diagnostics-20261015-a`
+used native source `bf4ddad652ac50396b164e6ae018a51da31ac890`, immutable binary
+SHA256 `82a591431485309f893814b522e61a46668c6876b147ccd1602891fb5485edbc`, and
+the unchanged reviewed harness (`0ae10ff124b4238910686799c3000e2c99f60894d69bc3f79bac2edc0ff1562d`).
+It copied the clean enabled 2024-block seed into a fresh directory while
+preserving all prior runs. Actual native provisioning, funded pending-stop
+recovery, observer readmission and all-nine authenticated default quorum passed
+at stdout line 46 across all nine nodes.
+
+The unchanged 300-second seed-finality deadline then expired. Four of the nine
+nodes (nodes 6, 7, 8 and 9) finalized the seed tip (`tip_finalized=true`,
+`tip_confidence` 132–134), while nodes 1 through 5 reached `tip_confidence` 110,
+105, 127, 121 and 123 (below the 128 finalization threshold). Every observed
+application rejection across all nine nodes fell into `application_rejections.other`
+(final counts 4, 1, 9, 3, 8, 7, 12, 5, 6), paired 1:1 with
+`peer_disconnect_causes.application_rejected`, occurring on the 60-second
+`getavaproofs` discovery cycle and interrupting peer eligibility and confidence
+accumulation. Zero cooldown rejections, zero response rejections, zero invalid
+headers/bodies, and zero transport read/write errors occurred. All twelve owned
+child processes exited 0 and their PIDs were confirmed absent.
+
+The [diagnostic failure evidence](evidence/v2-native-quorum-bf4d-finality-deadline-20261015.json)
+retains the passed quorum checkpoint, final gate and stdout statuses, per-line
+confidence/rejection/activation trajectories, cleanup records and raw-trace
+SHA256 digests. Fork, parking and nine-node restart gates were not reached. A
+reviewed repair to proof-discovery shortid matching, already-known proof
+registration and per-connection outbound queue draining is required before the
+next acceptance run.
+

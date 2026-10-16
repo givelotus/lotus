@@ -32,11 +32,20 @@ wallet-enabled daemon, CLI, wallet tool and V2 wallet client build passed; see
 [evidence](evidence/v2-native-build-bf4ddad652.json). Dependency deployment-target
 warnings remain; this does not establish older-macOS or Linux compatibility.
 
-The preceding cd8 nine-node run failed its unchanged finality deadline. A new run
-with these frozen binaries is authorized with the same harness, quorum defaults
-and deadlines; its outcome is not yet established. No finality fix or complete
-private-testnet acceptance is claimed. Full final-revision suites, coverage,
-separate-host workflow and consolidation build gates remain incomplete.
+The bounded diagnostic run with these frozen binaries (`bf4ddad652`, daemon SHA256
+`82a591431485309f893814b522e61a46668c6876b147ccd1602891fb5485edbc`) passed seed
+reuse, all nine native proof provisions, funded pending-stop recovery, observer
+readmission and all-nine authenticated default quorum. Four nodes (6, 7, 8, 9)
+finalized the seed tip, while nodes 1–5 reached tip confidence 105–127 before the
+unchanged 300-second deadline expired; see
+[quorum acceptance](lotus-v2-native-quorum-acceptance-20261015.md) and
+[diagnostic evidence](evidence/v2-native-quorum-bf4d-finality-deadline-20261015.json).
+All twelve owned child processes exited 0 and their PIDs were confirmed absent.
+Every observed peer application rejection fell into `other` on the 60-second
+`getavaproofs` discovery cycle (`peer_disconnect_causes.application_rejected`).
+A reviewed discovery/queue repair is required before the next acceptance run.
+Full final-revision suites, coverage, separate-host workflow and consolidation
+build gates remain incomplete.
 
 ### Reviewed audit repairs through 317 (October 15)
 
