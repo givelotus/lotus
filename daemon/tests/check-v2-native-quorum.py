@@ -20,6 +20,7 @@ def main():
     p.add_argument('--output',type=Path,required=True)
     p.add_argument('--phase',choices=('seed','quorum'),default='quorum')
     p.add_argument('--seed',type=Path,help='reuse a stopped enabled seed produced by this harness')
+    p.add_argument('--resume-seed',action='store_true',help='continue a cleanly stopped enabled seed after an import deadline')
     p.add_argument('--seed-daemon-sha256',help='explicit compatible old seed binary hash when upgrading only observational API')
     p.add_argument('--require-block-observation',action='store_true')
     p.add_argument('--timeout',type=float,default=30)
@@ -30,6 +31,7 @@ def main():
     require=local.require
     daemon=a.daemon.resolve();bootstrap=a.bootstrap.resolve();root=a.output.resolve()
     require(root.as_posix().startswith('/private/tmp/'),'isolated canonical /private/tmp output required')
+    require(not a.resume_seed or a.seed,'resume requires an explicit stopped enabled seed')
     require(local.digest(daemon)==a.daemon_sha256,'immutable daemon hash differs')
     require(local.hex_string(a.daemon_source,20),'full source pin required')
     require(60<=a.deadline_seconds<=14400 and 1<=a.timeout<=60,'bounded deadlines required')
@@ -66,15 +68,20 @@ def main():
     try:
         if a.seed:
             previous=a.seed.resolve(); prior=json.loads((previous/'evidence.json').read_text())
-            require(prior.get('seed_passed') and prior['daemon_sha256']==(a.seed_daemon_sha256 or a.daemon_sha256) and prior['manifest_sha256']==local.digest(manifest),'stopped enabled seed evidence mismatch')
+            resumable=a.resume_seed and prior.get('phase')=='seed' and prior.get('failure',{}).get('error') in ('import deadline expired','global deadline expired waiting for quiescence')
+            require((prior.get('seed_passed') or resumable) and prior['daemon_sha256']==(a.seed_daemon_sha256 or a.daemon_sha256) and prior['manifest_sha256']==local.digest(manifest),'stopped enabled seed evidence mismatch')
             require(all(x['exit']==0 for x in prior['cleanup']),'seed not cleanly stopped')
             evidence['seed_source']=dict(directory=str(previous),evidence_sha256=local.digest(previous/'evidence.json'),daemon_source=prior['daemon_source'],daemon_sha256=prior['daemon_sha256'])
             save()
             shutil.copytree(previous/'seed-home',root/'seed-home')
         seed=start('seed',root/'seed-home')
-        initial=status(seed);require(initial['height']==(2024 if a.seed else 0) and initial['avalanche']['observer'],'enabled observer state differs')
+        initial=status(seed)
+        require(initial['avalanche']['observer'] and (0<=initial['height']<=2024 if a.resume_seed else initial['height']==(2024 if a.seed else 0)),'enabled observer state differs')
         ledger=[json.loads(row) for row in (bootstrap/'accepted-blocks.jsonl').read_text().splitlines()]
-        for row in ([] if a.seed else ledger):
+        if initial['height']:
+            require(all(initial[k]==ledger[initial['height']-1]['status'][k] for k in local.STATE_FIELDS),'resumed enabled seed differs from actual accepted ledger')
+            check('resumed-enabled-seed-ledger-prefix',status=initial)
+        for row in [r for r in ledger if r['height']>initial['height']]:
             require(time.monotonic()<end,'import deadline expired')
             height=row['height'];body=bootstrap/'blocks'/(str(height)+'.block')
             require(local.digest(body)==row['body_sha256'],'bootstrap body hash mismatch')
