@@ -1,5 +1,10 @@
 # Native explorer asset acceptance
 
+The complete gate passes on native source
+`8cd36091ba9da0665ceab621ce42306963fcbfd9`, binary SHA256
+`635d7c5a6512b686e7af5add1daa29c8252eb5f77db5dcae4fd49f0dd84b2d0d`.
+The recorded result is [the acceptance evidence](evidence/v2-explorer-assets-live-acceptance.json).
+
 The dedicated gate is `daemon/tests/check-v2-explorer-assets-live.py`. It uses
 native development-node JSONL controls and actual explorer HTTP. It creates fresh
 homes, binds ephemeral loopback ports, refuses ports 10604/10605/8331, stops its
@@ -33,8 +38,11 @@ The complete gate checks:
 The harness records exact binary/profile/harness/reference hashes, process
 commands, accepted full block bytes, submitted transaction bytes, native JSONL
 responses, and timestamped HTTP requests. A final `passed:true` requires every
-stage. There is a separate HTTP-only idle publication probe; it must not hide
-sustained generation churn behind unbounded snapshot retries.
+stage. There is a separate HTTP-only idle publication probe. Each sample waits for
+a ready status within a bounded deadline, retaining transient unavailable
+observations. Ten ready samples must share the exact epoch, generation and tip;
+there is no retry on a generation mismatch. Attempt counts and elapsed probe
+time are recorded, with a 300-second overall run deadline.
 
 Example (requires Python with `blake3`, and a freshly named output directory):
 
@@ -47,7 +55,31 @@ python3 daemon/tests/check-v2-explorer-assets-live.py \
   --output /tmp/new-explorer-assets-acceptance
 ```
 
-## Initial live finding
+## Passing native lifecycle
+
+The final run at
+`/private/tmp/lotus-v2-explorer-assets-native-live-20261015-g/evidence.json`
+passes all four complete asset observations. At height 3 the summary has one
+event/two token outputs; height 4 has two events/four outputs; height 5 has
+three events/four outputs and no live token UTXO. The mint's zero burn remains
+in history. The transfer reports 250 explicit plus 150 implicit burned units;
+the final input-only event reports another 600 implicit burned units.
+
+A competing native chain forks from height 2 and becomes canonical at height 6.
+The original asset and its transactions return fenced 404, the registry is empty,
+and the original mined funding coin is restored. The same three transaction
+frames re-enter the real pool and are selected by `minepool`, then confirm in
+height 7 at transaction indexes 1/2/3. The asset's first occurrence and every
+creation/spend/event location move to this new block. Counters return to three
+events/four outputs; both burn modes and an empty token UTXO set still match.
+
+The idle HTTP-only probe keeps generation `3` at unchanged genesis for all ten
+ready samples. The final evidence includes every native and HTTP request,
+accepted body hashes and all process exit codes; every owned child exits cleanly.
+The earlier passing run `f` remains available independently. Native consensus,
+wallet token support and compiler contracts were not changed by this test.
+
+## Initial live finding (preserved failure)
 
 Binary source `86201398e3df61605c2eb2d09c201ce774013e7f`, SHA256
 `8c6c2d0ed9fc490b8cdb8900f01564ca6902c5d7dbe269eae8d0becefe27ae32`,
@@ -65,5 +97,5 @@ and publication in the native event loop. These original traces are retained at
 
 This initial binary does not pass the complete gate. Mint acceptance and the
 failed pinned read do not establish transfer, burn, rollback or complete explorer
-acceptance. A repaired exact binary must pass the entire same gate before those
-claims are made.
+acceptance. The repaired exact binary listed above subsequently passes the complete gate;
+the original failure traces remain unchanged.

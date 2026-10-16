@@ -215,12 +215,12 @@ def main(argv=None):
         ready(a)
         # No native command or transaction is issued between these HTTP-only
         # samples. Record idle publication churn explicitly before pinned reads.
-        idle=[]
+        idle=[]; probe_started=time.monotonic_ns(); probe_http_start=len(record['http'])
         for _ in range(10):
-            sample=http(a,'/status');idle.append(dict(monotonic_ns=time.monotonic_ns(),tip=sample['indexed_anchor'],epoch=sample['service_epoch'],generation=sample['generation'],ready=sample['ready']))
+            sample=eventually(lambda:http(a,'/status'),lambda s:s['ready'],'idle status never became ready');idle.append(dict(monotonic_ns=time.monotonic_ns(),tip=sample['indexed_anchor'],epoch=sample['service_epoch'],generation=sample['generation'],ready=sample['ready']))
             time.sleep(.025)
-        check('idle-http-only-authority-stability',samples=idle)
-        require(all(s['ready'] for s in idle) and len({(s['epoch'],s['generation']) for s in idle})==1,
+        check('idle-http-only-authority-stability',samples=idle,http_attempts=len(record['http'])-probe_http_start,elapsed_ns=time.monotonic_ns()-probe_started,total_deadline_seconds=300)
+        require(all(s['ready'] for s in idle) and len({(s['epoch'],s['generation'],s['tip']['block_id'],s['tip']['height']) for s in idle})==1,
             'idle authority publications prevent stable pinned reads; inspect idle HTTP-only trace')
         funding,_=mine(a,0)
         for _ in range(manifest['coinbase_maturity']-1): mine(a,0)
@@ -258,6 +258,8 @@ def main(argv=None):
     finally:
         for node in reversed(nodes):
             if node.process.poll() is None: node.stop()
+        record['cleanup']=dict(all_stopped=all(node.process.poll() is not None for node in nodes),processes=[dict(label=node.label,pid=node.process.pid,returncode=node.process.returncode) for node in nodes])
+        save()
     print('Native explorer asset lifecycle passed:',root)
 
 
