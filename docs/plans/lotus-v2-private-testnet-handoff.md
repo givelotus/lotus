@@ -2,6 +2,23 @@
 
 The goal remains active: a reviewed private network on separate machines, including wallet payments relayed A→B and mined from C’s mempool, restart/reorg reconciliation, explorer and authenticated Avalanche. Component passes do not establish completion. QUIC/public deployment deferred.
 
+## Latest acceptance result
+
+Native63c run `/private/tmp/lotus-v2-native-quorum-63c5149944-20261015-a`
+passed authenticated default quorum on all9nodes, then failed
+`real-polled-seed-finality deadline expired` after300seconds. All12owned children
+exited0; mesh PIDs are absent. No finality/fork/restart acceptance claim.
+`avalanche_provisioning` and `avalanche_provision_review` are independently
+investigating source/traces without changing thresholds or deadline. Harness
+owner is archiving failure evidence. No new run is authorized before diagnosis.
+
+Operator acceptance evidence is integrated `93d479b3`; updated runbook commits
+`4dcfe652`/`0a36c6f6` document implemented commands and exact source distinctions.
+The functional owner has authorization for scoped CLI/wallet/protobuf builds at
+63c and an isolated Python3.13 dependency environment, but no functional node
+runs yet. Remaining inventory is292scripts/319variants. Disk5.2GiB does not meet
+long-pruning8GiBminimum; retain that as incomplete. Full goal remains active.
+
 ## Current continuation — supersedes earlier status below
 
 - Reviewed operator source integrated as `80da829b` and `f2abf45a`. Root's
