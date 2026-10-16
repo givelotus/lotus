@@ -179,7 +179,11 @@ def main():
                 receipt['failure'] = failure
             receipt['retained_log_receipts'] = []
             receipt['actual_port_settings'] = []
-            for path in sorted(target.rglob('*')):
+            for entry_index, path in enumerate(target.rglob('*')):
+                if entry_index >= 50000:
+                    failure = failure or 'receipt_file_scan_cap'
+                    receipt['failure'] = failure
+                    break
                 if path.is_file() and (path.name.endswith('.log') or path.name in ('bitcoin.conf', 'results.xml')):
                     receipt['retained_log_receipts'].append({'path': str(path), 'bytes': path.stat().st_size, 'sha256': digest(path)})
                     if path.name == 'bitcoin.conf':
