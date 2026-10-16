@@ -193,16 +193,24 @@ def main():
         # Equal work preserves the selected tip. Poll this retained rival while
         # it is still eligible, before finality would suppress reconciliation.
         for node in active:
+            selected_before=node.request('blockstatus',block_id=selected_id)
+            check('selected-block-before-rival-submission',node=node.label,status=selected_before)
+            require(selected_before['tip']==selected_id and not selected_before['avalanche']['tip_finalized'],'selected block finalized before rival submission')
+            if a.require_block_observation:
+                observation=selected_before['block_observation']
+                require(selected_before['block_id']==selected_id and observation['observation_available'] and observation['active'] and not observation['finalized'],'selected requested-id pre-finality observation differs')
             answer=node.request('submitblock',block=fork_body)
-            require(answer.get('ok'),'equal-work fork submission failed')
             check('competing-fork-submitted-before-finality',node=node.label,block_id=fork_id,response=answer)
+            require(answer.get('ok') and answer['tip']==selected_id and not answer['avalanche']['tip_finalized'],'rival submission crossed selected-block finality')
         if a.require_block_observation:
             until=min(end,time.monotonic()+180)
             while time.monotonic()<until:
                 observations=[n.request('blockstatus',block_id=fork_id) for n in active]
-                if all(q.get('block_observation',{}).get('observation_available') and q['block_observation']['parked'] for q in observations):
-                    check('real-polled-competing-fork-parked',statuses=observations);break
-                evidence['last_fork_observations']=observations;save();time.sleep(.25)
+                evidence['last_fork_observations']=observations;save()
+                require(all(q['tip']==selected_id and not q['avalanche']['tip_finalized'] and not q.get('block_observation',{}).get('conflicting_finalized',False) for q in observations),'selected block finalized before actual rival parking evidence')
+                if all(q.get('block_observation',{}).get('observation_available') and q['block_id']==fork_id and q['block_observation']['valid'] and q['block_observation']['has_data'] and q['block_observation']['parked'] and not q['block_observation']['active'] and not q['block_observation']['finalized'] for q in observations):
+                    check('real-polled-competing-fork-parked-before-finality',statuses=observations);break
+                time.sleep(.25)
             else:raise AssertionError('real-polled competing fork did not park')
         selected=wait_all('selected-block-real-finality',lambda s:s['tip']==selected_id and s['avalanche']['tip_finalized'],300)
         for node in active:
