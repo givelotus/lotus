@@ -105,3 +105,25 @@ Any substantive failure pauses progression without weakening assertions. Record
 skip77, timeout, resource refusal and unrun remainder explicitly. Full inherited
 functional acceptance needs all319 variant receipts; native V2 chain, VM,
 quorum/finality and asset acceptance remain separate.
+
+## First approved batch result
+
+At exact native `63c51499441ded6d0fe34d87ff43d53a14b1398f`, batch001
+exited1 after128.48seconds: **2passed,1failed,5notrun due failfast**.
+The five runner skips are unexecuted variants, with no feature exclusions.
+`abc_p2p_compactblocks.py` and `abc_feature_parkedchain.py` passed.
+`abc-cmdline.py:100` expects the upstream Bitcoin ABC user-agent brand;
+retained peer version logs show `/Lotus:0.34.1(EB32.0; testnode-0)/`.
+Its2MB restart passed `getexcessiveblock` before the brand assertion failed.
+The existing EB2.0 and comment assertions must survive the fixture correction.
+
+[Batch receipt](evidence/v2-functional-final-gate-plan-63c5149944/batch-001/results.json)
+records all eight identities, exact source/config/binary provenance, raw log
+paths and hashes, JUnit, resource supervision and empty final process group.
+There was no deadline/resource termination or cleanup signal. Minimum observed
+free space was4,603,490,304bytes; peak measured scratch216,354,816bytes.
+All raw homes/logs remain at the recorded paths. No later batch ran.
+Across the319variant plan there are2passes,1failure and316notrun.
+Continuation is paused for review; only the failing script may be rerun after
+review of its scoped fixture correction. These inherited regtest results do
+not establish native V2 quorum or consensus acceptance.
