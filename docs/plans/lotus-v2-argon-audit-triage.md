@@ -48,3 +48,30 @@ is ready.
 The independently discovered expired-poll response mismatch is being repaired
 in disjoint Avalanche peer/poll/driver files. It is not evidence that Argon's
 other findings are resolved, or that the nine-node finality failure is fixed.
+
+## Root call-path check at native63c (October 15)
+
+- **10 remains open, confirmed repeated work:** `Node::ReadBlock` creates a new
+  body vector and calls `ReadConnectedBody` for every1..65536-byte request.
+  `ReadRetainedBlockBody` reads retained metadata/undo, decodes the full wire,
+  verifies identities/PoW/state binding, then the command slices the requested
+  range. For a sequential B-byte read at fixed chunk C this repeats full-body
+  work ceil(B/C) times. This is the local JSONL command path; do not infer every
+  P2P serving path behaves identically. A bounded cache must retain runtime
+  authority/profile/generation checks and cannot merely bypass revalidation.
+- **12 remains open:** repeated `EncodeTransaction` calls are present in ordinary
+  validation, monetary accounting and outer costing. The report's exact4x/2x
+  per-block counts have not been established for every path. Any prepared facts
+  must bind exact immutable transaction/profile/chain inputs and preserve
+  public validation APIs and corruption/error detection.
+- **13 remains open:** `RefreshInventory` preserves progress on periodic refresh,
+  but explicit deadline0 resets it; accepted submissions and activations set0.
+  Sustained explicit invalidations need a fairness regression. Requiring relay
+  bit8 is visible in Node::Attach, but whether it is an intended local node
+  policy or violates a protocol promise requires version/profile review before
+  changing negotiation.
+
+The independent expired-response correction is integrated in native `71d24930cf`
+(original reviewed605e1483b5). Poll/peer tests and strict driver compilation pass;
+full daemon/series export/quorum rerun remain pending. The maintained series still
+ends at63c/307; this native-only integration is not a new validated daemon claim.
