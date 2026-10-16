@@ -18,7 +18,6 @@ Decision packet P02, October 9, 2026. **Recommended candidate**, not frozen or i
 | owninput | `Lotus/v2/owninput` |
 | output | `Lotus/v2/output` |
 | txroot | `Lotus/v2/txroot` |
-| outpointkey | `Lotus/v2/outpointkey` |
 | utxo | `Lotus/v2/utxo` |
 | state | `Lotus/v2/state` |
 | blockid | `Lotus/v2/blockid` |
@@ -81,58 +80,52 @@ Zero32                   = 00^32
 
 Because layer index $s$ runs bottom-up from $0$ (leaves) to $k - 1$ (root), for any leaf index `idx in 0 .. n - 1`, at step $s = 0 \dots k - 1$, bit $s$ of `idx` (`(idx >> s) & 1`) is `0` when the node is the left child (`cur[2j]`) and `1` when the node is the right child (`cur[2j + 1]`). Consequently, `MERKLEROOT_INDEXED` (`0xc1`, `hash_alg = 0`) verifies any leaf `L[idx]` against `IndexedTreeRoot(L)` in a single instruction (`<L[idx]> <u16(idx)> <proof_bytes> <0> MERKLEROOT_INDEXED`), while the outer transaction header in `TxID` (`input_count:u16` and `output_count:u16` in [P01](encoding-and-signatures.md)) binds the exact vector lengths.
 
-## Block transaction vector: ordered, count-bound tree (and planned Merklix sharding upgrade)
+## Block transaction commitment: prefix-sharded Merklix `Subtree A` and top-level `CoinbaseLeaf`
 
-Let transaction i, including the first coinbase, have the 64-byte leaf value `w_i = TxHash_i || TxID_i`. Define `T(xs)`:
+Per the maintainer's sharding architecture ([*Sharding Bitcoin Cash*](https://www.bitcoinabc.org/2018-09-06-sharding-bitcoin-cash/), September 6, 2018), scaling block construction, mempool acceptance, and transaction commitment across horizontal CPU cores and processes requires **consistent key-prefix range partitioning** rather than positional array-index splitting.
+
+Let transaction $i$ ($0 \le i < n$) have identity pair `(TxID_i, TxHash_i)`, with `vtx[0]` as the block's coinbase transaction and `vtx[1 .. n - 1]` as the block's non-coinbase transactions. All `TxID_i` in a block (or commitment vector) MUST be pairwise distinct. Define:
 
 ```text
-T([])  = H_txroot(02)
-T([w]) = H_txroot(00 || w)
-T(xs), n>1:
-    k = greatest power of two strictly less than n
-    return H_txroot(01 || T(xs[0:k]) || T(xs[k:n]))
-TxRoot(xs) = H_txroot(03 || u32(n) || T(xs))
+TxLeaf(TxID, TxHash) = H_txroot(00 || TxID || TxHash)
+TxNode(d, l, r)      = H_txroot(01 || u16(d) || l || r)       # d=0..255
+EmptyTxRoot          = H_txroot(02)
 ```
 
-Each leaf commits to both identities of its transaction, TxHash first, as Lotus v1's block tree does. The TxHash fixes the complete bytes, witnesses included; the TxID lets a proof show that a transaction ID, and therefore its outpoints, is in a block by supplying the two 32-byte hashes, without the transaction or its witnesses. Children are ordered; no sorting, duplication or zero-padding occurs. Empty vector has a defined commitment for tools, but a block with no coinbase is invalid. Count is bounded before construction. This split strategy follows the ordered-tree principle in [RFC 6962 §2.1](https://www.rfc-editor.org/rfc/rfc6962#section-2.1); Lotus adds its own context and count wrapper and uses BLAKE3.
+Key bit `d` of `TxID` is `bit(TxID, d) = (TxID[d//8] >> (d%8)) & 1` (the exact same 256-bit little-endian bit order as `UtxoRoot`). For a set of distinct `(TxID, TxHash)` non-coinbase entries inside the subtree at depth `d` (`0 <= d <= 256`), the single-leaf-collapsed Merklix subtree root `tx_smt(entries, d)` is:
 
-A transaction inclusion proof is `count:u32 || index:u32 || Vec(h32 siblings)` plus the transaction bytes, or the TxHash and TxID pair, being proved. A verifier given only the pair learns that the TxID is committed, not that the TxHash it was given corresponds to any particular witness bytes. Require `0 <= index < count`, count within the consensus block-transaction limit, and exact sibling consumption. Reconstruct recursively: for n=1 use the leaf; otherwise compute k, recurse into the child containing index, consume the next sibling from the bottom-up proof, and combine left/right according to index<k. Finally apply the count wrapper. No direction mask is serialized; count and index determine every direction. A proof API must clearly distinguish committed transaction membership from complete transaction/block validity.
+- **Empty subtree (`|entries| == 0`):** `EmptyTxRoot`.
+- **Single-leaf subtree (`|entries| == 1`):** `TxLeaf(TxID, TxHash)` directly, regardless of depth `d` (all single-child levels from `d` to `256` are collapsed).
+- **Multi-entry subtree (`|entries| >= 2`, `0 <= d < 256`):** Partition `entries` by `bit(TxID, d)` into `left` (bit `0`) and `right` (bit `1`), and return `TxNode(d, tx_smt(left, d + 1), tx_smt(right, d + 1))`.
 
-### Maintainer architecture direction (2026-10-16): Horizontal sharding via prefix-keyed Merklix trees
+The top-level block transaction commitment `TxRoot(xs)` is:
 
-Per the maintainer's sharding design ([*Sharding Bitcoin Cash*](https://www.bitcoinabc.org/2018-09-06-sharding-bitcoin-cash/), September 6, 2018), scaling block construction, mempool acceptance, and UTXO validation across horizontal CPU cores and processes requires **consistent key-prefix range partitioning** rather than positional array-index splitting:
+- **Empty vector ($n == 0$, tool primitive only):** `TxRoot([]) = EmptyTxRoot` (a block with no coinbase is invalid).
+- **Non-empty vector ($n \ge 1$):** Let `CoinbaseLeaf = TxLeaf(TxID_0, TxHash_0)` and `SubtreeA = tx_smt(xs[1 .. n - 1], 0)`. Then:
+  ```text
+  TxRoot(xs) = H_txroot(03 || CoinbaseLeaf || SubtreeA)
+  ```
+  ```text
+                   [ header.tx_root ]
+                      /          \
+        [ CoinbaseLeaf ]        [ Subtree A ]   <-- 256-bit Merklix tree of vtx[1..n-1] keyed by TxID
+                                  /       \
+                        [ Subtree B ]   [ Subtree C ]
+                         (prefix 0...)   (prefix 1...)
+  ```
 
-1. **Why positional `T(xs[0:k]) || T(xs[k:n])` prevents horizontal sharding:**
-   - In an array-index-split tree (`k = greatest_power_of_two(n)`), internal node boundaries depend on the exact element count `n` of preceding ranges. If Shard `0` (owning `TxID` prefix `0b0...`) adds or removes a single transaction, the array index of every transaction in Shards `1 .. 2^k - 1` shifts by $\pm 1$, crossing power-of-two boundaries and invalidating every subsequent shard's subtree hashes.
-2. **Prefix-sharded Merklix `Subtree A` + top-level `Coinbase` combination (`tx_root`):**
-   - Non-coinbase transactions (`vtx[1 .. n - 1]`) are canonically ordered by `TxID` (`CTOR`) and committed in a **256-bit `TxID`-prefix-keyed single-leaf-collapsed Merklix tree (`Subtree A`)**:
-     ```text
-                      [ header.tx_root ]
-                         /          \
-           [ CoinbaseLeaf ]        [ Subtree A ]   <-- 256-bit Merklix tree of vtx[1..n-1] keyed by TxID
-                                     /       \
-                           [ Subtree B ]   [ Subtree C ]
-                            (prefix 0...)   (prefix 1...)
-     ```
-   - In `Subtree A`, the **256-bit key** (which defines the bit-path through the tree and the canonical `CTOR` wire order) is **`TxID`**, while the **leaf hash** at the end of that path commits to both `TxID` and `TxHash`:
-     ```text
-     TxLeaf(TxID, TxHash) = H_txroot(00 || TxID || TxHash)
-     ```
-     (`TxHash` is committed as the leaf value at key `TxID` and never alters the tree path or sort order.)
-   - Because `Subtree A` splits strictly by the bits of `TxID`, any $2^k$ mempool/validation shards (where Shard $s \in [0, 2^k - 1]$ owns the $k$-bit `TxID` prefix $s$) can maintain their mempool subtrees and pre-compute `(TxSubtreeRoot[s], fee_sum[s], cost_sum[s])` **100% independently with zero cross-shard count synchronization**.
-   - On `getblocktemplate`, the coordinator aggregates the $2^k$ shard roots into `Subtree A` (32 bytes) and sums `fee_sum`/`cost_sum`, constructs the block's coinbase (`vtx[0]`), and combines `CoinbaseLeaf` with `Subtree A` in **one single top-level hash ($O(1)$)** without re-entering any shard:
-     ```text
-     TxRoot = H_txroot(03 || CoinbaseLeaf || SubtreeA)
-     ```
-3. **Shard- and B+Tree-co-located Outpoint keys (`txid || vout` prefix preservation):**
-   - Hashing `Outpoint` via `H_outpointkey(txid || vout)` scatters multiple outputs of the same transaction (`vout = 0, 1, ...`) across uncorrelated shards, separate 27-level Merklix paths, and separate 4 KB `libmdbx` B+Tree leaf pages.
-   - Preserving `txid` as the leading prefix of `OutpointKey` (`txid || vout`, read MSB-first to match `Path::Key()` in `dbi_smt_nodes` and `dbi_coins`) guarantees that:
-     - **Path-based Merklix storage (`dbi_smt_nodes`) and Vout lookup storage (`dbi_coins`) share the exact same key prefix:** A depth-$d$ path in `dbi_smt_nodes` is simply the first $d$ bits of `txid || vout`. All outputs created by a single transaction share one Merklix path down to the transaction's `txid` depth and sit adjacent in a single 4 KB `libmdbx` leaf page in both `dbi_coins` and `dbi_smt_nodes`.
-     - **Two-phase sharded validation (`ProvenTx` + async spend-mark):** When a transaction `tx` arrives with wallet-supplied `CoinProof`s (`ProvenTx`), the shard owning `tx.TxID` verifies the `CoinProof`s and VM scripts in RAM with zero disk/network I/O and already owns the UTXO shard where all of `tx`'s new outputs (`(tx.TxID, vout)`) are inserted; it only sends a lightweight async spend-mark/double-spend check `(prev_txid, prev_vout, spending_txid)` to the shard owning `prev_txid`'s prefix.
-4. **Explicit delayed / pipelined coinbase UTXO insertion:**
-   - Because Block $h$'s coinbase transaction (`vtx[0]`) cannot be constructed until after the shards report `fee_sum` for Block $h$, inserting Block $h$'s coinbase outputs into `UtxoRoot` during Block $h$ itself would force a second round-trip from the coordinator back to whichever shard owns `coinbase_txid`'s prefix before `state_root` could be finalized.
-   - Because coinbase outputs are already unspendable until maturity (`COINBASE_MATURITY = 100`), **coinbase outputs from Block $h$ are explicitly inserted into `UtxoRoot` in a subsequent block (e.g., Block $h + 1$, or upon maturity)** when Block $h$'s `coinbase_txid` is already immutable and known to all shards at the start of the block.
-   - This eliminates the second coordinator-to-shard round-trip during `getblocktemplate` while ensuring that every coinbase UTXO resides on the exact UTXO shard corresponding to `coinbase_txid`'s prefix and is looked up and spent identically to an ordinary transaction.
+Each leaf commits to both identities of its transaction (`TxID` first, then `TxHash`). `TxHash` fixes the complete witness bytes as the leaf value at key `TxID`, while `TxID` alone defines the 256-bit prefix path through `Subtree A`. Because `Subtree A` partitions strictly by the bits of `TxID`, any $2^k$ mempool/validation shards (where Shard $s \in [0, 2^k - 1]$ owns the $k$-bit `TxID` prefix $s$) can maintain their mempool subtrees and pre-compute `(TxSubtreeRoot[s], fee_sum[s], cost_sum[s])` **100% independently with zero cross-shard count synchronization**, and `Subtree A` is invariant to the slice ordering of `vtx[1 .. n - 1]` (allowing topological parent-before-child ordering in block wire format while committing a canonical prefix-keyed tree). On `getblocktemplate`, the coordinator aggregates the $2^k$ shard roots into `Subtree A` (32 bytes), constructs `vtx[0]`, and combines `CoinbaseLeaf` with `Subtree A` in **one single top-level hash ($O(1)$)** without re-entering any shard.
+
+### Canonical transaction membership and absence proof
+
+A transaction proof against `TxRoot` begins with a 1-byte selector `is_coinbase:u8`:
+
+- **`is_coinbase = 1` (coinbase proof):** `01 || TxID_0:h32 || TxHash_0:h32 || SubtreeA:h32` (97 bytes). The verifier computes `CoinbaseLeaf = TxLeaf(TxID_0, TxHash_0)` and checks `H_txroot(03 || CoinbaseLeaf || SubtreeA) == TxRoot`.
+- **`is_coinbase = 0` (non-coinbase Merklix proof in `Subtree A` for `query_txid:h32`):**
+  ```text
+  00 || CoinbaseLeaf:h32 || presence:u8 || [TxID:h32 || TxHash:h32 if presence in (1, 2)] || bitmap:32bytes || siblings
+  ```
+  where `presence` (`0` = empty branch absence, `1` = membership with `TxID == query_txid`, `2` = prefix-collision absence with a single leaf `TxID != query_txid` agreeing on bits `0 .. k - 1`), `bitmap` (32 bytes), and `siblings` (`popcount(bitmap)` 32-byte hashes ordered from depth `k - 1` down to `0`, none equal to `EmptyTxRoot`) reconstruct `SubtreeA` using `TxLeaf`, `TxNode`, and `EmptyTxRoot` by the exact same rules as `UtxoRoot` below, and the verifier checks `H_txroot(03 || CoinbaseLeaf || SubtreeA) == TxRoot`.
 
 ## UTXO map: compact single-leaf-collapsed sparse binary tree
 
@@ -140,7 +133,8 @@ Use a 256-bit keyed sparse binary tree with single-leaf subtree collapsing as th
 
 ```text
 Outpoint = txid:h32 || output_index:u32
-key = H_outpointkey(Outpoint)
+OutpointKey(txid, output_index) = txid[0..28] || u32_le(u32_le(txid[28..32]) ^ output_index)
+key = OutpointKey(txid, output_index)
 Coin = Outpoint || Bytes(Output) || creation_height:u64
        || creation_parent_mtp:u64 || coinbase:u8
 UtxoLeaf(key,coin) = H_utxo(00 || key || Bytes(Coin))
@@ -148,19 +142,21 @@ UtxoNode(d,l,r) = H_utxo(01 || u16(d) || l || r)       # d=0..255
 EmptyRoot = H_utxo(02)
 ```
 
+Preserving the first 28 bytes (224 bits) of `txid` and XORing the trailing 32-bit little-endian word `txid[28..32]` with `output_index` keeps all outputs of a single transaction co-located under the same 224-bit prefix in `UtxoRoot`, on the same horizontal shard as `txid` in `Subtree A`, and adjacent in B+Tree storage (`dbi_coins` and `dbi_smt_nodes`), while guaranteeing distinct 256-bit keys for distinct `output_index` values of the same `txid`.
+
 Key bit `d` is `bit(key, d) = (key[d//8] >> (d%8)) & 1`: bit `d` of the key read as an unsigned little-endian 256-bit integer, least significant bit first, in keeping with the byte-order convention used everywhere else. For a set of distinct `(key, coin)` entries inside the subtree at depth `d` (`0 <= d <= 256`), the subtree root `smt(entries, d)` is:
 
 - **Empty subtree (`|entries| == 0`):** `EmptyRoot`.
 - **Single-leaf subtree (`|entries| == 1`):** `UtxoLeaf(key, coin)` directly, regardless of depth `d` (all single-child levels from `d` to `256` are collapsed).
 - **Multi-entry subtree (`|entries| >= 2`, `0 <= d < 256`):** Partition `entries` by `bit(key, d)` into `left` (bit `0`) and `right` (bit `1`), and return `UtxoNode(d, smt(left, d + 1), smt(right, d + 1))`.
 
-`UtxoRoot` is `smt(all_entries, 0)`. Only spendable outputs (`(flags & 0x02) == 0`) are inserted into `UtxoRoot`; burn/commitment outputs (`(flags & 0x02) != 0`, which have `path_count == 0`) are pruned at transaction application and never enter `UtxoRoot` (`C17`). Coin's outpoint must derive its key, coinbase must be `0` or `1`, flags must be `0x00` or `0x01`, and its output must satisfy spendable output well-formedness (including `MAX_OUTPUT_BRANCHES = 16` and `MAX_OUTPUT_PATHS = 16`, which bounds every `Coin` record to $\le 868\text{ bytes}$). Height/time and coinbase flag are consensus metadata, not database hints. Inserting a different outpoint at an occupied hash key rejects; never overwrite or merge such entries.
+`UtxoRoot` is `smt(all_entries, 0)`. Only spendable outputs (`(flags & 0x02) == 0`) are inserted into `UtxoRoot`; burn/commitment outputs (`(flags & 0x02) != 0`, which have `path_count == 0`) are pruned at transaction application and never enter `UtxoRoot` (`C17`). Coin's outpoint must derive its key, coinbase must be `0` or `1`, flags must be `0x00` or `0x01`, and its output must satisfy spendable output well-formedness (including `MAX_OUTPUT_BRANCHES = 16` and `MAX_OUTPUT_PATHS = 16`, which bounds every `Coin` record to $\le 868\text{ bytes}$). Height/time and coinbase flag are consensus metadata, not database hints. Inserting a different outpoint at an occupied key rejects; never overwrite or merge such entries.
 
 The map root is independent of insertion order. Deletion removes the entry, which automatically collapses any ancestor node whose remaining subtree drops to a single entry. Duplicate-key snapshot entries reject even when identical. Pre/post roots alone do not establish that the intervening transaction set was valid.
 
 ### Canonical membership and absence proof
 
-For a queried `Outpoint` with `query_key = H_outpointkey(Outpoint)`, encode:
+For a queried `Outpoint = txid:h32 || output_index:u32` with `query_key = OutpointKey(txid, output_index)`, encode:
 
 ```text
 presence:u8 || [Bytes(Coin) if presence in (1, 2)] || bitmap:32bytes || siblings
@@ -176,7 +172,7 @@ In a single-leaf-collapsed tree, following `bit(query_key, d)` from `d = 0` term
 
 - **`presence = 1` (membership):** `Coin.Outpoint` MUST equal the queried `Outpoint`, and `acc = UtxoLeaf(query_key, Coin)`.
 - **`presence = 0` (absence at an empty branch):** No `Coin` is serialized, and `acc = EmptyRoot`. (When `k > 0`, the sibling at depth `k - 1` must be an interior node rather than a single leaf, because a parent with `EmptyRoot` on one side and a single leaf on the other would have collapsed to that single leaf; implementations may additionally reject a single-leaf sibling if tagged, and root comparison binds `UtxoNode(k - 1, ...)` against `UtxoRoot`.)
-- **`presence = 2` (absence by prefix collision with another single leaf):** `Coin.Outpoint` MUST differ from the queried `Outpoint`, `other_key = H_outpointkey(Coin.Outpoint)` MUST agree with `query_key` on all bits `0 .. k - 1` (`bit(other_key, d) == bit(query_key, d)` for every `0 <= d < k`), and `acc = UtxoLeaf(other_key, Coin)`.
+- **`presence = 2` (absence by prefix collision with another single leaf):** `Coin.Outpoint` MUST differ from the queried `Outpoint`, `other_key = OutpointKey(Coin.txid, Coin.output_index)` MUST agree with `query_key` on all bits `0 .. k - 1` (`bit(other_key, d) == bit(query_key, d)` for every `0 <= d < k`), and `acc = UtxoLeaf(other_key, Coin)`.
 
 For each depth `d = k - 1` down to `0`, let `sib = EmptyRoot` if bit `d` of `bitmap` is `0`, or consume the next 32-byte hash from `siblings` if bit `d` is `1` (rejecting if `sib == EmptyRoot`). Set `acc = UtxoNode(d, acc, sib)` when `bit(query_key, d) == 0`, or `UtxoNode(d, sib, acc)` when `bit(query_key, d) == 1`. After `k` steps (`d = 0`), require `acc == UtxoRoot`.
 
@@ -198,7 +194,7 @@ A node accepts the package only if: the anchor is on its best chain and at most 
 
 A TxID-based proof is not a substitute: a TxID with its transaction-tree path and output-tree path shows only that an output was created in some block, not that it remains unspent at the current tip.
 
-Limits of this candidate. Proof size is about one sibling per doubling of the coin set (about 27 siblings, near 1 KB per input, at 10^8 coins). A proof expires when its anchor leaves the window; any state-holding node can reissue it and need not be trusted. Checking a block's new state_root without state additionally needs the paths of every key the block inserts; because keys are hashes of outpoints these are scattered, so a block-level multiproof from the producer is required and is not designed here. Block producers need the coin set or a complete set of proofs.
+Limits of this candidate. Proof size is about one sibling per doubling of the coin set (about 27 siblings, near 1 KB per input, at 10^8 coins). A proof expires when its anchor leaves the window; any state-holding node can reissue it and need not be trusted. Checking a block's new state_root without state additionally needs the paths of every key the block inserts; because all outputs of a transaction share a 224-bit `txid` prefix, outputs created by the same transaction share a single Merklix path down to depth 224 and are co-located on the shard owning `txid`'s prefix. Block producers need the coin set or a complete set of proofs.
 
 ## Full state root and canonical 56-byte `MonetaryState`
 

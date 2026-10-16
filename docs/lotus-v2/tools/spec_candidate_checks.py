@@ -102,65 +102,130 @@ def branch(a: bytes, b: bytes) -> bytes:
     return h('branch', b'\1' + lo + hi)
 
 
-def split(n: int) -> int:
-    return 1 << ((n - 1).bit_length() - 1)
-
-
-def tree(items: list[bytes]) -> bytes:
-    if not items:
-        return h('txroot', b'\2')
-    if len(items) == 1:
-        return h('txroot', b'\0' + items[0])
-    k = split(len(items))
-    return h('txroot', b'\1' + tree(items[:k]) + tree(items[k:]))
-
-
-def txroot(items: list[bytes]) -> bytes:
-    return h('txroot', b'\3' + u(len(items), 4) + tree(items))
-
-
-def audit(items: list[bytes], index: int) -> list[bytes]:
-    if len(items) == 1:
-        return []
-    k = split(len(items))
-    if index < k:
-        return audit(items[:k], index) + [tree(items[k:])]
-    return audit(items[k:], index - k) + [tree(items[:k])]
-
-
-def recover_txroot(count: int, index: int, witness_id: bytes, siblings: list[bytes]) -> bytes:
-    route = []
-    n, i = count, index
-    assert 0 <= i < n
-    while n > 1:
-        k = split(n)
-        left = i < k
-        route.append(left)
-        if left:
-            n = k
-        else:
-            n, i = n - k, i - k
-    assert len(route) == len(siblings)
-    root = h('txroot', b'\0' + witness_id)
-    for left, sibling in zip(reversed(route), siblings):
-        a, b = (root, sibling) if left else (sibling, root)
-        root = h('txroot', b'\1' + a + b)
-    return h('txroot', b'\3' + u(count, 4) + root)
-
-
-def node(depth: int, left: bytes, right: bytes) -> bytes:
-    return h('utxo', b'\1' + u(depth, 2) + left + right)
-
-
+EMPTY_TX_ROOT = h('txroot', b'\2')
 EMPTY_ROOT = h('utxo', b'\2')
-
-
 EMPTY_INDEXED_ROOT = h('merkleidx', b'\2')
 ZERO32 = b'\0' * 32
 
 
 def bit(key: bytes, depth: int) -> int:
     return (key[depth // 8] >> (depth % 8)) & 1  # little-endian bit order
+
+
+def tx_leaf(tx_id: bytes, tx_hash: bytes) -> bytes:
+    assert len(tx_id) == 32 and len(tx_hash) == 32
+    return h('txroot', b'\0' + tx_id + tx_hash)
+
+
+def tx_node(depth: int, left: bytes, right: bytes) -> bytes:
+    return h('txroot', b'\1' + u(depth, 2) + left + right)
+
+
+def tx_smt(entries: dict[bytes, bytes], depth: int = 0) -> bytes:
+    if not entries:
+        return EMPTY_TX_ROOT
+    if len(entries) == 1:
+        tx_id, tx_hash = next(iter(entries.items()))
+        return tx_leaf(tx_id, tx_hash)
+    assert depth < 256
+    left = {k: v for k, v in entries.items() if bit(k, depth) == 0}
+    right = {k: v for k, v in entries.items() if bit(k, depth) == 1}
+    return tx_node(depth, tx_smt(left, depth + 1), tx_smt(right, depth + 1))
+
+
+def txroot(items: list[bytes]) -> bytes:
+    if not items:
+        return EMPTY_TX_ROOT
+    seen_ids: set[bytes] = set()
+    for item in items:
+        assert len(item) == 64
+        tx_id = item[32:64]
+        assert tx_id not in seen_ids, 'duplicate transaction id'
+        seen_ids.add(tx_id)
+    cb_hash, cb_id = items[0][:32], items[0][32:64]
+    cb_leaf = tx_leaf(cb_id, cb_hash)
+    entries = {item[32:64]: item[:32] for item in items[1:]}
+    return h('txroot', b'\3' + cb_leaf + tx_smt(entries))
+
+
+def tx_path(entries: dict[bytes, bytes], key: bytes, depth: int = 0) -> tuple[dict[bytes, bytes], list[tuple[int, bytes]]]:
+    if len(entries) <= 1:
+        return entries, []
+    assert depth < 256
+    selected = {k: v for k, v in entries.items() if bit(k, depth) == bit(key, depth)}
+    other = {k: v for k, v in entries.items() if bit(k, depth) != bit(key, depth)}
+    terminal, path = tx_path(selected, key, depth + 1)
+    return terminal, path + [(depth, tx_smt(other, depth + 1))]
+
+
+def tx_proof(items: list[bytes], query_txid: bytes, is_coinbase: bool = False) -> bytes:
+    assert len(items) >= 1 and len(query_txid) == 32
+    cb_hash, cb_id = items[0][:32], items[0][32:64]
+    cb_leaf = tx_leaf(cb_id, cb_hash)
+    entries = {item[32:64]: item[:32] for item in items[1:]}
+    if is_coinbase:
+        assert query_txid == cb_id
+        return b'\1' + cb_id + cb_hash + tx_smt(entries)
+    terminal, path = tx_path(entries, query_txid)
+    if not terminal:
+        start = b'\0'
+    else:
+        term_id, term_hash = next(iter(terminal.items()))
+        start = (b'\1' if term_id == query_txid else b'\2') + term_id + term_hash
+    bitmap = bytearray(32)
+    nondefault = []
+    for depth, sibling in path:
+        if sibling != EMPTY_TX_ROOT:
+            bitmap[depth // 8] |= 1 << (depth % 8)
+            nondefault.append(sibling)
+    return b'\0' + cb_leaf + start + bytes(bitmap) + b''.join(nondefault)
+
+
+def recover_txroot(query_txid: bytes, proof: bytes) -> bytes:
+    is_cb = proof[0]
+    assert is_cb in (0, 1)
+    if is_cb == 1:
+        assert len(proof) == 97 and proof[1:33] == query_txid
+        cb_leaf = tx_leaf(proof[1:33], proof[33:65])
+        return h('txroot', b'\3' + cb_leaf + proof[65:97])
+    cb_leaf = proof[1:33]
+    presence = proof[33]
+    assert presence in (0, 1, 2)
+    offset = 34
+    term_id, term_hash = None, None
+    if presence in (1, 2):
+        term_id = proof[offset:offset + 32]
+        term_hash = proof[offset + 32:offset + 64]
+        assert len(term_id) == 32 and len(term_hash) == 32
+        offset += 64
+    bitmap = proof[offset:offset + 32]
+    assert len(bitmap) == 32
+    offset += 32
+    set_bits = [d for d in range(256) if bitmap[d // 8] & (1 << (d % 8))]
+    k = 0 if not set_bits else max(set_bits) + 1
+    if presence == 0:
+        acc = EMPTY_TX_ROOT
+    elif presence == 1:
+        assert term_id == query_txid and term_hash is not None
+        acc = tx_leaf(term_id, term_hash)
+    else:
+        assert term_id is not None and term_id != query_txid and term_hash is not None
+        assert all(bit(term_id, d) == bit(query_txid, d) for d in range(k))
+        acc = tx_leaf(term_id, term_hash)
+    for depth in range(k - 1, -1, -1):
+        sibling = EMPTY_TX_ROOT
+        if bitmap[depth // 8] & (1 << (depth % 8)):
+            sibling = proof[offset:offset + 32]
+            assert len(sibling) == 32 and sibling != EMPTY_TX_ROOT
+            offset += 32
+        left, right = (sibling, acc) if bit(query_txid, depth) else (acc, sibling)
+        acc = tx_node(depth, left, right)
+    assert offset == len(proof)
+    return h('txroot', b'\3' + cb_leaf + acc)
+
+
+def node(depth: int, left: bytes, right: bytes) -> bytes:
+    return h('utxo', b'\1' + u(depth, 2) + left + right)
 
 
 def indexed_tree_root(leaves: list[bytes]) -> bytes:
@@ -273,9 +338,15 @@ def state_proof(entries: dict[bytes, bytes], key: bytes) -> bytes:
     return start + bytes(bitmap) + b''.join(nondefault)
 
 
+def outpoint_key(outpoint: bytes) -> bytes:
+    assert len(outpoint) == 36
+    tail = int.from_bytes(outpoint[28:32], 'little') ^ int.from_bytes(outpoint[32:36], 'little')
+    return outpoint[:28] + u(tail, 4)
+
+
 def recover_compact(outpoint: bytes, proof: bytes) -> bytes:
     """Decode the generated P02 fixtures; this is not a hardened input parser."""
-    key = h('outpointkey', outpoint)
+    key = outpoint_key(outpoint)
     presence = proof[0]
     assert presence in (0, 1, 2)
     offset, coin = 1, None
@@ -304,7 +375,7 @@ def recover_compact(outpoint: bytes, proof: bytes) -> bytes:
         root = h('utxo', b'\0' + key + blob(coin))
     else:
         assert coin is not None and coin[:36] != outpoint
-        other_key = h('outpointkey', coin[:36])
+        other_key = outpoint_key(coin[:36])
         assert all(bit(other_key, d) == bit(key, d) for d in range(k))
         root = h('utxo', b'\0' + other_key + blob(coin))
     for depth in range(k - 1, -1, -1):
@@ -761,24 +832,37 @@ def make_vectors() -> dict:
 
     transaction_trees = []
     for count in range(18):
-        items = [h('txhash', u(i, 4)) + h('txid', u(i, 4)) for i in range(count)]  # leaf = TxHash || TxID
+        items = [h('txhash', u(i, 4)) + h('txid', u(i, 4)) for i in range(count)]  # item = TxHash || TxID
         expected = txroot(items)
+        if count >= 2:
+            assert txroot([items[0]] + list(reversed(items[1:]))) == expected
         for i in range(count):
-            assert recover_txroot(count, i, items[i], audit(items, i)) == expected
+            query_txid = items[i][32:64]
+            assert recover_txroot(query_txid, tx_proof(items, query_txid, is_coinbase=(i == 0))) == expected
+        if count >= 1:
+            absent_txid = h('txid', u(999, 4))
+            assert recover_txroot(absent_txid, tx_proof(items, absent_txid, is_coinbase=False)) == expected
         transaction_trees.append({'count': count, 'root': expected.hex()})
 
     coin = outpoint + blob(prev_output) + u(100, 8) + u(1700000000, 8) + b'\0'
-    key = h('outpointkey', outpoint)
+    key = outpoint_key(outpoint)
+    assert key == outpoint[:32]  # vout = 0 preserves txid exactly
+    same_tx_outpoint_1 = outpoint[:32] + u(1, 4)
+    same_tx_key_1 = outpoint_key(same_tx_outpoint_1)
+    assert same_tx_key_1[:28] == key[:28] and same_tx_key_1[28:32] != key[28:32]
+    same_tx_coin_1 = same_tx_outpoint_1 + blob(output) + u(100, 8) + u(1700000000, 8) + b'\0'
+    _, same_tx_path = state_path({key: coin, same_tx_key_1: same_tx_coin_1}, key)
+    assert len(same_tx_path) == 225 and same_tx_path[0][0] == 224
     other_outpoint = b'\x22' * 32 + u(1, 4)
     other_coin = other_outpoint + blob(output) + u(101, 8) + u(1700000001, 8) + b'\0'
-    other_key = h('outpointkey', other_outpoint)
+    other_key = outpoint_key(other_outpoint)
     absent_outpoint = b'\x33' * 32 + u(2, 4)
-    absent_key = h('outpointkey', absent_outpoint)
+    absent_key = outpoint_key(absent_outpoint)
     entries = {key: coin, other_key: other_coin}
     state_root = smt(entries)
     assert state_root == smt(dict(reversed(list(entries.items()))))
     for query_outpoint in (outpoint, other_outpoint, absent_outpoint):
-        query = h('outpointkey', query_outpoint)
+        query = outpoint_key(query_outpoint)
         assert recover_compact(query_outpoint, state_proof(entries, query)) == state_root
     # Single-leaf map: root is UtxoLeaf directly (0 interior node hashes), and absence uses presence=2 at k=0.
     single_map = {key: coin}

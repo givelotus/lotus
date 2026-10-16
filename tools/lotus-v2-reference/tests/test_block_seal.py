@@ -2,7 +2,7 @@
 
 import unittest
 
-from lotus_v2_reference.block import Connected, Undo, state_root, transaction_root
+from lotus_v2_reference.block import Connected, Undo, outpoint_key, state_root, transaction_root
 from lotus_v2_reference.block_seal import (
     HEADER_SIZE, MAX_TIME, Header, block_id, decode_target, meets_target,
     parse_header, seal_child_header, serialize_header,
@@ -98,22 +98,39 @@ class BlockSealTests(unittest.TestCase):
         parent, connected, _supplied = _sample()
         # Native leaf fill: tx_hash is i, tx_id is i+16.
         identities = tuple(
-            (bytes([i]) * 32, bytes([i + 16]) * 32) for i in (1, 2)
+            (bytes([i]) * 32, bytes([i + 16]) * 32) for i in (1, 2, 3)
         )
         empty = transaction_root(())
         self.assertEqual(
             empty.hex(),
-            "eebdd2bf2b0f92f1764c36eaef67a3ba72195a4206f2ea225db80605833beadb",
+            "24518f458e1e543b742619b81b0f24839a1753a447ff5322ca80fcfa705b0856",
         )
         one = transaction_root(identities[:1])
-        two = transaction_root(identities)
+        two = transaction_root(identities[:2])
+        three = transaction_root(identities)
         self.assertNotEqual(one, empty)
         self.assertNotEqual(two, one)
+        self.assertNotEqual(three, two)
         self.assertNotEqual(transaction_root((identities[1], identities[0])), two)
+        self.assertEqual(
+            transaction_root((identities[0], identities[2], identities[1])),
+            three,
+        )
+        with self.assertRaisesRegex(ValueError, "duplicate transaction id"):
+            transaction_root((identities[0], identities[0]))
+        with self.assertRaisesRegex(ValueError, "duplicate transaction id"):
+            transaction_root((identities[0], identities[1], (bytes([99]) * 32, identities[1][1])))
+        sample_txid = bytes(range(32))
+        self.assertEqual(outpoint_key(sample_txid, 0), sample_txid)
+        self.assertEqual(outpoint_key(sample_txid, 1)[:28], sample_txid[:28])
+        self.assertEqual(
+            int.from_bytes(outpoint_key(sample_txid, 1)[28:32], "little"),
+            int.from_bytes(sample_txid[28:32], "little") ^ 1,
+        )
         committed_state = state_root(
             parent.chain_id, 100, connected.utxo_root, MONEY,
         )
-        for root in (empty, one, two):
+        for root in (empty, one, two, three):
             sealed = seal_child_header(
                 parent, connected, root, 2, 50120, 400, 0x1D00FFFF, POW_LIMIT,
             )

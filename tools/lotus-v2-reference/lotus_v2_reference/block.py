@@ -72,7 +72,8 @@ def branch_leaf(script: bytes) -> bytes:
 
 
 def outpoint_key(tx_id: bytes, index: int) -> bytes:
-    return tagged("Lotus/v2/outpointkey", tx_id + index.to_bytes(4, "little"))
+    tail = int.from_bytes(tx_id[28:32], "little") ^ (index & 0xFFFFFFFF)
+    return tx_id[:28] + tail.to_bytes(4, "little")
 
 
 def encode_spend_core(tx_id: bytes, index: int, script: bytes = OP_TRUE) -> bytes:
@@ -185,24 +186,27 @@ def state_root(chain_id: bytes, height: int, root: bytes, monetary: MonetaryStat
     return tagged("Lotus/v2/state", payload)
 
 
-def _transaction_subtree(identities: tuple[tuple[bytes, bytes], ...]) -> bytes:
-    count = len(identities)
-    if count == 0:
+def _transaction_leaf(tx_id: bytes, tx_hash: bytes) -> bytes:
+    return tagged("Lotus/v2/txroot", bytes([0]) + tx_id + tx_hash)
+
+
+def _transaction_subtree(rows: list[tuple[bytes, bytes]], depth: int) -> bytes:
+    if not rows:
         return tagged("Lotus/v2/txroot", bytes([2]))
-    if count == 1:
-        tx_hash, tx_id = identities[0]
-        return tagged("Lotus/v2/txroot", bytes([0]) + tx_hash + tx_id)
-    # Greatest power of two strictly less than count. Children stay ordered.
-    split = 1
-    while split < count - split:
-        split <<= 1
-    left = _transaction_subtree(identities[:split])
-    right = _transaction_subtree(identities[split:])
-    return tagged("Lotus/v2/txroot", bytes([1]) + left + right)
+    if len(rows) == 1:
+        tx_hash, tx_id = rows[0]
+        return _transaction_leaf(tx_id, tx_hash)
+    left: list[tuple[bytes, bytes]] = []
+    right: list[tuple[bytes, bytes]] = []
+    for row in rows:
+        (right if _bit(row[1], depth) else left).append(row)
+    payload = bytes([1, depth & 0xFF, (depth >> 8) & 0xFF])
+    payload += _transaction_subtree(left, depth + 1) + _transaction_subtree(right, depth + 1)
+    return tagged("Lotus/v2/txroot", payload)
 
 
 def transaction_root(identities: tuple[tuple[bytes, bytes], ...]) -> bytes:
-    """Count-wrapped ordered root of ``(tx_hash, tx_id)`` pairs.
+    """Prefix-sharded Merklix root of ``(tx_hash, tx_id)`` pairs with top-level coinbase leaf.
 
     Empty is defined for tools. This does not require a coinbase or accept a block.
     """
@@ -212,6 +216,7 @@ def transaction_root(identities: tuple[tuple[bytes, bytes], ...]) -> bytes:
     if count > 0xFFFFFFFF:
         raise ValueError("transaction count")
     leaves: list[tuple[bytes, bytes]] = []
+    seen_ids: set[bytes] = set()
     for item in identities:
         if (isinstance(item, (bytes, bytearray)) or not isinstance(item, (list, tuple))
                 or len(item) != 2):
@@ -220,9 +225,17 @@ def transaction_root(identities: tuple[tuple[bytes, bytes], ...]) -> bytes:
         if (not isinstance(tx_hash, bytes) or len(tx_hash) != 32
                 or not isinstance(tx_id, bytes) or len(tx_id) != 32):
             raise ValueError("transaction identity")
+        if tx_id in seen_ids:
+            raise ValueError("duplicate transaction id")
+        seen_ids.add(tx_id)
         leaves.append((tx_hash, tx_id))
-    payload = bytes([3]) + count.to_bytes(4, "little") + _transaction_subtree(tuple(leaves))
-    if len(payload) != 37:
+    if count == 0:
+        return tagged("Lotus/v2/txroot", bytes([2]))
+    coinbase_hash, coinbase_id = leaves[0]
+    coinbase_leaf = _transaction_leaf(coinbase_id, coinbase_hash)
+    subtree_a = _transaction_subtree(leaves[1:], 0)
+    payload = bytes([3]) + coinbase_leaf + subtree_a
+    if len(payload) != 65:
         raise ValueError("transaction root preimage width")
     return tagged("Lotus/v2/txroot", payload)
 

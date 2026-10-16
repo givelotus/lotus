@@ -45,7 +45,7 @@ def mine(chain, header, target):
 def construct():
     source = (HERE.parent / 'local-test-manifest.json').read_bytes()
     provenance = json.loads((HERE.parent / 'provenance.json').read_text())
-    assert sha256(source).hexdigest() == provenance['manifest_sha256'] == '0ccb2872198a354e9cdc5e9c91d1816cf65bf8109efc200d86537d65dc660d05'
+    assert sha256(source).hexdigest() == provenance['manifest_sha256'] == 'edad7f53b49ce09f62250947240fa4590664e16e53d40fe0cc873e3d6cfb590b'
     assert base.profile_digest(json.loads(source)) == provenance['profile_digest']
     m = json.loads(source)
     chain = base.tagged('Lotus/v2/development-chain', NAME.encode('ascii'))

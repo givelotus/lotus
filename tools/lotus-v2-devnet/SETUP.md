@@ -95,7 +95,7 @@ separately. Preserve the generated inputs alongside runtime evidence.
 
 The output contains complete `config.json`, exact copied `manifest.json` and
 `network.json`, `provenance.json`, and shell-quoted `commands.txt`. The manifest
-SHA256 is `0ccb2872198a354e9cdc5e9c91d1816cf65bf8109efc200d86537d65dc660d05`.
+SHA256 is `edad7f53b49ce09f62250947240fa4590664e16e53d40fe0cc873e3d6cfb590b`.
 The manifest uses schema 2 and `tail_formula_version=1`. Its monetary array
 retains the original ten fields, then appends genesis tail `1000000` and work `2`
 as 32 little-endian bytes. These are the actual local fixture anchors; the
@@ -103,9 +103,9 @@ reference toy profile uses `200`/`9`, and the proposed development profile in
 `docs/lotus-v2/development-profile.md` is a separate artifact.
 
 The chain ID is `6ff87f5f041a6e4e16018ac58b33f7397d956da5712642015edf5fc560deb9c9`,
-genesis ID `53e6c3d9bf12bc18f84e818349da5e5d3d11ee6e33576dab3b81be0a7a978959`,
+genesis ID `673696c416c1fa28bd543f7b490551a61f8858888f719b6868a7ba145ed3fc2d`,
 and native validator profile digest
-`1415adf3bc8c1f4d868ddb65aebb8e50205cb07e18d2feef006d4dfca4ecb39b`.
+`067a25e978036d1519299b7f411983244c37e561c0ddbcc8f51e610bccab4ff2`.
 The initial 56-byte monetary envelope, timestamp, difficulty, limits, maturity
 and cost schedules are unchanged. Chain ID and genesis commitments are new.
 Always choose fresh homes for this identity. Preserve previous homes as legacy

@@ -13,7 +13,7 @@ from lotus_v2_reference.monetary import MonetaryState, advance, initialize_genes
 
 # Recorded by the native commitment test for TransactionRoot of no transactions.
 RECORDED_EMPTY_TX_ROOT = bytes.fromhex(
-    "eebdd2bf2b0f92f1764c36eaef67a3ba72195a4206f2ea225db80605833beadb")
+    "24518f458e1e543b742619b81b0f24839a1753a447ff5322ca80fcfa705b0856")
 
 
 def _height_one(state):

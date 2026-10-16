@@ -29,13 +29,8 @@ DEVELOPMENT_CHAIN_ID = bytes(32)
 
 
 def empty_transaction_root() -> bytes:
-    """TransactionRoot of no transactions.
-
-    The empty subtree is tag byte 2. The count wrapper is tag byte 3, a
-    little-endian uint32 count, then that subtree digest. Both use Lotus/v2/txroot.
-    """
-    subtree = tagged("Lotus/v2/txroot", bytes([2]))
-    return tagged("Lotus/v2/txroot", bytes([3]) + (0).to_bytes(4, "little") + subtree)
+    """TransactionRoot of no transactions (EmptyTxRoot = H_txroot(0x02))."""
+    return tagged("Lotus/v2/txroot", bytes([2]))
 
 
 def initial_test_state() -> MonetaryState:
