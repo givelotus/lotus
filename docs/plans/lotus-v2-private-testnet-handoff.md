@@ -62,13 +62,15 @@ First consolidation boundary is constructed: draft
 `f91be29f1348b453d49f815f89cfc80dd42f7e1c`, tree
 `0cc8053d0f9bd0ff29fd351a9b57fe9294eca859`,64owned units/51paths applied without
 conflicts. Builder commit `0cd41d68`,8tiny Git-fixture checks pass. Independent
-builder/tree review is running; compilation and registered tests have NOT run.
+builder/tree review passed: independent replay matched all 64 intermediate
+unit trees and blobs and the final tree. Boundary compilation and registered
+behavior tests have NOT run. Builder is not integrated into the monorepo yet.
 
 ## Authoritative repositories and exact pins
 
 | Purpose | Path / state at snapshot |
 | --- | --- |
-| User monorepo | `/private/tmp/lotus-v2-repo`, branch `lotus-v2`, `3e6b49aaca00c98b7bb36d216625473b278de5a1` before this handoff commit |
+| User monorepo | `/private/tmp/lotus-v2-repo`, branch `lotus-v2`, `321a1b66` before this handoff update |
 | Root monorepo integration | `/private/tmp/lotus-v2-integration-owner-20261015`, branch `v2-integration-owner-20261015`, same content; root alone integrates |
 | Root native integration | `/private/tmp/lotus-v2-native-integration-20261015`, `307570da46f9bae7c4425085eb6ed6ddaf591b5a`, tracked clean |
 | Native shared Git | `/private/tmp/lotus-v2-native-slice-review/.git` |
@@ -155,13 +157,17 @@ has metadata costs. Optional per-call counters count actual load **attempts**.
 
 Final cache session98229 is terminal exit0: registered runtime test passed6.09s
 and the actual extracted ReadBlock/FaultEnv adapter passed2.28s (2/2). Source and
-artifact-hash review is green; frontend reviewer is independently rerunning these
-two executables. No cache-owned build/node process remains. Evidence directory:
+artifact-hash review is green; independent reruns passed runtime/adapter 2/2
+and Chronik sync/explorer 2/2. No cache-owned build/node process remains. Evidence directory:
 `/private/tmp/lotus-v2-runtime-block-cache-evidence-20261015/`; `final-test.log`
 and `final-artifacts.json` bind source/three binaries. The negative control removes
 the postStatus fence and fails stale-publication; restored fence passes. Adapter
 does not execute full actual Node::Status/whole node. A separate NodeStatus
-serializer is being prepared, so recheck dirty files before taking ownership.
+serializer has passed its scoped compile and JSON test (session 24450, exit 0,
+1/1 in 0.42s). Independent review and a separate source commit remain pending;
+recheck dirty files before taking ownership. This test executes extracted actual
+helpers, not the whole node. It checks field mappings, UINT64_MAX, null versus
+zero confidence, disconnect causes, and nonmutation. No owned build remains.
 Cache commit and later diagnostics serializer must remain separate.
 
 **Compatibility blocker found and repaired before integration:**
