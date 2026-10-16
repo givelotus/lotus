@@ -48,13 +48,29 @@ Do not lower acceptance thresholds or enlarge the finality deadline to get green
   it with a commit updating `daemon/docs/lotus-v2-implementation-plan.md`.
   No partial series promotion on a failed tree check.
 
+## Latest integrated checkpoint
+
+Native source now `307570da46f9bae7c4425085eb6ed6ddaf591b5a`:
+`c1ab871772` integrates reviewed passive diagnostics; `0c2f38fc48` integrates the
+cache; `307570da46` fixes its standalone Chronik test linkage. Root verified all
+cache/compatibility source and binary hashes; runtime/adapter2of2 and Chronik
+sync/explorer2of2 pass. No new full daemon build or mailbox export yet. NodeStatus
+diagnostic serialization is still a separate pending commit. Frozen acceptance
+binaries remain cd8 and the finality failure remains unresolved.
+
+First consolidation boundary is constructed: draft
+`f91be29f1348b453d49f815f89cfc80dd42f7e1c`, tree
+`0cc8053d0f9bd0ff29fd351a9b57fe9294eca859`,64owned units/51paths applied without
+conflicts. Builder commit `0cd41d68`,8tiny Git-fixture checks pass. Independent
+builder/tree review is running; compilation and registered tests have NOT run.
+
 ## Authoritative repositories and exact pins
 
 | Purpose | Path / state at snapshot |
 | --- | --- |
 | User monorepo | `/private/tmp/lotus-v2-repo`, branch `lotus-v2`, `3e6b49aaca00c98b7bb36d216625473b278de5a1` before this handoff commit |
 | Root monorepo integration | `/private/tmp/lotus-v2-integration-owner-20261015`, branch `v2-integration-owner-20261015`, same content; root alone integrates |
-| Root native integration | `/private/tmp/lotus-v2-native-integration-20261015`, `7db963beb40b1695da6cd7465d154234d8faf2e7`, tracked clean |
+| Root native integration | `/private/tmp/lotus-v2-native-integration-20261015`, `307570da46f9bae7c4425085eb6ed6ddaf591b5a`, tracked clean |
 | Native shared Git | `/private/tmp/lotus-v2-native-slice-review/.git` |
 | Real-.git full-build clone | `/private/tmp/lotus-v2-daemon-runtime-staging-20261015`, `cd8d5140ec7fce7da9a4e2a5a8b5d803ed4dc3f5`, tracked clean |
 | Maintained mailboxes | `daemon/patches/v2/series`,318patches000–317; ABCbase `1fb7db17c176cdea8a2c60d887891589382ee4e3` |
@@ -63,7 +79,7 @@ The maintained series ends at native `cd8d5140ec`, tree
 `a14a946342d31ee07ee8851906500746800b0c46`. All318 intermediate trees verify;
 see [replay evidence](../../daemon/docs/evidence/v2-series-replay-317.json).
 Series commit `dfd493fe` and immediate plan `9ab0c7c7` preserve000–307 bytes.
-The two later native commits are **not exported/build-integrated yet**:
+Later native commits are **not exported/full-build-integrated yet**. The first two are:
 
 1. `64832d49e428debefff566ac19f36f2006089bfb`: inventory fairness. Repeated soft
    submission/peer refreshes finish the bounded current traversal; hard authority
@@ -114,14 +130,15 @@ Quorum harness/evidence owner clone:
 `/private/tmp/lotus-v2-native-quorum-acceptance-20261015`, last evidence32293106.
 Owner `/root/native_quorum_acceptance` is completed; no retry active.
 
-## Live candidates — NOT integrated, verify before taking ownership
+## Current work — verify integrated state and ownership before editing
 
 ### A. Verified block-body chunk cache
 
 Owner `/root/audit_safety_repairs`; reviewer `/root/explorer_frontend_review`
 (with additional source review from `/root/avalanche_provision_review`).
 Worktree `/private/tmp/lotus-v2-runtime-block-cache-20261015`, base64832d49e4,
-cache commit `5a26ce6df372f3c37064dd25135fc0783fd24efd` (NOT integrated).
+cache candidate `5a26ce6df372f3c37064dd25135fc0783fd24efd`, now integrated as
+`0c2f38fc48` plus compatibility follow-up `307570da46`.
 Committed cache files: development_runtime.{h,cpp}, development_node_command.cpp,
 test_development_runtime.cpp, development_runtime_test/CMakeLists.txt and new
 `development_runtime_test/check_block_chunk_command.py` under `src/lotus_v2/`.
@@ -147,13 +164,13 @@ does not execute full actual Node::Status/whole node. A separate NodeStatus
 serializer is being prepared, so recheck dirty files before taking ownership.
 Cache commit and later diagnostics serializer must remain separate.
 
-**Known integration blocker discovered after those passes:**
+**Compatibility blocker found and repaired before integration:**
 `chronik_sync_test/CMakeLists.txt` introspects the runtime test target's SOURCES.
 The new object-library test refactor would omit implementations from that caller.
-Owner is authorized to repair that CMake file separately, search other consumers,
-and run affected Chronik sync/explorer standalone checks. Do NOT merge cache until
-this compatibility follow-up and independent review pass. Production behavior is
-unchanged by this build-registration problem.
+Follow-up `9ad56aadab` fixes that caller and is integrated as `307570da46`.
+Both affected standalone tests pass; other SOURCES consumers were searched. Root
+reviewed linkage and verified source/binary hashes. Production behavior is
+unchanged by this build-registration repair.
 
 
 ### B. Passive Avalanche diagnostics
@@ -163,32 +180,33 @@ Worktree `/private/tmp/lotus-v2-native-ava-diagnostics-20261016`, base64832d49e4
 candidateHEAD3c7a68e3a4.
 Candidate changes: avalanche_{poll,peer,driver}.{h,cpp}, NEW avalanche_diagnostics.h,
 test_avalanche_{v2,peer,driver}.cpp, avalanche_driver_test/README.md.
-Candidate commit `3c7a68e3a4` is now ready, NOT integrated. Poll session88394/
+Candidate commit `3c7a68e3a4` passed final independent review and is integrated
+as native `c1ab871772`. Poll session88394/
 test0.61s, peer session54321/test1.93s, and driver session53703/test1.79s all passed
-and are terminal. No owned compiler/node remains. Final exact-commit review is
-pending; prior source review was green. Cache compatibility checks now own the
-heavy window. No full daemon or acceptance run was performed.
+and are terminal. No owned compiler/node remains. Final exact-commit source/evidence review is green. Cache compatibility checks
+also finished; verify ownership before starting another heavy job. No full daemon or acceptance run was performed.
 
 Fixed saturating counters/gauges report query expiry, applied/ignored/rejected/local
 responses, classified peer failures, queue/backpressure, tracked disconnect causes
 and optional current-tip confidence. They must not affect protocol decisions.
 Unknown/external causes remain explicit, not inferred by subtracting overlaps.
 NodeStatus serialization is owned by cache agent in a separate dependent commit.
-Next: final independent review; serialize and build combined
+Next: finish separate NodeStatus serializer and build combined
 source, freeze binary, then NEW unchanged-quorum run after review.
 
 ### C. Consolidation builder, first boundary only
 
 Owner `/root/audit_network_repairs`; reviewer `/root/explorer_storage_review`.
 Monorepo `/private/tmp/lotus-v2-consolidation-builder-20261015`, branch
-`audit-v2-consolidation-builder`, base66b378fdc007acce99f3a5e390149d704be1fa17.
-Latest root inspection finds an untracked builder script being written; no candidate
-native tree or build is yet reported. Owns only
+`audit-v2-consolidation-builder`, base66b378fdc007acce99f3a5e390149d704be1fa17,
+builderHEAD0cd41d68.
+Builder source is committed as `0cd41d68`, worktree clean, no active processes.
+Owns only
 `daemon/scripts/consolidate-v2-candidate.py` and
 `daemon/tests/test-consolidate-v2-candidate.py`. Recheck as implementation continues.
 Reserved NEW native/evidence paths:
 `/private/tmp/lotus-v2-consolidated-inherited-20261015` and
-`/private/tmp/lotus-v2-consolidated-inherited-evidence-20261015` were nonexistent.
+`/private/tmp/lotus-v2-consolidated-inherited-evidence-20261015` now hold the draft/evidence described in the latest checkpoint.
 
 Reviewed [ledger](lotus-v2-consolidation-ledger.md) and JSON integrated at
 c88d6d6c/3e6b49aa:318mailboxes,1051file diffs,1053exclusive units,51proposed topics.
