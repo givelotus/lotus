@@ -6,15 +6,37 @@ Updated October 15, 2026. Development plan; no genesis parameters are frozen and
 
 ## Source foundation and current status
 
-The current executable [V2 series](../patches/v2/series) contains 318 patches,
-`000`–`317`, on ABC master `1fb7db17c176cdea8a2c60d887891589382ee4e3`.
-[Latest replay evidence](evidence/v2-series-replay-317.json) verifies every
+The current executable [V2 series](../patches/v2/series) contains 324 patches,
+`000`–`323`, on ABC master `1fb7db17c176cdea8a2c60d887891589382ee4e3`.
+[Latest replay evidence](evidence/v2-series-replay-323.json) verifies every
 intermediate tree. Offline daemon acceptance, restart, disconnect/reconnect,
 resumable fork recovery, bounded selection and actual two-process TCP full/compact
 synchronization have separate evidence below. Native production of signed fixture-payment blocks also passes across two nodes.
 The foreground local controller now completes a live-wallet payment and restart
 across two isolated nodes; see the current controller evidence below. Development
 profile adoption and public launch remain pending.
+
+### Reviewed cache and diagnostic integration through 323 (October 15)
+
+Series commit `f070f0958c9ae6d550bc25582ddbd349ee2c1e09` appends six reviewed native commits with
+all prior 000–317 mailbox bytes unchanged. A new replay verifies all 324 trees;
+native source `bf4ddad652ac50396b164e6ae018a51da31ac890` ends at tree
+`3992775915b3258705b6aff3af248a112f324a5f`. This plan commit immediately follows
+that series commit, whose parent was the then-current Lotus V2 tip.
+
+Changes cover inventory traversal fairness, inherited RPC branding expectations,
+one-entry authenticated block-body chunk caching and its Chronik test linkage,
+and passive Avalanche diagnostics including exact status counters and disconnect
+causes. Independent focused checks pass. The combined Debug, Chronik-enabled,
+wallet-enabled daemon, CLI, wallet tool and V2 wallet client build passed; see
+[evidence](evidence/v2-native-build-bf4ddad652.json). Dependency deployment-target
+warnings remain; this does not establish older-macOS or Linux compatibility.
+
+The preceding cd8 nine-node run failed its unchanged finality deadline. A new run
+with these frozen binaries is authorized with the same harness, quorum defaults
+and deadlines; its outcome is not yet established. No finality fix or complete
+private-testnet acceptance is claimed. Full final-revision suites, coverage,
+separate-host workflow and consolidation build gates remain incomplete.
 
 ### Reviewed audit repairs through 317 (October 15)
 
