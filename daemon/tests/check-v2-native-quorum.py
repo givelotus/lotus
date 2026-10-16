@@ -66,6 +66,8 @@ def main():
             previous=a.seed.resolve(); prior=json.loads((previous/'evidence.json').read_text())
             require(prior.get('seed_passed') and prior['daemon_sha256']==(a.seed_daemon_sha256 or a.daemon_sha256) and prior['manifest_sha256']==local.digest(manifest),'stopped enabled seed evidence mismatch')
             require(all(x['exit']==0 for x in prior['cleanup']),'seed not cleanly stopped')
+            evidence['seed_source']=dict(directory=str(previous),evidence_sha256=local.digest(previous/'evidence.json'),daemon_source=prior['daemon_source'],daemon_sha256=prior['daemon_sha256'])
+            save()
             shutil.copytree(previous/'seed-home',root/'seed-home')
         seed=start('seed',root/'seed-home')
         initial=status(seed);require(initial['height']==(2024 if a.seed else 0) and initial['avalanche']['observer'],'enabled observer state differs')
@@ -87,7 +89,9 @@ def main():
         for funding in original['funding']:
             coin=seed.request('coin',txid=funding['txid'],index=0)
             require(coin.get('coin')==funding['coin'],'actual funding coin mismatch')
-        evidence['seed_final']=status(seed);stop(seed)
+        evidence['seed_final']=status(seed)
+        require(evidence['seed_final']['height']==2024 and evidence['seed_final']['avalanche']['observer'] and evidence['seed_final']['avalanche']['proof_count']==0 and not evidence['seed_final']['avalanche']['tip_finalized'],'seed must remain an unfinalized proof-free enabled observer')
+        stop(seed)
         check('seed-stopped-before-copy',namespace_marker=(root/'seed-home'/'lotus-v2-development.identity').read_text())
         if a.phase=='seed':
             evidence['seed_passed']=True;evidence['remaining']='provisioning, authenticated quorum, real finality, competing fork, recovery and restart';save();return
@@ -178,7 +182,9 @@ def main():
         active=[];endpoints=[]
         for i in range(9):
             node=start('restart-'+str(i+1),homes[i],endpoints,credentials=credentials[i]);active.append(node);endpoints.append(node.ready['listen'])
-            check('restart-initial-proof-count',node=i+1,status=status(node))
+            initial_restart=status(node)
+            if i==0:require(initial_restart['peer_active']==0 and initial_restart['avalanche']['authenticated_peer_count']==0 and initial_restart['avalanche']['proof_count']==9,'proofs must reload before any remote peer reconnects')
+            check('restart-initial-proof-count',node=i+1,status=initial_restart)
         restarted=wait_all('restart-authenticated-default-quorum',lambda s:s['tip']==selected_id and s['height']==2025 and s['avalanche']['proof_count']==9 and s['avalanche']['authenticated_peer_count']>=8 and s['avalanche']['quorum_ready'] and s['avalanche']['quorum_established'])
         wait_all('restart-real-finality',lambda s:s['tip']==selected_id and s['avalanche']['tip_finalized'],300)
         for node in active:
