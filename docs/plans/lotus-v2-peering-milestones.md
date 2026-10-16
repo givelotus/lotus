@@ -43,9 +43,9 @@ The inspected ABC source has no QUIC implementation. `src/net_processing.cpp:684
 
 Public QUIC discovery/authentication and any removal of Avalanche application signatures require separate review. TLS encrypting a connection does not establish stake authority, consensus validity or independence from another peer. Preserve the working TCP transport throughout milestone 2.
 
-## Milestone 1.5 — Progressive Merklix Mempool Overlays, `tmplblock` Relay, and Avalanche Bulk Pre-Consensus (`Patches 023–034`)
+## Milestone 1.5 — Progressive Merklix Mempool Overlays, `tmplblock` Relay, Avalanche Bulk Pre-Consensus, Coroutine RPC, and Relay/Bootstrap Hygiene (`Patches 023–041`)
 
-Following the consolidated baseline (`000`–`021`) and Merklix sharding upgrade (`022`), the [bulk pre-consensus and mempool overlays plan](lotus-v2-bulk-preconsensus-and-mempool-overlays.md) specifies a **6-stage, 12-commit incremental implementation sequence (`Patches 023–034`)** that decouples each subsystem into an independently testable patch:
+Following the consolidated baseline (`000`–`021`) and Merklix sharding upgrade (`022`), the [bulk pre-consensus and mempool overlays plan](lotus-v2-bulk-preconsensus-and-mempool-overlays.md) and [RPC coroutines and lock-free snapshots plan](lotus-v2-rpc-coroutines-and-lockfree-snapshots.md) specify a **9-stage, 19-commit incremental implementation sequence (`Patches 023–041`)** that decouples each subsystem into an independently testable patch:
 
 - **Stage A (`023`–`025`): Pure Offline Overlay & Syndrome Primitives:**
   - `023`: In-memory persistent `TxOverlayArena` & `UtxoOverlayArena` (`MempoolOverlayLayer` $L_0 \dots L_k$, sort-merge batch path-copying, by-value `libmdbx` clean sibling/coin copy + `ResetReadTxn()`, in-place epoch folding).
@@ -54,10 +54,10 @@ Following the consolidated baseline (`000`–`021`) and Merklix sharding upgrade
 - **Stage B (`026`–`027`): Local Speculative Mempool Overlays & $O(1)$ Block Assembly (Tier 0):**
   - `026`: Attach `MerklixOverlayManager` to `CTxMemPool` (`addUnchecked`, `removeUnchecked`, `ConnectBlockReset`) maintaining $L_0$ and live $L_{\text{spec}}$ + pre-populated `cached_block`.
   - `027`: Overhaul `BlockAssembler::CreateNewBlock` (`src/node/miner.cpp`) to slot `vtx[0] = coinbaseRef` into `overlay->cached_block` and compute `hashMerkleRoot` and `hashStateRoot` in 2 BLAKE3 hashes ($< 2\text{ }\mu\text{s}$).
-- **Stage C (`028`): Transaction-Free Block Relay (`tmplblock`) & Candidate Root Match Stage:**
-  - `028`: Add `NetMsgType::TMPLBLOCK` (`Header || CoinbaseTx`, ~284 bytes), Stage 1 `MatchCandidateOverlay` (`{L_k, L_{k-1}, L_{k-2}, L_0, L_spec}`), `ConnectMatchedOverlayBlock`, and Stage 2 automatic fallback to `getdata(MSG_CMPCT_BLOCK / MSG_BLOCK)`.
+- **Stage C (`028`): Dependency-Injected `V2PeerProtocolHandler`, Transaction-Free Block Relay (`tmplblock`), & Candidate Root Match Stage:**
+  - `028`: Add constructor-injected `V2PeerProtocolHandler` (`src/net/v2_protocol_handler.h/.cpp`), `NetMsgType::TMPLBLOCK` (`Header || CoinbaseTx`, ~284 bytes), Stage 1 `MatchCandidateOverlay` (`{L_k, L_{k-1}, L_{k-2}, L_0, L_spec}`), `ConnectMatchedOverlayBlock`, and Stage 2 automatic fallback to `getdata(MSG_CMPCT_BLOCK / MSG_BLOCK)`.
 - **Stage D (`029`): Generalized P2P Merklix Mempool Reconciliation:**
-  - `029`: Add `merklixsync`, `getmerklixbuck`, `merklixbuck`, `getshorttx`, `shorttx` (`ReconScope`) and `PendingCandidateTracker`, verified standalone in Tier 0 live mempool sync (`ReconScope::LIVE_MEMPOOL_SYNC`).
+  - `029`: Add `merklixsync`, `getmerklixbuck`, `merklixbuck`, `getshorttx`, `shorttx` (`ReconScope`) to `V2PeerProtocolHandler` and `PendingCandidateTracker`, verified standalone in Tier 0 live mempool sync (`ReconScope::LIVE_MEMPOOL_SYNC`).
 - **Stage E (`030`–`031`): Avalanche Block Parking, Staking Rewards (`25%`), and Staker-Voted Treasury (`25%`):**
   - `030`: Restore `ParkBlock`/`UnparkBlock` in `ConnectTip` and `avaresponse`, and enable `StakingRewardsPolicy` (`STAKER_REWARD_RATIO = 25%` via `MSG_AVA_STAKE_CONTENDER`).
   - `031`: Add `MSG_AVA_TREASURY_CONTENDER`, `NetMsgType::AVATREASURY`, `TreasuryContenderCache`, `TreasuryPolicy` (`TREASURY_REWARD_RATIO = 25%`), and the `50% Miner / 25% Staker / 25% Treasury` coinbase split in `BuildV2CoinbaseTx`.
@@ -66,12 +66,15 @@ Following the consolidated baseline (`000`–`021`) and Merklix sharding upgrade
   - `033`: Enable the 3-stage `Ingest -> Mature -> Vote` logical epoch clock, `AbortStaleEpochsBelow(M)` cumulative jump $L_{N-1} \to L_M$, `finalized-tx-conflict` in `MemPoolAccept::PreChecks`, and `PreConsensusPolicy` in `ConnectTip`.
   - `034`: Retire superseded per-tx `finalizedTxs` (`RadixTree`) and legacy `BlockAssembler` per-tx poll loop.
 - **Stage G1 (`035`–`036`, Upstreamable ABC): C++20 `Boost.Asio` Coroutine HTTP/RPC Engine (see [`lotus-v2-rpc-coroutines-and-lockfree-snapshots.md`](./lotus-v2-rpc-coroutines-and-lockfree-snapshots.md)):**
-  - `035`: Replace the 4-thread blocking `WorkQueue<HTTPClosure>` in `src/httpserver.cpp` with a header-only C++20 `boost::asio::thread_pool` + `boost::asio::awaitable` coroutine dispatcher and optional `CRPCCommand::AsyncActor`.
-  - `036`: Convert OS-thread-parking `waitfornewblock`, `waitforblock`, `waitforblockheight`, and `getblocktemplate` `longpollid` (`wait_until`) to non-blocking `co_await` on `AsyncBlockChangeWaiter`.
+  - `035`: Replace the 4-thread blocking `WorkQueue<HTTPClosure>` and static HTTP worker globals in `src/httpserver.cpp` with a dependency-injected C++20 `boost::asio::thread_pool` + `boost::asio::awaitable` coroutine dispatcher and optional `CRPCCommand::AsyncActor`.
+  - `036`: Convert OS-thread-parking `waitfornewblock`, `waitforblock`, `waitforblockheight`, and `getblocktemplate` `longpollid` (`wait_until`) to non-blocking `co_await` on `AsyncBlockChangeWaiter` (injected via `NodeContext`, eliminating global `g_best_block_mutex`/`g_best_block_cv`/`cond_blockchange`).
 - **Stage G2 (`037`–`039`, Lotus V2): Lock-Free RCU `ChainAndMempoolSnapshot`, True $O(1)$ `getblocktemplate`, and Atomic Batch RPCs (see [`lotus-v2-rpc-coroutines-and-lockfree-snapshots.md`](./lotus-v2-rpc-coroutines-and-lockfree-snapshots.md)):**
-  - `037`: Add `ChainAndMempoolSnapshot`, `SnapshotPublisher` (`std::atomic<std::shared_ptr<const ChainAndMempoolSnapshot>>`), and `ScopedMdbxReadTxn` (`MDBX_TXN_RDONLY`) so read RPCs (`getblockchaininfo`, `getblockheader`, `gettxout`, `getmempoolinfo`, `getrawmempool`) run with zero `cs_main` or `mempool.cs` locks.
+  - `037`: Add `ChainAndMempoolSnapshot`, `SnapshotPublisher` (`std::atomic<std::shared_ptr<const ChainAndMempoolSnapshot>>` injected via `NodeContext`), and `ScopedMdbxReadTxn` (`MDBX_TXN_RDONLY`) so read RPCs (`getblockchaininfo`, `getblockheader`, `gettxout`, `getmempoolinfo`, `getrawmempool`) run with zero `cs_main` or `mempool.cs` locks.
   - `038`: Eliminate the legacy $O(N)$ `EncodeHexTx(tx)` loop in `getblocktemplate` (`src/rpc/mining.cpp:1115–1137`), returning $O(1)$ V2 overlay commitment fields (`overlay_id`, `subtree_a_root`, `utxo_root`, `stateroot`, and `50/25/25` `coinbasetxn`) in $< 5\text{ }\mu\text{s}$ and pairing with `submittemplateblock(header_hex, coinbase_tx_hex)`.
   - `039`: Add `submitrawtxbatch` (two-phase all-or-nothing atomic DAG validation + mempool/epoch commit with zero partial commits and detailed per-tx rejection diagnostics) and `testrawtxbatch` (Phase 1 lock-free dry-run wrapper over `BatchCoinsView` + `ChainAndMempoolSnapshot`).
+- **Stage H (`040`–`041`, Pre-`1.0.0` Relay Tuning, Bootstrap Gate, & Prototype Retirement):**
+  - `040`: Tune Poisson `inv` trickling for 5-second epochs (`INBOUND_INVENTORY_BROADCAST_INTERVAL = 500ms`, per-outbound-peer `OUTBOUND_INVENTORY_BROADCAST_INTERVAL = 150ms` via `rand_exp_duration`, `nonpref_peer_delay = 200ms`, `INVENTORY_BROADCAST_PER_SECOND = 250`, and `GETSHORTTX` bypass of `m_recently_announced_invs`) and enforce `IsAvalancheBootstrapComplete` (`nAvalancheBootstrapHeight` + `nMinimumAvalancheQuorumStake`) so Genesis cold-start mines cleanly in Tier 0 before activating `PreConsensusPolicy`, `StakingRewardsPolicy`, and `TreasuryPolicy`.
+  - `041`: Retire superseded standalone prototype scaffolding in `src/lotus_v2/` (`peer_tcp.*`, `peer_dispatcher.*`, `development_node_command.*`, `transaction_pool.*`, `candidate_store.*`, `avalanche_driver.*`) now that `lotusd` runs native V2 consensus, `libmdbx` `DiskStateStore`, `CTxMemPool`, `CConnman`, `PeerManager`, and `avalanche::Processor` directly.
 
 
 ## Follow-on milestones — commitment-based state sync and hostile suppliers

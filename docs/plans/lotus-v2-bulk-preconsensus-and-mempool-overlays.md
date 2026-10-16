@@ -1676,12 +1676,149 @@ return std::move(pblocktemplate);
 
 ---
 
-### 6.7 Modular Component Architecture & 17-Commit Incremental Staging Roadmap (`Patches 023–039`)
+### 6.6.6 Phase 7: Poisson `inv` / `getdata` Relay Tuning for 5-Second Epochs, Avalanche Genesis Cold-Start Gate, and Dependency-Injected `V2PeerProtocolHandler` (`Stage H`)
+
+#### 1. Poisson `inv` Trickling & `getdata` Delay Tuning (`src/net_processing.cpp`)
+
+Bitcoin Core and Bitcoin ABC use an exponential (Poisson process) timer (`FastRandomContext::rand_exp_duration`) to trickle transaction `inv` announcements so an eavesdropper cannot trivially infer the origin IP or arrival timestamp of a transaction. However, the legacy parameters in `src/net_processing.cpp` were tuned for **600-second blocks without 5-second pre-consensus epochs**:
+
+| Parameter / Mechanism | Legacy Location in `src/net_processing.cpp` | Legacy Value & Behavior | Problem for 5s Pre-Consensus Epochs | Lotus V2 Target Value & Mechanism |
+| :--- | :--- | :--- | :--- | :--- |
+| **Inbound Poisson `inv` Trickle (`INBOUND_INVENTORY_BROADCAST_INTERVAL`)** | Line `275`, `PeerManagerImpl::NextInvToInbounds` (`lines 1821–1832`), `computeNextInvSendTime` (`lines 9046–9048`) | `5s` mean exponential delay (`m_rng.rand_exp_duration(5s)`), shared across all inbound peers via `m_next_inv_to_inbounds` | A 5s mean exponential draw frequently samples $10\text{–}15\text{ s}$ tails—spanning **2 to 3 entire pre-consensus epochs** (`T_epoch = 5s`) before an inbound peer even receives an `inv(MSG_TX)`! | **`500ms` mean** (`INBOUND_INVENTORY_BROADCAST_INTERVAL = 500ms`). Preserves Poisson batching against timing correlation while ensuring inbound peers receive `inv` within the 2.5s `Stage 1 (Ingest)` window. |
+| **Outbound Poisson `inv` Jitter (`OUTBOUND_INVENTORY_BROADCAST_INTERVAL`)** | `computeNextInvSendTime` (`lines 9049–9053`) | **`0s` delay** (`next = current_time;` *"Skip delay for outbound peers"*) | Zero timing privacy on outbound links: a spy node accepting inbound connections from a victim can measure exact millisecond transaction arrival times. | **`150ms` per-peer exponential jitter** (`OUTBOUND_INVENTORY_BROADCAST_INTERVAL = 150ms`, `next = current_time + m_rng.rand_exp_duration(150ms)` per outbound `Peer`). Adds strong Poisson timing jitter while keeping 4-hop outbound propagation under $\sim 600\text{ ms} \ll 2.5\text{ s}$ cohort maturity! |
+| **Non-Preferred Peer `getdata` Delay (`TX_REQUEST_PARAMS.nonpref_peer_delay`)** | Lines `168, 189–196` | **`2s` fixed delay** before requesting `getdata(MSG_TX)` from an inbound or non-preferred peer | Adds a deterministic `2,000ms` stall on top of the `inv` trickle whenever a transaction is first announced by an inbound peer. | **`200ms`** (`std::chrono::milliseconds(200)` in `TX_REQUEST_PARAMS` and `PROOF_REQUEST_PARAMS`; widen `DataRequestParameters::nonpref_peer_delay` and `overloaded_peer_delay` from `std::chrono::seconds` to `std::chrono::milliseconds`). |
+| **Per-Peer `inv` Drain Rate Cap (`INVENTORY_BROADCAST_PER_SECOND`)** | Lines `280–285`, `9160–9162` | **`7` tx/s per MB** (`35` tx per 5s trickle) | At $1,000\text{ tx/s}$ ($5,000$ txs per 5s epoch), a 7 tx/s/MB drain cap artificially starves `inv` propagation and forces every epoch to rely heavily on `GETSHORTTX` recovery. | **`250` tx/s per MB** (`INVENTORY_BROADCAST_PER_SECOND = 250`), with `INVENTORY_MAX_RECENT_RELAY = 35000`. |
+| **`FindTxForGetData` Filter vs. `GETSHORTTX` (`shorttx`)** | `PeerManagerImpl::FindTxForGetData` (`lines 3546–3583`) | Refuses `getdata(MSG_TX)` unless `txid` is in `peer.GetTxRelay()->m_recently_announced_invs` or older than `UNCONDITIONAL_RELAY_DELAY` (`2min`) | During `merklixsync` set reconciliation, Peer P decodes a missing 64-bit `short_id` from Peer Q's `(s1, s3)` syndrome **before** Peer Q's Poisson `inv` timer has fired! If `FindTxForGetData` gated `GETSHORTTX`, Peer Q would refuse to serve the transaction! | **`GETSHORTTX` (`shorttx`) bypasses `m_recently_announced_invs`:** `HandleGetShortTx` resolves 64-bit `short_id`s directly via `m_mempool.GetOverlayManager().LookupTxByShortId(ctx, short_id)` and serves any transaction in `CTxMemPool` whose `local_cohort <= ctx.epoch + 1`. Additionally, `UNCONDITIONAL_RELAY_DELAY` for `getdata(MSG_TX)` is reduced from `2min` to **`15s`** ($3 \times T_{\text{epoch}}$). |
+
+- **Exact Code Change in `src/net_processing.cpp` (`lines 189–196, 275–286, 9039–9057`):**
+  ```cpp
+  static constexpr DataRequestParameters TX_REQUEST_PARAMS{
+      250,                               // max_peer_request_in_flight (was 100)
+      25000,                             // max_peer_announcements (was 5000)
+      std::chrono::milliseconds(200),    // nonpref_peer_delay (was 2s)
+      std::chrono::milliseconds(500),    // overloaded_peer_delay (was 2s)
+      std::chrono::seconds(10),          // getdata_interval (was 60s)
+      NetPermissionFlags::Relay,
+  };
+
+  static constexpr auto INBOUND_INVENTORY_BROADCAST_INTERVAL{500ms};  // was 5s
+  static constexpr auto OUTBOUND_INVENTORY_BROADCAST_INTERVAL{150ms}; // was 0s (unbuffered)
+  static constexpr unsigned int INVENTORY_BROADCAST_PER_SECOND = 250; // was 7
+  static constexpr unsigned int INVENTORY_MAX_RECENT_RELAY = 35000;   // was 3500
+
+  // In PeerManagerImpl::SendMessages (src/net_processing.cpp:9039):
+  auto computeNextInvSendTime =
+      [&](std::chrono::microseconds &next)
+          EXCLUSIVE_LOCKS_REQUIRED(g_msgproc_mutex) -> bool {
+      bool fSendTrickle = pto->HasPermission(NetPermissionFlags::NoBan);
+      if (next < current_time) {
+          fSendTrickle = true;
+          if (pto->IsInboundConn()) {
+              next = NextInvToInbounds(
+                  current_time, INBOUND_INVENTORY_BROADCAST_INTERVAL);
+          } else {
+              // Per-outbound-peer Poisson jitter (mean 150ms): obscures local
+              // tx arrival/origin timestamps while keeping 4-hop relay < 600ms.
+              next = current_time +
+                     m_rng.rand_exp_duration(OUTBOUND_INVENTORY_BROADCAST_INTERVAL);
+          }
+      }
+      return fSendTrickle;
+  };
+  ```
+
+---
+
+#### 2. Avalanche Genesis Cold-Start & Quorum Bootstrap Grace Period (`nAvalancheBootstrapHeight` + Minimum Quorum Stake Gate)
+
+- **The Cold-Start Chicken-and-Egg Problem:**
+  - Avalanche stake proofs (`avalanche::Proof`) must stake confirmed, mature UTXOs (`LOTUS_V2_COINBASE_MATURITY`).
+  - At Genesis (`height = 0`) and during the first `N_bootstrap` blocks of a fresh chain (or an isolated regtest/testnet launch), **zero mature UTXOs exist yet**, so no node can construct or finalize an Avalanche proof, nor can any `MSG_AVA_STAKE_CONTENDER`, `MSG_AVA_TREASURY_CONTENDER`, or `MSG_AVA_MEMPOOL_BATCH` poll reach quorum!
+  - If `StakingRewardsPolicy` (`25%`), `TreasuryPolicy` (`25%`), or `PreConsensusPolicy` were active before a real Avalanche quorum formed, either:
+    1. Every block at `height >= 1` would be parked for missing staker/treasury outputs, or
+    2. A tiny single-node proof with negligible stake could hijack 50% of coinbase rewards and park honest PoW blocks during chain bootstrap.
+- **Two-Factor Bootstrap Activation Gate (`IsAvalancheBootstrapComplete`):**
+  1. **Height Gate (`consensusParams.nAvalancheBootstrapHeight`):**
+     - Add `int nAvalancheBootstrapHeight` to `Consensus::Params` (`src/consensus/params.h`):
+       - **Mainnet / Testnet candidate default:** `nAvalancheBootstrapHeight = 2 * COINBASE_MATURITY` (e.g., `200` blocks, giving miners at least 100 mature coinbase UTXOs to register and finalize Avalanche stake proofs before any soft parking policy activates).
+       - **Regtest / functional tests:** Configurable via `-avalanchebootstrapheight=<n>` (default `0` when `-avalanche=1` in existing tests so test suites can test immediate activation once a test quorum is connected).
+  2. **Live Finalized Quorum Stake Gate (`m_avalanche->hasFinalizedQuorum(min_quorum_stake)`):**
+     - Even after `pindexPrev->nHeight + 1 >= consensusParams.nAvalancheBootstrapHeight`, `avalanche::Processor` checks that:
+       - `getSuitableNodeCount() >= m_minQuorumNodes` (default 8 peers in production, configurable in tests), **AND**
+       - `getConnectedFinalizedStakeAmount() >= consensusParams.nMinimumAvalancheQuorumStake` (e.g., $\ge 10{,}000\text{ XPI}$ on mainnet, configurable via `-avalancheminquorumstake`).
+  3. **Graceful Tier-0 Behavior Prior to Bootstrap Completion:**
+     - While `!IsAvalancheBootstrapComplete(pindexPrev, consensusParams)`:
+       - `m_avalanche->isPreconsensusActivated(pindexPrev)` returns **`false`**.
+       - `m_avalanche->isStakingRewardsActivated(pindexPrev)` returns **`false`**.
+       - `m_avalanche->isTreasuryGovernanceActivated(pindexPrev)` returns **`false`**.
+       - `BuildV2CoinbaseTx` (`src/node/miner.cpp`) allocates **100% of net claimable block reward** (`S_n + fees - burn`) to `vtx[0].vout[0]` (the miner's `scriptPubKeyIn`), and `ConnectTip` (`src/validation.cpp`) connects valid PoW blocks directly in Tier 0 without parking.
+     - Once `IsAvalancheBootstrapComplete(pindexPrev, consensusParams)` becomes **`true`** AND a finalized winner exists for `pindexPrev->GetBlockHash()`:
+       - `BuildV2CoinbaseTx` includes the `25%` Staker output (if `getStakingRewardWinners` has a finalized winner) and the `25%` Treasury output (if `getTreasuryWinner` has a finalized winner; if no treasury proposal was submitted or finalized for `pindexPrev`, its `25%` share remains with the miner or is burned per policy configuration, never stalling block production!).
+
+---
+
+#### 3. Dependency-Injected `V2PeerProtocolHandler` & Zero-Globals Hygiene (`src/net/v2_protocol_handler.h/.cpp`)
+
+- **Why We Should Not Bloat `src/net_processing.cpp`'s 9,555-Line `ProcessMessage` Switch:**
+  - `src/net_processing.cpp` is already 9,555 lines long, with `PeerManagerImpl::ProcessMessage` spanning nearly 2,500 lines of cascading `if (msg_type == ...)` branches.
+  - Adding 7 new Lotus V2 wire message handlers (`tmplblock`, `merklixsync`, `getmerklixbuck`, `merklixbuck`, `getshorttx`, `shorttx`, `avatreasury`) plus epoch timer callbacks directly inside `net_processing.cpp` would make `PeerManagerImpl` even harder to maintain, test, and audit.
+- **Clean Dependency-Injected Handler Class (`lotus::v2::net::V2PeerProtocolHandler`):**
+  - Instead of writing inline `if (msg_type == ...)` blocks in `src/net_processing.cpp` or introducing any global/singleton state, all new V2 P2P protocol logic is encapsulated in a dedicated, constructor-injected service class (`src/net/v2_protocol_handler.h/.cpp`) owned by `node::NodeContext` (or `PeerManagerImpl`):
+    ```cpp
+    namespace lotus::v2::net {
+
+    class V2PeerProtocolHandler {
+    public:
+        struct Dependencies {
+            const Config &config;
+            CConnman &connman;
+            ChainstateManager &chainman;
+            CTxMemPool &mempool;
+            MerklixOverlayManager &overlay_mgr;
+            avalanche::Processor *avalanche; // nullable in Tier 0
+            node::SnapshotPublisher &snapshot_publisher;
+        };
+
+        explicit V2PeerProtocolHandler(Dependencies deps);
+
+        // Returns true if msg_type is a V2 protocol message and was handled:
+        bool TryHandleMessage(CNode &pfrom, const std::string &msg_type,
+                              DataStream &vRecv, std::chrono::microseconds now,
+                              const std::atomic<bool> &interrupt);
+
+        void OnEpochTick(std::chrono::microseconds now);
+
+    private:
+        void HandleTmplBlock(CNode &pfrom, DataStream &vRecv);
+        void HandleMerklixSync(CNode &pfrom, DataStream &vRecv);
+        void HandleGetMerklixBuck(CNode &pfrom, DataStream &vRecv);
+        void HandleMerklixBuck(CNode &pfrom, DataStream &vRecv);
+        void HandleGetShortTx(CNode &pfrom, DataStream &vRecv);
+        void HandleShortTx(CNode &pfrom, DataStream &vRecv);
+        void HandleAvaTreasury(CNode &pfrom, DataStream &vRecv);
+
+        Dependencies m_deps;
+    };
+
+    } // namespace lotus::v2::net
+    ```
+  - In `PeerManagerImpl::ProcessMessage` (`src/net_processing.cpp`), routing is a **single 4-line delegation**:
+    ```cpp
+    if (m_v2_handler && m_v2_handler->TryHandleMessage(
+            pfrom, msg_type, vRecv, time_received, interruptMsgProc)) {
+        return;
+    }
+    ```
+  - **Unit Testability Without `CConnman` or Global State:** Because `V2PeerProtocolHandler` takes explicit references via `Dependencies`, unit tests can instantiate two `V2PeerProtocolHandler` instances in a single test process with mock/in-memory streams and zero global variables!
+
+---
+
+### 6.7 Modular Component Architecture & 19-Commit Incremental Staging Roadmap (`Patches 023–041`)
 
 > [!IMPORTANT]
 > **Why Incremental Staging Matters (No Monolithic Commits):**
-> Implementing overlay arenas, $GF(2^{64})$ syndromes, mempool hooks, $O(1)$ block assembly, `tmplblock` relay, staking/treasury voting, Avalanche batch polling, upstreamable C++20 coroutine RPCs, and lock-free RCU overlay snapshots in one giant commit would be impossible to review or bisect.
-> Below is the **17-commit incremental patch roadmap (`023`–`039`)** broken into **8 decoupled stages** (including **Stage G1** which has zero V2 coupling and can be upstreamed directly to Bitcoin ABC), where **every single commit compiles cleanly, passes 100% of existing unit + functional tests, and includes its own isolated test suite before the next commit is stacked on top.**
+> Implementing overlay arenas, $GF(2^{64})$ syndromes, mempool hooks, $O(1)$ block assembly, `tmplblock` relay, staking/treasury voting, Avalanche batch polling, upstreamable C++20 coroutine RPCs, lock-free RCU overlay snapshots, Poisson relay tuning, and retiring legacy `src/lotus_v2/` prototype scaffolding in one giant commit would be impossible to review or bisect.
+> Below is the **19-commit incremental patch roadmap (`023`–`041`)** broken into **9 decoupled stages** (including **Stage G1** which has zero V2 coupling and can be upstreamed directly to Bitcoin ABC), where **every single commit compiles cleanly, passes 100% of existing unit + functional tests, and includes its own isolated test suite before the next commit is stacked on top.**
 
 | Patch # | Patch Name | Component & Scope | Files Modified / Added | Standalone Verification Gate |
 | :--- | :--- | :--- | :--- | :--- |
@@ -1692,10 +1829,10 @@ return std::move(pblocktemplate);
 | **Stage B** | **Local Speculative Mempool Overlay & $O(1)$ Block Assembly (Works in Tier 0 Without Avalanche!)** | | | |
 | **`026`** | `026-wire-txmempool-speculative-merklix-overlay.patch` | Attach `MerklixOverlayManager` to `CTxMemPool`. Hook `addUnchecked`, `removeUnchecked`, and `ConnectBlockReset` to maintain $L_0$ (with delayed coinbase insertion) and live speculative overlay $L_{\text{spec}}$ + `cached_block`. | `src/txmempool.h/.cpp`<br/>`src/txmempoolentry.h`<br/>`src/test/txmempool_overlay_tests.cpp` *(new)* | All 303 functional tests + new unit tests verifying `L_spec.subtree_a_root` and `L_spec.utxo_root` after mempool adds/evictions/reorgs. |
 | **`027`** | `027-overhaul-miner-to-o1-overlay-assembly.patch` | Update `BlockAssembler::CreateNewBlock` to read `GetMiningOverlay()` ($L_{\text{spec}}$ in Tier 0), slot `vtx[0] = coinbaseRef` into `overlay->cached_block`, and compute `hashMerkleRoot` and `hashStateRoot` in $O(1)$ (2 BLAKE3 hashes). | `src/node/miner.h/.cpp`<br/>`src/test/miner_tests.cpp` | `miner_tests` + `mining_basic.py`, `feature_block.py`: verify $O(1)$ template assembly produces consensus-valid blocks in $< 5\text{ }\mu\text{s}$. |
-| **Stage C** | **Transaction-Free Block Relay (`tmplblock`) & Candidate Root Match Stage** | | | |
-| **`028`** | `028-add-tmplblock-relay-and-candidate-root-match.patch` | Add `NetMsgType::TMPLBLOCK` (`Header \|\| CoinbaseTx`), Stage 1 `MatchCandidateOverlay` (`{L_k, L_{k-1}, L_{k-2}, L_0, L_spec}`), `ConnectMatchedOverlayBlock`, and Stage 2 automatic fallback to `getdata(MSG_CMPCT_BLOCK / MSG_BLOCK)`. | `src/protocol.h/.cpp`<br/>`src/blockencodings.h/.cpp`<br/>`src/net_processing.cpp`<br/>`src/validation.h/.cpp`<br/>`test/functional/p2p_tmplblock_relay.py` *(new)* | Functional test proving synced nodes connect blocks via 284-byte `tmplblock` in 0 RTT, while lagging/unsynced nodes fall back to `cmpctblock` / `block`. |
+| **Stage C** | **Dependency-Injected `V2PeerProtocolHandler`, Transaction-Free Block Relay (`tmplblock`), & Candidate Root Match Stage** | | | |
+| **`028`** | `028-add-v2-protocol-handler-and-tmplblock-relay.patch` | Add dependency-injected `V2PeerProtocolHandler` (`src/net/v2_protocol_handler.h/.cpp`), `NetMsgType::TMPLBLOCK` (`Header \|\| CoinbaseTx`), Stage 1 `MatchCandidateOverlay` (`{L_k, L_{k-1}, L_{k-2}, L_0, L_spec}`), `ConnectMatchedOverlayBlock`, and Stage 2 automatic fallback to `getdata(MSG_CMPCT_BLOCK / MSG_BLOCK)`. | `src/net/v2_protocol_handler.h/.cpp` *(new)*<br/>`src/protocol.h/.cpp`<br/>`src/blockencodings.h/.cpp`<br/>`src/net_processing.cpp`<br/>`src/validation.h/.cpp`<br/>`test/functional/p2p_tmplblock_relay.py` *(new)* | Functional test proving synced nodes connect blocks via 284-byte `tmplblock` in 0 RTT, while lagging/unsynced nodes fall back to `cmpctblock` / `block`. |
 | **Stage D** | **Generalized P2P Merklix Mempool Reconciliation (`merklixsync` / `merklixbuck` / `shorttx`)** | | | |
-| **`029`** | `029-add-generalized-merklix-reconciliation-protocol.patch` | Add `merklixsync`, `getmerklixbuck`, `merklixbuck`, `getshorttx`, `shorttx` and `PendingCandidateTracker` (`ProcessTransaction` $\to$ `addUnchecked` $\to$ `OnMempoolTxAdded`). | `src/protocol.h/.cpp`<br/>`src/net_processing.cpp`<br/>`src/lotus_v2/mempool_overlay.h/.cpp`<br/>`test/functional/p2p_merklix_mempool_sync.py` *(new)* | Test `ReconScope::LIVE_MEMPOOL_SYNC (0x02)` in Tier 0 (no Avalanche): prove two nodes with differing mempools reconcile via `(s1, s3)` and child bisection. |
+| **`029`** | `029-add-generalized-merklix-reconciliation-protocol.patch` | Add `merklixsync`, `getmerklixbuck`, `merklixbuck`, `getshorttx`, `shorttx` to `V2PeerProtocolHandler` and `PendingCandidateTracker` (`ProcessTransaction` $\to$ `addUnchecked` $\to$ `OnMempoolTxAdded`). | `src/net/v2_protocol_handler.h/.cpp`<br/>`src/protocol.h/.cpp`<br/>`src/lotus_v2/mempool_overlay.h/.cpp`<br/>`test/functional/p2p_merklix_mempool_sync.py` *(new)* | Test `ReconScope::LIVE_MEMPOOL_SYNC (0x02)` in Tier 0 (no Avalanche): prove two nodes with differing mempools reconcile via `(s1, s3)` and child bisection. |
 | **Stage E** | **Avalanche Block Parking, Staking Rewards (`25%`), and Staker-Voted Treasury (`25%`)** | | | |
 | **`030`** | `030-restore-avalanche-block-parking-and-staking-rewards.patch` | Un-decouple `ParkBlock`/`UnparkBlock` in `ConnectTip` (`src/validation.cpp`) and `avaresponse` (`src/net_processing.cpp`). Enable `StakingRewardsPolicy` (`STAKER_REWARD_RATIO = 25%`, configurable) for V2 blocks. | `src/validation.cpp`<br/>`src/net_processing.cpp`<br/>`src/policy/block/stakingrewards.h/.cpp`<br/>`test/functional/abc_p2p_avalanche_staking_rewards.py` | Existing + V2 staking rewards functional tests pass: blocks omitting finalized staker payout are parked; compliant blocks connect. |
 | **`031`** | `031-add-avalanche-treasury-contender-voting-and-policy.patch` | Add `MSG_AVA_TREASURY_CONTENDER`, `NetMsgType::AVATREASURY`, `TreasuryContenderCache`, and `TreasuryPolicy` (`TREASURY_REWARD_RATIO = 25%`, leaving `50%` to Miner). Update `BuildV2CoinbaseTx` in `src/node/miner.cpp` to emit the `50% / 25% / 25%` split. | `src/protocol.h/.cpp`<br/>`src/avalanche/treasurycontendercache.h/.cpp` *(new)*<br/>`src/avalanche/processor.h/.cpp`<br/>`src/policy/block/treasurypolicy.h/.cpp` *(new)*<br/>`src/node/miner.cpp`<br/>`test/functional/avalanche_treasury_voting.py` *(new)* | Functional test proving stakers converge on a treasury payout script via `MSG_AVA_TREASURY_CONTENDER`, `getblocktemplate` pays `50/25/25`, and violating blocks are parked. |
@@ -1704,12 +1841,15 @@ return std::move(pblocktemplate);
 | **`033`** | `033-enable-causal-epoch-pipeline-and-preconsensus-policy.patch` | Enable the 3-stage `Ingest -> Mature -> Vote` logical epoch clock, `AbortStaleEpochsBelow(M)` cumulative jump $L_{N-1} \to L_M$, `finalized-tx-conflict` in `MemPoolAccept::PreChecks`, and `PreConsensusPolicy` parking in `ConnectTip`. | `src/lotus_v2/mempool_overlay.h/.cpp`<br/>`src/validation.cpp`<br/>`src/policy/block/preconsensus.h/.cpp`<br/>`test/functional/abc_p2p_avalanche_preconsensus.py` | Full pre-consensus functional test suite: double-spend rejection, lagging-node cumulative catch-up $L_{N-1} \to L_M$, and rogue block parking. |
 | **`034`** | `034-retire-legacy-per-tx-radix-preconsensus.patch` | Remove superseded per-tx `finalizedTxs` (`RadixTree<const CTxMemPoolEntry>`) and legacy `BlockAssembler` per-tx poll loop (`src/net_processing.cpp:7169`). | `src/txmempool.h/.cpp`<br/>`src/net_processing.cpp` | Full CTest + 300+ functional test suite pass with zero legacy per-tx radix overhead. |
 | **Stage G1** | **Upstreamable ABC C++20 `Boost.Asio` Coroutine RPC Engine ([`lotus-v2-rpc-coroutines-and-lockfree-snapshots.md`](./lotus-v2-rpc-coroutines-and-lockfree-snapshots.md))** | | | |
-| **`035`** | `035-rpc-asio-cpp20-coroutine-http-dispatcher.patch` | *(Upstreamable to ABC)* Replace blocking `WorkQueue<HTTPClosure>` in `src/httpserver.cpp` with header-only C++20 `boost::asio::thread_pool` + `boost::asio::awaitable` coroutine dispatch. Add optional `AsyncActor` (`boost::asio::awaitable<UniValue>`) to `CRPCCommand` (`src/rpc/server.h`). | `src/httpserver.h/.cpp`<br/>`src/rpc/server.h/.cpp`<br/>`src/rpc/util.h/.cpp`<br/>`src/test/httpserver_tests.cpp` | `httpserver_tests` + `rpc_*.py` pass unchanged; async coroutine RPCs suspend without occupying an OS worker thread. |
-| **`036`** | `036-rpc-async-longpoll-waitforblock-and-gbt.patch` | *(Upstreamable to ABC)* Add `AsyncBlockChangeWaiter` and convert `waitfornewblock`, `waitforblock`, `waitforblockheight` (`src/rpc/blockchain.cpp`) and `getblocktemplate` `longpollid` (`src/rpc/mining.cpp`) from blocking `wait_until` on OS threads to `co_await`. | `src/rpc/blockchain.h/.cpp`<br/>`src/rpc/mining.cpp`<br/>`test/functional/rpc_longpoll_coroutines.py` *(new)* | Functional test proving 200+ concurrent `waitfornewblock` + `getblocktemplate(longpollid)` calls with `-rpcthreads=4` never starve concurrent normal RPCs. |
+| **`035`** | `035-rpc-asio-cpp20-coroutine-http-dispatcher.patch` | *(Upstreamable to ABC)* Replace blocking `WorkQueue<HTTPClosure>` and static HTTP worker globals in `src/httpserver.cpp` with a dependency-injected C++20 `boost::asio::thread_pool` + `boost::asio::awaitable` coroutine dispatcher (`HttpRpcCoroEngine`). Add optional `AsyncActor` (`boost::asio::awaitable<UniValue>`) to `CRPCCommand` (`src/rpc/server.h`). | `src/httpserver.h/.cpp`<br/>`src/rpc/server.h/.cpp`<br/>`src/rpc/util.h/.cpp`<br/>`src/test/httpserver_tests.cpp` | `httpserver_tests` + `rpc_*.py` pass unchanged; async coroutine RPCs suspend without occupying an OS worker thread. |
+| **`036`** | `036-rpc-async-longpoll-waitforblock-and-gbt.patch` | *(Upstreamable to ABC)* Add `AsyncBlockChangeWaiter` (injected via `NodeContext`, replacing global `g_best_block_mutex`/`g_best_block_cv`/`cond_blockchange`) and convert `waitfornewblock`, `waitforblock`, `waitforblockheight` (`src/rpc/blockchain.cpp`) and `getblocktemplate` `longpollid` (`src/rpc/mining.cpp`) from blocking `wait_until` on OS threads to `co_await`. | `src/node/context.h`<br/>`src/rpc/blockchain.h/.cpp`<br/>`src/rpc/mining.cpp`<br/>`test/functional/rpc_longpoll_coroutines.py` *(new)* | Functional test proving 200+ concurrent `waitfornewblock` + `getblocktemplate(longpollid)` calls with `-rpcthreads=4` never starve concurrent normal RPCs. |
 | **Stage G2** | **Lotus V2 Lock-Free RCU Snapshots, True $O(1)$ `getblocktemplate`, and Atomic Batch RPCs ([`lotus-v2-rpc-coroutines-and-lockfree-snapshots.md`](./lotus-v2-rpc-coroutines-and-lockfree-snapshots.md))** | | | |
-| **`037`** | `037-v2-rcu-snapshot-and-lockfree-rpc-queries.patch` | Add `ChainAndMempoolSnapshot`, `SnapshotPublisher` (`std::atomic<std::shared_ptr<const ChainAndMempoolSnapshot>>`), and `ScopedMdbxReadTxn`. Convert `getblockchaininfo`, `getblockheader`, `gettxout`, `getmempoolinfo`, and `getrawmempool` to lock-free RCU overlay + MVCC reads (zero `cs_main` / `mempool.cs`). | `src/node/snapshot.h/.cpp` *(new)*<br/>`src/lotus_v2/disk_state.h/.cpp`<br/>`src/rpc/blockchain.cpp`<br/>`src/rpc/mempool.cpp`<br/>`src/test/snapshot_rcu_tests.cpp` *(new)* | Unit + concurrency stress test: 64 concurrent reader coroutines calling `gettxout` / `getmempoolinfo` while `ConnectTip` and `addUnchecked` mutate state continuously with zero lock contention. |
+| **`037`** | `037-v2-rcu-snapshot-and-lockfree-rpc-queries.patch` | Add `ChainAndMempoolSnapshot`, `SnapshotPublisher` (`std::atomic<std::shared_ptr<const ChainAndMempoolSnapshot>>` injected via `NodeContext`), and `ScopedMdbxReadTxn`. Convert `getblockchaininfo`, `getblockheader`, `gettxout`, `getmempoolinfo`, and `getrawmempool` to lock-free RCU overlay + MVCC reads (zero `cs_main` / `mempool.cs`). | `src/node/snapshot.h/.cpp` *(new)*<br/>`src/node/context.h`<br/>`src/lotus_v2/disk_state.h/.cpp`<br/>`src/rpc/blockchain.cpp`<br/>`src/rpc/mempool.cpp`<br/>`src/test/snapshot_rcu_tests.cpp` *(new)* | Unit + concurrency stress test: 64 concurrent reader coroutines calling `gettxout` / `getmempoolinfo` while `ConnectTip` and `addUnchecked` mutate state continuously with zero lock contention. |
 | **`038`** | `038-v2-o1-getblocktemplate-and-submittemplateblock.patch` | Make `getblocktemplate` truly $O(1)$ ($< 5\text{ }\mu\text{s}$, zero locks, $\sim 1\text{ KB}$ response) over V2 pre-consensus overlays by returning `overlay_id`, `subtree_a_root`, `utxo_root`, `stateroot`, and `50/25/25` `coinbasetxn` from `SnapshotPublisher::Load()`, lazily caching `cached_gbt_txs` on `MempoolOverlayLayer` for legacy callers, waking long-polls on new finalized epoch $L_e$, and adding `submittemplateblock`. | `src/rpc/mining.cpp`<br/>`src/lotus_v2/mempool_overlay.h/.cpp`<br/>`test/functional/mining_v2_o1_gbt.py` *(new)* | `mining_v2_o1_gbt.py`: prove `< 5 us` $O(1)$ `getblocktemplate` + `submittemplateblock` at 100k mempool txs with zero `cs_main` / `mempool.cs` locks. |
 | **`039`** | `039-add-atomic-testrawtxbatch-and-submitrawtxbatch-rpc.patch` | Add `testrawtxbatch` (lock-free atomic dry-run validation of arbitrary DAG topologies over `BatchCoinsView` + `ChainAndMempoolSnapshot`) and `submitrawtxbatch` / `submitpackage(..., atomic=true)` (two-phase all-or-nothing validation + atomic mempool/epoch commit with zero partial commits). | `src/rpc/mempool.cpp`<br/>`src/validation.h/.cpp`<br/>`test/functional/rpc_atomic_tx_batch.py` *(new)* | `rpc_atomic_tx_batch.py`: prove multi-hop Stamp/Signet chains ($T_1 \to T_2 \to T_3$) and fan-out batches commit all-or-nothing (0 partial commits when $T_k$ fails or races). |
+| **Stage H** | **Pre-`1.0.0` Network Relay Tuning, Avalanche Bootstrap Gate, & Legacy Prototype Retirement** | | | |
+| **`040`** | `040-tune-poisson-tx-relay-and-avalanche-bootstrap-gate.patch` | Tune Poisson `inv` trickling (`INBOUND_INVENTORY_BROADCAST_INTERVAL = 500ms`, per-outbound-peer `OUTBOUND_INVENTORY_BROADCAST_INTERVAL = 150ms` via `rand_exp_duration`, `nonpref_peer_delay = 200ms`, `INVENTORY_BROADCAST_PER_SECOND = 250`) and add `IsAvalancheBootstrapComplete` (`nAvalancheBootstrapHeight` + `nMinimumAvalancheQuorumStake`) cold-start gate before activating `PreConsensusPolicy`, `StakingRewardsPolicy`, and `TreasuryPolicy`. | `src/net_processing.cpp`<br/>`src/consensus/params.h`<br/>`src/avalanche/processor.h/.cpp`<br/>`src/node/miner.cpp`<br/>`test/functional/p2p_v2_poisson_relay_and_bootstrap.py` *(new)* | Functional test proving Genesis cold-start mines cleanly in Tier 0 until `nAvalancheBootstrapHeight` + quorum stake threshold is met, then transitions seamlessly to `50/25/25` + pre-consensus with sub-500ms Poisson `inv` propagation. |
+| **`041`** | `041-retire-standalone-lotus-v2-prototype-scaffolding.patch` | Retire superseded standalone prototype scaffolding in `src/lotus_v2/` (`peer_tcp.*`, `peer_dispatcher.*`, `development_node_command.*`, `transaction_pool.*`, `candidate_store.*`, `avalanche_driver.*`, `-lotusv2development`, `-lotusv2node`) now that `lotusd` runs native V2 consensus, `libmdbx` `DiskStateStore`, `CTxMemPool`, `CConnman`, `PeerManager`, and `avalanche::Processor` directly. | `src/bitcoind.cpp`<br/>`src/lotus_v2/CMakeLists.txt`<br/>`src/lotus_v2/*` | Clean build + full unit/functional test suite with zero duplicate P2P/mempool/chainstate scaffolding in `src/lotus_v2/`. |
 
 ---
 
@@ -1721,16 +1861,17 @@ return std::move(pblocktemplate);
    - Adopt delayed/pipelined coinbase UTXO insertion (Block $h$'s coinbase outputs enter `UtxoRoot` in $L_0$ of Block $h+1$).
 2. **Typed Avalanche Polling (`CInv` & `AnyVoteItem`) + Generalized Merklix Reconciliation:**
    - Distinguish every vote domain via explicit `CInv::type` and `AnyVoteItem` variants: `MSG_AVA_PROOF` (proofs), `MSG_BLOCK` (blocks), `MSG_AVA_STAKE_CONTENDER` (25% staker reward winner), **`MSG_AVA_TREASURY_CONTENDER`** (25% staker-voted treasury payout script), and **`MSG_AVA_MEMPOOL_BATCH`** (pre-consensus epoch/bucket Merklix roots).
-   - Keep set reconciliation generalized (`merklixsync`, `getmerklixbuck`, `merklixbuck`, `getshorttx`, `shorttx` with `ReconScope`) so it works both when an `avapoll` encounters an unknown `MSG_AVA_MEMPOOL_BATCH` and in Tier 0 live mempool sync without Avalanche.
-3. **Avalanche Staking Rewards (`25%`), Staker-Voted Treasury (`25%`), Miner Share (`50%`), and Soft Block Parking:**
-   - Keep the 50% / 25% / 25% coinbase split as an Avalanche soft block-parking policy (`StakingRewardsPolicy` + `TreasuryPolicy` in `ConnectTip`) rather than a hard consensus rule, and construct all three outputs in `vtx[0]` once inside `CreateNewBlock` (no coinbase grinding needed thanks to the 64-bit header `nonce`, and zero impact on `L_k.subtree_a_root` or `L_k.utxo_root`).
-4. **In-Memory Persistent Merklix Overlay Engine (`MerklixOverlayArena`) & `tmplblock` Relay:**
-   - Pre-populate `L_e->cached_block` (`vtx[1..N_e]` in CTOR order) once when snapshot $L_e$ finalizes so both `getblocktemplate` and incoming ~284-byte `tmplblock` (`Header || CoinbaseTx`) announcements simply slot in `vtx[0] = coinbase_tx` in $O(1)$, falling back automatically to `cmpctblock` / `block` if no local candidate overlay matches.
+   - Keep set reconciliation generalized (`merklixsync`, `getmerklixbuck`, `merklixbuck`, `getshorttx`, `shorttx` with `ReconScope`) and encapsulated inside a constructor-injected **`V2PeerProtocolHandler`** (`src/net/v2_protocol_handler.h/.cpp`) so it works both when an `avapoll` encounters an unknown `MSG_AVA_MEMPOOL_BATCH` and in Tier 0 live mempool sync without bloating `src/net_processing.cpp`.
+3. **Avalanche Staking Rewards (`25%`), Staker-Voted Treasury (`25%`), Miner Share (`50%`), Soft Block Parking, and Cold-Start Bootstrap Gate:**
+   - Keep the 50% / 25% / 25% coinbase split as an Avalanche soft block-parking policy (`StakingRewardsPolicy` + `TreasuryPolicy` in `ConnectTip`) gated by `IsAvalancheBootstrapComplete` (`nAvalancheBootstrapHeight` + minimum finalized quorum stake) so Genesis cold-start operates cleanly in Tier 0 until mature UTXO stake proofs form a quorum.
+4. **In-Memory Persistent Merklix Overlay Engine (`MerklixOverlayArena`), `tmplblock` Relay, & Poisson Trickle Tuning:**
+   - Pre-populate `L_e->cached_block` (`vtx[1..N_e]` in CTOR order) once when snapshot $L_e$ finalizes so both `getblocktemplate` and incoming ~284-byte `tmplblock` (`Header || CoinbaseTx`) announcements simply slot in `vtx[0] = coinbase_tx` in $O(1)$.
+   - Tune Poisson `inv` trickling (`500ms` inbound mean, `150ms` per-outbound-peer exponential jitter, `200ms` non-preferred `getdata` delay, `250` tx/s/MB broadcast cap) to preserve timing privacy while completing propagation well inside the 2.5s `Stage 1 (Ingest)` epoch window.
 5. **Upstreamable C++20 `Boost.Asio` Coroutine RPC Engine (`Stage G1`) + Lotus V2 Lock-Free RCU Snapshots, True $O(1)$ `getblocktemplate`, and Atomic Batch RPCs (`Stage G2`, see [`lotus-v2-rpc-coroutines-and-lockfree-snapshots.md`](./lotus-v2-rpc-coroutines-and-lockfree-snapshots.md)):**
    - First, replace the legacy 4-thread blocking `WorkQueue` in `src/httpserver.cpp` and OS-thread-parking `wait_until` long-polls (`waitfornewblock`, `getblocktemplate` `longpollid`) with header-only C++20 `boost::asio::awaitable` coroutines in two standalone, upstreamable ABC patches (`035`–`036`).
    - Second, add `ChainAndMempoolSnapshot` (`std::atomic<std::shared_ptr<const ChainAndMempoolSnapshot>>`) + `ScopedMdbxReadTxn` (`037`), true $O(1)$ overlay `getblocktemplate` + `submittemplateblock` (`038`), and lock-free atomic batch validation (`testrawtxbatch`) + two-phase all-or-nothing batch submission (`submitrawtxbatch`, `039`).
-6. **17-Commit Modular Implementation Roadmap (`Patches 023–039`):**
-   - Execute the work in 8 cleanly isolated stages (`023`–`039`)—from pure offline overlay arenas (`023`–`025`), to local speculative overlays and $O(1)$ mining (`026`–`027`), `tmplblock` relay (`028`), generalized Merklix sync (`029`), staking + treasury soft policies (`030`–`031`), Avalanche batch pre-consensus (`032`–`034`), upstreamable C++20 coroutine HTTP/RPC (`035`–`036`), and Lotus V2 lock-free RCU snapshot queries, $O(1)$ `getblocktemplate`, and atomic `testrawtxbatch`/`submitrawtxbatch` (`037`–`039`).
+6. **19-Commit Modular Implementation Roadmap (`Patches 023–041`):**
+   - Execute the work in 9 cleanly isolated stages (`023`–`041`)—ending with Stage H (`040`–`041`) to tune Poisson transaction relay, enforce the Avalanche cold-start bootstrap gate, and retire the superseded standalone `src/lotus_v2/` prototype scaffolding before `1.0.0`.
 
 
 
