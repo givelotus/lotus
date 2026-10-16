@@ -63,3 +63,25 @@ The wrapper now fails immediately when a pinned request is invalidated at its
 unchanged native anchor and skips additional audit work after the primary
 failure, preserving cleanup and the original cause. A repaired immutable native
 binary is required before another actual run; the existing failure is not reset.
+
+## Review corrections before the repaired-binary run
+
+A same-tip 409 can follow a legitimate header/body/policy context change. The
+lifecycle gate now records both raw native observations, durable HTTP stamps,
+the old pinned envelope, the error context and elapsed time, and restarts the
+whole observation at most three times. Native coin reads and multi-screen DOM
+results are accepted only across a stable context; an unchanged-context error
+remains a failure. Temporary ready/busy status alone is not a durable stamp
+change authorizing a retry.
+
+An independent initial-A probe uses HTTP only, before peers or further native
+JSONL commands. Over at least two seconds and twenty coherent rounds it requires
+one durable epoch/generation/binding/anchor and exact pinned response. Bounded
+transient unavailable attempts remain in the request trace; 409, durable stamp
+churn or sustained unavailability fails the probe.
+
+Live DOM execution now includes historical outpoint details and all seven typed
+search modes. Unknown asset lookup is explicitly a covered-history absence when
+the native asset registry is empty. This wallet gate does not establish asset
+accounting even if tokens happen to appear; `--require-assets` fails explicitly
+and directs review to the separately owned native asset lifecycle harness.

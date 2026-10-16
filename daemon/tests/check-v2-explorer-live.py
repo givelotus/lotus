@@ -29,7 +29,8 @@ def load(name, path):
 
 
 class Changed(Exception):
-    pass
+    def __init__(self, reason='observation changed', context=None):
+        super().__init__(reason);self.context=context
 
 
 # Runs the actual built app and its live fetch adapter against the real proxy.
@@ -54,7 +55,11 @@ const witness=[...win.document.querySelectorAll('#results button')].find(b=>b.te
 async function contains(text){const end=Date.now()+15000;while(Date.now()<end){if(win.document.querySelector('#results').textContent.includes(text))return;const n=win.document.querySelector('#notice').textContent;if(n.includes('unavailable')||n.includes('Snapshot changed'))throw new Error(n);await new Promise(r=>setTimeout(r,20));}throw new Error('DOM detail deadline: '+text);}
 if(witness){witness.click();await contains('Public witnesses');}
 const wire=[...win.document.querySelectorAll('#results button')].find(b=>b.textContent==='Inspect exact transaction wire');wire.click();await contains(plan.wire_prefix);
-await screen('/transactions/by-hash/'+plan.txhash,plan.txid);await screen('/assets');
+await screen('/transactions/by-hash/'+plan.txhash,plan.txid);await screen('/outputs/'+plan.txid+'/0',plan.output_value);await screen('/assets');
+async function search(kind,value,expected,missing=false){win.document.querySelector('#notice').textContent='';win.document.querySelector('#kind').value=kind;win.document.querySelector('#query').value=value;win.document.querySelector('#search').dispatchEvent(new win.Event('submit',{cancelable:true}));if(missing){const end=Date.now()+15000;while(Date.now()<end&&!win.document.querySelector('#notice').textContent.startsWith('Absent'))await new Promise(r=>setTimeout(r,20));if(!win.document.querySelector('#notice').textContent.startsWith('Absent'))throw new Error('Unknown asset search must show covered-history absence');}else{await ready();if(expected&&!win.document.querySelector('#results').textContent.includes(expected))throw new Error('Typed search missing native fact '+kind);}screens.push({search_kind:kind,value,text:win.document.querySelector('#results').textContent,notice:win.document.querySelector('#notice').textContent});}
+await search('height',plan.height,plan.block_id);await search('block',plan.block_id,plan.block_id);await search('txid',plan.txid,plan.txhash);await search('txhash',plan.txhash,plan.txid);await search('outpoint',plan.txid+':0',plan.output_value);
+await search('asset',plan.assets[0]??'00'.repeat(32),plan.assets[0],plan.assets.length===0);
+if(plan.root)await search('branch',plan.root,plan.root);
 for(const id of plan.assets)await screen('/assets/'+id,id);
 if(plan.root){win.document.querySelector('#notice').textContent='';win.document.querySelector('#roots').value=plan.root;win.document.querySelector('#positions').value=JSON.stringify([{position:'0',roots:[plan.root]}]);win.document.querySelector('#branches').dispatchEvent(new win.Event('submit',{cancelable:true}));await ready();if(!win.document.querySelector('#results').textContent.includes(plan.root))throw new Error('Actual branch root missing from DOM');screens.push({route:'POST /branches/outputs',text:win.document.querySelector('#results').textContent});}
 if(!win.document.querySelector('#anchor').textContent.includes(plan.tip))throw new Error('DOM anchor differs from authenticated native tip');
@@ -69,7 +74,7 @@ def main(argv=None):
         parser.add_argument('--'+name, type=Path, required=True)
     for name in ('reference-source', 'frontend-source', 'expected-daemon-sha256', 'expected-wallet-sha256', 'expected-manifest-sha256'):
         parser.add_argument('--'+name, required=True)
-    parser.add_argument('--require-assets', action='store_true', help='Fail unless a native accepted token occurrence is exercised')
+    parser.add_argument('--require-assets', action='store_true', help='Fail explicitly: asset accounting/lifecycle requires the separate asset harness')
     own, driver_args = parser.parse_known_args(argv)
     driver = load('explorer_wallet_discovery_driver', Path(__file__).with_name('check-v2-wallet-discovery-live.py'))
     local = driver.local_module()
@@ -139,10 +144,10 @@ def main(argv=None):
             parsed=urllib.parse.urlparse(self.proxy_base);require(parsed.hostname=='127.0.0.1' and parsed.port not in local.FORBIDDEN_PORTS,'proxy must be private ephemeral loopback')
             record('listeners',node=self.label,home=self.home,native=self.base,proxy=self.proxy_base,proxy_pid=proxy.pid)
             self.audit(force=True)
-        def http(self, route, token=None, body=None, expected=200, proxy=False):
+        def http(self, route, token=None, body=None, expected=200, proxy=False, idle_probe=False, budget=None):
             url=(self.proxy_base if proxy else self.base)+PREFIX+route
             if token: url += ('&' if '?' in url else '?')+urllib.parse.urlencode({'snapshot_token':token})
-            deadline=time.monotonic()+self.timeout
+            deadline=time.monotonic()+(self.timeout if budget is None else budget)
             while True:
                 request=urllib.request.Request(url,data=None if body is None else json.dumps(body).encode(),headers={'Content-Type':'application/json'},method='GET' if body is None else 'POST')
                 try:
@@ -152,15 +157,15 @@ def main(argv=None):
                     code=error.code;raw=error.read(262145);cache=error.headers.get('Cache-Control')
                 require(len(raw)<=262144,'HTTP encoded response cap exceeded');value=json.loads(raw)
                 require(cache=='no-store','HTTP must not cache mutable observations')
-                evidence['requests'].append(dict(node=self.label,route=route,token=token,body=body,proxy=proxy,status=code,response=value))
+                evidence['requests'].append(dict(monotonic=time.monotonic(),node=self.label,route=route,token=token,body=body,proxy=proxy,status=code,response=value))
                 require(len(evidence['requests'])<=20000,'acceptance request budget exceeded')
                 if code==503:
                     require(time.monotonic()<deadline,'explorer stayed unavailable');time.sleep(.025);continue
                 if code==409 and expected!=409:
                     current=value.get('snapshot') or {}
-                    if self.auditing and current.get('tip')==getattr(self,'audit_tip',None):raise AssertionError('pinned explorer view invalidated at unchanged native anchor: '+str(current))
-                    raise Changed()
-                if code!=expected and self.auditing and self.raw('status').get('tip')!=getattr(self,'audit_tip',None):raise Changed()
+                    if idle_probe:raise AssertionError('idle probe token invalidated without native control commands: '+str(current))
+                    raise Changed('HTTP pinned request changed',dict(route=route,status=code,error=value))
+                if code!=expected and self.auditing and not idle_probe and self.raw('status').get('tip')!=getattr(self,'audit_tip',None):raise Changed()
                 require(code==expected,'unexpected HTTP result '+str((route,code,value)))
                 require(value.get('api_version')=='1','wrong explorer API version')
                 return value
@@ -201,13 +206,45 @@ def main(argv=None):
                 if next_offset is None:require(len(raw)==int(total),'wire final length');return bytes(raw)
                 require(next_offset==str(len(raw)) and int(next_offset)>int(offset),'wire did not advance');offset=next_offset
             raise AssertionError('transaction wire exceeded local bound')
+        def context(self):
+            return dict(native=self.raw('status'),http=self.http('/status'))
+        @staticmethod
+        def stamp(context):
+            n=context['native'];h=context['http']
+            return dict(native={k:n.get(k) for k in (*local.STATE_FIELDS,'fetch_epoch','pending_journal','pending_receipt','pending_propagation','execution_paused','reopen_required','mempool_ready')},http={k:h.get(k) for k in ('service_epoch','generation','binding','indexed_anchor','authoritative_anchor')})
+        def idle_probe(self):
+            # Initial A has no peers and no commands run inside this interval.
+            started=time.monotonic();end=started+6;first_request=len(evidence['requests']);baseline=None;rounds=0;busy=0
+            while rounds<20 or time.monotonic()-started<2:
+                require(time.monotonic()<end,'idle HTTP-only probe did not complete bounded ready observations')
+                status=self.http('/status',idle_probe=True,budget=min(2,end-time.monotonic()))
+                if not status['ready']:
+                    busy+=1;time.sleep(.01);continue
+                stamp={k:status[k] for k in ('service_epoch','generation','binding','indexed_anchor','authoritative_anchor')}
+                if baseline is None:
+                    envelope=self.http('/blocks?page_size=1',idle_probe=True,budget=min(2,end-time.monotonic()));baseline=stamp
+                require(stamp==baseline,'idle durable authority stamp changed')
+                page=self.http('/blocks?page_size=1',envelope['snapshot_token'],idle_probe=True,budget=min(2,end-time.monotonic()))
+                require(page==envelope,'idle pinned data changed');rounds+=1;time.sleep(.1)
+            record('http-only-idle-authority-probe',node=self.label,seconds=time.monotonic()-started,rounds=rounds,not_ready_observations=busy,baseline=baseline,request_range=[first_request,len(evidence['requests'])])
         def audit(self, force=False):
             if self.auditing or self.base is None:return
-            self.auditing=True;deadline=time.monotonic()+self.timeout
+            self.auditing=True;started=time.monotonic();deadline=started+self.timeout;attempt=0
             try:
                 while True:
+                    attempt+=1;self.audit_context=None
                     try:return self.audit_once(force)
-                    except Changed:require(time.monotonic()<deadline,'explorer snapshots kept changing')
+                    except (Changed,AssertionError) as error:
+                        before=self.audit_context
+                        if before is None:raise
+                        after=self.context()
+                        # Same tip may acquire a new header/body/policy context.
+                        # Native coin reads and multi-screen DOM use the latest
+                        # state: retry only when their observation fence changed.
+                        changed=self.stamp(before)!=self.stamp(after)
+                        if not changed:raise
+                        record('whole-observation-restart',node=self.label,attempt=attempt,max_attempts=4,elapsed=time.monotonic()-started,deadline_seconds=self.timeout,error=str(error),error_context=getattr(error,'context',None),old_snapshot=getattr(self,'audit_envelope',None),before=before,after=after)
+                        require(attempt<4 and time.monotonic()<deadline,'whole observation kept changing beyond bounded retries')
             except Exception:
                 self.failed=True
                 raise
@@ -220,11 +257,13 @@ def main(argv=None):
                 native=self.raw('status');status=self.http('/status')
                 if status['ready'] and status['indexed_anchor']['block_id']==native.get('tip') and native.get('mempool_ready') is True and not any(native.get(k) for k in ('pending_journal','pending_receipt','pending_propagation','execution_paused','reopen_required')):break
                 require(time.monotonic()<deadline,'explorer/native did not converge');time.sleep(.025)
-            self.audit_tip=native['tip'];identity=(native['tip'],status['service_epoch'],status['generation'])
+            self.audit_tip=native['tip'];self.audit_context=dict(native=native,http=status);identity=(native['tip'],status['service_epoch'],status['generation'])
             if identity in self.audited and not force:return
+            if self.label=='a' and not getattr(self,'idle_probed',False):
+                self.idle_probe();self.idle_probed=True
             for k in ('accepted_pool','detached_history','finality'):require(status['capabilities'][k] is False,'unsupported feature claim')
             require(status['binding']==dict(chain_id=native['chain_id'],genesis=native['genesis_id'],profile_id=native['profile_digest']),'native chain/profile differs')
-            envelope=self.http('/blocks?page_size=1');snapshot=envelope['snapshot'];token=envelope['snapshot_token']
+            envelope=self.http('/blocks?page_size=1');self.audit_envelope=envelope;snapshot=envelope['snapshot'];token=envelope['snapshot_token']
             if snapshot['tip']!=native['tip']:raise Changed()
             blocks=self.pages('/blocks',envelope);require([int(b['height']) for b in blocks]==list(range(native['height'],-1,-1)),'canonical block paging incomplete/order wrong')
             old=previous.get(self.home)
@@ -267,7 +306,7 @@ def main(argv=None):
                         wanted=dict(txid=txid,out_idx=str(ordinal),flags=str(native_output.flags),value=str(native_output.value),has_token=native_output.token_id is not None,is_burn=bool(native_output.flags&2),branches=[b.hex() for b in native_output.branches],paths=[list(map(str,p)) for p in native_output.paths])
                         require(all(row[k]==v for k,v in wanted.items()),'native output facts differ');require(row['creation']==dict(block_id=bid,height=summary['height'],tx_index=str(index),txid=txid,txhash=txhash),'native output creation differs');require(row==self.pinned('/outputs/'+txid+'/'+str(ordinal),envelope),'historical outpoint differs');rows[(txid,str(ordinal))]=row
                         if native_output.token_id is not None:require(row['token_id']==native_output.token_id.hex(),'native token identity differs');expected_assets.add(row['token_id'])
-                    if index>0 or plan is None:plan=dict(block_id=bid,txid=txid,txhash=txhash,wire_prefix=wire[:24].hex(),tip=snapshot['tip'],assets=[])
+                    if index>0 or plan is None:plan=dict(block_id=bid,height=summary['height'],txid=txid,txhash=txhash,wire_prefix=wire[:24].hex(),output_value=str(transaction.outputs[0].value),tip=snapshot['tip'],assets=[])
             for point,row in rows.items():
                 require(row['spend']==spends.get(point),'spend history differs from decoded native inputs')
                 coin=self.raw('coin',txid=point[0],index=int(point[1]));require((coin['coin'] is not None)==(point not in spends and not row['is_burn']),'native UTXO presence differs from historical spend/burn')
@@ -280,7 +319,7 @@ def main(argv=None):
             assets=self.pages('/assets',envelope);require([a['token_id'] for a in assets]==sorted(expected_assets),'asset registry differs from native token occurrences')
             for asset in assets:
                 aid=asset['token_id'];require(self.pinned('/assets/'+aid,envelope)==asset,'asset detail differs');self.pages('/assets/'+aid+'/events',envelope);self.pages('/assets/'+aid+'/outputs?view=history',envelope);self.pages('/assets/'+aid+'/outputs?view=unspent',envelope)
-            if assets:evidence['asset_fixture']='native_accepted_token_observed'
+            if assets:evidence['asset_fixture']='native_accepted_token_observed_only_not_accounting_validated'
             # Every native pending transaction remains absent from confirmed-only explorer.
             for txid,payment in payments.items():
                 native_tx=self.raw('transactionstatus',txid=txid,txhash=payment['txhash'],wire=payment['wire'])
@@ -331,7 +370,7 @@ def main(argv=None):
                 if phase==3:transition=dict(home=home,txid=txid,snapshots=found);break
             if transition:break
         require(transition is not None,'same-home confirmed/detached/remined explorer membership missing');record('confirmed-detached-remined-membership',**transition)
-        require(not own.require_assets or evidence['asset_fixture']=='native_accepted_token_observed','native accepted token fixture not supplied; asset events/detail gate incomplete')
+        require(not own.require_assets,'asset accounting/lifecycle is a separate acceptance harness; this wallet gate does not establish it')
         evidence['native_evidence_sha256']=local.digest(output/'evidence.json');evidence['passed']=True;save()
     except Exception as error:
         evidence['failure']=dict(kind=type(error).__name__,error=str(error));save();raise
