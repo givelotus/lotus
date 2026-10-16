@@ -41,6 +41,12 @@ def executable(path, body):
 
 
 class CommandFlowTests(ControllerCase):
+    def tearDown(self):
+        # Lifecycle metadata must be flushed before the fixture deletes its session.
+        for controller in getattr(self, "controllers", []):
+            controller.close()
+        super().tearDown()
+
     def make_controller(self, wallet_mode="route", secret_prompt=None):
         daemon = executable(
             self.root / "fake-daemon",
@@ -114,6 +120,7 @@ class CommandFlowTests(ControllerCase):
         )
         controller.start()
         self.nodes.extend(controller.nodes.values())
+        self.controllers = getattr(self, "controllers", []) + [controller]
         self.addCleanup(controller.close)
         return controller, config_path
 

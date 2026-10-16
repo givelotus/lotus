@@ -44,22 +44,25 @@ def main(argv=None):
         "--session",
         type=Path,
         required=True,
-        help="new directory; existing homes are never reused",
+        help="new directory, or clean stopped session with --resume",
     )
     parser.add_argument(
         "--check",
         action="store_true",
         help="validate pins/configuration only; no processes or files",
     )
+    parser.add_argument("--resume", action="store_true", help="resume a new-format clean stopped session")
     args = parser.parse_args(argv)
     controller = None
     previous = {}
     try:
         config = load_config(args.config)
         if args.check:
+            if args.resume:
+                Controller(config, args.session, resume=True).check_resume()
             print(json.dumps({"ok": True, "result": "configuration_checked"}))
             return 0
-        controller = Controller(config, args.session, terminal_secret)
+        controller = Controller(config, args.session, terminal_secret, resume=args.resume)
 
         def interrupted(signum, _frame):
             raise KeyboardInterrupt

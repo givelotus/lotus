@@ -7,6 +7,7 @@ server. Native processes own validation, encrypted keys and wallet persistence.
 from __future__ import annotations
 
 import collections
+import fcntl
 import hashlib
 import http.client
 import importlib.util
@@ -21,6 +22,7 @@ import selectors
 import shlex
 import signal
 import socket
+import stat
 import subprocess
 import threading
 import time
@@ -355,7 +357,7 @@ def _load_config(path):
             "home must be beneath new session",
         )
         require(
-            home.parts[0] not in ("wallets", "public", "network", "session.json"),
+            home.parts[0] not in ("wallets", "public", "network", "session.json", "session.lock"),
             "home uses controller namespace",
         )
         require(
@@ -392,7 +394,8 @@ def _load_config(path):
         network = decode_json(source.read_bytes())
         exact(
             network,
-            ("schema", "magic", "listen", "connect", "receive_limit", "local_policy"),
+            ("schema", "magic", "listen", "connect", "receive_limit", "local_policy")
+            + tuple(key for key in ("chronik_bind", "avalanche") if key in network),
         )
         require(
             type(network["schema"]) is int
@@ -400,6 +403,26 @@ def _load_config(path):
             and network["local_policy"] == "bounded-local-v1",
             "network schema/policy",
         )
+        if "chronik_bind" in network:
+            bind = network["chronik_bind"]
+            require(isinstance(bind, str), "chronik_bind numeric socket required")
+            match = re.fullmatch(r"(?:\[([0-9a-f:]+)\]|([0-9.]+)):([0-9]+)", bind)
+            require(match is not None, "chronik_bind numeric socket required")
+            address = ipaddress.ip_address(match[1] or match[2])
+            require(str(address) == (match[1] or match[2])
+                    and str(address) in ("127.0.0.1", "::1"),
+                    "chronik_bind requires 127.0.0.1 or [::1]")
+            require(str(int(match[3])) == match[3], "canonical chronik_bind port required")
+            integer(int(match[3]), 1, 65535)
+        if "avalanche" in network:
+            avalanche = network["avalanche"]
+            exact(avalanche, ("credentials", "initial_download"))
+            credentials = avalanche["credentials"]
+            require(credentials is None or (isinstance(credentials, str)
+                    and Path(credentials).is_absolute()), "absolute Avalanche credentials path required")
+            exact(avalanche["initial_download"], ("minimum_height", "maximum_tip_age_seconds"))
+            integer(avalanche["initial_download"]["minimum_height"], 0, 0xFFFFFFFF)
+            integer(avalanche["initial_download"]["maximum_tip_age_seconds"], 1, 0xFFFFFFFF)
         exact(network["listen"], ("address", "port"))
         endpoint(network["listen"], listen=True)
         require(isinstance(network["connect"], list) and len(network["connect"]) <= 64,
@@ -654,7 +677,10 @@ class NodeProcess:
             # shutdown was interrupted by a signal or SystemExit.
             try:
                 if self.process.poll() is None:
+                    self.cleanup_uncertain = True
                     terminate_owned(self.process)
+                if self.process.returncode != 0:
+                    self.cleanup_uncertain = True
             except BaseException as error:
                 if failure is None:
                     failure = error
@@ -948,8 +974,15 @@ class WalletProcess:
 
 
 class Controller:
-    def __init__(self, config, session, secret_prompt=None):
-        self.config, self.session = config, Path(session).resolve()
+    def __init__(self, config, session, secret_prompt=None, resume=False):
+        self.config = config
+        require(".." not in Path(session).parts, "session path aliases are forbidden")
+        self.session = Path(session).absolute()
+        self.resume = resume
+        self._lock_fd = None
+        self._record = None
+        self._launch_complete = False
+        self._cleanup_uncertain = False
         self.nodes = {}
         self.wallet_nodes = {}
         self.secret_prompt = secret_prompt
@@ -966,31 +999,39 @@ class Controller:
         require(
             not self.started and not self.closed, "controller already started/closed"
         )
-        # No existing session, resume/reset or arbitrary external home is allowed.
-        self.session.mkdir(mode=0o700, parents=False, exist_ok=False)
+        self._safe_path(self.session, private=False, ancestors=True)
+        if self.resume:
+            self.check_resume()
+        else:
+            self.session.mkdir(mode=0o700, parents=False, exist_ok=False)
         self.started = True
         try:
-            for name in ("manifest", "daemon", "wallet_client"):
-                pinned = self.config[name]
-                require(
-                    sha256_file(pinned["path"]) == pinned["sha256"],
-                    name + " changed before launch",
-                )
-            (self.session / "network").mkdir(mode=0o700)
-            (self.session / "wallets").mkdir(mode=0o700)
-            (self.session / "public").mkdir(mode=0o700)
+            self._acquire_lock()
+            if self.resume:
+                self.check_resume(compile_recipients=True)
+                self.wallet_nodes = dict(self._record["wallet_nodes"])
+                self._record["generation"] += 1
+            else:
+                self._record = self._metadata()
+                for name in ("network", "wallets", "public"):
+                    (self.session / name).mkdir(mode=0o700)
+                (self.session / "public" / "recipients").mkdir(mode=0o700)
+            self._record["lifecycle"] = "starting"
+            self._persist()
+            self._check_pins()
             identity = None
             for item in self.config["nodes"]:
                 home = self.session / item["home"]
                 home.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-                require(not home.exists(), "node home already exists")
+                require(home.is_dir() if self.resume else not home.exists(),
+                        "recorded node home missing" if self.resume else "node home already exists")
                 network = dict(item["resolved_network"])
                 network["connect"] = list(network["connect"]) + [
                     self.nodes[name].ready["listen"] for name in item["connect_to"]
                 ]
                 for peer in network["connect"]:
                     endpoint(peer)
-                network_path = self.session / "network" / (item["name"] + ".json")
+                network_path = self.session / "network" / (item["name"] + ("" if self._record["generation"] == 1 else "-" + str(self._record["generation"])) + ".json")
                 self._write_new(network_path, encode_json(network) + b"\n")
                 node = NodeProcess(
                     item["name"],
@@ -1027,40 +1068,119 @@ class Controller:
                     identity is None or identity == observed,
                     "node profile identities differ",
                 )
+                require(not self.resume or list(observed) == self._record["identity"],
+                        "resumed node identity changed")
                 identity = observed
                 if "chronik" in item:
                     require((item["chronik"]["chain_id"], item["chronik"]["profile_id"])
                             == (observed[0], observed[2]),
                             "Chronik binding differs from native node")
-            self._write_new(
-                self.session / "session.json",
-                encode_json(
-                    {
-                        "schema": 1,
-                        "manifest": self.config["manifest"],
-                        "daemon": self.config["daemon"],
-                        "wallet_client": self.config["wallet_client"],
-                        "compiler": self.config["compiler"],
-                        "compiler_sha256": sha256_file(
-                            Path(self.config["compiler"]["directory"])
-                            / "dist/generic.js"
-                        ),
-                        "payment_source_sha256": sha256_file(
-                            Path(self.config["compiler"]["directory"])
-                            / "examples/gallery/payment.lotus"
-                        ),
-                        "identity": identity,
-                        "nodes": [
-                            {"name": name, "listen": node.ready["listen"]}
-                            for name, node in self.nodes.items()
-                        ],
-                    }
-                )
-                + b"\n",
-            )
+            require(not self.resume or list(identity) == self._record["identity"],
+                    "resumed node identity changed")
+            self._record["identity"] = list(identity)
+            for name in self.wallet_nodes:
+                self._validate_wallet_info(self._invoke(name, "info", {}, self.deadline()))
+            self._record["lifecycle"] = "running"
+            self._persist()
+            self._launch_complete = True
         except BaseException:
             self.close()
             raise
+
+    @staticmethod
+    def _safe_path(path, private=True, ancestors=False):
+        path = Path(path)
+        candidates = list(reversed(path.parents)) + [path] if ancestors else [path]
+        for candidate in candidates:
+            if not candidate.exists() and not candidate.is_symlink():
+                continue
+            info = candidate.lstat()
+            require(stat.S_ISREG(info.st_mode) or stat.S_ISDIR(info.st_mode),
+                    "managed path must be regular file or directory")
+            if private and candidate == path:
+                require(info.st_uid == os.getuid() and not info.st_mode & 0o022,
+                        "managed path ownership or writable permissions unsafe")
+
+    def _check_pins(self):
+        for name in ("manifest", "daemon", "wallet_client"):
+            pinned = self.config[name]
+            require(sha256_file(pinned["path"]) == pinned["sha256"], name + " changed before launch")
+        for item in self.config["nodes"]:
+            require(sha256_file(item["network"]["path"]) == item["network"]["sha256"], "network pin changed")
+
+    def _metadata(self):
+        compiler = Path(self.config["compiler"]["directory"])
+        return {"schema": 2, "session": str(self.session), "config": self.config,
+                "compiler_sha256": sha256_file(compiler / "dist/generic.js"),
+                "payment_source_sha256": sha256_file(compiler / "examples/gallery/payment.lotus"),
+                "node_sha256": sha256_file(self.config["compiler"]["node"]),
+                "identity": None, "wallet_nodes": {}, "generation": 1, "lifecycle": "starting"}
+
+    def check_resume(self, compile_recipients=False):
+        self._safe_path(self.session, ancestors=True)
+        require(self.session.is_dir(), "resume session missing")
+        # Inspect all managed components before reading metadata or opening homes.
+        def walk_error(error):
+            raise ControllerError("invalid", "cannot inspect managed session paths") from error
+        for directory, dirs, files in os.walk(self.session, followlinks=False, onerror=walk_error):
+            for name in dirs + files:
+                self._safe_path(Path(directory) / name)
+        require((self.session / "session.lock").is_file(), "resume session lock missing")
+        path = self.session / "session.json"
+        require(path.is_file() and path.stat().st_size <= 262144, "resume metadata missing or oversized")
+        record = decode_json(path.read_bytes(), max_depth=32)
+        expected = self._metadata()
+        require(isinstance(record, dict) and type(record.get("schema")) is int and record["schema"] == 2,
+                "only new schema-2 sessions support resume")
+        exact(record, expected)
+        for key in ("session", "config", "compiler_sha256", "payment_source_sha256", "node_sha256"):
+            require(encode_json(record[key]) == encode_json(expected[key]), "resume " + key + " changed")
+        require(record["lifecycle"] == "stopped", "resume requires clean stopped session")
+        integer(record["generation"], 1, 0xFFFFFFFF)
+        require(isinstance(record["identity"], list) and len(record["identity"]) == 3, "resume identity missing")
+        for value in record["identity"]:
+            hexadecimal(value)
+        require(isinstance(record["wallet_nodes"], dict), "wallet bindings missing")
+        names = {item["name"] for item in self.config["nodes"]}
+        for name, node in record["wallet_nodes"].items():
+            self._alias(name)
+            require(node in names and (self.session / "wallets" / name).is_dir(), "recorded wallet home missing")
+        for item in self.config["nodes"]:
+            require((self.session / item["home"]).is_dir(), "recorded node home missing")
+        for name in ("network", "wallets", "public", "public/recipients"):
+            require((self.session / name).is_dir(), "managed directory missing")
+        require({path.name for path in (self.session / "wallets").iterdir()} == set(record["wallet_nodes"]), "unknown wallet home")
+        self._check_pins()
+        self._record = record
+        for path in (self.session / "public/recipients").iterdir():
+            self._alias(path.stem)
+            require(path.name == path.stem + ".json", "unknown recipient file")
+            self._read_recipient(path, self.deadline(), record["identity"], compile_root=compile_recipients)
+        return record
+
+    def _acquire_lock(self):
+        path = self.session / "session.lock"
+        self._safe_path(self.session)
+        self._safe_path(path)
+        fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+        try:
+            require(stat.S_ISREG(os.fstat(fd).st_mode), "session lock must be regular")
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BaseException:
+            os.close(fd)
+            raise ControllerError("locked", "session is locked or lock unsafe")
+        self._lock_fd = fd
+
+    def _persist(self):
+        self._record["wallet_nodes"] = dict(self.wallet_nodes)
+        temporary = self.session / (".session-" + uuid.uuid4().hex + ".tmp")
+        self._write_new(temporary, encode_json(self._record) + b"\n")
+        os.replace(temporary, self.session / "session.json")
+        fd = os.open(self.session, os.O_RDONLY)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
 
     @staticmethod
     def _write_new(path, data):
@@ -1083,15 +1203,95 @@ class Controller:
         self.cleanup_errors = []
         for node in reversed(list(self.nodes.values())):
             try:
+                was_uncertain = getattr(node, "cleanup_uncertain", False)
                 node.stop(
                     time.monotonic()
                     + min(2, self.config["limits"]["deadline_ms"] / 1000)
                 )
+                require(was_uncertain or not getattr(node, "cleanup_uncertain", False), "child cleanup uncertain")
             except BaseException as error:
+                self._cleanup_uncertain = True
                 self.cleanup_errors.append(
                     {"node": node.name, "error": type(error).__name__}
                 )
+        live = any(node.process is not None and node.process.poll() is None for node in self.nodes.values())
+        if self._lock_fd is not None and not live:
+            try:
+                if self._launch_complete and not self.cleanup_errors and not self._cleanup_uncertain:
+                    self._record["lifecycle"] = "stopped"
+                    self._persist()
+            except BaseException as error:
+                self._cleanup_uncertain = True
+                self.cleanup_errors.append({"metadata": "session.json", "error": type(error).__name__})
+            finally:
+                os.close(self._lock_fd)
+                self._lock_fd = None
         # Preserve evidence and encrypted homes, including partially created ones.
+
+    @staticmethod
+    def _alias(name):
+        require(isinstance(name, str) and re.fullmatch(r"[A-Za-z][A-Za-z0-9_-]{0,31}", name), "recipient/wallet alias")
+        return name
+
+    def _validate_wallet_info(self, info):
+        require([hexadecimal(info.get(key)) for key in
+                 ("chain_id", "genesis_id", "profile_digest")] == self._record["identity"],
+                "wallet identity differs from session")
+        hexadecimal(info.get("public_key"))
+
+    def _validate_recipient(self, value, deadline, identity=None, compile_root=True):
+        exact(value, ("schema", "kind", "chain_id", "genesis_id", "profile_digest", "public_key", "payment_output"))
+        require(type(value["schema"]) is int and value["schema"] == 1
+                and value["kind"] == "lotus-v2-payment-recipient", "recipient schema/kind")
+        observed = [hexadecimal(value[key]) for key in ("chain_id", "genesis_id", "profile_digest")]
+        require(observed == (identity or self._record["identity"]), "recipient identity differs from session")
+        owner = hexadecimal(value["public_key"])
+        output = value["payment_output"]
+        exact(output, ("flags", "value", "branches", "paths"))
+        require(type(output["flags"]) is int and output["flags"] == 0
+                and output["value"] == "0" and isinstance(output["branches"], list)
+                and len(output["branches"]) == 1 and output["paths"] == [[0]]
+                and type(output["paths"][0][0]) is int,
+                "canonical sole Payment output required")
+        root = hexadecimal(output["branches"][0])
+        if compile_root:
+            require(self._compile(owner, deadline)["root"] == root, "recipient compiled Payment root differs")
+        return value
+
+    def _read_recipient(self, path, deadline, identity=None, compile_root=True):
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        try:
+            require(stat.S_ISREG(os.fstat(fd).st_mode), "recipient must be regular file")
+            data = os.read(fd, 16385)
+            require(len(data) <= 16384, "recipient file exceeds 16 KiB")
+        finally:
+            os.close(fd)
+        return self._validate_recipient(decode_json(data, max_depth=8), deadline, identity, compile_root)
+
+    def _recipient_command(self, words, deadline):
+        require(len(words) == 5 and words[1] in ("export", "import"),
+                "recipient export NAME --output PATH | recipient import ALIAS --file PATH")
+        operation, name = words[1:3]
+        self._alias(name)
+        require(words[3] == ("--output" if operation == "export" else "--file"), "recipient file option")
+        path = Path(words[4])
+        require(path.is_absolute(), "absolute recipient file path required")
+        self._safe_path(path, private=False, ancestors=True)
+        if operation == "export":
+            require(name in self.wallet_nodes, "unknown local wallet")
+            info = self._invoke(name, "info", {}, deadline)
+            self._validate_wallet_info(info)
+            require(info.get("payment_policy_registered") is True, "recipient compiled Payment not registered")
+            value = {"schema": 1, "kind": "lotus-v2-payment-recipient",
+                     **{key: info[key] for key in ("chain_id", "genesis_id", "profile_digest", "public_key", "payment_output")}}
+            self._validate_recipient(value, deadline)
+        else:
+            value = self._read_recipient(path, deadline)
+            path = self.session / "public/recipients" / (name + ".json")
+        data = encode_json(value) + b"\n"
+        self._write_new(path, data)
+        return {"ok": True, "result": "recipient_" + operation, "path": str(path),
+                "sha256": hashlib.sha256(data).hexdigest()}
 
     def _node(self, name=None):
         if name is None:
@@ -1099,8 +1299,9 @@ class Controller:
         require(name in self.nodes, "unknown node")
         return self.nodes[name]
 
-    def _wallet(self, name):
+    def _wallet(self, name, allow_new=False):
         require(re.fullmatch(r"[A-Za-z][A-Za-z0-9_-]{0,31}", name), "wallet name")
+        require(allow_new or name in self.wallet_nodes, "unknown wallet binding")
         home = self.session / "wallets" / name
         require(
             home.resolve() == home and not home.is_symlink(),
@@ -1422,6 +1623,8 @@ class Controller:
                     for node in selected
                 }
                 return {"ok": True, "result": "status", "nodes": result}
+            if words[0] == "recipient":
+                return self._recipient_command(words, deadline)
             if words[0] == "wallet":
                 require(len(words) >= 3, "wallet COMMAND NAME")
                 command, name = words[1:3]
@@ -1445,7 +1648,8 @@ class Controller:
                     ),
                     "wallet command",
                 )
-                wallet = self._wallet(name)
+                wallet = self._wallet(name, allow_new=True) if command == "create" else self._wallet(name)
+                require(command == "create" or name in self.wallet_nodes, "unknown wallet binding")
                 if command == "create":
                     require(len(words) in (3, 5), "wallet create NAME [--node NODE]")
                     require(
@@ -1457,6 +1661,8 @@ class Controller:
                         )
                         self._node(words[4])
                         self.wallet_nodes[name] = words[4]
+                    self.wallet_nodes[name] = self.wallet_nodes.get(name, self.config["nodes"][0]["name"])
+                    self._persist()
                     value = self._invoke(name, "create", {}, deadline, True)
                     compiled = self._compile(value["public_key"], deadline)
                     self._invoke(name, "register", compiled, deadline)
@@ -1492,15 +1698,17 @@ class Controller:
                     if command == "export":
                         self._save_wire(value)
                 else:
-                    options = self._options(words[3:], ("to", "amount", "fee"))
-                    info = self._invoke(options["to"], "info", {}, deadline)
-                    require(
-                        info.get("payment_policy_registered") is True,
-                        "recipient compiled Payment not registered",
-                    )
-                    recipient = dict(
-                        info["payment_output"], value=decimal(options["amount"])
-                    )
+                    remote = "--to-recipient" in words[3:]
+                    target = "to-recipient" if remote else "to"
+                    options = self._options(words[3:], (target, "amount", "fee"))
+                    if remote:
+                        alias = self._alias(options[target])
+                        info = self._read_recipient(self.session / "public/recipients" / (alias + ".json"), deadline)
+                    else:
+                        info = self._invoke(options["to"], "info", {}, deadline)
+                        require(info.get("payment_policy_registered") is True,
+                                "recipient compiled Payment not registered")
+                    recipient = dict(info["payment_output"], value=decimal(options["amount"]))
                     self._discover_if_configured(name, deadline)
                     if command in ("sign", "pay"):
                         signing_wallet = name

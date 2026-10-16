@@ -91,7 +91,9 @@ def fake_node(mode, report):
     ready.update(tip_known=True, reopen_required=False)
     if len(sys.argv) >= 8:
         home = Path(sys.argv[-2])
-        home.mkdir(mode=0o700, parents=False, exist_ok=False)
+        # Native node startup supports reopening an existing home; the controller
+        # decides whether a fresh launch or explicit resume may use it.
+        home.mkdir(mode=0o700, parents=False, exist_ok=True)
         ready["listen"]["port"] += int(home.name.endswith("right"))
     emit(ready)
     if mode == "duplicate-ready":
@@ -280,6 +282,11 @@ def fake_wallet(mode, report, native_argv):
             time.sleep(30)
             return 9
         return 9  # no stdout: controller must report OutcomeUnknown, no retry
+    if mode == "pay-accepted" and command in ("sign", "pay"):
+        value = {"txid": TXID, "txhash": TXHASH, "wire": "010203", "digest": "33" * 32}
+        pending_path.write_text(json.dumps(value))
+        emit({"result": "success", "submission": "accepted", **value})
+        return 0
     if mode == "pay-inconclusive" and command == "pay":
         home.mkdir(mode=0o700, parents=True, exist_ok=True)
         value = {"txid": TXID, "txhash": TXHASH, "wire": "010203", "digest": "33" * 32}
@@ -413,7 +420,7 @@ class ControllerCase(unittest.TestCase):
         cls.api = load_controller()
 
     def setUp(self):
-        self.root = Path(tempfile.mkdtemp(prefix="lotus-v2-controller-test-"))
+        self.root = Path(tempfile.mkdtemp(prefix="lotus-v2-controller-test-")).resolve()
         self.report = self.root / "public-report.jsonl"
         self.nodes = []
 

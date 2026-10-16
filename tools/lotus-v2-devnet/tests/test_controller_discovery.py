@@ -31,6 +31,7 @@ class Tests(unittest.TestCase):
         ctl = c.Controller(dict(nodes=[dict(name='alice', chronik=binding)],
                                 limits=dict(deadline_ms=1000)), '/tmp/synthetic-controller-only')
         ctl.started = True
+        ctl.wallet_nodes = {"alice": "alice", "bob": "alice"}
         node = SimpleNamespace(name='alice', ready=dict(chain_id=H(1), profile_digest=H(2)))
         ctl._wallet = lambda name: SimpleNamespace(node=node)
         ctl.calls = []
