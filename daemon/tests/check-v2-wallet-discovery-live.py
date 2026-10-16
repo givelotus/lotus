@@ -129,6 +129,7 @@ def main(argv=None):
         check('wallet-'+command,node=node.label,home=str(home),request=payload or {},response=value)
         return value
     def compile_payment(public_key):
+        require(local.digest(compiler/'dist/generic.js')==record['compiler_sha256'],'compiler changed before invocation')
         source = compiler/'examples/gallery/payment.lotus'
         js = "import {readFileSync} from 'node:fs';const {compileContract}=await import(process.argv[1]); console.log(JSON.stringify(compileContract(readFileSync(process.argv[2],'utf8'),{contract:'Payment',bindings:{Payment:{owner:process.argv[3]}}})));"
         answer = subprocess.run([args.node,'--input-type=module','-e',js,(compiler/'dist/generic.js').as_uri(),str(source),public_key], capture_output=True,text=True,timeout=args.timeout)
