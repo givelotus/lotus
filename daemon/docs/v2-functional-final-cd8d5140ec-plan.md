@@ -75,3 +75,17 @@ No unrelated process or existing home was modified. No later batch ran.
 At this final binary pin there are2variant passes,1failure and316notrun.
 Historical63c passes remain separate. Substantive failure pauses progression
 until root review; complete-suite acceptance has not been established.
+
+### Reviewed RPC fixture rerun
+
+The separately reviewed `abc_rpc_excessiveblock.py` candidate
+`dcb64ada9315ab2e4f17bf2c28140e52b3b8c548` **passed** using the same frozen
+cd8d binaries and fresh data. Its three literal brand prefixes now expect
+Lotus, preserving EB2.0/13.0/13.1 precision, comment and RPC value assertions.
+Fixture SHA256: `a0d58cc800af977e1654a275f2f3e06f47e9132051fce4392438ccce662ea035`.
+[Separate rerun receipt](evidence/v2-functional-final-cd8d5140ec/rpc-eb-reviewed-rerun/results.json)
+retains exact hashes/JUnit/logs and actual port mapping. The supervisor took
+4.02seconds and exited0 with an empty process group and no signals/refusal.
+Disk and seed0 port checks now fail closed within the supervisor before
+launch. The original batch failure remains preserved. Remaining five
+failfast-unrun identities were not launched; no further batch is authorized.
