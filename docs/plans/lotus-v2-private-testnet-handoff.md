@@ -30,13 +30,22 @@ Frozen binaries: `/private/tmp/lotus-v2-node-build-cd8d5140ec/`.
 records exact binary and build-log hashes. Daemon SHA256:
 `5767c34242f939f5d6fb0fa7f740f87b0c829d179717a58eb4df5cb84c88f7d9`.
 
-A fresh quorum run was launched by `native_quorum_acceptance` in
-`/private/tmp/lotus-v2-native-quorum-cd8d5140ec-20261015-a`, session47425,
-harness PID17347. Verify actual live process state before treating these as
-current. Uses copied clean 2024-block seed and unchanged defaults/deadlines.
-The prior63c run passed nine-node authentication but failed300s finality;
-its evidence remains preserved. New finality/fork/restart success is unproven.
-Quorum owns the sole heavy execution window.
+Latest cd8 quorum run is terminal: all-nine authenticated quorum passed, then
+unchanged300s finality failed with only node8 finalized. All12 owned children
+exited0 and their PIDs are absent. Evidence commit `2f5d1579` preserves50raw
+trace hashes, complete activation trajectories and last gate statuses; root
+independently verified those hashes/trajectory references/cleanup. No retry.
+Passive polling/peer diagnostics are being designed/implemented separately;
+existing traces do not distinguish the remaining cause.
+
+Final-cd8 functional batch002 is terminal: two passed, excessive-block RPC test
+failed on obsolete BitcoinABC branding, five not run due to failfast. Evidence
+`19c8dd77` preserves38verified artifact hashes and the initial port-preflight
+enforcement mistake. Candidate `dcb64ada93` changes only3literal brand prefixes,
+retaining EB2.0/13.0/13.1/comment assertions. Root independently approved a
+narrow rerun with fail-closed port checks; verify owner session before assuming
+it is active. No other functional batch is authorized. Cache owner may edit
+runtime/node source but cannot run heavy builds during functional execution.
 
 First eight inherited functional identities passed across documented63c runs,
 including a separately reviewed branding fixture repair; original failure kept.
