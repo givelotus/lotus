@@ -81,7 +81,7 @@ Zero32                   = 00^32
 
 Because layer index $s$ runs bottom-up from $0$ (leaves) to $k - 1$ (root), for any leaf index `idx in 0 .. n - 1`, at step $s = 0 \dots k - 1$, bit $s$ of `idx` (`(idx >> s) & 1`) is `0` when the node is the left child (`cur[2j]`) and `1` when the node is the right child (`cur[2j + 1]`). Consequently, `MERKLEROOT_INDEXED` (`0xc1`, `hash_alg = 0`) verifies any leaf `L[idx]` against `IndexedTreeRoot(L)` in a single instruction (`<L[idx]> <u16(idx)> <proof_bytes> <0> MERKLEROOT_INDEXED`), while the outer transaction header in `TxID` (`input_count:u16` and `output_count:u16` in [P01](encoding-and-signatures.md)) binds the exact vector lengths.
 
-## Block transaction vector: ordered, count-bound tree
+## Block transaction vector: ordered, count-bound tree (and planned Merklix sharding upgrade)
 
 Let transaction i, including the first coinbase, have the 64-byte leaf value `w_i = TxHash_i || TxID_i`. Define `T(xs)`:
 
@@ -97,6 +97,42 @@ TxRoot(xs) = H_txroot(03 || u32(n) || T(xs))
 Each leaf commits to both identities of its transaction, TxHash first, as Lotus v1's block tree does. The TxHash fixes the complete bytes, witnesses included; the TxID lets a proof show that a transaction ID, and therefore its outpoints, is in a block by supplying the two 32-byte hashes, without the transaction or its witnesses. Children are ordered; no sorting, duplication or zero-padding occurs. Empty vector has a defined commitment for tools, but a block with no coinbase is invalid. Count is bounded before construction. This split strategy follows the ordered-tree principle in [RFC 6962 §2.1](https://www.rfc-editor.org/rfc/rfc6962#section-2.1); Lotus adds its own context and count wrapper and uses BLAKE3.
 
 A transaction inclusion proof is `count:u32 || index:u32 || Vec(h32 siblings)` plus the transaction bytes, or the TxHash and TxID pair, being proved. A verifier given only the pair learns that the TxID is committed, not that the TxHash it was given corresponds to any particular witness bytes. Require `0 <= index < count`, count within the consensus block-transaction limit, and exact sibling consumption. Reconstruct recursively: for n=1 use the leaf; otherwise compute k, recurse into the child containing index, consume the next sibling from the bottom-up proof, and combine left/right according to index<k. Finally apply the count wrapper. No direction mask is serialized; count and index determine every direction. A proof API must clearly distinguish committed transaction membership from complete transaction/block validity.
+
+### Maintainer architecture direction (2026-10-16): Horizontal sharding via prefix-keyed Merklix trees
+
+Per the maintainer's sharding design ([*Sharding Bitcoin Cash*](https://www.bitcoinabc.org/2018-09-06-sharding-bitcoin-cash/), September 6, 2018), scaling block construction, mempool acceptance, and UTXO validation across horizontal CPU cores and processes requires **consistent key-prefix range partitioning** rather than positional array-index splitting:
+
+1. **Why positional `T(xs[0:k]) || T(xs[k:n])` prevents horizontal sharding:**
+   - In an array-index-split tree (`k = greatest_power_of_two(n)`), internal node boundaries depend on the exact element count `n` of preceding ranges. If Shard `0` (owning `TxID` prefix `0b0...`) adds or removes a single transaction, the array index of every transaction in Shards `1 .. 2^k - 1` shifts by $\pm 1$, crossing power-of-two boundaries and invalidating every subsequent shard's subtree hashes.
+2. **Prefix-sharded Merklix `Subtree A` + top-level `Coinbase` combination (`tx_root`):**
+   - Non-coinbase transactions (`vtx[1 .. n - 1]`) are canonically ordered by `TxID` (`CTOR`) and committed in a **256-bit `TxID`-prefix-keyed single-leaf-collapsed Merklix tree (`Subtree A`)**:
+     ```text
+                      [ header.tx_root ]
+                         /          \
+           [ CoinbaseLeaf ]        [ Subtree A ]   <-- 256-bit Merklix tree of vtx[1..n-1] keyed by TxID
+                                     /       \
+                           [ Subtree B ]   [ Subtree C ]
+                            (prefix 0...)   (prefix 1...)
+     ```
+   - In `Subtree A`, the **256-bit key** (which defines the bit-path through the tree and the canonical `CTOR` wire order) is **`TxID`**, while the **leaf hash** at the end of that path commits to both `TxID` and `TxHash`:
+     ```text
+     TxLeaf(TxID, TxHash) = H_txroot(00 || TxID || TxHash)
+     ```
+     (`TxHash` is committed as the leaf value at key `TxID` and never alters the tree path or sort order.)
+   - Because `Subtree A` splits strictly by the bits of `TxID`, any $2^k$ mempool/validation shards (where Shard $s \in [0, 2^k - 1]$ owns the $k$-bit `TxID` prefix $s$) can maintain their mempool subtrees and pre-compute `(TxSubtreeRoot[s], fee_sum[s], cost_sum[s])` **100% independently with zero cross-shard count synchronization**.
+   - On `getblocktemplate`, the coordinator aggregates the $2^k$ shard roots into `Subtree A` (32 bytes) and sums `fee_sum`/`cost_sum`, constructs the block's coinbase (`vtx[0]`), and combines `CoinbaseLeaf` with `Subtree A` in **one single top-level hash ($O(1)$)** without re-entering any shard:
+     ```text
+     TxRoot = H_txroot(03 || CoinbaseLeaf || SubtreeA)
+     ```
+3. **Shard- and B+Tree-co-located Outpoint keys (`txid || vout` prefix preservation):**
+   - Hashing `Outpoint` via `H_outpointkey(txid || vout)` scatters multiple outputs of the same transaction (`vout = 0, 1, ...`) across uncorrelated shards, separate 27-level Merklix paths, and separate 4 KB `libmdbx` B+Tree leaf pages.
+   - Preserving `txid` as the leading prefix of `OutpointKey` (`txid || vout`, read MSB-first to match `Path::Key()` in `dbi_smt_nodes` and `dbi_coins`) guarantees that:
+     - **Path-based Merklix storage (`dbi_smt_nodes`) and Vout lookup storage (`dbi_coins`) share the exact same key prefix:** A depth-$d$ path in `dbi_smt_nodes` is simply the first $d$ bits of `txid || vout`. All outputs created by a single transaction share one Merklix path down to the transaction's `txid` depth and sit adjacent in a single 4 KB `libmdbx` leaf page in both `dbi_coins` and `dbi_smt_nodes`.
+     - **Two-phase sharded validation (`ProvenTx` + async spend-mark):** When a transaction `tx` arrives with wallet-supplied `CoinProof`s (`ProvenTx`), the shard owning `tx.TxID` verifies the `CoinProof`s and VM scripts in RAM with zero disk/network I/O and already owns the UTXO shard where all of `tx`'s new outputs (`(tx.TxID, vout)`) are inserted; it only sends a lightweight async spend-mark/double-spend check `(prev_txid, prev_vout, spending_txid)` to the shard owning `prev_txid`'s prefix.
+4. **Explicit delayed / pipelined coinbase UTXO insertion:**
+   - Because Block $h$'s coinbase transaction (`vtx[0]`) cannot be constructed until after the shards report `fee_sum` for Block $h$, inserting Block $h$'s coinbase outputs into `UtxoRoot` during Block $h$ itself would force a second round-trip from the coordinator back to whichever shard owns `coinbase_txid`'s prefix before `state_root` could be finalized.
+   - Because coinbase outputs are already unspendable until maturity (`COINBASE_MATURITY = 100`), **coinbase outputs from Block $h$ are explicitly inserted into `UtxoRoot` in a subsequent block (e.g., Block $h + 1$, or upon maturity)** when Block $h$'s `coinbase_txid` is already immutable and known to all shards at the start of the block.
+   - This eliminates the second coordinator-to-shard round-trip during `getblocktemplate` while ensuring that every coinbase UTXO resides on the exact UTXO shard corresponding to `coinbase_txid`'s prefix and is looked up and spent identically to an ordinary transaction.
 
 ## UTXO map: compact single-leaf-collapsed sparse binary tree
 
