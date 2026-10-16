@@ -2,6 +2,7 @@
 from dataclasses import dataclass
 import json
 import re
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -117,14 +118,19 @@ class HttpTransport:
 
 class Client:
     def __init__(self, transport, chain_id, profile_id, *, page_size=100,
-                 max_pages=100, retries=2):
+                 max_pages=100, retries=2, retry_wait=None):
         self.transport = transport
         self.binding = hash32(chain_id), hash32(profile_id)
         if (type(page_size) is not int or not 1 <= page_size <= 100 or
                 type(max_pages) is not int or not 1 <= max_pages <= 10000 or
                 type(retries) is not int or not 0 <= retries <= 10):
             raise DiscoveryError("invalid discovery bounds")
+        if retry_wait is not None and not callable(retry_wait):
+            raise DiscoveryError("retry waiter must be callable")
         self.page_size, self.max_pages, self.retries = page_size, max_pages, retries
+        # Controllers supply a cancellation/deadline-aware waiter. Standalone
+        # callers retain a finite retry count with a bounded delay per retry.
+        self.retry_wait = time.sleep if retry_wait is None else retry_wait
 
     def _envelope(self, row):
         if type(row.get("version")) is not int or row["version"] != 2 or row.get("confirmed_only") is not True:
@@ -144,6 +150,10 @@ class Client:
             except RetryDiscovery:
                 if attempt == self.retries:
                     raise DiscoveryError("discovery retry budget exhausted")
+                # A busy index can remain unavailable for an entire event-loop
+                # turn. Restart the whole snapshot after yielding, never retry
+                # native track/reconcile or signing as part of this scan loop.
+                self.retry_wait(min(0.05 * (2 ** attempt), 0.5))
             except (KeyError, TypeError, AttributeError) as error:
                 raise DiscoveryError("malformed Chronik response") from error
 

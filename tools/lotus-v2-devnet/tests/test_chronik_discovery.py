@@ -94,6 +94,28 @@ class Tests(unittest.TestCase):
             m.discover_and_reconcile(self.client(Queue(STATUS, page(), STATUS)), [H(9)], reject, lambda: calls.append('reconcile'))
         self.assertEqual(calls, [])
 
+    def test_retry_delays_are_bounded_and_scan_restarts(self):
+        waits = []
+        q = Queue(*(m.RetryDiscovery('busy') for _ in range(6)), STATUS, page([]), STATUS)
+        result = self.client(q, retries=6, retry_wait=waits.append).discover([H(9)])
+        self.assertEqual(result.candidates, ())
+        self.assertEqual(waits, [.05, .1, .2, .4, .5, .5])
+        self.assertTrue(all(path == '/v2/status' and payload is None for path, payload in q.calls[:7]))
+
+    def test_wait_cancellation_and_transport_failure_are_not_retried(self):
+        def cancelled(delay):
+            raise KeyboardInterrupt()
+        q = Queue(m.RetryDiscovery('busy'), STATUS)
+        with self.assertRaises(KeyboardInterrupt):
+            self.client(q, retry_wait=cancelled).discover([H(9)])
+        self.assertEqual(len(q.calls), 1)
+        waits = []
+        q = Queue(m.DiscoveryError('network cancelled'), STATUS)
+        with self.assertRaises(m.DiscoveryError):
+            self.client(q, retry_wait=waits.append).discover([H(9)])
+        self.assertEqual(waits, [])
+        self.assertEqual(len(q.calls), 1)
+
     def test_real_http_transport_fixture(self):
         # Actual local HTTP transport, synthetic API responses; no daemon claim.
         class Handler(BaseHTTPRequestHandler):

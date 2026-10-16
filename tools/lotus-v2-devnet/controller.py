@@ -957,6 +957,7 @@ class Controller:
         self.closed = False
         self.cleanup_errors = []
         self._operation_lock = threading.Lock()
+        self._discovery_cancel = threading.Event()
 
     def deadline(self):
         return time.monotonic() + self.config["limits"]["deadline_ms"] / 1000
@@ -1075,6 +1076,7 @@ class Controller:
             os.close(directory)
 
     def close(self):
+        self._discovery_cancel.set()
         if self.closed and not self.cleanup_errors:
             return
         self.closed = True
@@ -1155,6 +1157,12 @@ class Controller:
             if isinstance(password, bytearray):
                 password[:] = b"\0" * len(password)
 
+    def _wait_discovery_retry(self, delay, deadline):
+        require(not self.closed, "controller closed during discovery", "closed")
+        if self._discovery_cancel.wait(min(delay, remaining(deadline))):
+            raise ControllerError("closed", "controller closed during discovery")
+        remaining(deadline)
+
     def _discover(self, name, deadline):
         """HTTP outpoints are hints; only native track/reconcile authenticate coins."""
         node = self._wallet(name).node
@@ -1173,7 +1181,9 @@ class Controller:
                                  hexadecimal(info.get("profile_digest"))),
                 "wallet/node/Chronik binding mismatch", "discovery_failed")
         try:
-            client = discovery_api.Client(DiscoveryTransport(binding, deadline), *expected)
+            client = discovery_api.Client(
+                DiscoveryTransport(binding, deadline), *expected, retries=10,
+                retry_wait=lambda delay: self._wait_discovery_retry(delay, deadline))
             discovery, state = discovery_api.discover_and_reconcile(
                 client, info["payment_output"]["branches"],
                 lambda point: self._invoke(name, "track", {

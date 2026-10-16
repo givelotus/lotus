@@ -202,6 +202,65 @@ class Tests(unittest.TestCase):
             c.decode_json('[' * 100000 + '0' + ']' * 100000)
         self.assertEqual(caught.exception.code, 'protocol_error')
 
+    def test_real_http_busy_then_stale_cursor_recovers_before_native_tracking(self):
+        ctl = self.controller()
+        requests, times = [], []
+        responses = [(503, {}), (200, STATUS), (409, {}),
+                     (200, STATUS), (200, PAGE), (200, STATUS)]
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, *args):
+                pass
+            def answer(self):
+                requests.append(self.path)
+                times.append(time.monotonic())
+                code, row = responses.pop(0)
+                data = json.dumps(row).encode()
+                self.send_response(code)
+                self.send_header('Content-Length', str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+            def do_GET(self):
+                self.answer()
+            def do_POST(self):
+                self.rfile.read(int(self.headers['Content-Length']))
+                self.answer()
+        server = ThreadingHTTPServer(('127.0.0.1', 0), Handler)
+        server.daemon_threads = True
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        ctl.config['nodes'][0]['chronik']['url'] = f'http://127.0.0.1:{server.server_port}'
+        try:
+            result = ctl.execute('wallet balance alice')
+            self.assertTrue(result['ok'], result)
+            self.assertEqual([x[0] for x in ctl.calls], ['info', 'track', 'reconcile'])
+            self.assertEqual(requests, ['/v2/status', '/v2/status', '/v2/branches/utxos',
+                                        '/v2/status', '/v2/branches/utxos', '/v2/status'])
+            self.assertGreaterEqual(times[1] - times[0], .04)
+            self.assertGreaterEqual(times[3] - times[2], .09)
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join()
+
+    def test_retry_wait_respects_deadline_and_close_cancellation(self):
+        ctl = self.controller()
+        ctl.config['limits']['deadline_ms'] = 20
+        calls = []
+        def factory(binding, deadline):
+            def busy(path, payload):
+                calls.append(path)
+                raise d.RetryDiscovery('busy')
+            return busy
+        with patch.object(c, 'DiscoveryTransport', factory):
+            result = ctl.execute('wallet balance alice')
+        self.assertEqual(result['result'], 'timeout')
+        self.assertEqual(calls, ['/v2/status'])
+        self.assertEqual([x[0] for x in ctl.calls], ['info'])
+        ctl._discovery_cancel.set()
+        with self.assertRaises(c.ControllerError) as caught:
+            ctl._wait_discovery_retry(.5, time.monotonic() + 1)
+        self.assertEqual(caught.exception.code, 'closed')
+
     def test_native_tracking_never_starts_after_deadline(self):
         ctl = self.controller()
         ctl.config['limits']['deadline_ms'] = 10
