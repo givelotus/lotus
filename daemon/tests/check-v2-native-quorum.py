@@ -40,6 +40,7 @@ def main():
     manifest=root/'manifest.json';manifest.write_bytes((bootstrap/'manifest.json').read_bytes())
     original=json.loads((bootstrap/'evidence.json').read_text());report=json.loads((bootstrap/'candidate-report.json').read_text())
     require(original['passed'] and original['accepted_blocks']==2024,'actual accepted bootstrap evidence required')
+    require([f['public_fixture_scalar'] for f in original['funding']]==list(range(1,10)),'exact public fixture scalars 1..9 required')
     require(report['quorum']==1000000000000 and report['stake_dust']==10000000000 and report['stake_confirmations']==2016,'upstream proof policy differs')
     evidence=dict(schema='lotus-v2/native-quorum-acceptance/1',passed=False,phase=a.phase,
         daemon_source=a.daemon_source,daemon_sha256=local.digest(daemon),harness_sha256=local.digest(Path(__file__)),
