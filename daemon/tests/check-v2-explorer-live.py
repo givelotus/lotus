@@ -28,6 +28,10 @@ def load(name, path):
     return module
 
 
+class IdleFailure(Exception):
+    pass
+
+
 class Changed(Exception):
     def __init__(self, reason='observation changed', context=None):
         super().__init__(reason);self.context=context
@@ -52,7 +56,7 @@ async function screen(route,expected){win.document.querySelector('#notice').text
 await screen('/blocks',plan.block_id);await screen('/blocks/'+plan.block_id,plan.txid);
 await screen('/transactions/by-id/'+plan.txid,plan.txhash);
 const witness=[...win.document.querySelectorAll('#results button')].find(b=>b.textContent.startsWith('Witnesses:'));
-async function contains(text){const end=Date.now()+15000;while(Date.now()<end){if(win.document.querySelector('#results').textContent.includes(text))return;const n=win.document.querySelector('#notice').textContent;if(n.includes('unavailable')||n.includes('Snapshot changed'))throw new Error(n);await new Promise(r=>setTimeout(r,20));}throw new Error('DOM detail deadline: '+text);}
+async function contains(text){const end=Date.now()+15000;while(Date.now()<end){if(win.document.querySelector('#results').textContent.includes(text))return;const n=win.document.querySelector('#notice').textContent;if(n.startsWith('Index unavailable')||n.startsWith('Invalid or unavailable')||n.startsWith('Snapshot changed'))throw new Error(n);await new Promise(r=>setTimeout(r,20));}throw new Error('DOM detail deadline: '+text);}
 if(witness){witness.click();await contains('Public witnesses');}
 const wire=[...win.document.querySelectorAll('#results button')].find(b=>b.textContent==='Inspect exact transaction wire');wire.click();await contains(plan.wire_prefix);
 await screen('/transactions/by-hash/'+plan.txhash,plan.txid);await screen('/outputs/'+plan.txid+'/0',plan.output_value);await screen('/assets');
@@ -263,7 +267,9 @@ def main(argv=None):
             self.audit_tip=native['tip'];self.audit_context=dict(native=native,http=status);identity=(native['tip'],status['service_epoch'],status['generation'])
             if identity in self.audited and not force:return
             if self.label=='a' and not getattr(self,'idle_probed',False):
-                self.idle_probe();self.idle_probed=True
+                try:self.idle_probe()
+                except Exception as error:raise IdleFailure(str(error)) from error
+                self.idle_probed=True
             for k in ('accepted_pool','detached_history','finality'):require(status['capabilities'][k] is False,'unsupported feature claim')
             require(status['binding']==dict(chain_id=native['chain_id'],genesis=native['genesis_id'],profile_id=native['profile_digest']),'native chain/profile differs')
             envelope=self.http('/blocks?page_size=1');self.audit_envelope=envelope;snapshot=envelope['snapshot'];token=envelope['snapshot_token']
@@ -334,7 +340,12 @@ def main(argv=None):
             if plan and (self.label.startswith('a') or self.label=='c-fork'):
                 plan['root']=next((root for root in roots if any(root in i['record']['branches'] for i in history)),None);plan['assets']=sorted(expected_assets)
                 answer=subprocess.run([node_exe,'--input-type=module','-e',DOM_SCRIPT,str(frontend),self.proxy_base,json.dumps(plan)],capture_output=True,text=True,timeout=min(60,self.timeout*2))
-                require(answer.returncode==0,'actual frontend DOM failed '+answer.stderr);record('actual-frontend-dom',node=self.label,observation=snapshot,result=json.loads(answer.stdout))
+                require(answer.returncode==0,'actual frontend DOM failed '+answer.stderr)
+                after_dom=self.context()
+                if self.stamp(self.audit_context)!=self.stamp(after_dom):raise Changed('context changed during successful multi-screen DOM',dict(after=after_dom))
+                record('actual-frontend-dom',node=self.label,observation=snapshot,result=json.loads(answer.stdout))
+            after_all=self.context()
+            if self.stamp(self.audit_context)!=self.stamp(after_all):raise Changed('context changed during successful parity audit',dict(after=after_all))
             previous[self.home]=dict(token=token,cursor=envelope['data']['next_cursor'],tip=snapshot['tip'],epoch=snapshot['service_epoch'],snapshot=snapshot)
             snapshots.append(dict(node=self.label,home=self.home,snapshot=snapshot,txids=sorted({k[0] for k in rows}),history=history))
             record('native-explorer-snapshot',**snapshots[-1]);self.audited.add(identity)

@@ -85,3 +85,13 @@ search modes. Unknown asset lookup is explicitly a covered-history absence when
 the native asset registry is empty. This wallet gate does not establish asset
 accounting even if tokens happen to appear; `--require-assets` fails explicitly
 and directs review to the separately owned native asset lifecycle harness.
+
+The repaired `8cd36091ba9da0665ceab621ce42306963fcbfd9` binary's first run is
+retained at `/private/tmp/lotus-v2-explorer-live-acceptance-20261015-b`.
+The HTTP-only twenty-round/two-second idle probe passed. The run then failed
+in the harness DOM wait helper: it matched the normal phrase “detached history
+unavailable” as a service failure. The helper now recognizes error prefixes.
+Idle-probe failures use a dedicated nonretryable exception, and successful DOM
+and native parity audits have an additional final context fence before evidence
+publication. This retained harness failure establishes no frontend defect or
+completed explorer lifecycle acceptance.
