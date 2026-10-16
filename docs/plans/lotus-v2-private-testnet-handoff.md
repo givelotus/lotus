@@ -2,6 +2,43 @@
 
 The goal remains active: a reviewed private network on separate machines, including wallet payments relayed A→B and mined from C’s mempool, restart/reorg reconciliation, explorer and authenticated Avalanche. Component passes do not establish completion. QUIC/public deployment deferred.
 
+## Latest continuation — supersedes older in-flight notes below
+
+- Monorepo/user branch reached `a5b9d3f4`; native integration and real-.git staging
+  now `e775de1363c8ef9411f4c38b6c7504dacf4402be`. Series307patches000–306,
+  final tree `5dd4b465f2b84eb56320825819cb5d4afb171ccc`, every intermediate tree
+  verified. Series `bf7e71cb` parents `0923f47d`; immediate plan `a5b9d3f4`.
+- Current immutable daemon `/private/tmp/lotus-v2-node-build-e775de1363/lotusd`,
+  SHA256 `5d2ba8f0a2b5bb84de31a2e76860f8b6ef947ddf611b72bb9f03fb10635c59b0`.
+  Full Debug Chronik build passed. It adds independently reviewed process-local
+  initial-download completion latch; all initial checks unchanged, driver runtime
+  authority still separately fenced. Both focused tests passed independently.
+- Old c0 quorum run reached2024 and nine funded proofs, passed nonempty public
+  cache pending-stop/observer-recovery, then failed readiness deadline amid IBD
+  oscillation. All12owned children exited0; original failure and clean seed remain.
+  NEW run `/private/tmp/lotus-v2-native-quorum-e775de1363-20261015-a` is active
+  against a copy of that completed seed, with no reimport. It requires explicit
+  selected-block-not-finalized and rival parked/not-conflicting-finalized checks.
+  Owner `native_quorum_acceptance`; reviewer `avalanche_provision_review`.
+- Exact c0 functional smoke evidence integrated `a06ef593`:
+  `daemon/docs/v2-functional-smoke-c0ddb9cf30.md`. All10variants/8scripts passed;
+  root independently verified binary/script/artifact hashes, JUnit and source.
+  Remaining284scripts/309variants were not run by that gate.
+- Runbook `daemon/docs/v2-private-testnet-runbook.md` integrated `0923f47d`.
+  It accurately describes the c0 recipe and current operator gaps, not completed
+  separate-host acceptance. It will need its build tree/pin refreshed after final
+  operator/native acceptance; older recipe is deliberately pinned.
+- Astra operator contract `docs/plans/lotus-v2-operator-workflow.md` integrated
+  `ac0c5378`, independently reviewed. Sol6.1medium owner
+  `operator_workflow_implementation` works in
+  `/private/tmp/lotus-v2-operator-workflow-20261015`; owns controller.py, devnet.py,
+  config.schema.json and controller tests only. Config compatibility, explicit
+  clean-stop resume and public recipient export/import are in progress. Reviewer
+  `explorer_frontend_review`. No native/consensus/compiler changes in that task.
+- Separate-host aliases/OS/architecture and permission for fresh isolated test
+  directories/listeners were requested asynchronously and remain unanswered.
+  Continue local work; do not deploy to unspecified hosts.
+
 ## Ownership and safety
 
 One root integrates. Use new isolated worktrees and disjoint files; implementation agents use Sol 6.1 medium. Preserve main at `/Users/shammah/repos/lotus`, all production workspaces/data/releases and existing worktrees. No reset, push, tag or publication. No test ports 10604, 10605 or 8331. Do not weaken pinned ABC quorum/stake/maturity/confidence defaults or invent production constants. Do not redo compiler imports or emit OP_DEFINE/OP_INVOKE.
