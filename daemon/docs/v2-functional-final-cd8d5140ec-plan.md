@@ -168,3 +168,11 @@ Preparation verification compiled the supervisor and dry-ran batch003 without
 nodes, and checked282unique ordinary variants plus12pending nonordinary
 batches. Cache owner currently holds the build/test window. No continuation
 execution has been authorized or launched.
+
+The JUnit parser treats both `<failure>` and `<error>` as failed cases, retaining
+the original element kind. Skips stay distinct and require review. Six focused
+synthetic-XML checks passed: pass/failure/error/skip, nonzero runner exit despite
+all-pass cases, and identity mismatch.
+[Parser check receipt](evidence/v2-functional-final-cd8d5140ec/supervisor-parser-check.json)
+records the exact supervisor/test hashes. No child process or node was launched;
+explicit range authorization and owner resource release are still required.

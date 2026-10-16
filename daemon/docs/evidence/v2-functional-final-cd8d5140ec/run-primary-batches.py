@@ -51,6 +51,24 @@ def write(path, value):
     path.write_text(json.dumps(value, indent=2) + '\n')
 
 
+def read_results(path, expected, exit_code):
+    """Validate identities and preserve pass/failure/error/skip classifications."""
+    cases = ET.parse(path).getroot().findall('testcase')
+    if sorted(c.attrib['name'] for c in cases) != sorted(expected):
+        raise RuntimeError('junit_identity_mismatch')
+    parsed = []
+    for case in cases:
+        kind = ('error' if case.find('error') is not None else
+                'failure' if case.find('failure') is not None else
+                'skipped' if case.find('skipped') is not None else 'passed')
+        parsed.append({'id': case.attrib['name'], 'seconds': float(case.attrib['time']),
+                       'junit_kind': kind, 'status': 'failed' if kind in ('failure', 'error') else
+                       'not_run_or_skip_requires_review' if kind == 'skipped' else 'passed'})
+    reason = 'runner_nonzero_exit' if exit_code else (
+        'substantive_failure_or_skip' if any(c['status'] != 'passed' for c in parsed) else None)
+    return parsed, reason
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--manifest', type=Path, default=Path(__file__).with_name('primary-continuation.json'))
@@ -133,16 +151,10 @@ def main():
                         raise RuntimeError('scratch_cap')
                     time.sleep(2)
             receipt['exit_code'] = process.wait()
-            cases = ET.parse(target / 'results.xml').getroot().findall('testcase')
-            actual = [case.attrib['name'] for case in cases]
-            expected = [variant['id'] for variant in batch['variants']]
-            if sorted(actual) != sorted(expected):
-                raise RuntimeError('junit_identity_mismatch')
-            receipt['cases'] = [{'id': c.attrib['name'], 'seconds': float(c.attrib['time']),
-                'status': 'failed' if c.find('failure') is not None else 'not_run_or_skip_requires_review'
-                if c.find('skipped') is not None else 'passed'} for c in cases]
-            if receipt['exit_code'] or any(c['status'] != 'passed' for c in receipt['cases']):
-                raise RuntimeError('substantive_failure_or_skip')
+            receipt['cases'], reason = read_results(
+                target / 'results.xml', [v['id'] for v in batch['variants']], receipt['exit_code'])
+            if reason:
+                raise RuntimeError(reason)
         except BaseException as error:
             failure = f'{type(error).__name__}:{error}'
         finally:
