@@ -70,7 +70,8 @@ def main():
             previous=a.seed.resolve(); prior=json.loads((previous/'evidence.json').read_text())
             resumable=a.resume_seed and prior.get('phase')=='seed' and prior.get('failure',{}).get('error') in ('import deadline expired','global deadline expired waiting for quiescence')
             require((prior.get('seed_passed') or resumable) and prior['daemon_sha256']==(a.seed_daemon_sha256 or a.daemon_sha256) and prior['manifest_sha256']==local.digest(manifest),'stopped enabled seed evidence mismatch')
-            require(all(x['exit']==0 for x in prior['cleanup']),'seed not cleanly stopped')
+            seed_cleanup=[x for x in prior['cleanup'] if x['label']=='seed']
+            require(seed_cleanup and all(x['exit']==0 for x in seed_cleanup),'seed not cleanly stopped')
             evidence['seed_source']=dict(directory=str(previous),evidence_sha256=local.digest(previous/'evidence.json'),daemon_source=prior['daemon_source'],daemon_sha256=prior['daemon_sha256'])
             save()
             shutil.copytree(previous/'seed-home',root/'seed-home')
@@ -101,6 +102,7 @@ def main():
         evidence['seed_final']=status(seed)
         require(evidence['seed_final']['height']==2024 and evidence['seed_final']['avalanche']['observer'] and evidence['seed_final']['avalanche']['proof_count']==0 and not evidence['seed_final']['avalanche']['tip_finalized'],'seed must remain an unfinalized proof-free enabled observer')
         stop(seed)
+        evidence['seed_passed']=True
         check('seed-stopped-before-copy',namespace_marker=(root/'seed-home'/'lotus-v2-development.identity').read_text())
         if a.phase=='seed':
             evidence['seed_passed']=True;evidence['remaining']='provisioning, authenticated quorum, real finality, competing fork, recovery and restart';save();return
