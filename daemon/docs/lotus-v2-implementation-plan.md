@@ -6,9 +6,9 @@ Updated October 15, 2026. Development plan; no genesis parameters are frozen and
 
 ## Source foundation and current status
 
-The current executable [V2 series](../patches/v2/series) contains 261 patches,
-`000`–`260`, on ABC master `1fb7db17c176cdea8a2c60d887891589382ee4e3`.
-[Latest replay evidence](evidence/v2-series-replay-260.json) verifies every
+The current executable [V2 series](../patches/v2/series) contains 301 patches,
+`000`–`300`, on ABC master `1fb7db17c176cdea8a2c60d887891589382ee4e3`.
+[Latest replay evidence](evidence/v2-series-replay-300.json) verifies every
 intermediate tree. Offline daemon acceptance, restart, disconnect/reconnect,
 resumable fork recovery, bounded selection and actual two-process TCP full/compact
 synchronization have separate evidence below. Native production of signed fixture-payment blocks also passes across two nodes.
@@ -16,7 +16,39 @@ The foreground local controller now completes a live-wallet payment and restart
 across two isolated nodes; see the current controller evidence below. Development
 profile adoption and public launch remain pending.
 
-### Reviewed integration through 260 (October 15)
+### Reviewed integration through 300 (October 15)
+
+All 301 mailboxes replayed in a fresh worktree with `git am --keep-non-patch`,
+verifying every intermediate tree. Final native source `86201398e3` has tree
+`d2048e32a58cf773094dbedd740087b9d23f1118`. Mailboxes 000–260, including the
+binary literal in 033, are unchanged. Series commit `fb4adb26` has parent
+`a6a0f471`, the then-current `lotus-v2` tip; this plan commit immediately follows.
+
+The appended patches integrate native Avalanche driving, candidate reconciliation,
+existing-home private proof provisioning, direct block-policy observations, and
+schema-3 explorer facts, bounded HTTP queries, asset indexing and atomic undo.
+The [explorer integration report](v2-explorer-integration.md) records a successful
+Chronik-enabled daemon build, 61 Rust component checks, two native producer/sync
+checks and actual observer process checks. The frontend is maintained separately
+under `explorer/v2`; 18 tests and independent review pass. A fresh
+`chronik-v2-explorer-v1` directory preserves earlier index files.
+
+[Wallet discovery acceptance](discovery-live-wallet-acceptance.md) now records
+78 checks on its separately pinned native/controller/compiler revisions, including
+relay, mining, restart and reorg. [Compiler validation](../../docs/plans/lotus-v2-compiler-integrated-validation.md)
+records 185 passing tests, two explicit eCash native skips, and 92 cross-engine
+comparisons without discrepancies. These are scoped results, not a claim that all
+components passed on this final native revision.
+
+Still outstanding: funded quorum/finality/parking/recovery, a reviewed fix for
+repeated ancestry reads in large finalization batches, actual explorer/asset
+acceptance across restart/reorg, exact-final-revision full validation, and
+separate-machine acceptance. Storage experiments remain optional candidates with
+[reviewed limitations](../../docs/plans/lotus-v2-storage-experiment-review.md);
+no cache/Bloom default or custom database is adopted. Production constants remain
+open. QUIC and public deployment are deferred.
+
+### Historical reviewed integration through 260 (October 15)
 
 All 261 mailboxes replay in a fresh worktree with `git am --keep-non-patch`.
 Every intermediate tree matches. Final source `e96a6c7da9` has tree
