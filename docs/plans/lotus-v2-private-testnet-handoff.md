@@ -1,6 +1,6 @@
 # Lotus V2 — Gemini Argon 4 continuation handoff
 
-Snapshot: **2026-10-16 02:28 UTC**. This replaces stale scheduling summaries;
+Snapshot: **2026-10-16 02:29 UTC**. This replaces stale scheduling summaries;
 prior versions remain in Git. The private-testnet goal is **active, incomplete**.
 This is preparation for a handoff, not evidence that current Codex workers have
 stopped. Before taking ownership, inspect actual processes and coordinate the
@@ -147,22 +147,34 @@ does not execute full actual Node::Status/whole node. A separate NodeStatus
 serializer is being prepared, so recheck dirty files before taking ownership.
 Cache commit and later diagnostics serializer must remain separate.
 
+**Known integration blocker discovered after those passes:**
+`chronik_sync_test/CMakeLists.txt` introspects the runtime test target's SOURCES.
+The new object-library test refactor would omit implementations from that caller.
+Owner is authorized to repair that CMake file separately, search other consumers,
+and run affected Chronik sync/explorer standalone checks. Do NOT merge cache until
+this compatibility follow-up and independent review pass. Production behavior is
+unchanged by this build-registration problem.
+
+
 ### B. Passive Avalanche diagnostics
 
 Owner `/root/avalanche_provisioning`; reviewer `/root/avalanche_provision_review`.
-Worktree `/private/tmp/lotus-v2-native-ava-diagnostics-20261016`, detachedHEAD64832d49e4.
-Dirty avalanche_{poll,peer,driver}.{h,cpp}, NEW avalanche_diagnostics.h,
+Worktree `/private/tmp/lotus-v2-native-ava-diagnostics-20261016`, base64832d49e4,
+candidateHEAD3c7a68e3a4.
+Candidate changes: avalanche_{poll,peer,driver}.{h,cpp}, NEW avalanche_diagnostics.h,
 test_avalanche_{v2,peer,driver}.cpp, avalanche_driver_test/README.md.
-No candidate commit at snapshot. Poll session88394/test0.61s and peer session54321/
-test1.93s passed and are terminal. Driver diagnostics focused build was just started after cache released its window;
-verify actual owner session/PID before acting. No daemon or node was launched.
+Candidate commit `3c7a68e3a4` is now ready, NOT integrated. Poll session88394/
+test0.61s, peer session54321/test1.93s, and driver session53703/test1.79s all passed
+and are terminal. No owned compiler/node remains. Final exact-commit review is
+pending; prior source review was green. Cache compatibility checks now own the
+heavy window. No full daemon or acceptance run was performed.
 
 Fixed saturating counters/gauges report query expiry, applied/ignored/rejected/local
 responses, classified peer failures, queue/backpressure, tracked disconnect causes
 and optional current-tip confidence. They must not affect protocol decisions.
 Unknown/external causes remain explicit, not inferred by subtracting overlaps.
 NodeStatus serialization is owned by cache agent in a separate dependent commit.
-Next: driver focused test, independent review, commit; serialize and build combined
+Next: final independent review; serialize and build combined
 source, freeze binary, then NEW unchanged-quorum run after review.
 
 ### C. Consolidation builder, first boundary only
