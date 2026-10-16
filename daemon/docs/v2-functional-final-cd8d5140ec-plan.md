@@ -17,7 +17,10 @@ The validated Python3.13 venv is reused with protobuf7.36.2 and
 websocket-client1.9.2; its freeze is retained. The generated Chronik module
 is reused because the protobuf source is unchanged between pins.
 
-All292functional script identities were compared with frozen63c. The only
+The source contains295top-level Python files:292registered functional scripts
+and3non-test helpers (`combine_logs.py`, `create_cache.py`, `test_runner.py`).
+[Registered-script comparison](evidence/v2-functional-final-cd8d5140ec/registered-script-comparison.json)
+records both pin hashes for each of the292registered identities. The only
 changed script is `abc-cmdline.py`, the reviewed literal Lotus branding fix;
 its EB2.0/comment assertions remain intact. Runner and protobuf sources are
 unchanged. All eight selected scripts retain their original inventory hashes.
