@@ -42,7 +42,7 @@ CMAKE_ARGS=(
     -DENABLE_NATPMP=OFF
 )
 
-if [[ "$SERIES" == "v1" ]]; then
+if [[ "$SERIES" == "v1" || "$SERIES" == "v2" ]]; then
     CMAKE_ARGS+=(-DBUILD_CHRONIK=ON)
 fi
 
