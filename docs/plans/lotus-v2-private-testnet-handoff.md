@@ -1,6 +1,6 @@
 # Lotus V2 — Gemini Argon 4 continuation handoff
 
-Snapshot: **2026-10-16 02:25 UTC**. This replaces stale scheduling summaries;
+Snapshot: **2026-10-16 02:28 UTC**. This replaces stale scheduling summaries;
 prior versions remain in Git. The private-testnet goal is **active, incomplete**.
 This is preparation for a handoff, not evidence that current Codex workers have
 stopped. Before taking ownership, inspect actual processes and coordinate the
@@ -120,8 +120,9 @@ Owner `/root/native_quorum_acceptance` is completed; no retry active.
 
 Owner `/root/audit_safety_repairs`; reviewer `/root/explorer_frontend_review`
 (with additional source review from `/root/avalanche_provision_review`).
-Worktree `/private/tmp/lotus-v2-runtime-block-cache-20261015`, base/HEAD64832d49e4.
-Dirty files: development_runtime.{h,cpp}, development_node_command.cpp,
+Worktree `/private/tmp/lotus-v2-runtime-block-cache-20261015`, base64832d49e4,
+cache commit `5a26ce6df372f3c37064dd25135fc0783fd24efd` (NOT integrated).
+Committed cache files: development_runtime.{h,cpp}, development_node_command.cpp,
 test_development_runtime.cpp, development_runtime_test/CMakeLists.txt and new
 `development_runtime_test/check_block_chunk_command.py` under `src/lotus_v2/`.
 Untracked build `build-cache-review/` is owned evidence, not source to commit.
@@ -135,12 +136,15 @@ which can silently fault runtime, before publishing bytes. Existing full-body AP
 for peers/Chronik remains. No claim the whole command becomesO(chunk): Status still
 has metadata costs. Optional per-call counters count actual load **attempts**.
 
-Initial focused runtime test passed4.69s. Final build/test session98229 was launched
-before snapshot (two targets: real runtime and extracted actual ReadBlock with real
-FaultEnv); do not assume it finished. Check owner/process/logs. Evidence directory:
-`/private/tmp/lotus-v2-runtime-block-cache-evidence-20261015/`.
-Negative control removes the postStatus fence and must fail. Adapter does not
-execute the full actual Node::Status/whole network node; preserve that scope.
+Final cache session98229 is terminal exit0: registered runtime test passed6.09s
+and the actual extracted ReadBlock/FaultEnv adapter passed2.28s (2/2). Source and
+artifact-hash review is green; frontend reviewer is independently rerunning these
+two executables. No cache-owned build/node process remains. Evidence directory:
+`/private/tmp/lotus-v2-runtime-block-cache-evidence-20261015/`; `final-test.log`
+and `final-artifacts.json` bind source/three binaries. The negative control removes
+the postStatus fence and fails stale-publication; restored fence passes. Adapter
+does not execute full actual Node::Status/whole node. A separate NodeStatus
+serializer is being prepared, so recheck dirty files before taking ownership.
 Cache commit and later diagnostics serializer must remain separate.
 
 ### B. Passive Avalanche diagnostics
@@ -150,8 +154,8 @@ Worktree `/private/tmp/lotus-v2-native-ava-diagnostics-20261016`, detachedHEAD64
 Dirty avalanche_{poll,peer,driver}.{h,cpp}, NEW avalanche_diagnostics.h,
 test_avalanche_{v2,peer,driver}.cpp, avalanche_driver_test/README.md.
 No candidate commit at snapshot. Poll session88394/test0.61s and peer session54321/
-test1.93s passed and are terminal. Driver diagnostics project remains unrun.
-No diagnostic-owned live processes; cache final session currently owns build window.
+test1.93s passed and are terminal. Driver diagnostics focused build was just started after cache released its window;
+verify actual owner session/PID before acting. No daemon or node was launched.
 
 Fixed saturating counters/gauges report query expiry, applied/ignored/rejected/local
 responses, classified peer failures, queue/backpressure, tracked disconnect causes
@@ -166,7 +170,8 @@ source, freeze binary, then NEW unchanged-quorum run after review.
 Owner `/root/audit_network_repairs`; reviewer `/root/explorer_storage_review`.
 Monorepo `/private/tmp/lotus-v2-consolidation-builder-20261015`, branch
 `audit-v2-consolidation-builder`, base66b378fdc007acce99f3a5e390149d704be1fa17.
-At last owner checkpoint, clean/no edits or processes. Owns only
+Latest root inspection finds an untracked builder script being written; no candidate
+native tree or build is yet reported. Owns only
 `daemon/scripts/consolidate-v2-candidate.py` and
 `daemon/tests/test-consolidate-v2-candidate.py`. Recheck as implementation continues.
 Reserved NEW native/evidence paths:
