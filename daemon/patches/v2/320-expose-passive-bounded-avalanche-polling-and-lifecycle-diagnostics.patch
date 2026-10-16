@@ -1,0 +1,549 @@
+From c1ab871772e161b467e9b95769bbe9b5c1aff989 Mon Sep 17 00:00:00 2001
+From: Shammah Chancellor <shammah.chancellor@notvalid.com>
+Date: Thu, 15 Oct 2026 19:30:09 -0700
+Subject: [PATCH] Expose passive bounded Avalanche polling and lifecycle
+ diagnostics
+
+The authenticated nine-node quorum still misses the finality deadline, and existing status cannot distinguish expired queries, rejected applications and transport closures. Add fixed-size saturating counters, live query gauges and optional current-tip confidence without feeding diagnostics into voting or connection decisions.
+
+Keep response-handler outcomes distinct from application rejection categories and record one explicit cause per tracked connection removal. Unknown causes remain unknown. Focused poll, peer and driver tests and independent review pass; node serialization and a new real quorum run remain separate gates.
+---
+ src/lotus_v2/avalanche_diagnostics.h         | 55 ++++++++++++++++++++
+ src/lotus_v2/avalanche_driver.cpp            | 44 ++++++++++++----
+ src/lotus_v2/avalanche_driver.h              | 13 ++++-
+ src/lotus_v2/avalanche_driver_test/README.md | 22 ++++++++
+ src/lotus_v2/avalanche_peer.cpp              | 29 ++++++++++-
+ src/lotus_v2/avalanche_peer.h                |  3 ++
+ src/lotus_v2/avalanche_poll.cpp              | 23 ++++++--
+ src/lotus_v2/avalanche_poll.h                |  4 ++
+ src/lotus_v2/test_avalanche_driver.cpp       | 23 +++++++-
+ src/lotus_v2/test_avalanche_peer.cpp         |  9 ++++
+ src/lotus_v2/test_avalanche_v2.cpp           | 10 +++-
+ 11 files changed, 217 insertions(+), 18 deletions(-)
+ create mode 100644 src/lotus_v2/avalanche_diagnostics.h
+
+diff --git a/src/lotus_v2/avalanche_diagnostics.h b/src/lotus_v2/avalanche_diagnostics.h
+new file mode 100644
+index 0000000000..6b4886ab16
+--- /dev/null
++++ b/src/lotus_v2/avalanche_diagnostics.h
+@@ -0,0 +1,55 @@
++// Copyright (c) 2026 The Lotus developers
++#ifndef LOTUS_V2_AVALANCHE_DIAGNOSTICS_H
++#define LOTUS_V2_AVALANCHE_DIAGNOSTICS_H
++#include <array>
++#include <cstdint>
++#include <cstddef>
++#include <limits>
++namespace lotus::v2::ava {
++// Diagnostics never feed protocol decisions. Counters saturate; gauges are
++// current container sizes and are named live_* to distinguish them.
++inline void IncrementDiagnostic(uint64_t &counter) {
++    if(counter!=std::numeric_limits<uint64_t>::max()) ++counter;
++}
++struct PollDiagnostics {
++    uint64_t queries_created{}, queries_expired{}, queries_cancelled{}, responses_matched{};
++    // Applied means a matched response was processed, including duplicate or
++    // inconclusive votes; it does not promise a confidence increase.
++    uint64_t responses_applied{}, responses_ignored{}, responses_rejected{}, responses_local_failure{};
++    uint64_t live_queries{}, live_records{};
++    bool operator==(const PollDiagnostics &) const = default;
++};
++enum class PeerRejection {
++    Signature, Framing, Content, LateResponseAbuse, DiscoveryCooldown,
++    ProofCooldown, NegotiatedCapacity, PayloadCapacity, Other, Count
++};
++struct PeerDiagnostics {
++    // These four count only response handler outcomes. The
++    // rejection categories below cover all application commands, so response
++    // rejections are also included there. Each rejection gets one category.
++    uint64_t responses_applied{}, responses_ignored{}, responses_rejected{}, responses_local_failure{};
++    uint64_t dead_applications{};
++    std::array<uint64_t,static_cast<size_t>(PeerRejection::Count)> application_rejections{};
++    bool operator==(const PeerDiagnostics &) const = default;
++};
++enum class DisconnectCause {
++    Unknown, ApplicationRejected, DeadTarget, NegotiatedCapacity,
++    TransportRequested, TransportEndOfStream, TransportStreamError,
++    TransportStreamContract, TransportPeerRejected, TransportLocalFailure,
++    TransportCapacity, TransportTimedOut, Count
++};
++struct DriverDiagnostics {
++    // Queued means accepted into the adapter action queue, not socket-written.
++    // Backpressure counts attempts, including retries of the same pending poll.
++    uint64_t poll_actions_queued{}, poll_backpressure{}, poll_dead_targets{}, poll_capacity_rejected{};
++    uint64_t discovery_dead_targets{}, discovery_capacity_rejected{}, dispatch_dead_targets{}, dispatch_local_failures{};
++    // Public driver Handle outcomes count attempts; retained notices can retry.
++    uint64_t dead_applications{}, applications_local_failure{};
++    uint64_t disconnects{};
++    // Exactly one cause per tracked connection removed. Unknown is explicit;
++    // no external reason is inferred by subtracting overlapping counters.
++    std::array<uint64_t,static_cast<size_t>(DisconnectCause::Count)> disconnect_causes{};
++    bool operator==(const DriverDiagnostics &) const = default;
++};
++}
++#endif
+diff --git a/src/lotus_v2/avalanche_driver.cpp b/src/lotus_v2/avalanche_driver.cpp
+index 074ef6309a..cddd13e3a5 100644
+--- a/src/lotus_v2/avalanche_driver.cpp
++++ b/src/lotus_v2/avalanche_driver.cpp
+@@ -33,7 +33,9 @@ DriverStatus AvalancheDriver::Status() const {
+     return {started_,failed_,initial_download_,
+         Ready() && !initial_download_ && current && quorum.ready,
+         quorum.established,quorum.proof_count,quorum.authenticated_peer_count,
+-        quorum.eligible_peer_count,quorum.active_stake_score,quorum.connected_stake_score};
++        quorum.eligible_peer_count,quorum.active_stake_score,quorum.connected_stake_score,
++        polls_.Diagnostics(),peer_.Diagnostics(),diagnostics_,
++        current?polls_.Confidence({ItemKind::Block,native.chain->stable_tip}):std::nullopt};
+ }
+ bool AvalancheDriver::Snapshot(ChainSnapshot &out, std::string &e) {
+     auto before=runtime_.Snapshot();
+@@ -165,20 +167,24 @@ DriverResult AvalancheDriver::Start(bool ibd,int64_t wall) {
+     if(!ReconcileProofs(e)){failed_=true;return Error(DriverCode::ProtocolFailure,e);}
+     validated_=s;started_=true;return {};
+ }
+-DriverResult AvalancheDriver::ClosePeer(peer::ConnectionId id) {
+-    Disconnect(id);DriverResult result;result.disconnected_peer=id;return result;
++DriverResult AvalancheDriver::ClosePeer(peer::ConnectionId id,DisconnectCause cause) {
++    Disconnect(id,cause);DriverResult result;result.disconnected_peer=id;return result;
+ }
+ DriverResult AvalancheDriver::Pump(uint64_t now) {
+     const auto id=peer_.PendingConnection();const auto result=peer_.Pump(now);
+     if(result==peer::DispatcherResult::UnknownPeer || result==peer::DispatcherResult::Closed ||
+        (result==peer::DispatcherResult::CapacityRefused && id && !peer_.Active(*id))) {
+-        if(id)return ClosePeer(*id);
++        if(id) {IncrementDiagnostic(diagnostics_.dispatch_dead_targets);return ClosePeer(*id,DisconnectCause::DeadTarget);}
+         return Error(DriverCode::ProtocolFailure,"missing-terminal-action-target");
+     }
+-    if(result==peer::DispatcherResult::CapacityRefused)
++    if(result==peer::DispatcherResult::CapacityRefused) {
++        IncrementDiagnostic(diagnostics_.dispatch_local_failures);
+         return Error(DriverCode::ProtocolFailure,"avalanche-local-dispatch-capacity");
+-    if(result==peer::DispatcherResult::InvalidConfiguration || result==peer::DispatcherResult::OperationalFailure)
++    }
++    if(result==peer::DispatcherResult::InvalidConfiguration || result==peer::DispatcherResult::OperationalFailure) {
++        IncrementDiagnostic(diagnostics_.dispatch_local_failures);
+         return Error(DriverCode::ProtocolFailure,"avalanche-local-dispatch-failure");
++    }
+     return {};
+ }
+ DriverResult AvalancheDriver::Tick(bool ibd,int64_t ms,int64_t wall) {
+@@ -196,7 +202,8 @@ DriverResult AvalancheDriver::Tick(bool ibd,int64_t ms,int64_t wall) {
+             const auto interval=std::max<uint64_t>(60000,config_.limits.discovery_interval_ms);
+             due=interval>std::numeric_limits<uint64_t>::max()-now?std::numeric_limits<uint64_t>::max():now+interval;
+         }
+-        if(r==PeerResult::UnknownPeer || r==PeerResult::Rejected)return ClosePeer(id);
++        if(r==PeerResult::UnknownPeer) {IncrementDiagnostic(diagnostics_.discovery_dead_targets);return ClosePeer(id,DisconnectCause::DeadTarget);}
++        if(r==PeerResult::Rejected) {IncrementDiagnostic(diagnostics_.discovery_capacity_rejected);return ClosePeer(id,DisconnectCause::NegotiatedCapacity);}
+         if(r==PeerResult::LocalFailure)return Error(DriverCode::ProtocolFailure,e);
+     }
+     peer_.Tick(static_cast<uint64_t>(ms));
+@@ -205,13 +212,17 @@ DriverResult AvalancheDriver::Tick(bool ibd,int64_t ms,int64_t wall) {
+     if(!pending_poll_) {OutgoingPoll p;if(polls_.Next(quorum_,s,ms,p,e))pending_poll_=std::move(p);}
+     if(pending_poll_) {
+         auto r=peer_.Poll(*pending_poll_,e);
+-        if(r==PeerResult::Backpressure)return Error(DriverCode::Backpressure,e);
++        if(r==PeerResult::Backpressure) {IncrementDiagnostic(diagnostics_.poll_backpressure);return Error(DriverCode::Backpressure,e);}
+         if(r==PeerResult::UnknownPeer || r==PeerResult::Rejected) {
++            const auto cause=r==PeerResult::UnknownPeer?DisconnectCause::DeadTarget:DisconnectCause::NegotiatedCapacity;
++            if(r==PeerResult::UnknownPeer) IncrementDiagnostic(diagnostics_.poll_dead_targets);
++            else IncrementDiagnostic(diagnostics_.poll_capacity_rejected);
+             const auto node=pending_poll_->node;
+-            if(const auto id=peer_.Connection(node))return ClosePeer(*id);
++            if(const auto id=peer_.Connection(node))return ClosePeer(*id,cause);
+             polls_.Disconnect(node);quorum_.Disconnect(node);pending_poll_.reset();return {};
+         }
+         if(r!=PeerResult::Accepted)return Error(DriverCode::ProtocolFailure,e);
++        IncrementDiagnostic(diagnostics_.poll_actions_queued);
+         pending_poll_.reset();
+     }
+     pumped=Pump(static_cast<uint64_t>(ms));if(!pumped || pumped.disconnected_peer)return pumped;return proof_reconcile_pending_?Error(DriverCode::Backpressure,"proof-vote-record-capacity"):DriverResult{};
+@@ -223,6 +234,12 @@ PeerResult AvalancheDriver::Activate(peer::ConnectionId id,std::string &e) {
+     return config_.local_proof.proof ? peer_.Hello(id,config_.delegation,e) : PeerResult::Accepted;
+ }
+ PeerResult AvalancheDriver::Handle(const peer::DispatcherNotice &n,uint64_t ms,std::string &e) {
++    const auto result=HandleImpl(n,ms,e);
++    if(result==PeerResult::UnknownPeer) IncrementDiagnostic(diagnostics_.dead_applications);
++    if(result==PeerResult::LocalFailure) IncrementDiagnostic(diagnostics_.applications_local_failure);
++    return result;
++}
++PeerResult AvalancheDriver::HandleImpl(const peer::DispatcherNotice &n,uint64_t ms,std::string &e) {
+     if(!Ready() || ms>uint64_t(std::numeric_limits<int64_t>::max()) || ms<uint64_t(now_ms_)){e="driver-unavailable-or-invalid-clock";return PeerResult::LocalFailure;}
+     if(!peer_.Active(n.connection)) {e="avalanche-inactive-peer";return PeerResult::UnknownPeer;}
+     now_ms_=static_cast<int64_t>(ms);ChainSnapshot s;if(!Refresh(s,e))return PeerResult::LocalFailure;
+@@ -238,7 +255,14 @@ PeerResult AvalancheDriver::Handle(const peer::DispatcherNotice &n,uint64_t ms,s
+     }
+     return result;
+ }
+-void AvalancheDriver::Disconnect(peer::ConnectionId id) {discovery_due_.erase(id);peer_.Disconnect(id);}
++void AvalancheDriver::Disconnect(peer::ConnectionId id,DisconnectCause cause) {
++    if(discovery_due_.erase(id)) {
++        IncrementDiagnostic(diagnostics_.disconnects);
++        const auto category=static_cast<size_t>(cause)<static_cast<size_t>(DisconnectCause::Count)?cause:DisconnectCause::Unknown;
++        IncrementDiagnostic(diagnostics_.disconnect_causes[static_cast<size_t>(category)]);
++    }
++    peer_.Disconnect(id);
++}
+ bool AvalancheDriver::Reconcile(const PollItem &p,bool accepted,std::string &e) {return Ready() && polls_.Reconcile(p,accepted,e);}
+ DriverResult AvalancheDriver::Save() {
+     if(!Ready())return Error(DriverCode::NotReady,"driver-not-started");
+diff --git a/src/lotus_v2/avalanche_driver.h b/src/lotus_v2/avalanche_driver.h
+index a8706093c4..4d6272f16f 100644
+--- a/src/lotus_v2/avalanche_driver.h
++++ b/src/lotus_v2/avalanche_driver.h
+@@ -30,6 +30,13 @@ struct DriverStatus {
+     bool quorum_ready{}, quorum_established{};
+     uint64_t proof_count{}, authenticated_peer_count{}, eligible_peer_count{};
+     uint64_t active_stake_score{}, connected_stake_score{};
++    PollDiagnostics polls;
++    PeerDiagnostics peer;
++    DriverDiagnostics diagnostics;
++    // Null when the current authoritative tip has no live record or authority
++    // is unavailable. Runtime tip_finalized distinguishes finalized absence.
++    std::optional<uint16_t> tip_confidence;
++    bool operator==(const DriverStatus &) const = default;
+ };
+ // Single owner. Application inv/getdata notices must contain proof inventory
+ // only: the node demultiplexes transaction inventory before calling Handle.
+@@ -42,7 +49,7 @@ public:
+     DriverResult Tick(bool initial_download, int64_t monotonic_ms, int64_t wall_seconds);
+     PeerResult Activate(peer::ConnectionId, std::string &);
+     PeerResult Handle(const peer::DispatcherNotice &, uint64_t monotonic_ms, std::string &);
+-    void Disconnect(peer::ConnectionId);
++    void Disconnect(peer::ConnectionId, DisconnectCause = DisconnectCause::Unknown);
+     // Durably saves the last active admitted public peer records even while runtime
+     // recovery is pending. Does not assert their current chain eligibility;
+     // Start revalidates every restored record before it can enter the quorum.
+@@ -51,7 +58,8 @@ public:
+     bool Ready() const { return started_ && !failed_; }
+     DriverStatus Status() const;
+ private:
+-    DriverResult ClosePeer(peer::ConnectionId);
++    PeerResult HandleImpl(const peer::DispatcherNotice &, uint64_t, std::string &);
++    DriverResult ClosePeer(peer::ConnectionId, DisconnectCause);
+     DriverResult Pump(uint64_t);
+     bool Snapshot(ChainSnapshot &, std::string &);
+     bool Refresh(ChainSnapshot &, std::string &);
+@@ -61,6 +69,7 @@ private:
+     std::optional<ProofEnvelope> Proof(const ::avalanche::ProofId &) const;
+     bool Apply(const std::vector<BlockUpdate> &, std::string &);
+     PeerCallbacks Callbacks();
++    DriverDiagnostics diagnostics_;
+     DevelopmentRuntime &runtime_;
+     DriverConfig config_;
+     Quorum quorum_;
+diff --git a/src/lotus_v2/avalanche_driver_test/README.md b/src/lotus_v2/avalanche_driver_test/README.md
+index daa0522b55..1e34b36a6d 100644
+--- a/src/lotus_v2/avalanche_driver_test/README.md
++++ b/src/lotus_v2/avalanche_driver_test/README.md
+@@ -85,3 +85,25 @@ Ignored authenticated late replies without closing the connection. Rejected
+ remote content remains a peer failure; failed local chain snapshot or commit
+ remains LocalFailure. The legacy bool PollEngine::Receive predicate returns true
+ only for Applied; callers requiring peer disposition must use ReceiveResponse.
++
++Passive diagnostics expose separate protocol layers. Poll counters track query
++creation, expiry/cancellation and matched/applied/ignored/rejected/local-failure
++responses. `live_queries` and `live_records` are current gauges. Before counters
++saturate, created queries equal matched plus expired plus cancelled plus live
++queries. Peer outcome counters cover response handler results; its fixed
++rejection categories cover every rejected application, including responses, so
++these two views overlap deliberately. Ignored engine responses may become peer
++rejections at the existing abuse threshold; they are never labelled applied.
++
++Driver `poll_actions_queued` counts adapter queue acceptance, not socket writes;
++`poll_backpressure` counts attempts, including retries. Disconnect totals count
++tracked Avalanche connections once, with exactly one explicit cause category.
++Endpoint owners pass the actual transport cause when available; otherwise the
++Unknown category is used. Duplicate close notifications do not add a second
++count or rewrite the first cause. Unknown is never inferred by subtraction.
++All counters saturate at UINT64_MAX and are never consulted by voting, ownership,
++cooldown, eligibility or scheduling decisions. Reading Status/Diagnostics never
++expires queries, generates polls, changes confidence, revalidates proofs or
++establishes quorum. Optional tip confidence is absent when the current authority
++is unavailable or no live tip record exists; runtime tip_finalized identifies a
++finalized absence. No keys, proof IDs, hashes or retained query traces are added.
+diff --git a/src/lotus_v2/avalanche_peer.cpp b/src/lotus_v2/avalanche_peer.cpp
+index dd9d7386a4..1142ae8a0f 100644
+--- a/src/lotus_v2/avalanche_peer.cpp
++++ b/src/lotus_v2/avalanche_peer.cpp
+@@ -199,7 +199,34 @@ void AvalanchePeer::Tick(uint64_t now) {
+         }
+     }
+ }
+-PeerResult AvalanchePeer::Handle(const peer::DispatcherNotice &notice, uint64_t now, std::string &e) {
++PeerResult AvalanchePeer::Handle(const peer::DispatcherNotice &notice,uint64_t now,std::string &e) {
++    const auto result=HandleImpl(notice,now,e);
++    if(result==PeerResult::UnknownPeer) IncrementDiagnostic(diagnostics_.dead_applications);
++    if(notice.kind==peer::DispatcherNoticeKind::Application && notice.application && notice.application->command=="avaresponse") {
++        switch(result) {
++            case PeerResult::Accepted:IncrementDiagnostic(diagnostics_.responses_applied);break;
++            case PeerResult::Ignored:IncrementDiagnostic(diagnostics_.responses_ignored);break;
++            case PeerResult::Rejected:IncrementDiagnostic(diagnostics_.responses_rejected);break;
++            case PeerResult::LocalFailure:IncrementDiagnostic(diagnostics_.responses_local_failure);break;
++            default:break;
++        }
++    }
++    if(result==PeerResult::Rejected) {
++        auto category=PeerRejection::Other;
++        if(notice.kind!=peer::DispatcherNoticeKind::Application || !notice.application) category=PeerRejection::Other;
++        else if(e=="invalid-response-signature") category=PeerRejection::Signature;
++        else if(e=="response-framing" || e=="invalid-avalanche-serialization") category=PeerRejection::Framing;
++        else if(e=="invalid-ava-response-size" || e=="invalid-ava-response-content" || e=="unknown-response-node") category=PeerRejection::Content;
++        else if(e=="unexpected-ava-response-abuse") category=PeerRejection::LateResponseAbuse;
++        else if(e=="discovery-cooldown") category=PeerRejection::DiscoveryCooldown;
++        else if(e=="proof-request-cooldown") category=PeerRejection::ProofCooldown;
++        else if(e=="avalanche-negotiated-capacity") category=PeerRejection::NegotiatedCapacity;
++        else if(e=="avalanche-payload-capacity") category=PeerRejection::PayloadCapacity;
++        IncrementDiagnostic(diagnostics_.application_rejections[static_cast<size_t>(category)]);
++    }
++    return result;
++}
++PeerResult AvalanchePeer::HandleImpl(const peer::DispatcherNotice &notice, uint64_t now, std::string &e) {
+     if(!Active(notice.connection)) {e="avalanche-inactive-peer";return PeerResult::UnknownPeer;}
+     auto found = peers_.find(notice.connection);
+     if (found == peers_.end()) return PeerResult::UnknownPeer;
+diff --git a/src/lotus_v2/avalanche_peer.h b/src/lotus_v2/avalanche_peer.h
+index 2abc140b44..e61689657e 100644
+--- a/src/lotus_v2/avalanche_peer.h
++++ b/src/lotus_v2/avalanche_peer.h
+@@ -53,6 +53,7 @@ public:
+     peer::DispatcherResult Pump(uint64_t now_ms);
+     void Disconnect(peer::ConnectionId);
+     std::optional<NodeId> Node(peer::ConnectionId) const;
++    PeerDiagnostics Diagnostics() const { return diagnostics_; }
+     bool Active(peer::ConnectionId) const;
+     std::optional<peer::ConnectionId> Connection(NodeId) const;
+     std::optional<peer::ConnectionId> PendingConnection() const;
+@@ -80,6 +81,7 @@ private:
+         std::vector<uint64_t> discovery_shortids;
+     };
+     struct Action { peer::ConnectionId connection; peer::Message message; };
++    PeerResult HandleImpl(const peer::DispatcherNotice &, uint64_t, std::string &);
+     bool Room(uint32_t count, uint64_t bytes) const;
+     PeerResult Queue(peer::ConnectionId, peer::Message, std::string &);
+     PeerResult QueueBatch(peer::ConnectionId, std::vector<peer::Message>, std::string &);
+@@ -90,6 +92,7 @@ private:
+     std::deque<Action> actions_;
+     uint64_t action_bytes_{};
+     NodeId next_node_{};
++    PeerDiagnostics diagnostics_;
+ };
+ }
+ #endif
+diff --git a/src/lotus_v2/avalanche_poll.cpp b/src/lotus_v2/avalanche_poll.cpp
+index 55a13019c4..8a3571050e 100644
+--- a/src/lotus_v2/avalanche_poll.cpp
++++ b/src/lotus_v2/avalanche_poll.cpp
+@@ -20,6 +20,7 @@ bool PollItem::operator<(const PollItem &other) const { return kind!=other.kind?
+ struct PollEngine::Impl {
+     Profile profile;
+     uint64_t round{};
++    PollDiagnostics diagnostics;
+     std::map<PollItem,::avalanche::VoteRecord> records;
+     struct Query { std::vector<PollItem> items; int64_t timeout{}; };
+     std::map<std::pair<NodeId,uint64_t>,Query> queries;
+@@ -46,7 +47,7 @@ bool PollEngine::Next(Quorum &quorum,const ChainSnapshot &snapshot,int64_t now,O
+     PruneProofs(quorum);
+     if(!quorum.Established(snapshot)) return Fail(error,"quorum-not-established");
+     for(auto it=impl_->queries.begin();it!=impl_->queries.end();) {
+-        if(it->second.timeout<now) { impl_->Release(it->second); it=impl_->queries.erase(it); } else ++it;
++        if(it->second.timeout<now) { impl_->Release(it->second); it=impl_->queries.erase(it); IncrementDiagnostic(impl_->diagnostics.queries_expired); } else ++it;
+     }
+     if(impl_->queries.size()>=impl_->profile.max_queries) return Fail(error,"query-capacity");
+     auto node=quorum.Select(now); if(!node) return Fail(error,"no-poll-node");
+@@ -63,9 +64,10 @@ bool PollEngine::Next(Quorum &quorum,const ChainSnapshot &snapshot,int64_t now,O
+     ++impl_->round;
+     const auto timeout=Deadline(now,impl_->profile.query_timeout_ms);
+     impl_->queries.emplace(std::make_pair(next.node,next.round),Impl::Query{next.items,timeout});
++    IncrementDiagnostic(impl_->diagnostics.queries_created);
+     quorum.Cooldown(next.node,timeout); out=std::move(next); return true;
+ }
+-PollReceiveResult PollEngine::ReceiveResponse(Quorum &quorum,NodeId node,const SignedResponse &signed_response,
++PollReceiveResult PollEngine::ReceiveResponseImpl(Quorum &quorum,NodeId node,const SignedResponse &signed_response,
+     const ChainSnapshot &snapshot,int64_t now,int64_t wall_seconds,const ApplyBlockUpdates &apply,std::string &error) {
+     auto auth=quorum.Node(node); if(!auth) {Fail(error,"unknown-response-node");return PollReceiveResult::Rejected;}
+     if(!AuthenticateResponse(auth->session_key,signed_response,error)) return PollReceiveResult::Rejected;
+@@ -74,6 +76,7 @@ PollReceiveResult PollEngine::ReceiveResponse(Quorum &quorum,NodeId node,const S
+     // Pinned ABC does not disconnect for an authenticated reply whose query
+     // already timed out. No ownership, vote history or cooldown is changed.
+     if(query==impl_->queries.end()) {Fail(error,"unexpected-ava-response");return PollReceiveResult::Ignored;}
++    IncrementDiagnostic(impl_->diagnostics.responses_matched);
+     auto items=std::move(query->second.items); impl_->queries.erase(query);
+     Impl::Query release{items,0};
+     quorum.Cooldown(node,Deadline(now,response.getCooldown()));
+@@ -107,6 +110,20 @@ PollReceiveResult PollEngine::ReceiveResponse(Quorum &quorum,NodeId node,const S
+     impl_->records.swap(staged);
+     return PollReceiveResult::Applied;
+ }
++PollReceiveResult PollEngine::ReceiveResponse(Quorum &quorum,NodeId node,const SignedResponse &response,
++    const ChainSnapshot &snapshot,int64_t now,int64_t wall,const ApplyBlockUpdates &apply,std::string &error) {
++    const auto result=ReceiveResponseImpl(quorum,node,response,snapshot,now,wall,apply,error);
++    switch(result) {
++        case PollReceiveResult::Applied:IncrementDiagnostic(impl_->diagnostics.responses_applied);break;
++        case PollReceiveResult::Ignored:IncrementDiagnostic(impl_->diagnostics.responses_ignored);break;
++        case PollReceiveResult::Rejected:IncrementDiagnostic(impl_->diagnostics.responses_rejected);break;
++        case PollReceiveResult::LocalFailure:IncrementDiagnostic(impl_->diagnostics.responses_local_failure);break;
++    }
++    return result;
++}
++PollDiagnostics PollEngine::Diagnostics() const {
++    auto result=impl_->diagnostics;result.live_queries=impl_->queries.size();result.live_records=impl_->records.size();return result;
++}
+ bool PollEngine::Receive(Quorum &quorum,NodeId node,const SignedResponse &response,
+     const ChainSnapshot &snapshot,int64_t now,int64_t wall,const ApplyBlockUpdates &apply,std::string &error) {
+     return ReceiveResponse(quorum,node,response,snapshot,now,wall,apply,error)==PollReceiveResult::Applied;
+@@ -136,6 +153,6 @@ bool PollEngine::Respond(const OutgoingPoll &poll,const ObserveBlock &observe,co
+     out=std::move(result); return true;
+ }
+ void PollEngine::Disconnect(NodeId node) {
+-    for(auto it=impl_->queries.begin();it!=impl_->queries.end();) if(it->first.first==node) { impl_->Release(it->second); it=impl_->queries.erase(it); } else ++it;
++    for(auto it=impl_->queries.begin();it!=impl_->queries.end();) if(it->first.first==node) { impl_->Release(it->second); it=impl_->queries.erase(it); IncrementDiagnostic(impl_->diagnostics.queries_cancelled); } else ++it;
+ }
+ } // namespace lotus::v2::ava
+diff --git a/src/lotus_v2/avalanche_poll.h b/src/lotus_v2/avalanche_poll.h
+index 63853aeeb1..70ccc1ca87 100644
+--- a/src/lotus_v2/avalanche_poll.h
++++ b/src/lotus_v2/avalanche_poll.h
+@@ -2,6 +2,7 @@
+ #ifndef LOTUS_V2_AVALANCHE_POLL_H
+ #define LOTUS_V2_AVALANCHE_POLL_H
+ #include "avalanche_chain.h"
++#include "avalanche_diagnostics.h"
+ #include "avalanche_quorum.h"
+ #include <memory>
+ namespace lotus::v2::ava {
+@@ -37,7 +38,10 @@ public:
+     void Disconnect(NodeId);
+     // Passive native VoteRecord observation; never polls or expires queries.
+     std::optional<uint16_t> Confidence(const PollItem &) const;
++    PollDiagnostics Diagnostics() const;
+ private:
++    PollReceiveResult ReceiveResponseImpl(Quorum &, NodeId, const SignedResponse &, const ChainSnapshot &,
++        int64_t, int64_t, const ApplyBlockUpdates &, std::string &);
+     struct Impl; std::unique_ptr<Impl> impl_;
+ };
+ } // namespace lotus::v2::ava
+diff --git a/src/lotus_v2/test_avalanche_driver.cpp b/src/lotus_v2/test_avalanche_driver.cpp
+index 907809e6e5..77452cd909 100644
+--- a/src/lotus_v2/test_avalanche_driver.cpp
++++ b/src/lotus_v2/test_avalanche_driver.cpp
+@@ -83,7 +83,7 @@ int main() {
+             "unstarted driver status is passive and empty");
+         Check(bool(observer.Start(true,1700000000)),"observer starts with exact default policy and native runtime");
+         Check(observer.Ready(),"observer ready without invented stake");
+-        const auto started=observer.Status();
++        const auto started=observer.Status();Check(observer.Status()==started,"passive driver status does not generate polls, mutate counters or establish quorum");
+         Check(started.started && !started.failed && started.initial_download &&
+             !started.quorum_ready && !started.quorum_established,
+             "driver startup readiness is distinct from IBD quorum readiness");
+@@ -95,7 +95,9 @@ int main() {
+             idle.authenticated_peer_count==0 && idle.eligible_peer_count==0 && idle.active_stake_score==0 &&
+             idle.connected_stake_score==0,"observer IBD completion invents no authenticated peers or quorum");
+         Check(observer.Tick(false,100,1700000002).code==DriverCode::InvalidConfiguration,"monotonic time regression refused");
++        Check(!observer.Status().tip_confidence,"absent tip record remains distinct from zero confidence");
+         Check(observer.Reconcile({ItemKind::Block,config.profile.genesis_id},true,e),"real indexed genesis reconciliation");
++        Check(observer.Status().tip_confidence==std::optional<uint16_t>{0},"enrolled authoritative tip exposes actual zero confidence");
+         Check(bool(observer.Save()),"real public peer store saved");
+         PeerStore store(config.peer_file,config.profile);std::vector<PersistedPeer> loaded;
+         Check(bool(store.Load(loaded)) && loaded.empty(),"observer persists no invented peers or secrets");
+@@ -169,8 +171,27 @@ int main() {
+         closed.a.dispatcher->Remove(closed.a.connection);
+         const auto cleaned=closing_driver.Tick(true,102,1700000001);
+         Check(bool(cleaned) && cleaned.disconnected_peer==closed.a.connection && closing_driver.Ready(),"terminal queued target disconnects without owner failure");
++        const auto closed_diagnostics=closing_driver.Status().diagnostics;
++        Check(closed_diagnostics.disconnects==1 && closed_diagnostics.dispatch_dead_targets==1 && closed_diagnostics.disconnect_causes[static_cast<size_t>(DisconnectCause::DeadTarget)]==1,"terminal action has one classified disconnect");
++        closing_driver.Disconnect(closed.a.connection,DisconnectCause::TransportRequested);
++        Check(closing_driver.Status().diagnostics==closed_diagnostics,"duplicate owner close cannot double-count or rewrite cause");
+         Check(closing_driver.Handle(retained,103,e)==PeerResult::UnknownPeer,"retained dead driver application stops before runtime callbacks");
++        Check(closing_driver.Status().diagnostics.dead_applications==1 && closing_driver.Status().peer.dead_applications==0,"driver fences dead application before adapter boundary");
+         Check(bool(closing_driver.Tick(true,104,1700000002)),"dead discovery entry no longer retries or blocks healthy owner");
++        Pair classified;auto classified_config=Configuration(classified.a);
++        AvalancheDriver classified_driver(*classified.a.runtime,*classified.a.dispatcher,classified_config);
++        Check(bool(classified_driver.Start(true,1700000000)) && classified_driver.Activate(classified.a.connection,e)==PeerResult::Accepted,"activate explicit endpoint closure category fixture");
++        classified_driver.Disconnect(classified.a.connection,DisconnectCause::TransportTimedOut);
++        Check(classified_driver.Status().diagnostics.disconnect_causes[static_cast<size_t>(DisconnectCause::TransportTimedOut)]==1 && classified_driver.Status().diagnostics.disconnect_causes[static_cast<size_t>(DisconnectCause::Unknown)]==0,"endpoint cause is explicit rather than inferred");
++        Check(classified_driver.Activate(classified.a.connection,e)==PeerResult::Accepted,"reactivate a fresh tracked Avalanche peer");
++        classified_driver.Disconnect(classified.a.connection);
++        const auto explicit_unknown=classified_driver.Status().diagnostics;
++        Check(explicit_unknown.disconnects==2 && explicit_unknown.disconnect_causes[static_cast<size_t>(DisconnectCause::Unknown)]==1 && explicit_unknown.disconnect_causes[static_cast<size_t>(DisconnectCause::TransportTimedOut)]==1,"unspecified endpoint cause is explicitly unknown without subtraction");
++        Check(classified_driver.Reconcile({ItemKind::Block,classified_config.profile.genesis_id},true,e) && classified_driver.Status().tip_confidence==std::optional<uint16_t>{0},"fresh observer has a real zero-confidence record");
++        HeaderAdmission pending_header;CandidateBodyStatus pending_body;
++        Check(classified.a.runtime->AdmitHeader(HeaderOf(V(0)),pending_header,e)==DevelopmentRuntimeResult::Progress && classified.a.runtime->RetainBody(H(V(0).id),runtime_fixture::Bytes(V(0).wire),pending_body,e)==DevelopmentRuntimeResult::Progress,"prepare actual pending authority fixture");
++        for(unsigned n=0;n<300;++n){classified.a.runtime->Tick(UINT64_MAX,0,TickLimits());const auto s=classified.a.runtime->Snapshot();if(s.chain&&s.chain->pending_journal)break;}
++        Check(classified.a.runtime->Snapshot().chain->pending_journal && !classified_driver.Status().tip_confidence,"unavailable authority hides confidence instead of reporting zero");
+         std::cout<<"Avalanche driver runtime and public-store checks passed\n";
+         ECC_Stop();return 0;
+     } catch(const std::exception &e) {std::cerr<<e.what()<<'\n';ECC_Stop();return 1;}
+diff --git a/src/lotus_v2/test_avalanche_peer.cpp b/src/lotus_v2/test_avalanche_peer.cpp
+index 540bd0ccf2..309c802175 100644
+--- a/src/lotus_v2/test_avalanche_peer.cpp
++++ b/src/lotus_v2/test_avalanche_peer.cpp
+@@ -164,6 +164,11 @@ int main() {
+         std::set<uint64_t> updated(fifth.begin(), fifth.end()); updated.insert(sixth.begin(), sixth.end());
+         expected.clear(); for (const auto &id : catalog) expected.insert(SipHashUint256(2, 3, id) & 0xffffffffffffULL);
+         Check(updated == expected && enumerations == 3, "new cycle fairly enumerates additions and removals");
++        DispatcherNotice malformed{DispatcherNoticeKind::Closed,pages.b.connection,{},{},{},{}};
++        e="invalid-response-signature";const auto before_malformed=server.Diagnostics();
++        Check(server.Handle(malformed,pages.ms,e)==PeerResult::Rejected,"malformed direct notice remains rejected");
++        const auto after_malformed=server.Diagnostics();
++        Check(after_malformed.application_rejections[static_cast<size_t>(PeerRejection::Other)]==before_malformed.application_rejections[static_cast<size_t>(PeerRejection::Other)]+1 && after_malformed.application_rejections[static_cast<size_t>(PeerRejection::Signature)]==before_malformed.application_rejections[static_cast<size_t>(PeerRejection::Signature)],"malformed notice cannot reuse stale error category");
+         auto mismatch_callbacks = Callbacks(key, proof, registered, bound, received);
+         CKey other; other.MakeNewKey(true); mismatch_callbacks.local_session_key = other.GetPubKey();
+         AvalanchePeer mismatch(*pages.a.dispatcher, limits, std::move(mismatch_callbacks));
+@@ -220,6 +225,7 @@ int main() {
+         Check(hol_peer.Activate(hol.a.connection,e)==PeerResult::Accepted && hol_peer.Activate(healthy_id,e)==PeerResult::Accepted,"activate both action targets");
+         Check(hol_peer.Hello(hol.a.connection,delegation,e)==PeerResult::Accepted && hol_peer.Hello(healthy_id,delegation,e)==PeerResult::Accepted,"queue dead and healthy target actions");
+         hol.a.dispatcher->Remove(hol.a.connection);
++        const auto passive_peer=hol_peer.Diagnostics();Check(hol_peer.Diagnostics()==passive_peer,"diagnostics do not pump queued actions");
+         const auto terminal=hol_peer.Pump(hol.ms);Check(terminal==DispatcherResult::Closed || terminal==DispatcherResult::UnknownPeer,"pump reports terminal front target");
+         hol_peer.Disconnect(hol.a.connection);
+         Check(hol_peer.PendingActions()==1 && hol_peer.Pump(hol.ms)==DispatcherResult::Queued,"terminal cleanup releases head of line and preserves healthy peer");
+@@ -241,6 +247,9 @@ int main() {
+         receive_outcome=PollReceiveResult::Ignored;
+         for(unsigned n=1;n<62;++n) Check(ignored_peer.Handle(ignored_notice,ignored_pair.ms+n,e)==PeerResult::Ignored,"pinned ABC tolerates first62 authenticated unknown replies");
+         Check(ignored_peer.Handle(ignored_notice,ignored_pair.ms+62,e)==PeerResult::Rejected && e=="unexpected-ava-response-abuse","63rd authenticated fault crosses unchanged ban-score threshold");
++        const auto ignored_stats=ignored_peer.Diagnostics();
++        Check(ignored_stats.responses_ignored==62 && ignored_stats.responses_rejected==1 && ignored_stats.responses_local_failure==1 && ignored_stats.responses_applied==0,"response outcome counters distinguish ignored from applied");
++        Check(ignored_stats.application_rejections[static_cast<size_t>(PeerRejection::LateResponseAbuse)]==1 && ignored_peer.Diagnostics()==ignored_stats,"fixed rejection category and passive snapshot");
+         ignored_peer.Disconnect(ignored_pair.a.connection);
+         Pair quiet_pair;auto quiet_callbacks=Callbacks(key,proof,registered,bound,received);
+         quiet_callbacks.receive=[&](NodeId,const SignedResponse &,std::string &){return receive_outcome;};
+diff --git a/src/lotus_v2/test_avalanche_v2.cpp b/src/lotus_v2/test_avalanche_v2.cpp
+index fb00685b96..b716112f9b 100644
+--- a/src/lotus_v2/test_avalanche_v2.cpp
++++ b/src/lotus_v2/test_avalanche_v2.cpp
+@@ -14,6 +14,7 @@ const std::function<std::string(const char *)> G_TRANSLATION_FUN = nullptr;
+ int main() {
+  ECC_Start();
+  try {
++  uint64_t saturated=UINT64_MAX-1;IncrementDiagnostic(saturated);CHECK(saturated==UINT64_MAX);IncrementDiagnostic(saturated);CHECK(saturated==UINT64_MAX);
+   Profile profile; profile.chain_id[0]=1; profile.genesis_id[0]=2; profile.validation_digest[0]=3;
+   ChainSnapshot snapshot; snapshot.tip[0]=4; snapshot.height=3000;
+   Quorum quorum(profile); PollEngine engine(profile); std::string error;
+@@ -132,7 +133,14 @@ int main() {
+   mismatch_response.response=::avalanche::Response(current.round,100,std::move(wrong_votes));CHECK(key.SignSchnorr(ResponseDigest(mismatch_response.response),mismatch_response.signature));
+   CHECK(delayed.ReceiveResponse(quorum,current.node,mismatch_response,snapshot,10305,wall_seconds,late_apply,error)==PollReceiveResult::Rejected);
+   CHECK(error=="invalid-ava-response-content" && !late_applies && delayed.Confidence(block)==confidence_before);
++  const auto delayed_stats=delayed.Diagnostics();
++  CHECK(delayed_stats.queries_created==2 && delayed_stats.queries_expired==1 && delayed_stats.responses_matched==1);
++  CHECK(delayed_stats.responses_applied==0 && delayed_stats.responses_ignored==2 && delayed_stats.responses_rejected==2 && delayed_stats.responses_local_failure==0);
++  CHECK(delayed_stats.live_queries==0 && delayed_stats.live_records==1 && delayed.Diagnostics()==delayed_stats && delayed.Confidence(block)==confidence_before);
+   CHECK(quorum.Node(expired.node) && delayed.Next(quorum,snapshot,10406,current,error));
++  const auto queued_stats=delayed.Diagnostics();CHECK(queued_stats.queries_created==3 && queued_stats.live_queries==1);
++  delayed.Disconnect(current.node);const auto cancelled_stats=delayed.Diagnostics();CHECK(cancelled_stats.queries_cancelled==1 && cancelled_stats.live_queries==0);
++  CHECK(cancelled_stats.queries_created==cancelled_stats.responses_matched+cancelled_stats.queries_expired+cancelled_stats.queries_cancelled+cancelled_stats.live_queries);
+   // Real upstream VoteRecord must finalize only after sustained diverse votes.
+   size_t finalized=0;
+   ApplyBlockUpdates finalize=[&](const std::vector<BlockUpdate> &updates,std::string &){
+@@ -164,7 +172,7 @@ int main() {
+    const auto result=transactional.ReceiveResponse(quorum,poll.node,response,snapshot,now+1,wall_seconds,atomic,error);
+    CHECK(result==PollReceiveResult::Applied || (result==PollReceiveResult::LocalFailure && rejected_final));
+   }
+-  CHECK(rejected_final); CHECK(batch_finalized==2);
++  CHECK(rejected_final); CHECK(batch_finalized==2); CHECK(transactional.Diagnostics().responses_local_failure==1 && transactional.Diagnostics().responses_applied>0);
+   // Ten inflight polls per inventory item, independently of peer capacity.
+   for(int i=8;i<20;++i) { CHECK(quorum.Bind(i,delegation,hello,transcript,16,error)); }
+   PollEngine bounded(profile); CHECK(bounded.Reconcile(block,true,error));
+-- 
+2.50.1 (Apple Git-155)
+
