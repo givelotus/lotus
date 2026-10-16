@@ -4,6 +4,19 @@ The goal remains active: a reviewed private network on separate machines, includ
 
 ## Current status — supersedes historical continuations below
 
+Pending native source repair: `64832d49e428debefff566ac19f36f2006089bfb`
+integrates independently reviewed inventory fairness candidate `0c3d78a5a2`.
+Actual extracted scheduler regression fails on exact cd8 baseline and passes
+with repair; existing relay-output regression also passes. Soft submission/peer
+refreshes now wait for the bounded current traversal; hard context fences remain
+immediate. No full build or mailbox export for this commit yet. Frozen cd8
+acceptance binaries and source archives remain unchanged.
+
+Final-cd8 inherited batch002 inputs are reviewed and integrated at `a2f80839`;
+292 registered script hashes verified, 295 top-level files include three helpers.
+Eight tests are prepared, not run; quorum still owns the execution window.
+
+
 Series `000`–`317` is integrated: series commit `dfd493fe`, immediate plan
 commit `9ab0c7c7`. All 318 intermediate replay trees match. Native source
 `cd8d5140ec7fce7da9a4e2a5a8b5d803ed4dc3f5`, tree
