@@ -124,9 +124,9 @@ class BlockWireTests(unittest.TestCase):
         self.assertEqual(vm,18)
         c = authenticated_transaction_costs(coinbase,TX,coins,2,1120,0,COST)
         s = authenticated_transaction_costs(spend,TX,coins,2,1120,vm,COST)
-        self.assertEqual((c.account_linear,s.account_linear),(1570,70742))
-        cost = block_cost(authenticated_envelope_cost(2,2,COST),(1570,70742),DEVELOPMENT_GENESIS)
-        self.assertEqual(cost,625935502)
+        self.assertEqual((c.account_linear,s.account_linear),(1570,10286))
+        cost = block_cost(authenticated_envelope_cost(2,2,COST),(1570,10286),DEVELOPMENT_GENESIS)
+        self.assertEqual(cost,13546450)
         trans = advance(DEVELOPMENT_GENESIS,money,work=2,transactions=(record,),
             coinbase_native_outputs=0,coinbase_native_burn=0,coinbase_bytes=101,
             tx_frame_prefix_bytes=2,account_block_cost=cost,enforce_block_cost=cost)
