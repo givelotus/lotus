@@ -51,8 +51,9 @@ async function screen(route,expected){win.document.querySelector('#notice').text
 await screen('/blocks',plan.block_id);await screen('/blocks/'+plan.block_id,plan.txid);
 await screen('/transactions/by-id/'+plan.txid,plan.txhash);
 const witness=[...win.document.querySelectorAll('#results button')].find(b=>b.textContent.startsWith('Witnesses:'));
-if(witness){witness.click();await new Promise(r=>setTimeout(r,150));if(!win.document.querySelector('#results').textContent.includes('Public witnesses'))throw new Error('Witness view missing');}
-const wire=[...win.document.querySelectorAll('#results button')].find(b=>b.textContent==='Inspect exact transaction wire');wire.click();await new Promise(r=>setTimeout(r,150));if(!win.document.querySelector('#results').textContent.includes(plan.wire_prefix))throw new Error('Actual wire missing from DOM');
+async function contains(text){const end=Date.now()+15000;while(Date.now()<end){if(win.document.querySelector('#results').textContent.includes(text))return;const n=win.document.querySelector('#notice').textContent;if(n.includes('unavailable')||n.includes('Snapshot changed'))throw new Error(n);await new Promise(r=>setTimeout(r,20));}throw new Error('DOM detail deadline: '+text);}
+if(witness){witness.click();await contains('Public witnesses');}
+const wire=[...win.document.querySelectorAll('#results button')].find(b=>b.textContent==='Inspect exact transaction wire');wire.click();await contains(plan.wire_prefix);
 await screen('/transactions/by-hash/'+plan.txhash,plan.txid);await screen('/assets');
 for(const id of plan.assets)await screen('/assets/'+id,id);
 if(plan.root){win.document.querySelector('#notice').textContent='';win.document.querySelector('#roots').value=plan.root;win.document.querySelector('#positions').value=JSON.stringify([{position:'0',roots:[plan.root]}]);win.document.querySelector('#branches').dispatchEvent(new win.Event('submit',{cancelable:true}));await ready();if(!win.document.querySelector('#results').textContent.includes(plan.root))throw new Error('Actual branch root missing from DOM');screens.push({route:'POST /branches/outputs',text:win.document.querySelector('#results').textContent});}
@@ -121,7 +122,7 @@ def main(argv=None):
         def __init__(self, label, daemon_path, manifest_file, home, network, destination, timeout):
             require(local.digest(daemon_path)==own.expected_daemon_sha256, 'daemon changed before launch')
             config=json.loads(network.read_text());config['chronik_bind']='127.0.0.1:0';network.write_text(json.dumps(config)+'\n')
-            self.home=str(home.resolve());self.auditing=False;self.audited=set();self.base=None;self.proxy=None
+            self.home=str(home.resolve());self.failed=False;self.auditing=False;self.audited=set();self.base=None;self.proxy=None
             super().__init__(label,daemon_path,manifest_file,home,network,destination,timeout)
         def raw(self, command, **fields): return super().request(command, **fields)
         def await_ready(self):
@@ -155,7 +156,10 @@ def main(argv=None):
                 require(len(evidence['requests'])<=20000,'acceptance request budget exceeded')
                 if code==503:
                     require(time.monotonic()<deadline,'explorer stayed unavailable');time.sleep(.025);continue
-                if code==409 and expected!=409: raise Changed()
+                if code==409 and expected!=409:
+                    current=value.get('snapshot') or {}
+                    if self.auditing and current.get('tip')==getattr(self,'audit_tip',None):raise AssertionError('pinned explorer view invalidated at unchanged native anchor: '+str(current))
+                    raise Changed()
                 if code!=expected and self.auditing and self.raw('status').get('tip')!=getattr(self,'audit_tip',None):raise Changed()
                 require(code==expected,'unexpected HTTP result '+str((route,code,value)))
                 require(value.get('api_version')=='1','wrong explorer API version')
@@ -204,6 +208,9 @@ def main(argv=None):
                 while True:
                     try:return self.audit_once(force)
                     except Changed:require(time.monotonic()<deadline,'explorer snapshots kept changing')
+            except Exception:
+                self.failed=True
+                raise
             finally:self.auditing=False
         def audit_once(self, force):
             require(all(local.digest(reference/p)==digest for p,digest in evidence['reference_sha256'].items()),'reference source changed during acceptance')
@@ -211,7 +218,7 @@ def main(argv=None):
             deadline=time.monotonic()+self.timeout
             while True:
                 native=self.raw('status');status=self.http('/status')
-                if status['ready'] and status['indexed_anchor']['block_id']==native.get('tip'):break
+                if status['ready'] and status['indexed_anchor']['block_id']==native.get('tip') and native.get('mempool_ready') is True and not any(native.get(k) for k in ('pending_journal','pending_receipt','pending_propagation','execution_paused','reopen_required')):break
                 require(time.monotonic()<deadline,'explorer/native did not converge');time.sleep(.025)
             self.audit_tip=native['tip'];identity=(native['tip'],status['service_epoch'],status['generation'])
             if identity in self.audited and not force:return
@@ -298,7 +305,7 @@ def main(argv=None):
             return result
         def stop(self):
             try:
-                if self.process.poll() is None and self.base:self.audit(force=True)
+                if self.process.poll() is None and self.base and not self.failed:self.audit(force=True)
             finally:
                 super().stop()
                 if self.proxy and self.proxy.poll() is None:

@@ -45,3 +45,21 @@ The harness refuses an existing output path, uses ephemeral loopback listeners,
 and owns/cleans every native and proxy process. Failures are retained. It never
 resets a home, deploys a site, touches production ports or changes a published
 release. Preparation/syntax checks alone establish no runtime result.
+
+## First actual attempt (retained failure)
+
+Harness commit `b4aae19d` ran against immutable native
+`86201398e3df61605c2eb2d09c201ce774013e7f`, binary SHA256
+`8c6c2d0ed9fc490b8cdb8900f01564ca6902c5d7dbe269eae8d0becefe27ae32`.
+Output `/private/tmp/lotus-v2-explorer-live-acceptance-20261015-a` is retained.
+The service repeatedly invalidated pinned observations at unchanged genesis;
+status generation reached `12316` at height `0`, with one service epoch and the
+same native anchor. The harness exhausted its 20,000-request safety budget
+before funding. A cleanup force-audit repeated that assertion, while the owned
+native/proxy processes were still stopped. This run establishes a failure of
+idle snapshot stability, not explorer acceptance.
+
+The wrapper now fails immediately when a pinned request is invalidated at its
+unchanged native anchor and skips additional audit work after the primary
+failure, preserving cleanup and the original cause. A repaired immutable native
+binary is required before another actual run; the existing failure is not reset.
