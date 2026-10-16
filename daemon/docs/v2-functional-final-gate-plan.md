@@ -144,3 +144,20 @@ remained enforced. No existing artifacts were deleted. This allowance does
 not authorize another ordinary batch. The original exact63c batch failure and
 its counts remain preserved; the rerun uses the explicitly identified fixture
 candidate and does not establish complete functional-suite acceptance.
+
+### Five previously unrun variants
+
+The separately authorized remaining-five run **passed all5** using unchanged
+exact63c scripts and frozen63c binaries. Runner elapsed8seconds; supervisor
+elapsed10.04seconds. Neither the two original passes nor the corrected
+command-line fixture was rerun.
+[Remaining-five receipt](evidence/v2-functional-final-gate-plan-63c5149944/batch-001-remaining-five/results.json)
+records every case/source hash, JUnit, raw log locations and resource evidence.
+Root approved3GiB launch minimum only for this five-case set, retaining the
+2GiB floor/scratch cap, jobs1/failfast and1800second deadline. No signals were
+needed and the final process group was empty. No subsequent batch ran.
+
+The first eight identities now have passes across the documented scoped runs:
+7with unchanged63c fixtures and1with reviewed branding correction. The original
+command-line fixture failure remains recorded. There are311variants still
+notrun; this evidence does not claim complete-suite acceptance.
