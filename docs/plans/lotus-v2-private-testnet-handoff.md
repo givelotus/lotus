@@ -1,203 +1,253 @@
-# Private testnet integration handoff — 2026-10-15
+# Lotus V2 — Gemini Argon 4 continuation handoff
 
-The goal remains active: a reviewed private network on separate machines, including wallet payments relayed A→B and mined from C’s mempool, restart/reorg reconciliation, explorer and authenticated Avalanche. Component passes do not establish completion. QUIC/public deployment deferred.
+Snapshot: **2026-10-16 02:25 UTC**. This replaces stale scheduling summaries;
+prior versions remain in Git. The private-testnet goal is **active, incomplete**.
+This is preparation for a handoff, not evidence that current Codex workers have
+stopped. Before taking ownership, inspect actual processes and coordinate the
+transfer. Do not edit files concurrently with their listed owner.
 
-## Current status — supersedes historical continuations below
+## Read first and preserve the actual goal
 
-Pending native source repair: `64832d49e428debefff566ac19f36f2006089bfb`
-integrates independently reviewed inventory fairness candidate `0c3d78a5a2`.
-Actual extracted scheduler regression fails on exact cd8 baseline and passes
-with repair; existing relay-output regression also passes. Soft submission/peer
-refreshes now wait for the bounded current traversal; hard context fences remain
-immediate. No full build or mailbox export for this commit yet. Frozen cd8
-acceptance binaries and source archives remain unchanged.
+Read both user objective files:
 
-Final-cd8 inherited batch002 inputs are reviewed and integrated at `a2f80839`;
-292 registered script hashes verified, 295 top-level files include three helpers.
-Eight tests are prepared, not run; quorum still owns the execution window.
+- `/Users/shammah/.codex/attachments/ff8ddba3-095c-47ec-a423-9fa916a72fa4/pasted-text-1.txt`
+- `/Users/shammah/.codex/attachments/3ea1c835-3be0-41d7-918c-90138ada0080/pasted-text-1.txt`
 
+Deliver a reviewed private V2 testnet on separate machines: wallet-created
+payments originate on A, relay through B, and are mined from C's mempool;
+wallet/indexer/explorer reconcile across restart and reorg; actual pinned-ABC
+Avalanche quorum, finality, parking, conflicting branches and recovery work.
+Provide builds and operator instructions. Component tests and same-host demos
+are not the complete acceptance criterion. QUIC and public deployment are deferred.
 
-Series `000`–`317` is integrated: series commit `dfd493fe`, immediate plan
-commit `9ab0c7c7`. All 318 intermediate replay trees match. Native source
-`cd8d5140ec7fce7da9a4e2a5a8b5d803ed4dc3f5`, tree
-`a14a946342d31ee07ee8851906500746800b0c46`. Earlier mailbox bytes are unchanged.
-Combined Debug Chronik-enabled daemon, CLI, wallet tool and V2 wallet client
-build passed. macOS deployment-target linker warnings remain disclosed in the
-implementation plan; no Linux or older macOS compatibility claim.
+Production parameters remain open. Preserve the accepted absolute tail formula
+anchored to genesis reward/work, reward lag, and direct genesis-anchored ASERT.
+Do not substitute a wall-clock emission schedule or restore iterative previous-tail
+adjustment. Preserve pinned ABC quorum/stake/maturity/confidence/default policies.
+Do not lower acceptance thresholds or enlarge the finality deadline to get green.
 
-Frozen binaries: `/private/tmp/lotus-v2-node-build-cd8d5140ec/`.
-[Build provenance](../../daemon/docs/evidence/v2-native-build-cd8d5140ec.json)
-records exact binary and build-log hashes. Daemon SHA256:
+## Safety and integration rules
+
+- Never edit, checkout or reset protected main `/Users/shammah/repos/lotus`, its
+  production workspaces, nodes, chain data or releases. V2 shares its Git directory.
+- No reset of existing worktrees; no push, tag or publication. New worktrees per
+  implementer, disjoint files, one integration owner. User requested Sol6.1 medium
+  implementations and Astra unresolved design; independent review is required.
+- Test with fresh development data and explicit nonproduction ports. Never use
+  10604, 10605 or8331. Do not terminate processes you did not launch.
+- Preserve failures, old binaries, source/bytecode/engine mismatches and raw traces.
+  Do not delete unknown build/data directories. Disk availability was about105GiB
+  at this snapshot, after earlier4GiB constraints; recheck, do not assume.
+- Helpers remain inlined, recursion rejected, nesting capped16. CABI07/08 already
+  implemented. Never emit OP_DEFINE/OP_INVOKE. Multi-chain research does not permit
+  changing Lotus consensus to make examples compile.
+- Native source lives in the ABC worktrees; monorepo carries mailbox patches.
+  Replay all patches with `git am --keep-non-patch` in a NEW worktree; verify every
+  intermediate tree before promotion. Preserve033's binary CSV exactly.
+- Series commit parent must be the then-current `lotus-v2` tip. Immediately follow
+  it with a commit updating `daemon/docs/lotus-v2-implementation-plan.md`.
+  No partial series promotion on a failed tree check.
+
+## Authoritative repositories and exact pins
+
+| Purpose | Path / state at snapshot |
+| --- | --- |
+| User monorepo | `/private/tmp/lotus-v2-repo`, branch `lotus-v2`, `3e6b49aaca00c98b7bb36d216625473b278de5a1` before this handoff commit |
+| Root monorepo integration | `/private/tmp/lotus-v2-integration-owner-20261015`, branch `v2-integration-owner-20261015`, same content; root alone integrates |
+| Root native integration | `/private/tmp/lotus-v2-native-integration-20261015`, `7db963beb40b1695da6cd7465d154234d8faf2e7`, tracked clean |
+| Native shared Git | `/private/tmp/lotus-v2-native-slice-review/.git` |
+| Real-.git full-build clone | `/private/tmp/lotus-v2-daemon-runtime-staging-20261015`, `cd8d5140ec7fce7da9a4e2a5a8b5d803ed4dc3f5`, tracked clean |
+| Maintained mailboxes | `daemon/patches/v2/series`,318patches000–317; ABCbase `1fb7db17c176cdea8a2c60d887891589382ee4e3` |
+
+The maintained series ends at native `cd8d5140ec`, tree
+`a14a946342d31ee07ee8851906500746800b0c46`. All318 intermediate trees verify;
+see [replay evidence](../../daemon/docs/evidence/v2-series-replay-317.json).
+Series commit `dfd493fe` and immediate plan `9ab0c7c7` preserve000–307 bytes.
+The two later native commits are **not exported/build-integrated yet**:
+
+1. `64832d49e428debefff566ac19f36f2006089bfb`: inventory fairness. Repeated soft
+   submission/peer refreshes finish the bounded current traversal; hard authority
+   fences remain immediate. Real extracted scheduler fails before, passes after;
+   independent review passed. Original candidate `0c3d78a5a2`.
+2. `7db963beb40b1695da6cd7465d154234d8faf2e7`: three inherited excessive-block RPC
+   test brand prefixes changed BitcoinABC→Lotus. EB2.0/13.0/13.1, comment and value
+   assertions preserved. Exact frozen-daemon rerun passes. Original `dcb64ada93`.
+
+## Frozen binaries — never infer newer source from these
+
+`/private/tmp/lotus-v2-node-build-cd8d5140ec/` contains daemon, CLI, wallet tool and
+V2 wallet client, with provenance and build log. Debug, ChronikON, walletON build
+passed. Daemon SHA256:
 `5767c34242f939f5d6fb0fa7f740f87b0c829d179717a58eb4df5cb84c88f7d9`.
+[Tracked provenance](../../daemon/docs/evidence/v2-native-build-cd8d5140ec.json)
+records all binaries. Some dependencies warn macOS26.5 objects target26.0;
+older-macOS/Linux compatibility is not established by this build.
 
-Latest cd8 quorum run is terminal: all-nine authenticated quorum passed, then
-unchanged300s finality failed with only node8 finalized. All12 owned children
-exited0 and their PIDs are absent. Evidence commit `2f5d1579` preserves50raw
-trace hashes, complete activation trajectories and last gate statuses; root
-independently verified those hashes/trajectory references/cleanup. No retry.
-Passive polling/peer diagnostics are being designed/implemented separately;
-existing traces do not distinguish the remaining cause.
+Full-tree CMake needs real `.git` (the inherited reflog code breaks worktree files).
+Python3.13: `/opt/homebrew/bin/python3.13`; compiler/reference venv:
+`/private/tmp/lotus-v2-compiler-review-venv/bin/python`.
+Rust1.93; LLVM library envs `/opt/homebrew/opt/llvm/lib`.
+Secp archive: `/private/tmp/lotus-v2-native-033-wt/build-secp-install/libsecp256k1.a`.
+Boost: `/opt/homebrew/opt/boost/include`. VM/block standalone targets require
+field_size.cpp, persistent_utxo.cpp and header.cpp dependencies as registered.
 
-Final-cd8 functional batch002 is terminal: two passed, excessive-block RPC test
-failed on obsolete BitcoinABC branding, five not run due to failfast. Evidence
-`19c8dd77` preserves38verified artifact hashes and the initial port-preflight
-enforcement mistake. Candidate `dcb64ada93` changes only3literal brand prefixes,
-retaining EB2.0/13.0/13.1/comment assertions. Root independently approved a
-narrow rerun with fail-closed port checks; verify owner session before assuming
-it is active. No other functional batch is authorized. Cache owner may edit
-runtime/node source but cannot run heavy builds during functional execution.
+## Highest-priority blocker: real Avalanche finality
 
-First eight inherited functional identities passed across documented63c runs,
-including a separately reviewed branding fixture repair; original failure kept.
-311 variants remain unrun. These are not final-cd8 full-suite results. Updated
-coverage, complete final-revision suites and separate-host acceptance remain.
+Latest actual run:
+`/private/tmp/lotus-v2-native-quorum-cd8d5140ec-20261015-a`.
+Unchanged harness/defaults, fresh clean2024-block seed copy. All9 proof provisions,
+funded pending-stop/recovery and authenticated default quorum passed. The unchanged
+300second `real-polled-seed-finality` gate **failed**; only node8 finalized.
+Fork/parking/restart gates were not reached. All12 owned native children exited0;
+the harness/session47425 is terminal and owned PIDs were checked absent.
 
-Audit repairs cover FIFO relay inventory, authority-fenced application retention,
-prepared-VM ownership, early pool resource checks, descriptor flag restoration,
-valid monetary fixtures and portable temporary paths. Independent focused checks
-passed. Consensus cost calibration and branch-root semantics are separately
-reviewed in `lotus-v2-argon-consensus-and-consolidation-review.md`; do not alter
-consensus while squashing. Consolidation ledger work is docs-only in a new
-isolated worktree. Inventory fairness investigation owns a separate native
-worktree, not the acceptance source. Repeated retained-block reads and repeated
-transaction encoding remain open performance findings.
+[Evidence](../../daemon/docs/evidence/v2-native-quorum-cd8d-finality-deadline-20261015.json)
+and [acceptance document](../../daemon/docs/lotus-v2-native-quorum-acceptance-20261015.md)
+are integrated at `2f5d1579`. Root verified50raw hashes and every recorded
+activation trajectory reference. Final activations:18,18,18,17,18,26,16,17,16.
+The prior63c run similarly finalized only one node. Correctly signed late replies
+were repaired with pinned ABC fault policy, but that repair was insufficient.
+Existing traces have no polling/confidence/disconnect breakdown: do not invent a
+root cause or simply repeat this run. Next run needs reviewed passive diagnostics.
 
-Operator same-host acceptance remains integrated at `93d479b3`; separate-host
-access is still unspecified. No public deployment, goal completion or finality
-claim. Prior continuations below are historical evidence only.
+Quorum harness/evidence owner clone:
+`/private/tmp/lotus-v2-native-quorum-acceptance-20261015`, last evidence32293106.
+Owner `/root/native_quorum_acceptance` is completed; no retry active.
 
-## Current continuation — supersedes earlier status below
+## Live candidates — NOT integrated, verify before taking ownership
 
-- Reviewed operator source integrated as `80da829b` and `f2abf45a`. Root's
-  integrated unittest run passed 65 tests with two explicit native-gate skips;
-  log `/private/tmp/lotus-v2-operator-integrated-f2abf45a-20261015.log`.
-  Separate actual native gate passed at operator `f5a72c4c`, native e775:
-  `/private/tmp/lotus-v2-operator-native-gate-20261015/evidence.json`.
-  Independent review verified 58 public commands, recipient exchange, payment
-  without mining, independent receiver mining, both clean resumes, reorg and
-  original-wire reconfirmation. All children reaped. Same host, Avalanche OFF;
-  no separate-machine/finality claim. Owner is preparing tracked evidence.
-- Python reference evidence committed `391e2a0f`: all95tests passed at a69d576d;
-  `daemon/docs/evidence/v2-python-reference-a69d576d/`. Exact source hashes and
-  raw log retained; this is not full final integrated validation.
-- Peer lifecycle repair `5eddad1c15` independently reviewed and integrated native
-  `63c51499441ded6d0fe34d87ff43d53a14b1398f`. Focused peer/driver tests and full
-  Debug Chronik daemon build pass. Immutable binary
-  `/private/tmp/lotus-v2-node-build-63c5149944/lotusd`, SHA256
-  `7d86468e24d457eaf2bbac541cc33ddd422e8a481fee96c8e5b6c07e70de7d0e`.
-  Build log `/private/tmp/lotus-v2-peer-lifecycle-integrated-build-20261015.log`.
-  Real-.git staging is this exact native revision. Build no longer running.
-- Series308patches000–307 replayed with every intermediate tree checked;
-  final `b148281abc3b8a7b599182219835bfc41e2b7ba8`. Prior000–306 unchanged.
-  Series commit `9a767a72` parents then-current user tip `391e2a0f`; immediate
-  plan commit `b96abff9`. Replay evidence `v2-series-replay-307.json`.
-- Quorum owner launched NEW run
-  `/private/tmp/lotus-v2-native-quorum-63c5149944-20261015-a`, exec session81970.
-  Same reviewed harness/defaults/deadlines, copied clean2024seed. Verify actual
-  process status before assuming it remains running. No finality claim yet.
-- Runbook owner `explorer_frontend` is updating only its document for integrated
-  operator commands and latest source/build pins. Separate-host information
-  remains unanswered. Broader final-revision suites and updated coverage remain.
+### A. Verified block-body chunk cache
 
-## Latest continuation — supersedes older in-flight notes below
+Owner `/root/audit_safety_repairs`; reviewer `/root/explorer_frontend_review`
+(with additional source review from `/root/avalanche_provision_review`).
+Worktree `/private/tmp/lotus-v2-runtime-block-cache-20261015`, base/HEAD64832d49e4.
+Dirty files: development_runtime.{h,cpp}, development_node_command.cpp,
+test_development_runtime.cpp, development_runtime_test/CMakeLists.txt and new
+`development_runtime_test/check_block_chunk_command.py` under `src/lotus_v2/`.
+Untracked build `build-cache-review/` is owned evidence, not source to commit.
 
-- Monorepo/user branch reached `a5b9d3f4`; native integration and real-.git staging
-  now `e775de1363c8ef9411f4c38b6c7504dacf4402be`. Series307patches000–306,
-  final tree `5dd4b465f2b84eb56320825819cb5d4afb171ccc`, every intermediate tree
-  verified. Series `bf7e71cb` parents `0923f47d`; immediate plan `a5b9d3f4`.
-- Current immutable daemon `/private/tmp/lotus-v2-node-build-e775de1363/lotusd`,
-  SHA256 `5d2ba8f0a2b5bb84de31a2e76860f8b6ef947ddf611b72bb9f03fb10635c59b0`.
-  Full Debug Chronik build passed. It adds independently reviewed process-local
-  initial-download completion latch; all initial checks unchanged, driver runtime
-  authority still separately fenced. Both focused tests passed independently.
-- Old c0 quorum run reached2024 and nine funded proofs, passed nonempty public
-  cache pending-stop/observer-recovery, then failed readiness deadline amid IBD
-  oscillation. All12owned children exited0; original failure and clean seed remain.
-  NEW run `/private/tmp/lotus-v2-native-quorum-e775de1363-20261015-a` stopped
-  after quorum7 exited1 with `avalanche-negotiated-capacity`; other11children
-  exited0. IBD remained false, but finality was not reached. Raw failing command
-  and missing-versus-zero ActiveLimit were not logged. The configured2MiB live
-  limit exceeds the earlier256000-byte local guard, supporting a stale/dead peer
-  diagnosis rather than oversized live traffic. All failed homes remain intact.
-  Sol owner `avalanche_provisioning` now implements typed peer-local outcomes
-  and atomic queue batches in new `/private/tmp/lotus-v2-native-peer-lifecycle-20261016`,
-  based on e775, with independent review. No blind rerun is authorized. It requires explicit
-  selected-block-not-finalized and rival parked/not-conflicting-finalized checks.
-  Owner `native_quorum_acceptance`; reviewer `avalanche_provision_review`.
-- Exact c0 functional smoke evidence integrated `a06ef593`:
-  `daemon/docs/v2-functional-smoke-c0ddb9cf30.md`. All10variants/8scripts passed;
-  root independently verified binary/script/artifact hashes, JUnit and source.
-  Remaining284scripts/309variants were not run by that gate.
-- Runbook `daemon/docs/v2-private-testnet-runbook.md` integrated `0923f47d`.
-  It accurately describes the c0 recipe and current operator gaps, not completed
-  separate-host acceptance. It will need its build tree/pin refreshed after final
-  operator/native acceptance; older recipe is deliberately pinned.
-- Astra operator contract `docs/plans/lotus-v2-operator-workflow.md` integrated
-  `ac0c5378`, independently reviewed. Sol6.1medium owner
-  `operator_workflow_implementation` works in
-  `/private/tmp/lotus-v2-operator-workflow-20261015`; owns controller.py, devnet.py,
-  config.schema.json and controller tests only. Config compatibility, explicit
-  clean-stop resume and public recipient export/import are in progress. Reviewer
-  `explorer_frontend_review`. No native/consensus/compiler changes in that task.
-- Separate-host aliases/OS/architecture and permission for fresh isolated test
-  directories/listeners were requested asynchronously and remain unanswered.
-  Continue local work; do not deploy to unspecified hosts.
+One-entry cache stores authenticated previously-connected bytes. Detached blocks
+remain readable as before. Every chunk checks current runtime authority/profile;
+stamp includes identity/profile/tip/root/revision/invalid_epoch/body_epoch/context
+_generation. Caller cap applies on hits; chunks<=64KiB; output unchanged on failure.
+Old entry clears before replacement. Node rechecks memory snapshot AFTER Status,
+which can silently fault runtime, before publishing bytes. Existing full-body API
+for peers/Chronik remains. No claim the whole command becomesO(chunk): Status still
+has metadata costs. Optional per-call counters count actual load **attempts**.
 
-## Ownership and safety
+Initial focused runtime test passed4.69s. Final build/test session98229 was launched
+before snapshot (two targets: real runtime and extracted actual ReadBlock with real
+FaultEnv); do not assume it finished. Check owner/process/logs. Evidence directory:
+`/private/tmp/lotus-v2-runtime-block-cache-evidence-20261015/`.
+Negative control removes the postStatus fence and must fail. Adapter does not
+execute the full actual Node::Status/whole network node; preserve that scope.
+Cache commit and later diagnostics serializer must remain separate.
 
-One root integrates. Use new isolated worktrees and disjoint files; implementation agents use Sol 6.1 medium. Preserve main at `/Users/shammah/repos/lotus`, all production workspaces/data/releases and existing worktrees. No reset, push, tag or publication. No test ports 10604, 10605 or 8331. Do not weaken pinned ABC quorum/stake/maturity/confidence defaults or invent production constants. Do not redo compiler imports or emit OP_DEFINE/OP_INVOKE.
+### B. Passive Avalanche diagnostics
 
-## Authoritative state
+Owner `/root/avalanche_provisioning`; reviewer `/root/avalanche_provision_review`.
+Worktree `/private/tmp/lotus-v2-native-ava-diagnostics-20261016`, detachedHEAD64832d49e4.
+Dirty avalanche_{poll,peer,driver}.{h,cpp}, NEW avalanche_diagnostics.h,
+test_avalanche_{v2,peer,driver}.cpp, avalanche_driver_test/README.md.
+No candidate commit at snapshot. Poll session88394/test0.61s and peer session54321/
+test1.93s passed and are terminal. Driver diagnostics project remains unrun.
+No diagnostic-owned live processes; cache final session currently owns build window.
 
-- Monorepo: `/private/tmp/lotus-v2-integration-owner-20261015`; user branch `/private/tmp/lotus-v2-repo` is fast-forwarded through `9df84e01` before this update. Verify cleanliness and HEAD before further integration.
-- Native integration: `/private/tmp/lotus-v2-native-integration-20261015`, `c0ddb9cf307a97a43309b72cffef383c29e559e8`. Reviewed lifecycle repair `1c8428c91b` and documentation correction are integrated, built, and exported.
-- Maintained series:306 patches000–305, final tree `2f8ada7e076b9c4e529bc8348834823785029fcd`. Every intermediate tree verified. Evidence `daemon/docs/evidence/v2-series-replay-305.json`. Prior000–303 byte-identical. Series commit `293e9249` parents then-current user tip `2fed44c7`; immediate plan commit `15c87074`.
-- Immutable current daemon `/private/tmp/lotus-v2-node-build-c0ddb9cf30/lotusd`, SHA256 `5c05a1acf36a91c690505ca08bd291d9fd2e985fd483f9db08386c712c1f8bfa`; provenance alongside. Full Debug Chronik build passed. Dependency macOS deployment warnings retained; no portability claim.
-- Real-.git build clone `/private/tmp/lotus-v2-daemon-runtime-staging-20261015`, `build-chronik-v2`, now c0ddb9cf30. Unit build window released. No further source changes during current acceptance runs. Approximately8GiB free; avoid full clones and costly parallel jobs.
+Fixed saturating counters/gauges report query expiry, applied/ignored/rejected/local
+responses, classified peer failures, queue/backpressure, tracked disconnect causes
+and optional current-tip confidence. They must not affect protocol decisions.
+Unknown/external causes remain explicit, not inferred by subtracting overlaps.
+NodeStatus serialization is owned by cache agent in a separate dependent commit.
+Next: driver focused test, independent review, commit; serialize and build combined
+source, freeze binary, then NEW unchanged-quorum run after review.
 
-## Two critical acceptance gaps
+### C. Consolidation builder, first boundary only
 
-### Avalanche recovery and quorum
+Owner `/root/audit_network_repairs`; reviewer `/root/explorer_storage_review`.
+Monorepo `/private/tmp/lotus-v2-consolidation-builder-20261015`, branch
+`audit-v2-consolidation-builder`, base66b378fdc007acce99f3a5e390149d704be1fa17.
+At last owner checkpoint, clean/no edits or processes. Owns only
+`daemon/scripts/consolidate-v2-candidate.py` and
+`daemon/tests/test-consolidate-v2-candidate.py`. Recheck as implementation continues.
+Reserved NEW native/evidence paths:
+`/private/tmp/lotus-v2-consolidated-inherited-20261015` and
+`/private/tmp/lotus-v2-consolidated-inherited-evidence-20261015` were nonexistent.
 
-Agent `avalanche_provisioning` implemented `a4e9aeb100` in `/private/tmp/lotus-v2-native-avalanche-lifecycle-20261015`; independent reviewer passed source and focused real journal reopen/deadline/persistence-failure tests. Root integrated it as above. Startup recovers pending durable work before driver/listener; stop persists last admitted public cache without claiming current eligibility. Load still revalidates.
+Reviewed [ledger](lotus-v2-consolidation-ledger.md) and JSON integrated at
+c88d6d6c/3e6b49aa:318mailboxes,1051file diffs,1053exclusive units,51proposed topics.
+All source/section/binary hashes and DAG validate. Three context SCCs remain.
+First inherited topic:64owned file sections in original order from pinnedABCbase.
+Builder verifies ledger before mutation, refuses existing destinations/dirty roots,
+uses git apply --index withoutthreeway/futureblob fallback, preserves first conflict
+and stops. Draft commit allowed only after all64 apply; build gates still pending.
+Do not replace maintained series from a mapping or clean application alone.
+Newer648/7db/cache/diagnostics are outside this immutable000–317 ledger.
 
-The immutable repaired daemon recovered a NEW COPY of failed seed `/private/tmp/lotus-v2-native-quorum-enabled-seed-20261015-a`. Original failed at height1737 with pending journal; preserve it. Old binary recovery probe also failed before readiness. Do not relabel original clean or restart existing homes casually.
+## Functional testing and queued automation
 
-Agent `native_quorum_acceptance` owns isolated harness worktree `/private/tmp/lotus-v2-native-quorum-acceptance-20261015`; commits through `26caab8f` are not integrated. Actual run `/private/tmp/lotus-v2-native-quorum-c0ddb9cf30-20261015-a` recovered pending height1738 with exact ledger state and is importing the suffix. Original failed homes remain unchanged. New gate tests nonempty funded public proof persistence across pending stop and same-home recovery as an observer. Then finish bootstrap2024, nine real proofs/full mesh, actual quorum/finality/parking/conflicting forks/restart. Ask owner for ordered owned commits before integrating.
+Final-cd8 batch002 now has8passing identities across scoped runs:7original fixtures
+plus the independently reviewed excessive-block branding fixture. Original failure
+and a port-preflight enforcement mistake are preserved, not relabelled green.
+All subprocesses stopped. Root verified raw hashes; evidence integrated29e05e25/
+a7c8a816. First8 identities had passed on older63c, not automatically on cd8.
+**311 of319 variants remain unrun on the final-cd8 pin.**
 
-### Explorer availability — resolved in scoped live acceptance
+[Plan and receipts](../../daemon/docs/v2-functional-final-cd8d5140ec-plan.md).
+Source/binaries frozen at `/private/tmp/lotus-v2-functional-final-cd8d5140ec-20261015`.
+Owner clone `/private/tmp/lotus-v2-functional-final-cd8d5140ec-docs-20261015`.
+Integrated supervisor throughffdf8cac defaults dry-run, explicit batch range,
+verifies hashes, refuses existing run dirs, fail-closed allocated port checks,
+jobs1,1800s/batch,4GiB launch,2GiB floor/scratch, exactJUnit, owned-process-group
+cleanup. All6parser tests pass, including JUnit errors/skip/nonzeroexit/identity.
+38 ordinary batches003–040 cover282unique queued variants; other feature/platform/
+resource lanes and the final rerun of first8 remain explicit pending work.
+Batch019 dynamic node count requires review. No further execution authorized while
+cache/diagnostics builds own the resource window. Next eligible batch003 is prepared.
 
-Reviewed frontend `40c3191a` is integrated as `6b2f9972`; harness commits through
-`8e8d43d6` are integrated through root `a8cecc18`. Passing run f evidence is
-integrated as `d96efee6` in `daemon/docs/v2-explorer-live-acceptance-20261015.md`.
-Independent audit verified42artifacthashes,78nativewalletchecks,153explorerchecks,
-19actualDOMruns, same-home confirmed5→detached7→remined8 membership, and ten clean
-native exits. Request-local retries recovered81transient503 with zero manual
-reloads. Failed run e remains preserved. This gate is complete for native
-currency at its exact documented pins; assets retain their separate gate.
+## Other completed component evidence and remaining scope
 
-## Validation status
+- Compiler: `docs/plans/lotus-v2-compiler-integrated-validation.md` —185/187 tests
+  passed, two eCash interpreter skips;92cross-engine comparisons, mismatches kept.
+  Exact pins in report. This is not the current full combined acceptance gate.
+- Python reference:95tests passed at a69d576d, evidence
+  `daemon/docs/evidence/v2-python-reference-a69d576d/`.
+- Operator: `daemon/docs/v2-operator-workflow-acceptance.md`, integrated93d479b3;
+  same-host independent sessions, AvalancheOFF, public recipient exchange, payment,
+  receiver mining, clean resumes and reorg recovery. Not separate-host or finality.
+- Explorer native currency live/reorg and asset mint/transfer/burn/remine/restart
+  evidence exists. Asset gate used public TRUE/MINT native fixtures, not secure
+  compiler-issued contracts. Never broaden that claim.
+- Coverage: `docs/plans/lotus-v2-explorer-coverage.md` is older exactpins; frontend
+ 681/750lines, native220/260lines/107of164branches, Rust2565/2971lines. New authority,
+ lifecycle, audit/cache/diagnostics changes are not covered by that baseline.
+- Storage experiments are reviewed evidence, not an adopted engine replacement.
+  Do not restart broad MonadDB research. Repeated transaction encode/identity work
+  remains an open performance finding; cache repair addresses retained-body reads.
+- Argon audit findings1/2cost accounting and7branch-root asymmetry match explicit
+  development rules. Read `lotus-v2-argon-consensus-and-consolidation-review.md`;
+  don't silently change consensus while squashing. P03's two cf→ea prose typos
+  were corrected atd5a44570, preserving VM behavior.
 
-Exact8cd inherited aggregates completed:305/305 runners (147default,147upgrade-named,11Avalanche). Evidence integrated as `9df84e01`, `daemon/docs/v2-final-unit-8cd36091ba.md` and its evidence directory. Independent reviewer rehashed all305 retained logs and both binaries, verified terminal success and exact source. These results precede lifecycle repair; upgrade names do not force distinct activation.
+## Next actions in order
 
-`avalanche_node_integration` now owns a bounded unchanged functional smoke at c0ddb9cf30 (8scripts/10variants), fresh isolated docs/evidence. It must preflight generated config, CLI/wallet-tool provenance and coordinate resources with quorum/explorer owners; no broad reruns or source edits. Execution passed all ten variants, without failures/skips, in32.49seconds; scoped evidence commit is being finalized.
+1. Reinspect current HEADs, dirty files, actual sessions/PIDs and owner transfer.
+   Preserve moving work; do not run a competing Gemini integration loop.
+2. Finish cache final regression/review; finish diagnostic driver test/review and
+   separate NodeStatus serializer. Integrate only approved exact commits, preserving
+   already-integrated648/7db. Do not mistake an agent base for the current native tip.
+3. Build combined daemon/tools, freeze source/binary provenance, replay/export new
+   append-only mailboxes in fresh worktree and follow series-parent/plan ordering.
+4. Run NEW quorum acceptance unchanged with diagnostic evidence. If failed, use
+   measured counters to identify cause; no threshold/deadline relaxation.
+5. Resume bounded functional batches as resource windows permit. Final acceptance
+   needs all applicable inherited/native/compiler/reference/wallet/Chronik suites
+   on an exact integrated revision plus updated meaningful coverage.
+6. Continue isolated consolidation construction with ledger provenance. Every
+   boundary builds and runs native units/registeredCTests/cumulativeV2checks;
+   owning-boundary regressions; final/config-change fullfunctional and four-config
+   Debug/Release ChronikON/OFF matrix. Preserve exact final tree and033binary.
+7. Finish separate-machine demo and runbook. Host/access information has been asked
+   but not supplied; do not deploy unspecified infrastructure. This is not a reason
+   to stop useful local implementation/testing or claim the overall goal complete.
 
-## Completed scoped evidence; do not repeat broad work
-
-- Compiler:185/187 pass, two unavailable eCash interpreter skips;92 Python/native comparisons without mismatches. `docs/plans/lotus-v2-compiler-integrated-validation.md`.
-- Wallet actual discovery/pay/relay/mining/restart/reorg gate:78 checks at documented earlier pins. `daemon/docs/discovery-live-wallet-acceptance.md`.
-- Native token index mint/transfer/explicit+implicit burn/reorg/exact-wire remine/restart: independent review passed final run h. `daemon/docs/v2-explorer-assets-live-acceptance.md`. Public permissive TRUE/MINT scripts, not secure issuance or compiler contracts.
-- Coverage baseline: `docs/plans/lotus-v2-explorer-coverage.md`; exact older pins, newer authority repair excluded. No full path coverage claim.
-- Storage cache/Bloom/body-locator experiments reviewed. `docs/plans/lotus-v2-storage-experiment-review.md`. No default engine change or production adoption; further broad benchmarks unnecessary for milestone.
-- Functional inventory: `daemon/docs/v2-functional-acceptance-matrix.md`;292 scripts/319 variants classified. Exact-pin execution remains outstanding, not implied by inventory.
-
-## Finish order
-
-1. Preserve the completed reviewed explorer gate; integrate pending functional smoke evidence.
-2. Complete the running suffix bootstrap and genuine funded quorum/persistence/fork/restart gates; copied-home startup recovery has passed.
-3. Integrate owned reviewed commits; export new native mailboxes only after fresh complete intermediate-tree replay. Update plan immediately after series commit.
-4. Validate final integrated revision across applicable functional/native/compiler/wallet/Chronik gates; update coverage for changed scope and preserve failures.
-5. Prepare reproducible build/profile/peer/funding/mining/wallet/explorer runbook. Separate-host OS/architecture/SSH aliases and permission for fresh test directories/listeners have been requested asynchronously. No unspecified infrastructure is authorized.
-6. Demonstrate separate-machine workflow and audit every goal requirement before declaring completion.
-
-Full objectives remain in `/Users/shammah/.codex/attachments/ff8ddba3-095c-47ec-a423-9fa916a72fa4/pasted-text-1.txt` and its referenced predecessor. This handoff does not reduce their scope.
+The goal remains active until all original requirements have direct evidence.
