@@ -106,3 +106,65 @@ unchanged fixtures and1with the reviewed fixture candidate. The original
 branding failure is preserved;311of319variants remain notrun at this pin.
 Historical63c passes remain separate. No broader batch has been launched
 or authorized; complete functional acceptance remains outstanding.
+
+## Prepared continuation automation (not executed)
+
+[Continuation manifest](evidence/v2-functional-final-cd8d5140ec/primary-continuation.json)
+and [supervisor](evidence/v2-functional-final-cd8d5140ec/run-primary-batches.py)
+prepare ordinary primary batches003–040:38batches/282unique variants.
+No first- or second-batch identity is selected; older63c passes are not final-pin
+passes. The supervisor defaults to dry-run and requires an explicit inclusive
+`--through` endpoint plus `--execute` after owner authorization. It refuses
+existing batch output directories, preserving prior receipts without deletion.
+
+Next proposed command, from this document worktree:
+
+```sh
+/private/tmp/lotus-v2-functional-full-63c5149944-20261015/primary/venv/bin/python3 daemon/docs/evidence/v2-functional-final-cd8d5140ec/run-primary-batches.py --start batch-003 --through batch-003 --execute
+```
+
+Remove `--execute` to inspect commands without launching nodes. Batch003 has
+`feature_anchors.py`, `feature_asmap.py`, `feature_blocksdir.py`,
+`feature_config_args.py`, `feature_dirsymlinks.py`, `feature_fastprune.py`,
+`feature_filelock.py`, `feature_help.py`. Exact runner invocation/environment
+is in the manifest; it retains jobs1/failfast/extended, fresh cache/JUnit/run
+paths and timeout-factor2. Its scripts require the existing wallet/CLI-enabled
+Debug profile and ordinary filesystem locking/symlink support, with no
+plugin/ZMQ/USDT dependency. Source inspection finds maximum2nodes per script.
+`feature_asmap.py`'s8333value is address-manager test data, not a listener.
+`feature_config_args.py` uses127.1.1.1 for RPC argument-log coverage;
+macOS fixture behavior remains an actual test result, never presumed passed.
+
+Before each authorized batch, the same supervisor verifies binary/config/runner
+and selected source hashes,4GiB launch disk, and initial framework port slots
+for every possible timing-sorted script/seed pairing. Port mapping is
+classbase44000/47000/50000/53000/56000 plus64*seed+node. It uses the maximum
+constant `self.num_nodes` found in that batch and fails closed if this count
+cannot be resolved. Batch019's `wallet_import_rescan.py` is explicitly
+unresolved and will stop for port review, remaining pending. These checks
+cover framework initial allocation; scripts' unusual endpoint overrides need
+source review before their batch is authorized. They never alter existing
+listeners or reserve ports against unrelated later processes.
+
+Per batch:<=8variants,1800second outer budget,2GiB scratch cap/free-disk
+floor and bounded50000file resource scan. The supervisor requires exact JUnit
+identities and stops on any failure, skip, resource/preflight refusal, missing
+JUnit or owned process requiring cleanup. It cleans only its recorded process
+group with bounded INT/TERM/KILL escalation, retains logs and supervisor
+receipts, and never automatically bypasses a stopped batch. Skip reasons
+require review; failfast-notrun cannot become a feature exclusion. Disk is
+rechecked after terminal cleanup as well as before each next launch.
+
+Long resource batches041–045 remain separate pending gates: pruning needs
+at least8GiB free and its proposed three-hour allowance; dbcrash/assumeutxo
+retain their separate budgets. Plugin046 needs an honest plugin build and
+dependencies; ZMQ047 needs an honest ZMQ build/Python package. Linux
+network048–051 needs isolated interfaces and its explicit fixture flags,
+USDT052 needs Linux tracing/BCC/BPF permissions. All12nonordinary batches
+and their exact variants remain pending in the manifest, not excluded or
+passed. SQLite batch040 remains a primary pending gate.
+
+Preparation verification compiled the supervisor and dry-ran batch003 without
+nodes, and checked282unique ordinary variants plus12pending nonordinary
+batches. Cache owner currently holds the build/test window. No continuation
+execution has been authorized or launched.
