@@ -44,7 +44,9 @@ def main():
         manifest_sha256=local.digest(manifest),bootstrap_ledger_sha256=local.digest(bootstrap/'accepted-blocks.jsonl'),
         public_fixture_keys='Public scalars 1..9 only; no production funds',checks=[],processes=[],cleanup=[])
     end=time.monotonic()+a.deadline_seconds;nodes=[]
-    def save():(root/'evidence.json').write_text(json.dumps(evidence,indent=2)+'\n')
+    def save():
+        temporary=root/'evidence.pending.json'
+        temporary.write_text(json.dumps(evidence,indent=2)+'\n');temporary.replace(root/'evidence.json')
     def check(name,**fields):evidence['checks'].append(dict(check=name,**fields));save()
     def start(label,home,connect=(),port=0,credentials=None):
         config=root/(label+'.network.json')
@@ -204,9 +206,18 @@ def main():
     except Exception as error:
         evidence['failure']=dict(kind=type(error).__name__,error=str(error));save();raise
     finally:
+        cleanup_errors=[]
         for node in nodes:
-            if node.process.poll() is None:stop(node)
+            try:
+                if node.process.poll() is None:stop(node)
+                elif not any(c['pid']==node.process.pid for c in evidence['cleanup']):
+                    evidence['cleanup'].append(dict(label=node.label,pid=node.process.pid,exit=node.process.poll()))
+                    require(node.process.poll()==0,'owned node exited unexpectedly')
+            except Exception as error:cleanup_errors.append(dict(node=node.label,error=str(error)))
+        if cleanup_errors:
+            evidence['passed']=False;evidence['cleanup_errors']=cleanup_errors
         save()
+        require(not cleanup_errors,'owned process cleanup failed')
 
 
 if __name__=='__main__':main()
