@@ -111,6 +111,42 @@ class VMTests(unittest.TestCase):
         result = evaluate(bytes.fromhex("67796a4e"), (), PROFILE, input_count=3)
         self.assertEqual(result.charged_cost, 4 + 1 + 3 * (1 + 1) + 1)
 
+    def test_bigint_arithmetic_and_zero_padding(self):
+        wide_profile = VMProfile(
+            max_script_bytes=8192, max_arguments=8, max_element_bytes=2048,
+            max_stack_items=16, max_altstack_items=8, max_vm_bytes=16384,
+            max_ast_depth=8, max_invocation_cost=10_000_000,
+            structural_byte_cost=1, opcode_costs={op: 1 for op in ASSIGNED},
+        )
+        # 1024-byte signed arithmetic (ADD, SUB, MUL, DIV, MOD, SQRT, LOG)
+        a_val = (1 << 8000) + 123456789
+        b_val = (1 << 4000) + 7
+        a_bytes = a_val.to_bytes(1024, "little", signed=True)
+        b_bytes = b_val.to_bytes(512, "little", signed=True)
+        q, r = divmod(a_val, b_val)
+        self.assertEqual(
+            evaluate(bytes.fromhex("a14cfd0004") + q.to_bytes(1024, "little", signed=True) + bytes.fromhex("924e"),
+                     (a_bytes, b_bytes), wide_profile).stack,
+            (ONE,)
+        )
+        self.assertEqual(
+            evaluate(bytes.fromhex("a24cfd0004") + r.to_bytes(1024, "little", signed=True) + bytes.fromhex("924e"),
+                     (a_bytes, b_bytes), wide_profile).stack,
+            (ONE,)
+        )
+        # Mismatched length zero-padding on AND, OR, XOR, ADDCARRY, SUBCARRY, MUL128_WIDE
+        self.assertEqual(
+            evaluate(bytes.fromhex("8e025500924e"), (b"\xff", b"\x55\xaa"), wide_profile).stack,
+            (ONE,)
+        )
+        self.assertEqual(
+            evaluate(bytes.fromhex("b07910") + number(0x202) + bytes.fromhex("924e"),
+                     (b"\x01", b"\x00\x02", number(1)), wide_profile).stack,
+            (ONE,)
+        )
+        with self.assertRaises(VMError):
+            evaluate(bytes.fromhex("98"), (bytes(1025),), wide_profile)
+
 
 if __name__ == "__main__":
     unittest.main()

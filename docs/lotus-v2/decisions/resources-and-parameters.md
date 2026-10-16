@@ -44,7 +44,12 @@ The pass **never rejects a script and adds no validity rule**. It only chooses c
 | Instruction | Bound of each result |
 | --- | --- |
 | PUSH_n, PUSHDATA | exact data length |
-| constants, arithmetic on N or U values, comparisons, OUTPUTCONTINUESBRANCH and every other Boolean result, BIN2NUM, DEPTH, SIZE, counts, indices, values | 16 |
+| constants, comparisons, NOT, 0NOTEQUAL, BOOLAND, BOOLOR, WITHIN, LOG, OUTPUTCONTINUESBRANCH and every other Boolean result, DEPTH, SIZE, counts, indices, values | 16 |
+| BIN2NUM, 1ADD, 1SUB, NEGATE, ABS, SQRT, MULPOW2 | `clamp(bound(a), 16, 1024)` (with quadratic limb surcharge `(limbs^2 - 1) * 16` operand bytes on `LOG` and `SQRT` when `limbs = ceil(min(bound(a), 1024) / 16) > 1`) |
+| ADD, SUB, DIV, MOD, MIN, MAX | `max(clamp(bound(a), 16, 1024), clamp(bound(b), 16, 1024))` (with quadratic limb surcharge `(limbs_a * limbs_b - 1) * 16` operand bytes on `DIV` and `MOD` when `limbs_a * limbs_b > 1`) |
+| MUL | `16` when `bound(a) <= 16` and `bound(b) <= 16`, else `min(2048, clamp(bound(a), 16, 1024) + clamp(bound(b), 16, 1024))` (with quadratic limb surcharge `(limbs_a * limbs_b - 1) * 16` operand bytes when `limbs_a * limbs_b > 1`) |
+| ADDCARRY, SUBCARRY | low limb `clamp(max(bound(a), bound(b)), 16, 1024)`, carry/borrow `16` |
+| MUL128_WIDE | both limbs `clamp(max(bound(a), bound(b)), 16, 1024)` (with quadratic limb surcharge `(limbs_a * limbs_b - 1) * 16` operand bytes when `limbs_a * limbs_b > 1`) |
 | RAWLEFTBITSHIFT | the shifted operand's bound |
 | hashes, LEAFHASH, NODEHASH, MERKLEROOT_SORTED, MERKLEROOT_INDEXED, TXID, OUTPOINTTXID, CHAINID, SIGHASH, BRANCHROOT, token IDs, branch roots | 32 |
 | CAT | sum of both operand bounds, capped at MAX_ELEMENT_BYTES |

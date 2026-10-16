@@ -10,8 +10,8 @@ Status: review draft, derived from [consensus C04–C25](consensus.md). P01 and 
 | Method selection | Revealed script plus unordered membership proof selects a leaf; no numeric method index in consensus |
 | Arguments | Count followed by length-prefixed byte strings; wire order is bottom-to-top, last argument on top |
 | Initial machine | Fresh main stack, empty alternate stack, no shared mutable branch state. In a mint, the node pushes the mint delta above the arguments |
-| Numeric operand | Exactly 16 bytes, signed two's complement, little-endian; no implicit Bitcoin ScriptNum conversion |
-| Boolean | Exactly int128 zero or one; Boolean consumers reject other values in this draft |
+| Numeric operand | 16..1,024 bytes (16-byte int128 baseline up to 8,192-bit big-int; wide products up to 2,048 bytes), signed two's complement, little-endian; no implicit Bitcoin ScriptNum conversion |
+| Boolean | Exactly 16-byte int128 zero or one; Boolean consumers reject other values in this draft |
 | Bytes | Remain bytes until an explicit opcode interprets them; hashes, keys and signatures are not int128 values |
 | Success | Ordinary execution: exactly one Boolean true on main stack, empty alternate stack. An unassigned OP_SUCCESS_N instead succeeds for the whole invocation during P03's scan, after outer witness/proof checks |
 | Failure | Invalid encoding/type/range/index, overflow, division by zero, unmatched structure, resource excess, or false result rejects under ordinary execution; P03 defines the success-scan exception |
