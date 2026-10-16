@@ -117,3 +117,30 @@ and selected finality remains false. Any crossed finality boundary fails with
 its original snapshots. The production park-write path is exclusively signed
 poll response handling through `PollEngine::Receive`, `AvalancheDriver::Apply`
 and `DevelopmentRuntime::ApplyAvalancheUpdates`.
+
+## Latch-fixed peer-capacity failure
+
+Source `e775de1363c8ef9411f4c38b6c7504dacf4402be`, binary SHA256
+`5d2ba8f0a2b5bb84de31a2e76860f8b6ef947ddf611b72bb9f03fb10635c59b0`,
+reused a new copy of the clean 2024 seed without reimport. All nine native proof
+provisions and the funded pending-stop/observer-cache recovery check passed.
+Initial download mode remained false, and each node reported an established
+quorum in the retained snapshots. The simultaneous readiness gate did not pass.
+
+Node seven then exited 1 with `Avalanche application:
+avalanche-negotiated-capacity`. All twelve children are stopped: eleven exited 0
+and node seven exited 1. Finality and fork gates did not run.
+
+[Compact failure evidence](evidence/v2-native-quorum-peer-capacity-failure-20261015.json)
+retains exact pins, cleanup, last states and raw-trace paths/hashes. The last two
+node-seven states show authentication recovering from seven to eight peers and
+nine total activations. Every configured receive limit was 2 MiB.
+
+`AvalanchePeer::Queue` first bounds a payload to 256000 bytes, then emits the
+negotiated-capacity error if `ActiveLimit` is absent or the payload exceeds that
+limit. The dispatcher can return an absent limit for a removed peer or zero for
+a non-active transport. The observed bounds therefore implicate a stale or dead
+peer; the actual incoming application command, payload size and missing-versus-
+zero limit were not logged and remain unknown. This peer-local condition must
+not be presented as successful quorum acceptance. The failed homes remain
+preserved; no retry is authorized until a reviewed immutable repair is supplied.
