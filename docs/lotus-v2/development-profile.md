@@ -48,18 +48,18 @@ No additional native-output dust threshold is proposed. C14a token burn and the 
 
 The bootstrap and tail each contribute 1,000,000 atoms to height 1, so its gross entitlement is **2,000,000 atoms**. This is computed from the selected state, never supplied as a caller override. The initial reserve is fully telescoping under the existing recurrence. With target work 2 at both genesis and the first block, the next tail stays 1,000,000.
 
-The burn shifts are deliberately gentle test values. For the exact 103-byte spendable coinbase example below, the conservative outer schedule gives `L=35,665`, envelope cost `993`, and `C_block=46,362`. At initial EMA 65,536:
+The burn shifts are deliberately gentle test values. For the exact 103-byte spendable coinbase example below, the conservative outer schedule gives `L=5,437`, envelope cost `993`, and `C_block=6,655`. At initial EMA 65,536:
 
 ```text
-R = ((46,362 * 65,536) >> 64) + ((46,362^2) >> 32) = 0
+R = ((6,655 * 65,536) >> 64) + ((6,655^2) >> 32) = 0
 K = 103 + 134 + 4 + 1 = 242 atoms
 U_required = max(K, R) = 242 atoms
 payout = 2,000,000 - 242 = 1,999,758 atoms
 ```
 
-All transaction, state and envelope costs are computed; a zero rounded parabolic floor does not waive the real byte charge. The resulting state is `(reserve=1,048,575,000,000, tail=1,000,000, work=2, EMA=65,517)`.
+All transaction, state and envelope costs are computed; a zero rounded parabolic floor does not waive the real byte charge. The resulting state is `(reserve=1,048,575,000,000, tail=1,000,000, work=2, EMA=65,478)`.
 
-The choice of linear shift 64 also gives a useful liveness bound. For this fixed minimal spendable coinbase template and **every representable u64 EMA**, `R <= 46,361`; the quadratic term is zero. Even after the bootstrap reserve is exhausted, `Tmin=1,000,000` covers `max(K,R)` and leaves a positive payout. At maximum EMA, the next EMA for this small block decreases and fits u64. This proves affordability for that template and this schedule, not for every larger coinbase, arbitrary workload or future extension. Shift 20 would not give this all-EMA bound; we do not copy that choice without its liveness analysis.
+The choice of linear shift 64 also gives a useful liveness bound. For this fixed minimal spendable coinbase template and **every representable u64 EMA**, `R <= 6,654`; the quadratic term is zero. Even after the bootstrap reserve is exhausted, `Tmin=1,000,000` covers `max(K,R)` and leaves a positive payout. At maximum EMA, the next EMA for this small block decreases and fits u64. This proves affordability for that template and this schedule, not for every larger coinbase, arbitrary workload or future extension. Shift 20 would not give this all-EMA bound; we do not copy that choice without its liveness analysis.
 
 ## 3. Structural bounds and complete cost schedule
 
@@ -95,7 +95,7 @@ For each assigned opcode, charge `base + sum(operand_size_bounds) + sum(result_s
 
 The signature base includes the bounded signing-message hashing; the same CHECKDATASIG base covers all four defined algorithms. SHA256/BLAKE3 bases plus byte terms, explicit double-hash/domain allowances and fixed signing-preimage allowance make all charges reproducible. They are **uncalibrated test weights**, not benchmarked worst-case CPU guarantees. Merkle opcodes add per-step charges: selector 0 uses BLAKE3 with a 96-byte conservative tagged input bound; selector 1 uses BLAKE3 over 64 bytes; selectors 2/3 use SHA256/HASH256 over 64 bytes; each result bound is 32 bytes. A nonconstant selector uses the maximum of all four. Under this table those charges are 129/97/97/160, so the maximum is 160 and also agrees with P05's maximum-of-hash-families wording for this particular schedule. Use the full P05 bound on steps, not runtime early exit.
 
-Outer transaction/block accounting uses the **explicit proposed conservative model** `conservative-block-cost-1`, implemented by the separately reviewed `block_cost.py` snapshot with SHA256 `80e111d12902c1e128a3477caf37f236aab2ee7d41fd46a3fb5b7b834b83ace0`. The generator verifies that source digest. This digest identifies the proposed charge algorithm; it is not a requirement to execute Python or build the same binary. An equivalent native implementation must reproduce its integers. `BlockCostProfile(hash_base,hash_byte,resolve_byte,asset_comparison)=(1,1,1,1)`.
+Outer transaction/block accounting uses the **explicit proposed conservative model** `conservative-block-cost-1`, implemented by the separately reviewed `block_cost.py` snapshot with SHA256 `b2e782254ab04844c9a0487cb8bbbc5e106d2549e631809c97e5a3104ea6f876`. The generator verifies that source digest. This digest identifies the proposed charge algorithm; it is not a requirement to execute Python or build the same binary. An equivalent native implementation must reproduce its integers. `BlockCostProfile(hash_base,hash_byte,resolve_byte,asset_comparison)=(1,1,1,1)`.
 
 For clarity, the model's complete accounting recipe is:
 
@@ -103,7 +103,7 @@ For clarity, the model's complete accounting recipe is:
 - Start L with exact full transaction bytes + summed charged invocations + `2*h(112)` for TxID/TxHash. For each input add `h(len(InputCore))+h(len(InputFull))`; for each revealed witness add `h(1+c(script_len)+script_len)+siblings*h(65)`.
 - For each spending input, add encoded coin bytes for resolution, `h(c(output_len)+output_len)`, `h(core_len+c(output_len)+output_len)`, 256 comparison units, and one state-key charge. Each mint adds `h(0)` for its empty coin entry. Coinbase adds no coin-resolution/signing-coin charge.
 - Add indexed-tree allowance `(A*max(I,1)+2*max(O,1))*h(66)`, with A=4 for coinbase and 6 otherwise. For every output add `h(c(output_len)+output_len)` and, for a spendable output, one state-key charge. Burn outputs create no state key.
-- A state-key charge for a coin of serialized length n is `h(36)+h(33+c(n)+n)+256*h(67)`. It reserves all 256 sparse levels rather than charging a cache-dependent or typical path. The value of the outpoint hash does not change the charge.
+- A state-key charge for a coin of serialized length n is `h(36)+h(33+c(n)+n)+27*h(67)`. It reserves 27 collapsed sparse levels rather than charging a cache-dependent or typical path. The value of the outpoint hash does not change the charge.
 - Add `(r*r+r+S)` comparison units with r=I+O, covering conservative deterministic asset accumulation. Require final L to fit u64, then apply the existing knee formula with checked u128 square.
 - For N block transactions and total frame-prefix bytes F, `C_envelope=138+F+(N*N+N)+(2*N-1)*h(65)+h(37)+h(130)+h(116)+h(50)+h(64)`. This includes bounded duplicate-ID comparison work, transaction-root hashing, state envelope and recursive header hashing. Accumulate block costs in checked u128.
 
@@ -184,7 +184,7 @@ p = dict(name=name, chain_id=chain.hex(), header_version=2, transaction_version=
     max_invocation_cost=100000000, structural_byte_cost=1,
     max_block_transactions=4294967295, max_block_invocation_sum=(1<<128)-1,
     outer_schedule='conservative-block-cost-1',
-    outer_model_sha256='80e111d12902c1e128a3477caf37f236aab2ee7d41fd46a3fb5b7b834b83ace0',
+    outer_model_sha256='b2e782254ab04844c9a0487cb8bbbc5e106d2549e631809c97e5a3104ea6f876',
     future_rule='local-utc-plus-window-retry', future_window_seconds=7200,
     hash_base=1, hash_byte=1,
     resolve_byte=1, asset_comparison=1,
@@ -297,20 +297,20 @@ Path('lotus-v2-devnet-20261015-absolute1.manifest.json').write_text(json.dumps(m
 Expected artifact identifiers and measurements from that run:
 
 - `chain_id`: `00fee6074719a08dda1bfca8e1d3c9831338af36f493626348ff935551466b80`
-- `profile_digest`: `96d3b061700fd82efaa7189f51a8111880f74f0cbf4fa757e22cab16676b3ee5`
+- `profile_digest`: `d846ed873bf36a1c2c414221c326f31898c863880de229c1223923128473b177`
 - `parameter_bytes`: `5817`
-- `parameter_sha256`: `6ffd57a2ce8cd85cbd6b691e882b13fc16fc74a8ec78ad4967822f2a88311fb7`
+- `parameter_sha256`: `ee122b5068a36925715cf9b4140ce152cc334bdcea0700fb16deca52cd6e6496`
 - `genesis_id`: `7b76718e1f49d8bbad83cc6db172d99c7ea1a377802b646975b2a7865eaaed4a`
 - `genesis_nonce`: `0`
-- `first_id`: `b92f6c5855ab2ca5db099d9fa4fd098a1cbf0a4f177ec1ca7521787069acc013`
-- `first_nonce`: `2`
-- `linear_cost`: `35665`
+- `first_id`: `87a602074908bb91959fb5e14216b37f2f2e3f8a0f82b7e6f1aca29ccee1c128`
+- `first_nonce`: `0`
+- `linear_cost`: `5437`
 - `envelope_cost`: `993`
-- `block_cost`: `46362`
+- `block_cost`: `6655`
 - `burn_floor`: `0`
 - `payout`: `1999758`
 - `initial_state`: `00000024f400000040420f000000000002000000000000000000000000000000000000000000000000000000000000000000010000000000`
-- `first_state`: `c0bdf023f400000040420f00000000000200000000000000000000000000000000000000000000000000000000000000edff000000000000`
+- `first_state`: `c0bdf023f400000040420f00000000000200000000000000000000000000000000000000000000000000000000000000c6ff000000000000`
 
 Exact genesis block bytes (240 bytes, hexadecimal, digest order):
 
@@ -321,7 +321,7 @@ Exact genesis block bytes (240 bytes, hexadecimal, digest order):
 Exact first block bytes (242 bytes; this is an illustrative mined child, not a checkpoint):
 
 ```text
-7b76718e1f49d8bbad83cc6db172d99c7ea1a377802b646975b2a7865eaaed4affff7f20f817d06a0000020000000000000002000000f2000000000000000100000000000000fc65566329c5f2498b97ddedfdf06969a159c3543e606aca5b7b8c166c1629fcf1ef7c63096370db38913d7e4d7d26dd125941c4cd1c23985afcbe6253b9844b0100000067070000000000000000000000010001007b76718e1f49d8bbad83cc6db172d99c7ea1a377802b646975b2a7865eaaed4a01000000ffffffff0200008e831e00000000000159128a347a29ca0178ac8ab3dd868a6a30ab185e9f51dad77c5737e4cbad0526010100
+7b76718e1f49d8bbad83cc6db172d99c7ea1a377802b646975b2a7865eaaed4affff7f20f817d06a0000000000000000000002000000f2000000000000000100000000000000fc65566329c5f2498b97ddedfdf06969a159c3543e606aca5b7b8c166c1629fc7285b111fc96547a46d0b41170692ba2fb375fe6ae737a0398bc21f46f751daf0100000067070000000000000000000000010001007b76718e1f49d8bbad83cc6db172d99c7ea1a377802b646975b2a7865eaaed4a01000000ffffffff0200008e831e00000000000159128a347a29ca0178ac8ab3dd868a6a30ab185e9f51dad77c5737e4cbad0526010100
 ```
 
 Absolute-tail migration (2026-10-15): this renamed proposal replaces prior `lotus-v2-devnet-20261015-a`. Historical ChainID `63b5ddca6f75cbc64df5ff128cadd35e8658905595afc290b7698b2419b9745c`, profile digest `384bb3c6cd4f47eb84860ebb56f4ceafebaa6414ebf7f230e85682a2afe8fdd1` and genesis `9dc4d2fa9803bad48ae38ec24027bf55abff952f7e549a738986112848fab629` describe that earlier recurrence proposal. The actual tested controller fixture has separate migration evidence.

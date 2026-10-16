@@ -1,7 +1,7 @@
 """Explicit conservative development P05 schedule; no launch coefficients.
 
 All inputs derive from decoded transactions and resolved coins. Reserve 64
-bytes of domain prefix for each hash and all 256 sparse-tree levels per key.
+bytes of domain prefix for each hash and 27 collapsed sparse-tree levels per key.
 The quadratic asset comparison bound covers deterministic ordered lookups.
 Genesis allocation shares accounting/enforcement; extensions need separate
 validated engines before using this boundary. No caller supplied cost override.
@@ -42,7 +42,7 @@ def _width(n):
 
 def _state_key(coin, cost):
     size = len(coin.encode())
-    return cost.hash(36) + cost.hash(33 + _width(size) + size) + 256*cost.hash(67)
+    return cost.hash(36) + cost.hash(33 + _width(size) + size) + 27*cost.hash(67)
 
 
 def authenticated_transaction_costs(tx, profile, coins, height, parent_mtp, invocation_cost, cost):
