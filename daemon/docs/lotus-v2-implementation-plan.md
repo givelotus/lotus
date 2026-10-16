@@ -6,9 +6,9 @@ Updated October 15, 2026. Development plan; no genesis parameters are frozen and
 
 ## Source foundation and current status
 
-The current executable [V2 series](../patches/v2/series) contains 219 patches,
-`000`–`218`, on ABC master `1fb7db17c176cdea8a2c60d887891589382ee4e3`.
-[Latest replay evidence](evidence/v2-series-replay-218.json) verifies every
+The current executable [V2 series](../patches/v2/series) contains 261 patches,
+`000`–`260`, on ABC master `1fb7db17c176cdea8a2c60d887891589382ee4e3`.
+[Latest replay evidence](evidence/v2-series-replay-260.json) verifies every
 intermediate tree. Offline daemon acceptance, restart, disconnect/reconnect,
 resumable fork recovery, bounded selection and actual two-process TCP full/compact
 synchronization have separate evidence below. Native production of signed fixture-payment blocks also passes across two nodes.
@@ -16,7 +16,38 @@ The foreground local controller now completes a live-wallet payment and restart
 across two isolated nodes; see the current controller evidence below. Development
 profile adoption and public launch remain pending.
 
-### Private transaction integration through 218 (October 15)
+### Reviewed integration through 260 (October 15)
+
+All 261 mailboxes replay in a fresh worktree with `git am --keep-non-patch`.
+Every intermediate tree matches. Final source `e96a6c7da9` has tree
+`ff7e7a99a37ad02e0492419334bb704fef109589`. Existing mailboxes 000–218,
+including binary patch 033, are byte-for-byte preserved. The series commit's
+parent is the then-current `lotus-v2` tip `09bb0951`; this plan update follows
+that series commit directly.
+
+The appended changes include the native Chronik bridge, confirmed HTTP service,
+linear catchup and authority fences; the bounded Avalanche peer store, wire
+adapter, driver and passive status; and reviewed startup/test fixture repairs.
+Actual Chronik/wallet reorg evidence is recorded separately in
+[evidence/v2-chronik-live-wallet-reorg.json](evidence/v2-chronik-live-wallet-reorg.json).
+The [native audit](v2-abc-unit-audit.md) records clean full default and
+upgrade-named aggregates (147 runners each), plus 11 Avalanche suites; those
+upgrade-named runners do not establish distinct upgrade activation semantics.
+The [functional audit](v2-abc-functional-audit.md) records seven inherited and
+one SQLite script passing, with the remaining inherited scripts unrun.
+These pins and scopes are not an exact-final-revision acceptance claim.
+
+The independently audited [2,024-block stake preparation](evidence/v2-quorum-bootstrap-native.json)
+proves actual native blocks, funding and maturity; it does not prove peer proof
+admission, quorum, polling or finality. The node's Avalanche driver wiring,
+parked-candidate enrollment, private proof provisioning and real quorum test
+remain subsequent integration work outside this series. Named compiler policies
+and explicit entrypoint/package support are maintained separately in the
+monorepo. Actual automatic wallet discovery across reorg is still under test.
+Explorer implementation follows the reviewed API contract. Separate-machine
+acceptance, production parameters and public deployment remain incomplete.
+
+### Historical private transaction integration through 218 (October 15)
 
 The complete 219-entry series replays with `git am --keep-non-patch` from the
 pinned ABC base. Every intermediate tree matches; final source tree is
