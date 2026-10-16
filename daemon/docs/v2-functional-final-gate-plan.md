@@ -127,3 +127,20 @@ Across the319variant plan there are2passes,1failure and316notrun.
 Continuation is paused for review; only the failing script may be rerun after
 review of its scoped fixture correction. These inherited regtest results do
 not establish native V2 quorum or consensus acceptance.
+
+### Reviewed fixture rerun
+
+The separately authorized `abc-cmdline.py` rerun **passed** in18.07seconds
+using unchanged frozen63c daemon/CLI/wallet binaries, fresh data, and reviewed
+test-only commit `2e66cae1b2b8fbcb1d02744f29deec627c345278`. The sole source
+change expects literal `Lotus` branding while retaining EB2.0/comment assertions.
+Fixture SHA256: `bf6264844d11ca9dfd7492d482e03b32a90493c4d5a5a59af890d4444c479010`.
+[Separate rerun receipt](evidence/v2-functional-final-gate-plan-63c5149944/cmdline-reviewed-rerun/results.json)
+retains the exact binary/config/fixture hashes, JUnit, raw-log locations and
+resource evidence. The final process group was empty; no termination signals
+were needed. Root approved a3GiB launch allowance for this single case after
+observing3.953GiB free; the2GiB free floor/scratch cap and1800second deadline
+remained enforced. No existing artifacts were deleted. This allowance does
+not authorize another ordinary batch. The original exact63c batch failure and
+its counts remain preserved; the rerun uses the explicitly identified fixture
+candidate and does not establish complete functional-suite acceptance.
