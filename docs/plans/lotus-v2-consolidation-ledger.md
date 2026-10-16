@@ -4,7 +4,6 @@ Status: **review candidate; ownership complete; construction and bisectability
 unproved**. This is a docs/data design artifact from monorepo
 `9ab0c7c783de2fbc881fe9e90ae34c74ed5262f7`. No patches, source, active manifest,
 nodes or published assets were changed. No builds or test binaries were run.
-The current heavy-work window remains with the quorum owner.
 
 The [machine-readable ledger](lotus-v2-consolidation-ledger.json) maps all **318
 mailboxes, 000–317**, to **51 proposed topic commits**. It records 1,051 original
@@ -242,8 +241,11 @@ project/dependency paths. `REFERENCE`, `MONOREPO` and `MANIFEST` must identify t
 pinned reference/profile artifacts. Use fresh build/evidence directories for
 each boundary/configuration; same-boundary secp/ABC archives for standalone tests.
 
-The required matrix is Debug and Release, each with Chronik OFF and ON, wallet
-ON, plugins/Qt/seeder/ZMQ OFF, pinned Rust1.93.0 and Python<=3.13. This defines the
+The final candidate matrix is Debug and Release, each with Chronik OFF and ON,
+wallet ON, plugins/Qt/seeder/ZMQ OFF, pinned Rust1.93.0 and Python<=3.13. Apply
+relevant matrix rows earlier when a boundary changes configuration dependencies;
+record the triggering dependency. Ordinary boundaries use one coherent Debug
+configuration: Chronik OFF before `chronik_query`, ON afterward. This defines the
 candidate review matrix; it makes no other-platform/plugin/GUI claim. Additional
 supported configurations remain explicit final gates, not implicit passes.
 
@@ -251,8 +253,10 @@ At **every** candidate commit:
 
 - Configure and record `cmake --build "$BUILD" --target help` and CTest JSON.
 - Build daemon, CLI, wallet tool and native tests; build the V2 wallet pilot/client
-  when introduced. Run inherited `check-all` and
-  `check-upgrade-activated-extended`, preserving all registered functional variants.
+  when introduced. Run cumulative native suites `check-bitcoin`,
+  `check-bitcoin-upgrade-activated`, `check-avalanche`, `check-pow`,
+  `check-secp256k1`, `check-univalue` and `check-leveldb`. Run affected inherited
+  regressions at the feature boundary that owns the behavior.
 - Run every cumulative V2 custom `check-*` target. CTest alone does not execute
   these custom targets. Run CTest separately.
 - Configure/build/run each cumulative standalone project and its registered
@@ -260,10 +264,27 @@ At **every** candidate commit:
   authority test; it is not covered by the default lightweight latch test alone.
 - With Chronik ON, run the registered CMake `check-crates` target using the exact
   generated CXX bridge and Python environment.
-- Run cumulative auxiliary VM/reference/FD/relay queue commands recorded in the
-  JSON. Add the pinned node/process scripts' complete documented invocations and
-  inputs to their boundary record before acceptance. No node script is run by
-  this docs-only task.
+- Run auxiliary VM/reference/FD/relay queue commands recorded in the JSON at
+  their introduction, when covered code changes, and at final acceptance. Add
+  the pinned node/process scripts' complete documented invocations and
+  inputs to the relevant boundary record before acceptance. No node script is run
+  by this docs-only task.
+
+At the final candidate, run the complete inherited functional suite, including
+all registered variants, through `check-all` and
+`check-upgrade-activated-extended`, together with the complete native, Rust,
+standalone and custom-check gates across the required final matrix. Earlier
+configuration changes require the relevant configuration-dependent checks;
+repeat a full inherited functional suite earlier only when a concrete behavior
+risk justifies it. No exclusion, environmental failure or timeout counts as a pass.
+
+**Root-reviewed verification-scope correction:** the original draft required
+full inherited functional suites and four configurations at every one of the51
+topic boundaries. That repetition was not required. This revision retains every
+intermediate compile, cumulative native suite, registered CTest/custom V2 check
+and owning-boundary regression, while concentrating the full functional/matrix
+sweep at final acceptance and justified configuration boundaries. It changes no
+ownership assignment or reported test result.
 
 Missing tools, failed configuration, empty unexpected inventory, failed tests,
 resource limits and timeouts remain failures or unexecuted gates. Neither
