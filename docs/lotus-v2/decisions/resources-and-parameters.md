@@ -37,7 +37,7 @@ MAX_ELEMENT_BYTES has a working value of 8192, chosen so that a post-quantum sig
 
 The pass **never rejects a script and adds no validity rule**. It only chooses charges. Where it cannot follow the stack it falls back to the maximum, which is the rule this packet had before.
 
-**State.** Either `Known(main, alt)`, two lists holding one byte-size bound per stack item, or `Unknown`. In `Unknown` every operand is charged at MAX_ELEMENT_BYTES. The initial state is `Known`: the witness arguments at their actual lengths in wire order, then N-sized (16) for the mint delta in a mint invocation; `alt` is empty.
+**State.** Either `Known(main, alt)`, two lists holding one byte-size bound per stack item, or `Unknown`. In `Unknown` every operand is charged at MAX_ELEMENT_BYTES (plus the worst-case quadratic limb surcharge `(max_limbs^2 - 1) * 16` with `max_limbs = ceil(min(MAX_ELEMENT_BYTES, 1024) / 16)` on `MUL`, `DIV`, `MOD`, `MUL128_WIDE`, `LOG` and `SQRT` when `max_limbs > 1`). The initial state is `Known`: the witness arguments at their actual lengths in wire order, then N-sized (16) for the mint delta in a mint invocation; `alt` is empty.
 
 **Transfer rules.** An instruction that needs more items than a `Known` state holds moves the pass to `Unknown` (it would error if executed, but it may sit in an arm that never runs).
 

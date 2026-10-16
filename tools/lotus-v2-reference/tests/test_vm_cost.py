@@ -192,6 +192,16 @@ class SizeCostTests(unittest.TestCase):
         self.assertEqual(c64.state.main, (128,))
         self.assertLess(c16.cost, c32.cost)
         self.assertLess(c32.cost, c64.cost)
+        # Unknown state must charge at least as much as Known state on 1024B operands.
+        for op_hex, arity in (("a0", 2), ("a1", 2), ("a2", 2), ("b2", 2), ("b3", 1), ("b4", 1)):
+            known_1024 = sized(op_hex, initial=(1024,) * arity, selected=wide_profile).cost
+            unknown = sized(op_hex, initial=(), selected=wide_profile).cost
+            self.assertGreaterEqual(unknown, known_1024)
+        # 32-byte push before NUM2BIN or PICK is not treated as a 16-byte constant literal.
+        num2bin_32 = sized("20" + "10" + "00" * 31 + "8a", initial=(16,), selected=wide_profile)
+        self.assertEqual(num2bin_32.state.main, (2048,))
+        pick_32 = sized("20" + "00" * 32 + "7d", initial=(16, 64), selected=wide_profile)
+        self.assertEqual(pick_32.state.main, (16, 64, 64))
 
 
 if __name__ == "__main__":

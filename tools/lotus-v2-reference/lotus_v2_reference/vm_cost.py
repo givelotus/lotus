@@ -230,7 +230,13 @@ def static_size_cost(ast: tuple[Node, ...], profile: VMProfile, *,
         return _checked_cost(base + extra, U128_MAX)
 
     def worst_charge(op: int, *, enforce: bool) -> int:
-        base = charge(op, (limit,) * 6, (limit,) * 4, enforce=enforce)
+        ops: tuple[int, ...] = (limit,) * 6
+        if op in (0xa0, 0xa1, 0xa2, 0xb2, 0xb3, 0xb4):
+            max_limbs = max(1, (min(limit, 1024) + 15) // 16)
+            quad = max_limbs * max_limbs
+            if quad > 1:
+                ops = ops + ((quad - 1) * 16,)
+        base = charge(op, ops, (limit,) * 4, enforce=enforce)
         return add_merkle(op, base, None, None, enforce=enforce)
 
     def transfer(ins: Instruction, state: SizeState, previous: Instruction | None) -> tuple[SizeState, int]:
