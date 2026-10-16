@@ -1,7 +1,7 @@
 # Next inherited functional batch: final cd8d5140ec
 
 Prepared from monorepo `e5bb81c0` for native
-`cd8d5140ec7fce7da9a4e2a5a8b5d803ed4dc3f5`. **Not run.**
+`cd8d5140ec7fce7da9a4e2a5a8b5d803ed4dc3f5`. **Batch002 executed; continuation paused after failure.**
 Quorum currently owns the heavy window; execution requires its release and
 root authorization. No build or functional node was launched during preparation.
 
@@ -51,3 +51,27 @@ or resource refusal, retaining failure logs. Require JUnit to contain exactly
 the eight registered identities and distinguish failfast-notrun from feature
 exclusions. Stop on substantive failure; no following batch is authorized.
 Inherited regtest results do not establish native V2 consensus/quorum acceptance.
+
+## Batch002 result
+
+Exact final-cd8 batch002 exited1 after12.02seconds: **2passed,1failed,
+5notrun due failfast**, with no feature exclusions.
+`abc_wallet_standardness.py` and `feature_addrman.py` passed.
+`abc_rpc_excessiveblock.py:61` retains an upstream literal Bitcoin ABC brand
+assertion with EB2.0/comment structure; it failed after the RPC update.
+The five unexecuted variants are explicitly named in the
+[batch receipt](evidence/v2-functional-final-cd8d5140ec/batch-002/results.json).
+Original source assertions are preserved; no correction or rerun followed.
+
+The supervisor enforced its4GiB launch check,2GiB floor/scratch cap and
+1800second budget. No signals or resource/deadline refusal occurred; final
+process group27241 was empty. Raw homes/logs remain at receipted paths.
+A broad port probe encountered unrelated existing50415, but the shell
+continued and launched the supervisor despite that probe failure. This
+preflight enforcement mistake is recorded explicitly; selected tests reported
+no bind error and their actual configured ports are retained in the receipt.
+No unrelated process or existing home was modified. No later batch ran.
+
+At this final binary pin there are2variant passes,1failure and316notrun.
+Historical63c passes remain separate. Substantive failure pauses progression
+until root review; complete-suite acceptance has not been established.
