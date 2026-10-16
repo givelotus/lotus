@@ -113,3 +113,32 @@ passed those observations. Its final status fence encountered a temporary
 to classify it as a legitimate publication and stopped. The final fence now
 uses the same coherent-ready bounded wait as the other context reads, sharing
 the whole-observation deadline. The run and original failure remain retained.
+
+## Repaired-binary availability gate (retained failure)
+
+Run `/private/tmp/lotus-v2-explorer-live-acceptance-20261015-e`, harness
+`d5ea1f7b`, used immutable native
+`8cd36091ba9da0665ceab621ce42306963fcbfd9` (binary SHA256
+`635d7c5a6512b686e7af5add1daa29c8252eb5f77db5dcae4fd49f0dd84b2d0d`)
+and reviewed frontend `dc9236e44cf7f4d9fe26d98f07817370bd895f21`.
+It reached real funded native payment confirmation at height 5, but did **not**
+complete the lifecycle. A typed branch search exhausted its three explicit
+stale-screen reloads on 503 while the durable context remained unchanged. The
+harness truthfully failed its configured availability bound and did not restart
+the whole observation to hide that failure.
+
+Before failure, 78 explorer checks included 24 native-parity snapshots, seven
+actual DOM runs, six native-pending versus confirmed-history misses, eighteen
+stale-token rejections and fifteen stale-cursor rejections. Four token checks
+proved same-tip service-restart invalidation. The independent HTTP-only idle
+probe passed. There were 1,836 wrapper HTTP observations: 1,748 success, 49
+transient unavailable, 33 expected stale and six expected covered-history misses.
+DOM fetches and explicit reload notices are recorded separately in each DOM
+result; the failing DOM stderr retains its exhausted reload notices.
+
+All seven owned native processes exited zero; all seven private proxies were
+terminated. The raw explorer evidence SHA256 is
+`c5aac2efbffba9165ebe86eb8bbe5574b19121df78eba1a52ac01f4ce48d0be9`.
+Independent review found no remaining concrete harness false-failure in this
+attempt. Reorg/re-mining and a complete usable DOM lifecycle remain pending;
+asset accounting remains the separately owned native asset gate.
