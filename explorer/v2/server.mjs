@@ -15,7 +15,7 @@ const server=http.createServer(async(req,res)=>{
   if(!['GET','POST'].includes(req.method)){res.writeHead(405).end();return;}
   let bytes=0;const chunks=[];const deadline=setTimeout(()=>{if(!res.headersSent)res.writeHead(503,{'Content-Type':'application/json'});res.end(JSON.stringify({api_version:'1',error:{code:'index_unavailable',meaning:'Private proxy incoming body deadline exceeded'},snapshot:null,coverage:null}));req.destroy();},15000);deadline.unref();
   try{for await(const chunk of req){bytes+=chunk.length;if(bytes>32768){res.writeHead(413).end();return;}chunks.push(chunk);}}finally{clearTimeout(deadline);}
-  if(req.destroyed||res.writableEnded)return;
+  if(req.aborted||res.writableEnded)return;
   if(req.url.length>32768){res.writeHead(413).end();return;}
   const abort=new AbortController();req.on('aborted',()=>abort.abort());res.on('close',()=>abort.abort());
   const remote=await fetch(new URL(incoming.pathname+incoming.search,api),{method:req.method,headers:{'Content-Type':'application/json'},body:req.method==='POST'?Buffer.concat(chunks):undefined,signal:AbortSignal.any([abort.signal,AbortSignal.timeout(15000)]),redirect:'error'});
