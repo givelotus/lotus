@@ -6,6 +6,43 @@ This is preparation for a handoff, not evidence that current Codex workers have
 stopped. Before taking ownership, inspect actual processes and coordinate the
 transfer. Do not edit files concurrently with their listed owner.
 
+## Current checkpoint — supersedes older snapshot details below
+
+- Monorepo: `839ebc09` before this handoff update. Series commit `f070f095`
+  parents `a5593771`, followed immediately by implementation-plan commit `839ebc09`.
+- Root native and real-.git build checkout:
+  `bf4ddad652ac50396b164e6ae018a51da31ac890`, tree
+  `3992775915b3258705b6aff3af248a112f324a5f`. Tracked sources are clean.
+- Maintained series now has **324 patches, 000–323**. All 324 intermediate trees
+  verified in NEW `/private/tmp/lotus-v2-series-replay-323-20261015`.
+  Prior 000–317 mailboxes are byte-identical. Evidence:
+  `daemon/docs/evidence/v2-series-replay-323.json`.
+- Serializer `ac403f18ee` independently reviewed and integrated as `bf4ddad652`.
+  Focused final test passed; all three known rejection paths now report their
+  observed cause. No policy or quorum changes. Previous pending cache/diagnostic
+  source work described below is integrated and exported.
+- Combined Debug/Chronik ON/wallet ON daemon/tools build **passed**, session47835
+  terminal exit0. Frozen binaries: `/private/tmp/lotus-v2-node-build-bf4ddad652/`.
+  Daemon SHA256 `82a591431485309f893814b522e61a46668c6876b147ccd1602891fb5485edbc`.
+  Tracked provenance: `daemon/docs/evidence/v2-native-build-bf4ddad652.json`.
+  macOS dependency target warnings remain. Full final-revision suites not run.
+- **Acceptance run in flight:** owner `/root/native_quorum_acceptance`, session85355,
+  harness PID56690, initial copied-seed node PID56702. Output
+  `/private/tmp/lotus-v2-native-quorum-diagnostics-20261015-a` and adjacent `.log`.
+  Same harness SHA `0ae10ff124b4238910686799c3000e2c99f60894d69bc3f79bac2edc0ff1562d`,
+  seed, quorum defaults and 300-second finality deadline. Raw status JSON retains
+  new diagnostics automatically. Revalidate process state before action; do not
+  launch a duplicate or competing heavy build. Outcome unknown at this update.
+- First consolidation boundary build is prepared, not run: new real-.git clone
+  `/private/tmp/lotus-v2-consolidated-inherited-build-src-20261015` at `f91be29f`.
+  Commands/evidence in `/private/tmp/lotus-v2-consolidated-inherited-build-evidence-20261015`.
+  No consolidation promotion. Builder integrated as `c9fc434a`.
+
+The detailed sections below preserve prior evidence and worktree ownership, but
+older pins and pending-state descriptions are historical where this checkpoint
+supersedes them. The prior cd8 finality failure is still unresolved until the new
+run supplies evidence. Private-testnet acceptance remains incomplete.
+
 ## Read first and preserve the actual goal
 
 Read both user objective files:
