@@ -66,6 +66,8 @@ class ComponentTests(unittest.TestCase):
     def test_native_and_distributor_versions_are_distinct_and_deterministic(self):
         self.prepare()
         data=self.manifest()
+        dockerfile=(self.root/'daemon/releases/bitcoin-core/Dockerfile').read_text()
+        self.assertIn('libatomic1',dockerfile)
         self.assertEqual(data['tag'],'bitcoin-core-v1.0.0')
         self.assertEqual(data['upstream_version'],'32.99.0')
         self.assertEqual(data['native_version'],'32.99.0')
