@@ -193,7 +193,71 @@ public:
 
 ---
 
-## 4. Modular Patch Breakdown (`Patches 035–038`)
+### 3.3 Atomic Transaction & Batch Validation (`testtxbatch`) and All-or-Nothing Submission (`submittxbatch`)
+
+#### Why Stamp / Signet Hit RPC Limits and Partial Blockchain Commits in the Legacy Daemon
+In the inherited `src/rpc/mempool.cpp` and `src/validation.cpp`, multi-transaction applications like **Frank / Stamp / Signet** (which build multi-step transaction graphs such as split UTXO $\to$ metadata/message parent $\to$ stamp/reply/burn children) hit three severe limitations:
+
+1. **`submitpackage` Actively Causes Partial Commits (`src/validation.cpp:1319–1348`):**
+   - `submitpackage` (`src/rpc/mempool.cpp:895`) explicitly states: *"If any transaction passes, it will be accepted to mempool."*
+   - Inside `MemPoolAccept::AcceptPackage` (`src/validation.cpp:1319`), the daemon loops over the package and calls `AcceptSubPackage({tx})` with `test_accept = false` **one by one before validating the rest of the batch**. If $T_1$ is valid on its own, it is immediately committed to `m_pool` (`line 1326`) and broadcast on P2P (`src/rpc/mempool.cpp:1041`) even when $T_2$ fails validation (`quit_early = true`, `line 1344`)!
+2. **`submitpackage` Rejects General DAGs / Chains (`IsChildWithParentsTree`, `src/rpc/mempool.cpp:984`):**
+   - `submitpackage` rejects any batch that is not a single child with direct independent parents (`"package topology disallowed. not child-with-parents or parents depend on each other"`). A 3-hop chain ($T_1 \to T_2 \to T_3$), a fan-out batch (1 funding parent $\to$ $K$ Stamp outputs), or a bundle of independent transactions is rejected outright.
+3. **`testmempoolaccept` + $N \times$ `sendrawtransaction` Race Window & Lock Contention:**
+   - Because `submitpackage` rejects general topologies, applications are forced to call `testmempoolaccept` (which grabs `LOCK(cs_main)` + `LOCK(m_pool.cs)` at `src/rpc/mempool.cpp:238` and is capped at `MAX_PACKAGE_COUNT = 25`) followed by $N$ separate `sendrawtransaction` HTTP calls—exhausting the 4 HTTP worker threads and creating a race window where $T_1 \dots T_{k-1}$ commit while $T_k \dots T_N$ fail.
+
+#### The Two-Part Solution: Lock-Free `testtxbatch` + Two-Phase All-or-Nothing `submittxbatch`
+
+We introduce **`testtxbatch`** (and upgrade `testmempoolaccept`) plus **`submittxbatch`** (and an `"atomic": true` option on `submitpackage`), supporting **arbitrary valid DAG topologies** (chains $T_1 \to T_2 \to \dots \to T_m$, fan-out, fan-in, and independent transactions, topologically sorted automatically):
+
+1. **`testtxbatch(rawtxs, options)` — 100% Lock-Free Atomic Dry-Run Validation Against `ChainAndMempoolSnapshot`:**
+   - Runs on a `g_rpc_coro_pool` coroutine worker against the current RCU `ChainAndMempoolSnapshot` (`snap->speculative_overlay` $L_{\text{spec}}$, `snap->finalized_overlay` $L_k$, and a thread-local `ScopedMdbxReadTxn`) with **ZERO `cs_main` or `mempool.cs` locks**:
+     1. **Topological Sort & Intra-Batch Conflict Check:** Builds the intra-batch dependency DAG over `rawtxs` (up to `MAX_ATOMIC_BATCH_COUNT = 256` transactions). Rejects any intra-batch cycle or intra-batch double-spend before running scripts.
+     2. **Ephemeral Batch UTXO Overlay (`BatchCoinsView`):** Evaluates $T_1 \dots T_m$ in topological order against $L_{\text{spec}}$ + `libmdbx`. Each validated $T_i$ inserts its outputs into the ephemeral `BatchCoinsView` and marks its spent `OutpointKey`s consumed, so $T_j$ ($j > i$) can spend $T_i$'s outputs across arbitrary multi-hop chains ($T_1 \to T_2 \to T_3 \dots$).
+     3. **Full Consensus, Policy, Pre-Consensus Conflict, and VM Script Verification:** Verifies every input's signature/VM script, P05 resource bounds, fee floors, and checks that no input conflicts with a finalized pre-consensus overlay (`finalized-tx-conflict`).
+     4. **Atomic Verdict (`all_valid`):** Returns `"all_valid": true/false`, the exact `snapshot_tip_hash` and `snapshot_overlay_id` checked against, aggregate batch fees/CUs/size, and per-transaction results. Because it touches zero global locks, Stamp/Signet can run dozens of concurrent `testtxbatch` checks per second without slowing down block or mempool processing.
+
+2. **`submittxbatch(rawtxs, options)` — Two-Phase All-or-Nothing Mempool & Epoch Admission:**
+   - Guarantees that **either all $m$ transactions in `rawtxs` are admitted to the mempool together, or 0 transactions are admitted (zero partial mempool commits)**:
+     - **Phase 1 (Lock-Free Parallel Validation on Coroutine Worker):**
+       - Executes the exact lock-free `testtxbatch` pipeline above (including all expensive Schnorr/ECDSA/VM script executions!) against `snap = g_snapshot_publisher.Load()` **without holding `cs_main` or `mempool.cs`**.
+       - If *any* transaction $T_i \in \{T_1 \dots T_m\}$ fails validation, `submittxbatch` immediately returns `"accepted": false` with the exact failing `txid` and `reject-reason`—**0 transactions were added to `m_pool` and 0 locks were taken!**
+     - **Phase 2 (Fast Atomic Commit on `m_mempool_strand`):**
+       - Only after all $m$ transactions pass Phase 1 (with their `PrecomputedTransactionData` and script-check cache entries already populated), the coroutine hops via `co_await` to `m_mempool_strand` (acquiring `m_pool.cs`).
+       - **Optimistic Concurrency Re-Check ($O(\sum |\text{vin}|)$):** Verifies that:
+         1. If the caller supplied an optional `"expected_tip_hash"` (or `"expected_overlay_id"`), the active tip still matches.
+         2. Every external UTXO spent by $T_1 \dots T_m$ is still unspent in `CoinsTip` + `m_pool.mapNextTx` and unconflicted in `L_k`.
+         3. Adding the aggregate byte size of $T_1 \dots T_m$ will not trigger a `LimitMempoolSize()` eviction of any transaction in the batch.
+       - **All-or-Nothing Commit Point:** If any check in Step 2 fails (e.g. a racing block or conflicting tx arrived during the 1 ms of Phase 1), Phase 2 aborts **before calling `addUnchecked` on a single transaction** and returns `"accepted": false, "reject-reason": "batch-input-spent-or-tip-changed"`.
+       - Otherwise, Phase 2 inserts **all $m$ transactions** via `addUnchecked` in a single critical section, assigns all $m$ transactions the **exact same `entry_epoch`** (so the Lotus V2 Causal Epoch Pipeline promotes the entire batch together in the same pre-consensus epoch $\Delta_e$!), updates $L_{\text{spec}}$, and broadcasts all $m$ transactions.
+
+```mermaid
+sequenceDiagram
+    participant App as Stamp / Signet Client
+    participant Coro as RPC Coroutine Worker (No Locks)
+    participant Snap as RCU ChainAndMempoolSnapshot
+    participant Strand as Mempool Writer Strand (m_pool.cs)
+
+    App->>Coro: submittxbatch([T1, T2, ..., Tm])
+    Coro->>Snap: snap = Load() (atomic, 2 ns)
+    Note over Coro: Phase 1 (Lock-Free):<br/>1. Topo-sort DAG (T1 -> T2 -> ... -> Tm)<br/>2. Ephemeral BatchCoinsView overlay<br/>3. Run ALL consensus + VM script checks
+    alt Any Ti fails validation in Phase 1
+        Coro-->>App: {accepted: false, failed_txid: Ti}<br/>(0 txs committed, 0 locks acquired!)
+    else All T1..Tm valid in Phase 1
+        Coro->>Strand: co_await CommitAtomicBatch(T1..Tm)
+        Note over Strand: Phase 2 (Atomic under m_pool.cs):<br/>Verify external inputs still unspent &<br/>mempool capacity sufficient for all m txs
+        alt Concurrent conflict or tip mismatch
+            Strand-->>App: {accepted: false, reason: "concurrent-conflict"}<br/>(Rollback before any addUnchecked: 0 txs committed!)
+        else All external inputs still available
+            Note over Strand: Commit ALL T1..Tm via addUnchecked<br/>with identical entry_epoch e!<br/>Batch-update L_spec & relay T1..Tm
+            Strand-->>App: {accepted: true, txids: [T1..Tm], epoch: e}
+        end
+    end
+```
+
+---
+
+## 4. Modular Patch Breakdown (`Patches 035–039`)
 
 | Patch # | Track | Patch Name | Scope & Files | Verification Gate |
 | :--- | :--- | :--- | :--- | :--- |
@@ -201,3 +265,5 @@ public:
 | **`036`** | **Track 1 (Upstreamable ABC)** | `036-rpc-async-longpoll-waitforblock-and-gbt.patch` | Add `AsyncBlockChangeWaiter` (`boost::asio::steady_timer` strand) and convert `waitfornewblock`, `waitforblock`, `waitforblockheight`, and `getblocktemplate` `longpollid` from blocking OS-thread `wait_until` to `co_await`. | `rpc_longpoll_coroutines.py`: 200 concurrent long-polls with `-rpcthreads=4` never block concurrent RPCs. |
 | **`037`** | **Track 2 (Lotus V2)** | `037-v2-rcu-snapshot-and-lockfree-rpc-queries.patch` | Add `ChainAndMempoolSnapshot`, `SnapshotPublisher`, and `ScopedMdbxReadTxn`. Migrate `getblockchaininfo`, `getblockheader`, `gettxout`, `getmempoolinfo`, and `getrawmempool` to wait-free RCU + `libmdbx` `MDBX_TXN_RDONLY` reads (zero `cs_main` / `mempool.cs`). | `snapshot_rcu_tests`: 64 concurrent reader coroutines + continuous `ConnectTip` / mempool writes with zero lock contention. |
 | **`038`** | **Track 2 (Lotus V2)** | `038-v2-o1-getblocktemplate-and-submittemplateblock.patch` | Make `getblocktemplate` read `SnapshotPublisher::Load()` with zero locks, return $O(1)$ V2 overlay commitment fields (`overlay_id`, `subtree_a_root`, `utxo_root`, `stateroot`, `coinbasetxn` with `50/25/25` split) in $< 5\text{ }\mu\text{s}$, cache `cached_gbt_txs` on `MempoolOverlayLayer` for legacy callers, wake long-polls on new finalized epoch $L_e$, and add `submittemplateblock(header_hex, coinbase_tx_hex)`. | `mining_v2_o1_gbt.py`: verify $O(1)$ `< 5 us` `getblocktemplate` + `submittemplateblock` at 100k mempool txs with zero `cs_main` lock acquisition. |
+| **`039`** | **Track 1 & 2 (Upstreamable + V2 Overlay)** | `039-add-atomic-testtxbatch-and-submittxbatch-rpc.patch` | Add `testtxbatch` (lock-free atomic dry-run validation of arbitrary DAG topologies over `BatchCoinsView` + `ChainAndMempoolSnapshot`) and `submittxbatch` / `submitpackage(..., atomic=true)` (two-phase all-or-nothing validation + atomic mempool/epoch commit with zero partial commits). | `rpc_atomic_tx_batch.py`: prove multi-hop Stamp/Signet chains ($T_1 \to T_2 \to T_3$) and fan-out batches commit all-or-nothing (0 partial commits when $T_k$ fails or races). |
+
