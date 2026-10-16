@@ -676,6 +676,11 @@ struct MempoolOverlayLayer {
     uint64_t total_burned_atoms{0};      // Cumulative burned atoms (IS_BURN + implicit coinbase burn)
     uint64_t required_burn_floor_atoms{0}; // Exact P05 parabolic burn floor at cumulative cost C(L_i)
 
+    // Pre-Built Candidate CBlock Snapshot (shared by getblocktemplate AND tmplblock receipt!):
+    // vtx[0] is a reserved slot (nullptr until CoinbaseTx is slotted in);
+    // vtx[1..N_i] are pre-populated in CTOR order when L_i is finalized!
+    std::shared_ptr<CBlock> cached_block;
+
     // Batch Delta Reference (for O(|Δ_i|) incremental diffing & libmdbx commit)
     std::vector<uint32_t> batch_tx_indices; // Sorted by TxID within Δ_i
 };
@@ -1197,6 +1202,7 @@ flowchart LR
      - Computes the per-epoch SipHash key $(k_0^{(e)}, k_1^{(e)}) = \text{BLAKE3\_Keyed\_128}(\texttt{"Lotus/v2/preconsensus/sipkey"}, B_h.\text{BlockID} \parallel e \parallel L_{e-1}.\text{overlay\_id})$ (Hole 1) and builds the candidate `Subtree A` bucket roots `(count[s], root_32B[s], s1[s], s3[s])` in `TxOverlayArena` (without touching `UtxoOverlayArena` yet, per Hole 9!).
   2. `CommitFinalizedEpoch(uint32_t epoch_e, std::span<const uint32_t> finalized_pool_indices)`:
      - Executes parallel sort-merge batch path-copying (`ApplyTxBatchRecursive` and `ApplyUtxoBatchRecursive`) across the 256 prefix shards to produce immutable `MempoolOverlayLayer` $L_e$ (`subtree_a_root`, `utxo_root`, `overlay_id`, `total_fee_atoms`, `total_cost_units`, `required_burn_floor_atoms`) in **$\sim 2.05\text{ ms}$**.
+     - Pre-populates `L_e->cached_block` (`vtx[0] = nullptr` placeholder, `vtx[1..N_e]` in CTOR order via `std::merge` of `L_{e-1}->cached_block->vtx` and the newly finalized batch $\Delta_e$) once when $L_e$ is finalized—so **both `getblocktemplate` and incoming `tmplblock` headers reuse the exact same pre-built `CBlock` by merely slotting in `vtx[0] = coinbase_tx`!**
      - Acquires short-lived `MDBX_TXN_RDONLY`, copies newly touched 33B sibling summaries and spent `Coin` records by value into `CleanSummaryArena` / `CoinRecordArena`, and calls `ResetReadTxn()` immediately (Hole 8).
      - Folds $L_{e-3} \to L_{\text{base}}$ (`FoldOldEpochToBase(e - 3)`), spilling to `dbi_staged_coins` / `dbi_staged_smt` only if total arena RAM exceeds `-maxoverlayram` (Hole 9).
 
@@ -1466,15 +1472,15 @@ CMutableTransaction coinbaseTx = BuildV2CoinbaseTx(
     total_fees - Amount(int64_t(extra_coinbase_burn)), m_avalanche);
 
 CTransactionRef coinbaseRef = MakeTransactionRef(std::move(coinbaseTx));
-pblock->vtx.clear();
-if (overlay) {
-    // Materialize CTOR-ordered CTransactionRef vector from overlay's cached TxOverlayArena leaves
-    // (or lazily attach overlay->tx_refs without sorting or re-validating!)
-    overlay->FillBlockVtx(coinbaseRef, pblock->vtx);
+if (overlay && overlay->cached_block) {
+    // Reuse the snapshot's pre-built CBlock candidate (vtx[1..N_e] already in CTOR order!)
+    // and simply slot in vtx[0] = coinbaseRef in O(1)!
+    *pblock = *overlay->cached_block;
+    pblock->vtx[0] = coinbaseRef;
     pblocktemplate->m_overlay_id = overlay->HasFinalizedQuorum() ? overlay->overlay_id : uint256::ZERO;
     pblocktemplate->m_overlay_layer = overlay;
 } else {
-    pblock->vtx.push_back(coinbaseRef);
+    pblock->vtx.assign({coinbaseRef});
 }
 
 // 3. O(1) Block Size (NO GetSerializeSize(*pblock) over 100,000 txs!):
@@ -1500,7 +1506,7 @@ return std::move(pblocktemplate);
 
 - **Performance Impact on `BlockAssembler::CreateNewBlock`:**
   - **Old `CreateNewBlock` at $N = 100{,}000$ txs:** $\sim 450\text{–}900\text{ ms}$ under `cs_main` + `m_mempool->cs` (iterating `mapTx`/`finalizedTxs`, serializing 25 MB of transactions, computing $200{,}000$ Merkle hashes, running $100{,}000$ UTXO state transitions in `ComputeV2BlockStateRoot`, and running `ConnectBlock` in `TestBlockValidity`).
-  - **New `CreateNewBlock` at $N = 100{,}000$ txs:** **$< 2\text{ microseconds}$** ($2$ BLAKE3 hashes + coinbase construction)!
+  - **New `CreateNewBlock` at $N = 100{,}000$ txs:** **$< 2\text{ microseconds}$** ($2$ BLAKE3 hashes + slotting `vtx[0] = coinbaseRef` into the snapshot's pre-built `cached_block`)!
 
 ---
 
@@ -1551,10 +1557,15 @@ return std::move(pblocktemplate);
       if (auto matched_overlay = m_mempool->GetOverlayManager().MatchCandidateOverlay(
               header, *coinbase_tx, m_chainman.GetConsensus())) {
           // Exact 256-bit match on BOTH header.tx_root AND header.state_root!
-          // Assemble CBlock in RAM from (coinbase_tx, matched_overlay->txs), relay tmplblock,
-          // and connect tip via the O(1) CommitFinalizedOverlay fast path!
+          // matched_overlay->cached_block ALREADY has vtx[1..n-1] pre-populated from when L_k finalized
+          // (the exact same snapshot that feeds getblocktemplate!).
+          // We simply slot in header and vtx[0] = coinbase_tx in O(1), relay tmplblock, and commit L_k!
+          std::shared_ptr<CBlock> pblock = matched_overlay->cached_block;
+          static_cast<CBlockHeader &>(*pblock) = header;
+          pblock->vtx[0] = coinbase_tx;
+
           RelayTemplateBlockAnnounce(header, coinbase_tx);
-          m_chainman.ConnectMatchedOverlayBlock(pindexHeader, header, coinbase_tx, matched_overlay);
+          m_chainman.ConnectMatchedOverlayBlock(pindexHeader, pblock, matched_overlay);
           return;
       }
   }
