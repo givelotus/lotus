@@ -181,6 +181,28 @@ class SizeCostTests(unittest.TestCase):
         self.assertGreater(sha_step, step("50c0", (), heavy))
         self.assertEqual(step("c0", (16,), heavy), sha_step)
 
+    def test_bigint_quadratic_limb_cost_scaling(self):
+        wide_profile = VMProfile(512, 8, 2048, 16, 8, 4096, 8, 10_000_000, 1,
+                                 {op: price for op in ASSIGNED})
+        c16 = sized("a0", initial=(16, 16), selected=wide_profile)
+        c32 = sized("a0", initial=(32, 32), selected=wide_profile)
+        c64 = sized("a0", initial=(64, 64), selected=wide_profile)
+        self.assertEqual(c16.state.main, (16,))
+        self.assertEqual(c32.state.main, (64,))
+        self.assertEqual(c64.state.main, (128,))
+        self.assertLess(c16.cost, c32.cost)
+        self.assertLess(c32.cost, c64.cost)
+        # Unknown state must charge at least as much as Known state on 1024B operands.
+        for op_hex, arity in (("a0", 2), ("a1", 2), ("a2", 2), ("b2", 2), ("b3", 1), ("b4", 1)):
+            known_1024 = sized(op_hex, initial=(1024,) * arity, selected=wide_profile).cost
+            unknown = sized(op_hex, initial=(), selected=wide_profile).cost
+            self.assertGreaterEqual(unknown, known_1024)
+        # 32-byte push before NUM2BIN or PICK is not treated as a 16-byte constant literal.
+        num2bin_32 = sized("20" + "10" + "00" * 31 + "8a", initial=(16,), selected=wide_profile)
+        self.assertEqual(num2bin_32.state.main, (2048,))
+        pick_32 = sized("20" + "00" * 32 + "7d", initial=(16, 64), selected=wide_profile)
+        self.assertEqual(pick_32.state.main, (16, 64, 64))
+
 
 if __name__ == "__main__":
     unittest.main()

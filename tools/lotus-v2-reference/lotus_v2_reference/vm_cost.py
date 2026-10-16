@@ -9,7 +9,8 @@ from typing import Mapping, Sequence
 
 from .encoding import Output, encode_output
 from .vm import (Conditional, Instruction, Loop, Node, UnsupportedFeature,
-                 VMError, VMProfile, U128_MAX, _checked_cost)
+                 VMError, VMProfile, U128_MAX, MIN_NUMERIC_BYTES,
+                 MAX_NUMERIC_BYTES, MAX_MUL_BYTES, _checked_cost)
 from .vm_context import InvocationContext
 
 
@@ -229,7 +230,13 @@ def static_size_cost(ast: tuple[Node, ...], profile: VMProfile, *,
         return _checked_cost(base + extra, U128_MAX)
 
     def worst_charge(op: int, *, enforce: bool) -> int:
-        base = charge(op, (limit,) * 6, (limit,) * 4, enforce=enforce)
+        ops: tuple[int, ...] = (limit,) * 6
+        if op in (0xa0, 0xa1, 0xa2, 0xb2, 0xb3, 0xb4):
+            max_limbs = max(1, (min(limit, 1024) + 15) // 16)
+            quad = max_limbs * max_limbs
+            if quad > 1:
+                ops = ops + ((quad - 1) * 16,)
+        base = charge(op, ops, (limit,) * 4, enforce=enforce)
         return add_merkle(op, base, None, None, enforce=enforce)
 
     def transfer(ins: Instruction, state: SizeState, previous: Instruction | None) -> tuple[SizeState, int]:
@@ -330,7 +337,8 @@ def static_size_cost(ast: tuple[Node, ...], profile: VMProfile, *,
                 width = _literal(previous)
                 push(width if width is not None and 0 <= width <= limit else limit)
             elif op == 0x8b:
-                pop(); push(16)
+                a = pop()
+                push(min(max(a, MIN_NUMERIC_BYTES), MAX_NUMERIC_BYTES))
             elif op == 0x8c:
                 if not main: raise IndexError
                 operands.append(main[-1]); push(16)
@@ -346,16 +354,51 @@ def static_size_cost(ast: tuple[Node, ...], profile: VMProfile, *,
             elif op == 0x94:
                 pop(); push(pop())
             elif op in (*range(0x98, 0x9e), 0xb3, 0xb4):
-                pop(); push(16)
+                a = pop()
+                clamped_a = min(max(a, MIN_NUMERIC_BYTES), MAX_NUMERIC_BYTES)
+                if op in (0xb3, 0xb4):
+                    limbs = max(1, (min(a, MAX_NUMERIC_BYTES) + 15) // 16)
+                    if limbs > 1:
+                        operands.append((limbs * limbs - 1) * 16)
+                if op in (0x9c, 0x9d, 0xb3):
+                    push(16)
+                else:
+                    push(clamped_a)
             elif op in (0x9e, 0x9f, 0xa0, 0xa1, 0xa2, 0xa3, *range(0xa4, 0xaf)):
-                pop(); pop()
-                if op != 0xa7: push(16)
+                b, a = pop(), pop()
+                clamped_a = min(max(a, MIN_NUMERIC_BYTES), MAX_NUMERIC_BYTES)
+                clamped_b = min(max(b, MIN_NUMERIC_BYTES), MAX_NUMERIC_BYTES)
+                if op in (0xa0, 0xa1, 0xa2):
+                    limbs_a = max(1, (min(a, MAX_NUMERIC_BYTES) + 15) // 16)
+                    limbs_b = max(1, (min(b, MAX_NUMERIC_BYTES) + 15) // 16)
+                    quad = limbs_a * limbs_b
+                    if quad > 1:
+                        operands.append((quad - 1) * 16)
+                if op == 0xa0:
+                    push(16 if a <= 16 and b <= 16 else min(MAX_MUL_BYTES, clamped_a + clamped_b))
+                elif op == 0xa3:
+                    push(clamped_a)
+                elif op in (0x9e, 0x9f, 0xa1, 0xa2, 0xad, 0xae):
+                    push(max(clamped_a, clamped_b))
+                elif op != 0xa7:
+                    push(16)
             elif op in (0xaf, 0xb0, 0xb1):
-                pop(); pop(); pop()
-                if op == 0xaf: push(16)
-                else: push(16); push(16)
+                pop()
+                b, a = pop(), pop()
+                if op == 0xaf:
+                    push(16)
+                else:
+                    push(min(max(max(a, b), MIN_NUMERIC_BYTES), MAX_NUMERIC_BYTES))
+                    push(16)
             elif op == 0xb2:
-                pop(); pop(); push(16); push(16)
+                b, a = pop(), pop()
+                limbs_a = max(1, (min(a, MAX_NUMERIC_BYTES) + 15) // 16)
+                limbs_b = max(1, (min(b, MAX_NUMERIC_BYTES) + 15) // 16)
+                quad = limbs_a * limbs_b
+                if quad > 1:
+                    operands.append((quad - 1) * 16)
+                w = min(max(max(a, b), MIN_NUMERIC_BYTES), MAX_NUMERIC_BYTES)
+                push(w); push(w)
             elif op in HASHES:
                 arity = {0xbf: 2, 0xc0: 3, 0xc1: 4, 0xc2: 1,
                          0xd9: 2, 0xe4: 2}.get(op, 0 if op in (0xce, 0xcf, 0xf2) else 1)

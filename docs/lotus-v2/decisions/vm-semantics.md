@@ -4,7 +4,7 @@ Decision packet P03, October 9, 2026. **Recommended candidate**, not frozen. Res
 
 ## Values and parsing
 
-Stacks contain bounded byte strings. `N(x)` is exactly sixteen-byte signed little-endian int128. `U(x)` interprets exactly sixteen bytes as an unsigned limb; its output is also sixteen raw bytes. Boolean consumers accept only N(0)/N(1). Comparisons and signatures produce those canonical booleans. For ordinary execution, main and alternate stacks start as described in the ABI; finish requires main=[N(1)], alternate=[]. The success-scan exception below initializes neither stack. Every push, duplicate, move and concatenation must satisfy element/count/total-byte limits before mutation.
+Stacks contain bounded byte strings. `N(x)` is a signed two's-complement little-endian integer of `16..1024` bytes (`MIN_NUMERIC_BYTES = 16`, `MAX_NUMERIC_BYTES = 1024`, i.e., 128-bit baseline up to 8,192-bit big-int). Constants, counts, indices, values, booleans, and `LOG` push canonical 16-byte signed little-endian `int128`; unary arithmetic preserves `len(a)`, binary arithmetic (`ADD`, `SUB`, `DIV`, `MOD`, `MIN`, `MAX`) operates at `W = max(len(a), len(b))`, and `MUL` produces `max(W, minimal_signed_width(a * b))` up to `MAX_MUL_BYTES = 2048` bytes. `U(x)` interprets `0..1024` bytes as an unsigned little-endian integer, automatically zero-padding shorter operands to `W = max(16, len(a), len(b))` and returning `W`-byte unsigned limbs. Boolean consumers accept only 16-byte `N(0)`/`N(1)`. Comparisons and signatures produce those canonical booleans. For ordinary execution, main and alternate stacks start as described in the ABI; finish requires main=[N(1)], alternate=[]. The success-scan exception below initializes neither stack. Every push, duplicate, move and concatenation must satisfy element/count/total-byte limits before mutation.
 
 First perform the bounded OP_SUCCESS_N scan specified below. If it finds no unassigned success opcode, decode the entire script to structured syntax before execution, including unreachable regions; malformed pushes and unmatched structures reject even in skipped code. Push data bytes are never opcodes. Canonical push framing is one-byte fixed length for 1..75 bytes, or opcode 4c followed by shortest `Bytes(data)` for empty data or lengths ≥76. Bytes 4d and 4e mean NEGATIVE_ONE and ONE; they have no legacy PUSHDATA meaning. Constant opcodes push N values. A fixed-length push of sixteen bytes is allowed even if a constant opcode could produce the same stack item: different programs have different commitments; canonical parsing does not imply a unique program for each computation.
 
@@ -86,12 +86,12 @@ The [machine-readable opcode registry](../tools/opcodes.json) owns byte assignme
 | 88 | CAT | a b → a concatenated with b |
 | 89 | SPLIT | bytes N(i) → bytes[0:i] bytes[i:] |
 | 8a | NUM2BIN | N(x) N(width) → signed LE encoding of x at exact width |
-| 8b | BIN2NUM | 0..16 bytes interpreted signed LE → N(x); empty → N(0) |
+| 8b | BIN2NUM | 0..1024 bytes interpreted signed LE → N(x) at width max(16, minimal_signed_width(x)); empty → N(0) |
 | 8c | SIZE | bytes → bytes N(byte length) |
 | 8d | INVERT | bytes → bitwise complement of every byte |
-| 8e | AND | equal-length a b → bytewise a AND b |
-| 8f | OR | equal-length a b → bytewise a OR b |
-| 90 | XOR | equal-length a b → bytewise a XOR b |
+| 8e | AND | a b → bytewise a AND b (shorter operand zero-padded to max(len(a), len(b))) |
+| 8f | OR | a b → bytewise a OR b (shorter operand zero-padded to max(len(a), len(b))) |
+| 90 | XOR | a b → bytewise a XOR b (shorter operand zero-padded to max(len(a), len(b))) |
 | 91 | EQUAL | a b → Boolean byte equality |
 | 92 | EQUALVERIFY | EQUAL then VERIFY |
 | 93 | LESSSWAP | a b → the same two items with the smaller one deeper and the larger on top, compared as unsigned little-endian integers |
@@ -125,9 +125,9 @@ The [machine-readable opcode registry](../tools/opcodes.json) owns byte assignme
 | ad | MIN | N(a) N(b) → N(min(a,b)) |
 | ae | MAX | N(a) N(b) → N(max(a,b)) |
 | af | WITHIN | N(x) N(lo) N(hi) → Boolean(lo≤x<hi) |
-| b0 | ADDCARRY | U(a) U(b) N(c) → U(low128(a+b+c)) N(carry) |
-| b1 | SUBCARRY | U(a) U(b) N(c) → U((a−b−c) mod 2^128) N(borrow) |
-| b2 | MUL128_WIDE | U(a) U(b) → U(high128(a*b)) U(low128(a*b)) |
+| b0 | ADDCARRY | U(a) U(b) N(c) → U_W((a+b+c) mod 2^(8W)) N(carry), W=max(16,len(a),len(b)) |
+| b1 | SUBCARRY | U(a) U(b) N(c) → U_W((a−b−c) mod 2^(8W)) N(borrow), W=max(16,len(a),len(b)) |
+| b2 | MUL128_WIDE | U(a) U(b) → U_W(high_W(a*b)) U_W(low_W(a*b)), W=max(16,len(a),len(b)) |
 | b3 | LOG | N(x) → N(LOG2_Q64(x)), algorithm below |
 | b4 | SQRT | N(x) → N(floor(sqrt(x))); x≥0 |
 
@@ -209,13 +209,13 @@ Existing template spellings may prefix `OP_`; that does not alter bytes. In-scri
 
 ## Arithmetic edge semantics
 
-PICK/ROLL require `0≤n<remaining_stack_size`; SPLIT requires `0≤i≤len(bytes)`. NUM2BIN width must be 0..MAX_ELEMENT_BYTES and x must fit its signed width; zero width accepts only zero. Larger widths sign-extend. BIN2NUM sign-extends to sixteen bytes and never silently truncates longer input. Decode an unsigned short byte string by appending a zero sign byte before BIN2NUM where needed; an unsigned 128-bit limb with its high bit set stays a U operand, not a positive N.
+PICK/ROLL require `0≤n<remaining_stack_size`; SPLIT requires `0≤i≤len(bytes)`. NUM2BIN width must be 0..MAX_ELEMENT_BYTES and x must fit its signed width; zero width accepts only zero. Larger widths sign-extend. BIN2NUM accepts `0..1024` bytes (`MAX_NUMERIC_BYTES = 1024`), sign-extending or compacting redundant sign bytes to width `max(16, minimal_signed_width(x))` and never silently truncating input. Decode an unsigned byte string as a nonnegative N by appending a zero sign byte before BIN2NUM where needed. Bitwise `AND`, `OR`, and `XOR` automatically zero-pad the shorter operand to `max(len(a), len(b))` (accelerated with 16-byte SIMD NEON/SSE2 chunks in the native evaluator).
 
-All signed arithmetic overflow rejects. DIV and MOD reject zero divisor and the minimum-int/−1 case. NEGATE/ABS of minimum-int reject. Carry input must be N(0) or N(1); borrow is one iff a<b+c. Wide operations use bounded 129/256-bit intermediates independent of host integer types.
+Signed numeric operands `N(x)` have byte width `16 <= len <= 1024` (8,192-bit big-ints over 64-bit / 128-bit limbs). Unary arithmetic (`1ADD`, `1SUB`, `NEGATE`, `ABS`, `SQRT`) preserves operand width `len(a)` and rejects overflow at that width; binary `ADD`, `SUB`, `DIV`, `MOD`, `MIN`, `MAX` operate at `W = max(len(a), len(b))` and reject overflow at `W`; `MUL` widens when necessary to `max(W, minimal_signed_width(a * b))` up to `MAX_MUL_BYTES = 2048` bytes (so 16-byte products that fit `int128` remain 16 bytes and overflow only if configured via `NUM2BIN` or exceeding 2,048 bytes). DIV and MOD reject zero divisor and the minimum-int/−1 overflow at width `W`. NEGATE/ABS of minimum-int at width `len(a)` reject. `ADDCARRY`, `SUBCARRY`, and `MUL128_WIDE` accept `0..1024`-byte unsigned operands, automatically zero-padding shorter operands to `W = max(16, len(a), len(b))`; carry input must be `N(0)` or `N(1)`, and borrow is one iff `a < b + c`.
 
-RAWLEFTBITSHIFT interprets bytes as unsigned little-endian, retains the original byte length and discards shifted-out bits. Positive k shifts left; negative k shifts right; abs(k)≥8*length returns all-zero bytes of the same length. Handle minimum-int k by comparison, not an overflowing signed absolute operation. MULPOW2 uses signed mathematical a, preserves no discarded high bits on multiplication, and truncates division toward zero. For nonzero a, k≥128 rejects; a=0 returns zero. For k≤−128 the division result is zero. Intermediate host shifts by their type width are never the definition.
+RAWLEFTBITSHIFT interprets bytes as unsigned little-endian, retains the original byte length and discards shifted-out bits. Positive k shifts left; negative k shifts right; abs(k)≥8*length returns all-zero bytes of the same length. Handle minimum-int k by comparison, not an overflowing signed absolute operation. MULPOW2 uses signed mathematical a at width `W = len(a)`, preserves no discarded high bits on multiplication, and truncates division toward zero. For nonzero a, `k >= 8*W` or signed overflow at width `W` rejects; a=0 returns zero. For `k <= -8*W` the division result is zero. Intermediate host shifts by their type width are never the definition.
 
-LOG returns the following fixed algorithm, **not a claim of exact real logarithm rounding**. Require x>0. Let e=floor(log2(x)) determined by bit length; z=x*2^(127−e). Initialize f=0. Repeat exactly 64 times: t=floor(z*z/2^127); bit=1 if t≥2^128, else 0; z=floor(t/2) if bit=1 else t; f=2*f+bit. Return N(e*2^64+f). Products fit unsigned 256 bits. SQRT is the largest nonnegative integer r with r*r≤x; implementations may use any equivalent bounded algorithm. Monetary consensus need not use these script opcodes to implement its own recurrence.
+LOG returns the following fixed algorithm, **not a claim of exact real logarithm rounding**. Require x>0. Let e=floor(log2(x)) determined by bit length, and let `k = max(127, e)`; `z = x * 2^(k - e)`. Initialize f=0. Repeat exactly 64 times: `t = floor(z * z / 2^k)`; `bit = 1` if `t >= 2^(k+1)`, else `0`; `z = floor(t / 2)` if `bit = 1` else `t`; `f = 2 * f + bit`. Return 16-byte `N(e * 2^64 + f)`. SQRT is the largest nonnegative integer r with `r * r <= x`, returned at the input's byte width `len(x)`; implementations may use any equivalent bounded algorithm (such as Newton-Raphson `isqrt`). Monetary consensus need not use these script opcodes to implement its own recurrence.
 
 ## Introspection and execution contexts
 

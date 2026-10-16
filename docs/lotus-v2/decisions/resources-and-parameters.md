@@ -37,14 +37,19 @@ MAX_ELEMENT_BYTES has a working value of 8192, chosen so that a post-quantum sig
 
 The pass **never rejects a script and adds no validity rule**. It only chooses charges. Where it cannot follow the stack it falls back to the maximum, which is the rule this packet had before.
 
-**State.** Either `Known(main, alt)`, two lists holding one byte-size bound per stack item, or `Unknown`. In `Unknown` every operand is charged at MAX_ELEMENT_BYTES. The initial state is `Known`: the witness arguments at their actual lengths in wire order, then N-sized (16) for the mint delta in a mint invocation; `alt` is empty.
+**State.** Either `Known(main, alt)`, two lists holding one byte-size bound per stack item, or `Unknown`. In `Unknown` every operand is charged at MAX_ELEMENT_BYTES (plus the worst-case quadratic limb surcharge `(max_limbs^2 - 1) * 16` with `max_limbs = ceil(min(MAX_ELEMENT_BYTES, 1024) / 16)` on `MUL`, `DIV`, `MOD`, `MUL128_WIDE`, `LOG` and `SQRT` when `max_limbs > 1`). The initial state is `Known`: the witness arguments at their actual lengths in wire order, then N-sized (16) for the mint delta in a mint invocation; `alt` is empty.
 
 **Transfer rules.** An instruction that needs more items than a `Known` state holds moves the pass to `Unknown` (it would error if executed, but it may sit in an arm that never runs).
 
 | Instruction | Bound of each result |
 | --- | --- |
 | PUSH_n, PUSHDATA | exact data length |
-| constants, arithmetic on N or U values, comparisons, OUTPUTCONTINUESBRANCH and every other Boolean result, BIN2NUM, DEPTH, SIZE, counts, indices, values | 16 |
+| constants, comparisons, NOT, 0NOTEQUAL, BOOLAND, BOOLOR, WITHIN, LOG, OUTPUTCONTINUESBRANCH and every other Boolean result, DEPTH, SIZE, counts, indices, values | 16 |
+| BIN2NUM, 1ADD, 1SUB, NEGATE, ABS, SQRT, MULPOW2 | `clamp(bound(a), 16, 1024)` (with quadratic limb surcharge `(limbs^2 - 1) * 16` operand bytes on `LOG` and `SQRT` when `limbs = ceil(min(bound(a), 1024) / 16) > 1`) |
+| ADD, SUB, DIV, MOD, MIN, MAX | `max(clamp(bound(a), 16, 1024), clamp(bound(b), 16, 1024))` (with quadratic limb surcharge `(limbs_a * limbs_b - 1) * 16` operand bytes on `DIV` and `MOD` when `limbs_a * limbs_b > 1`) |
+| MUL | `16` when `bound(a) <= 16` and `bound(b) <= 16`, else `min(2048, clamp(bound(a), 16, 1024) + clamp(bound(b), 16, 1024))` (with quadratic limb surcharge `(limbs_a * limbs_b - 1) * 16` operand bytes when `limbs_a * limbs_b > 1`) |
+| ADDCARRY, SUBCARRY | low limb `clamp(max(bound(a), bound(b)), 16, 1024)`, carry/borrow `16` |
+| MUL128_WIDE | both limbs `clamp(max(bound(a), bound(b)), 16, 1024)` (with quadratic limb surcharge `(limbs_a * limbs_b - 1) * 16` operand bytes when `limbs_a * limbs_b > 1`) |
 | RAWLEFTBITSHIFT | the shifted operand's bound |
 | hashes, LEAFHASH, NODEHASH, MERKLEROOT_SORTED, MERKLEROOT_INDEXED, TXID, OUTPOINTTXID, CHAINID, SIGHASH, BRANCHROOT, token IDs, branch roots | 32 |
 | CAT | sum of both operand bounds, capped at MAX_ELEMENT_BYTES |

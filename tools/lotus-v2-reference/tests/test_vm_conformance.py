@@ -112,16 +112,19 @@ class Conformance(unittest.TestCase):
     def test_byte_conversion_bitwise_and_shifts(self):
         cases = ((n(-128)+n(1)+b"\x8a", b"\x80"),
             (n(0)+n(0)+b"\x8a", b""), (push(b"\x80")+b"\x8b", number(-128)),
+            (push(bytes(17))+b"\x8b", number(0)),
             (push(b"\x01\x80")+b"\x8d", b"\xfe\x7f"),
             (push(b"\x81")+push(b"\x01")+b"\x8e", b"\x01"),
+            (push(b"x")+push(b"xx")+b"\x8e", b"x\x00"),
             (push(b"\x80")+push(b"\x01")+b"\x8f", b"\x81"),
+            (push(b"x")+push(b"xx")+b"\x8f", b"xx"),
             (push(b"\x81")+push(b"\x01")+b"\x90", b"\x80"),
+            (push(b"x")+push(b"xx")+b"\x90", b"\x00x"),
             (push(b"\x01\x01")+n(8)+b"\x94", b"\x00\x01"),
             (push(b"\x01\x01")+n(-8)+b"\x94", b"\x01\x00"),
             (push(b"\xff")+n(-(1<<127))+b"\x94", b"\x00"),
             (push(b"\x00\x00")+push(b"\x00")+b"\x93\x88", b"\x00\x00\x00"))
         for body, expected in cases:
             with self.subTest(body=body.hex()): self.assertTrue(self.execute(body, expected).success)
-        for body in (n(128)+n(1)+b"\x8a", push(bytes(17))+b"\x8b",
-                     push(b"x")+push(b"xx")+b"\x8e"):
+        for body in (n(128)+n(1)+b"\x8a",):
             with self.assertRaises(VMError): self.execute(body)

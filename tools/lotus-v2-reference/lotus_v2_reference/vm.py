@@ -170,21 +170,39 @@ def _verify_checksig(signature: bytes, public_key: bytes,
         return False
 
 
-def number(value: int) -> bytes:
-    if type(value) is not int or not INT_MIN <= value <= INT_MAX:
+MIN_NUMERIC_BYTES = 16
+MAX_NUMERIC_BYTES = 1024
+MAX_MUL_BYTES = 2048
+BIGINT_MIN = -(1 << (8 * MAX_NUMERIC_BYTES - 1))
+BIGINT_MAX = (1 << (8 * MAX_NUMERIC_BYTES - 1)) - 1
+
+
+def _minimal_signed_width(value: int) -> int:
+    if value == 0:
+        return 1
+    if value > 0:
+        return value.bit_length() // 8 + 1
+    return ((-value - 1).bit_length()) // 8 + 1
+
+
+def number(value: int, width: int = MIN_NUMERIC_BYTES) -> bytes:
+    if type(value) is not int or width < MIN_NUMERIC_BYTES:
         raise VMError("int128 overflow")
-    return value.to_bytes(16, "little", signed=True)
+    try:
+        return value.to_bytes(width, "little", signed=True)
+    except OverflowError as exc:
+        raise VMError("int128 overflow") from exc
 
 
 def _numeric(data: bytes) -> int:
-    if len(data) != 16:
+    if not MIN_NUMERIC_BYTES <= len(data) <= MAX_NUMERIC_BYTES:
         raise VMError("numeric operand is not N")
     return int.from_bytes(data, "little", signed=True)
 
 
 def _boolean(data: bytes) -> bool:
     value = _numeric(data)
-    if value not in (0, 1):
+    if len(data) != MIN_NUMERIC_BYTES or value not in (0, 1):
         raise VMError("noncanonical Boolean")
     return bool(value)
 
@@ -193,15 +211,18 @@ _U128_MASK = (1 << 128) - 1
 
 
 def _unsigned(data: bytes) -> int:
-    if len(data) != 16:
+    if not 0 <= len(data) <= MAX_NUMERIC_BYTES:
         raise VMError("operand is not U")
     return int.from_bytes(data, "little", signed=False)
 
 
-def _unsigned_bytes(value: int) -> bytes:
-    if type(value) is not int or not 0 <= value <= _U128_MASK:
+def _unsigned_bytes(value: int, width: int = MIN_NUMERIC_BYTES) -> bytes:
+    if type(value) is not int or value < 0:
         raise VMError("unsigned width")
-    return value.to_bytes(16, "little")
+    try:
+        return value.to_bytes(width, "little", signed=False)
+    except OverflowError as exc:
+        raise VMError("unsigned width") from exc
 
 
 def _log2_q64(x: int) -> int:
@@ -209,11 +230,12 @@ def _log2_q64(x: int) -> int:
     if x <= 0:
         raise VMError("LOG requires x>0")
     e = x.bit_length() - 1
-    z = x << (127 - e)
+    k = max(127, e)
+    z = x << (k - e)
     fraction = 0
     for _ in range(64):
-        t = (z * z) >> 127
-        bit = 1 if t >= (1 << 128) else 0
+        t = (z * z) >> k
+        bit = 1 if t >= (1 << (k + 1)) else 0
         z = (t >> 1) if bit else t
         fraction = (fraction << 1) | bit
     return (e << 64) | fraction
@@ -751,20 +773,23 @@ def evaluate(script: bytes, args: tuple[bytes, ...], profile: VMProfile, *,
                         raise VMError("NUM2BIN overflow") from exc
             elif op == 0x8b:
                 value = pop()
-                if len(value) > 16:
+                if len(value) > MAX_NUMERIC_BYTES:
                     raise VMError("BIN2NUM width")
-                push(number(int.from_bytes(value, "little", signed=True)))
+                n_val = int.from_bytes(value, "little", signed=True)
+                out_width = max(MIN_NUMERIC_BYTES, _minimal_signed_width(n_val))
+                push(number(n_val, out_width))
             elif op in (0x8d, 0x8e, 0x8f, 0x90):
                 right = pop()
                 if op == 0x8d:
                     push(bytes(byte ^ 255 for byte in right))
                 else:
                     left = pop()
-                    if len(left) != len(right):
-                        raise VMError("bitwise operand length mismatch")
+                    width = max(len(left), len(right))
+                    l_pad = left.ljust(width, b"\x00")
+                    r_pad = right.ljust(width, b"\x00")
                     operation = {0x8e: lambda a, b: a & b, 0x8f: lambda a, b: a | b,
                                  0x90: lambda a, b: a ^ b}[op]
-                    push(bytes(operation(a, b) for a, b in zip(left, right)))
+                    push(bytes(operation(a, b) for a, b in zip(l_pad, r_pad)))
             elif op == 0x93:
                 right, left = pop(), pop()
                 low, high = sorted((left, right), key=lambda b: (int.from_bytes(b, "little"), len(b)))
@@ -793,79 +818,107 @@ def evaluate(script: bytes, args: tuple[bytes, ...], profile: VMProfile, *,
                 else:
                     push(number(int(equal)))
             elif op in (0x98, 0x99, 0x9a, 0x9b, 0x9c, 0x9d):
-                a = _numeric(pop())
-                if op == 0x98: result = a + 1
-                elif op == 0x99: result = a - 1
-                elif op == 0x9a: result = -a
-                elif op == 0x9b: result = abs(a)
-                elif op == 0x9c:
-                    if a not in (0, 1): raise VMError("noncanonical Boolean")
-                    result = 1 - a
-                else: result = int(a != 0)
-                push(number(result))
+                raw_a = pop()
+                if op == 0x9c:
+                    push(number(int(not _boolean(raw_a))))
+                else:
+                    a = _numeric(raw_a)
+                    if op == 0x9d:
+                        push(number(int(a != 0)))
+                    else:
+                        result = {0x98: a + 1, 0x99: a - 1, 0x9a: -a, 0x9b: abs(a)}[op]
+                        push(number(result, len(raw_a)))
             elif op == 0xa3:
-                k, a = _numeric(pop()), _numeric(pop())
-                if k >= 128:
+                raw_k, raw_a = pop(), pop()
+                k, a = _numeric(raw_k), _numeric(raw_a)
+                a_width = len(raw_a)
+                max_bits = 8 * a_width
+                if k >= max_bits:
                     if a: raise VMError("MULPOW2 overflow")
                     result = 0
                 elif k >= 0:
                     result = a << k
-                elif k <= -128:
+                elif k <= -max_bits:
                     result = 0
                 else:
                     result = abs(a) >> -k
                     if a < 0: result = -result
-                push(number(result))
+                try:
+                    push(result.to_bytes(a_width, "little", signed=True))
+                except OverflowError as exc:
+                    raise VMError("MULPOW2 overflow") from exc
             elif op in (0x9e, 0x9f, 0xa0, 0xa1, 0xa2, 0xa4, 0xa5, 0xa6, 0xa7,
                         0xa8, 0xa9, 0xaa, 0xab, 0xac, 0xad, 0xae):
-                b, a = _numeric(pop()), _numeric(pop())
-                if op in (0xa4, 0xa5) and (a not in (0, 1) or b not in (0, 1)):
-                    raise VMError("noncanonical Boolean")
-                if op in (0xa1, 0xa2):
-                    if b == 0 or (a == INT_MIN and b == -1): raise VMError("invalid division")
-                    q = (abs(a) // abs(b)) * (-1 if (a < 0) != (b < 0) else 1)
-                    result = q if op == 0xa1 else a - q * b
+                raw_b, raw_a = pop(), pop()
+                if op in (0xa4, 0xa5):
+                    b_bool, a_bool = _boolean(raw_b), _boolean(raw_a)
+                    push(number(int(a_bool and b_bool if op == 0xa4 else a_bool or b_bool)))
                 else:
-                    result = {
-                        0x9e: lambda: a+b, 0x9f: lambda: a-b, 0xa0: lambda: a*b,
-                        0xa4: lambda: int(bool(a) and bool(b)), 0xa5: lambda: int(bool(a) or bool(b)),
-                        0xa6: lambda: int(a == b), 0xa7: lambda: int(a == b),
-                        0xa8: lambda: int(a != b), 0xa9: lambda: int(a < b),
-                        0xaa: lambda: int(a > b), 0xab: lambda: int(a <= b),
-                        0xac: lambda: int(a >= b), 0xad: lambda: min(a, b),
-                        0xae: lambda: max(a, b),
-                    }[op]()
-                if op == 0xa7:
-                    if not result: raise VMError("NUMEQUALVERIFY failed")
-                else:
-                    push(number(result))
+                    b, a = _numeric(raw_b), _numeric(raw_a)
+                    width = max(len(raw_a), len(raw_b))
+                    if op in (0xa1, 0xa2):
+                        if b == 0:
+                            raise VMError("invalid division")
+                        q = (abs(a) // abs(b)) * (-1 if (a < 0) != (b < 0) else 1)
+                        r = a - q * b
+                        if _minimal_signed_width(q) > width:
+                            raise VMError("invalid division")
+                        push(number(q if op == 0xa1 else r, width))
+                    elif op == 0xa0:
+                        prod = a * b
+                        out_width = max(width, _minimal_signed_width(prod))
+                        if out_width > MAX_MUL_BYTES:
+                            raise VMError("int128 overflow")
+                        push(number(prod, out_width))
+                    elif op in (0x9e, 0x9f, 0xad, 0xae):
+                        result = {0x9e: a + b, 0x9f: a - b, 0xad: min(a, b), 0xae: max(a, b)}[op]
+                        push(number(result, width))
+                    else:
+                        result = {
+                            0xa6: int(a == b), 0xa7: int(a == b),
+                            0xa8: int(a != b), 0xa9: int(a < b),
+                            0xaa: int(a > b), 0xab: int(a <= b),
+                            0xac: int(a >= b),
+                        }[op]
+                        if op == 0xa7:
+                            if not result: raise VMError("NUMEQUALVERIFY failed")
+                        else:
+                            push(number(result))
             elif op == 0xaf:
                 hi, lo, x = _numeric(pop()), _numeric(pop()), _numeric(pop())
                 push(number(int(lo <= x < hi)))
             elif op in (0xb0, 0xb1):
-                carry = _numeric(pop())
-                b, a = _unsigned(pop()), _unsigned(pop())
-                if carry not in (0, 1):
+                raw_c = pop()
+                carry = _numeric(raw_c)
+                raw_b, raw_a = pop(), pop()
+                b, a = _unsigned(raw_b), _unsigned(raw_a)
+                if len(raw_c) != MIN_NUMERIC_BYTES or carry not in (0, 1):
                     raise VMError("carry is not N(0)/N(1)")
+                width = max(MIN_NUMERIC_BYTES, len(raw_a), len(raw_b))
+                modulus = 1 << (8 * width)
                 if op == 0xb0:
                     total = a + b + carry
-                    push(_unsigned_bytes(total & _U128_MASK))
-                    push(number(total >> 128))
+                    push(_unsigned_bytes(total & (modulus - 1), width))
+                    push(number(total >> (8 * width)))
                 else:
-                    push(_unsigned_bytes((a - b - carry) % (1 << 128)))
+                    push(_unsigned_bytes((a - b - carry) % modulus, width))
                     push(number(int(a < b + carry)))
             elif op == 0xb2:
-                b, a = _unsigned(pop()), _unsigned(pop())
+                raw_b, raw_a = pop(), pop()
+                b, a = _unsigned(raw_b), _unsigned(raw_a)
+                width = max(MIN_NUMERIC_BYTES, len(raw_a), len(raw_b))
+                modulus = 1 << (8 * width)
                 product = a * b
-                push(_unsigned_bytes(product >> 128))
-                push(_unsigned_bytes(product & _U128_MASK))
+                push(_unsigned_bytes(product >> (8 * width), width))
+                push(_unsigned_bytes(product & (modulus - 1), width))
             elif op == 0xb3:
                 push(number(_log2_q64(_numeric(pop()))))
             elif op == 0xb4:
-                value = _numeric(pop())
+                raw_a = pop()
+                value = _numeric(raw_a)
                 if value < 0:
                     raise VMError("SQRT requires x>=0")
-                push(number(math.isqrt(value)))
+                push(number(math.isqrt(value), len(raw_a)))
             elif op == 0xbd:
                 algorithm = _numeric(pop())
                 public_key, message, signature = pop(), pop(), pop()
