@@ -144,3 +144,27 @@ peer; the actual incoming application command, payload size and missing-versus-
 zero limit were not logged and remain unknown. This peer-local condition must
 not be presented as successful quorum acceptance. The failed homes remain
 preserved; no retry is authorized until a reviewed immutable repair is supplied.
+
+## Peer-fixed actual quorum and bounded finality failure
+
+Source `63c51499441ded6d0fe34d87ff43d53a14b1398f`, binary SHA256
+`7d86468e24d457eaf2bbac541cc33ddd422e8a481fee96c8e5b6c07e70de7d0e`,
+ran the same reviewed harness in fresh copies with unchanged thresholds, budgets
+and deadlines. Nine native proof provisions and funded pending-stop/observer
+readmission passed. **The authenticated default quorum gate passed on all nine
+nodes**, with eight authenticated and eligible peers each.
+
+The unchanged 300-second all-nine seed finality gate then failed. At its last
+snapshot, all nine nodes again had eight active/authenticated/eligible peers and
+reported established, ready quorums. Only node six reported the tip finalized;
+the other eight did not. Activation counts ranged from 13 to 23, establishing
+reconnect activity without identifying its cause. No driver error was reported
+in that last snapshot. All twelve owned native processes stopped with exit 0.
+
+[Compact finality evidence](evidence/v2-native-quorum-finality-deadline-20261015.json)
+retains the passed quorum checkpoint, exact final states, cleanup and raw-trace
+hashes/paths. No raw incoming application trace or confidence counter was added.
+This demonstrates actual authentication and quorum formation; it does not pass
+the all-nine finality requirement or establish that finalization is universally
+impossible. Fork, parking and nine-node restart gates were not reached. The
+failure remains preserved, with no longer deadline or blind retry.
