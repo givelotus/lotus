@@ -58,7 +58,7 @@ test('new primitives enforce argument types and receiver types',()=>{
 test('branch index bounds and numeric byte casts reject adversarial runtime arguments',()=>{
  const programs=[
   ['Index', 'contract Index { function spend(i: Int) { require(this.coin.branch(i) == this.coin.branch(0)); } }', [-1n,2n,65536n]],
-  ['Cast', 'contract Cast { function spend(n: Int) { require(sha256(num_bytes(n)) == sha256(num_bytes(n))); } }', ['','00','00'.repeat(17)]],
+  ['Cast', 'contract Cast { function spend(n: Int) { require(sha256(num_bytes(n)) == sha256(num_bytes(n))); } }', ['','00','00'.repeat(15),'00'.repeat(1025)]],
  ];
  for(const [contract,s,values] of programs){const a=compileContract(s,{contract,bindings:{}}),m=a.methods[0];for(const value of values){const c={script:m.scriptHex,proof:m.proof,args:[typeof value==='bigint'?int(value):value],coin:coin([a.policy.root,other]),outputs:[coin([a.policy.root,other])]};check(`${contract} invalid ${value}`,s,a,c,'rejected');}}
 });
