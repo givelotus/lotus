@@ -14,12 +14,13 @@ SERIES="${SERIES:-v1}"
 
 case "$SERIES" in
     v1) LOTUSD="$DAEMON_DIR/workspace-v1/build/src/lotusd" ;;
+    v2) LOTUSD="$DAEMON_DIR/workspace-v2/build/src/lotusd" ;;
     ecash) LOTUSD="$DAEMON_DIR/workspace-ecash/build/src/bitcoind" ;;
     doged) LOTUSD="$DAEMON_DIR/workspace-doged-abc/build/src/doged" ;;
     doged-reference) LOTUSD="$DAEMON_DIR/workspace-doged-reference/build/src/doged" ;;
     bitcoin) LOTUSD="$DAEMON_DIR/workspace-bitcoin/build/bin/bitcoind" ;;
     bchn) LOTUSD="$DAEMON_DIR/workspace-bchn/build/src/bitcoind" ;;
-    *) echo "Unsupported series: $SERIES (choose v1, ecash, doged, doged-reference, bchn, or bitcoin)" >&2; exit 1 ;;
+    *) echo "Unsupported series: $SERIES (choose v1, v2, ecash, doged, doged-reference, bchn, or bitcoin)" >&2; exit 1 ;;
 esac
 
 if [[ ! -x "$LOTUSD" ]]; then

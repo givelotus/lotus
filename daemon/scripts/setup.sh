@@ -141,5 +141,22 @@ if [[ "$SERIES" == "ecash" ]]; then
     exit 0
 fi
 
-echo "Unsupported series: $SERIES (choose v1, ecash, doged, doged-reference, bchn, or bitcoin)" >&2
+# ─── V2: pinned bitcoin-abc base + self-describing layered V2 patch series ───
+if [[ "$SERIES" == "v2" ]]; then
+    WORKSPACE="$DAEMON_DIR/workspace-v2"
+    VERSION_FILE="$DAEMON_DIR/bitcoin-abc-version"
+    SERIES_FILE="$DAEMON_DIR/patches/v2/series"
+    PATCHES_DIR="$DAEMON_DIR/patches/v2"
+    REMOTE="${BITCOIN_ABC_REMOTE:-https://github.com/Bitcoin-ABC/bitcoin-abc.git}"
+    REF=$(grep -v '^#' "$VERSION_FILE" | grep -v '^$' | head -1)
+    echo "bitcoin-abc ref: $REF"
+    clone_and_checkout "$WORKSPACE" "$REMOTE" "$REF" "lotus-v2-work" "V2 (Lotus new chain)"
+    apply_patch_series "$SERIES_FILE" "$PATCHES_DIR"
+    echo ""
+    echo "V2 workspace ready at: $WORKSPACE"
+    echo "Build with: make build SERIES=v2"
+    exit 0
+fi
+
+echo "Unsupported series: $SERIES (choose v1, v2, ecash, doged, doged-reference, bchn, or bitcoin)" >&2
 exit 1

@@ -16,12 +16,13 @@ SERIES="${SERIES:-v1}"
 
 case "$SERIES" in
     v1) WORKSPACE="$DAEMON_DIR/workspace-v1"; LABEL="V1 (mainnet)"; TARGETS=(lotusd lotus-cli) ;;
+    v2) WORKSPACE="$DAEMON_DIR/workspace-v2"; LABEL="V2 (Lotus new chain)"; TARGETS=(lotusd lotus-cli) ;;
     ecash) WORKSPACE="$DAEMON_DIR/workspace-ecash"; LABEL="eCash candidates"; TARGETS=(bitcoind bitcoin-cli) ;;
     doged) WORKSPACE="$DAEMON_DIR/workspace-doged-abc"; LABEL="Dogecoin on Bitcoin ABC"; TARGETS=(doged doge-cli) ;;
     doged-reference) WORKSPACE="$DAEMON_DIR/workspace-doged-reference"; LABEL="historical doged reference"; TARGETS=(doged doge-cli) ;;
     bitcoin) WORKSPACE="$DAEMON_DIR/workspace-bitcoin"; LABEL="Bitcoin Core BTC"; TARGETS=(bitcoind bitcoin-cli) ;;
     bchn) WORKSPACE="$DAEMON_DIR/workspace-bchn"; LABEL="BCHN candidates"; TARGETS=(bitcoind bitcoin-cli) ;;
-    *) echo "Unsupported series: $SERIES (choose v1, ecash, doged, doged-reference, bchn, or bitcoin)" >&2; exit 1 ;;
+    *) echo "Unsupported series: $SERIES (choose v1, v2, ecash, doged, doged-reference, bchn, or bitcoin)" >&2; exit 1 ;;
 esac
 
 BUILD_DIR="$WORKSPACE/build"
@@ -45,7 +46,7 @@ else
     CMAKE_ARGS+=(-DBUILD_QT=OFF -DBUILD_ZMQ=OFF)
 fi
 
-if [[ "$SERIES" == "v1" || "$SERIES" == "doged" || "$SERIES" == "doged-reference" ]]; then
+if [[ "$SERIES" == "v1" || "$SERIES" == "v2" || "$SERIES" == "doged" || "$SERIES" == "doged-reference" ]]; then
     CMAKE_ARGS+=(-DBUILD_CHRONIK=ON)
 fi
 

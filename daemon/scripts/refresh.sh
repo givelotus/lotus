@@ -44,7 +44,7 @@ rebase_patchset() {
     local resolved
     resolved=$(resolve_upstream_ref "$workspace" "$NEW_REF")
     local extra=(--base "$resolved")
-    [[ "$series" == v1 ]] || extra+=(--allow-empty)
+    [[ "$series" == v1 || "$series" == v2 ]] || extra+=(--allow-empty)
     python3 "$SCRIPT_DIR/patch-series.py" "$workspace" "$series_file" "${extra[@]}"
     # Publish the pin only after the entire series succeeds.
     local pin_temp
@@ -63,6 +63,12 @@ rebase_patchset() {
 # ─── Lotus mainnet: reapply patches on a new pinned bitcoin-abc base ─────────
 if [[ "$SERIES" == "v1" ]]; then
     rebase_patchset v1 "$DAEMON_DIR/workspace-v1" "$DAEMON_DIR/bitcoin-abc-v1-version"
+    exit 0
+fi
+
+# ─── Lotus V2: reapply layered ecash + v2 patches on a new bitcoin-abc base ──
+if [[ "$SERIES" == "v2" ]]; then
+    rebase_patchset v2 "$DAEMON_DIR/workspace-v2" "$DAEMON_DIR/bitcoin-abc-version"
     exit 0
 fi
 
@@ -131,5 +137,5 @@ if [[ "$SERIES" == "bchn" ]]; then
     exit 0
 fi
 
-echo "Unsupported series: $SERIES (choose v1, ecash, doged, doged-reference, bchn, or bitcoin)" >&2
+echo "Unsupported series: $SERIES (choose v1, v2, ecash, doged, doged-reference, bchn, or bitcoin)" >&2
 exit 1
