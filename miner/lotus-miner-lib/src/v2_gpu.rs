@@ -142,6 +142,137 @@ impl V2GpuHasher {
         }
         Ok(results)
     }
+
+    /// Pre-packs a 134-byte header, 32-byte ChainID, and 32-byte Target into
+    /// `(work_words[18], id_prefix_words[13], target_words[8])` for `find_nonce_matches`.
+    pub fn pack_template_words(
+        header: &[u8],
+        chain_id: &[u8; 32],
+        target: &[u8; 32],
+    ) -> Result<([u32; 18], [u32; 13], [u32; 8])> {
+        if header.len() != HEADER_LEN {
+            bail!("V2 header must be exactly {HEADER_LEN} bytes");
+        }
+        let (body_hash, _, _) = hashes(header, chain_id)?;
+        let mut work_padded = [0u8; 72];
+        work_padded[..21].copy_from_slice(b"Lotus/v2/header/work\0");
+        work_padded[21..31].copy_from_slice(&header[32..NONCE_OFFSET]);
+        work_padded[39..71].copy_from_slice(&body_hash);
+
+        let mut work_words = [0u32; 18];
+        for (i, word) in work_words.iter_mut().enumerate() {
+            let j = i * 4;
+            *word = u32::from_le_bytes(work_padded[j..j + 4].try_into()?);
+        }
+
+        let mut id_prefix_padded = [0u8; 52];
+        id_prefix_padded[..17].copy_from_slice(b"Lotus/v2/blockid\0");
+        id_prefix_padded[17..49].copy_from_slice(&header[..32]);
+
+        let mut id_prefix_words = [0u32; 13];
+        for (i, word) in id_prefix_words.iter_mut().enumerate() {
+            let j = i * 4;
+            *word = u32::from_le_bytes(id_prefix_padded[j..j + 4].try_into()?);
+        }
+
+        let mut target_words = [0u32; 8];
+        for (i, word) in target_words.iter_mut().enumerate() {
+            let j = i * 4;
+            *word = u32::from_le_bytes(target[j..j + 4].try_into()?);
+        }
+
+        Ok((work_words, id_prefix_words, target_words))
+    }
+
+    /// High-throughput production GPU search using `find_nonce_matches`.
+    /// Transfers only the 4-byte `match_count` when no share is found, and verifies
+    /// any returned winning nonces on CPU before returning.
+    pub fn find_nonce_matches(
+        &self,
+        header: &[u8],
+        chain_id: &[u8; 32],
+        target: &[u8; 32],
+        start_nonce: u64,
+        count: usize,
+        max_matches: usize,
+    ) -> Result<Vec<GpuNonceResult>> {
+        validate_batch(header, start_nonce, count)?;
+        if max_matches == 0 || max_matches > 4096 {
+            bail!("max_matches must be between 1 and 4096");
+        }
+        let (work_words, id_prefix_words, target_words) =
+            Self::pack_template_words(header, chain_id, target)?;
+
+        let work_buf = Buffer::<u32>::builder()
+            .queue(self.queue.clone())
+            .len(work_words.len())
+            .copy_host_slice(&work_words)
+            .build()?;
+        let id_buf = Buffer::<u32>::builder()
+            .queue(self.queue.clone())
+            .len(id_prefix_words.len())
+            .copy_host_slice(&id_prefix_words)
+            .build()?;
+        let target_buf = Buffer::<u32>::builder()
+            .queue(self.queue.clone())
+            .len(target_words.len())
+            .copy_host_slice(&target_words)
+            .build()?;
+        let winning_buf = Buffer::<u64>::builder()
+            .queue(self.queue.clone())
+            .len(max_matches)
+            .build()?;
+        let count_buf = Buffer::<u32>::builder()
+            .queue(self.queue.clone())
+            .len(1)
+            .copy_host_slice(&[0u32])
+            .build()?;
+
+        let kernel = Kernel::builder()
+            .program(&self.program)
+            .name("find_nonce_matches")
+            .queue(self.queue.clone())
+            .global_work_size(count)
+            .arg(&work_buf)
+            .arg(&id_buf)
+            .arg(&target_buf)
+            .arg(start_nonce)
+            .arg(&winning_buf)
+            .arg(&count_buf)
+            .arg(max_matches as u32)
+            .build()?;
+        unsafe { kernel.enq()? };
+
+        let mut match_count_host = [0u32; 1];
+        count_buf.read(&mut match_count_host[..]).enq()?;
+        let found = (match_count_host[0] as usize).min(max_matches);
+        if found == 0 {
+            return Ok(Vec::new());
+        }
+
+        let mut winning_nonces = vec![0u64; found];
+        winning_buf
+            .read(&mut winning_nonces[..])
+            .len(found)
+            .enq()?;
+        winning_nonces.sort_unstable();
+
+        let mut verified = Vec::with_capacity(found);
+        for nonce in winning_nonces {
+            let mut candidate = header.to_vec();
+            candidate[NONCE_OFFSET..NONCE_OFFSET + 8].copy_from_slice(&nonce.to_le_bytes());
+            let (_, _, block_id) = hashes(&candidate, chain_id)?;
+            if !meets_target(&block_id, target) {
+                bail!("find_nonce_matches candidate failed independent CPU target check at nonce {nonce}");
+            }
+            verified.push(GpuNonceResult {
+                nonce,
+                block_id,
+                meets_target: true,
+            });
+        }
+        Ok(verified)
+    }
 }
 
 #[cfg(test)]
@@ -156,6 +287,21 @@ mod tests {
         assert!(validate_batch(&header, u64::MAX, 2).is_err());
         assert!(validate_batch(&header, u64::MAX - 1, 2).is_ok());
         assert!(validate_batch(&header[..HEADER_LEN - 1], 0, 1).is_err());
+    }
+
+    #[test]
+    fn packs_template_words_deterministically() {
+        let mut header = [0u8; HEADER_LEN];
+        for (i, b) in header.iter_mut().enumerate() {
+            *b = i as u8;
+        }
+        let chain_id: [u8; 32] = std::array::from_fn(|i| i as u8);
+        let target: [u8; 32] = [0xef; 32];
+        let (work_words, id_words, target_words) =
+            V2GpuHasher::pack_template_words(&header, &chain_id, &target).unwrap();
+        assert_eq!(work_words[0], u32::from_le_bytes(*b"Lotu"));
+        assert_eq!(id_words[0], u32::from_le_bytes(*b"Lotu"));
+        assert_eq!(target_words, [0xefef_efefu32; 8]);
     }
 
     #[test]
@@ -299,4 +445,54 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    #[ignore = "requires an installed OpenCL runtime and device"]
+    fn find_nonce_matches_parity_and_atomic_readback() {
+        let gpu = V2GpuHasher::setup(0).unwrap();
+        let chain_id: [u8; 32] = std::array::from_fn(|i| i as u8);
+        let vector_header = hex::decode(concat!(
+            "202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f",
+            "ffff001d0605040302010f0e0d0c0b0a0908020000008877665544332211",
+            "00ffeeddccbbaa99404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f",
+            "606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f"
+        ))
+        .unwrap();
+
+        let start = 0x0809_0a0b_0c0d_0e0fu64;
+        let full = gpu
+            .hash_nonces(&vector_header, &chain_id, &[0xff; 32], start, 4)
+            .unwrap();
+        let matches = gpu
+            .find_nonce_matches(&vector_header, &chain_id, &[0xff; 32], start, 4, 16)
+            .unwrap();
+        assert_eq!(matches, full);
+
+        // Zero target should return 0 matches (only 4-byte count readback)
+        let none = gpu
+            .find_nonce_matches(&vector_header, &chain_id, &[0u8; 32], start, 1024, 16)
+            .unwrap();
+        assert!(none.is_empty());
+
+        // Exact target boundary for nonce[1] (which has smaller BlockID 8a96..24 vs fbe9..70)
+        let target_one = full[1].block_id;
+        let exact = gpu
+            .find_nonce_matches(&vector_header, &chain_id, &target_one, start, 2, 16)
+            .unwrap();
+        assert_eq!(exact.len(), 1);
+        assert_eq!(exact[0].nonce, start + 1);
+        assert_eq!(exact[0].block_id, target_one);
+
+        // u32 carry and u64::MAX boundary
+        let max_hit = gpu
+            .find_nonce_matches(&vector_header, &chain_id, &[0xff; 32], u64::MAX, 1, 16)
+            .unwrap();
+        assert_eq!(max_hit.len(), 1);
+        assert_eq!(max_hit[0].nonce, u64::MAX);
+        assert_eq!(
+            hex::encode(max_hit[0].block_id),
+            "ce606e015b769cf60502917d0bac3597048e25668c7df323f817b53969aab371"
+        );
+    }
 }
+

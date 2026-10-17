@@ -113,3 +113,101 @@ __kernel void hash_nonces(__global const uchar *work_template,
     for (uint i = 0; i < 32; ++i) digests[lane * 32 + i] = block_id[i];
     matches[lane] = accept;
 }
+
+void b3_compress_words(__private const uint *cv, __private const uint *m,
+                       uint block_len, uint flags, __private uint *out) {
+    uint v[16];
+    for (uint i = 0; i < 8; ++i) {
+        v[i] = cv[i];
+    }
+    for (uint i = 0; i < 4; ++i) {
+        v[i + 8] = B3_IV[i];
+    }
+    v[12] = 0;
+    v[13] = 0;
+    v[14] = block_len;
+    v[15] = flags;
+    for (uint r = 0; r < 7; ++r) {
+        b3_g(v, 0, 4, 8, 12, m[B3_SCHEDULE[r][0]], m[B3_SCHEDULE[r][1]]);
+        b3_g(v, 1, 5, 9, 13, m[B3_SCHEDULE[r][2]], m[B3_SCHEDULE[r][3]]);
+        b3_g(v, 2, 6, 10, 14, m[B3_SCHEDULE[r][4]], m[B3_SCHEDULE[r][5]]);
+        b3_g(v, 3, 7, 11, 15, m[B3_SCHEDULE[r][6]], m[B3_SCHEDULE[r][7]]);
+        b3_g(v, 0, 5, 10, 15, m[B3_SCHEDULE[r][8]], m[B3_SCHEDULE[r][9]]);
+        b3_g(v, 1, 6, 11, 12, m[B3_SCHEDULE[r][10]], m[B3_SCHEDULE[r][11]]);
+        b3_g(v, 2, 7, 8, 13, m[B3_SCHEDULE[r][12]], m[B3_SCHEDULE[r][13]]);
+        b3_g(v, 3, 4, 9, 14, m[B3_SCHEDULE[r][14]], m[B3_SCHEDULE[r][15]]);
+    }
+    for (uint i = 0; i < 8; ++i) {
+        out[i] = v[i] ^ v[i + 8];
+    }
+}
+
+// High-throughput production V2 kernel: takes pre-packed uint words
+// (work_words[18], id_prefix_words[13], target_words[8], start_nonce) and
+// writes only winning nonces via atomic_inc(match_count).
+__kernel void find_nonce_matches(__global const uint *work_words,
+                                 __global const uint *id_prefix_words,
+                                 __global const uint *target_words,
+                                 ulong start_nonce,
+                                 __global ulong *winning_nonces,
+                                 __global volatile uint *match_count,
+                                 uint max_matches) {
+    uint lane = get_global_id(0);
+    ulong nonce = start_nonce + (ulong)lane;
+
+    uint iv[8];
+    for (uint i = 0; i < 8; ++i) iv[i] = B3_IV[i];
+
+    // Stage 1: WorkHash (71 bytes = 64 + 7)
+    uint m0[16];
+    for (uint i = 0; i < 16; ++i) m0[i] = work_words[i];
+    m0[7] = (work_words[7] & 0x00ffffffu) | (((uint)(nonce & 0xfful)) << 24);
+    m0[8] = (uint)(nonce >> 8);
+    m0[9] = (work_words[9] & 0xff000000u) | ((uint)(nonce >> 40) & 0x00ffffffu);
+
+    uint cv[8];
+    b3_compress_words(iv, m0, 64u, 1u, cv);
+
+    uint m1[16];
+    m1[0] = work_words[16];
+    m1[1] = work_words[17] & 0x00ffffffu;
+    for (uint i = 2; i < 16; ++i) m1[i] = 0u;
+
+    uint work_cv[8];
+    b3_compress_words(cv, m1, 7u, 10u, work_cv);
+
+    // Stage 2: BlockID (81 bytes = 64 + 17)
+    uint id0[16];
+    for (uint i = 0; i < 12; ++i) id0[i] = id_prefix_words[i];
+    id0[12] = (id_prefix_words[12] & 0xffu) | (work_cv[0] << 8);
+    id0[13] = (work_cv[0] >> 24) | (work_cv[1] << 8);
+    id0[14] = (work_cv[1] >> 24) | (work_cv[2] << 8);
+    id0[15] = (work_cv[2] >> 24) | (work_cv[3] << 8);
+
+    b3_compress_words(iv, id0, 64u, 1u, cv);
+
+    uint id1[16];
+    id1[0] = (work_cv[3] >> 24) | (work_cv[4] << 8);
+    id1[1] = (work_cv[4] >> 24) | (work_cv[5] << 8);
+    id1[2] = (work_cv[5] >> 24) | (work_cv[6] << 8);
+    id1[3] = (work_cv[6] >> 24) | (work_cv[7] << 8);
+    id1[4] = work_cv[7] >> 24;
+    for (uint i = 5; i < 16; ++i) id1[i] = 0u;
+
+    uint block_cv[8];
+    b3_compress_words(cv, id1, 17u, 10u, block_cv);
+
+    uint accept = 1u;
+    for (int i = 7; i >= 0; --i) {
+        if (block_cv[i] < target_words[i]) break;
+        if (block_cv[i] > target_words[i]) { accept = 0u; break; }
+    }
+
+    if (accept == 1u) {
+        uint idx = atomic_inc(match_count);
+        if (idx < max_matches) {
+            winning_nonces[idx] = nonce;
+        }
+    }
+}
+

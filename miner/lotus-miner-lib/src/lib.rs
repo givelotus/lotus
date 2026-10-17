@@ -5,6 +5,7 @@ mod sha256;
 pub mod v2_gpu;
 pub mod v2_header;
 pub mod v2_job;
+pub mod v2_pool_client;
 
 use eyre::Result;
 pub use miner::Miner;
