@@ -22,7 +22,8 @@ export function compileTargetContract(source: string, options: TargetCompileOpti
     if (options.method !== undefined) fail('E1202', 'Lotus compilation commits the complete contract policy; method selection is available only for the eCash script target.');
     return compileContract(source, { ...options, target: 'lotus-v2' }, file);
   }
-  if (options.optimize === true) fail('E1203', 'The eCash backend has no optimizer; omit optimize or set optimize:false. Lotus optimizations are not applied to eCash bytecode.');
+  if (options.optimize === true || (options.optimizerVersion !== undefined && options.optimizerVersion !== 'none'))
+    fail('E1203', 'The eCash backend has no optimizer; omit optimize or set optimize:false. Lotus optimizations are not applied to eCash bytecode.');
   const program = parseModuleSource(source, true, file, sources);
   if (program.imports.length) fail('E1203', 'eCash source compilation does not yet link packages or imported helpers.', program.imports[0]!.span);
   const contract = program.contracts.get(options.contract);

@@ -577,6 +577,8 @@ export function resolveDistributedSources(project: string, root: PackageInfo, li
   const lock = {
     schema: LOCK_SCHEMA_V2,
     root: { name: root.manifest.name, version: root.manifest.version,
+      ...(root.manifest.edition !== undefined ? { edition: root.manifest.edition } : {}),
+      ...(root.manifest.optimizer !== undefined ? { optimizer: root.manifest.optimizer } : {}),
       dependencies: Object.fromEntries([...root.manifest.dependencies].sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0)),
       ...(root.manifest.replace.size ? { replace } : {}) },
     packages: entries,

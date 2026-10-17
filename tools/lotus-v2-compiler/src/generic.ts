@@ -4,8 +4,35 @@ import { schnorr } from '@noble/curves/secp256k1';
 import { DiagnosticBag, SourceManager, suggest, type DiagnosticExtra } from './diagnostics.js';
 import { assertPortableName } from './names.js';
 import { resolveTarget, type TargetId } from './targets.js';
-import { optimizeInstructions, type Instruction } from './optimizer.js';
+import {
+  DEFAULT_COMPILER_EDITION,
+  DEFAULT_OPTIMIZER_VERSION,
+  OPTIMIZER_PASSES_BY_VERSION,
+  SUPPORTED_COMPILER_EDITIONS,
+  SUPPORTED_OPTIMIZER_VERSIONS,
+  isSupportedCompilerEdition,
+  isSupportedOptimizerVersion,
+  optimizeInstructions,
+  resolveCompilerEdition,
+  resolveOptimizerVersion,
+  type CompilerEdition,
+  type Instruction,
+  type OptimizerVersion,
+} from './optimizer.js';
 import { PromiseScheduler, type SchedulerEvent } from './scheduler.js';
+export {
+  DEFAULT_COMPILER_EDITION,
+  DEFAULT_OPTIMIZER_VERSION,
+  OPTIMIZER_PASSES_BY_VERSION,
+  SUPPORTED_COMPILER_EDITIONS,
+  SUPPORTED_OPTIMIZER_VERSIONS,
+  isSupportedCompilerEdition,
+  isSupportedOptimizerVersion,
+  resolveCompilerEdition,
+  resolveOptimizerVersion,
+  type CompilerEdition,
+  type OptimizerVersion,
+} from './optimizer.js';
 export type { SchedulerEvent } from './scheduler.js';
 
 export type ValueType = 'PublicKey' | 'Signature' | 'Bytes32' | `Bytes(${number})` | 'Int' | 'Amount' | 'TokenId' | 'Bool' | 'MethodLeafHash' | 'ContractRootHash' | 'InputIndex' | 'OutputIndex';
@@ -44,7 +71,15 @@ export type ContractArtifact = { languageVersion?: LanguageVersion; schema: 'lot
   build?: import('./packages.js').BuildGraph;
   /** Library contracts this artifact commits to (CABI-08). Omitted when empty so single-file artifacts stay unchanged. */
   links?: LinkedContract[]; }
-export type CompileOptions = { languageVersion?: LanguageVersion; contract: string; bindings: Record<string, Record<string, BoundValue>>; optimize?: boolean; target?: TargetId };
+export type CompileOptions = {
+  languageVersion?: LanguageVersion;
+  edition?: CompilerEdition;
+  optimizerVersion?: OptimizerVersion;
+  contract: string;
+  bindings: Record<string, Record<string, BoundValue>>;
+  optimize?: boolean;
+  target?: TargetId;
+};
 
 const MAX_SOURCE = 65536, MAX_SCRIPT = 8192, MAX_OPS = 4096, MAX_EXPANSIONS = 256, MAX_METHODS = 16;
 const MAX_INFERENCE_VISITS = 8192;
@@ -370,8 +405,9 @@ class Emitter {
   }
   op(name: keyof typeof OPCODES, span: Span, origin?: Span, delta = 0): void { this.append(Uint8Array.of(OPCODES[name]), name, span, origin, delta); if (name === 'CHECKSIG') this.signatureChecks++; }
   control(name: 'IF'|'ELSE'|'ENDIF', span: Span, origin?: Span): void { this.op(name, span, origin, name === 'IF' ? -1 : 0); }
-  finish(optimize: boolean): { script: Uint8Array; map: MethodArtifact['sourceMap']; resources: Pick<MethodArtifact['staticResources'], 'scriptBytes'|'opcodes'|'maxStackItems'> } {
-    const entries = optimize ? optimizeInstructions(this.instructions, this.args) : this.instructions;
+  finish(optimizeOrVersion: boolean | OptimizerVersion): { script: Uint8Array; map: MethodArtifact['sourceMap']; resources: Pick<MethodArtifact['staticResources'], 'scriptBytes'|'opcodes'|'maxStackItems'> } {
+    const version: OptimizerVersion = typeof optimizeOrVersion === 'boolean' ? (optimizeOrVersion ? 'v1' : 'none') : optimizeOrVersion;
+    const entries = version === 'none' ? this.instructions : optimizeInstructions(this.instructions, this.args, version);
     const structured = entries.some(entry => ['IF','ELSE','ENDIF','ENUMERATE_INPUTS','ENUMERATE_OUTPUTS','ENDENUMERATE'].includes(entry.map.op));
     const map: MethodArtifact['sourceMap'] = [];
     let offset = 0, height = this.args, maxStackItems = height;
@@ -956,7 +992,7 @@ class Compiler {
       for (let i = 0; i < method.params.length; i++) emitter.op('DROP',method.span,undefined,-1);
       emitter.number(1n,method.span);
       if (emitter.height !== 1) this.fatal('E9001', 'compiled method final stack mismatch', method.span);
-      const finished = emitter.finish(this.options.optimize !== false); const script = finished.script;
+      const finished = emitter.finish(resolveOptimizerVersion(this.options)); const script = finished.script;
       let loopMultiplier = 1, worstCaseSignatureChecks = 0;
       for (const entry of finished.map) {
         if (entry.op === 'ENUMERATE_INPUTS' || entry.op === 'ENUMERATE_OUTPUTS') loopMultiplier *= 65535;
@@ -1000,6 +1036,18 @@ class Compiler {
 
 function requireOptions(options: CompileOptions, bag: DiagnosticBag): void {
   if (options?.languageVersion !== undefined && options.languageVersion !== 0 && options.languageVersion !== 1) bag.raise('E0132', 'unsupported languageVersion; expected 0 or 1');
+  if (options?.edition !== undefined && !isSupportedCompilerEdition(options.edition)) {
+    bag.raise('E0133', `unsupported compiler edition "${String(options.edition)}"; expected one of: ${SUPPORTED_COMPILER_EDITIONS.join(', ')}`);
+  }
+  if (options?.optimizerVersion !== undefined && !isSupportedOptimizerVersion(options.optimizerVersion)) {
+    bag.raise('E0134', `unsupported optimizerVersion "${String(options.optimizerVersion)}"; expected one of: ${SUPPORTED_OPTIMIZER_VERSIONS.join(', ')}`);
+  }
+  if (options?.optimize === false && options?.optimizerVersion !== undefined && options.optimizerVersion !== 'none') {
+    bag.raise('E0134', `conflicting compile options: optimize: false cannot be combined with optimizerVersion: "${options.optimizerVersion}"`);
+  }
+  if (options?.optimize === true && options?.optimizerVersion === 'none') {
+    bag.raise('E0134', 'conflicting compile options: optimize: true cannot be combined with optimizerVersion: "none"');
+  }
   if (options?.target !== undefined) {
     try { resolveTarget(options.target); } catch (error) { bag.raise('E1200', (error as Error).message); }
     if (options.target !== 'lotus-v2') bag.raise('E1201', 'compileContract emits Lotus policies only; use compileTargetContract for an explicit eCash script artifact.');
@@ -1020,10 +1068,12 @@ export function compileContract(source: string, options: CompileOptions, file = 
   const bag = openSource(source, file); requireOptions(options, bag);
   return new Compiler(singleModule(source, file, bag, options.languageVersion), options, bag).compile();
 }
+export const compileGenericContract = compileContract;
 export async function compileContractAsync(source: string, options: CompileOptions, onEvent?: (event: SchedulerEvent) => void, file = '<source>'): Promise<ContractArtifact> {
   const bag = openSource(source, file); requireOptions(options, bag);
   return new Compiler(singleModule(source, file, bag, options.languageVersion), options, bag).compileAsync(onEvent);
 }
+export const compileGenericContractAsync = compileContractAsync;
 /** @internal Package linker entry: parse one module (declaration-only modules may omit contracts). */
 export function parseModuleSource(source: string, requireContract: boolean, file = '<source>', sources?: SourceManager, languageVersion: LanguageVersion = 0): Program {
   const bag = openSource(source, file, sources);
@@ -1052,3 +1102,14 @@ export function methodLeafHash(artifact: ContractArtifact, method: string): { ki
 export function contractRootHash(artifact: ContractArtifact): { kind: 'ContractRootHash'; hex: string } {
   return { kind: 'ContractRootHash', hex: artifact.policy.root };
 }
+export {
+  SPEND_BUNDLE_SCHEMA,
+  assertSpendBundleReproducibility,
+  createSpendBundle,
+  verifyBranchRootReproducibility,
+  verifySpendBundleReproducibility,
+  type SpendBundle,
+  type SpendBundleOptions,
+  type SpendBundleSourceFile,
+  type SpendBundleVerification,
+} from './packages.js';

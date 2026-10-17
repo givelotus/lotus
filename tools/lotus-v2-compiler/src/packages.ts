@@ -15,8 +15,36 @@ import { lstatSync, readdirSync, readFileSync, realpathSync, statSync, writeFile
 import { join, relative, sep } from 'node:path';
 import { bytes, concat, cs, hex, tagged, type Span } from './compiler.js';
 import { CompileError, SourceManager, diagnostic } from './diagnostics.js';
-import { compileLinkedProgramAsync, parseModuleSource, type BoundValue, type CompileOptions, type Contract, type ContractArtifact, type Expr, type Helper,
-  type HelperStmt, type ImportDecl, type LinkedContract, type Method, type Param, type Program, type SchedulerEvent, type Stmt } from './generic.js';
+import {
+  DEFAULT_COMPILER_EDITION,
+  DEFAULT_OPTIMIZER_VERSION,
+  SUPPORTED_COMPILER_EDITIONS,
+  SUPPORTED_OPTIMIZER_VERSIONS,
+  compileContract,
+  compileLinkedProgramAsync,
+  isSupportedCompilerEdition,
+  isSupportedOptimizerVersion,
+  parseModuleSource,
+  resolveCompilerEdition,
+  resolveOptimizerVersion,
+  type BoundValue,
+  type CompileOptions,
+  type CompilerEdition,
+  type Contract,
+  type ContractArtifact,
+  type Expr,
+  type Helper,
+  type HelperStmt,
+  type ImportDecl,
+  type LanguageVersion,
+  type LinkedContract,
+  type Method,
+  type OptimizerVersion,
+  type Param,
+  type Program,
+  type SchedulerEvent,
+  type Stmt,
+} from './generic.js';
 import { assertPortableName } from './names.js';
 import { assertGitLocator, classifyRequirement, isGitLocator, isModulePath, resolveDistributedSources, type FetchOptions } from './package-sources.js';
 import { PromiseScheduler } from './scheduler.js';
@@ -63,6 +91,7 @@ export function packageCompileError(error: PackageError, sources = new SourceMan
 }
 
 export type Manifest = { name: string; version: string; kind: 'library' | 'contract'; source: string; modules: string[]; exports: string[]; entry?: string;
+  edition?: CompilerEdition; optimizer?: OptimizerVersion;
   /** alias -> `name@version` or `module@selector` */ dependencies: Map<string, string>;
   /** Root-only locators. Short names are project-relative paths; other hosts are git URLs. */ sources: Map<string, string>;
   /** Root-only module-path replacements (relative path or git locator). Never inherited. */ replace: Map<string, string> };
@@ -71,13 +100,13 @@ export type PackageInfo = { id: string; manifest: Manifest; root: string; manife
   /** Git/replace packages record the selected tag (`vX.Y.Z`) or commit. Path packages omit it. */ selectedVersion?: string };
 type ModuleNode = { id: string; pkg: PackageInfo; path: string; file: string; digest: Uint8Array; program: Program; isEntry: boolean; imports: { decl: ImportDecl; target: ModuleNode }[] };
 type LockPackage = { name: string; version: string; locator: { kind: 'path'; path: string }; root: string; dependencies: Record<string, string>; files: { path: string; digest: string }[]; treeDigest: string };
-export type LockFile = { schema: typeof LOCK_SCHEMA; root: { name: string; version: string; dependencies: Record<string, string> }; packages: LockPackage[] };
+export type LockFile = { schema: typeof LOCK_SCHEMA; root: { name: string; version: string; edition?: CompilerEdition; optimizer?: OptimizerVersion; dependencies: Record<string, string> }; packages: LockPackage[] };
 
 export type BuildGraph = {
   schema: typeof BUILD_GRAPH_SCHEMA;
   interfaceVersion?: 'lotus-v2/module-interface/lc1';
   instances?: { name: string; template: string; bindings: ContractArtifact['bindings']; root: string }[];
-  compiler: { name: string; version: string; profile: 'optimized' | 'unoptimized' };
+  compiler: { name: string; version: string; profile: 'optimized' | 'unoptimized'; edition?: CompilerEdition; optimizerVersion?: OptimizerVersion };
   target: string;
   root: { package: string; module: string };
   lockDigest: string;
@@ -137,13 +166,23 @@ function inside(child: string, parent: string): boolean { return child === paren
 export function parseManifest(text: string, file: string): Manifest {
   let doc;
   try { doc = parseTomlSubset(text, file); } catch (error) { throw new PackageError('manifest', (error as Error).message.replace(`${file}:`, 'line '), file); }
-  for (const table of doc.keys()) if (!['package', 'dependencies', 'sources', 'replace'].includes(table)) throw new PackageError('manifest', `unknown table [${table}]`, file);
+  for (const table of doc.keys()) if (!['package', 'build', 'dependencies', 'sources', 'replace'].includes(table)) throw new PackageError('manifest', `unknown table [${table}]`, file);
   const pkg = doc.get('package'); if (!pkg) throw new PackageError('manifest', 'missing [package] table', file);
-  for (const key of pkg.keys()) if (!['name', 'version', 'kind', 'source', 'modules', 'exports', 'entry'].includes(key)) throw new PackageError('manifest', `unknown package key ${key}`, file);
+  for (const key of pkg.keys()) if (!['name', 'version', 'kind', 'source', 'modules', 'exports', 'entry', 'edition', 'optimizer', 'optimizer_version'].includes(key)) throw new PackageError('manifest', `unknown package key ${key}`, file);
+  const buildTable = doc.get('build');
+  if (buildTable) {
+    for (const key of buildTable.keys()) if (!['edition', 'optimizer', 'optimizer_version'].includes(key)) throw new PackageError('manifest', `unknown build key ${key}`, file);
+  }
   const string = (key: string, required = true): string | undefined => {
     const value = pkg.get(key);
     if (value === undefined) { if (required) throw new PackageError('manifest', `missing package.${key}`, file); return undefined; }
     if (typeof value !== 'string') throw new PackageError('manifest', `package.${key} must be a string`, file);
+    return value;
+  };
+  const buildString = (key: string): string | undefined => {
+    const value = buildTable?.get(key);
+    if (value === undefined) return undefined;
+    if (typeof value !== 'string') throw new PackageError('manifest', `build.${key} must be a string`, file);
     return value;
   };
   const list = (key: string): string[] => {
@@ -179,6 +218,24 @@ export function parseManifest(text: string, file: string): Manifest {
   const entry = string('entry', false);
   if (kind === 'contract' && (entry === undefined || !modules.includes(entry))) throw new PackageError('manifest', 'contract packages require package.entry naming a declared module', file);
   if (kind === 'library' && entry !== undefined) throw new PackageError('manifest', 'library packages are declaration-only and have no entry', file);
+  const pkgEdition = string('edition', false), buildEdition = buildString('edition');
+  if (pkgEdition !== undefined && buildEdition !== undefined && pkgEdition !== buildEdition) {
+    throw new PackageError('manifest', `conflicting edition in [package] (${JSON.stringify(pkgEdition)}) and [build] (${JSON.stringify(buildEdition)})`, file);
+  }
+  const rawEdition = pkgEdition ?? buildEdition;
+  if (rawEdition !== undefined && !isSupportedCompilerEdition(rawEdition)) {
+    throw new PackageError('manifest', `unsupported compiler edition ${JSON.stringify(rawEdition)}; expected one of: ${SUPPORTED_COMPILER_EDITIONS.join(', ')}`, file);
+  }
+  const pkgOpt = string('optimizer', false), pkgOptVer = string('optimizer_version', false);
+  const buildOpt = buildString('optimizer'), buildOptVer = buildString('optimizer_version');
+  const optCandidates = [pkgOpt, pkgOptVer, buildOpt, buildOptVer].filter((x): x is string => x !== undefined);
+  if (new Set(optCandidates).size > 1) {
+    throw new PackageError('manifest', `conflicting optimizer version settings in manifest: ${optCandidates.map(x => JSON.stringify(x)).join(', ')}`, file);
+  }
+  const rawOptimizer = optCandidates[0];
+  if (rawOptimizer !== undefined && !isSupportedOptimizerVersion(rawOptimizer)) {
+    throw new PackageError('manifest', `unsupported optimizer version ${JSON.stringify(rawOptimizer)}; expected one of: ${SUPPORTED_OPTIMIZER_VERSIONS.join(', ')}`, file);
+  }
   const table = (title: string): Map<string, string> => {
     const out = new Map<string, string>();
     for (const [key, value] of doc.get(title) ?? []) {
@@ -209,7 +266,10 @@ export function parseManifest(text: string, file: string): Manifest {
     if (isGitLocator(path)) assertGitLocator(path, file);
     else relPath(path, `[replace] ${pkgName}`, file);
   }
-  return { name, version, kind, source, modules, exports, ...(entry !== undefined ? { entry } : {}), dependencies, sources, replace };
+  return { name, version, kind, source, modules, exports, ...(entry !== undefined ? { entry } : {}),
+    ...(rawEdition !== undefined ? { edition: rawEdition } : {}),
+    ...(rawOptimizer !== undefined ? { optimizer: rawOptimizer } : {}),
+    dependencies, sources, replace };
 }
 
 // ---------------------------------------------------------------------------
@@ -349,7 +409,13 @@ export function resolveWorkspace(projectDir: string, limits: PackageLimits, onli
 function renderLock(root: PackageInfo, packages: Map<string, PackageInfo>): string {
   const lock: LockFile = {
     schema: LOCK_SCHEMA,
-    root: { name: root.manifest.name, version: root.manifest.version, dependencies: sorted(root.manifest.dependencies) },
+    root: {
+      name: root.manifest.name,
+      version: root.manifest.version,
+      ...(root.manifest.edition !== undefined ? { edition: root.manifest.edition } : {}),
+      ...(root.manifest.optimizer !== undefined ? { optimizer: root.manifest.optimizer } : {}),
+      dependencies: sorted(root.manifest.dependencies),
+    },
     packages: [...packages.values()].map(pkg => ({ name: pkg.manifest.name, version: pkg.manifest.version,
       locator: { kind: 'path' as const, path: root.manifest.sources.get(pkg.manifest.name)! }, root: pkg.root,
       dependencies: sorted(pkg.manifest.dependencies), files: pkg.files.map(f => ({ path: f.path, digest: hex(f.digest) })), treeDigest: hex(pkg.treeDigest) })).sort(byName),
@@ -377,6 +443,14 @@ function verifyLock(ws: Workspace): Uint8Array {
     // Explain the first difference: a changed file digest is the common case.
     let lock: LockFile | undefined;
     try { lock = JSON.parse(text) as LockFile; } catch { /* reported below */ }
+    if (lock?.root) {
+      if (lock.root.edition !== ws.root.manifest.edition) {
+        throw new PackageError('lock-mismatch', `manifest edition ${JSON.stringify(ws.root.manifest.edition)} differs from locked ${JSON.stringify(lock.root.edition)}; run lotus-v2-package-lock`, LOCK_FILE);
+      }
+      if (lock.root.optimizer !== ws.root.manifest.optimizer) {
+        throw new PackageError('lock-mismatch', `manifest optimizer ${JSON.stringify(ws.root.manifest.optimizer)} differs from locked ${JSON.stringify(lock.root.optimizer)}; run lotus-v2-package-lock`, LOCK_FILE);
+      }
+    }
     if (lock && Array.isArray(lock.packages)) for (const entry of lock.packages) {
       const pkg = ws.packages.get(entry?.name);
       // Git lock versions are selected tags (`vX.Y.Z`) or commits, not the manifest's MAJOR.MINOR.PATCH.
@@ -713,12 +787,38 @@ export async function compilePackage(projectDir: string, options: PackageCompile
       exports: exported.map(x => ({ name: x.name, signature: x.signature, digest: hex(x.digest) })) });
   };
   await scheduler.run(`module:${entry.id}`);
-  let effectiveOptions: CompileOptions = options as CompileOptions;
+  if (options.edition !== undefined && !isSupportedCompilerEdition(options.edition)) {
+    throw new PackageError('manifest', `unsupported compiler edition ${JSON.stringify(options.edition)}; expected one of: ${SUPPORTED_COMPILER_EDITIONS.join(', ')}`, root.manifestFile);
+  }
+  if (options.optimizerVersion !== undefined && !isSupportedOptimizerVersion(options.optimizerVersion)) {
+    throw new PackageError('manifest', `unsupported optimizerVersion ${JSON.stringify(options.optimizerVersion)}; expected one of: ${SUPPORTED_OPTIMIZER_VERSIONS.join(', ')}`, root.manifestFile);
+  }
+  if (options.edition !== undefined && root.manifest.edition !== undefined && options.edition !== root.manifest.edition) {
+    throw new PackageError('manifest', `compile option edition ${JSON.stringify(options.edition)} conflicts with manifest edition ${JSON.stringify(root.manifest.edition)}`, root.manifestFile);
+  }
+  if (options.optimizerVersion !== undefined && root.manifest.optimizer !== undefined && options.optimizerVersion !== root.manifest.optimizer) {
+    throw new PackageError('manifest', `compile option optimizerVersion ${JSON.stringify(options.optimizerVersion)} conflicts with manifest optimizer ${JSON.stringify(root.manifest.optimizer)}`, root.manifestFile);
+  }
+  if (options.optimize === false && root.manifest.optimizer !== undefined && root.manifest.optimizer !== 'none') {
+    throw new PackageError('manifest', `compile option optimize: false conflicts with manifest optimizer ${JSON.stringify(root.manifest.optimizer)}`, root.manifestFile);
+  }
+  if (options.optimize === true && root.manifest.optimizer === 'none') {
+    throw new PackageError('manifest', 'compile option optimize: true conflicts with manifest optimizer "none"', root.manifestFile);
+  }
+  const explicitEdition = options.edition ?? root.manifest.edition;
+  const explicitOptimizer = options.optimizerVersion ?? root.manifest.optimizer;
+  const effectiveOptimize = explicitOptimizer !== undefined ? explicitOptimizer !== 'none' : options.optimize;
+  let effectiveOptions: CompileOptions = {
+    ...(options as CompileOptions),
+    ...(explicitEdition !== undefined ? { edition: explicitEdition } : {}),
+    ...(explicitOptimizer !== undefined ? { optimizerVersion: explicitOptimizer } : {}),
+    ...(effectiveOptimize !== undefined ? { optimize: effectiveOptimize } : {}),
+  };
   const instanceArtifacts = new Map<string, ContractArtifact>();
   if (lc1) {
     if (Object.keys(options.instances ?? {}).length > limits.maxImportBindings) throw new PackageError('limit', `instances exceed ${limits.maxImportBindings}`);
     const bound = bindInstances(contracts, templates, owners, resolveTemplate!, options, helpers);
-    effectiveOptions = { ...options, bindings: bound.bindings };
+    effectiveOptions = { ...effectiveOptions, bindings: bound.bindings };
     const program: Program = { languageVersion: 1, helpers, contracts, imports: [] };
     // Resolve constructor references in topological order. Every explicitly requested binding is checked.
     const completed = instanceArtifacts;
@@ -742,7 +842,13 @@ export async function compilePackage(projectDir: string, options: PackageCompile
     schema: BUILD_GRAPH_SCHEMA,
     ...(lc1 ? { interfaceVersion: 'lotus-v2/module-interface/lc1' as const,
       instances: [...instanceArtifacts].filter(([name]) => Object.hasOwn(options.instances ?? {}, name)).map(([name, item]) => ({ name, template: options.instances![name]!.template, bindings: item.bindings, root: item.policy.root })).sort(byName) } : {}),
-    compiler: { name: COMPILER_NAME, version: COMPILER_VERSION, profile: options.optimize === false ? 'unoptimized' : 'optimized' },
+    compiler: {
+      name: COMPILER_NAME,
+      version: COMPILER_VERSION,
+      profile: effectiveOptimize === false ? 'unoptimized' : 'optimized',
+      ...(explicitEdition !== undefined ? { edition: explicitEdition } : {}),
+      ...(explicitOptimizer !== undefined ? { optimizerVersion: explicitOptimizer } : {}),
+    },
     target: TARGET,
     root: { package: root.id, module: entry.id },
     lockDigest: hex(lockDigest),
@@ -755,3 +861,278 @@ export async function compilePackage(projectDir: string, options: PackageCompile
   const build: BuildGraph = { ...graph, digest: hex(tagged('build-graph', utf8(JSON.stringify(graph)))) };
   return { artifact: links.length ? { ...artifact, links, build } : { ...artifact, build }, trace, parses };
 }
+
+// ---------------------------------------------------------------------------
+// Permanent BranchRoot Spendability & Source-Lock Reproducibility Verifier
+
+export const SPEND_BUNDLE_SCHEMA = 'lotus-v2/spend-bundle/1' as const;
+
+export type SpendBundleSourceFile = {
+  path: string;
+  content: string;
+  digest: string;
+};
+
+export type SpendBundle = {
+  schema: typeof SPEND_BUNDLE_SCHEMA;
+  contract: string;
+  kind: 'contract' | 'token';
+  edition: CompilerEdition;
+  optimizerVersion: OptimizerVersion;
+  languageVersion: LanguageVersion;
+  entryFile: string;
+  sources: SpendBundleSourceFile[];
+  bindings: Record<string, Record<string, BoundValue>>;
+  expectedRoot: string;
+  expectedMethods: { name: string; leaf: string; scriptHex: string; proof: string[] }[];
+  bundleDigest: string;
+};
+
+export type SpendBundleOptions = {
+  edition?: CompilerEdition;
+  optimizerVersion?: OptimizerVersion;
+  optimize?: boolean;
+  languageVersion?: LanguageVersion;
+  bindings?: Record<string, Record<string, BoundValue>>;
+  entryFile?: string;
+};
+
+export type SpendBundleVerification = {
+  ok: boolean;
+  contractRoot: string;
+  recomputedRoot?: string;
+  matchesRoot: boolean;
+  matchesMethods: boolean;
+  edition: CompilerEdition;
+  optimizerVersion: OptimizerVersion;
+  artifact?: ContractArtifact;
+  error?: string;
+};
+
+function sourceFileDigest(content: string): string {
+  return hex(tagged('package/file', bytes(utf8(content))));
+}
+
+function normalizeSpendBundleSources(
+  sources: string | Record<string, string> | readonly { path: string; content: string }[],
+  defaultEntryFile: string,
+): { entryFile: string; files: SpendBundleSourceFile[] } {
+  if (typeof sources === 'string') {
+    const entryFile = defaultEntryFile;
+    return {
+      entryFile,
+      files: [{ path: entryFile, content: sources, digest: sourceFileDigest(sources) }],
+    };
+  }
+  if (Array.isArray(sources)) {
+    if (!sources.length) throw new Error('spend bundle requires at least one source file');
+    const files = sources
+      .map(item => ({ path: item.path, content: item.content, digest: sourceFileDigest(item.content) }))
+      .sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0));
+    const entryFile = defaultEntryFile !== '<source>' ? defaultEntryFile : files[0]!.path;
+    return { entryFile, files };
+  }
+  if (sources && typeof sources === 'object') {
+    const entries = Object.entries(sources as Record<string, string>);
+    if (!entries.length) throw new Error('spend bundle requires at least one source file');
+    const files = entries
+      .map(([path, content]) => ({ path, content, digest: sourceFileDigest(content) }))
+      .sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0));
+    const entryFile = defaultEntryFile !== '<source>' ? defaultEntryFile : entries[0]![0];
+    return { entryFile, files };
+  }
+  throw new Error('invalid sources for spend bundle');
+}
+
+function serializeBindingsForDigest(bindings: Record<string, Record<string, BoundValue>>): Record<string, Record<string, string | boolean>> {
+  const out: Record<string, Record<string, string | boolean>> = {};
+  for (const contractName of Object.keys(bindings).sort()) {
+    const inner = bindings[contractName]!;
+    const innerSorted: Record<string, string | boolean> = {};
+    for (const key of Object.keys(inner).sort()) {
+      const val = inner[key]!;
+      innerSorted[key] = typeof val === 'bigint' ? val.toString() : val;
+    }
+    out[contractName] = innerSorted;
+  }
+  return out;
+}
+
+function computeSpendBundleDigest(bundle: Omit<SpendBundle, 'bundleDigest'>): string {
+  const canonical = {
+    schema: bundle.schema,
+    contract: bundle.contract,
+    kind: bundle.kind,
+    edition: bundle.edition,
+    optimizerVersion: bundle.optimizerVersion,
+    languageVersion: bundle.languageVersion,
+    entryFile: bundle.entryFile,
+    sources: bundle.sources.map(s => ({ path: s.path, digest: s.digest })),
+    bindings: serializeBindingsForDigest(bundle.bindings),
+    expectedRoot: bundle.expectedRoot,
+    expectedMethods: bundle.expectedMethods,
+  };
+  return hex(tagged('spend-bundle', utf8(JSON.stringify(canonical))));
+}
+
+/**
+ * Package canonical `.lotus` source files, compiler `edition`, `optimizerVersion`, constructor
+ * `bindings`, and expected `BranchRoot` + leaf commitments into a self-contained `SpendBundle`
+ * so covenant UTXOs remain permanently spendable and reproducible across compiler upgrades.
+ */
+export function createSpendBundle(
+  artifact: ContractArtifact,
+  sources: string | Record<string, string> | readonly { path: string; content: string }[],
+  options: SpendBundleOptions = {},
+): SpendBundle {
+  const edition = resolveCompilerEdition(options.edition ?? artifact.build?.compiler?.edition ?? DEFAULT_COMPILER_EDITION);
+  const optimizerVersion = resolveOptimizerVersion({
+    optimize: options.optimize ?? (artifact.build?.compiler?.profile === 'unoptimized' ? false : undefined),
+    optimizerVersion: options.optimizerVersion ?? artifact.build?.compiler?.optimizerVersion,
+  });
+  const languageVersion: LanguageVersion = options.languageVersion ?? artifact.languageVersion ?? 0;
+  const reconstructedContractBindings: Record<string, BoundValue> = {};
+  for (const b of artifact.bindings) {
+    reconstructedContractBindings[b.name] = b.value;
+  }
+  const bindings: Record<string, Record<string, BoundValue>> = {
+    [artifact.contract]: reconstructedContractBindings,
+    ...(options.bindings ?? {}),
+  };
+  const { entryFile, files } = normalizeSpendBundleSources(sources, options.entryFile ?? '<source>');
+  const expectedMethods = artifact.methods.map(m => ({
+    name: m.name,
+    leaf: m.leaf,
+    scriptHex: m.scriptHex,
+    proof: [...m.proof],
+  }));
+  const unsigned: Omit<SpendBundle, 'bundleDigest'> = {
+    schema: SPEND_BUNDLE_SCHEMA,
+    contract: artifact.contract,
+    kind: artifact.kind ?? 'contract',
+    edition,
+    optimizerVersion,
+    languageVersion,
+    entryFile,
+    sources: files,
+    bindings,
+    expectedRoot: artifact.policy.root,
+    expectedMethods,
+  };
+  return {
+    ...unsigned,
+    bundleDigest: computeSpendBundleDigest(unsigned),
+  };
+}
+
+/**
+ * Verify that a `SpendBundle` has intact BLAKE3 source/bundle digests and that recompiling its
+ * sources under the pinned `edition` and `optimizerVersion` reproduces the exact byte-for-byte
+ * method leaf scripts, Merkle proofs, and 32-byte `BranchRoot`.
+ */
+export function verifySpendBundleReproducibility(bundle: SpendBundle): SpendBundleVerification {
+  const fail = (error: string, recomputedRoot?: string): SpendBundleVerification => ({
+    ok: false,
+    contractRoot: bundle?.expectedRoot ?? '',
+    ...(recomputedRoot !== undefined ? { recomputedRoot } : {}),
+    matchesRoot: false,
+    matchesMethods: false,
+    edition: (bundle?.edition ?? DEFAULT_COMPILER_EDITION) as CompilerEdition,
+    optimizerVersion: (bundle?.optimizerVersion ?? DEFAULT_OPTIMIZER_VERSION) as OptimizerVersion,
+    error,
+  });
+  if (!bundle || bundle.schema !== SPEND_BUNDLE_SCHEMA) {
+    return fail(`unsupported spend bundle schema "${String(bundle?.schema)}"`);
+  }
+  if (!isSupportedCompilerEdition(bundle.edition)) {
+    return fail(`unsupported compiler edition "${String(bundle.edition)}"; expected one of: ${SUPPORTED_COMPILER_EDITIONS.join(', ')}`);
+  }
+  if (!isSupportedOptimizerVersion(bundle.optimizerVersion)) {
+    return fail(`unsupported optimizerVersion "${String(bundle.optimizerVersion)}"; expected one of: ${SUPPORTED_OPTIMIZER_VERSIONS.join(', ')}`);
+  }
+  if (!Array.isArray(bundle.sources) || !bundle.sources.length) {
+    return fail('spend bundle has no source files');
+  }
+  for (const file of bundle.sources) {
+    if (typeof file?.path !== 'string' || typeof file?.content !== 'string' || typeof file?.digest !== 'string') {
+      return fail('malformed source file entry in spend bundle');
+    }
+    const actualDigest = sourceFileDigest(file.content);
+    if (actualDigest !== file.digest) {
+      return fail(`source digest mismatch for ${file.path}: expected ${file.digest}, got ${actualDigest}`);
+    }
+  }
+  const expectedBundleDigest = computeSpendBundleDigest(bundle);
+  if (bundle.bundleDigest !== expectedBundleDigest) {
+    return fail(`spend bundle digest mismatch: expected ${bundle.bundleDigest}, computed ${expectedBundleDigest}`);
+  }
+  const entry = bundle.sources.find(s => s.path === bundle.entryFile) ?? bundle.sources[0]!;
+  let artifact: ContractArtifact;
+  try {
+    artifact = compileContract(
+      entry.content,
+      {
+        contract: bundle.contract,
+        bindings: bundle.bindings,
+        edition: bundle.edition,
+        optimizerVersion: bundle.optimizerVersion,
+        languageVersion: bundle.languageVersion,
+      },
+      entry.path,
+    );
+  } catch (error) {
+    return fail(`recompilation failed: ${(error as Error).message}`);
+  }
+  const recomputedRoot = artifact.policy.root;
+  const matchesRoot = recomputedRoot === bundle.expectedRoot;
+  let matchesMethods = artifact.methods.length === bundle.expectedMethods.length;
+  if (matchesMethods) {
+    for (let i = 0; i < bundle.expectedMethods.length; i++) {
+      const exp = bundle.expectedMethods[i]!;
+      const got = artifact.methods.find(m => m.name === exp.name);
+      if (
+        !got ||
+        got.leaf !== exp.leaf ||
+        got.scriptHex !== exp.scriptHex ||
+        JSON.stringify(got.proof) !== JSON.stringify(exp.proof)
+      ) {
+        matchesMethods = false;
+        break;
+      }
+    }
+  }
+  if (!matchesRoot || !matchesMethods) {
+    return {
+      ok: false,
+      contractRoot: bundle.expectedRoot,
+      recomputedRoot,
+      matchesRoot,
+      matchesMethods,
+      edition: bundle.edition,
+      optimizerVersion: bundle.optimizerVersion,
+      artifact,
+      error: !matchesRoot
+        ? `recomputed BranchRoot ${recomputedRoot} does not match expected ${bundle.expectedRoot}`
+        : 'recomputed method leaves or scriptHex do not match expected methods',
+    };
+  }
+  return {
+    ok: true,
+    contractRoot: bundle.expectedRoot,
+    recomputedRoot,
+    matchesRoot: true,
+    matchesMethods: true,
+    edition: bundle.edition,
+    optimizerVersion: bundle.optimizerVersion,
+    artifact,
+  };
+}
+
+export const verifyBranchRootReproducibility = verifySpendBundleReproducibility;
+
+export function assertSpendBundleReproducibility(bundle: SpendBundle): ContractArtifact {
+  const result = verifySpendBundleReproducibility(bundle);
+  if (!result.ok) throw new Error(result.error ?? 'spend bundle reproducibility verification failed');
+  return result.artifact!;
+}
+

@@ -263,7 +263,49 @@ function symbolicRegion(entries: readonly Instruction[], state: State, budget: {
  * effect and the same error behavior for a valid x. No operation with a
  * potential runtime error is deleted or reordered.
  */
-export function optimizeInstructions(original: readonly Instruction[], argumentCount: number): Instruction[] {
+export const SUPPORTED_COMPILER_EDITIONS = ['2026.1'] as const;
+export type CompilerEdition = (typeof SUPPORTED_COMPILER_EDITIONS)[number];
+export const DEFAULT_COMPILER_EDITION: CompilerEdition = '2026.1';
+
+export const SUPPORTED_OPTIMIZER_VERSIONS = ['none', 'v1'] as const;
+export type OptimizerVersion = (typeof SUPPORTED_OPTIMIZER_VERSIONS)[number];
+export const DEFAULT_OPTIMIZER_VERSION: OptimizerVersion = 'v1';
+
+export function isSupportedCompilerEdition(edition: unknown): edition is CompilerEdition {
+  return typeof edition === 'string' && (SUPPORTED_COMPILER_EDITIONS as readonly string[]).includes(edition);
+}
+
+export function isSupportedOptimizerVersion(version: unknown): version is OptimizerVersion {
+  return typeof version === 'string' && (SUPPORTED_OPTIMIZER_VERSIONS as readonly string[]).includes(version);
+}
+
+export function resolveCompilerEdition(edition?: CompilerEdition): CompilerEdition {
+  if (edition === undefined) return DEFAULT_COMPILER_EDITION;
+  if (!isSupportedCompilerEdition(edition)) {
+    throw new Error(`unsupported compiler edition "${String(edition)}"; expected one of: ${SUPPORTED_COMPILER_EDITIONS.join(', ')}`);
+  }
+  return edition;
+}
+
+export function resolveOptimizerVersion(options?: { optimize?: boolean; optimizerVersion?: OptimizerVersion }): OptimizerVersion {
+  const optimize = options?.optimize;
+  const version = options?.optimizerVersion;
+  if (version !== undefined) {
+    if (!isSupportedOptimizerVersion(version)) {
+      throw new Error(`unsupported optimizerVersion "${String(version)}"; expected one of: ${SUPPORTED_OPTIMIZER_VERSIONS.join(', ')}`);
+    }
+    if (optimize === false && version !== 'none') {
+      throw new Error(`conflicting compile options: optimize: false cannot be combined with optimizerVersion: "${version}"`);
+    }
+    if (optimize === true && version === 'none') {
+      throw new Error('conflicting compile options: optimize: true cannot be combined with optimizerVersion: "none"');
+    }
+    return version;
+  }
+  return optimize === false ? 'none' : 'v1';
+}
+
+function optimizeInstructionsV1(original: readonly Instruction[], argumentCount: number): Instruction[] {
   let entries = [...original];
   // The compiler preserves original arguments below expression temporaries.
   // One depth-zero read in a straight-line single-argument method can consume
@@ -314,3 +356,16 @@ export function optimizeInstructions(original: readonly Instruction[], argumentC
   }
   throw new Error('optimizer fuel exhausted');
 }
+
+export const OPTIMIZER_PASSES_BY_VERSION: Readonly<Record<OptimizerVersion, (original: readonly Instruction[], argumentCount: number) => Instruction[]>> = {
+  none: (original) => [...original],
+  v1: optimizeInstructionsV1,
+};
+
+export function optimizeInstructions(original: readonly Instruction[], argumentCount: number, version: OptimizerVersion = 'v1'): Instruction[] {
+  if (!Object.hasOwn(OPTIMIZER_PASSES_BY_VERSION, version)) {
+    throw new Error(`unsupported optimizerVersion "${String(version)}"; expected one of: ${SUPPORTED_OPTIMIZER_VERSIONS.join(', ')}`);
+  }
+  return OPTIMIZER_PASSES_BY_VERSION[version](original, argumentCount);
+}
+

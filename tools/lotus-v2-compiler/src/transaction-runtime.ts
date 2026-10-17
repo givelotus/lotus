@@ -550,3 +550,21 @@ export function finalizeTransactionCall(
     throw Error("native fee below final byte floor");
   return { wire: final.wire, txid: final.txid, txhash: final.txhash, stages };
 }
+
+export {
+  DEFAULT_DUST_LIMIT_ATOMS,
+  DEFAULT_FEERATE_PER_KCU,
+  DEFAULT_SDK_PADDING_BPS,
+  DEFAULT_TX_KNEE_SHIFT,
+  estimateTransactionCuAndFee,
+  simulateFeeAndAdjustChange,
+  type FeeSimulationOptions,
+  type FeeSimulationResult,
+  type SimInput,
+  type SimOutput,
+  type SimTransactionLike,
+  type SimWitness,
+  type SimWitnessMethod,
+  type TransactionFeeEstimate,
+} from "./runtime.js";
+
