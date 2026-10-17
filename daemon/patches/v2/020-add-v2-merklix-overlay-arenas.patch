@@ -1,24 +1,27 @@
-From 603a404eb121a2ce7c3045f125b5948f2576d664 Mon Sep 17 00:00:00 2001
+From bdff7fb07ec9bacf47ea0bcf4058cb2e897cc03f Mon Sep 17 00:00:00 2001
 From: Shammah Chancellor <shammah.chancellor@notvalid.com>
-Date: Fri, 16 Oct 2026 15:22:42 -0700
-Subject: [PATCH] 020-add-v2-merklix-overlay-arenas: add persistent Merklix
- overlay arenas and O(1) commitment helpers
+Date: Fri, 16 Oct 2026 18:18:42 -0700
+Subject: 020-add-v2-merklix-overlay-arenas: add persistent Merklix overlay
+ arenas and O(1) commitment helpers
 
+Rolls in unified SmtNode::script_pubkey preservation and frozen-epoch
+re-anchoring so UtxoOverlayArena and lock-free RCU gettxout share a single
+SmtNode representation.
 ---
  src/lotus_v2/CMakeLists.txt        |   2 +-
- src/lotus_v2/mempool_overlay.cpp   | 881 +++++++++++++++++++++++++++++
- src/lotus_v2/mempool_overlay.h     | 352 ++++++++++++
- src/primitives/block.cpp           | 470 +++++++++------
- src/primitives/block.h             |  33 ++
+ src/lotus_v2/mempool_overlay.cpp   | 963 ++++++++++++++++++++++++++++
+ src/lotus_v2/mempool_overlay.h     | 380 +++++++++++
+ src/primitives/block.cpp           | 970 ++++++++++++++++++++++-------
+ src/primitives/block.h             |  82 +++
  src/test/CMakeLists.txt            |   1 +
- src/test/mempool_overlay_tests.cpp | 258 +++++++++
- 7 files changed, 1815 insertions(+), 182 deletions(-)
+ src/test/mempool_overlay_tests.cpp | 258 ++++++++
+ 7 files changed, 2441 insertions(+), 215 deletions(-)
  create mode 100644 src/lotus_v2/mempool_overlay.cpp
  create mode 100644 src/lotus_v2/mempool_overlay.h
  create mode 100644 src/test/mempool_overlay_tests.cpp
 
 diff --git a/src/lotus_v2/CMakeLists.txt b/src/lotus_v2/CMakeLists.txt
-index 15aaa79ed590208a41d40c4485b111205457a26f..d981b589ec3eb6336c48aea96e49f60ec2ff2427 100644
+index 15aaa79ed5..d981b589ec 100644
 --- a/src/lotus_v2/CMakeLists.txt
 +++ b/src/lotus_v2/CMakeLists.txt
 @@ -18,7 +18,7 @@ if(NOT TARGET Boost::headers)
@@ -32,10 +35,10 @@ index 15aaa79ed590208a41d40c4485b111205457a26f..d981b589ec3eb6336c48aea96e49f60e
  add_executable(test_lotus_v2_header
 diff --git a/src/lotus_v2/mempool_overlay.cpp b/src/lotus_v2/mempool_overlay.cpp
 new file mode 100644
-index 0000000000000000000000000000000000000000..46892aa28761cd72dddf4d7a3bfbab3b9848eee5
+index 0000000000..df22661b5d
 --- /dev/null
 +++ b/src/lotus_v2/mempool_overlay.cpp
-@@ -0,0 +1,881 @@
+@@ -0,0 +1,963 @@
 +// Copyright (c) 2026 The Lotus developers
 +// Distributed under the MIT software license, see the accompanying
 +// file COPYING or http://www.opensource.org/licenses/mit-license.php.
@@ -44,6 +47,7 @@ index 0000000000000000000000000000000000000000..46892aa28761cd72dddf4d7a3bfbab3b
 +
 +#include "tagged_hash.h"
 +
++#include <algorithm>
 +#include <cassert>
 +#include <cstring>
 +
@@ -76,13 +80,16 @@ index 0000000000000000000000000000000000000000..46892aa28761cd72dddf4d7a3bfbab3b
 +    return TaggedHash(HashDomain::TxRoot, buf);
 +}
 +
-+std::shared_ptr<const SmtNode> MakeSmtLeaf(const Coin &coin, const Hash &key,
-+                                           const Hash &leaf_hash) {
++std::shared_ptr<const SmtNode> MakeSmtLeaf(
++    const Coin &coin, const Hash &key, const Hash &leaf_hash,
++    std::span<const uint8_t> script_pubkey) {
 +    auto node = std::make_shared<SmtNode>();
 +    node->digest = leaf_hash;
 +    node->count = 1;
++    node->total_value = coin.output.value;
 +    node->key = key;
 +    node->coin = std::make_shared<const Coin>(coin);
++    node->script_pubkey.assign(script_pubkey.begin(), script_pubkey.end());
 +    return node;
 +}
 +
@@ -94,8 +101,10 @@ index 0000000000000000000000000000000000000000..46892aa28761cd72dddf4d7a3bfbab3b
 +    while (SmtKeyBit(existing->key, split) == SmtKeyBit(added->key, split)) {
 +        ++split;
 +    }
++    const uint64_t pair_value = existing->total_value + added->total_value;
 +    auto subtree = std::make_shared<SmtNode>();
 +    subtree->count = 2;
++    subtree->total_value = pair_value;
 +    const unsigned old_bit = SmtKeyBit(existing->key, split);
 +    subtree->child[old_bit] = existing;
 +    subtree->child[1 - old_bit] = added;
@@ -103,6 +112,7 @@ index 0000000000000000000000000000000000000000..46892aa28761cd72dddf4d7a3bfbab3b
 +    for (unsigned d = split; d-- > depth;) {
 +        auto parent = std::make_shared<SmtNode>();
 +        parent->count = 2;
++        parent->total_value = pair_value;
 +        parent->child[SmtKeyBit(old_key, d)] = std::move(subtree);
 +        parent->Refresh(d);
 +        subtree = std::move(parent);
@@ -112,25 +122,30 @@ index 0000000000000000000000000000000000000000..46892aa28761cd72dddf4d7a3bfbab3b
 +
 +std::shared_ptr<const SmtNode>
 +SmtInsertAt(const std::shared_ptr<const SmtNode> &node, const Coin &coin,
-+            const Hash &key, const Hash &leaf_hash, unsigned depth) {
++            const Hash &key, const Hash &leaf_hash,
++            std::span<const uint8_t> script_pubkey, unsigned depth) {
 +    if (!node) {
-+        return MakeSmtLeaf(coin, key, leaf_hash);
++        return MakeSmtLeaf(coin, key, leaf_hash, script_pubkey);
 +    }
 +    if (node->IsLeaf()) {
 +        if (node->key == key) {
-+            if (node->digest == leaf_hash) {
++            if (node->digest == leaf_hash &&
++                std::equal(node->script_pubkey.begin(),
++                           node->script_pubkey.end(), script_pubkey.begin(),
++                           script_pubkey.end())) {
 +                return node;
 +            }
-+            return MakeSmtLeaf(coin, key, leaf_hash);
++            return MakeSmtLeaf(coin, key, leaf_hash, script_pubkey);
 +        }
-+        return JoinSmtLeaves(node, MakeSmtLeaf(coin, key, leaf_hash), depth);
++        return JoinSmtLeaves(
++            node, MakeSmtLeaf(coin, key, leaf_hash, script_pubkey), depth);
 +    }
 +    if (depth >= 256) {
 +        return node;
 +    }
 +    const unsigned bit = SmtKeyBit(key, depth);
-+    auto new_child =
-+        SmtInsertAt(node->child[bit], coin, key, leaf_hash, depth + 1);
++    auto new_child = SmtInsertAt(node->child[bit], coin, key, leaf_hash,
++                                 script_pubkey, depth + 1);
 +    if (new_child == node->child[bit]) {
 +        return node;
 +    }
@@ -138,6 +153,8 @@ index 0000000000000000000000000000000000000000..46892aa28761cd72dddf4d7a3bfbab3b
 +    next->child[bit] = std::move(new_child);
 +    next->count = (next->child[0] ? next->child[0]->count : 0) +
 +                  (next->child[1] ? next->child[1]->count : 0);
++    next->total_value = (next->child[0] ? next->child[0]->total_value : 0) +
++                        (next->child[1] ? next->child[1]->total_value : 0);
 +    next->Refresh(depth);
 +    return next;
 +}
@@ -174,6 +191,8 @@ index 0000000000000000000000000000000000000000..46892aa28761cd72dddf4d7a3bfbab3b
 +    auto next = std::make_shared<SmtNode>(*node);
 +    next->child[bit] = std::move(new_child);
 +    next->count = new_count;
++    next->total_value = (next->child[0] ? next->child[0]->total_value : 0) +
++                        (next->child[1] ? next->child[1]->total_value : 0);
 +    next->Refresh(depth);
 +    return next;
 +}
@@ -190,13 +209,14 @@ index 0000000000000000000000000000000000000000..46892aa28761cd72dddf4d7a3bfbab3b
 +    return (key[depth / 8] >> (depth % 8)) & 1;
 +}
 +
-+void SmtInsert(std::shared_ptr<const SmtNode> &root, const Coin &coin) {
++void SmtInsert(std::shared_ptr<const SmtNode> &root, const Coin &coin,
++               std::span<const uint8_t> script_pubkey) {
 +    Hash leaf_hash{};
 +    if (!UtxoLeaf(coin, leaf_hash)) {
 +        return;
 +    }
 +    const Hash key = OutpointKey(coin.outpoint);
-+    root = SmtInsertAt(root, coin, key, leaf_hash, 0);
++    root = SmtInsertAt(root, coin, key, leaf_hash, script_pubkey, 0);
 +}
 +
 +void SmtErase(std::shared_ptr<const SmtNode> &root, const Outpoint &outpoint) {
@@ -460,6 +480,7 @@ index 0000000000000000000000000000000000000000..46892aa28761cd72dddf4d7a3bfbab3b
 +
 +    base_smt_root_ = base_root;
 +    current_smt_root_ = base_root;
++    smt_root_dirty_ = false;
 +    root_idx_ = ImportSmtNode(base_smt_root_);
 +}
 +
@@ -485,11 +506,37 @@ index 0000000000000000000000000000000000000000..46892aa28761cd72dddf4d7a3bfbab3b
 +    node.is_leaf = smt_node->IsLeaf();
 +    if (node.is_leaf && smt_node->coin) {
 +        node.coin = *smt_node->coin;
++        node.script_pubkey = smt_node->script_pubkey;
 +    } else {
 +        node.base_child[0] = smt_node->child[0];
 +        node.base_child[1] = smt_node->child[1];
 +    }
 +    return AllocNode(node);
++}
++
++std::shared_ptr<const SmtNode>
++UtxoOverlayArena::ExportSmtNode(uint32_t node_idx) const {
++    if (node_idx == kNullIdx) {
++        return nullptr;
++    }
++    const UtxoOverlayNode &n = nodes_[node_idx];
++    auto smt = std::make_shared<SmtNode>();
++    smt->digest = n.digest;
++    smt->count = n.count;
++    if (n.is_leaf) {
++        smt->total_value = n.coin.output.value;
++        smt->key = n.key;
++        smt->coin = std::make_shared<const Coin>(n.coin);
++        smt->script_pubkey = n.script_pubkey;
++        return smt;
++    }
++    smt->child[0] =
++        (n.child[0] != kNullIdx) ? ExportSmtNode(n.child[0]) : n.base_child[0];
++    smt->child[1] =
++        (n.child[1] != kNullIdx) ? ExportSmtNode(n.child[1]) : n.base_child[1];
++    smt->total_value = (smt->child[0] ? smt->child[0]->total_value : 0) +
++                       (smt->child[1] ? smt->child[1]->total_value : 0);
++    return smt;
 +}
 +
 +uint32_t UtxoOverlayArena::MakeLeaf(const Coin &coin, const Hash &key,
@@ -658,13 +705,23 @@ index 0000000000000000000000000000000000000000..46892aa28761cd72dddf4d7a3bfbab3b
 +    }
 +    const Hash key = OutpointKey(coin.outpoint);
 +    root_idx_ = InsertAt(root_idx_, coin, key, leaf_hash, 0);
-+    SmtInsert(current_smt_root_, coin);
++    // [Optimization — Rolls into Patch 020]: Defer SmtNode export until GetSmtRoot()
++    smt_root_dirty_ = true;
 +}
 +
 +void UtxoOverlayArena::EraseOutpoint(const Outpoint &outpoint) {
 +    const Hash key = OutpointKey(outpoint);
 +    root_idx_ = EraseAt(root_idx_, outpoint, key, 0);
-+    SmtErase(current_smt_root_, outpoint);
++    // [Optimization — Rolls into Patch 020]: Defer SmtNode export until GetSmtRoot()
++    smt_root_dirty_ = true;
++}
++
++const std::shared_ptr<const SmtNode> &UtxoOverlayArena::GetSmtRoot() const {
++    if (smt_root_dirty_) {
++        current_smt_root_ = ExportSmtNode(root_idx_);
++        smt_root_dirty_ = false;
++    }
++    return current_smt_root_;
 +}
 +
 +Hash UtxoOverlayArena::RootDigest() const {
@@ -809,6 +866,7 @@ index 0000000000000000000000000000000000000000..46892aa28761cd72dddf4d7a3bfbab3b
 +            erased.push_back(op);
 +        }
 +    }
++    std::sort(erased.begin(), erased.end(), OutpointLess{});
 +    return erased;
 +}
 +
@@ -820,6 +878,10 @@ index 0000000000000000000000000000000000000000..46892aa28761cd72dddf4d7a3bfbab3b
 +            inserted.push_back(coin);
 +        }
 +    }
++    std::sort(inserted.begin(), inserted.end(),
++              [](const Coin &a, const Coin &b) {
++                  return OutpointLess{}(a.outpoint, b.outpoint);
++              });
 +    return inserted;
 +}
 +
@@ -874,8 +936,31 @@ index 0000000000000000000000000000000000000000..46892aa28761cd72dddf4d7a3bfbab3b
 +        return;
 +    }
 +
-+    auto existing_txs = speculative_layer_.GetOrderedTxs();
++    const bool same_or_unset_tip =
++        (speculative_layer_.GetParentBlockId() == tip_block_id ||
++         speculative_layer_.GetParentBlockId() == Hash{});
++    auto old_frozen = std::move(frozen_epochs_);
 +    frozen_epochs_.clear();
++    if (same_or_unset_tip) {
++        for (const auto &old_layer : old_frozen) {
++            MempoolOverlayLayer reanchored(tip_block_id, base_utxo_root,
++                                           base_mon_state, next_height,
++                                           parent_mtp, old_layer.GetLayerId());
++            for (auto [tx_id, entry] : old_layer.GetOrderedTxs()) {
++                for (auto &coin : entry.created_coins) {
++                    coin.creation_height = next_height;
++                    coin.creation_parent_mtp = parent_mtp;
++                }
++                reanchored.AddTransaction(
++                    entry.tx_id, entry.tx_hash, entry.linear_cost,
++                    entry.spent_outpoints, entry.created_coins, entry.fee_sats,
++                    entry.sigchecks, entry.tx_ref);
++            }
++            frozen_epochs_.push_back(std::move(reanchored));
++        }
++    }
++
++    auto existing_txs = speculative_layer_.GetOrderedTxs();
 +    speculative_layer_.Reset(tip_block_id, std::move(base_utxo_root),
 +                             base_mon_state, next_height, parent_mtp,
 +                             next_epoch_id_);
@@ -919,10 +1004,10 @@ index 0000000000000000000000000000000000000000..46892aa28761cd72dddf4d7a3bfbab3b
 +} // namespace lotus::v2
 diff --git a/src/lotus_v2/mempool_overlay.h b/src/lotus_v2/mempool_overlay.h
 new file mode 100644
-index 0000000000000000000000000000000000000000..56a66c003c74766fd8fe5e5115c3bef63fd04180
+index 0000000000..893aa6c781
 --- /dev/null
 +++ b/src/lotus_v2/mempool_overlay.h
-@@ -0,0 +1,352 @@
+@@ -0,0 +1,380 @@
 +// Copyright (c) 2026 The Lotus developers
 +// Distributed under the MIT software license, see the accompanying
 +// file COPYING or http://www.opensource.org/licenses/mit-license.php.
@@ -939,8 +1024,10 @@ index 0000000000000000000000000000000000000000..56a66c003c74766fd8fe5e5115c3bef6
 +#include <array>
 +#include <cstddef>
 +#include <cstdint>
++#include <cstring>
 +#include <map>
 +#include <memory>
++#include <unordered_map>
 +#include <vector>
 +
 +namespace lotus::v2 {
@@ -948,12 +1035,18 @@ index 0000000000000000000000000000000000000000..56a66c003c74766fd8fe5e5115c3bef6
 +/**
 + * Persistent Sparse Merkle Tree node for UTXO state commitments.
 + * Shared across historical block snapshots and mempool overlay layers.
++ * Optimization (rolled into initial overlay commit): stores script_pubkey bytes
++ * alongside Coin in SmtNode so lock-free RCU gettxout (LookupV2SmtCoin) and
++ * MempoolOverlayLayer share a single unified SmtNode representation without
++ * separate tree conversions.
 + */
 +struct SmtNode {
 +    Hash digest{};
 +    size_t count{0};
++    uint64_t total_value{0};
 +    Hash key{};
 +    std::shared_ptr<const Coin> coin;
++    std::vector<uint8_t> script_pubkey;
 +    std::array<std::shared_ptr<const SmtNode>, 2> child;
 +
 +    bool IsLeaf() const noexcept { return coin != nullptr; }
@@ -964,7 +1057,8 @@ index 0000000000000000000000000000000000000000..56a66c003c74766fd8fe5e5115c3bef6
 +};
 +
 +bool SmtKeyBit(const Hash &key, unsigned depth) noexcept;
-+void SmtInsert(std::shared_ptr<const SmtNode> &root, const Coin &coin);
++void SmtInsert(std::shared_ptr<const SmtNode> &root, const Coin &coin,
++               std::span<const uint8_t> script_pubkey = {});
 +void SmtErase(std::shared_ptr<const SmtNode> &root, const Outpoint &outpoint);
 +std::shared_ptr<const Coin> SmtFind(const std::shared_ptr<const SmtNode> &root,
 +                                    const Outpoint &outpoint);
@@ -1032,12 +1126,19 @@ index 0000000000000000000000000000000000000000..56a66c003c74766fd8fe5e5115c3bef6
 +    std::array<std::shared_ptr<const SmtNode>, 2> base_child{{nullptr, nullptr}};
 +    Hash key{};
 +    Coin coin{};
++    std::vector<uint8_t> script_pubkey;
 +    bool is_leaf{false};
 +};
 +
 +/**
 + * Contiguous arena-backed UTXO SMT overlay supporting O(1) initialization from
 + * a parent block's SmtNode root and path-copying InsertCoin / EraseOutpoint.
++ *
++ * [Optimization — Rolls into Patch 020]:
++ * Eliminates duplicate per-coin SmtInsert/SmtErase tree walks and BLAKE3 hashes
++ * during InsertCoin/EraseOutpoint. Instead, all mutations operate solely on the
++ * contiguous `nodes_` arena and `GetSmtRoot()` lazily exports `current_smt_root_`
++ * from `nodes_[root_idx_]` on demand with zero BLAKE3 re-hashing.
 + */
 +class UtxoOverlayArena {
 +public:
@@ -1054,9 +1155,7 @@ index 0000000000000000000000000000000000000000..56a66c003c74766fd8fe5e5115c3bef6
 +
 +    Hash RootDigest() const;
 +    uint32_t RootIdx() const noexcept { return root_idx_; }
-+    const std::shared_ptr<const SmtNode> &GetSmtRoot() const noexcept {
-+        return current_smt_root_;
-+    }
++    const std::shared_ptr<const SmtNode> &GetSmtRoot() const;
 +    const std::shared_ptr<const SmtNode> &GetBaseSmtRoot() const noexcept {
 +        return base_smt_root_;
 +    }
@@ -1066,10 +1165,12 @@ index 0000000000000000000000000000000000000000..56a66c003c74766fd8fe5e5115c3bef6
 +    std::vector<UtxoOverlayNode> nodes_;
 +    uint32_t root_idx_{kNullIdx};
 +    std::shared_ptr<const SmtNode> base_smt_root_;
-+    std::shared_ptr<const SmtNode> current_smt_root_;
++    mutable std::shared_ptr<const SmtNode> current_smt_root_;
++    mutable bool smt_root_dirty_{false};
 +
 +    uint32_t AllocNode(const UtxoOverlayNode &node);
 +    uint32_t ImportSmtNode(const std::shared_ptr<const SmtNode> &smt_node);
++    std::shared_ptr<const SmtNode> ExportSmtNode(uint32_t node_idx) const;
 +    uint32_t MakeLeaf(const Coin &coin, const Hash &key, const Hash &leaf_hash);
 +    uint32_t JoinLeaves(uint32_t existing_idx, uint32_t added_idx,
 +                        unsigned depth);
@@ -1084,6 +1185,18 @@ index 0000000000000000000000000000000000000000..56a66c003c74766fd8fe5e5115c3bef6
 +};
 +
 +Hash EmptyTxRoot();
++
++/**
++ * O(1) hash functor for Outpoint in unordered_map tables.
++ */
++struct OutpointHasher {
++    size_t operator()(const Outpoint &op) const noexcept {
++        uint64_t h = 0;
++        std::memcpy(&h, op.tx_id.data(), sizeof(h));
++        return static_cast<size_t>(
++            h ^ (static_cast<uint64_t>(op.index) * 0x9e3779b97f4a7c15ULL));
++    }
++};
 +
 +/**
 + * Comparator matching Bitcoin/Lotus CTOR TxId ordering (uint256::Compare,
@@ -1156,7 +1269,7 @@ index 0000000000000000000000000000000000000000..56a66c003c74766fd8fe5e5115c3bef6
 +
 +    Hash GetSubtreeARoot() const { return tx_arena_.SubtreeARoot(tx_root_idx_); }
 +    Hash GetUtxoRootDigest() const { return utxo_arena_.RootDigest(); }
-+    const std::shared_ptr<const SmtNode> &GetUtxoRoot() const noexcept {
++    const std::shared_ptr<const SmtNode> &GetUtxoRoot() const {
 +        return utxo_arena_.GetSmtRoot();
 +    }
 +    const std::shared_ptr<const SmtNode> &GetBaseUtxoRoot() const noexcept {
@@ -1202,8 +1315,8 @@ index 0000000000000000000000000000000000000000..56a66c003c74766fd8fe5e5115c3bef6
 +    uint64_t sum_non_cb_effective_cost_{0};
 +
 +    std::map<Hash, OverlayTxEntry, CtorTxIdCompare> active_txs_;
-+    std::map<Outpoint, Coin, OutpointLess> created_coins_;
-+    std::map<Outpoint, uint32_t, OutpointLess> spent_outpoints_;
++    std::unordered_map<Outpoint, Coin, OutpointHasher> created_coins_;
++    std::unordered_map<Outpoint, uint32_t, OutpointHasher> spent_outpoints_;
 +};
 +
 +/**
@@ -1276,10 +1389,16 @@ index 0000000000000000000000000000000000000000..56a66c003c74766fd8fe5e5115c3bef6
 +
 +#endif // LOTUS_V2_MEMPOOL_OVERLAY_H
 diff --git a/src/primitives/block.cpp b/src/primitives/block.cpp
-index 90b4d3b72f4293324521341e85ce0389093620fb..41dbc7079f7da389f48fff4d4b1842a896a8940f 100644
+index 90b4d3b72f..13f0c27939 100644
 --- a/src/primitives/block.cpp
 +++ b/src/primitives/block.cpp
-@@ -10,11 +10,15 @@
+@@ -5,16 +5,21 @@
+ 
+ #include <primitives/block.h>
+ 
++#include <algorithm>
+ #include <cassert>
+ #include <cstring>
  #include <filesystem>
  #include <fstream>
  #include <hash.h>
@@ -1295,7 +1414,7 @@ index 90b4d3b72f4293324521341e85ce0389093620fb..41dbc7079f7da389f48fff4d4b1842a8
  #include <tinyformat.h>
  
  namespace {
-@@ -22,150 +26,10 @@ lotus::v2::ChainId g_active_v2_chain_id{};
+@@ -22,150 +27,11 @@ lotus::v2::ChainId g_active_v2_chain_id{};
  std::mutex g_v2_utxo_mutex;
  std::string g_v2_state_persist_dir;
  
@@ -1445,12 +1564,25 @@ index 90b4d3b72f4293324521341e85ce0389093620fb..41dbc7079f7da389f48fff4d4b1842a8
 -}
 +using lotus::v2::SmtErase;
 +using lotus::v2::SmtInsert;
++using lotus::v2::SmtKeyBit;
 +using lotus::v2::SmtNode;
 +using lotus::v2::SmtRoot;
  
  struct V2BlockStateSnapshot {
      std::shared_ptr<const SmtNode> utxo_root;
-@@ -183,13 +47,7 @@ constexpr lotus::v2::MonetaryProfile kDefaultMonetaryProfile{
+@@ -173,9 +39,11 @@ struct V2BlockStateSnapshot {
+     BlockHash parent_hash{};
+     std::vector<lotus::v2::Outpoint> erased_outpoints;
+     std::vector<lotus::v2::Coin> inserted_coins;
++    uint64_t circulating_supply{0};
+ };
+ 
+ std::map<BlockHash, V2BlockStateSnapshot> g_v2_state_snapshots;
++uint64_t g_latest_v2_circulating_supply = 0;
+ 
+ constexpr uint64_t kDeltaSnapshotMagic = 0xFFFFFFFFFFFFFFFEULL;
+ 
+@@ -183,13 +51,7 @@ constexpr lotus::v2::MonetaryProfile kDefaultMonetaryProfile{
      2, 16, 2, 4, 32, 60, 2, 2000, 3, 1000, 200, lotus::v2::Hash{2}};
  
  lotus::v2::MonetaryState InitialV2MonetaryState() {
@@ -1465,10 +1597,195 @@ index 90b4d3b72f4293324521341e85ce0389093620fb..41dbc7079f7da389f48fff4d4b1842a8
  }
  
  void SaveV2BlockStateToDiskLocked(const BlockHash &blockHash,
-@@ -408,6 +266,40 @@ bool LoadV2BlockStateFromDiskLocked(const BlockHash &blockHash,
+@@ -259,8 +121,17 @@ void SaveV2BlockStateToDiskLocked(const BlockHash &blockHash,
+     std::filesystem::rename(tmp_path, final_path, ec);
+ }
+ 
+-bool LoadV2BlockStateFromDiskLocked(const BlockHash &blockHash,
+-                                    V2BlockStateSnapshot &snap) {
++struct RawDiskDeltaSnapshot {
++    BlockHash block_hash{};
++    lotus::v2::MonetaryState mon_state{};
++    bool is_delta{false};
++    BlockHash parent_hash{};
++    std::vector<lotus::v2::Outpoint> erased_outpoints;
++    std::vector<lotus::v2::Coin> inserted_coins;
++};
++
++bool ReadRawDiskSnapshotFile(const BlockHash &blockHash,
++                             RawDiskDeltaSnapshot &out) {
+     if (g_v2_state_persist_dir.empty()) {
+         return false;
+     }
+@@ -271,12 +142,13 @@ bool LoadV2BlockStateFromDiskLocked(const BlockHash &blockHash,
+     if (!in) {
+         return false;
+     }
++    out.block_hash = blockHash;
+     std::vector<uint8_t> mon_bytes(56);
+     if (!in.read(reinterpret_cast<char *>(mon_bytes.data()), 56)) {
+         return false;
+     }
+     try {
+-        snap.mon_state = lotus::v2::DecodeMonetaryState(mon_bytes);
++        out.mon_state = lotus::v2::DecodeMonetaryState(mon_bytes);
+     } catch (...) {
+         return false;
+     }
+@@ -289,26 +161,12 @@ bool LoadV2BlockStateFromDiskLocked(const BlockHash &blockHash,
+         count |= uint64_t(count_buf[i]) << (8 * i);
+     }
+     if (count == kDeltaSnapshotMagic) {
++        out.is_delta = true;
+         uint256 parent_raw;
+         if (!in.read(reinterpret_cast<char *>(parent_raw.begin()), 32)) {
+             return false;
+         }
+-        snap.parent_hash = BlockHash{parent_raw};
+-        snap.utxo_root.reset();
+-        if (!snap.parent_hash.IsNull()) {
+-            auto it = g_v2_state_snapshots.find(snap.parent_hash);
+-            if (it != g_v2_state_snapshots.end()) {
+-                snap.utxo_root = it->second.utxo_root;
+-            } else {
+-                V2BlockStateSnapshot parent_snap;
+-                if (!LoadV2BlockStateFromDiskLocked(snap.parent_hash,
+-                                                    parent_snap)) {
+-                    return false;
+-                }
+-                snap.utxo_root = parent_snap.utxo_root;
+-                g_v2_state_snapshots[snap.parent_hash] = std::move(parent_snap);
+-            }
+-        }
++        out.parent_hash = BlockHash{parent_raw};
+         uint8_t erased_buf[4]{};
+         if (!in.read(reinterpret_cast<char *>(erased_buf), 4)) {
+             return false;
+@@ -320,8 +178,8 @@ bool LoadV2BlockStateFromDiskLocked(const BlockHash &blockHash,
+         if (erased_count > 1000000) {
+             return false;
+         }
+-        snap.erased_outpoints.clear();
+-        snap.erased_outpoints.reserve(erased_count);
++        out.erased_outpoints.clear();
++        out.erased_outpoints.reserve(erased_count);
+         for (uint32_t c = 0; c < erased_count; ++c) {
+             lotus::v2::Outpoint op{};
+             if (!in.read(reinterpret_cast<char *>(op.tx_id.data()), 32)) {
+@@ -335,8 +193,7 @@ bool LoadV2BlockStateFromDiskLocked(const BlockHash &blockHash,
+             for (unsigned i = 0; i < 4; ++i) {
+                 op.index |= uint32_t(idx_buf[i]) << (8 * i);
+             }
+-            SmtErase(snap.utxo_root, op);
+-            snap.erased_outpoints.push_back(op);
++            out.erased_outpoints.push_back(op);
+         }
+         uint8_t inserted_buf[4]{};
+         if (!in.read(reinterpret_cast<char *>(inserted_buf), 4)) {
+@@ -349,8 +206,8 @@ bool LoadV2BlockStateFromDiskLocked(const BlockHash &blockHash,
+         if (inserted_count > 1000000) {
+             return false;
+         }
+-        snap.inserted_coins.clear();
+-        snap.inserted_coins.reserve(inserted_count);
++        out.inserted_coins.clear();
++        out.inserted_coins.reserve(inserted_count);
+         for (uint32_t c = 0; c < inserted_count; ++c) {
+             uint8_t len_buf[4]{};
+             if (!in.read(reinterpret_cast<char *>(len_buf), 4)) {
+@@ -371,17 +228,18 @@ bool LoadV2BlockStateFromDiskLocked(const BlockHash &blockHash,
+             if (!lotus::v2::DecodeCoinBytes(encoded, coin)) {
+                 return false;
+             }
+-            SmtInsert(snap.utxo_root, coin);
+-            snap.inserted_coins.push_back(std::move(coin));
++            out.inserted_coins.push_back(std::move(coin));
+         }
+         return true;
+     }
+     if (count > 1000000) {
+         return false;
+     }
+-    snap.utxo_root.reset();
+-    snap.erased_outpoints.clear();
+-    snap.inserted_coins.clear();
++    out.is_delta = false;
++    out.parent_hash = BlockHash{};
++    out.erased_outpoints.clear();
++    out.inserted_coins.clear();
++    out.inserted_coins.reserve(count);
+     for (uint64_t c = 0; c < count; ++c) {
+         uint8_t len_buf[4]{};
+         if (!in.read(reinterpret_cast<char *>(len_buf), 4)) {
+@@ -402,17 +260,108 @@ bool LoadV2BlockStateFromDiskLocked(const BlockHash &blockHash,
+         if (!lotus::v2::DecodeCoinBytes(encoded, coin)) {
+             return false;
+         }
+-        SmtInsert(snap.utxo_root, coin);
+-        snap.inserted_coins.push_back(std::move(coin));
++        out.inserted_coins.push_back(std::move(coin));
+     }
      return true;
  }
  
++bool LoadV2BlockStateFromDiskLocked(const BlockHash &blockHash,
++                                    V2BlockStateSnapshot &snap) {
++    std::vector<RawDiskDeltaSnapshot> chain;
++    BlockHash cur = blockHash;
++    std::shared_ptr<const lotus::v2::SmtNode> base_root{};
++
++    while (!cur.IsNull()) {
++        auto it = g_v2_state_snapshots.find(cur);
++        if (it != g_v2_state_snapshots.end()) {
++            base_root = it->second.utxo_root;
++            break;
++        }
++        RawDiskDeltaSnapshot raw;
++        if (!ReadRawDiskSnapshotFile(cur, raw)) {
++            if (chain.empty()) {
++                return false;
++            }
++            // Reached unpersisted genesis ancestor; base UTXO tree is empty.
++            base_root.reset();
++            break;
++        }
++        const bool is_delta = raw.is_delta;
++        const BlockHash next_parent = raw.parent_hash;
++        chain.push_back(std::move(raw));
++        if (!is_delta) {
++            base_root.reset();
++            break;
++        }
++        cur = next_parent;
++    }
++
++    std::shared_ptr<const lotus::v2::SmtNode> running_root = base_root;
++    for (auto it = chain.rbegin(); it != chain.rend(); ++it) {
++        if (!it->is_delta) {
++            running_root.reset();
++        }
++        for (const auto &op : it->erased_outpoints) {
++            SmtErase(running_root, op);
++        }
++        for (const auto &coin : it->inserted_coins) {
++            SmtInsert(running_root, coin);
++        }
++        V2BlockStateSnapshot built;
++        built.utxo_root = running_root;
++        built.mon_state = it->mon_state;
++        built.parent_hash = it->parent_hash;
++        built.erased_outpoints = std::move(it->erased_outpoints);
++        built.inserted_coins = std::move(it->inserted_coins);
++        built.circulating_supply =
++            running_root ? running_root->total_value : 0;
++        if (it + 1 == chain.rend()) {
++            snap = built;
++        }
++        g_v2_state_snapshots[it->block_hash] = std::move(built);
++    }
++    return true;
++}
++
 +lotus::v2::MonetaryState
 +AdvanceV2MonetaryStateForBlock(const lotus::v2::MonetaryState &parent_mon_state,
 +                               uint32_t nBits,
@@ -1506,7 +1823,21 @@ index 90b4d3b72f4293324521341e85ce0389093620fb..41dbc7079f7da389f48fff4d4b1842a8
  V2BlockStateSnapshot BuildNextV2BlockState(const CBlock &block,
                                             const BlockHash &hashPrevBlock,
                                             uint64_t nHeight,
-@@ -432,6 +324,12 @@ V2BlockStateSnapshot BuildNextV2BlockState(const CBlock &block,
+                                            uint64_t nParentMtp) {
+-    V2BlockStateSnapshot state{{}, InitialV2MonetaryState(), hashPrevBlock, {}, {}};
++    V2BlockStateSnapshot state{{}, InitialV2MonetaryState(), hashPrevBlock, {}, {}, 0};
+     if (nHeight == 0) {
+         return state;
+     }
+@@ -422,6 +371,7 @@ V2BlockStateSnapshot BuildNextV2BlockState(const CBlock &block,
+         if (it != g_v2_state_snapshots.end()) {
+             state.utxo_root = it->second.utxo_root;
+             state.mon_state = it->second.mon_state;
++            state.circulating_supply = it->second.circulating_supply;
+         } else if (LoadV2BlockStateFromDiskLocked(hashPrevBlock, state)) {
+             V2BlockStateSnapshot cached = state;
+             g_v2_state_snapshots[hashPrevBlock] = std::move(cached);
+@@ -432,6 +382,12 @@ V2BlockStateSnapshot BuildNextV2BlockState(const CBlock &block,
      }
      std::vector<uint64_t> tx_linear_costs;
      tx_linear_costs.reserve(block.vtx.size());
@@ -1514,12 +1845,12 @@ index 90b4d3b72f4293324521341e85ce0389093620fb..41dbc7079f7da389f48fff4d4b1842a8
 +    std::vector<lotus::v2::Outpoint> ordered_spent;
 +    std::map<lotus::v2::Outpoint, lotus::v2::Coin, lotus::v2::OutpointLess>
 +        block_created;
-+    std::vector<lotus::v2::Coin> ordered_created;
++    std::vector<std::pair<lotus::v2::Coin, CScript>> ordered_created;
 +
      for (const auto &ptx : block.vtx) {
          const CTransaction &tx = *ptx;
          const uint64_t linear_cost =
-@@ -445,8 +343,8 @@ V2BlockStateSnapshot BuildNextV2BlockState(const CBlock &block,
+@@ -445,8 +401,8 @@ V2BlockStateSnapshot BuildNextV2BlockState(const CBlock &block,
                      std::memcpy(op.tx_id.data(), txin.prevout.GetTxId().begin(),
                                  32);
                      op.index = txin.prevout.GetN();
@@ -1530,14 +1861,15 @@ index 90b4d3b72f4293324521341e85ce0389093620fb..41dbc7079f7da389f48fff4d4b1842a8
                  }
              }
          }
-@@ -464,45 +362,82 @@ V2BlockStateSnapshot BuildNextV2BlockState(const CBlock &block,
+@@ -464,45 +420,99 @@ V2BlockStateSnapshot BuildNextV2BlockState(const CBlock &block,
                      nHeight,
                      nParentMtp,
                      tx.IsCoinBase()};
 -                SmtInsert(state.utxo_root, coin);
 -                state.inserted_coins.push_back(std::move(coin));
 +                block_created[coin.outpoint] = coin;
-+                ordered_created.push_back(std::move(coin));
++                ordered_created.emplace_back(std::move(coin),
++                                             tx.vout[j].scriptPubKey);
              }
          }
      }
@@ -1563,9 +1895,10 @@ index 90b4d3b72f4293324521341e85ce0389093620fb..41dbc7079f7da389f48fff4d4b1842a8
 -        if (work == 0) {
 -            work = 1;
 +    }
-+    for (auto &coin : ordered_created) {
++    for (auto &[coin, script] : ordered_created) {
 +        if (block_spent.find(coin.outpoint) == block_spent.end()) {
-+            SmtInsert(state.utxo_root, coin);
++            SmtInsert(state.utxo_root, coin,
++                      std::span<const uint8_t>(script.data(), script.size()));
 +            state.inserted_coins.push_back(std::move(coin));
          }
      }
@@ -1589,6 +1922,8 @@ index 90b4d3b72f4293324521341e85ce0389093620fb..41dbc7079f7da389f48fff4d4b1842a8
 -    state.mon_state = transition.state;
 +    state.mon_state = AdvanceV2MonetaryStateForBlock(state.mon_state,
 +                                                     block.nBits, block_cost);
++    state.circulating_supply =
++        state.utxo_root ? state.utxo_root->total_value : 0;
      return state;
  }
 +
@@ -1637,10 +1972,23 @@ index 90b4d3b72f4293324521341e85ce0389093620fb..41dbc7079f7da389f48fff4d4b1842a8
 +        }
 +    }
 +}
++
++void CollectSmtCoins(const std::shared_ptr<const SmtNode> &node,
++                     std::vector<lotus::v2::Coin> &out) {
++    if (!node) {
++        return;
++    }
++    if (node->IsLeaf()) {
++        out.push_back(*node->coin);
++        return;
++    }
++    CollectSmtCoins(node->child[0], out);
++    CollectSmtCoins(node->child[1], out);
++}
  } // namespace
  
  const lotus::v2::ChainId &GetActiveV2ChainId() {
-@@ -521,6 +456,34 @@ void SetV2StatePersistDir(const std::string &dir_path) {
+@@ -521,6 +531,34 @@ void SetV2StatePersistDir(const std::string &dir_path) {
      }
  }
  
@@ -1675,7 +2023,7 @@ index 90b4d3b72f4293324521341e85ce0389093620fb..41dbc7079f7da389f48fff4d4b1842a8
  uint256 ComputeV2BlockStateRoot(const CBlock &block,
                                  const BlockHash &hashPrevBlock,
                                  uint64_t nHeight,
-@@ -534,7 +497,11 @@ uint256 ComputeV2BlockStateRoot(const CBlock &block,
+@@ -534,9 +572,14 @@ uint256 ComputeV2BlockStateRoot(const CBlock &block,
      uint256 out;
      std::memcpy(out.begin(), sroot.data(), 32);
      if (record) {
@@ -1687,11 +2035,50 @@ index 90b4d3b72f4293324521341e85ce0389093620fb..41dbc7079f7da389f48fff4d4b1842a8
 +        const BlockHash blockHash = hdr.GetHash();
          std::lock_guard<std::mutex> lock(g_v2_utxo_mutex);
          SaveV2BlockStateToDiskLocked(blockHash, next_state);
++        g_latest_v2_circulating_supply = next_state.circulating_supply;
          g_v2_state_snapshots[blockHash] = std::move(next_state);
-@@ -554,6 +521,147 @@ void RecordV2BlockState(const CBlock &block,
+     }
+     return out;
+@@ -551,9 +594,508 @@ void RecordV2BlockState(const CBlock &block,
+         BuildNextV2BlockState(block, hashPrevBlock, nHeight, nParentMtp);
+     std::lock_guard<std::mutex> lock(g_v2_utxo_mutex);
+     SaveV2BlockStateToDiskLocked(blockHash, next_state);
++    g_latest_v2_circulating_supply = next_state.circulating_supply;
      g_v2_state_snapshots[blockHash] = std::move(next_state);
  }
  
++uint64_t GetV2BlockCirculatingSupply(const BlockHash &blockHash) {
++    std::lock_guard<std::mutex> lock(g_v2_utxo_mutex);
++    if (blockHash.IsNull()) {
++        return g_latest_v2_circulating_supply;
++    }
++    auto it = g_v2_state_snapshots.find(blockHash);
++    if (it != g_v2_state_snapshots.end()) {
++        return it->second.circulating_supply;
++    }
++    V2BlockStateSnapshot snap;
++    if (LoadV2BlockStateFromDiskLocked(blockHash, snap)) {
++        const uint64_t supply = snap.circulating_supply;
++        g_latest_v2_circulating_supply = supply;
++        g_v2_state_snapshots[blockHash] = std::move(snap);
++        return supply;
++    }
++    return g_latest_v2_circulating_supply;
++}
++
++void SetV2BlockCirculatingSupplyForTest(const BlockHash &blockHash,
++                                        uint64_t circulating_supply) {
++    std::lock_guard<std::mutex> lock(g_v2_utxo_mutex);
++    g_latest_v2_circulating_supply = circulating_supply;
++    if (!blockHash.IsNull()) {
++        auto &snap = g_v2_state_snapshots[blockHash];
++        if (snap.mon_state.tail_subsidy == 0) {
++            snap.mon_state = InitialV2MonetaryState();
++        }
++        snap.circulating_supply = circulating_supply;
++    }
++}
++
 +uint256 ComputeV2TxRootFromSubtreeA(const CTransaction &coinbase_tx,
 +                                    const lotus::v2::Hash &subtree_a_root) {
 +    std::array<uint8_t, 65> cb_buf{};
@@ -1747,7 +2134,10 @@ index 90b4d3b72f4293324521341e85ce0389093620fb..41dbc7079f7da389f48fff4d4b1842a8
 +                nHeight,
 +                nParentMtp,
 +                true};
-+            SmtInsert(final_utxo_root, coin);
++            SmtInsert(
++                final_utxo_root, coin,
++                std::span<const uint8_t>(coinbase_tx.vout[j].scriptPubKey.data(),
++                                         coinbase_tx.vout[j].scriptPubKey.size()));
 +            if (record) {
 +                cb_coins.push_back(std::move(coin));
 +            }
@@ -1776,6 +2166,21 @@ index 90b4d3b72f4293324521341e85ce0389093620fb..41dbc7079f7da389f48fff4d4b1842a8
 +    std::memcpy(out.begin(), sroot.data(), 32);
 +
 +    if (record && pBlockHash != nullptr) {
++        for (const auto &[_, oentry] : overlay.GetOrderedTxs()) {
++            const auto ptx =
++                std::static_pointer_cast<const CTransaction>(oentry.tx_ref);
++            if (!ptx) {
++                continue;
++            }
++            for (const auto &coin : oentry.created_coins) {
++                if (coin.outpoint.index < ptx->vout.size() &&
++                    lotus::v2::SmtFind(final_utxo_root, coin.outpoint)) {
++                    const auto &spk = ptx->vout[coin.outpoint.index].scriptPubKey;
++                    SmtInsert(final_utxo_root, coin,
++                              std::span<const uint8_t>(spk.data(), spk.size()));
++                }
++            }
++        }
 +        uint256 parent_raw;
 +        std::memcpy(parent_raw.begin(), overlay.GetParentBlockId().data(), 32);
 +        V2BlockStateSnapshot next_state;
@@ -1787,8 +2192,11 @@ index 90b4d3b72f4293324521341e85ce0389093620fb..41dbc7079f7da389f48fff4d4b1842a8
 +        for (auto &c : cb_coins) {
 +            next_state.inserted_coins.push_back(std::move(c));
 +        }
++        next_state.circulating_supply =
++            next_state.utxo_root ? next_state.utxo_root->total_value : 0;
 +        std::lock_guard<std::mutex> lock(g_v2_utxo_mutex);
 +        SaveV2BlockStateToDiskLocked(*pBlockHash, next_state);
++        g_latest_v2_circulating_supply = next_state.circulating_supply;
 +        g_v2_state_snapshots[*pBlockHash] = std::move(next_state);
 +    }
 +
@@ -1833,23 +2241,354 @@ index 90b4d3b72f4293324521341e85ce0389093620fb..41dbc7079f7da389f48fff4d4b1842a8
 +    return RemoveTransactionFromOverlay(manager.GetSpeculativeOverlay(), tx);
 +}
 +
++V2TemplateBaseState BuildV2TemplateBaseState(
++    std::span<const CTransactionRef> non_coinbase_txs,
++    const BlockHash &hashPrevBlock,
++    uint64_t nHeight,
++    uint64_t nParentMtp) {
++    V2TemplateBaseState base{};
++    base.mon_state = InitialV2MonetaryState();
++    base.height = nHeight;
++    base.parent_mtp = nParentMtp;
++    base.non_cb_tx_count = non_coinbase_txs.size();
++    if (nHeight == 0) {
++        return base;
++    }
++    if (!hashPrevBlock.IsNull()) {
++        std::lock_guard<std::mutex> lock(g_v2_utxo_mutex);
++        auto it = g_v2_state_snapshots.find(hashPrevBlock);
++        if (it != g_v2_state_snapshots.end()) {
++            base.utxo_root = it->second.utxo_root;
++            base.mon_state = it->second.mon_state;
++        } else {
++            V2BlockStateSnapshot disk_state{};
++            if (LoadV2BlockStateFromDiskLocked(hashPrevBlock, disk_state)) {
++                base.utxo_root = disk_state.utxo_root;
++                base.mon_state = disk_state.mon_state;
++                g_v2_state_snapshots[hashPrevBlock] = std::move(disk_state);
++            }
++        }
++    }
++    for (const auto &ptx : non_coinbase_txs) {
++        const CTransaction &tx = *ptx;
++        const uint64_t linear_cost =
++            ::GetSerializeSize(tx) +
++            uint64_t(tx.vin.size() * 64 + tx.vout.size() * 64);
++        base.sum_non_cb_effective_cost +=
++            lotus::v2::TransactionEffectiveCost(linear_cost,
++                                                kDefaultMonetaryProfile);
++        if (!tx.IsCoinBase()) {
++            for (const auto &txin : tx.vin) {
++                if (txin.nFlags != 3) {
++                    lotus::v2::Outpoint op{};
++                    std::memcpy(op.tx_id.data(), txin.prevout.GetTxId().begin(),
++                                32);
++                    op.index = txin.prevout.GetN();
++                    SmtErase(base.utxo_root, op);
++                }
++            }
++        }
++        lotus::v2::Hash txid{};
++        std::memcpy(txid.data(), tx.GetId().begin(), 32);
++        for (size_t j = 0; j < tx.vout.size(); ++j) {
++            if (tx.vout[j].scriptPubKey.IsUnspendable()) {
++                continue;
++            }
++            const lotus::v2::Output v2out = tx.vout[j].ToV2Output();
++            if (!v2out.IsBurn()) {
++                lotus::v2::Coin coin{
++                    {txid, static_cast<uint32_t>(j)},
++                    v2out,
++                    nHeight,
++                    nParentMtp,
++                    tx.IsCoinBase()};
++                SmtInsert(base.utxo_root, coin,
++                          std::span<const uint8_t>(tx.vout[j].scriptPubKey.data(),
++                                                   tx.vout[j].scriptPubKey.size()));
++            }
++        }
++    }
++    return base;
++}
++
++uint256 ComputeV2StateRootFromTemplate(
++    const V2TemplateBaseState &base_state,
++    const CTransaction &coinbase_tx,
++    uint32_t nBits) {
++    lotus::v2::MonetaryState mon_state = base_state.mon_state;
++    lotus::v2::Hash utxo_root_hash{};
++    if (base_state.height > 0) {
++        lotus::v2::Hash txid{};
++        std::memcpy(txid.data(), coinbase_tx.GetId().begin(), 32);
++        if (base_state.utxo_arena) {
++            lotus::v2::UtxoOverlayArena arena = *base_state.utxo_arena;
++            for (size_t j = 0; j < coinbase_tx.vout.size(); ++j) {
++                if (coinbase_tx.vout[j].scriptPubKey.IsUnspendable()) {
++                    continue;
++                }
++                const lotus::v2::Output v2out =
++                    coinbase_tx.vout[j].ToV2Output();
++                if (!v2out.IsBurn()) {
++                    lotus::v2::Coin coin{
++                        {txid, static_cast<uint32_t>(j)},
++                        v2out,
++                        base_state.height,
++                        base_state.parent_mtp,
++                        true};
++                    arena.InsertCoin(coin);
++                }
++            }
++            utxo_root_hash = arena.RootDigest();
++        } else {
++            std::shared_ptr<const SmtNode> utxo_root = base_state.utxo_root;
++            for (size_t j = 0; j < coinbase_tx.vout.size(); ++j) {
++                if (coinbase_tx.vout[j].scriptPubKey.IsUnspendable()) {
++                    continue;
++                }
++                const lotus::v2::Output v2out =
++                    coinbase_tx.vout[j].ToV2Output();
++                if (!v2out.IsBurn()) {
++                    lotus::v2::Coin coin{
++                        {txid, static_cast<uint32_t>(j)},
++                        v2out,
++                        base_state.height,
++                        base_state.parent_mtp,
++                        true};
++                    SmtInsert(
++                        utxo_root, coin,
++                        std::span<const uint8_t>(
++                            coinbase_tx.vout[j].scriptPubKey.data(),
++                            coinbase_tx.vout[j].scriptPubKey.size()));
++                }
++            }
++            utxo_root_hash = SmtRoot(utxo_root);
++        }
++        const uint64_t cb_linear_cost =
++            ::GetSerializeSize(coinbase_tx) +
++            uint64_t(coinbase_tx.vin.size() * 64 + coinbase_tx.vout.size() * 64);
++        const lotus::v2::MonetaryInteger cb_effective_cost =
++            lotus::v2::TransactionEffectiveCost(cb_linear_cost,
++                                                kDefaultMonetaryProfile);
++        const lotus::v2::MonetaryInteger envelope_cost =
++            138 + uint64_t(1 + base_state.non_cb_tx_count) * 64;
++        const lotus::v2::MonetaryInteger block_cost =
++            envelope_cost + cb_effective_cost +
++            base_state.sum_non_cb_effective_cost;
++
++        mon_state = AdvanceV2MonetaryStateForBlock(mon_state, nBits, block_cost);
++    } else {
++        utxo_root_hash = base_state.utxo_arena
++                             ? base_state.utxo_arena->RootDigest()
++                             : SmtRoot(base_state.utxo_root);
++    }
++    const lotus::v2::Hash sroot = lotus::v2::StateRoot(
++        GetActiveV2ChainId(), base_state.height, utxo_root_hash, mon_state);
++    uint256 out;
++    std::memcpy(out.begin(), sroot.data(), 32);
++    return out;
++}
++
++bool GetV2BlockStateCoinsAndMonetary(
++    const BlockHash &blockHash,
++    uint64_t nHeight,
++    std::vector<lotus::v2::Coin> &coins_out,
++    lotus::v2::MonetaryState &monetary_out) {
++    coins_out.clear();
++    if (nHeight == 0) {
++        monetary_out = InitialV2MonetaryState();
++        return true;
++    }
++    std::lock_guard<std::mutex> lock(g_v2_utxo_mutex);
++    auto it = g_v2_state_snapshots.find(blockHash);
++    if (it == g_v2_state_snapshots.end()) {
++        V2BlockStateSnapshot loaded;
++        if (!LoadV2BlockStateFromDiskLocked(blockHash, loaded)) {
++            return false;
++        }
++        it = g_v2_state_snapshots.emplace(blockHash, std::move(loaded)).first;
++    }
++    monetary_out = it->second.mon_state;
++    CollectSmtCoins(it->second.utxo_root, coins_out);
++    std::sort(coins_out.begin(), coins_out.end(),
++              [](const lotus::v2::Coin &a, const lotus::v2::Coin &b) {
++                  if (a.outpoint.tx_id != b.outpoint.tx_id) {
++                      return a.outpoint.tx_id < b.outpoint.tx_id;
++                  }
++                  return a.outpoint.index < b.outpoint.index;
++              });
++    return true;
++}
++
++void ImportV2BlockStateCoinsAndMonetary(
++    const BlockHash &blockHash,
++    const std::vector<lotus::v2::Coin> &coins,
++    const lotus::v2::MonetaryState &monetary_state) {
++    V2BlockStateSnapshot snap{{}, monetary_state, BlockHash{}, {}, {}};
++    snap.inserted_coins.reserve(coins.size());
++    for (const auto &coin : coins) {
++        SmtInsert(snap.utxo_root, coin);
++        snap.inserted_coins.push_back(coin);
++    }
++    std::lock_guard<std::mutex> lock(g_v2_utxo_mutex);
++    SaveV2BlockStateToDiskLocked(blockHash, snap);
++    g_v2_state_snapshots[blockHash] = std::move(snap);
++}
++
++lotus::v2::MonetaryState AdvanceV2BlockMonetaryState(
++    const CBlock &block,
++    const lotus::v2::MonetaryState &parent_mon_state) {
++    std::vector<uint64_t> tx_linear_costs;
++    tx_linear_costs.reserve(block.vtx.size());
++    for (const auto &ptx : block.vtx) {
++        const CTransaction &tx = *ptx;
++        const uint64_t linear_cost =
++            ::GetSerializeSize(tx) +
++            uint64_t(tx.vin.size() * 64 + tx.vout.size() * 64);
++        tx_linear_costs.push_back(linear_cost);
++    }
++    lotus::v2::Hash pow_limit{};
++    pow_limit.fill(0xff);
++    lotus::v2::Hash target_hash{};
++    lotus::v2::MonetaryInteger work = 2;
++    if (lotus::v2::DecodeTarget(block.nBits, pow_limit, target_hash)) {
++        lotus::v2::MonetaryInteger target_int = 0;
++        for (size_t i = target_hash.size(); i > 0; --i) {
++            target_int <<= 8;
++            target_int += target_hash[i - 1];
++        }
++        work = (lotus::v2::MonetaryInteger(1) << 256) / (target_int + 1);
++        if (work == 0) {
++            work = 1;
++        }
++    }
++    const lotus::v2::MonetaryInteger envelope_cost =
++        138 + uint64_t(block.vtx.size()) * 64;
++    const lotus::v2::MonetaryInteger block_cost = lotus::v2::BlockEffectiveCost(
++        envelope_cost, tx_linear_costs, kDefaultMonetaryProfile);
++    const lotus::v2::MonetaryInteger capped_cost =
++        (lotus::v2::RequiredBlockBurn(block_cost,
++                                      parent_mon_state.ema_block_cost,
++                                      kDefaultMonetaryProfile) >
++         parent_mon_state.tail_subsidy)
++            ? lotus::v2::MonetaryInteger(kDefaultMonetaryProfile.ema_min)
++            : block_cost;
++    const lotus::v2::MonetaryTransition transition = lotus::v2::AdvanceMonetary(
++        kDefaultMonetaryProfile, parent_mon_state, work, {},
++        /*coinbase_native_outputs=*/0, /*coinbase_native_burn=*/0,
++        /*coinbase_bytes=*/0, /*tx_frame_prefix_bytes=*/0, capped_cost,
++        capped_cost);
++    return transition.state;
++}
++
++std::shared_ptr<const SmtNode> GetV2BlockUtxoRoot(const BlockHash &blockHash,
++                                                  bool *found_out) {
++    if (blockHash.IsNull()) {
++        if (found_out) {
++            *found_out = false;
++        }
++        return nullptr;
++    }
++    std::lock_guard<std::mutex> lock(g_v2_utxo_mutex);
++    auto it = g_v2_state_snapshots.find(blockHash);
++    if (it != g_v2_state_snapshots.end()) {
++        if (found_out) {
++            *found_out = true;
++        }
++        return it->second.utxo_root;
++    }
++    V2BlockStateSnapshot disk_state{};
++    if (LoadV2BlockStateFromDiskLocked(blockHash, disk_state)) {
++        auto root = disk_state.utxo_root;
++        g_v2_state_snapshots[blockHash] = std::move(disk_state);
++        if (found_out) {
++            *found_out = true;
++        }
++        return root;
++    }
++    if (found_out) {
++        *found_out = false;
++    }
++    return nullptr;
++}
++
++std::optional<CTxOut> LookupV2SmtCoin(const std::shared_ptr<const SmtNode> &root,
++                                      const COutPoint &outpoint,
++                                      uint32_t *height_out,
++                                      bool *coinbase_out) {
++    if (!root) {
++        return std::nullopt;
++    }
++    lotus::v2::Outpoint op{};
++    std::memcpy(op.tx_id.data(), outpoint.GetTxId().begin(), 32);
++    op.index = outpoint.GetN();
++    const lotus::v2::Hash key = lotus::v2::OutpointKey(op);
++    std::shared_ptr<const SmtNode> node = root;
++    unsigned depth = 0;
++    while (node && !node->IsLeaf() && depth < 256) {
++        node = node->child[SmtKeyBit(key, depth++)];
++    }
++    if (!node || !node->IsLeaf() || node->key != key || !node->coin ||
++        node->coin->outpoint != op) {
++        return std::nullopt;
++    }
++    if (height_out) {
++        *height_out = static_cast<uint32_t>(node->coin->creation_height);
++    }
++    if (coinbase_out) {
++        *coinbase_out = node->coin->coinbase;
++    }
++    CTxOut txout = CTxOut::FromV2Output(node->coin->output);
++    if (!node->script_pubkey.empty()) {
++        txout.scriptPubKey =
++            CScript(node->script_pubkey.begin(), node->script_pubkey.end());
++    }
++    return txout;
++}
++
  lotus::v2::Header CBlockHeader::ToV2Header() const {
      lotus::v2::Header h;
      std::memcpy(h.prev_id.data(), hashPrevBlock.begin(), 32);
 diff --git a/src/primitives/block.h b/src/primitives/block.h
-index fa79c174a50d9992d265facd5a0887f00dce2f02..d31bb981d74512a41f76f8cf1898557b3b334473 100644
+index fa79c174a5..6145ef678e 100644
 --- a/src/primitives/block.h
 +++ b/src/primitives/block.h
-@@ -197,7 +197,18 @@ struct CBlockLocator {
+@@ -8,9 +8,12 @@
+ 
+ #include <array>
+ #include <lotus_v2/header.h>
++#include <lotus_v2/monetary.h>
++#include <memory>
+ #include <primitives/blockhash.h>
+ #include <primitives/transaction.h>
+ #include <serialize.h>
++#include <span>
+ #include <uint256.h>
+ #include <util/time.h>
+ 
+@@ -197,7 +200,32 @@ struct CBlockLocator {
      bool IsNull() const { return vHave.empty(); }
  };
  
 +namespace lotus::v2 {
++struct Coin;
 +struct SmtNode;
 +struct MonetaryState;
++class UtxoOverlayArena;
 +class MempoolOverlayLayer;
 +class MerklixOverlayManager;
 +} // namespace lotus::v2
++
++struct V2TemplateBaseState {
++    std::shared_ptr<const lotus::v2::SmtNode> utxo_root;
++    // [Patch 035 optimization] Flat arena snapshot from MerklixOverlayManager
++    // avoids exporting O(U) shared_ptr<SmtNode> trees on every mempool update.
++    std::shared_ptr<const lotus::v2::UtxoOverlayArena> utxo_arena;
++    lotus::v2::MonetaryState mon_state{};
++    lotus::v2::MonetaryInteger sum_non_cb_effective_cost{0};
++    size_t non_cb_tx_count{0};
++    uint64_t height{0};
++    uint64_t parent_mtp{0};
++};
 +
  void SetV2StatePersistDir(const std::string &dir_path);
 +bool GetV2BlockStateSnapshot(
@@ -1859,10 +2598,13 @@ index fa79c174a50d9992d265facd5a0887f00dce2f02..d31bb981d74512a41f76f8cf1898557b
  uint256 ComputeV2BlockStateRoot(const CBlock &block,
                                  const BlockHash &hashPrevBlock,
                                  uint64_t nHeight,
-@@ -208,5 +219,27 @@ void RecordV2BlockState(const CBlock &block,
+@@ -208,5 +236,59 @@ void RecordV2BlockState(const CBlock &block,
                          const BlockHash &hashPrevBlock,
                          uint64_t nHeight,
                          uint64_t nParentMtp);
++uint64_t GetV2BlockCirculatingSupply(const BlockHash &blockHash);
++void SetV2BlockCirculatingSupplyForTest(const BlockHash &blockHash,
++                                        uint64_t circulating_supply);
 +uint256 ComputeV2TxRootFromSubtreeA(const CTransaction &coinbase_tx,
 +                                    const lotus::v2::Hash &subtree_a_root);
 +uint256 ComputeV2StateRootFromOverlay(
@@ -1885,10 +2627,39 @@ index fa79c174a50d9992d265facd5a0887f00dce2f02..d31bb981d74512a41f76f8cf1898557b
 +                                  const CTransaction &tx);
 +bool RemoveTransactionFromOverlay(lotus::v2::MerklixOverlayManager &manager,
 +                                  const CTransaction &tx);
++V2TemplateBaseState BuildV2TemplateBaseState(
++    std::span<const CTransactionRef> non_coinbase_txs,
++    const BlockHash &hashPrevBlock,
++    uint64_t nHeight,
++    uint64_t nParentMtp);
++uint256 ComputeV2StateRootFromTemplate(
++    const V2TemplateBaseState &base_state,
++    const CTransaction &coinbase_tx,
++    uint32_t nBits);
++bool GetV2BlockStateCoinsAndMonetary(
++    const BlockHash &blockHash,
++    uint64_t nHeight,
++    std::vector<lotus::v2::Coin> &coins_out,
++    lotus::v2::MonetaryState &monetary_out);
++void ImportV2BlockStateCoinsAndMonetary(
++    const BlockHash &blockHash,
++    const std::vector<lotus::v2::Coin> &coins,
++    const lotus::v2::MonetaryState &monetary_state);
++lotus::v2::MonetaryState AdvanceV2BlockMonetaryState(
++    const CBlock &block,
++    const lotus::v2::MonetaryState &parent_mon_state);
++std::shared_ptr<const lotus::v2::SmtNode>
++GetV2BlockUtxoRoot(const BlockHash &blockHash, bool *found_out = nullptr);
++std::optional<CTxOut>
++LookupV2SmtCoin(const std::shared_ptr<const lotus::v2::SmtNode> &root,
++                const COutPoint &outpoint,
++                uint32_t *height_out = nullptr,
++                bool *coinbase_out = nullptr);
  
  #endif // BITCOIN_PRIMITIVES_BLOCK_H
++
 diff --git a/src/test/CMakeLists.txt b/src/test/CMakeLists.txt
-index 49ef02d4683b79cce9966959ffb4ddaef1470544..8e586f12d44aaceecd01109dc329959bfd23524b 100644
+index 49ef02d468..8e586f12d4 100644
 --- a/src/test/CMakeLists.txt
 +++ b/src/test/CMakeLists.txt
 @@ -191,6 +191,7 @@ add_boost_unit_tests_to_suite(bitcoin test_bitcoin
@@ -1901,7 +2672,7 @@ index 49ef02d4683b79cce9966959ffb4ddaef1470544..8e586f12d44aaceecd01109dc329959b
  		merkleblock_tests.cpp
 diff --git a/src/test/mempool_overlay_tests.cpp b/src/test/mempool_overlay_tests.cpp
 new file mode 100644
-index 0000000000000000000000000000000000000000..3b6ea27eaded01c63abb4e960576103b1113bf81
+index 0000000000..3b6ea27ead
 --- /dev/null
 +++ b/src/test/mempool_overlay_tests.cpp
 @@ -0,0 +1,258 @@
