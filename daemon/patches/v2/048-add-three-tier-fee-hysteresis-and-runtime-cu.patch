@@ -1,0 +1,1369 @@
+From 823926ff3008ac8921eba4c7baccec58c79f4780 Mon Sep 17 00:00:00 2001
+From: Shammah Chancellor <shammah.chancellor@notvalid.com>
+Date: Sat, 17 Oct 2026 01:06:50 -0700
+Subject: [PATCH] lotus_v2: implement 3-tier fee hysteresis, exact runtime CU,
+ and <k> ENUMERATE bound
+
+---
+ src/lotus_v2/CMakeLists.txt     |   2 +-
+ src/lotus_v2/fee_hysteresis.cpp | 189 +++++++++++++++++++++++++
+ src/lotus_v2/fee_hysteresis.h   |  96 +++++++++++++
+ src/lotus_v2/test_vm.cpp        |  29 +++-
+ src/lotus_v2/vm.cpp             | 190 ++++++++++++++++++++++---
+ src/lotus_v2/vm.h               |  10 +-
+ src/lotus_v2/vm_cost.inc        |   6 +-
+ src/rpc/mempool.cpp             | 143 ++++++++++++++++++-
+ src/test/policy_fee_tests.cpp   | 241 ++++++++++++++++++++++++++++++++
+ 9 files changed, 873 insertions(+), 33 deletions(-)
+ create mode 100644 src/lotus_v2/fee_hysteresis.cpp
+ create mode 100644 src/lotus_v2/fee_hysteresis.h
+
+diff --git a/src/lotus_v2/CMakeLists.txt b/src/lotus_v2/CMakeLists.txt
+index aa86fe9f91..b346ffc833 100644
+--- a/src/lotus_v2/CMakeLists.txt
++++ b/src/lotus_v2/CMakeLists.txt
+@@ -52,7 +52,7 @@ if(NOT TARGET Boost::headers)
+     find_package(Boost 1.64 REQUIRED)
+ endif()
+ 
+-add_library(lotus_v2_header STATIC header.cpp tagged_hash.cpp commitment.cpp output.cpp transaction.cpp sparse_state.cpp monetary.cpp mempool_overlay.cpp set_reconciliation.cpp utxo_fast_filter.cpp)
++add_library(lotus_v2_header STATIC header.cpp tagged_hash.cpp commitment.cpp output.cpp transaction.cpp sparse_state.cpp monetary.cpp mempool_overlay.cpp set_reconciliation.cpp utxo_fast_filter.cpp fee_hysteresis.cpp)
+ target_link_libraries(lotus_v2_header PUBLIC lotus_v2_blake3 Boost::headers)
+ 
+ add_executable(test_lotus_v2_header
+diff --git a/src/lotus_v2/fee_hysteresis.cpp b/src/lotus_v2/fee_hysteresis.cpp
+new file mode 100644
+index 0000000000..e159207d49
+--- /dev/null
++++ b/src/lotus_v2/fee_hysteresis.cpp
+@@ -0,0 +1,189 @@
++// Copyright (c) 2026 The Lotus developers
++// Distributed under the MIT software license, see the accompanying
++// file COPYING or http://www.opensource.org/licenses/mit-license.php.
++
++#include "fee_hysteresis.h"
++
++#include <algorithm>
++#include <limits>
++
++namespace lotus::v2 {
++
++namespace {
++using UInt128 = unsigned __int128;
++
++uint64_t ClampU128ToU64(UInt128 v) noexcept {
++    if (v > UInt128(std::numeric_limits<uint64_t>::max())) {
++        return std::numeric_limits<uint64_t>::max();
++    }
++    return static_cast<uint64_t>(v);
++}
++} // namespace
++
++FeeHysteresisController::FeeHysteresisController(FeeHysteresisConfig config)
++    : config_(config),
++      current_rpc_rate_per_kcu_(std::max<uint64_t>(
++          1, config.consensus_floor_per_kcu)) {
++    config_.consensus_floor_per_kcu = current_rpc_rate_per_kcu_;
++    if (config_.hysteresis_window_ms < 0) {
++        config_.hysteresis_window_ms = 0;
++    }
++    if (config_.hysteresis_discount_permille > 1000) {
++        config_.hysteresis_discount_permille = 1000;
++    }
++    samples_.push_back(RateSample{0, current_rpc_rate_per_kcu_});
++}
++
++uint64_t FeeHysteresisController::GetConsensusFloorPerKCu() const noexcept {
++    return config_.consensus_floor_per_kcu;
++}
++
++void FeeHysteresisController::PruneLocked(int64_t now_ms) const {
++    const int64_t cutoff_ms = now_ms - config_.hysteresis_window_ms;
++    while (!samples_.empty() && samples_.front().timestamp_ms < cutoff_ms) {
++        samples_.pop_front();
++    }
++}
++
++uint64_t FeeHysteresisController::RollingMinRpcRateLocked(int64_t now_ms) const {
++    PruneLocked(now_ms);
++    uint64_t min_rate = current_rpc_rate_per_kcu_;
++    for (const auto &s : samples_) {
++        if (s.timestamp_ms <= now_ms) {
++            min_rate = std::min(min_rate, s.rpc_rate_per_kcu);
++        }
++    }
++    return std::max(config_.consensus_floor_per_kcu, min_rate);
++}
++
++uint64_t FeeHysteresisController::GetRpcAdmissionRatePerKCu(
++    int64_t now_ms) const {
++    std::lock_guard<std::mutex> lock(mutex_);
++    PruneLocked(now_ms);
++    return current_rpc_rate_per_kcu_;
++}
++
++uint64_t FeeHysteresisController::GetRecommendedSdkRatePerKCu(
++    int64_t now_ms) const {
++    const uint64_t rpc_rate = GetRpcAdmissionRatePerKCu(now_ms);
++    const UInt128 num =
++        UInt128(rpc_rate) * UInt128(1000 + config_.sdk_cushion_permille);
++    return ClampU128ToU64((num + 999) / 1000);
++}
++
++uint64_t FeeHysteresisController::GetP2pRelayRatePerKCu(int64_t now_ms) const {
++    std::lock_guard<std::mutex> lock(mutex_);
++    const uint64_t min_rpc = RollingMinRpcRateLocked(now_ms);
++    const uint64_t keep_permille = 1000 - config_.hysteresis_discount_permille;
++    const uint64_t discounted = static_cast<uint64_t>(
++        (UInt128(min_rpc) * UInt128(keep_permille)) / 1000);
++    return std::max(config_.consensus_floor_per_kcu, discounted);
++}
++
++FeeRateInfo FeeHysteresisController::GetFeeRateInfo(int64_t now_ms) const {
++    std::lock_guard<std::mutex> lock(mutex_);
++    const uint64_t rpc_rate = current_rpc_rate_per_kcu_;
++    const uint64_t min_rpc = RollingMinRpcRateLocked(now_ms);
++    const uint64_t keep_permille = 1000 - config_.hysteresis_discount_permille;
++    const uint64_t discounted = static_cast<uint64_t>(
++        (UInt128(min_rpc) * UInt128(keep_permille)) / 1000);
++    const uint64_t p2p_rate =
++        std::max(config_.consensus_floor_per_kcu, discounted);
++    const UInt128 sdk_num =
++        UInt128(rpc_rate) * UInt128(1000 + config_.sdk_cushion_permille);
++    const uint64_t sdk_rate = ClampU128ToU64((sdk_num + 999) / 1000);
++
++    return FeeRateInfo{
++        .consensus_floor_per_kcu = config_.consensus_floor_per_kcu,
++        .p2p_relay_feerate_per_kcu = p2p_rate,
++        .rpc_admission_feerate_per_kcu = rpc_rate,
++        .recommended_sdk_feerate_per_kcu = sdk_rate,
++        .hysteresis_window_ms = config_.hysteresis_window_ms,
++        .hysteresis_discount_permille = config_.hysteresis_discount_permille,
++    };
++}
++
++void FeeHysteresisController::SetRpcAdmissionRatePerKCu(
++    uint64_t rpc_rate_per_kcu, int64_t now_ms) {
++    std::lock_guard<std::mutex> lock(mutex_);
++    const uint64_t clamped =
++        std::max(config_.consensus_floor_per_kcu, rpc_rate_per_kcu);
++    current_rpc_rate_per_kcu_ = clamped;
++    PruneLocked(now_ms);
++    if (!samples_.empty() && samples_.back().timestamp_ms == now_ms) {
++        samples_.back().rpc_rate_per_kcu = clamped;
++    } else {
++        samples_.push_back(RateSample{now_ms, clamped});
++    }
++}
++
++uint64_t FeeHysteresisController::UpdateCongestion(uint64_t active_utilization,
++                                                   uint64_t target_capacity,
++                                                   int64_t now_ms) {
++    const uint64_t target =
++        target_capacity > 0 ? target_capacity : config_.target_utilization_cu;
++    uint64_t next_rate = config_.consensus_floor_per_kcu;
++    if (target > 0 && active_utilization > target) {
++        const UInt128 excess = UInt128(active_utilization - target);
++        const UInt128 floor = UInt128(config_.consensus_floor_per_kcu);
++        const UInt128 linear_term = (floor * excess) / UInt128(target);
++        const UInt128 quad_term =
++            (floor * excess * excess) / (UInt128(target) * UInt128(target));
++        next_rate = ClampU128ToU64(floor + linear_term + quad_term);
++    }
++    SetRpcAdmissionRatePerKCu(next_rate, now_ms);
++    return next_rate;
++}
++
++void FeeHysteresisController::Reset(int64_t now_ms) {
++    std::lock_guard<std::mutex> lock(mutex_);
++    samples_.clear();
++    current_rpc_rate_per_kcu_ = config_.consensus_floor_per_kcu;
++    samples_.push_back(RateSample{now_ms, current_rpc_rate_per_kcu_});
++}
++
++uint64_t FeeHysteresisController::ComputeFeeForCu(
++    uint64_t tx_cu, uint64_t rate_per_kcu) noexcept {
++    if (tx_cu == 0 || rate_per_kcu == 0) {
++        return 0;
++    }
++    const UInt128 prod = UInt128(tx_cu) * UInt128(rate_per_kcu);
++    return ClampU128ToU64((prod + 999) / 1000);
++}
++
++FeeCheckResult FeeHysteresisController::EvaluateTransactionFee(
++    FeeTier tier, uint64_t tx_cu, uint64_t paid_fee_sats,
++    int64_t now_ms) const {
++    const FeeRateInfo info = GetFeeRateInfo(now_ms);
++    uint64_t required_rate = info.consensus_floor_per_kcu;
++    switch (tier) {
++        case FeeTier::RpcAdmission:
++            required_rate = info.rpc_admission_feerate_per_kcu;
++            break;
++        case FeeTier::P2pRelay:
++            required_rate = info.p2p_relay_feerate_per_kcu;
++            break;
++        case FeeTier::ConsensusFloor:
++            required_rate = info.consensus_floor_per_kcu;
++            break;
++    }
++    const uint64_t required_fee = ComputeFeeForCu(tx_cu, required_rate);
++    const uint64_t recommended_sdk_fee =
++        ComputeFeeForCu(tx_cu, info.recommended_sdk_feerate_per_kcu);
++    return FeeCheckResult{
++        .accepted = paid_fee_sats >= required_fee,
++        .tier = tier,
++        .tx_cu = tx_cu,
++        .paid_fee_sats = paid_fee_sats,
++        .required_fee_sats = required_fee,
++        .required_rate_per_kcu = required_rate,
++        .recommended_sdk_fee_sats = std::max(required_fee, recommended_sdk_fee),
++    };
++}
++
++FeeHysteresisController &GetGlobalFeeHysteresisController() {
++    static FeeHysteresisController instance{};
++    return instance;
++}
++
++} // namespace lotus::v2
+diff --git a/src/lotus_v2/fee_hysteresis.h b/src/lotus_v2/fee_hysteresis.h
+new file mode 100644
+index 0000000000..93da9a5b0e
+--- /dev/null
++++ b/src/lotus_v2/fee_hysteresis.h
+@@ -0,0 +1,96 @@
++// Copyright (c) 2026 The Lotus developers
++// Distributed under the MIT software license, see the accompanying
++// file COPYING or http://www.opensource.org/licenses/mit-license.php.
++
++#ifndef LOTUS_V2_FEE_HYSTERESIS_H
++#define LOTUS_V2_FEE_HYSTERESIS_H
++
++#include <cstdint>
++#include <deque>
++#include <mutex>
++
++namespace lotus::v2 {
++
++enum class FeeTier : uint8_t {
++    RpcAdmission = 1,
++    P2pRelay = 2,
++    ConsensusFloor = 3,
++};
++
++constexpr uint64_t DEFAULT_CONSENSUS_FLOOR_PER_KCU = 1000;
++constexpr int64_t DEFAULT_HYSTERESIS_WINDOW_MS = 30000;
++constexpr uint64_t DEFAULT_HYSTERESIS_DISCOUNT_PERMILLE = 150;
++constexpr uint64_t DEFAULT_SDK_CUSHION_PERMILLE = 50;
++constexpr uint64_t DEFAULT_TARGET_UTILIZATION_CU = 25'000'000;
++
++struct FeeHysteresisConfig {
++    uint64_t consensus_floor_per_kcu = DEFAULT_CONSENSUS_FLOOR_PER_KCU;
++    int64_t hysteresis_window_ms = DEFAULT_HYSTERESIS_WINDOW_MS;
++    uint64_t hysteresis_discount_permille = DEFAULT_HYSTERESIS_DISCOUNT_PERMILLE;
++    uint64_t sdk_cushion_permille = DEFAULT_SDK_CUSHION_PERMILLE;
++    uint64_t target_utilization_cu = DEFAULT_TARGET_UTILIZATION_CU;
++};
++
++struct FeeRateInfo {
++    uint64_t consensus_floor_per_kcu = DEFAULT_CONSENSUS_FLOOR_PER_KCU;
++    uint64_t p2p_relay_feerate_per_kcu = DEFAULT_CONSENSUS_FLOOR_PER_KCU;
++    uint64_t rpc_admission_feerate_per_kcu = DEFAULT_CONSENSUS_FLOOR_PER_KCU;
++    uint64_t recommended_sdk_feerate_per_kcu = 1050;
++    int64_t hysteresis_window_ms = DEFAULT_HYSTERESIS_WINDOW_MS;
++    uint64_t hysteresis_discount_permille = DEFAULT_HYSTERESIS_DISCOUNT_PERMILLE;
++};
++
++struct FeeCheckResult {
++    bool accepted = false;
++    FeeTier tier = FeeTier::RpcAdmission;
++    uint64_t tx_cu = 0;
++    uint64_t paid_fee_sats = 0;
++    uint64_t required_fee_sats = 0;
++    uint64_t required_rate_per_kcu = 0;
++    uint64_t recommended_sdk_fee_sats = 0;
++};
++
++class FeeHysteresisController {
++public:
++    explicit FeeHysteresisController(
++        FeeHysteresisConfig config = FeeHysteresisConfig{});
++
++    uint64_t GetConsensusFloorPerKCu() const noexcept;
++    uint64_t GetRpcAdmissionRatePerKCu(int64_t now_ms) const;
++    uint64_t GetRecommendedSdkRatePerKCu(int64_t now_ms) const;
++    uint64_t GetP2pRelayRatePerKCu(int64_t now_ms) const;
++
++    FeeRateInfo GetFeeRateInfo(int64_t now_ms) const;
++
++    uint64_t UpdateCongestion(uint64_t active_utilization,
++                              uint64_t target_capacity, int64_t now_ms);
++    void SetRpcAdmissionRatePerKCu(uint64_t rpc_rate_per_kcu, int64_t now_ms);
++    void Reset(int64_t now_ms = 0);
++
++    FeeCheckResult EvaluateTransactionFee(FeeTier tier, uint64_t tx_cu,
++                                          uint64_t paid_fee_sats,
++                                          int64_t now_ms) const;
++
++    static uint64_t ComputeFeeForCu(uint64_t tx_cu,
++                                    uint64_t rate_per_kcu) noexcept;
++
++private:
++    struct RateSample {
++        int64_t timestamp_ms = 0;
++        uint64_t rpc_rate_per_kcu = DEFAULT_CONSENSUS_FLOOR_PER_KCU;
++    };
++
++    void PruneLocked(int64_t now_ms) const;
++    uint64_t RollingMinRpcRateLocked(int64_t now_ms) const;
++
++    FeeHysteresisConfig config_;
++    mutable std::mutex mutex_;
++    mutable std::deque<RateSample> samples_;
++    uint64_t current_rpc_rate_per_kcu_ = DEFAULT_CONSENSUS_FLOOR_PER_KCU;
++};
++
++FeeHysteresisController &GetGlobalFeeHysteresisController();
++
++} // namespace lotus::v2
++
++#endif // LOTUS_V2_FEE_HYSTERESIS_H
+diff --git a/src/lotus_v2/test_vm.cpp b/src/lotus_v2/test_vm.cpp
+index 44afa97d44..7a4ae71d51 100644
+--- a/src/lotus_v2/test_vm.cpp
++++ b/src/lotus_v2/test_vm.cpp
+@@ -436,18 +436,37 @@ void ChargedAccounting() {
+     };
+     auto hash = charge("03616263b8");
+     CHECK(hash.charged && hash.accounting_cost == 45 &&
+-          hash.enforcement_cost == 45);
++          hash.enforcement_cost == 45 &&
++          hash.invocation.executed_cost == 45);
+     auto underflow = charge("b8");
+     CHECK(underflow.charged && underflow.accounting_cost == 1282);
+     auto loop = charge("4e69796a4e");
+-    CHECK(loop.charged && loop.accounting_cost == 4664 &&
+-          loop.invocation.status == VmStatus::Success);
++    CHECK(loop.charged && loop.accounting_cost == 74 &&
++          loop.invocation.status == VmStatus::Success &&
++          loop.invocation.executed_cost == 74);
++    auto loop_five = charge("5269796a4e");
++    CHECK(loop_five.charged && loop_five.accounting_cost == 56 + 5 * 18 &&
++          loop_five.invocation.status == VmStatus::Success &&
++          loop_five.invocation.executed_cost == 56 + 5 * 18);
++    auto loop_dynamic = charge("69796a4e", {Number(1)});
++    CHECK(loop_dynamic.charged && loop_dynamic.accounting_cost == 4646 &&
++          loop_dynamic.invocation.status == VmStatus::Success &&
++          loop_dynamic.invocation.executed_cost == 56);
++    auto loop_break = charge("5269794e6b6a4e");
++    CHECK(loop_break.charged &&
++          loop_break.invocation.status == VmStatus::Success &&
++          loop_break.invocation.executed_cost > 0 &&
++          loop_break.invocation.executed_cost < loop_break.accounting_cost);
+     auto ignored_suffix = charge("5e4cfd");
+     CHECK(ignored_suffix.charged && ignored_suffix.accounting_cost == 3 &&
+-          ignored_suffix.invocation.status == VmStatus::AutomaticSuccess);
++          ignored_suffix.invocation.status == VmStatus::AutomaticSuccess &&
++          ignored_suffix.invocation.executed_cost == 3);
+     CHECK(!charge("4cfd5e").charged); // bad push before success
+     auto skipped = charge("0061b8634e64");
+-    CHECK(skipped.charged && skipped.accounting_cost > 128);
++    CHECK(skipped.charged && skipped.accounting_cost > 128 &&
++          skipped.invocation.status == VmStatus::Success &&
++          skipped.invocation.executed_cost > 0 &&
++          skipped.invocation.executed_cost < skipped.accounting_cost);
+     // Merkle folding adds a conservative selected hash charge for every
+     // bounded proof step. An unknown selector takes the maximum step price.
+     const VmBytes leaf(32), empty, two_steps(64);
+diff --git a/src/lotus_v2/vm.cpp b/src/lotus_v2/vm.cpp
+index 9a40c32564..1fa92facc1 100644
+--- a/src/lotus_v2/vm.cpp
++++ b/src/lotus_v2/vm.cpp
+@@ -1089,9 +1089,12 @@ namespace {
+         return curve.Equal(left, right);
+     }
+ 
++#include "vm_cost.inc"
++
+     class Machine {
+         const std::vector<Instruction> &code;
+         const VmProfile &profile;
++        const VmCostProfile &cost_profile;
+         uint16_t input_count;
+         uint16_t output_count;
+         const VmExecutionContext *context;
+@@ -1104,12 +1107,32 @@ namespace {
+         std::vector<VmBytes> alternate;
+         size_t bytes = 0;
+         size_t steps = 0;
++        VmCostUnits executed_cost = 0;
++        bool tracking_step = false;
++        std::vector<size_t> step_operands;
++        std::vector<size_t> step_results;
++
++        void Charge(VmCostUnits delta) {
++            executed_cost = RawAdd(executed_cost, delta);
++        }
++        VmCostUnits MerkleStepCost(Int selector) const {
++            const std::array<size_t, 1> tagged{96}, pair{64};
++            const std::array<size_t, 1> digest{32};
++            const std::array<VmCostUnits, 4> cost{
++                OpCost(0xba, tagged, digest, cost_profile, false),
++                OpCost(0xba, pair, digest, cost_profile, false),
++                OpCost(0xb8, pair, digest, cost_profile, false),
++                OpCost(0xb9, pair, digest, cost_profile, false)};
++            if (selector >= 0 && selector <= 3) return cost[size_t(selector)];
++            return *std::max_element(cost.begin(), cost.end());
++        }
+ 
+         VmBytes Pop() {
+             if (stack.empty()) throw VmFailure("stack underflow");
+             VmBytes value = std::move(stack.back());
+             bytes -= value.size();
+             stack.pop_back();
++            if (tracking_step) step_operands.push_back(value.size());
+             return value;
+         }
+         void Push(VmBytes value, bool to_alt = false) {
+@@ -1120,6 +1143,7 @@ namespace {
+                 target.size() >= cap ||
+                 value.size() > profile.max_vm_bytes - bytes)
+                 throw VmFailure("stack bound exceeded");
++            if (tracking_step && !to_alt) step_results.push_back(value.size());
+             bytes += value.size();
+             target.push_back(std::move(value));
+         }
+@@ -1228,7 +1252,14 @@ namespace {
+                 const auto &ins = code[i];
+                 const uint8_t op = ins.op;
+                 if (op == 0x61 || op == 0x62) {
+-                    bool condition = Boolean(Pop());
++                    VmBytes cond_bytes = Pop();
++                    const std::array<size_t, 1> cond_op{cond_bytes.size()};
++                    Charge(OpCost(op, cond_op, {}, cost_profile, false));
++                    if (ins.peer != ins.end) {
++                        Charge(OpCost(0x63, {}, {}, cost_profile, false));
++                    }
++                    Charge(OpCost(0x64, {}, {}, cost_profile, false));
++                    bool condition = Boolean(cond_bytes);
+                     if (op == 0x62) condition = !condition;
+                     size_t branch_begin = condition ? i + 1 : ins.peer + 1;
+                     size_t branch_end = condition ? ins.peer : ins.end;
+@@ -1239,14 +1270,22 @@ namespace {
+                     continue;
+                 }
+                 if (op >= 0x67 && op <= 0x69) {
++                    VmBytes bound_bytes;
++                    if (op == 0x69) bound_bytes = Pop();
+                     Int bound = op == 0x67   ? Int(input_count)
+                                 : op == 0x68 ? Int(output_count)
+-                                             : Numeric(Pop());
++                                             : Numeric(bound_bytes);
+                     if (bound < 0 || (op == 0x69 && bound > 256))
+                         throw VmFailure("loop bound");
++                    const std::array<size_t, 1> loop_op{bound_bytes.size()};
++                    Charge(OpCost(op,
++                                  op == 0x69 ? std::span<const size_t>(loop_op)
++                                             : std::span<const size_t>(),
++                                  {}, cost_profile, false));
+                     for (size_t index = 0; index < size_t(bound); ++index) {
+                         Tick();
+                         Push(Number(index));
++                        Charge(OpCost(0x6a, {}, {}, cost_profile, false));
+                         unsigned signal =
+                             Execute(i + 1, ins.peer, active_loops + 1);
+                         if (signal) {
+@@ -1257,16 +1296,28 @@ namespace {
+                     i = ins.peer;
+                     continue;
+                 }
++                step_operands.clear();
++                step_results.clear();
++                tracking_step = true;
+                 if (op >= 1 && op <= 0x4c) {
+                     Push(ins.data);
++                    tracking_step = false;
++                    Charge(OpCost(op, step_operands, step_results, cost_profile,
++                                  false));
+                     continue;
+                 }
+                 if (op == 0) {
+                     Push(Number(0));
++                    tracking_step = false;
++                    Charge(OpCost(op, step_operands, step_results, cost_profile,
++                                  false));
+                     continue;
+                 }
+                 if (op >= 0x4d && op <= 0x5d) {
+                     Push(Number(op == 0x4d ? -1 : op - 0x4d));
++                    tracking_step = false;
++                    Charge(OpCost(op, step_operands, step_results, cost_profile,
++                                  false));
+                     continue;
+                 }
+                 switch (op) {
+@@ -1281,6 +1332,9 @@ namespace {
+                         Int depth = Numeric(Pop());
+                         if (depth < 1 || depth > active_loops)
+                             throw VmFailure("BREAK depth");
++                        tracking_step = false;
++                        Charge(OpCost(op, step_operands, step_results,
++                                      cost_profile, false));
+                         return unsigned(depth);
+                     }
+                     case 0x70:
+@@ -1292,6 +1346,7 @@ namespace {
+                         VmBytes value = std::move(alternate.back());
+                         bytes -= value.size();
+                         alternate.pop_back();
++                        step_operands.push_back(value.size());
+                         Push(std::move(value));
+                         break;
+                     }
+@@ -1328,11 +1383,15 @@ namespace {
+                     }
+                     case 0x76:
+                         Require(6);
++                        for (auto it = stack.end() - 6; it != stack.end(); ++it)
++                            step_operands.push_back(it->size());
+                         std::rotate(stack.end() - 6, stack.end() - 4,
+                                     stack.end());
+                         break;
+                     case 0x77:
+                         Require(4);
++                        for (auto it = stack.end() - 4; it != stack.end(); ++it)
++                            step_operands.push_back(it->size());
+                         std::rotate(stack.end() - 4, stack.end() - 2,
+                                     stack.end());
+                         break;
+@@ -1344,6 +1403,7 @@ namespace {
+                         break;
+                     case 0x7a:
+                         Require(1);
++                        step_operands.push_back(stack.back().size());
+                         Push(stack.back());
+                         break;
+                     case 0x7b: {
+@@ -1351,17 +1411,23 @@ namespace {
+                         auto top = Pop();
+                         Pop();
+                         Push(std::move(top));
++                        step_operands.erase(step_operands.begin());
++                        step_results.pop_back();
+                         break;
+                     }
+                     case 0x7c:
+                         Require(2);
++                        step_operands.push_back(stack[stack.size() - 2].size());
+                         Push(stack[stack.size() - 2]);
+                         break;
+                     case 0x7d: {
+                         const Int index = Numeric(Pop());
+                         if (index < 0 || index >= Int(stack.size()))
+                             throw VmFailure("PICK index");
+-                        Push(stack[stack.size() - 1 - size_t(index)]);
++                        const auto &picked =
++                            stack[stack.size() - 1 - size_t(index)];
++                        step_operands.push_back(picked.size());
++                        Push(picked);
+                         break;
+                     }
+                     case 0x7e: {
+@@ -1369,21 +1435,31 @@ namespace {
+                         if (index < 0 || index >= Int(stack.size()))
+                             throw VmFailure("ROLL index");
+                         auto item = stack.end() - 1 - size_t(index);
++                        step_operands.push_back(item->size());
++                        if (i > begin && LiteralValue(&code[i - 1])) {
++                            step_results.push_back(item->size());
++                        }
+                         std::rotate(item, item + 1, stack.end());
+                         break;
+                     }
+                     case 0x7f:
+                         Require(3);
++                        for (auto it = stack.end() - 3; it != stack.end(); ++it)
++                            step_operands.push_back(it->size());
+                         std::rotate(stack.end() - 3, stack.end() - 2,
+                                     stack.end());
+                         break;
+                     case 0x80:
+                         Require(2);
++                        step_operands.push_back(stack[stack.size() - 2].size());
++                        step_operands.push_back(stack[stack.size() - 1].size());
+                         std::swap(stack[stack.size() - 1],
+                                   stack[stack.size() - 2]);
+                         break;
+                     case 0x81: {
+                         Require(2);
++                        step_operands.push_back(stack[stack.size() - 2].size());
++                        step_operands.push_back(stack[stack.size() - 1].size());
+                         auto top = stack.back();
+                         std::swap(stack[stack.size() - 1],
+                                   stack[stack.size() - 2]);
+@@ -1430,6 +1506,7 @@ namespace {
+                     }
+                     case 0x8c:
+                         Require(1);
++                        step_operands.push_back(stack.back().size());
+                         Push(Number(stack.back().size()));
+                         break;
+                     case 0x8d: {
+@@ -1449,8 +1526,12 @@ namespace {
+                     case 0x92: {
+                         auto b = Pop(), a = Pop();
+                         Push(Number(a == b));
+-                        if (op == 0x92 && !Boolean(Pop()))
+-                            throw VmFailure("EQUALVERIFY false");
++                        if (op == 0x92) {
++                            if (!Boolean(Pop()))
++                                throw VmFailure("EQUALVERIFY false");
++                            step_operands.pop_back();
++                            step_results.pop_back();
++                        }
+                         break;
+                     }
+                     case 0x93: {
+@@ -1547,6 +1628,21 @@ namespace {
+                     case 0xad:
+                     case 0xae: {
+                         const auto raw_b = Pop(), raw_a = Pop();
++                        if (op == 0xa0 || op == 0xa1 || op == 0xa2) {
++                            const size_t limbs_a = std::max<size_t>(
++                                1, (std::min<size_t>(raw_a.size(),
++                                                     VM_MAX_NUMERIC_BYTES) +
++                                    15) /
++                                       16);
++                            const size_t limbs_b = std::max<size_t>(
++                                1, (std::min<size_t>(raw_b.size(),
++                                                     VM_MAX_NUMERIC_BYTES) +
++                                    15) /
++                                       16);
++                            const size_t quad = limbs_a * limbs_b;
++                            if (quad > 1)
++                                step_operands.push_back((quad - 1) * 16);
++                        }
+                         if (op == 0xa4 || op == 0xa5) {
+                             const bool b = Boolean(raw_b), a = Boolean(raw_a);
+                             Push(Number(op == 0xa4 ? (a && b) : (a || b)));
+@@ -1563,8 +1659,12 @@ namespace {
+                             if (op == 0xab) flag = (cmp <= 0);
+                             if (op == 0xac) flag = (cmp >= 0);
+                             Push(Number(flag));
+-                            if (op == 0xa7 && !Boolean(Pop()))
+-                                throw VmFailure("NUMEQUALVERIFY false");
++                            if (op == 0xa7) {
++                                if (!Boolean(Pop()))
++                                    throw VmFailure("NUMEQUALVERIFY false");
++                                step_operands.pop_back();
++                                step_results.pop_back();
++                            }
+                             break;
+                         }
+                         const size_t width = std::max(raw_a.size(), raw_b.size());
+@@ -1667,6 +1767,12 @@ namespace {
+                         if (raw_a.size() > VM_MAX_NUMERIC_BYTES ||
+                             raw_b.size() > VM_MAX_NUMERIC_BYTES)
+                             throw VmFailure("operand is not U");
++                        const size_t limbs_a = std::max<size_t>(
++                            1, (raw_a.size() + 15) / 16);
++                        const size_t limbs_b = std::max<size_t>(
++                            1, (raw_b.size() + 15) / 16);
++                        const size_t quad = limbs_a * limbs_b;
++                        if (quad > 1) step_operands.push_back((quad - 1) * 16);
+                         const size_t width = std::max<size_t>(
+                             VM_MIN_NUMERIC_BYTES, std::max(raw_a.size(), raw_b.size()));
+                         const Mag prod =
+@@ -1678,11 +1784,27 @@ namespace {
+                         Push(std::move(low));
+                         break;
+                     }
+-                    case 0xb3:
+-                        Push(Number(Log2Q64(NumericBig(Pop()))));
++                    case 0xb3: {
++                        const auto raw_a = Pop();
++                        const size_t limbs = std::max<size_t>(
++                            1, (std::min<size_t>(raw_a.size(),
++                                                 VM_MAX_NUMERIC_BYTES) +
++                                15) /
++                                   16);
++                        if (limbs > 1)
++                            step_operands.push_back((limbs * limbs - 1) * 16);
++                        Push(Number(Log2Q64(NumericBig(raw_a))));
+                         break;
++                    }
+                     case 0xb4: {
+                         const auto raw_a = Pop();
++                        const size_t limbs = std::max<size_t>(
++                            1, (std::min<size_t>(raw_a.size(),
++                                                 VM_MAX_NUMERIC_BYTES) +
++                                15) /
++                                   16);
++                        if (limbs > 1)
++                            step_operands.push_back((limbs * limbs - 1) * 16);
+                         const BigInt root = IntegerSqrt(NumericBig(raw_a));
+                         Push(root.ToSignedBytes(raw_a.size()));
+                         break;
+@@ -1768,6 +1890,8 @@ namespace {
+                                              uint16_t(layer), left, other);
+                         }
+                         Push(VmBytes(acc.begin(), acc.end()));
++                        Charge(RawMul(MerkleStepCost(selected),
++                                      proof.size() / 32));
+                         break;
+                     }
+                     case 0xc2: {
+@@ -2057,6 +2181,9 @@ namespace {
+                         throw VmFailure("assigned opcode not implemented",
+                                         true);
+                 }
++                tracking_step = false;
++                Charge(OpCost(op, step_operands, step_results, cost_profile,
++                              false));
+             }
+             return 0;
+         }
+@@ -2064,15 +2191,16 @@ namespace {
+     public:
+         Machine(const std::vector<Instruction> &code,
+                 std::span<const uint8_t> script, const VmProfile &profile,
++                const VmCostProfile &cost_profile,
+                 uint16_t input_count, uint16_t output_count,
+                 const std::vector<VmBytes> &arguments,
+                 const VmExecutionContext *context,
+                 const PreparedSigningContext *prepared_signing,
+                 BatchSigCollector *batch_sigs)
+-            : code(code), profile(profile), input_count(input_count),
+-              output_count(output_count), context(context),
+-              prepared_signing(prepared_signing), batch_sigs(batch_sigs),
+-              active_script(script),
++            : code(code), profile(profile), cost_profile(cost_profile),
++              input_count(input_count), output_count(output_count),
++              context(context), prepared_signing(prepared_signing),
++              batch_sigs(batch_sigs), active_script(script),
+               mint_count(context && context->prepared ? context->prepared->MintCount() :
+                          context ? std::count_if(
+                                        context->tx.inputs.begin(),
+@@ -2101,8 +2229,8 @@ namespace {
+                 throw VmFailure("unclean final stack");
+             return stack;
+         }
++        VmCostUnits ExecutedCost() const { return executed_cost; }
+     };
+-#include "vm_cost.inc"
+ } // namespace
+ bool ValidateVmCostProfile(const VmProfile &vm, const VmCostProfile &cost, std::string &error) {
+     try {
+@@ -2252,6 +2380,16 @@ VmResult EvaluateVmImpl(std::span<const uint8_t> script,
+             ApplyDerivedFieldSizes(*authenticated_cost, *context);
+             cost_profile = &*authenticated_cost;
+         }
++        VmCostProfile default_unit_cost;
++        if (!cost_profile) {
++            default_unit_cost.max_invocation_cost = ~VmCostUnits(0);
++            default_unit_cost.structural_byte_cost = 1;
++            for (auto &f : default_unit_cost.opcode) {
++                f = {1, 1, 1};
++            }
++        }
++        const VmCostProfile &exec_cost_profile =
++            cost_profile ? *cost_profile : default_unit_cost;
+         std::optional<PreparedSigningContext> local_signing;
+         const PreparedSigningContext *prepared_signing = nullptr;
+         if (context) {
+@@ -2316,6 +2454,8 @@ VmResult EvaluateVmImpl(std::span<const uint8_t> script,
+                 throw VmFailure("extension enforcement charge unavailable",
+                                 true);
+         }
++        const VmCostUnits exec_structural =
++            RawMul(script.size(), exec_cost_profile.structural_byte_cost);
+         if (Scan(script, profile, code)) {
+             if (cost_profile) {
+                 const auto cost =
+@@ -2325,7 +2465,7 @@ VmResult EvaluateVmImpl(std::span<const uint8_t> script,
+                     throw VmFailure("static cost cap exceeded");
+                 *charged_cost = cost;
+             }
+-            return {VmStatus::AutomaticSuccess, {}, {}};
++            return {VmStatus::AutomaticSuccess, {}, {}, exec_structural};
+         }
+         Structure(code, profile);
+         if (cost_profile) {
+@@ -2349,14 +2489,22 @@ VmResult EvaluateVmImpl(std::span<const uint8_t> script,
+         BatchSigCollector *target_sigs =
+             batch_sigs ? batch_sigs : (context ? context->batch_sigs : nullptr);
+         BatchSigCollector staged_sigs;
+-        Machine machine(code, script, profile, input_count, output_count,
+-                        arguments, context, prepared_signing,
++        Machine machine(code, script, profile, exec_cost_profile, input_count,
++                        output_count, arguments, context, prepared_signing,
+                         target_sigs ? &staged_sigs : nullptr);
+-        auto final_stack = machine.Run();
+-        if (target_sigs) {
+-            target_sigs->Merge(std::move(staged_sigs));
++        try {
++            auto final_stack = machine.Run();
++            if (target_sigs) {
++                target_sigs->Merge(std::move(staged_sigs));
++            }
++            const VmCostUnits executed =
++                RawAdd(exec_structural, machine.ExecutedCost());
++            return {VmStatus::Success, {}, std::move(final_stack), executed};
++        } catch (const VmFailure &failure) {
++            const VmCostUnits executed =
++                RawAdd(exec_structural, machine.ExecutedCost());
++            return {failure.status, failure.what(), {}, executed};
+         }
+-        return {VmStatus::Success, {}, std::move(final_stack)};
+     } catch (const VmFailure &failure) {
+         return {failure.status, failure.what(), {}};
+     } catch (const std::exception &failure) {
+diff --git a/src/lotus_v2/vm.h b/src/lotus_v2/vm.h
+index 62bbc21409..d866894c8c 100644
+--- a/src/lotus_v2/vm.h
++++ b/src/lotus_v2/vm.h
+@@ -33,6 +33,11 @@ struct VmProfile {
+     size_t max_steps; // host-work guard; P05 cost is a separate obligation
+ };
+ 
++// Candidate schedule is supplied explicitly. The coefficients must be
++// nonnegative and monotonically bound the selected primitive's work; no
++// mainnet schedule is selected here. All assigned bytes need positive base.
++using VmCostUnits = __uint128_t;
++
+ enum class VmStatus {
+     Success,
+     AutomaticSuccess,
+@@ -44,6 +49,7 @@ struct VmResult {
+     VmStatus status = VmStatus::Invalid;
+     std::string error;
+     std::vector<VmBytes> final_stack;
++    VmCostUnits executed_cost = 0;
+ };
+ 
+ class PreparedVmTransaction;
+@@ -60,10 +66,6 @@ struct VmExecutionContext {
+     BatchSigCollector *batch_sigs = nullptr;
+ };
+ 
+-// Candidate schedule is supplied explicitly. The coefficients must be
+-// nonnegative and monotonically bound the selected primitive's work; no
+-// mainnet schedule is selected here. All assigned bytes need positive base.
+-using VmCostUnits = __uint128_t;
+ struct VmOpcodeCost {
+     uint64_t base = 0;
+     uint64_t per_operand_byte = 0;
+diff --git a/src/lotus_v2/vm_cost.inc b/src/lotus_v2/vm_cost.inc
+index ee30b88971..d80d218215 100644
+--- a/src/lotus_v2/vm_cost.inc
++++ b/src/lotus_v2/vm_cost.inc
+@@ -632,9 +632,13 @@ class SizePass {
+                     for (auto &exit_state : body.exits)
+                         if (exit_state) exit_state = UnknownSizes();
+                 }
++                const auto lit =
++                    op == 0x69 ? LiteralValue(previous) : std::nullopt;
+                 const size_t bound = op == 0x67   ? input_count
+                                      : op == 0x68 ? output_count
+-                                                  : 256;
++                                     : (lit && *lit >= 0 && *lit <= 256)
++                                         ? static_cast<size_t>(*lit)
++                                         : 256;
+                 const std::array<size_t, 1> loop_operand{16};
+                 part = OpCost(op,
+                               op == 0x69 ? std::span<const size_t>(loop_operand)
+diff --git a/src/rpc/mempool.cpp b/src/rpc/mempool.cpp
+index 0931aebc4a..13b7ce622b 100644
+--- a/src/rpc/mempool.cpp
++++ b/src/rpc/mempool.cpp
+@@ -8,11 +8,13 @@
+ 
+ #include <chainparams.h>
+ #include <core_io.h>
++#include <lotus_v2/fee_hysteresis.h>
+ #include <net_processing.h>
+ #include <node/context.h>
+ #include <node/mempool_persist_args.h>
+ #include <node/snapshot.h>
+ #include <node/types.h>
++#include <policy/policy.h>
+ #include <policy/settings.h>
+ #include <primitives/transaction.h>
+ #include <rpc/server.h>
+@@ -22,6 +24,7 @@
+ #include <univalue.h>
+ #include <util/fs.h>
+ #include <util/moneystr.h>
++#include <util/time.h>
+ #include <validation.h>
+ #include <validationinterface.h>
+ 
+@@ -1235,6 +1238,16 @@ static RPCHelpMan testrawtxbatch() {
+                            /*optional=*/true, "Rejection reason string"},
+                           {RPCResult::Type::STR, "reject-details",
+                            /*optional=*/true, "Rejection details string"},
++                          {RPCResult::Type::NUM, "required_cu",
++                           /*optional=*/true,
++                           "Required transaction compute units (CU)"},
++                          {RPCResult::Type::NUM, "required_fee_sats",
++                           /*optional=*/true,
++                           "Minimum required RPC admission fee in satoshis"},
++                          {RPCResult::Type::NUM, "recommended_sdk_fee_sats",
++                           /*optional=*/true,
++                           "Recommended SDK fee in satoshis (includes +5% "
++                           "anti-bounce cushion)"},
+                       }},
+                  }},
+             },
+@@ -1285,6 +1298,9 @@ static RPCHelpMan testrawtxbatch() {
+                 package_result.m_state.GetResult() !=
+                 PackageValidationResult::PCKG_POLICY;
+             bool exit_early{false};
++            const int64_t now_ms =
++                TicksSinceEpoch<std::chrono::milliseconds>(NodeClock::now());
++            const auto &fee_ctrl = lotus::v2::GetGlobalFeeHysteresisController();
+ 
+             for (const auto &tx : txns) {
+                 UniValue result_inner(UniValue::VOBJ);
+@@ -1296,8 +1312,28 @@ static RPCHelpMan testrawtxbatch() {
+                     continue;
+                 }
+                 const auto &tx_result = it->second;
++                const uint64_t tx_cu = static_cast<uint64_t>(std::max<int64_t>(
++                    0, tx_result.m_vsize.has_value()
++                           ? tx_result.m_vsize.value()
++                           : GetVirtualTransactionSize(*tx)));
++                const uint64_t paid_fee_sats =
++                    tx_result.m_base_fees.has_value()
++                        ? static_cast<uint64_t>(std::max<int64_t>(
++                              0, tx_result.m_base_fees.value() / SATOSHI))
++                        : 0ULL;
++                const lotus::v2::FeeCheckResult fee_eval =
++                    fee_ctrl.EvaluateTransactionFee(
++                        lotus::v2::FeeTier::RpcAdmission, tx_cu, paid_fee_sats,
++                        now_ms);
++                result_inner.pushKV("required_cu", fee_eval.tx_cu);
++                result_inner.pushKV("required_fee_sats",
++                                    fee_eval.required_fee_sats);
++                result_inner.pushKV("recommended_sdk_fee_sats",
++                                    fee_eval.recommended_sdk_fee_sats);
++
+                 if (tx_result.m_result_type ==
+-                    MempoolAcceptResult::ResultType::VALID) {
++                        MempoolAcceptResult::ResultType::VALID &&
++                    fee_eval.accepted) {
+                     const Amount fee = tx_result.m_base_fees.value();
+                     const int64_t virtual_size = tx_result.m_vsize.value();
+                     result_inner.pushKV("allowed", true);
+@@ -1315,6 +1351,22 @@ static RPCHelpMan testrawtxbatch() {
+                     fees.pushKV("effective-includes",
+                                 std::move(effective_includes_res));
+                     result_inner.pushKV("fees", std::move(fees));
++                } else if (tx_result.m_result_type ==
++                               MempoolAcceptResult::ResultType::VALID &&
++                           !fee_eval.accepted) {
++                    all_allowed = false;
++                    result_inner.pushKV("allowed", false);
++                    result_inner.pushKV("reject-reason",
++                                        "rpc-fee-hysteresis-insufficient");
++                    result_inner.pushKV(
++                        "reject-details",
++                        strprintf("paid %llu sats < required %llu sats "
++                                  "(recommended SDK fee: %llu sats)",
++                                  static_cast<unsigned long long>(paid_fee_sats),
++                                  static_cast<unsigned long long>(
++                                      fee_eval.required_fee_sats),
++                                  static_cast<unsigned long long>(
++                                      fee_eval.recommended_sdk_fee_sats)));
+                 } else {
+                     all_allowed = false;
+                     result_inner.pushKV("allowed", false);
+@@ -1432,6 +1484,16 @@ static RPCHelpMan submitrawtxbatch() {
+                            /*optional=*/true, "Rejection reason string"},
+                           {RPCResult::Type::STR, "reject-details",
+                            /*optional=*/true, "Rejection details string"},
++                          {RPCResult::Type::NUM, "required_cu",
++                           /*optional=*/true,
++                           "Required transaction compute units (CU)"},
++                          {RPCResult::Type::NUM, "required_fee_sats",
++                           /*optional=*/true,
++                           "Minimum required RPC admission fee in satoshis"},
++                          {RPCResult::Type::NUM, "recommended_sdk_fee_sats",
++                           /*optional=*/true,
++                           "Recommended SDK fee in satoshis (includes +5% "
++                           "anti-bounce cushion)"},
+                       }},
+                  }},
+             },
+@@ -1477,6 +1539,9 @@ static RPCHelpMan submitrawtxbatch() {
+             UniValue results_arr(UniValue::VARR);
+             bool all_allowed = false;
+             std::string package_error_str;
++            const int64_t now_ms =
++                TicksSinceEpoch<std::chrono::milliseconds>(NodeClock::now());
++            const auto &fee_ctrl = lotus::v2::GetGlobalFeeHysteresisController();
+ 
+             {
+                 LOCK(::cs_main);
+@@ -1511,6 +1576,26 @@ static RPCHelpMan submitrawtxbatch() {
+                         continue;
+                     }
+                     const auto &tx_result = it->second;
++                    const uint64_t tx_cu =
++                        static_cast<uint64_t>(std::max<int64_t>(
++                            0, tx_result.m_vsize.has_value()
++                                   ? tx_result.m_vsize.value()
++                                   : GetVirtualTransactionSize(*tx)));
++                    const uint64_t paid_fee_sats =
++                        tx_result.m_base_fees.has_value()
++                            ? static_cast<uint64_t>(std::max<int64_t>(
++                                  0, tx_result.m_base_fees.value() / SATOSHI))
++                            : 0ULL;
++                    const lotus::v2::FeeCheckResult fee_eval =
++                        fee_ctrl.EvaluateTransactionFee(
++                            lotus::v2::FeeTier::RpcAdmission, tx_cu,
++                            paid_fee_sats, now_ms);
++                    result_inner.pushKV("required_cu", fee_eval.tx_cu);
++                    result_inner.pushKV("required_fee_sats",
++                                        fee_eval.required_fee_sats);
++                    result_inner.pushKV("recommended_sdk_fee_sats",
++                                        fee_eval.recommended_sdk_fee_sats);
++
+                     if (tx_result.m_result_type ==
+                         MempoolAcceptResult::ResultType::VALID) {
+                         const Amount fee = tx_result.m_base_fees.value();
+@@ -1590,6 +1675,61 @@ static RPCHelpMan submitrawtxbatch() {
+     };
+ }
+ 
++static RPCHelpMan getfeerateinfo() {
++    return RPCHelpMan{
++        "getfeerateinfo",
++        "Returns the active Lotus V2 three-tier fee hysteresis schedule "
++        "(consensus floor, P2P relay hysteresis rate, RPC admission rate, and "
++        "recommended SDK fee rate with anti-bounce cushion).\n",
++        {},
++        RPCResult{
++            RPCResult::Type::OBJ,
++            "",
++            "",
++            {
++                {RPCResult::Type::NUM, "consensus_floor_per_kcu",
++                 "Tier 3 consensus floor fee rate in satoshis per 1,000 CU"},
++                {RPCResult::Type::NUM, "p2p_relay_feerate_per_kcu",
++                 "Tier 2 P2P relay and orphan admission fee rate in satoshis "
++                 "per 1,000 CU"},
++                {RPCResult::Type::NUM, "rpc_admission_feerate_per_kcu",
++                 "Tier 1 local RPC admission fee rate in satoshis per 1,000 "
++                 "CU"},
++                {RPCResult::Type::NUM, "recommended_sdk_feerate_per_kcu",
++                 "Recommended wallet/SDK fee rate in satoshis per 1,000 CU "
++                 "(+5% anti-bounce cushion above Tier 1)"},
++                {RPCResult::Type::NUM, "hysteresis_window_ms",
++                 "Rolling P2P relay hysteresis window in milliseconds"},
++                {RPCResult::Type::NUM, "hysteresis_discount_permille",
++                 "Hysteresis discount below rolling minimum RPC rate in "
++                 "permille"},
++            }},
++        RPCExamples{HelpExampleCli("getfeerateinfo", "") +
++                    HelpExampleRpc("getfeerateinfo", "")},
++        [&](const RPCHelpMan &self, const Config &config,
++            const JSONRPCRequest &request) -> UniValue {
++            const int64_t now_ms =
++                TicksSinceEpoch<std::chrono::milliseconds>(NodeClock::now());
++            const lotus::v2::FeeRateInfo info =
++                lotus::v2::GetGlobalFeeHysteresisController().GetFeeRateInfo(
++                    now_ms);
++            UniValue ret(UniValue::VOBJ);
++            ret.pushKV("consensus_floor_per_kcu",
++                       info.consensus_floor_per_kcu);
++            ret.pushKV("p2p_relay_feerate_per_kcu",
++                       info.p2p_relay_feerate_per_kcu);
++            ret.pushKV("rpc_admission_feerate_per_kcu",
++                       info.rpc_admission_feerate_per_kcu);
++            ret.pushKV("recommended_sdk_feerate_per_kcu",
++                       info.recommended_sdk_feerate_per_kcu);
++            ret.pushKV("hysteresis_window_ms", info.hysteresis_window_ms);
++            ret.pushKV("hysteresis_discount_permille",
++                       info.hysteresis_discount_permille);
++            return ret;
++        },
++    };
++}
++
+ void RegisterMempoolRPCCommands(CRPCTable &t) {
+     static const CRPCCommand commands[]{
+         // category     actor (function)
+@@ -1598,6 +1738,7 @@ void RegisterMempoolRPCCommands(CRPCTable &t) {
+         {"rawtransactions", testmempoolaccept},
+         {"rawtransactions", testrawtxbatch},
+         {"rawtransactions", submitrawtxbatch},
++        {"blockchain", getfeerateinfo},
+         {"blockchain", getmempoolancestors},
+         {"blockchain", getmempooldescendants},
+         {"blockchain", getmempoolentry},
+diff --git a/src/test/policy_fee_tests.cpp b/src/test/policy_fee_tests.cpp
+index 72403612e0..c586aa77c0 100644
+--- a/src/test/policy_fee_tests.cpp
++++ b/src/test/policy_fee_tests.cpp
+@@ -2,11 +2,21 @@
+ // Distributed under the MIT software license, see the accompanying
+ // file COPYING or http://www.opensource.org/licenses/mit-license.php.
+ 
++#include <config.h>
+ #include <consensus/amount.h>
++#include <core_io.h>
+ #include <feerate.h>
++#include <key.h>
++#include <lotus_v2/fee_hysteresis.h>
++#include <lotus_v2/vm.h>
+ #include <policy/fees.h>
++#include <rpc/server.h>
++#include <script/standard.h>
++#include <util/strencodings.h>
++#include <util/time.h>
+ 
+ #include <test/util/setup_common.h>
++#include <test/util/transaction_utils.h>
+ 
+ #include <boost/test/unit_test.hpp>
+ 
+@@ -32,4 +42,235 @@ BOOST_AUTO_TEST_CASE(FeeRounder) {
+     BOOST_CHECK_EQUAL(fee_rounder.round(MAX_MONEY), 9170997 * SATOSHI);
+ }
+ 
++BOOST_AUTO_TEST_CASE(FeeHysteresisScheduleAndWindow) {
++    lotus::v2::FeeHysteresisController ctrl;
++
++    // Default uncongested state at t = 0 ms
++    const auto info0 = ctrl.GetFeeRateInfo(0);
++    BOOST_CHECK_EQUAL(info0.consensus_floor_per_kcu, 1000ULL);
++    BOOST_CHECK_EQUAL(info0.p2p_relay_feerate_per_kcu, 1000ULL);
++    BOOST_CHECK_EQUAL(info0.rpc_admission_feerate_per_kcu, 1000ULL);
++    BOOST_CHECK_EQUAL(info0.recommended_sdk_feerate_per_kcu, 1050ULL);
++    BOOST_CHECK_EQUAL(info0.hysteresis_window_ms, 30000);
++    BOOST_CHECK_EQUAL(info0.hysteresis_discount_permille, 150ULL);
++
++    // Rising congestion at t = 10,000 ms: RPC admission jumps to 2,000 per kCU.
++    // Because t = 0 ms (rate 1,000) is still inside the 30-second rolling window
++    // [t - 30,000, t], P2P relay stays anchored at 1,000 so in-flight transactions
++    // signed just before the spike still propagate across P2P.
++    ctrl.SetRpcAdmissionRatePerKCu(2000, 10000);
++    const auto info_rising = ctrl.GetFeeRateInfo(10000);
++    BOOST_CHECK_EQUAL(info_rising.rpc_admission_feerate_per_kcu, 2000ULL);
++    BOOST_CHECK_EQUAL(info_rising.recommended_sdk_feerate_per_kcu, 2100ULL);
++    BOOST_CHECK_EQUAL(info_rising.p2p_relay_feerate_per_kcu, 1000ULL);
++
++    // After 30 seconds of sustained congestion (t = 40,001 ms), the t = 0 sample
++    // expires from the rolling window; rolling min is 2,000, so P2P relay rate
++    // becomes floor(0.85 * 2000) = 1,700 per kCU.
++    const auto info_sustained = ctrl.GetFeeRateInfo(40001);
++    BOOST_CHECK_EQUAL(info_sustained.rpc_admission_feerate_per_kcu, 2000ULL);
++    BOOST_CHECK_EQUAL(info_sustained.recommended_sdk_feerate_per_kcu, 2100ULL);
++    BOOST_CHECK_EQUAL(info_sustained.p2p_relay_feerate_per_kcu, 1700ULL);
++
++    // Falling congestion at t = 45,000 ms: RPC admission drops to 1,400 per kCU.
++    // Rolling min in [15,000, 45,000] immediately becomes 1,400, so P2P relay drops
++    // to floor(0.85 * 1400) = 1,190 per kCU.
++    ctrl.SetRpcAdmissionRatePerKCu(1400, 45000);
++    const auto info_falling = ctrl.GetFeeRateInfo(45000);
++    BOOST_CHECK_EQUAL(info_falling.rpc_admission_feerate_per_kcu, 1400ULL);
++    BOOST_CHECK_EQUAL(info_falling.recommended_sdk_feerate_per_kcu, 1470ULL);
++    BOOST_CHECK_EQUAL(info_falling.p2p_relay_feerate_per_kcu, 1190ULL);
++
++    // Congestion clears via UpdateCongestion below target capacity: clamped at 1,000.
++    const uint64_t cleared_rate = ctrl.UpdateCongestion(10'000'000, 25'000'000, 50000);
++    BOOST_CHECK_EQUAL(cleared_rate, 1000ULL);
++    BOOST_CHECK_EQUAL(ctrl.GetP2pRelayRatePerKCu(50000), 1000ULL);
++
++    // Dynamic congestion above target capacity scales quadratically above 1,000.
++    const uint64_t congested_rate = ctrl.UpdateCongestion(50'000'000, 25'000'000, 90000);
++    BOOST_CHECK_EQUAL(congested_rate, 3000ULL);
++}
++
++BOOST_AUTO_TEST_CASE(ThreeTierAdmissionAndBounceDiagnostics) {
++    lotus::v2::FeeHysteresisController ctrl;
++    ctrl.Reset(0);
++    ctrl.SetRpcAdmissionRatePerKCu(2000, 0);
++    // Advance past the 30s window so rolling min is 2,000 and P2P rate is 1,700.
++    const int64_t now_ms = 35000;
++    const uint64_t tx_cu = 2500;
++
++    // 1. RPC Bounce Diagnostics (Tier 1):
++    // Required fee at 2,000 sats/kCU for 2,500 CU = 5,000 sats.
++    // Recommended SDK fee (+5% cushion = 2,100 sats/kCU) = 5,250 sats.
++    // A transaction paying 4,500 sats is rejected at Tier 1 with exact diagnostics.
++    const auto rpc_reject = ctrl.EvaluateTransactionFee(
++        lotus::v2::FeeTier::RpcAdmission, tx_cu, /*paid_fee_sats=*/4500, now_ms);
++    BOOST_CHECK(!rpc_reject.accepted);
++    BOOST_CHECK_EQUAL(rpc_reject.required_rate_per_kcu, 2000ULL);
++    BOOST_CHECK_EQUAL(rpc_reject.required_fee_sats, 5000ULL);
++    BOOST_CHECK_EQUAL(rpc_reject.recommended_sdk_fee_sats, 5250ULL);
++
++    // Re-signing with required_fee_sats (or recommended_sdk_fee_sats) succeeds in 1 round-trip.
++    const auto rpc_accept = ctrl.EvaluateTransactionFee(
++        lotus::v2::FeeTier::RpcAdmission, tx_cu, rpc_reject.recommended_sdk_fee_sats, now_ms);
++    BOOST_CHECK(rpc_accept.accepted);
++
++    // 2. P2P Relay Hysteresis Band (Tier 2):
++    // The same 4,500-sat transaction (>= 4,250 sats required at 1,700 sats/kCU)
++    // is accepted over P2P relay, preventing mempool divergence across peers.
++    const auto p2p_accept = ctrl.EvaluateTransactionFee(
++        lotus::v2::FeeTier::P2pRelay, tx_cu, /*paid_fee_sats=*/4500, now_ms);
++    BOOST_CHECK(p2p_accept.accepted);
++    BOOST_CHECK_EQUAL(p2p_accept.required_rate_per_kcu, 1700ULL);
++    BOOST_CHECK_EQUAL(p2p_accept.required_fee_sats, 4250ULL);
++
++    // 3. Consensus Floor Invariance (Tier 3):
++    // Even if local RPC admission spikes to 50,000 sats/kCU, avabatch and block
++    // validation only enforce the 1,000 sats/kCU consensus floor (2,500 sats).
++    ctrl.SetRpcAdmissionRatePerKCu(50000, now_ms);
++    const auto consensus_accept = ctrl.EvaluateTransactionFee(
++        lotus::v2::FeeTier::ConsensusFloor, tx_cu, /*paid_fee_sats=*/2500, now_ms);
++    BOOST_CHECK(consensus_accept.accepted);
++    BOOST_CHECK_EQUAL(consensus_accept.required_rate_per_kcu, 1000ULL);
++    BOOST_CHECK_EQUAL(consensus_accept.required_fee_sats, 2500ULL);
++}
++
++BOOST_AUTO_TEST_CASE(VmEnumerateConstantBoundAndExecutedCost) {
++    const lotus::v2::VmProfile profile{4096, 16, 1024, 128, 32, 8192, 16, 1000};
++    lotus::v2::VmCostProfile schedule{};
++    schedule.max_invocation_cost = 1'000'000;
++    schedule.structural_byte_cost = 1;
++    for (auto &op : schedule.opcode) {
++        op = {1, 1, 1};
++    }
++
++    auto eval_script = [&](const std::string &hex,
++                           const std::vector<lotus::v2::VmBytes> &args = {}) {
++        const auto code = ParseHex(hex);
++        return lotus::v2::EvaluateVmCharged(code, args, profile, schedule);
++    };
++
++    // <1> ENUMERATE DROP ENDENUMERATE <1>: constant k = 1 charges 1 iteration (74 CU),
++    // not 256 iterations (4,664 CU).
++    const auto enum1 = eval_script("4e69796a4e");
++    BOOST_CHECK(enum1.charged);
++    BOOST_CHECK_EQUAL(static_cast<int>(enum1.invocation.status),
++                      static_cast<int>(lotus::v2::VmStatus::Success));
++    BOOST_CHECK_EQUAL(static_cast<uint64_t>(enum1.accounting_cost), 74ULL);
++    BOOST_CHECK_EQUAL(static_cast<uint64_t>(enum1.invocation.executed_cost), 74ULL);
++
++    // <5> ENUMERATE DROP ENDENUMERATE <1>: constant k = 5 charges 5 iterations (146 CU).
++    const auto enum5 = eval_script("5269796a4e");
++    BOOST_CHECK(enum5.charged);
++    BOOST_CHECK_EQUAL(static_cast<int>(enum5.invocation.status),
++                      static_cast<int>(lotus::v2::VmStatus::Success));
++    BOOST_CHECK_EQUAL(static_cast<uint64_t>(enum5.accounting_cost), 56ULL + 5ULL * 18ULL);
++    BOOST_CHECK_EQUAL(static_cast<uint64_t>(enum5.invocation.executed_cost), 56ULL + 5ULL * 18ULL);
++
++    // Dynamic ENUMERATE (top of stack is runtime value 1, not a literal opcode)
++    // retains the worst-case 256 bound for accounting_cost (4,646 CU) while reporting
++    // exact runtime executed_cost (56 CU).
++    const lotus::v2::VmBytes one_arg(lotus::v2::VM_MIN_NUMERIC_BYTES, 0);
++    std::vector<lotus::v2::VmBytes> dyn_args{one_arg};
++    dyn_args[0][0] = 1;
++    const auto enum_dyn = eval_script("69796a4e", dyn_args);
++    BOOST_CHECK(enum_dyn.charged);
++    BOOST_CHECK_EQUAL(static_cast<int>(enum_dyn.invocation.status),
++                      static_cast<int>(lotus::v2::VmStatus::Success));
++    BOOST_CHECK_EQUAL(static_cast<uint64_t>(enum_dyn.accounting_cost), 4646ULL);
++    BOOST_CHECK_EQUAL(static_cast<uint64_t>(enum_dyn.invocation.executed_cost), 56ULL);
++    BOOST_CHECK_LT(static_cast<uint64_t>(enum_dyn.invocation.executed_cost),
++                   static_cast<uint64_t>(enum_dyn.accounting_cost));
++
++    // Early BREAK inside <5> ENUMERATE DROP <1> BREAK ENDENUMERATE <1>:
++    // static accounting_cost charges all 5 iterations, while executed_cost charges only 1.
++    const auto enum_break = eval_script("5269794e6b6a4e");
++    BOOST_CHECK(enum_break.charged);
++    BOOST_CHECK_EQUAL(static_cast<int>(enum_break.invocation.status),
++                      static_cast<int>(lotus::v2::VmStatus::Success));
++    BOOST_CHECK_GT(static_cast<uint64_t>(enum_break.invocation.executed_cost), 0ULL);
++    BOOST_CHECK_LT(static_cast<uint64_t>(enum_break.invocation.executed_cost),
++                   static_cast<uint64_t>(enum_break.accounting_cost));
++}
++
++BOOST_FIXTURE_TEST_CASE(GetFeeRateInfoAndTestRawTxBatchRpc, TestChain100Setup) {
++    GlobalConfig config;
++    auto &fee_ctrl = lotus::v2::GetGlobalFeeHysteresisController();
++    fee_ctrl.Reset(TicksSinceEpoch<std::chrono::milliseconds>(NodeClock::now()));
++
++    // 1. Verify getfeerateinfo RPC returns all 6 expected hysteresis fields.
++    {
++        JSONRPCRequest req;
++        req.context = &m_node;
++        req.strMethod = "getfeerateinfo";
++        req.params = UniValue(UniValue::VARR);
++        UniValue res = tableRPC.execute(config, req);
++        BOOST_CHECK_EQUAL(res.find_value("consensus_floor_per_kcu").getInt<uint64_t>(), 1000ULL);
++        BOOST_CHECK_EQUAL(res.find_value("p2p_relay_feerate_per_kcu").getInt<uint64_t>(), 1000ULL);
++        BOOST_CHECK_EQUAL(res.find_value("rpc_admission_feerate_per_kcu").getInt<uint64_t>(), 1000ULL);
++        BOOST_CHECK_EQUAL(res.find_value("recommended_sdk_feerate_per_kcu").getInt<uint64_t>(), 1050ULL);
++        BOOST_CHECK_EQUAL(res.find_value("hysteresis_window_ms").getInt<int64_t>(), 30000);
++        BOOST_CHECK_EQUAL(res.find_value("hysteresis_discount_permille").getInt<uint64_t>(), 150ULL);
++    }
++
++    // 2. Verify testrawtxbatch reports required_cu, required_fee_sats, and
++    // recommended_sdk_fee_sats, and enforces Tier 1 RPC fee hysteresis with
++    // exact bounce diagnostics when RPC admission fee rate rises.
++    CKey dest_key;
++    dest_key.MakeNewKey(true);
++    CScript dest_spk = GetScriptForDestination(PKHash(dest_key.GetPubKey()));
++    const Amount cb_val = m_coinbase_txns[0]->vout[0].nValue;
++    CMutableTransaction mtx = CreateValidMempoolTransaction(
++        m_coinbase_txns[0], 0, 1, coinbaseKey, dest_spk,
++        cb_val - 2000 * SATOSHI, /*submit=*/false);
++    CTransactionRef tx = MakeTransactionRef(mtx);
++    const std::string tx_hex = EncodeHexTx(*tx);
++
++    {
++        JSONRPCRequest req;
++        req.context = &m_node;
++        req.strMethod = "testrawtxbatch";
++        UniValue arr(UniValue::VARR);
++        arr.push_back(tx_hex);
++        req.params = UniValue(UniValue::VARR);
++        req.params.push_back(std::move(arr));
++
++        UniValue res = tableRPC.execute(config, req);
++        BOOST_CHECK(res.find_value("allowed").get_bool());
++        const UniValue &tx_res = res.find_value("results").get_array()[0];
++        const uint64_t req_cu = tx_res.find_value("required_cu").getInt<uint64_t>();
++        const uint64_t req_fee = tx_res.find_value("required_fee_sats").getInt<uint64_t>();
++        const uint64_t sdk_fee = tx_res.find_value("recommended_sdk_fee_sats").getInt<uint64_t>();
++        BOOST_CHECK_GT(req_cu, 0ULL);
++        BOOST_CHECK_EQUAL(req_fee, req_cu);
++        BOOST_CHECK_GE(sdk_fee, req_fee);
++    }
++
++    // Raise RPC admission rate to 50,000 sats/kCU so 2,000 sats is insufficient at Tier 1.
++    const int64_t now_ms = TicksSinceEpoch<std::chrono::milliseconds>(NodeClock::now());
++    fee_ctrl.SetRpcAdmissionRatePerKCu(50000, now_ms);
++    {
++        JSONRPCRequest req;
++        req.context = &m_node;
++        req.strMethod = "testrawtxbatch";
++        UniValue arr(UniValue::VARR);
++        arr.push_back(tx_hex);
++        req.params = UniValue(UniValue::VARR);
++        req.params.push_back(std::move(arr));
++
++        UniValue res = tableRPC.execute(config, req);
++        BOOST_CHECK(!res.find_value("allowed").get_bool());
++        const UniValue &tx_res = res.find_value("results").get_array()[0];
++        BOOST_CHECK(!tx_res.find_value("allowed").get_bool());
++        BOOST_CHECK_EQUAL(tx_res.find_value("reject-reason").get_str(),
++                          "rpc-fee-hysteresis-insufficient");
++        const uint64_t req_cu = tx_res.find_value("required_cu").getInt<uint64_t>();
++        BOOST_CHECK_EQUAL(tx_res.find_value("required_fee_sats").getInt<uint64_t>(),
++                          req_cu * 50ULL);
++        BOOST_CHECK_EQUAL(tx_res.find_value("recommended_sdk_fee_sats").getInt<uint64_t>(),
++                          (req_cu * 52500ULL + 999ULL) / 1000ULL);
++    }
++    fee_ctrl.Reset(now_ms);
++}
++
+ BOOST_AUTO_TEST_SUITE_END()
+-- 
+2.50.1 (Apple Git-155)
+
