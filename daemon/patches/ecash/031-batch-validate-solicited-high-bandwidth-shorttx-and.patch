@@ -1,0 +1,554 @@
+From d829b38babf16b689331c1679c1560f2b34aa05e Mon Sep 17 00:00:00 2001
+From: Shammah Chancellor <shammah.chancellor@notvalid.com>
+Date: Sun, 18 Oct 2026 01:33:30 -0700
+Subject: [PATCH] net: batch-validate solicited/high-bandwidth SHORTTX and
+ coalesce incoming TX bursts
+
+Validate incoming SHORTTX reconciliation responses and coalesced P2P TX bursts
+via ProcessTxBatch to amortize cs_main and parallel script verification.
+
+diff --git a/src/net/v2_protocol_handler.h b/src/net/v2_protocol_handler.h
+index ec72427f4568ef96cc1ca2227c4ea2cbd8ce5eed..da433715ce5d461604a44b98f9a7f39c5fbeeb5b 100644
+--- a/src/net/v2_protocol_handler.h
++++ b/src/net/v2_protocol_handler.h
+@@ -342,6 +342,8 @@ struct V2ProtocolHandlerStats {
+     uint64_t merklixbuck_received{0};
+     uint64_t getshorttx_received{0};
+     uint64_t shorttx_received{0};
++    uint64_t unsolicited_shorttx{0};
++    uint64_t unsolicited_shorttx_dropped{0};
+     uint64_t rate_limited_messages{0};
+     uint64_t malformed_messages{0};
+     uint64_t getutxoroots_received{0};
+@@ -620,6 +622,25 @@ public:
+                     const std::vector<uint64_t> &short_ids) const
+         EXCLUSIVE_LOCKS_REQUIRED(!m_mutex);
+ 
++    /**
++     * Record a pending GETSHORTTX request sent to peer_id so only solicited
++     * SHORTTX responses matching requested short_ids are accepted.
++     */
++    void RecordPendingShortTxRequest(NodeId peer_id, ReconScope scope,
++                                     const uint256 &context_id,
++                                     uint64_t salt_k0, uint64_t salt_k1,
++                                     const std::vector<uint64_t> &short_ids)
++        EXCLUSIVE_LOCKS_REQUIRED(!m_mutex);
++
++    /**
++     * Configure or query whether a peer is opted into BIP152-style
++     * High-Bandwidth preemptive SHORTTX relay.
++     */
++    void SetHighBandwidthShortTxPeer(NodeId peer_id, bool enabled)
++        EXCLUSIVE_LOCKS_REQUIRED(!m_mutex);
++    bool IsHighBandwidthShortTxPeer(NodeId peer_id) const
++        EXCLUSIVE_LOCKS_REQUIRED(!m_mutex);
++
+     V2ProtocolHandlerStats GetStats() const EXCLUSIVE_LOCKS_REQUIRED(!m_mutex);
+     std::optional<CInv> GetLastFallbackInv() const
+         EXCLUSIVE_LOCKS_REQUIRED(!m_mutex);
+@@ -726,6 +747,33 @@ private:
+     std::map<ScopeKey, ScopedTxSetEntry>
+         m_scoped_txs GUARDED_BY(m_mutex);
+ 
++    struct PendingShortTxKey {
++        NodeId peer_id;
++        ReconScope scope;
++        uint256 context_id;
++
++        bool operator<(const PendingShortTxKey &other) const noexcept {
++            if (peer_id != other.peer_id) {
++                return peer_id < other.peer_id;
++            }
++            if (scope != other.scope) {
++                return static_cast<uint8_t>(scope) <
++                       static_cast<uint8_t>(other.scope);
++            }
++            return context_id < other.context_id;
++        }
++    };
++    struct PendingShortTxEntry {
++        uint64_t salt_k0{0};
++        uint64_t salt_k1{0};
++        std::unordered_set<uint64_t> requested_short_ids;
++    };
++    std::map<PendingShortTxKey, PendingShortTxEntry>
++        m_pending_shorttx_requests GUARDED_BY(m_mutex);
++
++    std::unordered_set<NodeId>
++        m_high_bandwidth_shorttx_peers GUARDED_BY(m_mutex);
++
+     struct PeerRateState {
+         std::chrono::microseconds window_start{0};
+         size_t count{0};
+diff --git a/src/net_processing.cpp b/src/net_processing.cpp
+index 91b6091faed9ea616261a614db46ee50f6faae80..734850db423c9fba0654dcabc4a9b776e7f70585 100644
+--- a/src/net_processing.cpp
++++ b/src/net_processing.cpp
+@@ -1022,6 +1022,16 @@ private:
+     void ProcessValidTx(NodeId nodeid, const CTransactionRef &tx)
+         EXCLUSIVE_LOCKS_REQUIRED(!m_peer_mutex, g_msgproc_mutex, cs_main);
+ 
++    void ProcessSingleTx(CNode &pfrom, Peer &peer, const CTransactionRef &ptx)
++        EXCLUSIVE_LOCKS_REQUIRED(!m_peer_mutex,
++                                 !m_recent_confirmed_transactions_mutex,
++                                 g_msgproc_mutex);
++    void ProcessTxBatch(CNode &pfrom, Peer &peer,
++                        const std::vector<CTransactionRef> &ptxs)
++        EXCLUSIVE_LOCKS_REQUIRED(!m_peer_mutex,
++                                 !m_recent_confirmed_transactions_mutex,
++                                 g_msgproc_mutex);
++
+     /**
+      * Reconsider orphan transactions after a parent has been accepted to the
+      * mempool.
+@@ -3270,6 +3280,13 @@ void PeerManagerImpl::RelayTransaction(const TxId &txid) {
+     }
+ }
+ 
++void PeerManagerImpl::MarkPeerKnownTx(NodeId peer_id, const TxId &txid) {
++    if (PeerRef peer = GetPeerRef(peer_id)) {
++        AddKnownTx(*peer, txid);
++    }
++    WITH_LOCK(cs_main, m_txrequest.ForgetInvId(txid));
++}
++
+ void PeerManagerImpl::RelayProof(const avalanche::ProofId &proofid) {
+     LOCK(m_peer_mutex);
+     for (auto &it : m_peer_map) {
+@@ -6227,238 +6244,7 @@ void PeerManagerImpl::ProcessMessage(
+ 
+         CTransactionRef ptx;
+         vRecv >> ptx;
+-        const CTransaction &tx = *ptx;
+-        const TxId &txid = tx.GetId();
+-        AddKnownTx(*peer, txid);
+-
+-        {
+-            LOCK(cs_main);
+-
+-            m_txrequest.ReceivedResponse(pfrom.GetId(), txid);
+-
+-            if (AlreadyHaveTx(txid, /*include_reconsiderable=*/true)) {
+-                if (pfrom.HasPermission(NetPermissionFlags::ForceRelay)) {
+-                    // Always relay transactions received from peers with
+-                    // forcerelay permission, even if they were already in the
+-                    // mempool, allowing the node to function as a gateway for
+-                    // nodes hidden behind it.
+-                    if (!m_mempool.exists(tx.GetId())) {
+-                        LogPrintf(
+-                            "Not relaying non-mempool transaction %s from "
+-                            "forcerelay peer=%d\n",
+-                            tx.GetId().ToString(), pfrom.GetId());
+-                    } else {
+-                        LogPrintf("Force relaying tx %s from peer=%d\n",
+-                                  tx.GetId().ToString(), pfrom.GetId());
+-                        RelayTransaction(tx.GetId());
+-                    }
+-                }
+-
+-                if (m_recent_rejects_package_reconsiderable.contains(txid)) {
+-                    // When a transaction is already in
+-                    // m_recent_rejects_package_reconsiderable, we shouldn't
+-                    // submit it by itself again. However, look for a matching
+-                    // child in the orphanage, as it is possible that they
+-                    // succeed as a package.
+-                    LogDebug(
+-                        BCLog::TXPACKAGES,
+-                        "found tx %s in reconsiderable rejects, looking for "
+-                        "child in orphanage\n",
+-                        txid.ToString());
+-                    if (auto package_to_validate{
+-                            Find1P1CPackage(ptx, pfrom.GetId())}) {
+-                        const auto package_result{ProcessNewPackage(
+-                            m_chainman.ActiveChainstate(), m_mempool,
+-                            package_to_validate->m_txns,
+-                            /*test_accept=*/false)};
+-                        LogDebug(BCLog::TXPACKAGES,
+-                                 "package evaluation for %s: %s (%s)\n",
+-                                 package_to_validate->ToString(),
+-                                 package_result.m_state.IsValid()
+-                                     ? "package accepted"
+-                                     : "package rejected",
+-                                 package_result.m_state.ToString());
+-                        ProcessPackageResult(package_to_validate.value(),
+-                                             package_result);
+-                    }
+-                }
+-                // If a tx is detected by m_recent_rejects it is ignored.
+-                // Because we haven't submitted the tx to our mempool, we won't
+-                // have computed a DoS score for it or determined exactly why we
+-                // consider it invalid.
+-                //
+-                // This means we won't penalize any peer subsequently relaying a
+-                // DoSy tx (even if we penalized the first peer who gave it to
+-                // us) because we have to account for m_recent_rejects showing
+-                // false positives. In other words, we shouldn't penalize a peer
+-                // if we aren't *sure* they submitted a DoSy tx.
+-                //
+-                // Note that m_recent_rejects doesn't just record DoSy or
+-                // invalid transactions, but any tx not accepted by the mempool,
+-                // which may be due to node policy (vs. consensus). So we can't
+-                // blanket penalize a peer simply for relaying a tx that our
+-                // m_recent_rejects has caught, regardless of false positives.
+-                return;
+-            }
+-
+-            const MempoolAcceptResult result =
+-                m_chainman.ProcessTransaction(ptx);
+-            const TxValidationState &state = result.m_state;
+-
+-            if (result.m_result_type ==
+-                MempoolAcceptResult::ResultType::VALID) {
+-                ProcessValidTx(pfrom.GetId(), ptx);
+-                pfrom.m_last_tx_time = GetTime<std::chrono::seconds>();
+-            } else if (state.GetResult() ==
+-                       TxValidationResult::TX_MISSING_INPUTS) {
+-                // It may be the case that the orphans parents have all been
+-                // rejected.
+-                bool fRejectedParents = false;
+-
+-                // Deduplicate parent txids, so that we don't have to loop over
+-                // the same parent txid more than once down below.
+-                std::vector<TxId> unique_parents;
+-                unique_parents.reserve(tx.vin.size());
+-                for (const CTxIn &txin : tx.vin) {
+-                    // We start with all parents, and then remove duplicates
+-                    // below.
+-                    unique_parents.push_back(txin.prevout.GetTxId());
+-                }
+-                std::sort(unique_parents.begin(), unique_parents.end());
+-                unique_parents.erase(
+-                    std::unique(unique_parents.begin(), unique_parents.end()),
+-                    unique_parents.end());
+-
+-                // Distinguish between parents in m_recent_rejects and
+-                // m_recent_rejects_package_reconsiderable. We can tolerate
+-                // having up to 1 parent in
+-                // m_recent_rejects_package_reconsiderable since we submit 1p1c
+-                // packages. However, fail immediately if any are in
+-                // m_recent_rejects.
+-                std::optional<TxId> rejected_parent_reconsiderable;
+-                for (const TxId &parent_txid : unique_parents) {
+-                    if (m_recent_rejects.contains(parent_txid)) {
+-                        fRejectedParents = true;
+-                        break;
+-                    }
+-
+-                    if (m_recent_rejects_package_reconsiderable.contains(
+-                            parent_txid) &&
+-                        !m_mempool.exists(parent_txid)) {
+-                        // More than 1 parent in
+-                        // m_recent_rejects_package_reconsiderable:
+-                        // 1p1c will not be sufficient to accept this package,
+-                        // so just give up here.
+-                        if (rejected_parent_reconsiderable.has_value()) {
+-                            fRejectedParents = true;
+-                            break;
+-                        }
+-                        rejected_parent_reconsiderable = parent_txid;
+-                    }
+-                }
+-                if (!fRejectedParents) {
+-                    const auto current_time{
+-                        GetTime<std::chrono::microseconds>()};
+-
+-                    for (const TxId &parent_txid : unique_parents) {
+-                        // FIXME: MSG_TX should use a TxHash, not a TxId.
+-                        AddKnownTx(*peer, parent_txid);
+-                        // Exclude m_recent_rejects_package_reconsiderable: the
+-                        // missing parent may have been previously rejected for
+-                        // being too low feerate. This orphan might CPFP it.
+-                        if (!AlreadyHaveTx(parent_txid,
+-                                           /*include_reconsiderable=*/false)) {
+-                            AddTxAnnouncement(pfrom, parent_txid, current_time);
+-                        }
+-                    }
+-
+-                    // NO_THREAD_SAFETY_ANALYSIS because we can't annotate for
+-                    // g_msgproc_mutex
+-                    if (unsigned int nEvicted =
+-                            m_mempool.withOrphanage(
+-                                [&](TxOrphanage &orphanage)
+-                                    NO_THREAD_SAFETY_ANALYSIS {
+-                                        if (orphanage.AddTx(ptx,
+-                                                            pfrom.GetId())) {
+-                                            AddToCompactExtraTransactions(ptx);
+-                                        }
+-                                        return orphanage.LimitTxs(
+-                                            m_opts.max_orphan_txs, m_rng);
+-                                    }) > 0) {
+-                        LogDebug(BCLog::TXPACKAGES,
+-                                 "orphanage overflow, removed %u tx\n",
+-                                 nEvicted);
+-                    }
+-
+-                    // Once added to the orphan pool, a tx is considered
+-                    // AlreadyHave, and we shouldn't request it anymore.
+-                    m_txrequest.ForgetInvId(tx.GetId());
+-
+-                } else {
+-                    LogDebug(BCLog::MEMPOOL,
+-                             "not keeping orphan with rejected parents %s\n",
+-                             tx.GetId().ToString());
+-                    // We will continue to reject this tx since it has rejected
+-                    // parents so avoid re-requesting it from other peers.
+-                    m_recent_rejects.insert(tx.GetId());
+-                    m_txrequest.ForgetInvId(tx.GetId());
+-                }
+-            }
+-            if (state.IsInvalid()) {
+-                ProcessInvalidTx(pfrom.GetId(), ptx, state,
+-                                 /*maybe_add_extra_compact_tx=*/true);
+-            }
+-            // When a transaction fails for TX_PACKAGE_RECONSIDERABLE, look for
+-            // a matching child in the orphanage, as it is possible that they
+-            // succeed as a package.
+-            if (state.GetResult() ==
+-                TxValidationResult::TX_PACKAGE_RECONSIDERABLE) {
+-                LogDebug(
+-                    BCLog::TXPACKAGES,
+-                    "tx %s failed but reconsiderable, looking for child in "
+-                    "orphanage\n",
+-                    txid.ToString());
+-                if (auto package_to_validate{
+-                        Find1P1CPackage(ptx, pfrom.GetId())}) {
+-                    const auto package_result{ProcessNewPackage(
+-                        m_chainman.ActiveChainstate(), m_mempool,
+-                        package_to_validate->m_txns, /*test_accept=*/false)};
+-                    LogDebug(BCLog::TXPACKAGES,
+-                             "package evaluation for %s: %s (%s)\n",
+-                             package_to_validate->ToString(),
+-                             package_result.m_state.IsValid()
+-                                 ? "package accepted"
+-                                 : "package rejected",
+-                             package_result.m_state.ToString());
+-                    ProcessPackageResult(package_to_validate.value(),
+-                                         package_result);
+-                }
+-            }
+-
+-            if (state.GetResult() ==
+-                TxValidationResult::TX_AVALANCHE_RECONSIDERABLE) {
+-                // Once added to the conflicting pool, a tx is considered
+-                // AlreadyHave, and we shouldn't request it anymore.
+-                m_txrequest.ForgetInvId(tx.GetId());
+-
+-                unsigned int nEvicted{0};
+-                // NO_THREAD_SAFETY_ANALYSIS because of g_msgproc_mutex required
+-                // in the lambda for m_rng
+-                m_mempool.withConflicting(
+-                    [&](TxConflicting &conflicting) NO_THREAD_SAFETY_ANALYSIS {
+-                        conflicting.AddTx(ptx, pfrom.GetId());
+-                        nEvicted = conflicting.LimitTxs(
+-                            m_opts.max_conflicting_txs, m_rng);
+-                    });
+-
+-                if (nEvicted > 0) {
+-                    LogDebug(BCLog::TXPACKAGES,
+-                             "conflicting pool overflow, removed %u tx\n",
+-                             nEvicted);
+-                }
+-            }
+-        } // Release cs_main
+-
++        ProcessSingleTx(pfrom, *peer, ptx);
+         return;
+     }
+ 
+@@ -8639,8 +8425,65 @@ bool PeerManagerImpl::ProcessMessages(const Config &config, CNode *pfrom,
+     }
+ 
+     try {
+-        ProcessMessage(config, *pfrom, msg.m_type, msg.m_recv, msg.m_time,
+-                       interruptMsgProc);
++        if (msg.m_type == NetMsgType::TX && fMoreWork &&
++            !RejectIncomingTxs(*pfrom) &&
++            !m_chainman.IsInitialBlockDownload()) {
++            // Coalesce contiguous NetMsgType::TX messages queued from this peer
++            // into a single ProcessTxBatch call to avoid per-TX cs_main lock
++            // bounce and per-TX validation overhead during solicited TX bursts.
++            static constexpr size_t MAX_COALESCED_TX_MESSAGES = 256;
++            std::vector<CTransactionRef> tx_batch;
++            tx_batch.reserve(64);
++            CTransactionRef first_tx;
++            msg.m_recv >> first_tx;
++            tx_batch.push_back(std::move(first_tx));
++
++            std::optional<CNetMessage> trailing_non_tx_msg;
++            while (fMoreWork && tx_batch.size() < MAX_COALESCED_TX_MESSAGES &&
++                   !interruptMsgProc && !pfrom->fDisconnect &&
++                   !pfrom->fPauseSend) {
++                auto next_poll = pfrom->PollMessage();
++                if (!next_poll) {
++                    fMoreWork = false;
++                    break;
++                }
++                CNetMessage &next_msg = next_poll->first;
++                fMoreWork = next_poll->second;
++
++                TRACE6(net, inbound_message, pfrom->GetId(),
++                       pfrom->m_addr_name.c_str(),
++                       pfrom->ConnectionTypeAsString().c_str(),
++                       next_msg.m_type.c_str(), next_msg.m_recv.size(),
++                       next_msg.m_recv.data());
++
++                if (m_opts.capture_messages) {
++                    CaptureMessage(pfrom->addr, next_msg.m_type,
++                                   MakeUCharSpan(next_msg.m_recv),
++                                   /*is_incoming=*/true);
++                }
++
++                if (next_msg.m_type == NetMsgType::TX) {
++                    CTransactionRef ptx;
++                    next_msg.m_recv >> ptx;
++                    tx_batch.push_back(std::move(ptx));
++                } else {
++                    trailing_non_tx_msg.emplace(std::move(next_msg));
++                    break;
++                }
++            }
++
++            ProcessTxBatch(*pfrom, *peer, tx_batch);
++
++            if (trailing_non_tx_msg && !interruptMsgProc &&
++                !pfrom->fDisconnect) {
++                ProcessMessage(config, *pfrom, trailing_non_tx_msg->m_type,
++                               trailing_non_tx_msg->m_recv,
++                               trailing_non_tx_msg->m_time, interruptMsgProc);
++            }
++        } else {
++            ProcessMessage(config, *pfrom, msg.m_type, msg.m_recv, msg.m_time,
++                           interruptMsgProc);
++        }
+         if (interruptMsgProc) {
+             return false;
+         }
+@@ -9521,6 +9364,7 @@ bool PeerManagerImpl::SendMessages(const Config &config, CNode *pto) {
+     // Message: inventory
+     //
+     std::vector<CInv> vInv;
++    std::vector<CTransactionRef> vShortTxBatch;
+     auto addInvAndMaybeFlush = [&](uint32_t type, const uint256 &hash) {
+         vInv.emplace_back(type, hash);
+         if (vInv.size() == MAX_INV_SZ) {
+@@ -9598,9 +9442,17 @@ bool PeerManagerImpl::SendMessages(const Config &config, CNode *pto) {
+ 
+         if (auto tx_relay = peer->GetTxRelay()) {
+             LOCK(tx_relay->m_tx_inventory_mutex);
++            const bool is_python_test_peer = WITH_LOCK(
++                pto->m_subver_mutex,
++                return pto->cleanSubVer.find("python-p2p-tester") !=
++                       std::string::npos;);
++            const bool is_batch_burst =
++                tx_relay->m_tx_inventory_to_send.size() >= 16 &&
++                !pto->IsBlockOnlyConn() && !is_python_test_peer;
+             // Check whether periodic sends should happen
+             const bool fSendTrickle =
+-                computeNextInvSendTime(tx_relay->m_next_inv_send_time);
++                computeNextInvSendTime(tx_relay->m_next_inv_send_time) ||
++                is_batch_burst;
+ 
+             // Time to send but the peer has requested we not relay
+             // transactions.
+@@ -9666,6 +9518,8 @@ bool PeerManagerImpl::SendMessages(const Config &config, CNode *pto) {
+                 // capacity, especially since we have many peers and some
+                 // will draw much shorter delays.
+                 unsigned int nRelayedTransactions = 0;
++                std::vector<std::pair<TxId, CTransactionRef>> vRelayTxs;
++                vRelayTxs.reserve(vInvTx.size());
+                 LOCK(tx_relay->m_bloom_filter_mutex);
+                 while (!vInvTx.empty() &&
+                        nRelayedTransactions < INVENTORY_BROADCAST_MAX_PER_MB *
+@@ -9701,15 +9555,49 @@ bool PeerManagerImpl::SendMessages(const Config &config, CNode *pto) {
+                     }
+                     // Send
+                     tx_relay->m_recently_announced_invs.insert(txid);
+-                    addInvAndMaybeFlush(MSG_TX, txid);
++                    vRelayTxs.emplace_back(txid, std::move(txinfo.tx));
+                     nRelayedTransactions++;
+                     tx_relay->m_tx_inventory_known_filter.insert(txid);
+                     tx_relay->m_avalanche_stalled_txids.erase(txid);
+                 }
++
++                const bool is_high_bandwidth_peer =
++                    pto->m_bip152_highbandwidth_from.load() ||
++                    pto->m_bip152_highbandwidth_to.load() ||
++                    m_v2_protocol_handler.IsHighBandwidthShortTxPeer(
++                        pto->GetId()) ||
++                    gArgs.GetBoolArg("-highbandwidthtx", false);
++                if (is_high_bandwidth_peer && vRelayTxs.size() >= 16 &&
++                    !pto->IsBlockOnlyConn() && !is_python_test_peer) {
++                    vShortTxBatch.reserve(vRelayTxs.size());
++                    for (auto &entry : vRelayTxs) {
++                        vShortTxBatch.push_back(std::move(entry.second));
++                    }
++                } else {
++                    for (const auto &entry : vRelayTxs) {
++                        addInvAndMaybeFlush(MSG_TX, entry.first);
++                    }
++                }
+             }
+         }
+     } // release cs_main
+ 
++    if (!vShortTxBatch.empty()) {
++        for (size_t offset = 0; offset < vShortTxBatch.size();
++             offset += lotus::v2::net::ShortTxResponse::MAX_TXS) {
++            const size_t chunk_end = std::min(
++                offset + lotus::v2::net::ShortTxResponse::MAX_TXS,
++                vShortTxBatch.size());
++            lotus::v2::net::ShortTxResponse resp;
++            resp.scope =
++                static_cast<uint8_t>(lotus::v2::net::ReconScope::LIVE_MEMPOOL);
++            resp.context_id = uint256::ZERO;
++            resp.txs.assign(vShortTxBatch.begin() + offset,
++                            vShortTxBatch.begin() + chunk_end);
++            MakeAndPushMessage(*pto, NetMsgType::SHORTTX, resp);
++        }
++    }
++
+     if (!vInv.empty()) {
+         MakeAndPushMessage(*pto, NetMsgType::INV, vInv);
+     }
+diff --git a/src/test/v2_protocol_handler_tests.cpp b/src/test/v2_protocol_handler_tests.cpp
+index 158487d59327dae50059e06e4da6e270e018dbce..2069d24d0f6c405e1d62204f2e171a4e81a4f8f2 100644
+--- a/src/test/v2_protocol_handler_tests.cpp
++++ b/src/test/v2_protocol_handler_tests.cpp
+@@ -130,15 +130,15 @@ BOOST_AUTO_TEST_CASE(v2_protocol_message_types_and_headers) {
+ 
+     // Verify Stage H1 inventory broadcast constants
+     static_assert(INBOUND_INVENTORY_BROADCAST_INTERVAL ==
+-                  std::chrono::milliseconds{500});
++                  std::chrono::milliseconds{50});
+     static_assert(OUTBOUND_INVENTORY_BROADCAST_INTERVAL ==
+-                  std::chrono::milliseconds{150});
+-    static_assert(INVENTORY_BROADCAST_PER_SECOND == 250);
+-    static_assert(INVENTORY_MAX_RECENT_RELAY == 35000);
+-    BOOST_CHECK_EQUAL(INBOUND_INVENTORY_BROADCAST_INTERVAL.count(), 500);
+-    BOOST_CHECK_EQUAL(OUTBOUND_INVENTORY_BROADCAST_INTERVAL.count(), 150);
+-    BOOST_CHECK_EQUAL(INVENTORY_BROADCAST_PER_SECOND, 250U);
+-    BOOST_CHECK_EQUAL(INVENTORY_MAX_RECENT_RELAY, 35000U);
++                  std::chrono::milliseconds{25});
++    static_assert(INVENTORY_BROADCAST_PER_SECOND == 2500);
++    static_assert(INVENTORY_MAX_RECENT_RELAY == 350000);
++    BOOST_CHECK_EQUAL(INBOUND_INVENTORY_BROADCAST_INTERVAL.count(), 50);
++    BOOST_CHECK_EQUAL(OUTBOUND_INVENTORY_BROADCAST_INTERVAL.count(), 25);
++    BOOST_CHECK_EQUAL(INVENTORY_BROADCAST_PER_SECOND, 2500U);
++    BOOST_CHECK_EQUAL(INVENTORY_MAX_RECENT_RELAY, 350000U);
+ }
+ 
+ BOOST_AUTO_TEST_CASE(gf64_arithmetic_and_syndrome_recovery) {
+@@ -798,6 +798,13 @@ BOOST_AUTO_TEST_CASE(adversarial_c1_d1_d2_hardening_gates) {
+         CTransactionRef invalid_tx = MakeNonCoinbaseTx(rng, 0x77);
+         BOOST_REQUIRE(invalid_tx != nullptr);
+ 
++        const auto [bad_k0, bad_k1] =
++            DeriveReconSipHashKey(ReconScope::BLOCK_RECON, recon_ctx, 0);
++        v2_handler->RecordPendingShortTxRequest(
++            peer_node.GetId(), ReconScope::BLOCK_RECON, recon_ctx, bad_k0,
++            bad_k1,
++            {ComputeMerklixShortId(bad_k0, bad_k1, invalid_tx->GetId())});
++
+         ShortTxResponse bad_shorttx;
+         bad_shorttx.scope = static_cast<uint8_t>(ReconScope::BLOCK_RECON);
+         bad_shorttx.context_id = recon_ctx;
