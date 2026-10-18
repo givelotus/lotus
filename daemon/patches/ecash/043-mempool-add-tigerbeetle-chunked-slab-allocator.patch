@@ -1,0 +1,598 @@
+From 4b0175724f1cd3b6c1ad69d7101e1d71bcd716bc Mon Sep 17 00:00:00 2001
+From: Shammah Chancellor <shammah.chancellor@notvalid.com>
+Date: Sun, 18 Oct 2026 01:59:46 -0700
+Subject: [PATCH] mempool: add TigerBeetle chunked slab allocator for mapTx and
+ mapNextTx
+
+Replace individual ::operator new node allocations in CTxMemPool::mapTx (boost::multi_index_container) and CTxMemPool::mapNextTx (indirectmap) with a TigerBeetle-style ChunkedSlabAllocator<T, 16384> backed by contiguous slab chunks and an O(1) LIFO intrusive freelist.
+
+- Add SlabArena, ChunkedSlabResource, and ChunkedSlabAllocator in src/support/allocators/chunked_slab.h, serving single-node (n == 1) allocations from 16,384-slot contiguous chunks + intrusive freelist while forwarding multi-element (n > 1) hash bucket arrays to aligned ::operator new.
+- Add an optional Allocator template parameter (with automatic value_type rebinding) to indirectmap in src/indirectmap.h while preserving 100% source compatibility for 2-parameter callers.
+- Wire ChunkedSlabAllocator into CTxMemPool::indexed_transaction_set (mapTx) and CTxMemPool::mapNextTx in src/txmempool.h, along with memusage::DynamicUsage overloads.
+- Add mempool_slab_allocator_churn unit test in src/test/mempool_tests.cpp covering direct slab bump allocation, multi-chunk growth, LIFO freelist reuse, allocator rebinding, n > 1 fallback, and CTxMemPool churn.
+---
+ src/indirectmap.h                     |  13 +-
+ src/support/allocators/chunked_slab.h | 312 ++++++++++++++++++++++++++
+ src/test/mempool_tests.cpp            | 146 ++++++++++++
+ src/txmempool.h                       |  24 +-
+ 4 files changed, 491 insertions(+), 4 deletions(-)
+ create mode 100644 src/support/allocators/chunked_slab.h
+
+diff --git a/src/indirectmap.h b/src/indirectmap.h
+index 649d30afb5..92daf406ce 100644
+--- a/src/indirectmap.h
++++ b/src/indirectmap.h
+@@ -6,6 +6,7 @@
+ #define BITCOIN_INDIRECTMAP_H
+ 
+ #include <map>
++#include <memory>
+ 
+ template <class T> struct DereferencingComparator {
+     bool operator()(const T a, const T b) const { return *a < *b; }
+@@ -23,9 +24,15 @@ template <class T> struct DereferencingComparator {
+  * Objects pointed to by keys must not be modified in any way that changes the
+  * result of DereferencingComparator.
+  */
+-template <class K, class T> class indirectmap {
++template <class K, class T,
++          class Allocator = std::allocator<std::pair<const K *const, T>>>
++class indirectmap {
+ private:
+-    typedef std::map<const K *, T, DereferencingComparator<const K *>> base;
++    using MapAllocator = typename std::allocator_traits<
++        Allocator>::template rebind_alloc<std::pair<const K *const, T>>;
++    typedef std::map<const K *, T, DereferencingComparator<const K *>,
++                     MapAllocator>
++        base;
+     base m;
+ 
+ public:
+@@ -33,6 +40,7 @@ public:
+     typedef typename base::const_iterator const_iterator;
+     typedef typename base::size_type size_type;
+     typedef typename base::value_type value_type;
++    typedef typename base::allocator_type allocator_type;
+ 
+     // passthrough (pointer interface)
+     std::pair<iterator, bool> insert(const value_type &value) {
+@@ -60,6 +68,7 @@ public:
+     const_iterator end() const { return m.end(); }
+     const_iterator cbegin() const { return m.cbegin(); }
+     const_iterator cend() const { return m.cend(); }
++    allocator_type get_allocator() const { return m.get_allocator(); }
+ };
+ 
+ #endif // BITCOIN_INDIRECTMAP_H
+diff --git a/src/support/allocators/chunked_slab.h b/src/support/allocators/chunked_slab.h
+new file mode 100644
+index 0000000000..b565d0d040
+--- /dev/null
++++ b/src/support/allocators/chunked_slab.h
+@@ -0,0 +1,312 @@
++// Copyright (c) 2026 The Lotus developers
++// Distributed under the MIT software license, see the accompanying
++// file COPYING or http://www.opensource.org/licenses/mit-license.php.
++
++#ifndef BITCOIN_SUPPORT_ALLOCATORS_CHUNKED_SLAB_H
++#define BITCOIN_SUPPORT_ALLOCATORS_CHUNKED_SLAB_H
++
++#include <algorithm>
++#include <cassert>
++#include <cstddef>
++#include <memory>
++#include <new>
++#include <type_traits>
++#include <utility>
++#include <vector>
++
++/**
++ * TigerBeetle-style chunked slab arena with an O(1) intrusive freelist for
++ * fixed-size node allocations (such as boost::multi_index_container and
++ * std::map / indirectmap tree and hash-index nodes in CTxMemPool).
++ *
++ * Instead of calling ::operator new for every individual node (which scatters
++ * tree/hash nodes across disjoint heap pages under mempool churn), SlabArena
++ * carves contiguous chunks of `SlotsPerChunk` slots and recycles freed slots
++ * through an in-place LIFO intrusive freelist.
++ */
++class SlabArena final {
++public:
++    struct FreeNode {
++        FreeNode *next;
++    };
++    static_assert(std::is_trivially_destructible_v<FreeNode>);
++
++private:
++    std::size_t m_slot_size{0};
++    std::size_t m_slot_align{0};
++    std::size_t m_chunk_bytes{0};
++    FreeNode *m_free_head{nullptr};
++    std::byte *m_bump_ptr{nullptr};
++    std::byte *m_bump_end{nullptr};
++    std::vector<std::byte *> m_chunks{};
++
++    void AllocateChunk() {
++        m_chunks.reserve(m_chunks.size() + 1);
++        auto *raw = static_cast<std::byte *>(
++            ::operator new(m_chunk_bytes, std::align_val_t{m_slot_align}));
++        m_chunks.push_back(raw);
++        m_bump_ptr = raw;
++        m_bump_end = raw + m_chunk_bytes;
++    }
++
++public:
++    constexpr SlabArena() noexcept = default;
++
++    SlabArena(std::size_t slot_size, std::size_t slot_align,
++              std::size_t slots_per_chunk) noexcept
++        : m_slot_size(slot_size), m_slot_align(slot_align),
++          m_chunk_bytes(slot_size * slots_per_chunk) {
++        assert(m_slot_size >= sizeof(void *));
++        assert(m_slot_align >= alignof(FreeNode));
++        assert((m_slot_align & (m_slot_align - 1)) == 0);
++        assert(m_slot_size % m_slot_align == 0);
++        assert(m_chunk_bytes >= m_slot_size);
++    }
++
++    SlabArena(const SlabArena &) = delete;
++    SlabArena &operator=(const SlabArena &) = delete;
++    SlabArena(SlabArena &&) = delete;
++    SlabArena &operator=(SlabArena &&) = delete;
++
++    ~SlabArena() {
++        for (std::byte *chunk : m_chunks) {
++            ::operator delete(chunk, m_chunk_bytes,
++                              std::align_val_t{m_slot_align});
++        }
++    }
++
++    void Init(std::size_t slot_size, std::size_t slot_align,
++              std::size_t slots_per_chunk) noexcept {
++        assert(m_slot_size == 0 && m_chunks.empty());
++        m_slot_size = slot_size;
++        m_slot_align = slot_align;
++        m_chunk_bytes = slot_size * slots_per_chunk;
++    }
++
++    [[nodiscard]] bool IsInitialized() const noexcept {
++        return m_slot_size != 0;
++    }
++
++    [[nodiscard]] bool Matches(std::size_t slot_size,
++                               std::size_t slot_align) const noexcept {
++        return m_slot_size == slot_size && m_slot_align == slot_align;
++    }
++
++    template <std::size_t SlotSize, std::size_t SlotAlign>
++    [[nodiscard]] void *AllocateSlot() {
++        static_assert(SlotSize >= sizeof(void *),
++                      "SlotSize must be able to hold a freelist pointer");
++        assert(m_slot_size == SlotSize && m_slot_align == SlotAlign);
++        if (m_free_head != nullptr) {
++            FreeNode *node = m_free_head;
++            m_free_head = node->next;
++            return node;
++        }
++        if (m_bump_ptr == m_bump_end) {
++            AllocateChunk();
++        }
++        std::byte *slot = m_bump_ptr;
++        m_bump_ptr += SlotSize;
++        return slot;
++    }
++
++    void DeallocateSlot(void *p) noexcept {
++        assert(p != nullptr);
++        m_free_head = ::new (p) FreeNode{m_free_head};
++    }
++
++    [[nodiscard]] std::size_t NumAllocatedChunks() const noexcept {
++        return m_chunks.size();
++    }
++
++    [[nodiscard]] std::size_t ChunkSizeBytes() const noexcept {
++        return m_chunk_bytes;
++    }
++
++    [[nodiscard]] std::size_t SlotSizeBytes() const noexcept {
++        return m_slot_size;
++    }
++
++    [[nodiscard]] std::size_t FreeListCount() const noexcept {
++        std::size_t count = 0;
++        for (const FreeNode *cur = m_free_head; cur != nullptr;
++             cur = cur->next) {
++            ++count;
++        }
++        return count;
++    }
++};
++
++/**
++ * Shared resource backing a family of rebound ChunkedSlabAllocator instances.
++ *
++ * Node-based containers (boost::multi_index_container, std::map) rebind their
++ * value_type allocator to internal node type(s). Sharing a ChunkedSlabResource
++ * across rebinds ensures that on-the-fly rebinding and stored node allocators
++ * always resolve to the same SlabArena for a given (SlotSize, SlotAlign).
++ */
++template <std::size_t SlotsPerChunk = 16384> class ChunkedSlabResource final {
++    static_assert(SlotsPerChunk > 0, "SlotsPerChunk must be positive");
++
++    SlabArena m_primary_arena{};
++    std::vector<std::unique_ptr<SlabArena>> m_overflow_arenas{};
++
++public:
++    ChunkedSlabResource() noexcept = default;
++    ChunkedSlabResource(const ChunkedSlabResource &) = delete;
++    ChunkedSlabResource &operator=(const ChunkedSlabResource &) = delete;
++
++    [[nodiscard]] SlabArena *GetOrCreateArena(std::size_t slot_size,
++                                              std::size_t slot_align) {
++        if (!m_primary_arena.IsInitialized()) {
++            m_primary_arena.Init(slot_size, slot_align, SlotsPerChunk);
++            return &m_primary_arena;
++        }
++        if (m_primary_arena.Matches(slot_size, slot_align)) {
++            return &m_primary_arena;
++        }
++        for (const auto &arena : m_overflow_arenas) {
++            if (arena->Matches(slot_size, slot_align)) {
++                return arena.get();
++            }
++        }
++        m_overflow_arenas.push_back(
++            std::make_unique<SlabArena>(slot_size, slot_align, SlotsPerChunk));
++        return m_overflow_arenas.back().get();
++    }
++
++    [[nodiscard]] std::size_t NumAllocatedChunks() const noexcept {
++        std::size_t total = m_primary_arena.NumAllocatedChunks();
++        for (const auto &arena : m_overflow_arenas) {
++            total += arena->NumAllocatedChunks();
++        }
++        return total;
++    }
++
++    [[nodiscard]] std::size_t TotalAllocatedChunkBytes() const noexcept {
++        std::size_t total = m_primary_arena.NumAllocatedChunks() *
++                            m_primary_arena.ChunkSizeBytes();
++        for (const auto &arena : m_overflow_arenas) {
++            total += arena->NumAllocatedChunks() * arena->ChunkSizeBytes();
++        }
++        return total;
++    }
++};
++
++/**
++ * STL- and Boost.MultiIndex-compatible stateful allocator backed by
++ * ChunkedSlabResource.
++ *
++ * - Single-element allocations (`n == 1`, used for all tree/hash index nodes)
++ *   are served in O(1) from the slab arena's intrusive freelist or contiguous
++ *   bump chunk.
++ * - Multi-element allocations (`n > 1`, such as contiguous bucket pointer
++ *   arrays in `boost::multi_index::hashed_unique`) fall back directly to
++ *   aligned `::operator new` / `::operator delete`.
++ */
++template <typename T, std::size_t SlotsPerChunk = 16384>
++class ChunkedSlabAllocator {
++    static_assert(SlotsPerChunk > 0, "SlotsPerChunk must be positive");
++
++    static constexpr std::size_t SlotAlign() noexcept {
++        return std::max(alignof(T), alignof(SlabArena::FreeNode));
++    }
++
++    static constexpr std::size_t SlotSize() noexcept {
++        constexpr std::size_t align =
++            std::max(alignof(T), alignof(SlabArena::FreeNode));
++        constexpr std::size_t raw =
++            std::max(sizeof(T), sizeof(SlabArena::FreeNode));
++        constexpr std::size_t size = ((raw + align - 1) / align) * align;
++        static_assert(size >= sizeof(void *),
++                      "SlotSize must be at least sizeof(void*)");
++        static_assert((align & (align - 1)) == 0,
++                      "SlotAlign must be a power of two");
++        return size;
++    }
++
++    std::shared_ptr<ChunkedSlabResource<SlotsPerChunk>> m_resource;
++    mutable SlabArena *m_arena{nullptr};
++
++    template <typename U, std::size_t S> friend class ChunkedSlabAllocator;
++
++    SlabArena *EnsureArena() const {
++        if (m_arena == nullptr) {
++            m_arena = m_resource->GetOrCreateArena(SlotSize(), SlotAlign());
++        }
++        return m_arena;
++    }
++
++public:
++    using value_type = T;
++    using pointer = T *;
++    using const_pointer = const T *;
++    using size_type = std::size_t;
++    using difference_type = std::ptrdiff_t;
++    using propagate_on_container_copy_assignment = std::true_type;
++    using propagate_on_container_move_assignment = std::true_type;
++    using propagate_on_container_swap = std::true_type;
++    using is_always_equal = std::false_type;
++
++    template <typename U> struct rebind {
++        using other = ChunkedSlabAllocator<U, SlotsPerChunk>;
++    };
++
++    ChunkedSlabAllocator()
++        : m_resource(std::make_shared<ChunkedSlabResource<SlotsPerChunk>>()),
++          m_arena(nullptr) {}
++
++    ChunkedSlabAllocator(const ChunkedSlabAllocator &other) noexcept = default;
++    ChunkedSlabAllocator &
++    operator=(const ChunkedSlabAllocator &other) noexcept = default;
++
++    ChunkedSlabAllocator(ChunkedSlabAllocator &&other) noexcept = default;
++    ChunkedSlabAllocator &
++    operator=(ChunkedSlabAllocator &&other) noexcept = default;
++
++    template <typename U>
++    ChunkedSlabAllocator(
++        const ChunkedSlabAllocator<U, SlotsPerChunk> &other) noexcept
++        : m_resource(other.m_resource), m_arena(nullptr) {}
++
++    [[nodiscard]] T *allocate(std::size_t n) {
++        if (n == 1) {
++            return static_cast<T *>(
++                EnsureArena()
++                    ->template AllocateSlot<SlotSize(), SlotAlign()>());
++        }
++        return static_cast<T *>(
++            ::operator new(n * sizeof(T), std::align_val_t{alignof(T)}));
++    }
++
++    void deallocate(T *p, std::size_t n) noexcept {
++        if (p == nullptr) {
++            return;
++        }
++        if (n == 1) {
++            EnsureArena()->DeallocateSlot(p);
++            return;
++        }
++        ::operator delete(p, n * sizeof(T), std::align_val_t{alignof(T)});
++    }
++
++    [[nodiscard]] ChunkedSlabResource<SlotsPerChunk> *resource() const noexcept {
++        return m_resource.get();
++    }
++
++    [[nodiscard]] SlabArena *arena() const { return EnsureArena(); }
++};
++
++template <typename T1, typename T2, std::size_t SlotsPerChunk>
++bool operator==(const ChunkedSlabAllocator<T1, SlotsPerChunk> &a,
++                const ChunkedSlabAllocator<T2, SlotsPerChunk> &b) noexcept {
++    return a.resource() == b.resource();
++}
++
++template <typename T1, typename T2, std::size_t SlotsPerChunk>
++bool operator!=(const ChunkedSlabAllocator<T1, SlotsPerChunk> &a,
++                const ChunkedSlabAllocator<T2, SlotsPerChunk> &b) noexcept {
++    return !(a == b);
++}
++
++#endif // BITCOIN_SUPPORT_ALLOCATORS_CHUNKED_SLAB_H
+diff --git a/src/test/mempool_tests.cpp b/src/test/mempool_tests.cpp
+index fbe275305a..ae312c7398 100644
+--- a/src/test/mempool_tests.cpp
++++ b/src/test/mempool_tests.cpp
+@@ -894,4 +894,150 @@ BOOST_AUTO_TEST_CASE(long_chain_accepted) {
+     BOOST_CHECK_EQUAL(m_node.mempool->size(), 100UL);
+ }
+ 
++BOOST_AUTO_TEST_CASE(mempool_slab_allocator_churn) {
++    // 1. Direct ChunkedSlabAllocator unit tests: single-slot bump allocation,
++    // multi-chunk growth, LIFO intrusive freelist reuse, rebind sharing, and
++    // n > 1 array allocation fallback.
++    {
++        ChunkedSlabAllocator<uint64_t, 4> alloc;
++        BOOST_CHECK_EQUAL(alloc.resource()->NumAllocatedChunks(), 0U);
++
++        uint64_t *p0 = alloc.allocate(1);
++        uint64_t *p1 = alloc.allocate(1);
++        uint64_t *p2 = alloc.allocate(1);
++        uint64_t *p3 = alloc.allocate(1);
++        *p0 = 10;
++        *p1 = 20;
++        *p2 = 30;
++        *p3 = 40;
++        BOOST_CHECK_EQUAL(alloc.resource()->NumAllocatedChunks(), 1U);
++        BOOST_CHECK_EQUAL(alloc.arena()->FreeListCount(), 0U);
++        // Contiguous bump slots within the same chunk:
++        BOOST_CHECK_EQUAL(reinterpret_cast<std::byte *>(p1) -
++                              reinterpret_cast<std::byte *>(p0),
++                          static_cast<std::ptrdiff_t>(sizeof(uint64_t)));
++
++        // 5th allocation triggers a 2nd chunk when SlotsPerChunk == 4:
++        uint64_t *p4 = alloc.allocate(1);
++        *p4 = 50;
++        BOOST_CHECK_EQUAL(alloc.resource()->NumAllocatedChunks(), 2U);
++
++        // Return p1 and p3 to the intrusive freelist and verify LIFO reuse:
++        alloc.deallocate(p1, 1);
++        alloc.deallocate(p3, 1);
++        BOOST_CHECK_EQUAL(alloc.arena()->FreeListCount(), 2U);
++
++        uint64_t *r1 = alloc.allocate(1);
++        uint64_t *r2 = alloc.allocate(1);
++        BOOST_CHECK_EQUAL(r1, p3);
++        BOOST_CHECK_EQUAL(r2, p1);
++        BOOST_CHECK_EQUAL(alloc.arena()->FreeListCount(), 0U);
++        BOOST_CHECK_EQUAL(alloc.resource()->NumAllocatedChunks(), 2U);
++
++        // Rebind to a larger node type and verify shared resource:
++        struct DummyNode {
++            uint64_t a;
++            uint64_t b;
++            uint64_t c;
++        };
++        ChunkedSlabAllocator<uint64_t, 4>::rebind<DummyNode>::other rebound(
++            alloc);
++        BOOST_CHECK(rebound == alloc);
++        DummyNode *dn = rebound.allocate(1);
++        dn->a = 1;
++        dn->b = 2;
++        dn->c = 3;
++        BOOST_CHECK_EQUAL(alloc.resource()->NumAllocatedChunks(), 3U);
++        rebound.deallocate(dn, 1);
++        BOOST_CHECK_EQUAL(rebound.arena()->FreeListCount(), 1U);
++
++        // Multi-element (n > 1) bucket-array fallback does not allocate slab
++        // chunks:
++        uint64_t *arr = alloc.allocate(32);
++        for (size_t i = 0; i < 32; ++i) {
++            arr[i] = i;
++        }
++        BOOST_CHECK_EQUAL(alloc.resource()->NumAllocatedChunks(), 3U);
++        alloc.deallocate(arr, 32);
++
++        alloc.deallocate(p0, 1);
++        alloc.deallocate(r2, 1);
++        alloc.deallocate(p2, 1);
++        alloc.deallocate(r1, 1);
++        alloc.deallocate(p4, 1);
++        BOOST_CHECK_EQUAL(alloc.arena()->FreeListCount(), 5U);
++    }
++
++    // 2. CTxMemPool mapTx and mapNextTx insertion/removal churn test:
++    CTxMemPool &pool = *Assert(m_node.mempool);
++    LOCK2(cs_main, pool.cs);
++    pool.clear(/*include_finalized_txs=*/true);
++
++    TestMemPoolEntryHelper entry;
++    entry.SigChecks(0);
++
++    constexpr size_t BATCH_SIZE = 64;
++    std::vector<CTransactionRef> active_txs;
++    active_txs.reserve(BATCH_SIZE);
++
++    auto makeChurnTx = [](int64_t round, int64_t idx) {
++        CMutableTransaction mtx;
++        mtx.nVersion = 2;
++        mtx.vin.resize(2);
++        mtx.vin[0].prevout = COutPoint(TxId{FastRandomContext().rand256()}, 0);
++        mtx.vin[1].prevout = COutPoint(TxId{FastRandomContext().rand256()}, 1);
++        mtx.vout.emplace_back((10000 + round * 100 + idx) * SATOSHI,
++                              CScript() << OP_TRUE);
++        mtx.vout.emplace_back((20000 + round * 100 + idx) * SATOSHI,
++                              CScript() << OP_TRUE);
++        return MakeTransactionRef(mtx);
++    };
++
++    for (size_t i = 0; i < BATCH_SIZE; ++i) {
++        CTransactionRef tx = makeChurnTx(0, static_cast<int64_t>(i));
++        pool.addUnchecked(entry.Fee(1000 * SATOSHI).FromTx(tx));
++        active_txs.push_back(std::move(tx));
++    }
++
++    BOOST_CHECK_EQUAL(pool.size(), BATCH_SIZE);
++    BOOST_CHECK_EQUAL(pool.mapNextTx.size(), BATCH_SIZE * 2);
++
++    const size_t tx_chunks_initial =
++        pool.mapTx.get_allocator().resource()->NumAllocatedChunks();
++    const size_t next_chunks_initial =
++        pool.mapNextTx.get_allocator().resource()->NumAllocatedChunks();
++    BOOST_CHECK_GE(tx_chunks_initial, 1U);
++    BOOST_CHECK_GE(next_chunks_initial, 1U);
++
++    // Churn through 3 rounds of evicting half the mempool and refilling back to
++    // BATCH_SIZE, verifying slab freelist slot reuse without new chunk growth.
++    for (int64_t round = 1; round <= 3; ++round) {
++        for (size_t i = 0; i < BATCH_SIZE / 2; ++i) {
++            pool.removeRecursive(*active_txs[i], REMOVAL_REASON_DUMMY);
++        }
++        active_txs.erase(active_txs.begin(),
++                         active_txs.begin() + (BATCH_SIZE / 2));
++        BOOST_CHECK_EQUAL(pool.size(), BATCH_SIZE / 2);
++        BOOST_CHECK_EQUAL(pool.mapNextTx.size(), BATCH_SIZE);
++
++        for (size_t i = 0; i < BATCH_SIZE / 2; ++i) {
++            CTransactionRef tx = makeChurnTx(round, static_cast<int64_t>(i));
++            pool.addUnchecked(entry.Fee(1000 * SATOSHI).FromTx(tx));
++            active_txs.push_back(std::move(tx));
++        }
++        BOOST_CHECK_EQUAL(pool.size(), BATCH_SIZE);
++        BOOST_CHECK_EQUAL(pool.mapNextTx.size(), BATCH_SIZE * 2);
++        BOOST_CHECK_EQUAL(
++            pool.mapTx.get_allocator().resource()->NumAllocatedChunks(),
++            tx_chunks_initial);
++        BOOST_CHECK_EQUAL(
++            pool.mapNextTx.get_allocator().resource()->NumAllocatedChunks(),
++            next_chunks_initial);
++    }
++
++    pool.clear(/*include_finalized_txs=*/true);
++    BOOST_CHECK_EQUAL(pool.size(), 0UL);
++    BOOST_CHECK(pool.mapNextTx.empty());
++}
++
+ BOOST_AUTO_TEST_SUITE_END()
+diff --git a/src/txmempool.h b/src/txmempool.h
+index 0cbfc003f7..ae7c84f95b 100644
+--- a/src/txmempool.h
++++ b/src/txmempool.h
+@@ -19,6 +19,7 @@
+ #include <policy/packages.h>
+ #include <primitives/transaction.h>
+ #include <radix.h>
++#include <support/allocators/chunked_slab.h>
+ #include <sync.h>
+ #include <txconflicting.h>
+ #include <txorphanage.h>
+@@ -30,6 +31,21 @@
+ #include <boost/multi_index/sequenced_index.hpp>
+ #include <boost/multi_index_container.hpp>
+ 
++namespace memusage {
++template <typename X, typename Y, typename T, std::size_t SlotsPerChunk>
++static inline size_t DynamicUsage(
++    const indirectmap<X, Y, ChunkedSlabAllocator<T, SlotsPerChunk>> &m) {
++    return MallocUsage(sizeof(stl_tree_node<std::pair<const X *, Y>>)) *
++           m.size();
++}
++
++template <typename X, typename Y, typename T, std::size_t SlotsPerChunk>
++static inline size_t IncrementalDynamicUsage(
++    const indirectmap<X, Y, ChunkedSlabAllocator<T, SlotsPerChunk>> &m) {
++    return MallocUsage(sizeof(stl_tree_node<std::pair<const X *, Y>>));
++}
++} // namespace memusage
++
+ #include <atomic>
+ #include <map>
+ #include <memory>
+@@ -287,7 +303,8 @@ public:
+             boost::multi_index::ordered_unique<
+                 boost::multi_index::tag<entry_id>,
+                 boost::multi_index::identity<CTxMemPoolEntryRef>,
+-                CompareTxMemPoolEntryByEntryId>>>
++                CompareTxMemPoolEntryByEntryId>>,
++        ChunkedSlabAllocator<CTxMemPoolEntryRef>>
+         indexed_transaction_set;
+ 
+     /**
+@@ -351,7 +368,10 @@ private:
+         EXCLUSIVE_LOCKS_REQUIRED(cs);
+ 
+ public:
+-    indirectmap<COutPoint, CTransactionRef> mapNextTx GUARDED_BY(cs);
++    indirectmap<
++        COutPoint, CTransactionRef,
++        ChunkedSlabAllocator<std::pair<const COutPoint *const, CTransactionRef>>>
++        mapNextTx GUARDED_BY(cs);
+     std::map<TxId, Amount> mapDeltas GUARDED_BY(cs);
+ 
+     using Options = kernel::MemPoolOptions;
+-- 
+2.50.1 (Apple Git-155)
+
