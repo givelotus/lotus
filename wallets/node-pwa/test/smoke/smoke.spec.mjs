@@ -150,6 +150,15 @@ test('dev proxy: create a wallet, mine, receive, send, inspect, peers, console',
   expect((await node.rpc('getnetworkinfo')).networkactive).toBe(false);
   await page.getByTestId('network-toggle').click();
   await expect(page.getByTestId('network-toggle')).toHaveText('Network on');
+  // No peers exist on an isolated node, so bans are added over RPC and removed in the UI.
+  await node.rpc('setban', ['203.0.113.9', 'add', 3600]);
+  await node.rpc('setban', ['198.51.100.0/24', 'add', 3600]);
+  await expect(page.getByTestId('ban-table')).toContainText('203.0.113.9');
+  await page.getByTestId('ban-table').getByRole('row').filter({ hasText: '203.0.113.9' }).getByRole('button', { name: 'Unban' }).click();
+  await expect(page.getByTestId('ban-table')).not.toContainText('203.0.113.9');
+  await page.getByRole('button', { name: 'Clear all' }).click();
+  await expect(page.getByTestId('no-bans')).toBeVisible();
+  expect(await node.rpc('listbanned')).toEqual([]);
 
   // 7. Node view renders chain data.
   await page.getByRole('link', { name: 'Node', exact: true }).click();
