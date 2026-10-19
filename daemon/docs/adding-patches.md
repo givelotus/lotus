@@ -4,7 +4,54 @@ Run commands below from the monorepo root. A patch is one ordinary Git commit,
 exported with `git format-patch` and replayed with `git am`. Its commit body should
 explain the problem, the chosen fix, dependencies and validation limits.
 
-## Add a patch
+## Mechanistic Branch-First Workflow (`daemon/scripts/lotus-git.py`)
+
+Subdaemon stacks (`daemon/ecash`, `daemon/v2`, `daemon/v1`, `daemon/doged`,
+`daemon/bchn`, `daemon/bitcoin`) are maintained directly as Git branches with
+their tip SHAs pinned in `daemon/*-version`—no `.patch` file generation is
+needed during normal development:
+
+```sh
+# 1. Inspect branch, base, and pin status across all subdaemons:
+make -C daemon status
+
+# 2. Initialize workspace Git refs (rebase.updateRefs=true, rebase.autoSquash=true,
+#    rerere.enabled=true, base/abc, daemon/ecash, and daemon/v2):
+make -C daemon init SERIES=v2
+
+# 3. Iterate using ordinary Git commits (and --fixup commits) in the workspace:
+cd daemon/workspace-v2
+git add path/to/changed/file
+# Either create a new feature commit:
+git commit -m "subsystem: describe the change"
+# Or create a fixup targeting an earlier commit (by SHA or :/subject-substring):
+git commit --fixup <earlier-sha>
+cd ../..
+
+# 3b. Non-interactively autosquash all fixup! commits and update daemon/ecash + daemon/v2:
+make -C daemon autosquash SERIES=v2
+
+# 4a. If a new commit is chain-agnostic and belongs in the eCash base tier (daemon/ecash),
+#     sink it down onto daemon/ecash and replay daemon/v2 on top automatically:
+make -C daemon sink-to-ecash COMMIT=HEAD
+
+# 4b. Pin the updated branch SHAs in daemon/*-version and push daemon/* branches:
+make -C daemon sync SERIES=v2 PUSH=1
+
+# 5. Extract selected commit(s) onto a clean branch off base/abc for an upstream PR:
+make -C daemon extract-pr SERIES=ecash BRANCH=pr/my-feature COMMITS="<sha1> <sha2>"
+
+# 6. Rebase the entire two-tier stack (daemon/ecash -> daemon/v2) onto a new upstream commit:
+make -C daemon rebase-upstream SERIES=v2 COMMIT=<sha-or-latest>
+```
+
+- **When to use `git commit --fixup <sha>`:** Any time a bugfix, compiler warning fix, test fix, or review refinement belongs to an earlier commit in `base/abc..daemon/ecash` or `daemon/ecash..daemon/v2`. Follow with `make -C daemon autosquash SERIES=v2` (which runs `GIT_SEQUENCE_EDITOR=true git rebase -i --autosquash --update-refs` without opening an interactive editor).
+- `make -C daemon sync` verifies linear history and refuses if any unsquashed `fixup!` or `squash!` commits remain.
+- If legacy `.patch` files are ever needed for external archival, pass `PATCHES=1` (`make -C daemon sync SERIES=v2 PATCHES=1`).
+
+---
+
+## Legacy Single-Patch Export (`mkpatch`)
 
 Work in a separate monorepo checkout so setup cannot change a running node's
 source workspace:
