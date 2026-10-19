@@ -7,6 +7,8 @@
 //   (1 s doubling to 30 s). A success resets it.
 // - The long-poll loop calls waitForBlock(); when it returns a different
 //   block hash it pokes an immediate tick. Its errors back off the same way.
+//   It runs only while the page is visible: every waiting call holds one of
+//   the node's RPC worker threads (-rpcthreads) for up to 30 s.
 //
 // Timers are injected so tests can use fake ones. onChange(topic, fn) is the
 // hook views subscribe to; a later WebSocket event stream can call emit()
@@ -72,6 +74,12 @@ export function createPoller(cfg) {
 
   async function longPoll() {
     if (!running || !cfg.waitForBlock) return;
+    if (!isVisible()) {
+      // Each waiting long-poll occupies one of the node's RPC worker threads
+      // for up to 30 s, so hidden tabs leave it to the periodic tick.
+      lpTimer = st(() => { lpTimer = null; void longPoll(); }, 1000);
+      return;
+    }
     lpAbort = new AbortController();
     try {
       const hash = await cfg.waitForBlock(lastHash, lpAbort.signal);

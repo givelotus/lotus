@@ -169,12 +169,13 @@ export function createDevServer(opts) {
     return (await readFile(opts.cookieFile, 'utf8')).trim();
   }
 
-  async function forward(path, body, credentials) {
+  async function forward(path, body, credentials, signal) {
     const auth = 'Basic ' + Buffer.from(credentials ?? (await nodeCredentials())).toString('base64');
     const resp = await fetch(new URL(path, opts.rpcUrl), {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', Authorization: auth },
       body,
+      signal,
     });
     return { status: resp.status, body: Buffer.from(await resp.arrayBuffer()) };
   }
@@ -304,10 +305,14 @@ export function createDevServer(opts) {
     } catch (e) {
       return reply(res, e.status ?? 400, {}, '');
     }
+    // Drop the upstream request when the browser goes away.
+    const ctl = new AbortController();
+    res.on('close', () => { if (!res.writableFinished) ctl.abort(); });
     try {
-      const r = await forward(url.pathname, body, credentials);
+      const r = await forward(url.pathname, body, credentials, ctl.signal);
       return reply(res, r.status, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' }, r.body);
     } catch (e) {
+      if (ctl.signal.aborted) return undefined;
       log(`rpc: node unreachable (${e.cause?.code ?? e.message})`);
       return reply(res, 502, { 'Content-Type': 'text/plain; charset=utf-8' }, 'node unreachable');
     }

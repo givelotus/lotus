@@ -57,8 +57,11 @@ export function createApp({ fetch, location = globalThis.location, history = glo
 
   const poller = createPoller({
     tick,
+    // 10 s rather than longer: an abandoned call (closed or reloaded tab)
+    // keeps one of the node's RPC worker threads (-rpcthreads, default 4)
+    // busy until it times out.
     waitForBlock: async (_last, signal) => {
-      const r = await rpc.call('waitfornewblock', [30000], { timeoutMs: 40000, signal });
+      const r = await rpc.call('waitfornewblock', [10000], { timeoutMs: 20000, signal });
       return r?.hash ?? null;
     },
   });
@@ -232,6 +235,11 @@ export function createApp({ fetch, location = globalThis.location, history = glo
     store.set((s) => ({ toasts: [...s.toasts, { id, text, kind }] }));
     setTimeout(() => store.set((s) => ({ toasts: s.toasts.filter((t) => t.id !== id) })), ms);
   }
+
+  // Refresh right away when the tab becomes visible again.
+  globalThis.document?.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'visible') poller.poke();
+  });
 
   return {
     mode, auth, rpc, store, poller, walletCall, selectWallet, boot, loginPassword, logout, toast,

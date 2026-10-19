@@ -124,3 +124,19 @@ test('long-poll errors back off', async () => {
   assert.equal(calls, 3);
   p.stop();
 });
+
+test('long-poll pauses while the page is hidden', async () => {
+  const t = fakeTimers();
+  let calls = 0, visible = false;
+  const p = createPoller({
+    tick: async () => {}, waitForBlock: () => { calls++; return new Promise(() => {}); },
+    isVisible: () => visible, setTimeout: t.setTimeout, clearTimeout: t.clearTimeout,
+  });
+  p.start();
+  await t.advance(10000);
+  assert.equal(calls, 0);
+  visible = true;
+  await t.advance(1000);
+  assert.equal(calls, 1);
+  p.stop();
+});
