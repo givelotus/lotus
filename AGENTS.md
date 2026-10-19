@@ -49,26 +49,86 @@ Workspaces (`daemon/workspace-*`) are **gitignored** local clones created by `ma
 
 | SERIES | Base | Version file | Workspace | Purpose |
 |--------|------|-------------|-----------|---------|
+| `v2` | `daemon/ecash` (on `1fb7db17`) | `bitcoin-abc-version` | `workspace-v2/` | **Lotus V2 new chain** — stacked directly on `daemon/ecash` (`@include ../ecash/series` + `patches/v2/series`) |
+| `ecash` | `bitcoin-abc` `1fb7db17` | `bitcoin-abc-version` | `workspace-v2/` (shared `daemon/ecash` ref) or `workspace-ecash/` | Shared high-throughput ABC engine & P2P layer (`patches/ecash/series`) |
 | `v1` | `bitcoin-abc` `8c67fe1e85` | `bitcoin-abc-v1-version` | `workspace-v1/` | **Lotus V1 mainnet (`v11.6.1`)** — 153 maintained patches (`000`–`247`) plus generated release metadata + in-process Chronik (`-DBUILD_CHRONIK=ON`) |
-| `ecash` | `bitcoin-abc` `1fb7db17` | `bitcoin-abc-version` | `workspace-ecash/` | Upstream reference patches |
 | `doged` | `bitcoin-abc` | `bitcoin-abc-version` | `workspace-doged-abc/` | Dogecoin implementation, 174-patch maintained series |
 | `doged-reference` | `doged-io/doged` | `doged-reference-version` | `workspace-doged-reference/` | Historical Doged reference build |
 | `bchn` | BCHN `abd433abe0` (29.2.1) | `bchn-version` | `workspace-bchn/` | Current-tip Bitcoin Cash Node upstream candidates |
+| `bitcoin` | Bitcoin Core `f13ae519de` | `bitcoin-core-version` | `workspace-bitcoin/` | Bitcoin Core (`BTC`) source pin and patches |
+
+### Mechanistic Branch-First Workflow (`daemon/scripts/lotus-git.py`)
+
+**CRITICAL RULE FOR AGENTS & DEVELOPERS:**
+Do **NOT** create or hand-edit `.patch` files in `daemon/patches/<series>/`. Subdaemons are maintained as real Git branches (`refs/heads/daemon/ecash`, `refs/heads/daemon/v2`, etc.) with their commit SHAs pinned in `daemon/*-version`. Work with normal Git commits inside `daemon/workspace-<series>` and use [`daemon/scripts/lotus-git.py`](daemon/scripts/lotus-git.py) (or its `make -C daemon` targets):
+
+1. **Check Status Across All Subdaemons:**
+   ```bash
+   make -C daemon status
+   ```
+2. **Two-Tier `daemon/ecash` $\rightarrow$ `daemon/v2` Architecture Inside `daemon/workspace-v2`:**
+   - `daemon/workspace-v2` holds **both** `refs/heads/daemon/ecash` (Tier 1: chain-agnostic engine, C++ Chronik, PWA Wallet) and `refs/heads/daemon/v2` (Tier 2: Lotus V2 consensus/wire), with `rebase.updateRefs=true` and `rebase.autoSquash=true` enabled automatically by `make -C daemon init SERIES=v2`.
+   - **When to Use `git commit --fixup <sha>` vs. a New Commit vs. `--amend` (Mandatory Agent Rules):**
+     - **Use `git commit --fixup <sha>` (or `git commit --fixup :/<subject-substring>`) whenever you are:**
+       1. Fixing a bug, compiler error/warning, lint issue, or test failure introduced by an earlier commit in `base/abc..daemon/ecash` or `daemon/ecash..daemon/v2`.
+       2. Addressing code review feedback or refining an existing feature/optimization commit that is buried below `HEAD` (especially a commit in `daemon/ecash` while `HEAD` is at `daemon/v2`).
+       3. *Never* leave noisy "fix build", "fix typo", or "address review" commits at the top of the branch when the change logically belongs inside an earlier commit.
+     - **Use `git commit --amend` ONLY when:**
+       - Your fix belongs to the very last commit at `HEAD` (`daemon/v2` tip) and does not cross the `daemon/ecash` boundary.
+     - **Create a new standalone `git commit` ONLY when:**
+       - Introducing a genuinely distinct, self-contained logical feature or optimization that stands on its own in upstream review.
+   - **How to Squash Fixups Non-Interactively (`make -C daemon autosquash`):**
+     - **Agents must NEVER run bare `git rebase -i` without `GIT_SEQUENCE_EDITOR=true`**, because interactive terminal editors (`vim`/`nano`) will hang non-interactive agent sessions.
+     - Instead, after creating one or more `git commit --fixup <sha>` commits, run:
+       ```bash
+       make -C daemon autosquash SERIES=v2
+       ```
+       This saves a backup ref (`refs/backups/pre-autosquash-...`), runs `GIT_SEQUENCE_EDITOR=true git rebase -i --autosquash --update-refs base/abc` to fold every `fixup!` commit into its target commit across both tiers, updates **both** `daemon/ecash` and `daemon/v2` branch pointers, and re-pins `daemon/ecash-version` and `daemon/v2-version` (`make -C daemon sync` will refuse if any unsquashed `fixup!` commit remains).
+   - **Adding or moving a new shared engine commit into `daemon/ecash`:** Commit your new feature on `HEAD` in `daemon/workspace-v2`, then sink it down onto `daemon/ecash` in one command:
+     ```bash
+     make -C daemon sink-to-ecash COMMIT=HEAD
+     ```
+   - **Pinning & Pushing Subdaemon Branches:**
+     ```bash
+     make -C daemon sync SERIES=v2 PUSH=1
+     ```
+     Updates `daemon/ecash-version` and `daemon/v2-version` with the branch tip SHAs and pushes `refs/heads/daemon/ecash` and `refs/heads/daemon/v2` to `origin` with `--force-with-lease` (while hard-blocking `main` from ever being force-pushed).
+3. **Extracting a Clean Branch for Submitting Upstream PRs (Bitcoin ABC / BCHN / Core):**
+   ```bash
+   make -C daemon extract-pr SERIES=ecash BRANCH=pr/my-upstream-feature COMMITS="<sha1> <sha2>"
+   ```
+   Cherry-picks the selected commit(s) onto a fresh branch (`pr/my-upstream-feature`) directly on top of `base/abc` (`1fb7db17`), ready to push to an upstream PR.
+4. **Rebasing Both Tiers Onto a New Upstream Commit:**
+   ```bash
+   make -C daemon rebase-upstream SERIES=v2 COMMIT=<new-abc-sha-or-latest>
+   ```
 
 ### Commands
 
 ```bash
-# 1. Clone the pinned V1 bitcoin-abc base and apply all 153 patches in order:
-make -C daemon setup SERIES=v1
+# 1. Clone the pinned base and initialize lotus-git refs (updateRefs + autoSquash):
+make -C daemon setup SERIES=v2
 
-# 2. Compile lotusd and lotus-cli (with -DBUILD_CHRONIK=ON enabled by default for SERIES=v1):
-make -C daemon build SERIES=v1
+# 2. Compile lotusd and lotus-cli:
+make -C daemon build SERIES=v2
 
-# 3. Run lotusd on mainnet with in-process Chronik enabled:
-./daemon/workspace-v1/build/src/lotusd -chronik=1 -daemon
+# 3. Check branch & pin-sync status across all subdaemons:
+make -C daemon status
 
-# Rebase a selected patch stack against its upstream's current default branch:
-make -C daemon refresh SERIES=v1 COMMIT=latest
+# 4. Non-interactively fold all `fixup!` commits into their targets across both tiers:
+make -C daemon autosquash SERIES=v2
+
+# 5. Pin workspace Git branch SHAs in daemon/*-version (and optionally push branches to origin):
+make -C daemon sync SERIES=v2 PUSH=1
+
+# 6. Move a general engine commit from the top of daemon/v2 down into daemon/ecash:
+make -C daemon sink-to-ecash COMMIT=HEAD
+
+# 7. Spin selected commits from daemon/ecash onto a clean base/abc branch for an upstream PR:
+make -C daemon extract-pr SERIES=ecash BRANCH=pr/my-feature COMMITS="<sha>"
+
+# 8. Rebase a selected stack against upstream with --update-refs:
+make -C daemon rebase-upstream SERIES=v2 COMMIT=latest
 
 # Prepare a review-only shared Chronik provider refresh candidate:
 make -C daemon refresh-chronik CANDIDATE=/tmp/chronik-provider-candidate
@@ -76,11 +136,6 @@ make -C daemon refresh-chronik CANDIDATE=/tmp/chronik-provider-candidate
 # Rebase eCash, Dogecoin, and Chronik against one ABC commit:
 make -C daemon refresh-abc CANDIDATE=/tmp/abc-update-candidate
 ```
-
-`COMMIT=latest` resolves the workspace remote's advertised default branch and
-updates its selector only after the complete patch replay succeeds. It does not
-upgrade the independent Chronik provider pin or validate behavior; see
-`daemon/docs/adding-patches.md`.
 
 `refresh-chronik` fetches the canonical ABC default branch into temporary
 storage, exports the requested immutable Chronik revision into a new candidate,

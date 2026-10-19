@@ -18,7 +18,14 @@ help:
 	@echo "  Existing workspaces are preserved; move an old workspace aside before setup."
 	@echo "  make build [SERIES=v1|v2|ecash|doged|doged-reference|bchn|bitcoin] Build selected daemon and CLI"
 	@echo "  make run   [SERIES=v1|v2|ecash|doged|doged-reference|bchn|bitcoin] ARGS=\"...\"  Run selected daemon"
-	@echo "  make mkpatch NAME=<n>          Export committed HEAD with authorship and rationale"
+	@echo "  make status                                  Show branch, base, and pin-sync status for all subdaemons"
+	@echo "  make init  [SERIES=v2|ecash|v1|doged|bchn|bitcoin] Configure workspace Git refs, updateRefs & autoSquash"
+	@echo "  make autosquash [SERIES=v2]                  Non-interactively squash all fixup! commits & update stacked refs"
+	@echo "  make sync  [SERIES=v2|ecash|...] [PUSH=1] [PATCHES=1] Pin branch SHAs (and optionally push/export patches)"
+	@echo "  make sink-to-ecash [COMMIT=HEAD]             Move a commit from daemon/v2 down onto daemon/ecash"
+	@echo "  make rebase-upstream SERIES=v2 COMMIT=<sha|latest> Rebase branch stack onto upstream with --update-refs"
+	@echo "  make extract-pr SERIES=ecash BRANCH=pr/... [COMMITS=\"<sha>\"] Spin commits onto a clean upstream PR branch"
+	@echo "  make mkpatch NAME=<n>                        (Legacy) Export single committed HEAD"
 	@echo "  make refresh COMMIT=<sha|tag|latest> [SERIES=...]  Rebase patches, then advance the pin"
 	@echo "    COMMIT=latest resolves origin's advertised default branch; review every rebase/build result."
 	@echo "  make refresh-abc [REF=latest] CANDIDATE=<new-dir>  Replay eCash/Doged and Chronik on one ABC commit"
@@ -65,6 +72,34 @@ ifdef RESET
 else
 	SERIES=$(SERIES) $(SCRIPTS)/setup.sh
 endif
+	python3 $(SCRIPTS)/lotus-git.py init $(SERIES)
+
+status:
+	python3 $(SCRIPTS)/lotus-git.py status
+
+init:
+	python3 $(SCRIPTS)/lotus-git.py init $(SERIES)
+
+autosquash:
+	python3 $(SCRIPTS)/lotus-git.py autosquash $(SERIES) $(if $(filter 1,$(PATCHES)),--export-patches)
+
+sync:
+	python3 $(SCRIPTS)/lotus-git.py sync $(SERIES) $(if $(filter 1,$(PATCHES)),--export-patches) $(if $(filter 1,$(VERIFY)),--verify-replay) $(if $(filter 1,$(PUSH)),--push)
+
+sink-to-ecash:
+	python3 $(SCRIPTS)/lotus-git.py sink-to-ecash $(or $(COMMIT),HEAD) $(if $(filter 1,$(PATCHES)),--export-patches)
+
+rebase-upstream:
+ifndef COMMIT
+	$(error COMMIT is required: make rebase-upstream SERIES=v2 COMMIT=<sha|latest>)
+endif
+	python3 $(SCRIPTS)/lotus-git.py rebase-upstream $(SERIES) --onto "$(COMMIT)" $(if $(filter 1,$(PATCHES)),--export-patches)
+
+extract-pr:
+ifndef BRANCH
+	$(error BRANCH is required: make extract-pr SERIES=ecash BRANCH=pr/my-feature COMMITS="<sha>")
+endif
+	python3 $(SCRIPTS)/lotus-git.py extract-pr $(SERIES) --branch "$(BRANCH)" $(or $(COMMITS),base/abc..daemon/$(SERIES))
 
 build:
 	SERIES=$(SERIES) FEATURES="$(FEATURES)" $(SCRIPTS)/build.sh
@@ -85,7 +120,7 @@ endif
 ifndef CANDIDATE
 	$(error CANDIDATE must identify a new directory for the review candidate)
 endif
-	python3 $(SCRIPTS)/prepare-release.py --upstream "$(UPSTREAM)" --version "$(VERSION)" --candidate "$(CANDIDATE)"
+	python3 $(SCRIPTS)/prepare-release.py --upstream "$(UPSTREAM)" --version "$(VERSION)" --patch-revision "$(or $(PATCH_REVISION),1)" --candidate "$(CANDIDATE)"
 
 prepare-component:
 ifndef COMPONENT
