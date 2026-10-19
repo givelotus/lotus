@@ -76,6 +76,12 @@ export function createRpc(cfg) {
       clearTimeout(timeout);
       opts.signal?.removeEventListener('abort', onAbort);
     }
+    if (resp.status === 502 || resp.status === 504) {
+      // A reverse proxy (or the dev proxy) answered, but the node did not.
+      const err = new NetworkError(`node unreachable (HTTP ${resp.status} from proxy)`);
+      cfg.onNetworkError?.(err);
+      throw err;
+    }
     cfg.onReachable?.();
     if (resp.status === 401) {
       cfg.auth.onUnauthorized();
