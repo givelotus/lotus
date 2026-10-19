@@ -3,6 +3,10 @@
 import { html, useState } from '../vendor/htm-preact-standalone.mjs';
 import { useAsync, ErrorText, Field, walletLabel } from '../ui/components.js';
 
+// Creating an encrypted wallet tops up and encrypts the whole keypool, and
+// loading a wallet may rescan; both can take minutes on a real node.
+const SLOW = { timeoutMs: 30 * 60 * 1000 };
+
 export function WalletsView({ app, state }) {
   const loaded = state.wallets ?? [];
   const dir = useAsync(() => app.rpc.call('listwalletdir'), [loaded.join('\u0000')]);
@@ -29,14 +33,14 @@ export function WalletsView({ app, state }) {
   };
 
   const load = (name) => act(async () => {
-    const r = await app.rpc.call('loadwallet', [name]);
+    const r = await app.rpc.call('loadwallet', [name], SLOW);
     app.selectWallet(name);
     return r;
   }, `Opened ${walletLabel(name)}`);
   const unload = (name) => {
     if (!confirm(`Close wallet ${walletLabel(name)}? It stays on disk and can be opened again.`)) return;
     act(async () => {
-      const r = await app.rpc.call('unloadwallet', [name]);
+      const r = await app.rpc.call('unloadwallet', [name], SLOW);
       if (state.wallet === name) app.selectWallet(null);
       return r;
     }, `Closed ${walletLabel(name)}`);
@@ -83,7 +87,7 @@ function CreateWallet({ app, busy, act }) {
     setLocalError(null);
     const n = name.trim();
     const ok = await act(async () => {
-      const r = await app.rpc.call('createwallet', [n, noKeys, blank, pass, false, descriptors]);
+      const r = await app.rpc.call('createwallet', [n, noKeys, blank, pass, false, descriptors], SLOW);
       app.selectWallet(r.name);
       return r;
     }, `Created wallet ${walletLabel(n)}`);
@@ -104,6 +108,9 @@ function CreateWallet({ app, busy, act }) {
       <label class="check"><input type="checkbox" checked=${noKeys} onChange=${(e) => setNoKeys(e.currentTarget.checked)} /> Disable private keys (watch-only)</label>
       <label class="check"><input type="checkbox" checked=${blank} onChange=${(e) => setBlank(e.currentTarget.checked)} /> Blank wallet (no keys or HD seed)</label>
       <label class="check"><input type="checkbox" checked=${descriptors} onChange=${(e) => setDescriptors(e.currentTarget.checked)} /> Descriptor wallet</label>
-      <div class="actions"><button type="submit" disabled=${busy || !name.trim()}>Create wallet</button></div>
+      <div class="actions">
+        <button type="submit" disabled=${busy || !name.trim()}>Create wallet</button>
+        ${busy ? html`<span class="muted" aria-live="polite">Working… encrypting a new wallet can take several minutes.</span>` : null}
+      </div>
     </form>`;
 }

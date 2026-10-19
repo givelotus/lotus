@@ -3,6 +3,7 @@
 import { html, render, useEffect, useState } from './vendor/htm-preact-standalone.mjs';
 import { createApp } from './app.js';
 import { parseRoute } from './router.js';
+import { tokenFromHash } from './lib/session.js';
 import { useStore } from './ui/components.js';
 import { Sidebar, TopBar, StatusBar, Toasts, UpdateBanner } from './ui/layout.js';
 import { LoginView } from './views/login.js';
@@ -74,6 +75,11 @@ function Root() {
 
 render(html`<${Root} />`, document.getElementById('app'));
 app.boot();
+
+// A login link opened in an already-open tab only changes the hash.
+addEventListener('hashchange', () => {
+  if (tokenFromHash(location.hash)) app.boot();
+});
 
 // Installability and offline shell.
 addEventListener('beforeinstallprompt', (e) => {

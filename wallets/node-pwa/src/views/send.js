@@ -87,6 +87,20 @@ export function SendView({ app, state }) {
 
   const review = async (e) => {
     e.preventDefault();
+    // Addresses still inside the validation debounce are checked now.
+    for (const r of recipients) {
+      const v = validations.current[r.id];
+      if (r.address.trim() && v?.status !== 'valid' && v?.status !== 'invalid') {
+        try {
+          const res = await app.rpc.call('validateaddress', [r.address.trim()]);
+          validations.current[r.id] = res.isvalid
+            ? { status: 'valid', message: '', normalized: res.address }
+            : { status: 'invalid', message: 'not a valid address for this node' };
+        } catch {
+          // leave it unchecked; checkRecipients reports it
+        }
+      }
+    }
     const { errors: errs, outputs } = checkRecipients(recipients, validations.current, p.decimals);
     setErrors(errs);
     if (Object.keys(errs).length) return;

@@ -11,7 +11,6 @@ export function LoginView({ app, state }) {
     setBusy(true);
     await app.loginPassword(user.trim(), password);
     setBusy(false);
-    setPassword('');
   };
   return html`
     <main class="center-page">
