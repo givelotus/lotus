@@ -316,6 +316,16 @@ def fixtures():
                  prop(3, bytes(4)): b'\0\0' + bytes.fromhex('79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798')}
     good('native-signing-slot-unfunded', [global_map, arguments])
     output = b'\0' + (1000).to_bytes(8, 'little') + b'\x01' + b'\x22' * 32 + b'\x01\x01\0'
+    # These exercise the full transaction output scanner, not only the standalone
+    # output codec: HAS_STATE contributes 32 bytes before branch/path records.
+    for name, flags, commitments in (
+            ('state-bearing-output', 4, b'\x33' * 32),
+            ('token-and-state-output', 5, b'\x44' * 32 + b'\x33' * 32)):
+        state_output = bytes([flags]) + output[1:9] + commitments + output[9:]
+        state_global = dict(global_map)
+        state_global[b'\x05'] = b'\x01'
+        state_global[prop(2)] = tx[:14] + b'\x01\0' + tx[16:] + state_output
+        good(name, [state_global, {}, {}])
     coin = op + blob(output) + bytes(16) + b'\0\x02' + bytes(8) + (131400).to_bytes(8, 'little')
     funded = dict(arguments)
     funded[prop(1)] = coin
