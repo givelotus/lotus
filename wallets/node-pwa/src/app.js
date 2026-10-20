@@ -6,19 +6,19 @@
 import { createRpc, RpcError, HttpError, NetworkError, RPC_IN_WARMUP, RPC_WALLET_NOT_FOUND, RPC_WALLET_NOT_SPECIFIED } from './lib/rpc.js';
 import { createProxyAuth, createSessionAuth, authModeFromDocument, tokenFromHash } from './lib/session.js';
 import { createPoller } from './lib/poller.js';
-import { detectProfile } from './lib/profile.js';
+import { ChainAdaptor, UnsupportedDiscoveryError, ConnectionInvalidatedError } from './lib/chain-adaptor.js';
 import { createStore } from './lib/store.js';
 import { load, save } from './lib/storage.js';
 import { parseRoute, routeHash } from './router.js';
 
 /**
  * @typedef {{
- *   phase: 'boot'|'login'|'warmup'|'offline'|'ready',
- *   session: any, profile: import('./lib/profile.js').Profile|null,
+ *   phase: 'boot'|'login'|'warmup'|'offline'|'unsupported'|'ready',
+ *   session: any, profile: import('./lib/chainconfig.js').ChainConfig|null,
  *   wallets: string[]|null, wallet: string|null,
  *   chain: any, net: any, balances: any, walletInfo: any, txs: any[]|null,
  *   warmup: string, offlineSince: number|null, retryInMs: number,
- *   loginError: string, toasts: Array<{id: number, text: string, kind: string}>,
+ *   loginError: string, discoveryError: string, toasts: Array<{id: number, text: string, kind: string}>,
  *   swUpdate: boolean, installPrompt: any, lastTick: number,
  * }} AppState
  */
@@ -31,7 +31,7 @@ export function createApp({ fetch, location = globalThis.location, history = glo
   const store = createStore({
     phase: 'boot', session: null, profile: null, wallets: null, wallet: null,
     chain: null, net: null, balances: null, walletInfo: null, txs: null,
-    warmup: '', offlineSince: null, retryInMs: 0, loginError: '', toasts: [],
+    warmup: '', offlineSince: null, retryInMs: 0, loginError: '', discoveryError: '', toasts: [],
     swUpdate: false, installPrompt: null, lastTick: 0,
   });
 
@@ -48,7 +48,15 @@ export function createApp({ fetch, location = globalThis.location, history = glo
     onWarmup: (msg) => store.set({ warmup: msg }),
   });
 
+  const chainAdaptor = new ChainAdaptor({ rpc });
+  const invalidateConnection = () => {
+    chainAdaptor.invalidate();
+    lastTxKey = '';
+    store.set({ profile: null, wallets: null, wallet: null, balances: null, walletInfo: null, txs: null, chain: null, net: null });
+  };
+
   auth.setUnauthorizedHandler(() => {
+    invalidateConnection();
     poller.stop();
     if (store.get().phase !== 'login') {
       store.set({ phase: 'login', session: null, loginError: 'Your session ended. Please log in again.' });
@@ -79,11 +87,14 @@ export function createApp({ fetch, location = globalThis.location, history = glo
   async function tick() {
     const s = store.get();
     if (s.phase !== 'ready') return;
+    const epoch = chainAdaptor.epoch;
     const w = s.wallet;
     const calls = [['getblockchaininfo'], ['getnetworkinfo'], ['listwallets']];
     if (w !== null) calls.push(['getbalances'], ['getwalletinfo']);
     const out = await rpc.batch(calls, { wallet: w });
+    if (epoch !== chainAdaptor.epoch) return;
     const [chain, net, wallets, balances, walletInfo] = out;
+    if (!(chain instanceof RpcError) && chain.chain !== s.profile.chain) { goOffline(); return; }
     if (chain instanceof RpcError && chain.code === RPC_IN_WARMUP) {
       store.set({ warmup: chain.message });
       return;
@@ -118,7 +129,7 @@ export function createApp({ fetch, location = globalThis.location, history = glo
       if (key !== lastTxKey || hasUnconfirmed) {
         const txs = await rpc.call('listtransactions', ['*', 50, 0, true], { wallet: w });
         lastTxKey = key;
-        if (store.get().wallet === w) store.set({ txs: txs.slice().reverse() });
+        if (epoch === chainAdaptor.epoch && store.get().wallet === w) store.set({ txs: txs.slice().reverse() });
       }
     }
   }
@@ -126,7 +137,7 @@ export function createApp({ fetch, location = globalThis.location, history = glo
   function pickWallet(wallets) {
     const route = parseRoute(location.hash);
     if (route.wallet !== null && wallets.includes(route.wallet)) return route.wallet;
-    const remembered = load('wallet', null);
+    const remembered = load(`wallet:${chainAdaptor.config.chainIdentifier}`, null);
     if (remembered !== null && wallets.includes(remembered)) return remembered;
     return wallets.length > 0 ? wallets[0] : null;
   }
@@ -134,7 +145,7 @@ export function createApp({ fetch, location = globalThis.location, history = glo
   function selectWallet(name) {
     lastTxKey = '';
     store.set({ wallet: name, balances: null, walletInfo: null, txs: null });
-    if (name !== null) save('wallet', name);
+    if (name !== null) save(`wallet:${chainAdaptor.config.chainIdentifier}`, name);
     syncWalletToHash();
     poller.poke();
   }
@@ -151,6 +162,9 @@ export function createApp({ fetch, location = globalThis.location, history = glo
 
   async function boot() {
     clearTimeout(reconnectTimer);
+    poller.stop();
+    invalidateConnection();
+    store.set({ phase: 'boot', discoveryError: '' });
     try {
       let session = await auth.status();
       const token = tokenFromHash(location.hash);
@@ -173,7 +187,9 @@ export function createApp({ fetch, location = globalThis.location, history = glo
       store.set({ session, loginError: '' });
       await afterLogin();
     } catch (e) {
-      if (e instanceof NetworkError || e instanceof TypeError) goOffline();
+      if (e instanceof ConnectionInvalidatedError) return;
+      if (e instanceof UnsupportedDiscoveryError) store.set({ phase: 'unsupported', discoveryError: e.message });
+      else if (e instanceof NetworkError || e instanceof TypeError) goOffline();
       else if (e instanceof HttpError && e.status === 401) { /* handled by the unauthorized handler */ }
       else { goOffline(String(e?.message ?? e)); }
     }
@@ -182,8 +198,11 @@ export function createApp({ fetch, location = globalThis.location, history = glo
   async function afterLogin() {
     for (;;) {
       try {
-        const profile = await detectProfile(rpc);
+        const epoch = chainAdaptor.epoch;
+        const profile = await chainAdaptor.discover();
+        if (epoch !== chainAdaptor.epoch) return;
         const wallets = await rpc.call('listwallets');
+        if (epoch !== chainAdaptor.epoch) return;
         store.set({ profile, wallets, wallet: pickWallet(wallets), phase: 'ready', warmup: '', offlineSince: null });
         reconnectDelay = 0;
         if (globalThis.document) document.title = `${profile.client} · ${profile.chain}`;
@@ -204,6 +223,7 @@ export function createApp({ fetch, location = globalThis.location, history = glo
 
   function goOffline() {
     poller.stop();
+    invalidateConnection();
     const s = store.get();
     reconnectDelay = reconnectDelay ? Math.min(reconnectDelay * 2, 30000) : 1000;
     store.set({ phase: 'offline', offlineSince: s.offlineSince ?? Date.now(), retryInMs: reconnectDelay });
@@ -217,12 +237,16 @@ export function createApp({ fetch, location = globalThis.location, history = glo
       store.set({ session, loginError: '' });
       await afterLogin();
     } catch (e) {
-      store.set({ loginError: e.message });
+      if (e instanceof ConnectionInvalidatedError) return;
+      if (e instanceof UnsupportedDiscoveryError) store.set({ phase: 'unsupported', discoveryError: e.message });
+      else store.set({ loginError: e.message });
     }
   }
 
   async function logout() {
     poller.stop();
+    store.set({ phase: 'login', session: null });
+    invalidateConnection();
     await auth.logout().catch(() => {});
     store.set({ phase: 'login', session: null, loginError: '', wallet: null, balances: null, walletInfo: null, txs: null });
   }
@@ -242,7 +266,7 @@ export function createApp({ fetch, location = globalThis.location, history = glo
   });
 
   return {
-    mode, auth, rpc, store, poller, walletCall, selectWallet, boot, loginPassword, logout, toast,
+    mode, auth, rpc, chainAdaptor, store, poller, walletCall, selectWallet, boot, loginPassword, logout, toast,
     retryNow: () => { reconnectDelay = 0; boot(); },
     refresh: () => poller.poke(),
   };

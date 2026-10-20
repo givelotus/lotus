@@ -23,28 +23,6 @@ export function validateMiningDescriptor(value) {
     template_rpc: 'getrawunsolvedblock', submit_rpc: 'submitblock' });
 }
 
-export function resolveChainConfig({ chain, profile, currency, addressFormat, hrp, client, version, miningInfo }) {
-  const rpcDecimals = Number(currency.decimals);
-  if (!Number.isInteger(rpcDecimals) || rpcDecimals < 0 || rpcDecimals > 18) throw new Error(`bad currency decimals ${currency.decimals}`);
-  const atomicUnitsPerCoin = String(currency.satoshisperunit ?? 10n ** BigInt(rpcDecimals));
-  if (!/^\d+$/.test(atomicUnitsPerCoin) || BigInt(atomicUnitsPerCoin) !== 10n ** BigInt(rpcDecimals)) throw new Error('Currency atomic unit and RPC precision disagree.');
-  const ticker = String(currency.ticker);
-  if (!ticker || ticker.length > 16) throw new Error('Invalid currency ticker.');
-  let mining;
-  try { mining = Object.freeze({ supported: true, descriptor: validateMiningDescriptor(miningInfo?.pow) }); }
-  catch (error) { mining = Object.freeze({ supported: false, reason: error.message }); }
-  return Object.freeze({
-    configVersion: 1,
-    network: Object.freeze({ chain, profile, client, version }),
-    currency: Object.freeze({ ticker, atomicUnitsPerCoin, rpcDecimals, displayDecimals: Math.min(2, rpcDecimals) }),
-    address: Object.freeze({ format: addressFormat, hrp }),
-    mining,
-    rpc: Object.freeze({ testBlockGeneration: chain === 'regtest', template: mining.supported ? mining.descriptor.template_rpc : null,
-      submission: mining.supported ? mining.descriptor.submit_rpc : null }),
-    // Existing views read these aliases from the same resolver during migration.
-    chain, profile, client, version, ticker, decimals: rpcDecimals, addressFormat, hrp,
-  });
-}
 
 function object(value, label) {
   if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error(`Invalid ${label}.`);

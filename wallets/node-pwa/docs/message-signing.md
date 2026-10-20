@@ -9,8 +9,8 @@ keys stay in that wallet. Unlock/relock belongs to the existing secure wallet
 interaction, not to a browser key implementation.
 
 The current Sign/Verify UI remains the implemented legacy P2PKH flow.
-The new adapter boundary is ready for the one-call discovery activation;
-it does not change the current daemon's cryptography.
+It now invokes the adapter/provider boundary after one-call discovery;
+this does not change the current daemon's cryptography.
 
 ## Implemented legacy scheme
 

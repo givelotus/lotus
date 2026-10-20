@@ -55,7 +55,8 @@ try {
   await page.route('**/wallet/test.html', (route) => route.fulfill({ contentType: 'text/html', body: '<!doctype html><div></div>' }));
   await page.goto(`http://127.0.0.1:${server.address().port}/wallet/test.html`);
   receipt.browser = await browser.version();
-  receipt.mining = await page.evaluate(async ({ descriptor, address }) => {
+  const uiOnly = process.env.NODE_PWA_MINING_UI_ONLY === '1';
+  if (!uiOnly) receipt.mining = await page.evaluate(async ({ descriptor, address }) => {
     const { BrowserMiner } = await import('/wallet/lib/browser-miner.js');
     return new Promise((resolve, reject) => {
       let hashes = 0;
@@ -70,9 +71,31 @@ try {
     });
   }, { descriptor, address });
   const after = await node.rpc('getblockchaininfo');
-  if (after.blocks !== 1) throw new Error(`Expected accepted block height1, got${after.blocks}`);
-  receipt.accepted_height = after.blocks; receipt.accepted_blockhash = after.bestblockhash;
-  receipt.header = await node.rpc('getblockheader', [after.bestblockhash, false]);
+  if (after.blocks !== (uiOnly ? 0 : 1)) throw new Error(`Unexpected proof height ${after.blocks}`);
+  if (!uiOnly) {
+    receipt.accepted_height = after.blocks; receipt.accepted_blockhash = after.bestblockhash;
+    receipt.header = await node.rpc('getblockheader', [after.bestblockhash, false]);
+  }
+  if (uiOnly) {
+    const methods = [];
+    page.on('request', (request) => {
+      if (request.method() !== 'POST') return;
+      try { const body = request.postDataJSON(); for (const call of Array.isArray(body) ? body : [body]) methods.push(call.method); } catch {}
+    });
+    await page.goto(`http://127.0.0.1:${server.address().port}/wallet/#/mining?w=gpu-proof`);
+    await page.getByLabel('Payout address', { exact: true }).waitFor();
+    await page.getByLabel('Payout address', { exact: true }).fill(address);
+    if (!await page.getByRole('button', { name: 'Start GPU mining', exact: true }).isEnabled()) throw new Error('Public GPU Start control was not enabled by discovery.');
+    const actual = await page.evaluate(async () => {
+      nodePwa.poller.stop();
+      const config = nodePwa.store.get().profile;
+      return { identity: config.chainIdentifier, ticker: config.currency.ticker, singleton: config === await nodePwa.chainAdaptor.discover(), immutable: Object.isFrozen(config) };
+    });
+    const discoveryCalls = methods.filter((method) => method === 'getchainconfig').length;
+    const probes = methods.filter((method) => ['getcurrencyinfo', 'getmininginfo', 'getblockheader', 'validateaddress'].includes(method));
+    if (discoveryCalls !== 1 || probes.length || !actual.singleton || !actual.immutable) throw new Error('Public UI did not use one authoritative immutable discovery.');
+    receipt.public_ui = { ...actual, discovery_calls: discoveryCalls, legacy_probes: probes, gpu_start_enabled: true, mining_started: false };
+  }
   receipt.status = 'ok';
 } catch (error) { receipt.status = 'failed'; receipt.error = error.stack; process.exitCode = 1; }
 finally {

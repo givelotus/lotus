@@ -2,6 +2,7 @@
 // Keys and passphrases are never persisted by this page.
 import { html, useState } from '../vendor/htm-preact-standalone.mjs';
 import { CopyButton, ErrorText, Field, Modal } from '../ui/components.js';
+import { DaemonWalletMessageProvider } from '../lib/message-signing.js';
 import { routeHash } from '../router.js';
 
 export function MessagesView({ app, state }) {
@@ -54,7 +55,7 @@ function SignMessage({ app, wallet }) {
         await call('walletpassphrase', [passphrase, 60]);
         unlocked = true;
       }
-      const value = await call('signmessage', [request.address, request.message]);
+      const value = await app.chainAdaptor.signMessage({ address: request.address, message: request.message, walletProvider: new DaemonWalletMessageProvider({ rpc: app.rpc, wallet }) });
       setSignature({ ...request, value });
       setPending(null);
     } catch (err) {
@@ -135,7 +136,7 @@ function VerifyMessage({ app }) {
   const submit = async (event) => {
     event.preventDefault();
     setBusy(true); setValid(null); setError(null);
-    try { setValid(await app.rpc.call('verifymessage', [address.trim(), signature.trim(), message])); }
+    try { setValid(await app.chainAdaptor.verifyMessage({ address: address.trim(), signature: signature.trim(), message })); }
     catch (err) { setError(err); }
     finally { setBusy(false); }
   };

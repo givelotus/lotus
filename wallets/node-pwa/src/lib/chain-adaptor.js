@@ -5,6 +5,7 @@ import { RpcError } from './rpc.js';
 import { LEGACY_MESSAGE_SCHEME, NATIVE_MESSAGE_CAPABILITY, validateCompactSignature } from './message-signing.js';
 
 export class UnsupportedDiscoveryError extends Error {}
+export class ConnectionInvalidatedError extends Error {}
 
 export class ChainAdaptor {
   constructor({ rpc, onIdentityChange = () => {} }) {
@@ -58,8 +59,10 @@ export class ChainAdaptor {
         if (error instanceof RpcError && error.code === -32601) throw new UnsupportedDiscoveryError('This node does not support getchainconfig. Use a node build with chain discovery enabled.');
         throw error;
       }
-      const config = new ChainConfig(raw);
-      if (epoch !== this.epoch) throw new Error('Node discovery was invalidated while connecting.');
+      let config;
+      try { config = new ChainConfig(raw); }
+      catch (error) { throw new UnsupportedDiscoveryError(`Node discovery is unsupported or invalid: ${error.message}`); }
+      if (epoch !== this.epoch) throw new ConnectionInvalidatedError('Node discovery was invalidated while connecting.');
       const identity = `${config.chainIdentifier}|${config.network.genesis}|${config.network.chainid ?? ''}`;
       if (this.previousIdentity !== null && identity !== this.previousIdentity) this.onIdentityChange(config);
       this.previousIdentity = identity;

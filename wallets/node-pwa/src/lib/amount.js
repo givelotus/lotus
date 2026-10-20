@@ -1,6 +1,6 @@
 // Exact fixed-point amounts as BigInt base units.
 //
-// The number of decimals comes from getcurrencyinfo; nothing is hard-coded.
+// The number of decimals comes from ChainConfig/getchainconfig; nothing is hard-coded.
 // Amounts are never rounded: input with more fractional digits than the
 // currency has is refused, and RPC values are converted from their exact text.
 

@@ -7,7 +7,7 @@ import { tokenFromHash } from './lib/session.js';
 import { useStore } from './ui/components.js';
 import { Sidebar, TopBar, StatusBar, Toasts, UpdateBanner } from './ui/layout.js';
 import { LoginView } from './views/login.js';
-import { OfflineView, WarmupView, BootView } from './views/offline.js';
+import { OfflineView, WarmupView, BootView, UnsupportedNodeView } from './views/offline.js';
 import { OverviewView } from './views/overview.js';
 import { SendView } from './views/send.js';
 import { ReceiveView } from './views/receive.js';
@@ -58,6 +58,7 @@ function Root() {
 
   if (state.phase === 'boot') return html`<${BootView} />`;
   if (state.phase === 'login') return html`<${LoginView} app=${app} state=${state} />`;
+  if (state.phase === 'unsupported') return html`<${UnsupportedNodeView} app=${app} state=${state} />`;
   if (state.phase === 'offline') return html`<${OfflineView} app=${app} state=${state} />`;
   if (state.phase === 'warmup') return html`<${WarmupView} state=${state} />`;
   const View = VIEWS[route.view] ?? OverviewView;

@@ -2,6 +2,8 @@
 import { test, expect } from '@playwright/test';
 import { fileURLToPath } from 'node:url';
 import { createDevServer } from '../../tools/devserver.mjs';
+import { chainDiscovery } from '../helpers/chain-discovery.mjs';
+const COMPACT_SIGNATURE = Buffer.from([31, ...new Uint8Array(64).fill(1)]).toString('base64');
 
 let server;
 let base;
@@ -19,8 +21,10 @@ async function mount(page, kind, config = {}) {
   await page.route('**/wallet/test.html', (route) => route.fulfill({ contentType: 'text/html', body: '<!doctype html><div id="root"></div>' }));
   await page.goto(`${base}test.html`);
   if (config.shell) await page.addStyleTag({ url: `${base}app.css` });
-  await page.evaluate(async ({ kind, config }) => {
+  await page.evaluate(async ({ kind, config, discovery, compactSignature }) => {
     const { html, render } = await import('/wallet/vendor/htm-preact-standalone.mjs');
+    const { ChainAdaptor } = await import('/wallet/lib/chain-adaptor.js');
+    const { ChainConfig } = await import('/wallet/lib/chainconfig.js');
     const { WalletsView } = await import('/wallet/views/wallets.js');
     const { StatusBar, Sidebar, TopBar } = await import('/wallet/ui/layout.js');
     const { ReceiveView } = await import('/wallet/views/receive.js');
@@ -38,7 +42,10 @@ async function mount(page, kind, config = {}) {
     }
     window.selected = null;
     window.refreshed = 0;
-    const state = { wallets: config.loaded ?? [], wallet: kind === 'receive' || kind === 'mining' || (kind === 'messages' && !config.noWallet) ? '' : null, net: { networkactive: true }, profile: { ticker: 'XEC', decimals: 2, addressFormat: 'cashaddr', chain: config.chain ?? 'regtest', mining: config.pow ? { supported: true, descriptor: config.pow } : { supported: false, reason: 'This node does not advertise a supported mining descriptor.' } } };
+    const discovered = new ChainConfig(discovery);
+    const profile = config.disableGpu ? { ...discovered, mining: { supported: false, reason: 'GPU mining is unavailable for this configuration.' } }
+      : config.pow ? { ...discovered, mining: { supported: true, descriptor: config.pow } } : discovered;
+    const state = { wallets: config.loaded ?? [], wallet: kind === 'receive' || kind === 'mining' || (kind === 'messages' && !config.noWallet) ? '' : null, net: { networkactive: true }, profile };
     const draw = () => {
       const View = kind === 'wallets' ? WalletsView : kind === 'receive' ? ReceiveView : kind === 'messages' ? MessagesView : kind === 'mining' ? MiningView : StatusBar;
       const body = html`<${View} app=${app} state=${state} />${config.long ? Array.from({ length: 40 }, (_, i) => html`<section class="card"><h2>More wallet content ${i}</h2><p>Scrollable content with accessible controls.</p><button type="button" id=${`content-${i}`}>Content action ${i}</button></section>`) : null}`;
@@ -65,7 +72,7 @@ async function mount(page, kind, config = {}) {
         if (method === 'getblockchaininfo') return { chain: config.actualChain ?? config.chain ?? 'regtest' };
         if (method === 'generatetoaddress') return Array.from({ length: params[0] }, () => 'ab'.repeat(32));
         if (method === 'getwalletinfo') return config.locked ? { unlocked_until: 0 } : {};
-        if (method === 'signmessage') return 'compact-signature==';
+        if (method === 'signmessage') return compactSignature;
         if (method === 'verifymessage') return config.verify !== false;
         if (method === 'listwalletdir') {
           const disk = config.appearsAfterCheck && window.calls.filter((c) => c.method === method).length > 1 ? [''] : (config.disk ?? []);
@@ -80,8 +87,11 @@ async function mount(page, kind, config = {}) {
         if (method === 'setnetworkactive') state.net = { ...state.net, networkactive: params[0] };
       } },
     };
+    app.chainAdaptor = new ChainAdaptor({ rpc: app.rpc });
+    app.chainAdaptor.config = new ChainConfig(discovery);
+    app.chainAdaptor.promise = Promise.resolve(app.chainAdaptor.config);
     draw();
-  }, { kind, config });
+  }, { kind, config, discovery: chainDiscovery({ network: config.chain ?? 'regtest' }), compactSignature: COMPACT_SIGNATURE });
 }
 
 test('create default wallet passes empty name and selects it', async ({ page }) => {
@@ -164,11 +174,12 @@ test('signing preserves whitespace on the selected unnamed wallet without export
   const message = '  line one\nline two \n';
   await page.getByLabel('Message to sign', { exact: true }).fill(message);
   await page.getByRole('button', { name: 'Sign message', exact: true }).click();
-  await expect(page.getByTestId('signed-message')).toContainText('compact-signature==');
+  await expect(page.getByTestId('signed-message')).toContainText(COMPACT_SIGNATURE);
   await expect(page.getByRole('button', { name: 'Copy signature', exact: true })).toBeVisible();
   expect(await page.evaluate(() => window.calls)).toEqual([
     { method: 'getwalletinfo', params: [], wallet: '' },
     { method: 'signmessage', params: ['ecregtest:qkey', message], wallet: '' },
+    { method: 'verifymessage', params: ['ecregtest:qkey', COMPACT_SIGNATURE, message] },
   ]);
 });
 
@@ -179,8 +190,8 @@ test('locked wallet unlocks only for signing, relocks, and clears passphrase', a
   await page.getByLabel('Wallet passphrase', { exact: true }).fill('temporary-secret');
   await page.getByRole('button', { name: 'Unlock and sign', exact: true }).click();
   await expect(page.getByTestId('signed-message')).toBeVisible();
-  expect(await page.evaluate(() => window.calls.map((c) => c.method))).toEqual(['getwalletinfo', 'walletpassphrase', 'signmessage', 'walletlock']);
-  expect(await page.evaluate(() => window.calls.every((c) => c.wallet === ''))).toBe(true);
+  expect(await page.evaluate(() => window.calls.map((c) => c.method))).toEqual(['getwalletinfo', 'walletpassphrase', 'signmessage', 'verifymessage', 'walletlock']);
+  expect(await page.evaluate(() => window.calls.filter((c) => c.method !== 'verifymessage').every((c) => c.wallet === ''))).toBe(true);
   expect(await page.evaluate(() => Object.values(localStorage).some((v) => v.includes('temporary-secret')))).toBe(false);
   await expect(page.getByLabel('Wallet passphrase', { exact: true })).toHaveCount(0);
 });
@@ -302,8 +313,8 @@ test('message tabs preserve both forms and support arrow Home and End navigation
 });
 
 
-test('mining is opt-in and older node offers explicit regtest1/101 with no fake GPU counter', async ({ page }) => {
-  await mount(page, 'mining');
+test('mining is opt-in and unavailable GPU does not fake counts or disable explicit regtest controls', async ({ page }) => {
+  await mount(page, 'mining', { disableGpu: true });
   expect(await page.evaluate(() => window.calls)).toEqual([]);
   await expect(page.getByRole('button', { name: 'Start GPU mining', exact: true })).toBeDisabled();
   await expect(page.getByRole('button', { name: 'Mine 1 test block', exact: true })).toBeDisabled();

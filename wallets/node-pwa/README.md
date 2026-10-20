@@ -37,8 +37,8 @@ Node builds containing the PWA integration serve this app under `/wallet/`,
 with browser sessions (`/auth/session`, an HttpOnly cookie and an
 `X-CSRF-Token` header), `-walletpwadir=<dir>` for development, `-gui` and
 `getwalletpwaurl` for login links. Point `-walletpwadir` at this directory's
-`src/` and refresh the browser to review UI changes. Older node builds can
-use the development server below.
+`src/` and refresh the browser to review UI changes. A node with discovery
+but no built-in PWA host can use the development server below.
 
 ## Mining and ChainConfig
 
@@ -50,14 +50,17 @@ The page rechecks that the node is on regtest before calling it.
 
 Browser GPU mining is opt-in and requires WebGPU in a secure context
 (HTTPS or localhost), a usable GPU adapter, and authoritative `getchainconfig` discovery
-version 1. Older preview nodes keep ordinary wallet/regtest features but
-cannot enable GPU mining through the public UI without the discovery contract.
+version 1. Nodes missing this endpoint show an explicit unsupported-node
+screen; the app does not probe older RPCs to guess its configuration.
 The daemon host must serve local `.wgsl` files. No shader code, script URL
 or remote executable comes from the descriptor.
 
 `lib/chainconfig.js` resolves one immutable configuration from the node:
 network/genesis identity, address capabilities, currency atomic unit and RPC precision,
-display policy, and mining algorithm/header/RPC contract. Amount entry and
+display policy, and mining algorithm/header/RPC contract. `ChainAdaptor`
+caches one configuration per authenticated connection from one discovery
+call; disconnect, logout and network changes invalidate it. Reconnect checks
+the canonical network/genesis identity and clears cached wallet data. Amount entry and
 RPC serialization retain the full node precision. The default two-decimal
 display removes redundant zeroes only; nonzero atomic units are never hidden.
 
@@ -246,19 +249,18 @@ bumped by hand.
 
 ## Notes
 
-- Amounts are BigInt base units. Ticker and decimals come from
-  `getcurrencyinfo`; amounts are sent to the node as exact decimal strings and
-  RPC replies are parsed without rounding (`lib/json.js`).
-- Addresses are displayed exactly as the RPCs return them. On a Lotus V2 node
-  (134-byte headers) the app probes whether the node accepts `xpi1…`
-  addresses and, if so, checks typed addresses locally (`lib/xpiaddr.js`)
-  before asking `validateaddress`, which stays authoritative. Current V2
-  builds still return cashaddr, so the probe falls back to cashaddr.
+- Amounts are BigInt base units. Ticker and precision come from the
+  authoritative `getchainconfig` response; amounts are sent as exact decimal
+  strings and RPC replies are parsed without rounding (`lib/json.js`).
+- Addresses are displayed exactly as returned by the node. Actual accepted
+  formats, prefixes and destination types come from discovery. Address input
+  validation still uses `validateaddress` for the entered address; discovery
+  never probes a synthetic address or infers capabilities from a header size.
 - Each visible tab keeps one `waitfornewblock 10000` call open, which
   occupies one of the node's RPC worker threads (`-rpcthreads`, default 4).
   Hidden tabs pause it.
 - Receive-request history is kept in this browser's IndexedDB per node origin
-  and wallet; console history in localStorage (sensitive commands such as
+  canonical chain identity and wallet; console history in localStorage (sensitive commands such as
   `walletpassphrase` are never stored).
 - `node tools/icons.mjs` regenerates the PNG icons from the same geometry as
   `src/icons/icon.svg`.

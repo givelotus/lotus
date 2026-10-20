@@ -33,3 +33,13 @@ export function WarmupView({ state }) {
 export function BootView() {
   return html`<main class="center-page"><p class="muted">Connecting to the node…</p></main>`;
 }
+
+
+export function UnsupportedNodeView({ app, state }) {
+  return html`<main class="center-page"><div class="card" role="alert" data-testid="unsupported-node">
+    <h1>Unsupported node configuration</h1>
+    <p>${state.discoveryError}</p>
+    <p>Use a node build with the version 1 getchainconfig discovery endpoint. The wallet does not guess chain identity, address support or mining behavior.</p>
+    <button type="button" onClick=${() => app.retryNow()}>Retry discovery</button>
+  </div></main>`;
+}

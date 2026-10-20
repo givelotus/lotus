@@ -10,7 +10,7 @@ export function MiningView({ app, state }) {
   const [mining, setMining] = useState({ running: false, status: 'Stopped', hashes: 0, hashRate: 0 });
   const miner = useRef(null);
   const config = state.profile;
-  const testMode = config.rpc?.testBlockGeneration ?? config.chain === 'regtest';
+  const testMode = config.rpc.testBlockGeneration;
   const gpu = globalThis.isSecureContext && Boolean(navigator.gpu) && config.mining?.supported;
   useEffect(() => {
     const instance = new BrowserMiner({ rpc: app.rpc, onState: (patch) => setMining((s) => ({ ...s, ...patch })), onBlock: () => app.refresh() });
@@ -55,7 +55,7 @@ export function MiningView({ app, state }) {
     <section class="card"><h2>Browser GPU mining</h2>
       <p>Opt in to WebGPU proof-of-work hashing on this device. Mining uses power and can warm the device. It stops when you leave this page or hide the tab. There is no automatic start or resume.</p>
       <p class="muted">This is experimental mining support; browser hashing is not a promise of profitable mining.</p>
-      ${!config.mining?.supported ? html`<p class="muted">${config.mining?.reason ?? 'This node does not advertise a supported mining descriptor.'} Normal wallet operations and regtest generation remain available.</p>` : html`<p>Algorithm: ${config.mining.descriptor.algorithm}</p>`}
+      ${!config.mining?.supported ? html`<p class="muted">${config.mining?.reason ?? 'This node does not advertise a supported mining descriptor.'}</p>` : html`<p>Algorithm: ${config.mining.descriptor.algorithm}</p>`}
       ${!globalThis.isSecureContext || !navigator.gpu ? html`<p class="muted">WebGPU requires a compatible browser/GPU and a secure context (HTTPS or localhost).</p>` : null}
       <div class="actions"><button type="button" disabled=${busy || mining.running || !gpu || !address.trim()} onClick=${() => miner.current.start(address.trim(), config.mining.descriptor)}>Start GPU mining</button>
         <button type="button" class="secondary" disabled=${!mining.running} onClick=${() => miner.current.stop()}>Stop mining</button></div>

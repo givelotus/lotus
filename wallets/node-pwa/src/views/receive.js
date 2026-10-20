@@ -19,9 +19,10 @@ export function ReceiveView({ app, state }) {
   const [history, setHistory] = useState([]);
   const p = state.profile;
   const w = state.wallet;
+  const scope = `${p.chainIdentifier}:${w}`;
 
-  const reloadHistory = () => { if (w !== null) listRequests(w).then(setHistory); };
-  useEffect(reloadHistory, [w]);
+  const reloadHistory = () => { if (w !== null) listRequests(scope).then(setHistory); };
+  useEffect(reloadHistory, [scope]);
   const received = useAsync(
     () => (w === null ? Promise.resolve([]) : app.walletCall('listreceivedbyaddress', [0, true])),
     [w, state.walletInfo?.txcount],
@@ -64,7 +65,7 @@ export function ReceiveView({ app, state }) {
       const address = await app.walletCall('getnewaddress', [label.trim()]);
       received.reload();
       app.refresh();
-      const req = { wallet: w, address, label: label.trim(), amount: amountText, message: message.trim(), created: Math.floor(Date.now() / 1000) };
+      const req = { wallet: scope, address, label: label.trim(), amount: amountText, message: message.trim(), created: Math.floor(Date.now() / 1000) };
       await addRequest(req);
       setShown(req);
       setLabel(''); setAmount(''); setMessage('');
@@ -108,7 +109,7 @@ export function ReceiveView({ app, state }) {
                 <tr key=${r.id} class="clickable" onClick=${() => setShown(r)}>
                   <td>${formatTime(r.created)}</td><td>${r.label || html`<span class="muted">(no label)</span>`}</td>
                   <td>${r.message}</td><td class="num">${r.amount ? html`<${Amount} value=${r.amount} profile=${p} />` : '–'}</td>
-                  <td><button class="secondary small" onClick=${(e) => { e.stopPropagation(); deleteRequest(r.id, w).then(reloadHistory); }}>Remove</button></td>
+                  <td><button class="secondary small" onClick=${(e) => { e.stopPropagation(); deleteRequest(r.id, scope).then(reloadHistory); }}>Remove</button></td>
                 </tr>`)}
             </tbody>
           </table>`}
