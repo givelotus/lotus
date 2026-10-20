@@ -85,3 +85,21 @@ bounded historical backlog/outage tests, same-node forward/historical isolation
 and restart/downtime evidence described in N06a. This direction remains
 provisional through testnet; it does not assert these operational properties
 are already implemented or tested.
+
+
+## SHA256D mining envelope — discussion requested, 2026-10-20
+
+The maintainer requested an [optional 80-byte Bitcoin-shaped mining-envelope
+alternative](mining-envelope-alternative.md), with BLAKE3-committed canonical
+extension fields and SHA256D over exactly the 80-byte envelope. This is an
+unselected alternative to D12/P04, not an additional accepted block format;
+the current 134-byte recursive BLAKE3 header/work/BlockID scheme is unchanged.
+The proposed 80-bit search space combines 32 nonce, 32 former-time-position
+and 16 rolling-version bits; it is not a claim about S9 hardware counters.
+Actual time remains committed in the extension. BlockID, rolling allocation,
+controller/Stratum adaptation and any transition require separate selection.
+Height-driven upgrade preference is recorded for discussion without adopting
+new activation rules or assigning miner signaling control. The document records
+ASIC reuse/security/economic tradeoffs and independent-vector, real-device,
+controller, pool and full-validation gates. No compatibility, performance,
+exchange-listing or production-readiness result is claimed.
