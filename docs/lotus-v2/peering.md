@@ -163,6 +163,123 @@ TCP/QUIC, `tmplblock`, full/compact transfer and disk import must enter one V2 v
 
 Use greatest accumulated valid work under P04 and the explicitly chosen eligibility profile. Header work is not permission to mark an unvalidated state root trusted. Preserve bounded header presynchronization, reorg handling, download-stall recovery and distinct invalid/missing/context-ineligible results. Crash consistency and atomic undo must be established before peer-supplied blocks can change persistent state.
 
+### Snapshot catch-up and optional history (N06a)
+
+Maintainer direction, 2026-10-20: **“possibly never reaching genesis is
+reasonable, but never being able to catch up is not.”** This is a required
+operational property of the proposed synchronization design, subject to the
+supported conditions below. It is not a claim that the current implementation
+has demonstrated that property. It remains provisional through testnet.
+
+After admission of an authenticated snapshot/bootstrap state, forward
+validation MUST be able to close the outstanding validation backlog, reach
+the live eligible chain tip and continue following it while new blocks arrive.
+It MUST NOT wait for optional history to reach genesis. Snapshot admission
+retains [P02's state-envelope and historical-validation
+obligations](decisions/commitments-and-state.md): chain/profile binding,
+canonical complete state, authenticated commitments and required header/time
+context must be checked. An authenticated state commitment does not itself
+prove every historical transition valid. Record and expose the actual verified
+history boundary; catching up does not silently upgrade a snapshot's trust
+status. This requirement introduces no new snapshot trust anchor, assumed-valid
+history, finality rule, consensus rule or monetary parameter.
+
+A supported synchronization profile MUST state its workload and resource
+assumptions before claiming catch-up: transaction/block sizes and validation
+cost distribution, sustained and burst arrivals, live-state size, supported
+initial backlog/downtime, available CPU/RAM and sustained storage capacity and
+I/O, network throughput/latency, and availability of an admissible bootstrap
+and the post-bootstrap data needed for forward validation. Include competing
+node services and maintenance in that resource budget. Transport support must
+cover the profile's objects; N05's known large-object availability limitation
+cannot be hidden by a snapshot or compact-transfer claim. There is no promise
+for arbitrary hardware, arbitrarily sustained traffic, or unavailable required
+forward data. Report an unmet assumption as capacity/availability failure,
+not an invalid block or permission to skip validation.
+
+Catch-up acceptance requires **measured positive headroom**: sustained validated
+forward service must exceed newly arriving validation work over the declared
+workload windows, including the specified bursts and competing work. Matching
+the arrival rate only preserves existing lag. Measure backlog reduction and
+time to catch up from the stated starting lag against a moving tip; record
+validation work, bytes and elapsed time as well as heights, since equal-height
+gaps need not have equal cost. Publish the measured margin, test duration,
+queue/resource peaks and exact workload/hardware/network conditions. No
+throughput target, universal catch-up deadline or new numerical constant is
+selected here. A profile that can follow a stationary test chain but cannot
+close lag under its supported continuing arrivals does not satisfy N06a.
+
+Historical backfill towards genesis is optional, independently tracked and
+lower priority than forward validation. Bound its retained bytes, staging
+disk, memory, CPU/I/O service, network concurrency, outstanding requests and
+retry queues. Scheduling must reserve or reclaim sufficient capacity for the
+forward path to retain its measured headroom; a low-priority label alone is
+insufficient. Pause, throttle or discard/re-request optional historical work
+when its bounds are reached. Missing historical data may remain unavailable
+indefinitely without stopping an otherwise supported forward sync, causing
+unbounded retries/spool growth, or falsely reporting historical completeness.
+Bounded history retention is separate from live-state size, which still needs
+its own resource budget.
+
+Reverse peeling and archive backfill are different operations. Reverse peeling
+reconstructs/checks predecessor state and its verification boundary using
+state/undo/proof obligations; fetching and authenticating old block bodies into
+an archive does not accomplish that state verification. Neither an archived
+body nor a checksum substitutes for undo, full validation or snapshot trust.
+Concurrent historical verification must use independently managed historical
+state/progress and preserve the active forward state and live tip. This
+specification does not authorize rolling the active state backwards alongside
+forward connection. Existing reverse-peel code must demonstrate that isolation
+and its restart semantics before concurrent use is claimed safe.
+
+After downtime or restart, forward catch-up MUST resume from a consistent,
+durable state under the supported profile. Persist and recover the active tip,
+bootstrap identity and historical-verification/backfill progress distinctly;
+retain atomic state/undo invariants and bounded, idempotent recovery work. If
+required forward bodies have passed available retention, recovery needs an
+available admissible bootstrap or another supported source under the same
+trust contract; never invent missing history or reset verification status to
+hide a gap. An indefinitely paused historical job must not prevent reopening
+the node and resuming forward validation.
+
+An optional block archive may retain older immutable bodies separately from
+active validation state. The selected implementation direction is a filesystem
+backend first, with explicit retention, durability and recovery semantics;
+no S3 protocol/backend is mandated. Archive work inherits the bounds and
+forward-priority requirements above. Any operator mode requiring successful
+archival before local deletion must disclose its additional availability and
+spool assumptions and safe failure behavior; it cannot both promise indefinite
+archive outage tolerance and retain an unbounded required spool on bounded
+local disk. Archive availability never establishes finality or authorizes
+pruning required recovery data. Native logical horizon advancement and physical
+body/undo reclamation require separate implementation evidence.
+
+Required evidence before reporting this property implemented:
+
+1. Admit the supported authenticated bootstrap and close a nonzero backlog
+   while the eligible tip continues moving under the declared workload;
+   demonstrate continuing tip tracking and measured positive headroom.
+2. Exercise forward and historical work on the same node with a backlog larger
+   than its historical quotas, slow/unavailable archive sources and competing
+   services; verify bounded disk/memory/queues and preservation of forward
+   progress. Treat historical data as unavailable for the entire run and
+   specify indefinite waiting/retry bounds rather than inferring them from a
+   short successful download.
+3. Restart and interrupt the node during catch-up, during historical work and
+   after progress; verify consistent active state, durable distinct progress
+   boundaries, idempotent recovery and renewed catch-up after supported downtime.
+4. For concurrent reverse peeling, compare live tip/state and forward results
+   with a forward-only control, including restart partway through the peel.
+   Verify predecessor-state authentication independently from archive retrieval.
+5. Exercise missing required forward data and exceeded workload/resource
+   assumptions: report the limitation explicitly, retain bounded recovery
+   behavior and never claim complete history or synchronization falsely.
+
+These are acceptance requirements, not completed test results. Existing
+snapshot/reverse-peel primitives or successful small functional tests alone do
+not establish sustained catch-up headroom, physical history reclamation,
+indefinite historical-outage isolation or restart-safe concurrent operation.
+
 ### Generalized Merklix mempool reconciliation, `inv` queue deduplication, and Avalanche coordination (`Patches 023–041`)
 
 Following the [bulk pre-consensus and mempool overlays specification](../plans/lotus-v2-bulk-preconsensus-and-mempool-overlays.md):

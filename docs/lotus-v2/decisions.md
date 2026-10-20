@@ -63,3 +63,25 @@ encoding. The profile remains provisional through testnet. Specification
 checks do not imply completed daemon implementation or interoperability;
 implementation must preserve the specified transaction identity and witness
 separation and provide matching signing/finalization tests.
+
+
+## Forward catch-up and optional history — maintainer direction, 2026-10-20
+
+“Possibly never reaching genesis is reasonable, but never being able to catch
+up is not.” [N06a](peering.md#snapshot-catch-up-and-optional-history-n06a)
+requires authenticated bootstrap followed by forward validation to reach and
+follow the moving live tip under explicitly supported workload, hardware,
+storage, network and data-availability assumptions, with measured positive
+catch-up headroom. Genesis backfill is optional, bounded and lower priority;
+it may remain incomplete indefinitely without starving forward validation.
+Restart/downtime recovery must preserve separate durable active and historical
+progress. Historical archive retrieval is not reverse-peel state verification,
+and neither permits concurrent rollback of the active forward state.
+
+The optional archive direction is filesystem-first, separate from active
+validation state; no S3 commitment is selected. Trust, finality, consensus and
+monetary rules are unchanged. Closure requires moving-tip catch-up measurements,
+bounded historical backlog/outage tests, same-node forward/historical isolation
+and restart/downtime evidence described in N06a. This direction remains
+provisional through testnet; it does not assert these operational properties
+are already implemented or tested.
