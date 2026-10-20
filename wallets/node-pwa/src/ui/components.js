@@ -11,7 +11,13 @@ export { html };
 /** Subscribe a component to a store. */
 export function useStore(store) {
   const [s, set] = useState(store.get());
-  useEffect(() => store.subscribe(set), [store]);
+  useEffect(() => {
+    const unsubscribe = store.subscribe(set);
+    // Boot/discovery can finish before this effect subscribes. Reconcile the
+    // current snapshot after subscribing so a fast error cannot strand Boot.
+    set(store.get());
+    return unsubscribe;
+  }, [store]);
   return s;
 }
 
