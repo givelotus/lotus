@@ -66,7 +66,7 @@ function Root() {
         <${TopBar} app=${app} state=${state} />
         <${UpdateBanner} state=${state} />
         ${state.warmup ? html`<div class="banner info">${state.warmup}</div>` : null}
-        <main class="content" key=${`${route.view === 'tx' ? 'transactions' : route.view}|${state.wallet}`}>
+        <main class="content" tabindex="0" aria-label="Wallet content" key=${`${route.view === 'tx' ? 'transactions' : route.view}|${state.wallet}`}>
           <${View} app=${app} state=${state} route=${route} />
         </main>
         <${StatusBar} app=${app} state=${state} />

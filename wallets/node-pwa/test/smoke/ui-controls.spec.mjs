@@ -18,18 +18,24 @@ test.afterAll(async () => {
 async function mount(page, kind, config = {}) {
   await page.route('**/wallet/test.html', (route) => route.fulfill({ contentType: 'text/html', body: '<!doctype html><div id="root"></div>' }));
   await page.goto(`${base}test.html`);
+  if (config.shell) await page.addStyleTag({ url: `${base}app.css` });
   await page.evaluate(async ({ kind, config }) => {
     const { html, render } = await import('/wallet/vendor/htm-preact-standalone.mjs');
     const { WalletsView } = await import('/wallet/views/wallets.js');
-    const { StatusBar } = await import('/wallet/ui/layout.js');
+    const { StatusBar, Sidebar, TopBar } = await import('/wallet/ui/layout.js');
     const { ReceiveView } = await import('/wallet/views/receive.js');
     const { MessagesView } = await import('/wallet/views/messages.js');
     window.calls = [];
     window.selected = null;
     window.refreshed = 0;
     const state = { wallets: config.loaded ?? [], wallet: kind === 'receive' || (kind === 'messages' && !config.noWallet) ? '' : null, net: { networkactive: true }, profile: { ticker: 'XEC', decimals: 2, addressFormat: 'cashaddr' } };
-    const draw = () => render(html`<${kind === 'wallets' ? WalletsView : kind === 'receive' ? ReceiveView : kind === 'messages' ? MessagesView : StatusBar} app=${app} state=${state} />`, document.getElementById('root'));
+    const draw = () => {
+      const View = kind === 'wallets' ? WalletsView : kind === 'receive' ? ReceiveView : kind === 'messages' ? MessagesView : StatusBar;
+      const body = html`<${View} app=${app} state=${state} />${config.long ? Array.from({ length: 40 }, (_, i) => html`<section class="card"><h2>More wallet content ${i}</h2><p>Scrollable content with accessible controls.</p><button type="button" id=${`content-${i}`}>Content action ${i}</button></section>`) : null}`;
+      render(config.shell ? html`<div class="shell"><${Sidebar} app=${app} state=${state} route=${{ view: kind }} /><div class="main-col"><${TopBar} app=${app} state=${state} /><main class="content" tabindex="0" aria-label="Wallet content">${body}</main><${StatusBar} app=${app} state=${state} /></div></div>` : body, document.getElementById('root'));
+    };
     const app = {
+      auth: { canLogout: false },
       async walletCall(method, params) {
         window.calls.push({ method, params, wallet: state.wallet });
         if (method === 'getnewaddress') {
@@ -206,4 +212,51 @@ test('verification rejects mismatches clearly', async ({ page }) => {
   await page.getByLabel('Signature to verify', { exact: true }).fill('wrong-signature==');
   await page.getByRole('button', { name: 'Verify message', exact: true }).click();
   await expect(page.getByRole('status')).toContainText('Signature does not match');
+});
+
+
+for (const size of [{ width: 1280, height: 720 }, { width: 1440, height: 900 }]) {
+  test(`desktop shell keeps navigation and status visible while content scrolls at ${size.width}`, async ({ page }) => {
+    await page.setViewportSize(size);
+    await mount(page, 'wallets', { shell: true, long: true });
+    await expect(page.getByRole('button', { name: 'Create default wallet', exact: true })).toBeEnabled();
+    const before = await page.locator('.sidebar').boundingBox();
+    await page.locator('#content-39').scrollIntoViewIfNeeded();
+    const after = await page.locator('.sidebar').boundingBox();
+    expect(after.y).toBe(before.y);
+    await expect(page.getByRole('link', { name: 'Overview', exact: true })).toBeInViewport();
+    await expect(page.locator('.topbar')).toBeInViewport();
+    await expect(page.locator('.statusbar')).toBeInViewport();
+    await expect(page.locator('#content-39')).toBeInViewport();
+    expect(await page.locator('.content').evaluate((e) => e.scrollTop)).toBeGreaterThan(0);
+    expect(await page.evaluate(() => document.documentElement.scrollHeight)).toBe(size.height);
+    expect(await page.evaluate(() => document.documentElement.scrollWidth)).toBe(size.width);
+    // Keyboard users can focus the scroll area and reach its last control.
+    await page.locator('.content').focus();
+    await page.keyboard.press('Control+End');
+    await expect(page.locator('#content-39')).toBeInViewport();
+  });
+}
+
+test('wallet management and both creation actions fit a laptop viewport', async ({ page }, testInfo) => {
+  await page.setViewportSize({ width: 1280, height: 720 });
+  await mount(page, 'wallets', { shell: true });
+  await expect(page.getByRole('button', { name: 'Create default wallet', exact: true })).toBeEnabled();
+  await expect(page.getByRole('button', { name: 'Create wallet', exact: true })).toBeInViewport();
+  await expect(page.getByLabel('Wallet name', { exact: true })).toBeInViewport();
+  await expect(page.getByRole('heading', { name: 'Open wallets', exact: true })).toBeInViewport();
+  await page.screenshot({ path: testInfo.outputPath('wallets-laptop.png'), fullPage: true });
+});
+
+test('mobile layout stacks wallet controls and keeps final controls reachable without page overflow', async ({ page }, testInfo) => {
+  await page.setViewportSize({ width: 390, height: 844 });
+  await mount(page, 'wallets', { shell: true, long: true });
+  await expect(page.getByRole('button', { name: 'Create default wallet', exact: true })).toBeEnabled();
+  await page.locator('#content-39').scrollIntoViewIfNeeded();
+  await expect(page.locator('#content-39')).toBeInViewport();
+  expect(await page.evaluate(() => document.documentElement.scrollWidth)).toBe(390);
+  await page.getByRole('link', { name: 'Node', exact: true }).focus();
+  await expect(page.getByRole('link', { name: 'Node', exact: true })).toBeInViewport();
+  expect(await page.getByRole('link', { name: 'Node', exact: true }).evaluate((e) => e.getBoundingClientRect().height)).toBeGreaterThanOrEqual(44);
+  await page.screenshot({ path: testInfo.outputPath('wallets-mobile.png'), fullPage: false });
 });

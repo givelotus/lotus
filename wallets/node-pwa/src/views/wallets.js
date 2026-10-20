@@ -64,8 +64,8 @@ export function WalletsView({ app, state }) {
     <div class="wallets">
       <h1>Wallets</h1>
       <${ErrorText} error=${error} />
-      <section class="card">
-        <h2>Open wallets</h2>
+      <section class="card wallet-lists" aria-label="Wallets on this node">
+        <div><h2>Open wallets</h2>
         ${loaded.length === 0 ? html`<p class="muted" data-testid="no-wallets">No wallet is loaded.</p>` : html`
           <ul class="plain">
             ${loaded.map((w) => html`
@@ -75,24 +75,19 @@ export function WalletsView({ app, state }) {
                 <button class="secondary small" disabled=${busy} onClick=${() => unload(w)}>Close</button>
               </li>`)}
           </ul>`}
-      </section>
-      <section class="card">
-        <h2>Wallets on the node's disk</h2>
+        </div>
+        <div><h2>Wallets on the node's disk</h2>
         ${onDisk.length === 0 ? html`<p class="muted">No other wallets found in the node's wallet directory.</p>` : html`
           <ul class="plain">
             ${onDisk.map((w) => html`<li key=${w}>${walletLabel(w)} <button class="secondary small" disabled=${busy} onClick=${() => load(w)}>Open</button></li>`)}
           </ul>`}
+        </div>
       </section>
-      ${!defaultExists ? html`<section class="card">
-        <h2>Default wallet</h2>
-        <p>Create the node's unnamed wallet. You can also create named wallets below.</p>
-        <button type="button" disabled=${busy || !dir.value} onClick=${createDefault}>Create default wallet</button>
-      </section>` : null}
-      <${CreateWallet} app=${app} busy=${busy} act=${act} />
+      <${CreateWallet} app=${app} busy=${busy} act=${act} defaultExists=${defaultExists} defaultReady=${Boolean(dir.value)} createDefault=${createDefault} />
     </div>`;
 }
 
-function CreateWallet({ app, busy, act }) {
+function CreateWallet({ app, busy, act, defaultExists, defaultReady, createDefault }) {
   const [name, setName] = useState('');
   const [pass, setPass] = useState('');
   const [pass2, setPass2] = useState('');
@@ -115,6 +110,12 @@ function CreateWallet({ app, busy, act }) {
   return html`
     <form class="card" onSubmit=${submit} aria-labelledby="create-title">
       <h2 id="create-title">Create a wallet</h2>
+      ${!defaultExists ? html`<div class="wallet-default">
+        <p>Use the unnamed default wallet, or create a named wallet below.</p>
+        <button type="button" disabled=${busy || !defaultReady} onClick=${createDefault}>Create default wallet</button>
+      </div>` : null}
+      <h3>Named wallet</h3>
+      <div class="wallet-create-fields">
       <${Field} label="Wallet name" id="cw-name" hint="Created in the node's wallet directory">
         <input id="cw-name" value=${name} onInput=${(e) => setName(e.currentTarget.value)} autocomplete="off" required />
       <//>
@@ -124,9 +125,12 @@ function CreateWallet({ app, busy, act }) {
       ${pass ? html`<${Field} label="Repeat passphrase" id="cw-pass2" error=${localError}>
         <input id="cw-pass2" type="password" value=${pass2} onInput=${(e) => setPass2(e.currentTarget.value)} autocomplete="new-password" />
       <//>` : null}
+      </div>
+      <div class="wallet-options">
       <label class="check"><input type="checkbox" checked=${noKeys} onChange=${(e) => setNoKeys(e.currentTarget.checked)} /> Disable private keys (watch-only)</label>
       <label class="check"><input type="checkbox" checked=${blank} onChange=${(e) => setBlank(e.currentTarget.checked)} /> Blank wallet (no keys or HD seed)</label>
       <label class="check"><input type="checkbox" checked=${descriptors} onChange=${(e) => setDescriptors(e.currentTarget.checked)} /> Descriptor wallet</label>
+      </div>
       <div class="actions">
         <button type="submit" disabled=${busy || !name.trim()}>Create wallet</button>
         ${busy ? html`<span class="muted" aria-live="polite">Working… encrypting a new wallet can take several minutes.</span>` : null}
