@@ -103,3 +103,16 @@ new activation rules or assigning miner signaling control. The document records
 ASIC reuse/security/economic tradeoffs and independent-vector, real-device,
 controller, pool and full-validation gates. No compatibility, performance,
 exchange-listing or production-readiness result is claimed.
+
+
+Mining-envelope clarification (2026-10-20): the discussed direct-commitment
+architecture has the node supply completed work headers and the fixed extension
+commitment. A controller/host adapter partitions permitted header fields and
+returns solutions; miners need not generate coinbase/Merklix/extension data.
+Stratum session/target/share mechanisms may be reused with adapted job
+construction. A Bitcoin coinbase/Merkle wrapper is optional, not a prerequisite
+for the direct design. Expanded search space reduces node-template turnover
+only when the actual controller can use it; chip nonce exhaustion still requires
+appropriate chip assignments. A shared pool manager with native browser and
+Stratum adapters is a proposal, not existing ASIC support. P04 and the open
+selection/measurement gates remain unchanged.

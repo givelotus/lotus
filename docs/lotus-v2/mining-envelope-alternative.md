@@ -119,23 +119,67 @@ a fully independent 32-bit counter is an adapter/firmware requirement, not a
 consequence of matching the 80-byte length. A model-specific source audit and
 real-device test are required before any S9 support claim.
 
-Stock Stratum job construction is another obstacle. The original
+### Node-built jobs and focused controller adaptation
+
+The intended division of work is **node-built commitments, miner-side header
+search**. The node already constructs the native block template and its
+transaction/state commitments. In this alternative, it would assemble the full
+canonical extension, compute its commitment and supply a completed 80-byte work
+envelope, with a job identifier, allowed rolling fields/ranges and share target.
+The extension and full block template remain fixed for that job and available
+at the node/pool for validation and complete-block submission. Providing them
+to a mining client for inspection is possible; requiring that client to rebuild
+them is not part of this architecture. Miners do not construct the coinbase,
+transaction Merklix tree or extension to search that assigned job.
+
+A controller or host adapter consumes this node-provided work, partitions the
+permitted search space across devices, prepares whatever device-specific jobs
+or midstates the chips require, and returns the solved rolling words/nonce
+against the job ID. Exhausting a chip's 32-bit nonce range can require another
+**chip work assignment**, without requiring a new node template, coinbase or
+extension: the controller advances another permitted rolling field within the
+same job. The distinction between node jobs and chip assignments matters.
+The proposed 80- or 96-bit space is finite; coverage time is `2^b / H` seconds
+for `b` independent assigned bits at aggregate rate `H` hashes/second, ignoring
+overlap and overhead. No infinite-space or never-exhausted claim is made.
+If the controller can use the expanded space efficiently, new node jobs would
+normally follow parent, transaction/template, payout or real-timestamp changes,
+rather than exhaustion of the 32-bit nonce alone. Restricted masks, partition
+sizes, controller throughput and duplicate work can reduce useful coverage and
+must be measured.
+
+Existing Stratum **job construction** needs adaptation, not necessarily its
+whole session or share-handling design. The original
 [Stratum proxy implementation](https://github.com/slush0/stratum-mining-proxy/blob/master/mining_libs/jobs.py)
 builds a coinbase from supplied parts and extranonces, hashes it, combines
-SHA256D Merkle branches, and places that root in the header; it also constructs
-`nTime` in the controller. Such a pipeline cannot simply be told that the
-Merkle position contains an arbitrary BLAKE3 extension commitment. Inverting
-SHA256D to manufacture a matching coinbase is not a practical adapter.
+SHA256D Merkle branches and inserts the result into the header; it also
+constructs `nTime` in the controller. The proposed adapter replaces that
+coinbase/extranonce/Merkle-root job generator with the completed node-provided
+header and extension commitment. Stratum framing, session management, target
+assignment and share-accounting concepts can be reused, with explicit job and
+submission semantics for these rolling fields. Exact messages and negotiation
+still need specification; an unmodified client cannot be assumed to interpret
+the changed job correctly.
 
-Two designs remain worth evaluating: a controller/job adapter that accepts the
-explicit commitment and field assignments, or a different commitment structure
-that genuinely fits the chosen coinbase/Merkle job construction. The latter
-must prove how the complete Lotus extension is bound and validated, account
-for auxiliary coinbase/extranonce changes, and specify exact bytes; it is not
-the direct-commitment example above. Share submission must identify the retained
-full template, reconstruct all rolled fields, verify mask/target/commitment,
-handle stale jobs and submit the complete Lotus block. No stock Stratum, S9,
-getblocktemplate or submitblock interoperability is claimed by this document.
+A Bitcoin-style SHA256 coinbase/Merkle wrapper is **not required** merely to
+accommodate an unchanged client. Such a wrapper is an optional, distinct
+compatibility alternative only if retaining that client's construction path
+justifies it; it would require its own commitment and validation design.
+The direct-commitment design requires no SHA256 preimage trick. Controller
+adaptation is focused on job preparation, allowed-field scheduling and solution
+reporting, but this scope does not prove every proprietary firmware change
+trivial or every ASIC's field controls sufficient.
+
+A proposed shared pool manager could retain templates and job assignments,
+authenticate workers, set share targets, reject duplicate/stale/invalid shares
+and submit complete blocks, with native browser-protocol and adapted Stratum
+front ends feeding that same manager. Transport adapters must normalize the
+same exact header bytes, job identity and allowed search ranges; using another
+front end does not alter PoW or payout validation. This is a candidate
+architecture, not a claim of implemented ASIC or browser/Stratum interoperability.
+The node/pool must reconstruct the submitted envelope, verify mask, share/block
+target and extension commitment, and run complete block validation. Real-device
+controller throughput and end-to-end submission remain acceptance gates.
 
 ## Upgrade policy and mining economics
 
