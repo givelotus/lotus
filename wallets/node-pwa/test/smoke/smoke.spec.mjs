@@ -146,10 +146,10 @@ test('dev proxy: create a wallet, mine, receive, send, inspect, peers, console',
   await expect(page.getByTestId('no-peers')).toBeVisible();
   await expect(page.getByTestId('no-bans')).toBeVisible();
   await page.getByTestId('network-toggle').click();
-  await expect(page.getByTestId('network-toggle')).toHaveText('Network off');
+  await expect(page.getByTestId('network-toggle')).toHaveText('Enable peer networking');
   expect((await node.rpc('getnetworkinfo')).networkactive).toBe(false);
   await page.getByTestId('network-toggle').click();
-  await expect(page.getByTestId('network-toggle')).toHaveText('Network on');
+  await expect(page.getByTestId('network-toggle')).toHaveText('Disable peer networking');
   // No peers exist on an isolated node, so bans are added over RPC and removed in the UI.
   await node.rpc('setban', ['203.0.113.9', 'add', 3600]);
   await node.rpc('setban', ['198.51.100.0/24', 'add', 3600]);

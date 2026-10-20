@@ -83,3 +83,12 @@ test('failed creation reports error without selecting a wallet', async ({ page }
   await expect(page.getByRole('button', { name: 'Create default wallet', exact: true })).toBeEnabled();
 });
 
+test('network action toggles node P2P in both directions', async ({ page }) => {
+  await mount(page, 'network');
+  await page.getByRole('button', { name: 'Disable peer networking', exact: true }).click();
+  await expect(page.getByRole('button', { name: 'Enable peer networking', exact: true })).toBeVisible();
+  await expect(page.locator('#peer-network-help')).toContainText('disabled');
+  await page.getByRole('button', { name: 'Enable peer networking', exact: true }).click();
+  await expect(page.getByRole('button', { name: 'Disable peer networking', exact: true })).toBeVisible();
+  expect(await page.evaluate(() => window.calls.filter((c) => c.method === 'setnetworkactive').map((c) => c.params))).toEqual([[false], [true]]);
+});

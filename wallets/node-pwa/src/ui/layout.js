@@ -98,8 +98,10 @@ export function StatusBar({ app, state }) {
         ${n ? `${n.connections ?? 0} connection${n.connections === 1 ? '' : 's'} (${n.connections_in ?? 0} in, ${n.connections_out ?? 0} out)` : ''}
       </span>
       ${n ? html`<button class=${`small ${n.networkactive ? 'secondary' : 'warn'}`} disabled=${busy} onClick=${toggle}
-                  title="Turn all P2P network activity on or off" data-testid="network-toggle">
-          Network ${n.networkactive ? 'on' : 'off'}</button>` : null}
+                  title="Controls this node's peer connections; does not change your Wi-Fi or internet connection."
+                  aria-describedby="peer-network-help" data-testid="network-toggle">
+          ${n.networkactive ? 'Disable peer networking' : 'Enable peer networking'}</button>` : null}
+      ${n ? html`<span id="peer-network-help" class="muted">Peer networking ${n.networkactive ? 'enabled' : 'disabled'} · node connections only</span>` : null}
       <span class="spacer"></span>
       <span class="version muted">${n ? n.subversion : ''}</span>
     </footer>`;
