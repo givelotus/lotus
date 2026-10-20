@@ -15,6 +15,7 @@ V2's engineering goal is that **hard forks should not be needed after genesis**.
 | How do we get a useful node first? | [V1 implementation plan](../../daemon/docs/lotus-v1-implementation-plan.md) |
 | What did Lotus already implement? | [Feature provenance](../../daemon/docs/feature-provenance.md), [patch inventory](../../daemon/patches/inventory.csv) |
 | What would a v2 validator enforce? | [Consensus draft](consensus.md) |
+| How are native addresses and template IDs encoded? | [Address specification and implementation status](addresses.md) |
 | What still needs a decision? | [Decision register](decisions.md) |
 | How do wallets and contracts interact? | [Script ABI](script-abi.md), [worked examples](examples/README.md) |
 | Which choices are now concrete? | [Six technical decision packets](decisions.md), [implementation entry contracts](../plans/implementation-entry.md) |

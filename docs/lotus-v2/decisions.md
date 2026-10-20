@@ -32,3 +32,16 @@ The monetary analysis must choose an objective before optimizing it: expected di
 For each closed decision record: accepted rule and rejected alternatives; maintainer acceptance; spec revision and requirement IDs; exact parameter/vector digests; independent reviewer; remaining limitations; affected patches and examples. Reopening before genesis invalidates dependent vectors and measurements. After genesis, a changed validity rule is not an ordinary implementation update.
 
 D10 formula adoption (2026-10-15): maintainer authorizes the absolute genesis-anchored tail `F(work)=clip(isqrt(T_g²*work//W_g))`, retaining one-block lag. Immutable anchors and formula version 1 are bound to profile identity; 56-byte state caches are checked. Constant calibration and economic/runtime acceptance remain open.
+
+
+## Typed addresses — maintainer direction, 2026-10-19
+
+[Address specification](addresses.md): type 0 carries an explicit MAST root;
+type 1 is reserved for a standard keyhash program; 2–30 are future template
+IDs and 31 is an extended-ID escape. Exact keyhash/program/extension bytes
+remain to be specified and independently tested. This direction is
+provisional through testnet, not a frozen address format. Only the type-0
+codec exists today; wallet/RPC native-address wiring and native message
+proofs remain implementation work. Keep this decision and the daemon owner
+`v2/065` document synchronized; do not treat a docs update as implemented
+support for new selectors.
