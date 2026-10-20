@@ -8,7 +8,7 @@ node's wallet. It is not the Frank app and has no server of its own.
 Design: `docs/addendum-designs/P1-pwa-wallet-and-Q1-qt-removal.md` in the
 `lotus-v2-addendum` repository (§2 is the app, §2.9 the parity checklist).
 This directory implements phase 1: overview, send, receive, transactions,
-wallets, peers, message signing/verification, console and node information.
+wallets, peers, message signing/verification, mining, console and node information.
 
 The app is plain ES2022 modules with no build step: `src/` is exactly what the
 browser runs. The only runtime dependencies are two vendored, hash-pinned files
@@ -33,11 +33,69 @@ browser history or local storage.
 
 ## Status of the daemon side
 
-The node is meant to serve this app itself under `/wallet/`, with browser
-sessions (`/auth/session`, an HttpOnly cookie and an `X-CSRF-Token` header),
-`-walletpwadir=<dir>` for development, `-gui` and `getwalletpwaurl` for
-login links. **That daemon patch does not exist yet.** Until it does, use the
-development server below, which plays the node's part.
+Node builds containing the PWA integration serve this app under `/wallet/`,
+with browser sessions (`/auth/session`, an HttpOnly cookie and an
+`X-CSRF-Token` header), `-walletpwadir=<dir>` for development, `-gui` and
+`getwalletpwaurl` for login links. Point `-walletpwadir` at this directory's
+`src/` and refresh the browser to review UI changes. Older node builds can
+use the development server below.
+
+## Mining and ChainConfig
+
+The **Mining** page never starts mining automatically. A payout address may
+be entered or generated in the selected node wallet. Regtest has explicit
+**Mine 1 test block** and **Mine 101 test blocks** buttons using
+`generatetoaddress`; this is node-side test generation, not GPU hashing.
+The page rechecks that the node is on regtest before calling it.
+
+Browser GPU mining is opt-in and requires WebGPU in a secure context
+(HTTPS or localhost), a usable GPU adapter, and `getmininginfo.pow`
+version 1. Older preview nodes keep ordinary wallet/regtest features but
+cannot enable GPU mining through the public UI without that descriptor.
+The daemon host must serve local `.wgsl` files. No shader code, script URL
+or remote executable comes from the descriptor.
+
+`lib/chainconfig.js` resolves one immutable configuration from the node:
+network/address capabilities, currency atomic unit and RPC precision,
+display policy, and mining algorithm/header/RPC contract. Amount entry and
+RPC serialization retain the full node precision. The default two-decimal
+display removes redundant zeroes only; nonzero atomic units are never hidden.
+
+Supported algorithms are compiled into this bundle:
+
+- `sha256d`: 80-byte header, 32-bit little-endian nonce at byte 76.
+- `lotus-v2-blockid`: 134-byte header, 64-bit little-endian nonce at byte 42;
+  domain-separated BLAKE3 body, work and block-ID hashes with the raw chain
+  identity. This is not a single BLAKE3 hash of the serialized header.
+
+The worker dispatches at most 1,024 nonces per batch. Its GPU digests are
+checked against CPU reference hashes; the main thread also verifies winning
+proofs before submission. The node supplies the complete serialized candidate
+with `getrawunsolvedblock`, including coinbase and commitments. Only nonce
+bytes change; `submitblock` remains authoritative. Candidate size is limited
+to 32 MiB in this browser implementation. Stale tips are checked every five
+seconds and before submission; templates refresh after 15 seconds. Stop,
+leaving the page, hiding the tab, device loss or an error ends the session.
+Resuming requires another explicit Start. One already submitted bounded GPU
+batch or block-submission RPC may finish after Stop.
+
+Counters report only completed GPU dispatches. Session hash rate includes
+initialization, template refresh and submission time; it is not a benchmark
+or a promise of economically viable mining.
+
+Focused checks (no production node needed):
+
+```sh
+npm test
+MINING_GPU=1 node --test test/unit/mining-hashes.test.js test/unit/mining-runtime.test.js
+npx playwright test --config test/smoke/playwright.config.mjs ui-controls.spec.mjs
+```
+
+`test/smoke/mining-node-proof.mjs` is an explicit opt-in accepted-block proof
+using a supplied binary, a fresh isolated regtest datadir, and owned ports.
+It writes a receipt with binary hash, descriptor provenance and accepted tip.
+Its audited historical-reference fallback is test-only and does not enable
+mining on older nodes in the public UI.
 
 ## Development
 

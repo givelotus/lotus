@@ -1,7 +1,7 @@
 // Hash routing: #/<view>[/<arg>][?w=<wallet>]. The selected wallet travels in
 // the hash so links and reloads keep it; "w=" (empty) is the default wallet.
 
-export const VIEWS = ['overview', 'send', 'receive', 'transactions', 'tx', 'peers', 'console', 'node', 'wallets', 'messages', 'login'];
+export const VIEWS = ['overview', 'send', 'receive', 'transactions', 'tx', 'peers', 'console', 'node', 'wallets', 'mining', 'messages', 'login'];
 
 /** @returns {{view: string, arg: string|null, wallet: string|null, params: URLSearchParams}} */
 export function parseRoute(hash) {

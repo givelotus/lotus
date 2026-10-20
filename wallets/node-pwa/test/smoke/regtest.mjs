@@ -20,11 +20,11 @@ export function freePort() {
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-export async function startNode(binary) {
-  const base = process.env.NODE_PWA_SMOKE_TMP ?? tmpdir();
+export async function startNode(binary, options = {}) {
+  const base = options.datadirBase ?? process.env.NODE_PWA_SMOKE_TMP ?? tmpdir();
   const datadir = mkdtempSync(join(base, 'node-pwa-regtest-'));
-  const rpcPort = await freePort();
-  const p2pPort = await freePort();
+  const rpcPort = options.rpcPort ?? await freePort();
+  const p2pPort = options.p2pPort ?? await freePort();
   const args = ['-regtest', `-datadir=${datadir}`, `-rpcport=${rpcPort}`, `-port=${p2pPort}`, '-listen=0',
     '-server=1', '-rpcbind=127.0.0.1', '-rpcallowip=127.0.0.1', '-printtoconsole=0', '-discover=0', '-dnsseed=0', '-fixedseeds=0',
     // Encrypting a wallet encrypts its whole keypool, which is slow with the default 1000 keys.

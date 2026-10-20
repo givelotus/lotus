@@ -25,12 +25,22 @@ async function mount(page, kind, config = {}) {
     const { StatusBar, Sidebar, TopBar } = await import('/wallet/ui/layout.js');
     const { ReceiveView } = await import('/wallet/views/receive.js');
     const { MessagesView } = await import('/wallet/views/messages.js');
+    const { MiningView } = await import('/wallet/views/mining.js');
     window.calls = [];
+    window.workerStarts = 0; window.workerStops = 0;
+    if (config.fakeWorker) {
+      Object.defineProperty(navigator, 'gpu', { configurable: true, value: {} });
+      window.Worker = class {
+        constructor() { window.workerStarts++; }
+        postMessage() {}
+        terminate() { window.workerStops++; }
+      };
+    }
     window.selected = null;
     window.refreshed = 0;
-    const state = { wallets: config.loaded ?? [], wallet: kind === 'receive' || (kind === 'messages' && !config.noWallet) ? '' : null, net: { networkactive: true }, profile: { ticker: 'XEC', decimals: 2, addressFormat: 'cashaddr' } };
+    const state = { wallets: config.loaded ?? [], wallet: kind === 'receive' || kind === 'mining' || (kind === 'messages' && !config.noWallet) ? '' : null, net: { networkactive: true }, profile: { ticker: 'XEC', decimals: 2, addressFormat: 'cashaddr', chain: config.chain ?? 'regtest', mining: config.pow ? { supported: true, descriptor: config.pow } : { supported: false, reason: 'This node does not advertise a supported mining descriptor.' } } };
     const draw = () => {
-      const View = kind === 'wallets' ? WalletsView : kind === 'receive' ? ReceiveView : kind === 'messages' ? MessagesView : StatusBar;
+      const View = kind === 'wallets' ? WalletsView : kind === 'receive' ? ReceiveView : kind === 'messages' ? MessagesView : kind === 'mining' ? MiningView : StatusBar;
       const body = html`<${View} app=${app} state=${state} />${config.long ? Array.from({ length: 40 }, (_, i) => html`<section class="card"><h2>More wallet content ${i}</h2><p>Scrollable content with accessible controls.</p><button type="button" id=${`content-${i}`}>Content action ${i}</button></section>`) : null}`;
       render(config.shell ? html`<div class="shell"><${Sidebar} app=${app} state=${state} route=${{ view: kind }} /><div class="main-col"><${TopBar} app=${app} state=${state} /><main class="content" tabindex="0" aria-label="Wallet content">${body}</main><${StatusBar} app=${app} state=${state} /></div></div>` : body, document.getElementById('root'));
     };
@@ -50,6 +60,10 @@ async function mount(page, kind, config = {}) {
       rpc: { async call(method, params, opts) {
         window.calls.push({ method, params, ...(opts ? { wallet: opts.wallet } : {}) });
         if (config.fail && method === config.fail) throw new Error(config.failureMessage ?? 'RPC denied');
+        if (method === 'getrawunsolvedblock') return config.rawTemplate;
+        if (method === 'getbestblockhash') return 'ab'.repeat(32);
+        if (method === 'getblockchaininfo') return { chain: config.actualChain ?? config.chain ?? 'regtest' };
+        if (method === 'generatetoaddress') return Array.from({ length: params[0] }, () => 'ab'.repeat(32));
         if (method === 'getwalletinfo') return config.locked ? { unlocked_until: 0 } : {};
         if (method === 'signmessage') return 'compact-signature==';
         if (method === 'verifymessage') return config.verify !== false;
@@ -285,4 +299,50 @@ test('message tabs preserve both forms and support arrow Home and End navigation
   await expect(page.getByRole('tab', { name: 'Sign message', exact: true })).toBeFocused();
   await page.keyboard.press('ArrowRight');
   await expect(page.getByRole('tab', { name: 'Verify message', exact: true })).toHaveAttribute('aria-selected', 'true');
+});
+
+
+test('mining is opt-in and older node offers explicit regtest1/101 with no fake GPU counter', async ({ page }) => {
+  await mount(page, 'mining');
+  expect(await page.evaluate(() => window.calls)).toEqual([]);
+  await expect(page.getByRole('button', { name: 'Start GPU mining', exact: true })).toBeDisabled();
+  await expect(page.getByRole('button', { name: 'Mine 1 test block', exact: true })).toBeDisabled();
+  await page.getByRole('button', { name: 'Create payout address', exact: true }).click();
+  await expect(page.getByLabel('Payout address', { exact: true })).toHaveValue('ecregtest:qqtestaddress');
+  await page.getByRole('button', { name: 'Mine 1 test block', exact: true }).click();
+  await expect(page.getByRole('status').filter({ hasText: 'Generated 1 test block.' })).toBeVisible();
+  await page.getByRole('button', { name: 'Mine 101 test blocks', exact: true }).click();
+  await expect(page.getByRole('status').filter({ hasText: 'Generated 101 test blocks.' })).toBeVisible();
+  expect(await page.evaluate(() => window.calls.filter((c) => c.method === 'generatetoaddress').map((c) => c.params))).toEqual([[1, 'ecregtest:qqtestaddress'], [101, 'ecregtest:qqtestaddress']]);
+  expect(await page.evaluate(() => window.calls.filter((c) => c.method === 'getnewaddress')[0].wallet)).toBe('');
+  await expect(page.locator('.mining')).toContainText('not browser GPU hashing');
+});
+
+test('instant mining is absent on mainnet and stale regtest state cannot trigger mainnet generation', async ({ page }) => {
+  await mount(page, 'mining', { chain: 'main' });
+  await expect(page.getByRole('button', { name: 'Mine 1 test block', exact: true })).toHaveCount(0);
+  await mount(page, 'mining', { actualChain: 'main' });
+  await page.getByLabel('Payout address', { exact: true }).fill('address');
+  await page.getByRole('button', { name: 'Mine 1 test block', exact: true }).click();
+  await expect(page.getByRole('alert')).toContainText('only on regtest');
+  expect(await page.evaluate(() => window.calls.some((c) => c.method === 'generatetoaddress'))).toBe(false);
+});
+
+
+test('GPU mining starts only on click and hiding the tab stops it without auto-resume', async ({ page }) => {
+  const header = new Uint8Array(80); header.fill(0xab, 4, 36); new DataView(header.buffer).setUint32(72, 0x207fffff, true);
+  const pow = { version: 1, algorithm: 'sha256d', headerbytes: 80, nonceoffset: 76, noncebytes: 4, noncebyteorder: 'little', hashbyteorder: 'little', targetbyteorder: 'big', template_rpc: 'getrawunsolvedblock', submit_rpc: 'submitblock' };
+  const rawTemplate = { blockhex: Buffer.from(header).toString('hex') + '0100', target: '7fffff' + '00'.repeat(29) };
+  await mount(page, 'mining', { fakeWorker: true, pow, rawTemplate });
+  await page.getByLabel('Payout address', { exact: true }).fill('payout');
+  expect(await page.evaluate(() => window.workerStarts)).toBe(0);
+  await page.getByRole('button', { name: 'Start GPU mining', exact: true }).click();
+  await expect.poll(() => page.evaluate(() => window.workerStarts)).toBe(1);
+  await page.evaluate(() => { Object.defineProperty(document, 'hidden', { configurable: true, value: true }); document.dispatchEvent(new Event('visibilitychange')); });
+  await expect(page.getByRole('button', { name: 'Stop mining', exact: true })).toBeDisabled();
+  await expect(page.getByRole('status').filter({ hasText: 'Paused because this tab is hidden' })).toBeVisible();
+  await page.evaluate(() => { Object.defineProperty(document, 'hidden', { configurable: true, value: false }); document.dispatchEvent(new Event('visibilitychange')); });
+  expect(await page.evaluate(() => window.workerStarts)).toBe(1);
+  expect(await page.evaluate(() => window.workerStops)).toBe(1);
+  await expect(page.getByRole('button', { name: 'Start GPU mining', exact: true })).toBeEnabled();
 });

@@ -12,12 +12,13 @@ const SCOPE = new URL('./', self.location).pathname; // "/wallet/"
 // Precached in development; release bundles precache every file listed in BUNDLE.json.
 const PRECACHE = [
   '', 'index.html', 'app.css', 'main.js', 'app.js', 'router.js', 'manifest.webmanifest',
-  'lib/mining-hashes.js', 'mining/sha256d.wgsl', 'mining/blake3.wgsl',
-  'lib/chainconfig.js', 'lib/amount.js', 'lib/consoleparse.js', 'lib/json.js', 'lib/poller.js', 'lib/profile.js', 'lib/rpc.js',
+  'lib/chainconfig.js', 'lib/mining-hashes.js', 'lib/mining-work.js', 'lib/browser-miner.js',
+  'mining/worker.js', 'mining/sha256d.wgsl', 'mining/blake3.wgsl',
+  'lib/amount.js', 'lib/consoleparse.js', 'lib/json.js', 'lib/poller.js', 'lib/profile.js', 'lib/rpc.js',
   'lib/session.js', 'lib/storage.js', 'lib/store.js', 'lib/uri.js', 'lib/xpiaddr.js',
   'ui/address.js', 'ui/components.js', 'ui/layout.js',
   'views/console.js', 'views/login.js', 'views/nodeinfo.js', 'views/offline.js', 'views/overview.js',
-  'views/messages.js', 'views/peers.js', 'views/receive.js', 'views/send.js', 'views/transactions.js', 'views/wallets.js',
+  'views/mining.js', 'views/messages.js', 'views/peers.js', 'views/receive.js', 'views/send.js', 'views/transactions.js', 'views/wallets.js',
   'vendor/htm-preact-standalone.mjs', 'vendor/qrcodegen.mjs',
   'icons/icon.svg', 'icons/icon-192.png', 'icons/icon-512.png', 'icons/maskable-512.png',
 ];
