@@ -40,3 +40,12 @@ test('fromRpc converts Decimal, Number and string exactly', () => {
   assert.equal(fromRpc(undefined, 2), 0n);
   assert.throws(() => fromRpc(new Decimal('0.001'), 2), AmountError);
 });
+
+
+test('display precision removes only redundant zeros and never truncates spendable atoms', () => {
+  assert.equal(formatAmount(1000000n, 6, { minDecimals: 2 }), '1.00');
+  assert.equal(formatAmount(1000001n, 6, { minDecimals: 2 }), '1.000001');
+  assert.equal(formatAmount(1234567n, 6, { minDecimals: 2 }), '1.234567');
+  assert.equal(formatAmount(1230000n, 6, { minDecimals: 2 }), '1.23');
+  assert.equal(toRpc(1000000n, 6), '1.000000');
+});

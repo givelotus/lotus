@@ -13,7 +13,7 @@ const SCOPE = new URL('./', self.location).pathname; // "/wallet/"
 const PRECACHE = [
   '', 'index.html', 'app.css', 'main.js', 'app.js', 'router.js', 'manifest.webmanifest',
   'lib/mining-hashes.js', 'mining/sha256d.wgsl', 'mining/blake3.wgsl',
-  'lib/amount.js', 'lib/consoleparse.js', 'lib/json.js', 'lib/poller.js', 'lib/profile.js', 'lib/rpc.js',
+  'lib/chainconfig.js', 'lib/amount.js', 'lib/consoleparse.js', 'lib/json.js', 'lib/poller.js', 'lib/profile.js', 'lib/rpc.js',
   'lib/session.js', 'lib/storage.js', 'lib/store.js', 'lib/uri.js', 'lib/xpiaddr.js',
   'ui/address.js', 'ui/components.js', 'ui/layout.js',
   'views/console.js', 'views/login.js', 'views/nodeinfo.js', 'views/offline.js', 'views/overview.js',

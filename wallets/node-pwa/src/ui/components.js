@@ -47,7 +47,7 @@ export function Amount({ value, profile, units, sign = false, ticker = true }) {
     return html`<span class="amount">${String(value)}</span>`;
   }
   const cls = `amount${u < 0n ? ' neg' : ''}`;
-  return html`<span class=${cls}>${formatAmount(u, profile.decimals, { group: true, sign })}${ticker ? html` <span class="ticker">${profile.ticker}</span>` : ''}</span>`;
+  return html`<span class=${cls}>${formatAmount(u, profile.decimals, { group: true, sign, minDecimals: profile.currency?.displayDecimals ?? profile.decimals })}${ticker ? html` <span class="ticker">${profile.ticker}</span>` : ''}</span>`;
 }
 
 export function ErrorText({ error }) {

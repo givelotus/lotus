@@ -37,7 +37,7 @@ export function parseAmount(text, decimals, opts = {}) {
  * Format base units as a decimal string with exactly `decimals` digits.
  * @param {bigint} units
  * @param {number} decimals
- * @param {{group?: boolean, sign?: boolean}} [opts]
+ * @param {{group?: boolean, sign?: boolean, minDecimals?: number}} [opts]
  */
 export function formatAmount(units, decimals, opts = {}) {
   const neg = units < 0n;
@@ -45,7 +45,10 @@ export function formatAmount(units, decimals, opts = {}) {
   const scale = 10n ** BigInt(decimals);
   let whole = (abs / scale).toString();
   if (opts.group) whole = whole.replace(/\B(?=(\d{3})+(?!\d))/g, ' ');
-  const frac = decimals > 0 ? '.' + (abs % scale).toString().padStart(decimals, '0') : '';
+  const minimum = opts.minDecimals ?? decimals;
+  if (!Number.isInteger(minimum) || minimum < 0 || minimum > decimals) throw new AmountError('invalid display precision');
+  const digits = decimals > 0 ? (abs % scale).toString().padStart(decimals, '0').replace(/0+$/, '').padEnd(minimum, '0') : '';
+  const frac = digits ? '.' + digits : '';
   const sign = neg ? '-' : opts.sign && abs > 0n ? '+' : '';
   return sign + whole + frac;
 }

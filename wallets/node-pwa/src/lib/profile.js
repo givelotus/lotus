@@ -9,6 +9,7 @@
 
 import { encode, HRP_FOR_CHAIN } from './xpiaddr.js';
 import { RpcError } from './rpc.js';
+import { resolveChainConfig } from './chainconfig.js';
 
 /**
  * @typedef {{chain: string, ticker: string, decimals: number, profile: 'ecash'|'lotus-v2'|'generic',
@@ -49,14 +50,10 @@ export async function detectProfile(rpc) {
       hrp = HRP_FOR_CHAIN[chainInfo.chain];
     }
   }
-  return {
-    chain: chainInfo.chain,
-    ticker: String(currency.ticker),
-    decimals,
-    profile,
-    addressFormat,
-    hrp,
-    client: clientFromSubversion(net.subversion),
-    version: Number(net.version),
-  };
+  // Older preview nodes still support normal wallet operations and explicit
+  // regtest generation; GPU mining requires an unambiguous node descriptor.
+  const miningInfo = await rpc.call('getmininginfo').catch(() => null);
+  return resolveChainConfig({ chain: chainInfo.chain, profile, currency,
+    addressFormat, hrp, client: clientFromSubversion(net.subversion),
+    version: Number(net.version), miningInfo });
 }
