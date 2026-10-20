@@ -5,12 +5,34 @@ import { CopyButton, ErrorText, Field, Modal } from '../ui/components.js';
 import { routeHash } from '../router.js';
 
 export function MessagesView({ app, state }) {
+  const [tab, setTab] = useState(state.wallet === null ? 'verify' : 'sign');
+  const keyboard = (event) => {
+    let next;
+    if (event.key === 'ArrowLeft' || event.key === 'ArrowRight') next = tab === 'sign' ? 'verify' : 'sign';
+    else if (event.key === 'Home') next = 'sign';
+    else if (event.key === 'End') next = 'verify';
+    else return;
+    event.preventDefault();
+    setTab(next);
+    document.getElementById(`message-tab-${next}`).focus();
+  };
   return html`<div class="messages">
     <h1>Sign / verify message</h1>
-    <p>These node RPCs support legacy single-key (P2PKH) addresses. Native V2 and script addresses are not supported by this message-signature format. The node checks the address and reports unsupported types.</p>
-    <p class="muted">Spaces and line breaks matter: messages are sent exactly as entered. A valid signature proves control of the address key, not the truth of a message or anyone's identity.</p>
-    <${SignMessage} app=${app} wallet=${state.wallet} />
-    <${VerifyMessage} app=${app} />
+    <section class="card">
+      <div class="tabs" role="tablist" aria-label="Message action" onKeyDown=${keyboard}>
+        ${['sign', 'verify'].map((name) => html`<button type="button" role="tab" id=${`message-tab-${name}`} aria-controls=${`message-panel-${name}`}
+          aria-selected=${tab === name ? 'true' : 'false'} tabindex=${tab === name ? 0 : -1} class=${tab === name ? '' : 'secondary'}
+          onClick=${() => setTab(name)}>${name === 'sign' ? 'Sign message' : 'Verify message'}</button>`)}
+      </div>
+      <p>These node RPCs support legacy single-key (P2PKH) addresses. Native V2 and script addresses are not supported by this message-signature format. The node checks the address and reports unsupported types.</p>
+      <p class="muted">Spaces and line breaks matter: messages are sent exactly as entered. A valid signature proves control of the address key, not the truth of a message or anyone's identity.</p>
+      <div role="tabpanel" id="message-panel-sign" aria-labelledby="message-tab-sign" hidden=${tab !== 'sign'} tabindex="0">
+        <${SignMessage} app=${app} wallet=${state.wallet} />
+      </div>
+      <div role="tabpanel" id="message-panel-verify" aria-labelledby="message-tab-verify" hidden=${tab !== 'verify'} tabindex="0">
+        <${VerifyMessage} app=${app} />
+      </div>
+    </section>
   </div>`;
 }
 
@@ -61,7 +83,7 @@ function SignMessage({ app, wallet }) {
     finally { setBusy(false); }
   };
   const edit = (setter) => (event) => { setter(event.currentTarget.value); setSignature(null); };
-  return html`<section class="card">
+  return html`<div>
     <h2>Sign a message</h2>
     ${wallet === null ? html`<p><a href=${routeHash('wallets')}>Create or open a wallet</a> to sign. Verification below does not need a wallet.</p>` : null}
     <form onSubmit=${submit} aria-label="Sign message">
@@ -80,7 +102,7 @@ function SignMessage({ app, wallet }) {
         <${CopyButton} text=${signature.address} label="Copy signing address" toast=${app.toast} /></div>
     </div>` : null}
     ${pending ? html`<${UnlockMessage} busy=${busy} error=${error} onClose=${() => setPending(null)} onSign=${(pass) => sign(pending, pass)} />` : null}
-  </section>`;
+  </div>`;
 }
 
 function UnlockMessage({ busy, error, onClose, onSign }) {
@@ -117,7 +139,7 @@ function VerifyMessage({ app }) {
     catch (err) { setError(err); }
     finally { setBusy(false); }
   };
-  return html`<section class="card">
+  return html`<div>
     <h2>Verify a message</h2>
     <form onSubmit=${submit} aria-label="Verify message">
       <${Field} label="Verification address" id="msg-verify-address">
@@ -133,5 +155,5 @@ function VerifyMessage({ app }) {
     </form>
     <${ErrorText} error=${error} />
     ${valid === null ? null : html`<p role="status" class=${valid ? 'success' : 'error'}>${valid ? 'Valid signature for this address and exact message.' : 'Signature does not match this address and message.'}</p>`}
-  </section>`;
+  </div>`;
 }

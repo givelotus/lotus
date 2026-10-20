@@ -194,7 +194,10 @@ test('relock failure is visible even after successful signing', async ({ page })
 
 test('verification works without any wallet and sends the exact message', async ({ page }) => {
   await mount(page, 'messages', { noWallet: true });
+  await expect(page.getByRole('tab', { name: 'Verify message', exact: true })).toHaveAttribute('aria-selected', 'true');
+  await page.getByRole('tab', { name: 'Sign message', exact: true }).click();
   await expect(page.getByRole('button', { name: 'Sign message', exact: true })).toBeDisabled();
+  await page.getByRole('tab', { name: 'Verify message', exact: true }).click();
   await page.getByLabel('Verification address', { exact: true }).fill('ecregtest:qkey');
   await page.getByLabel('Signature to verify', { exact: true }).fill('compact-signature==');
   const message = ' \n exact text \n';
@@ -208,6 +211,7 @@ test('verification works without any wallet and sends the exact message', async 
 
 test('verification rejects mismatches clearly', async ({ page }) => {
   await mount(page, 'messages', { verify: false });
+  await page.getByRole('tab', { name: 'Verify message', exact: true }).click();
   await page.getByLabel('Verification address', { exact: true }).fill('ecregtest:qkey');
   await page.getByLabel('Signature to verify', { exact: true }).fill('wrong-signature==');
   await page.getByRole('button', { name: 'Verify message', exact: true }).click();
@@ -259,4 +263,26 @@ test('mobile layout stacks wallet controls and keeps final controls reachable wi
   await expect(page.getByRole('link', { name: 'Node', exact: true })).toBeInViewport();
   expect(await page.getByRole('link', { name: 'Node', exact: true }).evaluate((e) => e.getBoundingClientRect().height)).toBeGreaterThanOrEqual(44);
   await page.screenshot({ path: testInfo.outputPath('wallets-mobile.png'), fullPage: false });
+});
+
+
+test('message tabs preserve both forms and support arrow Home and End navigation', async ({ page }) => {
+  await mount(page, 'messages');
+  await page.getByLabel('Signing address', { exact: true }).fill('ecregtest:qkey');
+  await page.getByLabel('Message to sign', { exact: true }).fill('sign text');
+  await page.getByRole('tab', { name: 'Verify message', exact: true }).click();
+  await expect(page.getByRole('tabpanel')).toHaveCount(1);
+  await page.getByLabel('Message to verify', { exact: true }).fill('verify text');
+  await page.getByRole('tab', { name: 'Verify message', exact: true }).focus();
+  await page.keyboard.press('ArrowLeft');
+  await expect(page.getByRole('tab', { name: 'Sign message', exact: true })).toBeFocused();
+  await expect(page.getByLabel('Message to sign', { exact: true })).toHaveValue('sign text');
+  await expect(page.getByLabel('Signing address', { exact: true })).toHaveValue('ecregtest:qkey');
+  await page.keyboard.press('End');
+  await expect(page.getByRole('tab', { name: 'Verify message', exact: true })).toBeFocused();
+  await expect(page.getByLabel('Message to verify', { exact: true })).toHaveValue('verify text');
+  await page.keyboard.press('Home');
+  await expect(page.getByRole('tab', { name: 'Sign message', exact: true })).toBeFocused();
+  await page.keyboard.press('ArrowRight');
+  await expect(page.getByRole('tab', { name: 'Verify message', exact: true })).toHaveAttribute('aria-selected', 'true');
 });
