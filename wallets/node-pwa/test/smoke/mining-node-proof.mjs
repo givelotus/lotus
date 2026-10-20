@@ -8,6 +8,7 @@ import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { startNode } from './regtest.mjs';
 import { createDevServer } from '../../tools/devserver.mjs';
+import { ChainConfig } from '../../src/lib/chainconfig.js';
 import { v2BlockHash, sha256d, hexToBytes, bytesToHex } from '../../src/lib/mining-hashes.js';
 const binary = process.env.NODE_PWA_MINING_BINARY;
 const out = process.env.NODE_PWA_MINING_OUT;
@@ -23,8 +24,17 @@ try {
   const address = await node.rpc('getnewaddress', ['GPU proof'], 'gpu-proof');
   const chain = await node.rpc('getblockchaininfo');
   if (chain.chain !== 'regtest' || chain.blocks !== 0) throw new Error('Fresh isolated regtest required.');
-  const info = await node.rpc('getmininginfo');
-  let descriptor = info.pow;
+  let descriptor;
+  try {
+    const discovery = await node.rpc('getchainconfig');
+    const config = new ChainConfig(discovery);
+    descriptor = config.mining.descriptor;
+    receipt.discovery = discovery;
+    receipt.descriptor_provenance = 'One getchainconfig RPC and validated immutable ChainConfig';
+  } catch (error) {
+    if (process.env.NODE_PWA_MINING_ALLOW_REFERENCE !== '1') throw error;
+    receipt.discovery_error = error.message;
+  }
   if (!descriptor) {
     // Legacy reference-only proof: never enables old-node GPU in the public UI.
     const genesis = await node.rpc('getblockheader', [chain.bestblockhash, false]);
@@ -35,8 +45,8 @@ try {
       algorithm = 'lotus-v2-blockid'; headerbytes = 134; nonceoffset = 42; noncebytes = 8; chainid = '00'.repeat(32);
     } else throw new Error('Audited regtest proof-of-work identity did not match actual node genesis.');
     descriptor = { version: 1, algorithm, headerbytes, nonceoffset, noncebytes, noncebyteorder: 'little', hashbyteorder: 'little', targetbyteorder: 'big', ...(chainid ? { chainid } : {}), template_rpc: 'getrawunsolvedblock', submit_rpc: 'submitblock' };
-    receipt.descriptor_provenance = 'Reference artifact only: audited SHA256D/V2-zero-chain-id regtest descriptor independently verified against actual genesis. Public UI remains disabled without getmininginfo.pow; no new descriptor RPC, combined stack, or clean new-build validation.';
-  } else receipt.descriptor_provenance = 'getmininginfo.pow';
+    receipt.descriptor_provenance = 'Reference artifact only: audited SHA256D/V2-zero-chain-id regtest descriptor independently verified against actual genesis. Public UI requires getchainconfig; no new descriptor RPC, combined stack, or clean new-build validation.';
+  }
   receipt.descriptor = descriptor;
   ({ server } = createDevServer({ root: fileURLToPath(new URL('../../src/', import.meta.url)), rpcUrl: node.rpcUrl, cookieFile: node.cookieFile, auth: 'proxy' }));
   await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));

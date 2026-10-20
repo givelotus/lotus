@@ -49,14 +49,14 @@ be entered or generated in the selected node wallet. Regtest has explicit
 The page rechecks that the node is on regtest before calling it.
 
 Browser GPU mining is opt-in and requires WebGPU in a secure context
-(HTTPS or localhost), a usable GPU adapter, and `getmininginfo.pow`
+(HTTPS or localhost), a usable GPU adapter, and authoritative `getchainconfig` discovery
 version 1. Older preview nodes keep ordinary wallet/regtest features but
-cannot enable GPU mining through the public UI without that descriptor.
+cannot enable GPU mining through the public UI without the discovery contract.
 The daemon host must serve local `.wgsl` files. No shader code, script URL
 or remote executable comes from the descriptor.
 
 `lib/chainconfig.js` resolves one immutable configuration from the node:
-network/address capabilities, currency atomic unit and RPC precision,
+network/genesis identity, address capabilities, currency atomic unit and RPC precision,
 display policy, and mining algorithm/header/RPC contract. Amount entry and
 RPC serialization retain the full node precision. The default two-decimal
 display removes redundant zeroes only; nonzero atomic units are never hidden.
@@ -94,8 +94,9 @@ npx playwright test --config test/smoke/playwright.config.mjs ui-controls.spec.m
 `test/smoke/mining-node-proof.mjs` is an explicit opt-in accepted-block proof
 using a supplied binary, a fresh isolated regtest datadir, and owned ports.
 It writes a receipt with binary hash, descriptor provenance and accepted tip.
-Its audited historical-reference fallback is test-only and does not enable
-mining on older nodes in the public UI.
+Its audited historical-reference path requires
+`NODE_PWA_MINING_ALLOW_REFERENCE=1` explicitly and does not enable mining
+on older nodes in the public UI.
 
 ## Development
 
