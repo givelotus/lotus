@@ -139,3 +139,27 @@ on its defined quorum/bootstrap evidence, not a generic historical-validity
 claim. Root checking must never mark scripts executed. Proof encoding,
 completeness, status reporting, invalid-history handling and independent tests
 remain open; no new trust or activation mechanism is adopted here.
+
+
+## Prunable burn data and script receipts — open questions, 2026-10-20
+
+The maintainer requested the [burn-data appendix](burn-data-open-questions.md)
+to explore commitment-preserving pruning and large paid publication data.
+Existing native Merkleized output identities can retain an opaque leaf hash,
+but that hash alone does not authenticate disclosed burn classification or
+accounting fields. A separately committed small burn descriptor plus payload
+commitment is a hypothesis requiring its own canonical format, streaming
+validation, charged resource model and retention/retrieval evidence. It is
+not a selected rule or a request to rewrite block files.
+
+Descriptor-only pruning, script-readable historical receipts and consumable
+receipts/nullifiers are separate choices. Burned value remains unspendable;
+references must not resurrect it or bypass conservation. Read-only inputs are
+still forbidden. Any receipt capability requires explicit chain anchoring,
+reorg/replay/duplicate-claim handling and cost/availability analysis, with
+existing branch/HAS_STATE contract commitments considered first. The appendix
+flags the older P01 state-field description versus implementation discrepancy
+without modifying either rule. Backwards transition verification still needs
+its authenticated coin/provenance and full-state evidence. No payload
+availability guarantee, new wire format, consensus activation, fee parameter
+or burn distribution is selected.
