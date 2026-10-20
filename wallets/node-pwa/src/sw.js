@@ -12,7 +12,7 @@ const SCOPE = new URL('./', self.location).pathname; // "/wallet/"
 // Precached in development; release bundles precache every file listed in BUNDLE.json.
 const PRECACHE = [
   '', 'index.html', 'app.css', 'main.js', 'app.js', 'router.js', 'manifest.webmanifest',
-  'lib/chain-adaptor.js', 'lib/chainconfig.js', 'lib/mining-hashes.js', 'lib/mining-work.js', 'lib/browser-miner.js',
+  'lib/message-signing.js', 'lib/chain-adaptor.js', 'lib/chainconfig.js', 'lib/mining-hashes.js', 'lib/mining-work.js', 'lib/browser-miner.js',
   'mining/worker.js', 'mining/sha256d.wgsl', 'mining/blake3.wgsl',
   'lib/amount.js', 'lib/consoleparse.js', 'lib/json.js', 'lib/poller.js', 'lib/profile.js', 'lib/rpc.js',
   'lib/session.js', 'lib/storage.js', 'lib/store.js', 'lib/uri.js', 'lib/xpiaddr.js',

@@ -117,7 +117,7 @@ export class ChainConfig {
       address: { format: address.format, hrp, types: [...address.types], acceptedFormats: [...address.acceptedformats], base58Prefixes: { pubkeyhash, scripthash } },
       mining: { supported: true, descriptor: pow },
       rpc: { testBlockGeneration: testGeneration, template: pow.template_rpc, submission: pow.submit_rpc },
-      features: { legacyTransactions: legacy, nativeTransactions, messageSigning: features.message_signing },
+      features: { legacyTransactions: legacy, nativeTransactions, messageSigning: features.message_signing, nativeMessageSigning: false },
       // Existing view vocabulary references these same validated facts.
       chain: chain.network, profile: chain.kind, client, version, ticker, decimals: rpcDecimals, addressFormat: address.format, hrp,
     });
