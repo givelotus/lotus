@@ -37,11 +37,13 @@ D10 formula adoption (2026-10-15): maintainer authorizes the absolute genesis-an
 ## Typed addresses — maintainer direction, 2026-10-19
 
 [Address specification](addresses.md): type 0 carries an explicit MAST root;
-type 1 is reserved for a standard keyhash program; 2–30 are future template
-IDs and 31 is an extended-ID escape. Exact keyhash/program/extension bytes
-remain to be specified and independently tested. This direction is
-provisional through testnet, not a frozen address format. Only the type-0
-codec exists today; wallet/RPC native-address wiring and native message
-proofs remain implementation work. Keep this decision and the daemon owner
-`v2/065` document synchronized; do not treat a docs update as implemented
-support for new selectors.
+type 1 is the candidate BLAKE3(x-only secp256k1 public key) program defined
+there, with a full 32-byte payload and exact 37-byte native VM template.
+IDs 2–30 remain reserved and 31 is an extension escape whose encoding is
+still open. [Message signing](message-signing.md) records the maintainer's
+compact recoverable ECDSA choice, chain-bound Lotus digest, canonical
+keyhash binding, eCash compatibility and validation gates. Native transaction
+signatures remain BIP340. Both address and application-proof choices remain
+provisional through testnet. Type-1/message implementation is a separate
+candidate; native wallet receive/spend is a distinct dependency, not implied
+by codec acceptance. Keep this decision and daemon documentation synchronized.
