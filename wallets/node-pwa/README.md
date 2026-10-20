@@ -8,12 +8,28 @@ node's wallet. It is not the Frank app and has no server of its own.
 Design: `docs/addendum-designs/P1-pwa-wallet-and-Q1-qt-removal.md` in the
 `lotus-v2-addendum` repository (§2 is the app, §2.9 the parity checklist).
 This directory implements phase 1: overview, send, receive, transactions,
-wallets, peers, console and node information.
+wallets, peers, message signing/verification, console and node information.
 
 The app is plain ES2022 modules with no build step: `src/` is exactly what the
 browser runs. The only runtime dependencies are two vendored, hash-pinned files
 in `src/vendor/` (htm 3.1.1's Preact standalone build, and nayuki's QR Code
 generator 1.8.0); `VENDOR.json` records their origin, licence and sha256.
+
+## Message signatures
+
+Use **Sign / verify message** in the sidebar. Signing calls the selected
+wallet's `signmessage` RPC; verification calls the node's `verifymessage`
+RPC and needs no loaded wallet. Both implement the daemon's legacy compact
+signature format for P2PKH addresses. Native V2 and script addresses are not
+supported by these RPCs; the UI displays the daemon's errors rather than
+creating a different signature scheme.
+
+Messages retain their spaces and line breaks. Keys remain in the daemon. If
+the selected wallet is locked, the UI requests a passphrase for a 60-second
+unlock and relocks after the operation, including signing failures. It leaves
+an already-unlocked wallet unlocked. Passphrases are cleared and never saved;
+a relock failure is shown explicitly. Forms and signatures are not stored in
+browser history or local storage.
 
 ## Status of the daemon side
 

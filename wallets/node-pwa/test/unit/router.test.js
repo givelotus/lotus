@@ -6,6 +6,7 @@ test('parse and build hash routes with wallet query', () => {
   assert.deepEqual(pick(parseRoute('')), ['overview', null, null]);
   assert.deepEqual(pick(parseRoute('#/send?w=w1')), ['send', null, 'w1']);
   assert.deepEqual(pick(parseRoute('#/tx/abcd?w=')), ['tx', 'abcd', '']);
+  assert.deepEqual(pick(parseRoute('#/messages?w=')), ['messages', null, '']);
   assert.deepEqual(pick(parseRoute('#/nonsense')), ['overview', null, null]);
   assert.equal(routeHash('tx', 'ab', 'my wallet'), '#/tx/ab?w=my%20wallet');
   assert.equal(routeHash('overview', null, ''), '#/overview?w=');

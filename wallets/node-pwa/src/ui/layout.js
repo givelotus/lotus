@@ -12,6 +12,7 @@ const NAV = [
   ['transactions', 'Transactions'],
   ['wallets', 'Wallets'],
   ['peers', 'Peers'],
+  ['messages', 'Sign / verify message'],
   ['console', 'Console'],
   ['node', 'Node'],
 ];

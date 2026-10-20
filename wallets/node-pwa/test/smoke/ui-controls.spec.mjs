@@ -23,11 +23,12 @@ async function mount(page, kind, config = {}) {
     const { WalletsView } = await import('/wallet/views/wallets.js');
     const { StatusBar } = await import('/wallet/ui/layout.js');
     const { ReceiveView } = await import('/wallet/views/receive.js');
+    const { MessagesView } = await import('/wallet/views/messages.js');
     window.calls = [];
     window.selected = null;
     window.refreshed = 0;
-    const state = { wallets: config.loaded ?? [], wallet: kind === 'receive' ? '' : null, net: { networkactive: true }, profile: { ticker: 'XEC', decimals: 2, addressFormat: 'cashaddr' } };
-    const draw = () => render(html`<${kind === 'wallets' ? WalletsView : kind === 'receive' ? ReceiveView : StatusBar} app=${app} state=${state} />`, document.getElementById('root'));
+    const state = { wallets: config.loaded ?? [], wallet: kind === 'receive' || (kind === 'messages' && !config.noWallet) ? '' : null, net: { networkactive: true }, profile: { ticker: 'XEC', decimals: 2, addressFormat: 'cashaddr' } };
+    const draw = () => render(html`<${kind === 'wallets' ? WalletsView : kind === 'receive' ? ReceiveView : kind === 'messages' ? MessagesView : StatusBar} app=${app} state=${state} />`, document.getElementById('root'));
     const app = {
       async walletCall(method, params) {
         window.calls.push({ method, params, wallet: state.wallet });
@@ -40,8 +41,12 @@ async function mount(page, kind, config = {}) {
       selectWallet(name) { window.selected = name; },
       refresh() { window.refreshed++; draw(); },
       toast(message, kind) { window.toast = { message, kind }; },
-      rpc: { async call(method, params) {
-        window.calls.push({ method, params });
+      rpc: { async call(method, params, opts) {
+        window.calls.push({ method, params, ...(opts ? { wallet: opts.wallet } : {}) });
+        if (config.fail && method === config.fail) throw new Error(config.failureMessage ?? 'RPC denied');
+        if (method === 'getwalletinfo') return config.locked ? { unlocked_until: 0 } : {};
+        if (method === 'signmessage') return 'compact-signature==';
+        if (method === 'verifymessage') return config.verify !== false;
         if (method === 'listwalletdir') {
           const disk = config.appearsAfterCheck && window.calls.filter((c) => c.method === method).length > 1 ? [''] : (config.disk ?? []);
           return { wallets: disk.map((name) => ({ name })) };
@@ -130,4 +135,75 @@ test('payment request keeps its amount, message, browser history and durable add
   await page.getByRole('button', { name: 'Close', exact: true }).click();
   await expect(page.getByRole('heading', { name: 'Requested payments' }).locator('..')).toContainText('Coffee');
   await expect(page.getByRole('heading', { name: 'Received by address' }).locator('..')).toContainText('ecregtest:qqtestaddress');
+});
+
+
+test('signing preserves whitespace on the selected unnamed wallet without exporting keys', async ({ page }) => {
+  await mount(page, 'messages');
+  await page.getByLabel('Signing address', { exact: true }).fill(' ecregtest:qkey ');
+  const message = '  line one\nline two \n';
+  await page.getByLabel('Message to sign', { exact: true }).fill(message);
+  await page.getByRole('button', { name: 'Sign message', exact: true }).click();
+  await expect(page.getByTestId('signed-message')).toContainText('compact-signature==');
+  await expect(page.getByRole('button', { name: 'Copy signature', exact: true })).toBeVisible();
+  expect(await page.evaluate(() => window.calls)).toEqual([
+    { method: 'getwalletinfo', params: [], wallet: '' },
+    { method: 'signmessage', params: ['ecregtest:qkey', message], wallet: '' },
+  ]);
+});
+
+test('locked wallet unlocks only for signing, relocks, and clears passphrase', async ({ page }) => {
+  await mount(page, 'messages', { locked: true });
+  await page.getByLabel('Signing address', { exact: true }).fill('ecregtest:qkey');
+  await page.getByRole('button', { name: 'Sign message', exact: true }).click();
+  await page.getByLabel('Wallet passphrase', { exact: true }).fill('temporary-secret');
+  await page.getByRole('button', { name: 'Unlock and sign', exact: true }).click();
+  await expect(page.getByTestId('signed-message')).toBeVisible();
+  expect(await page.evaluate(() => window.calls.map((c) => c.method))).toEqual(['getwalletinfo', 'walletpassphrase', 'signmessage', 'walletlock']);
+  expect(await page.evaluate(() => window.calls.every((c) => c.wallet === ''))).toBe(true);
+  expect(await page.evaluate(() => Object.values(localStorage).some((v) => v.includes('temporary-secret')))).toBe(false);
+  await expect(page.getByLabel('Wallet passphrase', { exact: true })).toHaveCount(0);
+});
+
+test('unsupported signing address is reported and temporarily unlocked wallet still relocks', async ({ page }) => {
+  await mount(page, 'messages', { locked: true, fail: 'signmessage', failureMessage: 'Address does not refer to key' });
+  await page.getByLabel('Signing address', { exact: true }).fill('xpi-native');
+  await page.getByRole('button', { name: 'Sign message', exact: true }).click();
+  await page.getByLabel('Wallet passphrase', { exact: true }).fill('temporary-secret');
+  await page.getByRole('button', { name: 'Unlock and sign', exact: true }).click();
+  await expect(page.getByRole('dialog').getByRole('alert')).toContainText('Address does not refer to key');
+  await expect(page.getByLabel('Wallet passphrase', { exact: true })).toHaveValue('');
+  expect(await page.evaluate(() => window.calls.map((c) => c.method))).toEqual(['getwalletinfo', 'walletpassphrase', 'signmessage', 'walletlock']);
+});
+
+test('relock failure is visible even after successful signing', async ({ page }) => {
+  await mount(page, 'messages', { locked: true, fail: 'walletlock' });
+  await page.getByLabel('Signing address', { exact: true }).fill('ecregtest:qkey');
+  await page.getByRole('button', { name: 'Sign message', exact: true }).click();
+  await page.getByLabel('Wallet passphrase', { exact: true }).fill('temporary-secret');
+  await page.getByRole('button', { name: 'Unlock and sign', exact: true }).click();
+  await expect(page.getByTestId('signed-message')).toBeVisible();
+  await expect(page.getByRole('alert')).toContainText('Could not relock the wallet');
+});
+
+test('verification works without any wallet and sends the exact message', async ({ page }) => {
+  await mount(page, 'messages', { noWallet: true });
+  await expect(page.getByRole('button', { name: 'Sign message', exact: true })).toBeDisabled();
+  await page.getByLabel('Verification address', { exact: true }).fill('ecregtest:qkey');
+  await page.getByLabel('Signature to verify', { exact: true }).fill('compact-signature==');
+  const message = ' \n exact text \n';
+  await page.getByLabel('Message to verify', { exact: true }).fill(message);
+  await page.getByRole('button', { name: 'Verify message', exact: true }).click();
+  await expect(page.getByRole('status')).toContainText('Valid signature');
+  expect(await page.evaluate(() => window.calls)).toEqual([{ method: 'verifymessage', params: ['ecregtest:qkey', 'compact-signature==', message] }]);
+  await page.getByLabel('Message to verify', { exact: true }).fill('changed');
+  await expect(page.getByRole('status')).toHaveCount(0);
+});
+
+test('verification rejects mismatches clearly', async ({ page }) => {
+  await mount(page, 'messages', { verify: false });
+  await page.getByLabel('Verification address', { exact: true }).fill('ecregtest:qkey');
+  await page.getByLabel('Signature to verify', { exact: true }).fill('wrong-signature==');
+  await page.getByRole('button', { name: 'Verify message', exact: true }).click();
+  await expect(page.getByRole('status')).toContainText('Signature does not match');
 });

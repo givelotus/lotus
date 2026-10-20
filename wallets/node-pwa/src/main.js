@@ -15,6 +15,7 @@ import { TransactionsView } from './views/transactions.js';
 import { PeersView } from './views/peers.js';
 import { ConsoleView } from './views/console.js';
 import { NodeView } from './views/nodeinfo.js';
+import { MessagesView } from './views/messages.js';
 import { WalletsView } from './views/wallets.js';
 
 const app = createApp();
@@ -39,6 +40,7 @@ const VIEWS = {
   console: ConsoleView,
   node: NodeView,
   wallets: WalletsView,
+  messages: MessagesView,
   login: OverviewView,
 };
 

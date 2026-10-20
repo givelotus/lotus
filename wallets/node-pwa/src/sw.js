@@ -16,7 +16,7 @@ const PRECACHE = [
   'lib/session.js', 'lib/storage.js', 'lib/store.js', 'lib/uri.js', 'lib/xpiaddr.js',
   'ui/address.js', 'ui/components.js', 'ui/layout.js',
   'views/console.js', 'views/login.js', 'views/nodeinfo.js', 'views/offline.js', 'views/overview.js',
-  'views/peers.js', 'views/receive.js', 'views/send.js', 'views/transactions.js', 'views/wallets.js',
+  'views/messages.js', 'views/peers.js', 'views/receive.js', 'views/send.js', 'views/transactions.js', 'views/wallets.js',
   'vendor/htm-preact-standalone.mjs', 'vendor/qrcodegen.mjs',
   'icons/icon.svg', 'icons/icon-192.png', 'icons/icon-512.png', 'icons/maskable-512.png',
 ];
