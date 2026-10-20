@@ -7,30 +7,53 @@ function bytes(value, length) {
   if (!(value instanceof Uint8Array) || (length !== undefined && value.length !== length)) throw new TypeError(`Expected Uint8Array${length === undefined ? '' : `(${length})`}`);
   return value;
 }
+// One SHA256 compression without padding. State and message words use SHA's
+// big-endian convention; callers retain their input state unchanged.
+export function sha256Compress(state, block) {
+  if (!(state instanceof Uint32Array) || state.length !== 8) throw new TypeError('Expected eight SHA256 state words');
+  bytes(block, 64);
+  const view = new DataView(block.buffer, block.byteOffset, block.byteLength);
+  const h = state.slice(), w = new Uint32Array(64);
+  for (let i = 0; i < 16; i++) w[i] = view.getUint32(4*i);
+  for (let i = 16; i < 64; i++) {
+    const x = w[i-15], y = w[i-2];
+    w[i] = w[i-16] + (rotr(x,7)^rotr(x,18)^(x>>>3)) + w[i-7] + (rotr(y,17)^rotr(y,19)^(y>>>10));
+  }
+  let [a,b,c,d,e,f,g,z] = h;
+  for (let i = 0; i < 64; i++) {
+    const t = (z + (rotr(e,6)^rotr(e,11)^rotr(e,25)) + ((e&f)^(~e&g)) + K[i] + w[i]) >>> 0;
+    const u = ((rotr(a,2)^rotr(a,13)^rotr(a,22)) + ((a&b)^(a&c)^(b&c))) >>> 0;
+    z=g; g=f; f=e; e=(d+t)>>>0; d=c; c=b; b=a; a=(t+u)>>>0;
+  }
+  [a,b,c,d,e,f,g,z].forEach((v,i) => { h[i] += v; });
+  return h;
+}
 export function sha256(input) {
   bytes(input);
   const data = new Uint8Array(Math.ceil((input.length + 9) / 64) * 64);
   data.set(input); data[input.length] = 128;
   const view = new DataView(data.buffer);
   view.setBigUint64(data.length - 8, BigInt(input.length) * 8n);
-  const h = IV.slice(), w = new Uint32Array(64);
-  for (let pos = 0; pos < data.length; pos += 64) {
-    for (let i = 0; i < 16; i++) w[i] = view.getUint32(pos + 4*i);
-    for (let i = 16; i < 64; i++) {
-      const x = w[i-15], y = w[i-2];
-      w[i] = w[i-16] + (rotr(x,7)^rotr(x,18)^(x>>>3)) + w[i-7] + (rotr(y,17)^rotr(y,19)^(y>>>10));
-    }
-    let [a,b,c,d,e,f,g,z] = h;
-    for (let i = 0; i < 64; i++) {
-      const t = (z + (rotr(e,6)^rotr(e,11)^rotr(e,25)) + ((e&f)^(~e&g)) + K[i] + w[i]) >>> 0;
-      const u = ((rotr(a,2)^rotr(a,13)^rotr(a,22)) + ((a&b)^(a&c)^(b&c))) >>> 0;
-      z=g; g=f; f=e; e=(d+t)>>>0; d=c; c=b; b=a; a=(t+u)>>>0;
-    }
-    [a,b,c,d,e,f,g,z].forEach((v,i) => { h[i] += v; });
-  }
+  let h = IV.slice();
+  for (let pos = 0; pos < data.length; pos += 64) h = sha256Compress(h, data.subarray(pos, pos + 64));
   const result = new Uint8Array(32), out = new DataView(result.buffer);
   h.forEach((v,i) => out.setUint32(i*4,v));
   return result;
+}
+
+// Cache only the first unpadded 64 bytes of an eCash 80-byte header. Nonce,
+// timestamp, bits and the final four Merkle bytes belong to the second block.
+// Snapshot the prefix and return a copy so caller mutation cannot poison it.
+export function createSha256dMidstateCache() {
+  let prefix, midstate;
+  return (header) => {
+    bytes(header, 80);
+    if (!prefix || prefix.some((byte, i) => byte !== header[i])) {
+      prefix = header.slice(0, 64);
+      midstate = sha256Compress(IV, prefix);
+    }
+    return midstate.slice();
+  };
 }
 export function sha256d(header) { return sha256(sha256(bytes(header,80))); }
 

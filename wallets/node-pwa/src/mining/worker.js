@@ -1,13 +1,14 @@
 // A dedicated worker owns a bounded GPU dispatch. Terminating it stops further
 // dispatches; one already submitted GPU batch may finish. No RPC/auth here.
 import { validateMiningDescriptor } from '../lib/chainconfig.js';
-import { sha256d, v2BlockHash, setHeaderNonce, meetsTarget } from '../lib/mining-hashes.js';
+import { sha256d, createSha256dMidstateCache, v2BlockHash, setHeaderNonce, meetsTarget } from '../lib/mining-hashes.js';
 
 const COUNT = 1024;
 const STRIDE = 32;
 let device;
 let buffers = [];
 let running = false;
+const sha256dMidstate = createSha256dMidstateCache();
 self.onmessage = async ({ data }) => {
   if (data.type !== 'start' || running) return;
   running = true;
@@ -39,7 +40,11 @@ self.onmessage = async ({ data }) => {
     const padded = new Uint8Array(Math.ceil(header.length / 4) * 4); padded.set(header);
     device.queue.writeBuffer(head, 0, padded);
     const entries = [head, params, result].map((buffer, binding) => ({ binding, resource: { buffer } }));
-    if (chainid) {
+    if (descriptor.algorithm === 'sha256d') {
+      const state = make(32, GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST);
+      device.queue.writeBuffer(state, 0, sha256dMidstate(header));
+      entries.push({ binding: 3, resource: { buffer: state } });
+    } else if (chainid) {
       const chain = make(32, GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST);
       device.queue.writeBuffer(chain, 0, chainid); entries.push({ binding: 3, resource: { buffer: chain } });
     }
