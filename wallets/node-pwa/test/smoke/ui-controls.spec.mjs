@@ -22,12 +22,21 @@ async function mount(page, kind, config = {}) {
     const { html, render } = await import('/wallet/vendor/htm-preact-standalone.mjs');
     const { WalletsView } = await import('/wallet/views/wallets.js');
     const { StatusBar } = await import('/wallet/ui/layout.js');
+    const { ReceiveView } = await import('/wallet/views/receive.js');
     window.calls = [];
     window.selected = null;
     window.refreshed = 0;
-    const state = { wallets: config.loaded ?? [], wallet: null, net: { networkactive: true } };
-    const draw = () => render(html`<${kind === 'wallets' ? WalletsView : StatusBar} app=${app} state=${state} />`, document.getElementById('root'));
+    const state = { wallets: config.loaded ?? [], wallet: kind === 'receive' ? '' : null, net: { networkactive: true }, profile: { ticker: 'XEC', decimals: 2, addressFormat: 'cashaddr' } };
+    const draw = () => render(html`<${kind === 'wallets' ? WalletsView : kind === 'receive' ? ReceiveView : StatusBar} app=${app} state=${state} />`, document.getElementById('root'));
     const app = {
+      async walletCall(method, params) {
+        window.calls.push({ method, params, wallet: state.wallet });
+        if (method === 'getnewaddress') {
+          window.generatedLabel = params[0];
+          return 'ecregtest:qqtestaddress';
+        }
+        if (method === 'listreceivedbyaddress') return window.generatedLabel === undefined ? [] : [{ address: 'ecregtest:qqtestaddress', label: window.generatedLabel, amount: 0, confirmations: 0 }];
+      },
       selectWallet(name) { window.selected = name; },
       refresh() { window.refreshed++; draw(); },
       toast(message, kind) { window.toast = { message, kind }; },
@@ -91,4 +100,34 @@ test('network action toggles node P2P in both directions', async ({ page }) => {
   await page.getByRole('button', { name: 'Enable peer networking', exact: true }).click();
   await expect(page.getByRole('button', { name: 'Disable peer networking', exact: true })).toBeVisible();
   expect(await page.evaluate(() => window.calls.filter((c) => c.method === 'setnetworkactive').map((c) => c.params))).toEqual([[false], [true]]);
+});
+
+
+test('receiving address needs no request fields and is saved in the unnamed wallet', async ({ page }) => {
+  await mount(page, 'receive');
+  await page.getByRole('button', { name: 'Create receiving address', exact: true }).click();
+  await expect(page.getByRole('dialog', { name: 'Receiving address', exact: true })).toBeVisible();
+  await expect(page.getByTestId('request-address')).toHaveText('ecregtest:qqtestaddress');
+  await expect(page.getByRole('button', { name: 'Copy address', exact: true })).toBeVisible();
+  await expect(page.locator('svg.qr')).toBeVisible();
+  expect(await page.evaluate(() => window.calls.filter((c) => c.method === 'getnewaddress'))).toEqual([{ method: 'getnewaddress', params: [''], wallet: '' }]);
+  await page.getByRole('button', { name: 'Close', exact: true }).click();
+  await expect(page.getByRole('table')).toContainText('ecregtest:qqtestaddress');
+  await expect(page.locator('.receive')).toContainText('Addresses and labels are saved in the node');
+  await expect(page.getByRole('heading', { name: 'Requested payments' }).locator('..')).toContainText('No requests yet');
+});
+
+test('payment request keeps its amount, message, browser history and durable address', async ({ page }) => {
+  await mount(page, 'receive');
+  await page.getByLabel('Label (optional)', { exact: true }).fill('Coffee');
+  await page.getByLabel('Amount (XEC, optional)', { exact: true }).fill('2.50');
+  await page.getByLabel('Message (optional)', { exact: true }).fill('Thanks');
+  await page.getByRole('button', { name: 'Create payment request', exact: true }).click();
+  await expect(page.getByRole('dialog', { name: 'Payment request', exact: true })).toBeVisible();
+  await expect(page.getByRole('dialog')).toContainText('2.50');
+  await expect(page.getByRole('dialog')).toContainText('Thanks');
+  expect(await page.evaluate(() => window.calls.filter((c) => c.method === 'getnewaddress'))).toEqual([{ method: 'getnewaddress', params: ['Coffee'], wallet: '' }]);
+  await page.getByRole('button', { name: 'Close', exact: true }).click();
+  await expect(page.getByRole('heading', { name: 'Requested payments' }).locator('..')).toContainText('Coffee');
+  await expect(page.getByRole('heading', { name: 'Received by address' }).locator('..')).toContainText('ecregtest:qqtestaddress');
 });

@@ -28,6 +28,22 @@ export function ReceiveView({ app, state }) {
   );
   if (w === null) return html`<${NoWallet} state=${state} />`;
 
+  const createAddress = async () => {
+    setError(null);
+    setBusy(true);
+    try {
+      const address = await app.walletCall('getnewaddress', [label.trim()]);
+      setShown({ address, label: label.trim(), kind: 'address' });
+      setLabel('');
+      received.reload();
+      app.refresh();
+    } catch (err) {
+      setError(err);
+    } finally {
+      setBusy(false);
+    }
+  };
+
   const submit = async (e) => {
     e.preventDefault();
     setError(null);
@@ -46,6 +62,8 @@ export function ReceiveView({ app, state }) {
     setBusy(true);
     try {
       const address = await app.walletCall('getnewaddress', [label.trim()]);
+      received.reload();
+      app.refresh();
       const req = { wallet: w, address, label: label.trim(), amount: amountText, message: message.trim(), created: Math.floor(Date.now() / 1000) };
       await addRequest(req);
       setShown(req);
@@ -61,10 +79,15 @@ export function ReceiveView({ app, state }) {
   return html`
     <div class="receive">
       <h1>Receive</h1>
-      <form class="card" onSubmit=${submit} aria-label="Request payment">
-        <${Field} label="Label" id="rcv-label" hint="Stored with the new address in the wallet">
+      <form class="card" onSubmit=${submit} aria-label="Receive funds">
+        <h2>Create a receiving address</h2>
+        <p>Addresses and labels are saved in the node's wallet. They remain available if you close this browser or clear its data.</p>
+        <${Field} label="Label (optional)" id="rcv-label" hint="Stored with the new address in the wallet">
           <input id="rcv-label" value=${label} onInput=${(e) => setLabel(e.currentTarget.value)} autocomplete="off" />
         <//>
+        <div class="actions"><button type="button" disabled=${busy} onClick=${createAddress}>Create receiving address</button></div>
+        <h3>Optional payment request</h3>
+        <p class="muted">Add an amount or message to share with the address. Request details and history are saved only in this browser; the address and label are saved in the node's wallet.</p>
         <${Field} label=${`Amount (${p.ticker}, optional)`} id="rcv-amount" error=${amountError}>
           <input id="rcv-amount" class="amount-input" inputmode="decimal" value=${amount} onInput=${(e) => setAmount(e.currentTarget.value)} autocomplete="off" />
         <//>
@@ -77,7 +100,7 @@ export function ReceiveView({ app, state }) {
 
       <section class="card" aria-labelledby="req-title">
         <h2 id="req-title">Requested payments</h2>
-        ${history.length === 0 ? html`<p class="muted">No requests yet. They are stored in this browser only.</p>` : html`
+        ${history.length === 0 ? html`<p class="muted">No requests yet. Request details are stored in this browser only; receiving addresses are saved in the node's wallet.</p>` : html`
           <table class="table">
             <thead><tr><th>Date</th><th>Label</th><th>Message</th><th class="num">Amount</th><th></th></tr></thead>
             <tbody>
@@ -114,7 +137,7 @@ function RequestModal({ app, profile, req, onClose }) {
   const qrText = buildUri(req, fmt, { qr: true });
   const base = `payment-request-${req.address.replace(/^[a-z]+:/, '').slice(0, 12)}`;
   return html`
-    <${Modal} title="Payment request" onClose=${onClose}>
+    <${Modal} title=${req.kind === 'address' ? 'Receiving address' : 'Payment request'} onClose=${onClose}>
       <div class="request">
         <${QR} text=${qrText} label="QR code of the payment URI" />
         <dl>

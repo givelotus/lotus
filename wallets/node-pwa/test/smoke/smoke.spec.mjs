@@ -52,7 +52,7 @@ async function consoleRun(page, line) {
 
 async function newAddress(page, label) {
   await page.getByRole('link', { name: 'Receive', exact: true }).click();
-  await page.getByLabel('Label', { exact: true }).fill(label);
+  await page.getByLabel('Label (optional)', { exact: true }).fill(label);
   await page.getByRole('button', { name: 'Create payment request' }).click();
   const addr = (await page.getByTestId('request-address').textContent()).trim();
   await expect(page.locator('svg.qr')).toBeVisible();
