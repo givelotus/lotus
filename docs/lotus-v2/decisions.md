@@ -116,3 +116,26 @@ only when the actual controller can use it; chip nonce exhaustion still requires
 appropriate chip assignments. A shared pool manager with native browser and
 Stratum adapters is a proposal, not existing ASIC support. P04 and the open
 selection/measurement gates remain unchanged.
+
+
+## Historical root verification — provisional maintainer direction, 2026-10-20
+
+[N06a historical verification policy](peering.md#historical-verification-policy-root-checks-by-default-full-replay-opt-in)
+records the proposed default: authenticated backwards root-transition checks,
+with full historical transaction/script/signature execution on a separate
+opt-in track. Neither full historical replay nor reaching genesis is required
+for catch-up. Every newly connected forward block still requires the existing
+full consensus validation. This is a pre-testnet/provisional synchronization
+policy, not a consensus relaxation or an implemented proof protocol.
+
+Archive commitment checks, block-derived root-transition checks and full
+historical execution carry distinct assurance and durable provenance. Arbitrary
+root-changing updates do not prove transaction authorization or monetary
+validity; full `StateRoot` components, spent/creation proofs, block binding and
+expiry-sweep completeness need a precise reviewed proof contract. Authenticated
+snapshot/header/PoW and any required finalization anchors remain explicit.
+Peer-count majorities are not trust proofs; Avalanche reliance is conditional
+on its defined quorum/bootstrap evidence, not a generic historical-validity
+claim. Root checking must never mark scripts executed. Proof encoding,
+completeness, status reporting, invalid-history handling and independent tests
+remain open; no new trust or activation mechanism is adopted here.

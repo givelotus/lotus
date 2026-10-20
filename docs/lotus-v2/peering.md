@@ -232,6 +232,76 @@ specification does not authorize rolling the active state backwards alongside
 forward connection. Existing reverse-peel code must demonstrate that isolation
 and its restart semantics before concurrent use is claimed safe.
 
+#### Historical verification policy: root checks by default, full replay opt-in
+
+Maintainer direction, 2026-10-20, **provisional before and through testnet**:
+backwards synchronization should default to authenticated root-transition
+verification; executing historical transactions and signatures should be a
+separate opt-in verification track. Full historical replay and reaching genesis
+are not prerequisites for forward catch-up. This is a proposed local
+synchronization/assurance policy, not a relaxation of block consensus or an
+assertion that a suitable proof protocol is already deployed.
+
+Every newly connected forward block, including post-bootstrap catch-up blocks,
+MUST still undergo the existing full transaction, script/signature, monetary,
+state-transition and contextual validation rules. Selecting the historical
+root-check track cannot disable those checks. Historical execution omitted by
+the selected bootstrap policy must be disclosed rather than reported as having
+passed. The assurance levels are distinct:
+
+| Track | What it establishes | What it does not establish |
+| --- | --- | --- |
+| Archived body checked | Retrieved canonical bytes match the authenticated block/body commitments | Correct state updates, transaction authorization or monetary validity |
+| Historical root transition checked | Under the selected proof contract, block-derived updates connect the authenticated predecessor and successor state commitments | Successful execution of omitted scripts/signatures or all monetary/transaction consensus rules |
+| Historical full execution verified | The historical blocks passed the applicable full consensus execution with authenticated required context | Trust in any earlier bootstrap/history that this execution did not cover |
+
+The root-transition proof contract remains to be specified and independently
+validated. A proof that an arbitrary supplied update list changes root A into
+root B is insufficient. It must bind the updates to the actual committed block
+and account for required consumed coins, creation/nonmembership checks,
+in-block dependencies and applicable delayed coinbase effects. Exact treatment
+of expired-coin sweeps, deterministic sweep selection and completeness, omitted
+or extra updates, and all required witnesses is still a design obligation.
+Authentication covers the full `StateRoot` envelope and its non-UTXO components,
+including `MonetaryState`, not just a pair of UTXO roots. Authenticating monetary
+field values is different from executing and proving every rule governing their
+change. The design must enumerate which checks it performs, which proof
+establishes them and which omitted validity judgments depend on the admitted
+bootstrap anchor; it must not claim authorization or supply validity merely
+from root equality. No proof wire format is selected here.
+
+The default remains conditional on an explicitly admitted authenticated
+snapshot, chain identity and header ancestry with the required PoW/context
+checks, plus any finalization anchor required by the chosen bootstrap profile.
+PoW and state commitments alone do not cryptographically prove all past
+transactions valid. Counting a majority of connected peer nodes is not a trust
+proof: connections can be Sybils or eclipse the node. Any reliance on Avalanche
+attestation must identify and satisfy the defined quorum, stake/proof,
+finalization and bootstrap rules, with verifiable evidence; an informal claim
+that most of the network accepts the chain cannot substitute for them. This
+direction does not introduce a new trust anchor, define such a quorum, or claim
+current attestations prove historical consensus execution.
+
+Node status and any advertised assurance must retain the bootstrap provenance,
+anchor identity and separate ranges/boundaries for body checks, root-transition
+checks and full historical execution. Persist those distinctions through restart,
+reorg and optional verification progress. Root checking MUST NOT set a
+script-executed status such as `BLOCK_VALID_SCRIPTS`, advance a full-execution
+watermark or erase the snapshot-derived provenance. Public RPC/service encoding
+for these distinctions remains open; do not reuse an existing full-validation
+claim to advertise a weaker track. An operator may enable full historical
+execution later, subject to the same bounded low-priority scheduling. Any failure
+must remain visible, not be relabeled successful by the weaker track; remediation
+and invalid-history handling need an explicit implementation policy.
+
+Acceptance tests must distinguish valid root updates containing unauthorized
+historical spends from successful script execution; reject update/block
+mismatches, missing/extra proof elements and unproven sweep completeness; cover
+non-UTXO envelope tampering; and preserve separate provenance across restart.
+Disabling full historical execution must leave mandatory forward validation
+intact. These tests and proof completeness are open requirements, not evidence
+that the existing reverse-peel implementation already meets this policy.
+
 After downtime or restart, forward catch-up MUST resume from a consistent,
 durable state under the supported profile. Persist and recover the active tip,
 bootstrap identity and historical-verification/backfill progress distinctly;
