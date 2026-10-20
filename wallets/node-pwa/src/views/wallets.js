@@ -37,6 +37,20 @@ export function WalletsView({ app, state }) {
     app.selectWallet(name);
     return r;
   }, `Opened ${walletLabel(name)}`);
+  const defaultExists = loaded.includes('') || (dir.value?.wallets ?? []).some((w) => w.name === '');
+  const createDefault = () => act(async () => {
+    // Recheck before creating: another tab may have opened or created it.
+    const current = await app.rpc.call('listwallets');
+    if (current.includes('')) {
+      app.selectWallet('');
+      return;
+    }
+    const disk = await app.rpc.call('listwalletdir');
+    const method = disk.wallets.some((w) => w.name === '') ? 'loadwallet' : 'createwallet';
+    const r = await app.rpc.call(method, [''], SLOW);
+    app.selectWallet('');
+    return r;
+  }, 'Opened default wallet');
   const unload = (name) => {
     if (!confirm(`Close wallet ${walletLabel(name)}? It stays on disk and can be opened again.`)) return;
     act(async () => {
@@ -69,6 +83,11 @@ export function WalletsView({ app, state }) {
             ${onDisk.map((w) => html`<li key=${w}>${walletLabel(w)} <button class="secondary small" disabled=${busy} onClick=${() => load(w)}>Open</button></li>`)}
           </ul>`}
       </section>
+      ${!defaultExists ? html`<section class="card">
+        <h2>Default wallet</h2>
+        <p>Create the node's unnamed wallet. You can also create named wallets below.</p>
+        <button type="button" disabled=${busy || !dir.value} onClick=${createDefault}>Create default wallet</button>
+      </section>` : null}
       <${CreateWallet} app=${app} busy=${busy} act=${act} />
     </div>`;
 }
