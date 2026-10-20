@@ -47,3 +47,19 @@ signatures remain BIP340. Both address and application-proof choices remain
 provisional through testnet. Type-1/message implementation is a separate
 candidate; native wallet receive/spend is a distinct dependency, not implied
 by codec acceptance. Keep this decision and daemon documentation synchronized.
+
+
+## Partially signed transactions — maintainer direction, 2026-10-20
+
+The [Lotus PSBT profile](psbt.md) retains BIP174's container and key/value
+map conventions wherever possible. Native v7 transaction structure does not
+fit Bitcoin PSBTv2 output semantics, so the candidate uses the distinct
+profile version `0x4c560001` rather than claiming Bitcoin PSBTv2 compatibility.
+The initial profile covers ordinary native spends; specialized invocation
+construction is outside that initial scope. Its executable
+[profile checks](tools/psbt_profile_checks.py) and
+[conformance vectors](examples/psbt-profile-vectors.json) bind the proposed
+encoding. The profile remains provisional through testnet. Specification
+checks do not imply completed daemon implementation or interoperability;
+implementation must preserve the specified transaction identity and witness
+separation and provide matching signing/finalization tests.
