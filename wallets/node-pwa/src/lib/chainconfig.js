@@ -69,9 +69,13 @@ export class ChainConfig {
     if (BigInt(atoms) !== 10n ** BigInt(rpcDecimals)) throw new Error('Currency atomic unit and RPC precision disagree.');
     const ticker = text(money.ticker, 'currency ticker', /^[A-Za-z0-9]{1,16}$/);
     const address = object(raw.address, 'address capabilities');
-    if (!['cashaddr', 'base58check'].includes(address.format) || !Array.isArray(address.acceptedformats) || !address.acceptedformats.includes(address.format) || address.acceptedformats.some((f) => !['cashaddr', 'base58check'].includes(f))) throw new Error('Unsupported address codec.');
+    if (!['cashaddr', 'base58check'].includes(address.format) || !Array.isArray(address.acceptedformats) || !address.acceptedformats.includes(address.format) || address.acceptedformats.some((f) => !['cashaddr', 'base58check', ...(native ? ['xpiaddr'] : [])].includes(f))) throw new Error('Unsupported address codec.');
     if (!Array.isArray(address.types) || address.types.length !== 2 || !address.types.includes(0) || !address.types.includes(1)) throw new Error('Unsupported address destination types.');
     const hrp = text(address.hrp, 'address prefix', /^[a-z0-9]+$/);
+    const hasNativeCodec = address.acceptedformats.includes('xpiaddr');
+    const nativeHrp = address.nativehrp === undefined ? null : text(address.nativehrp, 'native address prefix', /^(xpi|txpi|rxpi)$/);
+    if ((nativeHrp !== null && !native) || hasNativeCodec !== (nativeHrp !== null)) throw new Error('Native address codec and prefix disagree.');
+    if (nativeHrp !== null && nativeHrp !== ({ main: 'xpi', test: 'txpi', regtest: 'rxpi' })[chain.network]) throw new Error('Native address prefix disagrees with network.');
     const prefixes = object(address.base58prefixes, 'Base58 prefixes');
     const pubkeyhash = text(prefixes.pubkeyhash, 'Base58 pubkey prefix', /^(?:[0-9a-f]{2})+$/);
     const scripthash = text(prefixes.scripthash, 'Base58 script prefix', /^(?:[0-9a-f]{2})+$/);
@@ -88,12 +92,20 @@ export class ChainConfig {
     const node = object(raw.node, 'node identity');
     const client = text(node.client, 'node client');
     const version = integer(node.version, 'node version', 0x7fffffff);
+    let nativeReceiving = false;
+    const receive = raw.wallet?.native_receiving;
+    if (receive !== undefined) {
+      object(receive, 'native wallet receiving capability');
+      nativeReceiving = bool(receive.available, 'native wallet receiving availability');
+      if (nativeReceiving && (!native || !hasNativeCodec || nativeHrp === null || receive.address_type !== 'native' || receive.format !== 'xpiaddr' || receive.template !== 'keyhash')) throw new Error('Unsupported native wallet receiving contract.');
+    }
     Object.assign(this, {
       configVersion: 1, chainIdentifier: identifier,
       network: { family: chain.family, kind: chain.kind, chain: chain.network, chainIdentifier: identifier, genesis, chainid, client, version },
       currency: { ticker, atomicUnitsPerCoin: atoms, rpcDecimals, displayDecimals },
-      address: { format: address.format, hrp, types: [...address.types], acceptedFormats: [...address.acceptedformats], base58Prefixes: { pubkeyhash, scripthash } },
+      address: { format: address.format, hrp, nativeHrp, types: [...address.types], acceptedFormats: [...address.acceptedformats], base58Prefixes: { pubkeyhash, scripthash } },
       mining: { supported: true, descriptor: pow },
+      wallet: { nativeReceiving },
       rpc: { testBlockGeneration: testGeneration, template: pow.template_rpc, submission: pow.submit_rpc },
       features: { legacyTransactions: legacy, nativeTransactions, messageSigning: features.message_signing, nativeMessageSigning: false },
       // Existing view vocabulary references these same validated facts.

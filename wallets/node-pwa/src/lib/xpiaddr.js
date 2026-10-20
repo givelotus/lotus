@@ -1,4 +1,5 @@
-// Lotus V2 "xpiaddr" encoder/decoder (version 0: one 32-byte branch root).
+// Lotus V2 xpiaddr codec: type 0 explicit branch root, type 1 native key hash.
+// Root-only encode/decode remain strict; template consumers use typed functions.
 //
 //   <hrp> "1" <version symbol> <52 payload symbols> <8 checksum symbols>
 //
@@ -67,23 +68,26 @@ function symbolsToRoot(symbols) {
  * @param {Uint8Array|number[]} root 32 bytes
  * @returns {string} lowercase address
  */
-export function encode(hrp, root) {
+export function encodeTyped(hrp, root, type) {
+  if (type !== 0 && type !== 1) throw new XpiAddrError('unknown version');
   if (!Object.hasOwn(K, hrp)) throw new XpiAddrError('unknown prefix');
   if (root.length !== 32) throw new XpiAddrError('root must be 32 bytes');
-  const data = [VERSION_ROOT, ...rootToSymbols(root)];
+  const data = [type, ...rootToSymbols(root)];
   const mod = polymod([...data, 0, 0, 0, 0, 0, 0, 0, 0]) ^ K[hrp];
   const checksum = [];
   for (let i = 0; i < 8; i++) checksum.push(Number((mod >> BigInt(5 * (7 - i))) & 31n));
   return hrp + '1' + [...data, ...checksum].map((s) => CHARSET[s]).join('');
 }
 
+export function encode(hrp, root) { return encodeTyped(hrp, root, VERSION_ROOT); }
+
 /**
  * Decode an address. Callers trim whitespace and strip URI framing first.
  * @param {string} addr
  * @param {string} [expectedHrp]
- * @returns {{hrp: string, root: Uint8Array}}
+ * @returns {{hrp: string, type: number, payload: Uint8Array}}
  */
-export function decode(addr, expectedHrp) {
+export function decodeTyped(addr, expectedHrp) {
   if (addr !== addr.toLowerCase() && addr !== addr.toUpperCase()) throw new XpiAddrError('mixed case');
   const a = addr.toLowerCase();
   const sep = a.lastIndexOf('1');
@@ -99,8 +103,15 @@ export function decode(addr, expectedHrp) {
     symbols.push(v);
   }
   if (polymod(symbols) !== K[hrp]) throw new XpiAddrError('bad checksum');
-  if (symbols[0] !== VERSION_ROOT) throw new XpiAddrError('unknown version');
-  return { hrp, root: symbolsToRoot(symbols.slice(1, 1 + PAYLOAD_LEN)) };
+  if (symbols[0] !== 0 && symbols[0] !== 1) throw new XpiAddrError('unknown version');
+  return { hrp, type: symbols[0], payload: symbolsToRoot(symbols.slice(1, 1 + PAYLOAD_LEN)) };
+}
+
+// Preserve root-only callers: a key hash must never be interpreted as a branch root.
+export function decode(addr, expectedHrp) {
+  const value = decodeTyped(addr, expectedHrp);
+  if (value.type !== VERSION_ROOT) throw new XpiAddrError('unknown version');
+  return { hrp: value.hrp, root: value.payload };
 }
 
 /** True when the string looks like it is meant to be an xpiaddr (for UI hints). */

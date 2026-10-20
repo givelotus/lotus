@@ -28,7 +28,7 @@ export async function startNode(binary, options = {}) {
   const args = ['-regtest', `-datadir=${datadir}`, `-rpcport=${rpcPort}`, `-port=${p2pPort}`, '-listen=0',
     '-server=1', '-rpcbind=127.0.0.1', '-rpcallowip=127.0.0.1', '-printtoconsole=0', '-discover=0', '-dnsseed=0', '-fixedseeds=0',
     // Encrypting a wallet encrypts its whole keypool, which is slow with the default 1000 keys.
-    '-keypool=5'];
+    '-keypool=5', ...(options.extraArgs ?? [])];
   const proc = spawn(binary, args, { stdio: ['ignore', 'ignore', 'pipe'] });
   let stderr = '';
   proc.stderr.on('data', (d) => { stderr += d; });

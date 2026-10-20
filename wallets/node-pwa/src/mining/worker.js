@@ -44,8 +44,11 @@ self.onmessage = async ({ data }) => {
       device.queue.writeBuffer(chain, 0, chainid); entries.push({ binding: 3, resource: { buffer: chain } });
     }
     const group = device.createBindGroup({ layout: pipeline.getBindGroupLayout(0), entries });
-    const limit = 1n << BigInt(descriptor.noncebytes * 8);
-    for (let nonce = 0n; nonce < limit && !lost; nonce += BigInt(COUNT)) {
+    const fullLimit = 1n << BigInt(descriptor.noncebytes * 8);
+    const first = data.work.nonceStart === undefined ? 0n : BigInt(data.work.nonceStart);
+    const limit = data.work.nonceEnd === undefined ? fullLimit : BigInt(data.work.nonceEnd);
+    if (first < 0n || first >= limit || limit > fullLimit) throw new Error('Invalid mining nonce range.');
+    for (let nonce = first; nonce < limit && !lost; nonce += BigInt(COUNT)) {
       const count = Number(limit - nonce < BigInt(COUNT) ? limit - nonce : BigInt(COUNT));
       device.queue.writeBuffer(params, 0, new Uint32Array([Number(nonce & 0xffffffffn), count, Number(nonce >> 32n), 0]));
       const encoder = device.createCommandEncoder();

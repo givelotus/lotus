@@ -247,6 +247,50 @@ and on a `node-pwa-vX.Y.Z` tag publishes the tarball and its `.sha256`. The
 daemon's pin (the depends recipe and `daemon/wallet-pwa-version`) is then
 bumped by hand.
 
+## Built-in Lotus V2 pool mining
+
+The Mining page supports solo mining and the built-in Lotus V2 pool over the
+existing authenticated node RPC connection. It never starts or resumes mining
+automatically. Review the pool address, operator commission and PPLNS share
+window, choose a native payout destination and worker name, then press Start.
+Pool statistics and the PPLNS window live in node memory and clear on restart.
+A share count or PPLNS weight is not an earned balance or a promised payout.
+
+Native pool payouts require the node's explicit `address.nativehrp` and
+`xpiaddr` in `address.acceptedformats`; the legacy default address format and
+prefix remain independent. Selected-wallet payouts additionally require:
+`wallet.native_receiving = {available: true, address_type: "native", format:
+"xpiaddr", template: "keyhash"}`. The app calls
+`getnewaddress("Pool mining", "native")` and verifies selected-wallet ownership
+with native `getaddressinfo` before mining. Older nodes leave that provider
+disabled. External native wallets are a separate explicit provider; the user
+supplies an address they control. Native receiving ownership does not imply
+that the ordinary wallet Send flow can spend native funds.
+
+The browser uses the existing bounded WebGPU worker and native three-stage
+PoW with CPU verification, searches only its assigned 24-bit nonce prefix,
+submits exact decimal-string uint64 nonces and refreshes jobs/VarDiff after
+shares and at most every five seconds. It stops on visibility, navigation,
+wallet/connection changes, device/RPC errors and changed pool terms.
+
+This is private-node integration. It does not grant remote browsers public
+operator RPC access, implement a public pool gateway, or enable pooled XEC
+mining. The daemon pool endpoint and native-wallet capability must be supplied
+by an independently validated backend build.
+
+Focused opt-in browser checks:
+
+```sh
+MINING_GPU=1 node --test --test-name-pattern='native GPU worker honors' test/unit/mining-runtime.test.js
+MINING_UI=1 node --test test/unit/pool-ui.test.js
+NODE_PWA_POOL_BINARY=/absolute/path/lotusd NODE_PWA_POOL_OUT=/persistent/evidence node test/smoke/pool-node-proof.mjs
+```
+
+The last command creates a fresh isolated regtest node and tests the real UI,
+native wallet ownership, GPU pool shares, accepted block and operator
+commission. It requires the combined discovery/native-receive/pool backend;
+unit or mock UI success is not evidence that this integration passed.
+
 ## Notes
 
 - Amounts are BigInt base units. Ticker and precision come from the
