@@ -46,3 +46,5 @@ The immutable clone parent has a separate radix test for independent descendants
 ## Validation still required
 
 Build `lotusd` and `test_bitcoin` in the coordinated incremental build. Run native radix, relay, snapshot/RCU and protocol-handler suites. Then compare identical finite-work admission cohorts with unchanged fee policy and sufficiently high valid fixture fees, default reconciliation still enabled. Sample actual ingestion at matched pool depths and inspect callback/index/mempool wait chains. Record the candidate source, tree, binary and actual accepted inventory. Keep incomplete long-run attempts and resource effects visible.
+
+Follow-up source fixups before validation: `29bc6ed3b7` clarifies that the stable-copy contract also permits a mutable source protected through root sharing by its exclusive writer lock. `155f61fe56` adds a real cross-tree lookup during an existing RCU traversal to exercise the new non-nesting read-section join API. The candidate branch now points to `155f61fe56`; no production logic was changed by these two fixups. They must be folded into their named owners after validation.
