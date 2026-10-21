@@ -76,7 +76,11 @@ def manifest(candidate):
         entry['path'] = str(path)
         entry['sha256'] = digest(path.read_bytes())
         entry['files'] = sorted(set(entry['files']) | set(re.findall(r'^\+\+\+ b/(.+)$', path.read_text(), re.M)))
-        entry['original_step'] = int(entry['original_patch'].split('/')[1]) + (52 if entry['series'] == 'v2' else 0)
+        historical_number = re.fullmatch(r'(ecash|v2)/(\d+)', entry['original_patch'])
+        entry['original_step'] = (
+            int(historical_number.group(2)) + (52 if historical_number.group(1) == 'v2' else 0)
+            if historical_number else None
+        )
         patches.append(entry)
     for series in ('ecash', 'v2'):
         actual = [line.strip() for line in (candidate / 'daemon/patches' / series / 'series').read_text().splitlines()
