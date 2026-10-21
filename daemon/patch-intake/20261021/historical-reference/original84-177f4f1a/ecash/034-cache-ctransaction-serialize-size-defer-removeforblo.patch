@@ -1,0 +1,148 @@
+From 6e40636b727c24c87f8e6c1b798d59663edd64bc Mon Sep 17 00:00:00 2001
+From: Shammah Chancellor <shammah.chancellor@notvalid.com>
+Date: Sun, 18 Oct 2026 01:33:30 -0700
+Subject: [PATCH] perf: cache CTransaction serialize size, defer removeForBlock
+ overlay walks, and optimize ConnectTip/Snapshot hotpaths
+
+Cache serialized byte size on CTransaction, batch removeForBlock Merklix overlay
+erasures, and eliminate redundant ConnectTip snapshot rebuilds.
+---
+ src/primitives/transaction.cpp |  4 ---
+ src/primitives/transaction.h   |  5 +++-
+ src/txmempool.cpp              | 53 ++++++++++++++++++++++++++++++----
+ src/txmempool.h                |  1 +
+ 4 files changed, 52 insertions(+), 11 deletions(-)
+
+diff --git a/src/primitives/transaction.cpp b/src/primitives/transaction.cpp
+index 48cace2ef0..fb357f6dfd 100644
+--- a/src/primitives/transaction.cpp
++++ b/src/primitives/transaction.cpp
+@@ -201,10 +201,6 @@ Amount CTransaction::GetValueOut() const {
+     return nValueOut;
+ }
+ 
+-unsigned int CTransaction::GetTotalSize() const {
+-    return ::GetSerializeSize(*this);
+-}
+-
+ std::string CTransaction::ToString() const {
+     std::string str;
+     str += strprintf("CTransaction(txid=%s, ver=%u, vin.size=%u, vout.size=%u, "
+diff --git a/src/primitives/transaction.h b/src/primitives/transaction.h
+index 04fa0da46b..47d842743d 100644
+--- a/src/primitives/transaction.h
++++ b/src/primitives/transaction.h
+@@ -262,7 +262,10 @@ public:
+      * Get the total transaction size in bytes.
+      * @return Total transaction size in bytes
+      */
+-    unsigned int GetTotalSize() const;
++    unsigned int GetTotalSize() const {
++        return m_serialize_size > 0 ? m_serialize_size
++                                    : ::GetSerializeSize(*this);
++    }
+ 
+     bool IsCoinBase() const {
+         return (vin.size() == 1 && vin[0].prevout.IsNull());
+diff --git a/src/txmempool.cpp b/src/txmempool.cpp
+index 4e98ed2038..b46516a243 100644
+--- a/src/txmempool.cpp
++++ b/src/txmempool.cpp
+@@ -241,8 +241,12 @@ void CTxMemPool::removeUnchecked(txiter it, MemPoolRemovalReason reason) {
+     const CTransaction &tx = (*it)->GetTx();
+     const TxId &txid = tx.GetId();
+ 
+-    FlushPendingOverlayAdds();
+-    RemoveTransactionFromOverlay(m_merklix_overlay, tx);
++    if (m_defer_snapshot_depth > 0) {
++        m_pending_overlay_removes.push_back(txid);
++    } else {
++        FlushPendingOverlayAdds();
++        RemoveTransactionFromOverlay(m_merklix_overlay, tx);
++    }
+ 
+     if (reason != MemPoolRemovalReason::BLOCK) {
+         if (m_opts.signals) {
+@@ -425,6 +429,7 @@ void CTxMemPool::_clear() {
+     mapTx.clear();
+     mapNextTx.clear();
+     m_pending_overlay_adds.clear();
++    m_pending_overlay_removes.clear();
+     m_merklix_overlay.Clear();
+     m_utxo_fast_filter.ClearMempool();
+     totalTxSize = 0;
+@@ -438,12 +443,45 @@ void CTxMemPool::_clear() {
+ 
+ void CTxMemPool::FlushPendingOverlayAdds() const {
+     AssertLockHeld(cs);
+-    if (m_pending_overlay_adds.empty()) {
++    if (m_pending_overlay_adds.empty() && m_pending_overlay_removes.empty()) {
+         return;
+     }
+-    auto pending = std::move(m_pending_overlay_adds);
+-    m_pending_overlay_adds.clear();
+-    AddTransactionsToOverlayBatch(m_merklix_overlay, pending);
++    if (!m_pending_overlay_removes.empty()) {
++        if (mapTx.empty()) {
++            m_pending_overlay_adds.clear();
++            m_pending_overlay_removes.clear();
++            m_merklix_overlay.Clear();
++            return;
++        }
++        if (m_pending_overlay_removes.size() >= mapTx.size()) {
++            m_pending_overlay_adds.clear();
++            m_pending_overlay_removes.clear();
++            m_merklix_overlay.Clear();
++            std::vector<std::tuple<CTransactionRef, int64_t, int64_t>> remaining;
++            remaining.reserve(mapTx.size());
++            for (const auto &entry : mapTx.get<entry_id>()) {
++                remaining.emplace_back(entry->GetSharedTx(),
++                                       entry->GetFee() / SATOSHI,
++                                       entry->GetSigChecks());
++            }
++            AddTransactionsToOverlayBatch(m_merklix_overlay, remaining);
++            return;
++        }
++    }
++    if (!m_pending_overlay_adds.empty()) {
++        auto pending = std::move(m_pending_overlay_adds);
++        m_pending_overlay_adds.clear();
++        AddTransactionsToOverlayBatch(m_merklix_overlay, pending);
++    }
++    if (!m_pending_overlay_removes.empty()) {
++        auto removes = std::move(m_pending_overlay_removes);
++        m_pending_overlay_removes.clear();
++        for (const TxId &rm_txid : removes) {
++            lotus::v2::Hash id{};
++            std::memcpy(id.data(), rm_txid.begin(), 32);
++            m_merklix_overlay.RemoveTransaction(id);
++        }
++    }
+ }
+ 
+ CTxMemPool::ScopedSnapshotDefer::~ScopedSnapshotDefer() {
+@@ -477,6 +515,9 @@ void CTxMemPool::SyncMerklixOverlayToTip(const BlockHash &tip_hash,
+         FlushPendingOverlayAdds();
+         return;
+     }
++    if (!m_pending_overlay_removes.empty()) {
++        FlushPendingOverlayAdds();
++    }
+     std::shared_ptr<const lotus::v2::SmtNode> utxo_root;
+     lotus::v2::MonetaryState mon_state = lotus::v2::GetInitialV2MonetaryState();
+     m_merklix_overlay.ReanchorExistingTxs(tip_id, std::move(utxo_root),
+diff --git a/src/txmempool.h b/src/txmempool.h
+index 66d92b1627..5e3df3f125 100644
+--- a/src/txmempool.h
++++ b/src/txmempool.h
+@@ -728,6 +728,7 @@ private:
+     mutable lotus::v2::MerklixOverlayManager m_merklix_overlay GUARDED_BY(cs);
+     mutable std::vector<std::tuple<CTransactionRef, int64_t, int64_t>>
+         m_pending_overlay_adds GUARDED_BY(cs);
++    mutable std::vector<TxId> m_pending_overlay_removes GUARDED_BY(cs);
+     mutable lotus::v2::UtxoFastFilter m_utxo_fast_filter;
+     mutable uint32_t m_defer_snapshot_depth GUARDED_BY(cs){0};
+     mutable bool m_snapshot_dirty GUARDED_BY(cs){false};
+-- 
+2.50.1 (Apple Git-155)
+
