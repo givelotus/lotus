@@ -22,7 +22,7 @@ diff --git a/src/example.cpp b/src/example.cpp
 -old_function();
 +new_function();
  end
--- 
+--\x20
 2.50.0
 '''
 

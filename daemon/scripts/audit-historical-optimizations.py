@@ -217,7 +217,7 @@ def main():
     for filename, rows in [('patches.csv', patch_rows), ('hunks.csv', hunk_rows)]:
         with (args.output / filename).open('w') as f:
             fields = list(rows[0]) if rows else ['status']
-            writer = csv.DictWriter(f, fieldnames=fields)
+            writer = csv.DictWriter(f, fieldnames=fields, lineterminator='\n')
             writer.writeheader()
             writer.writerows(rows)
     hunk_summary = dict(Counter(h['status'] for r in results.values() for h in r['hunks']))
