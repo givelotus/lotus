@@ -1,0 +1,229 @@
+From 9f25a1ec4f076195b82b7740ca17607afc2f66f0 Mon Sep 17 00:00:00 2001
+From: Shammah Chancellor <shammah.chancellor@notvalid.com>
+Date: Sun, 18 Oct 2026 01:33:31 -0700
+Subject: [PATCH] sync(v2): implement reverse disk-window peeling and pruning
+ configuration
+
+Extract this concern so its mechanism can be reviewed and measured independently.
+No source semantics are added or removed by this history operation.
+
+Original patch rationale (describes the unsplit source, not every extracted part):
+Extract 36-byte Outpoints directly in ParseNodeFast during authenticated internal
+tree walks, eliminate unchanged-sibling DB reads at non-collapsing depths in EraseAt,
+and wire one-wave V2 PreChecksBatch and pre-cs_main outpoint/sighash readahead.
+
+Original-Commit: 6b77f6b3eaa39d56184e29082fb069af38b70f4a
+Original-Patch: v2/029
+Split-Concern: peel
+
+Historical compilation prerequisites are tracked separately in daemon/patch-audit;
+this provenance-preserving split does not imply standalone build validation.
+
+(cherry picked from commit de302c6b8039392bf8bd4b7757817246dd10a428)
+
+Canonical-Source-Commit: de302c6b8039392bf8bd4b7757817246dd10a428
+
+diff --git a/src/init.cpp b/src/init.cpp
+index 1a4e905cb0a689a68dadc7fc9d17c46b02aa06d3..87b622c6c4ec1436589cf54ca84df0b1973a990e 100644
+--- a/src/init.cpp
++++ b/src/init.cpp
+@@ -712,6 +712,7 @@ void SetupServerArgs(NodeContext &node) {
+                   "by a net-specific datadir location. (default: %s)",
+                   BITCOIN_PID_FILENAME),
+         ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
++    argsman.AddArg("-prunefinalized=<n>", "Automatically prune finalized block and undo data older than <n> blocks behind the active/finalized tip while retaining all headers (default: 0 = disabled)", ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
+     argsman.AddArg(
+         "-prune=<n>",
+         strprintf("Reduce storage requirements by enabling pruning (deleting) "
+diff --git a/src/lotus_v2/fast_sync.cpp b/src/lotus_v2/fast_sync.cpp
+index a70b321b43e3371f63f5f81109618b4bede89d96..8da765f4c8b36a422e0b148bcec2ad4c55477b4c 100644
+--- a/src/lotus_v2/fast_sync.cpp
++++ b/src/lotus_v2/fast_sync.cpp
+@@ -1474,4 +1474,122 @@ bool PeelDiskBlockReverse(const std::vector<uint8_t> &block_wire,
+     return true;
+ }
+ 
++bool PeelDiskBlockWindowReverse(const std::vector<ReversePeelBlockStep> &steps,
++                                const HeaderChainProfile &header_profile,
++                                OrdinaryCandidateProfile ordinary_profile,
++                                const MonetaryProfile &monetary_profile,
++                                const BlockCostProfile &cost_profile,
++                                DiskStateStore &store,
++                                std::string &error) {
++    if (steps.empty()) {
++        error = "empty reverse peel block window";
++        return false;
++    }
++    if (!store.IsOpen()) {
++        error = "disk state store is closed";
++        return false;
++    }
++    const DiskStateMetadata meta_h = store.Metadata();
++    MonetaryState monetary_cur{};
++    try {
++        monetary_cur = DecodeMonetaryState(meta_h.monetary);
++    } catch (const std::exception &e) {
++        error = e.what();
++        return false;
++    }
++    std::vector<Coin> coins_h;
++    DiskStateError disk_err{};
++    if (!store.ExportCoins(coins_h, disk_err)) {
++        error = disk_err.message;
++        return false;
++    }
++    UtxoSet state_cur;
++    for (const Coin &c : coins_h) {
++        state_cur.Insert(c);
++    }
++
++    // Track net delta across the entire K-block reverse peel window:
++    // - net_erased_from_initial: outpoints present in the initial disk store at
++    //   height h that must be erased to reach height h - K.
++    // - net_inserted_at_end: prior spent coins restored during the window that
++    //   were NOT created later inside the same window (cross-block ephemeral
++    //   UTXOs created at h_i and spent at h_j > h_i cancel out in RAM).
++    std::set<Outpoint, OutpointLess> net_erased_from_initial;
++    std::map<Outpoint, Coin, OutpointLess> net_inserted_at_end;
++
++    for (const ReversePeelBlockStep &step : steps) {
++        FramedBlock block;
++        if (!DecodeBlockWire(step.block_wire, ordinary_profile.transaction,
++                             header_profile.chain_id, block, error)) {
++            return false;
++        }
++        const auto parent_mtp = ParentMedianTime(
++            header_profile, step.parent_header, step.history);
++        if (!parent_mtp) {
++            error = "failed computing ParentMedianTime for windowed disk reverse peel";
++            return false;
++        }
++        std::vector<Coin> net_created;
++        std::vector<Coin> prior_spent;
++        if (!PartitionBlockOutputsAndSpends(block, *parent_mtp, step.undo_msg,
++                                            net_created, prior_spent, error)) {
++            return false;
++        }
++        if (!PeelBlockReverse(step.block_wire, step.undo_msg,
++                              step.parent_header, step.history, header_profile,
++                              ordinary_profile, monetary_profile, cost_profile,
++                              state_cur, monetary_cur, error)) {
++            return false;
++        }
++
++        // Apply step (erase net_created, insert prior_spent) to cumulative delta:
++        for (const Coin &c : net_created) {
++            const auto ins_it = net_inserted_at_end.find(c.outpoint);
++            if (ins_it != net_inserted_at_end.end()) {
++                // Cross-block ephemeral UTXO: spent in a later block of the
++                // window and created in this block; cancels out completely!
++                net_inserted_at_end.erase(ins_it);
++            } else {
++                net_erased_from_initial.insert(c.outpoint);
++            }
++        }
++        for (const Coin &spent : prior_spent) {
++            net_inserted_at_end[spent.outpoint] = spent;
++        }
++    }
++
++    std::vector<Outpoint> final_erased(net_erased_from_initial.begin(),
++                                       net_erased_from_initial.end());
++    std::vector<Coin> final_inserted;
++    final_inserted.reserve(net_inserted_at_end.size());
++    for (const auto &[op, coin] : net_inserted_at_end) {
++        (void)op;
++        final_inserted.push_back(coin);
++    }
++
++    const ReversePeelBlockStep &last_step = steps.back();
++    DiskStateMetadata final_parent_meta{};
++    BlockId(header_profile.chain_id, last_step.parent_header,
++            final_parent_meta.tip);
++    std::array<uint8_t, HEADER_SIZE> raw_parent{};
++    SerializeHeader(last_step.parent_header, raw_parent);
++    final_parent_meta.header.assign(raw_parent.begin(), raw_parent.end());
++    final_parent_meta.monetary.assign(
++        last_step.undo_msg.parent_monetary_state.begin(),
++        last_step.undo_msg.parent_monetary_state.end());
++    if (!last_step.history.empty()) {
++        final_parent_meta.auxiliary =
++            EncodeDiskChainContext(last_step.history, {});
++    }
++
++    if (!store.PeelBlockStateReverse(meta_h.tip, final_parent_meta,
++                                     last_step.parent_header, final_erased,
++                                     final_inserted, disk_err)) {
++        error = disk_err.message;
++        return false;
++    }
++    error.clear();
++    return true;
++}
++
+ } // namespace lotus::v2
+diff --git a/src/lotus_v2/fast_sync.h b/src/lotus_v2/fast_sync.h
+index 61c431dc95bb060d242e9e75dc4567580cb1ea51..5333daa1aa612ff04b8bff18b3347a558bd723cc 100644
+--- a/src/lotus_v2/fast_sync.h
++++ b/src/lotus_v2/fast_sync.h
+@@ -243,6 +243,25 @@ bool PeelDiskBlockReverse(const std::vector<uint8_t> &block_wire,
+                           DiskStateStore &store,
+                           std::string &error);
+ 
++struct ReversePeelBlockStep {
++    std::vector<uint8_t> block_wire;
++    BlockUndoMessage undo_msg;
++    Header parent_header{};
++    std::vector<Header> history;
++};
++
++// Peels a contiguous window of K blocks [h, h - 1, ..., h - K + 1] backwards in
++// RAM with full cryptographic verification at every intermediate height,
++// cancelling cross-block ephemeral UTXOs in memory and committing the net delta
++// to DiskStateStore in a single batch.
++bool PeelDiskBlockWindowReverse(const std::vector<ReversePeelBlockStep> &steps,
++                                const HeaderChainProfile &header_profile,
++                                OrdinaryCandidateProfile ordinary_profile,
++                                const MonetaryProfile &monetary_profile,
++                                const BlockCostProfile &cost_profile,
++                                DiskStateStore &store,
++                                std::string &error);
++
+ } // namespace lotus::v2
+ 
+ #endif // LOTUS_V2_FAST_SYNC_H
+diff --git a/src/test/fast_sync_shard_tests.cpp b/src/test/fast_sync_shard_tests.cpp
+index fb305a2d058c35c53bbb6fd371280b5f5954859d..1911356f219dee714650869fc937b6e5361f5534 100644
+--- a/src/test/fast_sync_shard_tests.cpp
++++ b/src/test/fast_sync_shard_tests.cpp
+@@ -850,6 +850,30 @@ BOOST_AUTO_TEST_CASE(bijective_reverse_block_peeling_and_hole_12_intra_block_spe
+         p.monetary, p.cost, peel_store, error));
+     BOOST_CHECK(peel_store.Root() == utxo_0.Root());
+     BOOST_CHECK(peel_store.Metadata().tip == p.header.genesis_id);
++
++    // Also verify windowed multi-block reverse peel (B3 -> B0 in one disk batch,
++    // cancelling funding_coin created in B1 and spent in B3 in RAM).
++    const auto window_store_dir =
++        m_args.GetDataDirNet() / "fast_sync_peel_window_store";
++    std::filesystem::create_directories(window_store_dir);
++    DiskStateStore window_store;
++    BOOST_REQUIRE_MESSAGE(
++        DiskStateStore::Open(window_store_dir.string(), disk_opts, {},
++                             window_store, derr),
++        derr.message);
++    BOOST_REQUIRE(ImportVerifiedFastSyncPivotToDisk(
++        hdr_3, p.header.chain_id, {hdr_3, hdr_2, hdr_1, hdr_0}, pivot_roots,
++        pivot_shards, window_store, error));
++    const std::vector<ReversePeelBlockStep> window_steps = {
++        {b3_mined.wire, undo_3, hdr_2, history_b3},
++        {b2_mined.wire, undo_2, hdr_1, history_b2},
++        {b1_mined.wire, undo_1, hdr_0, history_b1},
++    };
++    BOOST_REQUIRE(PeelDiskBlockWindowReverse(
++        window_steps, p.header, p.ordinary, p.monetary, p.cost, window_store,
++        error));
++    BOOST_CHECK(window_store.Root() == utxo_0.Root());
++    BOOST_CHECK(window_store.Metadata().tip == p.header.genesis_id);
+ }
+ 
+ BOOST_AUTO_TEST_CASE(fast_sync_wire_and_validation_edge_cases) {

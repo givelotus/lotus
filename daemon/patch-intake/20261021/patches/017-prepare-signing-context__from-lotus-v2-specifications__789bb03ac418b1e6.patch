@@ -1,0 +1,408 @@
+From ae23d70df980c5e5afd4d642fb5fe9eeda3b14e5 Mon Sep 17 00:00:00 2001
+From: Shammah Chancellor <shammah.chancellor@notvalid.com>
+Date: Wed, 14 Oct 2026 17:24:43 -0700
+Subject: [PATCH] Prepare V2 signing commitments once per transaction
+
+Cache identities, resolved CoinsRoot, OwnInputHash values and validated selectors before CHECKSIG/SIGHASH. The prepared path hashes only the fixed 138/150/178-byte preimage per invocation; retain the one-off wrapper for tests and wallet helpers. Verify prepared and wrapper digests match for all spend modes and mint mode in Debug and Release.
+---
+ src/lotus_v2/signing.cpp      | 243 ++++++++++++++++++++--------------
+ src/lotus_v2/signing.h        |  47 ++++++-
+ src/lotus_v2/test_signing.cpp |  14 ++
+ 3 files changed, 205 insertions(+), 99 deletions(-)
+
+diff --git a/src/lotus_v2/signing.cpp b/src/lotus_v2/signing.cpp
+index 37128972c..e21b418ce 100644
+--- a/src/lotus_v2/signing.cpp
++++ b/src/lotus_v2/signing.cpp
+@@ -61,68 +61,22 @@ namespace {
+         return true;
+     }
+ 
+-    bool Selector(const Transaction &tx, const ResolvedCoins &resolved,
+-                  size_t input_index, size_t witness_index,
+-                  const std::optional<PositiveDelta> &positive_delta,
+-                  std::vector<uint8_t> &out, std::string &error) {
+-        if (!ResolvedValid(tx, resolved, error) ||
+-            input_index >= tx.inputs.size()) {
+-            error = "input index / resolved coin";
++    bool NonzeroDelta(const PositiveDelta &delta) {
++        return std::any_of(delta.begin(), delta.end(),
++                           [](uint8_t byte) { return byte != 0; });
++    }
++
++    bool OwnInputHashOf(const Input &input, const TxProfile &profile,
++                        const Output &coin, Hash &result, std::string &error) {
++        std::vector<uint8_t> core, wire;
++        if (!EncodeInputCore(input, profile, core, error) ||
++            !OutputBytes(coin, wire, error))
+             return false;
+-        }
+-        const auto &input = tx.inputs[input_index];
+-        if (input.flags == 1) {
+-            if (positive_delta ||
+-                input.path_index >= resolved[input_index]->paths.size()) {
+-                error = "spend path/delta";
+-                return false;
+-            }
+-            const auto &coin = *resolved[input_index];
+-            const auto &path = coin.paths[input.path_index];
+-            if (input.witnesses.size() != path.size() ||
+-                witness_index >= path.size()) {
+-                error = "positional witness count/index";
+-                return false;
+-            }
+-            const auto branch_index = path[witness_index];
+-            const auto &witness = input.witnesses[witness_index];
+-            if (branch_index >= coin.branches.size() ||
+-                BranchProofRoot(BranchLeaf(witness.script), witness.siblings) !=
+-                    coin.branches[branch_index]) {
+-                error = "branch membership";
+-                return false;
+-            }
+-            out.push_back(1);
+-            Integer(input_index, 4, out);
+-            Integer(branch_index, 4, out);
+-            const auto leaf = BranchLeaf(witness.script);
+-            out.insert(out.end(), leaf.begin(), leaf.end());
+-            return true;
+-        }
+-        if (input.flags == 3) {
+-            if (input.witnesses.size() != 1 || witness_index != 0 ||
+-                !positive_delta ||
+-                std::all_of(positive_delta->begin(), positive_delta->end(),
+-                            [](uint8_t byte) { return byte == 0; })) {
+-                error = "mint selector delta/index";
+-                return false;
+-            }
+-            const auto &witness = input.witnesses[0];
+-            const auto leaf = BranchLeaf(witness.script);
+-            if (BranchProofRoot(leaf, witness.siblings) != input.prev_txid) {
+-                error = "mint root";
+-                return false;
+-            }
+-            out.push_back(3);
+-            out.insert(out.end(), input.prev_txid.begin(),
+-                       input.prev_txid.end());
+-            out.insert(out.end(), positive_delta->begin(),
+-                       positive_delta->end());
+-            out.insert(out.end(), leaf.begin(), leaf.end());
+-            return true;
+-        }
+-        error = "coinbase selector";
+-        return false;
++        CompactSize(wire.size(), core);
++        core.insert(core.end(), wire.begin(), wire.end());
++        result = TaggedHash(HashDomain::OwnInput, core);
++        error.clear();
++        return true;
+     }
+ 
+ } // namespace
+@@ -197,61 +151,145 @@ bool ComputeOwnInputHash(const Transaction &tx, const TxProfile &profile,
+         error = "own input spend";
+         return false;
+     }
+-    std::vector<uint8_t> core, wire;
+-    if (!EncodeInputCore(tx.inputs[input_index], profile, core, error) ||
+-        !OutputBytes(*resolved[input_index], wire, error))
++    return OwnInputHashOf(tx.inputs[input_index], profile,
++                          *resolved[input_index], result, error);
++}
++
++bool PrepareSigningContext(const Transaction &tx, const TxProfile &profile,
++                           const ChainId &chain_id,
++                           const ResolvedCoins &resolved,
++                           PreparedSigningContext &result,
++                           std::string &error) {
++    IdentityDigests ids;
++    if (!ComputeIdentities(tx, profile, chain_id, ids, error)) return false;
++    PreparedSigningContext prepared;
++    if (!ComputeCoinsRoot(tx, resolved, prepared.coins_root_, error))
+         return false;
+-    CompactSize(wire.size(), core);
+-    core.insert(core.end(), wire.begin(), wire.end());
+-    result = TaggedHash(HashDomain::OwnInput, core);
++    prepared.chain_id_ = chain_id;
++    prepared.lock_ = tx.lock;
++    prepared.txid_ = ids.txid;
++    prepared.outputs_root_ = ids.outputs_root;
++    prepared.output_leaves_ = std::move(ids.output_leaves);
++    prepared.own_input_hashes_.resize(tx.inputs.size());
++    prepared.invocations_.resize(tx.inputs.size());
++    for (size_t i = 0; i < tx.inputs.size(); ++i) {
++        const Input &input = tx.inputs[i];
++        auto &invocations = prepared.invocations_[i];
++        if (input.flags == 1) {
++            const Output &coin = *resolved[i];
++            if (input.path_index >= coin.paths.size() ||
++                input.witnesses.size() != coin.paths[input.path_index].size()) {
++                error = "positional witness count/index";
++                return false;
++            }
++            if (!OwnInputHashOf(input, profile, coin,
++                                prepared.own_input_hashes_[i].emplace(),
++                                error))
++                return false;
++            const auto &path = coin.paths[input.path_index];
++            invocations.reserve(path.size());
++            for (size_t j = 0; j < path.size(); ++j) {
++                const uint8_t branch_index = path[j];
++                const BranchWitness &witness = input.witnesses[j];
++                const Hash leaf = BranchLeaf(witness.script);
++                if (branch_index >= coin.branches.size() ||
++                    BranchProofRoot(leaf, witness.siblings) !=
++                        coin.branches[branch_index]) {
++                    error = "branch membership";
++                    return false;
++                }
++                PreparedSigningContext::Invocation invocation;
++                invocation.kind = 1;
++                invocation.selector.push_back(1);
++                Integer(i, 4, invocation.selector);
++                Integer(branch_index, 4, invocation.selector);
++                invocation.selector.insert(invocation.selector.end(),
++                                           leaf.begin(), leaf.end());
++                invocations.push_back(std::move(invocation));
++            }
++        } else if (input.flags == 3) {
++            const BranchWitness &witness = input.witnesses[0];
++            const Hash leaf = BranchLeaf(witness.script);
++            if (BranchProofRoot(leaf, witness.siblings) != input.prev_txid) {
++                error = "mint root";
++                return false;
++            }
++            PreparedSigningContext::Invocation invocation;
++            invocation.kind = 3;
++            invocation.selector.push_back(3);
++            invocation.selector.insert(invocation.selector.end(),
++                                       input.prev_txid.begin(),
++                                       input.prev_txid.end());
++            invocation.selector.insert(invocation.selector.end(), 16, 0);
++            invocation.selector.insert(invocation.selector.end(), leaf.begin(),
++                                       leaf.end());
++            invocations.push_back(std::move(invocation));
++        }
++    }
++    prepared.ready_ = true;
++    result = std::move(prepared);
+     error.clear();
+     return true;
+ }
+ 
+-bool SigningMessage(const Transaction &tx, const TxProfile &profile,
+-                    const ChainId &chain_id, const ResolvedCoins &resolved,
+-                    size_t input_index, size_t witness_index, uint8_t mode,
++bool SigningMessage(const PreparedSigningContext &prepared, size_t input_index,
++                    size_t witness_index, uint8_t mode,
+                     const std::optional<PositiveDelta> &positive_delta,
+                     Hash &result, std::string &error) {
+-    if (mode > 2) {
+-        error = "signing mode";
++    if (!prepared.ready_ || mode > 2 ||
++        input_index >= prepared.invocations_.size() ||
++        witness_index >= prepared.invocations_[input_index].size()) {
++        error = "signing mode or invocation index";
+         return false;
+     }
+-    IdentityDigests ids;
+-    if (!ComputeIdentities(tx, profile, chain_id, ids, error)) return false;
+-    std::vector<uint8_t> selector;
+-    if (!Selector(tx, resolved, input_index, witness_index, positive_delta,
+-                  selector, error))
++    const auto &invocation =
++        prepared.invocations_[input_index][witness_index];
++    if (invocation.kind == 1 && positive_delta) {
++        error = "spend delta";
++        return false;
++    }
++    if (invocation.kind == 3 &&
++        (mode != 0 || !positive_delta || !NonzeroDelta(*positive_delta))) {
++        error = "mint selector delta/mode";
+         return false;
++    }
++    if (mode == 2 && input_index >= prepared.output_leaves_.size()) {
++        error = "partial mode unavailable";
++        return false;
++    }
+     std::vector<uint8_t> preimage;
+-    preimage.insert(preimage.end(), chain_id.begin(), chain_id.end());
++    preimage.reserve(invocation.kind == 3 ? 178 : mode == 0 ? 138 : 150);
++    preimage.insert(preimage.end(), prepared.chain_id_.begin(),
++                    prepared.chain_id_.end());
+     preimage.push_back(mode);
+     if (mode == 0) {
+-        Hash coins;
+-        if (!ComputeCoinsRoot(tx, resolved, coins, error)) return false;
+-        preimage.insert(preimage.end(), ids.txid.begin(), ids.txid.end());
+-        preimage.insert(preimage.end(), coins.begin(), coins.end());
++        preimage.insert(preimage.end(), prepared.txid_.begin(),
++                        prepared.txid_.end());
++        preimage.insert(preimage.end(), prepared.coins_root_.begin(),
++                        prepared.coins_root_.end());
+     } else {
+-        if (tx.inputs[input_index].flags != 1 ||
+-            (mode == 2 && input_index >= tx.outputs.size())) {
+-            error = "partial mode unavailable";
+-            return false;
+-        }
+-        Hash own;
+-        if (!ComputeOwnInputHash(tx, profile, resolved, input_index, own,
+-                                 error))
+-            return false;
+         Integer(7, 4, preimage);
+-        Integer(tx.lock, 8, preimage);
++        Integer(prepared.lock_, 8, preimage);
++        const Hash &own = *prepared.own_input_hashes_[input_index];
+         preimage.insert(preimage.end(), own.begin(), own.end());
+-        const auto &output_commitment =
+-            mode == 1 ? ids.outputs_root : ids.output_leaves[input_index];
++        const Hash &output_commitment = mode == 1
++            ? prepared.outputs_root_ : prepared.output_leaves_[input_index];
+         preimage.insert(preimage.end(), output_commitment.begin(),
+                         output_commitment.end());
+     }
+-    preimage.insert(preimage.end(), selector.begin(), selector.end());
++    if (invocation.kind == 3) {
++        preimage.insert(preimage.end(), invocation.selector.begin(),
++                        invocation.selector.begin() + 33);
++        preimage.insert(preimage.end(), positive_delta->begin(),
++                        positive_delta->end());
++        preimage.insert(preimage.end(), invocation.selector.begin() + 49,
++                        invocation.selector.end());
++    } else {
++        preimage.insert(preimage.end(), invocation.selector.begin(),
++                        invocation.selector.end());
++    }
+     if (preimage.size() !=
+-        (mode == 0 ? (selector.size() == 81 ? 178 : 138) : 150)) {
++        (invocation.kind == 3 ? 178 : mode == 0 ? 138 : 150)) {
+         error = "sighash preimage width";
+         return false;
+     }
+@@ -260,6 +298,19 @@ bool SigningMessage(const Transaction &tx, const TxProfile &profile,
+     return true;
+ }
+ 
++bool SigningMessage(const Transaction &tx, const TxProfile &profile,
++                    const ChainId &chain_id, const ResolvedCoins &resolved,
++                    size_t input_index, size_t witness_index, uint8_t mode,
++                    const std::optional<PositiveDelta> &positive_delta,
++                    Hash &result, std::string &error) {
++    PreparedSigningContext prepared;
++    if (!PrepareSigningContext(tx, profile, chain_id, resolved, prepared,
++                               error))
++        return false;
++    return SigningMessage(prepared, input_index, witness_index, mode,
++                          positive_delta, result, error);
++}
++
+ SignatureStatus VerifyBip340Signature(std::span<const uint8_t> public_key,
+                                       std::span<const uint8_t> signature,
+                                       const Hash &message, bool mint) {
+diff --git a/src/lotus_v2/signing.h b/src/lotus_v2/signing.h
+index 2033eb58a..b3b0a137f 100644
+--- a/src/lotus_v2/signing.h
++++ b/src/lotus_v2/signing.h
+@@ -28,6 +28,47 @@ struct IdentityDigests {
+ using ResolvedCoins = std::vector<std::optional<Output>>;
+ using PositiveDelta = std::array<uint8_t, 16>; // u128 little-endian, nonzero
+ 
++// Immutable snapshot for repeated CHECKSIG/SIGHASH calls on one validated
++// transaction. Rebuild it if the transaction or resolved coins change.
++class PreparedSigningContext {
++public:
++    PreparedSigningContext() = default;
++
++private:
++    struct Invocation {
++        uint8_t kind{};
++        std::vector<uint8_t> selector; // 41-byte spend or 81-byte mint form.
++    };
++    ChainId chain_id_{};
++    uint64_t lock_{};
++    Hash txid_{};
++    Hash coins_root_{};
++    Hash outputs_root_{};
++    std::vector<Hash> output_leaves_;
++    std::vector<std::optional<Hash>> own_input_hashes_;
++    std::vector<std::vector<Invocation>> invocations_;
++    bool ready_ = false;
++
++    friend bool PrepareSigningContext(
++        const Transaction &, const TxProfile &, const ChainId &,
++        const ResolvedCoins &, PreparedSigningContext &, std::string &);
++    friend bool SigningMessage(const PreparedSigningContext &, size_t, size_t,
++                               uint8_t, const std::optional<PositiveDelta> &,
++                               Hash &, std::string &);
++};
++
++bool PrepareSigningContext(const Transaction &tx, const TxProfile &profile,
++                           const ChainId &chain_id,
++                           const ResolvedCoins &resolved,
++                           PreparedSigningContext &result,
++                           std::string &error);
++// After preparation this hashes one fixed-width signing preimage. No input,
++// output, witness, or coin collection is traversed per invocation.
++bool SigningMessage(const PreparedSigningContext &prepared, size_t input_index,
++                    size_t witness_index, uint8_t mode,
++                    const std::optional<PositiveDelta> &positive_delta,
++                    Hash &result, std::string &error);
++
+ bool ComputeIdentities(const Transaction &tx, const TxProfile &profile,
+                        const ChainId &chain_id, IdentityDigests &result,
+                        std::string &error);
+@@ -37,9 +78,9 @@ bool ComputeOwnInputHash(const Transaction &tx, const TxProfile &profile,
+                          const ResolvedCoins &resolved, size_t input_index,
+                          Hash &result, std::string &error);
+ 
+-// Resolved coins and positive mint delta are supplied by a separate validated
+-// accounting/state layer. This checks selected-path proof/arity, but does not
+-// execute scripts or prove the caller's delta is the transaction's true delta.
++// One-off convenience wrapper. Repeated invocations must use the prepared
++// overload to avoid rebuilding roots on every signature. Resolved coins and
++// positive mint delta come from a separate validated accounting/state layer.
+ bool SigningMessage(const Transaction &tx, const TxProfile &profile,
+                     const ChainId &chain_id, const ResolvedCoins &resolved,
+                     size_t input_index, size_t witness_index, uint8_t mode,
+diff --git a/src/lotus_v2/test_signing.cpp b/src/lotus_v2/test_signing.cpp
+index ba7c95d29..83849f311 100644
+--- a/src/lotus_v2/test_signing.cpp
++++ b/src/lotus_v2/test_signing.cpp
+@@ -112,11 +112,17 @@ void PaymentFixture() {
+         "04a85123186ad1a571dc9878c2f2ae8e27329e6f409dcece4e47368428067ecd",
+         "edd48a54efc1c6fb3a548525e570021b14c890bada1c0419a66cbdbd04c31c2a",
+         "45d5a4af0c5a832acab582eb5b6fc5b5fadba6f0b670bd92e36256f6d5fd72e8"};
++    PreparedSigningContext prepared;
++    CHECK(PrepareSigningContext(tx, PROFILE, chain, resolved, prepared, error));
+     for (uint8_t mode = 0; mode < 3; ++mode) {
+         Hash message;
+         CHECK(SigningMessage(tx, PROFILE, chain, resolved, 0, 0, mode,
+                              std::nullopt, message, error));
+         CHECK(message == HashHex(expected[mode]));
++        Hash cached_message;
++        CHECK(SigningMessage(prepared, 0, 0, mode, std::nullopt,
++                             cached_message, error));
++        CHECK(cached_message == message);
+     }
+     const auto signature = tx.inputs[0].witnesses[0].arguments[0];
+     const auto pubkey =
+@@ -180,11 +186,19 @@ void MintMessage() {
+         chain[i] = uint8_t(i);
+     PositiveDelta delta{};
+     delta[0] = 1;
++    PreparedSigningContext prepared;
++    CHECK(PrepareSigningContext(tx, PROFILE, chain, resolved, prepared, error));
+     Hash message;
+     CHECK(SigningMessage(tx, PROFILE, chain, resolved, 1, 0, 0, delta, message,
+                          error));
+     CHECK(message == HashHex("e377de4d5eeef48cba47286c47dc88a1a61019c06f6f2f1e4"
+                              "ea2f263d60bb587"));
++    Hash cached_message;
++    CHECK(SigningMessage(prepared, 1, 0, 0, delta, cached_message, error));
++    CHECK(cached_message == message);
++    CHECK(!SigningMessage(prepared, 1, 0, 1, delta, cached_message, error));
++    CHECK(!SigningMessage(prepared, 1, 0, 0, std::nullopt, cached_message,
++                          error));
+     CHECK(!SigningMessage(tx, PROFILE, chain, resolved, 1, 0, 1, delta, message,
+                           error));
+     CHECK(!SigningMessage(tx, PROFILE, chain, resolved, 1, 0, 2, delta, message,

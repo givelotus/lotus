@@ -1,0 +1,167 @@
+From d8033b3888b608e45ef745d1c6ad862348b01de0 Mon Sep 17 00:00:00 2001
+From: Shammah Chancellor <shammah.chancellor@notvalid.com>
+Date: Mon, 19 Oct 2026 04:10:34 -0700
+Subject: [PATCH] fixup! feat(v2): add C17a deterministic fee-backed UTXO
+ expiry and cleaning-crew validation
+
+---
+ src/validation.cpp                            | 61 +++++++++++++++--
+ .../feature_native_coin_recovery.py           | 65 +++++++++++++++++++
+ 2 files changed, 121 insertions(+), 5 deletions(-)
+ create mode 100644 test/functional/feature_native_coin_recovery.py
+
+diff --git a/src/validation.cpp b/src/validation.cpp
+index 30b2a99e33..0a0cac2351 100644
+--- a/src/validation.cpp
++++ b/src/validation.cpp
+@@ -8012,20 +8012,71 @@ bool Chainstate::RollforwardBlock(const CBlockIndex *pindex,
+         return false;
+     }
+ 
+-    for (const CTransactionRef &tx : block.vtx) {
+-        // Pass check = true as every addition may be an overwrite.
+-        AddCoins(view, *tx, pindex->nHeight, true);
++    // A partially flushed coins view cannot supply authoritative input values:
++    // some inputs may already be spent, including inputs created in this block.
++    // The durable undo record preserves the accepted block's original inputs.
++    CBlockUndo undo;
++    if (!m_blockman.ReadBlockUndo(undo, *pindex) || block.vtx.empty() ||
++        undo.vtxundo.size() != block.vtx.size() - 1) {
++        LogError("ReplayBlock(): missing or inconsistent undo at %d, hash=%s\n",
++                 pindex->nHeight, pindex->GetBlockHash().ToString());
++        return false;
++    }
++    std::vector<uint64_t> fee_shares(block.vtx.size(), 0);
++    for (size_t i = 1; i < block.vtx.size(); ++i) {
++        const CTransaction &tx = *block.vtx[i];
++        const auto &spent = undo.vtxundo[i - 1].vprevout;
++        Amount fee = Amount::zero();
++        TxValidationState state;
++        if (spent.size() != tx.vin.size() ||
++            !Consensus::CheckTxInputsFromSpentCoins(
++                tx, spent, state, pindex->nHeight, fee)) {
++            LogError("ReplayBlock(): inconsistent transaction undo at %d, "
++                     "hash=%s, tx=%s\n", pindex->nHeight,
++                     pindex->GetBlockHash().ToString(), tx.GetId().ToString());
++            return false;
++        }
++        size_t spendable_outputs = 0;
++        for (const auto &out : tx.vout) {
++            if (!out.scriptPubKey.IsUnspendable() && (out.nFlags & 0x02) == 0) {
++                ++spendable_outputs;
++            }
++        }
++        fee_shares[i] = lotus::v2::ComputeTxFeePerSpendableOutput(
++            static_cast<uint64_t>(fee / SATOSHI), spendable_outputs);
++    }
++
++    for (size_t i = 0; i < block.vtx.size(); ++i) {
++        const CTransaction &tx = *block.vtx[i];
++        // Reapply full Coin metadata as well as output values. Both operations
++        // are idempotent, regardless of which entries reached disk before crash.
++        AddCoins(view, tx, pindex->nHeight, /*check=*/true);
++        if (fee_shares[i] != 0) {
++            const uint64_t expiration = lotus::v2::ComputeUtxoExpirationHeight(
++                static_cast<uint64_t>(pindex->nHeight), false, fee_shares[i]);
++            const TxId txid = tx.GetId();
++            for (size_t output = 0; output < tx.vout.size(); ++output) {
++                view.UpdateCoinFeeLifespan(COutPoint(txid, output),
++                                          fee_shares[i], expiration);
++            }
++        }
+     }
+ 
+     for (const CTransactionRef &tx : block.vtx) {
+         if (tx->IsCoinBase()) {
+             continue;
+         }
+-
+         for (const CTxIn &txin : tx->vin) {
+-            view.SpendCoin(txin.prevout);
++            if (txin.nFlags != 3) {
++                view.SpendCoin(txin.prevout);
++            }
+         }
+     }
++    // Expiration removals belong to the same committed block transition, even
++    // when the block has no ordinary spends. Replaying them is idempotent too.
++    for (const auto &expired : undo.vexpired) {
++        view.SpendCoin(expired.outpoint);
++    }
+ 
+     return true;
+ }
+diff --git a/test/functional/feature_native_coin_recovery.py b/test/functional/feature_native_coin_recovery.py
+new file mode 100644
+index 0000000000..c6dcd1fef5
+--- /dev/null
++++ b/test/functional/feature_native_coin_recovery.py
+@@ -0,0 +1,65 @@
++#!/usr/bin/env python3
++# Copyright (c) 2026 The Lotus developers
++# Distributed under the MIT software license, see the accompanying
++# file COPYING or http://www.opensource.org/licenses/mit-license.php.
++"""Paid native Coin metadata survives a deterministic partial chainstate flush."""
++
++import http.client
++
++from test_framework.test_framework import BitcoinTestFramework
++from test_framework.util import assert_equal
++from test_framework.wallet import MiniWallet
++
++
++class NativeCoinRecoveryTest(BitcoinTestFramework):
++    def set_test_params(self):
++        self.num_nodes = 2
++        self.supports_cli = False
++        self.extra_args = [["-dbcache=4", "-dbbatchsize=200000"], []]
++
++    def setup_network(self):
++        self.add_nodes(self.num_nodes, extra_args=self.extra_args)
++        self.start_nodes()
++        # Deliberately unconnected: node0 receives exactly the paid block below.
++
++    def run_test(self):
++        recovering, reference = self.nodes
++        wallet = MiniWallet(reference)
++        wallet.rescan_utxos()
++        wallet.send_self_transfer_multi(from_node=reference, num_outputs=5000)
++        [tip] = self.generate(reference, 1, sync_fun=self.no_op)
++        expected = reference.gettxoutsetinfo()["hash_serialized"]
++        block = reference.getblock(tip, False)
++
++        # Every partial batch crashes, independently of RNG state. On restart,
++        # disable the fault so recovery must complete rather than crash again.
++        self.restart_node(0, self.extra_args[0] + ["-dbcrashratio=1"])
++        with recovering.assert_debug_log(["Simulating a crash. Goodbye."]):
++            try:
++                recovering.submitblock(block)
++                recovering.gettxoutsetinfo()  # Force a dirty coins-cache flush.
++            except (OSError, http.client.HTTPException):
++                pass
++            self.wait_for_node_exit(0, timeout=30)
++        self.start_node(0, self.extra_args[0])
++        assert_equal(recovering.getbestblockhash(), tip)
++        assert_equal(recovering.gettxoutsetinfo()["hash_serialized"], expected)
++
++        # Both undo and a second connect must preserve the same authenticated
++        # fee-share/expiration bytes, followed by an ordinary clean restart.
++        for node in self.nodes:
++            node.invalidateblock(tip)
++        assert_equal(
++            recovering.gettxoutsetinfo()["hash_serialized"],
++            reference.gettxoutsetinfo()["hash_serialized"],
++        )
++        for node in self.nodes:
++            node.reconsiderblock(tip)
++            assert_equal(node.getbestblockhash(), tip)
++            assert_equal(node.gettxoutsetinfo()["hash_serialized"], expected)
++        self.restart_node(0, self.extra_args[0])
++        assert_equal(recovering.gettxoutsetinfo()["hash_serialized"], expected)
++
++
++if __name__ == "__main__":
++    NativeCoinRecoveryTest().main()
+-- 
+2.50.1 (Apple Git-155)
+

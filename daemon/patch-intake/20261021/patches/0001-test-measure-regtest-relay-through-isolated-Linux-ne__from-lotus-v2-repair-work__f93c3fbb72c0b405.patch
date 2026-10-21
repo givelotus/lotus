@@ -1,0 +1,148 @@
+From 32dab15099ec6d9ddd22c6fcd8350fe8e74ea103 Mon Sep 17 00:00:00 2001
+From: Canonical endpoint audit <audit@localhost>
+Date: Sun, 18 Oct 2026 21:10:03 -0700
+Subject: [PATCH] test: measure regtest relay through isolated Linux netem
+ forwarders
+
+---
+ test/functional/data/merklix-netem.Dockerfile |   5 +
+ test/functional/merklix_netem_bench.py        | 115 ++++++++++++++++++
+ 2 files changed, 120 insertions(+)
+ create mode 100644 test/functional/data/merklix-netem.Dockerfile
+ create mode 100644 test/functional/merklix_netem_bench.py
+
+diff --git a/test/functional/data/merklix-netem.Dockerfile b/test/functional/data/merklix-netem.Dockerfile
+new file mode 100644
+index 0000000000..db39c19484
+--- /dev/null
++++ b/test/functional/data/merklix-netem.Dockerfile
+@@ -0,0 +1,5 @@
++FROM alpine:3.22
++RUN apk add --no-cache iproute2 socat
++# Only this disposable network namespace is modified. A packet travelling
++# either direction exits eth0 once, so request/response adds 2 * halfRTT.
++ENTRYPOINT ["sh", "-ec", "tc qdisc add dev eth0 root netem delay ${1}ms loss ${2}%; exec socat TCP-LISTEN:19000,reuseaddr,fork TCP:host.docker.internal:${3}", "netem"]
+diff --git a/test/functional/merklix_netem_bench.py b/test/functional/merklix_netem_bench.py
+new file mode 100644
+index 0000000000..9bf6da53f2
+--- /dev/null
++++ b/test/functional/merklix_netem_bench.py
+@@ -0,0 +1,115 @@
++#!/usr/bin/env python3
++# Copyright (c) 2026 The Lotus developers
++# Distributed under the MIT software license, see the accompanying
++# file COPYING or http://www.opensource.org/licenses/mit-license.php.
++"""Native regtest relay through isolated Docker Linux netem TCP forwarders.
++
++Build image first: docker build -t lotus-merklix-netem -f
++ test/functional/data/merklix-netem.Dockerfile test/functional/data
++Run each RTT20/80/200 x loss0/1 case with and without --legacy-baseline.
++This measures injected packet impairment, not a real WAN. Host networking is
++never reconfigured; only disposable container eth0 qdiscs are touched.
++"""
++import json
++import math
++import re
++import subprocess
++import time
++from decimal import Decimal
++from pathlib import Path
++
++from p2p_v2_fast_sync_and_reverse_peel import V2_OP_TRUE_DESCRIPTOR, build_v2_op_true_tx
++from test_framework.test_framework import BitcoinTestFramework
++
++
++def docker(*args):
++    return subprocess.check_output(["docker", *args], text=True).strip()
++
++
++def quantile(values, q):
++    return sorted(values)[max(0, math.ceil(q * len(values)) - 1)]
++
++
++class MerklixNetemBench(BitcoinTestFramework):
++    def add_options(self, parser):
++        parser.add_argument("--rtt-ms", type=int, choices=[20, 80, 200], required=True)
++        parser.add_argument("--loss-percent", type=int, choices=[0, 1], required=True)
++        parser.add_argument("--legacy-baseline", action="store_true")
++        parser.add_argument("--samples", type=int, default=30)
++        parser.add_argument("--result", type=Path, required=True)
++
++    def set_test_params(self):
++        self.num_nodes = 3
++        self.setup_clean_chain = True
++        self.extra_args = [["-avalanche=0", "-bind=0.0.0.0", "-debug=net",
++                            f"-merklixreconciliation={int(not self.options.legacy_baseline)}"]
++                           for _ in range(self.num_nodes)]
++
++    def run_test(self):
++        assert 1 <= self.options.samples <= 100
++        self.generatetodescriptor(self.nodes[0], 110 + self.options.samples,
++                                  V2_OP_TRUE_DESCRIPTOR)
++        self.sync_all()
++        self.disconnect_nodes(0, 1)
++        self.disconnect_nodes(1, 2)
++        containers = []
++        try:
++            for source, target in [(0, 1), (1, 2)]:
++                cid = docker("run", "-d", "--rm", "--cap-add=NET_ADMIN",
++                             "-p", "127.0.0.1::19000", "lotus-merklix-netem",
++                             str(self.options.rtt_ms / 2), str(self.options.loss_percent),
++                             str(self.nodes[target].p2p_port))
++                containers.append(cid)
++                port = int(docker("port", cid, "19000/tcp").rsplit(":", 1)[1])
++                self.nodes[source].addnode(f"127.0.0.1:{port}", "onetry")
++                self.wait_until(lambda: len(self.nodes[source].getpeerinfo()) >= 1)
++            self.wait_until(lambda: len(self.nodes[1].getpeerinfo()) == 2)
++            # Complete handshakes before transaction clocks begin.
++            self.wait_until(lambda: all(all(p["version"] > 0 for p in n.getpeerinfo())
++                                       for n in self.nodes))
++            log_offsets = [(Path(n.datadir) / "regtest" / "debug.log").stat().st_size
++                           for n in self.nodes]
++            before_bytes = sum(n.getnettotals()["totalbytessent"] for n in self.nodes)
++            durations = []
++            start = time.monotonic()
++            for i in range(self.options.samples):
++                node = self.nodes[i % self.num_nodes]
++                cb = node.getblock(node.getblockhash(i + 1), 2)["tx"][0]
++                value = int(Decimal(str(cb["vout"][0]["value"])) * 100)
++                tx = build_v2_op_true_tx(int(cb["txid"], 16), 0, [value - 10000])
++                submitted = time.monotonic()
++                txid = node.sendrawtransaction(tx.serialize().hex())
++                self.wait_until(lambda: all(txid in n.getrawmempool() for n in self.nodes),
++                                timeout=60, check_interval=0.005)
++                durations.append(1000 * (time.monotonic() - submitted))
++            elapsed = time.monotonic() - start
++            after_bytes = sum(n.getnettotals()["totalbytessent"] for n in self.nodes)
++            messages = {}
++            for node, offset in zip(self.nodes, log_offsets):
++                with (Path(node.datadir) / "regtest" / "debug.log").open() as log:
++                    log.seek(offset)
++                    for command in re.findall(r"sending ([a-z0-9]+) ", log.read()):
++                        messages[command] = messages.get(command, 0) + 1
++            result = {"kind": "isolated-linux-netem", "real_wan": False,
++                      "rtt_configured_ms": self.options.rtt_ms,
++                      "packet_loss_percent": self.options.loss_percent,
++                      "nodes": self.num_nodes, "samples": len(durations),
++                      "relay": "inv/getdata" if self.options.legacy_baseline else "merklix+inv",
++                      "latency_ms": {"p50": quantile(durations, .5),
++                                     "p90": quantile(durations, .9),
++                                     "p99": quantile(durations, .99)},
++                      "elapsed_s": elapsed, "sent_messages": messages,
++                      "bytes_per_tx": (after_bytes - before_bytes) / len(durations),
++                      "round_trips_per_reconciliation": None,
++                      "epoch_freeze_rate": None, "rate_limited_messages": None,
++                      "dropped_messages": None,
++                      "limits": "RPC observations include polling overhead; packet impairment is real but not WAN. Per-round/epoch/drop instrumentation not yet available; null means unmeasured."}
++            self.options.result.write_text(json.dumps(result, indent=2) + "\n")
++            self.log.info("%s", json.dumps(result))
++        finally:
++            for cid in containers:
++                docker("rm", "-f", cid)
++
++
++if __name__ == "__main__":
++    MerklixNetemBench().main()
+-- 
+2.50.1 (Apple Git-155)
+

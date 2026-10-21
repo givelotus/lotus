@@ -1,0 +1,1269 @@
+From 1e77876d6797499322b318d00d48e695223560e1 Mon Sep 17 00:00:00 2001
+From: Shammah Chancellor <shammah.chancellor@notvalid.com>
+Date: Tue, 20 Oct 2026 08:46:57 -0700
+Subject: [PATCH] wallet(v2): add bounded native PSBT interchange codec
+
+Reuse BIP174 magic, maps and proprietary framing with explicit native version 0x4c560001. Preserve canonical native templates, complete Coin-v2 metadata, proof and slot fields without routing v7 through legacy unsigned transactions. Reject duplicates, noncanonical encodings, critical extensions, conflicts, and resource overflows.
+
+Canonical schema: lotus-v2 specification d8a3b859. Fresh native-Chronik/wallet configure and normal 183-action test target build pass; focused C++ cases and all 35 independent schema vectors pass. No native signing or hardware-wallet compatibility is claimed by this codec commit.
+---
+ src/lotus_v2/CMakeLists.txt                 |  11 +
+ src/lotus_v2/psbt.cpp                       | 521 ++++++++++++++++++++
+ src/lotus_v2/psbt.h                         |  81 +++
+ src/lotus_v2/psbt_map.h                     | 156 ++++++
+ src/lotus_v2/psbt_test/check_vectors.py     |  38 ++
+ src/lotus_v2/psbt_test/profile_vectors.json | 162 ++++++
+ src/lotus_v2/test_psbt.cpp                  | 226 +++++++++
+ 7 files changed, 1195 insertions(+)
+ create mode 100644 src/lotus_v2/psbt.cpp
+ create mode 100644 src/lotus_v2/psbt.h
+ create mode 100644 src/lotus_v2/psbt_map.h
+ create mode 100644 src/lotus_v2/psbt_test/check_vectors.py
+ create mode 100644 src/lotus_v2/psbt_test/profile_vectors.json
+ create mode 100644 src/lotus_v2/test_psbt.cpp
+
+diff --git a/src/lotus_v2/CMakeLists.txt b/src/lotus_v2/CMakeLists.txt
+index 24823d12ed398d2e5831a0794e43c90645b4563a..3b75f4f6ce201c0721becbb8dbbc09633f2f4e25 100644
+--- a/src/lotus_v2/CMakeLists.txt
++++ b/src/lotus_v2/CMakeLists.txt
+@@ -197,6 +197,17 @@ target_include_directories(lotus_v2_validation PUBLIC
+ target_link_libraries(lotus_v2_validation PUBLIC
+     lotus_v2_block_template lotus_v2_sparse_state lotus_v2_incremental_utxo lotus_v2_mdbx Boost::headers secp256k1 leveldb OpenSSL::Crypto crypto)
+ 
++# Wallet interchange only: no transaction or block consensus changes.
++add_library(lotus_v2_psbt STATIC psbt.cpp)
++target_link_libraries(lotus_v2_psbt PUBLIC lotus_v2_validation)
++add_executable(test_lotus_v2_psbt test_psbt.cpp)
++target_link_libraries(test_lotus_v2_psbt PRIVATE lotus_v2_psbt)
++add_test(NAME lotus_v2_psbt COMMAND test_lotus_v2_psbt)
++add_test(NAME lotus_v2_psbt_vectors
++    COMMAND ${Python_EXECUTABLE}
++        ${CMAKE_CURRENT_SOURCE_DIR}/psbt_test/check_vectors.py
++        $<TARGET_FILE:test_lotus_v2_psbt>)
++
+ # Compare the disk path against the retained in-memory connector oracle using
+ # the same dependencies selected by the full daemon build.
+ add_executable(test_lotus_v2_disk_block
+diff --git a/src/lotus_v2/psbt.cpp b/src/lotus_v2/psbt.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..8fce5ab734660622b27d3ea94fecad3ae24933ac
+--- /dev/null
++++ b/src/lotus_v2/psbt.cpp
+@@ -0,0 +1,521 @@
++// Copyright (c) 2026 The Lotus developers
++// Distributed under the MIT software license, see COPYING.
++#include "psbt.h"
++
++#include <crypto/ripemd160.h>
++#include <crypto/sha256.h>
++
++#include <secp256k1.h>
++#include <secp256k1_extrakeys.h>
++
++#include <algorithm>
++#include <array>
++#include <bit>
++
++namespace lotus::v2 {
++namespace {
++    using namespace psbt_detail;
++    constexpr std::array<uint8_t, 5> MAGIC{0x70, 0x73, 0x62, 0x74, 0xff};
++    constexpr std::array<uint8_t, 8> IDENTIFIER{'l', 'o', 't', 'u',
++                                                's', '-', 'v', '2'};
++
++    bool Fail(std::string &error, const char *message) {
++        error = message;
++        return false;
++    }
++
++    bool Scalar(const Bytes &bytes, size_t width, uint64_t &value) {
++        Reader reader(bytes);
++        return bytes.size() == width && reader.Integer(width, value);
++    }
++
++    bool Count(const Map &map, uint8_t key, uint64_t &value) {
++        auto found = map.find({key});
++        if (found == map.end()) return false;
++        Reader reader(found->second);
++        return reader.Compact(value) && reader.Empty();
++    }
++
++    bool PublicKey(std::span<const uint8_t> bytes, bool xonly = false) {
++        if (xonly) {
++            secp256k1_xonly_pubkey pubkey;
++            return bytes.size() == 32 &&
++                   secp256k1_xonly_pubkey_parse(secp256k1_context_static,
++                                                &pubkey, bytes.data());
++        }
++        secp256k1_pubkey pubkey;
++        return (bytes.size() == 33 || bytes.size() == 65) &&
++               secp256k1_ec_pubkey_parse(secp256k1_context_static, &pubkey,
++                                         bytes.data(), bytes.size());
++    }
++
++    // Validate proprietary framing for every identifier, including unknown
++    // ones. Standard keys are reported separately. Other namespaces remain
++    // opaque.
++    struct Key {
++        uint64_t type{};
++        bool native{};
++        uint64_t subtype{};
++        Bytes data;
++    };
++    bool ParseKey(const Bytes &bytes, Key &key, std::string &error) {
++        Reader reader(bytes);
++        if (!reader.Compact(key.type))
++            return Fail(error, "invalid PSBT key type");
++        if (key.type != 0xfc) {
++            return reader.Blob(reader.Remaining(), key.data);
++        }
++        Bytes identifier;
++        if (!reader.Vector(MAX_NATIVE_PSBT_KEY_BYTES, identifier) ||
++            !reader.Compact(key.subtype)) {
++            return Fail(error, "invalid PSBT proprietary key");
++        }
++        key.native = std::ranges::equal(identifier, IDENTIFIER);
++        return reader.Blob(reader.Remaining(), key.data);
++    }
++
++    bool Bounds(const Map &map, std::string &error) {
++        if (map.size() > MAX_NATIVE_PSBT_MAP_ENTRIES) {
++            return Fail(error, "too many PSBT map entries");
++        }
++        for (const auto &[key, value] : map) {
++            if (key.empty() || key.size() > MAX_NATIVE_PSBT_KEY_BYTES ||
++                value.size() > MAX_NATIVE_PSBT_VALUE_BYTES) {
++                return Fail(error, "PSBT field exceeds profile bounds");
++            }
++        }
++        return true;
++    }
++
++    size_t CompactWidth(size_t value) {
++        return value < 253           ? 1
++               : value <= 0xffff     ? 3
++               : value <= 0xffffffff ? 5
++                                     : 9;
++    }
++
++    bool AddMapSize(const Map &map, size_t &total) {
++        if (total >= MAX_NATIVE_PSBT_BYTES) return false;
++        ++total; // Separator.
++        for (const auto &[key, value] : map) {
++            for (size_t bytes : {CompactWidth(key.size()), key.size(),
++                                 CompactWidth(value.size()), value.size()}) {
++                if (bytes > MAX_NATIVE_PSBT_BYTES - total) return false;
++                total += bytes;
++            }
++        }
++        return true;
++    }
++
++    bool Arguments(const Bytes &bytes, PsbtArguments &result) {
++        Reader reader(bytes);
++        uint64_t count;
++        if (!reader.Compact(count) || count > DefaultTxProfile.max_arguments ||
++            count > reader.Remaining())
++            return false;
++        PsbtArguments parsed;
++        parsed.reserve(count);
++        for (size_t i = 0; i < count; ++i) {
++            Bytes arg;
++            if (!reader.Vector(DefaultTxProfile.max_argument_bytes, arg))
++                return false;
++            parsed.push_back(std::move(arg));
++        }
++        if (!reader.Empty()) return false;
++        result = std::move(parsed);
++        return true;
++    }
++
++    bool Origin(const Key &key, const Bytes &value) {
++        return key.data.size() == 33 && PublicKey(key.data) &&
++               value.size() >= 4 && (value.size() - 4) % 4 == 0 &&
++               (value.size() - 4) / 4 <= 255;
++    }
++
++    bool IsLegacyP2pkh(const Output &coin) {
++        if (!coin.legacy_script) return false;
++        const auto &script = *coin.legacy_script;
++        return script.size() == 25 && script[0] == 0x76 && script[1] == 0xa9 &&
++               script[2] == 20 && script[23] == 0x88 && script[24] == 0xac;
++    }
++
++    bool IsLegacyP2sh(const Output &coin) {
++        if (!coin.legacy_script) return false;
++        const auto &script = *coin.legacy_script;
++        return script.size() == 23 && script[0] == 0xa9 && script[1] == 20 &&
++               script[22] == 0x87;
++    }
++
++    bool LegacyP2pkhRole(const Input &input, const Output &coin, PsbtSlot slot,
++                         const PsbtSignRequest &request,
++                         const PsbtArguments &args) {
++        if (!IsLegacyP2pkh(coin) || input.path_index != 0 ||
++            input.witnesses.size() != 1 || slot.witness != 0 ||
++            slot.argument != 0 || !input.witnesses[0].script.empty() ||
++            !input.witnesses[0].siblings.empty() || args.size() != 2 ||
++            args[1].size() != 33 || !PublicKey(args[1]) ||
++            !std::equal(request.public_key.begin(), request.public_key.end(),
++                        args[1].begin() + 1))
++            return false;
++        std::array<uint8_t, 20> hash;
++        std::array<uint8_t, 32> sha;
++        CSHA256().Write(args[1].data(), args[1].size()).Finalize(sha.data());
++        CRIPEMD160().Write(sha.data(), sha.size()).Finalize(hash.data());
++        return std::equal(hash.begin(), hash.end(),
++                          coin.legacy_script->begin() + 3);
++    }
++
++    bool Proof(const Bytes &bytes, CoinProof &result) {
++        Reader reader(bytes);
++        Bytes bitmap;
++        uint64_t count;
++        if (!reader.Blob(32, bitmap) || !reader.Compact(count) || count > 256 ||
++            reader.Remaining() != count * 32)
++            return false;
++        size_t bits = 0;
++        for (auto byte : bitmap)
++            bits += std::popcount(byte);
++        if (count != bits) return false;
++        CoinProof parsed;
++        parsed.presence = ProofPresence::Present;
++        std::copy(bitmap.begin(), bitmap.end(), parsed.bitmap.begin());
++        for (size_t i = 0; i < count; ++i) {
++            Bytes hash;
++            if (!reader.Blob(32, hash)) return false;
++            Hash sibling;
++            std::copy(hash.begin(), hash.end(), sibling.begin());
++            parsed.siblings.push_back(sibling);
++        }
++        result = std::move(parsed);
++        return true;
++    }
++
++    bool InputMap(const Map &map, const Input &input, NativePsbtInput &parsed,
++                  bool has_root, std::string &error) {
++        if (!Bounds(map, error)) return false;
++        for (const auto &[raw_key, value] : map) {
++            Key key;
++            if (!ParseKey(raw_key, key, error)) return false;
++            if (key.type != 0xfc)
++                return Fail(error, "standard native PSBT input key");
++            if (!key.native || key.subtype >= 0x80) continue;
++            if (key.subtype == 1) {
++                Coin coin;
++                if (!key.data.empty() || !DecodeCoinBytes(value, coin) ||
++                    coin.outpoint.tx_id != input.prev_txid ||
++                    coin.outpoint.index != input.prev_index) {
++                    return Fail(error, "invalid PSBT coin or outpoint");
++                }
++                parsed.coin = std::move(coin);
++            } else if (key.subtype == 2 || key.subtype == 5) {
++                uint64_t witness;
++                PsbtArguments args;
++                if (!Scalar(key.data, 2, witness) ||
++                    witness >= input.witnesses.size() ||
++                    !Arguments(value, args))
++                    return Fail(error, "invalid PSBT arguments");
++                (key.subtype == 2 ? parsed.arguments : parsed.final_arguments)
++                    .emplace(uint16_t(witness), std::move(args));
++            } else if (key.subtype == 3 || key.subtype == 4) {
++                Reader reader(key.data);
++                uint64_t witness, argument;
++                if (key.data.size() != 4 || !reader.Integer(2, witness) ||
++                    !reader.Integer(2, argument) ||
++                    witness >= input.witnesses.size()) {
++                    return Fail(error, "invalid PSBT signature slot");
++                }
++                PsbtSlot slot{uint16_t(witness), uint16_t(argument)};
++                if (key.subtype == 4) {
++                    parsed.signatures.emplace(slot, value);
++                } else {
++                    if (value.size() < 2 || value[0] > 2 || value[1] > 2 ||
++                        !PublicKey(std::span(value).subspan(2),
++                                   value[0] == 0)) {
++                        return Fail(error, "invalid PSBT signing request");
++                    }
++                    parsed.requests.emplace(
++                        slot,
++                        PsbtSignRequest{value[0], value[1],
++                                        Bytes(value.begin() + 2, value.end())});
++                }
++            } else if (key.subtype == 6) {
++                CoinProof proof;
++                if (!key.data.empty() || !has_root || !Proof(value, proof)) {
++                    return Fail(error, "invalid PSBT coin proof");
++                }
++                parsed.proof = std::move(proof);
++            } else if (key.subtype == 7) {
++                if (!Origin(key, value))
++                    return Fail(error, "invalid PSBT key origin");
++            } else {
++                return Fail(error, "unknown critical native PSBT input field");
++            }
++        }
++        for (const auto &[slot, request] : parsed.requests) {
++            auto args = parsed.arguments.find(slot.witness);
++            if (args == parsed.arguments.end() ||
++                slot.argument >= args->second.size() ||
++                !args->second[slot.argument].empty()) {
++                return Fail(error,
++                            "PSBT request requires an empty argument slot");
++            }
++            if (parsed.coin) {
++                const auto &coin = parsed.coin->output;
++                if ((request.scheme != 0 && !IsLegacyP2sh(coin)) ||
++                    (request.scheme == 0 && coin.legacy_script &&
++                     !LegacyP2pkhRole(input, coin, slot, request,
++                                      args->second))) {
++                    return Fail(
++                        error,
++                        "PSBT request scheme does not match coin policy");
++                }
++            }
++        }
++        for (const auto &[slot, signature] : parsed.signatures) {
++            if (!parsed.requests.contains(slot)) {
++                return Fail(error, "PSBT signature has no signing request");
++            }
++            if (signature.empty() || signature.size() > 73) {
++                return Fail(error, "invalid PSBT signature size");
++            }
++            const auto &request = parsed.requests.at(slot);
++            if (request.scheme == 0) {
++                if (signature.size() != (request.mode == 0 ? 64 : 65) ||
++                    (request.mode != 0 && signature.back() != request.mode)) {
++                    return Fail(error,
++                                "invalid native PSBT signature mode encoding");
++                }
++            } else {
++                constexpr std::array<uint8_t, 3> types{0x41, 0xc1, 0xc3};
++                if (signature.back() != types[request.mode] ||
++                    (request.scheme == 2 && signature.size() != 65)) {
++                    return Fail(
++                        error, "invalid legacy PSBT bridge signature encoding");
++                }
++            }
++        }
++        if (parsed.proof) {
++            if (!parsed.coin)
++                return Fail(error, "PSBT proof requires its coin");
++            parsed.proof->coin = parsed.coin;
++        }
++        return true;
++    }
++} // namespace
++
++PsbtBytes NativePsbtKey(uint64_t subtype, std::span<const uint8_t> keydata) {
++    Bytes result{0xfc};
++    Vector(IDENTIFIER, result);
++    Compact(subtype, result);
++    result.insert(result.end(), keydata.begin(), keydata.end());
++    return result;
++}
++
++PsbtBytes EncodePsbtArguments(const PsbtArguments &arguments) {
++    Bytes result;
++    Compact(arguments.size(), result);
++    for (const auto &arg : arguments)
++        Vector(arg, result);
++    return result;
++}
++
++PsbtBytes EncodePsbtWitness(uint16_t witness) {
++    Bytes result;
++    Integer(witness, 2, result);
++    return result;
++}
++
++PsbtBytes EncodePsbtSlot(PsbtSlot slot) {
++    Bytes result = EncodePsbtWitness(slot.witness);
++    Integer(slot.argument, 2, result);
++    return result;
++}
++
++bool NativePsbt::Inspect(NativePsbtData &result, std::string &error) const {
++    size_t encoded_size = MAGIC.size();
++    if (!AddMapSize(global, encoded_size))
++        return Fail(error, "native PSBT exceeds total size limit");
++    for (const auto &map : inputs) {
++        if (!AddMapSize(map, encoded_size))
++            return Fail(error, "native PSBT exceeds total size limit");
++    }
++    for (const auto &map : outputs) {
++        if (!AddMapSize(map, encoded_size))
++            return Fail(error, "native PSBT exceeds total size limit");
++    }
++    if (!Bounds(global, error)) return false;
++    NativePsbtData parsed;
++    uint64_t version{}, in_count{}, out_count{};
++    auto version_it = global.find({0xfb});
++    if (version_it == global.end() || !Scalar(version_it->second, 4, version) ||
++        version != NATIVE_PSBT_VERSION || !Count(global, 4, in_count) ||
++        !Count(global, 5, out_count) || in_count == 0 ||
++        in_count > MAX_TX_INPUTS || out_count > MAX_TX_OUTPUTS ||
++        inputs.size() != in_count || outputs.size() != out_count) {
++        return Fail(error, "invalid native PSBT version or counts");
++    }
++    bool chain = false, tx = false;
++    for (const auto &[raw_key, value] : global) {
++        Key key;
++        if (!ParseKey(raw_key, key, error)) return false;
++        if (key.type != 0xfc) {
++            if ((key.type != 4 && key.type != 5 && key.type != 0xfb) ||
++                !key.data.empty())
++                return Fail(error, "standard native PSBT global key");
++            continue;
++        }
++        if (!key.native || key.subtype >= 0x80) continue;
++        if (!key.data.empty())
++            return Fail(error, "unexpected native PSBT global keydata");
++        if (key.subtype == 1 || key.subtype == 3) {
++            if (value.size() != 32)
++                return Fail(error, "invalid PSBT chain/root width");
++            Hash hash;
++            std::copy(value.begin(), value.end(), hash.begin());
++            if (key.subtype == 1) {
++                parsed.chain_id = hash;
++                chain = true;
++            } else {
++                parsed.utxo_root = hash;
++            }
++        } else if (key.subtype == 2) {
++            Bytes roundtrip;
++            if (!DecodeTransaction(value, DefaultTxProfile, parsed.tx_template,
++                                   error) ||
++                !EncodeTransaction(parsed.tx_template, DefaultTxProfile,
++                                   roundtrip, error) ||
++                value != roundtrip)
++                return Fail(error, "invalid native PSBT transaction template");
++            for (const auto &input : parsed.tx_template.inputs) {
++                if (input.flags != 1 || input.witnesses.size() > 16) {
++                    return Fail(error,
++                                "native PSBT requires ordinary spend inputs");
++                }
++                for (const auto &witness : input.witnesses) {
++                    if (!witness.arguments.empty())
++                        return Fail(error, "PSBT template has arguments");
++                }
++            }
++            tx = true;
++        } else {
++            return Fail(error, "unknown critical native PSBT global field");
++        }
++    }
++    if (!chain || !tx || parsed.tx_template.inputs.size() != in_count ||
++        parsed.tx_template.outputs.size() != out_count) {
++        return Fail(error,
++                    "missing native PSBT chain/template or mismatched counts");
++    }
++    parsed.inputs.resize(inputs.size());
++    for (size_t i = 0; i < inputs.size(); ++i) {
++        if (!InputMap(inputs[i], parsed.tx_template.inputs[i], parsed.inputs[i],
++                      parsed.utxo_root.has_value(), error))
++            return false;
++    }
++    for (const auto &map : outputs) {
++        if (!Bounds(map, error)) return false;
++        for (const auto &[raw_key, value] : map) {
++            Key key;
++            if (!ParseKey(raw_key, key, error)) return false;
++            if (key.type != 0xfc)
++                return Fail(error, "standard native PSBT output key");
++            if (!key.native || key.subtype >= 0x80) continue;
++            if (key.subtype != 1)
++                return Fail(error, "unknown critical native PSBT output field");
++            if (!Origin(key, value))
++                return Fail(error, "invalid PSBT output key origin");
++        }
++    }
++    result = std::move(parsed);
++    error.clear();
++    return true;
++}
++
++bool NativePsbt::Serialize(PsbtBytes &result, std::string &error) const {
++    NativePsbtData parsed;
++    if (!Inspect(parsed, error)) return false;
++    Bytes wire(MAGIC.begin(), MAGIC.end());
++    WriteMap(global, wire);
++    for (const auto &map : inputs)
++        WriteMap(map, wire);
++    for (const auto &map : outputs)
++        WriteMap(map, wire);
++    if (wire.size() > MAX_NATIVE_PSBT_BYTES)
++        return Fail(error, "native PSBT exceeds total size limit");
++    result = std::move(wire);
++    return true;
++}
++
++bool DecodeNativePsbt(std::span<const uint8_t> wire, NativePsbt &result,
++                      std::string &error) {
++    if (wire.size() > MAX_NATIVE_PSBT_BYTES || wire.size() < MAGIC.size() ||
++        !std::equal(MAGIC.begin(), MAGIC.end(), wire.begin())) {
++        return Fail(error, "invalid native PSBT magic or size");
++    }
++    Reader reader(wire.subspan(MAGIC.size()));
++    NativePsbt parsed;
++    auto read_map = [&](Map &map) {
++        return reader.ReadMap(map, MAX_NATIVE_PSBT_KEY_BYTES,
++                              MAX_NATIVE_PSBT_VALUE_BYTES,
++                              MAX_NATIVE_PSBT_MAP_ENTRIES, error);
++    };
++    uint64_t in_count{}, out_count{};
++    if (!read_map(parsed.global)) return false;
++    if (!Count(parsed.global, 4, in_count) ||
++        !Count(parsed.global, 5, out_count) || in_count == 0 ||
++        in_count > MAX_TX_INPUTS || out_count > MAX_TX_OUTPUTS ||
++        in_count + out_count > reader.Remaining()) {
++        return Fail(error, "invalid native PSBT map counts");
++    }
++    parsed.inputs.resize(in_count);
++    parsed.outputs.resize(out_count);
++    for (auto &map : parsed.inputs)
++        if (!read_map(map)) return false;
++    for (auto &map : parsed.outputs)
++        if (!read_map(map)) return false;
++    if (!reader.Empty()) return Fail(error, "trailing native PSBT bytes");
++    NativePsbtData data;
++    if (!parsed.Inspect(data, error)) return false;
++    result = std::move(parsed);
++    return true;
++}
++
++bool CreateNativePsbt(const Transaction &tx_template, const ChainId &chain_id,
++                      NativePsbt &result, std::string &error) {
++    NativePsbt parsed;
++    Bytes wire;
++    if (!EncodeTransaction(tx_template, DefaultTxProfile, wire, error))
++        return false;
++    Integer(NATIVE_PSBT_VERSION, 4, parsed.global[{0xfb}]);
++    Compact(tx_template.inputs.size(), parsed.global[{4}]);
++    Compact(tx_template.outputs.size(), parsed.global[{5}]);
++    parsed.global[NativePsbtKey(1)] = Bytes(chain_id.begin(), chain_id.end());
++    parsed.global[NativePsbtKey(2)] = std::move(wire);
++    parsed.inputs.resize(tx_template.inputs.size());
++    parsed.outputs.resize(tx_template.outputs.size());
++    NativePsbtData data;
++    if (!parsed.Inspect(data, error)) return false;
++    result = std::move(parsed);
++    return true;
++}
++
++bool NativePsbt::Merge(const NativePsbt &other, std::string &error) {
++    NativePsbtData left, right;
++    if (!Inspect(left, error) || !other.Inspect(right, error)) return false;
++    if (left.chain_id != right.chain_id ||
++        global.at(NativePsbtKey(2)) != other.global.at(NativePsbtKey(2))) {
++        return Fail(error, "different native PSBT chain or template");
++    }
++    NativePsbt merged = *this;
++    if (!MergeMap(merged.global, other.global, error)) return false;
++    for (size_t i = 0; i < inputs.size(); ++i) {
++        if (!MergeMap(merged.inputs[i], other.inputs[i], error)) return false;
++    }
++    for (size_t i = 0; i < outputs.size(); ++i) {
++        if (!MergeMap(merged.outputs[i], other.outputs[i], error)) return false;
++    }
++    if (!merged.Inspect(left, error)) return false;
++    *this = std::move(merged);
++    return true;
++}
++} // namespace lotus::v2
+diff --git a/src/lotus_v2/psbt.h b/src/lotus_v2/psbt.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..59f144ea040c2d1d72e394492c9f26617b86daf1
+--- /dev/null
++++ b/src/lotus_v2/psbt.h
+@@ -0,0 +1,81 @@
++// Copyright (c) 2026 The Lotus developers
++// Distributed under the MIT software license, see COPYING.
++#ifndef LOTUS_V2_PSBT_H
++#define LOTUS_V2_PSBT_H
++
++#include "psbt_map.h"
++#include "signing.h"
++#include "sparse_state.h"
++
++#include <compare>
++#include <map>
++#include <optional>
++#include <span>
++
++namespace lotus::v2 {
++
++constexpr uint32_t NATIVE_PSBT_VERSION = 0x4c560001;
++constexpr size_t MAX_NATIVE_PSBT_BYTES = 16777216;
++constexpr size_t MAX_NATIVE_PSBT_KEY_BYTES = 1024;
++constexpr size_t MAX_NATIVE_PSBT_VALUE_BYTES = 8388608;
++constexpr size_t MAX_NATIVE_PSBT_MAP_ENTRIES = 4096;
++
++using PsbtBytes = psbt_detail::Bytes;
++using PsbtMap = psbt_detail::Map;
++using PsbtArguments = std::vector<PsbtBytes>;
++
++struct PsbtSlot {
++    uint16_t witness{};
++    uint16_t argument{};
++    auto operator<=>(const PsbtSlot &) const = default;
++};
++
++struct PsbtSignRequest {
++    uint8_t scheme{};
++    uint8_t mode{};
++    PsbtBytes public_key;
++};
++
++struct NativePsbtInput {
++    std::optional<Coin> coin;
++    std::optional<CoinProof> proof;
++    std::map<uint16_t, PsbtArguments> arguments;
++    std::map<PsbtSlot, PsbtSignRequest> requests;
++    std::map<PsbtSlot, PsbtBytes> signatures;
++    std::map<uint16_t, PsbtArguments> final_arguments;
++};
++
++struct NativePsbtData {
++    ChainId chain_id{};
++    Transaction tx_template;
++    std::optional<Hash> utxo_root;
++    std::vector<NativePsbtInput> inputs;
++};
++
++// Maps remain lossless, including opaque proprietary fields. Every operation
++// validates them anew; callers cannot bypass schema checks through mutation.
++struct NativePsbt {
++    PsbtMap global;
++    std::vector<PsbtMap> inputs;
++    std::vector<PsbtMap> outputs;
++
++    bool Inspect(NativePsbtData &result, std::string &error) const;
++    bool Serialize(PsbtBytes &result, std::string &error) const;
++    bool Merge(const NativePsbt &other, std::string &error);
++};
++
++bool DecodeNativePsbt(std::span<const uint8_t> wire, NativePsbt &result,
++                      std::string &error);
++bool CreateNativePsbt(const Transaction &tx_template, const ChainId &chain_id,
++                      NativePsbt &result, std::string &error);
++
++// Keys/arguments use only the exact profile registry. These helpers do not
++// claim that supplied coins, roots, origins or policies are authenticated.
++PsbtBytes NativePsbtKey(uint64_t subtype,
++                        std::span<const uint8_t> keydata = {});
++PsbtBytes EncodePsbtArguments(const PsbtArguments &arguments);
++PsbtBytes EncodePsbtWitness(uint16_t witness);
++PsbtBytes EncodePsbtSlot(PsbtSlot slot);
++
++} // namespace lotus::v2
++#endif
+diff --git a/src/lotus_v2/psbt_map.h b/src/lotus_v2/psbt_map.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..1f70f760fffa4d64187f092b49a99157d5e34ead
+--- /dev/null
++++ b/src/lotus_v2/psbt_map.h
+@@ -0,0 +1,156 @@
++// Copyright (c) 2026 The Lotus developers
++// Distributed under the MIT software license, see COPYING.
++#ifndef LOTUS_V2_PSBT_MAP_H
++#define LOTUS_V2_PSBT_MAP_H
++
++#include <cstddef>
++#include <cstdint>
++#include <map>
++#include <span>
++#include <string>
++#include <utility>
++#include <vector>
++
++namespace lotus::v2::psbt_detail {
++
++using Bytes = std::vector<uint8_t>;
++using Map = std::map<Bytes, Bytes>;
++
++// BIP174 maps use canonical CompactSize lengths and byte-string keys. Keep
++// unknown keys and values opaque; decoding never normalizes their payloads.
++class Reader {
++    std::span<const uint8_t> bytes_;
++    size_t pos_{};
++
++public:
++    explicit Reader(std::span<const uint8_t> bytes) : bytes_(bytes) {}
++    size_t Remaining() const { return bytes_.size() - pos_; }
++    bool Empty() const { return Remaining() == 0; }
++
++    bool Integer(size_t width, uint64_t &value) {
++        if (width > 8 || width > Remaining()) return false;
++        value = 0;
++        for (size_t i = 0; i < width; ++i) {
++            value |= uint64_t(bytes_[pos_++]) << (8 * i);
++        }
++        return true;
++    }
++
++    bool Compact(uint64_t &value) {
++        uint64_t lead;
++        if (!Integer(1, lead)) return false;
++        if (lead < 253) {
++            value = lead;
++            return true;
++        }
++        const size_t width = lead == 253 ? 2 : lead == 254 ? 4 : 8;
++        return Integer(width, value) && (width == 2   ? value >= 253
++                                         : width == 4 ? value > 0xffff
++                                                      : value > 0xffffffff);
++    }
++
++    bool Blob(size_t count, Bytes &value) {
++        if (count > Remaining()) return false;
++        value.assign(bytes_.begin() + pos_, bytes_.begin() + pos_ + count);
++        pos_ += count;
++        return true;
++    }
++
++    bool Vector(size_t limit, Bytes &value) {
++        uint64_t count;
++        return Compact(count) && count <= limit && count <= Remaining() &&
++               Blob(static_cast<size_t>(count), value);
++    }
++
++    bool ReadMap(Map &result, size_t max_key, size_t max_value,
++                 size_t max_entries, std::string &error) {
++        Map parsed;
++        while (!Empty()) {
++            Bytes key;
++            if (!Vector(max_key, key)) {
++                error = "invalid PSBT key length";
++                return false;
++            }
++            if (key.empty()) {
++                result = std::move(parsed);
++                error.clear();
++                return true;
++            }
++            // A key's type itself is CompactSize, including unknown types.
++            Reader type_reader(key);
++            uint64_t type;
++            if (!type_reader.Compact(type)) {
++                error = "invalid PSBT key type";
++                return false;
++            }
++            Bytes value;
++            if (!Vector(max_value, value)) {
++                error = "invalid PSBT value length";
++                return false;
++            }
++            if (parsed.size() >= max_entries) {
++                error = "too many PSBT map entries";
++                return false;
++            }
++            if (!parsed.emplace(std::move(key), std::move(value)).second) {
++                error = "duplicate PSBT key";
++                return false;
++            }
++        }
++        error = "missing PSBT map separator";
++        return false;
++    }
++};
++
++inline void Integer(uint64_t value, size_t width, Bytes &result) {
++    for (size_t i = 0; i < width; ++i) {
++        result.push_back(uint8_t(value >> (8 * i)));
++    }
++}
++
++inline void Compact(uint64_t value, Bytes &result) {
++    if (value < 253) {
++        Integer(value, 1, result);
++    } else {
++        result.push_back(value <= 0xffff       ? 253
++                         : value <= 0xffffffff ? 254
++                                               : 255);
++        Integer(value,
++                value <= 0xffff       ? 2
++                : value <= 0xffffffff ? 4
++                                      : 8,
++                result);
++    }
++}
++
++inline void Vector(std::span<const uint8_t> bytes, Bytes &result) {
++    Compact(bytes.size(), result);
++    result.insert(result.end(), bytes.begin(), bytes.end());
++}
++
++inline void WriteMap(const Map &map, Bytes &result) {
++    for (const auto &[key, value] : map) {
++        Vector(key, result);
++        Vector(value, result);
++    }
++    result.push_back(0);
++}
++
++// Combiner conflicts are errors even for fields this implementation does not
++// understand. Stage into a copy so a failed combine cannot partially mutate.
++inline bool MergeMap(Map &target, const Map &source, std::string &error) {
++    Map merged = target;
++    for (const auto &[key, value] : source) {
++        auto [it, added] = merged.emplace(key, value);
++        if (!added && it->second != value) {
++            error = "conflicting PSBT map value";
++            return false;
++        }
++    }
++    target = std::move(merged);
++    error.clear();
++    return true;
++}
++
++} // namespace lotus::v2::psbt_detail
++#endif
+diff --git a/src/lotus_v2/psbt_test/check_vectors.py b/src/lotus_v2/psbt_test/check_vectors.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..0db99858ae842977701d20e7f36ca59b28f969db
+--- /dev/null
++++ b/src/lotus_v2/psbt_test/check_vectors.py
+@@ -0,0 +1,38 @@
++#!/usr/bin/env python3
++"""Check the C++ codec against independent specification schema fixtures.
++
++Vector provenance: lotus-v2 specification commits d8a3b859 and 6305e947, examples/
++psbt-profile-vectors.json. These shape-only fixtures do not authenticate
++coins or demonstrate valid signatures or VM execution.
++"""
++
++import json
++import subprocess
++import sys
++from pathlib import Path
++
++
++def main():
++    fixtures = json.loads(Path(__file__).with_name("profile_vectors.json").read_text())
++    total = 0
++    for kind in ("positive", "negative"):
++        for fixture in fixtures[kind]:
++            result = subprocess.run(
++                [sys.argv[1], "--roundtrip", fixture["hex"]],
++                capture_output=True,
++                text=True,
++                check=False,
++            )
++            if kind == "positive":
++                assert result.returncode == 0, (fixture["name"], result.stderr)
++                assert result.stdout.strip() == fixture.get(
++                    "canonical_hex", fixture["hex"]
++                ), fixture["name"]
++            else:
++                assert result.returncode != 0, fixture["name"]
++            total += 1
++    print(f"{total} independent native PSBT schema vectors passed")
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/src/lotus_v2/psbt_test/profile_vectors.json b/src/lotus_v2/psbt_test/profile_vectors.json
+new file mode 100644
+index 0000000000000000000000000000000000000000..6613d1e6c6e0c95a52150b697b1658fcf304e69b
+--- /dev/null
++++ b/src/lotus_v2/psbt_test/profile_vectors.json
+@@ -0,0 +1,162 @@
++{
++  "profile": "Lotus native PSBT 0x4c560001",
++  "scope": "Independent container/schema fixtures only; no signatures, VM or authenticated roots.",
++  "positive": [
++    {
++      "name": "incomplete-one-spend-zero-outputs",
++      "hex": "70736274ff010401010105010001fb040100564c0bfc086c6f7475732d76320120000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f0bfc086c6f7475732d7632023f07000000000000000000000001000000111111111111111111111111111111111111111111111111111111111111111100000000ffffffff010001015100000000"
++    },
++    {
++      "name": "unknown-vendor-and-noncritical-preserved",
++      "hex": "70736274ff010401010105010001fb040100564c0bfc086c6f7475732d76320120000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f0bfc086c6f7475732d7632023f07000000000000000000000001000000111111111111111111111111111111111111111111111111111111111111111100000000ffffffff01000101510000000bfc056f74686572016b6579066f70617175650bfc086c6f7475732d7632800666757475726500"
++    },
++    {
++      "name": "native-signing-slot-unfunded",
++      "hex": "70736274ff010401010105010001fb040100564c0bfc086c6f7475732d76320120000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f0bfc086c6f7475732d7632023f07000000000000000000000001000000111111111111111111111111111111111111111111111111111111111111111100000000ffffffff01000101510000000dfc086c6f7475732d76320200000201000ffc086c6f7475732d7632030000000022000079be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f8179800"
++    },
++    {
++      "name": "state-bearing-output",
++      "hex": "70736274ff010401010105010101fb040100564c0bfc086c6f7475732d76320120000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f0bfc086c6f7475732d7632028c07000000000000000000000001000100111111111111111111111111111111111111111111111111111111111111111100000000ffffffff0100010151000004e8030000000000003333333333333333333333333333333333333333333333333333333333333333012222222222222222222222222222222222222222222222222222222222222222010100000000"
++    },
++    {
++      "name": "token-and-state-output",
++      "hex": "70736274ff010401010105010101fb040100564c0bfc086c6f7475732d76320120000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f0bfc086c6f7475732d763202ac07000000000000000000000001000100111111111111111111111111111111111111111111111111111111111111111100000000ffffffff0100010151000005e80300000000000044444444444444444444444444444444444444444444444444444444444444443333333333333333333333333333333333333333333333333333333333333333012222222222222222222222222222222222222222222222222222222222222222010100000000"
++    },
++    {
++      "name": "full-coin-v2-metadata-framing",
++      "hex": "70736274ff010401010105010001fb040100564c0bfc086c6f7475732d76320120000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f0bfc086c6f7475732d7632023f07000000000000000000000001000000111111111111111111111111111111111111111111111111111111111111111100000000ffffffff01000101510000000bfc086c6f7475732d763201741111111111111111111111111111111111111111111111111111111111111111000000002d00e803000000000000012222222222222222222222222222222222222222222222222222222222222222010100000000000000000000000000000000000002000000000000000048010200000000000dfc086c6f7475732d76320200000201000ffc086c6f7475732d7632030000000022000079be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f8179800"
++    },
++    {
++      "name": "mode-zero-signature-shape-not-cryptographic",
++      "hex": "70736274ff010401010105010001fb040100564c0bfc086c6f7475732d76320120000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f0bfc086c6f7475732d7632023f07000000000000000000000001000000111111111111111111111111111111111111111111111111111111111111111100000000ffffffff01000101510000000bfc086c6f7475732d763201741111111111111111111111111111111111111111111111111111111111111111000000002d00e803000000000000012222222222222222222222222222222222222222222222222222222222222222010100000000000000000000000000000000000002000000000000000048010200000000000dfc086c6f7475732d76320200000201000ffc086c6f7475732d7632030000000022000079be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f817980ffc086c6f7475732d76320400000000400000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
++    },
++    {
++      "name": "single-leaf-proof-framing-only",
++      "hex": "70736274ff010401010105010001fb040100564c0bfc086c6f7475732d76320120000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f0bfc086c6f7475732d7632023f07000000000000000000000001000000111111111111111111111111111111111111111111111111111111111111111100000000ffffffff010001015100000bfc086c6f7475732d763203203333333333333333333333333333333333333333333333333333333333333333000bfc086c6f7475732d763201741111111111111111111111111111111111111111111111111111111111111111000000002d00e803000000000000012222222222222222222222222222222222222222222222222222222222222222010100000000000000000000000000000000000002000000000000000048010200000000000dfc086c6f7475732d76320200000201000ffc086c6f7475732d7632030000000022000079be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f817980bfc086c6f7475732d7632062100000000000000000000000000000000000000000000000000000000000000000000"
++    },
++    {
++      "name": "unordered-global-map",
++      "hex": "70736274ff0bfc086c6f7475732d7632023f07000000000000000000000001000000111111111111111111111111111111111111111111111111111111111111111100000000ffffffff010001015100000bfc086c6f7475732d76320120000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f01fb040100564c01050100010401010000",
++      "canonical_hex": "70736274ff010401010105010001fb040100564c0bfc086c6f7475732d76320120000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f0bfc086c6f7475732d7632023f07000000000000000000000001000000111111111111111111111111111111111111111111111111111111111111111100000000ffffffff010001015100000000"
++    }
++  ],
++  "negative": [
++    {
++      "name": "duplicate-global-version",
++      "hex": "70736274ff01fb040100564c010401010105010001fb040100564c0bfc086c6f7475732d76320120000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f0bfc086c6f7475732d7632023f07000000000000000000000001000000111111111111111111111111111111111111111111111111111111111111111100000000ffffffff010001015100000000"
++    },
++    {
++      "name": "nonminimal-key-length",
++      "hex": "70736274fffd0100fb040100564c00"
++    },
++    {
++      "name": "nonminimal-key-type",
++      "hex": "70736274ff03fdfb00040100564c00"
++    },
++    {
++      "name": "trailing-byte",
++      "hex": "70736274ff010401010105010001fb040100564c0bfc086c6f7475732d76320120000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f0bfc086c6f7475732d7632023f07000000000000000000000001000000111111111111111111111111111111111111111111111111111111111111111100000000ffffffff01000101510000000000"
++    },
++    {
++      "name": "truncated-final-map",
++      "hex": "70736274ff010401010105010001fb040100564c0bfc086c6f7475732d76320120000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f0bfc086c6f7475732d7632023f07000000000000000000000001000000111111111111111111111111111111111111111111111111111111111111111100000000ffffffff0100010151000000"
++    },
++    {
++      "name": "wrong-magic",
++      "hex": "7878787878010401010105010001fb040100564c0bfc086c6f7475732d76320120000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f0bfc086c6f7475732d7632023f07000000000000000000000001000000111111111111111111111111111111111111111111111111111111111111111100000000ffffffff010001015100000000"
++    },
++    {
++      "name": "bitcoin-version-two",
++      "hex": "70736274ff010401010105010001fb04020000000bfc086c6f7475732d76320120000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f0bfc086c6f7475732d7632023f07000000000000000000000001000000111111111111111111111111111111111111111111111111111111111111111100000000ffffffff010001015100000000"
++    },
++    {
++      "name": "mismatched-input-count",
++      "hex": "70736274ff010401020105010001fb040100564c0bfc086c6f7475732d76320120000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f0bfc086c6f7475732d7632023f07000000000000000000000001000000111111111111111111111111111111111111111111111111111111111111111100000000ffffffff010001015100000000"
++    },
++    {
++      "name": "nonminimal-count",
++      "hex": "70736274ff010403fd01000105010001fb040100564c0bfc086c6f7475732d76320120000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f0bfc086c6f7475732d7632023f07000000000000000000000001000000111111111111111111111111111111111111111111111111111111111111111100000000ffffffff010001015100000000"
++    },
++    {
++      "name": "short-chain-id",
++      "hex": "70736274ff010401010105010001fb040100564c0bfc086c6f7475732d7632011f000000000000000000000000000000000000000000000000000000000000000bfc086c6f7475732d7632023f07000000000000000000000001000000111111111111111111111111111111111111111111111111111111111111111100000000ffffffff010001015100000000"
++    },
++    {
++      "name": "forbidden-unsigned-tx",
++      "hex": "70736274ff01003f07000000000000000000000001000000111111111111111111111111111111111111111111111111111111111111111100000000ffffffff01000101510000010401010105010001fb040100564c0bfc086c6f7475732d76320120000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f0bfc086c6f7475732d7632023f07000000000000000000000001000000111111111111111111111111111111111111111111111111111111111111111100000000ffffffff010001015100000000"
++    },
++    {
++      "name": "unknown-critical-subtype",
++      "hex": "70736274ff010401010105010001fb040100564c0bfc086c6f7475732d76320120000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f0bfc086c6f7475732d7632023f07000000000000000000000001000000111111111111111111111111111111111111111111111111111111111111111100000000ffffffff010001015100000bfc086c6f7475732d76327f000000"
++    },
++    {
++      "name": "forbidden-legacy-utxo",
++      "hex": "70736274ff010401010105010001fb040100564c0bfc086c6f7475732d76320120000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f0bfc086c6f7475732d7632023f07000000000000000000000001000000111111111111111111111111111111111111111111111111111111111111111100000000ffffffff010001015100000001000000"
++    },
++    {
++      "name": "out-of-range-witness",
++      "hex": "70736274ff010401010105010001fb040100564c0bfc086c6f7475732d76320120000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f0bfc086c6f7475732d7632023f07000000000000000000000001000000111111111111111111111111111111111111111111111111111111111111111100000000ffffffff01000101510000000dfc086c6f7475732d7632020100010000"
++    },
++    {
++      "name": "orphan-signature",
++      "hex": "70736274ff010401010105010001fb040100564c0bfc086c6f7475732d76320120000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f0bfc086c6f7475732d7632023f07000000000000000000000001000000111111111111111111111111111111111111111111111111111111111111111100000000ffffffff01000101510000000ffc086c6f7475732d76320400000000400000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
++    },
++    {
++      "name": "short-signature",
++      "hex": "70736274ff010401010105010001fb040100564c0bfc086c6f7475732d76320120000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f0bfc086c6f7475732d7632023f07000000000000000000000001000000111111111111111111111111111111111111111111111111111111111111111100000000ffffffff01000101510000000bfc086c6f7475732d763201741111111111111111111111111111111111111111111111111111111111111111000000002d00e803000000000000012222222222222222222222222222222222222222222222222222222222222222010100000000000000000000000000000000000002000000000000000048010200000000000dfc086c6f7475732d76320200000201000ffc086c6f7475732d7632030000000022000079be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f817980ffc086c6f7475732d763204000000003f00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
++    },
++    {
++      "name": "explicit-zero-mode",
++      "hex": "70736274ff010401010105010001fb040100564c0bfc086c6f7475732d76320120000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f0bfc086c6f7475732d7632023f07000000000000000000000001000000111111111111111111111111111111111111111111111111111111111111111100000000ffffffff01000101510000000bfc086c6f7475732d763201741111111111111111111111111111111111111111111111111111111111111111000000002d00e803000000000000012222222222222222222222222222222222222222222222222222222222222222010100000000000000000000000000000000000002000000000000000048010200000000000dfc086c6f7475732d76320200000201000ffc086c6f7475732d7632030000000022000079be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f817980ffc086c6f7475732d7632040000000041000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
++    },
++    {
++      "name": "nonempty-signature-slot",
++      "hex": "70736274ff010401010105010001fb040100564c0bfc086c6f7475732d76320120000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f0bfc086c6f7475732d7632023f07000000000000000000000001000000111111111111111111111111111111111111111111111111111111111111111100000000ffffffff01000101510000000dfc086c6f7475732d7632020000030101780ffc086c6f7475732d7632030000000022000079be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f8179800"
++    },
++    {
++      "name": "coin-outpoint-mismatch",
++      "hex": "70736274ff010401010105010001fb040100564c0bfc086c6f7475732d76320120000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f0bfc086c6f7475732d7632023f07000000000000000000000001000000111111111111111111111111111111111111111111111111111111111111111100000000ffffffff01000101510000000bfc086c6f7475732d763201741211111111111111111111111111111111111111111111111111111111111111000000002d00e8030000000000000122222222222222222222222222222222222222222222222222222222222222220101000000000000000000000000000000000000020000000000000000480102000000000000"
++    },
++    {
++      "name": "coin-provenance-truncated",
++      "hex": "70736274ff010401010105010001fb040100564c0bfc086c6f7475732d76320120000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f0bfc086c6f7475732d7632023f07000000000000000000000001000000111111111111111111111111111111111111111111111111111111111111111100000000ffffffff01000101510000000bfc086c6f7475732d763201731111111111111111111111111111111111111111111111111111111111111111000000002d00e80300000000000001222222222222222222222222222222222222222222222222222222222222222201010000000000000000000000000000000000000200000000000000004801020000000000"
++    },
++    {
++      "name": "proof-root-missing",
++      "hex": "70736274ff010401010105010001fb040100564c0bfc086c6f7475732d76320120000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f0bfc086c6f7475732d7632023f07000000000000000000000001000000111111111111111111111111111111111111111111111111111111111111111100000000ffffffff01000101510000000bfc086c6f7475732d763201741111111111111111111111111111111111111111111111111111111111111111000000002d00e803000000000000012222222222222222222222222222222222222222222222222222222222222222010100000000000000000000000000000000000002000000000000000048010200000000000dfc086c6f7475732d76320200000201000ffc086c6f7475732d7632030000000022000079be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f817980bfc086c6f7475732d7632062100000000000000000000000000000000000000000000000000000000000000000000"
++    },
++    {
++      "name": "proof-popcount-mismatch",
++      "hex": "70736274ff010401010105010001fb040100564c0bfc086c6f7475732d76320120000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f0bfc086c6f7475732d7632023f07000000000000000000000001000000111111111111111111111111111111111111111111111111111111111111111100000000ffffffff010001015100000bfc086c6f7475732d763203203333333333333333333333333333333333333333333333333333333333333333000bfc086c6f7475732d763201741111111111111111111111111111111111111111111111111111111111111111000000002d00e803000000000000012222222222222222222222222222222222222222222222222222222222222222010100000000000000000000000000000000000002000000000000000048010200000000000bfc086c6f7475732d76320641000000000000000000000000000000000000000000000000000000000000000001000000000000000000000000000000000000000000000000000000000000000000"
++    },
++    {
++      "name": "proof-coin-missing",
++      "hex": "70736274ff010401010105010001fb040100564c0bfc086c6f7475732d76320120000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f0bfc086c6f7475732d7632023f07000000000000000000000001000000111111111111111111111111111111111111111111111111111111111111111100000000ffffffff010001015100000bfc086c6f7475732d763203203333333333333333333333333333333333333333333333333333333333333333000bfc086c6f7475732d7632062100000000000000000000000000000000000000000000000000000000000000000000"
++    },
++    {
++      "name": "nonminimal-proprietary-subtype",
++      "hex": "70736274ff010401010105010001fb040100564c0bfc086c6f7475732d76320120000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f0bfc086c6f7475732d7632023f07000000000000000000000001000000111111111111111111111111111111111111111111111111111111111111111100000000ffffffff01000101510000000dfc086c6f7475732d7632fd80000000"
++    },
++    {
++      "name": "oversized-key",
++      "hex": "70736274ff010401010105010001fb040100564c0bfc086c6f7475732d76320120000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f0bfc086c6f7475732d7632023f07000000000000000000000001000000111111111111111111111111111111111111111111111111111111111111111100000000ffffffff0100010151000000fd0804fc056f7468657201000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
++    },
++    {
++      "name": "mint-unsupported",
++      "hex": "70736274ff010401010105010001fb040100564c0bfc086c6f7475732d76320120000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f0bfc086c6f7475732d7632023f07000000000000000000000001000000111111111111111111111111111111111111111111111111111111111111111100000000ffffffff030001015100000000"
++    },
++    {
++      "name": "coinbase-unsupported",
++      "hex": "70736274ff010401010105010001fb040100564c0bfc086c6f7475732d76320120000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f0bfc086c6f7475732d7632023f07000000000000000000000001000000111111111111111111111111111111111111111111111111111111111111111100000000ffffffff020001015100000000"
++    },
++    {
++      "name": "nonempty-template-arguments",
++      "hex": "70736274ff010401010105010001fb040100564c0bfc086c6f7475732d76320120000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f0bfc086c6f7475732d7632023f07000000000000000000000001000000111111111111111111111111111111111111111111111111111111111111111100000000ffffffff010001015100010000"
++    }
++  ],
++  "merge": {
++    "left_hex": "70736274ff010401010105010001fb040100564c0bfc086c6f7475732d76320120000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f0bfc086c6f7475732d7632023f07000000000000000000000001000000111111111111111111111111111111111111111111111111111111111111111100000000ffffffff01000101510000000bfc056f74686572016b6579016100",
++    "right_hex": "70736274ff010401010105010001fb040100564c0bfc086c6f7475732d76320120000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f0bfc086c6f7475732d7632023f07000000000000000000000001000000111111111111111111111111111111111111111111111111111111111111111100000000ffffffff01000101510000000bfc056f74686572016b6579016200",
++    "expected": "key conflict"
++  }
++}
+diff --git a/src/lotus_v2/test_psbt.cpp b/src/lotus_v2/test_psbt.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..ffe2d5ed0155a7fa95c8a15b71ac22a575d5bb21
+--- /dev/null
++++ b/src/lotus_v2/test_psbt.cpp
+@@ -0,0 +1,226 @@
++// Copyright (c) 2026 The Lotus developers
++// Distributed under the MIT software license, see COPYING.
++#include "commitment.h"
++#include "psbt.h"
++
++#include <iostream>
++#include <stdexcept>
++
++#define CHECK(condition)                                                       \
++    do {                                                                       \
++        if (!(condition))                                                      \
++            throw std::runtime_error("check failed: " #condition);             \
++    } while (false)
++
++namespace {
++using namespace lotus::v2::psbt_detail;
++using namespace lotus::v2;
++
++Bytes Hex(const std::string &value) {
++    auto digit = [](char c) -> uint8_t {
++        if (c >= '0' && c <= '9') return c - '0';
++        if (c >= 'a' && c <= 'f') return c - 'a' + 10;
++        throw std::runtime_error("invalid hex");
++    };
++    CHECK(value.size() % 2 == 0);
++    Bytes result;
++    for (size_t i = 0; i < value.size(); i += 2) {
++        result.push_back(uint8_t(digit(value[i]) * 16 + digit(value[i + 1])));
++    }
++    return result;
++}
++
++std::string HexStr(const Bytes &value) {
++    constexpr char alphabet[] = "0123456789abcdef";
++    std::string result;
++    for (auto byte : value) {
++        result.push_back(alphabet[byte >> 4]);
++        result.push_back(alphabet[byte & 15]);
++    }
++    return result;
++}
++
++void Maps() {
++    const Map original{{{0x01}, {0, 1, 0xff}},
++                       {{0xfd, 0xfd, 0}, {0x80, 0}},
++                       {{0xfc, 1, 'x', 1, 0}, {}}};
++    Bytes wire;
++    WriteMap(original, wire);
++    Reader reader(wire);
++    Map decoded;
++    std::string error = "stale";
++    CHECK(reader.ReadMap(decoded, 1024, 8192, 4096, error));
++    CHECK(reader.Empty() && error.empty() && decoded == original);
++    Bytes encoded;
++    WriteMap(decoded, encoded);
++    CHECK(encoded == wire);
++
++    auto reject = [&](const Bytes &bad, size_t keys = 1024,
++                      size_t values = 8192, size_t entries = 4096) {
++        const Map saved = decoded;
++        Reader invalid(bad);
++        CHECK(!invalid.ReadMap(decoded, keys, values, entries, error));
++        CHECK(!error.empty() && decoded == saved);
++    };
++    reject({1, 1, 0, 1, 1, 0, 0}); // Duplicate key, including empty value.
++    reject({0xfd, 1, 0, 1, 0, 0}); // Noncanonical key length.
++    reject({1, 1, 0xfd, 0, 0, 0}); // Noncanonical value length.
++    reject({3, 0xfd, 1, 0, 0, 0}); // Noncanonical key type.
++    reject({1, 1, 0});             // No map separator.
++    reject({1, 1, 3, 1, 2});       // Truncated value.
++    reject({0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff});
++    reject(wire, 1);
++    reject(wire, 1024, 1);
++    reject(wire, 1024, 8192, 1);
++
++    Map merged = original;
++    CHECK(MergeMap(merged, original, error));
++    CHECK(merged == original && error.empty());
++    CHECK(MergeMap(merged, Map{{{2}, {3}}}, error));
++    const Map saved = merged;
++    CHECK(!MergeMap(merged, Map{{{0}, {}}, {{1}, {9}}}, error));
++    CHECK(merged == saved && !error.empty());
++}
++
++struct Fixture {
++    Bytes pubkey =
++        Hex("f9308a019258c31049344f85f89d5229b531c845836f99b08601f113bce036f9");
++    Transaction tx;
++    Coin coin;
++    ChainId chain{};
++    NativePsbt psbt;
++
++    Fixture() {
++        auto script = pubkey;
++        script.insert(script.begin(), 32);
++        script.push_back(0xbb);
++        Input input;
++        input.prev_txid.fill(0x11);
++        input.sequence = 0xffffffff;
++        input.flags = 1;
++        input.witnesses.push_back({script, {}, {}});
++        tx.inputs.push_back(input);
++        Output output;
++        output.value = 90000;
++        output.branches = {BranchLeaf(script)};
++        output.paths = {{0}};
++        tx.outputs.push_back(output);
++        coin.outpoint = {input.prev_txid, 0};
++        coin.output = output;
++        coin.output.value = 100000;
++        coin.creation_height = 1;
++        coin.creation_parent_mtp = 1000;
++        coin.fee_per_output = 100;
++        chain.fill(0x42);
++        std::string error;
++        CHECK(CreateNativePsbt(tx, chain, psbt, error));
++    }
++
++    void Fund() {
++        CHECK(EncodeCoin(coin, psbt.inputs[0][NativePsbtKey(1)]));
++        psbt.inputs[0][NativePsbtKey(2, EncodePsbtWitness(0))] =
++            EncodePsbtArguments({{}});
++        Bytes request{0, 0};
++        request.insert(request.end(), pubkey.begin(), pubkey.end());
++        psbt.inputs[0][NativePsbtKey(3, EncodePsbtSlot({0, 0}))] = request;
++    }
++};
++
++void Codec() {
++    Fixture fixture;
++    fixture.Fund();
++    std::string error;
++    NativePsbtData data;
++    CHECK(fixture.psbt.Inspect(data, error));
++    CHECK(data.inputs[0].coin->creation_parent_mtp == 1000);
++    CHECK(data.inputs[0].coin->fee_per_output == 100);
++    CHECK(data.inputs[0].coin->expiration_height ==
++          ComputeUtxoExpirationHeight(fixture.coin));
++    const Bytes opaque_key{0xfc, 1, 'x', 1, 2};
++    fixture.psbt.global[opaque_key] = {0, 0xff, 3};
++    fixture.psbt.inputs[0][NativePsbtKey(0x80)] = {0xff, 0};
++    Bytes wire;
++    CHECK(fixture.psbt.Serialize(wire, error));
++    NativePsbt decoded;
++    CHECK(DecodeNativePsbt(wire, decoded, error));
++    Bytes again;
++    CHECK(decoded.Serialize(again, error) && again == wire);
++    CHECK(decoded.global.at(opaque_key) == Bytes({0, 0xff, 3}));
++
++    auto reject = [&](NativePsbt bad) {
++        CHECK(!bad.Inspect(data, error));
++        CHECK(!error.empty());
++    };
++    auto bad = fixture.psbt;
++    bad.global[{0}] = {};
++    reject(bad);
++    bad = fixture.psbt;
++    bad.global[NativePsbtKey(0x7f)] = {};
++    reject(bad);
++    bad = fixture.psbt;
++    bad.inputs[0][NativePsbtKey(2, EncodePsbtWitness(1))] = {0};
++    reject(bad);
++    bad = fixture.psbt;
++    bad.inputs[0][NativePsbtKey(2, EncodePsbtWitness(0))] =
++        EncodePsbtArguments({{1}});
++    reject(bad);
++    bad = fixture.psbt;
++    auto wrong_coin = fixture.coin;
++    wrong_coin.outpoint.index = 1;
++    CHECK(EncodeCoin(wrong_coin, bad.inputs[0][NativePsbtKey(1)]));
++    reject(bad);
++    bad = fixture.psbt;
++    bad.global[{4}] = {0xfd, 1, 0};
++    reject(bad);
++    bad = fixture.psbt;
++    bad.inputs[0][NativePsbtKey(4, EncodePsbtSlot({0, 0}))] = Bytes(65);
++    reject(bad); // Explicit zero appended mode is not canonical.
++    bad = fixture.psbt;
++    bad.outputs[0][{1}] = {};
++    reject(bad);
++
++    auto nonempty = fixture.tx;
++    nonempty.inputs[0].witnesses[0].arguments = {{1}};
++    CHECK(!CreateNativePsbt(nonempty, fixture.chain, decoded, error));
++    auto coinbase = fixture.tx;
++    coinbase.inputs[0].flags = 2;
++    CHECK(!CreateNativePsbt(coinbase, fixture.chain, decoded, error));
++
++    auto conflict = fixture.psbt;
++    conflict.global[opaque_key] = {4};
++    const auto original = fixture.psbt.global;
++    CHECK(!fixture.psbt.Merge(conflict, error));
++    CHECK(fixture.psbt.global == original);
++    conflict = fixture.psbt;
++    conflict.global[NativePsbtKey(1)][0] ^= 1;
++    CHECK(!fixture.psbt.Merge(conflict, error));
++    conflict = fixture.psbt;
++    conflict.inputs[0][NativePsbtKey(0x81)] = {4};
++    CHECK(fixture.psbt.Merge(conflict, error));
++    CHECK(fixture.psbt.inputs[0].contains(NativePsbtKey(0x81)));
++
++    wire.push_back(0);
++    CHECK(!DecodeNativePsbt(wire, decoded, error));
++}
++} // namespace
++
++int main(int argc, char **argv) {
++    try {
++        if (argc == 3 && std::string(argv[1]) == "--roundtrip") {
++            NativePsbt psbt;
++            Bytes wire;
++            std::string error;
++            if (!DecodeNativePsbt(Hex(argv[2]), psbt, error) ||
++                !psbt.Serialize(wire, error))
++                throw std::runtime_error(error);
++            std::cout << HexStr(wire) << '\n';
++            return 0;
++        }
++        Maps();
++        Codec();
++        std::cout << "Lotus V2 PSBT tests passed\n";
++    } catch (const std::exception &error) {
++        std::cerr << error.what() << '\n';
++        return 1;
++    }
++}
+-- 
+2.50.1 (Apple Git-155)
+

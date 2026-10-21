@@ -1,0 +1,185 @@
+From d22f6957c451caafc3c9aee4f46dab926c6a95e9 Mon Sep 17 00:00:00 2001
+From: Shammah Chancellor <shammah.chancellor@notvalid.com>
+Date: Mon, 19 Oct 2026 16:42:27 -0700
+Subject: [PATCH] validation: fence secondary queues for broadcast callers that
+ wait
+
+BroadcastTransaction(wait_callback=true) waited only for the main
+validation queue. Subscribers that move work to their own worker
+(Chronik today, the wallet next) could still be behind when it returned.
+sendrawtransaction covered this with an extra
+SyncWithValidationInterfaceQueue(); submitpackage, the Qt wallet and any
+other caller did not.
+
+Add ValidationSignals::SyncSecondaryQueues(), which waits for every
+subscriber's SyncTransactionQueue(). SyncWithValidationInterfaceQueue()
+and FlushBackgroundCallbacks() use it instead of their inline loops,
+with the same behaviour. BroadcastTransaction calls it after its
+main-queue promise resolves, outside cs_main.
+
+Tier: eCash
+---
+ src/node/transaction.cpp               |  3 ++
+ src/node/transaction.h                 |  7 ++--
+ src/test/validationinterface_tests.cpp | 49 ++++++++++++++++++++++++++
+ src/validationinterface.cpp            |  9 +++--
+ src/validationinterface.h              |  8 +++++
+ 5 files changed, 70 insertions(+), 6 deletions(-)
+
+diff --git a/src/node/transaction.cpp b/src/node/transaction.cpp
+index f81c04d81b87aeeba3d7e79d10b317044eabf5bb..65d0370b16aeab17a13c762e0b85a6c53d7045af 100644
+--- a/src/node/transaction.cpp
++++ b/src/node/transaction.cpp
+@@ -110,6 +110,9 @@ TransactionError BroadcastTransaction(const NodeContext &node,
+         // Wait until Validation Interface clients have been notified of the
+         // transaction entering the mempool.
+         promise.get_future().wait();
++        // Subscribers that deliver on their own worker (the wallet, Chronik)
++        // received the event from the main queue; wait for them too.
++        node.validation_signals->SyncSecondaryQueues();
+     }
+ 
+     if (relay) {
+diff --git a/src/node/transaction.h b/src/node/transaction.h
+index a61c13ff41b0d521ba330257aebd881b370c8937..24d1bfd8616ebc938fe58186560f92fdf31ed095 100644
+--- a/src/node/transaction.h
++++ b/src/node/transaction.h
+@@ -40,7 +40,8 @@ static const CFeeRate DEFAULT_MAX_RAW_TX_FEE_RATE{COIN / 10};
+  * over the CValidationInterface) or asynchronous (will submit and not wait for
+  * notification), depending on the value of wait_callback. wait_callback MUST
+  * NOT be set while cs_main, cs_mempool or cs_wallet are held to avoid
+- * deadlock.
++ * deadlock: the wait covers subscribers' worker queues (the wallet notification
++ * worker needs cs_wallet).
+  *
+  * @param[in]  node reference to node context
+  * @param[in]  tx the transaction to broadcast
+@@ -49,8 +50,8 @@ static const CFeeRate DEFAULT_MAX_RAW_TX_FEE_RATE{COIN / 10};
+  * @param[in]  max_tx_fee reject txs with fees higher than this (if 0, accept
+  * any fee)
+  * @param[in]  relay flag if both mempool insertion and p2p relay are requested
+- * @param[in]  wait_callback wait until callbacks have been processed to avoid
+- * stale result due to a sequentially RPC.
++ * @param[in]  wait_callback wait until callbacks, and their secondary worker
++ * queues, have been processed to avoid stale result due to a sequentially RPC.
+  * @return error
+  */
+ [[nodiscard]] TransactionError
+diff --git a/src/test/validationinterface_tests.cpp b/src/test/validationinterface_tests.cpp
+index bb4cb234ac4439c40e8fa05e8453bfddc0e4d2c1..3bee4515f7119d6a49cf1d2b6c71c5e998d0616a 100644
+--- a/src/test/validationinterface_tests.cpp
++++ b/src/test/validationinterface_tests.cpp
+@@ -4,8 +4,10 @@
+ 
+ #include <avalanche/processor.h>
+ #include <consensus/validation.h>
++#include <node/transaction.h>
+ #include <primitives/block.h>
+ #include <scheduler.h>
++#include <script/standard.h>
+ #include <util/check.h>
+ #include <validation.h>
+ #include <validationinterface.h>
+@@ -972,6 +974,53 @@ BOOST_AUTO_TEST_CASE(bounded_worker_block_policy_names_its_thread) {
+     queue.Stop();
+ }
+ 
++/** Forwards mempool additions to its own worker queue, which a test holds. */
++struct MempoolSecondaryQueueSubscriber final : public CValidationInterface {
++    std::promise<void> release_indexing;
++    std::shared_future<void> release{release_indexing.get_future().share()};
++    std::atomic<bool> indexed{false};
++    BoundedTaskQueue queue{1 << 20, 1024, [] {}};
++
++    using CValidationInterface::TransactionAddedToMempool;
++    void TransactionAddedToMempool(const CTransactionRef &,
++                                   std::shared_ptr<const std::vector<Coin>>,
++                                   uint64_t) override {
++        queue.Enqueue(1, [this] {
++            release.wait();
++            indexed = true;
++        });
++    }
++    void SyncTransactionQueue() override { queue.Sync(); }
++};
++
++BOOST_FIXTURE_TEST_CASE(broadcast_wait_fences_secondary_queue,
++                        TestChain100Setup) {
++    using namespace std::chrono_literals;
++    auto subscriber = std::make_shared<MempoolSecondaryQueueSubscriber>();
++    m_node.validation_signals->RegisterSharedValidationInterface(subscriber);
++    const auto spend = MakeTransactionRef(CreateValidMempoolTransaction(
++        m_coinbase_txns[0], 0, 1, coinbaseKey,
++        GetScriptForRawPubKey(coinbaseKey.GetPubKey()),
++        m_coinbase_txns[0]->vout[0].nValue - 2000 * SATOSHI,
++        /*submit=*/false));
++    auto broadcast = std::async(std::launch::async, [&] {
++        std::string err;
++        return node::BroadcastTransaction(m_node, spend, err, Amount::zero(),
++                                          /*relay=*/false,
++                                          /*wait_callback=*/true);
++    });
++    // The main queue drains at once; the held worker queue does not.
++    const bool waited =
++        broadcast.wait_for(100ms) == std::future_status::timeout;
++    subscriber->release_indexing.set_value();
++    BOOST_CHECK(waited);
++    BOOST_REQUIRE(broadcast.wait_for(60s) == std::future_status::ready);
++    BOOST_CHECK(broadcast.get() == node::TransactionError::OK);
++    // Returned only after the worker had applied the event.
++    BOOST_CHECK(subscriber->indexed);
++    m_node.validation_signals->UnregisterSharedValidationInterface(subscriber);
++}
++
+ BOOST_AUTO_TEST_CASE(queued_payload_charges_retained_shared_ownership) {
+     auto tx = MakeTransactionRef();
+     const size_t control = sizeof(memusage::stl_shared_counter);
+diff --git a/src/validationinterface.cpp b/src/validationinterface.cpp
+index d4c5553a2e54142f9a15d4c78bde7e1fc3cc7aed..5f8097b7d22659b00e1219b59429cbc20f5d1198 100644
+--- a/src/validationinterface.cpp
++++ b/src/validationinterface.cpp
+@@ -112,6 +112,11 @@ ValidationSignals::~ValidationSignals() = default;
+ 
+ void ValidationSignals::FlushBackgroundCallbacks() {
+     m_internals->m_task_runner->flush();
++    SyncSecondaryQueues();
++}
++
++void ValidationSignals::SyncSecondaryQueues() {
++    AssertLockNotHeld(cs_main);
+     m_internals->Iterate([](CValidationInterface &callbacks) {
+         callbacks.SyncTransactionQueue();
+     });
+@@ -161,9 +166,7 @@ void ValidationSignals::SyncWithValidationInterfaceQueue() {
+     std::promise<void> promise;
+     CallFunctionInValidationInterfaceQueue([&promise] { promise.set_value(); });
+     promise.get_future().wait();
+-    m_internals->Iterate([](CValidationInterface &callbacks) {
+-        callbacks.SyncTransactionQueue();
+-    });
++    SyncSecondaryQueues();
+ }
+ 
+ // Use a macro instead of a function for conditional logging to prevent
+diff --git a/src/validationinterface.h b/src/validationinterface.h
+index f29ba603c906f42a43e2a78a037a53d9274401ed..7e8a3ace9219a539a9e7db200ad57c931c22017c 100644
+--- a/src/validationinterface.h
++++ b/src/validationinterface.h
+@@ -244,6 +244,14 @@ public:
+      */
+     void SyncWithValidationInterfaceQueue() LOCKS_EXCLUDED(cs_main);
+ 
++    /**
++     * Wait for the work that subscribers have already moved from the main
++     * queue to their own worker queues (SyncTransactionQueue()). Callers that
++     * have already drained the main queue use it to also cover subscribers
++     * that do not run on the scheduler thread.
++     */
++    void SyncSecondaryQueues() LOCKS_EXCLUDED(cs_main);
++
+     void UpdatedBlockTip(const CBlockIndex *, const CBlockIndex *,
+                          bool fInitialDownload);
+     void TransactionAddedToMempool(const CTransactionRef &,
+-- 
+2.50.1 (Apple Git-155)
+

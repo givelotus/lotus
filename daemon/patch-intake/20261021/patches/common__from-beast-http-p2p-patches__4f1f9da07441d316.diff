@@ -1,0 +1,177 @@
+diff --git a/doc/logging-async.md b/doc/logging-async.md
+index 59c678e00c..4e23a86f25 100644
+--- a/doc/logging-async.md
++++ b/doc/logging-async.md
+@@ -10,7 +10,8 @@ have different allocation costs from the warmed structured producer path.
+ When a ring is full, debug/info records are discarded and counted. The logger
+ reports the count and `/metrics` exposes `lotus_log_dropped_lines_total`.
+ Warnings/errors use backpressure rather than being discarded because of a
+-full ring. This is not a configurable blocking mode.
++full ring. With an active worker, producers wait for the consumer rather than
++rendering or acquiring its mutex. This is not a configurable blocking mode.
+ 
+ A callback runs on the consumer and cannot wait for its own ring to drain.
+ Each ring therefore reserves one extra 512-byte record for a severe reentrant
+@@ -23,9 +24,12 @@ rare and may perform rendering/I/O on a thread already acting as the consumer.
+ 
+ Source-site byte quotas remain separate from ring overflow. They can suppress
+ file output intentionally and do not increment the ring-drop counter. Error
+-logging and explicit Flush drain queued records; tests that change options or
+-callbacks must Flush first because those changes apply when records are
+-written, rather than when they are queued.
++logging requests a consumer pass that starts after the record was
++published and waits for an atomic acknowledgment after its stdio flush. This
++also covers other rings registered before the request, not just the error
++record itself. Explicit Flush, or a deliberately paused/stopped worker, may
++render on the calling thread. Tests changing options or callbacks must Flush
++first: those changes apply when records are written, not when queued.
+ 
+ At the inherited capacity of 1,024 records, slot storage is 512 KiB per
+ prepared thread, plus the reserved record and metadata. Slots are not zeroed
+diff --git a/src/logging.cpp b/src/logging.cpp
+index ea51d1997e..d07f19db8a 100644
+--- a/src/logging.cpp
++++ b/src/logging.cpp
+@@ -701,6 +701,15 @@ void BCLog::Logger::LogPrintMovedStr(std::string &&str,
+ }
+ 
+ BCLog::LogRecord *BCLog::Logger::ClaimSlow(LogRing &ring) {
++    // Ordinary severe backpressure leaves rendering on the consumer. The
++    // paused/stopped fallback below is for explicit test/shutdown operation.
++    while (!t_in_consumer && m_thread_running && !m_paused_for_testing) {
++        if (LogRecord * rec{ring.Claim()}) return rec;
++        m_wake = true;
++        m_wake_cv.notify_one();
++        std::this_thread::sleep_for(std::chrono::microseconds{50});
++    }
++
+     // Warnings and errors are never dropped: wait for the logger thread
+     // (or write the queue ourselves) until a slot is free. Only a thread
+     // writing records itself (logging from a print callback) cannot wait.
+@@ -720,6 +729,25 @@ BCLog::LogRecord *BCLog::Logger::ClaimSlow(LogRing &ring) {
+     return nullptr;
+ }
+ 
++void BCLog::Logger::FlushOnConsumer() {
++    if (t_in_consumer) return;
++    if (!m_thread_running || m_paused_for_testing) {
++        Flush();
++        return;
++    }
++    const uint64_t requested{
++        m_flush_requested.fetch_add(1, std::memory_order_acq_rel) + 1};
++    while (m_flush_completed.load(std::memory_order_acquire) < requested) {
++        if (!m_thread_running || m_paused_for_testing) {
++            Flush();
++            return;
++        }
++        m_wake = true;
++        m_wake_cv.notify_one();
++        std::this_thread::sleep_for(std::chrono::microseconds{50});
++    }
++}
++
+ void BCLog::Logger::WriteEmergency(LogRecord &rec) NO_THREAD_SAFETY_ANALYSIS {
+     // A print callback already holds the consumer and callback locks. It
+     // cannot drain its own full ring or call itself again. Keep the outer
+@@ -853,9 +881,9 @@ void BCLog::Logger::Enqueue(std::string_view str, std::string *owned,
+     }
+ 
+     if (level >= Level::Error) {
+-        // Errors often precede an abort: write them (and everything queued
+-        // before them) through, so that crash logs are complete.
+-        Flush();
++        // Errors often precede abort. Wait for a consumer pass that starts
++        // after this publication and completes its stdio flush.
++        FlushOnConsumer();
+     }
+ }
+ 
+@@ -1201,6 +1229,8 @@ BCLog::EventBuilder::PutRef(FieldId id, std::shared_ptr<const void> object,
+ }
+ 
+ bool BCLog::Logger::DrainLocked() {
++    const uint64_t flush_requested{
++        m_flush_requested.load(std::memory_order_acquire)};
+     t_in_consumer = true;
+     ReopenIfRequested();
+     {
+@@ -1301,6 +1331,7 @@ bool BCLog::Logger::DrainLocked() {
+             fflush(stdout);
+         }
+     }
++    m_flush_completed.store(flush_requested, std::memory_order_release);
+     t_in_consumer = false;
+     return wrote;
+ }
+diff --git a/src/logging.h b/src/logging.h
+index 46047ba2f3..445d87d7ab 100644
+--- a/src/logging.h
++++ b/src/logging.h
+@@ -501,6 +501,10 @@ private:
+     std::atomic<bool> m_thread_running{false};
+     //! A wake-up of the logger thread is pending (rings filling up)
+     std::atomic<bool> m_wake_requested{false};
++    //! Errors request a pass that starts after publication; the consumer
++    //! acknowledges it only after all captured sinks have been flushed.
++    std::atomic<uint64_t> m_flush_requested{0};
++    std::atomic<uint64_t> m_flush_completed{0};
+     //! Tests: the logger thread stops writing (Flush and full rings still
+     //! do)
+     std::atomic<bool> m_paused_for_testing{false};
+@@ -519,6 +523,10 @@ private:
+     LogRecord *ClaimSlow(LogRing &ring)
+         EXCLUSIVE_LOCKS_REQUIRED(!m_consumer_mutex, !m_cs, !m_rings_mutex,
+                                  !m_wake_mutex);
++    /** Error path: wait for the consumer to flush, without rendering here. */
++    void FlushOnConsumer()
++        EXCLUSIVE_LOCKS_REQUIRED(!m_consumer_mutex, !m_cs, !m_rings_mutex,
++                                 !m_wake_mutex);
+     /** Consumer reentrancy only: write severe overflow without callbacks. */
+     void WriteEmergency(LogRecord &rec);
+     bool m_writing_emergency GUARDED_BY(m_consumer_mutex){false};
+diff --git a/src/test/logging_tests.cpp b/src/test/logging_tests.cpp
+index 549617817d..1c33a03acc 100644
+--- a/src/test/logging_tests.cpp
++++ b/src/test/logging_tests.cpp
+@@ -1005,4 +1005,40 @@ BOOST_FIXTURE_TEST_CASE(logging_callback_severe_overflow, LogSetup) {
+     BOOST_CHECK_EQUAL(LogInstance().DroppedLines() - before, 0U);
+ }
+ 
++BOOST_FIXTURE_TEST_CASE(logging_error_is_flushed_by_consumer, LogSetup) {
++    LogInstance().PauseForTesting(true);
++    LogInstance().Flush();
++    const auto producer{std::this_thread::get_id()};
++    std::atomic<bool> seen{false}, rendered_on_producer{false};
++    auto callback{LogInstance().PushBackCallback([&](const std::string &line) {
++        if (line.find("consumer flush marker") != std::string::npos) {
++            rendered_on_producer = std::this_thread::get_id() == producer;
++            seen = true;
++        }
++    })};
++    std::atomic<bool> locked{false}, go{false};
++    std::thread blocker{[&] {
++        std::unique_lock<StdMutex> lock{
++            BCLog::LoggerTestAccess::WakeMutex(LogInstance())};
++        locked = true;
++        while (!go.load())
++            std::this_thread::yield();
++        std::this_thread::sleep_for(std::chrono::milliseconds{20});
++    }};
++    while (!locked.load())
++        std::this_thread::yield();
++    LogInstance().PauseForTesting(false);
++    go = true;
++    LogError("consumer flush marker\n");
++    // Read without calling Flush: returning from Error must already have
++    // completed the consumer's stdio flush, not just published a slot.
++    std::ifstream stream{LogInstance().m_file_path};
++    const std::string content{std::istreambuf_iterator<char>{stream}, {}};
++    blocker.join();
++    LogInstance().DeleteCallback(callback);
++    BOOST_CHECK(seen.load());
++    BOOST_CHECK(!rendered_on_producer.load());
++    BOOST_CHECK(content.find("consumer flush marker\n") != std::string::npos);
++}
++
+ BOOST_AUTO_TEST_SUITE_END()

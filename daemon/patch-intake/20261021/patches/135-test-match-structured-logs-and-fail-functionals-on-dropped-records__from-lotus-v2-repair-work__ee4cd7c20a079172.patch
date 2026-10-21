@@ -1,0 +1,888 @@
+From 25a9aff88963abab1baf11126c16c4775cdba3e9 Mon Sep 17 00:00:00 2001
+From: Shammah Chancellor <shammah.chancellor@notvalid.com>
+Date: Mon, 19 Oct 2026 07:52:42 -0700
+Subject: [PATCH] test: match structured logs and fail functionals on dropped
+ records
+
+Keep substring matching and a human text log while adding a JSON sidecar and nested typed field matching. Drain live-node logging at assertion boundaries, track changed log paths, and handle JSON-only nodes. A worker-written final counter makes dropped records an explicit functional failure rather than a missing-log timeout.
+
+Validated the exact framework plus bounded-load candidate tree e61b616721b358d0d9336b41a2b52ae51b4475e5: full extended suite 276 passed, 61 platform/disabled skips, zero failures, 764.8 seconds. Source and executable hashes stayed fixed. Native logging/event/metrics/RPC checks: 66 cases, 393755 assertions. Collector and production call-site changes are separate.
+
+(cherry picked from commit 554ecf419218f2efc3b787570ed04bbb3e6a9d2c)
+
+N3-Source-Commit: 554ecf419218f2efc3b787570ed04bbb3e6a9d2c
+N3-Source-Export: 0042
+---
+ doc/logging-async.md                          |  14 +-
+ doc/logging-test-framework.md                 |  46 +++++
+ src/logging.cpp                               |  55 +++++-
+ src/logging.h                                 |  18 +-
+ src/logging/fields.h                          |   1 +
+ src/test/logging_tests.cpp                    |  36 +++-
+ test/functional/feature_logging.py            |  36 +++-
+ test/functional/test_framework/log_match.py   | 163 ++++++++++++++++++
+ .../functional/test_framework/log_messages.py |  74 ++++++++
+ test/functional/test_framework/test_node.py   | 104 +++++++++--
+ 10 files changed, 515 insertions(+), 32 deletions(-)
+ create mode 100644 doc/logging-test-framework.md
+ create mode 100644 test/functional/test_framework/log_messages.py
+
+diff --git a/doc/logging-async.md b/doc/logging-async.md
+index 9865148a8530d376168efe5dd75edb4f8cabcacf..893912340fd462a35de22308d9c38e4eaf472f2e 100644
+--- a/doc/logging-async.md
++++ b/doc/logging-async.md
+@@ -47,8 +47,12 @@ slot is placement-constructed before publication and read after acquire.
+ Records must remain trivially destructible; reference payloads are still
+ released by the consumer before their slot is reused.
+ 
+-Wake notifications retain the original 512-record threshold, independently of
+-burst capacity. No user-facing sizing option is added. This is burst capacity,
+-not a promise to buffer an indefinitely stalled sink. Sustained artificial
+-floods may still drop; measurements must report accepted, dropped and actually
+-written counts.
++The inherited 1,024-slot ring lost debug/info records during the full functional
++suite. With the framework JSON sidecar, a 16,384-slot candidate still lost
++44,787 lines in compactblocks. A 65,536-slot candidate still lost 4,482
++lines, so the next power of two above that measured burst plus the existing
++queue is 131,072. Wake notifications retain the original 512-record
++threshold, independently of burst capacity. No user-facing sizing option is
++added. This is burst capacity, not a promise to buffer an indefinitely stalled
++sink. Sustained artificial floods may still drop; measurements must report
++accepted, dropped and actually written counts.
+diff --git a/doc/logging-test-framework.md b/doc/logging-test-framework.md
+new file mode 100644
+index 0000000000000000000000000000000000000000..c8bfa52e7ebc0fb2a34d2eb6b749568205bf11fc
+--- /dev/null
++++ b/doc/logging-test-framework.md
+@@ -0,0 +1,46 @@
++# Functional-test logs
++
++Every `TestNode` process writes generic JSON records to
++`debug-framework.jsonl` in its chain directory, alongside its normal log.
++Tests exercising another primary format keep that format. An explicit
++`-debuglogjsonfile` overrides the sidecar path. Paths are absolute in the
++process arguments, so a test's working directory does not change their meaning.
++
++`assert_debug_log` accepts strings or dictionaries; `wait_for_debug_log` accepts
++bytes or dictionaries. Existing substring checks keep their exact text/byte
++semantics. A dictionary matches a subset of **one** JSON record, recursively:
++
++```python
++with node.assert_debug_log([
++    {"event": "peer_connected", "peer_id": 7},
++    {"source": {"function": "UpdateTipLog"}},
++]):
++    trigger_action()
++```
++
++Matching fields from separate records never satisfies one dictionary. Booleans
++are distinct from numeric values. Helpers snapshot both log offsets before the
++action, then allow the asynchronous logger its full timeout after the action.
++For a live RPC connection, each helper first calls the existing `logging` RPC
++to flush older queued records before taking offsets. A stopped process needs no
++RPC barrier. JSON-only nodes do not require a text log file, and a new sidecar
++path selected during startup begins at offset zero. Only complete JSON lines
++are parsed while the process is running; malformed
++complete records fail rather than silently disappearing.
++
++Graceful process exit asks the logger worker to drain, write an unfiltered
++`logger_shutdown` record with the cumulative integer `dropped_lines` counter,
++and exit before its thread-local encoder buffers are destroyed.
++The internal final counter is written directly to sinks without print callbacks,
++so callbacks cannot enqueue more records after the final count. The framework
++checks only records appended by the current process lifetime.
++Any nonzero summary or written overflow notice fails the test explicitly.
++A successfully started process exiting normally must provide the summary.
++This also protects tests using a custom primary log filename.
++
++Expected initialization failures and intentional abnormal exits cannot always
++write a final record. They do not require a summary, but any written drop notice
++or nonzero summary still fails. An absent notice after an abrupt crash does not
++prove that no logging was lost. Debug/info floods may drop in production; the
++framework treats that as insufficient evidence for a passing functional test.
++Warnings and errors retain their separate full-ring delivery guarantee.
+diff --git a/src/logging.cpp b/src/logging.cpp
+index 78140342b9f66d9faf2c137b5f5316a545465334..60edde8d18f3d5e4e65b77e7a7dc537fde4b6d03 100644
+--- a/src/logging.cpp
++++ b/src/logging.cpp
+@@ -184,10 +184,43 @@ bool BCLog::Logger::StartLogging() {
+     // destroyed, see LogInstance).
+     static std::once_flag flush_at_exit;
+     std::call_once(flush_at_exit,
+-                   [] { std::atexit([] { LogInstance().StopThread(); }); });
++                   [] { std::atexit([] { LogInstance().FinishLogging(); }); });
+     return true;
+ }
+ 
++void BCLog::Logger::FinishLogging() {
++    // TLS scratch buffers may already be destroyed on the exiting thread.
++    // Let the still-running consumer render before its own TLS destruction.
++    StopThread(/*summarize=*/true);
++}
++
++void BCLog::Logger::WriteDropSummary() {
++    const uint64_t dropped{DroppedLines()};
++    constexpr LogEventSite site{
++        "logger_shutdown",
++        "Logger shutdown: {dropped_lines} debug/info log lines dropped",
++        LogFlags::ALL, Level::Info};
++    const FieldHeader header{FieldId::DroppedLines, FieldKind::U64, false,
++                             sizeof(dropped), 0};
++    std::array<std::byte, sizeof(header) + sizeof(dropped)> payload;
++    std::memcpy(payload.data(), &header, sizeof(header));
++    std::memcpy(payload.data() + sizeof(header), &dropped, sizeof(dropped));
++    // Direct sink write: neither a full producer ring, severity filtering nor
++    // a source-site quota may hide the counter used by test shutdown checks.
++    WriteLogLine(LogLine{.time = SystemClock::now(),
++                         .mocktime = GetMockTime(),
++                         .level = dropped ? Level::Warning : Level::Info,
++                         .category = LogFlags::ALL,
++                         .thread = "logger",
++                         .loc = std::source_location::current(),
++                         .event = &site,
++                         .fields = FieldList{payload, 1}},
++                 /*to_file=*/true, /*notify_callbacks=*/false);
++    if (m_fileout) fflush(m_fileout);
++    if (m_json_fileout) fflush(m_json_fileout);
++    if (m_print_to_console) fflush(stdout);
++}
++
+ void BCLog::Logger::DisconnectTestLogger() {
+     StopThread();
+     StdLockGuard consumer_lock(m_consumer_mutex);
+@@ -225,6 +258,7 @@ void BCLog::Logger::StartThread() {
+     {
+         std::lock_guard<std::mutex> lock(m_wake_mutex);
+         m_stop = false;
++        m_shutdown_summary = false;
+     }
+     m_thread_running = true;
+     m_thread = std::thread{[this] {
+@@ -248,13 +282,14 @@ int BCLog::Logger::ForkProcess() {
+ }
+ #endif
+ 
+-void BCLog::Logger::StopThread() {
++void BCLog::Logger::StopThread(bool summarize) {
+     if (!m_thread.joinable()) {
+         return;
+     }
+     {
+         std::lock_guard<std::mutex> lock(m_wake_mutex);
+         m_stop = true;
++        m_shutdown_summary = summarize;
+     }
+     m_wake_cv.notify_all();
+     m_thread.join();
+@@ -262,6 +297,7 @@ void BCLog::Logger::StopThread() {
+ }
+ 
+ void BCLog::Logger::ThreadMain() NO_THREAD_SAFETY_ANALYSIS {
++    bool summarize{false};
+     while (true) {
+         bool busy{false};
+         if (!m_paused_for_testing) {
+@@ -273,6 +309,7 @@ void BCLog::Logger::ThreadMain() NO_THREAD_SAFETY_ANALYSIS {
+         }
+         std::unique_lock<std::mutex> lock(m_wake_mutex);
+         if (m_stop) {
++            summarize = m_shutdown_summary;
+             break;
+         }
+         m_wake_cv.wait_for(
+@@ -283,6 +320,10 @@ void BCLog::Logger::ThreadMain() NO_THREAD_SAFETY_ANALYSIS {
+     }
+     StdLockGuard consumer_lock(m_consumer_mutex);
+     DrainLocked();
++    if (summarize) {
++        StdLockGuard scoped_lock(m_cs);
++        WriteDropSummary();
++    }
+ }
+ 
+ void BCLog::Logger::Flush() {
+@@ -926,11 +967,12 @@ void BCLog::Logger::ReopenIfRequested() {
+     }
+ }
+ 
+-void BCLog::Logger::WriteLine(const std::string &line, bool to_file) {
++void BCLog::Logger::WriteLine(const std::string &line, bool to_file,
++                              bool notify_callbacks) {
+     if (m_print_to_console) {
+         fwrite(line.data(), 1, line.size(), stdout);
+     }
+-    if (!m_writing_emergency) {
++    if (notify_callbacks && !m_writing_emergency) {
+         for (const auto &cb : m_print_callbacks)
+             cb(line);
+     }
+@@ -939,7 +981,8 @@ void BCLog::Logger::WriteLine(const std::string &line, bool to_file) {
+     }
+ }
+ 
+-void BCLog::Logger::WriteLogLine(const LogLine &line, bool to_file) {
++void BCLog::Logger::WriteLogLine(const LogLine &line, bool to_file,
++                                 bool notify_callbacks) {
+     Encode(line);
+     if (m_log_format == LogFormat::JOURNALD) {
+         const bool failed{to_file && !m_journal.Send(m_line_buf)};
+@@ -962,7 +1005,7 @@ void BCLog::Logger::WriteLogLine(const LogLine &line, bool to_file) {
+             fflush(stderr);
+         }
+     }
+-    WriteLine(m_line_buf, to_file);
++    WriteLine(m_line_buf, to_file, notify_callbacks);
+     if (m_json_fileout && to_file) {
+         const LogOptions opts{.timestamps = true,
+                               .time_micros = true,
+diff --git a/src/logging.h b/src/logging.h
+index 6496ec810544f416a23d659629df9627fabc12e5..dcf269f5d7e91ef3497d17c52c761497c9dc3f50 100644
+--- a/src/logging.h
++++ b/src/logging.h
+@@ -472,7 +472,8 @@ private:
+     /** Encode a line into m_line_buf in the current format */
+     void Encode(const LogLine &line) EXCLUSIVE_LOCKS_REQUIRED(m_consumer_mutex);
+     /** Write a line to every sink (encoding it in each one's format) */
+-    void WriteLogLine(const LogLine &line, bool to_file)
++    void WriteLogLine(const LogLine &line, bool to_file,
++                      bool notify_callbacks = true)
+         EXCLUSIVE_LOCKS_REQUIRED(m_consumer_mutex, m_cs);
+     //! The secondary JSON log file (-debuglogjsonfile)
+     FILE *m_json_fileout GUARDED_BY(m_consumer_mutex) = nullptr;
+@@ -510,6 +511,7 @@ private:
+     std::condition_variable m_wake_cv;
+     std::atomic<bool> m_wake{false};
+     bool m_stop GUARDED_BY(m_wake_mutex){false};
++    bool m_shutdown_summary GUARDED_BY(m_wake_mutex){false};
+     std::atomic<bool> m_thread_running{false};
+     //! A wake-up of the logger thread is pending (rings filling up)
+     std::atomic<bool> m_wake_requested{false};
+@@ -521,6 +523,8 @@ private:
+     //! do)
+     std::atomic<bool> m_paused_for_testing{false};
+ 
++    void WriteDropSummary()
++        EXCLUSIVE_LOCKS_REQUIRED(m_consumer_mutex, m_cs, !m_rings_mutex);
+ 
+     /** Keep a message logged before StartLogging (with m_cs held) */
+     void BufferLog(std::string_view str, std::source_location &&source_loc,
+@@ -556,14 +560,16 @@ private:
+     void WriteRecord(LogRecord &rec)
+         EXCLUSIVE_LOCKS_REQUIRED(m_consumer_mutex, m_cs);
+     /** Write a rendered line to the outputs */
+-    void WriteLine(const std::string &line, bool to_file)
++    void WriteLine(const std::string &line, bool to_file,
++                   bool notify_callbacks = true)
+         EXCLUSIVE_LOCKS_REQUIRED(m_consumer_mutex, m_cs);
+     void ReopenIfRequested() EXCLUSIVE_LOCKS_REQUIRED(m_consumer_mutex);
+     void ThreadMain() EXCLUSIVE_LOCKS_REQUIRED(!m_consumer_mutex, !m_cs,
+                                                !m_rings_mutex, !m_wake_mutex);
+     void StartThread() EXCLUSIVE_LOCKS_REQUIRED(!m_wake_mutex);
+-    void StopThread() EXCLUSIVE_LOCKS_REQUIRED(!m_wake_mutex, !m_consumer_mutex,
+-                                               !m_cs, !m_rings_mutex);
++    void StopThread(bool summarize = false)
++        EXCLUSIVE_LOCKS_REQUIRED(!m_wake_mutex, !m_consumer_mutex, !m_cs,
++                                 !m_rings_mutex);
+ 
+ public:
+     Logger();
+@@ -645,6 +651,10 @@ public:
+ 
+     /** Lines dropped because their thread's ring was full (ever) */
+     uint64_t DroppedLines() const EXCLUSIVE_LOCKS_REQUIRED(!m_rings_mutex);
++    /** Drain on graceful exit, then write the unfiltered final drop counter. */
++    void FinishLogging()
++        EXCLUSIVE_LOCKS_REQUIRED(!m_consumer_mutex, !m_cs, !m_rings_mutex,
++                                 !m_wake_mutex);
+ 
+     /** Connect a slot to the print signal and return the connection */
+     std::list<std::function<void(const std::string &)>>::iterator
+diff --git a/src/logging/fields.h b/src/logging/fields.h
+index c0ea3d90933c05580d3f82845e1b87995b48245f..eaa31352be0c3c42cf2757ba78f66286cdca4c33 100644
+--- a/src/logging/fields.h
++++ b/src/logging/fields.h
+@@ -62,6 +62,7 @@
+     X(Height, height, INT, "", "")                                             \
+     X(TxId, txid, HASH, "", "")                                                \
+     X(Bytes, bytes, UINT, "", "")                                              \
++    X(DroppedLines, dropped_lines, UINT, "", "")                               \
+     X(Count, count, UINT, "", "")                                              \
+     X(AmountSats, amount_sats, INT, "", "")                                    \
+     X(Method, method, STRING, "", "rpc.method")                                \
+diff --git a/src/test/logging_tests.cpp b/src/test/logging_tests.cpp
+index 26342788253966f80433321896d8a92629632de7..932c6557d7d482d3eb471946fde38e874d3e71a4 100644
+--- a/src/test/logging_tests.cpp
++++ b/src/test/logging_tests.cpp
+@@ -931,7 +931,6 @@ BOOST_FIXTURE_TEST_CASE(logging_async_reopen_under_load, LogSetup) {
+     // Apply the fixture path before rename. A lightly filled larger ring may
+     // otherwise remain below its wake threshold during the first rotation.
+     LogInstance().Flush();
+-
+     // The log file is rotated (renamed, then reopened) while a thread logs:
+     // every line is in exactly one of the files, in order, unless it was
+     // dropped because the thread outran the logger (counted).
+@@ -1099,6 +1098,41 @@ BOOST_FIXTURE_TEST_CASE(logging_error_is_flushed_by_consumer, LogSetup) {
+     BOOST_CHECK(content.find("consumer flush marker\n") != std::string::npos);
+ }
+ 
++BOOST_AUTO_TEST_CASE(logging_shutdown_counter_is_unfiltered) {
++    BCLog::Logger logger;
++    logger.m_file_path = m_args.GetDataDirBase() / "shutdown-counter.jsonl";
++    logger.m_print_to_file = true;
++    logger.m_log_format = BCLog::LogFormat::JSON;
++    logger.PauseForTesting(true);
++    BOOST_REQUIRE(logger.StartLogging());
++    size_t callback_summaries{0};
++    logger.PushBackCallback([&](const std::string &line) {
++        callback_summaries +=
++            line.find("Logger shutdown:") != std::string::npos;
++    });
++    for (size_t i = 0; i < BCLog::LogRing::CAPACITY + 7; ++i) {
++        logger.LogPrintStr("shutdown flood marker\n",
++                           std::source_location::current(), BCLog::NET,
++                           BCLog::Level::Debug, nullptr);
++    }
++    logger.SetLogLevel(BCLog::Level::Error);
++    logger.DisableCategory(BCLog::ALL);
++    logger.FinishLogging();
++    std::ifstream stream{logger.m_file_path};
++    size_t written{0};
++    UniValue last;
++    for (std::string line; std::getline(stream, line);) {
++        if (line.empty()) continue;
++        BOOST_REQUIRE(last.read(line));
++        written += last["message"].get_str() == "shutdown flood marker";
++    }
++    BOOST_CHECK_EQUAL(written, BCLog::LogRing::CAPACITY);
++    BOOST_CHECK_EQUAL(last["event"].get_str(), "logger_shutdown");
++    BOOST_CHECK_EQUAL(last["dropped_lines"].getInt<uint64_t>(), 7U);
++    BOOST_CHECK_EQUAL(callback_summaries, 0U);
++    logger.DisconnectTestLogger();
++}
++
+ BOOST_FIXTURE_TEST_CASE(logging_pause_rechecks_consumer_lock, LogSetup) {
+     LogInstance().PauseForTesting(true);
+     LogInstance().Flush();
+diff --git a/test/functional/feature_logging.py b/test/functional/feature_logging.py
+index a1386d0e756c34972a04d4d77c0b06ce1b02ed7c..33601f96a6afe2da7d75265b614096b1c38a6ce6 100644
+--- a/test/functional/feature_logging.py
++++ b/test/functional/feature_logging.py
+@@ -89,6 +89,7 @@ class LoggingTest(BitcoinTestFramework):
+         self.test_syslog_format()
+         self.test_text_priority()
+         self.test_json_aux_only()
++        self.test_framework_fields()
+ 
+     def assert_no_absolute_source_paths(self, log_path):
+         src = os.path.join(self.config["environment"]["SRCDIR"], "src") + os.sep
+@@ -202,20 +203,51 @@ class LoggingTest(BitcoinTestFramework):
+         with open(self.relative_log_path("priority-default.log"), encoding="utf-8") as stream:
+             lines = [line for line in stream if line.strip()]
+         assert lines and all(not line.startswith("<") for line in lines)
++
+     def test_json_aux_only(self):
+         self.log.info("An auxiliary JSON sink keeps logging enabled on its own")
+         path = self.relative_log_path("aux-only.jsonl")
+-        self.restart_node(0, [
++        self.stop_node(0)
++        default_log = self.relative_log_path("debug.log")
++        if os.path.exists(default_log):
++            os.unlink(default_log)
++        self.start_node(0, [
+             "-nodebuglogfile", "-printtoconsole=0", f"-debuglogjsonfile={path}",
+         ])
+         height = self.nodes[0].getblockcount() + 1
+-        self.generate(self.nodes[0], 1)
++        with self.nodes[0].assert_debug_log([
++            {"source": {"function": "UpdateTipLog"}},
++        ]):
++            self.generate(self.nodes[0], 1)
+         self.stop_node(0)
++        assert not os.path.exists(default_log)
+         with open(path, encoding="utf-8") as stream:
+             records = [json.loads(line) for line in stream if line.strip()]
+         assert any("UpdateTip: new best=" in record["message"] and
+                    f"height={height} " in record["message"] for record in records)
+         assert any(record["message"] == "Shutdown: done" for record in records)
++
++    def test_framework_fields(self):
++        self.log.info("Framework dictionary matching and final drop counter")
++        self.restart_node(0, [])
++        node = self.nodes[0]
++        with node.assert_debug_log([
++            {"source": {"file": "src/validation.cpp", "function": "UpdateTipLog"}},
++            "UpdateTip: new best=",
++        ]):
++            self.generate(node, 1)
++        with node.wait_for_debug_log([
++            {"source": {"function": "UpdateTipLog"}}, b"UpdateTip: new best=",
++        ]):
++            self.generate(node, 1)
++        self.stop_node(0)
++        records = [
++            json.loads(line)
++            for line in node.debug_log_json_path.read_text().splitlines()
++        ]
++        summaries = [r for r in records if r.get("event") == "logger_shutdown"]
++        assert summaries and summaries[-1]["dropped_lines"] == 0
++
+     def test_json_format(self):
+         self.log.info("Test -logformat=json")
+         self.stop_node(0)
+diff --git a/test/functional/test_framework/log_match.py b/test/functional/test_framework/log_match.py
+index f23b5e099cb0ba39124f798c4812e95943bf2bb1..a0fc98f47691f6b639549da6ebf0cf2302987997 100644
+--- a/test/functional/test_framework/log_match.py
++++ b/test/functional/test_framework/log_match.py
+@@ -31,6 +31,7 @@ class AsyncLogDeadlineTests(unittest.TestCase):
+             def drain(_interval):
+                 logfile.write_text("expected asynchronous line\n")
+                 clock[0] += 0.05
++
+             with (
+                 patch("test_framework.test_node.time.time", lambda: clock[0]),
+                 patch("test_framework.test_node.time.sleep", drain),
+@@ -47,6 +48,168 @@ class AsyncLogDeadlineTests(unittest.TestCase):
+         self.exercise(TestNode.wait_for_debug_log, [b"expected asynchronous line"])
+ 
+ 
++class StructuredLogTests(unittest.TestCase):
++    def test_nested_fields_match_one_record(self):
++        from test_framework.log_messages import has_message
++
++        self.assertTrue(
++            has_message(
++                {"source": {"line": 7}},
++                "",
++                [{"source": {"line": 7, "file": "net.cpp"}}],
++            )
++        )
++        self.assertFalse(
++            has_message(
++                {"peer_id": 7, "bytes": 42}, "", [{"peer_id": 7}, {"bytes": 42}]
++            )
++        )
++        self.assertFalse(has_message({"peer_id": 1}, "", [{"peer_id": True}]))
++
++    def test_complete_json_lines_only(self):
++        from test_framework.log_messages import read_records
++
++        with tempfile.TemporaryDirectory() as directory:
++            path = Path(directory) / "records.jsonl"
++            path.write_bytes(b'{"height":7}\n{"height":')
++            self.assertEqual(read_records(path), [{"height": 7}])
++            path.write_bytes(b"not-json\n")
++            with self.assertRaises(ValueError):
++                read_records(path)
++
++    def test_drop_check_lifetimes_and_missing_counter(self):
++        from test_framework.log_messages import assert_no_drops
++
++        with self.assertRaisesRegex(AssertionError, "Missing logger_shutdown"):
++            assert_no_drops([], require_summary=True)
++        with self.assertRaisesRegex(AssertionError, "dropped 3"):
++            assert_no_drops([{"event": "logger_shutdown", "dropped_lines": 3}])
++        with self.assertRaisesRegex(AssertionError, "Invalid"):
++            assert_no_drops([{"event": "logger_shutdown", "dropped_lines": False}])
++        with self.assertRaisesRegex(AssertionError, "Logger dropped lines"):
++            assert_no_drops(
++                [
++                    {
++                        "message": "Logging could not keep up: 2 debug/info log lines were dropped (2 in total)."
++                    }
++                ]
++            )
++        assert_no_drops(
++            [{"event": "logger_shutdown", "dropped_lines": 0}], require_summary=True
++        )
++        assert_no_drops(
++            [], require_summary=False
++        )  # An expected crash cannot report a final counter.
++
++    def test_process_offset_excludes_earlier_drops(self):
++        from test_framework.log_messages import assert_no_drops, read_records
++
++        with tempfile.TemporaryDirectory() as directory:
++            path = Path(directory) / "records.jsonl"
++            path.write_text('{"event":"logger_shutdown","dropped_lines":10}\n')
++            start = path.stat().st_size
++            with path.open("a") as stream:
++                stream.write('{"event":"logger_shutdown","dropped_lines":0}\n')
++            assert_no_drops(read_records(path, start), require_summary=True)
++
++    def exercise(self, helper, expected):
++        with tempfile.TemporaryDirectory() as directory:
++            text = Path(directory) / "debug.log"
++            records = Path(directory) / "debug-framework.jsonl"
++            text.touch()
++            records.touch()
++
++            def fail(message):
++                raise AssertionError(message)
++
++            node = SimpleNamespace(
++                timeout_factor=1,
++                debug_log_path=text,
++                debug_log_json_path=records,
++                debug_log_size=lambda **kwargs: text.stat().st_size,
++                _raise_assertion_error=fail,
++            )
++            with helper(node, expected):
++                text.write_text("historical human message\n")
++                records.write_text(
++                    '{"event":"peer_connected","peer_id":7,"source":{"file":"net.cpp","line":42}}\n'
++                )
++
++    def test_assert_accepts_fields_and_substring(self):
++        self.exercise(
++            TestNode.assert_debug_log,
++            [
++                "historical human message",
++                {"event": "peer_connected", "peer_id": 7, "source": {"line": 42}},
++            ],
++        )
++
++    def test_wait_accepts_fields_and_bytes(self):
++        self.exercise(
++            TestNode.wait_for_debug_log, [b"historical human message", {"peer_id": 7}]
++        )
++
++
++class StructuredLogPathTests(unittest.TestCase):
++    def exercise(self, helper):
++        with tempfile.TemporaryDirectory() as directory:
++            text = Path(directory) / "debug.log"
++            text.touch()
++            old = Path(directory) / "old.jsonl"
++            old.write_text('{"message":"earlier process"}\n' * 20)
++            new = Path(directory) / "new.jsonl"
++
++            def fail(message):
++                raise AssertionError(message)
++
++            node = SimpleNamespace(
++                timeout_factor=1,
++                debug_log_path=text,
++                debug_log_json_path=old,
++                debug_log_size=lambda **kwargs: 0,
++                _raise_assertion_error=fail,
++            )
++            with helper(node, [{"event": "startup"}], timeout=0):
++                # Starting a node with an explicit sidecar path updates it
++                # during the context. The previous file's offset cannot apply.
++                node.debug_log_json_path = new
++                new.write_text('{"event":"startup"}\n')
++
++    def test_assert_matches_new_process_path(self):
++        self.exercise(TestNode.assert_debug_log)
++
++    def test_wait_matches_new_process_path(self):
++        self.exercise(TestNode.wait_for_debug_log)
++
++
++class StructuredLogWithoutTextTests(unittest.TestCase):
++    def exercise(self, helper):
++        with tempfile.TemporaryDirectory() as directory:
++            text = Path(directory) / "debug.log"  # Deliberately never created.
++            records = Path(directory) / "debug-framework.jsonl"
++
++            def fail(message):
++                raise AssertionError(message)
++
++            node = SimpleNamespace(
++                timeout_factor=1,
++                debug_log_path=text,
++                debug_log_json_path=records,
++                _raise_assertion_error=fail,
++            )
++            node.debug_log_size = lambda **kwargs: TestNode.debug_log_size(
++                node, **kwargs
++            )
++            with helper(node, [{"event": "json_only"}], timeout=0):
++                records.write_text('{"event":"json_only"}\n')
++
++    def test_assert_uses_json_without_text_file(self):
++        self.exercise(TestNode.assert_debug_log)
++
++    def test_wait_uses_json_without_text_file(self):
++        self.exercise(TestNode.wait_for_debug_log)
++
++
+ class AsyncLogBoundaryTests(unittest.TestCase):
+     def fixture(self, helper, *, expect_stale=False):
+         with tempfile.TemporaryDirectory() as directory:
+diff --git a/test/functional/test_framework/log_messages.py b/test/functional/test_framework/log_messages.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..70d6854387e1b5d341996f9cabbed3dd306f35e3
+--- /dev/null
++++ b/test/functional/test_framework/log_messages.py
+@@ -0,0 +1,74 @@
++# Copyright (c) 2026 The Lotus developers
++# Distributed under the MIT software license, see the accompanying
++# file COPYING or http://www.opensource.org/licenses/mit-license.php.
++"""Pure JSON log parsing and matching, shared by node helpers and their tests."""
++
++import json
++import re
++
++
++def read_records(path, offset=0):
++    """Read complete JSON lines; an asynchronous writer may leave a partial tail."""
++    if not path.exists():
++        return []
++    with path.open("rb") as stream:
++        stream.seek(offset)
++        raw = stream.read()
++    records = []
++    for line in raw.splitlines(keepends=True):
++        if not line.endswith(b"\n") or not line.strip():
++            continue
++        record = json.loads(line)
++        if not isinstance(record, dict):
++            raise AssertionError(f"JSON log record is not an object: {record!r}")
++        records.append(record)
++    return records
++
++
++def matches_fields(record, expected):
++    """A nested dict is a subset of one record; booleans are not numbers."""
++    for key, value in expected.items():
++        if key not in record:
++            return False
++        actual = record[key]
++        if isinstance(value, dict):
++            if not isinstance(actual, dict) or not matches_fields(actual, value):
++                return False
++        elif isinstance(actual, bool) != isinstance(value, bool) or actual != value:
++            return False
++    return True
++
++
++def has_message(expected, text, records):
++    if isinstance(expected, dict):
++        return any(matches_fields(record, expected) for record in records)
++    if isinstance(text, bytes) and isinstance(expected, str):
++        expected = expected.encode()
++    return expected in text
++
++
++def assert_no_drops(records, *, require_summary=False):
++    """Check only one process lifetime, never an earlier run's appended records."""
++    summaries = [r for r in records if r.get("event") == "logger_shutdown"]
++    for record in records:
++        count = record.get("dropped_lines")
++        if record.get("event") == "logger_shutdown":
++            if type(count) is not int or count < 0:
++                raise AssertionError(
++                    f"Invalid logger shutdown drop counter: {record!r}"
++                )
++            if count:
++                raise AssertionError(
++                    f"Logger dropped {count} debug/info lines: {record!r}"
++                )
++        # Also catch notices from an intentionally killed process with no summary.
++        message = record.get("message", "")
++        if re.search(
++            r"Logging could not keep up: [1-9][0-9]* debug/info log lines were dropped",
++            message,
++        ):
++            raise AssertionError(f"Logger dropped lines: {message}")
++    if require_summary and not summaries:
++        raise AssertionError(
++            "Missing logger_shutdown drop counter after graceful node exit"
++        )
+diff --git a/test/functional/test_framework/test_node.py b/test/functional/test_framework/test_node.py
+index 464b7fb8ad3c8e9454b3b776cbaacd8774b5f695..d8b169871c89d44dd966d73ea9c40e8d67bba5e9 100644
+--- a/test/functional/test_framework/test_node.py
++++ b/test/functional/test_framework/test_node.py
+@@ -28,6 +28,7 @@ from .address import ADDRESS_ECREG_UNSPENDABLE
+ from .authproxy import JSONRPCException
+ from .descriptors import descsum_create
+ from .jsonrpctools import ChronikElectrumClient
++from .log_messages import assert_no_drops, has_message, read_records
+ from .messages import XEC, CTransaction, FromHex
+ from .p2p import P2P_SUBVERSION
+ from .util import (
+@@ -107,6 +108,8 @@ class TestNode:
+         self.stdout_dir = os.path.join(self.datadir, "stdout")
+         self.stderr_dir = os.path.join(self.datadir, "stderr")
+         self.chain = chain
++        self.debug_log_json_path = self.chain_path / "debug-framework.jsonl"
++        self.debug_log_json_start = 0
+         self.host = host
+         self.rpc_port = rpc_port
+         self.p2p_port = p2p_port
+@@ -319,6 +322,31 @@ class TestNode:
+         if extra_args is None:
+             extra_args = self.extra_args
+ 
++        # Preserve caller args across restarts. The generic JSON sidecar keeps
++        # machine-readable records even when a test exercises a different primary
++        # presentation format; existing substring assertions retain debug.log.
++        extra_args = list(extra_args or [])
++        supplied = next(
++            (
++                arg.split("=", 1)[1]
++                for arg in reversed(self.default_args + extra_args)
++                if arg.startswith("-debuglogjsonfile=")
++            ),
++            None,
++        )
++        self.debug_log_json_path = (
++            Path(supplied) if supplied else self.chain_path / "debug-framework.jsonl"
++        )
++        if not self.debug_log_json_path.is_absolute():
++            self.debug_log_json_path = self.chain_path / self.debug_log_json_path
++        if supplied is None:
++            extra_args.append(f"-debuglogjsonfile={self.debug_log_json_path}")
++        self.debug_log_json_start = (
++            self.debug_log_json_path.stat().st_size
++            if self.debug_log_json_path.exists()
++            else 0
++        )
++
+         # If listening and no -bind is given, then bitcoind would bind P2P ports on
+         # 0.0.0.0:P and 127.0.0.1:18445 (for incoming Tor connections), where P is
+         # a unique port chosen by the test framework and configured as port=P in
+@@ -572,6 +600,10 @@ class TestNode:
+         if stderr != expected_stderr:
+             raise AssertionError(f"Unexpected stderr {stderr} != {expected_stderr}")
+ 
++        assert_no_drops(
++            read_records(self.debug_log_json_path, self.debug_log_json_start),
++            require_summary=return_code == 0 and self.rpc_connected,
++        )
+         self.stdout.close()
+         self.stderr.close()
+ 
+@@ -610,9 +642,12 @@ class TestNode:
+         return self.chain_path / "debug.log"
+ 
+     def debug_log_size(self, **kwargs) -> int:
+-        with open(self.debug_log_path, **kwargs) as dl:
+-            dl.seek(0, 2)
+-            return dl.tell()
++        try:
++            with open(self.debug_log_path, **kwargs) as dl:
++                dl.seek(0, 2)
++                return dl.tell()
++        except FileNotFoundError:
++            return 0
+ 
+     @contextlib.contextmanager
+     def assert_debug_log(self, expected_msgs, unexpected_msgs=None, timeout=2):
+@@ -636,6 +671,12 @@ class TestNode:
+             encoding="utf-8"
+         )  # Must use same encoding that is used to read() below
+ 
++        field_match = any(
++            isinstance(m, dict) for m in [*expected_msgs, *unexpected_msgs]
++        )
++        json_path = self.debug_log_json_path if field_match else None
++        json_start = json_path.stat().st_size if json_path and json_path.exists() else 0
++
+         yield
+ 
+         # The action can take arbitrarily long; give the asynchronous logger
+@@ -645,18 +686,35 @@ class TestNode:
+         while True:
+             found = True
+             missing = []
+-            with open(self.debug_log_path, encoding="utf-8", errors="replace") as dl:
+-                dl.seek(prev_size)
+-                log = dl.read()
++            try:
++                with open(
++                    self.debug_log_path, encoding="utf-8", errors="replace"
++                ) as dl:
++                    dl.seek(prev_size)
++                    log = dl.read()
++            except FileNotFoundError:
++                log = ""
++            records = (
++                read_records(
++                    self.debug_log_json_path,
++                    json_start if self.debug_log_json_path == json_path else 0,
++                )
++                if field_match
++                else []
++            )
+             print_log = " - " + "\n - ".join(log.splitlines())
++            if field_match:
++                print_log += "\nStructured JSON records:\n" + json.dumps(
++                    records, indent=2
++                )
+             for unexpected_msg in unexpected_msgs:
+-                if re.search(re.escape(unexpected_msg), log, flags=re.MULTILINE):
++                if has_message(unexpected_msg, log, records):
+                     self._raise_assertion_error(
+                         f'Unexpected message "{unexpected_msg}" partially matches '
+                         f"log:\n\n{print_log}\n\n"
+                     )
+             for expected_msg in expected_msgs:
+-                if re.search(re.escape(expected_msg), log, flags=re.MULTILINE) is None:
++                if not has_message(expected_msg, log, records):
+                     missing.append(expected_msg)
+                     found = False
+             if found:
+@@ -678,7 +736,7 @@ class TestNode:
+     @contextlib.contextmanager
+     def wait_for_debug_log(
+         self,
+-        expected_msgs: List[bytes],
++        expected_msgs: List[bytes | dict],
+         timeout=60,
+         interval: Optional[float] = 0.05,
+         chatty_callable=None,
+@@ -692,6 +750,9 @@ class TestNode:
+         if getattr(self, "rpc_connected", False):
+             self.rpc.logging()  # Flush older queued records before this boundary.
+         prev_size = self.debug_log_size(mode="rb")
++        field_match = any(isinstance(m, dict) for m in expected_msgs)
++        json_path = self.debug_log_json_path if field_match else None
++        json_start = json_path.stat().st_size if json_path and json_path.exists() else 0
+ 
+         yield
+ 
+@@ -706,12 +767,23 @@ class TestNode:
+                 # interested in the debug log content here.
+                 chatty_callable()
+ 
+-            with open(self.debug_log_path, "rb") as dl:
+-                dl.seek(prev_size)
+-                log = dl.read()
+-
++            try:
++                with open(self.debug_log_path, "rb") as dl:
++                    dl.seek(prev_size)
++                    log = dl.read()
++            except FileNotFoundError:
++                log = b""
++
++            records = (
++                read_records(
++                    self.debug_log_json_path,
++                    json_start if self.debug_log_json_path == json_path else 0,
++                )
++                if field_match
++                else []
++            )
+             for expected_msg in expected_msgs:
+-                if expected_msg not in log:
++                if not has_message(expected_msg, log, records):
+                     missing.append(expected_msg)
+                     found = False
+ 
+@@ -722,6 +794,10 @@ class TestNode:
+                 print_log = " - " + "\n - ".join(
+                     [f"\n - {line.decode()}" for line in log.splitlines()]
+                 )
++                if field_match:
++                    print_log += "\nStructured JSON records:\n" + json.dumps(
++                        records, indent=2
++                    )
+                 break
+             if interval is not None:
+                 time.sleep(interval)
+-- 
+2.50.1 (Apple Git-155)
+

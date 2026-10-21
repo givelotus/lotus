@@ -1,0 +1,750 @@
+From 23517efad5085aef8b47788d4859db51ee6c842d Mon Sep 17 00:00:00 2001
+From: Shammah Chancellor <shammah.chancellor@notvalid.com>
+Date: Tue, 20 Oct 2026 08:50:24 -0700
+Subject: [PATCH] wallet(v2): authenticate and sign native PSBT slots
+
+Require independently trusted full Coin-v2 records or externally trusted sparse-tree roots and chain context. Review checked per-asset totals, fee floors, locks, selected paths and explicit partial-mode authorization. Use existing BIP340 SigningMessage for supported native direct-key/keyhash policies; preserve proofs/core identity and verify signatures plus ordinary validation before finalization.
+
+Legacy bridge transport is retained, but automated bridge signing/finalization fails closed in this profile implementation. Focused six-flow two-signer signing/keyhash/mode and authentication/proof regression target added; strict source syntax checks pass; normal build/runtime validation pending coordinated compiler slot.
+---
+ src/lotus_v2/CMakeLists.txt        |   5 +-
+ src/lotus_v2/psbt_signing.cpp      | 368 +++++++++++++++++++++++++++++
+ src/lotus_v2/psbt_signing.h        |  47 ++++
+ src/lotus_v2/test_psbt_signing.cpp | 276 ++++++++++++++++++++++
+ 4 files changed, 695 insertions(+), 1 deletion(-)
+ create mode 100644 src/lotus_v2/psbt_signing.cpp
+ create mode 100644 src/lotus_v2/psbt_signing.h
+ create mode 100644 src/lotus_v2/test_psbt_signing.cpp
+
+diff --git a/src/lotus_v2/CMakeLists.txt b/src/lotus_v2/CMakeLists.txt
+index 3b75f4f6ce201c0721becbb8dbbc09633f2f4e25..215aff79cd832ff1c8febd2954f69e21c1663033 100644
+--- a/src/lotus_v2/CMakeLists.txt
++++ b/src/lotus_v2/CMakeLists.txt
+@@ -198,11 +198,14 @@ target_link_libraries(lotus_v2_validation PUBLIC
+     lotus_v2_block_template lotus_v2_sparse_state lotus_v2_incremental_utxo lotus_v2_mdbx Boost::headers secp256k1 leveldb OpenSSL::Crypto crypto)
+ 
+ # Wallet interchange only: no transaction or block consensus changes.
+-add_library(lotus_v2_psbt STATIC psbt.cpp)
++add_library(lotus_v2_psbt STATIC psbt.cpp psbt_signing.cpp)
+ target_link_libraries(lotus_v2_psbt PUBLIC lotus_v2_validation)
+ add_executable(test_lotus_v2_psbt test_psbt.cpp)
+ target_link_libraries(test_lotus_v2_psbt PRIVATE lotus_v2_psbt)
+ add_test(NAME lotus_v2_psbt COMMAND test_lotus_v2_psbt)
++add_executable(test_lotus_v2_psbt_signing test_psbt_signing.cpp)
++target_link_libraries(test_lotus_v2_psbt_signing PRIVATE lotus_v2_psbt)
++add_test(NAME lotus_v2_psbt_signing COMMAND test_lotus_v2_psbt_signing)
+ add_test(NAME lotus_v2_psbt_vectors
+     COMMAND ${Python_EXECUTABLE}
+         ${CMAKE_CURRENT_SOURCE_DIR}/psbt_test/check_vectors.py
+diff --git a/src/lotus_v2/psbt_signing.cpp b/src/lotus_v2/psbt_signing.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..137465b62a8eed777d25fc07a4371a5c5f902f5f
+--- /dev/null
++++ b/src/lotus_v2/psbt_signing.cpp
+@@ -0,0 +1,368 @@
++// Copyright (c) 2026 The Lotus developers
++// Distributed under the MIT software license, see COPYING.
++#include "psbt_signing.h"
++
++#include "address.h"
++
++#include <support/cleanse.h>
++
++#include <algorithm>
++#include <limits>
++
++namespace lotus::v2 {
++namespace {
++    bool Fail(std::string &error, const char *message) {
++        error = message;
++        return false;
++    }
++
++    struct Prepared {
++        NativePsbtData data;
++        Transaction tx;
++        std::vector<Coin> coins;
++        ResolvedCoins resolved;
++        PreparedSigningContext signing;
++        NativePsbtReview review;
++    };
++
++    bool SameCoin(const Coin &a, const Coin &b) {
++        PsbtBytes left, right;
++        return EncodeCoin(a, left) && EncodeCoin(b, right) && left == right;
++    }
++
++    bool Authenticate(const NativePsbt &psbt, const NativePsbtContext &context,
++                      Prepared &prepared, std::string &error) {
++        if (!psbt.Inspect(prepared.data, error)) return false;
++        if (prepared.data.chain_id != context.chain_id) {
++            return Fail(error,
++                        "native PSBT ChainID differs from trusted chain");
++        }
++        if (!ValidateOrdinaryProfile(context.profile, error)) return false;
++        prepared.coins.reserve(prepared.data.inputs.size());
++        for (const auto &input : prepared.data.inputs) {
++            if (!input.coin)
++                return Fail(error, "native PSBT is missing a full coin");
++            bool authenticated = false;
++            if (context.lookup) {
++                Coin trusted;
++                const auto status =
++                    context.lookup(input.coin->outpoint, trusted, error);
++                if (status == CoinReadResult::Error) return false;
++                if (status == CoinReadResult::Missing) {
++                    return Fail(
++                        error,
++                        "native PSBT coin is unavailable in trusted state");
++                }
++                if (!SameCoin(*input.coin, trusted)) {
++                    return Fail(error,
++                                "native PSBT coin differs from trusted state");
++                }
++                authenticated = true;
++            }
++            if (input.proof) {
++                if (!context.trusted_utxo_root || !prepared.data.utxo_root ||
++                    *context.trusted_utxo_root != *prepared.data.utxo_root ||
++                    !VerifyCoinProof(input.coin->outpoint, *input.proof,
++                                     *context.trusted_utxo_root)) {
++                    return Fail(error,
++                                "native PSBT coin proof is not authenticated");
++                }
++                authenticated = true;
++            }
++            if (!authenticated)
++                return Fail(
++                    error,
++                    "native PSBT requires independently authenticated coins");
++            prepared.coins.push_back(*input.coin);
++            prepared.resolved.push_back(input.coin->output);
++        }
++        prepared.tx = prepared.data.tx_template;
++        for (size_t i = 0; i < prepared.tx.inputs.size(); ++i) {
++            const auto &metadata = prepared.data.inputs[i];
++            for (size_t w = 0; w < prepared.tx.inputs[i].witnesses.size();
++                 ++w) {
++                auto args = metadata.arguments.find(uint16_t(w));
++                if (args == metadata.arguments.end()) {
++                    return Fail(
++                        error,
++                        "native PSBT is missing explicit witness arguments");
++                }
++                prepared.tx.inputs[i].witnesses[w].arguments = args->second;
++            }
++        }
++        if (!CheckOrdinaryLocks(prepared.tx, prepared.coins, context.profile,
++                                error))
++            return false;
++        if (!PrepareSigningContext(prepared.tx, context.profile.transaction,
++                                   context.chain_id, prepared.resolved,
++                                   prepared.signing, error))
++            return false;
++        return true;
++    }
++
++    bool Review(Prepared &prepared, const NativePsbtContext &context,
++                std::string &error) {
++        if (!ComputeVmAssetTotals(prepared.tx, prepared.resolved,
++                                  prepared.review.assets, error))
++            return false;
++        const auto native = prepared.review.assets.find(Hash{});
++        const VmAssetTotals zero{};
++        const auto &totals =
++            native == prepared.review.assets.end() ? zero : native->second;
++        if (totals.outputs > totals.inputs)
++            return Fail(error, "native PSBT inflates native currency");
++        prepared.review.native_fee = totals.inputs - totals.outputs;
++        for (const auto &[asset, amounts] : prepared.review.assets) {
++            if (asset != Hash{} && amounts.outputs > amounts.inputs) {
++                return Fail(error,
++                            "native PSBT inflates a token without a mint");
++            }
++        }
++
++        // Calculate the final wire size from explicit slots, without pretending
++        // that dummy signature bytes authorize or validate a spend.
++        Transaction projected = prepared.tx;
++        for (size_t i = 0; i < prepared.data.inputs.size(); ++i) {
++            for (const auto &[slot, request] :
++                 prepared.data.inputs[i].requests) {
++                if (request.scheme != 0)
++                    return Fail(error,
++                                "legacy bridge PSBT signing is unsupported");
++                if (request.mode != 0 && !context.allow_partial_modes) {
++                    return Fail(error, "partial native PSBT signing mode "
++                                       "requires explicit authorization");
++                }
++                if (request.mode == 2 && i >= projected.outputs.size()) {
++                    return Fail(
++                        error,
++                        "native PSBT paired-output mode has no paired output");
++                }
++                projected.inputs[i]
++                    .witnesses[slot.witness]
++                    .arguments[slot.argument]
++                    .assign(request.mode == 0 ? 64 : 65, 0);
++            }
++        }
++        PsbtBytes wire;
++        if (!EncodeTransaction(projected, context.profile.transaction, wire,
++                               error))
++            return false;
++        prepared.review.signed_wire_bytes = wire.size();
++        size_t token_outputs = 0;
++        for (const auto &output : projected.outputs)
++            token_outputs += output.HasToken();
++        const __uint128_t token_floor =
++            __uint128_t{2} * context.profile.dust_limit * token_outputs;
++        if (prepared.review.native_fee < wire.size() ||
++            prepared.review.native_fee < token_floor) {
++            return Fail(error,
++                        "native PSBT fee is below the byte or token floor");
++        }
++        return true;
++    }
++
++    bool SupportedRole(const Prepared &prepared, size_t input_index,
++                       PsbtSlot slot, const PsbtSignRequest &request,
++                       std::string &error) {
++        if (request.scheme != 0 ||
++            prepared.coins[input_index].output.legacy_script) {
++            return Fail(error, "automated native PSBT signer does not support "
++                               "this coin policy");
++        }
++        const auto &witness =
++            prepared.tx.inputs[input_index].witnesses[slot.witness];
++        PsbtBytes direct{32};
++        direct.insert(direct.end(), request.public_key.begin(),
++                      request.public_key.end());
++        direct.push_back(0xbb); // Native CHECKSIG.
++        if (slot.argument == 0 && witness.arguments.size() == 1 &&
++            witness.script == direct)
++            return true;
++        const std::span<const uint8_t, 32> pubkey(request.public_key.data(),
++                                                  32);
++        if (slot.argument == 0 && witness.arguments.size() == 2 &&
++            witness.arguments[1] == request.public_key &&
++            witness.script == KeyHashProgram(NativeKeyHash(pubkey)))
++            return true;
++        return Fail(
++            error, "native PSBT signing request has an unsupported key policy");
++    }
++
++    bool VerifyPartial(const Prepared &prepared, size_t input_index,
++                       PsbtSlot slot, const PsbtSignRequest &request,
++                       const PsbtBytes &signature, std::string &error) {
++        if (request.scheme != 0 ||
++            prepared.coins[input_index].output.legacy_script) {
++            return Fail(error,
++                        "legacy bridge PSBT finalization is unsupported");
++        }
++        Hash message;
++        if (!SigningMessage(prepared.signing, input_index, slot.witness,
++                            request.mode, std::nullopt, message, error))
++            return false;
++        if (VerifyBip340Signature(request.public_key, signature, message,
++                                  false) != SignatureStatus::Valid)
++            return Fail(error, "invalid native PSBT partial signature");
++        return true;
++    }
++} // namespace
++
++bool UpdateNativePsbt(NativePsbt &psbt, const NativePsbtContext &context,
++                      std::string &error) {
++    NativePsbtData data;
++    if (!psbt.Inspect(data, error)) return false;
++    if (data.chain_id != context.chain_id || !context.lookup) {
++        return Fail(
++            error,
++            "native PSBT update requires the trusted chain and coin lookup");
++    }
++    NativePsbt updated = psbt;
++    for (size_t i = 0; i < data.tx_template.inputs.size(); ++i) {
++        const auto &input = data.tx_template.inputs[i];
++        Coin coin;
++        const auto result =
++            context.lookup({input.prev_txid, input.prev_index}, coin, error);
++        if (result == CoinReadResult::Error) return false;
++        if (result == CoinReadResult::Missing) continue;
++        if (coin.outpoint != Outpoint{input.prev_txid, input.prev_index}) {
++            return Fail(error, "trusted lookup returned a different outpoint");
++        }
++        PsbtBytes bytes;
++        if (!EncodeCoin(coin, bytes))
++            return Fail(error, "invalid trusted coin");
++        auto [it, added] = updated.inputs[i].emplace(NativePsbtKey(1), bytes);
++        if (!added && it->second != bytes)
++            return Fail(error, "native PSBT coin conflicts with trusted state");
++    }
++    if (!updated.Inspect(data, error)) return false;
++    psbt = std::move(updated);
++    error.clear();
++    return true;
++}
++
++bool ReviewNativePsbt(const NativePsbt &psbt, const NativePsbtContext &context,
++                      NativePsbtReview &review, std::string &error) {
++    Prepared prepared;
++    if (!Authenticate(psbt, context, prepared, error) ||
++        !Review(prepared, context, error))
++        return false;
++    review = std::move(prepared.review);
++    error.clear();
++    return true;
++}
++
++bool SignNativePsbt(NativePsbt &psbt, const NativePsbtContext &context,
++                    const NativePsbtKeyLookup &keys,
++                    const std::array<uint8_t, 32> &aux_randomness,
++                    size_t &signed_slots, std::string &error) {
++    signed_slots = 0;
++    Prepared prepared;
++    if (!Authenticate(psbt, context, prepared, error) ||
++        !Review(prepared, context, error))
++        return false;
++    NativePsbt signed_psbt = psbt;
++    size_t added = 0;
++    for (size_t i = 0; i < prepared.data.inputs.size(); ++i) {
++        const auto &input = prepared.data.inputs[i];
++        for (const auto &[slot, request] : input.requests) {
++            if (!SupportedRole(prepared, i, slot, request, error)) return false;
++            auto present = input.signatures.find(slot);
++            if (present != input.signatures.end()) {
++                if (!VerifyPartial(prepared, i, slot, request, present->second,
++                                   error))
++                    return false;
++                continue;
++            }
++            std::array<uint8_t, 32> secret{};
++            struct Cleanse {
++                std::array<uint8_t, 32> &secret;
++                ~Cleanse() { memory_cleanse(secret.data(), secret.size()); }
++            } cleanse{secret};
++            if (!keys || !keys(request.public_key, secret)) continue;
++            Hash message;
++            PsbtBytes signature;
++            if (!SigningMessage(prepared.signing, i, slot.witness, request.mode,
++                                std::nullopt, message, error) ||
++                !SignBip340Message(secret, message, request.mode,
++                                   aux_randomness, signature, error) ||
++                !VerifyPartial(prepared, i, slot, request, signature, error))
++                return false;
++            signed_psbt.inputs[i][NativePsbtKey(4, EncodePsbtSlot(slot))] =
++                std::move(signature);
++            ++added;
++        }
++    }
++    NativePsbtData checked;
++    if (!signed_psbt.Inspect(checked, error)) return false;
++    psbt = std::move(signed_psbt);
++    signed_slots = added;
++    error.clear();
++    return true;
++}
++
++bool FinalizeNativePsbt(NativePsbt &psbt, const NativePsbtContext &context,
++                        Transaction &extracted, std::string &error) {
++    Prepared prepared;
++    if (!Authenticate(psbt, context, prepared, error) ||
++        !Review(prepared, context, error))
++        return false;
++    Transaction final_tx = prepared.tx;
++    for (size_t i = 0; i < prepared.data.inputs.size(); ++i) {
++        const auto &input = prepared.data.inputs[i];
++        if (prepared.coins[i].output.legacy_script) {
++            return Fail(error,
++                        "legacy bridge PSBT finalization is unsupported");
++        }
++        for (const auto &[slot, request] : input.requests) {
++            auto signature = input.signatures.find(slot);
++            if (signature == input.signatures.end())
++                return Fail(error,
++                            "native PSBT is missing a requested signature");
++            if (!VerifyPartial(prepared, i, slot, request, signature->second,
++                               error))
++                return false;
++            final_tx.inputs[i]
++                .witnesses[slot.witness]
++                .arguments[slot.argument] = signature->second;
++        }
++        for (const auto &[witness, args] : input.final_arguments) {
++            if (args != final_tx.inputs[i].witnesses[witness].arguments) {
++                return Fail(
++                    error,
++                    "native PSBT final arguments conflict with declared slots");
++            }
++        }
++    }
++    DevelopmentUtxoView view;
++    for (const auto &coin : prepared.coins)
++        view.emplace(coin.outpoint, coin);
++    OrdinaryCandidateEffects effects;
++    if (!CheckOrdinaryCandidate(final_tx, context.profile, context.chain_id,
++                                view, effects, error))
++        return false;
++    IdentityDigests original, final_ids;
++    if (!ComputeIdentities(prepared.data.tx_template,
++                           context.profile.transaction, context.chain_id,
++                           original, error) ||
++        !ComputeIdentities(final_tx, context.profile.transaction,
++                           context.chain_id, final_ids, error) ||
++        original.txid != final_ids.txid) {
++        return Fail(error,
++                    "native PSBT finalization changed transaction identity");
++    }
++    NativePsbt finalized = psbt;
++    for (size_t i = 0; i < final_tx.inputs.size(); ++i) {
++        for (size_t w = 0; w < final_tx.inputs[i].witnesses.size(); ++w) {
++            finalized
++                .inputs[i][NativePsbtKey(5, EncodePsbtWitness(uint16_t(w)))] =
++                EncodePsbtArguments(final_tx.inputs[i].witnesses[w].arguments);
++        }
++    }
++    NativePsbtData checked;
++    if (!finalized.Inspect(checked, error)) return false;
++    psbt = std::move(finalized);
++    extracted = std::move(final_tx);
++    error.clear();
++    return true;
++}
++} // namespace lotus::v2
+diff --git a/src/lotus_v2/psbt_signing.h b/src/lotus_v2/psbt_signing.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..3b3552e646f7cf6dd6728ad3eae3e32870958a47
+--- /dev/null
++++ b/src/lotus_v2/psbt_signing.h
+@@ -0,0 +1,47 @@
++// Copyright (c) 2026 The Lotus developers
++// Distributed under the MIT software license, see COPYING.
++#ifndef LOTUS_V2_PSBT_SIGNING_H
++#define LOTUS_V2_PSBT_SIGNING_H
++
++#include "ordinary_validation.h"
++#include "psbt.h"
++
++#include <functional>
++
++namespace lotus::v2 {
++
++// All context here is provisioned independently of the transported document.
++// A proof root is an authenticated snapshot, not a claim of future
++// availability.
++struct NativePsbtContext {
++    ChainId chain_id{};
++    OrdinaryCandidateProfile profile{};
++    CoinLookup lookup;
++    std::optional<Hash> trusted_utxo_root;
++    bool allow_partial_modes = false;
++};
++
++struct NativePsbtReview {
++    VmAssetTotalsMap assets;
++    __uint128_t native_fee{};
++    uint64_t signed_wire_bytes{};
++};
++
++// The provider must only return keys whose use the wallet policy authorizes.
++// The signer verifies key ownership and supported program placement itself.
++using NativePsbtKeyLookup =
++    std::function<bool(std::span<const uint8_t>, std::array<uint8_t, 32> &)>;
++
++bool UpdateNativePsbt(NativePsbt &psbt, const NativePsbtContext &context,
++                      std::string &error);
++bool ReviewNativePsbt(const NativePsbt &psbt, const NativePsbtContext &context,
++                      NativePsbtReview &review, std::string &error);
++bool SignNativePsbt(NativePsbt &psbt, const NativePsbtContext &context,
++                    const NativePsbtKeyLookup &keys,
++                    const std::array<uint8_t, 32> &aux_randomness,
++                    size_t &signed_slots, std::string &error);
++bool FinalizeNativePsbt(NativePsbt &psbt, const NativePsbtContext &context,
++                        Transaction &extracted, std::string &error);
++
++} // namespace lotus::v2
++#endif
+diff --git a/src/lotus_v2/test_psbt_signing.cpp b/src/lotus_v2/test_psbt_signing.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..e5df01afe9a6956b0f77c6c2578821132dfa9e37
+--- /dev/null
++++ b/src/lotus_v2/test_psbt_signing.cpp
+@@ -0,0 +1,276 @@
++// Copyright (c) 2026 The Lotus developers
++// Distributed under the MIT software license, see COPYING.
++#include "psbt_signing.h"
++
++#include "address.h"
++#include "commitment.h"
++
++#include <algorithm>
++#include <iostream>
++#include <stdexcept>
++
++using namespace lotus::v2;
++
++#define CHECK(condition)                                                       \
++    do {                                                                       \
++        if (!(condition))                                                      \
++            throw std::runtime_error("check failed: " #condition);             \
++    } while (false)
++
++namespace {
++PsbtBytes Hex(const char *text) {
++    auto digit = [](char c) -> uint8_t {
++        return c <= '9' ? c - '0' : c - 'a' + 10;
++    };
++    PsbtBytes result;
++    for (size_t i = 0; text[i]; i += 2) {
++        result.push_back(uint8_t(digit(text[i]) * 16 + digit(text[i + 1])));
++    }
++    return result;
++}
++
++OrdinaryCandidateProfile Profile() {
++    OrdinaryCandidateProfile result{
++        DefaultTxProfile,
++        VmProfile{10000, 65535, 8192, 65535, 65535, 1048576, 64, 100000},
++        VmCostProfile{},
++        100,
++        50000,
++        2,
++        100,
++        10000000};
++    result.vm_cost.max_invocation_cost = 1000000;
++    result.vm_cost.structural_byte_cost = 1;
++    for (auto &opcode : result.vm_cost.opcode)
++        opcode = {1, 1, 1};
++    return result;
++}
++
++struct Fixture {
++    std::vector<PsbtBytes> public_keys{
++        Hex("f9308a019258c31049344f85f89d5229b531c845836f99b08601f113bce036f9"),
++        Hex("79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f8179"
++            "8")};
++    std::vector<Coin> coins;
++    NativePsbt psbt;
++    ChainId chain{};
++
++    explicit Fixture(uint8_t mode = 0, bool keyhash = false) {
++        chain.fill(0x42);
++        Transaction tx;
++        for (size_t i = 0; i < 2; ++i) {
++            const std::span<const uint8_t, 32> key(public_keys[i].data(), 32);
++            PsbtBytes script;
++            if (keyhash) {
++                script = KeyHashProgram(NativeKeyHash(key));
++            } else {
++                script = {32};
++                script.insert(script.end(), key.begin(), key.end());
++                script.push_back(0xbb);
++            }
++            Hash sibling{};
++            sibling.fill(0x50 + uint8_t(i));
++            Input input;
++            input.prev_txid.fill(0x11 + uint8_t(i));
++            input.flags = 1;
++            input.sequence = 0xffffffff;
++            input.path_index = 1;
++            input.witnesses = {{script, {sibling}, {}}};
++            tx.inputs.push_back(input);
++            Output output;
++            output.value = 90000;
++            output.branches = {BranchLeaf(PsbtBytes{0x4e}),
++                               BranchNode(BranchLeaf(script), sibling)};
++            output.paths = {{0}, {1}};
++            tx.outputs.push_back(output);
++            Coin coin;
++            coin.outpoint = {input.prev_txid, 0};
++            coin.output = output;
++            coin.output.value = 100000;
++            coin.output.flags = OUTPUT_FLAG_HAS_STATE;
++            coin.output.state_root.fill(0x70 + uint8_t(i));
++            coin.creation_height = 1;
++            coin.creation_parent_mtp = 1000;
++            coin.fee_per_output = 10;
++            coins.push_back(coin);
++        }
++        std::string error;
++        CHECK(CreateNativePsbt(tx, chain, psbt, error));
++        for (size_t i = 0; i < coins.size(); ++i) {
++            CHECK(EncodeCoin(coins[i], psbt.inputs[i][NativePsbtKey(1)]));
++            PsbtArguments args{{}};
++            if (keyhash) args.push_back(public_keys[i]);
++            psbt.inputs[i][NativePsbtKey(2, EncodePsbtWitness(0))] =
++                EncodePsbtArguments(args);
++            PsbtBytes request{0, mode};
++            request.insert(request.end(), public_keys[i].begin(),
++                           public_keys[i].end());
++            psbt.inputs[i][NativePsbtKey(3, EncodePsbtSlot({0, 0}))] = request;
++            psbt.inputs[i][NativePsbtKey(0x80)] = {0, 0xff};
++        }
++    }
++
++    NativePsbtContext Context() {
++        return {chain, Profile(),
++                [this](const Outpoint &outpoint, Coin &coin, std::string &) {
++                    for (const auto &trusted : coins) {
++                        if (trusted.outpoint == outpoint) {
++                            coin = trusted;
++                            return CoinReadResult::Found;
++                        }
++                    }
++                    return CoinReadResult::Missing;
++                },
++                std::nullopt, false};
++    }
++
++    NativePsbtKeyLookup Keys(size_t index) {
++        return [this, index](std::span<const uint8_t> key,
++                             std::array<uint8_t, 32> &secret) {
++            if (!std::ranges::equal(key, public_keys[index])) return false;
++            secret.fill(0);
++            secret[31] = index == 0 ? 3 : 1;
++            return true;
++        };
++    }
++};
++
++void TwoSigners(uint8_t mode, bool keyhash) {
++    Fixture fixture(mode, keyhash);
++    auto context = fixture.Context();
++    std::string error;
++    size_t slots;
++    std::array<uint8_t, 32> aux{}; // Fixed test entropy only.
++    auto first = fixture.psbt;
++    auto second = fixture.psbt;
++    const auto template_wire = first.global.at(NativePsbtKey(2));
++    if (mode != 0) {
++        CHECK(!SignNativePsbt(first, context, fixture.Keys(0), aux, slots,
++                              error));
++        context.allow_partial_modes = true;
++    }
++    NativePsbtReview review;
++    CHECK(ReviewNativePsbt(first, context, review, error));
++    CHECK(review.native_fee == 20000);
++    CHECK(SignNativePsbt(first, context, fixture.Keys(0), aux, slots, error) &&
++          slots == 1);
++    Transaction extracted;
++    CHECK(!FinalizeNativePsbt(first, context, extracted, error));
++    CHECK(SignNativePsbt(second, context, fixture.Keys(1), aux, slots, error) &&
++          slots == 1);
++    CHECK(first.Merge(second, error));
++    CHECK(FinalizeNativePsbt(first, context, extracted, error));
++    CHECK(first.global.at(NativePsbtKey(2)) == template_wire);
++    CHECK(first.inputs[0].at(NativePsbtKey(0x80)) == PsbtBytes({0, 0xff}));
++    CHECK(extracted.inputs[0].witnesses[0].siblings.size() == 1);
++    CHECK(extracted.inputs[0].path_index == 1);
++    CHECK(!extracted.outputs[0].HasState());
++    CHECK(extracted.inputs[0].witnesses[0].arguments[0].size() ==
++          (mode ? 65 : 64));
++    NativePsbtData data;
++    CHECK(first.Inspect(data, error));
++    CHECK(data.inputs[0].coin->output.HasState());
++    IdentityDigests before, after;
++    CHECK(ComputeIdentities(data.tx_template, DefaultTxProfile, fixture.chain,
++                            before, error));
++    CHECK(ComputeIdentities(extracted, DefaultTxProfile, fixture.chain, after,
++                            error));
++    CHECK(before.txid == after.txid && before.txhash != after.txhash);
++    CHECK(FinalizeNativePsbt(first, context, extracted, error));
++
++    auto tampered = first;
++    auto &signature =
++        tampered.inputs[0][NativePsbtKey(4, EncodePsbtSlot({0, 0}))];
++    signature[0] ^= 1;
++    CHECK(!FinalizeNativePsbt(tampered, context, extracted, error));
++    tampered = first;
++    tampered.inputs[0][NativePsbtKey(5, EncodePsbtWitness(0))].back() ^= 1;
++    CHECK(!FinalizeNativePsbt(tampered, context, extracted, error));
++    tampered = fixture.psbt;
++    context.chain_id[0] ^= 1;
++    CHECK(
++        !SignNativePsbt(tampered, context, fixture.Keys(0), aux, slots, error));
++}
++
++void AuthenticationAndFailures() {
++    Fixture fixture;
++    auto context = fixture.Context();
++    std::string error;
++    size_t slots;
++    std::array<uint8_t, 32> aux{};
++    auto psbt = fixture.psbt;
++    auto counterfeit = fixture.coins[0];
++    ++counterfeit.fee_per_output;
++    CHECK(EncodeCoin(counterfeit, psbt.inputs[0][NativePsbtKey(1)]));
++    CHECK(!SignNativePsbt(psbt, context, fixture.Keys(0), aux, slots, error));
++    CHECK(slots == 0);
++    psbt = fixture.psbt;
++    context.lookup = {};
++    CHECK(!SignNativePsbt(psbt, context, fixture.Keys(0), aux, slots, error));
++    context = fixture.Context();
++    context.profile.candidate_height =
++        ComputeUtxoExpirationHeight(fixture.coins[0]);
++    CHECK(!SignNativePsbt(psbt, context, fixture.Keys(0), aux, slots, error));
++
++    // Proofs authenticate exactly the complete Coin-v2 bytes to an external
++    // root. Supplying that same root inside the PSBT alone gives no trust.
++    UtxoSet set;
++    for (const auto &coin : fixture.coins)
++        CHECK(set.Insert(coin));
++    const auto root = set.Root();
++    psbt.global[NativePsbtKey(3)] = PsbtBytes(root.begin(), root.end());
++    for (size_t i = 0; i < fixture.coins.size(); ++i) {
++        auto proof = set.Prove(fixture.coins[i].outpoint);
++        PsbtBytes wire(proof.bitmap.begin(), proof.bitmap.end());
++        psbt_detail::Compact(proof.siblings.size(), wire);
++        for (const auto &sibling : proof.siblings)
++            wire.insert(wire.end(), sibling.begin(), sibling.end());
++        psbt.inputs[i][NativePsbtKey(6)] = wire;
++    }
++    context = fixture.Context();
++    context.lookup = {};
++    CHECK(!SignNativePsbt(psbt, context, fixture.Keys(0), aux, slots, error));
++    context.trusted_utxo_root = root;
++    CHECK(SignNativePsbt(psbt, context, fixture.Keys(0), aux, slots, error));
++    CHECK(slots == 1);
++    psbt.inputs[0][NativePsbtKey(6)].back() ^= 1;
++    CHECK(!SignNativePsbt(psbt, context, fixture.Keys(1), aux, slots, error));
++
++    // Update adds authentic metadata but cannot replace coordinator-supplied
++    // conflicts. Incomplete metadata is allowed in transport, not signing.
++    psbt = fixture.psbt;
++    psbt.inputs[0].erase(NativePsbtKey(1));
++    context = fixture.Context();
++    CHECK(!SignNativePsbt(psbt, context, fixture.Keys(0), aux, slots, error));
++    CHECK(UpdateNativePsbt(psbt, context, error));
++    CHECK(SignNativePsbt(psbt, context, fixture.Keys(0), aux, slots, error));
++    psbt = fixture.psbt;
++    CHECK(EncodeCoin(counterfeit, psbt.inputs[0][NativePsbtKey(1)]));
++    CHECK(!UpdateNativePsbt(psbt, context, error));
++
++    // A key provider returning the wrong private key cannot add a signature.
++    psbt = fixture.psbt;
++    auto wrong_key = [](std::span<const uint8_t>,
++                        std::array<uint8_t, 32> &secret) {
++        secret.fill(0);
++        secret[31] = 9;
++        return true;
++    };
++    CHECK(!SignNativePsbt(psbt, context, wrong_key, aux, slots, error));
++    CHECK(slots == 0);
++}
++} // namespace
++
++int main() {
++    try {
++        for (uint8_t mode = 0; mode < 3; ++mode) {
++            TwoSigners(mode, false);
++            TwoSigners(mode, true);
++        }
++        AuthenticationAndFailures();
++        std::cout << "Lotus V2 authenticated PSBT signing tests passed\n";
++    } catch (const std::exception &error) {
++        std::cerr << error.what() << '\n';
++        return 1;
++    }
++}
+-- 
+2.50.1 (Apple Git-155)
+

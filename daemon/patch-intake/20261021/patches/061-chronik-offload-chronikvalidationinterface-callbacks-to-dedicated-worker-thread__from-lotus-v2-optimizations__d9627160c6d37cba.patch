@@ -1,0 +1,405 @@
+From 8e204c6a26a0b3ada0733daf2a097a429dee2a87 Mon Sep 17 00:00:00 2001
+From: Shammah Chancellor <shammah.chancellor@notvalid.com>
+Date: Sun, 18 Oct 2026 01:58:40 -0700
+Subject: [PATCH] chronik: offload ChronikValidationInterface callbacks to
+ dedicated worker thread
+
+Add a dedicated background worker thread and bounded FIFO task queue to ChronikValidationInterface so Chronik indexing events execute in strict FIFO order off the shared ValidationSignals scheduler thread.
+
+Original-Commit: fcea86012096e7f339ec3ed4f3d6790cb628334b
+Original-Patch: ecash/049
+Split-Concern: whole
+
+Folded owner repair: both validation synchronization entrypoints also fence the
+secondary FIFO. The worker bypasses its own fence; shutdown drain belongs to
+StopWorker/join. Native regressions prove both entrypoints wait for indexing.
+Full Chronik-enabled prefix validation remains required at this boundary.
+---
+ .../chronik_validationinterface.cpp           | 135 ++++++++++++++++--
+ src/test/validationinterface_tests.cpp        | 114 +++++++++++++++
+ src/validationinterface.cpp                   |   6 +
+ src/validationinterface.h                     |   2 +
+ 4 files changed, 244 insertions(+), 13 deletions(-)
+
+diff --git a/chronik/chronik-cpp/chronik_validationinterface.cpp b/chronik/chronik-cpp/chronik_validationinterface.cpp
+index 15f183d481..0167eb7871 100644
+--- a/chronik/chronik-cpp/chronik_validationinterface.cpp
++++ b/chronik/chronik-cpp/chronik_validationinterface.cpp
+@@ -12,6 +12,13 @@
+ #include <txmempool.h>
+ #include <validationinterface.h>
+ 
++#include <condition_variable>
++#include <deque>
++#include <functional>
++#include <future>
++#include <mutex>
++#include <thread>
++
+ namespace chronik {
+ 
+ /**
+@@ -21,7 +28,10 @@ class ChronikValidationInterface final : public CValidationInterface {
+ public:
+     ChronikValidationInterface(const node::NodeContext &node,
+                                rust::Box<chronik_bridge::Chronik> chronik_box)
+-        : m_node(node), m_chronik(std::move(chronik_box)) {}
++        : m_chronik(std::move(chronik_box)), m_node(node),
++          m_worker_thread([this] { WorkerLoop(); }) {}
++
++    ~ChronikValidationInterface() { StopWorker(); }
+ 
+     void Register() {
+         m_node.validation_signals->RegisterValidationInterface(this);
+@@ -33,7 +43,45 @@ public:
+ 
+     void InterruptChronik() { m_chronik->interrupt(); }
+ 
++    // Normal-operation fence for work already forwarded by ValidationSignals.
++    // Once shutdown starts, StopWorker/join owns draining the remaining FIFO.
++    void SyncTransactionQueue() override {
++        if (std::this_thread::get_id() == m_worker_thread.get_id()) {
++            return;
++        }
++        auto promise = std::make_shared<std::promise<void>>();
++        auto completed = promise->get_future();
++        bool enqueued = false;
++        {
++            std::unique_lock<std::mutex> lock(m_mutex);
++            m_cv_space.wait(lock, [this] {
++                return m_stopping || m_queue.size() < MAX_QUEUE_SIZE;
++            });
++            if (!m_stopping) {
++                m_queue.push_back([promise] { promise->set_value(); });
++                enqueued = true;
++            }
++        }
++        if (enqueued) {
++            m_cv.notify_one();
++            completed.wait();
++        }
++    }
++
++    void StopWorker() {
++        {
++            std::lock_guard<std::mutex> lock(m_mutex);
++            m_stopping = true;
++        }
++        m_cv.notify_all();
++        m_cv_space.notify_all();
++        if (m_worker_thread.joinable()) {
++            m_worker_thread.join();
++        }
++    }
++
+     bool StopChronik() {
++        StopWorker();
+         try {
+             m_chronik->stop();
+         } catch (const std::exception &e) {
+@@ -44,8 +92,52 @@ public:
+     }
+ 
+ private:
++    static constexpr size_t MAX_QUEUE_SIZE = 65536;
++
+     rust::Box<chronik_bridge::Chronik> m_chronik;
+     const node::NodeContext &m_node;
++    std::deque<std::function<void()>> m_queue;
++    std::mutex m_mutex;
++    std::condition_variable m_cv;
++    std::condition_variable m_cv_space;
++    bool m_stopping{false};
++    std::thread m_worker_thread;
++
++    void WorkerLoop() {
++        while (true) {
++            std::function<void()> task;
++            {
++                std::unique_lock<std::mutex> lock(m_mutex);
++                m_cv.wait(lock, [this] {
++                    return m_stopping || !m_queue.empty();
++                });
++                if (m_queue.empty()) {
++                    if (m_stopping) {
++                        break;
++                    }
++                    continue;
++                }
++                task = std::move(m_queue.front());
++                m_queue.pop_front();
++                m_cv_space.notify_one();
++            }
++            task();
++        }
++    }
++
++    void Enqueue(std::function<void()> task) {
++        {
++            std::unique_lock<std::mutex> lock(m_mutex);
++            m_cv_space.wait(lock, [this] {
++                return m_stopping || m_queue.size() < MAX_QUEUE_SIZE;
++            });
++            if (m_stopping) {
++                return;
++            }
++            m_queue.push_back(std::move(task));
++        }
++        m_cv.notify_one();
++    }
+ 
+     using CValidationInterface::TransactionAddedToMempool;
+ 
+@@ -59,7 +151,11 @@ private:
+                 entry_time != 0
+                     ? entry_time
+                     : m_node.mempool->info(ptx->GetId()).m_time.count();
+-            m_chronik->handle_tx_added_to_mempool(*ptx, *spent_coins, tx_time);
++            Enqueue([this, ptx, spent_coins = std::move(spent_coins),
++                     tx_time]() {
++                m_chronik->handle_tx_added_to_mempool(*ptx, *spent_coins,
++                                                      tx_time);
++            });
+         } else {
+             LogPrintf("Chronik: transaction %s added to mempool but spent "
+                       "coins are not available\n",
+@@ -67,11 +163,13 @@ private:
+         }
+     }
+ 
+-    void TransactionRemovedFromMempool(const CTransactionRef &ptx,
+-                                       MemPoolRemovalReason reason,
+-                                       uint64_t mempool_sequence) override {
+-        m_chronik->handle_tx_removed_from_mempool(
+-            chronik::util::HashToArray(ptx->GetId()));
++    void TransactionRemovedFromMempool(
++        const CTransactionRef &ptx, MemPoolRemovalReason /* reason */,
++        uint64_t /* mempool_sequence */) override {
++        const auto txid = chronik::util::HashToArray(ptx->GetId());
++        Enqueue([this, txid]() {
++            m_chronik->handle_tx_removed_from_mempool(txid);
++        });
+     }
+ 
+     void BlockConnected(ChainstateRole role,
+@@ -86,33 +184,44 @@ private:
+ 
+         // We can safely pass T& here as Rust guarantees us that no references
+         // can be kept after the below function call completed.
+-        m_chronik->handle_block_connected(*block, *pindex);
++        Enqueue([this, block, pindex]() {
++            m_chronik->handle_block_connected(*block, *pindex);
++        });
+     }
+ 
+     void BlockDisconnected(const std::shared_ptr<const CBlock> &block,
+                            const CBlockIndex *pindex) override {
+         // See BlockConnected for safety
+-        m_chronik->handle_block_disconnected(*block, *pindex);
++        Enqueue([this, block, pindex]() {
++            m_chronik->handle_block_disconnected(*block, *pindex);
++        });
+     }
+ 
+     void BlockFinalized(const CBlockIndex *pindex) override {
+-        m_chronik->handle_block_finalized(*pindex);
++        Enqueue([this, pindex]() {
++            m_chronik->handle_block_finalized(*pindex);
++        });
+     }
+ 
+     void BlockInvalidated(const CBlockIndex *pindex,
+                           const std::shared_ptr<const CBlock> &block) override {
+-        m_chronik->handle_block_invalidated(*block, *pindex);
++        Enqueue([this, block, pindex]() {
++            m_chronik->handle_block_invalidated(*block, *pindex);
++        });
+     }
+ 
+     void TransactionFinalized(const CTransactionRef &tx) override {
+-        m_chronik->handle_tx_finalized(chronik::util::HashToArray(tx->GetId()));
++        const auto txid = chronik::util::HashToArray(tx->GetId());
++        Enqueue([this, txid]() { m_chronik->handle_tx_finalized(txid); });
+     }
+ 
+     void TransactionInvalidated(
+         const CTransactionRef &tx,
+         std::shared_ptr<const std::vector<Coin>> spent_coins) override {
+         if (spent_coins) {
+-            m_chronik->handle_tx_invalidated(*tx, *spent_coins);
++            Enqueue([this, tx, spent_coins = std::move(spent_coins)]() {
++                m_chronik->handle_tx_invalidated(*tx, *spent_coins);
++            });
+         } else {
+             LogPrintf("Chronik: transaction %s invalidated but spent coins are "
+                       "not available\n",
+diff --git a/src/test/validationinterface_tests.cpp b/src/test/validationinterface_tests.cpp
+index 206841cab3..7c704d1903 100644
+--- a/src/test/validationinterface_tests.cpp
++++ b/src/test/validationinterface_tests.cpp
+@@ -14,6 +14,11 @@
+ 
+ #include <boost/test/unit_test.hpp>
+ 
++#include <condition_variable>
++#include <deque>
++#include <future>
++#include <util/task_runner.h>
++
+ BOOST_FIXTURE_TEST_SUITE(validationinterface_tests, ChainTestingSetup)
+ 
+ struct TestSubscriberNoop final : public CValidationInterface {
+@@ -673,4 +678,113 @@ BOOST_FIXTURE_TEST_CASE(transaction_invalidated, TestChain100Setup) {
+     }
+ }
+ 
++
++// A subscriber with an independently scheduled FIFO, like Chronik. Latches
++// establish ordering: no timing delay is used to infer that the fence blocked.
++class SecondaryQueueSubscriber final : public CValidationInterface {
++    std::mutex mutex;
++    std::condition_variable ready;
++    std::deque<std::function<void()>> queue;
++    bool stopping{false};
++    std::thread worker;
++
++    void Enqueue(std::function<void()> task) {
++        {
++            std::lock_guard<std::mutex> lock(mutex);
++            queue.push_back(std::move(task));
++        }
++        ready.notify_one();
++    }
++
++public:
++    std::promise<void> release_indexing;
++    std::future<void> release{release_indexing.get_future()};
++    std::atomic<bool> indexed{false};
++    std::mutex observation_mutex;
++    std::condition_variable observation;
++    bool fence_entered{false};
++    bool sync_returned{false};
++
++    SecondaryQueueSubscriber() : worker([this] {
++        for (;;) {
++            std::function<void()> task;
++            {
++                std::unique_lock<std::mutex> lock(mutex);
++                ready.wait(lock, [&] { return stopping || !queue.empty(); });
++                if (queue.empty()) return;
++                task = std::move(queue.front());
++                queue.pop_front();
++            }
++            task();
++        }
++    }) {}
++
++    ~SecondaryQueueSubscriber() {
++        {
++            std::lock_guard<std::mutex> lock(mutex);
++            stopping = true;
++        }
++        ready.notify_one();
++        worker.join();
++    }
++
++    void TransactionFinalized(const CTransactionRef &) override {
++        Enqueue([this] {
++            release.wait();
++            indexed = true;
++        });
++    }
++
++    void SyncTransactionQueue() override {
++        auto promise = std::make_shared<std::promise<void>>();
++        auto completed = promise->get_future();
++        Enqueue([promise] { promise->set_value(); });
++        {
++            std::lock_guard<std::mutex> lock(observation_mutex);
++            fence_entered = true;
++        }
++        observation.notify_one();
++        completed.wait();
++    }
++};
++
++static void CheckSecondaryQueueFence(bool flush) {
++    ValidationSignals signals(std::make_unique<util::ImmediateTaskRunner>());
++    auto subscriber = std::make_shared<SecondaryQueueSubscriber>();
++    signals.RegisterSharedValidationInterface(subscriber);
++    signals.TransactionFinalized(MakeTransactionRef());
++    auto sync = std::async(std::launch::async, [&] {
++        if (flush) signals.FlushBackgroundCallbacks();
++        else signals.SyncWithValidationInterfaceQueue();
++        {
++            std::lock_guard<std::mutex> lock(subscriber->observation_mutex);
++            subscriber->sync_returned = true;
++        }
++        subscriber->observation.notify_one();
++    });
++    {
++        std::unique_lock<std::mutex> lock(subscriber->observation_mutex);
++        // Without the hook, sync_returned wakes us and both assertions fail;
++        // the regression never hangs waiting for an absent hook.
++        subscriber->observation.wait(lock, [&] {
++            return subscriber->fence_entered || subscriber->sync_returned;
++        });
++        BOOST_CHECK(subscriber->fence_entered);
++        BOOST_CHECK(!subscriber->sync_returned);
++        BOOST_CHECK(!subscriber->indexed);
++    }
++    subscriber->release_indexing.set_value();
++    sync.get();
++    BOOST_CHECK(subscriber->indexed);
++    signals.UnregisterAllValidationInterfaces();
++}
++
++BOOST_AUTO_TEST_CASE(flush_waits_for_secondary_queue) {
++    CheckSecondaryQueueFence(true);
++}
++
++BOOST_AUTO_TEST_CASE(sync_waits_for_secondary_queue) {
++    CheckSecondaryQueueFence(false);
++}
++
+ BOOST_AUTO_TEST_SUITE_END()
+diff --git a/src/validationinterface.cpp b/src/validationinterface.cpp
+index c99d083bfe..d4c5553a2e 100644
+--- a/src/validationinterface.cpp
++++ b/src/validationinterface.cpp
+@@ -112,6 +112,9 @@ ValidationSignals::~ValidationSignals() = default;
+ 
+ void ValidationSignals::FlushBackgroundCallbacks() {
+     m_internals->m_task_runner->flush();
++    m_internals->Iterate([](CValidationInterface &callbacks) {
++        callbacks.SyncTransactionQueue();
++    });
+ }
+ 
+ size_t ValidationSignals::CallbacksPending() {
+@@ -158,6 +161,9 @@ void ValidationSignals::SyncWithValidationInterfaceQueue() {
+     std::promise<void> promise;
+     CallFunctionInValidationInterfaceQueue([&promise] { promise.set_value(); });
+     promise.get_future().wait();
++    m_internals->Iterate([](CValidationInterface &callbacks) {
++        callbacks.SyncTransactionQueue();
++    });
+ }
+ 
+ // Use a macro instead of a function for conditional logging to prevent
+diff --git a/src/validationinterface.h b/src/validationinterface.h
+index 146c346f17..f29ba603c9 100644
+--- a/src/validationinterface.h
++++ b/src/validationinterface.h
+@@ -51,6 +51,8 @@ protected:
+      * public and virtual.
+      */
+     ~CValidationInterface() = default;
++    /** Wait for prior callbacks offloaded to a subscriber's secondary queue. */
++    virtual void SyncTransactionQueue() {}
+     /**
+      * Notifies listeners when the block chain tip advances.
+      *
+-- 
+2.50.1 (Apple Git-155)
+

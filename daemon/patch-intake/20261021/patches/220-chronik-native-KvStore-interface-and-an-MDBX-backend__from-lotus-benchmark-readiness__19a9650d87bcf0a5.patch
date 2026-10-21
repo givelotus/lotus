@@ -1,0 +1,1961 @@
+From ff61756a9fd2f9643f9b7ffbe54cf745aa8fde29 Mon Sep 17 00:00:00 2001
+From: Shammah Chancellor <shammah.chancellor@notvalid.com>
+Date: Mon, 19 Oct 2026 05:04:05 -0700
+Subject: [PATCH] chronik: native KvStore interface and an MDBX backend
+ matching Rust
+
+Add the storage layer of the native Chronik:
+
+- store.h: KvStore with ordered cursors, duplicate-value cursors, read
+  snapshots and read-your-writes write transactions. It is the only path
+  from the core to storage; the core library includes no database header
+  and links no database. Backends are separate libraries that register
+  themselves explicitly (RegisterMdbxStore()), so a host links exactly the
+  backends it selects.
+- schema.h: the 26 eCash-tier tables in the order the Rust chronik-db
+  registers them, with their duplicate-value layout (script_utxo is
+  DUPSORT|DUPFIXED with 20-byte tx_num/out_idx/sats entries, token_id_utxo
+  DUPSORT with variable entries). Schema::Add lets a tier extension add
+  its own tables; the eCash tier carries no V2 table.
+- store/mdbx: chronik_native_store_mdbx, built on the vendored libmdbx. It
+  reproduces the Rust environment exactly: one env at indexes/chronik,
+  256 readers, max(n_tables+16, 64) DBIs, the same geometry (1 MiB lower,
+  16 MiB initial, 256 GiB upper, 64 MiB growth, 128 MiB shrink, 16 KiB
+  pages), SAFE_NOSYNC|NOMETASYNC|LIFORECLAIM|NOSTICKYTHREADS|NOMEMINIT,
+  mode 0600, 16 MiB sync bytes and 65536 sync period, a named DBI per
+  table, and keys longer than 7500 bytes stored as
+  "MDBX_SHA256_KEY:" || sha256(key) using the host's SHA-256. Rust's merge
+  emulation is a physical detail: callers do explicit read-modify-writes,
+  which produce the same bytes.
+
+A conformance suite runs against every registered backend: ordering,
+SeekGe/SeekLe/SeekLast/Prev, duplicate semantics, read-your-writes,
+snapshot isolation under a concurrent writer, Clear, long keys, reopen
+persistence, and the environment settings above.
+
+Tier: eCash
+---
+ chronik/native/CMakeLists.txt                 |   3 +
+ chronik/native/core/db/schema.cpp             |  82 ++
+ chronik/native/core/db/sources.cmake          |  12 +
+ chronik/native/core/db/store_registry.cpp     |  73 ++
+ .../include/chronik/native/mdbx_store.h       |  93 +++
+ .../native/include/chronik/native/schema.h    |  83 ++
+ chronik/native/include/chronik/native/store.h | 151 ++++
+ chronik/native/store/mdbx/mdbx_store.cpp      | 770 ++++++++++++++++++
+ chronik/native/store/store.cmake              |  45 +
+ chronik/native/test/store_tests.cpp           | 523 ++++++++++++
+ 10 files changed, 1835 insertions(+)
+ create mode 100644 chronik/native/core/db/schema.cpp
+ create mode 100644 chronik/native/core/db/sources.cmake
+ create mode 100644 chronik/native/core/db/store_registry.cpp
+ create mode 100644 chronik/native/include/chronik/native/mdbx_store.h
+ create mode 100644 chronik/native/include/chronik/native/schema.h
+ create mode 100644 chronik/native/include/chronik/native/store.h
+ create mode 100644 chronik/native/store/mdbx/mdbx_store.cpp
+ create mode 100644 chronik/native/store/store.cmake
+ create mode 100644 chronik/native/test/store_tests.cpp
+
+diff --git a/chronik/native/CMakeLists.txt b/chronik/native/CMakeLists.txt
+index 9ecd14b96744ea641cdf9f702de4686e914df89c..e1d812e02bf9f729f510a8662af1bedd4e1638b6 100644
+--- a/chronik/native/CMakeLists.txt
++++ b/chronik/native/CMakeLists.txt
+@@ -63,6 +63,9 @@ endforeach()
+ # Libraries the unit tests link in addition to the core (backends, protobuf).
+ # Backend/transport source lists below append to it.
+ 
++# ---- Storage backends (each its own library; see store/store.cmake) ----
++include("${CHRONIK_NATIVE_ROOT}/store/store.cmake")
++
+ # ---- Core library ----
+ add_library(chronik_native_core STATIC ${CHRONIK_NATIVE_CORE_SOURCES})
+ target_include_directories(chronik_native_core
+diff --git a/chronik/native/core/db/schema.cpp b/chronik/native/core/db/schema.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..ac770b1e2f0eaf66382ac26b762500e983902e06
+--- /dev/null
++++ b/chronik/native/core/db/schema.cpp
+@@ -0,0 +1,82 @@
++// Copyright (c) 2026 The Lotus developers
++// Distributed under the MIT software license, see the accompanying
++// file COPYING or http://www.opensource.org/licenses/mit-license.php.
++
++#include <chronik/native/error.h>
++#include <chronik/native/schema.h>
++
++#include <array>
++
++namespace chronik::native::schema {
++
++namespace {
++using Kind = TableSpec::Kind;
++
++constexpr TableSpec Plain(std::string_view name) {
++    return TableSpec{name, Kind::Plain, std::nullopt};
++}
++
++// Order of Db::open: BlockWriter, BlockStatsWriter, MetadataWriter, TxWriter,
++// ScriptHistoryWriter, ScriptUtxoWriter, SpentByWriter, TokenWriter,
++// TokenIdHistoryWriter, TokenIdUtxoWriter, LokadIdHistoryWriter,
++// PluginsWriter (each add_cfs).
++const std::array<TableSpec, 26> kEcashTables = {{
++    // BlockWriter
++    Plain(kBlk),
++    Plain(kLookupBlkByHash),
++    // BlockStatsWriter
++    Plain(kBlkStats),
++    // MetadataWriter
++    Plain(kMeta),
++    // TxWriter
++    Plain(kTx),
++    Plain(kBlkByFirstTx),
++    Plain(kFirstTxByBlk),
++    Plain(kLookupTxByHash),
++    // ScriptHistoryWriter
++    Plain(kScriptHistory),
++    Plain(kScriptHistoryNumTxs),
++    Plain(kScripthash),
++    // ScriptUtxoWriter (UtxoDataValue: DUPSORT | DUPFIXED)
++    TableSpec{kScriptUtxo, Kind::Dup, kUtxoValueDupSize},
++    // SpentByWriter
++    Plain(kSpentBy),
++    // TokenWriter
++    Plain(kTokenGenesisInfo),
++    Plain(kTokenMeta),
++    Plain(kTokenTx),
++    // TokenIdHistoryWriter
++    Plain(kTokenIdHistory),
++    Plain(kTokenIdHistoryNumTxs),
++    // TokenIdUtxoWriter (UtxoDataOutput: DUPSORT only)
++    TableSpec{kTokenIdUtxo, Kind::Dup, std::nullopt},
++    // LokadIdHistoryWriter
++    Plain(kLokadIdHistory),
++    Plain(kLokadIdHistoryNumTxs),
++    // PluginsWriter: opened like Rust so the env is identical; never written
++    // by the native implementation.
++    Plain(kPluginMeta),
++    Plain(kPluginOutputs),
++    TableSpec{kPluginGroupUtxos, Kind::Dup, std::nullopt},
++    Plain(kPluginHistory),
++    Plain(kPluginHistoryNumTxs),
++}};
++} // namespace
++
++std::span<const TableSpec> EcashTables() {
++    return kEcashTables;
++}
++
++Schema::Schema() : m_tables(kEcashTables.begin(), kEcashTables.end()) {}
++
++void Schema::Add(TableSpec spec) {
++    for (const TableSpec &t : m_tables) {
++        if (t.name == spec.name) {
++            throw ChronikError("Duplicate Chronik table " +
++                               std::string(spec.name));
++        }
++    }
++    m_tables.push_back(spec);
++}
++
++} // namespace chronik::native::schema
+diff --git a/chronik/native/core/db/sources.cmake b/chronik/native/core/db/sources.cmake
+new file mode 100644
+index 0000000000000000000000000000000000000000..dbf623b9d75b1ca31e9276f8f9b00594a33b664b
+--- /dev/null
++++ b/chronik/native/core/db/sources.cmake
+@@ -0,0 +1,12 @@
++# Copyright (c) 2026 The Lotus developers
++# Distributed under the MIT software license, see the accompanying
++# file COPYING or http://www.opensource.org/licenses/mit-license.php.
++
++# Storage-neutral DB layer: backend registry and table schema.
++list(APPEND CHRONIK_NATIVE_CORE_SOURCES
++    core/db/schema.cpp
++    core/db/store_registry.cpp
++)
++list(APPEND CHRONIK_NATIVE_TEST_SOURCES
++    test/store_tests.cpp
++)
+diff --git a/chronik/native/core/db/store_registry.cpp b/chronik/native/core/db/store_registry.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..0aecea79b71e5e8577694eb2580fad320b0af5d2
+--- /dev/null
++++ b/chronik/native/core/db/store_registry.cpp
+@@ -0,0 +1,73 @@
++// Copyright (c) 2026 The Lotus developers
++// Distributed under the MIT software license, see the accompanying
++// file COPYING or http://www.opensource.org/licenses/mit-license.php.
++
++#include <chronik/native/error.h>
++#include <chronik/native/store.h>
++
++#include <map>
++#include <mutex>
++
++namespace chronik::native {
++
++namespace {
++struct Backend {
++    StoreOpenFn open;
++    StoreDestroyFn destroy;
++};
++
++std::mutex &RegistryMutex() {
++    static std::mutex mutex;
++    return mutex;
++}
++
++std::map<StoreBackend, Backend> &Registry() {
++    static std::map<StoreBackend, Backend> registry;
++    return registry;
++}
++
++Backend GetBackend(StoreBackend backend) {
++    std::lock_guard<std::mutex> lock(RegistryMutex());
++    auto it = Registry().find(backend);
++    if (it == Registry().end()) {
++        throw ChronikError("Chronik storage backend " +
++                           std::string(StoreBackendName(backend)) +
++                           " is not available in this build");
++    }
++    return it->second;
++}
++} // namespace
++
++std::string_view StoreBackendName(StoreBackend backend) {
++    switch (backend) {
++        case StoreBackend::Mdbx:
++            return "mdbx";
++        case StoreBackend::LevelDb:
++            return "leveldb";
++    }
++    return "unknown";
++}
++
++void RegisterStoreBackend(StoreBackend backend, StoreOpenFn open,
++                          StoreDestroyFn destroy) {
++    std::lock_guard<std::mutex> lock(RegistryMutex());
++    Registry()[backend] = Backend{std::move(open), std::move(destroy)};
++}
++
++bool HasStoreBackend(StoreBackend backend) {
++    std::lock_guard<std::mutex> lock(RegistryMutex());
++    return Registry().count(backend) > 0;
++}
++
++std::unique_ptr<KvStore> OpenStore(StoreBackend backend,
++                                   const std::filesystem::path &dir,
++                                   std::span<const TableSpec> tables,
++                                   const StoreOptions &opts) {
++    return GetBackend(backend).open(dir, tables, opts);
++}
++
++void DestroyStore(StoreBackend backend, const std::filesystem::path &dir) {
++    GetBackend(backend).destroy(dir);
++}
++
++} // namespace chronik::native
+diff --git a/chronik/native/include/chronik/native/mdbx_store.h b/chronik/native/include/chronik/native/mdbx_store.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..44bd34f9a58521b34c31fde282d6f346561c54e3
+--- /dev/null
++++ b/chronik/native/include/chronik/native/mdbx_store.h
+@@ -0,0 +1,93 @@
++// Copyright (c) 2026 The Lotus developers
++// Distributed under the MIT software license, see the accompanying
++// file COPYING or http://www.opensource.org/licenses/mit-license.php.
++
++#ifndef CHRONIK_NATIVE_MDBX_STORE_H
++#define CHRONIK_NATIVE_MDBX_STORE_H
++
++#include <chronik/native/store.h>
++
++#include <cstdint>
++#include <filesystem>
++#include <memory>
++#include <optional>
++#include <span>
++
++/**
++ * MDBX storage backend (library chronik_native_store_mdbx). Only this library
++ * includes mdbx.h; the core reaches it only through the KvStore interface.
++ */
++namespace chronik::native {
++
++/**
++ * Environment profile. The default (ChronikIndexProfile) reproduces the Rust
++ * Chronik index env of chronik-db/src/db.rs `Db::open_with_cfs` exactly; tier
++ * extensions (e.g. the Lotus V2 v2_index env) define their own.
++ */
++struct MdbxEnvProfile {
++    int64_t size_lower = 1 << 20;             // 1 MiB
++    int64_t size_now = 16 << 20;              // 16 MiB
++    int64_t size_upper = int64_t(256) << 30;  // 256 GiB
++    int64_t growth_step = 64 << 20;           // 64 MiB
++    int64_t shrink_threshold = 128 << 20;     // 128 MiB
++    int64_t pagesize = 16384;                 // 16 KiB
++    // Env flags
++    bool safe_nosync = true;
++    bool nometasync = true;
++    bool liforeclaim = true;
++    bool nostickythreads = true;
++    bool nomeminit = true;
++    uint32_t mode = 0600;
++    uint32_t max_readers = 256;
++    /** 0 => max(n_tables + 16, 64), like Rust. */
++    uint32_t max_dbs = 0;
++    /** MDBX_OPT_SYNC_BYTES / MDBX_OPT_SYNC_PERIOD, if set */
++    std::optional<uint64_t> sync_bytes = uint64_t(16) << 20;
++    std::optional<uint64_t> sync_period = uint64_t(1) << 16;
++    /** Keys longer than this are stored as "MDBX_SHA256_KEY:" || sha256. */
++    size_t max_inline_key_len = 7500;
++    /** Durable env sync right after creating the DBIs (Rust does this). */
++    bool sync_after_open = true;
++};
++
++/** The Rust Chronik index env (indexes/chronik). */
++MdbxEnvProfile ChronikIndexProfile();
++
++/** Registers StoreBackend::Mdbx (with ChronikIndexProfile) in the registry. */
++void RegisterMdbxStore();
++
++std::unique_ptr<KvStore> OpenMdbxStore(const std::filesystem::path &dir,
++                                       std::span<const TableSpec> tables,
++                                       const StoreOptions &opts,
++                                       const MdbxEnvProfile &profile);
++
++/** Deletes the env files, like Rust Db::destroy (incl. RocksDB leftovers). */
++void DestroyMdbxStore(const std::filesystem::path &dir);
++
++/** Diagnostics of an open MDBX store (tests, dump tool). */
++struct MdbxStoreInfo {
++    uint64_t geo_lower{}, geo_upper{}, geo_current{}, geo_grow{}, geo_shrink{};
++    uint32_t pagesize{};
++    uint32_t env_flags{};
++    uint32_t max_readers{};
++    uint64_t sync_bytes{}, sync_period{};
++    /** Per-table DBI flags (MDBX_DUPSORT etc.), in TableNames() order. */
++    std::vector<uint32_t> dbi_flags;
++};
++/** Throws if store is not an MDBX store. */
++MdbxStoreInfo GetMdbxStoreInfo(const KvStore &store);
++
++/** Flag values (as in mdbx.h), for interpreting MdbxStoreInfo. */
++namespace mdbx_flags {
++inline constexpr uint32_t kSafeNoSync = 0x10000;
++inline constexpr uint32_t kNoMetaSync = 0x40000;
++inline constexpr uint32_t kNoStickyThreads = 0x200000;
++inline constexpr uint32_t kNoMemInit = 0x1000000;
++inline constexpr uint32_t kLifoReclaim = 0x4000000;
++inline constexpr uint32_t kDupSort = 0x04;
++inline constexpr uint32_t kDupFixed = 0x10;
++} // namespace mdbx_flags
++
++} // namespace chronik::native
++
++#endif // CHRONIK_NATIVE_MDBX_STORE_H
+diff --git a/chronik/native/include/chronik/native/schema.h b/chronik/native/include/chronik/native/schema.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..9ef3228952451d19a5452c0f61ef6bab25b05ea6
+--- /dev/null
++++ b/chronik/native/include/chronik/native/schema.h
+@@ -0,0 +1,83 @@
++// Copyright (c) 2026 The Lotus developers
++// Distributed under the MIT software license, see the accompanying
++// file COPYING or http://www.opensource.org/licenses/mit-license.php.
++
++#ifndef CHRONIK_NATIVE_SCHEMA_H
++#define CHRONIK_NATIVE_SCHEMA_H
++
++#include <chronik/native/store.h>
++
++#include <span>
++#include <string_view>
++#include <vector>
++
++/**
++ * The Chronik index tables (Rust column families) of the eCash tier, exactly
++ * as chronik-db `Db::open` registers them (build/ecash-src
++ * chronik/chronik-db/src/db.rs). Tier extensions (e.g. Lotus V2) append their
++ * own tables to a Schema; the eCash-tier core never opens them.
++ */
++namespace chronik::native::schema {
++
++inline constexpr uint64_t kCurrentIndexerVersion = 13;
++
++inline constexpr std::string_view kBlk = "blk";
++inline constexpr std::string_view kBlkByFirstTx = "blk_by_first_tx";
++inline constexpr std::string_view kBlkStats = "blk_stats";
++inline constexpr std::string_view kFirstTxByBlk = "first_tx_by_blk";
++inline constexpr std::string_view kLokadIdHistory = "lokad_id_history";
++inline constexpr std::string_view kLokadIdHistoryNumTxs =
++    "lokad_id_history_num_txs";
++inline constexpr std::string_view kLookupBlkByHash = "lookup_blk_by_hash";
++inline constexpr std::string_view kLookupTxByHash = "lookup_tx_by_hash";
++inline constexpr std::string_view kMeta = "meta";
++inline constexpr std::string_view kPluginGroupUtxos = "plugin_utxos";
++inline constexpr std::string_view kPluginHistory = "plugin_history";
++inline constexpr std::string_view kPluginHistoryNumTxs =
++    "plugin_history_num_txs";
++inline constexpr std::string_view kPluginMeta = "plugin_meta";
++inline constexpr std::string_view kPluginOutputs = "plugin_outputs";
++inline constexpr std::string_view kScripthash = "scripthash";
++inline constexpr std::string_view kScriptHistory = "script_history";
++inline constexpr std::string_view kScriptHistoryNumTxs =
++    "script_history_num_txs";
++inline constexpr std::string_view kScriptUtxo = "script_utxo";
++inline constexpr std::string_view kTokenIdHistory = "token_id_history";
++inline constexpr std::string_view kTokenIdHistoryNumTxs =
++    "token_id_history_num_txs";
++inline constexpr std::string_view kTokenIdUtxo = "token_id_utxo";
++inline constexpr std::string_view kSpentBy = "spent_by";
++inline constexpr std::string_view kTokenGenesisInfo = "token_genesis_info";
++inline constexpr std::string_view kTokenMeta = "token_meta";
++inline constexpr std::string_view kTokenTx = "token_tx";
++inline constexpr std::string_view kTx = "tx";
++
++/** 12-byte big-endian (tx_num, out_idx) prefix of every UTXO dup value. */
++inline constexpr uint32_t kUtxoOutpointSize = 12;
++/**
++ * Dup size of "value" UTXO groups (UtxoDataValue = sats): outpoint || sats
++ * as little-endian i64. Those tables are MDBX_DUPSORT | MDBX_DUPFIXED.
++ * "Output" groups (UtxoDataOutput) store outpoint || sats LE8 || raw script,
++ * variable length, MDBX_DUPSORT only.
++ */
++inline constexpr uint32_t kUtxoValueDupSize = 20;
++
++/** The 26 eCash-tier tables, in Rust registration order. */
++std::span<const TableSpec> EcashTables();
++
++/** A table set: the eCash-tier tables plus any tier-extension tables. */
++class Schema {
++public:
++    /** Starts with EcashTables(). */
++    Schema();
++    /** Append an extension table; throws if the name is already present. */
++    void Add(TableSpec spec);
++    std::span<const TableSpec> Tables() const { return m_tables; }
++
++private:
++    std::vector<TableSpec> m_tables;
++};
++
++} // namespace chronik::native::schema
++
++#endif // CHRONIK_NATIVE_SCHEMA_H
+diff --git a/chronik/native/include/chronik/native/store.h b/chronik/native/include/chronik/native/store.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..d5a87c3c824972b52d7c07c1be2a60d7bf8aea89
+--- /dev/null
++++ b/chronik/native/include/chronik/native/store.h
+@@ -0,0 +1,151 @@
++// Copyright (c) 2026 The Lotus developers
++// Distributed under the MIT software license, see the accompanying
++// file COPYING or http://www.opensource.org/licenses/mit-license.php.
++
++#ifndef CHRONIK_NATIVE_STORE_H
++#define CHRONIK_NATIVE_STORE_H
++
++#include <chronik/native/types.h>
++
++#include <cstdint>
++#include <filesystem>
++#include <functional>
++#include <memory>
++#include <optional>
++#include <span>
++#include <string>
++#include <string_view>
++#include <vector>
++
++/**
++ * Ordered key-value storage interface. This is the ONLY path from the native
++ * Chronik core to storage: the core never includes a database header. Each
++ * backend (MDBX, LevelDB) is a separate library implementing this interface,
++ * so a host can link exactly the backends it wants.
++ */
++namespace chronik::native {
++
++enum class StoreBackend { Mdbx, LevelDb };
++
++struct TableSpec {
++    /** Exact Rust CF name, e.g. "script_utxo" */
++    std::string_view name;
++    enum class Kind { Plain, Dup } kind = Kind::Plain;
++    /** Dup only; MDBX_DUPFIXED when set */
++    std::optional<uint32_t> dup_fixed_size;
++};
++using TableId = uint16_t;
++
++/** Ordered iteration over one table (plain tables). */
++class Cursor {
++public:
++    virtual ~Cursor() = default;
++    virtual bool SeekFirst() = 0;
++    virtual bool SeekLast() = 0;
++    /** First key >= key (MDBX_SET_RANGE) */
++    virtual bool SeekGe(ByteView key) = 0;
++    /** Last key <= key (MDBX_TO_KEY_LESSER_OR_EQUAL) */
++    virtual bool SeekLe(ByteView key) = 0;
++    virtual bool Next() = 0;
++    virtual bool Prev() = 0;
++    virtual bool Valid() const = 0;
++    /** Views valid until the cursor moves or the txn ends. */
++    virtual ByteView Key() const = 0;
++    virtual ByteView Value() const = 0;
++};
++
++/** The duplicate values of one key, ascending (dup tables). */
++class DupCursor {
++public:
++    virtual ~DupCursor() = default;
++    /** Position at the first dup of key; false if the key has no dups. */
++    virtual bool Seek(ByteView key) = 0;
++    /** First dup of key with value >= value_prefix (GET_BOTH_RANGE). */
++    virtual bool SeekValueGe(ByteView key, ByteView value_prefix) = 0;
++    /** Next dup of the same key; false at the end. */
++    virtual bool Next() = 0;
++    virtual bool Valid() const = 0;
++    virtual ByteView Value() const = 0;
++    /** Number of dups from the current position to the end of the key. */
++    virtual size_t CountRemaining() = 0;
++};
++
++class ReadTxn {
++public:
++    virtual ~ReadTxn() = default;
++    /** View valid until the txn ends or (write txn) the next write. */
++    virtual std::optional<ByteView> Get(TableId, ByteView key) const = 0;
++    virtual std::unique_ptr<Cursor> OpenCursor(TableId) const = 0;
++    virtual std::unique_ptr<DupCursor> OpenDupCursor(TableId) const = 0;
++    virtual uint64_t EstimateEntries(TableId) const = 0;
++};
++
++/** Reads observe this txn's own writes. */
++class WriteTxn : public ReadTxn {
++public:
++    virtual void Put(TableId, ByteView key, ByteView value) = 0;
++    virtual void Del(TableId, ByteView key) = 0;
++    /** Idempotent */
++    virtual void PutDup(TableId, ByteView key, ByteView value) = 0;
++    /** Exact match */
++    virtual void DelDup(TableId, ByteView key, ByteView value) = 0;
++    /** Delete the first dup of key starting with value_prefix (if any). */
++    virtual void DelDupByPrefix(TableId, ByteView key,
++                                ByteView value_prefix) = 0;
++    /** Remove every entry of the table (mdbx_drop(..., false)) */
++    virtual void Clear(TableId) = 0;
++    /** Throws on failure; txn unusable after. */
++    virtual void Commit() = 0;
++};
++
++class KvStore {
++public:
++    virtual ~KvStore() = default;
++    /** Throws ChronikError "Column family <name> doesn't exist" if unknown. */
++    virtual TableId Table(std::string_view name) const = 0;
++    /** Names of all tables, in the order they were opened. */
++    virtual std::vector<std::string> TableNames() const = 0;
++    /** Any thread, concurrent */
++    virtual std::unique_ptr<ReadTxn> BeginRead() const = 0;
++    /** Writer thread only */
++    virtual std::unique_ptr<WriteTxn> BeginWrite() = 0;
++    /** Durability checkpoint (force = full fsync). */
++    virtual void Sync(bool force) = 0;
++};
++
++/**
++ * Lifetime rule: every ReadTxn/WriteTxn (and their cursors) must be destroyed
++ * before the KvStore that created them. A ReadTxn may be used from any thread,
++ * but by one thread at a time.
++ */
++
++/** Hook used by backends needing SHA-256 (MDBX long-key hashing). */
++using Sha256Fn = std::function<void(ByteView data, uint8_t out[32])>;
++
++struct StoreOptions {
++    Sha256Fn sha256;
++};
++
++/**
++ * Backend registry. Each backend library exposes an explicit registration
++ * function (e.g. RegisterMdbxStore() in chronik/native/mdbx_store.h), which the
++ * host adapter calls for the backends it links. Opening an unregistered
++ * backend throws.
++ */
++using StoreOpenFn = std::function<std::unique_ptr<KvStore>(
++    const std::filesystem::path &dir, std::span<const TableSpec> tables,
++    const StoreOptions &opts)>;
++using StoreDestroyFn = std::function<void(const std::filesystem::path &dir)>;
++
++void RegisterStoreBackend(StoreBackend, StoreOpenFn, StoreDestroyFn);
++bool HasStoreBackend(StoreBackend);
++std::unique_ptr<KvStore> OpenStore(StoreBackend,
++                                   const std::filesystem::path &dir,
++                                   std::span<const TableSpec> tables,
++                                   const StoreOptions &opts);
++void DestroyStore(StoreBackend, const std::filesystem::path &dir);
++std::string_view StoreBackendName(StoreBackend);
++
++} // namespace chronik::native
++
++#endif // CHRONIK_NATIVE_STORE_H
+diff --git a/chronik/native/store/mdbx/mdbx_store.cpp b/chronik/native/store/mdbx/mdbx_store.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..a11f3cee16c7904d69ac54d8fa3375b7d20021f2
+--- /dev/null
++++ b/chronik/native/store/mdbx/mdbx_store.cpp
+@@ -0,0 +1,770 @@
++// Copyright (c) 2026 The Lotus developers
++// Distributed under the MIT software license, see the accompanying
++// file COPYING or http://www.opensource.org/licenses/mit-license.php.
++
++// MDBX backend of the native Chronik KvStore. Reproduces the Rust Chronik
++// MDBX environment (chronik-db/src/db.rs) so both implementations open the
++// same index directory: same geometry, flags, sync options, file mode, DBI
++// names and flags, and the same physical key for keys longer than 7500 bytes.
++
++#include <chronik/native/codec/bytes.h>
++#include <chronik/native/error.h>
++#include <chronik/native/mdbx_store.h>
++
++#include <mdbx.h>
++
++#include <algorithm>
++#include <array>
++#include <cstdio>
++#include <cstring>
++#include <map>
++#include <mutex>
++#include <string>
++#include <vector>
++
++namespace chronik::native {
++
++static_assert(mdbx_flags::kSafeNoSync == MDBX_SAFE_NOSYNC);
++static_assert(mdbx_flags::kNoMetaSync == MDBX_NOMETASYNC);
++static_assert(mdbx_flags::kNoStickyThreads == MDBX_NOSTICKYTHREADS);
++static_assert(mdbx_flags::kNoMemInit == MDBX_NOMEMINIT);
++static_assert(mdbx_flags::kLifoReclaim == MDBX_LIFORECLAIM);
++static_assert(mdbx_flags::kDupSort == MDBX_DUPSORT);
++static_assert(mdbx_flags::kDupFixed == MDBX_DUPFIXED);
++
++namespace {
++
++constexpr std::string_view kHashedKeyPrefix = "MDBX_SHA256_KEY:";
++constexpr size_t kHashedKeyLen = 16 + 32;
++constexpr size_t kMaxPooledReadTxns = 32;
++
++[[noreturn]] void ThrowMdbx(int rc, std::string_view context) {
++    const char *msg = mdbx_strerror(rc);
++    throw ChronikError("libmdbx error: " + std::string(context) + ": [" +
++                       std::to_string(rc) + "] " +
++                       (msg ? std::string(msg) : "unknown mdbx error"));
++}
++
++inline MDBX_val ToVal(ByteView v) {
++    MDBX_val val;
++    val.iov_base = const_cast<uint8_t *>(v.data());
++    val.iov_len = v.size();
++    return val;
++}
++
++inline ByteView FromVal(const MDBX_val &v) {
++    if (v.iov_len == 0) {
++        return ByteView();
++    }
++    return ByteView(static_cast<const uint8_t *>(v.iov_base), v.iov_len);
++}
++
++inline bool Found(int rc) {
++    return rc == MDBX_SUCCESS || rc == MDBX_RESULT_TRUE;
++}
++
++inline bool Missing(int rc) {
++    return rc == MDBX_NOTFOUND || rc == MDBX_ENODATA;
++}
++
++class MdbxStore;
++
++/** Normalized physical key (long keys are hashed), owning its buffer. */
++class NormKey {
++public:
++    NormKey(const MdbxStore &store, ByteView key);
++    ByteView View() const { return m_view; }
++    MDBX_val Val() const { return ToVal(m_view); }
++
++private:
++    std::array<uint8_t, kHashedKeyLen> m_buf{};
++    ByteView m_view;
++};
++
++class MdbxStore final : public KvStore {
++public:
++    MdbxStore(const std::filesystem::path &dir,
++              std::span<const TableSpec> tables, const StoreOptions &opts,
++              const MdbxEnvProfile &profile);
++    ~MdbxStore() override;
++
++    TableId Table(std::string_view name) const override {
++        auto it = m_by_name.find(std::string(name));
++        if (it == m_by_name.end()) {
++            throw ChronikError("Column family " + std::string(name) +
++                               " doesn't exist");
++        }
++        return it->second;
++    }
++    std::vector<std::string> TableNames() const override { return m_names; }
++    std::unique_ptr<ReadTxn> BeginRead() const override;
++    std::unique_ptr<WriteTxn> BeginWrite() override;
++    void Sync(bool force) override {
++        const int rc = mdbx_env_sync_ex(m_env, force, false);
++        if (rc != MDBX_SUCCESS && rc != MDBX_RESULT_TRUE) {
++            ThrowMdbx(rc, "mdbx_env_sync_ex");
++        }
++    }
++
++    MDBX_dbi Dbi(TableId id) const {
++        if (id >= m_dbis.size()) {
++            throw ChronikError("Unknown Chronik table id " +
++                               std::to_string(id));
++        }
++        return m_dbis[id];
++    }
++    const TableSpec &Spec(TableId id) const { return m_specs.at(id); }
++    MDBX_env *Env() const { return m_env; }
++    size_t MaxInlineKeyLen() const { return m_profile.max_inline_key_len; }
++    void HashKey(ByteView key, uint8_t out[32]) const {
++        if (!m_opts.sha256) {
++            throw ChronikError(
++                "MDBX store needs a SHA-256 hook for keys longer than " +
++                std::to_string(m_profile.max_inline_key_len) + " bytes");
++        }
++        m_opts.sha256(key, out);
++    }
++
++    MDBX_txn *AcquireReadTxn() const;
++    void ReleaseReadTxn(MDBX_txn *txn) const;
++
++private:
++    MDBX_env *m_env = nullptr;
++    StoreOptions m_opts;
++    MdbxEnvProfile m_profile;
++    std::vector<std::string> m_names;
++    std::vector<TableSpec> m_specs; // names point into m_names
++    std::vector<MDBX_dbi> m_dbis;
++    std::map<std::string, TableId> m_by_name;
++    mutable std::mutex m_pool_mutex;
++    mutable std::vector<MDBX_txn *> m_read_pool;
++};
++
++NormKey::NormKey(const MdbxStore &store, ByteView key) {
++    if (key.size() <= store.MaxInlineKeyLen()) {
++        m_view = key;
++        return;
++    }
++    std::memcpy(m_buf.data(), kHashedKeyPrefix.data(), kHashedKeyPrefix.size());
++    store.HashKey(key, m_buf.data() + kHashedKeyPrefix.size());
++    m_view = ByteView(m_buf.data(), m_buf.size());
++}
++
++// ---- Cursors ----
++
++class MdbxCursor final : public Cursor {
++public:
++    MdbxCursor(const MdbxStore &store, MDBX_txn *txn, MDBX_dbi dbi)
++        : m_store(store) {
++        const int rc = mdbx_cursor_open(txn, dbi, &m_cursor);
++        if (rc != MDBX_SUCCESS) {
++            ThrowMdbx(rc, "mdbx_cursor_open");
++        }
++    }
++    ~MdbxCursor() override { mdbx_cursor_close(m_cursor); }
++
++    bool SeekFirst() override { return Op(nullptr, MDBX_FIRST); }
++    bool SeekLast() override { return Op(nullptr, MDBX_LAST); }
++    bool SeekGe(ByteView key) override {
++        NormKey norm(m_store, key);
++        return Op(&norm, MDBX_SET_RANGE);
++    }
++    bool SeekLe(ByteView key) override {
++        NormKey norm(m_store, key);
++        return Op(&norm, MDBX_TO_KEY_LESSER_OR_EQUAL);
++    }
++    bool Next() override { return m_valid && Op(nullptr, MDBX_NEXT); }
++    bool Prev() override { return m_valid && Op(nullptr, MDBX_PREV); }
++    bool Valid() const override { return m_valid; }
++    ByteView Key() const override { return FromVal(m_key); }
++    ByteView Value() const override { return FromVal(m_val); }
++
++private:
++    bool Op(const NormKey *key, MDBX_cursor_op op) {
++        if (key) {
++            m_key = key->Val();
++        }
++        m_val = MDBX_val{nullptr, 0};
++        const int rc = mdbx_cursor_get(m_cursor, &m_key, &m_val, op);
++        if (Found(rc)) {
++            m_valid = true;
++            return true;
++        }
++        m_valid = false;
++        if (Missing(rc)) {
++            return false;
++        }
++        ThrowMdbx(rc, "mdbx_cursor_get");
++    }
++
++    const MdbxStore &m_store;
++    MDBX_cursor *m_cursor = nullptr;
++    MDBX_val m_key{nullptr, 0};
++    MDBX_val m_val{nullptr, 0};
++    bool m_valid = false;
++};
++
++class MdbxDupCursor final : public DupCursor {
++public:
++    MdbxDupCursor(const MdbxStore &store, MDBX_txn *txn, TableId table)
++        : m_store(store), m_txn(txn), m_dbi(store.Dbi(table)),
++          m_fixed(store.Spec(table).dup_fixed_size) {
++        const int rc = mdbx_cursor_open(txn, m_dbi, &m_cursor);
++        if (rc != MDBX_SUCCESS) {
++            ThrowMdbx(rc, "mdbx_cursor_open");
++        }
++    }
++    ~MdbxDupCursor() override { mdbx_cursor_close(m_cursor); }
++
++    bool Seek(ByteView key) override {
++        NormKey norm(m_store, key);
++        MDBX_val k = norm.Val();
++        m_val = MDBX_val{nullptr, 0};
++        return Result(mdbx_cursor_get(m_cursor, &k, &m_val, MDBX_SET_KEY));
++    }
++    bool SeekValueGe(ByteView key, ByteView value_prefix) override {
++        NormKey norm(m_store, key);
++        MDBX_val k = norm.Val();
++        Bytes search = SearchValue(value_prefix);
++        m_val = ToVal(search);
++        return Result(
++            mdbx_cursor_get(m_cursor, &k, &m_val, MDBX_GET_BOTH_RANGE));
++    }
++    bool Next() override {
++        if (!m_valid) {
++            return false;
++        }
++        MDBX_val k{nullptr, 0};
++        m_val = MDBX_val{nullptr, 0};
++        return Result(mdbx_cursor_get(m_cursor, &k, &m_val, MDBX_NEXT_DUP));
++    }
++    bool Valid() const override { return m_valid; }
++    ByteView Value() const override { return FromVal(m_val); }
++    size_t CountRemaining() override {
++        if (!m_valid) {
++            return 0;
++        }
++        MDBX_cursor *copy = mdbx_cursor_create(nullptr);
++        if (!copy) {
++            throw ChronikError("libmdbx error: mdbx_cursor_create failed");
++        }
++        int rc = mdbx_cursor_copy(m_cursor, copy);
++        if (rc != MDBX_SUCCESS) {
++            mdbx_cursor_close(copy);
++            ThrowMdbx(rc, "mdbx_cursor_copy");
++        }
++        size_t count = 1;
++        while (true) {
++            MDBX_val k{nullptr, 0}, v{nullptr, 0};
++            rc = mdbx_cursor_get(copy, &k, &v, MDBX_NEXT_DUP);
++            if (Found(rc)) {
++                ++count;
++                continue;
++            }
++            mdbx_cursor_close(copy);
++            if (Missing(rc)) {
++                return count;
++            }
++            ThrowMdbx(rc, "mdbx_cursor_get(count)");
++        }
++    }
++
++    /** Search value for GET_BOTH_RANGE: DUPFIXED needs the exact size. */
++    Bytes SearchValue(ByteView prefix) const {
++        Bytes search(prefix.begin(), prefix.end());
++        if (m_fixed) {
++            if (search.size() > *m_fixed) {
++                search.resize(*m_fixed);
++            }
++            search.resize(*m_fixed, 0);
++        }
++        return search;
++    }
++
++private:
++    bool Result(int rc) {
++        if (Found(rc)) {
++            m_valid = true;
++            return true;
++        }
++        m_valid = false;
++        if (Missing(rc)) {
++            return false;
++        }
++        ThrowMdbx(rc, "mdbx_cursor_get(dup)");
++    }
++
++    const MdbxStore &m_store;
++    MDBX_txn *m_txn;
++    MDBX_dbi m_dbi;
++    std::optional<uint32_t> m_fixed;
++    MDBX_cursor *m_cursor = nullptr;
++    MDBX_val m_val{nullptr, 0};
++    bool m_valid = false;
++};
++
++// ---- Transactions ----
++
++/** Read operations shared by read and write txns. */
++class TxnOps {
++public:
++    TxnOps(const MdbxStore &store, MDBX_txn *txn) : m_store(store), m_txn(txn) {}
++
++    std::optional<ByteView> DoGet(TableId table, ByteView key) const {
++        NormKey norm(m_store, key);
++        MDBX_val k = norm.Val();
++        MDBX_val v{nullptr, 0};
++        const int rc = mdbx_get(m_txn, m_store.Dbi(table), &k, &v);
++        if (rc == MDBX_SUCCESS) {
++            return FromVal(v);
++        }
++        if (rc == MDBX_NOTFOUND) {
++            return std::nullopt;
++        }
++        ThrowMdbx(rc, "mdbx_get");
++    }
++    uint64_t DoEstimate(TableId table) const {
++        MDBX_stat stat{};
++        const int rc =
++            mdbx_dbi_stat(m_txn, m_store.Dbi(table), &stat, sizeof(stat));
++        if (rc != MDBX_SUCCESS) {
++            ThrowMdbx(rc, "mdbx_dbi_stat");
++        }
++        return stat.ms_entries;
++    }
++
++    const MdbxStore &m_store;
++    MDBX_txn *m_txn;
++};
++
++class MdbxReadTxn final : public ReadTxn {
++public:
++    MdbxReadTxn(const MdbxStore &store, MDBX_txn *txn) : m_ops(store, txn) {}
++    ~MdbxReadTxn() override { m_ops.m_store.ReleaseReadTxn(m_ops.m_txn); }
++
++    std::optional<ByteView> Get(TableId table, ByteView key) const override {
++        return m_ops.DoGet(table, key);
++    }
++    std::unique_ptr<Cursor> OpenCursor(TableId table) const override {
++        return std::make_unique<MdbxCursor>(m_ops.m_store, m_ops.m_txn,
++                                            m_ops.m_store.Dbi(table));
++    }
++    std::unique_ptr<DupCursor> OpenDupCursor(TableId table) const override {
++        return std::make_unique<MdbxDupCursor>(m_ops.m_store, m_ops.m_txn,
++                                               table);
++    }
++    uint64_t EstimateEntries(TableId table) const override {
++        return m_ops.DoEstimate(table);
++    }
++
++private:
++    TxnOps m_ops;
++};
++
++class MdbxWriteTxn final : public WriteTxn {
++public:
++    MdbxWriteTxn(const MdbxStore &store, MDBX_txn *txn) : m_ops(store, txn) {}
++    ~MdbxWriteTxn() override {
++        if (m_ops.m_txn) {
++            mdbx_txn_abort(m_ops.m_txn);
++        }
++    }
++
++    std::optional<ByteView> Get(TableId table, ByteView key) const override {
++        return m_ops.DoGet(table, Live(key));
++    }
++    std::unique_ptr<Cursor> OpenCursor(TableId table) const override {
++        return std::make_unique<MdbxCursor>(m_ops.m_store, Txn(),
++                                            m_ops.m_store.Dbi(table));
++    }
++    std::unique_ptr<DupCursor> OpenDupCursor(TableId table) const override {
++        return std::make_unique<MdbxDupCursor>(m_ops.m_store, Txn(), table);
++    }
++    uint64_t EstimateEntries(TableId table) const override {
++        Txn();
++        return m_ops.DoEstimate(table);
++    }
++
++    void Put(TableId table, ByteView key, ByteView value) override {
++        NormKey norm(m_ops.m_store, key);
++        MDBX_val k = norm.Val();
++        MDBX_val v = ToVal(value);
++        const int rc =
++            mdbx_put(Txn(), m_ops.m_store.Dbi(table), &k, &v, MDBX_UPSERT);
++        if (rc != MDBX_SUCCESS) {
++            ThrowMdbx(rc, "mdbx_put");
++        }
++    }
++    void Del(TableId table, ByteView key) override {
++        NormKey norm(m_ops.m_store, key);
++        MDBX_val k = norm.Val();
++        const int rc = mdbx_del(Txn(), m_ops.m_store.Dbi(table), &k, nullptr);
++        if (rc != MDBX_SUCCESS && rc != MDBX_NOTFOUND) {
++            ThrowMdbx(rc, "mdbx_del");
++        }
++    }
++    void PutDup(TableId table, ByteView key, ByteView value) override {
++        NormKey norm(m_ops.m_store, key);
++        MDBX_val k = norm.Val();
++        MDBX_val v = ToVal(value);
++        const int rc =
++            mdbx_put(Txn(), m_ops.m_store.Dbi(table), &k, &v, MDBX_UPSERT);
++        // An identical duplicate is a no-op (MDBX_KEYEXIST only arises with
++        // MDBX_NODUPDATA, but tolerate it for idempotence).
++        if (rc != MDBX_SUCCESS && rc != MDBX_KEYEXIST) {
++            ThrowMdbx(rc, "mdbx_put(dup)");
++        }
++    }
++    void DelDup(TableId table, ByteView key, ByteView value) override {
++        NormKey norm(m_ops.m_store, key);
++        MDBX_val k = norm.Val();
++        MDBX_val v = ToVal(value);
++        const int rc = mdbx_del(Txn(), m_ops.m_store.Dbi(table), &k, &v);
++        if (rc != MDBX_SUCCESS && rc != MDBX_NOTFOUND) {
++            ThrowMdbx(rc, "mdbx_del(dup)");
++        }
++    }
++    void DelDupByPrefix(TableId table, ByteView key,
++                        ByteView value_prefix) override {
++        // Same as the Rust batch op: GET_BOTH_RANGE to the first dup >= the
++        // (zero-padded) prefix, delete it if it starts with the prefix.
++        MdbxDupCursor cursor(m_ops.m_store, Txn(), table);
++        if (!cursor.SeekValueGe(key, value_prefix)) {
++            return;
++        }
++        if (!StartsWith(cursor.Value(), value_prefix)) {
++            return;
++        }
++        MDBX_cursor *c = nullptr;
++        // Re-position a raw cursor for deletion.
++        int rc = mdbx_cursor_open(Txn(), m_ops.m_store.Dbi(table), &c);
++        if (rc != MDBX_SUCCESS) {
++            ThrowMdbx(rc, "mdbx_cursor_open");
++        }
++        NormKey norm(m_ops.m_store, key);
++        MDBX_val k = norm.Val();
++        Bytes found(cursor.Value().begin(), cursor.Value().end());
++        MDBX_val v = ToVal(found);
++        rc = mdbx_cursor_get(c, &k, &v, MDBX_GET_BOTH);
++        if (Found(rc)) {
++            rc = mdbx_cursor_del(c, MDBX_CURRENT);
++            mdbx_cursor_close(c);
++            if (rc != MDBX_SUCCESS) {
++                ThrowMdbx(rc, "mdbx_cursor_del");
++            }
++            return;
++        }
++        mdbx_cursor_close(c);
++        if (!Missing(rc)) {
++            ThrowMdbx(rc, "mdbx_cursor_get(del_prefix)");
++        }
++    }
++    void Clear(TableId table) override {
++        const int rc = mdbx_drop(Txn(), m_ops.m_store.Dbi(table), false);
++        if (rc != MDBX_SUCCESS) {
++            ThrowMdbx(rc, "mdbx_drop(delete_range)");
++        }
++    }
++    void Commit() override {
++        MDBX_txn *txn = Txn();
++        m_ops.m_txn = nullptr;
++        const int rc = mdbx_txn_commit_ex(txn, nullptr);
++        if (rc != MDBX_SUCCESS) {
++            ThrowMdbx(rc, "mdbx_txn_commit_ex(write_batch)");
++        }
++    }
++
++private:
++    MDBX_txn *Txn() const {
++        if (!m_ops.m_txn) {
++            throw ChronikError("Chronik write txn used after commit");
++        }
++        return m_ops.m_txn;
++    }
++    ByteView Live(ByteView key) const {
++        Txn();
++        return key;
++    }
++
++    TxnOps m_ops;
++};
++
++// ---- Store ----
++
++MdbxStore::MdbxStore(const std::filesystem::path &dir,
++                     std::span<const TableSpec> tables,
++                     const StoreOptions &opts, const MdbxEnvProfile &profile)
++    : m_opts(opts), m_profile(profile) {
++    std::error_code ec;
++    std::filesystem::create_directories(dir, ec);
++    if (ec) {
++        throw ChronikError("libmdbx error: Failed to create DB directory " +
++                           dir.string() + ": " + ec.message());
++    }
++    m_names.reserve(tables.size());
++    for (const TableSpec &spec : tables) {
++        m_names.emplace_back(spec.name);
++    }
++    for (size_t i = 0; i < tables.size(); ++i) {
++        TableSpec spec = tables[i];
++        spec.name = m_names[i];
++        m_specs.push_back(spec);
++        if (!m_by_name.emplace(m_names[i], TableId(i)).second) {
++            throw ChronikError("Duplicate Chronik table " + m_names[i]);
++        }
++    }
++
++    int rc = mdbx_env_create(&m_env);
++    if (rc != MDBX_SUCCESS) {
++        m_env = nullptr;
++        ThrowMdbx(rc, "mdbx_env_create");
++    }
++    auto fail = [&](int code, std::string_view ctx) {
++        mdbx_env_close_ex(m_env, true);
++        m_env = nullptr;
++        ThrowMdbx(code, ctx);
++    };
++    rc = mdbx_env_set_maxreaders(m_env, profile.max_readers);
++    if (rc != MDBX_SUCCESS) {
++        fail(rc, "mdbx_env_set_maxreaders");
++    }
++    const uint32_t max_dbs =
++        profile.max_dbs ? profile.max_dbs
++                        : std::max<uint32_t>(uint32_t(tables.size()) + 16, 64);
++    rc = mdbx_env_set_maxdbs(m_env, max_dbs);
++    if (rc != MDBX_SUCCESS) {
++        fail(rc, "mdbx_env_set_maxdbs");
++    }
++    rc = mdbx_env_set_geometry(m_env, intptr_t(profile.size_lower),
++                               intptr_t(profile.size_now),
++                               intptr_t(profile.size_upper),
++                               intptr_t(profile.growth_step),
++                               intptr_t(profile.shrink_threshold),
++                               intptr_t(profile.pagesize));
++    if (rc != MDBX_SUCCESS) {
++        fail(rc, "mdbx_env_set_geometry");
++    }
++    unsigned flags = 0;
++    if (profile.safe_nosync) flags |= MDBX_SAFE_NOSYNC;
++    if (profile.nometasync) flags |= MDBX_NOMETASYNC;
++    if (profile.liforeclaim) flags |= MDBX_LIFORECLAIM;
++    if (profile.nostickythreads) flags |= MDBX_NOSTICKYTHREADS;
++    if (profile.nomeminit) flags |= MDBX_NOMEMINIT;
++    rc = mdbx_env_open(m_env, dir.string().c_str(), MDBX_env_flags_t(flags),
++                       mdbx_mode_t(profile.mode));
++    if (rc != MDBX_SUCCESS) {
++        fail(rc, "mdbx_env_open");
++    }
++    if (profile.sync_bytes) {
++        rc = mdbx_env_set_option(m_env, MDBX_opt_sync_bytes,
++                                 *profile.sync_bytes);
++        if (rc != MDBX_SUCCESS) {
++            fail(rc, "mdbx_env_set_option(sync)");
++        }
++    }
++    if (profile.sync_period) {
++        rc = mdbx_env_set_option(m_env, MDBX_opt_sync_period,
++                                 *profile.sync_period);
++        if (rc != MDBX_SUCCESS) {
++            fail(rc, "mdbx_env_set_option(sync)");
++        }
++    }
++
++    MDBX_txn *txn = nullptr;
++    rc = mdbx_txn_begin_ex(m_env, nullptr, MDBX_TXN_READWRITE, &txn, nullptr);
++    if (rc != MDBX_SUCCESS) {
++        fail(rc, "mdbx_txn_begin_ex(open_cfs)");
++    }
++    for (const TableSpec &spec : m_specs) {
++        unsigned dbi_flags = MDBX_CREATE;
++        if (spec.kind == TableSpec::Kind::Dup) {
++            dbi_flags |= MDBX_DUPSORT;
++            if (spec.dup_fixed_size) {
++                dbi_flags |= MDBX_DUPFIXED;
++            }
++        }
++        MDBX_dbi dbi = 0;
++        const std::string name(spec.name);
++        rc = mdbx_dbi_open(txn, name.c_str(), MDBX_db_flags_t(dbi_flags), &dbi);
++        if (rc != MDBX_SUCCESS) {
++            mdbx_txn_abort(txn);
++            fail(rc, "mdbx_dbi_open");
++        }
++        m_dbis.push_back(dbi);
++    }
++    rc = mdbx_txn_commit_ex(txn, nullptr);
++    if (rc != MDBX_SUCCESS) {
++        fail(rc, "mdbx_txn_commit_ex(open_cfs)");
++    }
++    if (profile.sync_after_open) {
++        // Publish the DBI metadata durably before returning, like Rust.
++        Sync(true);
++    }
++}
++
++MdbxStore::~MdbxStore() {
++    {
++        std::lock_guard<std::mutex> lock(m_pool_mutex);
++        for (MDBX_txn *txn : m_read_pool) {
++            mdbx_txn_abort(txn);
++        }
++        m_read_pool.clear();
++    }
++    if (m_env) {
++        const int rc = mdbx_env_sync_ex(m_env, true, false);
++        if (rc != MDBX_SUCCESS && rc != MDBX_RESULT_TRUE) {
++            std::fprintf(stderr, "Chronik MDBX shutdown sync failed: %s\n",
++                         mdbx_strerror(rc));
++        }
++        mdbx_env_close_ex(m_env, false);
++    }
++}
++
++MDBX_txn *MdbxStore::AcquireReadTxn() const {
++    MDBX_txn *txn = nullptr;
++    {
++        std::lock_guard<std::mutex> lock(m_pool_mutex);
++        if (!m_read_pool.empty()) {
++            txn = m_read_pool.back();
++            m_read_pool.pop_back();
++        }
++    }
++    if (txn) {
++        const int rc = mdbx_txn_renew(txn);
++        if (rc == MDBX_SUCCESS) {
++            return txn;
++        }
++        mdbx_txn_abort(txn);
++        ThrowMdbx(rc, "mdbx_txn_renew");
++    }
++    const int rc =
++        mdbx_txn_begin_ex(m_env, nullptr, MDBX_TXN_RDONLY, &txn, nullptr);
++    if (rc != MDBX_SUCCESS) {
++        ThrowMdbx(rc, "mdbx_txn_begin_ex(read)");
++    }
++    return txn;
++}
++
++void MdbxStore::ReleaseReadTxn(MDBX_txn *txn) const {
++    if (!txn) {
++        return;
++    }
++    if (mdbx_txn_reset(txn) == MDBX_SUCCESS) {
++        std::lock_guard<std::mutex> lock(m_pool_mutex);
++        if (m_read_pool.size() < kMaxPooledReadTxns) {
++            m_read_pool.push_back(txn);
++            return;
++        }
++    }
++    mdbx_txn_abort(txn);
++}
++
++std::unique_ptr<ReadTxn> MdbxStore::BeginRead() const {
++    return std::make_unique<MdbxReadTxn>(*this, AcquireReadTxn());
++}
++
++std::unique_ptr<WriteTxn> MdbxStore::BeginWrite() {
++    MDBX_txn *txn = nullptr;
++    const int rc =
++        mdbx_txn_begin_ex(m_env, nullptr, MDBX_TXN_READWRITE, &txn, nullptr);
++    if (rc != MDBX_SUCCESS) {
++        ThrowMdbx(rc, "mdbx_txn_begin_ex(write_batch)");
++    }
++    return std::make_unique<MdbxWriteTxn>(*this, txn);
++}
++
++} // namespace
++
++MdbxEnvProfile ChronikIndexProfile() {
++    return MdbxEnvProfile{};
++}
++
++std::unique_ptr<KvStore> OpenMdbxStore(const std::filesystem::path &dir,
++                                       std::span<const TableSpec> tables,
++                                       const StoreOptions &opts,
++                                       const MdbxEnvProfile &profile) {
++    return std::make_unique<MdbxStore>(dir, tables, opts, profile);
++}
++
++void DestroyMdbxStore(const std::filesystem::path &dir) {
++    // Same file set as Rust Db::destroy, which also clears RocksDB leftovers.
++    std::error_code ec;
++    if (!std::filesystem::exists(dir, ec)) {
++        return;
++    }
++    std::filesystem::remove_all(dir / "rocksdb.bak", ec);
++    for (const char *name : {"mdbx.dat", "mdbx.lck", "LOCK", "CURRENT",
++                             "IDENTITY", "LOG", "LOG.old"}) {
++        std::filesystem::remove(dir / name, ec);
++    }
++    for (const auto &entry : std::filesystem::directory_iterator(dir, ec)) {
++        const std::string fname = entry.path().filename().string();
++        auto starts = [&](std::string_view p) {
++            return fname.rfind(p, 0) == 0;
++        };
++        auto ends = [&](std::string_view s) {
++            return fname.size() >= s.size() &&
++                   fname.compare(fname.size() - s.size(), s.size(), s) == 0;
++        };
++        if (starts("MANIFEST-") || starts("OPTIONS-") || starts("LOG.old.") ||
++            ends(".sst") || ends(".log")) {
++            std::error_code ec2;
++            std::filesystem::remove(entry.path(), ec2);
++        }
++    }
++    // Only removes the directory if it is now empty (like fs::remove_dir).
++    std::filesystem::remove(dir, ec);
++}
++
++void RegisterMdbxStore() {
++    RegisterStoreBackend(
++        StoreBackend::Mdbx,
++        [](const std::filesystem::path &dir, std::span<const TableSpec> tables,
++           const StoreOptions &opts) {
++            return OpenMdbxStore(dir, tables, opts, ChronikIndexProfile());
++        },
++        [](const std::filesystem::path &dir) { DestroyMdbxStore(dir); });
++}
++
++MdbxStoreInfo GetMdbxStoreInfo(const KvStore &kv) {
++    const auto *store = dynamic_cast<const MdbxStore *>(&kv);
++    if (!store) {
++        throw ChronikError("Not an MDBX store");
++    }
++    MdbxStoreInfo out;
++    MDBX_envinfo info{};
++    int rc = mdbx_env_info_ex(store->Env(), nullptr, &info, sizeof(info));
++    if (rc != MDBX_SUCCESS) {
++        ThrowMdbx(rc, "mdbx_env_info_ex");
++    }
++    out.geo_lower = info.mi_geo.lower;
++    out.geo_upper = info.mi_geo.upper;
++    out.geo_current = info.mi_geo.current;
++    out.geo_grow = info.mi_geo.grow;
++    out.geo_shrink = info.mi_geo.shrink;
++    out.pagesize = info.mi_dxb_pagesize;
++    out.max_readers = info.mi_maxreaders;
++    unsigned flags = 0;
++    rc = mdbx_env_get_flags(store->Env(), &flags);
++    if (rc != MDBX_SUCCESS) {
++        ThrowMdbx(rc, "mdbx_env_get_flags");
++    }
++    out.env_flags = flags;
++    mdbx_env_get_option(store->Env(), MDBX_opt_sync_bytes, &out.sync_bytes);
++    mdbx_env_get_option(store->Env(), MDBX_opt_sync_period, &out.sync_period);
++    MDBX_txn *txn = store->AcquireReadTxn();
++    for (size_t i = 0; i < store->TableNames().size(); ++i) {
++        unsigned dbi_flags = 0, state = 0;
++        rc = mdbx_dbi_flags_ex(txn, store->Dbi(TableId(i)), &dbi_flags,
++                               &state);
++        if (rc != MDBX_SUCCESS) {
++            store->ReleaseReadTxn(txn);
++            ThrowMdbx(rc, "mdbx_dbi_flags_ex");
++        }
++        out.dbi_flags.push_back(dbi_flags);
++    }
++    store->ReleaseReadTxn(txn);
++    return out;
++}
++
++} // namespace chronik::native
+diff --git a/chronik/native/store/store.cmake b/chronik/native/store/store.cmake
+new file mode 100644
+index 0000000000000000000000000000000000000000..820b8d36375d87b92234832a31e9bdeb22a85e66
+--- /dev/null
++++ b/chronik/native/store/store.cmake
+@@ -0,0 +1,45 @@
++# Copyright (c) 2026 The Lotus developers
++# Distributed under the MIT software license, see the accompanying
++# file COPYING or http://www.opensource.org/licenses/mit-license.php.
++
++# Storage backends of the native Chronik. Each backend is a separate library
++# implementing the KvStore interface (include/chronik/native/store.h); the core
++# library never links a database. Hosts link the backends they select and call
++# their Register*Store() functions.
++
++if(CHRONIK_NATIVE_MDBX)
++    if(NOT TARGET lotus_v2_mdbx)
++        # Standalone build: the vendored libmdbx, compiled exactly as
++        # src/lotus_v2/CMakeLists.txt does for the node.
++        set(_mdbx_dir "${CHRONIK_NATIVE_REPO_ROOT}/src/lotus_v2/vendor/libmdbx")
++        add_library(lotus_v2_mdbx STATIC
++            "${_mdbx_dir}/mdbx.c"
++            "${_mdbx_dir}/mdbx_batch.c"
++        )
++        set_target_properties(lotus_v2_mdbx PROPERTIES
++            C_STANDARD 11 POSITION_INDEPENDENT_CODE ON)
++        target_include_directories(lotus_v2_mdbx PUBLIC "${_mdbx_dir}")
++        target_compile_definitions(lotus_v2_mdbx
++            PUBLIC MDBX_BUILD_SHARED_LIBRARY=0
++            PRIVATE NDEBUG MDBX_BUILD_FLAGS="-O3 -DNDEBUG" MDBX_WITHOUT_MSVC_CRT=0)
++        target_compile_options(lotus_v2_mdbx PRIVATE -O3 -Wno-unused-parameter
++            -Wno-sign-compare -Wno-cast-align -Wno-gnu -Wno-shadow
++            -Wno-documentation -Wno-implicit-fallthrough)
++        find_package(Threads REQUIRED)
++        target_link_libraries(lotus_v2_mdbx PUBLIC Threads::Threads)
++    endif()
++
++    add_library(chronik_native_store_mdbx STATIC
++        "${CHRONIK_NATIVE_ROOT}/store/mdbx/mdbx_store.cpp"
++    )
++    target_include_directories(chronik_native_store_mdbx
++        PUBLIC "${CHRONIK_NATIVE_ROOT}/include")
++    target_link_libraries(chronik_native_store_mdbx
++        PUBLIC chronik_native_core
++        PRIVATE lotus_v2_mdbx)
++    set_target_properties(chronik_native_store_mdbx PROPERTIES
++        POSITION_INDEPENDENT_CODE ON)
++    target_compile_definitions(chronik_native_store_mdbx
++        PUBLIC CHRONIK_NATIVE_HAVE_MDBX=1)
++    list(APPEND CHRONIK_NATIVE_TEST_LIBRARIES chronik_native_store_mdbx)
++endif()
+diff --git a/chronik/native/test/store_tests.cpp b/chronik/native/test/store_tests.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..b37a4bd897917d0f6eeb3e27973de9b58387380d
+--- /dev/null
++++ b/chronik/native/test/store_tests.cpp
+@@ -0,0 +1,523 @@
++// Copyright (c) 2026 The Lotus developers
++// Distributed under the MIT software license, see the accompanying
++// file COPYING or http://www.opensource.org/licenses/mit-license.php.
++
++// KvStore conformance suite, run against every storage backend linked into
++// the test binary, plus MDBX-specific environment checks.
++
++#include <chronik/native/codec/bytes.h>
++#include <chronik/native/codec/hex.h>
++#include <chronik/native/error.h>
++#include <chronik/native/schema.h>
++#include <chronik/native/store.h>
++#if CHRONIK_NATIVE_HAVE_MDBX
++#include <chronik/native/mdbx_store.h>
++#endif
++
++#include <test/test_sha256.h>
++
++#include <boost/test/unit_test.hpp>
++
++#include <atomic>
++#include <filesystem>
++#include <chrono>
++#include <random>
++#include <thread>
++
++using namespace chronik::native;
++
++namespace {
++
++/** Registers every backend linked into this test binary. */
++void RegisterTestStoreBackends() {
++#if CHRONIK_NATIVE_HAVE_MDBX
++    RegisterMdbxStore();
++#endif
++}
++
++/** Fresh temporary directory, removed on destruction. */
++struct TempDir {
++    std::filesystem::path path;
++    explicit TempDir(const std::string &name) {
++        static std::atomic<int> counter{0};
++        std::random_device rd;
++        path = std::filesystem::temp_directory_path() /
++               ("chronik-native-" + name + "-" + std::to_string(rd()) + "-" +
++                std::to_string(counter++));
++        std::filesystem::remove_all(path);
++    }
++    ~TempDir() {
++        std::error_code ec;
++        std::filesystem::remove_all(path, ec);
++    }
++};
++
++const TableSpec kTestTables[] = {
++    {"plain", TableSpec::Kind::Plain, std::nullopt},
++    {"dup_var", TableSpec::Kind::Dup, std::nullopt},
++    {"dup_fixed", TableSpec::Kind::Dup, 20},
++};
++
++StoreOptions Opts() {
++    StoreOptions opts;
++    opts.sha256 = [](ByteView data, uint8_t out[32]) {
++        test::TestSha256(data, out);
++    };
++    return opts;
++}
++
++std::vector<StoreBackend> Backends() {
++    RegisterTestStoreBackends();
++    std::vector<StoreBackend> out;
++    for (StoreBackend b : {StoreBackend::Mdbx, StoreBackend::LevelDb}) {
++        if (HasStoreBackend(b)) {
++            out.push_back(b);
++        }
++    }
++    BOOST_REQUIRE(!out.empty());
++    return out;
++}
++
++Bytes B(std::initializer_list<uint8_t> v) {
++    return Bytes(v);
++}
++
++Bytes S(std::string_view s) {
++    return Bytes(s.begin(), s.end());
++}
++
++Bytes Dup20(uint64_t tx_num, uint32_t out_idx, int64_t sats) {
++    Bytes v;
++    PutBe<uint64_t>(v, tx_num);
++    PutBe<uint32_t>(v, out_idx);
++    PutLe<int64_t>(v, sats);
++    return v;
++}
++
++std::vector<Bytes> AllDups(const ReadTxn &txn, TableId t, ByteView key) {
++    std::vector<Bytes> out;
++    auto c = txn.OpenDupCursor(t);
++    for (bool ok = c->Seek(key); ok; ok = c->Next()) {
++        out.emplace_back(c->Value().begin(), c->Value().end());
++    }
++    return out;
++}
++
++Bytes ToBytes(ByteView v) {
++    return Bytes(v.begin(), v.end());
++}
++
++} // namespace
++
++BOOST_AUTO_TEST_SUITE(store_tests)
++
++BOOST_AUTO_TEST_CASE(plain_ordering_and_seeks) {
++    for (StoreBackend backend : Backends()) {
++        BOOST_TEST_CONTEXT("backend " << StoreBackendName(backend)) {
++            TempDir dir("plain");
++            auto store = OpenStore(backend, dir.path, kTestTables, Opts());
++            const TableId t = store->Table("plain");
++            BOOST_CHECK_THROW(store->Table("nope"), ChronikError);
++            {
++                auto txn = store->BeginWrite();
++                for (uint32_t i : {5u, 1u, 3u, 200u, 0x100u}) {
++                    txn->Put(t, AsView(ToBe<uint32_t>(i)), S("v" + std::to_string(i)));
++                }
++                txn->Put(t, B({0x00}), B({}));
++                txn->Commit();
++            }
++            auto txn = store->BeginRead();
++            BOOST_CHECK(!txn->Get(t, B({0x99})));
++            BOOST_CHECK(ToBytes(*txn->Get(t, AsView(ToBe<uint32_t>(3)))) == S("v3"));
++            BOOST_CHECK(txn->Get(t, B({0x00}))->empty());
++            BOOST_CHECK_EQUAL(txn->EstimateEntries(t), 6u);
++
++            auto c = txn->OpenCursor(t);
++            std::vector<Bytes> keys;
++            for (bool ok = c->SeekFirst(); ok; ok = c->Next()) {
++                keys.push_back(ToBytes(c->Key()));
++            }
++            BOOST_REQUIRE_EQUAL(keys.size(), 6u);
++            BOOST_CHECK(keys[0] == B({0x00}));
++            BOOST_CHECK(keys[1] == ToBytes(AsView(ToBe<uint32_t>(1))));
++            BOOST_CHECK(keys[5] == ToBytes(AsView(ToBe<uint32_t>(0x100))));
++            BOOST_CHECK(!c->Valid());
++
++            BOOST_CHECK(c->SeekLast());
++            BOOST_CHECK(ToBytes(c->Key()) == ToBytes(AsView(ToBe<uint32_t>(0x100))));
++            BOOST_CHECK(c->Prev());
++            BOOST_CHECK(ToBytes(c->Key()) == ToBytes(AsView(ToBe<uint32_t>(200))));
++
++            BOOST_CHECK(c->SeekGe(AsView(ToBe<uint32_t>(4))));
++            BOOST_CHECK(ToBytes(c->Key()) == ToBytes(AsView(ToBe<uint32_t>(5))));
++            BOOST_CHECK(ToBytes(c->Value()) == S("v5"));
++            BOOST_CHECK(c->SeekGe(AsView(ToBe<uint32_t>(5))));
++            BOOST_CHECK(ToBytes(c->Key()) == ToBytes(AsView(ToBe<uint32_t>(5))));
++            BOOST_CHECK(!c->SeekGe(AsView(ToBe<uint32_t>(0x101))));
++
++            BOOST_CHECK(c->SeekLe(AsView(ToBe<uint32_t>(4))));
++            BOOST_CHECK(ToBytes(c->Key()) == ToBytes(AsView(ToBe<uint32_t>(3))));
++            BOOST_CHECK(c->SeekLe(AsView(ToBe<uint32_t>(3))));
++            BOOST_CHECK(ToBytes(c->Key()) == ToBytes(AsView(ToBe<uint32_t>(3))));
++            BOOST_CHECK(c->SeekLe(AsView(ToBe<uint32_t>(0xffffffff))));
++            BOOST_CHECK(ToBytes(c->Key()) == ToBytes(AsView(ToBe<uint32_t>(0x100))));
++            BOOST_CHECK(!c->SeekLe(B({})));
++        }
++    }
++}
++
++BOOST_AUTO_TEST_CASE(read_your_writes_and_delete) {
++    for (StoreBackend backend : Backends()) {
++        BOOST_TEST_CONTEXT("backend " << StoreBackendName(backend)) {
++            TempDir dir("ryw");
++            auto store = OpenStore(backend, dir.path, kTestTables, Opts());
++            const TableId t = store->Table("plain");
++            auto txn = store->BeginWrite();
++            txn->Put(t, S("a"), S("1"));
++            BOOST_CHECK(ToBytes(*txn->Get(t, S("a"))) == S("1"));
++            txn->Put(t, S("a"), S("2"));
++            BOOST_CHECK(ToBytes(*txn->Get(t, S("a"))) == S("2"));
++            txn->Put(t, S("b"), S("3"));
++            {
++                auto c = txn->OpenCursor(t);
++                BOOST_CHECK(c->SeekFirst());
++                BOOST_CHECK(ToBytes(c->Key()) == S("a"));
++                BOOST_CHECK(c->Next());
++                BOOST_CHECK(ToBytes(c->Key()) == S("b"));
++            }
++            txn->Del(t, S("a"));
++            txn->Del(t, S("missing")); // no-op
++            BOOST_CHECK(!txn->Get(t, S("a")));
++            {
++                // Not visible to readers before commit
++                auto rtxn = store->BeginRead();
++                BOOST_CHECK(!rtxn->Get(t, S("b")));
++            }
++            txn->Commit();
++            BOOST_CHECK_THROW(txn->Put(t, S("c"), S("4")), ChronikError);
++            auto rtxn = store->BeginRead();
++            BOOST_CHECK(!rtxn->Get(t, S("a")));
++            BOOST_CHECK(ToBytes(*rtxn->Get(t, S("b"))) == S("3"));
++
++            // Uncommitted txn is rolled back
++            {
++                auto wtxn = store->BeginWrite();
++                wtxn->Put(t, S("z"), S("9"));
++            }
++            auto rtxn2 = store->BeginRead();
++            BOOST_CHECK(!rtxn2->Get(t, S("z")));
++        }
++    }
++}
++
++BOOST_AUTO_TEST_CASE(dup_semantics) {
++    for (StoreBackend backend : Backends()) {
++        BOOST_TEST_CONTEXT("backend " << StoreBackendName(backend)) {
++            TempDir dir("dup");
++            auto store = OpenStore(backend, dir.path, kTestTables, Opts());
++            const TableId fixed = store->Table("dup_fixed");
++            const TableId var = store->Table("dup_var");
++            const Bytes member = S("member");
++            {
++                auto txn = store->BeginWrite();
++                txn->PutDup(fixed, member, Dup20(7, 1, 100));
++                txn->PutDup(fixed, member, Dup20(2, 0, -5));
++                txn->PutDup(fixed, member, Dup20(7, 0, 50));
++                txn->PutDup(fixed, member, Dup20(7, 0, 50)); // idempotent
++                txn->PutDup(fixed, S("other"), Dup20(1, 1, 1));
++                // variable: outpoint || sats LE8 || script
++                Bytes v1 = Dup20(3, 0, 10);
++                v1.push_back(0xac);
++                Bytes v2 = Dup20(3, 1, 11);
++                v2.insert(v2.end(), {0x76, 0xa9});
++                txn->PutDup(var, member, v2);
++                txn->PutDup(var, member, v1);
++                // read-your-writes on dups
++                BOOST_CHECK_EQUAL(AllDups(*txn, fixed, member).size(), 3u);
++                txn->Commit();
++            }
++            auto txn = store->BeginRead();
++            auto dups = AllDups(*txn, fixed, member);
++            BOOST_REQUIRE_EQUAL(dups.size(), 3u);
++            BOOST_CHECK(dups[0] == Dup20(2, 0, -5));
++            BOOST_CHECK(dups[1] == Dup20(7, 0, 50));
++            BOOST_CHECK(dups[2] == Dup20(7, 1, 100));
++            BOOST_CHECK(AllDups(*txn, fixed, S("nope")).empty());
++            BOOST_CHECK_EQUAL(txn->EstimateEntries(fixed), 4u);
++            {
++                auto c = txn->OpenDupCursor(fixed);
++                BOOST_CHECK(c->Seek(member));
++                BOOST_CHECK_EQUAL(c->CountRemaining(), 3u);
++                BOOST_CHECK(c->Next());
++                BOOST_CHECK_EQUAL(c->CountRemaining(), 2u);
++                // SeekValueGe with a 12-byte outpoint prefix
++                Bytes prefix;
++                PutBe<uint64_t>(prefix, 7);
++                PutBe<uint32_t>(prefix, 1);
++                BOOST_CHECK(c->SeekValueGe(member, prefix));
++                BOOST_CHECK(ToBytes(c->Value()) == Dup20(7, 1, 100));
++                BOOST_CHECK(!c->Next());
++                Bytes prefix_hi;
++                PutBe<uint64_t>(prefix_hi, 8);
++                PutBe<uint32_t>(prefix_hi, 0);
++                BOOST_CHECK(!c->SeekValueGe(member, prefix_hi));
++            }
++            auto vdups = AllDups(*txn, var, member);
++            BOOST_REQUIRE_EQUAL(vdups.size(), 2u);
++            BOOST_CHECK_EQUAL(vdups[0].size(), 21u);
++            BOOST_CHECK_EQUAL(vdups[1].size(), 22u);
++            txn.reset();
++
++            {
++                auto wtxn = store->BeginWrite();
++                Bytes prefix;
++                PutBe<uint64_t>(prefix, 7);
++                PutBe<uint32_t>(prefix, 0);
++                wtxn->DelDupByPrefix(fixed, member, prefix);
++                // Missing prefix: no-op
++                Bytes prefix_none;
++                PutBe<uint64_t>(prefix_none, 7);
++                PutBe<uint32_t>(prefix_none, 9);
++                wtxn->DelDupByPrefix(fixed, member, prefix_none);
++                wtxn->DelDupByPrefix(fixed, S("nope"), prefix_none);
++                wtxn->DelDup(fixed, member, Dup20(2, 0, -5));
++                wtxn->DelDup(fixed, member, Dup20(2, 0, -6)); // not present
++                Bytes vprefix;
++                PutBe<uint64_t>(vprefix, 3);
++                PutBe<uint32_t>(vprefix, 1);
++                wtxn->DelDupByPrefix(var, member, vprefix);
++                wtxn->Commit();
++            }
++            auto txn2 = store->BeginRead();
++            dups = AllDups(*txn2, fixed, member);
++            BOOST_REQUIRE_EQUAL(dups.size(), 1u);
++            BOOST_CHECK(dups[0] == Dup20(7, 1, 100));
++            vdups = AllDups(*txn2, var, member);
++            BOOST_REQUIRE_EQUAL(vdups.size(), 1u);
++            BOOST_CHECK(vdups[0] == [] {
++                Bytes v1 = Dup20(3, 0, 10);
++                v1.push_back(0xac);
++                return v1;
++            }());
++            txn2.reset();
++            // Deleting the last dup removes the key
++            {
++                auto wtxn = store->BeginWrite();
++                wtxn->DelDup(fixed, member, Dup20(7, 1, 100));
++                wtxn->Commit();
++            }
++            auto txn3 = store->BeginRead();
++            BOOST_CHECK(AllDups(*txn3, fixed, member).empty());
++            BOOST_CHECK_EQUAL(txn3->EstimateEntries(fixed), 1u);
++        }
++    }
++}
++
++BOOST_AUTO_TEST_CASE(clear_table) {
++    for (StoreBackend backend : Backends()) {
++        BOOST_TEST_CONTEXT("backend " << StoreBackendName(backend)) {
++            TempDir dir("clear");
++            auto store = OpenStore(backend, dir.path, kTestTables, Opts());
++            const TableId t = store->Table("plain");
++            const TableId d = store->Table("dup_fixed");
++            {
++                auto txn = store->BeginWrite();
++                for (int i = 0; i < 100; ++i) {
++                    txn->Put(t, AsView(ToBe<uint32_t>(i)), S("x"));
++                    txn->PutDup(d, S("m"), Dup20(i, 0, i));
++                }
++                txn->Commit();
++            }
++            {
++                auto txn = store->BeginWrite();
++                txn->Clear(t);
++                BOOST_CHECK(!txn->Get(t, AsView(ToBe<uint32_t>(5))));
++                txn->Put(t, S("after"), S("y")); // usable after Clear
++                txn->Commit();
++            }
++            auto txn = store->BeginRead();
++            BOOST_CHECK_EQUAL(txn->EstimateEntries(t), 1u);
++            BOOST_CHECK_EQUAL(txn->EstimateEntries(d), 100u);
++        }
++    }
++}
++
++BOOST_AUTO_TEST_CASE(snapshot_isolation_concurrent_writer) {
++    for (StoreBackend backend : Backends()) {
++        BOOST_TEST_CONTEXT("backend " << StoreBackendName(backend)) {
++            TempDir dir("snap");
++            auto store = OpenStore(backend, dir.path, kTestTables, Opts());
++            const TableId t = store->Table("plain");
++            {
++                auto txn = store->BeginWrite();
++                txn->Put(t, S("counter"), AsView(ToBe<uint64_t>(0)));
++                txn->Put(t, S("mirror"), AsView(ToBe<uint64_t>(0)));
++                txn->Commit();
++            }
++            // A snapshot taken now never sees later commits.
++            auto snapshot = store->BeginRead();
++            std::atomic<bool> stop{false};
++            std::thread writer([&] {
++                for (uint64_t i = 1; i <= 300; ++i) {
++                    auto txn = store->BeginWrite();
++                    txn->Put(t, S("counter"), AsView(ToBe<uint64_t>(i)));
++                    txn->Put(t, S("mirror"), AsView(ToBe<uint64_t>(i)));
++                    txn->Commit();
++                }
++                stop = true;
++            });
++            std::atomic<int> inconsistent{0};
++            std::vector<std::thread> readers;
++            for (int r = 0; r < 4; ++r) {
++                readers.emplace_back([&] {
++                    while (!stop) {
++                        auto txn = store->BeginRead();
++                        const uint64_t a = FromBe<uint64_t>(*txn->Get(t, S("counter")));
++                        std::this_thread::yield();
++                        const uint64_t b = FromBe<uint64_t>(*txn->Get(t, S("mirror")));
++                        if (a != b) {
++                            inconsistent++;
++                        }
++                    }
++                });
++            }
++            writer.join();
++            for (auto &th : readers) {
++                th.join();
++            }
++            BOOST_CHECK_EQUAL(inconsistent.load(), 0);
++            BOOST_CHECK_EQUAL(FromBe<uint64_t>(*snapshot->Get(t, S("counter"))), 0u);
++            snapshot.reset();
++            auto fresh = store->BeginRead();
++            BOOST_CHECK_EQUAL(FromBe<uint64_t>(*fresh->Get(t, S("counter"))), 300u);
++        }
++    }
++}
++
++BOOST_AUTO_TEST_CASE(reopen_persistence_and_destroy) {
++    for (StoreBackend backend : Backends()) {
++        BOOST_TEST_CONTEXT("backend " << StoreBackendName(backend)) {
++            TempDir dir("reopen");
++            {
++                auto store = OpenStore(backend, dir.path, kTestTables, Opts());
++                auto txn = store->BeginWrite();
++                txn->Put(store->Table("plain"), S("k"), S("v"));
++                txn->PutDup(store->Table("dup_fixed"), S("m"), Dup20(1, 2, 3));
++                txn->Commit();
++                store->Sync(true);
++            }
++            {
++                auto store = OpenStore(backend, dir.path, kTestTables, Opts());
++                auto txn = store->BeginRead();
++                BOOST_CHECK(ToBytes(*txn->Get(store->Table("plain"), S("k"))) == S("v"));
++                BOOST_CHECK(AllDups(*txn, store->Table("dup_fixed"), S("m")).size() == 1);
++                std::vector<std::string> names = store->TableNames();
++                BOOST_CHECK(names == (std::vector<std::string>{"plain", "dup_var", "dup_fixed"}));
++            }
++            DestroyStore(backend, dir.path);
++            BOOST_CHECK(!std::filesystem::exists(dir.path));
++            auto store = OpenStore(backend, dir.path, kTestTables, Opts());
++            auto txn = store->BeginRead();
++            BOOST_CHECK(!txn->Get(store->Table("plain"), S("k")));
++        }
++    }
++}
++
++BOOST_AUTO_TEST_CASE(long_keys) {
++    for (StoreBackend backend : Backends()) {
++        BOOST_TEST_CONTEXT("backend " << StoreBackendName(backend)) {
++            TempDir dir("longkey");
++            auto store = OpenStore(backend, dir.path, kTestTables, Opts());
++            const TableId t = store->Table("plain");
++            const TableId d = store->Table("dup_fixed");
++            const Bytes k7500(7500, 0x42);
++            Bytes k10000(10000, 0x43);
++            {
++                auto txn = store->BeginWrite();
++                txn->Put(t, k7500, S("inline"));
++                txn->Put(t, k10000, S("hashed"));
++                txn->PutDup(d, k10000, Dup20(1, 1, 1));
++                txn->Commit();
++            }
++            auto txn = store->BeginRead();
++            BOOST_CHECK(ToBytes(*txn->Get(t, k7500)) == S("inline"));
++            BOOST_CHECK(ToBytes(*txn->Get(t, k10000)) == S("hashed"));
++            BOOST_CHECK_EQUAL(AllDups(*txn, d, k10000).size(), 1u);
++            Bytes k10000b = k10000;
++            k10000b.back() ^= 1;
++            BOOST_CHECK(!txn->Get(t, k10000b));
++#if CHRONIK_NATIVE_HAVE_MDBX
++            if (backend == StoreBackend::Mdbx) {
++                // Physical key = "MDBX_SHA256_KEY:" || sha256(key), like Rust
++                uint8_t digest[32];
++                test::TestSha256(k10000, digest);
++                Bytes phys = S("MDBX_SHA256_KEY:");
++                phys.insert(phys.end(), digest, digest + 32);
++                auto c = txn->OpenCursor(t);
++                bool found = false;
++                for (bool ok = c->SeekFirst(); ok; ok = c->Next()) {
++                    if (ToBytes(c->Key()) == phys) {
++                        found = true;
++                        BOOST_CHECK(ToBytes(c->Value()) == S("hashed"));
++                    }
++                    BOOST_CHECK(c->Key().size() <= 7500);
++                }
++                BOOST_CHECK(found);
++                // The 7500-byte key is stored inline.
++                BOOST_CHECK(c->SeekGe(k7500));
++                BOOST_CHECK(ToBytes(c->Key()) == k7500);
++            }
++#endif
++        }
++    }
++}
++
++BOOST_AUTO_TEST_CASE(sha256_helper) {
++    uint8_t out[32];
++    test::TestSha256(Bytes{}, out);
++    BOOST_CHECK_EQUAL(HexEncode(ByteView(out, 32)),
++                      "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b"
++                      "7852b855");
++    test::TestSha256(S("abc"), out);
++    BOOST_CHECK_EQUAL(HexEncode(ByteView(out, 32)),
++                      "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61"
++                      "f20015ad");
++}
++
++#if CHRONIK_NATIVE_HAVE_MDBX
++BOOST_AUTO_TEST_CASE(mdbx_env_matches_rust) {
++    // chronik-db/src/db.rs Db::open_with_cfs and test_mdbx_durability_policy
++    TempDir dir("mdbxenv");
++    RegisterTestStoreBackends();
++    const auto tables = schema::EcashTables();
++    auto store = OpenStore(StoreBackend::Mdbx, dir.path, tables, Opts());
++    const MdbxStoreInfo info = GetMdbxStoreInfo(*store);
++    BOOST_CHECK_EQUAL(info.pagesize, 16384u);
++    BOOST_CHECK_EQUAL(info.geo_upper, uint64_t(256) << 30);
++    BOOST_CHECK_EQUAL(info.geo_grow, uint64_t(64) << 20);
++    BOOST_CHECK_EQUAL(info.geo_shrink, uint64_t(128) << 20);
++    // mdbx_env_set_maxreaders(256), which libmdbx rounds up to fill the lock
++    // file's pages, exactly as for the Rust env.
++    BOOST_CHECK_GE(info.max_readers, 256u);
++    BOOST_CHECK(info.env_flags & mdbx_flags::kSafeNoSync);
++    BOOST_CHECK(info.env_flags & mdbx_flags::kNoMetaSync);
++    BOOST_CHECK(info.env_flags & mdbx_flags::kLifoReclaim);
++    BOOST_CHECK(info.env_flags & mdbx_flags::kNoStickyThreads);
++    BOOST_CHECK(info.env_flags & mdbx_flags::kNoMemInit);
++    BOOST_CHECK_EQUAL(info.sync_bytes, uint64_t(16) << 20);
++    BOOST_CHECK_EQUAL(info.sync_period, uint64_t(1) << 16);
++    BOOST_REQUIRE_EQUAL(info.dbi_flags.size(), tables.size());
++    for (size_t i = 0; i < tables.size(); ++i) {
++        const bool dup = tables[i].kind == TableSpec::Kind::Dup;
++        BOOST_CHECK_EQUAL(bool(info.dbi_flags[i] & mdbx_flags::kDupSort), dup);
++        BOOST_CHECK_EQUAL(bool(info.dbi_flags[i] & mdbx_flags::kDupFixed),
++                          dup && tables[i].dup_fixed_size.has_value());
++    }
++    const auto perms = std::filesystem::status(dir.path / "mdbx.dat").permissions();
++    BOOST_CHECK((perms & std::filesystem::perms::all) ==
++                (std::filesystem::perms::owner_read |
++                 std::filesystem::perms::owner_write));
++}
++#endif
++
++BOOST_AUTO_TEST_SUITE_END()
+-- 
+2.50.1 (Apple Git-155)
+

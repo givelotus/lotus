@@ -1,0 +1,1349 @@
+From fbb302d342e849a2b0a515f6fa53f7e7c34cd866 Mon Sep 17 00:00:00 2001
+From: Shammah Chancellor <shammah.chancellor@notvalid.com>
+Date: Sun, 18 Oct 2026 01:33:29 -0700
+Subject: [PATCH] rpc: add atomic testrawtxbatch and submitrawtxbatch package
+ RPCs
+
+Add all-or-nothing batch transaction validation and submission RPCs
+(testrawtxbatch and submitrawtxbatch).
+
+Original-Commit: ce5e6b2465d878d80caf1f1f068bba9a84908f60
+Original-Patch: ecash/015
+Split-Concern: whole
+
+Historical compilation prerequisites are tracked separately in daemon/patch-audit;
+this provenance-preserving split does not imply standalone build validation.
+
+Candidate-Repair: Complete atomic batch admission at its first RPC owner using the existing ABC standard and next-block consensus script checks, staged dependency resolution, exact pre-insertion capacity reservation, one snapshot publication and ordered batched notifications. Preserve parallel raw decoding and reject malformed inputs deterministically. Move fee-controller diagnostics, concrete batched relay and parallel resolved-input script processing to their actual later feature owners; remove the historical serial-decoder regression/restoration churn. Capacity failure accepts nothing and evicts no existing transactions; ordinary admission and consensus remain unchanged. Retain all original assertions; add memory-boundary, no-partial-admission, parallel-error and two-node 40-transaction relay/mining regressions. Manual109Bitcoin/123Avalanche and dedicated functional checks pass; clean progression gates remain required.
+
+diff --git a/src/rpc/client.cpp b/src/rpc/client.cpp
+index 4d8983cecbc619ed4b8e2abe98f685aeda125cae..8d3aa3f5a85f63210798670a560e15b8ab6aced2 100644
+--- a/src/rpc/client.cpp
++++ b/src/rpc/client.cpp
+@@ -102,6 +102,10 @@ static const CRPCConvertParam vRPCConvertParams[] = {
+     {"submitpackage", 0, "package"},
+     {"testmempoolaccept", 0, "rawtxs"},
+     {"testmempoolaccept", 1, "maxfeerate"},
++    {"testrawtxbatch", 0, "rawtxs"},
++    {"testrawtxbatch", 1, "maxfeerate"},
++    {"submitrawtxbatch", 0, "rawtxs"},
++    {"submitrawtxbatch", 1, "maxfeerate"},
+     {"combinerawtransaction", 0, "txs"},
+     {"fundrawtransaction", 1, "options"},
+     {"fundrawtransaction", 1, "add_inputs"},
+diff --git a/src/rpc/mempool.cpp b/src/rpc/mempool.cpp
+index f85470077bd62d92cba1afa89ba5a53b885be69e..aa18f7562849e3d92425dc6494b54217d9cbd0fd 100644
+--- a/src/rpc/mempool.cpp
++++ b/src/rpc/mempool.cpp
+@@ -7,13 +7,21 @@
+ #include <kernel/mempool_persist.h>
+ 
+ #include <chainparams.h>
++#include <common/args.h>
+ #include <core_io.h>
++#include <lotus_v2/mempool_overlay.h>
++#include <net.h>
++#include <net/v2_protocol_handler.h>
++#include <net_processing.h>
++#include <netmessagemaker.h>
+ #include <node/context.h>
+ #include <node/mempool_persist_args.h>
+ #include <node/snapshot.h>
+ #include <node/types.h>
++#include <policy/policy.h>
+ #include <policy/settings.h>
+ #include <primitives/transaction.h>
++#include <protocol.h>
+ #include <rpc/server.h>
+ #include <rpc/server_util.h>
+ #include <rpc/util.h>
+@@ -21,9 +29,13 @@
+ #include <univalue.h>
+ #include <util/fs.h>
+ #include <util/moneystr.h>
++#include <util/time.h>
+ #include <validation.h>
+ #include <validationinterface.h>
+ 
++#include <atomic>
++#include <thread>
++
+ using kernel::DumpMempool;
+ 
+ using node::DEFAULT_MAX_RAW_TX_FEE_RATE;
+@@ -1163,12 +1175,505 @@ static RPCHelpMan submitpackage() {
+     };
+ }
+ 
++static void DecodeRawTxBatchParallel(const UniValue &raw_transactions,
++                                     std::vector<CTransactionRef> &txns,
++                                     UniValue *txids_arr) {
++    const auto &raw_vals = raw_transactions.getValues();
++    const size_t n = raw_vals.size();
++    for (const auto &rawtx : raw_vals) {
++        (void)rawtx.get_str();
++    }
++    txns.resize(n);
++    if (n < 32) {
++        for (size_t i = 0; i < n; ++i) {
++            CMutableTransaction mtx;
++            if (!DecodeHexTx(mtx, raw_vals[i].get_str())) {
++                throw JSONRPCError(RPC_DESERIALIZATION_ERROR,
++                                   "TX decode failed: " +
++                                       raw_vals[i].get_str());
++            }
++            txns[i] = MakeTransactionRef(std::move(mtx));
++            if (txids_arr != nullptr) {
++                txids_arr->push_back(txns[i]->GetId().GetHex());
++            }
++        }
++        return;
++    }
++
++    const size_t hw = std::max<size_t>(
++        1, std::min<size_t>(8, std::thread::hardware_concurrency()));
++    const size_t num_threads = std::min(hw, (n + 15) / 16);
++    std::atomic<size_t> next_idx{0};
++    std::atomic<size_t> first_fail{n};
++
++    std::vector<std::string> hex_ids(txids_arr != nullptr ? n : 0);
++
++    auto worker = [&]() {
++        while (true) {
++            const size_t base =
++                next_idx.fetch_add(8, std::memory_order_relaxed);
++            if (base >= n ||
++                base >= first_fail.load(std::memory_order_relaxed)) {
++                break;
++            }
++            const size_t end = std::min(n, base + 8);
++            for (size_t i = base; i < end; ++i) {
++                if (i >= first_fail.load(std::memory_order_relaxed)) {
++                    break;
++                }
++                CMutableTransaction mtx;
++                if (!DecodeHexTx(mtx, raw_vals[i].get_str())) {
++                    size_t cur = first_fail.load(std::memory_order_relaxed);
++                    while (i < cur &&
++                           !first_fail.compare_exchange_weak(
++                               cur, i, std::memory_order_relaxed)) {
++                    }
++                    break;
++                }
++                txns[i] = MakeTransactionRef(std::move(mtx));
++                if (txids_arr != nullptr) {
++                    hex_ids[i] = txns[i]->GetId().GetHex();
++                }
++            }
++        }
++    };
++
++    std::vector<std::thread> threads;
++    threads.reserve(num_threads > 0 ? num_threads - 1 : 0);
++    for (size_t t = 1; t < num_threads; ++t) {
++        threads.emplace_back(worker);
++    }
++    worker();
++    for (auto &th : threads) {
++        th.join();
++    }
++
++    const size_t bad = first_fail.load(std::memory_order_relaxed);
++    if (bad < n) {
++        throw JSONRPCError(RPC_DESERIALIZATION_ERROR,
++                           "TX decode failed: " + raw_vals[bad].get_str());
++    }
++    if (txids_arr != nullptr) {
++        txids_arr->reserve(n);
++        for (size_t i = 0; i < n; ++i) {
++            txids_arr->push_back(std::move(hex_ids[i]));
++        }
++    }
++}
++
++static RPCHelpMan testrawtxbatch() {
++    const auto ticker = Currency::getTicker();
++    return RPCHelpMan{
++        "testrawtxbatch",
++        "Returns result of mempool acceptance tests indicating if a batch of "
++        "raw transactions (serialized, hex-encoded) would be accepted by "
++        "mempool in dependency order.\n"
++        "Unlike testmempoolaccept, this supports up to " +
++            ToString(MAX_RAWTX_BATCH_COUNT) +
++            " transactions per call, evaluates parent-child dependencies "
++            "across the batch, and never mutates the mempool.\n",
++        {
++            {
++                "rawtxs",
++                RPCArg::Type::ARR,
++                RPCArg::Optional::NO,
++                "An array of hex strings of raw transactions.",
++                {
++                    {"rawtx", RPCArg::Type::STR_HEX, RPCArg::Optional::OMITTED,
++                     ""},
++                },
++            },
++            {"maxfeerate", RPCArg::Type::AMOUNT,
++             RPCArg::Default{
++                 FormatMoney(DEFAULT_MAX_RAW_TX_FEE_RATE.GetFeePerK())},
++             "Reject transactions whose fee rate is higher than the specified "
++             "value, expressed in " +
++                 ticker + "/kB\n"},
++        },
++        RPCResult{
++            RPCResult::Type::OBJ,
++            "",
++            "",
++            {
++                {RPCResult::Type::BOOL, "allowed",
++                 "True if and only if every transaction in the batch is valid "
++                 "and within maxfeerate"},
++                {RPCResult::Type::STR, "package-error", /*optional=*/true,
++                 "Package validation error, if any"},
++                {RPCResult::Type::ARR,
++                 "results",
++                 "Per-transaction validation results in input order",
++                 {
++                     {RPCResult::Type::OBJ,
++                      "",
++                      "",
++                      {
++                          {RPCResult::Type::STR_HEX, "txid",
++                           "The transaction id in hex"},
++                          {RPCResult::Type::BOOL, "allowed", /*optional=*/true,
++                           "Whether this transaction passed validation"},
++                          {RPCResult::Type::NUM, "size", /*optional=*/true,
++                           "Virtual transaction size"},
++                          {RPCResult::Type::OBJ,
++                           "fees",
++                           /*optional=*/true,
++                           "Transaction fees",
++                           {
++                               {RPCResult::Type::STR_AMOUNT, "base",
++                                "transaction fee in " + ticker},
++                               {RPCResult::Type::STR_AMOUNT,
++                                "effective-feerate",
++                                "effective feerate in " + ticker + " per KvB"},
++                               {RPCResult::Type::ARR,
++                                "effective-includes",
++                                "txids included in effective-feerate",
++                                {
++                                    RPCResult{RPCResult::Type::STR_HEX, "",
++                                              "transaction txid in hex"},
++                                }},
++                           }},
++                          {RPCResult::Type::STR, "reject-reason",
++                           /*optional=*/true, "Rejection reason string"},
++                          {RPCResult::Type::STR, "reject-details",
++                           /*optional=*/true, "Rejection details string"},
++                      }},
++                 }},
++            },
++        },
++        RPCExamples{HelpExampleCli("testrawtxbatch", R"('["signedhex"]')") +
++                    HelpExampleRpc("testrawtxbatch", "[\"signedhex\"]")},
++        [&](const RPCHelpMan &self, const Config &config,
++            const JSONRPCRequest &request) -> UniValue {
++            const UniValue &raw_transactions = request.params[0].get_array();
++            if (raw_transactions.size() < 1 ||
++                raw_transactions.size() > MAX_RAWTX_BATCH_COUNT) {
++                throw JSONRPCError(RPC_INVALID_PARAMETER,
++                                   "Array must contain between 1 and " +
++                                       ToString(MAX_RAWTX_BATCH_COUNT) +
++                                       " transactions.");
++            }
++
++            const CFeeRate max_raw_tx_fee_rate =
++                request.params[1].isNull()
++                    ? DEFAULT_MAX_RAW_TX_FEE_RATE
++                    : CFeeRate(AmountFromValue(request.params[1]));
++
++            std::vector<CTransactionRef> txns;
++            DecodeRawTxBatchParallel(raw_transactions, txns, nullptr);
++
++            NodeContext &node = EnsureAnyNodeContext(request.context);
++            CTxMemPool &mempool = EnsureMemPool(node);
++            ChainstateManager &chainman = EnsureChainman(node);
++            Chainstate &chainstate = chainman.ActiveChainstate();
++
++            const PackageMempoolAcceptResult package_result = [&] {
++                LOCK(::cs_main);
++                return ProcessRawTxBatch(chainstate, mempool, txns,
++                                         /*test_accept=*/true,
++                                         max_raw_tx_fee_rate);
++            }();
++
++            UniValue results_arr(UniValue::VARR);
++            bool all_allowed =
++                package_result.m_state.GetResult() !=
++                PackageValidationResult::PCKG_POLICY;
++            bool exit_early{false};
++
++            for (const auto &tx : txns) {
++                UniValue result_inner(UniValue::VOBJ);
++                result_inner.pushKV("txid", tx->GetId().GetHex());
++                auto it = package_result.m_tx_results.find(tx->GetId());
++                if (exit_early || it == package_result.m_tx_results.end()) {
++                    all_allowed = false;
++                    results_arr.push_back(std::move(result_inner));
++                    continue;
++                }
++                const auto &tx_result = it->second;
++
++                if (tx_result.m_result_type ==
++                        MempoolAcceptResult::ResultType::VALID) {
++                    const Amount fee = tx_result.m_base_fees.value();
++                    const int64_t virtual_size = tx_result.m_vsize.value();
++                    result_inner.pushKV("allowed", true);
++                    result_inner.pushKV("size", virtual_size);
++                    UniValue fees(UniValue::VOBJ);
++                    fees.pushKV("base", fee);
++                    fees.pushKV(
++                        "effective-feerate",
++                        tx_result.m_effective_feerate.value().GetFeePerK());
++                    UniValue effective_includes_res(UniValue::VARR);
++                    for (const auto &txid :
++                         tx_result.m_txids_fee_calculations.value()) {
++                        effective_includes_res.push_back(txid.ToString());
++                    }
++                    fees.pushKV("effective-includes",
++                                std::move(effective_includes_res));
++                    result_inner.pushKV("fees", std::move(fees));
++                } else {
++                    all_allowed = false;
++                    result_inner.pushKV("allowed", false);
++                    const TxValidationState state = tx_result.m_state;
++                    if (state.GetResult() ==
++                        TxValidationResult::TX_MISSING_INPUTS) {
++                        result_inner.pushKV("reject-reason", "missing-inputs");
++                    } else if (state.GetRejectReason() == "max-fee-exceeded") {
++                        result_inner.pushKV("reject-reason",
++                                            "max-fee-exceeded");
++                        exit_early = true;
++                    } else {
++                        result_inner.pushKV("reject-reason",
++                                            state.GetRejectReason());
++                        result_inner.pushKV("reject-details", state.ToString());
++                    }
++                }
++                results_arr.push_back(std::move(result_inner));
++            }
++
++            UniValue ret(UniValue::VOBJ);
++            ret.pushKV("allowed", all_allowed);
++            if (package_result.m_state.GetResult() ==
++                PackageValidationResult::PCKG_POLICY) {
++                ret.pushKV("package-error",
++                           package_result.m_state.GetRejectReason());
++            }
++            ret.pushKV("results", std::move(results_arr));
++            return ret;
++        },
++    };
++}
++
++static RPCHelpMan submitrawtxbatch() {
++    const auto ticker = Currency::getTicker();
++    return RPCHelpMan{
++        "submitrawtxbatch",
++        "Submit a batch of raw transactions (serialized, hex-encoded) in "
++        "dependency order with two-phase all-or-nothing semantics.\n"
++        "Phase 1 validates the entire batch under cs_main without mutating the "
++        "mempool. If any transaction fails validation or exceeds maxfeerate, "
++        "no transactions in the batch are accepted.\n"
++        "Phase 2 commits all validated transactions to the mempool under the "
++        "same cs_main lock acquisition, refreshes the RCU snapshot, and "
++        "broadcasts them.\n",
++        {
++            {
++                "rawtxs",
++                RPCArg::Type::ARR,
++                RPCArg::Optional::NO,
++                "An array of hex strings of raw transactions.",
++                {
++                    {"rawtx", RPCArg::Type::STR_HEX, RPCArg::Optional::OMITTED,
++                     ""},
++                },
++            },
++            {"maxfeerate", RPCArg::Type::AMOUNT,
++             RPCArg::Default{
++                 FormatMoney(DEFAULT_MAX_RAW_TX_FEE_RATE.GetFeePerK())},
++             "Reject transactions whose fee rate is higher than the specified "
++             "value, expressed in " +
++                 ticker +
++                 "/kB\nSet to 0 to accept any fee rate.\n"},
++        },
++        RPCResult{
++            RPCResult::Type::OBJ,
++            "",
++            "",
++            {
++                {RPCResult::Type::BOOL, "accepted",
++                 "True if all transactions in the batch were accepted into the "
++                 "mempool"},
++                {RPCResult::Type::STR, "package-error", /*optional=*/true,
++                 "Package validation error, if any"},
++                {RPCResult::Type::ARR,
++                 "txids",
++                 "Transaction IDs in input order",
++                 {
++                     RPCResult{RPCResult::Type::STR_HEX, "",
++                               "The transaction id in hex"},
++                 }},
++                {RPCResult::Type::ARR,
++                 "results",
++                 "Per-transaction validation results in input order",
++                 {
++                     {RPCResult::Type::OBJ,
++                      "",
++                      "",
++                      {
++                          {RPCResult::Type::STR_HEX, "txid",
++                           "The transaction id in hex"},
++                          {RPCResult::Type::BOOL, "allowed", /*optional=*/true,
++                           "Whether this transaction passed validation"},
++                          {RPCResult::Type::NUM, "size", /*optional=*/true,
++                           "Virtual transaction size"},
++                          {RPCResult::Type::OBJ,
++                           "fees",
++                           /*optional=*/true,
++                           "Transaction fees",
++                           {
++                               {RPCResult::Type::STR_AMOUNT, "base",
++                                "transaction fee in " + ticker},
++                               {RPCResult::Type::STR_AMOUNT,
++                                "effective-feerate",
++                                "effective feerate in " + ticker + " per KvB"},
++                               {RPCResult::Type::ARR,
++                                "effective-includes",
++                                "txids included in effective-feerate",
++                                {
++                                    RPCResult{RPCResult::Type::STR_HEX, "",
++                                              "transaction txid in hex"},
++                                }},
++                           }},
++                          {RPCResult::Type::STR, "reject-reason",
++                           /*optional=*/true, "Rejection reason string"},
++                          {RPCResult::Type::STR, "reject-details",
++                           /*optional=*/true, "Rejection details string"},
++                      }},
++                 }},
++            },
++        },
++        RPCExamples{HelpExampleCli("submitrawtxbatch", R"('["signedhex"]')") +
++                    HelpExampleRpc("submitrawtxbatch", "[\"signedhex\"]")},
++        [&](const RPCHelpMan &self, const Config &config,
++            const JSONRPCRequest &request) -> UniValue {
++            const UniValue &raw_transactions = request.params[0].get_array();
++            if (raw_transactions.size() < 1 ||
++                raw_transactions.size() > MAX_RAWTX_BATCH_COUNT) {
++                throw JSONRPCError(RPC_INVALID_PARAMETER,
++                                   "Array must contain between 1 and " +
++                                       ToString(MAX_RAWTX_BATCH_COUNT) +
++                                       " transactions.");
++            }
++
++            const CFeeRate max_raw_tx_fee_rate =
++                request.params[1].isNull()
++                    ? DEFAULT_MAX_RAW_TX_FEE_RATE
++                    : CFeeRate(AmountFromValue(request.params[1]));
++
++            std::vector<CTransactionRef> txns;
++            UniValue txids_arr(UniValue::VARR);
++            DecodeRawTxBatchParallel(raw_transactions, txns, &txids_arr);
++
++            AssertLockNotHeld(cs_main);
++            NodeContext &node = EnsureAnyNodeContext(request.context);
++            CTxMemPool &mempool = EnsureMemPool(node);
++            ChainstateManager &chainman = EnsureChainman(node);
++            Chainstate &chainstate = chainman.ActiveChainstate();
++
++            UniValue results_arr(UniValue::VARR);
++            bool all_allowed = false;
++            std::string package_error_str;
++
++            const PackageMempoolAcceptResult package_result = [&] {
++                LOCK2(::cs_main, mempool.cs);
++                CTxMemPool::ScopedSnapshotDefer snap_defer(mempool);
++                PackageMempoolAcceptResult res =
++                    ProcessRawTxBatch(chainstate, mempool, txns,
++                                      /*test_accept=*/false,
++                                      max_raw_tx_fee_rate);
++
++                if (res.m_state.IsValid() &&
++                    res.m_tx_results.size() == txns.size()) {
++                    for (const auto &tx : txns) {
++                        mempool.AddUnbroadcastTx(tx->GetId());
++                    }
++                    const auto cur_snap =
++                        node::GetGlobalSnapshotPublisher().Load();
++                    if (!cur_snap || !cur_snap->chain_valid ||
++                        cur_snap->chainman_ptr != &chainman) {
++                        node::PublishChainTipSnapshot(chainman, &mempool);
++                    }
++                }
++                return res;
++            }();
++
++            if (package_result.m_state.GetResult() ==
++                PackageValidationResult::PCKG_POLICY) {
++                package_error_str = package_result.m_state.GetRejectReason();
++            }
++
++            all_allowed = package_result.m_state.IsValid();
++            bool exit_early{false};
++
++            for (const auto &tx : txns) {
++                UniValue result_inner(UniValue::VOBJ);
++                result_inner.pushKV("txid", tx->GetId().GetHex());
++                auto it = package_result.m_tx_results.find(tx->GetId());
++                if (exit_early || it == package_result.m_tx_results.end()) {
++                    all_allowed = false;
++                    results_arr.push_back(std::move(result_inner));
++                    continue;
++                }
++                const auto &tx_result = it->second;
++
++                if (tx_result.m_result_type ==
++                    MempoolAcceptResult::ResultType::VALID) {
++                    const Amount fee = tx_result.m_base_fees.value();
++                    const int64_t virtual_size = tx_result.m_vsize.value();
++                    result_inner.pushKV("allowed", true);
++                    result_inner.pushKV("size", virtual_size);
++                    UniValue fees(UniValue::VOBJ);
++                    fees.pushKV("base", fee);
++                    fees.pushKV(
++                        "effective-feerate",
++                        tx_result.m_effective_feerate.value().GetFeePerK());
++                    UniValue effective_includes_res(UniValue::VARR);
++                    for (const auto &txid :
++                         tx_result.m_txids_fee_calculations.value()) {
++                        effective_includes_res.push_back(txid.ToString());
++                    }
++                    fees.pushKV("effective-includes",
++                                std::move(effective_includes_res));
++                    result_inner.pushKV("fees", std::move(fees));
++                } else {
++                    all_allowed = false;
++                    result_inner.pushKV("allowed", false);
++                    const TxValidationState state = tx_result.m_state;
++                    if (state.GetResult() ==
++                        TxValidationResult::TX_MISSING_INPUTS) {
++                        result_inner.pushKV("reject-reason", "missing-inputs");
++                    } else if (state.GetRejectReason() == "max-fee-exceeded") {
++                        result_inner.pushKV("reject-reason",
++                                            "max-fee-exceeded");
++                        exit_early = true;
++                    } else {
++                        result_inner.pushKV("reject-reason",
++                                            state.GetRejectReason());
++                        result_inner.pushKV("reject-details", state.ToString());
++                    }
++                }
++                results_arr.push_back(std::move(result_inner));
++            }
++
++            if (all_allowed) {
++                if (node.validation_signals) {
++                    node.validation_signals->SyncWithValidationInterfaceQueue();
++                }
++                if (node.peerman) {
++                    for (const auto &tx : txns) {
++                        node.peerman->RelayTransaction(tx->GetId());
++                    }
++                }
++            }
++
++            UniValue ret(UniValue::VOBJ);
++            ret.pushKV("accepted", all_allowed);
++            if (!package_error_str.empty()) {
++                ret.pushKV("package-error", package_error_str);
++            }
++            ret.pushKV("txids", std::move(txids_arr));
++            ret.pushKV("results", std::move(results_arr));
++            return ret;
++        },
++    };
++}
++
+ void RegisterMempoolRPCCommands(CRPCTable &t) {
+     static const CRPCCommand commands[]{
+         // category     actor (function)
+         // --------     ----------------
+         {"rawtransactions", sendrawtransaction},
+         {"rawtransactions", testmempoolaccept},
++        {"rawtransactions", testrawtxbatch},
++        {"rawtransactions", submitrawtxbatch},
+         {"blockchain", getmempoolancestors},
+         {"blockchain", getmempooldescendants},
+         {"blockchain", getmempoolentry},
+diff --git a/src/test/CMakeLists.txt b/src/test/CMakeLists.txt
+index 1afab5254da6700dbdd0af063b7d97c1cbf7cb74..14a98c6688eac029136844106605eb129fd4d60f 100644
+--- a/src/test/CMakeLists.txt
++++ b/src/test/CMakeLists.txt
+@@ -161,6 +161,7 @@ add_boost_unit_tests_to_suite(bitcoin test_bitcoin
+ 		checkpoints_tests.cpp
+ 		checkqueue_tests.cpp
+ 		coins_tests.cpp
++		rpc_batch_snapshot_tests.cpp
+ 		coinscachepair_tests.cpp
+ 		coinstatsindex_tests.cpp
+ 		compilerbug_tests.cpp
+diff --git a/src/test/rpc_batch_snapshot_tests.cpp b/src/test/rpc_batch_snapshot_tests.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..5130e230d053e6488aa2d5727d375dd3af56d349
+--- /dev/null
++++ b/src/test/rpc_batch_snapshot_tests.cpp
+@@ -0,0 +1,210 @@
++// Copyright (c) 2026 The Lotus developers
++// Distributed under the MIT software license, see the accompanying
++// file COPYING or http://www.opensource.org/licenses/mit-license.php.
++
++#include <config.h>
++#include <consensus/amount.h>
++#include <consensus/tx_check.h>
++#include <core_io.h>
++#include <kernel/disconnected_transactions.h>
++#include <key_io.h>
++#include <minerfund.h>
++#include <node/snapshot.h>
++#include <pow/pow.h>
++#include <primitives/block.h>
++#include <rpc/blockchain.h>
++#include <rpc/server.h>
++#include <script/standard.h>
++#include <streams.h>
++#include <test/util/setup_common.h>
++#include <txmempool.h>
++#include <univalue.h>
++#include <util/strencodings.h>
++#include <validation.h>
++
++#include <boost/asio/co_spawn.hpp>
++#include <boost/asio/detached.hpp>
++#include <boost/asio/thread_pool.hpp>
++#include <boost/test/unit_test.hpp>
++
++#include <atomic>
++#include <chrono>
++#include <cstring>
++#include <future>
++#include <memory>
++#include <thread>
++#include <vector>
++
++BOOST_FIXTURE_TEST_SUITE(rpc_batch_snapshot_tests, TestChain100Setup)
++
++BOOST_AUTO_TEST_CASE(testrawtxbatch_and_submitrawtxbatch_all_or_nothing) {
++    GlobalConfig config;
++    CKey parent_key;
++    parent_key.MakeNewKey(true);
++    CScript parent_spk =
++        GetScriptForDestination(PKHash(parent_key.GetPubKey()));
++
++    CKey child_key;
++    child_key.MakeNewKey(true);
++    CScript child_spk = GetScriptForDestination(PKHash(child_key.GetPubKey()));
++
++    // Create a parent transaction and a child transaction spending the parent.
++    const Amount cb_val = m_coinbase_txns[0]->vout[0].nValue;
++    CMutableTransaction parent_mtx = CreateValidMempoolTransaction(
++        m_coinbase_txns[0], 0, 1, coinbaseKey, parent_spk,
++        cb_val - 2000 * SATOSHI, /*submit=*/false);
++    CTransactionRef parent_tx = MakeTransactionRef(parent_mtx);
++
++    CMutableTransaction child_mtx = CreateValidMempoolTransaction(
++        parent_tx, 0, 101, parent_key, child_spk, cb_val - 4000 * SATOSHI,
++        /*submit=*/false);
++    CTransactionRef child_tx = MakeTransactionRef(child_mtx);
++
++    // Also create an invalid transaction spending a nonexistent outpoint.
++    CMutableTransaction invalid_mtx = child_mtx;
++    invalid_mtx.vin[0].prevout = COutPoint(TxId(uint256::ONE), 0);
++    CTransactionRef invalid_tx = MakeTransactionRef(invalid_mtx);
++
++    const std::string parent_hex = EncodeHexTx(*parent_tx);
++    const std::string child_hex = EncodeHexTx(*child_tx);
++    const std::string invalid_hex = EncodeHexTx(*invalid_tx);
++
++    // 1. testrawtxbatch([parent, child]) should succeed without mutating mempool.
++    {
++        JSONRPCRequest req;
++        req.context = &m_node;
++        req.strMethod = "testrawtxbatch";
++        UniValue arr(UniValue::VARR);
++        arr.push_back(parent_hex);
++        arr.push_back(child_hex);
++        req.params = UniValue(UniValue::VARR);
++        req.params.push_back(std::move(arr));
++
++        UniValue res = tableRPC.execute(config, req);
++        BOOST_CHECK_MESSAGE(res.find_value("allowed").get_bool(), res.write());
++        const UniValue &results = res.find_value("results").get_array();
++        BOOST_REQUIRE_EQUAL(results.size(), 2U);
++        BOOST_CHECK_EQUAL(results[0].find_value("allowed").get_bool(), true);
++        BOOST_CHECK_EQUAL(results[1].find_value("allowed").get_bool(), true);
++        BOOST_CHECK_EQUAL(m_node.mempool->size(), 0U);
++    }
++
++    // 2. submitrawtxbatch([parent, invalid]) must reject the entire batch
++    // (all-or-nothing) and leave mempool empty.
++    {
++        JSONRPCRequest req;
++        req.context = &m_node;
++        req.strMethod = "submitrawtxbatch";
++        UniValue arr(UniValue::VARR);
++        arr.push_back(parent_hex);
++        arr.push_back(invalid_hex);
++        req.params = UniValue(UniValue::VARR);
++        req.params.push_back(std::move(arr));
++
++        UniValue res = tableRPC.execute(config, req);
++        BOOST_CHECK_EQUAL(res.find_value("accepted").get_bool(), false);
++        BOOST_CHECK_EQUAL(m_node.mempool->size(), 0U);
++    }
++
++    // 3. submitrawtxbatch([parent, child]) must accept both transactions and
++    // update the RCU mempool snapshot.
++    {
++        JSONRPCRequest req;
++        req.context = &m_node;
++        req.strMethod = "submitrawtxbatch";
++        UniValue arr(UniValue::VARR);
++        arr.push_back(parent_hex);
++        arr.push_back(child_hex);
++        req.params = UniValue(UniValue::VARR);
++        req.params.push_back(std::move(arr));
++
++        UniValue res = tableRPC.execute(config, req);
++        BOOST_CHECK_EQUAL(res.find_value("accepted").get_bool(), true);
++        BOOST_CHECK_EQUAL(m_node.mempool->size(), 2U);
++
++        JSONRPCRequest mp_req;
++        mp_req.context = &m_node;
++        mp_req.strMethod = "getrawmempool";
++        mp_req.params = UniValue(UniValue::VARR);
++        UniValue raw_mp = tableRPC.execute(config, mp_req);
++        BOOST_CHECK_EQUAL(raw_mp.get_array().size(), 2U);
++    }
++
++}
++
++BOOST_AUTO_TEST_CASE(atomic_batch_rejects_capacity_without_partial_admission) {
++    const CScript spk = GetScriptForRawPubKey(coinbaseKey.GetPubKey());
++    const Amount value = m_coinbase_txns[0]->vout[0].nValue;
++    const auto parent = MakeTransactionRef(CreateValidMempoolTransaction(
++        m_coinbase_txns[0], 0, 1, coinbaseKey, spk, value - 2000 * SATOSHI, false));
++    const auto child = MakeTransactionRef(CreateValidMempoolTransaction(
++        parent, 0, 101, coinbaseKey, spk, value - 4000 * SATOSHI, false));
++    auto options = m_node.mempool->m_opts;
++    options.max_size_bytes = 1;
++    CTxMemPool small_pool(GetConfig(), options);
++    {
++        LOCK(cs_main);
++        const auto result = ProcessRawTxBatch(m_node.chainman->ActiveChainstate(),
++                                              small_pool, {parent, child}, false);
++        BOOST_CHECK(!result.m_state.IsValid());
++        BOOST_CHECK_EQUAL(result.m_state.GetRejectReason(), "mempool full");
++    }
++    BOOST_CHECK_EQUAL(small_pool.size(), 0U);
++    BOOST_CHECK_EQUAL(m_node.mempool->size(), 0U);
++}
++
++BOOST_AUTO_TEST_CASE(atomic_batch_capacity_accounts_for_parent_child_links) {
++    CMutableTransaction parent;
++    parent.vin.emplace_back(COutPoint(TxId(uint256S("1234")), 0));
++    parent.vout.emplace_back(1000 * SATOSHI, CScript() << OP_TRUE);
++    parent.vout.emplace_back(1000 * SATOSHI, CScript() << OP_TRUE);
++    CMutableTransaction child;
++    child.vin.emplace_back(COutPoint(parent.GetId(), 0));
++    child.vin.emplace_back(COutPoint(parent.GetId(), 1));
++    child.vout.emplace_back(1000 * SATOSHI, CScript() << OP_TRUE);
++    auto options = m_node.mempool->m_opts;
++    options.signals = nullptr;
++    size_t measured_usage;
++    {
++        CTxMemPool measured(GetConfig(), options);
++        LOCK2(cs_main, measured.cs);
++        measured.addUnchecked(TestMemPoolEntryHelper().FromTx(parent));
++        measured.addUnchecked(TestMemPoolEntryHelper().FromTx(child));
++        measured_usage = measured.DynamicMemoryUsage();
++    }
++    for (const bool exact_fit : {false, true}) {
++        options.max_size_bytes = measured_usage - (exact_fit ? 0 : 1);
++        CTxMemPool bounded(GetConfig(), options);
++        LOCK2(cs_main, bounded.cs);
++        bounded.addUnchecked(TestMemPoolEntryHelper().FromTx(parent));
++        auto entry = TestMemPoolEntryHelper().FromTx(child);
++        BOOST_CHECK_EQUAL(bounded.CanFitRawTxBatch({entry.get()}), exact_fit);
++        BOOST_CHECK_EQUAL(bounded.size(), 1U);
++        if (exact_fit) {
++            bounded.addUnchecked(entry);
++            BOOST_CHECK_EQUAL(bounded.DynamicMemoryUsage(), measured_usage);
++        }
++    }
++}
++
++BOOST_AUTO_TEST_CASE(parallel_batch_decode_reports_earliest_error_without_admission) {
++    GlobalConfig config;
++    const auto tx = CreateValidMempoolTransaction(m_coinbase_txns[0], 0, 1,
++        coinbaseKey, GetScriptForRawPubKey(coinbaseKey.GetPubKey()),
++        m_coinbase_txns[0]->vout[0].nValue - 2000 * SATOSHI, false);
++    JSONRPCRequest req;
++    req.context = &m_node; req.strMethod = "submitrawtxbatch";
++    req.params = UniValue(UniValue::VARR);
++    UniValue batch(UniValue::VARR);
++    for (size_t i = 0; i < 40; ++i) {
++        batch.push_back(i == 7 ? "badhex-at-seven" :
++                       i == 35 ? "badhex-at-thirtyfive" : EncodeHexTx(CTransaction(tx)));
++    }
++    req.params.push_back(std::move(batch));
++    BOOST_CHECK_EXCEPTION(tableRPC.execute(config, req), UniValue, [](const UniValue &e) {
++        return e.find_value("message").get_str() == "TX decode failed: badhex-at-seven";
++    });
++    BOOST_CHECK_EQUAL(m_node.mempool->size(), 0U);
++}
++
++BOOST_AUTO_TEST_SUITE_END()
+diff --git a/src/txmempool.cpp b/src/txmempool.cpp
+index 9004370e6ef0f5fa9d9dcf00cd0d7264cd590a37..6f818364dcd39f0d98a85c30288c452d294ac562 100644
+--- a/src/txmempool.cpp
++++ b/src/txmempool.cpp
+@@ -912,6 +912,30 @@ size_t CTxMemPool::DynamicMemoryUsage() const {
+            memusage::DynamicUsage(mapDeltas) + cachedInnerUsage;
+ }
+ 
++bool CTxMemPool::CanFitRawTxBatch(
++    const std::vector<const CTxMemPoolEntry *> &entries) const {
++    AssertLockHeld(cs);
++    size_t usage = DynamicMemoryUsage();
++    const size_t entry_overhead = memusage::MallocUsage(
++        sizeof(CTxMemPoolEntry) + 12 * sizeof(void *));
++    const CTxMemPoolEntry::Parents empty_links;
++    const size_t edge_usage = 2 * memusage::IncrementalDynamicUsage(empty_links);
++    std::set<TxId> staged;
++    for (const auto *entry : entries) {
++        usage += entry_overhead + entry->DynamicMemoryUsage();
++        std::set<TxId> parents;
++        for (const auto &input : entry->GetTx().vin) {
++            usage += memusage::IncrementalDynamicUsage(mapNextTx);
++            const auto &id = input.prevout.GetTxId();
++            if (exists(id) || staged.count(id)) parents.insert(id);
++        }
++        usage += parents.size() * edge_usage;
++        if (usage > m_opts.max_size_bytes) return false;
++        staged.insert(entry->GetTx().GetId());
++    }
++    return usage <= m_opts.max_size_bytes;
++}
++
+ void CTxMemPool::AddUnbroadcastTx(const TxId &txid) {
+     LOCK(cs);
+     if (exists(txid) && m_unbroadcast_txids.insert(txid).second) {
+diff --git a/src/txmempool.h b/src/txmempool.h
+index d0043318c63df2bd2e51f40b8417c052bad76161..ede6263303a54f5d3a3bdf9c2302ece652ddfff6 100644
+--- a/src/txmempool.h
++++ b/src/txmempool.h
+@@ -557,6 +557,10 @@ public:
+     CFeeRate estimateFee() const;
+ 
+     size_t DynamicMemoryUsage() const;
++    /** Check the entire staged batch before publishing any mutation. Unlike
++     * ordinary single admission, an atomic batch does not evict existing txs. */
++    bool CanFitRawTxBatch(const std::vector<const CTxMemPoolEntry *> &entries) const
++        EXCLUSIVE_LOCKS_REQUIRED(cs);
+ 
+     /** Adds a transaction to the unbroadcast set */
+     void AddUnbroadcastTx(const TxId &txid);
+diff --git a/src/validation.cpp b/src/validation.cpp
+index 3bc0f951daa172d94f47f853de531c942ed52078..8999b9d2ac32e9ffb3e234d3c3e71a6ad7e349c9 100644
+--- a/src/validation.cpp
++++ b/src/validation.cpp
+@@ -370,6 +370,21 @@ public:
+             };
+         }
+ 
++        static ATMPArgs
++        RawTxBatch(const Config &config, int64_t accept_time,
++                   std::vector<COutPoint> &coins_to_uncache, bool test_accept) {
++            return ATMPArgs{
++                config,
++                accept_time,
++                /*bypass_limits=*/false,
++                coins_to_uncache,
++                /*test_accept=*/test_accept,
++                /*height_override=*/0,
++                /*package_submission=*/!test_accept,
++                /*package_feerates=*/false,
++            };
++        }
++
+         /** Parameters for a single transaction within a package. */
+         static ATMPArgs SingleInPackageAccept(const ATMPArgs &package_args) {
+             return ATMPArgs{
+@@ -445,6 +460,12 @@ public:
+         EXCLUSIVE_LOCKS_REQUIRED(cs_main);
+ 
+ private:
++public:
++    PackageMempoolAcceptResult AcceptRawTxBatch(
++        const std::vector<CTransactionRef> &txns, ATMPArgs &args,
++        const CFeeRate &max_raw_tx_fee_rate) EXCLUSIVE_LOCKS_REQUIRED(cs_main);
++private:
++    using PendingMempoolNotification = ValidationSignals::MempoolAddedBatchItem;
+     // All the intermediate state that gets passed between the various levels
+     // of checking a given transaction.
+     struct Workspace {
+@@ -518,7 +539,8 @@ private:
+     // Try to add the transaction to the mempool, removing any conflicts first.
+     // Returns true if the transaction is in the mempool after any size
+     // limiting is performed, false otherwise.
+-    bool Finalize(const ATMPArgs &args, Workspace &ws)
++    bool Finalize(const ATMPArgs &args, Workspace &ws,
++        std::vector<PendingMempoolNotification> *deferred_notifications = nullptr)
+         EXCLUSIVE_LOCKS_REQUIRED(cs_main, m_pool.cs);
+ 
+     // Submit all transactions to the mempool and call ConsensusScriptChecks to
+@@ -818,7 +840,8 @@ bool MemPoolAccept::ConsensusScriptChecks(const ATMPArgs &args, Workspace &ws) {
+     return true;
+ }
+ 
+-bool MemPoolAccept::Finalize(const ATMPArgs &args, Workspace &ws) {
++bool MemPoolAccept::Finalize(const ATMPArgs &args, Workspace &ws,
++    std::vector<PendingMempoolNotification> *deferred_notifications) {
+     AssertLockHeld(cs_main);
+     AssertLockHeld(m_pool.cs);
+     const TxId &txid = ws.m_ptx->GetId();
+@@ -834,13 +857,14 @@ bool MemPoolAccept::Finalize(const ATMPArgs &args, Workspace &ws) {
+     Assume(spentCoins.has_value());
+ 
+     if (m_pool.m_opts.signals) {
+-        m_pool.m_opts.signals->TransactionAddedToMempool(
+-            ws.m_ptx,
+-            // Spent coins should never be null, but better be safe than sorry.
+-            spentCoins.has_value() ? std::make_shared<const std::vector<Coin>>(
+-                                         std::move(*spentCoins))
+-                                   : nullptr,
+-            m_pool.GetAndIncrementSequence());
++        auto coins = spentCoins.has_value()
++            ? std::make_shared<const std::vector<Coin>>(std::move(*spentCoins)) : nullptr;
++        const auto seq = m_pool.GetAndIncrementSequence();
++        if (deferred_notifications) {
++            deferred_notifications->push_back({ws.m_ptx, std::move(coins), seq});
++        } else {
++            m_pool.m_opts.signals->TransactionAddedToMempool(ws.m_ptx, std::move(coins), seq);
++        }
+     }
+ 
+     // Trim mempool and check if tx was trimmed.
+@@ -1136,6 +1160,228 @@ PackageMempoolAcceptResult MemPoolAccept::AcceptMultipleTransactions(
+     return PackageMempoolAcceptResult(package_state, std::move(results));
+ }
+ 
++PackageMempoolAcceptResult MemPoolAccept::AcceptRawTxBatch(
++    const std::vector<CTransactionRef> &txns,
++    ATMPArgs &args,
++    const CFeeRate &max_raw_tx_fee_rate) {
++    AssertLockHeld(cs_main);
++
++    PackageValidationState package_state;
++    const size_t batch_count = txns.size();
++    if (batch_count > MAX_RAWTX_BATCH_COUNT) {
++        package_state.Invalid(PackageValidationResult::PCKG_POLICY,
++                              "package-too-many-transactions");
++        return PackageMempoolAcceptResult(package_state, {});
++    }
++
++    if (batch_count > 1) {
++        const int64_t total_size = std::accumulate(
++            txns.cbegin(), txns.cend(), int64_t{0},
++            [](int64_t sum, const auto &tx) {
++                return sum + GetVirtualTransactionSize(*tx);
++            });
++        if (total_size > int64_t(MAX_RAWTX_BATCH_SIZE_KB) * 1000) {
++            package_state.Invalid(PackageValidationResult::PCKG_POLICY,
++                                  "package-too-large");
++            return PackageMempoolAcceptResult(package_state, {});
++        }
++
++        size_t txid_cap = 16;
++        while (txid_cap < batch_count * 2) {
++            txid_cap <<= 1;
++        }
++        const size_t txid_mask = txid_cap - 1;
++        struct TxIdIndexSlot {
++            TxId txid;
++            size_t index{0};
++            bool occupied{false};
++        };
++        std::vector<TxIdIndexSlot> txid_table(txid_cap);
++        size_t total_inputs = 0;
++        for (size_t i = 0; i < batch_count; ++i) {
++            const TxId &id = txns[i]->GetId();
++            total_inputs += txns[i]->vin.size();
++            size_t slot = id.GetUint64(0) & txid_mask;
++            while (txid_table[slot].occupied) {
++                if (txid_table[slot].txid == id) {
++                    package_state.Invalid(PackageValidationResult::PCKG_POLICY,
++                                          "package-contains-duplicates");
++                    return PackageMempoolAcceptResult(package_state, {});
++                }
++                slot = (slot + 1) & txid_mask;
++            }
++            txid_table[slot].txid = id;
++            txid_table[slot].index = i;
++            txid_table[slot].occupied = true;
++        }
++
++        size_t in_cap = 16;
++        while (in_cap < (total_inputs + 1) * 2) {
++            in_cap <<= 1;
++        }
++        const size_t in_mask = in_cap - 1;
++        struct OutpointSlot {
++            COutPoint outpoint;
++            bool occupied{false};
++        };
++        std::vector<OutpointSlot> inputs_seen(in_cap);
++        for (size_t i = 0; i < batch_count; ++i) {
++            const auto &tx = txns[i];
++            for (const auto &input : tx->vin) {
++                const TxId &prev_txid = input.prevout.GetTxId();
++                size_t tslot = prev_txid.GetUint64(0) & txid_mask;
++                while (txid_table[tslot].occupied) {
++                    if (txid_table[tslot].txid == prev_txid) {
++                        if (txid_table[tslot].index >= i) {
++                            package_state.Invalid(
++                                PackageValidationResult::PCKG_POLICY,
++                                "package-not-sorted");
++                            return PackageMempoolAcceptResult(package_state,
++                                                              {});
++                        }
++                        break;
++                    }
++                    tslot = (tslot + 1) & txid_mask;
++                }
++
++                const uint64_t ohash =
++                    prev_txid.GetUint64(0) ^
++                    (static_cast<uint64_t>(input.prevout.GetN()) *
++                     0x9e3779b97f4a7c15ULL);
++                size_t islot = static_cast<size_t>(ohash) & in_mask;
++                while (inputs_seen[islot].occupied) {
++                    if (inputs_seen[islot].outpoint == input.prevout) {
++                        package_state.Invalid(
++                            PackageValidationResult::PCKG_POLICY,
++                            "conflict-in-package");
++                        return PackageMempoolAcceptResult(package_state, {});
++                    }
++                    islot = (islot + 1) & in_mask;
++                }
++                inputs_seen[islot].outpoint = input.prevout;
++                inputs_seen[islot].occupied = true;
++            }
++        }
++    }
++
++    const uint32_t script_flags = GetNextBlockScriptFlags(
++        m_active_chainstate.m_chain.Tip(), m_active_chainstate.m_chainman);
++    std::vector<Workspace> workspaces;
++    workspaces.reserve(txns.size());
++    for (const auto &tx : txns) {
++        workspaces.emplace_back(tx, script_flags);
++    }
++
++    std::map<TxId, MempoolAcceptResult> results;
++    std::vector<PendingMempoolNotification> deferred_notifications;
++    if (!args.m_test_accept && m_pool.m_opts.signals) {
++        deferred_notifications.reserve(workspaces.size());
++    }
++
++    {
++        LOCK(m_pool.cs);
++        CTxMemPool::ScopedSnapshotDefer snap_defer(m_pool);
++
++        auto cleanup_views = [this]() {
++            for (const auto &outpoint : m_viewmempool.GetNonBaseCoins()) {
++                m_view.Uncache(outpoint);
++            }
++            m_viewmempool.Reset();
++        };
++
++        // Prefetch only uncached disk UTXO pages in sorted key order before Pass 1.
++        if (txns.size() >= 8) {
++            CCoinsViewCache &coins_tip = m_active_chainstate.CoinsTip();
++            std::vector<COutPoint> batch_outpoints;
++            batch_outpoints.reserve(txns.size() * 2);
++            for (const auto &tx : txns) {
++                for (const auto &in : tx->vin) {
++                    if (!coins_tip.HaveCoinInCache(in.prevout)) {
++                        batch_outpoints.push_back(in.prevout);
++                    }
++                }
++            }
++            if (!batch_outpoints.empty()) {
++                coins_tip.PrefetchOutpointsAsync(batch_outpoints);
++            }
++        }
++
++        // Validate the whole dependency-ordered batch against a private coins
++        // view before mutating the mempool. Standard AND next-block consensus
++        // script flags are checked, as in ordinary ABC admission.
++        for (Workspace &ws : workspaces) {
++            bool valid = PreChecks(args, ws);
++            if (valid) {
++                int consensus_sigchecks = 0;
++                valid = CheckInputScripts(*ws.m_ptx, ws.m_state, m_view,
++                    ws.m_next_block_script_verify_flags, true, true,
++                    ws.m_precomputed_txdata, GetValidationCache(), consensus_sigchecks);
++                if (valid && consensus_sigchecks != ws.m_sig_checks_standard) {
++                    valid = ws.m_state.Invalid(TxValidationResult::TX_CONSENSUS,
++                                              "inconsistent-sigchecks");
++                }
++            }
++            if (valid) {
++                const Amount max_fee = max_raw_tx_fee_rate.GetFee(ws.m_vsize);
++                if (max_fee != Amount::zero() && ws.m_base_fees > max_fee) {
++                    valid = ws.m_state.Invalid(TxValidationResult::TX_MEMPOOL_POLICY,
++                                              "max-fee-exceeded");
++                }
++            }
++            if (!valid) {
++                package_state.Invalid(PackageValidationResult::PCKG_TX,
++                                      "transaction failed");
++                results.emplace(ws.m_ptx->GetId(), MempoolAcceptResult::Failure(ws.m_state));
++                cleanup_views();
++                return PackageMempoolAcceptResult(package_state, std::move(results));
++            }
++            m_viewmempool.PackageAddTransaction(ws.m_ptx);
++        }
++        std::vector<const CTxMemPoolEntry *> staged_entries;
++        for (const auto &ws : workspaces) staged_entries.push_back(ws.m_entry.get());
++        if (!m_pool.CanFitRawTxBatch(staged_entries)) {
++            package_state.Invalid(PackageValidationResult::PCKG_POLICY, "mempool full");
++            cleanup_views();
++            return PackageMempoolAcceptResult(package_state, {});
++        }
++
++        if (args.m_test_accept) {
++            for (Workspace &ws : workspaces) {
++                const TxId &ws_txid = ws.m_ptx->GetId();
++                const CFeeRate effective_feerate{
++                    ws.m_modified_fees, static_cast<uint32_t>(ws.m_vsize)};
++                results.emplace(ws_txid,
++                                MempoolAcceptResult::Success(
++                                    ws.m_vsize, ws.m_base_fees,
++                                    effective_feerate,
++                                    std::vector<TxId>{ws_txid}));
++            }
++            cleanup_views();
++            return PackageMempoolAcceptResult(package_state,
++                                              std::move(results));
++        }
++
++        // No size trimming or script execution can partially accept a batch:
++        // both were completed under the same chain/pool locks above.
++        for (Workspace &ws : workspaces) {
++            const bool inserted = Finalize(args, ws, &deferred_notifications);
++            assert(inserted);
++            const TxId &id = ws.m_ptx->GetId();
++            results.emplace(id, MempoolAcceptResult::Success(ws.m_vsize, ws.m_base_fees,
++                CFeeRate(ws.m_modified_fees, static_cast<uint32_t>(ws.m_vsize)), {id}));
++        }
++        assert(m_pool.DynamicMemoryUsage() <= m_pool.m_opts.max_size_bytes);
++        cleanup_views();
++    } // release m_pool.cs before dispatching ValidationInterface notifications
++
++    if (m_pool.m_opts.signals && !deferred_notifications.empty()) {
++        m_pool.m_opts.signals->TransactionsAddedToMempoolBatch(
++            std::move(deferred_notifications));
++    }
++
++    return PackageMempoolAcceptResult(package_state, std::move(results));
++}
++
+ PackageMempoolAcceptResult
+ MemPoolAccept::AcceptSubPackage(const std::vector<CTransactionRef> &subpackage,
+                                 ATMPArgs &args) {
+@@ -1485,6 +1731,33 @@ PackageMempoolAcceptResult ProcessNewPackage(Chainstate &active_chainstate,
+     return result;
+ }
+ 
++PackageMempoolAcceptResult
++ProcessRawTxBatch(Chainstate &active_chainstate, CTxMemPool &pool,
++                  const Package &package, bool test_accept,
++                  const CFeeRate &max_raw_tx_fee_rate) {
++    AssertLockHeld(cs_main);
++    assert(!package.empty());
++    assert(std::all_of(package.cbegin(), package.cend(),
++                       [](const auto &tx) { return tx != nullptr; }));
++
++    const Config &config = active_chainstate.m_chainman.GetConfig();
++    std::vector<COutPoint> coins_to_uncache;
++    auto args = MemPoolAccept::ATMPArgs::RawTxBatch(
++        config, GetTime(), coins_to_uncache, test_accept);
++    PackageMempoolAcceptResult result =
++        MemPoolAccept(pool, active_chainstate)
++            .AcceptRawTxBatch(package, args, max_raw_tx_fee_rate);
++
++    if (test_accept || result.m_state.IsInvalid()) {
++        for (const COutPoint &hashTx : coins_to_uncache) {
++            active_chainstate.CoinsTip().Uncache(hashTx);
++        }
++    }
++    BlockValidationState state_dummy;
++    active_chainstate.FlushStateToDisk(state_dummy, FlushStateMode::PERIODIC);
++    return result;
++}
++
+ Amount GetBlockSubsidy(int nHeight, const Consensus::Params &consensusParams) {
+     int halvings = nHeight / consensusParams.nSubsidyHalvingInterval;
+     // Force block reward to zero when right shift is undefined.
+diff --git a/src/validation.h b/src/validation.h
+index 3e4f03567b6e83fbfee36121a21229c189ef9074..d20ef8b86255e06c0cc5ab7a40342dc3c7eac822 100644
+--- a/src/validation.h
++++ b/src/validation.h
+@@ -365,6 +365,23 @@ ProcessNewPackage(Chainstate &active_chainstate, CTxMemPool &pool,
+                   const Package &txns, bool test_accept)
+     EXCLUSIVE_LOCKS_REQUIRED(cs_main);
+ 
++/** Maximum number of transactions in a testrawtxbatch / submitrawtxbatch call. */
++static constexpr uint32_t MAX_RAWTX_BATCH_COUNT{1000};
++/** Maximum total virtual size of transactions in a rawtxbatch in KB (10 MB). */
++static constexpr uint32_t MAX_RAWTX_BATCH_SIZE_KB{10000};
++
++/**
++ * Validate and optionally commit an all-or-nothing
++ * batch of raw transactions in a single pass under cs_main, coalescing RCU
++ * snapshot publication via CTxMemPool::ScopedSnapshotDefer.
++ */
++PackageMempoolAcceptResult
++ProcessRawTxBatch(Chainstate &active_chainstate, CTxMemPool &pool,
++                  const Package &txns, bool test_accept,
++                  const CFeeRate &max_raw_tx_fee_rate = CFeeRate(Amount::zero()))
++    EXCLUSIVE_LOCKS_REQUIRED(cs_main);
++
++
+ /**
+  * Simple class for regulating resource usage during CheckInputScripts (and
+  * CScriptCheck), atomic so as to be compatible with parallel validation.
+diff --git a/src/validationinterface.cpp b/src/validationinterface.cpp
+index 4b343bfeacb72f946319405c4f2b92f6c74675ee..ead1bdc79a8b1031c787eda0d190c0e4826b2bf9 100644
+--- a/src/validationinterface.cpp
++++ b/src/validationinterface.cpp
+@@ -209,6 +209,30 @@ void ValidationSignals::TransactionAddedToMempool(
+                           tx->GetHash().ToString());
+ }
+ 
++void ValidationSignals::TransactionsAddedToMempoolBatch(
++    std::vector<MempoolAddedBatchItem> &&items) {
++    if (items.empty()) {
++        return;
++    }
++    if (items.size() == 1) {
++        TransactionAddedToMempool(items[0].tx, std::move(items[0].spent_coins),
++                                  items[0].mempool_sequence);
++        return;
++    }
++    auto shared_items =
++        std::make_shared<std::vector<MempoolAddedBatchItem>>(std::move(items));
++    const size_t count = shared_items->size();
++    auto event = [shared_items, this] {
++        m_internals->Iterate([&](CValidationInterface &callbacks) {
++            for (const auto &item : *shared_items) {
++                callbacks.TransactionAddedToMempool(item.tx, item.spent_coins,
++                                                    item.mempool_sequence);
++            }
++        });
++    };
++    ENQUEUE_AND_LOG_EVENT(event, "%s: count=%zu", __func__, count);
++}
++
+ void ValidationSignals::TransactionRemovedFromMempool(
+     const CTransactionRef &tx, MemPoolRemovalReason reason,
+     uint64_t mempool_sequence) {
+diff --git a/src/validationinterface.h b/src/validationinterface.h
+index a68b4790ffa550f289842315ba1c8fbd723088d0..1eb11421272dd7dcdb940481f921f2b026c8795e 100644
+--- a/src/validationinterface.h
++++ b/src/validationinterface.h
+@@ -240,6 +240,13 @@ public:
+     void TransactionAddedToMempool(const CTransactionRef &,
+                                    std::shared_ptr<const std::vector<Coin>>,
+                                    uint64_t mempool_sequence);
++    struct MempoolAddedBatchItem {
++        CTransactionRef tx;
++        std::shared_ptr<const std::vector<Coin>> spent_coins;
++        uint64_t mempool_sequence{0};
++    };
++    void TransactionsAddedToMempoolBatch(
++        std::vector<MempoolAddedBatchItem> &&items);
+     void TransactionRemovedFromMempool(const CTransactionRef &,
+                                        MemPoolRemovalReason,
+                                        uint64_t mempool_sequence);
+diff --git a/test/functional/rpc_atomic_tx_batch.py b/test/functional/rpc_atomic_tx_batch.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..e1e509d3f7202e0c8969409b3a510ebde415e9cf
+--- /dev/null
++++ b/test/functional/rpc_atomic_tx_batch.py
+@@ -0,0 +1,61 @@
++#!/usr/bin/env python3
++# Copyright (c) 2026 The Lotus developers
++# Distributed under the MIT software license, see the accompanying
++# file COPYING or http://www.opensource.org/licenses/mit-license.php.
++"""Atomic raw batches preserve ABC validation and relay dependency chains."""
++import copy
++from decimal import Decimal
++
++from test_framework.test_framework import BitcoinTestFramework
++from test_framework.util import assert_equal, assert_raises_rpc_error
++from test_framework.wallet import MiniWallet
++
++
++class AtomicTxBatchTest(BitcoinTestFramework):
++    def set_test_params(self):
++        self.num_nodes = 2
++        self.setup_clean_chain = True
++        self.supports_cli = False
++        self.extra_args = [["-avalanche=0"], ["-avalanche=0"]]
++
++    def run_test(self):
++        node, peer = self.nodes
++        wallet = MiniWallet(node)
++        self.generate(wallet, 102)
++        chain = wallet.create_self_transfer_chain(chain_length=40)
++        raw = [tx["hex"] for tx in chain]
++        ids = [tx["txid"] for tx in chain]
++        tested = node.testrawtxbatch(raw, 0)
++        assert tested["allowed"]
++        assert_equal(len(tested["results"]), len(raw))
++        assert all(result["allowed"] for result in tested["results"])
++        assert_equal(node.getrawmempool(), [])
++
++        bad = copy.deepcopy(chain[-1]["tx"])
++        bad.vin[0].prevout.txid = 42
++        for batch in ([raw[0], bad.serialize().hex()], list(reversed(raw)), [raw[0], raw[0]]):
++            assert not node.submitrawtxbatch(batch, 0)["accepted"]
++            assert_equal(node.getrawmempool(), [])
++        assert not node.submitrawtxbatch(raw, Decimal("0.01"))["accepted"]
++        assert_equal(node.getrawmempool(), [])
++        malformed = raw.copy()
++        malformed[7] = "badhex-at-seven"
++        malformed[35] = "badhex-at-thirtyfive"
++        assert_raises_rpc_error(-22, "TX decode failed: badhex-at-seven",
++                                node.submitrawtxbatch, malformed, 0)
++        assert_equal(node.getrawmempool(), [])
++        submitted = node.submitrawtxbatch(raw, 0)
++        assert submitted["accepted"]
++        assert_equal(submitted["txids"], ids)
++        self.sync_mempools()
++        assert_equal(sorted(node.getrawmempool()), sorted(ids))
++        assert_equal(sorted(peer.getrawmempool()), sorted(ids))
++        template = node.getblocktemplate()
++        assert_equal(sorted(tx["txid"] for tx in template["transactions"]), sorted(ids))
++        self.generate(node, 1)
++        assert_equal(node.getrawmempool(), [])
++        assert_equal(peer.getrawmempool(), [])
++
++
++if __name__ == "__main__":
++    AtomicTxBatchTest().main()

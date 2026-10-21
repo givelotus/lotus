@@ -1,0 +1,386 @@
+From 5b44e5b7fa132d486030b6e5ba8df6a32d122adb Mon Sep 17 00:00:00 2001
+From: Shammah Chancellor <shammah.chancellor@notvalid.com>
+Date: Mon, 19 Oct 2026 03:03:35 -0700
+Subject: [PATCH] net: reload outbound WebSocket TLS client certificates
+
+Outbound wss handshakes previously reused the client certificate loaded at
+startup even after the listener had adopted a rotated certificate. Check
+certificate/key mtimes on new outbound TLS handshakes at the listener's
+one-second cadence. Publish a fresh immutable client context only after the
+certificate chain and matching key load successfully; keep the last good
+identity on failure. Existing SSL sessions retain their original contexts.
+Anonymous clients, peer SPKI pinning, inbound TLS and plain TCP are unchanged.
+
+Add context tests for rotation, mismatched/malformed/missing files, zero
+mtimes and retained SSL identities. A three-node functional test observes
+the rotated SPKI on the next dial, keeps the first connection alive, and
+checks mismatch fallback and recovery after fixing the key.
+
+Validation: macOS arm64, Release, Chronik OFF and wallet OFF. All 17
+net_websocket_tests cases (1,175 assertions), the new client-reload test,
+and existing inbound certificate, peer-key and pinning functional tests
+pass. Rebuilding the original startup-only dialer makes the new functional
+fail at its first rotated-SPKI assertion. Linux, Windows, sanitizers and
+the full functional suite were not run; no performance claim is made.
+---
+ doc/p2p-websocket.md                          |  2 +-
+ src/net_websocket.cpp                         | 22 ++---
+ src/net_websocket_dialer.h                    |  4 +-
+ src/test/net_websocket_tests.cpp              | 51 ++++++++++
+ src/tls_util.cpp                              | 42 ++++++++
+ src/tls_util.h                                | 21 ++++
+ .../p2p_websocket_client_cert_reload.py       | 97 +++++++++++++++++++
+ 7 files changed, 222 insertions(+), 17 deletions(-)
+ create mode 100755 test/functional/p2p_websocket_client_cert_reload.py
+
+diff --git a/doc/p2p-websocket.md b/doc/p2p-websocket.md
+index f4b6353ad4bc441195687a71ad12cfe8b87f9cc8..f317776b63f08c4181c7ddee3a176b8e0b6b47e4 100644
+--- a/doc/p2p-websocket.md
++++ b/doc/p2p-websocket.md
+@@ -22,7 +22,7 @@ Plain TCP P2P is unchanged, and the two can be used together.
+ | `-p2pwebsocket` (default on) | Accept P2P upgrades at `/p2p/ws`. Needs `-listen` and `-server`. |
+ | `-publicbind=<addr>:<port>` | An extra listener for anyone, serving **only** P2P WebSocket and Chronik (`/chronik`). JSON-RPC, wallet and REST are refused there whatever the client address. Expose this port, never the RPC port. Not advertised. |
+ | RPC port | Also serves P2P WebSocket, but only to `-rpcallowip` clients. |
+-| `-tlscert`, `-tlskey` | Certificate chain and key for TLS. A replaced file (e.g. an ACME renewal) is picked up without a restart. |
++| `-tlscert`, `-tlskey` | Certificate chain and key for TLS. New inbound handshakes and outbound `wss://` dials pick up replaced files (e.g. an ACME renewal) without a restart, checking mtimes at most once a second. The certificate/key pair must load and match before replacing the context. Failed replacements keep the previous identity; established connections are unaffected. |
+ | `-tlsephemeral` (default on) | Without `-tlscert`, use a self-signed certificate in the datadir. It is issued for the first `-externaldomain` (else a random host name), valid for 90 days, and renewed with the same key when fewer than 30 days remain. |
+ | `-externaldomain=<domain>[:port]` | Advertise `wss://<domain>:<port><path>` (default port 443; the path is `-p2pwebsocketpath`, else `/p2p/ws`) to peers that support ADDRv2 (BIP155), so they can find and dial it. |
+ | `-p2pwebsocketpath=<path>` | Serve the upgrade at another path. |
+diff --git a/src/net_websocket.cpp b/src/net_websocket.cpp
+index 9c6fef6b8406b26c7944c98665d92d957c003dbd..498e573737967a82c38cd17b1fe1917263845e61 100644
+--- a/src/net_websocket.cpp
++++ b/src/net_websocket.cpp
+@@ -38,7 +38,7 @@ constexpr size_t MAX_RESPONSE_HEAD = 16 * 1024;
+ constexpr const char *WEBSOCKET_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
+ 
+ struct DialerState {
+-    tls::SslCtxPtr client_ctx;
++    std::unique_ptr<tls::ReloadingClientContext> client_ctx;
+     //! Sec-WebSocket-Protocol value offered ("" offers none)
+     std::string protocols;
+     //! -p2pwebsocketpin: required public key hash per (lowercase) host
+@@ -191,7 +191,8 @@ Handshake(const DialerState &state, std::unique_ptr<Sock> &&tcp,
+     std::unique_ptr<WebSocketByteLayer> layer;
+     auto info{std::make_shared<WebSocketTransportInfo>()};
+     if (url.tls) {
+-        tls::SslPtr ssl{SSL_new(state.client_ctx.get())};
++        const auto ctx{state.client_ctx->Get()};
++        tls::SslPtr ssl{ctx ? SSL_new(ctx.get()) : nullptr};
+         if (!ssl || SSL_set_fd(ssl.get(), int(sock->Fd())) != 1) {
+             return std::nullopt;
+         }
+@@ -340,21 +341,12 @@ bool StartP2PWebSocketDialer(const std::optional<fs::path> &client_cert,
+         }
+         state->pins[ToLower(entry.substr(0, eq))] = *pin;
+     }
+-    state->client_ctx = tls::NewContext(/*server=*/false);
+-    if (!state->client_ctx) {
++    // Context replacement is atomic and each SSL session retains its context.
++    state->client_ctx =
++        std::make_unique<tls::ReloadingClientContext>(client_cert, client_key);
++    if (!state->client_ctx->Get()) {
+         return false;
+     }
+-    // Peers commonly use self-signed certificates: TLS protects against
+-    // passive observers and lets proxies route by SNI; peers are not
+-    // authenticated (as with plain TCP P2P).
+-    SSL_CTX_set_verify(state->client_ctx.get(), SSL_VERIFY_NONE, nullptr);
+-    if (client_cert && client_key &&
+-        !tls::UseCertificateFiles(state->client_ctx.get(), *client_cert,
+-                                  *client_key)) {
+-        LogPrintf("Not presenting a TLS client certificate to WebSocket "
+-                  "peers: %s\n",
+-                  tls::ErrorString());
+-    }
+     // "p2p-zstd-v1,p2p-zstd" by default; "none" offers plain messages.
+     for (const std::string &token : util::SplitString(offer, ',')) {
+         const std::string t{util::TrimString(token)};
+diff --git a/src/net_websocket_dialer.h b/src/net_websocket_dialer.h
+index ab4da06336fcd5b38e1fa7605001b4c882f6b84f..f0e10453470f07ab609a54ce71b782db7023424b 100644
+--- a/src/net_websocket_dialer.h
++++ b/src/net_websocket_dialer.h
+@@ -21,7 +21,9 @@ static const char *const DEFAULT_P2P_WEBSOCKET_OFFER =
+ /**
+  * Start the outbound P2P WebSocket dialer (its own I/O thread) and register
+  * it with SetWebSocketDialer(). If given, the certificate is presented to
+- * wss:// peers that ask for one (see -tlsmutual). `offer` is a comma
++ * wss:// peers that ask for one (see -tlsmutual). New TLS handshakes pick
++ * up changed certificate/key files; invalid replacements keep the last valid
++ * identity and existing sessions retain their original identity. `offer` is a comma
+  * separated subset of DEFAULT_P2P_WEBSOCKET_OFFER, or "none". `pins` are
+  * -p2pwebsocketpin entries "<host>=<pin>" (see DecodeSpkiPin); returns
+  * false if one is invalid.
+diff --git a/src/test/net_websocket_tests.cpp b/src/test/net_websocket_tests.cpp
+index 9d7aeb614fa673d6c2be8cfc2a1211d6d3f95e71..36beecf8c63a5ed46300b8fe239349897d5e028d 100644
+--- a/src/test/net_websocket_tests.cpp
++++ b/src/test/net_websocket_tests.cpp
+@@ -23,6 +23,7 @@
+ #include <chrono>
+ #include <cstring>
+ #include <memory>
++#include <thread>
+ #include <vector>
+ 
+ #include <fcntl.h>
+@@ -181,6 +182,56 @@ struct WebSocketTestingSetup : BasicTestingSetup {
+ 
+ BOOST_FIXTURE_TEST_SUITE(net_websocket_tests, WebSocketTestingSetup)
+ 
++BOOST_AUTO_TEST_CASE(client_certificate_reload) {
++    const auto cert{m_path_root / "client.pem"};
++    const auto key{m_path_root / "client.key"};
++    const auto first{tls::GenerateSelfSigned("first.example", {}, {},
++                                           std::chrono::hours{24})};
++    const auto second{tls::GenerateSelfSigned("second.example", {}, {},
++                                            std::chrono::hours{24})};
++    BOOST_REQUIRE(first && second);
++    BOOST_REQUIRE(tls::WritePemFiles(*first, cert, key));
++    // Zero is a valid filesystem timestamp, not an uninitialized sentinel.
++    fs::last_write_time(cert, fs::file_time_type{});
++    fs::last_write_time(key, fs::file_time_type{});
++    tls::ReloadingClientContext contexts{cert, key};
++    const auto old{contexts.Get()};
++    BOOST_REQUIRE(old);
++    tls::SslPtr session{SSL_new(old.get())};
++    BOOST_REQUIRE(session);
++    const auto original{tls::SpkiSha256(SSL_get_certificate(session.get()))};
++    BOOST_REQUIRE_EQUAL(original.size(), 32);
++    const auto next_check = [] {
++        std::this_thread::sleep_for(std::chrono::milliseconds{1100});
++    };
++
++    // A mismatched pair cannot replace the valid published context.
++    BOOST_REQUIRE(tls::ReplaceFile(cert, second->cert_pem));
++    next_check();
++    BOOST_CHECK(contexts.Get() == old);
++    BOOST_CHECK(tls::SpkiSha256(SSL_get_certificate(session.get())) == original);
++    // The corrected key completes the rotation without restarting the dialer.
++    BOOST_REQUIRE(tls::ReplaceFile(key, second->key_pem));
++    next_check();
++    const auto rotated{contexts.Get()};
++    BOOST_REQUIRE(rotated);
++    BOOST_CHECK(rotated != old);
++    BOOST_CHECK(tls::SpkiSha256(SSL_CTX_get0_certificate(rotated.get())) != original);
++    BOOST_CHECK(tls::SpkiSha256(SSL_get_certificate(session.get())) == original);
++    BOOST_CHECK(contexts.Get() == rotated);
++    // Malformed and missing files also leave the last good identity intact.
++    BOOST_REQUIRE(tls::ReplaceFile(key, "not a PEM key"));
++    next_check();
++    BOOST_CHECK(contexts.Get() == rotated);
++    BOOST_REQUIRE(tls::ReplaceFile(key, second->key_pem));
++    fs::remove(cert);
++    next_check();
++    BOOST_CHECK(contexts.Get() == rotated);
++    tls::ReloadingClientContext anonymous{std::nullopt, std::nullopt};
++    BOOST_REQUIRE(anonymous.Get());
++    BOOST_CHECK(SSL_CTX_get0_certificate(anonymous.Get().get()) == nullptr);
++}
++
+ BOOST_AUTO_TEST_CASE(roundtrip_all_modes_and_sizes) {
+     FastRandomContext rng{/*fDeterministic=*/true};
+     for (const C mode : {C::NONE, C::ZSTD, C::ZSTD_DICT}) {
+diff --git a/src/tls_util.cpp b/src/tls_util.cpp
+index df86d20216db91ba3e9e64f90caffdf37227f0b8..7a76904ec12d7c3f45dcc2e346a6ae69ba4d8fa0 100644
+--- a/src/tls_util.cpp
++++ b/src/tls_util.cpp
+@@ -4,6 +4,7 @@
+ 
+ #include <tls_util.h>
+ 
++#include <logging.h>
+ #include <util/strencodings.h>
+ #include <util/string.h>
+ 
+@@ -175,6 +176,47 @@ bool UseCertificateFiles(SSL_CTX *ctx, const fs::path &cert_chain,
+            SSL_CTX_check_private_key(ctx) == 1;
+ }
+ 
++ReloadingClientContext::ReloadingClientContext(
++    const std::optional<fs::path> &cert, const std::optional<fs::path> &key)
++    : m_cert{cert}, m_key{key} {
++    auto ctx{NewContext(/*server=*/false)};
++    if (ctx) {
++        // Self-signed peers are allowed; explicit SPKI pins authenticate
++        // peers in the dialer, as before certificate reloading.
++        SSL_CTX_set_verify(ctx.get(), SSL_VERIFY_NONE, nullptr);
++        m_context = std::shared_ptr<SSL_CTX>{ctx.release(), SslCtxDeleter{}};
++    }
++}
++
++std::shared_ptr<SSL_CTX> ReloadingClientContext::Get() {
++    std::lock_guard<std::mutex> lock{m_mutex};
++    const auto now{std::chrono::steady_clock::now()};
++    if (!m_context || !m_cert || !m_key || now < m_next_check) {
++        return m_context;
++    }
++    m_next_check = now + std::chrono::seconds{1};
++    std::error_code cert_error, key_error;
++    const auto cert_mtime{fs::last_write_time(*m_cert, cert_error)};
++    const auto key_mtime{fs::last_write_time(*m_key, key_error)};
++    if (m_loaded && !cert_error && !key_error && cert_mtime == m_cert_mtime &&
++        key_mtime == m_key_mtime) {
++        return m_context;
++    }
++    auto ctx{NewContext(/*server=*/false)};
++    if (!ctx || !UseCertificateFiles(ctx.get(), *m_cert, *m_key)) {
++        LogPrintf("Not reloading TLS client certificate %s: %s\n",
++                  fs::PathToString(*m_cert), ErrorString());
++        return m_context;
++    }
++    SSL_CTX_set_verify(ctx.get(), SSL_VERIFY_NONE, nullptr);
++    m_context = std::shared_ptr<SSL_CTX>{ctx.release(), SslCtxDeleter{}};
++    m_loaded = true;
++    m_cert_mtime = cert_mtime;
++    m_key_mtime = key_mtime;
++    LogPrintf("Loaded TLS client certificate %s\n", fs::PathToString(*m_cert));
++    return m_context;
++}
++
+ namespace {
+ EVP_PKEY *NewP256Key() {
+     std::unique_ptr<EVP_PKEY_CTX, EVPPKeyCtxDeleter> pctx{
+diff --git a/src/tls_util.h b/src/tls_util.h
+index 185932df724e8f01a5d05c39e1e9d31170b3ed5f..4d8433e86f7342ece76298872df99fb7a0c5a7e9 100644
+--- a/src/tls_util.h
++++ b/src/tls_util.h
+@@ -11,6 +11,7 @@
+ 
+ #include <chrono>
+ #include <memory>
++#include <mutex>
+ #include <optional>
+ #include <string>
+ #include <vector>
+@@ -45,6 +46,26 @@ bool UseCertificatePem(SSL_CTX *ctx, const std::string &cert_chain_pem,
+ bool UseCertificateFiles(SSL_CTX *ctx, const fs::path &cert_chain,
+                          const fs::path &key);
+ 
++/**
++ * Client TLS contexts are immutable after publication. Check file mtimes on
++ * new handshakes (at most once a second), just like the inbound listener.
++ * A failed replacement retains the last valid context; existing SSL objects
++ * retain their own OpenSSL reference to that context.
++ */
++class ReloadingClientContext {
++    std::mutex m_mutex;
++    std::shared_ptr<SSL_CTX> m_context;
++    std::optional<fs::path> m_cert, m_key;
++    fs::file_time_type m_cert_mtime{}, m_key_mtime{};
++    bool m_loaded{false};
++    std::chrono::steady_clock::time_point m_next_check{};
++
++public:
++    ReloadingClientContext(const std::optional<fs::path> &cert,
++                           const std::optional<fs::path> &key);
++    std::shared_ptr<SSL_CTX> Get();
++};
++
+ struct SelfSigned {
+     std::string cert_pem;
+     std::string key_pem;
+diff --git a/test/functional/p2p_websocket_client_cert_reload.py b/test/functional/p2p_websocket_client_cert_reload.py
+new file mode 100755
+index 0000000000000000000000000000000000000000..133de89979bac80e2313284372aa20f39e47ab59
+--- /dev/null
++++ b/test/functional/p2p_websocket_client_cert_reload.py
+@@ -0,0 +1,97 @@
++#!/usr/bin/env python3
++# Copyright (c) 2026 The Bitcoin developers
++# Distributed under the MIT software license, see the accompanying
++# file COPYING or http://www.opensource.org/licenses/mit-license.php.
++"""Outbound wss dials reload client keys, retaining old sessions and bad-file fallback."""
++import base64
++import hashlib
++import os
++import shutil
++import subprocess
++import time
++from pathlib import Path
++
++from test_framework.test_framework import BitcoinTestFramework, SkipTest
++from test_framework.util import assert_equal, rpc_port
++
++
++class ClientCertificateReloadTest(BitcoinTestFramework):
++    def set_test_params(self):
++        self.num_nodes = 3
++        self.setup_clean_chain = True
++        self.extra_args = [["-tlsmutual"], [], ["-tlsmutual"]]
++
++    def setup_network(self):
++        self.add_nodes(self.num_nodes, self.extra_args)
++        self.start_nodes()
++
++    def skip_test_if_missing_module(self):
++        self.openssl = shutil.which("openssl")
++        if not self.openssl:
++            raise SkipTest("openssl not available")
++
++    def issue(self, path):
++        cert, key = path / "rotated.pem", path / "rotated.key"
++        subprocess.run([self.openssl, "req", "-new", "-x509", "-newkey", "ec",
++                        "-pkeyopt", "ec_paramgen_curve:P-256", "-nodes", "-days", "1",
++                        "-subj", "/CN=rotated.example", "-keyout", str(key), "-out", str(cert)],
++                       check=True, capture_output=True)
++        pubkey = subprocess.run([self.openssl, "x509", "-pubkey", "-noout", "-in", str(cert)],
++                                check=True, capture_output=True).stdout
++        der = subprocess.run([self.openssl, "pkey", "-pubin", "-outform", "DER"],
++                             input=pubkey, check=True, capture_output=True).stdout
++        return cert.read_bytes(), key.read_bytes(), base64.urlsafe_b64encode(hashlib.sha256(der).digest()).decode().rstrip("=")
++
++    def peers(self, n):
++        return [p for p in self.nodes[n].getpeerinfo() if p["transport"] == "wss"]
++
++    def dial(self, n):
++        self.nodes[1].addnode(f"wss://localhost:{rpc_port(n)}/p2p/ws", "onetry")
++        self.wait_until(lambda: len(self.peers(n)) == 1)
++        return self.peers(n)[0]["websocket"]["peer_spki"]
++
++    def disconnect_second(self):
++        self.nodes[2].disconnectnode(nodeid=self.peers(2)[0]["id"])
++        self.wait_until(lambda: not self.peers(2))
++        self.wait_until(lambda: len(self.peers(1)) == 1)
++
++    def replace(self, path, contents):
++        tmp = path.with_suffix(".replacement")
++        tmp.write_bytes(contents)
++        os.replace(tmp, path)
++
++    def run_test(self):
++        old = self.dial(0)
++        assert old
++        retained = self.peers(0)[0]["id"]
++        client_dir = Path(self.nodes[1].datadir) / self.chain
++        cert, key = client_dir / "node_tls_cert.pem", client_dir / "node_tls_key.pem"
++        replacement_cert, replacement_key, expected = self.issue(client_dir)
++        assert old != expected
++        self.replace(cert, replacement_cert)
++        self.replace(key, replacement_key)
++        time.sleep(1.1)  # Same mtime-check cadence as the inbound TLS listener.
++        assert_equal(self.dial(2), expected)
++        # Rotation must not disconnect or mutate the already established session.
++        assert_equal(self.peers(0)[0]["id"], retained)
++        assert_equal(self.peers(0)[0]["websocket"]["peer_spki"], old)
++        received_ping = self.peers(0)[0].get("bytesrecv_per_msg", {}).get("ping", 0)
++        self.nodes[1].ping()
++        self.wait_until(lambda: self.peers(0)[0].get("bytesrecv_per_msg", {}).get("ping", 0) > received_ping)
++        self.disconnect_second()
++
++        self.log.info("A mismatched certificate/key retains the last good identity")
++        third_cert, third_key, third_spki = self.issue(client_dir)
++        self.replace(cert, third_cert)
++        time.sleep(1.1)
++        assert_equal(self.dial(2), expected)
++        self.disconnect_second()
++        self.replace(key, third_key)
++        time.sleep(1.1)
++        assert_equal(self.dial(2), third_spki)
++        assert_equal(self.peers(0)[0]["id"], retained)
++        assert_equal(self.peers(0)[0]["websocket"]["peer_spki"], old)
++
++
++if __name__ == "__main__":
++    ClientCertificateReloadTest().main()
+-- 
+2.50.1 (Apple Git-155)
+

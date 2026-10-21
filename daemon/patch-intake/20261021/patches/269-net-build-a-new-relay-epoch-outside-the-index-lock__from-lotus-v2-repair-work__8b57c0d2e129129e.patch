@@ -1,0 +1,486 @@
+From 758af8c2f301e5516cd0c932ae219b4ad4ec0d0f Mon Sep 17 00:00:00 2001
+From: Shammah Chancellor <shammah.chancellor@notvalid.com>
+Date: Mon, 19 Oct 2026 18:31:59 -0700
+Subject: [PATCH] net: build a new relay epoch outside the index lock
+
+At a block the short-id index is re-keyed from the whole mempool. That
+took the index lock for the whole rebuild: 0.4-1.4 s at a 1M-transaction
+mempool (RelayIndexRekey1M, previous commit), during which every invshort
+lookup, every transaction queued for relay and every short-id request
+waited.
+
+The new epoch is now built in a private structure and swapped in under
+the lock; until then the current and previous epochs keep answering.
+Insert no longer needs the lock (it is only called on a private epoch or
+with the lock held), so it is renamed InsertUnlocked and documented as
+such; the collision counter it bumps is a mutable atomic.
+
+Tests: txrelay_tests (index epochs and collisions) pass;
+RelayIndexRekey1M still costs 0.4-1.4 s of CPU per block (unchanged: the
+same work, outside the lock). Not done: incremental double indexing that
+would spread the work over the epoch.
+
+Session recovery correctness repair:
+
+Fixup provenance: a0ba5c282f corrects epoch rebuild races introduced by a4345c1c49.
+
+Mutation tracking now starts before obtaining the mempool snapshot. The
+index builds outside its mutex and applies concurrent Add/Remove events
+before publication. A separate builder mutex serializes rebuilds; only
+builders take it. Snapshot callbacks run without the index mutex, so the
+index never nests its mutex across mempool.cs acquisition. No background
+thread, condition variable, shutdown waiter, or retry loop is introduced.
+
+The mutation journal stops at 65,536 events. Overflow discards the candidate
+and retains the current epoch for retry during the next normal update.
+Sustained churn can defer rekeying; this performance case was not measured.
+An exception clears active tracking. Initial snapshot admissions are merged
+with mutations when seeding the reconciliation window. Benchmark snapshot
+providers now copy the supplied data; pre-repair rekey timings therefore do
+not measure this new implementation.
+
+Validation: ninja -C build -j2 bitcoind test_bitcoin bitcoin-bench rc0;
+10 txrelay_tests pass in 0.83s, covering a deterministic stale snapshot with
+Add/Remove, 65,537-event overflow then successful retry, first-epoch window
+admissions, and failed-snapshot cleanup. No benchmark or suite rerun.
+
+Coordinator integration provenance (network403):
+Resolve integration context by retaining the incoming purposeful change together with existing shared/native consumers; exact old/new patch and file inventory is retained in owner-adaptations.json. No authored purpose or removed downstream behavior restored.
+Original scripted commands/hashes above are original-author provenance; modified parent/tool/catalog hashes are not claimed to reproduce this composition. Exact coordinator adaptation scripts and ordered tree proof are in composed403-network-metrics-delivery. Build/runtime/benchmarks NOT_RUN for this composition under user compile-first policy.
+---
+ src/bench/txrelay_index.cpp |   7 ++-
+ src/net/txrelay_index.cpp   | 120 +++++++++++++++++++++++++-----------
+ src/net/txrelay_index.h     |  28 +++++++--
+ src/net_processing.cpp      |  10 +--
+ src/test/txrelay_tests.cpp  |  79 ++++++++++++++++++++++--
+ 5 files changed, 191 insertions(+), 53 deletions(-)
+
+diff --git a/src/bench/txrelay_index.cpp b/src/bench/txrelay_index.cpp
+index ac98479bc3f115f531191e53cd99edba1c25467f..e2a264c7963916dd65bc94e065356d8c44f318b7 100644
+--- a/src/bench/txrelay_index.cpp
++++ b/src/bench/txrelay_index.cpp
+@@ -32,7 +32,8 @@ static void RelayIndexRekey(benchmark::Bench &bench, size_t n) {
+     txrelay::TxRelayIndex index;
+     // One run = one new epoch over the whole mempool.
+     bench.batch(n).unit("tx").run([&] {
+-        index.SetEpoch(txrelay::MakeEpochKey(BlockHash{rng.rand256()}, 1), txs);
++        index.SetEpoch(txrelay::MakeEpochKey(BlockHash{rng.rand256()}, 1),
++                       [&] { return txs; });
+     });
+ }
+ 
+@@ -48,7 +49,7 @@ static void RelayIndexRekey1M(benchmark::Bench &bench) {
+ static void RelayIndexAddRemove(benchmark::Bench &bench) {
+     const auto txs{MakeMempool(100'000)};
+     txrelay::TxRelayIndex index;
+-    index.SetEpoch(txrelay::MakeEpochKey(BlockHash{}, 1), txs);
++    index.SetEpoch(txrelay::MakeEpochKey(BlockHash{}, 1), [&] { return txs; });
+     FastRandomContext rng{true};
+     bench.minEpochIterations(20'000).run([&] {
+         const TxId txid{rng.rand256()};
+@@ -61,7 +62,7 @@ static void RelayIndexFind(benchmark::Bench &bench) {
+     const auto txs{MakeMempool(100'000)};
+     txrelay::TxRelayIndex index;
+     const auto key{txrelay::MakeEpochKey(BlockHash{}, 1)};
+-    index.SetEpoch(key, txs);
++    index.SetEpoch(key, [&] { return txs; });
+     size_t i{0};
+     std::vector<TxId> out;
+     bench.minEpochIterations(200'000).run([&] {
+diff --git a/src/net/txrelay_index.cpp b/src/net/txrelay_index.cpp
+index 818f0471d55d96cf18c53882a41028bb9dd8ca0e..35d54d7036e46a66f6b730db46458128fcc13e9f 100644
+--- a/src/net/txrelay_index.cpp
++++ b/src/net/txrelay_index.cpp
+@@ -57,7 +57,7 @@ std::optional<uint64_t> ParseShortIdRequestKey(const uint256 &key,
+ TxRelayIndex::TxRelayIndex(unsigned shortid_bits)
+     : m_bits{std::clamp(shortid_bits, 1U, 64U)} {}
+ 
+-void TxRelayIndex::Insert(Epoch &epoch, const TxId &txid) {
++void TxRelayIndex::InsertUnlocked(Epoch &epoch, const TxId &txid) const {
+     const uint64_t short_id{ShortId(epoch.key, txid)};
+     if (!epoch.short_id_of.emplace(txid, short_id).second) {
+         return;
+@@ -80,32 +80,77 @@ void TxRelayIndex::Insert(Epoch &epoch, const TxId &txid) {
+ }
+ 
+ void TxRelayIndex::SetEpoch(const EpochKey &key,
+-                            const std::vector<std::pair<TxId, Clock>> &txs) {
+-    LOCK(m_mutex);
+-    if (m_current && m_current->key == key) {
+-        return;
++                            const std::function<Snapshot()> &snapshot) {
++    LOCK(m_rebuild_mutex);
++    {
++        LOCK(m_mutex);
++        if (m_current && m_current->key == key) {
++            return;
++        }
++        m_epoch_changes.clear();
++        m_epoch_overflow = false;
++        m_rebuilding = true;
+     }
+-    auto epoch{std::make_unique<Epoch>()};
+-    epoch->key = key;
+-    epoch->by_short_id.reserve(txs.size());
+-    epoch->short_id_of.reserve(txs.size());
+-    for (const auto &[txid, time] : txs) {
+-        Insert(*epoch, txid);
+-    }
+-    if (m_window.empty()) {
+-        // First epoch: the window starts from the mempool's admission times.
+-        std::vector<std::pair<Clock, TxId>> window;
+-        window.reserve(txs.size());
++    try {
++        // Start tracking before taking the snapshot, covering the gap between
++        // releasing the mempool lock and building the new epoch as well.
++        const auto txs{snapshot()};
++        auto epoch{std::make_unique<Epoch>()};
++        epoch->key = key;
++        epoch->by_short_id.reserve(txs.size());
++        epoch->short_id_of.reserve(txs.size());
+         for (const auto &[txid, time] : txs) {
+-            window.emplace_back(time, txid);
++            InsertUnlocked(*epoch, txid);
++        }
++        LOCK(m_mutex);
++        m_rebuilding = false;
++        if (m_epoch_overflow) {
++            // A bounded failed attempt: keep serving the old epoch. Sustained
++            // churn can defer rekeying, but must never publish a stale index.
++            m_epoch_changes.clear();
++            return;
++        }
++        for (const auto &[txid, present] : m_epoch_changes) {
++            if (present) {
++                InsertUnlocked(*epoch, txid);
++            } else {
++                RemoveFromEpoch(*epoch, txid);
++            }
+         }
+-        std::stable_sort(
+-            window.begin(), window.end(),
+-            [](const auto &a, const auto &b) { return a.first < b.first; });
+-        m_window.assign(window.begin(), window.end());
++        m_epoch_changes.clear();
++        if (!m_current) {
++            // Include admissions during the initial snapshot as well as those
++            // that already existed before the first index was constructed.
++            std::vector<std::pair<Clock, TxId>> window{m_window.begin(),
++                                                       m_window.end()};
++            window.reserve(window.size() + txs.size());
++            for (const auto &[txid, time] : txs) {
++                window.emplace_back(time, txid);
++            }
++            std::stable_sort(
++                window.begin(), window.end(),
++                [](const auto &a, const auto &b) { return a.first < b.first; });
++            m_window.assign(window.begin(), window.end());
++        }
++        m_previous = std::move(m_current);
++        m_current = std::move(epoch);
++    } catch (...) {
++        LOCK(m_mutex);
++        m_rebuilding = false;
++        m_epoch_changes.clear();
++        throw;
+     }
+-    m_previous = std::move(m_current);
+-    m_current = std::move(epoch);
++}
++
++void TxRelayIndex::RecordEpochChange(const TxId &txid, bool present) {
++    if (!m_rebuilding || m_epoch_overflow) {
++        return;
++    }
++    if (m_epoch_changes.size() == MAX_EPOCH_CHANGES) {
++        m_epoch_overflow = true;
++        return;
++    }
++    m_epoch_changes.emplace_back(txid, present);
+ }
+ 
+ std::optional<EpochKey> TxRelayIndex::Current() const {
+@@ -149,33 +194,38 @@ std::optional<EpochKey> TxRelayIndex::FindEpoch(const uint256 &epoch_id) const {
+ 
+ void TxRelayIndex::Add(const TxId &txid, Clock time) {
+     LOCK(m_mutex);
++    RecordEpochChange(txid, true);
+     if (m_current) {
+         if (m_current->short_id_of.count(txid)) {
+             return;
+         }
+-        Insert(*m_current, txid);
++        InsertUnlocked(*m_current, txid);
+     }
+     m_window.emplace_back(time, txid);
+ }
+ 
+-void TxRelayIndex::Remove(const TxId &txid) {
+-    LOCK(m_mutex);
+-    if (!m_current) {
+-        return;
+-    }
+-    const auto it{m_current->short_id_of.find(txid)};
+-    if (it == m_current->short_id_of.end()) {
++void TxRelayIndex::RemoveFromEpoch(Epoch &epoch, const TxId &txid) {
++    const auto it{epoch.short_id_of.find(txid)};
++    if (it == epoch.short_id_of.end()) {
+         return;
+     }
+-    const auto bucket{m_current->by_short_id.find(it->second)};
+-    if (bucket != m_current->by_short_id.end()) {
++    const auto bucket{epoch.by_short_id.find(it->second)};
++    if (bucket != epoch.by_short_id.end()) {
+         auto &txids{bucket->second};
+         txids.erase(std::remove(txids.begin(), txids.end(), txid), txids.end());
+         if (txids.empty()) {
+-            m_current->by_short_id.erase(bucket);
++            epoch.by_short_id.erase(bucket);
+         }
+     }
+-    m_current->short_id_of.erase(it);
++    epoch.short_id_of.erase(it);
++}
++
++void TxRelayIndex::Remove(const TxId &txid) {
++    LOCK(m_mutex);
++    RecordEpochChange(txid, false);
++    if (m_current) {
++        RemoveFromEpoch(*m_current, txid);
++    }
+ }
+ 
+ TxRelayIndex::Lookup TxRelayIndex::Find(const uint256 &epoch_id,
+diff --git a/src/net/txrelay_index.h b/src/net/txrelay_index.h
+index cbd1bd3ca60a66e8b4f306e2fab66ee140dcfe5d..23bd03d68532c7a00cd529e08ac9a6273eb4e2e5 100644
+--- a/src/net/txrelay_index.h
++++ b/src/net/txrelay_index.h
+@@ -15,6 +15,7 @@
+ #include <chrono>
+ #include <cstdint>
+ #include <deque>
++#include <functional>
+ #include <memory>
+ #include <optional>
+ #include <unordered_map>
+@@ -90,14 +91,20 @@ public:
+         return ComputeShortId(key.k0, key.k1, txid, m_bits);
+     }
+ 
++    using Snapshot = std::vector<std::pair<TxId, Clock>>;
++
+     /**
+-     * Start a new epoch indexing `txs` (the mempool, with admission times).
++     * Start a new epoch from a mempool snapshot obtained by `snapshot`.
++     * The callback runs without the index lock, after mutation tracking starts.
++     * Concurrent additions/removals are replayed before publication. If the
++     * bounded mutation journal overflows, retain the old epoch and retry on
++     * the next normal update; do not publish an incomplete index.
+      * The current epoch becomes the previous one; an older one is dropped.
+      * A no-op if `key` already is the current epoch.
+      */
+     void SetEpoch(const EpochKey &key,
+-                  const std::vector<std::pair<TxId, Clock>> &txs)
+-        EXCLUSIVE_LOCKS_REQUIRED(!m_mutex);
++                  const std::function<Snapshot()> &snapshot)
++        EXCLUSIVE_LOCKS_REQUIRED(!m_mutex, !m_rebuild_mutex);
+     /** The current epoch, if any */
+     std::optional<EpochKey> Current() const EXCLUSIVE_LOCKS_REQUIRED(!m_mutex);
+     /** The current and the previous epoch (those indexed) */
+@@ -144,18 +151,29 @@ private:
+         std::unordered_map<uint64_t, std::vector<TxId>> by_short_id;
+         std::unordered_map<TxId, uint64_t, SaltedTxIdHasher> short_id_of;
+     };
+-    void Insert(Epoch &epoch, const TxId &txid)
++    //! Index txid in epoch (which the caller owns or guards with m_mutex)
++    void InsertUnlocked(Epoch &epoch, const TxId &txid) const;
++    static void RemoveFromEpoch(Epoch &epoch, const TxId &txid);
++    void RecordEpochChange(const TxId &txid, bool present)
+         EXCLUSIVE_LOCKS_REQUIRED(m_mutex);
+     const Epoch *Get(const uint256 &epoch_id) const
+         EXCLUSIVE_LOCKS_REQUIRED(m_mutex);
+ 
+     const unsigned m_bits;
++    //! Only builders take this lock; never held by Add/Remove or snapshot
++    //! callers.
++    Mutex m_rebuild_mutex;
+     mutable Mutex m_mutex;
++    //! Bounded mutation count, independent of churn or rebuild duration.
++    static constexpr size_t MAX_EPOCH_CHANGES{65'536};
++    bool m_rebuilding GUARDED_BY(m_mutex){false};
++    bool m_epoch_overflow GUARDED_BY(m_mutex){false};
++    std::vector<std::pair<TxId, bool>> m_epoch_changes GUARDED_BY(m_mutex);
+     std::unique_ptr<Epoch> m_current GUARDED_BY(m_mutex);
+     std::unique_ptr<Epoch> m_previous GUARDED_BY(m_mutex);
+     //! (admission time, txid), in admission order
+     std::deque<std::pair<Clock, TxId>> m_window GUARDED_BY(m_mutex);
+-    std::atomic<uint64_t> m_collisions{0};
++    mutable std::atomic<uint64_t> m_collisions{0};
+ };
+ 
+ } // namespace txrelay
+diff --git a/src/net_processing.cpp b/src/net_processing.cpp
+index ccf24b123c87a8a6f1e718a6385fea61ee473f32..2a83402ed7a3d7c7d772f299c94dbe2c07fe4ed6 100644
+--- a/src/net_processing.cpp
++++ b/src/net_processing.cpp
+@@ -3595,17 +3595,17 @@ void PeerManagerImpl::UpdateRelayEpochTo(const BlockHash &tip, int height) {
+         current && current->epoch_id == uint256{tip}) {
+         return;
+     }
+-    // A new key: re-index the mempool (one SipHash per transaction).
+-    std::vector<std::pair<TxId, std::chrono::microseconds>> txs;
+-    {
++    // Snapshot only after the index starts tracking concurrent mutations.
++    m_txrelay_index.SetEpoch(txrelay::MakeEpochKey(tip, uint64_t(height)), [&] {
++        txrelay::TxRelayIndex::Snapshot txs;
+         LOCK(m_mempool.cs);
+         txs.reserve(m_mempool.mapTx.size());
+         for (const auto &entry : m_mempool.mapTx) {
+             txs.emplace_back(entry->GetTx().GetId(),
+                              std::chrono::microseconds{entry->GetTime()});
+         }
+-    }
+-    m_txrelay_index.SetEpoch(txrelay::MakeEpochKey(tip, uint64_t(height)), txs);
++        return txs;
++    });
+ }
+ 
+ uint64_t PeerManagerImpl::ShortIdFor(const Peer &peer, const TxId &txid,
+diff --git a/src/test/txrelay_tests.cpp b/src/test/txrelay_tests.cpp
+index 2960c5f2e7208f25d8e49bf9c533f1cc78a98027..f9e357f8029693751226798edcf38234e0f99934 100644
+--- a/src/test/txrelay_tests.cpp
++++ b/src/test/txrelay_tests.cpp
+@@ -9,11 +9,13 @@
+ #include <config.h>
+ #include <net.h>
+ #include <net/txrelay_index.h>
++
+ #include <net/v2_protocol_handler.h>
+ #include <primitives/transaction.h>
+ #include <protocol.h>
+ #include <script/script.h>
+ #include <script/standard.h>
++#include <stdexcept>
+ #include <streams.h>
+ #include <txmempool.h>
+ #include <util/time.h>
+@@ -443,7 +445,7 @@ BOOST_AUTO_TEST_CASE(shortid_index_epochs_and_collisions) {
+         mempool.emplace_back(TxId{rng.rand256()},
+                              std::chrono::microseconds{i * 1'000'000});
+     }
+-    index.SetEpoch(key1, mempool);
++    index.SetEpoch(key1, [&] { return mempool; });
+     BOOST_CHECK(index.Current() == key1);
+     BOOST_CHECK_EQUAL(index.Size(), 50U);
+     const TxId &a{mempool[0].first};
+@@ -460,7 +462,9 @@ BOOST_AUTO_TEST_CASE(shortid_index_epochs_and_collisions) {
+     index.Remove(a);
+     BOOST_CHECK(index.Find(key1.epoch_id, index.ShortId(key1, a)) ==
+                 TxRelayIndex::Lookup::MISSING);
+-    index.SetEpoch(key2, {mempool.begin() + 1, mempool.end()});
++    index.SetEpoch(key2, [&] {
++        return TxRelayIndex::Snapshot{mempool.begin() + 1, mempool.end()};
++    });
+     BOOST_CHECK(index.Current() == key2);
+     BOOST_CHECK(index.FindEpoch(key1.epoch_id) == key1);
+     const TxId &b{mempool[1].first};
+@@ -472,13 +476,13 @@ BOOST_AUTO_TEST_CASE(shortid_index_epochs_and_collisions) {
+     index.Remove(b);
+     BOOST_CHECK(index.Find(key1.epoch_id, index.ShortId(key1, b)) ==
+                 TxRelayIndex::Lookup::HAVE);
+-    index.SetEpoch(key3, {});
++    index.SetEpoch(key3, [] { return TxRelayIndex::Snapshot{}; });
+     BOOST_CHECK(!index.FindEpoch(key1.epoch_id));
+     BOOST_CHECK(index.FindEpoch(key2.epoch_id));
+ 
+     // Window: transactions admitted since a time, still indexed.
+     TxRelayIndex window_index;
+-    window_index.SetEpoch(key1, mempool);
++    window_index.SetEpoch(key1, [&] { return mempool; });
+     const auto recent{
+         window_index.AdmittedSince(std::chrono::microseconds{40'000'000})};
+     BOOST_CHECK_EQUAL(recent.size(), 10U);
+@@ -496,7 +500,7 @@ BOOST_AUTO_TEST_CASE(shortid_index_epochs_and_collisions) {
+     // Collisions (forced with 4-bit ids): both are kept under the id and
+     // counted.
+     TxRelayIndex narrow{4};
+-    narrow.SetEpoch(key1, mempool);
++    narrow.SetEpoch(key1, [&] { return mempool; });
+     BOOST_CHECK_GT(narrow.Collisions(), 30U);
+     size_t total{0};
+     for (uint64_t id = 1; id < 16; ++id) {
+@@ -507,6 +511,71 @@ BOOST_AUTO_TEST_CASE(shortid_index_epochs_and_collisions) {
+     BOOST_CHECK_EQUAL(total, 50U);
+ }
+ 
++BOOST_AUTO_TEST_CASE(shortid_epoch_rebuild_preserves_mutations) {
++    using txrelay::TxRelayIndex;
++    FastRandomContext rng{true};
++    const auto key1{txrelay::MakeEpochKey(BlockHash{rng.rand256()}, 100)};
++    const auto key2{txrelay::MakeEpochKey(BlockHash{rng.rand256()}, 101)};
++    const auto key3{txrelay::MakeEpochKey(BlockHash{rng.rand256()}, 102)};
++    const TxId removed{rng.rand256()}, retained{rng.rand256()},
++        added{rng.rand256()};
++    const TxRelayIndex::Clock time{1'000'000};
++    const TxRelayIndex::Snapshot stale{{removed, time}, {retained, time}};
++    TxRelayIndex index;
++    index.SetEpoch(key1, [&] { return stale; });
++    index.SetEpoch(key2, [&] {
++        // Deliberately mutate after taking a stale snapshot: these events
++        // must also survive the index being built outside its mutex.
++        index.Add(added, time);
++        index.Remove(removed);
++        return stale;
++    });
++    BOOST_CHECK(index.Current() == key2);
++    BOOST_CHECK_EQUAL(index.Size(), 2U);
++    BOOST_CHECK(index.Find(key2.epoch_id, index.ShortId(key2, added)) ==
++                TxRelayIndex::Lookup::HAVE);
++    BOOST_CHECK(index.Find(key2.epoch_id, index.ShortId(key2, removed)) ==
++                TxRelayIndex::Lookup::MISSING);
++    BOOST_CHECK(index.Find(key2.epoch_id, index.ShortId(key2, retained)) ==
++                TxRelayIndex::Lookup::HAVE);
++
++    // A journal overflow abandons one bounded attempt, keeping the complete
++    // current epoch; the next update can retry without an internal spin.
++    index.SetEpoch(key3, [&] {
++        for (size_t i = 0; i < 65'537; ++i) {
++            index.Add(added, time);
++        }
++        return stale;
++    });
++    BOOST_CHECK(index.Current() == key2);
++    index.SetEpoch(key3, [&] {
++        return TxRelayIndex::Snapshot{{retained, time}, {added, time}};
++    });
++    BOOST_CHECK(index.Current() == key3);
++    BOOST_CHECK_EQUAL(index.Size(), 2U);
++
++    // Snapshot failure must stop journaling and allow a later rebuild.
++    BOOST_CHECK_THROW(index.SetEpoch(key1,
++                                     []() -> TxRelayIndex::Snapshot {
++                                         throw std::runtime_error(
++                                             "snapshot failure");
++                                     }),
++                      std::runtime_error);
++    BOOST_CHECK(index.Current() == key3);
++    index.SetEpoch(key1, [&] {
++        return TxRelayIndex::Snapshot{{retained, time}, {added, time}};
++    });
++    BOOST_CHECK(index.Current() == key1);
++
++    TxRelayIndex initial;
++    initial.SetEpoch(key1, [&] {
++        initial.Add(added, time);
++        return stale;
++    });
++    BOOST_CHECK_EQUAL(initial.Size(), 3U);
++    BOOST_CHECK_EQUAL(initial.AdmittedSince(TxRelayIndex::Clock{0}).size(), 3U);
++}
++
+ BOOST_AUTO_TEST_CASE(invshort_negotiation_and_announcements) {
+     LOCK(NetEventsInterface::g_msgproc_mutex);
+     MockTick clock{5'000'000ms};
+-- 
+2.50.1 (Apple Git-155)
+

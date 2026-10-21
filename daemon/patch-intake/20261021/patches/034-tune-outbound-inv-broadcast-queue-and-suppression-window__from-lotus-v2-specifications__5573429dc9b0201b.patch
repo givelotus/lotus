@@ -1,0 +1,539 @@
+From 5f1e8746e17f30e1f2a71aa8be6216eaaefc2535 Mon Sep 17 00:00:00 2001
+From: Shammah Chancellor <shammah.chancellor@notvalid.com>
+Date: Fri, 16 Oct 2026 18:20:37 -0700
+Subject: 034-tune-outbound-inv-broadcast-queue-and-suppression-window: tune
+ outbound inv broadcast queue and incoming inv suppression
+
+Tunes inbound/outbound inv broadcast cadence (500ms/250ms), raises
+MAX_INV_BROADCAST_INTERVAL to 7, suppresses redundant outbound invs when the
+peer already announced the tx, and adds outbound_inv_queue_suppression_window
+unit test.
+---
+ src/net_processing.cpp                 | 273 ++++++++++++++++++++++---
+ src/net_processing.h                   |  30 +++
+ src/test/v2_protocol_handler_tests.cpp | 113 ++++++++++
+ 3 files changed, 382 insertions(+), 34 deletions(-)
+
+diff --git a/src/net_processing.cpp b/src/net_processing.cpp
+index 49109ebe7b..e56ac3acb5 100644
+--- a/src/net_processing.cpp
++++ b/src/net_processing.cpp
+@@ -30,9 +30,12 @@
+ #include <invrequest.h>
+ #include <kernel/chain.h>
+ #include <kernel/mempool_entry.h>
++#include <lotus_v2/fast_sync.h>
+ #include <merkleblock.h>
++#include <net/v2_protocol_handler.h>
+ #include <netbase.h>
+ #include <netmessagemaker.h>
++
+ #include <node/blockstorage.h>
+ #include <node/miner.h>
+ #include <policy/fees.h>
+@@ -167,13 +170,13 @@ struct DataRequestParameters {
+     const size_t max_peer_announcements;
+ 
+     /** How long to delay requesting data from non-preferred peers */
+-    const std::chrono::seconds nonpref_peer_delay;
++    const std::chrono::milliseconds nonpref_peer_delay;
+ 
+     /**
+      * How long to delay requesting data from overloaded peers (see
+      * max_peer_request_in_flight).
+      */
+-    const std::chrono::seconds overloaded_peer_delay;
++    const std::chrono::milliseconds overloaded_peer_delay;
+ 
+     /**
+      * How long to wait (in microseconds) before a data request from an
+@@ -189,20 +192,20 @@ struct DataRequestParameters {
+ };
+ 
+ static constexpr DataRequestParameters TX_REQUEST_PARAMS{
+-    100,                       // max_peer_request_in_flight
+-    5000,                      // max_peer_announcements
+-    std::chrono::seconds(2),   // nonpref_peer_delay
+-    std::chrono::seconds(2),   // overloaded_peer_delay
+-    std::chrono::seconds(60),  // getdata_interval
+-    NetPermissionFlags::Relay, // bypass_request_limits_permissions
++    100,                             // max_peer_request_in_flight
++    5000,                            // max_peer_announcements
++    std::chrono::milliseconds{200},  // nonpref_peer_delay
++    std::chrono::milliseconds{2000}, // overloaded_peer_delay
++    std::chrono::seconds(60),        // getdata_interval
++    NetPermissionFlags::Relay,       // bypass_request_limits_permissions
+ };
+ 
+ static constexpr DataRequestParameters PROOF_REQUEST_PARAMS{
+-    100,                      // max_peer_request_in_flight
+-    5000,                     // max_peer_announcements
+-    std::chrono::seconds(2),  // nonpref_peer_delay
+-    std::chrono::seconds(2),  // overloaded_peer_delay
+-    std::chrono::seconds(60), // getdata_interval
++    100,                             // max_peer_request_in_flight
++    5000,                            // max_peer_announcements
++    std::chrono::milliseconds{200},  // nonpref_peer_delay
++    std::chrono::milliseconds{2000}, // overloaded_peer_delay
++    std::chrono::seconds(60),        // getdata_interval
+     NetPermissionFlags::
+         BypassProofRequestLimits, // bypass_request_limits_permissions
+ };
+@@ -270,22 +273,6 @@ static constexpr auto AVG_LOCAL_ADDRESS_BROADCAST_INTERVAL{24h};
+ static constexpr auto AVG_ADDRESS_BROADCAST_INTERVAL{30s};
+ /** Delay between rotating the peers we relay a particular address to */
+ static constexpr auto ROTATE_ADDR_RELAY_DEST_INTERVAL{24h};
+-/**
+- * Average delay between trickled inventory transmissions for inbound peers.
+- * Blocks and peers with NetPermissionFlags::NoBan permission bypass this.
+- */
+-static constexpr auto INBOUND_INVENTORY_BROADCAST_INTERVAL{5s};
+-/**
+- * Maximum rate of inventory items to send per second.
+- * Limits the impact of low-fee transaction floods.
+- */
+-static constexpr unsigned int INVENTORY_BROADCAST_PER_SECOND = 7;
+-/** Maximum number of inventory items to send per transmission. */
+-static constexpr unsigned int INVENTORY_BROADCAST_MAX_PER_MB =
+-    INVENTORY_BROADCAST_PER_SECOND *
+-    count_seconds(INBOUND_INVENTORY_BROADCAST_INTERVAL);
+-/** The number of most recently announced transactions a peer can request. */
+-static constexpr unsigned int INVENTORY_MAX_RECENT_RELAY = 3500;
+ /**
+  * Verify that INVENTORY_MAX_RECENT_RELAY is enough to cache everything
+  * typically relayed before unconditional relay from the mempool kicks in. This
+@@ -1412,7 +1399,7 @@ private:
+      */
+     std::chrono::microseconds
+     NextInvToInbounds(std::chrono::microseconds now,
+-                      std::chrono::seconds average_interval)
++                      std::chrono::milliseconds average_interval)
+         EXCLUSIVE_LOCKS_REQUIRED(g_msgproc_mutex);
+ 
+     lotus::v2::net::V2PeerProtocolHandler m_v2_protocol_handler;
+@@ -1796,12 +1783,14 @@ static void AddKnownTx(Peer &peer, const TxId &txid) {
+ 
+     LOCK(tx_relay->m_tx_inventory_mutex);
+     tx_relay->m_tx_inventory_known_filter.insert(txid);
++    tx_relay->m_tx_inventory_to_send.erase(txid);
+ }
+ 
+ static void AddKnownProof(Peer &peer, const avalanche::ProofId &proofid) {
+     if (peer.m_proof_relay != nullptr) {
+         LOCK(peer.m_proof_relay->m_proof_inventory_mutex);
+         peer.m_proof_relay->m_proof_inventory_known_filter.insert(proofid);
++        peer.m_proof_relay->m_proof_inventory_to_send.erase(proofid);
+     }
+ }
+ 
+@@ -1826,7 +1815,7 @@ static bool IsLimitedPeer(const Peer &peer) {
+ 
+ std::chrono::microseconds
+ PeerManagerImpl::NextInvToInbounds(std::chrono::microseconds now,
+-                                   std::chrono::seconds average_interval) {
++                                   std::chrono::milliseconds average_interval) {
+     if (m_next_inv_to_inbounds.load() < now) {
+         // If this function were called from multiple threads simultaneously
+         // it would possible that both update the next send variable, and return
+@@ -8183,6 +8172,222 @@ void PeerManagerImpl::ProcessMessage(
+         return;
+     }
+ 
++    if (msg_type == NetMsgType::GETUTXOROOTS) {
++        const auto span = MakeUCharSpan(vRecv);
++        const std::vector<uint8_t> bytes(span.begin(), span.end());
++        vRecv.ignore(vRecv.size());
++        lotus::v2::GetUtxoRootsRequest req{};
++        std::string err;
++        if (!lotus::v2::DecodeGetUtxoRootsRequest(bytes, req, err)) {
++            Misbehaving(*peer, "bad-getutxoroots");
++            return;
++        }
++
++        uint256 raw_hash;
++        std::memcpy(raw_hash.begin(), req.pivot_block_id.data(), 32);
++        const BlockHash block_hash{raw_hash};
++        CBlockHeader hdr;
++        uint64_t height = 0;
++        {
++            LOCK(cs_main);
++            const CBlockIndex *pindex =
++                m_chainman.m_blockman.LookupBlockIndex(block_hash);
++            if (!pindex || !m_chainman.ActiveChain().Contains(pindex)) {
++                return;
++            }
++            hdr = pindex->GetBlockHeader();
++            height = static_cast<uint64_t>(pindex->nHeight);
++        }
++
++        std::vector<lotus::v2::Coin> coins;
++        lotus::v2::MonetaryState mon_state{};
++        if (!GetV2BlockStateCoinsAndMonetary(block_hash, height, coins,
++                                             mon_state)) {
++            return;
++        }
++        lotus::v2::UtxoSet utxo_set;
++        for (const auto &c : coins) {
++            if (!utxo_set.Insert(c)) {
++                return;
++            }
++        }
++        lotus::v2::UtxoRootsMessage roots_msg{};
++        if (!lotus::v2::ExportUtxoRoots(utxo_set, GetActiveV2ChainId(),
++                                        hdr.ToV2Header(), mon_state,
++                                        roots_msg, err)) {
++            return;
++        }
++        const std::vector<uint8_t> payload =
++            lotus::v2::EncodeUtxoRootsMessage(roots_msg);
++        MakeAndPushMessage(pfrom, NetMsgType::UTXOROOTS, Span{payload});
++        return;
++    }
++
++    if (msg_type == NetMsgType::GETUTXOSHARD) {
++        const auto span = MakeUCharSpan(vRecv);
++        const std::vector<uint8_t> bytes(span.begin(), span.end());
++        vRecv.ignore(vRecv.size());
++        lotus::v2::GetUtxoShardRequest req{};
++        std::string err;
++        if (!lotus::v2::DecodeGetUtxoShardRequest(bytes, req, err)) {
++            Misbehaving(*peer, "bad-getutxoshard");
++            return;
++        }
++
++        uint256 raw_hash;
++        std::memcpy(raw_hash.begin(), req.pivot_block_id.data(), 32);
++        const BlockHash block_hash{raw_hash};
++        uint64_t height = 0;
++        {
++            LOCK(cs_main);
++            const CBlockIndex *pindex =
++                m_chainman.m_blockman.LookupBlockIndex(block_hash);
++            if (!pindex || !m_chainman.ActiveChain().Contains(pindex)) {
++                return;
++            }
++            height = static_cast<uint64_t>(pindex->nHeight);
++        }
++
++        std::vector<lotus::v2::Coin> coins;
++        lotus::v2::MonetaryState mon_state{};
++        if (!GetV2BlockStateCoinsAndMonetary(block_hash, height, coins,
++                                             mon_state)) {
++            return;
++        }
++        lotus::v2::UtxoSet utxo_set;
++        for (const auto &c : coins) {
++            if (!utxo_set.Insert(c)) {
++                return;
++            }
++        }
++        lotus::v2::UtxoShardMessage shard_msg{};
++        if (!lotus::v2::ExportUtxoShard(utxo_set, req.pivot_block_id,
++                                        req.prefix_depth, req.prefix_bits,
++                                        shard_msg, err)) {
++            return;
++        }
++        std::vector<uint8_t> payload;
++        if (!lotus::v2::EncodeUtxoShardMessage(shard_msg, payload, err)) {
++            return;
++        }
++        MakeAndPushMessage(pfrom, NetMsgType::UTXOSHARD, Span{payload});
++        return;
++    }
++
++    if (msg_type == NetMsgType::GETBLOCKUNDO) {
++        const auto span = MakeUCharSpan(vRecv);
++        const std::vector<uint8_t> bytes(span.begin(), span.end());
++        vRecv.ignore(vRecv.size());
++        lotus::v2::GetBlockUndoRequest req{};
++        std::string err;
++        if (!lotus::v2::DecodeGetBlockUndoRequest(bytes, req, err)) {
++            Misbehaving(*peer, "bad-getblockundo");
++            return;
++        }
++
++        uint256 raw_hash;
++        std::memcpy(raw_hash.begin(), req.block_id.data(), 32);
++        const BlockHash block_hash{raw_hash};
++        BlockHash parent_hash;
++        uint64_t parent_height = 0;
++        CBlock block;
++        {
++            LOCK(cs_main);
++            const CBlockIndex *pindex =
++                m_chainman.m_blockman.LookupBlockIndex(block_hash);
++            if (!pindex || pindex->nHeight <= 0 || !pindex->pprev ||
++                !m_chainman.ActiveChain().Contains(pindex)) {
++                return;
++            }
++            if (!m_chainman.m_blockman.ReadBlock(block, *pindex)) {
++                return;
++            }
++            parent_hash = pindex->pprev->GetBlockHash();
++            parent_height = static_cast<uint64_t>(pindex->pprev->nHeight);
++        }
++
++        std::vector<lotus::v2::Coin> parent_coins;
++        lotus::v2::MonetaryState parent_mon_state{};
++        if (!GetV2BlockStateCoinsAndMonetary(parent_hash, parent_height,
++                                             parent_coins, parent_mon_state)) {
++            return;
++        }
++        struct V2OutpointLess {
++            bool operator()(const lotus::v2::Outpoint &a,
++                            const lotus::v2::Outpoint &b) const {
++                if (a.tx_id != b.tx_id) {
++                    return a.tx_id < b.tx_id;
++                }
++                return a.index < b.index;
++            }
++        };
++        std::map<lotus::v2::Outpoint, lotus::v2::Coin, V2OutpointLess>
++            parent_view;
++        for (const auto &c : parent_coins) {
++            parent_view.emplace(c.outpoint, c);
++        }
++
++        std::set<lotus::v2::Outpoint, V2OutpointLess> created_outpoints;
++        for (const auto &ptx : block.vtx) {
++            const CTransaction &tx = *ptx;
++            lotus::v2::Hash txid{};
++            std::memcpy(txid.data(), tx.GetId().begin(), 32);
++            for (size_t j = 0; j < tx.vout.size(); ++j) {
++                if (tx.vout[j].scriptPubKey.IsUnspendable()) {
++                    continue;
++                }
++                const lotus::v2::Output v2out = tx.vout[j].ToV2Output();
++                if (!v2out.IsBurn()) {
++                    created_outpoints.insert(
++                        lotus::v2::Outpoint{txid, static_cast<uint32_t>(j)});
++                }
++            }
++        }
++
++        lotus::v2::BlockUndoMessage undo_msg{};
++        undo_msg.block_id = req.block_id;
++        undo_msg.parent_monetary_state =
++            lotus::v2::EncodeMonetaryState(parent_mon_state);
++        for (const auto &ptx : block.vtx) {
++            const CTransaction &tx = *ptx;
++            if (tx.IsCoinBase()) {
++                continue;
++            }
++            for (const auto &txin : tx.vin) {
++                if (txin.nFlags == 3) {
++                    continue;
++                }
++                lotus::v2::Outpoint op{};
++                std::memcpy(op.tx_id.data(), txin.prevout.GetTxId().begin(),
++                            32);
++                op.index = txin.prevout.GetN();
++                if (created_outpoints.count(op) > 0) {
++                    // Intra-block spend (I_h^intra): excluded from BlockUndo
++                    continue;
++                }
++                const auto it = parent_view.find(op);
++                if (it == parent_view.end()) {
++                    return;
++                }
++                undo_msg.prior_spent_coins.push_back(it->second);
++            }
++        }
++        std::vector<uint8_t> payload;
++        if (!lotus::v2::EncodeBlockUndoMessage(undo_msg, payload, err)) {
++            return;
++        }
++        MakeAndPushMessage(pfrom, NetMsgType::BLOCKUNDO, Span{payload});
++        return;
++    }
++
++
++    if (msg_type == NetMsgType::UTXOROOTS ||
++        msg_type == NetMsgType::UTXOSHARD ||
++        msg_type == NetMsgType::BLOCKUNDO) {
++        vRecv.ignore(vRecv.size());
++        return;
++    }
++
+     // Ignore unknown commands for extensibility
+     LogDebug(BCLog::NET, "Unknown command \"%s\" from peer=%d\n",
+              SanitizeString(msg_type), pfrom.GetId());
+@@ -9171,9 +9376,9 @@ bool PeerManagerImpl::SendMessages(const Config &config, CNode *pto) {
+                     next = NextInvToInbounds(
+                         current_time, INBOUND_INVENTORY_BROADCAST_INTERVAL);
+                 } else {
+-                    // Skip delay for outbound peers, as there is less privacy
+-                    // concern for them.
+-                    next = current_time;
++                    next = current_time +
++                           m_rng.rand_exp_duration(
++                               OUTBOUND_INVENTORY_BROADCAST_INTERVAL);
+                 }
+             }
+ 
+diff --git a/src/net_processing.h b/src/net_processing.h
+index ab0964bc52..d2ba4c34d9 100644
+--- a/src/net_processing.h
++++ b/src/net_processing.h
+@@ -45,6 +45,36 @@ static const unsigned int MAX_CMPCTBLOCKS_INFLIGHT_PER_BLOCK = 3;
+ /** The maximum number of address records permitted in an ADDR message. */
+ static constexpr size_t MAX_ADDR_TO_SEND{1000};
+ 
++/**
++ * Average delay between trickled inventory transmissions for inbound peers.
++ * Blocks and peers with NetPermissionFlags::NoBan permission bypass this.
++ */
++static constexpr std::chrono::milliseconds
++    INBOUND_INVENTORY_BROADCAST_INTERVAL{500};
++/**
++ * Average delay between trickled inventory transmissions for outbound peers.
++ * Batches outbound inv messages over a short suppression window so incoming
++ * invs and Merklix reconciliation summaries can suppress redundant outbound
++ * invs.
++ */
++static constexpr std::chrono::milliseconds
++    OUTBOUND_INVENTORY_BROADCAST_INTERVAL{150};
++/**
++ * Maximum rate of inventory items to send per second.
++ * Scaled for V2 high-throughput transaction relay.
++ */
++static constexpr unsigned int INVENTORY_BROADCAST_PER_SECOND = 250;
++/**
++ * Maximum number of inventory items to send per transmission per MB of max
++ * block size.
++ */
++static constexpr unsigned int INVENTORY_BROADCAST_MAX_PER_MB =
++    INVENTORY_BROADCAST_PER_SECOND * 5;
++static constexpr unsigned int INVENTORY_BROADCAST_MAX =
++    INVENTORY_BROADCAST_MAX_PER_MB;
++/** The number of most recently announced transactions a peer can request. */
++static constexpr unsigned int INVENTORY_MAX_RECENT_RELAY = 35000;
++
+ /**
+  * Number of headers sent in one getheaders result. We rely on the assumption
+  * that if a peer sends less than this number, we reached its tip. Changing
+diff --git a/src/test/v2_protocol_handler_tests.cpp b/src/test/v2_protocol_handler_tests.cpp
+index dbb4ca877d..d82ea6fdf2 100644
+--- a/src/test/v2_protocol_handler_tests.cpp
++++ b/src/test/v2_protocol_handler_tests.cpp
+@@ -993,4 +993,117 @@ BOOST_AUTO_TEST_CASE(adversarial_c1_d1_d2_hardening_gates) {
+ }
+ 
+ 
++BOOST_AUTO_TEST_CASE(outbound_inv_queue_suppression_window) {
++    LOCK(NetEventsInterface::g_msgproc_mutex);
++
++    const Config &config = m_node.chainman->GetConfig();
++    auto connman = std::make_unique<ConnmanTestMsg>(config, 0x3559, 0x3559,
++                                                    *m_node.addrman);
++    PeerManager::Options peer_opts;
++    peer_opts.deterministic_rng = true;
++    auto peerman = PeerManager::make(*connman, *m_node.addrman, nullptr,
++                                     *m_node.chainman, *m_node.mempool,
++                                     /*avalanche=*/nullptr, peer_opts);
++
++    CConnman::Options options;
++    options.m_msgproc = {peerman.get()};
++    connman->Init(options);
++
++    const int64_t base_time = 1'700'000'000;
++    SetMockTime(base_time);
++
++    CAddress addr(MakeTestIp(0xa0b0c030), NODE_NONE);
++    CNode peer_node(/*id=*/303, /*sock=*/nullptr, addr,
++                    /*nKeyedNetGroupIn=*/0, /*nLocalHostNonceIn=*/0,
++                    /*nLocalExtraEntropyIn=*/0, CAddress(), /*pszDest=*/"",
++                    ConnectionType::OUTBOUND_FULL_RELAY,
++                    /*inbound_onion=*/false);
++    connman->Handshake(
++        /*node=*/peer_node,
++        /*successfully_connected=*/true,
++        /*remote_services=*/ServiceFlags(NODE_NETWORK),
++        /*local_services=*/ServiceFlags(NODE_NETWORK),
++        /*version=*/PROTOCOL_VERSION,
++        /*relay_txs=*/true);
++
++    // Prime the outbound inv send timer via an initial SendMessages call.
++    BOOST_CHECK(peerman->SendMessages(config, &peer_node));
++    {
++        LOCK(peer_node.cs_vSend);
++        peer_node.vSendMsg.clear();
++    }
++
++    // Add two transactions to the mempool and queue both for relay to peer_node.
++    FastRandomContext rng(uint256{55});
++    CTransactionRef tx_suppressed = MakeNonCoinbaseTx(rng, 0x31);
++    CTransactionRef tx_unsuppressed = MakeNonCoinbaseTx(rng, 0x32);
++    BOOST_REQUIRE(tx_suppressed && tx_unsuppressed);
++
++    TestMemPoolEntryHelper entry;
++    {
++        LOCK2(cs_main, m_node.mempool->cs);
++        m_node.mempool->addUnchecked(entry.FromTx(tx_suppressed));
++        m_node.mempool->addUnchecked(entry.FromTx(tx_unsuppressed));
++    }
++
++    peerman->RelayTransaction(tx_suppressed->GetId());
++    peerman->RelayTransaction(tx_unsuppressed->GetId());
++
++    // Simulate receiving a remote INV for tx_suppressed during the outbound
++    // suppression window (before mocktime advances).
++    {
++        std::vector<CInv> remote_invs{CInv(MSG_TX, tx_suppressed->GetId())};
++        DataStream inv_stream{};
++        inv_stream << remote_invs;
++        std::atomic<bool> interrupt{false};
++        peerman->ProcessMessage(config, peer_node, NetMsgType::INV, inv_stream,
++                                std::chrono::seconds{base_time}, interrupt);
++    }
++
++    // Advance mocktime past the outbound broadcast interval so the queue
++    // flushes.
++    SetMockTime(base_time + 5);
++    BOOST_CHECK(peerman->SendMessages(config, &peer_node));
++
++    // Inspect sent INV messages: tx_unsuppressed must be announced, while
++    // tx_suppressed must have been suppressed by the incoming INV.
++    bool saw_suppressed = false;
++    bool saw_unsuppressed = false;
++    V1TransportDeserializer deserializer(config, peer_node.GetId());
++    {
++        LOCK(peer_node.cs_vSend);
++        for (const auto &chunk : peer_node.vSendMsg) {
++            Span<const uint8_t> sp{chunk};
++            while (!sp.empty()) {
++                const int ret = deserializer.Read(config, sp);
++                BOOST_REQUIRE_GE(ret, 0);
++                if (deserializer.Complete()) {
++                    bool reject_message = false;
++                    CNetMessage msg = deserializer.GetMessage(0us, reject_message);
++                    BOOST_CHECK(!reject_message);
++                    if (msg.m_type == NetMsgType::INV) {
++                        std::vector<CInv> sent_invs;
++                        msg.m_recv >> sent_invs;
++                        for (const CInv &inv : sent_invs) {
++                            if (inv.IsMsgTx()) {
++                                if (inv.hash == tx_suppressed->GetId()) {
++                                    saw_suppressed = true;
++                                }
++                                if (inv.hash == tx_unsuppressed->GetId()) {
++                                    saw_unsuppressed = true;
++                                }
++                            }
++                        }
++                    }
++                }
++            }
++        }
++    }
++    BOOST_CHECK(!saw_suppressed);
++    BOOST_CHECK(saw_unsuppressed);
++
++    SetMockTime(0);
++    peerman->FinalizeNode(config, peer_node);
++}
++
+ BOOST_AUTO_TEST_SUITE_END()
+-- 
+2.50.1 (Apple Git-155)
+

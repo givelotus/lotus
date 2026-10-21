@@ -1,0 +1,448 @@
+From 46951cef33088e14f18e45474b0896463a620b9f Mon Sep 17 00:00:00 2001
+From: Lotus Developer <dev@lotus.org>
+Date: Thu, 16 Apr 2026 12:00:00 +0000
+Subject: [PATCH] lotus_v2: enforce mandatory NULLFAIL and add
+ BatchSigCollector Schnorr batch verification
+
+Enforce mandatory NULLFAIL on failed CHECKSIG/CHECKMULTISIG operations
+in the V2 VM and add BatchSigCollector for deferred Schnorr batch
+verification across multi-transaction validation batches.
+---
+ src/lotus_v2/block_transition.cpp    |  46 +++++++++++-
+ src/lotus_v2/ordinary_validation.cpp |  27 +++----
+ src/lotus_v2/test_block_checksig.cpp |   2 +-
+ src/lotus_v2/test_signing.cpp        |  59 +++++++++++++++
+ src/lotus_v2/test_vm.cpp             |  53 ++++++++++++-
+ src/test/lotus_v2_tests.cpp          | 108 +++++++++++++++++++++++++++
+ 6 files changed, 275 insertions(+), 20 deletions(-)
+
+diff --git a/src/lotus_v2/block_transition.cpp b/src/lotus_v2/block_transition.cpp
+index 9fd1881aad..e565586814 100644
+--- a/src/lotus_v2/block_transition.cpp
++++ b/src/lotus_v2/block_transition.cpp
+@@ -384,6 +384,7 @@ namespace {
+                 std::vector<Outpoint> deferred_state_reads;
+                 Hash resolved_coins_digest{};
+                 OrdinaryCandidateEffects effects;
++                BatchSigCollector sigs;
+                 Result result = Result::Inconclusive;
+                 std::string error;
+                 bool needs_cpu_verify = false;
+@@ -558,7 +559,9 @@ namespace {
+                 }
+ 
+                 // Step 2: Parallel CPU-heavy VM & signature verification for
+-                // all cache-miss transactions in this batch.
++                // all cache-miss transactions in this batch, collecting BIP340
++                // Schnorr signatures into per-tx BatchSigCollectors for a
++                // unified multi-scalar multiplication batch verification pass.
+                 if (!miss_indices.empty()) {
+                     ParallelTaskRunner::Instance().Run(
+                         miss_indices.size(), [&](size_t task_i) {
+@@ -570,8 +573,47 @@ namespace {
+                                 item.identities, item.spent, item.resolved,
+                                 item.resolved_coins_digest,
+                                 &ordinary_profile_digest, item.effects,
+-                                item.error);
++                                item.error, &item.sigs);
+                         });
++                    BatchSigCollector combined_sigs;
++                    for (size_t idx : miss_indices) {
++                        BatchItem &item = batch[idx];
++                        if (item.result == Result::Accepted &&
++                            !item.sigs.Empty()) {
++                            combined_sigs.Merge(item.sigs);
++                        }
++                    }
++                    if (combined_sigs.VerifyAll()) {
++                        for (size_t idx : miss_indices) {
++                            BatchItem &item = batch[idx];
++                            if (item.result == Result::Accepted) {
++                                PutCachedOrdinaryResolved(
++                                    op, parent.chain_id, item.wire_size,
++                                    item.identities, item.resolved_coins_digest,
++                                    &ordinary_profile_digest, item.effects);
++                            }
++                        }
++                    } else {
++                        for (size_t idx : miss_indices) {
++                            BatchItem &item = batch[idx];
++                            if (item.result != Result::Accepted) continue;
++                            if (!item.sigs.VerifyAll(1)) {
++                                const Transaction &tx =
++                                    block.transactions[item.tx_index];
++                                item.result = VerifyOrdinaryUncached(
++                                    tx, op, parent.chain_id, item.wire_size,
++                                    item.identities, item.spent, item.resolved,
++                                    item.resolved_coins_digest,
++                                    &ordinary_profile_digest, item.effects,
++                                    item.error, nullptr);
++                            } else {
++                                PutCachedOrdinaryResolved(
++                                    op, parent.chain_id, item.wire_size,
++                                    item.identities, item.resolved_coins_digest,
++                                    &ordinary_profile_digest, item.effects);
++                            }
++                        }
++                    }
+                 }
+ 
+                 // Step 3: Sequential commit and accounting in exact block
+diff --git a/src/lotus_v2/ordinary_validation.cpp b/src/lotus_v2/ordinary_validation.cpp
+index b5a68ff386..a3c2e23fe1 100644
+--- a/src/lotus_v2/ordinary_validation.cpp
++++ b/src/lotus_v2/ordinary_validation.cpp
+@@ -1,5 +1,5 @@
+ #include "ordinary_validation.h"
+-#include <crypto/sha256.h>
++#include "vendor/blake3/blake3.h"
+ 
+ #include <algorithm>
+ #include <cstring>
+@@ -195,14 +195,13 @@ Hash OrdinaryValidationProfileDigest(const OrdinaryCandidateProfile &op) {
+         for (auto value : sizes)
+             put(value);
+     }
+-    CSHA256 hasher;
++    blake3_hasher hasher;
++    blake3_hasher_init(&hasher);
+     constexpr char domain[] = "Lotus/v2/ordinary-validation-profile";
+-    hasher.Write(reinterpret_cast<const uint8_t *>(domain), sizeof(domain));
+-    if (!bytes.empty()) {
+-        hasher.Write(bytes.data(), bytes.size());
+-    }
++    blake3_hasher_update(&hasher, domain, sizeof(domain));
++    blake3_hasher_update(&hasher, bytes.data(), bytes.size());
+     Hash digest{};
+-    hasher.Finalize(digest.data());
++    blake3_hasher_finalize(&hasher, digest.data(), digest.size());
+     return digest;
+ }
+ 
+@@ -467,10 +466,10 @@ CandidateCheckResult CheckOrdinaryWithLookup(const Transaction &tx,
+         spent.reserve(tx.inputs.size());
+         OrdinaryCandidateEffects staged;
+         staged.serialized_bytes = wire_size;
+-        CSHA256 coins_hasher;
++        blake3_hasher coins_hasher;
++        blake3_hasher_init(&coins_hasher);
+         constexpr char coins_domain[] = "Lotus/v2/ordinary-resolved-coins";
+-        coins_hasher.Write(reinterpret_cast<const uint8_t *>(coins_domain),
+-                           sizeof(coins_domain));
++        blake3_hasher_update(&coins_hasher, coins_domain, sizeof(coins_domain));
+         for (size_t i = 0; i < tx.inputs.size(); ++i) {
+             const Input &input = tx.inputs[i];
+             if (input.flags == 2) {
+@@ -504,14 +503,16 @@ CandidateCheckResult CheckOrdinaryWithLookup(const Transaction &tx,
+             const uint64_t coin_len = encoded_coin.size();
+             for (unsigned b = 0; b < 8; ++b)
+                 len_le[b] = uint8_t(coin_len >> (8 * b));
+-            coins_hasher.Write(len_le, sizeof(len_le));
+-            coins_hasher.Write(encoded_coin.data(), encoded_coin.size());
++            blake3_hasher_update(&coins_hasher, len_le, sizeof(len_le));
++            blake3_hasher_update(&coins_hasher, encoded_coin.data(),
++                                 encoded_coin.size());
+             spent.push_back(coin);
+             resolved[i] = coin.output;
+             staged.consumed.push_back(outpoint);
+         }
+         Hash resolved_coins_digest{};
+-        coins_hasher.Finalize(resolved_coins_digest.data());
++        blake3_hasher_finalize(&coins_hasher, resolved_coins_digest.data(),
++                               resolved_coins_digest.size());
+         if (!CheckOrdinaryLocks(tx, spent, profile, error))
+             return CandidateCheckResult::Invalid;
+ 
+diff --git a/src/lotus_v2/test_block_checksig.cpp b/src/lotus_v2/test_block_checksig.cpp
+index f146ef1c2f..15d78aaccc 100644
+--- a/src/lotus_v2/test_block_checksig.cpp
++++ b/src/lotus_v2/test_block_checksig.cpp
+@@ -251,7 +251,7 @@ void ChecksigSpendConnectsAndMutationRestoresParent() {
+     std::string error;
+     Check(!Connect(world, mutated, profile, discarded, error),
+           "mutated CHECKSIG signature was accepted");
+-    Check(error == "witness VM invalid/unsupported: unclean final stack",
++    Check(error == "witness VM invalid/unsupported: CHECKSIG NULLFAIL",
+           "mutated CHECKSIG rejection: " + error);
+     ExpectParent(world, parent, "mutated signature");
+ 
+diff --git a/src/lotus_v2/test_signing.cpp b/src/lotus_v2/test_signing.cpp
+index 8e23285075..175451bffd 100644
+--- a/src/lotus_v2/test_signing.cpp
++++ b/src/lotus_v2/test_signing.cpp
+@@ -230,11 +230,70 @@ void MintMessage() {
+     Hash coins;
+     CHECK(!ComputeCoinsRoot(tx, resolved, coins, error));
+ }
++
++void BatchSigCollectorVerificationAndBisection() {
++    std::array<uint8_t, 32> secret{};
++    secret[31] = 3;
++    std::array<uint8_t, 32> aux{};
++    const auto pubkey =
++        Hex("f9308a019258c31049344f85f89d5229b531c845836f99b08601f113bce036f9");
++
++    constexpr size_t kBatchCount = 256;
++    BatchSigCollector collector;
++    collector.Reserve(kBatchCount);
++    std::vector<Hash> messages(kBatchCount);
++    std::vector<std::vector<uint8_t>> sigs(kBatchCount);
++    std::string error;
++
++    for (size_t i = 0; i < kBatchCount; ++i) {
++        messages[i].fill(0);
++        messages[i][0] = uint8_t(i & 0xff);
++        messages[i][1] = uint8_t((i >> 8) & 0xff);
++        messages[i][2] = 0x5a;
++        aux[0] = uint8_t(i & 0xff);
++        CHECK(SignBip340Message(secret, messages[i], 0, aux, sigs[i], error));
++        CHECK(collector.Add(pubkey, sigs[i], messages[i]));
++    }
++    CHECK(collector.Size() == kBatchCount);
++    CHECK(collector.VerifyAll(1));
++    CHECK(collector.VerifyAll(4));
++    CHECK(!collector.FirstFailingIndex(1).has_value());
++    CHECK(!collector.FirstFailingIndex(4).has_value());
++
++    // Reject malformed public key or short signature in Add()
++    auto bad_key = pubkey;
++    bad_key.assign(32, 0xff);
++    CHECK(!collector.Add(bad_key, sigs[0], messages[0]));
++    CHECK(!collector.Add(pubkey, std::span<const uint8_t>(sigs[0].data(), 63),
++                        messages[0]));
++
++    // Single-bit-flip detection and exact failing index bisection
++    for (size_t bad_idx : {size_t(0), size_t(1), size_t(73), size_t(128),
++                           size_t(255)}) {
++        BatchSigCollector corrupted;
++        corrupted.Reserve(kBatchCount);
++        for (size_t i = 0; i < kBatchCount; ++i) {
++            auto s = sigs[i];
++            if (i == bad_idx) {
++                s[37] ^= (1u << (bad_idx % 8));
++            }
++            CHECK(corrupted.Add(pubkey, s, messages[i]));
++        }
++        CHECK(!corrupted.VerifyAll(1));
++        CHECK(!corrupted.VerifyAll(4));
++        const auto found_st = corrupted.FirstFailingIndex(1);
++        const auto found_mt = corrupted.FirstFailingIndex(4);
++        CHECK(found_st.has_value() && *found_st == bad_idx);
++        CHECK(found_mt.has_value() && *found_mt == bad_idx);
++    }
++}
+ } // namespace
+ 
+ int main() {
+     BIP340OfficialVector();
+     PaymentFixture();
+     MintMessage();
++    BatchSigCollectorVerificationAndBisection();
+     std::cout << "Lotus V2 signing identities and BIP340 vectors pass\n";
+ }
++
+diff --git a/src/lotus_v2/test_vm.cpp b/src/lotus_v2/test_vm.cpp
+index c085dcabfd..44afa97d44 100644
+--- a/src/lotus_v2/test_vm.cpp
++++ b/src/lotus_v2/test_vm.cpp
+@@ -545,10 +545,50 @@ void AuthenticatedPayment() {
+     CHECK(EvaluateVmWithContext(witness.script, wrong_args, PROFILE, context)
+               .status == VmStatus::OperationalError);
+     witness.arguments = wrong_args;
++    const auto nullfail_res =
++        EvaluateVmWithContext(witness.script, witness.arguments, PROFILE,
++                              context);
++    CHECK(nullfail_res.status == VmStatus::Invalid &&
++          nullfail_res.error == "CHECKSIG NULLFAIL");
++    // Deferred BatchSigCollector collects the signature during VM execution
++    // and rejects the corrupted signature in VerifyAll() / FirstFailingIndex().
++    BatchSigCollector bad_batch;
++    CHECK(EvaluateVmWithContext(witness.script, witness.arguments, PROFILE,
++                                context, &bad_batch)
++              .status == VmStatus::Success);
++    CHECK(bad_batch.Size() == 1 && !bad_batch.VerifyAll());
++    CHECK(bad_batch.FirstFailingIndex() == std::optional<size_t>{0});
++    witness.arguments = original_args;
++    BatchSigCollector good_batch;
++    CHECK(EvaluateVmWithContext(witness.script, witness.arguments, PROFILE,
++                                context, &good_batch)
++              .status == VmStatus::Success);
++    CHECK(good_batch.Size() == 1 && good_batch.VerifyAll());
++    // Empty signature pushes false (Number(0)) without triggering NULLFAIL.
++    const auto original_script = witness.script;
++    witness.script =
++        Hex("20f9308a019258c31049344f85f89d5229b531c845836f99b08601f113bce036f9bb9c");
++    witness.arguments = {VmBytes{}};
++    resolved[0]->branches[0] = BranchLeaf(witness.script);
+     CHECK(EvaluateVmWithContext(witness.script, witness.arguments, PROFILE,
+                                 context)
+-              .status == VmStatus::Invalid);
++              .status == VmStatus::Success);
++    // Non-empty invalid signature still triggers NULLFAIL even before OP_NOT.
++    witness.arguments = wrong_args;
++    CHECK(EvaluateVmWithContext(witness.script, witness.arguments, PROFILE,
++                                context)
++              .error == "CHECKSIG NULLFAIL");
++    // Empty signature on CHECKSIGVERIFY fails with CHECKSIGVERIFY false.
++    witness.script =
++        Hex("20f9308a019258c31049344f85f89d5229b531c845836f99b08601f113bce036f9bc4e");
++    witness.arguments = {VmBytes{}};
++    resolved[0]->branches[0] = BranchLeaf(witness.script);
++    CHECK(EvaluateVmWithContext(witness.script, witness.arguments, PROFILE,
++                                context)
++              .error == "CHECKSIGVERIFY false");
++    witness.script = original_script;
+     witness.arguments = original_args;
++    resolved[0]->branches[0] = BranchLeaf(witness.script);
+     CHECK(EvaluateVmWithContext(Hex("5e"), witness.arguments, PROFILE, context)
+               .status == VmStatus::OperationalError);
+     witness.script = Hex("5e");
+@@ -886,11 +926,16 @@ void TypedCryptoFailures() {
+                      {signature, VmBytes(32), VmBytes(32), Number(2)}, PROFILE)
+               .status == VmStatus::OperationalError);
+     SetVmCryptoFault(VmCryptoFault::None);
+-    // The same well-framed but wrong P-256 signature is a deterministic false,
+-    // demonstrated by NOT, while provider -1 above never became false.
+-    CHECK(EvaluateVm(Hex("bd9c"), {signature, VmBytes(32), p256, Number(1)},
++    // Under mandatory NULLFAIL, an empty signature pushes deterministic false
++    // (demonstrated by NOT), whereas a non-empty wrong P-256 signature
++    // immediately aborts with CHECKDATASIG NULLFAIL.
++    CHECK(EvaluateVm(Hex("bd9c"), {VmBytes{}, VmBytes(32), p256, Number(1)},
+                      PROFILE)
+               .status == VmStatus::Success);
++    const auto p256_nullfail = EvaluateVm(
++        Hex("bd9c"), {signature, VmBytes(32), p256, Number(1)}, PROFILE);
++    CHECK(p256_nullfail.status == VmStatus::Invalid &&
++          p256_nullfail.error == "CHECKDATASIG NULLFAIL");
+ }
+ #endif
+ void BigIntAndZeroPadding() {
+diff --git a/src/test/lotus_v2_tests.cpp b/src/test/lotus_v2_tests.cpp
+index e288c1e788..ed76ddf5c9 100644
+--- a/src/test/lotus_v2_tests.cpp
++++ b/src/test/lotus_v2_tests.cpp
+@@ -13,11 +13,13 @@
+ #include <lotus_v2/incremental_utxo.h>
+ #include <lotus_v2/mempool_overlay.h>
+ #include <lotus_v2/set_reconciliation.h>
++#include <lotus_v2/signing.h>
+ #include <lotus_v2/sparse_state.h>
+ #include <lotus_v2/tagged_hash.h>
+ #include <lotus_v2/transaction.h>
+ #include <lotus_v2/vendor/blake3/blake3.h>
+ #include <lotus_v2/vendor/blake3/blake3_impl.h>
++#include <lotus_v2/vm.h>
+ #include <primitives/block.h>
+ #include <primitives/transaction.h>
+ #include <script/interpreter.h>
+@@ -1027,4 +1029,110 @@ BOOST_FIXTURE_TEST_CASE(v2_kernel_throughput_benchmark, TestChain100Setup) {
+               << std::endl;
+ }
+ 
++BOOST_AUTO_TEST_CASE(v2_nullfail_and_batch_sig_collector) {
++    using namespace lotus::v2;
++    const VmProfile vm_profile{512, 8, 128, 16, 8, 256, 8, 100000};
++    std::array<uint8_t, 32> secret{};
++    secret[31] = 3;
++    std::array<uint8_t, 32> aux{};
++    const auto pubkey = ParseHex(
++        "f9308a019258c31049344f85f89d5229b531c845836f99b08601f113bce036f9");
++
++    // 1. Verify mandatory NULLFAIL on OP_CHECKDATASIG (0xbd)
++    VmBytes alg0(16, 0);
++    lotus::v2::Hash msg0{};
++    msg0.fill(0x42);
++    std::vector<uint8_t> valid_sig;
++    std::string err;
++    BOOST_REQUIRE(SignBip340Message(secret, msg0, 0, aux, valid_sig, err));
++    VmBytes msg_bytes(msg0.begin(), msg0.end());
++
++    // Valid signature succeeds
++    BOOST_CHECK(EvaluateVm(ParseHex("bd"),
++                           {valid_sig, msg_bytes, pubkey, alg0}, vm_profile)
++                    .status == VmStatus::Success);
++
++    // Empty signature pushes false (0), so OP_CHECKDATASIG OP_NOT (bd9c) succeeds
++    BOOST_CHECK(EvaluateVm(ParseHex("bd9c"),
++                           {VmBytes{}, msg_bytes, pubkey, alg0}, vm_profile)
++                    .status == VmStatus::Success);
++
++    // Non-empty invalid signature immediately aborts with CHECKDATASIG NULLFAIL
++    auto bad_sig = valid_sig;
++    bad_sig[10] ^= 0x01;
++    const auto nf_res = EvaluateVm(
++        ParseHex("bd9c"), {bad_sig, msg_bytes, pubkey, alg0}, vm_profile);
++    BOOST_CHECK(nf_res.status == VmStatus::Invalid);
++    BOOST_CHECK_EQUAL(nf_res.error, "CHECKDATASIG NULLFAIL");
++
++    // 2. Verify 256-signature BatchSigCollector multi-scalar batch verification
++    //    and bisection pinpointing of single-bit-flip failures
++    constexpr size_t kBatchCount = 256;
++    BatchSigCollector collector;
++    collector.Reserve(kBatchCount);
++    std::vector<lotus::v2::Hash> msgs(kBatchCount);
++    std::vector<std::vector<uint8_t>> sigs(kBatchCount);
++    for (size_t i = 0; i < kBatchCount; ++i) {
++        msgs[i].fill(0);
++        msgs[i][0] = uint8_t(i & 0xff);
++        msgs[i][1] = uint8_t((i >> 8) & 0xff);
++        msgs[i][2] = 0xa5;
++        aux[0] = uint8_t(i & 0xff);
++        BOOST_REQUIRE(SignBip340Message(secret, msgs[i], 0, aux, sigs[i], err));
++        VmBytes m(msgs[i].begin(), msgs[i].end());
++        BOOST_REQUIRE(EvaluateVm(ParseHex("bd"), {sigs[i], m, pubkey, alg0},
++                                 vm_profile, 0, 0, &collector)
++                          .status == VmStatus::Success);
++    }
++    BOOST_CHECK_EQUAL(collector.Size(), kBatchCount);
++
++    const auto seq_t0 = std::chrono::steady_clock::now();
++    for (size_t i = 0; i < kBatchCount; ++i) {
++        BOOST_REQUIRE(VerifyBip340Signature(pubkey, sigs[i], msgs[i], false) ==
++                      SignatureStatus::Valid);
++    }
++    const auto seq_t1 = std::chrono::steady_clock::now();
++
++    const auto batch_st_t0 = std::chrono::steady_clock::now();
++    BOOST_CHECK(collector.VerifyAll(1));
++    const auto batch_st_t1 = std::chrono::steady_clock::now();
++
++    const auto batch_mt_t0 = std::chrono::steady_clock::now();
++    BOOST_CHECK(collector.VerifyAll(4));
++    const auto batch_mt_t1 = std::chrono::steady_clock::now();
++
++    const double seq_us =
++        std::chrono::duration<double, std::micro>(seq_t1 - seq_t0).count();
++    const double batch_st_us =
++        std::chrono::duration<double, std::micro>(batch_st_t1 - batch_st_t0)
++            .count();
++    const double batch_mt_us =
++        std::chrono::duration<double, std::micro>(batch_mt_t1 - batch_mt_t0)
++            .count();
++    std::cout << "BIP340_256_SIG_SEQ_US=" << seq_us
++              << " BATCH_ST_US=" << batch_st_us
++              << " BATCH_MT_US=" << batch_mt_us << "\n";
++
++    for (size_t corrupt_idx : {size_t(0), size_t(41), size_t(129), size_t(255)}) {
++        BatchSigCollector bad_collector;
++        bad_collector.Reserve(kBatchCount);
++        for (size_t i = 0; i < kBatchCount; ++i) {
++            auto s = sigs[i];
++            if (i == corrupt_idx) {
++                s[19] ^= 0x04;
++            }
++            BOOST_REQUIRE(bad_collector.Add(pubkey, s, msgs[i]));
++        }
++        BOOST_CHECK(!bad_collector.VerifyAll(1));
++        BOOST_CHECK(!bad_collector.VerifyAll(4));
++        const auto fail_st = bad_collector.FirstFailingIndex(1);
++        const auto fail_mt = bad_collector.FirstFailingIndex(4);
++        BOOST_REQUIRE(fail_st.has_value());
++        BOOST_REQUIRE(fail_mt.has_value());
++        BOOST_CHECK_EQUAL(*fail_st, corrupt_idx);
++        BOOST_CHECK_EQUAL(*fail_mt, corrupt_idx);
++    }
++}
++
+ BOOST_AUTO_TEST_SUITE_END()
++

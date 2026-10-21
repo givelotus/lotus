@@ -1,0 +1,249 @@
+From 82478258d00d3b63673afca812817ebe337342a0 Mon Sep 17 00:00:00 2001
+From: Shammah Chancellor <shammah.chancellor@notvalid.com>
+Date: Mon, 19 Oct 2026 12:07:08 -0700
+Subject: [PATCH] chronik: take the node's decoding and TxId of raw V2 txs in
+ validate-tx
+
+validate-tx and the broadcast token checks decoded raw txs with the
+legacy TxMut::deser. A native V2 (v7) tx starts with a u64 lock and u16
+input/output counts, which that decoder reads as an empty legacy tx, so
+every V2 tx had no inputs or outputs, and lookup_spent_coins then
+recomputed the txid of those empty legacy fields: one constant txid for
+all V2 txs.
+
+The new bridge call decode_raw_tx decodes the raw bytes with the node
+and takes its inputs (mint inputs skipped, as indexed), outputs and
+GetId, leaving the coins for lookup_spent_coins. Bytes the node cannot
+decode keep their legacy fields and get the node txid of those fields.
+lookup_spent_coins now only looks up coins and keeps the txid.
+
+Tier: V2 (fixup to v2/035)
+---
+ chronik/chronik-bridge/src/ffi.rs             | 11 +++
+ chronik/chronik-cpp/chronik_bridge.cpp        | 77 ++++++++++++++-----
+ chronik/chronik-cpp/chronik_bridge.h          |  2 +
+ .../chronik-indexer/src/query/broadcast.rs    | 10 ++-
+ chronik/test/chronikbridge_tests.cpp          | 49 ++++++++++++
+ 5 files changed, 125 insertions(+), 24 deletions(-)
+
+diff --git a/chronik/chronik-bridge/src/ffi.rs b/chronik/chronik-bridge/src/ffi.rs
+index bcc95ef725..5eff2a3a1c 100644
+--- a/chronik/chronik-bridge/src/ffi.rs
++++ b/chronik/chronik-bridge/src/ffi.rs
+@@ -280,6 +280,17 @@ mod ffi_inner {
+             block_index: &CBlockIndex,
+         ) -> Result<&CBlockIndex>;
+ 
++        /// Replace `tx`, the legacy-shaped decoding of `raw_tx`, by the
++        /// node's own decoding of `raw_tx`: its inputs and outputs as
++        /// Chronik indexes them, its TxId, and unset (default) coins. If the
++        /// node cannot decode `raw_tx`, keep the legacy-shaped fields and
++        /// set the TxId the node computes for them.
++        fn decode_raw_tx(
++            self: &ChronikBridge,
++            raw_tx: &[u8],
++            tx: &mut Tx,
++        ) -> Result<()>;
++
+         /// Lookup the spent coins of a tx and fill them in in-place.
+         /// - `not_found` will be the outpoints that couldn't be found in the
+         ///   node or the DB.
+diff --git a/chronik/chronik-cpp/chronik_bridge.cpp b/chronik/chronik-cpp/chronik_bridge.cpp
+index 989be51d19..67a96008f0 100644
+--- a/chronik/chronik-cpp/chronik_bridge.cpp
++++ b/chronik/chronik-cpp/chronik_bridge.cpp
+@@ -439,32 +439,67 @@ const CBlockIndex &ChronikBridge::find_fork(const CBlockIndex &index) const {
+     return *fork;
+ }
+ 
++void ChronikBridge::decode_raw_tx(rust::Slice<const uint8_t> raw_tx,
++                                  Tx &tx) const {
++    std::optional<CMutableTransaction> node_tx;
++    try {
++        DataStream stream{chronik::util::FromRustSlice(raw_tx)};
++        CMutableTransaction mtx;
++        stream >> mtx;
++        node_tx = std::move(mtx);
++    } catch (const std::exception &) {
++        // Not a node tx: keep the legacy-shaped fields.
++    }
++    if (node_tx) {
++        // A native V2 tx has no legacy-shaped fields: take the node's
++        // inputs, outputs and identity, as indexed once it is broadcast.
++        const CTransaction ctx{std::move(*node_tx)};
++        const bool is_coinbase = ctx.IsCoinBase();
++        rust::Vec<TxInput> inputs;
++        inputs.reserve(ctx.vin.size());
++        for (const CTxIn &input : ctx.vin) {
++            if (!is_coinbase && input.nFlags == 3) {
++                continue;
++            }
++            inputs.push_back({
++                .prev_out = BridgeOutPoint(input.prevout),
++                .script = BridgeTxInputScript(input),
++                .sequence = input.nSequence,
++                .coin = {},
++            });
++        }
++        tx.txid = chronik::util::HashToArray(ctx.GetId());
++        tx.version = ctx.nVersion;
++        tx.inputs = std::move(inputs);
++        tx.outputs = BridgeTxOutputs(ctx.vout);
++        tx.locktime = ctx.nLockTime;
++        return;
++    }
++    CMutableTransaction mtx;
++    mtx.nVersion = tx.version;
++    mtx.nLockTime = tx.locktime;
++    mtx.vin.reserve(tx.inputs.size());
++    for (const TxInput &in : tx.inputs) {
++        mtx.vin.emplace_back(
++            COutPoint(TxId(chronik::util::ArrayToHash(in.prev_out.txid)),
++                      in.prev_out.out_idx),
++            CScript(in.script.data(), in.script.data() + in.script.size()),
++            in.sequence);
++    }
++    mtx.vout.reserve(tx.outputs.size());
++    for (const TxOutput &out : tx.outputs) {
++        mtx.vout.emplace_back(
++            out.sats * SATOSHI,
++            CScript(out.script.data(), out.script.data() + out.script.size()));
++    }
++    tx.txid = chronik::util::HashToArray(CTransaction(mtx).GetId());
++}
++
+ void ChronikBridge::lookup_spent_coins(
+     Tx &tx, rust::Vec<OutPoint> &not_found,
+     rust::Vec<OutPoint> &coins_to_uncache) const {
+     not_found.clear();
+     coins_to_uncache.clear();
+-    {
+-        CMutableTransaction mtx;
+-        mtx.nVersion = tx.version;
+-        mtx.nLockTime = tx.locktime;
+-        mtx.vin.reserve(tx.inputs.size());
+-        for (const TxInput &in : tx.inputs) {
+-            mtx.vin.emplace_back(
+-                COutPoint(TxId(chronik::util::ArrayToHash(in.prev_out.txid)),
+-                          in.prev_out.out_idx),
+-                CScript(in.script.data(), in.script.data() + in.script.size()),
+-                in.sequence);
+-        }
+-        mtx.vout.reserve(tx.outputs.size());
+-        for (const TxOutput &out : tx.outputs) {
+-            mtx.vout.emplace_back(
+-                out.sats * SATOSHI,
+-                CScript(out.script.data(),
+-                        out.script.data() + out.script.size()));
+-        }
+-        tx.txid = chronik::util::HashToArray(CTransaction(mtx).GetId());
+-    }
+     LOCK(cs_main);
+     CCoinsViewCache &coins_cache =
+         m_node.chainman->GetChainstateForIndexing().CoinsTip();
+diff --git a/chronik/chronik-cpp/chronik_bridge.h b/chronik/chronik-cpp/chronik_bridge.h
+index 41c013185c..7dad588e4c 100644
+--- a/chronik/chronik-cpp/chronik_bridge.h
++++ b/chronik/chronik-cpp/chronik_bridge.h
+@@ -93,6 +93,8 @@ public:
+ 
+     const CBlockIndex &find_fork(const CBlockIndex &index) const;
+ 
++    void decode_raw_tx(rust::Slice<const uint8_t> raw_tx, Tx &tx) const;
++
+     void lookup_spent_coins(Tx &, rust::Vec<OutPoint> &not_found,
+                             rust::Vec<OutPoint> &coins_to_uncache) const;
+     void uncache_coins(rust::Slice<const OutPoint>) const;
+diff --git a/chronik/chronik-indexer/src/query/broadcast.rs b/chronik/chronik-indexer/src/query/broadcast.rs
+index 94499bdae3..397f548b19 100644
+--- a/chronik/chronik-indexer/src/query/broadcast.rs
++++ b/chronik/chronik-indexer/src/query/broadcast.rs
+@@ -146,9 +146,11 @@ impl QueryBroadcast<'_> {
+         let mut coins_to_uncache = Vec::new();
+         let mut batch_txids = BTreeSet::new();
+         let mut batch_txs = HashMap::new();
+-        for mut raw_tx in raw_txs.iter().cloned() {
+-            let tx = TxMut::deser(&mut raw_tx).map_err(ParsingFailed)?;
++        for raw_tx in raw_txs.iter() {
++            let tx =
++                TxMut::deser(&mut raw_tx.clone()).map_err(ParsingFailed)?;
+             let mut ffi_tx = ffi::Tx::from(tx);
++            self.node.bridge.decode_raw_tx(raw_tx, &mut ffi_tx)?;
+ 
+             let mut tx_not_found = Vec::new();
+             let mut tx_coins_to_uncache = Vec::new();
+@@ -213,8 +215,10 @@ impl QueryBroadcast<'_> {
+     /// Parse the tx and validate it as a token tx without broadcasting,
+     /// returning verified tx data.
+     pub fn validate_tx(&self, raw_tx: Vec<u8>) -> Result<proto::Tx> {
+-        let tx = TxMut::deser(&mut raw_tx.into())?;
++        let raw_tx = Bytes::from(raw_tx);
++        let tx = TxMut::deser(&mut raw_tx.clone())?;
+         let mut ffi_tx = ffi::Tx::from(tx);
++        self.node.bridge.decode_raw_tx(&raw_tx, &mut ffi_tx)?;
+         let mut coins_to_uncache = Vec::new();
+         self.node.bridge.lookup_spent_coins(
+             &mut ffi_tx,
+diff --git a/chronik/test/chronikbridge_tests.cpp b/chronik/test/chronikbridge_tests.cpp
+index 117f9fdd66..f6a03dc429 100644
+--- a/chronik/test/chronikbridge_tests.cpp
++++ b/chronik/test/chronikbridge_tests.cpp
+@@ -218,6 +218,55 @@ BOOST_FIXTURE_TEST_CASE(test_lookup_spent_coin, TestChain100Setup) {
+     BOOST_CHECK(coins_cache.HaveCoinInCache(COutPoint(txid, 1)));
+ }
+ 
++BOOST_FIXTURE_TEST_CASE(test_decode_raw_tx, TestChain100Setup) {
++    // validate-tx decodes raw txs with the node's decoding: a native V2 (v7)
++    // tx, which the legacy-shaped Rust decoder reads as having no inputs or
++    // outputs, gets its own inputs, outputs and txid, and looking up its
++    // spent coins keeps that txid.
++    const chronik_bridge::ChronikBridge bridge(m_node);
++    std::vector<TxId> txids;
++    for (const int64_t sats : {1000, 2000}) {
++        CMutableTransaction mtx;
++        mtx.vin = {CTxIn(COutPoint(m_coinbase_txns[0]->GetId(), 1), CScript(),
++                         0xffffffff)};
++        mtx.vout = {CTxOut(sats * SATOSHI, CScript() << OP_TRUE)};
++        AdaptLegacyTxToV7(mtx);
++        const CTransaction ctx(mtx);
++        BOOST_REQUIRE_EQUAL(ctx.nVersion, 7);
++        DataStream ss{};
++        ss << ctx;
++        const auto raw = MakeUCharSpan(ss);
++
++        chronik_bridge::Tx tx = {
++            .txid = {},
++            .version = 7,
++            .inputs = {},
++            .outputs = {},
++            .locktime = 0,
++        };
++        bridge.decode_raw_tx(
++            rust::Slice<const uint8_t>(raw.data(), raw.size()), tx);
++        BOOST_CHECK(tx.txid == chronik::util::HashToArray(ctx.GetId()));
++        BOOST_CHECK_EQUAL(tx.version, 7);
++        BOOST_REQUIRE_EQUAL(tx.inputs.size(), 1);
++        BOOST_CHECK(tx.inputs[0].prev_out.txid ==
++                    chronik::util::HashToArray(m_coinbase_txns[0]->GetId()));
++        BOOST_CHECK_EQUAL(tx.inputs[0].prev_out.out_idx, 1);
++        BOOST_CHECK_EQUAL(tx.inputs[0].sequence, 0xffffffff);
++        BOOST_REQUIRE_EQUAL(tx.outputs.size(), 1);
++        BOOST_CHECK_EQUAL(tx.outputs[0].sats, sats);
++        BOOST_CHECK_EQUAL(tx.locktime, ctx.nLockTime);
++
++        const auto txid = tx.txid;
++        rust::Vec<chronik_bridge::OutPoint> not_found;
++        rust::Vec<chronik_bridge::OutPoint> coins_to_uncache;
++        bridge.lookup_spent_coins(tx, not_found, coins_to_uncache);
++        BOOST_CHECK(tx.txid == txid);
++        txids.push_back(ctx.GetId());
++    }
++    BOOST_CHECK(txids[0] != txids[1]);
++}
++
+ BOOST_FIXTURE_TEST_CASE(test_load_block, TestChain100Setup) {
+     const chronik_bridge::ChronikBridge bridge(m_node);
+     ChainstateManager &chainman = *Assert(m_node.chainman);
+-- 
+2.50.1 (Apple Git-155)
+

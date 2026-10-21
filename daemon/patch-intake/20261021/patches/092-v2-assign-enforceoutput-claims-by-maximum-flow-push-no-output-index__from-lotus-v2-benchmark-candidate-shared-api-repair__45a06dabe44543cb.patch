@@ -1,0 +1,1156 @@
+From bb658d883a69dff1774ac2d5007357cab80d9fec Mon Sep 17 00:00:00 2001
+From: Shammah Chancellor <shammah.chancellor@notvalid.com>
+Date: Mon, 19 Oct 2026 13:08:07 -0700
+Subject: [PATCH] v2: assign ENFORCEOUTPUT claims by maximum flow; push no
+ output index
+
+Consensus rule (user, 2026-10-20): a transaction is valid only if every
+ENFORCEOUTPUT claim can be assigned to outputs its template matches with
+no output receiving more than its value. Before this change, each claim
+went to the first matching output and the claims on each output were
+summed. That rejected transactions whose claims fit when assigned
+differently.
+
+Phase 1 (the opcode). ENFORCEOUTPUT checks its template against every
+output in range and records an OutputClaim: the claim amount and the
+match mask (every matching output index). A template that matches no
+output still fails the invocation. The opcode no longer pushes an output
+index, and the size pass no longer models a result. The output_mode byte
+is kept: it narrows the mask to one output, as a template constraint.
+OUTPUT_FIRST is renamed OUTPUT_ANY to match. A state-constraining
+template authorizes every output it matches; each of those carries
+exactly the expected root, and under I-10 any extra input could
+authorize them anyway.
+
+Phase 2 (the output-claims kind). One maximum-flow feasibility check per
+transaction, with no special case for single-match claims:
+
+- graph: source -> each claim (capacity: its amount) -> each output in
+  its mask -> sink (capacity: the output value);
+- feasible iff the maximum flow equals the total claimed;
+- solver: Dinic, with an iterative augmenting search so the depth does
+  not depend on the graph size;
+- arithmetic: 64-bit edge capacities, 128-bit totals;
+- an empty mask or an out-of-range index is rejected inline;
+- the reject reason is still "output-overclaimed".
+
+Splitting is the intended semantics (user, 2026-10-21): the flow may
+divide one claim's amount among several outputs its template matches, so
+several payments can share outputs. Assigning a whole output to one
+claim is already expressible with SIGHASH_SINGLE, so the rule does not
+restrict it.
+
+Other callers:
+
+- The simulation evaluator records the mask over the current outputs.
+  When nothing matches, the constructed draft is the mask. A claim does
+  not see outputs that later invocations append.
+- testv2transaction and simulatev2transaction report each claim as
+  {amount, matches}. post_check.outputs[].claimed is now the flow into
+  each output from one maximum flow; other assignments may exist.
+- The functional test's vault and creator scripts drop the DROP after
+  ENFORCEOUTPUT. A new case spends two payment coins. A first-match rule
+  would put both 20k claims on o0 (20k); the flow moves one to o1. The
+  transaction is accepted and mined, and a variant with o1 too small is
+  rejected with output-overclaimed.
+
+Tests:
+
+- test_lotus_v2_deferred_checks, max-flow cases:
+  - a greedy first match fails although an assignment exists;
+  - an exhausted output, with another matching output that has room;
+  - total and local (Hall) over-claims;
+  - overlapping masks on a cycle, at exactly enough room and one unit
+    short;
+  - a split claim;
+  - zero claims;
+  - claims at UINT64_MAX with 128-bit totals;
+  - the per-output assignment;
+  - 3000 random instances checked against the Gale/Hall subset condition.
+- test_vm: expected masks instead of indexes, and an empty final stack
+  apart from the script's TRUE. The claims block now shows that 60+40+1
+  on `any` is feasible, with a pinned claim sharing o1, until the total
+  exceeds 300.
+
+Tier: V2
+---
+ src/lotus_v2/deferred_checks.cpp         | 177 ++++++++++++++++++++---
+ src/lotus_v2/deferred_checks.h           |  23 ++-
+ src/lotus_v2/output_template.h           |   5 +-
+ src/lotus_v2/test_deferred_checks.cpp    |  90 ++++++++++++
+ src/lotus_v2/test_vm.cpp                 | 123 ++++++++--------
+ src/lotus_v2/test_vm_simulation.cpp      |   2 +-
+ src/lotus_v2/vm.cpp                      |  36 ++---
+ src/lotus_v2/vm_cost.inc                 |   1 -
+ src/rpc/v2vm.cpp                         |  48 ++++--
+ test/functional/feature_v2_vm_opcodes.py |  82 ++++++++++-
+ 10 files changed, 465 insertions(+), 122 deletions(-)
+
+diff --git a/src/lotus_v2/deferred_checks.cpp b/src/lotus_v2/deferred_checks.cpp
+index e9a15ea6197f1ae35ba1a80f3e8fe865b0d3dd2c..932fc7930d0e12144803502466713cb04ad93ad1 100644
+--- a/src/lotus_v2/deferred_checks.cpp
++++ b/src/lotus_v2/deferred_checks.cpp
+@@ -112,6 +112,154 @@ bool RunDeferredBlockChecks(const DeferredCheckRegistry &registry,
+ 
+ // ---------------------------------------------------------------------------
+ 
++// ---------------------------------------------------------------------------
++// Maximum flow (Dinic) over the bipartite claim graph. Nodes: 0 is the
++// source, 1..C the claims, C+1..C+O the outputs, C+O+1 the sink. The
++// augmenting search is iterative, so its depth does not depend on the
++// graph size.
++
++namespace {
++    struct FlowEdge {
++        uint32_t to;
++        uint32_t reverse;
++        uint64_t capacity;
++    };
++
++    class ClaimFlow {
++    public:
++        ClaimFlow(std::span<const OutputClaim> claims,
++                  std::span<const uint64_t> values)
++            : claims_(claims.size()), outputs_(values.size()),
++              graph_(claims.size() + values.size() + 2) {
++            const uint32_t source = 0, sink = Sink();
++            std::vector<uint8_t> used(values.size());
++            for (size_t c = 0; c < claims.size(); ++c) {
++                const uint32_t node = uint32_t(1 + c);
++                Connect(source, node, claims[c].amount);
++                for (uint16_t j : claims[c].matches) {
++                    Connect(node, OutputNode(j), claims[c].amount);
++                    used[j] = 1;
++                }
++            }
++            for (size_t j = 0; j < values.size(); ++j)
++                if (used[j]) Connect(OutputNode(j), sink, values[j]);
++        }
++
++        __uint128_t Run() {
++            __uint128_t total = 0;
++            while (Levels()) {
++                std::fill(next_.begin(), next_.end(), 0);
++                for (;;) {
++                    const uint64_t pushed = Augment();
++                    if (!pushed) break;
++                    total += pushed;
++                }
++            }
++            return total;
++        }
++
++        // Flow into each output: the used capacity of its sink edge.
++        std::vector<__uint128_t> Assigned(std::span<const uint64_t> values) const {
++            std::vector<__uint128_t> out(outputs_);
++            for (size_t j = 0; j < outputs_; ++j)
++                for (const auto &edge : graph_[OutputNode(j)])
++                    if (edge.to == Sink())
++                        out[j] = values[j] - edge.capacity;
++            return out;
++        }
++
++    private:
++        uint32_t Sink() const { return uint32_t(claims_ + outputs_ + 1); }
++        uint32_t OutputNode(size_t j) const {
++            return uint32_t(claims_ + 1 + j);
++        }
++        void Connect(uint32_t from, uint32_t to, uint64_t capacity) {
++            graph_[from].push_back(
++                FlowEdge{to, uint32_t(graph_[to].size()), capacity});
++            graph_[to].push_back(
++                FlowEdge{from, uint32_t(graph_[from].size() - 1), 0});
++        }
++        // Breadth-first levels from the source; false when the sink is
++        // unreachable in the residual graph.
++        bool Levels() {
++            level_.assign(graph_.size(), UINT32_MAX);
++            next_.assign(graph_.size(), 0);
++            std::vector<uint32_t> queue{0};
++            level_[0] = 0;
++            for (size_t head = 0; head < queue.size(); ++head) {
++                const uint32_t v = queue[head];
++                for (const auto &edge : graph_[v]) {
++                    if (edge.capacity && level_[edge.to] == UINT32_MAX) {
++                        level_[edge.to] = level_[v] + 1;
++                        queue.push_back(edge.to);
++                    }
++                }
++            }
++            return level_[Sink()] != UINT32_MAX;
++        }
++        // One augmenting path in the level graph (iterative depth-first
++        // search with per-node edge cursors); returns the flow pushed, or 0
++        // when the level graph is blocked.
++        uint64_t Augment() {
++            path_.clear();
++            uint32_t v = 0;
++            for (;;) {
++                if (v == Sink()) {
++                    uint64_t pushed = UINT64_MAX;
++                    for (const auto &[u, k] : path_)
++                        pushed = std::min(pushed, graph_[u][k].capacity);
++                    for (const auto &[u, k] : path_) {
++                        FlowEdge &edge = graph_[u][k];
++                        edge.capacity -= pushed;
++                        graph_[edge.to][edge.reverse].capacity += pushed;
++                    }
++                    return pushed;
++                }
++                auto &cursor = next_[v];
++                const auto &edges = graph_[v];
++                while (cursor < edges.size() &&
++                       (!edges[cursor].capacity ||
++                        level_[edges[cursor].to] != level_[v] + 1))
++                    ++cursor;
++                if (cursor < edges.size()) {
++                    path_.emplace_back(v, cursor);
++                    v = edges[cursor].to;
++                    continue;
++                }
++                // Dead end: retreat and skip the edge that led here.
++                if (path_.empty()) return 0;
++                level_[v] = UINT32_MAX;
++                v = path_.back().first;
++                path_.pop_back();
++                ++next_[v];
++            }
++        }
++
++        size_t claims_, outputs_;
++        std::vector<std::vector<FlowEdge>> graph_;
++        std::vector<uint32_t> level_;
++        std::vector<uint32_t> next_;
++        std::vector<std::pair<uint32_t, uint32_t>> path_;
++    };
++} // namespace
++
++__uint128_t MaxClaimFlow(std::span<const OutputClaim> claims,
++                         std::span<const uint64_t> output_values,
++                         std::vector<__uint128_t> *assigned) {
++    ClaimFlow flow(claims, output_values);
++    const __uint128_t total = flow.Run();
++    if (assigned) *assigned = flow.Assigned(output_values);
++    return total;
++}
++
++bool OutputClaimsFeasible(std::span<const OutputClaim> claims,
++                          std::span<const uint64_t> output_values,
++                          std::vector<__uint128_t> *assigned) {
++    __uint128_t claimed = 0;
++    for (const auto &claim : claims) claimed += claim.amount;
++    return MaxClaimFlow(claims, output_values, assigned) == claimed;
++}
++
+ const DeferredKindKey kStateAuthorizationKind{"state-authorization"};
+ const DeferredKindKey kOutputClaimsKind{"output-claims"};
+ 
+@@ -172,6 +320,10 @@ public:
+                 std::string &error) override {
+         auto &slot = per_input_[input];
+         for (const auto *claim : records.Of<OutputClaim>(kOutputClaimsKind)) {
++            if (claim->matches.empty()) {
++                error = "output-overclaimed";
++                return false;
++            }
+             for (uint16_t j : claim->matches) {
+                 if (j >= outputs_.size()) {
+                     error = "output-overclaimed";
+@@ -182,24 +334,15 @@ public:
+         }
+         return true;
+     }
+-    // Interim rule: each claim names one output, and the claims on output j
+-    // sum to at most its value.
++    // Phase 2: one maximum-flow feasibility check over every claim.
+     bool Final(std::string &error) override {
+-        std::vector<__uint128_t> claimed(outputs_.size());
+-        for (const auto &slot : per_input_) {
+-            for (const auto &claim : slot) {
+-                if (claim.matches.size() != 1) {
+-                    error = "output-overclaimed";
+-                    return false;
+-                }
+-                claimed[claim.matches[0]] += claim.amount;
+-            }
+-        }
+-        for (size_t j = 0; j < outputs_.size(); ++j) {
+-            if (claimed[j] > outputs_[j].value) {
+-                error = "output-overclaimed";
+-                return false;
+-            }
++        std::vector<uint64_t> values(outputs_.size());
++        for (size_t j = 0; j < outputs_.size(); ++j)
++            values[j] = outputs_[j].value;
++        const auto claims = Claims();
++        if (!OutputClaimsFeasible(claims, values)) {
++            error = "output-overclaimed";
++            return false;
+         }
+         return true;
+     }
+diff --git a/src/lotus_v2/deferred_checks.h b/src/lotus_v2/deferred_checks.h
+index 3e9eb1125fea6d00d1f6632ac19ca7f7fa5ab810..53decf932a66b5badce5c661792850a684dae04f 100644
+--- a/src/lotus_v2/deferred_checks.h
++++ b/src/lotus_v2/deferred_checks.h
+@@ -250,7 +250,16 @@ struct StateAuthorization {
+ };
+ 
+ // ENFORCEOUTPUT claims. Record: OutputClaim, the claimed amount and the
+-// outputs its template matched.
++// outputs its template matched (never empty: an ENFORCEOUTPUT that matches
++// nothing fails its invocation). Final rule ("output-overclaimed"): the
++// claims are feasible, i.e. the claimed amounts can be assigned to outputs
++// their templates match without any output receiving more than its value.
++// It is decided by one maximum-flow computation per transaction (source ->
++// claims -> matching outputs -> sink, capacities the claim amounts and the
++// output values): feasible iff the maximum flow equals the total claimed.
++// Every transaction takes this one code path; there is no special case for
++// claims with a single match. A flow may split one claim's amount across
++// several outputs it matches.
+ extern const DeferredKindKey kOutputClaimsKind;
+ struct OutputClaim {
+     uint64_t amount = 0;
+@@ -258,6 +267,18 @@ struct OutputClaim {
+     bool operator==(const OutputClaim &) const = default;
+ };
+ 
++// The maximum flow from claims to outputs (capacities: claim amounts and
++// `output_values`). With `assigned`, also the flow into each output. Match
++// indexes must be below output_values.size(). Uses 128-bit totals; every
++// edge capacity fits 64 bits.
++__uint128_t MaxClaimFlow(std::span<const OutputClaim> claims,
++                         std::span<const uint64_t> output_values,
++                         std::vector<__uint128_t> *assigned = nullptr);
++// Whether MaxClaimFlow equals the total claimed.
++bool OutputClaimsFeasible(std::span<const OutputClaim> claims,
++                          std::span<const uint64_t> output_values,
++                          std::vector<__uint128_t> *assigned = nullptr);
++
+ // Claims in canonical order (input, then witness, then staging order).
+ std::vector<OutputClaim> CollectOutputClaims(const DeferredTxRun &run);
+ // The payloads of one kind in a record list, by value, for comparisons.
+diff --git a/src/lotus_v2/output_template.h b/src/lotus_v2/output_template.h
+index 89c716f28fbde4eee90c906d1412a3cc1da5c045..64bf255784e2703fa56e74068e98bf2072b71ff4 100644
+--- a/src/lotus_v2/output_template.h
++++ b/src/lotus_v2/output_template.h
+@@ -10,7 +10,8 @@
+ //   branch_mask:u16   slots pinned to roots carried in the template
+ //   branch_stack_mask:u16  slots pinned to roots popped from the stack
+ //   state_mode:u8     0 none, 1 root in template, 2 root from the stack
+-//   output_mode:u8    0 first match, 1 index in template, 2 index from stack
++//   output_mode:u8    0 any output, 1 index in template, 2 index from stack
++//                     (restricts the match mask to one output)
+ //   [state_root:h32]  iff state_mode == 1 (nonzero)
+ //   [output_index:u16] iff output_mode == 1
+ //   popcount(branch_mask) x h32, in ascending slot order
+@@ -40,7 +41,7 @@ struct OutputTemplate {
+     // Paths: OMIT, EXPLICIT, INHERIT (the spent coin's paths).
+     enum : uint8_t { PATHS_EXPLICIT = 1, PATHS_INHERIT = 2 };
+     enum : uint8_t { STATE_NONE = 0, STATE_TEMPLATE = 1, STATE_STACK = 2 };
+-    enum : uint8_t { OUTPUT_FIRST = 0, OUTPUT_TEMPLATE = 1, OUTPUT_STACK = 2 };
++    enum : uint8_t { OUTPUT_ANY = 0, OUTPUT_TEMPLATE = 1, OUTPUT_STACK = 2 };
+ 
+     uint8_t value_mode = 0;
+     uint8_t token_mode = 0;
+diff --git a/src/lotus_v2/test_deferred_checks.cpp b/src/lotus_v2/test_deferred_checks.cpp
+index 603939f646dd0daa7a85d66db041ae5190d35ce6..d42b633b48b20e7472e40de96ad43e4fbb21718b 100644
+--- a/src/lotus_v2/test_deferred_checks.cpp
++++ b/src/lotus_v2/test_deferred_checks.cpp
+@@ -301,6 +301,18 @@ void ConsensusKinds() {
+         CHECK(run({a, claim(0, {7})}, error) == DeferredOutcome::Failed &&
+               error == "output-overclaimed");
+     }
++    // The kind assigns by maximum flow: output 0 is full, the second
++    // claim also matches the (authorized, stateful) output 1.
++    {
++        auto a = claim(100, {0});
++        a.Merge(authorize(1));
++        CHECK(run({a, claim(50, {0, 1})}, error) == DeferredOutcome::Accepted);
++        CHECK(run({a, claim(51, {0, 1})}, error) == DeferredOutcome::Failed &&
++              error == "output-overclaimed");
++        // An empty match mask is rejected inline.
++        CHECK(run({a, claim(0, {})}, error) == DeferredOutcome::Failed &&
++              error == "output-overclaimed");
++    }
+     // Canonical order of reject reasons: state authorization precedes
+     // claims in the registry.
+     CHECK(run({claim(1000, {0})}, error) == DeferredOutcome::Failed &&
+@@ -338,6 +350,83 @@ void ConsensusKinds() {
+     }
+ }
+ 
++// Gale/Hall condition: the claims are feasible iff every subset S of claims
++// asks for at most the total value of the outputs matched by S.
++bool BruteForceFeasible(const std::vector<OutputClaim> &claims,
++                        const std::vector<uint64_t> &values) {
++    for (uint32_t subset = 1; subset < (1u << claims.size()); ++subset) {
++        __uint128_t asked = 0, room = 0;
++        std::vector<uint8_t> neighbours(values.size());
++        for (size_t c = 0; c < claims.size(); ++c) {
++            if (!((subset >> c) & 1)) continue;
++            asked += claims[c].amount;
++            for (uint16_t j : claims[c].matches) neighbours[j] = 1;
++        }
++        for (size_t j = 0; j < values.size(); ++j)
++            if (neighbours[j]) room += values[j];
++        if (asked > room) return false;
++    }
++    return true;
++}
++
++void MaxFlowFeasibility() {
++    using Claims = std::vector<OutputClaim>;
++    using Values = std::vector<uint64_t>;
++    auto feasible = [](const Claims &claims, const Values &values) {
++        return OutputClaimsFeasible(claims, values);
++    };
++    // A greedy first-match assignment fails (A takes output 0, then B has
++    // nowhere to go), but A -> 1, B -> 0 exists.
++    CHECK(feasible({{10, {0, 1}}, {10, {0}}}, {10, 10}));
++    // Output 0 is exhausted by the first claim; the second claim also
++    // matches output 1, which has room.
++    CHECK(feasible({{5, {0}}, {10, {0, 1}}}, {5, 20}));
++    // Over-claims: in total, and locally (both claims only fit output 0,
++    // whatever output 1 holds).
++    CHECK(!feasible({{10, {0, 1}}, {11, {0, 1}}}, {10, 10}));
++    CHECK(!feasible({{6, {0}}, {6, {0}}}, {10, 1000}));
++    // Overlapping match sets around a cycle: each pair of claims shares an
++    // output. Exactly enough room is feasible; one unit less is not.
++    CHECK(feasible({{8, {0, 1}}, {8, {1, 2}}, {8, {0, 2}}}, {8, 8, 8}));
++    CHECK(!feasible({{8, {0, 1}}, {8, {1, 2}}, {8, {0, 2}}}, {8, 8, 7}));
++    // A Hall violation hidden among overlapping sets: claims 1 and 2 only
++    // reach output 1.
++    CHECK(!feasible({{1, {0, 1}}, {3, {1}}, {3, {1}}}, {100, 5}));
++    // A flow may split one claim across the outputs it matches.
++    CHECK(feasible({{10, {0, 1}}}, {5, 5}));
++    // Zero claims are always feasible (they still had to match).
++    CHECK(feasible({{0, {0}}, {0, {0}}}, {0}));
++    // 128-bit totals: two maximal claims over two maximal outputs, and one
++    // more unit overflows nothing but is infeasible.
++    CHECK(feasible({{UINT64_MAX, {0, 1}}, {UINT64_MAX, {0, 1}}},
++                   {UINT64_MAX, UINT64_MAX}));
++    CHECK(!feasible({{UINT64_MAX, {0, 1}}, {UINT64_MAX, {0, 1}}, {1, {1}}},
++                    {UINT64_MAX, UINT64_MAX}));
++    // The flow into each output is a valid assignment.
++    {
++        std::vector<__uint128_t> assigned;
++        CHECK(OutputClaimsFeasible(Claims{{10, {0, 1}}, {10, {0}}}, Values{10, 15},
++                                   &assigned));
++        CHECK(assigned.size() == 2 && assigned[0] == 10 && assigned[1] == 10);
++    }
++    // Randomized: the maximum flow agrees with the subset condition.
++    std::mt19937 rng(11);
++    for (int round = 0; round < 3000; ++round) {
++        const size_t outputs = 1 + rng() % 5, n = 1 + rng() % 7;
++        Values values(outputs);
++        for (auto &v : values) v = rng() % 12;
++        Claims claims(n);
++        for (auto &claim : claims) {
++            claim.amount = rng() % 9;
++            for (size_t j = 0; j < outputs; ++j)
++                if (rng() % 2) claim.matches.push_back(uint16_t(j));
++            if (claim.matches.empty())
++                claim.matches.push_back(uint16_t(rng() % outputs));
++        }
++        CHECK(feasible(claims, values) == BruteForceFeasible(claims, values));
++    }
++}
++
+ void ConservationKinds() {
+     std::string error;
+     // Native: inputs add, outputs subtract, the remainder is the fee.
+@@ -429,6 +518,7 @@ int main() {
+         FinalRulesAndFailFast();
+         FailedInputsNeverReachPhaseTwo();
+         ConsensusKinds();
++        MaxFlowFeasibility();
+         ConservationKinds();
+         BlockHook();
+     } catch (const std::exception &error) {
+diff --git a/src/lotus_v2/test_vm.cpp b/src/lotus_v2/test_vm.cpp
+index 316f67728b6d588a698fb9d8cfd9d09830ee91dd..e964bc6d27eb53831d3529972683fb24ba6481e9 100644
+--- a/src/lotus_v2/test_vm.cpp
++++ b/src/lotus_v2/test_vm.cpp
+@@ -1243,39 +1243,38 @@ void EnforceOutput() {
+         r.charged = EvaluateVmCharged(script, args, vm, cost, 2, 4, &ctx);
+         return r;
+     };
+-    // `<template> <claim> eb <j> EQUALVERIFY [drop delta] TRUE`
++    // `<template> <claim> eb [drop delta] TRUE`: ENFORCEOUTPUT pushes
++    // nothing; it records the claim and its match mask.
++    using Mask = std::vector<uint16_t>;
+     auto script_for = [&](const TemplateSpec &t, uint64_t claim,
+-                          int expect_j, bool for_mint = false,
+-                          const VmBytes &prefix = {}) {
++                          bool for_mint = false, const VmBytes &prefix = {}) {
+         VmBytes script = prefix;
+         PushBytes(script, EncodeTemplate(t));
+         VmBytes claim_n(16);
+         for (size_t i = 0; i < 8; ++i) claim_n[i] = uint8_t(claim >> (8 * i));
+         PushBytes(script, claim_n);
+         script.push_back(0xeb);
+-        PushBytes(script, Number(uint8_t(expect_j)));
+-        script.push_back(0x92);
+         if (for_mint) script.push_back(0x79);
+         script.push_back(0x4e);
+         return script;
+     };
+-    auto expect_match = [&](const TemplateSpec &t, int j, size_t input = 0,
+-                            std::vector<VmBytes> args = {},
++    auto expect_match = [&](const TemplateSpec &t, const Mask &mask,
++                            size_t input = 0, std::vector<VmBytes> args = {},
+                             const VmBytes &prefix = {}) {
+-        const auto r = run(input, script_for(t, 0, j, input == 1, prefix), args);
++        const auto r = run(input, script_for(t, 0, input == 1, prefix), args);
+         if (r.charged.invocation.status != VmStatus::Success)
+-            throw std::runtime_error("ENFORCEOUTPUT expected output " +
+-                                     std::to_string(j) + ": " +
++            throw std::runtime_error("ENFORCEOUTPUT expected a match: " +
+                                      r.charged.invocation.error);
+         const auto claims = ClaimsOf(r.effects);
+-        CHECK(claims.size() == 1 && claims[0].matches ==
+-                                        std::vector<uint16_t>{uint16_t(j)});
++        CHECK(claims.size() == 1 && claims[0].matches == mask);
++        // The stack is left as the script left it: `TRUE` alone.
++        CHECK(r.charged.invocation.final_stack.size() == 1);
+         return r;
+     };
+     auto expect_error = [&](const TemplateSpec &t, const std::string &error,
+                             size_t input = 0, std::vector<VmBytes> args = {},
+                             const VmBytes &prefix = {}) {
+-        const auto r = run(input, script_for(t, 0, 0, input == 1, prefix), args);
++        const auto r = run(input, script_for(t, 0, input == 1, prefix), args);
+         if (r.charged.invocation.status != VmStatus::Invalid ||
+             r.charged.invocation.error != error)
+             throw std::runtime_error("ENFORCEOUTPUT expected '" + error +
+@@ -1284,27 +1283,27 @@ void EnforceOutput() {
+     };
+     const std::string none = "ENFORCEOUTPUT no matching output";
+ 
+-    // Value modes: OMIT, EXACT, MIN, FROM_STACK. The scan takes the first
+-    // non-burn, stateless match.
++    // Value modes: OMIT, EXACT, MIN, FROM_STACK. The mask holds every
++    // non-burn, stateless output the template matches.
+     TemplateSpec any;
+-    expect_match(any, 0);
++    expect_match(any, {0, 1});
+     TemplateSpec exact;
+     exact.value_mode = 1;
+     exact.value = 200;
+-    expect_match(exact, 1);
++    expect_match(exact, {1});
+     exact.value = 201;
+     expect_error(exact, none);
+     TemplateSpec min;
+     min.value_mode = 2;
+     min.value = 101;
+-    expect_match(min, 1);
++    expect_match(min, {1});
+     TemplateSpec from_stack;
+     from_stack.value_mode = 3;
+-    expect_match(from_stack, 0, 0, {}, Hex("10 64000000000000000000000000000000"));
++    expect_match(from_stack, {0}, 0, {}, Hex("10 64000000000000000000000000000000"));
+     // Burn: only burn outputs match burn templates.
+     TemplateSpec burn;
+     burn.burn = true;
+-    expect_match(burn, 3);
++    expect_match(burn, {3});
+     burn.value_mode = 1;
+     burn.value = 8;
+     expect_error(burn, none);
+@@ -1321,14 +1320,14 @@ void EnforceOutput() {
+     expect_error(token, none, 0, {}, state_push());
+     token.token_mode = 3; // SELF: the mint's own token id
+     {
+-        const auto r = expect_match(token, 2, 1, {}, state_push());
++        const auto r = expect_match(token, {2}, 1, {}, state_push());
+         CHECK(AuthorizedOf(r.effects) == std::vector<uint16_t>{2});
+     }
+     TemplateSpec native = any;
+     native.token_mode = 1;
+-    expect_match(native, 0);
++    expect_match(native, {0, 1});
+     native.token_mode = 2; // EXACT with a zero id means native
+-    expect_match(native, 0);
++    expect_match(native, {0, 1});
+     // Branch count and static/stack pins (stack roots pushed ascending).
+     TemplateSpec pins;
+     pins.branch_count = 2;
+@@ -1338,7 +1337,7 @@ void EnforceOutput() {
+     // these pin cases state the paths explicitly.
+     pins.paths_mode = 1;
+     pins.paths = {{0}, {1}};
+-    expect_match(pins, 0);
++    expect_match(pins, {0});
+     pins.branches = {fill(0xa2)};
+     expect_error(pins, none);
+     TemplateSpec stack_pins;
+@@ -1349,7 +1348,7 @@ void EnforceOutput() {
+     VmBytes roots;
+     PushBytes(roots, VmBytes(32, 0xa0)); // slot 0 (deeper)
+     PushBytes(roots, VmBytes(32, 0xa1)); // slot 1 (top, popped first)
+-    expect_match(stack_pins, 0, 0, {}, roots);
++    expect_match(stack_pins, {0}, 0, {}, roots);
+     VmBytes swapped;
+     PushBytes(swapped, VmBytes(32, 0xa1));
+     PushBytes(swapped, VmBytes(32, 0xa0));
+@@ -1369,7 +1368,7 @@ void EnforceOutput() {
+         PushBytes(prefix, VmBytes(32, 0xa1));
+         PushBytes(prefix, VmBytes(32, 0xa3));
+         PushBytes(prefix, Number(100));
+-        expect_match(three, 0, 0, {}, prefix);
++        expect_match(three, {0}, 0, {}, prefix);
+         tx.outputs[0] = o0;
+     }
+     // OMIT paths requires every pinned root on every path: o0's path {1}
+@@ -1378,7 +1377,7 @@ void EnforceOutput() {
+     omit_paths.mask = 1;
+     omit_paths.branches = {fill(0xa0)};
+     tx.outputs[0].paths = {{0, 1}};
+-    expect_match(omit_paths, 0);
++    expect_match(omit_paths, {0});
+     tx.outputs[0].paths = {{0}, {1}};
+     expect_error(omit_paths, none);
+     tx.outputs[0] = o0;
+@@ -1386,16 +1385,16 @@ void EnforceOutput() {
+     TemplateSpec explicit_paths;
+     explicit_paths.paths_mode = 1;
+     explicit_paths.paths = {{0}, {1}};
+-    expect_match(explicit_paths, 0);
++    expect_match(explicit_paths, {0, 1});
+     explicit_paths.paths = {{0, 1}};
+     expect_error(explicit_paths, none);
+     // INHERIT: same paths and branch count as the spent coin; unpinned
+     // branches must also match unless the wildcard bit is set.
+     TemplateSpec inherit;
+     inherit.paths_mode = 2;
+-    expect_match(inherit, 1);
++    expect_match(inherit, {1});
+     {
+-        auto script = script_for(inherit, 0, 1);
++        auto script = script_for(inherit, 0);
+         tx.inputs[0].witnesses[0].script = script;
+         resolved[0]->branches[0] = BranchLeaf(script);
+         tx.outputs[1].branches = resolved[0]->branches;
+@@ -1403,11 +1402,11 @@ void EnforceOutput() {
+         tx.outputs[1].branches[1] = fill(0xc1); // changed unpinned branch
+         CHECK(run(0, script, {}, false).charged.invocation.error == none);
+         inherit.wildcard = true;
+-        // o0 has the coin's paths too, so a wildcard alone would select it;
+-        // pin output 1 (I-11: a script that needs an output pins it).
++        // o0 has the coin's paths too, so a wildcard alone also matches
++        // it; an output pin narrows the mask to output 1.
+         inherit.output_mode = 1;
+         inherit.output_index = 1;
+-        const auto wild = script_for(inherit, 0, 1);
++        const auto wild = script_for(inherit, 0);
+         tx.inputs[0].witnesses[0].script = wild;
+         resolved[0]->branches[0] = BranchLeaf(wild);
+         tx.outputs[1].branches[0] = resolved[0]->branches[0];
+@@ -1417,12 +1416,12 @@ void EnforceOutput() {
+                                      wild_run.charged.invocation.error);
+         inherit.wildcard = false;
+         inherit.output_mode = 0;
+-        // Unpinned, the wildcard selects the first output with the coin's
++        // Unpinned, the wildcard matches every output with the coin's
+         // paths and branch count.
+         TemplateSpec wild_first;
+         wild_first.paths_mode = 2;
+         wild_first.wildcard = true;
+-        expect_match(wild_first, 0);
++        expect_match(wild_first, {0, 1});
+     }
+     expect_error(inherit, "template inherit in mint", 1);
+     // State modes: NONE skips stateful outputs; TEMPLATE/STACK authorize.
+@@ -1430,21 +1429,21 @@ void EnforceOutput() {
+     stateful.state_mode = 1;
+     stateful.state_root = state;
+     {
+-        const auto r = expect_match(stateful, 2);
++        const auto r = expect_match(stateful, {2});
+         CHECK(AuthorizedOf(r.effects) == std::vector<uint16_t>{2});
+     }
+     stateful.state_root = fill(0x5f);
+     expect_error(stateful, none);
+     TemplateSpec stack_state;
+     stack_state.state_mode = 2;
+-    expect_match(stack_state, 2, 0, {}, state_push());
++    expect_match(stack_state, {2}, 0, {}, state_push());
+     expect_error(stack_state, "ENFORCEOUTPUT zero state", 0, {},
+                  [&] { VmBytes p; PushBytes(p, VmBytes(32)); return p; }());
+     // Output pinning: in the template or from the stack.
+     TemplateSpec pinned = any;
+     pinned.output_mode = 1;
+     pinned.output_index = 1;
+-    expect_match(pinned, 1);
++    expect_match(pinned, {1});
+     pinned.output_index = 3; // a burn: no match
+     expect_error(pinned, none);
+     pinned.output_index = 4;
+@@ -1454,14 +1453,14 @@ void EnforceOutput() {
+     {
+         VmBytes prefix;
+         PushBytes(prefix, Number(1));
+-        expect_match(stack_pinned, 1, 0, {}, prefix);
++        expect_match(stack_pinned, {1}, 0, {}, prefix);
+     }
+     // Malformed templates are script errors.
+     auto raw_error = [&](const VmBytes &raw, const std::string &error) {
+         VmBytes script;
+         PushBytes(script, raw);
+         PushBytes(script, Number(0));
+-        script.insert(script.end(), {0xeb, 0x79, 0x4e});
++        script.insert(script.end(), {0xeb, 0x4e});
+         const auto r = run(0, script);
+         if (r.charged.invocation.error != error)
+             throw std::runtime_error("template '" + error + "' got " +
+@@ -1509,40 +1508,42 @@ void EnforceOutput() {
+         VmBytes big(16, 0);
+         big[8] = 1; // 2^64
+         PushBytes(script, big);
+-        script.insert(script.end(), {0xeb, 0x79, 0x4e});
++        script.insert(script.end(), {0xeb, 0x4e});
+         CHECK(run(0, script).charged.invocation.error ==
+               "ENFORCEOUTPUT claim range");
+     }
+ 
+-    // Claims are recorded, not consumed (I-11): two identical templates
+-    // both select output 0, and the post-check judges the sum.
++    // Claims are recorded, not consumed (I-11), and assigned by maximum
++    // flow in phase 2. `any` matches o0 (100) and o1 (200).
+     {
+-        const auto first = run(0, script_for(any, 60, 0));
++        const auto first = run(0, script_for(any, 60));
+         CHECK(first.charged.invocation.status == VmStatus::Success);
+-        const auto second = run(0, script_for(any, 40, 0));
++        const auto second = run(0, script_for(any, 40));
+         std::vector<DeferredRecords> total{first.effects, second.effects};
+         std::string error;
+         CHECK(PostCheck(tx.outputs, total, error) == false &&
+               error == "state-output-unauthorized"); // o2 still unauthorized
+         total[1].Merge(AuthorizeRecords({2}));
+         CHECK(PostCheck(tx.outputs, total, error));
+-        const auto third = run(0, script_for(any, 1, 0));
+-        total.push_back(third.effects); // 60 + 40 + 1 > 100
++        // 60 + 40 + 1 exceeds o0 but fits o0 + o1: a first-match rule
++        // would have failed here; the assignment uses o1's room.
++        total.push_back(run(0, script_for(any, 1)).effects);
++        CHECK(PostCheck(tx.outputs, total, error));
++        // A claim pinned to o1 shares o1 with the flow: 100 + 200 fits.
++        pinned.output_index = 1;
++        total.push_back(run(0, script_for(pinned, 199)).effects);
++        CHECK(PostCheck(tx.outputs, total, error));
++        // One more unit of either kind is infeasible (301 > 300).
++        total.push_back(run(0, script_for(any, 1)).effects);
+         CHECK(!PostCheck(tx.outputs, total, error) &&
+               error == "output-overclaimed");
+-        // Pinning the second claim to output 1 (value 200) fixes it.
+-        pinned.output_index = 1;
+-        const auto moved = run(0, script_for(pinned, 101, 1));
+-        std::vector<DeferredRecords> pinned_total{first.effects, moved.effects};
+-        pinned_total[1].Merge(AuthorizeRecords({2}));
+-        CHECK(PostCheck(tx.outputs, pinned_total, error));
+     }
+     // A failing invocation commits nothing: `<enforce> FALSE`.
+     {
+         VmBytes script;
+         PushBytes(script, good);
+         PushBytes(script, Number(9));
+-        script.insert(script.end(), {0xeb, 0x79, 0x4d});
++        script.insert(script.end(), {0xeb, 0x4d});
+         const auto r = run(0, script);
+         CHECK(r.charged.invocation.status == VmStatus::Invalid &&
+               r.effects.Empty());
+@@ -1553,13 +1554,13 @@ void EnforceOutput() {
+         TemplateSpec forged;
+         forged.state_mode = 1;
+         forged.state_root = state;
+-        const auto r = run(0, script_for(forged, 0, 2));
++        const auto r = run(0, script_for(forged, 0));
+         CHECK(r.charged.invocation.status == VmStatus::Success &&
+               AuthorizedOf(r.effects) == std::vector<uint16_t>{2});
+     }
+     // Without a transaction-effects accumulator: Unsupported.
+     {
+-        const auto script = script_for(any, 0, 0);
++        const auto script = script_for(any, 0);
+         tx.inputs[0].witnesses[0].script = script;
+         resolved[0]->branches[0] = BranchLeaf(script);
+         tx.outputs[1].branches = resolved[0]->branches;
+@@ -1571,19 +1572,19 @@ void EnforceOutput() {
+     // Static cost: a literal template gives an exact charge including the
+     // per-output scan; a dynamic template is charged the worst case.
+     {
+-        const auto r = run(0, script_for(any, 0, 0));
++        const auto r = run(0, script_for(any, 0));
+         CHECK(r.charged.charged &&
+               r.charged.accounting_cost == r.charged.invocation.executed_cost);
+         VmCostProfile no_scan = cost;
+         no_scan.opcode[0xeb].per_scanned_output = 0;
+-        const auto script = script_for(any, 0, 0);
++        const auto script = script_for(any, 0);
+         VmExecutionContext ctx{tx, tx_profile, chain, resolved, 0, 0,
+                                std::nullopt};
+         DeferredRecords effects;
+         ctx.effects = &effects;
+         const auto cheaper = EvaluateVmCharged(script, {}, vm, no_scan, 2, 4, &ctx);
+         CHECK(cheaper.accounting_cost + 5 * 4 == r.charged.accounting_cost);
+-        VmBytes dynamic = Hex("eb 79 4e");
++        VmBytes dynamic = Hex("eb 4e");
+         const auto d = run(0, dynamic, {good, Number(0)});
+         CHECK(d.charged.invocation.status == VmStatus::Success &&
+               d.charged.accounting_cost > d.charged.invocation.executed_cost);
+@@ -1595,9 +1596,9 @@ void EnforceOutput() {
+         TemplateSpec vault;
+         vault.value_mode = 3;
+         vault.paths_mode = 2;
+-        expect_match(vault, 1, 0, {}, Hex("d0 d6"));
++        expect_match(vault, {1}, 0, {}, Hex("d0 d6"));
+         tx.outputs[1].value = 199;
+-        const auto script = script_for(vault, 0, 1, false, Hex("d0 d6"));
++        const auto script = script_for(vault, 0, false, Hex("d0 d6"));
+         tx.inputs[0].witnesses[0].script = script;
+         resolved[0]->branches[0] = BranchLeaf(script);
+         tx.outputs[1].branches = resolved[0]->branches;
+diff --git a/src/lotus_v2/test_vm_simulation.cpp b/src/lotus_v2/test_vm_simulation.cpp
+index 224b7fd721aab4fa44c60dfa286ba08d7faadbe5..cd45b99b28366bf99bcf4265e4c2d6efdcdd39dd 100644
+--- a/src/lotus_v2/test_vm_simulation.cpp
++++ b/src/lotus_v2/test_vm_simulation.cpp
+@@ -95,7 +95,7 @@ VmBytes Enforce(const Tpl &t, uint64_t claim, const VmBytes &prefix = {},
+     VmBytes script = prefix;
+     Push(script, Encode(t));
+     Push(script, Num(claim));
+-    script.insert(script.end(), {0xeb, 0x79});
++    script.push_back(0xeb); // pushes nothing
+     Append(script, extra);
+     script.push_back(0x4e);
+     return script;
+diff --git a/src/lotus_v2/vm.cpp b/src/lotus_v2/vm.cpp
+index b4ae3f6a8bf849ce28a4c66e98da7361f11460dd..78323ff71ea04ebe6419e5a26a6da95b17ab964d 100644
+--- a/src/lotus_v2/vm.cpp
++++ b/src/lotus_v2/vm.cpp
+@@ -2400,14 +2400,14 @@ namespace {
+                         Charge(RawMul(
+                             cost_profile.opcode[0xeb].per_scanned_output,
+                             last - first));
+-                        size_t found = last;
++                        // The match mask: every output in range the
++                        // template matches. Phase 2 assigns the claim.
++                        std::vector<uint16_t> matched;
+                         for (size_t j = first; j < last; ++j)
+-                            if (matches(outputs[j])) {
+-                                found = j;
+-                                break;
+-                            }
+-                        if (found == last && simulation &&
+-                            t.output_mode == OutputTemplate::OUTPUT_FIRST) {
++                            if (matches(outputs[j]))
++                                matched.push_back(uint16_t(j));
++                        if (matched.empty() && simulation &&
++                            t.output_mode == OutputTemplate::OUTPUT_ANY) {
+                             // Constructive matching: a draft built from the
+                             // template, with placeholders for free slots.
+                             Output draft;
+@@ -2475,25 +2475,27 @@ namespace {
+                             if (!matches(draft))
+                                 throw VmFailure(
+                                     "ENFORCEOUTPUT draft cannot match template");
+-                            found = simulation->AppendDraft(
++                            const size_t found = simulation->AppendDraft(
+                                 std::move(draft), template_bytes,
+                                 std::move(popped), uint64_t(claim),
+                                 std::move(placeholders));
+                             output_count = uint16_t(outputs.size());
+-                            last = found + 1; // the draft is the match
++                            matched = {uint16_t(found)}; // the draft
+                         }
+-                        if (found == last)
++                        if (matched.empty())
+                             throw VmFailure("ENFORCEOUTPUT no matching output");
+-                        // Order-free effects (I-11): record, never consume.
++                        // Order-free records (I-11): the claim and its match
++                        // mask; nothing is consumed or pushed. A
++                        // state-constraining template authorizes every
++                        // output it matches (each carries exactly the
++                        // expected root).
+                         const uint16_t witness = uint16_t(ctx.witness_index);
++                        if (t.state_mode != OutputTemplate::STATE_NONE)
++                            staged_effects.Add(kStateAuthorizationKind, witness,
++                                               StateAuthorization{matched});
+                         staged_effects.Add(
+                             kOutputClaimsKind, witness,
+-                            OutputClaim{uint64_t(claim), {uint16_t(found)}});
+-                        if (t.state_mode != OutputTemplate::STATE_NONE)
+-                            staged_effects.Add(
+-                                kStateAuthorizationKind, witness,
+-                                StateAuthorization{{uint16_t(found)}});
+-                        Push(Number(Int(found)));
++                            OutputClaim{uint64_t(claim), std::move(matched)});
+                         break;
+                     }
+                     case 0xec: { // TXTOKENBALANCE: asset -> N(in) N(out)
+diff --git a/src/lotus_v2/vm_cost.inc b/src/lotus_v2/vm_cost.inc
+index df451a4a41de538ff7c530adb2b59e0280a2d30b..2b9af874ac543e8130b0d4d22321bfad60216732 100644
+--- a/src/lotus_v2/vm_cost.inc
++++ b/src/lotus_v2/vm_cost.inc
+@@ -521,7 +521,6 @@ class SizePass {
+                     pop();
+                 if (parsed->state_mode == OutputTemplate::STATE_STACK) pop();
+                 if (parsed->output_mode == OutputTemplate::OUTPUT_STACK) pop();
+-                push(16);
+             } else if (op == 0xc3) { // STATEHASH
+                 const auto k = LiteralValue(previous);
+                 if (!k || *k < 0 || *k > Int(VM_STATEHASH_MAX_ITEMS))
+diff --git a/src/rpc/v2vm.cpp b/src/rpc/v2vm.cpp
+index 0ddf640cbb5d23497599725239f5f9a61be70040..dd1763dba946bd51f6576f69e2abfec60cc7e313 100644
+--- a/src/rpc/v2vm.cpp
++++ b/src/rpc/v2vm.cpp
+@@ -29,6 +29,8 @@
+ 
+ #include <univalue.h>
+ 
++#include <algorithm>
++
+ #include <string>
+ #include <vector>
+ 
+@@ -142,8 +144,12 @@ UniValue EffectsJson(const lotus::v2::DeferredRecords &effects) {
+     UniValue claims(UniValue::VARR);
+     for (const auto &record : lotus::v2::OutputClaimsOf(effects)) {
+         UniValue claim(UniValue::VOBJ);
+-        claim.pushKV("output", record.matches.front());
+         claim.pushKV("amount", record.amount);
++        UniValue matches(UniValue::VARR);
++        for (const auto output : record.matches) {
++            matches.push_back(output);
++        }
++        claim.pushKV("matches", matches);
+         claims.push_back(claim);
+     }
+     UniValue authorized(UniValue::VARR);
+@@ -169,24 +175,30 @@ UniValue PostCheckJson(const std::vector<lotus::v2::Output> &outputs,
+     if (ok) {
+         error.clear();
+     }
+-    UniValue claimed(UniValue::VARR);
+-    std::vector<__uint128_t> sums(outputs.size());
++    // One maximum-flow assignment of the claims (claims whose masks name
++    // a missing output are left out, as the check rejects them anyway).
++    std::vector<lotus::v2::OutputClaim> claims;
+     for (const auto &records : per_input) {
+-        for (const auto &claim : lotus::v2::OutputClaimsOf(records)) {
+-            if (claim.matches.front() < sums.size()) {
+-                sums[claim.matches.front()] += claim.amount;
++        for (auto &claim : lotus::v2::OutputClaimsOf(records)) {
++            if (std::all_of(claim.matches.begin(), claim.matches.end(),
++                            [&](uint16_t j) { return j < outputs.size(); })) {
++                claims.push_back(std::move(claim));
+             }
+         }
+     }
++    std::vector<uint64_t> values;
++    for (const auto &output : outputs) {
++        values.push_back(output.value);
++    }
++    std::vector<__uint128_t> sums;
++    lotus::v2::MaxClaimFlow(claims, values, &sums);
++    UniValue claimed(UniValue::VARR);
+     for (size_t j = 0; j < outputs.size(); ++j) {
+         UniValue entry(UniValue::VOBJ);
+         entry.pushKV("output", uint64_t(j));
+         entry.pushKV("value", outputs[j].value);
+         entry.pushKV("claimed", CostValue(sums[j]));
+-        entry.pushKV("unclaimed",
+-                     sums[j] <= outputs[j].value
+-                         ? UniValue(uint64_t(outputs[j].value - sums[j]))
+-                         : UniValue(0));
++        entry.pushKV("unclaimed", uint64_t(outputs[j].value - sums[j]));
+         claimed.push_back(entry);
+     }
+     UniValue out(UniValue::VOBJ);
+@@ -199,21 +211,23 @@ UniValue PostCheckJson(const std::vector<lotus::v2::Output> &outputs,
+ const RPCResult POST_CHECK_RESULT{
+     RPCResult::Type::OBJ,
+     "post_check",
+-    "The per-transaction ENFORCEOUTPUT/state post-check",
++    "The per-transaction deferred checks (state authorization, then "
++    "ENFORCEOUTPUT claims assigned by maximum flow)",
+     {
+         {RPCResult::Type::BOOL, "ok", "Whether it passes"},
+         {RPCResult::Type::STR, "error", "The failure, or empty"},
+         {RPCResult::Type::ARR,
+          "outputs",
+-         "Claims per output",
++         "The claims assigned to each output by one maximum flow",
+          {{RPCResult::Type::OBJ,
+            "",
+            "",
+            {{RPCResult::Type::NUM, "output", "Output index"},
+             {RPCResult::Type::NUM, "value", "Output value"},
+-            {RPCResult::Type::NUM, "claimed", "Sum of claims"},
+-            {RPCResult::Type::NUM, "unclaimed",
+-             "value - claimed, or 0 when over-claimed"}}}}},
++            {RPCResult::Type::NUM, "claimed",
++             "Claims assigned to this output (one maximum flow; other "
++             "assignments may exist)"},
++            {RPCResult::Type::NUM, "unclaimed", "value - claimed"}}}}},
+     }};
+ 
+ RPCHelpMan getv2vmprofile() {
+@@ -405,7 +419,9 @@ RPCHelpMan testv2transaction() {
+                      "The cost of the executed path (informational)"},
+                     {RPCResult::Type::OBJ,
+                      "effects",
+-                     "ENFORCEOUTPUT claims and state authorizations",
++                     "ENFORCEOUTPUT claims ({amount, matches}: the claimed "
++                     "amount and every output its template matched) and "
++                     "state authorizations",
+                      {{RPCResult::Type::ELISION, "", ""}}}}}}},
+                 POST_CHECK_RESULT,
+             }},
+diff --git a/test/functional/feature_v2_vm_opcodes.py b/test/functional/feature_v2_vm_opcodes.py
+index 08e0832b0a4ef11806dfd9e6434d8b3bf6021a7e..6c94ef3472133ac85aef6b602787d332ffd724d9 100644
+--- a/test/functional/feature_v2_vm_opcodes.py
++++ b/test/functional/feature_v2_vm_opcodes.py
+@@ -8,7 +8,10 @@ A counter vault holds HAS_STATE root STATEHASH(n). Spending it proves n with
+ STATEVERIFY, and ENFORCEOUTPUT requires an exact continuation of the vault
+ (INHERIT paths, same branches) holding STATEHASH(n + 1) and the vault's value
+ minus a fixed fee. The test creates, spends and continues the vault; checks
+-rejected transitions, unauthorized state, legacy EMITLOG; exercises
++rejected transitions, unauthorized state, legacy EMITLOG; checks that
++ENFORCEOUTPUT claims are assigned by maximum flow (a transaction a
++first-match rule would reject is accepted, an infeasible one rejected);
++exercises
+ getv2vmprofile, testv2transaction and simulatev2transaction (which builds the
+ continuation from a zero-output draft); and checks that a reorg restores the
+ spent state root and its continuation.
+@@ -33,7 +36,7 @@ FEE = 10_000
+ 
+ # Opcodes (P03 registry).
+ N0, N1 = b"\x00", b"\x4e"
+-DROP, DUP, ADD, SUB, EQUALVERIFY = b"\x79", b"\x7a", b"\x9e", b"\x9f", b"\x92"
++DUP, ADD, SUB = b"\x7a", b"\x9e", b"\x9f"
+ STATEHASH, INPUTINDEX, UTXOVALUE = b"\xc3", b"\xd0", b"\xd6"
+ ENFORCEOUTPUT, STATEVERIFY, EMITLOG = b"\xeb", b"\xed", b"\x6c"
+ 
+@@ -95,7 +98,7 @@ def template(
+ #   n DUP N(1) STATEHASH STATEVERIFY       -- the coin holds STATEHASH(n)
+ #   N(1) ADD N(1) STATEHASH                -- next state STATEHASH(n + 1)
+ #   INPUTINDEX UTXOVALUE <FEE> SUB         -- next value
+-#   <template> N(0) ENFORCEOUTPUT DROP TRUE
++#   <template> N(0) ENFORCEOUTPUT TRUE       -- ENFORCEOUTPUT pushes nothing
+ VAULT_TEMPLATE = template(value_mode=3, paths_mode=2, state_mode=2)
+ VAULT = (
+     DUP
+@@ -113,7 +116,6 @@ VAULT = (
+     + push(VAULT_TEMPLATE)
+     + N0
+     + ENFORCEOUTPUT
+-    + DROP
+     + N1
+ )
+ VAULT_ROOT = lotus_v2_branch_leaf(VAULT)
+@@ -122,7 +124,7 @@ VAULT_ROOT = lotus_v2_branch_leaf(VAULT)
+ # with that single branch. (Anyone may spend it: state authorization alone
+ # does not authenticate state, see plan I-10.)
+ CREATOR_TEMPLATE = template(value_mode=3, branch_count=1, stack_mask=1, state_mode=2)
+-CREATOR = push(CREATOR_TEMPLATE) + N0 + ENFORCEOUTPUT + DROP + N1
++CREATOR = push(CREATOR_TEMPLATE) + N0 + ENFORCEOUTPUT + N1
+ CREATOR_ROOT = lotus_v2_branch_leaf(CREATOR)
+ 
+ 
+@@ -210,6 +212,7 @@ class V2VmOpcodesTest(BitcoinTestFramework):
+         vault = self.test_create_vault()
+         vault = self.test_continue_vault(vault)
+         self.test_rejections(vault)
++        self.test_claim_assignment()
+         self.test_simulation_and_reorg(vault)
+ 
+     def test_profile(self):
+@@ -250,7 +253,8 @@ class V2VmOpcodesTest(BitcoinTestFramework):
+         result = self.node.testv2transaction(create)
+         assert_equal(result["valid"], True)
+         effects = result["invocations"][0]["effects"]
+-        assert_equal(effects["claims"], [{"output": 0, "amount": 0}])
++        # A claim records its amount and every output its template matches.
++        assert_equal(effects["claims"], [{"amount": 0, "matches": [0]}])
+         assert_equal(effects["state_authorized"], [0])
+         assert_equal(result["post_check"]["ok"], True)
+         create_txid = self.node.sendrawtransaction(create)
+@@ -343,6 +347,72 @@ class V2VmOpcodesTest(BitcoinTestFramework):
+         assert_equal(sim["invocations"][0]["status"], "success")
+         assert_equal(sim["events"][0]["topic"], b"topic".hex())
+ 
++    def test_claim_assignment(self):
++        self.log.info("Claims are assigned by maximum flow, not first match")
++        # Two payment coins pin root R. A claims 20k from an output of
++        # exactly 20k; B claims 20k from any output with R. Both templates
++        # match o0 first, so a first-match rule would put 40k on o0 (20k);
++        # the maximum flow assigns B to o1 instead.
++        root = bytes([0x11]) * 32
++
++        def pay(claim, **tpl):
++            return (
++                push(template(mask=1, branches=[root], **tpl))
++                + push(num(claim))
++                + ENFORCEOUTPUT
++                + N1
++            )
++
++        pay_a = pay(20_000, value_mode=1, value=20_000)
++        pay_b = pay(20_000)
++        txid, vout, value = self.coinbase(4)
++        fund = v7(
++            [spend_input(txid, vout, OP_TRUE)],
++            [
++                output(100_000, lotus_v2_branch_leaf(pay_b)),
++                output(100_000, lotus_v2_branch_leaf(pay_a)),
++                output(value - 200_000 - FEE, lotus_v2_branch_leaf(OP_TRUE)),
++            ],
++        )
++        fund_txid = self.node.sendrawtransaction(fund)
++        self.mine()
++
++        def spend(o1_value):
++            return v7(
++                [spend_input(fund_txid, 0, pay_b), spend_input(fund_txid, 1, pay_a)],
++                [
++                    output(20_000, root),
++                    output(o1_value, root),
++                    output(
++                        200_000 - 20_000 - o1_value - FEE, lotus_v2_branch_leaf(OP_TRUE)
++                    ),
++                ],
++            )
++
++        # o1 has room for B: feasible.
++        result = self.node.testv2transaction(spend(30_000))
++        assert_equal(result["valid"], True)
++        claims = [inv["effects"]["claims"] for inv in result["invocations"]]
++        assert_equal(
++            claims,
++            [
++                [{"amount": 20_000, "matches": [0, 1]}],
++                [{"amount": 20_000, "matches": [0]}],
++            ],
++        )
++        assigned = [o["claimed"] for o in result["post_check"]["outputs"]]
++        assert_equal(assigned, [20_000, 20_000, 0])
++        # o1 too small for B: no assignment exists.
++        result = self.node.testv2transaction(spend(19_999))
++        assert_equal(result["valid"], False)
++        assert_equal(result["post_check"]["error"], "output-overclaimed")
++        assert_raises_rpc_error(
++            -26, "output-overclaimed", self.node.sendrawtransaction, spend(19_999)
++        )
++        self.node.sendrawtransaction(spend(30_000))
++        self.mine()
++        assert_equal(self.node.getrawmempool(), [])
++
+     def test_simulation_and_reorg(self, vault):
+         self.log.info("Simulate the continuation from a zero-output draft")
+         txid, value, n = vault
+-- 
+2.50.1 (Apple Git-155)
+

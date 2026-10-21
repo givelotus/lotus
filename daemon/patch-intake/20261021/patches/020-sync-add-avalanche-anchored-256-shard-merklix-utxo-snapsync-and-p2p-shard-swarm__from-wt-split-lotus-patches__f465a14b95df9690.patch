@@ -1,0 +1,3028 @@
+From da552441f85dfad7f91f8290548395768113d831 Mon Sep 17 00:00:00 2001
+From: Shammah Chancellor <shammah.chancellor@notvalid.com>
+Date: Sun, 18 Oct 2026 01:33:29 -0700
+Subject: [PATCH] sync: add Avalanche-anchored 256-shard Merklix UTXO SnapSync
+ and P2P shard swarm
+
+Add 256-shard Merklix UTXO state synchronization anchored by Avalanche
+quorum state commitments.
+
+Original-Commit: b93d59944e56a4b4e13ee29f174e4633dcb8dae4
+Original-Patch: ecash/016
+Split-Concern: whole
+
+Historical compilation prerequisites are tracked separately in daemon/patch-audit;
+this provenance-preserving split does not imply standalone build validation.
+---
+ src/avalanche/processor.h   |   73 +-
+ src/avalanche/stateanchor.h |   29 +
+ src/dbwrapper.cpp           |    2 +-
+ src/init.cpp                |   27 +
+ src/lotus_v2/fast_sync.cpp  | 1290 +++++++++++++++++++++++++++++++++++
+ src/lotus_v2/fast_sync.h    |  228 +++++++
+ src/node/snapshot.cpp       |    5 +-
+ src/protocol.cpp            |   19 +-
+ src/protocol.h              |   45 ++
+ src/validation.cpp          |  900 +++++++++++++++++++++++-
+ src/validation.h            |   99 +++
+ 11 files changed, 2703 insertions(+), 14 deletions(-)
+ create mode 100644 src/avalanche/stateanchor.h
+ create mode 100644 src/lotus_v2/fast_sync.cpp
+ create mode 100644 src/lotus_v2/fast_sync.h
+
+diff --git a/src/avalanche/processor.h b/src/avalanche/processor.h
+index 017079742f1bbcd95be3f42b2dbe354b572b37d9..8d81c225067b1437c380663d7d7a1bdd8075e69a 100644
+--- a/src/avalanche/processor.h
++++ b/src/avalanche/processor.h
+@@ -13,6 +13,7 @@
+ #include <avalanche/proofcomparator.h>
+ #include <avalanche/protocol.h>
+ #include <avalanche/stakecontender.h>
++#include <avalanche/stateanchor.h>
+ #include <avalanche/voterecord.h> // For AVALANCHE_MAX_INFLIGHT_POLL
+ #include <blockindex.h>
+ #include <blockindexcomparators.h>
+@@ -39,6 +40,7 @@
+ #include <cstdint>
+ #include <functional>
+ #include <memory>
++#include <optional>
+ #include <unordered_map>
+ #include <unordered_set>
+ #include <variant>
+@@ -104,8 +106,9 @@ enum struct VoteStatus : uint8_t {
+     Stale,
+ };
+ 
+-using AnyVoteItem = std::variant<const ProofRef, const CBlockIndex *,
+-                                 const StakeContenderId, const CTransactionRef>;
++using AnyVoteItem =
++    std::variant<const ProofRef, const CBlockIndex *, const StakeContenderId,
++                 const CTransactionRef, const StateAnchorId>;
+ 
+ class VoteItemUpdate {
+     AnyVoteItem item;
+@@ -141,6 +144,9 @@ struct VoteMapComparator {
+                 [](const CTransactionRef &lhs, const CTransactionRef &rhs) {
+                     return lhs->GetId() < rhs->GetId();
+                 },
++                [](const StateAnchorId &lhs, const StateAnchorId &rhs) {
++                    return lhs < rhs;
++                },
+                 [](const auto &lhs, const auto &rhs) {
+                     // This serves 2 purposes:
+                     //  - This makes sure that we don't forget to implement a
+@@ -371,6 +377,24 @@ private:
+     std::atomic<uint16_t> m_fastPathConfidenceThreshold{
+         DEFAULT_FAST_PATH_CONFIDENCE_THRESHOLD};
+ 
++    struct StateAnchorEntry {
++        BlockHash blockhash;
++        uint256 utxo_root;
++        // 0 = accepted, 1 = rejected/conflicting, -2 = pending
++        int status{0};
++        bool finalized{false};
++    };
++
++    mutable Mutex cs_stateAnchors;
++    std::unordered_map<StateAnchorId, StateAnchorEntry, SaltedUint256Hasher>
++        stateAnchors GUARDED_BY(cs_stateAnchors);
++    std::unordered_map<BlockHash, uint256, SaltedUint256Hasher>
++        localBlockStateRoots GUARDED_BY(cs_stateAnchors);
++    std::unordered_map<BlockHash, uint256, SaltedUint256Hasher>
++        finalizedBlockStateRoots GUARDED_BY(cs_stateAnchors);
++    std::unordered_map<NodeId, bool>
++        nodeStateAnchorSupport GUARDED_BY(cs_stateAnchors);
++
+     Processor(Config avaconfig, interfaces::Chain &chain, CConnman *connmanIn,
+               ChainstateManager &chainman, CTxMemPool *mempoolIn,
+               CScheduler &scheduler, std::unique_ptr<PeerData> peerDataIn,
+@@ -493,7 +517,7 @@ public:
+         EXCLUSIVE_LOCKS_REQUIRED(!cs_stakingRewards, !cs_peerManager);
+     bool setStakingRewardWinners(
+         const CBlockIndex *pprev,
+-        const std::vector<std::pair<ProofId, CScript>> &winners)
++        std::vector<std::pair<ProofId, CScript>> const &winners)
+         EXCLUSIVE_LOCKS_REQUIRED(!cs_stakingRewards);
+ 
+     // Implement NetEventInterface. Only FinalizeNode is of interest.
+@@ -510,7 +534,8 @@ public:
+     /** Handle removal of a node */
+     void FinalizeNode(const ::Config &config,
+                       const CNode &node) override LOCKS_EXCLUDED(cs_main)
+-        EXCLUSIVE_LOCKS_REQUIRED(!cs_peerManager, !cs_delayedAvahelloNodeIds);
++        EXCLUSIVE_LOCKS_REQUIRED(!cs_peerManager, !cs_delayedAvahelloNodeIds,
++                                 !cs_stateAnchors);
+ 
+     /** Track votes on stake contenders */
+     int getStakeContenderStatus(const StakeContenderId &contenderId) const
+@@ -586,6 +611,34 @@ public:
+         MempoolBatchAnnouncement *outBatch = nullptr, bool force = false)
+         EXCLUSIVE_LOCKS_REQUIRED(!cs_mempoolBatches, !cs_finalizedItems);
+ 
++    /**
++     * Track and poll Avalanche state anchors (BlockHash + 256-shard Merklix
++     * UtxoRoot) for Tachyon SnapSync pivot and historical epoch blocks.
++     */
++    StateAnchorId registerStateAnchor(const BlockHash &blockhash,
++                                      const uint256 &utxo_root,
++                                      bool localAccepted = true,
++                                      bool poll = true)
++        EXCLUSIVE_LOCKS_REQUIRED(!cs_stateAnchors, !cs_finalizedItems);
++    int getStateAnchorStatus(const StateAnchorId &anchorId) const
++        EXCLUSIVE_LOCKS_REQUIRED(!cs_stateAnchors);
++    void acceptStateAnchor(const StateAnchorId &anchorId)
++        EXCLUSIVE_LOCKS_REQUIRED(!cs_stateAnchors);
++    void finalizeStateAnchor(const StateAnchorId &anchorId)
++        EXCLUSIVE_LOCKS_REQUIRED(!cs_stateAnchors);
++    void rejectStateAnchor(const StateAnchorId &anchorId)
++        EXCLUSIVE_LOCKS_REQUIRED(!cs_stateAnchors);
++    std::optional<uint256>
++    getFinalizedStateRoot(const BlockHash &blockhash) const
++        EXCLUSIVE_LOCKS_REQUIRED(!cs_stateAnchors);
++    std::optional<uint256>
++    getLocalStateRoot(const BlockHash &blockhash) const
++        EXCLUSIVE_LOCKS_REQUIRED(!cs_stateAnchors);
++    void setNodeSupportsStateAnchor(NodeId nodeid, bool supports)
++        EXCLUSIVE_LOCKS_REQUIRED(!cs_stateAnchors);
++    bool nodeSupportsStateAnchor(NodeId nodeid) const
++        EXCLUSIVE_LOCKS_REQUIRED(!cs_stateAnchors);
++
+     bool isPreconsensusActivated(const CBlockIndex *pprev) const
+         EXCLUSIVE_LOCKS_REQUIRED(!cs_finalizationTip);
+     bool isStakingPreconsensusActivated(const CBlockIndex *pprev) const;
+@@ -595,12 +648,13 @@ public:
+ private:
+     void updatedBlockTip()
+         EXCLUSIVE_LOCKS_REQUIRED(!cs_peerManager, !cs_finalizedItems,
+-                                 !cs_finalizationTip, !cs_stakingRewards);
++                                 !cs_finalizationTip, !cs_stakingRewards,
++                                 !cs_stateAnchors);
+     void transactionAddedToMempool(const CTransactionRef &tx)
+         EXCLUSIVE_LOCKS_REQUIRED(!cs_finalizedItems, !cs_finalizationTip);
+     void runEventLoop()
+         EXCLUSIVE_LOCKS_REQUIRED(!cs_peerManager, !cs_stakingRewards,
+-                                 !cs_finalizedItems);
++                                 !cs_finalizedItems, !cs_stateAnchors);
+     void clearInvsNotWorthPolling()
+         EXCLUSIVE_LOCKS_REQUIRED(!cs_peerManager, !cs_finalizedItems);
+     void clearTimedoutRequests() EXCLUSIVE_LOCKS_REQUIRED(!cs_peerManager);
+@@ -617,7 +671,8 @@ private:
+         EXCLUSIVE_LOCKS_REQUIRED(!cs_peerManager);
+     std::vector<CInv>
+     getInvsForNextPoll(RWCollection<VoteMap>::ReadView &voteRecordsReadView,
+-                       size_t max_elements, bool forPoll = true) const;
++                       size_t max_elements, bool forPoll = true,
++                       bool include_state_anchors = true) const;
+     bool sendHelloInternal(CNode *pfrom)
+         EXCLUSIVE_LOCKS_REQUIRED(cs_delayedAvahelloNodeIds);
+     AnyVoteItem getVoteItemFromInv(const CInv &inv) const
+@@ -668,6 +723,8 @@ private:
+         bool operator()(const StakeContenderId &contenderId) const
+             LOCKS_EXCLUDED(cs_peerManager, cs_stakingRewards);
+         bool operator()(const CTransactionRef &tx) const;
++        bool operator()(const StateAnchorId &anchorId) const
++            LOCKS_EXCLUDED(cs_stateAnchors);
+     };
+     bool isWorthPolling(const AnyVoteItem &item) const
+         EXCLUSIVE_LOCKS_REQUIRED(!cs_finalizedItems);
+@@ -684,6 +741,8 @@ private:
+             LOCKS_EXCLUDED(cs_peerManager);
+         bool operator()(const StakeContenderId &contenderId) const;
+         bool operator()(const CTransactionRef &tx) const;
++        bool operator()(const StateAnchorId &anchorId) const
++            LOCKS_EXCLUDED(cs_stateAnchors);
+     };
+     bool getLocalAcceptance(const AnyVoteItem &item) const {
+         return std::visit(GetLocalAcceptance(*this), item);
+diff --git a/src/avalanche/stateanchor.h b/src/avalanche/stateanchor.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..9a06db058625c3dce47e26b298aa235f53ca9592
+--- /dev/null
++++ b/src/avalanche/stateanchor.h
+@@ -0,0 +1,29 @@
++// Copyright (c) 2026 The Lotus developers
++// Distributed under the MIT software license, see the accompanying
++// file COPYING or http://www.opensource.org/licenses/mit-license.php.
++
++#ifndef BITCOIN_AVALANCHE_STATEANCHOR_H
++#define BITCOIN_AVALANCHE_STATEANCHOR_H
++
++#include <hash.h>
++#include <primitives/blockhash.h>
++#include <uint256.h>
++
++namespace avalanche {
++
++/**
++ * StateAnchorId commits to a (BlockHash, UtxoRoot) pair so that Avalanche
++ * quorums can poll, vote on, and finalize 256-shard Merklix UTXO state roots
++ * for pivot and epoch blocks without requiring a state_root field in the
++ * 80-byte CBlockHeader.
++ */
++struct StateAnchorId : public uint256 {
++    explicit StateAnchorId() : uint256() {}
++    explicit StateAnchorId(const uint256 &b) : uint256(b) {}
++    explicit StateAnchorId(const BlockHash &blockhash, const uint256 &utxo_root)
++        : uint256(Hash(blockhash, utxo_root)) {}
++};
++
++} // namespace avalanche
++
++#endif // BITCOIN_AVALANCHE_STATEANCHOR_H
+diff --git a/src/dbwrapper.cpp b/src/dbwrapper.cpp
+index 3d88e3ce1576dd654c997e440490564591cdf275..4ffc2ac7510ee64cb716eecc4a061e67eb40b3fe 100644
+--- a/src/dbwrapper.cpp
++++ b/src/dbwrapper.cpp
+@@ -369,7 +369,7 @@ CDBWrapper::CDBWrapper(const DBParams &params)
+     dbwrapper_private::HandleError(rc, "mdbx_env_set_geometry");
+ 
+     const MDBX_env_flags_t env_flags = static_cast<MDBX_env_flags_t>(
+-        MDBX_WRITEMAP | MDBX_SAFE_NOSYNC | MDBX_NOMETASYNC | MDBX_COALESCE |
++        MDBX_WRITEMAP | MDBX_SAFE_NOSYNC | MDBX_NOMETASYNC |
+         MDBX_LIFORECLAIM | MDBX_NOSTICKYTHREADS | MDBX_NOMEMINIT);
+ 
+     rc = mdbx_env_open(m_env, fs::PathToString(m_active_path).c_str(),
+diff --git a/src/init.cpp b/src/init.cpp
+index 39007c47ba8455ed518fd07537e8846f66f7959b..5238dc357964695ae9872334d38e53351b0d01d6 100644
+--- a/src/init.cpp
++++ b/src/init.cpp
+@@ -578,6 +578,29 @@ void SetupServerArgs(NodeContext &node) {
+         "Scale max generated and excessive block size elastically with "
+         "EMA block size and mempool backlog up to 1 GB (default: 1)",
+         ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
++    argsman.AddArg(
++        "-snapsync",
++        "Enable Tachyon SnapSync 256-shard UTXO fast sync and reverse block "
++        "peeling (set 0 to opt out and use traditional Genesis-upward sync, "
++        "default: 1)",
++        ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
++    argsman.AddArg(
++        "-reversesync",
++        "Enable reverse historical block peeling after SnapSync pivot "
++        "activation (set 0 to opt out and use traditional Genesis-upward "
++        "sync, default: 1)",
++        ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
++    argsman.AddArg(
++        "-reversesynchorizon=<n>",
++        "Maximum number of historical blocks to reverse-peel below a SnapSync "
++        "pivot for shallow reorg safety (0 to peel all the way to Genesis, "
++        "default: 50)",
++        ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
++    argsman.AddArg(
++        "-serveutxoshards",
++        "Advertise NODE_UTXO_SHARD and serve Tachyon SnapSync UTXO shards and "
++        "reverse block undo data to peers (default: 1)",
++        ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
+     argsman.AddArg(
+         "-gbtwithoutpeers",
+         "Allow getblocktemplate to succeed without connected P2P peers in "
+@@ -2938,6 +2961,10 @@ bool AppInitMain(Config &config, RPCServer &rpcServer,
+         }
+     }
+ 
++    if (args.GetBoolArg("-serveutxoshards", true)) {
++        nLocalServices = ServiceFlags(nLocalServices | NODE_UTXO_SHARD);
++    }
++
+     PeerManager::Options peerman_opts{};
+     ApplyArgsManOptions(args, peerman_opts);
+ 
+diff --git a/src/lotus_v2/fast_sync.cpp b/src/lotus_v2/fast_sync.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..865051efea177f421b282d07f6f3bce718908b63
+--- /dev/null
++++ b/src/lotus_v2/fast_sync.cpp
+@@ -0,0 +1,1290 @@
++// Copyright (c) 2026 The Lotus developers
++// Tachyon SnapSync: Fast UTXO Shard Sync protocol, Avalanche state-anchor
++// verification, and bijective reverse block peeling without header changes.
++#include "fast_sync.h"
++
++#include <algorithm>
++#include <cstring>
++#include <limits>
++#include <map>
++#include <set>
++
++namespace lotus::v2 {
++namespace {
++
++bool KeyBitAt(const Hash &key, uint8_t depth) {
++    return ((key[depth / 8] >> (depth % 8)) & 1u) != 0;
++}
++
++void WriteLE16(std::vector<uint8_t> &out, uint16_t val) {
++    out.push_back(static_cast<uint8_t>(val & 0xFFu));
++    out.push_back(static_cast<uint8_t>((val >> 8) & 0xFFu));
++}
++
++void WriteLE64(std::vector<uint8_t> &out, uint64_t val) {
++    for (unsigned i = 0; i < 8; ++i) {
++        out.push_back(static_cast<uint8_t>((val >> (8 * i)) & 0xFFu));
++    }
++}
++
++uint16_t ReadLE16(const uint8_t *p) {
++    return static_cast<uint16_t>(p[0]) | (static_cast<uint16_t>(p[1]) << 8);
++}
++
++uint64_t ReadLE64(const uint8_t *p) {
++    uint64_t v = 0;
++    for (unsigned i = 0; i < 8; ++i) {
++        v |= static_cast<uint64_t>(p[i]) << (8 * i);
++    }
++    return v;
++}
++
++void WriteCompactSize(std::vector<uint8_t> &out, uint64_t n) {
++    if (n < 253) {
++        out.push_back(static_cast<uint8_t>(n));
++    } else if (n <= 0xFFFFu) {
++        out.push_back(253);
++        WriteLE16(out, static_cast<uint16_t>(n));
++    } else {
++        out.push_back(254);
++        for (unsigned i = 0; i < 4; ++i) {
++            out.push_back(static_cast<uint8_t>((n >> (8 * i)) & 0xFFu));
++        }
++    }
++}
++
++bool ReadCompactSize(const std::vector<uint8_t> &bytes, size_t &offset,
++                     uint64_t max_val, uint64_t &out) {
++    if (offset >= bytes.size()) return false;
++    const uint8_t lead = bytes[offset++];
++    if (lead < 253) {
++        out = lead;
++    } else if (lead == 253) {
++        if (bytes.size() - offset < 2) return false;
++        out = ReadLE16(bytes.data() + offset);
++        offset += 2;
++        if (out < 253) return false;
++    } else if (lead == 254) {
++        if (bytes.size() - offset < 4) return false;
++        uint64_t v = 0;
++        for (unsigned i = 0; i < 4; ++i) {
++            v |= static_cast<uint64_t>(bytes[offset + i]) << (8 * i);
++        }
++        offset += 4;
++        if (v < 0x10000ULL) return false;
++        out = v;
++    } else {
++        if (bytes.size() - offset < 8) return false;
++        out = ReadLE64(bytes.data() + offset);
++        offset += 8;
++        if (out < 0x100000000ULL) return false;
++    }
++    return out <= max_val;
++}
++
++bool DecodeCanonicalCoinBytes(const uint8_t *data, size_t len, Coin &out,
++                              std::string &error) {
++    if (len < 54 || len > MAX_COIN_BYTES) {
++        error = "invalid coin byte length";
++        return false;
++    }
++    std::copy_n(data, 32, out.outpoint.tx_id.begin());
++    out.outpoint.index = static_cast<uint32_t>(data[32]) |
++                         (static_cast<uint32_t>(data[33]) << 8) |
++                         (static_cast<uint32_t>(data[34]) << 16) |
++                         (static_cast<uint32_t>(data[35]) << 24);
++    std::vector<uint8_t> buf(data, data + len);
++    size_t offset = 36;
++    uint64_t out_len = 0;
++    if (!ReadCompactSize(buf, offset, MAX_OUTPUT_BYTES, out_len) ||
++        buf.size() - offset < out_len ||
++        buf.size() - (offset + static_cast<size_t>(out_len)) != 17) {
++        error = "invalid coin output framing";
++        return false;
++    }
++    std::vector<uint8_t> output_bytes(
++        buf.begin() + offset,
++        buf.begin() + offset + static_cast<size_t>(out_len));
++    if (!DecodeOutput(output_bytes, out.output, error)) {
++        return false;
++    }
++    offset += static_cast<size_t>(out_len);
++    out.creation_height = ReadLE64(buf.data() + offset);
++    out.creation_parent_mtp = ReadLE64(buf.data() + offset + 8);
++    const uint8_t cb_flag = buf[offset + 16];
++    if (cb_flag > 1) {
++        error = "invalid coinbase flag in coin";
++        return false;
++    }
++    out.coinbase = (cb_flag == 1);
++
++    std::vector<uint8_t> reencoded;
++    if (!EncodeCoin(out, reencoded) || reencoded != buf) {
++        error = "non-canonical coin encoding";
++        return false;
++    }
++    return true;
++}
++
++struct KeyedCoinRef {
++    Hash key{};
++    const Coin *coin = nullptr;
++};
++
++bool ComputeSubtreeEntry(const std::vector<KeyedCoinRef> &entries,
++                         unsigned depth, ShardRootEntry &out) {
++    if (entries.empty()) {
++        out = {0, EmptyUtxoRoot()};
++        return true;
++    }
++    if (entries.size() == 1) {
++        out.cardinality_tag = 1;
++        return UtxoLeaf(*entries[0].coin, out.subtree_root);
++    }
++    if (depth >= 256) {
++        return false;
++    }
++    std::vector<KeyedCoinRef> left;
++    std::vector<KeyedCoinRef> right;
++    left.reserve(entries.size());
++    right.reserve(entries.size());
++    for (const auto &entry : entries) {
++        if (KeyBitAt(entry.key, static_cast<uint8_t>(depth))) {
++            right.push_back(entry);
++        } else {
++            left.push_back(entry);
++        }
++    }
++    ShardRootEntry left_entry, right_entry;
++    if (!ComputeSubtreeEntry(left, depth + 1, left_entry) ||
++        !ComputeSubtreeEntry(right, depth + 1, right_entry)) {
++        return false;
++    }
++    return FoldShardPair(static_cast<uint8_t>(depth), left_entry, right_entry,
++                         out);
++}
++
++bool SplitAndExportShardsRecursive(
++    const UtxoSet &utxo, const Hash &pivot_block_id,
++    const std::vector<KeyedCoinRef> &entries, uint8_t depth,
++    uint16_t prefix_bits, size_t max_shard_leaves,
++    std::vector<UtxoShardMessage> &out, std::string &error) {
++    if (entries.empty()) {
++        return true;
++    }
++    if (entries.size() <= max_shard_leaves) {
++        UtxoShardMessage msg;
++        if (!ExportUtxoShard(utxo, pivot_block_id, depth, prefix_bits, msg,
++                             error, max_shard_leaves)) {
++            return false;
++        }
++        out.push_back(std::move(msg));
++        return true;
++    }
++    if (depth >= kMaxUtxoShardPrefixDepth) {
++        error = "sub-shard at maximum depth 16 still exceeds leaf limit";
++        return false;
++    }
++    std::vector<KeyedCoinRef> left;
++    std::vector<KeyedCoinRef> right;
++    for (const auto &e : entries) {
++        if (KeyBitAt(e.key, depth)) {
++            right.push_back(e);
++        } else {
++            left.push_back(e);
++        }
++    }
++    const uint16_t left_prefix = prefix_bits;
++    const uint16_t right_prefix =
++        static_cast<uint16_t>(prefix_bits | (uint16_t{1} << depth));
++    return SplitAndExportShardsRecursive(utxo, pivot_block_id, left,
++                                         static_cast<uint8_t>(depth + 1),
++                                         left_prefix, max_shard_leaves, out,
++                                         error) &&
++           SplitAndExportShardsRecursive(utxo, pivot_block_id, right,
++                                         static_cast<uint8_t>(depth + 1),
++                                         right_prefix, max_shard_leaves, out,
++                                         error);
++}
++
++} // namespace
++
++bool CheckFastSyncPivotEligibility(const FastSyncPivotCandidate &candidate,
++                                   std::string &error) {
++    if (!candidate.has_minimum_chain_work) {
++        error = "pivot does not meet minimum chain work";
++        return false;
++    }
++    if (candidate.pivot_height > candidate.best_header_height) {
++        error = "pivot height exceeds best header height";
++        return false;
++    }
++    if (!candidate.is_avalanche_finalized) {
++        if (candidate.buried_blocks < kFastSyncMinBuriedBlocks ||
++            candidate.distinct_netgroup_confirmations <
++                kFastSyncMinNetgroupConfirmations) {
++            error = "unfinalized pivot lacks 100 buried blocks across >= 3 distinct netgroups";
++            return false;
++        }
++        if (candidate.best_header_height - candidate.pivot_height <
++            kFastSyncPivotSafetyCushion) {
++            error = "unfinalized pivot violates 10-block safety cushion below tip";
++            return false;
++        }
++    }
++    error.clear();
++    return true;
++}
++
++uint16_t OutpointPrefixBits(const Hash &outpoint_key, uint8_t prefix_depth) {
++    uint16_t bits = 0;
++    const uint8_t limit = std::min<uint8_t>(prefix_depth, 16);
++    for (uint8_t d = 0; d < limit; ++d) {
++        if (KeyBitAt(outpoint_key, d)) {
++            bits |= static_cast<uint16_t>(uint16_t{1} << d);
++        }
++    }
++    return bits;
++}
++
++bool IsValidShardRootEntry(const ShardRootEntry &entry) {
++    if (entry.cardinality_tag > 2) return false;
++    if (entry.cardinality_tag == 0) {
++        return entry.subtree_root == EmptyUtxoRoot();
++    }
++    return entry.subtree_root != EmptyUtxoRoot();
++}
++
++bool FoldShardPair(uint8_t depth, const ShardRootEntry &left,
++                   const ShardRootEntry &right, ShardRootEntry &out) {
++    if (!IsValidShardRootEntry(left) || !IsValidShardRootEntry(right)) {
++        return false;
++    }
++    if (left.cardinality_tag == 0 && right.cardinality_tag == 0) {
++        out = {0, EmptyUtxoRoot()};
++        return true;
++    }
++    if (left.cardinality_tag == 1 && right.cardinality_tag == 0) {
++        out = {1, left.subtree_root};
++        return true;
++    }
++    if (left.cardinality_tag == 0 && right.cardinality_tag == 1) {
++        out = {1, right.subtree_root};
++        return true;
++    }
++    out.cardinality_tag = 2;
++    return UtxoNode(depth, left.subtree_root, right.subtree_root,
++                    out.subtree_root);
++}
++
++std::optional<Hash> FoldDepth8ShardRoots(
++    const std::array<ShardRootEntry, kFastSyncShardCount> &shards,
++    std::string *error) {
++    for (size_t i = 0; i < shards.size(); ++i) {
++        if (!IsValidShardRootEntry(shards[i])) {
++            if (error) {
++                *error = "invalid shard root entry tag or empty digest mismatch";
++            }
++            return std::nullopt;
++        }
++    }
++    std::vector<ShardRootEntry> current(shards.begin(), shards.end());
++    for (int d = 7; d >= 0; --d) {
++        const size_t half = static_cast<size_t>(1u << d);
++        std::vector<ShardRootEntry> next(half);
++        for (size_t prefix = 0; prefix < half; ++prefix) {
++            const ShardRootEntry &left = current[prefix];
++            const ShardRootEntry &right = current[prefix | half];
++            FoldShardPair(static_cast<uint8_t>(d), left, right, next[prefix]);
++        }
++        current = std::move(next);
++    }
++    if (error) error->clear();
++    return current[0].subtree_root;
++}
++
++bool VerifyUtxoRootsAgainstAnchor(
++    const Hash &expected_pivot_block_id, uint64_t expected_height,
++    const std::optional<Hash> &expected_utxo_root_anchor,
++    const UtxoRootsMessage &msg, Hash &out_folded_utxo_root,
++    std::string &error) {
++    if (msg.pivot_block_id != expected_pivot_block_id) {
++        error = "utxoroots pivot_block_id does not match expected pivot block";
++        return false;
++    }
++    if (msg.height != expected_height) {
++        error = "utxoroots height does not match expected pivot height";
++        return false;
++    }
++    if (!expected_utxo_root_anchor.has_value()) {
++        error = "missing finalized Avalanche/epoch UtxoRoot state anchor for pivot";
++        return false;
++    }
++    try {
++        (void)DecodeMonetaryState(
++            std::vector<uint8_t>(msg.monetary_state.begin(),
++                                 msg.monetary_state.end()));
++    } catch (const std::exception &e) {
++        error = std::string("invalid utxoroots monetary_state: ") + e.what();
++        return false;
++    }
++    const auto folded_utxo_root = FoldDepth8ShardRoots(msg.shards, &error);
++    if (!folded_utxo_root) {
++        return false;
++    }
++    out_folded_utxo_root = *folded_utxo_root;
++    if (*folded_utxo_root != *expected_utxo_root_anchor) {
++        error =
++            "utxoroots folded UtxoRoot does not match Avalanche/epoch state anchor";
++        return false;
++    }
++    error.clear();
++    return true;
++}
++
++bool VerifyAndBuildUtxoShard(const ShardRootEntry &expected_depth8_entry,
++                             uint64_t pivot_height,
++                             const UtxoShardMessage &shard,
++                             ShardRootEntry *computed_subshard_out,
++                             std::string &error) {
++    if (!IsValidShardRootEntry(expected_depth8_entry)) {
++        error = "invalid expected depth-8 shard root entry";
++        return false;
++    }
++    if (shard.prefix_depth < kMinUtxoShardPrefixDepth ||
++        shard.prefix_depth > kMaxUtxoShardPrefixDepth) {
++        error = "utxoshard prefix_depth out of range [8..16]";
++        return false;
++    }
++    if (shard.prefix_depth < 16 &&
++        (shard.prefix_bits >> shard.prefix_depth) != 0) {
++        error = "utxoshard prefix_bits has non-zero bits above prefix_depth";
++        return false;
++    }
++    const size_t expected_siblings =
++        static_cast<size_t>(shard.prefix_depth - kMinUtxoShardPrefixDepth);
++    if (shard.boundary_siblings.size() != expected_siblings) {
++        error =
++            "utxoshard boundary_siblings length does not match prefix_depth - 8";
++        return false;
++    }
++    if (shard.coins.size() > kMaxUtxoShardLeaves) {
++        error = "utxoshard exceeds maximum allowed 4096 leaves";
++        return false;
++    }
++
++    std::vector<KeyedCoinRef> keyed;
++    keyed.reserve(shard.coins.size());
++    Hash prev_key{};
++    for (size_t i = 0; i < shard.coins.size(); ++i) {
++        const Coin &coin = shard.coins[i];
++        if (coin.output.IsBurn()) {
++            error = "utxoshard contains unspendable burn output";
++            return false;
++        }
++        if (coin.creation_height > pivot_height) {
++            error = "utxoshard coin creation_height exceeds pivot height";
++            return false;
++        }
++        Hash leaf_hash{};
++        if (!UtxoLeaf(coin, leaf_hash)) {
++            error = "utxoshard coin failed canonical UtxoLeaf validation";
++            return false;
++        }
++        const Hash key = OutpointKey(coin.outpoint);
++        if (OutpointPrefixBits(key, shard.prefix_depth) != shard.prefix_bits) {
++            error = "utxoshard coin OutpointKey does not match shard prefix_bits";
++            return false;
++        }
++        if (i > 0 && !(prev_key < key)) {
++            error =
++                "utxoshard coins are not in strictly ascending OutpointKey order";
++            return false;
++        }
++        prev_key = key;
++        keyed.push_back(KeyedCoinRef{key, &coin});
++    }
++
++    ShardRootEntry sub_entry{};
++    ComputeSubtreeEntry(keyed, shard.prefix_depth, sub_entry);
++    if (computed_subshard_out) {
++        *computed_subshard_out = sub_entry;
++    }
++
++    ShardRootEntry cur = sub_entry;
++    for (size_t i = 0; i < expected_siblings; ++i) {
++        const uint8_t d = static_cast<uint8_t>((shard.prefix_depth - 1) - i);
++        const Hash &sib_hash = shard.boundary_siblings[i];
++        const bool bit_is_right = ((shard.prefix_bits >> d) & 1u) != 0;
++
++        ShardRootEntry sib_entry{};
++        if (sib_hash == EmptyUtxoRoot()) {
++            sib_entry = {0, EmptyUtxoRoot()};
++        } else if (cur.cardinality_tag >= 1) {
++            sib_entry = {2, sib_hash};
++        } else {
++            bool higher_all_empty = true;
++            for (size_t j = i + 1; j < expected_siblings; ++j) {
++                if (shard.boundary_siblings[j] != EmptyUtxoRoot()) {
++                    higher_all_empty = false;
++                    break;
++                }
++            }
++            const uint8_t inferred_tag =
++                (expected_depth8_entry.cardinality_tag == 1 && higher_all_empty)
++                    ? 1
++                    : 2;
++            sib_entry = {inferred_tag, sib_hash};
++        }
++
++        const ShardRootEntry &left = bit_is_right ? sib_entry : cur;
++        const ShardRootEntry &right = bit_is_right ? cur : sib_entry;
++        ShardRootEntry next{};
++        FoldShardPair(d, left, right, next);
++        cur = next;
++    }
++
++    if (cur != expected_depth8_entry) {
++        error =
++            "utxoshard folded depth-8 entry does not match authenticated ShardRootEntry";
++        return false;
++    }
++    error.clear();
++    return true;
++}
++
++std::vector<uint8_t> EncodeGetUtxoRootsRequest(const GetUtxoRootsRequest &req) {
++    return std::vector<uint8_t>(req.pivot_block_id.begin(),
++                                req.pivot_block_id.end());
++}
++
++bool DecodeGetUtxoRootsRequest(const std::vector<uint8_t> &bytes,
++                               GetUtxoRootsRequest &out,
++                               std::string &error) {
++    if (bytes.size() != 32) {
++        error = "invalid getutxoroots request size";
++        return false;
++    }
++    std::copy_n(bytes.data(), 32, out.pivot_block_id.begin());
++    error.clear();
++    return true;
++}
++
++std::vector<uint8_t> EncodeUtxoRootsMessage(const UtxoRootsMessage &msg) {
++    std::vector<uint8_t> out;
++    out.reserve(32 + 8 + 56 + kFastSyncShardCount * 33);
++    out.insert(out.end(), msg.pivot_block_id.begin(), msg.pivot_block_id.end());
++    WriteLE64(out, msg.height);
++    out.insert(out.end(), msg.monetary_state.begin(), msg.monetary_state.end());
++    for (const auto &shard : msg.shards) {
++        out.push_back(shard.cardinality_tag);
++        out.insert(out.end(), shard.subtree_root.begin(),
++                   shard.subtree_root.end());
++    }
++    return out;
++}
++
++bool DecodeUtxoRootsMessage(const std::vector<uint8_t> &bytes,
++                            UtxoRootsMessage &out,
++                            std::string &error) {
++    constexpr size_t kExpectedSize = 32 + 8 + 56 + kFastSyncShardCount * 33;
++    if (bytes.size() != kExpectedSize) {
++        error = "invalid utxoroots message size";
++        return false;
++    }
++    UtxoRootsMessage parsed;
++    std::copy_n(bytes.data(), 32, parsed.pivot_block_id.begin());
++    parsed.height = ReadLE64(bytes.data() + 32);
++    std::copy_n(bytes.data() + 40, 56, parsed.monetary_state.begin());
++    size_t offset = 96;
++    for (size_t i = 0; i < kFastSyncShardCount; ++i) {
++        parsed.shards[i].cardinality_tag = bytes[offset++];
++        std::copy_n(bytes.data() + offset, 32,
++                    parsed.shards[i].subtree_root.begin());
++        offset += 32;
++        if (!IsValidShardRootEntry(parsed.shards[i])) {
++            error = "utxoroots contains invalid shard root entry";
++            return false;
++        }
++    }
++    out = parsed;
++    error.clear();
++    return true;
++}
++
++bool EncodeGetUtxoShardRequest(const GetUtxoShardRequest &req,
++                               std::vector<uint8_t> &out,
++                               std::string &error) {
++    if (req.prefix_depth < kMinUtxoShardPrefixDepth ||
++        req.prefix_depth > kMaxUtxoShardPrefixDepth) {
++        error = "getutxoshard prefix_depth out of range [8..16]";
++        return false;
++    }
++    if (req.prefix_depth < 16 && (req.prefix_bits >> req.prefix_depth) != 0) {
++        error = "getutxoshard prefix_bits out of range for prefix_depth";
++        return false;
++    }
++    out.clear();
++    out.reserve(35);
++    out.insert(out.end(), req.pivot_block_id.begin(), req.pivot_block_id.end());
++    out.push_back(req.prefix_depth);
++    WriteLE16(out, req.prefix_bits);
++    error.clear();
++    return true;
++}
++
++bool DecodeGetUtxoShardRequest(const std::vector<uint8_t> &bytes,
++                               GetUtxoShardRequest &out,
++                               std::string &error) {
++    if (bytes.size() != 35) {
++        error = "invalid getutxoshard request size";
++        return false;
++    }
++    GetUtxoShardRequest parsed;
++    std::copy_n(bytes.data(), 32, parsed.pivot_block_id.begin());
++    parsed.prefix_depth = bytes[32];
++    parsed.prefix_bits = ReadLE16(bytes.data() + 33);
++    if (parsed.prefix_depth < kMinUtxoShardPrefixDepth ||
++        parsed.prefix_depth > kMaxUtxoShardPrefixDepth) {
++        error = "getutxoshard prefix_depth out of range [8..16]";
++        return false;
++    }
++    if (parsed.prefix_depth < 16 &&
++        (parsed.prefix_bits >> parsed.prefix_depth) != 0) {
++        error = "getutxoshard prefix_bits out of range for prefix_depth";
++        return false;
++    }
++    out = parsed;
++    error.clear();
++    return true;
++}
++
++bool EncodeUtxoShardMessage(const UtxoShardMessage &msg,
++                            std::vector<uint8_t> &out,
++                            std::string &error) {
++    if (msg.prefix_depth < kMinUtxoShardPrefixDepth ||
++        msg.prefix_depth > kMaxUtxoShardPrefixDepth) {
++        error = "utxoshard prefix_depth out of range [8..16]";
++        return false;
++    }
++    if (msg.prefix_depth < 16 && (msg.prefix_bits >> msg.prefix_depth) != 0) {
++        error = "utxoshard prefix_bits out of range for prefix_depth";
++        return false;
++    }
++    const size_t expected_siblings =
++        static_cast<size_t>(msg.prefix_depth - kMinUtxoShardPrefixDepth);
++    if (msg.boundary_siblings.size() != expected_siblings) {
++        error = "utxoshard boundary_siblings count mismatch";
++        return false;
++    }
++    if (msg.coins.size() > kMaxUtxoShardLeaves) {
++        error = "utxoshard coins exceed 4096 limit";
++        return false;
++    }
++    std::vector<uint8_t> buf;
++    buf.reserve(35 + expected_siblings * 32 + msg.coins.size() * 64);
++    buf.insert(buf.end(), msg.pivot_block_id.begin(), msg.pivot_block_id.end());
++    buf.push_back(msg.prefix_depth);
++    WriteLE16(buf, msg.prefix_bits);
++    for (const Hash &sib : msg.boundary_siblings) {
++        buf.insert(buf.end(), sib.begin(), sib.end());
++    }
++    WriteCompactSize(buf, msg.coins.size());
++    for (const Coin &coin : msg.coins) {
++        std::vector<uint8_t> encoded_coin;
++        if (!EncodeCoin(coin, encoded_coin)) {
++            error = "utxoshard failed to encode coin";
++            return false;
++        }
++        WriteCompactSize(buf, encoded_coin.size());
++        buf.insert(buf.end(), encoded_coin.begin(), encoded_coin.end());
++    }
++    out = std::move(buf);
++    error.clear();
++    return true;
++}
++
++bool DecodeUtxoShardMessage(const std::vector<uint8_t> &bytes,
++                            UtxoShardMessage &out,
++                            std::string &error) {
++    if (bytes.size() < 36) {
++        error = "truncated utxoshard message header";
++        return false;
++    }
++    UtxoShardMessage parsed;
++    std::copy_n(bytes.data(), 32, parsed.pivot_block_id.begin());
++    parsed.prefix_depth = bytes[32];
++    parsed.prefix_bits = ReadLE16(bytes.data() + 33);
++    if (parsed.prefix_depth < kMinUtxoShardPrefixDepth ||
++        parsed.prefix_depth > kMaxUtxoShardPrefixDepth) {
++        error = "utxoshard prefix_depth out of range [8..16]";
++        return false;
++    }
++    if (parsed.prefix_depth < 16 &&
++        (parsed.prefix_bits >> parsed.prefix_depth) != 0) {
++        error = "utxoshard prefix_bits out of range for prefix_depth";
++        return false;
++    }
++    const size_t expected_siblings =
++        static_cast<size_t>(parsed.prefix_depth - kMinUtxoShardPrefixDepth);
++    size_t offset = 35;
++    if (bytes.size() - offset < expected_siblings * 32) {
++        error = "truncated utxoshard boundary_siblings";
++        return false;
++    }
++    parsed.boundary_siblings.resize(expected_siblings);
++    for (size_t i = 0; i < expected_siblings; ++i) {
++        std::copy_n(bytes.data() + offset, 32,
++                    parsed.boundary_siblings[i].begin());
++        offset += 32;
++    }
++    uint64_t coin_count = 0;
++    if (!ReadCompactSize(bytes, offset, kMaxUtxoShardLeaves, coin_count)) {
++        error = "invalid or excessive utxoshard coin count";
++        return false;
++    }
++    parsed.coins.resize(static_cast<size_t>(coin_count));
++    for (size_t i = 0; i < parsed.coins.size(); ++i) {
++        uint64_t coin_len = 0;
++        if (!ReadCompactSize(bytes, offset, MAX_COIN_BYTES, coin_len) ||
++            bytes.size() - offset < coin_len) {
++            error = "truncated utxoshard coin record";
++            return false;
++        }
++        if (!DecodeCanonicalCoinBytes(bytes.data() + offset,
++                                      static_cast<size_t>(coin_len),
++                                      parsed.coins[i], error)) {
++            return false;
++        }
++        offset += static_cast<size_t>(coin_len);
++    }
++    if (offset != bytes.size()) {
++        error = "trailing bytes in utxoshard message";
++        return false;
++    }
++    out = std::move(parsed);
++    error.clear();
++    return true;
++}
++
++bool ExportUtxoRootsForBlock(const UtxoSet &utxo, const Hash &pivot_block_id,
++                             uint64_t pivot_height,
++                             const MonetaryState &monetary,
++                             UtxoRootsMessage &out, std::string &error) {
++    std::array<std::vector<KeyedCoinRef>, kFastSyncShardCount> buckets;
++    for (const Coin &coin : utxo.Coins()) {
++        const Hash key = OutpointKey(coin.outpoint);
++        const uint8_t shard_idx = key[0];
++        buckets[shard_idx].push_back(KeyedCoinRef{key, &coin});
++    }
++    for (auto &b : buckets) {
++        std::sort(b.begin(), b.end(),
++                  [](const KeyedCoinRef &a, const KeyedCoinRef &c) {
++                      return a.key < c.key;
++                  });
++    }
++
++    UtxoRootsMessage msg;
++    msg.pivot_block_id = pivot_block_id;
++    msg.height = pivot_height;
++    msg.monetary_state = EncodeMonetaryState(monetary);
++    for (size_t s = 0; s < kFastSyncShardCount; ++s) {
++        ComputeSubtreeEntry(buckets[s], kMinUtxoShardPrefixDepth,
++                            msg.shards[s]);
++    }
++
++    out = msg;
++    error.clear();
++    return true;
++}
++
++namespace {
++
++void PopulateDepth8FromSmt(
++    const std::shared_ptr<const SmtNode> &node, uint8_t depth,
++    uint16_t prefix_bits,
++    std::array<ShardRootEntry, kFastSyncShardCount> &shards) {
++    if (!node || node->count == 0) {
++        return;
++    }
++    if (node->IsLeaf()) {
++        const uint8_t shard_idx = node->key[0];
++        shards[shard_idx] = ShardRootEntry{1, node->digest};
++        return;
++    }
++    if (depth == kMinUtxoShardPrefixDepth) {
++        shards[prefix_bits] = ShardRootEntry{
++            static_cast<uint8_t>(node->count == 1 ? 1 : 2), node->digest};
++        return;
++    }
++    if (node->child[0]) {
++        PopulateDepth8FromSmt(node->child[0], depth + 1, prefix_bits, shards);
++    }
++    if (node->child[1]) {
++        PopulateDepth8FromSmt(
++            node->child[1], depth + 1,
++            static_cast<uint16_t>(prefix_bits | (uint16_t(1u) << depth)),
++            shards);
++    }
++}
++
++void CollectSmtSubtreeCoins(const std::shared_ptr<const SmtNode> &node,
++                            std::vector<KeyedCoinRef> &out) {
++    if (!node || node->count == 0) {
++        return;
++    }
++    if (node->IsLeaf()) {
++        out.push_back(KeyedCoinRef{node->key, node->coin.get()});
++        return;
++    }
++    if (node->child[0]) {
++        CollectSmtSubtreeCoins(node->child[0], out);
++    }
++    if (node->child[1]) {
++        CollectSmtSubtreeCoins(node->child[1], out);
++    }
++}
++
++} // namespace
++
++bool ExportUtxoRootsFromSmt(const std::shared_ptr<const SmtNode> &root,
++                            const Hash &pivot_block_id, uint64_t pivot_height,
++                            const MonetaryState &monetary,
++                            UtxoRootsMessage &out, std::string &error) {
++    UtxoRootsMessage msg;
++    msg.pivot_block_id = pivot_block_id;
++    msg.height = pivot_height;
++    msg.monetary_state = EncodeMonetaryState(monetary);
++    for (size_t s = 0; s < kFastSyncShardCount; ++s) {
++        msg.shards[s] = ShardRootEntry{0, EmptyUtxoRoot()};
++    }
++    PopulateDepth8FromSmt(root, 0, 0, msg.shards);
++    out = std::move(msg);
++    error.clear();
++    return true;
++}
++
++bool ExportUtxoShard(const UtxoSet &utxo, const Hash &pivot_block_id,
++                     uint8_t prefix_depth, uint16_t prefix_bits,
++                     UtxoShardMessage &out, std::string &error,
++                     size_t max_shard_leaves) {
++    if (prefix_depth < kMinUtxoShardPrefixDepth ||
++        prefix_depth > kMaxUtxoShardPrefixDepth) {
++        error = "prefix_depth out of range [8..16]";
++        return false;
++    }
++    if (prefix_depth < 16 && (prefix_bits >> prefix_depth) != 0) {
++        error = "prefix_bits has bits set above prefix_depth";
++        return false;
++    }
++
++    const uint8_t depth8_idx = static_cast<uint8_t>(prefix_bits & 0xFFu);
++    std::vector<KeyedCoinRef> depth8_entries;
++    for (const Coin &coin : utxo.Coins()) {
++        const Hash key = OutpointKey(coin.outpoint);
++        if (key[0] == depth8_idx) {
++            depth8_entries.push_back(KeyedCoinRef{key, &coin});
++        }
++    }
++    std::sort(depth8_entries.begin(), depth8_entries.end(),
++              [](const KeyedCoinRef &a, const KeyedCoinRef &b) {
++                  return a.key < b.key;
++              });
++
++    std::vector<Hash> siblings_top_down;
++    siblings_top_down.reserve(prefix_depth - kMinUtxoShardPrefixDepth);
++    std::vector<KeyedCoinRef> current = std::move(depth8_entries);
++    for (uint8_t d = kMinUtxoShardPrefixDepth; d < prefix_depth; ++d) {
++        const bool target_bit = ((prefix_bits >> d) & 1u) != 0;
++        std::vector<KeyedCoinRef> target_side;
++        std::vector<KeyedCoinRef> sibling_side;
++        for (const auto &e : current) {
++            if (KeyBitAt(e.key, d) == target_bit) {
++                target_side.push_back(e);
++            } else {
++                sibling_side.push_back(e);
++            }
++        }
++        ShardRootEntry sib_entry{};
++        if (!ComputeSubtreeEntry(sibling_side, d + 1, sib_entry)) {
++            error = "failed computing boundary sibling subtree";
++            return false;
++        }
++        siblings_top_down.push_back(sib_entry.subtree_root);
++        current = std::move(target_side);
++    }
++
++    if (current.size() > max_shard_leaves ||
++        current.size() > kMaxUtxoShardLeaves) {
++        error =
++            "requested shard exceeds maximum leaf count; split to deeper prefix_depth";
++        return false;
++    }
++
++    UtxoShardMessage msg;
++    msg.pivot_block_id = pivot_block_id;
++    msg.prefix_depth = prefix_depth;
++    msg.prefix_bits = prefix_bits;
++    msg.boundary_siblings.assign(siblings_top_down.rbegin(),
++                                 siblings_top_down.rend());
++    msg.coins.reserve(current.size());
++    for (const auto &e : current) {
++        msg.coins.push_back(*e.coin);
++    }
++    out = std::move(msg);
++    error.clear();
++    return true;
++}
++
++bool ExportUtxoShardFromSmt(const std::shared_ptr<const SmtNode> &root,
++                            const Hash &pivot_block_id, uint8_t prefix_depth,
++                            uint16_t prefix_bits, UtxoShardMessage &out,
++                            std::string &error, size_t max_shard_leaves) {
++    if (prefix_depth < kMinUtxoShardPrefixDepth ||
++        prefix_depth > kMaxUtxoShardPrefixDepth) {
++        error = "prefix_depth out of range [8..16]";
++        return false;
++    }
++    if (prefix_depth < 16 && (prefix_bits >> prefix_depth) != 0) {
++        error = "prefix_bits has bits set above prefix_depth";
++        return false;
++    }
++
++    std::shared_ptr<const SmtNode> cur = root;
++    std::vector<Hash> siblings_top_down;
++    siblings_top_down.reserve(prefix_depth - kMinUtxoShardPrefixDepth);
++
++    for (uint8_t d = 0; d < prefix_depth; ++d) {
++        const bool target_bit = ((prefix_bits >> d) & 1u) != 0;
++        Hash sib_hash = EmptyUtxoRoot();
++        std::shared_ptr<const SmtNode> next_node = nullptr;
++
++        if (cur && cur->count > 0) {
++            if (cur->IsLeaf()) {
++                const bool leaf_bit = SmtKeyBit(cur->key, d);
++                if (leaf_bit == target_bit) {
++                    next_node = cur;
++                    sib_hash = EmptyUtxoRoot();
++                } else {
++                    next_node = nullptr;
++                    sib_hash = cur->digest;
++                }
++            } else {
++                next_node = cur->child[target_bit ? 1 : 0];
++                sib_hash = cur->ChildHash(target_bit ? 0 : 1);
++            }
++        }
++
++        if (d >= kMinUtxoShardPrefixDepth) {
++            siblings_top_down.push_back(sib_hash);
++        }
++        cur = std::move(next_node);
++    }
++
++    const size_t sub_count = cur ? cur->count : 0;
++    if (sub_count > max_shard_leaves || sub_count > kMaxUtxoShardLeaves) {
++        error =
++            "requested shard exceeds maximum leaf count; split to deeper prefix_depth";
++        return false;
++    }
++
++    std::vector<KeyedCoinRef> entries;
++    entries.reserve(sub_count);
++    CollectSmtSubtreeCoins(cur, entries);
++    std::sort(entries.begin(), entries.end(),
++              [](const KeyedCoinRef &a, const KeyedCoinRef &b) {
++                  return a.key < b.key;
++              });
++
++    UtxoShardMessage msg;
++    msg.pivot_block_id = pivot_block_id;
++    msg.prefix_depth = prefix_depth;
++    msg.prefix_bits = prefix_bits;
++    msg.boundary_siblings.assign(siblings_top_down.rbegin(),
++                                 siblings_top_down.rend());
++    msg.coins.reserve(entries.size());
++    for (const auto &e : entries) {
++        msg.coins.push_back(*e.coin);
++    }
++    out = std::move(msg);
++    error.clear();
++    return true;
++}
++
++bool ExportAdaptiveUtxoShards(const UtxoSet &utxo, const Hash &pivot_block_id,
++                              std::vector<UtxoShardMessage> &out,
++                              std::string &error, size_t max_shard_leaves) {
++    if (max_shard_leaves == 0 || max_shard_leaves > kMaxUtxoShardLeaves) {
++        error = "invalid max_shard_leaves parameter";
++        return false;
++    }
++    std::array<std::vector<KeyedCoinRef>, kFastSyncShardCount> buckets;
++    for (const Coin &coin : utxo.Coins()) {
++        const Hash key = OutpointKey(coin.outpoint);
++        buckets[key[0]].push_back(KeyedCoinRef{key, &coin});
++    }
++    for (auto &b : buckets) {
++        std::sort(b.begin(), b.end(),
++                  [](const KeyedCoinRef &a, const KeyedCoinRef &c) {
++                      return a.key < c.key;
++                  });
++    }
++    std::vector<UtxoShardMessage> shards;
++    for (uint16_t s = 0; s < kFastSyncShardCount; ++s) {
++        if (buckets[s].empty()) continue;
++        if (!SplitAndExportShardsRecursive(utxo, pivot_block_id, buckets[s],
++                                           kMinUtxoShardPrefixDepth, s,
++                                           max_shard_leaves, shards, error)) {
++            return false;
++        }
++    }
++    out = std::move(shards);
++    error.clear();
++    return true;
++}
++
++bool AssembleAndVerifyFastSyncPivot(
++    const Hash &pivot_block_id, uint64_t pivot_height,
++    const std::optional<Hash> &expected_utxo_root_anchor,
++    const UtxoRootsMessage &roots_msg,
++    const std::vector<UtxoShardMessage> &shards, UtxoSet &out_utxo,
++    MonetaryState &out_monetary, std::string &error) {
++    Hash folded_root{};
++    if (!VerifyUtxoRootsAgainstAnchor(pivot_block_id, pivot_height,
++                                      expected_utxo_root_anchor, roots_msg,
++                                      folded_root, error)) {
++        return false;
++    }
++
++    std::array<std::vector<const UtxoShardMessage *>, kFastSyncShardCount>
++        by_depth8;
++    for (const auto &shard : shards) {
++        if (shard.pivot_block_id != roots_msg.pivot_block_id) {
++            error = "utxoshard pivot_block_id mismatch";
++            return false;
++        }
++        if (shard.prefix_depth < kMinUtxoShardPrefixDepth ||
++            shard.prefix_depth > kMaxUtxoShardPrefixDepth) {
++            error = "utxoshard prefix_depth out of range";
++            return false;
++        }
++        const uint8_t s = static_cast<uint8_t>(shard.prefix_bits & 0xFFu);
++        by_depth8[s].push_back(&shard);
++    }
++
++    UtxoSet assembled;
++    for (size_t s = 0; s < kFastSyncShardCount; ++s) {
++        const ShardRootEntry &expected = roots_msg.shards[s];
++        const auto &subshards = by_depth8[s];
++        if (expected.cardinality_tag == 0) {
++            for (const auto *sub : subshards) {
++                ShardRootEntry sub_out{};
++                if (!VerifyAndBuildUtxoShard(expected, pivot_height, *sub,
++                                             &sub_out, error)) {
++                    return false;
++                }
++            }
++            continue;
++        }
++
++        if (subshards.empty()) {
++            error = "missing utxoshard for non-empty depth-8 shard " +
++                    std::to_string(s);
++            return false;
++        }
++
++        std::vector<KeyedCoinRef> shard_coins;
++        std::set<std::pair<uint8_t, uint16_t>> seen_prefixes;
++        for (const auto *sub : subshards) {
++            if (!seen_prefixes
++                     .emplace(sub->prefix_depth, sub->prefix_bits)
++                     .second) {
++                error = "duplicate utxoshard prefix";
++                return false;
++            }
++            ShardRootEntry sub_out{};
++            if (!VerifyAndBuildUtxoShard(expected, pivot_height, *sub, &sub_out,
++                                         error)) {
++                return false;
++            }
++            for (const Coin &coin : sub->coins) {
++                if (!assembled.Insert(coin)) {
++                    error = "overlapping or invalid coin across subshards";
++                    return false;
++                }
++                shard_coins.push_back(
++                    KeyedCoinRef{OutpointKey(coin.outpoint), &coin});
++            }
++        }
++        std::sort(shard_coins.begin(), shard_coins.end(),
++                  [](const KeyedCoinRef &a, const KeyedCoinRef &b) {
++                      return a.key < b.key;
++                  });
++        ShardRootEntry combined_depth8{};
++        if (!ComputeSubtreeEntry(shard_coins, kMinUtxoShardPrefixDepth,
++                                 combined_depth8) ||
++            combined_depth8 != expected) {
++            error = "incomplete subshard coverage for depth-8 shard " +
++                    std::to_string(s);
++            return false;
++        }
++    }
++
++    MonetaryState mon = DecodeMonetaryState(
++        std::vector<uint8_t>(roots_msg.monetary_state.begin(),
++                             roots_msg.monetary_state.end()));
++
++    out_utxo = std::move(assembled);
++    out_monetary = mon;
++    error.clear();
++    return true;
++}
++
++std::vector<uint8_t> EncodeGetBlockUndoRequest(const GetBlockUndoRequest &req) {
++    return std::vector<uint8_t>(req.block_id.begin(), req.block_id.end());
++}
++
++bool DecodeGetBlockUndoRequest(const std::vector<uint8_t> &bytes,
++                               GetBlockUndoRequest &out,
++                               std::string &error) {
++    if (bytes.size() != 32) {
++        error = "invalid getblockundo request size";
++        return false;
++    }
++    std::copy_n(bytes.data(), 32, out.block_id.begin());
++    error.clear();
++    return true;
++}
++
++bool EncodeBlockUndoMessage(const BlockUndoMessage &msg,
++                            std::vector<uint8_t> &out,
++                            std::string &error) {
++    if (msg.prior_spent_coins.size() > kMaxBlockUndoCoins) {
++        error = "blockundo prior_spent_coins exceeds limit";
++        return false;
++    }
++    std::vector<uint8_t> buf;
++    buf.reserve(32 + 56 + msg.prior_spent_coins.size() * 64);
++    buf.insert(buf.end(), msg.block_id.begin(), msg.block_id.end());
++    buf.insert(buf.end(), msg.parent_monetary_state.begin(),
++               msg.parent_monetary_state.end());
++    WriteCompactSize(buf, msg.prior_spent_coins.size());
++    for (const Coin &coin : msg.prior_spent_coins) {
++        std::vector<uint8_t> encoded_coin;
++        if (!EncodeCoin(coin, encoded_coin)) {
++            error = "blockundo failed to encode coin";
++            return false;
++        }
++        WriteCompactSize(buf, encoded_coin.size());
++        buf.insert(buf.end(), encoded_coin.begin(), encoded_coin.end());
++    }
++    out = std::move(buf);
++    error.clear();
++    return true;
++}
++
++bool DecodeBlockUndoMessage(const std::vector<uint8_t> &bytes,
++                            BlockUndoMessage &out,
++                            std::string &error) {
++    if (bytes.size() < 32 + 56 + 1) {
++        error = "truncated blockundo message header";
++        return false;
++    }
++    BlockUndoMessage parsed;
++    std::copy_n(bytes.data(), 32, parsed.block_id.begin());
++    std::copy_n(bytes.data() + 32, 56, parsed.parent_monetary_state.begin());
++    size_t offset = 88;
++    uint64_t count = 0;
++    if (!ReadCompactSize(bytes, offset, kMaxBlockUndoCoins, count)) {
++        error = "invalid blockundo coin count";
++        return false;
++    }
++    parsed.prior_spent_coins.resize(static_cast<size_t>(count));
++    for (size_t i = 0; i < parsed.prior_spent_coins.size(); ++i) {
++        uint64_t coin_len = 0;
++        if (!ReadCompactSize(bytes, offset, MAX_COIN_BYTES, coin_len) ||
++            bytes.size() - offset < coin_len) {
++            error = "truncated blockundo coin record";
++            return false;
++        }
++        if (!DecodeCanonicalCoinBytes(bytes.data() + offset,
++                                      static_cast<size_t>(coin_len),
++                                      parsed.prior_spent_coins[i], error)) {
++            return false;
++        }
++        offset += static_cast<size_t>(coin_len);
++    }
++    if (offset != bytes.size()) {
++        error = "trailing bytes in blockundo message";
++        return false;
++    }
++    out = std::move(parsed);
++    error.clear();
++    return true;
++}
++
++namespace {
++
++bool SameOutput(const Output &a, const Output &b) {
++    return a.flags == b.flags && a.value == b.value &&
++           a.token_id == b.token_id && a.branches == b.branches &&
++           a.paths == b.paths;
++}
++
++bool SameCoin(const Coin &a, const Coin &b) {
++    return a.outpoint == b.outpoint && a.creation_height == b.creation_height &&
++           a.coinbase == b.coinbase &&
++           a.creation_parent_mtp == b.creation_parent_mtp &&
++           SameOutput(a.output, b.output);
++}
++
++} // namespace
++
++bool VerifyAndPeelReverseBlock(
++    uint64_t block_height, uint64_t parent_mtp,
++    const std::vector<BlockCreatedOutput> &block_outputs,
++    const std::vector<Outpoint> &block_spent_outpoints,
++    const std::vector<Coin> &undo_spent_coins, UtxoSet &peel_utxo,
++    const std::optional<Hash> &expected_parent_utxo_root,
++    Hash &out_parent_utxo_root, std::string &error) {
++    if (block_height == 0) {
++        error = "cannot reverse-peel genesis block";
++        return false;
++    }
++
++    std::map<Outpoint, BlockCreatedOutput, OutpointLess> created_spendable;
++    for (const auto &created : block_outputs) {
++        if (created.output.IsBurn()) {
++            continue;
++        }
++        if (!created_spendable.emplace(created.outpoint, created).second) {
++            error = "duplicate created outpoint in block";
++            return false;
++        }
++    }
++
++    std::set<Outpoint, OutpointLess> seen_spends;
++    std::set<Outpoint, OutpointLess> intra_spends;
++    std::vector<Outpoint> prior_spend_order;
++    prior_spend_order.reserve(block_spent_outpoints.size());
++    for (const Outpoint &sp : block_spent_outpoints) {
++        if (!seen_spends.insert(sp).second) {
++            error = "duplicate spent outpoint in block";
++            return false;
++        }
++        if (created_spendable.count(sp) != 0) {
++            intra_spends.insert(sp);
++        } else {
++            prior_spend_order.push_back(sp);
++        }
++    }
++
++    // Accept either prior-only undo_spent_coins (from wire BlockUndoMessage) or
++    // full-input undo_spent_coins (including intra-block spends).
++    std::vector<Coin> prior_coins;
++    if (undo_spent_coins.size() == prior_spend_order.size()) {
++        prior_coins = undo_spent_coins;
++    } else if (undo_spent_coins.size() == block_spent_outpoints.size()) {
++        prior_coins.reserve(prior_spend_order.size());
++        for (size_t i = 0; i < block_spent_outpoints.size(); ++i) {
++            const Outpoint &sp = block_spent_outpoints[i];
++            const Coin &c = undo_spent_coins[i];
++            if (!(c.outpoint == sp)) {
++                error = "undo spent coin outpoint mismatch";
++                return false;
++            }
++            auto created_it = created_spendable.find(sp);
++            if (created_it != created_spendable.end()) {
++                Coin expected_intra;
++                expected_intra.outpoint = sp;
++                expected_intra.creation_height = block_height;
++                expected_intra.coinbase = created_it->second.is_coinbase;
++                expected_intra.creation_parent_mtp = c.creation_parent_mtp;
++                expected_intra.output = created_it->second.output;
++                if (!SameCoin(c, expected_intra)) {
++                    error = "intra-block spent coin does not match block output";
++                    return false;
++                }
++            } else {
++                prior_coins.push_back(c);
++            }
++        }
++    } else {
++        error = "undo spent coins count mismatch";
++        return false;
++    }
++
++    for (size_t i = 0; i < prior_spend_order.size(); ++i) {
++        const Coin &c = prior_coins[i];
++        if (!(c.outpoint == prior_spend_order[i])) {
++            error = "prior spent coin outpoint order mismatch";
++            return false;
++        }
++        if (c.output.IsBurn()) {
++            error = "prior spent coin cannot be burn output";
++            return false;
++        }
++        if (c.creation_height >= block_height) {
++            error = "prior spent coin creation_height >= block_height";
++            return false;
++        }
++        if (peel_utxo.Find(c.outpoint) != nullptr) {
++            error = "prior spent coin is still present in current UTXO state";
++            return false;
++        }
++    }
++
++    UtxoSet scratch = peel_utxo;
++
++    // 1. Verify and remove all net unspent outputs O_h^net created by block h.
++    for (const auto &[outpoint, created] : created_spendable) {
++        if (intra_spends.count(outpoint) != 0) {
++            continue;
++        }
++        const Coin *existing = scratch.Find(outpoint);
++        if (!existing) {
++            error = "net block output missing from UTXO state at height " +
++                    std::to_string(block_height);
++            return false;
++        }
++        Coin expected_created;
++        expected_created.outpoint = outpoint;
++        expected_created.creation_height = block_height;
++        expected_created.coinbase = created.is_coinbase;
++        expected_created.creation_parent_mtp =
++            (parent_mtp == 0 || existing->creation_parent_mtp == 0)
++                ? existing->creation_parent_mtp
++                : parent_mtp;
++        expected_created.output = created.output;
++        if (!SameCoin(*existing, expected_created)) {
++            error = "net block output in UTXO state does not match block";
++            return false;
++        }
++        if (!scratch.Erase(outpoint)) {
++            error = "failed erasing net block output from UTXO state";
++            return false;
++        }
++    }
++
++    // 2. Restore all prior-block spent coins I_h^prior.
++    for (const Coin &c : prior_coins) {
++        if (!scratch.Insert(c)) {
++            error = "failed inserting prior spent coin into parent UTXO state";
++            return false;
++        }
++    }
++
++    const Hash computed_parent_root = scratch.Root();
++    if (expected_parent_utxo_root.has_value() &&
++        computed_parent_root != *expected_parent_utxo_root) {
++        error = "peeled parent UtxoRoot mismatch against state anchor";
++        return false;
++    }
++
++    peel_utxo = std::move(scratch);
++    out_parent_utxo_root = computed_parent_root;
++    error.clear();
++    return true;
++}
++
++} // namespace lotus::v2
+diff --git a/src/lotus_v2/fast_sync.h b/src/lotus_v2/fast_sync.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..4d14ddd1e15157ca7b94052d10ca0f18b15f5c09
+--- /dev/null
++++ b/src/lotus_v2/fast_sync.h
+@@ -0,0 +1,228 @@
++// Copyright (c) 2026 The Lotus developers
++// Tachyon SnapSync: Fast UTXO Shard Sync protocol, Avalanche state-anchor
++// verification, and bijective reverse block peeling without header changes.
++#ifndef LOTUS_V2_FAST_SYNC_H
++#define LOTUS_V2_FAST_SYNC_H
++
++#include "commitment.h"
++#include "mempool_overlay.h"
++#include "sparse_state.h"
++
++#include <array>
++#include <cstddef>
++#include <cstdint>
++#include <memory>
++#include <optional>
++#include <string>
++#include <vector>
++
++namespace lotus::v2 {
++
++inline constexpr size_t kFastSyncShardCount = 256;
++inline constexpr uint8_t kMinUtxoShardPrefixDepth = 8;
++inline constexpr uint8_t kMaxUtxoShardPrefixDepth = 16;
++inline constexpr size_t kMaxUtxoShardLeaves = 4096;
++inline constexpr uint64_t kFastSyncMinBuriedBlocks = 100;
++inline constexpr size_t kFastSyncMinNetgroupConfirmations = 3;
++inline constexpr uint64_t kFastSyncPivotSafetyCushion = 10;
++
++// Cardinality tag for P02 single-leaf collapse verification (Hole 11 defense):
++// 0 = Empty (subtree_root == EmptyUtxoRoot())
++// 1 = SingleLeaf (subtree_root == UtxoLeaf(coin), collapsed without UtxoNode hashing)
++// 2 = InteriorNode (>= 2 leaves, subtree_root == UtxoNode(depth, left, right))
++struct ShardRootEntry {
++    uint8_t cardinality_tag = 0;
++    Hash subtree_root = EmptyUtxoRoot();
++    bool operator==(const ShardRootEntry &) const = default;
++};
++
++struct GetUtxoRootsRequest {
++    Hash pivot_block_id{};
++    bool operator==(const GetUtxoRootsRequest &) const = default;
++};
++
++struct UtxoRootsMessage {
++    Hash pivot_block_id{};
++    uint64_t height = 0;
++    std::array<uint8_t, 56> monetary_state{};
++    std::array<ShardRootEntry, kFastSyncShardCount> shards{};
++    bool operator==(const UtxoRootsMessage &) const = default;
++};
++
++struct GetUtxoShardRequest {
++    Hash pivot_block_id{};
++    uint8_t prefix_depth = kMinUtxoShardPrefixDepth;
++    uint16_t prefix_bits = 0;
++    bool operator==(const GetUtxoShardRequest &) const = default;
++};
++
++struct UtxoShardMessage {
++    Hash pivot_block_id{};
++    uint8_t prefix_depth = kMinUtxoShardPrefixDepth;
++    uint16_t prefix_bits = 0;
++    // Ordered from depth (prefix_depth - 1) down to depth 8.
++    std::vector<Hash> boundary_siblings;
++    // Sorted by OutpointKey(coin.outpoint), max kMaxUtxoShardLeaves (4096).
++    std::vector<Coin> coins;
++};
++
++// Dual Pivot Authentication Gate and Pivot Safety Cushion.
++struct FastSyncPivotCandidate {
++    uint64_t pivot_height = 0;
++    uint64_t best_header_height = 0;
++    bool has_minimum_chain_work = false;
++    bool is_avalanche_finalized = false;
++    uint64_t buried_blocks = 0;
++    size_t distinct_netgroup_confirmations = 0;
++};
++
++bool CheckFastSyncPivotEligibility(const FastSyncPivotCandidate &candidate,
++                                   std::string &error);
++
++// Extracts the little-endian prefix bits of outpoint_key for depths [0 .. prefix_depth - 1].
++// For prefix_depth == 8, this equals uint16_t(outpoint_key[0]).
++uint16_t OutpointPrefixBits(const Hash &outpoint_key, uint8_t prefix_depth);
++
++bool IsValidShardRootEntry(const ShardRootEntry &entry);
++
++// Folds two sibling subtrees at parent `depth` using exact P02 single-leaf collapse rules.
++bool FoldShardPair(uint8_t depth, const ShardRootEntry &left,
++                   const ShardRootEntry &right, ShardRootEntry &out);
++
++// Folds 256 depth-8 ShardRootEntries from depth d = 7 down to d = 0.
++std::optional<Hash> FoldDepth8ShardRoots(
++    const std::array<ShardRootEntry, kFastSyncShardCount> &shards,
++    std::string *error = nullptr);
++
++// Verifies UtxoRootsMessage against an expected pivot block ID, height, and
++// mandatory Avalanche-finalized / epoch-anchored UtxoRoot (without requiring
++// a state_root field in the 80-byte block header).
++bool VerifyUtxoRootsAgainstAnchor(
++    const Hash &expected_pivot_block_id, uint64_t expected_height,
++    const std::optional<Hash> &expected_utxo_root_anchor,
++    const UtxoRootsMessage &msg, Hash &out_folded_utxo_root,
++    std::string &error);
++
++// Verifies a UtxoShardMessage (depth k in [8..16], max 4096 leaves, strict prefix
++// membership, strict ascending OutpointKey order, no burn outputs, creation_height <= pivot_height,
++// and boundary-sibling folding up to depth 8) before any disk write.
++bool VerifyAndBuildUtxoShard(const ShardRootEntry &expected_depth8_entry,
++                             uint64_t pivot_height,
++                             const UtxoShardMessage &shard,
++                             ShardRootEntry *computed_subshard_out,
++                             std::string &error);
++
++// Wire serialization for P2P messages (getutxoroots, utxoroots, getutxoshard, utxoshard).
++std::vector<uint8_t> EncodeGetUtxoRootsRequest(const GetUtxoRootsRequest &req);
++bool DecodeGetUtxoRootsRequest(const std::vector<uint8_t> &bytes,
++                               GetUtxoRootsRequest &out,
++                               std::string &error);
++
++std::vector<uint8_t> EncodeUtxoRootsMessage(const UtxoRootsMessage &msg);
++bool DecodeUtxoRootsMessage(const std::vector<uint8_t> &bytes,
++                            UtxoRootsMessage &out,
++                            std::string &error);
++
++bool EncodeGetUtxoShardRequest(const GetUtxoShardRequest &req,
++                               std::vector<uint8_t> &out,
++                               std::string &error);
++bool DecodeGetUtxoShardRequest(const std::vector<uint8_t> &bytes,
++                               GetUtxoShardRequest &out,
++                               std::string &error);
++
++bool EncodeUtxoShardMessage(const UtxoShardMessage &msg,
++                            std::vector<uint8_t> &out,
++                            std::string &error);
++bool DecodeUtxoShardMessage(const std::vector<uint8_t> &bytes,
++                            UtxoShardMessage &out,
++                            std::string &error);
++
++// Export 256 depth-8 ShardRootEntries and 56-byte MonetaryState from a UtxoSet.
++bool ExportUtxoRootsForBlock(const UtxoSet &utxo, const Hash &pivot_block_id,
++                             uint64_t pivot_height,
++                             const MonetaryState &monetary,
++                             UtxoRootsMessage &out, std::string &error);
++
++// O(256) export of 256 depth-8 ShardRootEntries directly from a persistent SmtNode root.
++bool ExportUtxoRootsFromSmt(const std::shared_ptr<const SmtNode> &root,
++                            const Hash &pivot_block_id, uint64_t pivot_height,
++                            const MonetaryState &monetary,
++                            UtxoRootsMessage &out, std::string &error);
++
++bool ExportUtxoShard(const UtxoSet &utxo, const Hash &pivot_block_id,
++                     uint8_t prefix_depth, uint16_t prefix_bits,
++                     UtxoShardMessage &out, std::string &error,
++                     size_t max_shard_leaves = kMaxUtxoShardLeaves);
++
++// O(k + |shard|) export of a UTXO shard directly from a persistent SmtNode root.
++bool ExportUtxoShardFromSmt(const std::shared_ptr<const SmtNode> &root,
++                            const Hash &pivot_block_id, uint8_t prefix_depth,
++                            uint16_t prefix_bits, UtxoShardMessage &out,
++                            std::string &error,
++                            size_t max_shard_leaves = kMaxUtxoShardLeaves);
++
++// Exports all non-empty shards for a pivot UtxoSet, adaptively splitting any shard
++// exceeding `max_shard_leaves` down to depth k in [8..16].
++bool ExportAdaptiveUtxoShards(const UtxoSet &utxo, const Hash &pivot_block_id,
++                              std::vector<UtxoShardMessage> &out,
++                              std::string &error,
++                              size_t max_shard_leaves = kMaxUtxoShardLeaves);
++
++// Assembles and cryptographically verifies a complete set of UTXO shards against
++// the pivot block ID, height, optional Avalanche UtxoRoot anchor, and UtxoRootsMessage.
++bool AssembleAndVerifyFastSyncPivot(
++    const Hash &pivot_block_id, uint64_t pivot_height,
++    const std::optional<Hash> &expected_utxo_root_anchor,
++    const UtxoRootsMessage &roots_msg,
++    const std::vector<UtxoShardMessage> &shards, UtxoSet &out_utxo,
++    MonetaryState &out_monetary, std::string &error);
++
++// ============================================================================
++// Bijective Reverse Block Peeling (getblockundo / blockundo)
++// ============================================================================
++
++inline constexpr size_t kMaxBlockUndoCoins = 500000;
++
++struct GetBlockUndoRequest {
++    Hash block_id{};
++    bool operator==(const GetBlockUndoRequest &) const = default;
++};
++
++struct BlockUndoMessage {
++    Hash block_id{};
++    std::array<uint8_t, 56> parent_monetary_state{};
++    // Spent coins created strictly prior to height h (I_h^prior), in exact
++    // block input order. Intra-block spends (I_h^intra) are omitted and
++    // reconstructed locally from B_h.
++    std::vector<Coin> prior_spent_coins;
++};
++
++struct BlockCreatedOutput {
++    Outpoint outpoint{};
++    Output output{};
++    bool is_coinbase = false;
++};
++
++std::vector<uint8_t> EncodeGetBlockUndoRequest(const GetBlockUndoRequest &req);
++bool DecodeGetBlockUndoRequest(const std::vector<uint8_t> &bytes,
++                               GetBlockUndoRequest &out,
++                               std::string &error);
++
++bool EncodeBlockUndoMessage(const BlockUndoMessage &msg,
++                            std::vector<uint8_t> &out,
++                            std::string &error);
++bool DecodeBlockUndoMessage(const std::vector<uint8_t> &bytes,
++                            BlockUndoMessage &out,
++                            std::string &error);
++
++bool VerifyAndPeelReverseBlock(
++    uint64_t block_height, uint64_t parent_mtp,
++    const std::vector<BlockCreatedOutput> &block_outputs,
++    const std::vector<Outpoint> &block_spent_outpoints,
++    const std::vector<Coin> &undo_spent_coins, UtxoSet &peel_utxo,
++    const std::optional<Hash> &expected_parent_utxo_root,
++    Hash &out_parent_utxo_root, std::string &error);
++
++} // namespace lotus::v2
++
++#endif // LOTUS_V2_FAST_SYNC_H
+diff --git a/src/node/snapshot.cpp b/src/node/snapshot.cpp
+index cde14d58a9fc181960bcaf25be42a5baf40dc9ad..5cfcbd2d4a561b761711bd545877e720fcd9c3d2 100644
+--- a/src/node/snapshot.cpp
++++ b/src/node/snapshot.cpp
+@@ -866,8 +866,9 @@ void PublishChainTipSnapshot(ChainstateManager &chainman,
+         next->automatic_pruning = false;
+         next->prune_target_size = 0;
+     }
+-    next->fast_sync_active = false;
+-    next->earliest_verified_height = 0;
++    next->fast_sync_active = active_chainstate.IsFastSyncActive();
++    next->earliest_verified_height =
++        active_chainstate.GetEarliestVerifiedHeight();
+     next->chain_type_string = chainparams.GetChainTypeString();
+     next->nBits = tip->nBits;
+     next->consensus_params = chainparams.GetConsensus();
+diff --git a/src/protocol.cpp b/src/protocol.cpp
+index bd3414ca626249ec81c9b1316982df6483925500..c7cab7f93d7d2160f69769a80d1fd53e30533e3f 100644
+--- a/src/protocol.cpp
++++ b/src/protocol.cpp
+@@ -64,6 +64,12 @@ const char *GETMERKLIXBUCK = "getmerklixbuck";
+ const char *MERKLIXBUCK = "merklixbuck";
+ const char *GETSHORTTX = "getshorttx";
+ const char *SHORTTX = "shorttx";
++const char *GETUTXOROOTS = "getutxoroots";
++const char *UTXOROOTS = "utxoroots";
++const char *GETUTXOSHARD = "getutxoshard";
++const char *UTXOSHARD = "utxoshard";
++const char *GETBLOCKUNDO = "getblockundo";
++const char *BLOCKUNDO = "blockundo";
+ 
+ bool IsBlockLike(const std::string &strCommand) {
+     return strCommand == NetMsgType::BLOCK ||
+@@ -71,7 +77,9 @@ bool IsBlockLike(const std::string &strCommand) {
+            strCommand == NetMsgType::BLOCKTXN ||
+            strCommand == NetMsgType::MINEDHEADER ||
+            strCommand == NetMsgType::SEALEDHEADER ||
+-           strCommand == NetMsgType::SEALEDBLOCK;
++           strCommand == NetMsgType::SEALEDBLOCK ||
++           strCommand == NetMsgType::UTXOSHARD ||
++           strCommand == NetMsgType::BLOCKUNDO;
+ }
+ }; // namespace NetMsgType
+ 
+@@ -104,7 +112,10 @@ static const std::string allNetMessageTypes[] = {
+     NetMsgType::SEALEDHEADER,   NetMsgType::SEALEDBLOCK,
+     NetMsgType::MERKLIXSYNC,    NetMsgType::GETMERKLIXBUCK,
+     NetMsgType::MERKLIXBUCK,    NetMsgType::GETSHORTTX,
+-    NetMsgType::SHORTTX,
++    NetMsgType::SHORTTX,        NetMsgType::GETUTXOROOTS,
++    NetMsgType::UTXOROOTS,      NetMsgType::GETUTXOSHARD,
++    NetMsgType::UTXOSHARD,      NetMsgType::GETBLOCKUNDO,
++    NetMsgType::BLOCKUNDO,
+ };
+ static const std::vector<std::string>
+     allNetMessageTypesVec(std::begin(allNetMessageTypes),
+@@ -212,6 +223,8 @@ std::string CInv::GetMessageType() const {
+             // Stake contender does not have a NetMsgType because there is no
+             // contender-specific message, so we hard code the name here.
+             return cmd.append("stakecontender");
++        case MSG_AVA_STATE_ANCHOR:
++            return cmd.append("stateanchor");
+         default:
+             throw std::out_of_range(strprintf(
+                 "CInv::GetMessageType(): type=%d unknown type", type));
+@@ -253,6 +266,8 @@ static std::string serviceFlagToStr(const size_t bit) {
+             return "COMPACT_FILTERS";
+         case NODE_AVALANCHE:
+             return "AVALANCHE";
++        case NODE_UTXO_SHARD:
++            return "UTXO_SHARD";
+         default:
+             std::ostringstream stream;
+             stream.imbue(std::locale::classic());
+diff --git a/src/protocol.h b/src/protocol.h
+index b7c692b696c49389e22cebe621a06c7cdacf23ac..603a690bf2a012207aef4b13f1e0c3b9b01f73f0 100644
+--- a/src/protocol.h
++++ b/src/protocol.h
+@@ -358,6 +358,42 @@ extern const char *GETSHORTTX;
+  */
+ extern const char *SHORTTX;
+ 
++/**
++ * Requests the 256 depth-8 UTXO shard roots and 56-byte monetary state for a
++ * fast-sync pivot block.
++ */
++extern const char *GETUTXOROOTS;
++
++/**
++ * Transmits the 256 depth-8 UTXO shard roots and 56-byte monetary state for a
++ * fast-sync pivot block.
++ */
++extern const char *UTXOROOTS;
++
++/**
++ * Requests a UTXO shard (or sub-shard at prefix depth k in [8..16]) for a
++ * fast-sync pivot block.
++ */
++extern const char *GETUTXOSHARD;
++
++/**
++ * Transmits a UTXO shard (up to 4096 sorted coins plus boundary siblings) for a
++ * fast-sync pivot block.
++ */
++extern const char *UTXOSHARD;
++
++/**
++ * Requests the spent input coins (undo data) for a historical block during
++ * reverse sync peeling.
++ */
++extern const char *GETBLOCKUNDO;
++
++/**
++ * Transmits the spent input coins (undo data) for a historical block during
++ * reverse sync peeling.
++ */
++extern const char *BLOCKUNDO;
++
+ /**
+  * Indicate if the message is used to transmit the content of a block.
+  * These messages can be significantly larger than usual messages and therefore
+@@ -418,6 +454,10 @@ enum ServiceFlags : uint64_t {
+     // NODE_AVALANCHE means the node supports Bitcoin Cash's avalanche
+     // preconsensus mechanism.
+     NODE_AVALANCHE = (1 << 24),
++
++    // NODE_UTXO_SHARD means the node supports Tachyon SnapSync UTXO shard
++    // export, reverse block undo serving, and Avalanche state-anchor polling.
++    NODE_UTXO_SHARD = (1 << 25),
+ };
+ 
+ /**
+@@ -623,6 +663,7 @@ enum GetDataMsg {
+     MSG_SEALED_BLOCK = MSG_MINED_HEADER,
+     MSG_AVA_PROOF = 0x1f000001,
+     MSG_AVA_STAKE_CONTENDER = 0x1f000002,
++    MSG_AVA_STATE_ANCHOR = 0x1f000003,
+ };
+ 
+ /**
+@@ -665,6 +706,10 @@ public:
+         auto k = GetKind();
+         return k == MSG_AVA_MEMPOOL_BATCH;
+     }
++    bool IsMsgStateAnchor() const {
++        auto k = GetKind();
++        return k == MSG_AVA_STATE_ANCHOR;
++    }
+     bool IsMsgBlk() const {
+         auto k = GetKind();
+         return k == MSG_BLOCK;
+diff --git a/src/validation.cpp b/src/validation.cpp
+index 5faa9ec6a1ae7d15adbc14fc140f5ca273d713f3..c12dc26abfd71025a451572050f4119c04e89793 100644
+--- a/src/validation.cpp
++++ b/src/validation.cpp
+@@ -1518,7 +1518,7 @@ Chainstate::Chainstate(CTxMemPool *mempool, BlockManager &blockman,
+ 
+ const CBlockIndex *Chainstate::SnapshotBase() {
+     if (!m_from_snapshot_blockhash) {
+-        return nullptr;
++        return m_fast_sync_pivot_base;
+     }
+     if (!m_cached_snapshot_base) {
+         m_cached_snapshot_base = Assert(
+@@ -3435,6 +3435,7 @@ bool Chainstate::ActivateBestChainStep(
+     if (m_mempool) {
+         AssertLockHeld(m_mempool->cs);
+     }
++    UpdateConnectedBlockSmtState(block, pindex);
+ 
+     const CBlockIndex *pindexOldTip = m_chain.Tip();
+     const CBlockIndex *pindexFork = m_chain.FindFork(pindexMostWork);
+@@ -4374,7 +4375,8 @@ void ChainstateManager::ReceivedBlockTransactions(const CBlock &block,
+             // the assumeutxo snapshot block if assumeutxo snapshot metadata has
+             // an incorrect hardcoded AssumeutxoData::m_chain_tx_count value.
+             if (!Assume(pindex->m_chain_tx_count == 0 ||
+-                        pindex->m_chain_tx_count == prev_tx_sum(*pindex))) {
++                        pindex->m_chain_tx_count == prev_tx_sum(*pindex) ||
++                        pindex == GetSnapshotBaseBlock())) {
+                 LogPrintf("Internal bug detected: block %d has unexpected "
+                           "m_chain_tx_count %lu that should be %lu. Please "
+                           "report this issue here: %s\n",
+@@ -7675,3 +7677,897 @@ ChainstateManager::GetPruneRange(const Chainstate &chainstate,
+ 
+     return {prune_start, prune_end};
+ }
++
++namespace {
++
++lotus::v2::Hash BlockHashToV2Hash(const BlockHash &block_hash) {
++    lotus::v2::Hash out{};
++    std::copy_n(block_hash.begin(), 32, out.begin());
++    return out;
++}
++
++lotus::v2::Outpoint OutPointToV2Outpoint(const COutPoint &outpoint) {
++    lotus::v2::Outpoint out{};
++    std::copy_n(outpoint.GetTxId().begin(), 32, out.tx_id.begin());
++    out.index = outpoint.GetN();
++    return out;
++}
++
++COutPoint V2OutpointToOutPoint(const lotus::v2::Outpoint &outpoint) {
++    uint256 txid_u256;
++    std::copy_n(outpoint.tx_id.begin(), 32, txid_u256.begin());
++    return COutPoint(TxId(txid_u256), outpoint.index);
++}
++
++lotus::v2::Coin LegacyCoinToV2Coin(const COutPoint &outpoint,
++                                   const ::Coin &coin) {
++    lotus::v2::Coin v2_coin{};
++    v2_coin.outpoint = OutPointToV2Outpoint(outpoint);
++    v2_coin.creation_height = static_cast<uint64_t>(coin.GetHeight());
++    v2_coin.coinbase = coin.IsCoinBase();
++    v2_coin.creation_parent_mtp = 0;
++    v2_coin.output = coin.GetTxOut().ToV2Output();
++    return v2_coin;
++}
++
++lotus::v2::MonetaryState
++ComputeMonetaryStateForUtxoSet(const lotus::v2::UtxoSet &utxo,
++                               uint64_t height) {
++    lotus::v2::MonetaryState mon{};
++    uint64_t active_supply = 0;
++    for (const auto &coin : utxo.Coins()) {
++        if (!coin.output.IsBurn()) {
++            active_supply += coin.output.value;
++        }
++    }
++    mon.bootstrap_reserve = active_supply;
++    mon.tail_subsidy = height;
++    mon.prev_work[0] = 1;
++    return mon;
++}
++
++lotus::v2::MonetaryState ComputeMonetaryStateFromSmt(
++    const std::shared_ptr<const lotus::v2::SmtNode> &smt_root,
++    uint64_t height) {
++    lotus::v2::MonetaryState mon{};
++    mon.bootstrap_reserve = smt_root ? smt_root->total_value : 0;
++    mon.tail_subsidy = height;
++    mon.prev_work[0] = 1;
++    return mon;
++}
++
++void PopulateUtxoSetFromSmt(
++    const std::shared_ptr<const lotus::v2::SmtNode> &node,
++    lotus::v2::UtxoSet &utxo_set) {
++    if (!node || node->count == 0) {
++        return;
++    }
++    if (node->IsLeaf()) {
++        if (node->coin) {
++            utxo_set.Insert(*node->coin);
++        }
++        return;
++    }
++    if (node->child[0]) {
++        PopulateUtxoSetFromSmt(node->child[0], utxo_set);
++    }
++    if (node->child[1]) {
++        PopulateUtxoSetFromSmt(node->child[1], utxo_set);
++    }
++}
++
++lotus::v2::Hash ComputeGenesisUtxoRoot(const CBlock &genesis_block) {
++    std::shared_ptr<const lotus::v2::SmtNode> genesis_smt;
++    std::vector<lotus::v2::Coin> inserted;
++    for (size_t tx_i = 0; tx_i < genesis_block.vtx.size(); ++tx_i) {
++        const CTransaction &tx = *genesis_block.vtx[tx_i];
++        const TxId txid = tx.GetId();
++        for (size_t out_i = 0; out_i < tx.vout.size(); ++out_i) {
++            if (tx.vout[out_i].scriptPubKey.IsUnspendable()) {
++                continue;
++            }
++            lotus::v2::Coin c{};
++            c.outpoint = OutPointToV2Outpoint(
++                COutPoint(txid, static_cast<uint32_t>(out_i)));
++            c.creation_height = 0;
++            c.coinbase = tx.IsCoinBase();
++            c.creation_parent_mtp = 0;
++            c.output = tx.vout[out_i].ToV2Output();
++            inserted.push_back(std::move(c));
++        }
++    }
++    lotus::v2::SmtBatchUpdateParallel(genesis_smt, {}, inserted);
++    return lotus::v2::SmtRoot(genesis_smt);
++}
++
++} // namespace
++
++bool Chainstate::IsSnapSyncEnabled() const {
++    AssertLockHeld(::cs_main);
++    const bool snap =
++        m_snapsync_enabled_override.value_or(gArgs.GetBoolArg("-snapsync", true));
++    const bool rev = m_reversesync_enabled_override.value_or(
++        gArgs.GetBoolArg("-reversesync", true));
++    return snap && rev;
++}
++
++bool Chainstate::IsReverseSyncEnabled() const {
++    AssertLockHeld(::cs_main);
++    return IsSnapSyncEnabled();
++}
++
++int Chainstate::GetFastSyncMaxPeelBlocks() const {
++    AssertLockHeld(::cs_main);
++    if (m_max_peel_blocks_override.has_value()) {
++        return std::max(0, *m_max_peel_blocks_override);
++    }
++    return std::max<int>(
++        0, gArgs.GetIntArg("-reversesynchorizon", kDefaultFastSyncUndoHorizon));
++}
++
++void Chainstate::CacheFastSyncBlockState(
++    const BlockHash &block_hash,
++    std::shared_ptr<const lotus::v2::SmtNode> smt_root,
++    const lotus::v2::MonetaryState &monetary, const lotus::v2::Hash &utxo_root,
++    uint64_t height) {
++    AssertLockHeld(::cs_main);
++    FastSyncBlockState cached_state;
++    cached_state.smt_root = std::move(smt_root);
++    cached_state.monetary = monetary;
++    cached_state.utxo_root = utxo_root;
++    cached_state.height = height;
++
++    const bool already_present =
++        m_fast_sync_block_states.find(block_hash) !=
++        m_fast_sync_block_states.end();
++    m_fast_sync_block_states[block_hash] = std::move(cached_state);
++    m_fast_sync_state_anchors[block_hash] = utxo_root;
++
++    if (!already_present) {
++        m_fast_sync_state_fifo.push_back(block_hash);
++        while (m_fast_sync_state_fifo.size() > MAX_CACHED_FAST_SYNC_STATES) {
++            const BlockHash oldest = m_fast_sync_state_fifo.front();
++            m_fast_sync_state_fifo.pop_front();
++            if (oldest != m_tip_smt_blockhash) {
++                m_fast_sync_block_states.erase(oldest);
++            }
++        }
++    }
++}
++
++void Chainstate::UpdateConnectedBlockSmtState(const CBlock &block,
++                                              const CBlockIndex *pindex) {
++    AssertLockHeld(::cs_main);
++    if (!pindex || !IsSnapSyncEnabled()) {
++        return;
++    }
++
++    std::shared_ptr<const lotus::v2::SmtNode> smt_root;
++    if (pindex->nHeight == 0) {
++        smt_root = nullptr;
++    } else if (pindex->pprev) {
++        const BlockHash parent_hash = pindex->pprev->GetBlockHash();
++        if (m_tip_smt_blockhash == parent_hash) {
++            smt_root = m_tip_smt_root;
++        } else {
++            auto parent_it = m_fast_sync_block_states.find(parent_hash);
++            if (parent_it == m_fast_sync_block_states.end()) {
++                return;
++            }
++            smt_root = parent_it->second.smt_root;
++        }
++    } else {
++        return;
++    }
++
++    std::unordered_map<COutPoint, lotus::v2::Coin, SaltedOutpointHasher>
++        created_in_block;
++    std::vector<COutPoint> created_order;
++    std::unordered_set<COutPoint, SaltedOutpointHasher> spent_in_block;
++    std::vector<lotus::v2::Outpoint> net_erased;
++
++    for (size_t tx_i = 0; tx_i < block.vtx.size(); ++tx_i) {
++        const CTransaction &tx = *block.vtx[tx_i];
++        const TxId txid = tx.GetId();
++        for (size_t out_i = 0; out_i < tx.vout.size(); ++out_i) {
++            if (tx.vout[out_i].scriptPubKey.IsUnspendable()) {
++                continue;
++            }
++            const COutPoint outpoint(txid, static_cast<uint32_t>(out_i));
++            lotus::v2::Coin v2_c{};
++            v2_c.outpoint = OutPointToV2Outpoint(outpoint);
++            v2_c.creation_height = static_cast<uint64_t>(pindex->nHeight);
++            v2_c.coinbase = tx.IsCoinBase();
++            v2_c.creation_parent_mtp = 0;
++            v2_c.output = tx.vout[out_i].ToV2Output();
++            created_in_block.emplace(outpoint, std::move(v2_c));
++            created_order.push_back(outpoint);
++        }
++    }
++
++    for (size_t tx_i = 1; tx_i < block.vtx.size(); ++tx_i) {
++        const CTransaction &tx = *block.vtx[tx_i];
++        for (const CTxIn &txin : tx.vin) {
++            spent_in_block.insert(txin.prevout);
++            if (created_in_block.find(txin.prevout) == created_in_block.end()) {
++                net_erased.push_back(OutPointToV2Outpoint(txin.prevout));
++            }
++        }
++    }
++
++    std::vector<lotus::v2::Coin> net_inserted;
++    net_inserted.reserve(created_order.size());
++    for (const COutPoint &outpoint : created_order) {
++        if (spent_in_block.find(outpoint) == spent_in_block.end()) {
++            auto it = created_in_block.find(outpoint);
++            if (it != created_in_block.end()) {
++                net_inserted.push_back(std::move(it->second));
++            }
++        }
++    }
++
++    lotus::v2::SmtBatchUpdateParallel(smt_root, net_erased, net_inserted);
++    const uint64_t height = static_cast<uint64_t>(pindex->nHeight);
++    const lotus::v2::Hash utxo_root = lotus::v2::SmtRoot(smt_root);
++    const lotus::v2::MonetaryState monetary =
++        ComputeMonetaryStateFromSmt(smt_root, height);
++
++    m_tip_smt_root = smt_root;
++    m_tip_smt_blockhash = pindex->GetBlockHash();
++    CacheFastSyncBlockState(pindex->GetBlockHash(), std::move(smt_root),
++                            monetary, utxo_root, height);
++}
++
++void Chainstate::UpdateFastSyncPivotBase(CBlockIndex *new_base) {
++    AssertLockHeld(::cs_main);
++    if (!new_base || new_base->nHeight <= 0) {
++        m_fast_sync_pivot_base = nullptr;
++        for (int h = 0; h <= m_chain.Height(); ++h) {
++            CBlockIndex *idx = m_chain[h];
++            if (!idx) {
++                continue;
++            }
++            if (h == 0) {
++                idx->m_chain_tx_count = idx->nTx;
++            } else if (idx->pprev && idx->pprev->m_chain_tx_count > 0 &&
++                       idx->nTx > 0) {
++                idx->m_chain_tx_count = idx->pprev->m_chain_tx_count + idx->nTx;
++                idx->nStatus = idx->nStatus.withValidity(BlockValidity::SCRIPTS);
++            }
++            if (idx->pprev) {
++                auto range =
++                    m_blockman.m_blocks_unlinked.equal_range(idx->pprev);
++                for (auto it = range.first; it != range.second;) {
++                    if (it->second == idx) {
++                        it = m_blockman.m_blocks_unlinked.erase(it);
++                    } else {
++                        ++it;
++                    }
++                }
++            }
++            m_blockman.m_dirty_blockindex.insert(idx);
++        }
++        if (m_chain.Tip()) {
++            setBlockIndexCandidates.insert(m_chain.Tip());
++            PruneBlockIndexCandidates();
++        }
++        return;
++    }
++
++    m_fast_sync_pivot_base = new_base;
++    if (new_base->pprev && new_base->pprev->m_chain_tx_count > 0 &&
++        new_base->nTx > 0) {
++        new_base->m_chain_tx_count =
++            new_base->pprev->m_chain_tx_count + new_base->nTx;
++    } else if (new_base->m_chain_tx_count == 0) {
++        new_base->m_chain_tx_count = std::max<unsigned int>(
++            static_cast<unsigned int>(new_base->nHeight + 1), new_base->nTx);
++    }
++    m_blockman.m_dirty_blockindex.insert(new_base);
++
++    for (int h = new_base->nHeight + 1; h <= m_chain.Height(); ++h) {
++        CBlockIndex *idx = m_chain[h];
++        if (!idx || !idx->pprev) {
++            continue;
++        }
++        if (idx->nTx > 0 && idx->pprev->m_chain_tx_count > 0) {
++            idx->m_chain_tx_count = idx->pprev->m_chain_tx_count + idx->nTx;
++            idx->nStatus = idx->nStatus.withValidity(BlockValidity::SCRIPTS);
++        }
++        auto range = m_blockman.m_blocks_unlinked.equal_range(idx->pprev);
++        for (auto it = range.first; it != range.second;) {
++            if (it->second == idx) {
++                it = m_blockman.m_blocks_unlinked.erase(it);
++            } else {
++                ++it;
++            }
++        }
++        m_blockman.m_dirty_blockindex.insert(idx);
++    }
++
++    if (m_chain.Tip()) {
++        setBlockIndexCandidates.insert(m_chain.Tip());
++        PruneBlockIndexCandidates();
++    }
++}
++
++void Chainstate::SetFastSyncStateAnchor(const BlockHash &block_hash,
++                                        const lotus::v2::Hash &utxo_root) {
++    AssertLockHeld(::cs_main);
++    m_fast_sync_state_anchors[block_hash] = utxo_root;
++}
++
++std::optional<lotus::v2::Hash>
++Chainstate::GetFastSyncStateAnchor(const BlockHash &block_hash) const {
++    AssertLockHeld(::cs_main);
++    auto it = m_fast_sync_state_anchors.find(block_hash);
++    if (it != m_fast_sync_state_anchors.end()) {
++        return it->second;
++    }
++    auto state_it = m_fast_sync_block_states.find(block_hash);
++    if (state_it != m_fast_sync_block_states.end()) {
++        return state_it->second.utxo_root;
++    }
++    return std::nullopt;
++}
++
++const Chainstate::FastSyncBlockState *
++Chainstate::GetFastSyncBlockState(const BlockHash &block_hash) const {
++    AssertLockHeld(::cs_main);
++    auto it = m_fast_sync_block_states.find(block_hash);
++    if (it == m_fast_sync_block_states.end()) {
++        return nullptr;
++    }
++    return &it->second;
++}
++
++bool Chainstate::ExportV2BlockStateCoinsAndMonetary(
++    const CBlockIndex *pindex, FastSyncBlockState &out_state,
++    std::string &error, bool populate_utxo_set) {
++    AssertLockHeld(::cs_main);
++    if (!pindex) {
++        error = "null block index";
++        return false;
++    }
++    auto cached_it = m_fast_sync_block_states.find(pindex->GetBlockHash());
++    if (cached_it != m_fast_sync_block_states.end()) {
++        out_state = cached_it->second;
++        if (populate_utxo_set && out_state.utxo.Coins().empty() &&
++            out_state.smt_root) {
++            PopulateUtxoSetFromSmt(out_state.smt_root, out_state.utxo);
++        }
++        error.clear();
++        return true;
++    }
++    if (!m_chain.Contains(pindex) || !m_chain.Tip()) {
++        error = "requested block is not on the active chain";
++        return false;
++    }
++
++    std::shared_ptr<const lotus::v2::SmtNode> smt_root;
++    const CBlockIndex *tip = m_chain.Tip();
++    if (m_tip_smt_blockhash == tip->GetBlockHash()) {
++        smt_root = m_tip_smt_root;
++    } else {
++        auto tip_it = m_fast_sync_block_states.find(tip->GetBlockHash());
++        if (tip_it != m_fast_sync_block_states.end()) {
++            smt_root = tip_it->second.smt_root;
++            m_tip_smt_root = smt_root;
++            m_tip_smt_blockhash = tip->GetBlockHash();
++        } else {
++            if (!CanFlushToDisk()) {
++                error = "failed flushing CoinsTip before UTXO export";
++                return false;
++            }
++            CoinsTip().Flush();
++
++            std::vector<lotus::v2::Coin> initial_coins;
++            std::unique_ptr<CCoinsViewCursor> pcursor(CoinsDB().Cursor());
++            if (!pcursor) {
++                error = "failed opening CoinsDB cursor";
++                return false;
++            }
++            while (pcursor->Valid()) {
++                COutPoint key;
++                ::Coin coin;
++                if (pcursor->GetKey(key) && pcursor->GetValue(coin)) {
++                    if (!coin.IsSpent() &&
++                        !coin.GetTxOut().scriptPubKey.IsUnspendable()) {
++                        initial_coins.push_back(LegacyCoinToV2Coin(key, coin));
++                    }
++                }
++                pcursor->Next();
++            }
++            lotus::v2::SmtBatchUpdateParallel(smt_root, {}, initial_coins);
++            m_tip_smt_root = smt_root;
++            m_tip_smt_blockhash = tip->GetBlockHash();
++            const uint64_t tip_height = static_cast<uint64_t>(tip->nHeight);
++            const lotus::v2::Hash tip_root = lotus::v2::SmtRoot(smt_root);
++            const lotus::v2::MonetaryState tip_monetary =
++                ComputeMonetaryStateFromSmt(smt_root, tip_height);
++            CacheFastSyncBlockState(tip->GetBlockHash(), smt_root, tip_monetary,
++                                    tip_root, tip_height);
++        }
++    }
++
++    // If pindex is an ancestor of the active tip, unwind blocks from Tip() down
++    // to pindex using ReadBlock + ReadBlockUndo and SmtBatchUpdateParallel.
++    const CBlockIndex *cur = tip;
++    while (cur && cur != pindex) {
++        if (cur->pprev) {
++            auto parent_it =
++                m_fast_sync_block_states.find(cur->pprev->GetBlockHash());
++            if (parent_it != m_fast_sync_block_states.end()) {
++                smt_root = parent_it->second.smt_root;
++                cur = cur->pprev;
++                continue;
++            }
++        }
++
++        CBlock block;
++        if (!m_blockman.ReadBlock(block, *cur)) {
++            error = "failed reading block " + cur->GetBlockHash().ToString() +
++                    " while unwinding UTXO state";
++            return false;
++        }
++        CBlockUndo block_undo;
++        if (cur->nHeight > 0 && !m_blockman.ReadBlockUndo(block_undo, *cur)) {
++            error = "failed reading block undo " +
++                    cur->GetBlockHash().ToString() +
++                    " while unwinding UTXO state";
++            return false;
++        }
++        if (cur->nHeight > 0 &&
++            block_undo.vtxundo.size() + 1 != block.vtx.size()) {
++            error = "inconsistent block undo size at " +
++                    cur->GetBlockHash().ToString();
++            return false;
++        }
++
++        std::unordered_set<COutPoint, SaltedOutpointHasher> created_in_block;
++        std::vector<lotus::v2::Outpoint> unwind_erased;
++        std::vector<lotus::v2::Coin> unwind_inserted;
++
++        for (size_t tx_i = 0; tx_i < block.vtx.size(); ++tx_i) {
++            const CTransaction &tx = *block.vtx[tx_i];
++            const TxId txid = tx.GetId();
++            for (size_t out_i = 0; out_i < tx.vout.size(); ++out_i) {
++                if (tx.vout[out_i].scriptPubKey.IsUnspendable()) {
++                    continue;
++                }
++                const COutPoint outpoint(txid, static_cast<uint32_t>(out_i));
++                created_in_block.insert(outpoint);
++                unwind_erased.push_back(OutPointToV2Outpoint(outpoint));
++            }
++        }
++
++        for (size_t tx_i = 1; tx_i < block.vtx.size(); ++tx_i) {
++            const CTransaction &tx = *block.vtx[tx_i];
++            const CTxUndo &tx_undo = block_undo.vtxundo[tx_i - 1];
++            if (tx_undo.vprevout.size() != tx.vin.size()) {
++                error = "inconsistent tx undo input count";
++                return false;
++            }
++            for (size_t in_i = 0; in_i < tx.vin.size(); ++in_i) {
++                if (created_in_block.find(tx.vin[in_i].prevout) !=
++                    created_in_block.end()) {
++                    continue;
++                }
++                const ::Coin &spent = tx_undo.vprevout[in_i];
++                if (spent.IsSpent() ||
++                    spent.GetTxOut().scriptPubKey.IsUnspendable()) {
++                    continue;
++                }
++                unwind_inserted.push_back(
++                    LegacyCoinToV2Coin(tx.vin[in_i].prevout, spent));
++            }
++        }
++
++        lotus::v2::SmtBatchUpdateParallel(smt_root, unwind_erased,
++                                          unwind_inserted);
++        cur = cur->pprev;
++    }
++
++    FastSyncBlockState state;
++    state.smt_root = smt_root;
++    state.height = static_cast<uint64_t>(pindex->nHeight);
++    state.utxo_root = lotus::v2::SmtRoot(smt_root);
++    state.monetary = ComputeMonetaryStateFromSmt(smt_root, state.height);
++
++    CacheFastSyncBlockState(pindex->GetBlockHash(), smt_root, state.monetary,
++                            state.utxo_root, state.height);
++    if (populate_utxo_set && smt_root) {
++        PopulateUtxoSetFromSmt(smt_root, state.utxo);
++    }
++    out_state = std::move(state);
++    error.clear();
++    return true;
++}
++
++bool Chainstate::ActivateVerifiedFastSyncPivot(
++    CBlockIndex *pivot_index, const lotus::v2::UtxoRootsMessage &roots_msg,
++    const std::vector<lotus::v2::UtxoShardMessage> &shards,
++    std::string &error) {
++    AssertLockHeld(::cs_main);
++    if (!IsSnapSyncEnabled()) {
++        error = "snapsync / reverse sync is disabled (-snapsync=0 or -reversesync=0); using traditional sync";
++        return false;
++    }
++    if (!pivot_index) {
++        error = "null pivot block index";
++        return false;
++    }
++    if (!CanFlushToDisk()) {
++        error = "chainstate coins views not initialized";
++        return false;
++    }
++
++    const lotus::v2::Hash expected_pivot_id =
++        BlockHashToV2Hash(pivot_index->GetBlockHash());
++    const std::optional<lotus::v2::Hash> expected_anchor =
++        GetFastSyncStateAnchor(pivot_index->GetBlockHash());
++
++    lotus::v2::UtxoSet verified_utxo;
++    lotus::v2::MonetaryState verified_monetary;
++    if (!lotus::v2::AssembleAndVerifyFastSyncPivot(
++            expected_pivot_id, static_cast<uint64_t>(pivot_index->nHeight),
++            expected_anchor, roots_msg, shards, verified_utxo,
++            verified_monetary, error)) {
++        return false;
++    }
++
++    // Flush and wipe any existing coins in CoinsTip()/CoinsDB() before
++    // populating the verified pivot UTXO set.
++    CoinsTip().Flush();
++    {
++        std::vector<COutPoint> existing_keys;
++        std::unique_ptr<CCoinsViewCursor> pcursor(CoinsDB().Cursor());
++        while (pcursor && pcursor->Valid()) {
++            COutPoint key;
++            if (pcursor->GetKey(key)) {
++                existing_keys.push_back(key);
++            }
++            pcursor->Next();
++        }
++        for (const COutPoint &key : existing_keys) {
++            CoinsTip().SpendCoin(key);
++        }
++    }
++
++    for (const lotus::v2::Coin &v2_coin : verified_utxo.Coins()) {
++        const COutPoint outpoint = V2OutpointToOutPoint(v2_coin.outpoint);
++        const CTxOut txout = CTxOut::FromV2Output(v2_coin.output);
++        ::Coin legacy_coin(txout, static_cast<int32_t>(v2_coin.creation_height),
++                           v2_coin.coinbase);
++        CoinsTip().AddCoin(outpoint, std::move(legacy_coin),
++                           /*possible_overwrite=*/true);
++    }
++    CoinsTip().SetBestBlock(pivot_index->GetBlockHash());
++    CoinsTip().Flush();
++
++    m_chain.SetTip(*pivot_index);
++    UpdateFastSyncPivotBase(pivot_index);
++    m_chainman.RecalculateBestHeader();
++
++    std::shared_ptr<const lotus::v2::SmtNode> pivot_smt;
++    lotus::v2::SmtBatchUpdateParallel(pivot_smt, {}, verified_utxo.Coins());
++    const uint64_t pivot_height = static_cast<uint64_t>(pivot_index->nHeight);
++    const lotus::v2::Hash pivot_utxo_root = lotus::v2::SmtRoot(pivot_smt);
++
++    m_tip_smt_root = pivot_smt;
++    m_tip_smt_blockhash = pivot_index->GetBlockHash();
++    m_reverse_peel_smt_root = pivot_smt;
++    CacheFastSyncBlockState(pivot_index->GetBlockHash(), std::move(pivot_smt),
++                            verified_monetary, pivot_utxo_root, pivot_height);
++
++    m_reverse_peel_utxo = std::move(verified_utxo);
++    m_earliest_verified_block = pivot_index;
++    m_earliest_verified_height = pivot_index->nHeight;
++    m_fast_sync_pivot_height = pivot_index->nHeight;
++    m_peeled_blocks_count = 0;
++    m_pending_undo_coin_checks.clear();
++    m_fast_sync_active = (pivot_index->nHeight > 0);
++
++    BlockValidationState flush_state;
++    FlushStateToDisk(flush_state, FlushStateMode::ALWAYS);
++    node::PublishChainTipSnapshot(m_chainman, m_mempool);
++    error.clear();
++    return true;
++}
++
++bool Chainstate::PeelFastSyncBlock(
++    const CBlock &block, CBlockIndex *pindex,
++    const std::vector<lotus::v2::Coin> &spent_coins, std::string &error) {
++    AssertLockHeld(::cs_main);
++    if (!IsReverseSyncEnabled()) {
++        error = "reverse sync is disabled (-reversesync=0 or -snapsync=0); using traditional sync";
++        return false;
++    }
++    if (!m_fast_sync_active || !m_reverse_peel_utxo.has_value()) {
++        error = "fast sync reverse peeling is not active";
++        return false;
++    }
++    if (!pindex || pindex != m_earliest_verified_block ||
++        pindex->nHeight != m_earliest_verified_height) {
++        error = "block index does not match earliest_verified_height";
++        return false;
++    }
++    if (pindex->nHeight <= 0 || !pindex->pprev) {
++        error = "cannot reverse-peel genesis block";
++        return false;
++    }
++    if (block.GetHash() != pindex->GetBlockHash()) {
++        error = "block hash mismatch against pindex";
++        return false;
++    }
++
++    BlockValidationState block_state;
++    if (!CheckBlock(block, block_state, m_chainman.GetConsensus(),
++                    BlockValidationOptions(m_chainman.GetConfig())
++                        .withCheckPoW(true)
++                        .withCheckMerkleRoot(true)) ||
++        !ContextualCheckBlockHeader(block, block_state, m_blockman, m_chainman,
++                                    pindex->pprev, pindex->Time()) ||
++        !ContextualCheckBlock(block, block_state, m_chainman, pindex->pprev)) {
++        error = "historical block validation failed: " + block_state.ToString();
++        return false;
++    }
++
++    std::vector<lotus::v2::BlockCreatedOutput> block_outputs;
++    std::vector<lotus::v2::Outpoint> block_spent_outpoints;
++    std::vector<lotus::v2::Outpoint> smt_erased_outputs;
++    std::set<COutPoint> created_in_block;
++    std::unordered_map<COutPoint, lotus::v2::BlockCreatedOutput,
++                       SaltedOutpointHasher>
++        created_output_map;
++    for (size_t tx_i = 0; tx_i < block.vtx.size(); ++tx_i) {
++        const CTransaction &tx = *block.vtx[tx_i];
++        const TxId txid = tx.GetId();
++        for (size_t out_i = 0; out_i < tx.vout.size(); ++out_i) {
++            const COutPoint outpoint(txid, static_cast<uint32_t>(out_i));
++            lotus::v2::BlockCreatedOutput created{};
++            created.outpoint = OutPointToV2Outpoint(outpoint);
++            created.output = tx.vout[out_i].ToV2Output();
++            created.is_coinbase = tx.IsCoinBase();
++            block_outputs.push_back(created);
++            if (!tx.vout[out_i].scriptPubKey.IsUnspendable()) {
++                created_in_block.insert(outpoint);
++                smt_erased_outputs.push_back(created.outpoint);
++                created_output_map.emplace(outpoint, std::move(created));
++            }
++        }
++    }
++
++    // Verify any pending cross-block undo coin checks scheduled for this block
++    // height by higher peeled blocks before mutating any state.
++    const uint64_t current_height_u64 = static_cast<uint64_t>(pindex->nHeight);
++    auto pending_it = m_pending_undo_coin_checks.find(current_height_u64);
++    if (pending_it != m_pending_undo_coin_checks.end()) {
++        for (const lotus::v2::Coin &expected_coin : pending_it->second) {
++            const COutPoint expected_outpoint =
++                V2OutpointToOutPoint(expected_coin.outpoint);
++            auto found_it = created_output_map.find(expected_outpoint);
++            if (found_it == created_output_map.end() ||
++                !(found_it->second.output == expected_coin.output) ||
++                found_it->second.is_coinbase != expected_coin.coinbase) {
++                error =
++                    "cross-block undo coin creation_height/output mismatch against creating block";
++                return false;
++            }
++        }
++    }
++
++    std::vector<COutPoint> all_inputs;
++    std::vector<COutPoint> prior_inputs;
++    for (size_t tx_i = 1; tx_i < block.vtx.size(); ++tx_i) {
++        const CTransaction &tx = *block.vtx[tx_i];
++        for (const CTxIn &txin : tx.vin) {
++            all_inputs.push_back(txin.prevout);
++            block_spent_outpoints.push_back(OutPointToV2Outpoint(txin.prevout));
++            if (created_in_block.count(txin.prevout) == 0) {
++                prior_inputs.push_back(txin.prevout);
++            }
++        }
++    }
++
++    // Build an isolated CCoinsViewCache containing all prior-block spent coins
++    // so we can run full CheckTxInputs + VerifyScript on every transaction in
++    // the block before mutating the reverse-peel UTXO state.
++    CCoinsView dummy_base;
++    CCoinsViewCache peel_coins_view(&dummy_base);
++    std::vector<lotus::v2::Coin> prior_spent_v2_coins;
++    if (spent_coins.size() == prior_inputs.size()) {
++        prior_spent_v2_coins.reserve(prior_inputs.size());
++        for (size_t i = 0; i < prior_inputs.size(); ++i) {
++            const lotus::v2::Coin &v2_c = spent_coins[i];
++            if (!(v2_c.outpoint == OutPointToV2Outpoint(prior_inputs[i]))) {
++                error = "undo prior spent coin outpoint mismatch";
++                return false;
++            }
++            if (v2_c.creation_height >= current_height_u64) {
++                error = "undo prior spent coin creation_height >= block height";
++                return false;
++            }
++            prior_spent_v2_coins.push_back(v2_c);
++            ::Coin legacy_c(CTxOut::FromV2Output(v2_c.output),
++                            static_cast<int32_t>(v2_c.creation_height),
++                            v2_c.coinbase);
++            peel_coins_view.AddCoin(prior_inputs[i], std::move(legacy_c),
++                                    /*possible_overwrite=*/true);
++        }
++    } else if (spent_coins.size() == all_inputs.size()) {
++        for (size_t i = 0; i < all_inputs.size(); ++i) {
++            const lotus::v2::Coin &v2_c = spent_coins[i];
++            if (!(v2_c.outpoint == OutPointToV2Outpoint(all_inputs[i]))) {
++                error = "undo spent coin outpoint mismatch";
++                return false;
++            }
++            if (created_in_block.count(all_inputs[i]) == 0) {
++                if (v2_c.creation_height >= current_height_u64) {
++                    error =
++                        "undo prior spent coin creation_height >= block height";
++                    return false;
++                }
++                prior_spent_v2_coins.push_back(v2_c);
++                ::Coin legacy_c(CTxOut::FromV2Output(v2_c.output),
++                                static_cast<int32_t>(v2_c.creation_height),
++                                v2_c.coinbase);
++                peel_coins_view.AddCoin(all_inputs[i], std::move(legacy_c),
++                                        /*possible_overwrite=*/true);
++            }
++        }
++    } else {
++        error = "undo spent coins count mismatch";
++        return false;
++    }
++
++    const uint32_t script_flags =
++        GetNextBlockScriptFlags(pindex->pprev, m_chainman);
++    Amount nFees = Amount::zero();
++    CBlockUndo block_undo;
++    if (block.vtx.size() > 1) {
++        block_undo.vtxundo.resize(block.vtx.size() - 1);
++    }
++
++    for (size_t tx_i = 0; tx_i < block.vtx.size(); ++tx_i) {
++        const CTransaction &tx = *block.vtx[tx_i];
++        if (!tx.IsCoinBase()) {
++            if (!peel_coins_view.HaveInputs(tx)) {
++                error = "missing inputs during reverse block script validation";
++                return false;
++            }
++            TxValidationState tx_state;
++            Amount txfee = Amount::zero();
++            if (!Consensus::CheckTxInputs(tx, tx_state, peel_coins_view,
++                                          pindex->nHeight, txfee)) {
++                error = "CheckTxInputs failed during reverse peel: " +
++                        tx_state.ToString();
++                return false;
++            }
++            nFees += txfee;
++
++            PrecomputedTransactionData txdata(tx);
++            for (size_t in_i = 0; in_i < tx.vin.size(); ++in_i) {
++                const ::Coin &spent_coin =
++                    peel_coins_view.AccessCoin(tx.vin[in_i].prevout);
++                ScriptExecutionMetrics metrics{};
++                ScriptError serror = ScriptError::UNKNOWN;
++                if (!VerifyScript(
++                        tx.vin[in_i].scriptSig,
++                        spent_coin.GetTxOut().scriptPubKey, script_flags,
++                        TransactionSignatureChecker(
++                            &tx, in_i, spent_coin.GetTxOut().nValue, txdata),
++                        metrics, &serror)) {
++                    error = "VerifyScript failed during reverse peel: " +
++                            ScriptErrorString(serror);
++                    return false;
++                }
++            }
++        }
++        CTxUndo tx_undo_dummy;
++        UpdateCoins(peel_coins_view, tx,
++                    tx.IsCoinBase() ? tx_undo_dummy
++                                    : block_undo.vtxundo[tx_i - 1],
++                    pindex->nHeight);
++    }
++
++    const Amount blockReward =
++        nFees + GetBlockSubsidy(pindex->nHeight, m_chainman.GetConsensus());
++    if (block.vtx[0]->GetValueOut() > blockReward) {
++        error = "bad-cb-amount during reverse peel";
++        return false;
++    }
++
++    std::optional<lotus::v2::Hash> expected_parent_anchor =
++        GetFastSyncStateAnchor(pindex->pprev->GetBlockHash());
++    if (!expected_parent_anchor.has_value() && pindex->pprev->nHeight == 0) {
++        expected_parent_anchor =
++            ComputeGenesisUtxoRoot(m_chainman.GetParams().GenesisBlock());
++    }
++
++    lotus::v2::Hash parent_utxo_root{};
++    if (!lotus::v2::VerifyAndPeelReverseBlock(
++            static_cast<uint64_t>(pindex->nHeight), /*parent_mtp=*/0,
++            block_outputs, block_spent_outpoints, spent_coins,
++            *m_reverse_peel_utxo, expected_parent_anchor, parent_utxo_root,
++            error)) {
++        return false;
++    }
++
++    if (pending_it != m_pending_undo_coin_checks.end()) {
++        m_pending_undo_coin_checks.erase(pending_it);
++    }
++    for (const lotus::v2::Coin &prior_c : prior_spent_v2_coins) {
++        if (prior_c.creation_height == 0) {
++            // Verify against Genesis outputs immediately if created at height 0
++            const CBlock &genesis_blk = m_chainman.GetParams().GenesisBlock();
++            bool genesis_match = false;
++            for (const auto &gtx : genesis_blk.vtx) {
++                const TxId gtxid = gtx->GetId();
++                for (size_t out_i = 0; out_i < gtx->vout.size(); ++out_i) {
++                    const lotus::v2::Outpoint gout = OutPointToV2Outpoint(
++                        COutPoint(gtxid, static_cast<uint32_t>(out_i)));
++                    if (gout == prior_c.outpoint &&
++                        gtx->vout[out_i].ToV2Output() == prior_c.output &&
++                        gtx->IsCoinBase() == prior_c.coinbase) {
++                        genesis_match = true;
++                        break;
++                    }
++                }
++                if (genesis_match) {
++                    break;
++                }
++            }
++            if (!genesis_match) {
++                error =
++                    "undo coin claiming creation_height 0 does not match Genesis block";
++                return false;
++            }
++        } else {
++            m_pending_undo_coin_checks[prior_c.creation_height].push_back(
++                prior_c);
++        }
++    }
++
++    if (!pindex->nStatus.hasData()) {
++        FlatFilePos block_pos = m_blockman.WriteBlock(block, pindex->nHeight);
++        if (!block_pos.IsNull()) {
++            m_chainman.ReceivedBlockTransactions(block, pindex, block_pos);
++        }
++    }
++    if (!pindex->nStatus.hasUndo() && pindex->nHeight > 0) {
++        BlockValidationState undo_state;
++        m_blockman.WriteBlockUndo(block_undo, undo_state, *pindex);
++    }
++
++    pindex->nStatus = pindex->nStatus.withValidity(BlockValidity::SCRIPTS);
++    m_blockman.m_dirty_blockindex.insert(pindex);
++
++    lotus::v2::SmtBatchUpdateParallel(m_reverse_peel_smt_root,
++                                      smt_erased_outputs,
++                                      prior_spent_v2_coins);
++    const uint64_t parent_height = static_cast<uint64_t>(pindex->pprev->nHeight);
++    const lotus::v2::MonetaryState parent_monetary =
++        ComputeMonetaryStateFromSmt(m_reverse_peel_smt_root, parent_height);
++    CacheFastSyncBlockState(pindex->pprev->GetBlockHash(),
++                            m_reverse_peel_smt_root, parent_monetary,
++                            parent_utxo_root, parent_height);
++
++    m_earliest_verified_block = pindex->pprev;
++    m_earliest_verified_height = pindex->pprev->nHeight;
++    ++m_peeled_blocks_count;
++    UpdateFastSyncPivotBase(m_earliest_verified_block);
++
++    const int max_peel_blocks = GetFastSyncMaxPeelBlocks();
++    if (m_earliest_verified_height == 0 ||
++        (max_peel_blocks > 0 && m_peeled_blocks_count >= max_peel_blocks)) {
++        m_fast_sync_active = false;
++        m_reverse_peel_utxo.reset();
++        m_reverse_peel_smt_root.reset();
++        m_pending_undo_coin_checks.clear();
++    }
++
++    node::PublishChainTipSnapshot(m_chainman, m_mempool);
++    error.clear();
++    return true;
++}
+diff --git a/src/validation.h b/src/validation.h
+index 3e4f03567b6e83fbfee36121a21229c189ef9074..3002d666c2f769918733156b8d79be420ef7be59 100644
+--- a/src/validation.h
++++ b/src/validation.h
+@@ -28,6 +28,7 @@
+ #include <kernel/chainparams.h>
+ #include <kernel/chainstatemanager_opts.h>
+ #include <kernel/cs_main.h>
++#include <lotus_v2/fast_sync.h>
+ #include <node/blockstorage.h>
+ #include <policy/packages.h>
+ #include <script/script_error.h>
+@@ -49,6 +50,7 @@
+ #include <set>
+ #include <string>
+ #include <type_traits>
++#include <unordered_map>
+ #include <utility>
+ #include <vector>
+ 
+@@ -1062,7 +1064,104 @@ public:
+         return m_mempool ? &m_mempool->cs : nullptr;
+     }
+ 
++    static constexpr int kDefaultFastSyncUndoHorizon = 50;
++    static constexpr size_t MAX_CACHED_FAST_SYNC_STATES = 64;
++
++    struct FastSyncBlockState {
++        std::shared_ptr<const lotus::v2::SmtNode> smt_root;
++        lotus::v2::UtxoSet utxo;
++        lotus::v2::MonetaryState monetary;
++        lotus::v2::Hash utxo_root = lotus::v2::EmptyUtxoRoot();
++        uint64_t height = 0;
++    };
++
++    bool IsFastSyncActive() const EXCLUSIVE_LOCKS_REQUIRED(::cs_main) {
++        return m_fast_sync_active;
++    }
++    int GetEarliestVerifiedHeight() const EXCLUSIVE_LOCKS_REQUIRED(::cs_main) {
++        return m_earliest_verified_height;
++    }
++    const CBlockIndex *GetEarliestVerifiedBlock() const
++        EXCLUSIVE_LOCKS_REQUIRED(::cs_main) {
++        return m_earliest_verified_block;
++    }
++    int GetFastSyncMaxPeelBlocks() const EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
++    void SetFastSyncMaxPeelBlocks(std::optional<int> max_blocks)
++        EXCLUSIVE_LOCKS_REQUIRED(::cs_main) {
++        m_max_peel_blocks_override = max_blocks;
++    }
++    int GetFastSyncPeeledBlocksCount() const
++        EXCLUSIVE_LOCKS_REQUIRED(::cs_main) {
++        return m_peeled_blocks_count;
++    }
++    bool IsSnapSyncEnabled() const EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
++    bool IsReverseSyncEnabled() const EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
++    void SetSnapSyncEnabled(std::optional<bool> enabled)
++        EXCLUSIVE_LOCKS_REQUIRED(::cs_main) {
++        m_snapsync_enabled_override = enabled;
++    }
++    void SetReverseSyncEnabled(std::optional<bool> enabled)
++        EXCLUSIVE_LOCKS_REQUIRED(::cs_main) {
++        m_reversesync_enabled_override = enabled;
++    }
++    void SetFastSyncStateAnchor(const BlockHash &block_hash,
++                                const lotus::v2::Hash &utxo_root)
++        EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
++    std::optional<lotus::v2::Hash>
++    GetFastSyncStateAnchor(const BlockHash &block_hash) const
++        EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
++    const FastSyncBlockState *
++    GetFastSyncBlockState(const BlockHash &block_hash) const
++        EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
++    bool ExportV2BlockStateCoinsAndMonetary(
++        const CBlockIndex *pindex, FastSyncBlockState &out_state,
++        std::string &error, bool populate_utxo_set = true)
++        EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
++    bool ActivateVerifiedFastSyncPivot(
++        CBlockIndex *pivot_index, const lotus::v2::UtxoRootsMessage &roots_msg,
++        const std::vector<lotus::v2::UtxoShardMessage> &shards,
++        std::string &error) EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
++    bool PeelFastSyncBlock(const CBlock &block, CBlockIndex *pindex,
++                           const std::vector<lotus::v2::Coin> &spent_coins,
++                           std::string &error)
++        EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
++
+ private:
++    void CacheFastSyncBlockState(
++        const BlockHash &block_hash,
++        std::shared_ptr<const lotus::v2::SmtNode> smt_root,
++        const lotus::v2::MonetaryState &monetary,
++        const lotus::v2::Hash &utxo_root, uint64_t height)
++        EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
++    void UpdateConnectedBlockSmtState(const CBlock &block,
++                                      const CBlockIndex *pindex)
++        EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
++    void UpdateFastSyncPivotBase(CBlockIndex *new_base)
++        EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
++
++    bool m_fast_sync_active GUARDED_BY(::cs_main){false};
++    int m_earliest_verified_height GUARDED_BY(::cs_main){0};
++    CBlockIndex *m_earliest_verified_block GUARDED_BY(::cs_main){nullptr};
++    CBlockIndex *m_fast_sync_pivot_base GUARDED_BY(::cs_main){nullptr};
++    int m_fast_sync_pivot_height GUARDED_BY(::cs_main){0};
++    int m_peeled_blocks_count GUARDED_BY(::cs_main){0};
++    std::optional<int> m_max_peel_blocks_override GUARDED_BY(::cs_main);
++    std::optional<bool> m_snapsync_enabled_override GUARDED_BY(::cs_main);
++    std::optional<bool> m_reversesync_enabled_override GUARDED_BY(::cs_main);
++    std::optional<lotus::v2::UtxoSet> m_reverse_peel_utxo GUARDED_BY(::cs_main);
++    std::shared_ptr<const lotus::v2::SmtNode>
++        m_reverse_peel_smt_root GUARDED_BY(::cs_main);
++    std::shared_ptr<const lotus::v2::SmtNode>
++        m_tip_smt_root GUARDED_BY(::cs_main);
++    BlockHash m_tip_smt_blockhash GUARDED_BY(::cs_main){};
++    std::unordered_map<uint64_t, std::vector<lotus::v2::Coin>>
++        m_pending_undo_coin_checks GUARDED_BY(::cs_main);
++    std::deque<BlockHash> m_fast_sync_state_fifo GUARDED_BY(::cs_main);
++    std::unordered_map<BlockHash, FastSyncBlockState, SaltedUint256Hasher>
++        m_fast_sync_block_states GUARDED_BY(::cs_main);
++    std::unordered_map<BlockHash, lotus::v2::Hash, SaltedUint256Hasher>
++        m_fast_sync_state_anchors GUARDED_BY(::cs_main);
++
+     bool ActivateBestChainStep(
+         BlockValidationState &state, CBlockIndex *pindexMostWork,
+         const std::shared_ptr<const CBlock> &pblock, bool &fInvalidFound,
+-- 
+2.50.1 (Apple Git-155)
+

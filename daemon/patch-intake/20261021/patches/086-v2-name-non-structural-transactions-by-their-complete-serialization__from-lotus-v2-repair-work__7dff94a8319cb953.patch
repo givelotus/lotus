@@ -1,0 +1,535 @@
+From ab80f31638ed890001ce0efb0ffc15e87cc3381c Mon Sep 17 00:00:00 2001
+From: Shammah Chancellor <shammah.chancellor@notvalid.com>
+Date: Mon, 19 Oct 2026 11:45:26 -0700
+Subject: v2: name non-structural transactions by their complete serialization
+
+A transaction that is not a well-formed V2 structure (for example one
+that spends an outpoint twice, or a legacy-version transaction with more
+than 65,535 outputs) has no structural TxId. ComputeV2TxIdentities then
+fell back to a flat hash that omitted the path index, every witness
+after the first, siblings and arguments, concatenated variable-length
+fields without length prefixes, silently skipped outputs that failed to
+encode, and reused the TxId/TxHash tags without the chain ID. Two
+different transactions could therefore share a name, and an invalid
+transaction could be named like a valid one on another chain. Such
+transactions are rejected, but rejection is recorded by name, so a
+collision could poison a reject-cache entry for a different transaction.
+
+The fallback now hashes, under its own domain tag
+"Lotus/v2/txid/nonstructural", the active chain ID followed by the
+complete serialized transaction. The serialization is self-delimiting
+and is what the node relays, so distinct transactions get distinct
+names, and the tag keeps them apart from every structural TxId and
+TxHash. A non-structural transaction has no witness-free core, so its
+TxId and TxHash are the same value. The test framework's mirror in
+lotus_v2_compute_tx_identities (introduced by v2/034) computes the same
+name.
+
+transaction_tests checks that variants differing only in path index,
+extra witnesses, siblings, arguments, an unencodable output, or bytes
+moved across a script/argument boundary all get distinct names, none
+equal to the valid transaction's identity, and that the name depends on
+the chain ID. A fixed vector computed by the test framework matches the
+node, and feature_v2_fallback_identity.py checks that testmempoolaccept
+and decoderawtransaction report the framework's name for four such
+transactions.
+
+Tier: V2 (fixup to v2/031)
+---
+ src/consensus/tx_check.cpp                    |   2 +-
+ src/lotus_v2/tagged_hash.cpp                  |   1 +
+ src/lotus_v2/tagged_hash.h                    |   3 +
+ src/primitives/transaction.cpp                |  81 ++++------
+ src/primitives/transaction.h                  |   2 +-
+ src/test/transaction_tests.cpp                | 144 +++++++++++++++++-
+ .../feature_v2_fallback_identity.py           |  55 +++++++
+ test/functional/test_framework/messages.py    |  43 +-----
+ 8 files changed, 238 insertions(+), 93 deletions(-)
+ create mode 100755 test/functional/feature_v2_fallback_identity.py
+
+diff --git a/src/consensus/tx_check.cpp b/src/consensus/tx_check.cpp
+index cd35185d379a4d55ffa83f57ba457da052eab60c..ddc8215d533756a90c74951cba20557a5f4a280a 100644
+--- a/src/consensus/tx_check.cpp
++++ b/src/consensus/tx_check.cpp
+@@ -187,7 +187,7 @@ static bool CheckRegularTransactionRules(const CTransaction &tx,
+ }
+ 
+ // A transaction whose content is not a well-formed V2 transaction has only the
+-// flat fallback TxId/TxHash (see ComputeV2TxIdentities). Checked after every
++// fallback TxId/TxHash name (see ComputeV2TxIdentities). Checked after every
+ // other rule so the more specific reject reason wins; this catches what those
+ // rules do not, such as a legacy-version transaction with more than 65,535
+ // outputs (which the u16 V2 header cannot count).
+diff --git a/src/lotus_v2/tagged_hash.cpp b/src/lotus_v2/tagged_hash.cpp
+index 9f4ab928a11c1af764e1d17f4e6dde24b26313a9..6c77af77c1d957dca6daf44077a4e5f001b8d7ea 100644
+--- a/src/lotus_v2/tagged_hash.cpp
++++ b/src/lotus_v2/tagged_hash.cpp
+@@ -30,6 +30,7 @@ constexpr std::string_view TagView(HashDomain domain) noexcept {
+     case HashDomain::ContractState: return "Lotus/v2/contractstate";
+     case HashDomain::SimPlaceholder: return "Lotus/v2/sim/placeholder";
+     case HashDomain::VmProfile: return "Lotus/v2/vmprofile";
++    case HashDomain::TxIdFallback: return "Lotus/v2/txid/nonstructural";
+     }
+     std::abort();
+ }
+diff --git a/src/lotus_v2/tagged_hash.h b/src/lotus_v2/tagged_hash.h
+index c76d4c838790603e9c8ec44c8962baef91c09cc3..8b1d9a52964eec60b7ed8622447b461f97169fe3 100644
+--- a/src/lotus_v2/tagged_hash.h
++++ b/src/lotus_v2/tagged_hash.h
+@@ -38,6 +38,9 @@ enum class HashDomain {
+     SimPlaceholder,
+     // Non-consensus VM profile commitment (VmProfileDigest).
+     VmProfile,
++    // Name of a transaction that is not a well-formed V2 structure: the
++    // chain ID and its complete serialization (never a valid identity).
++    TxIdFallback,
+ };
+ 
+ // Hardware-accelerated BIP-340 style tagged SHA-256:
+diff --git a/src/primitives/transaction.cpp b/src/primitives/transaction.cpp
+index 3ae4cb13ce416d2884f7339ffde331bde7cb8c9d..3d4a0ace2b462c9665ad839f3c97677f3a5a2d57 100644
+--- a/src/primitives/transaction.cpp
++++ b/src/primitives/transaction.cpp
+@@ -377,19 +377,29 @@ static_assert(lotus::v2::MAX_TX_INPUTS == MAX_V2_TX_INPUTS &&
+               lotus::v2::MAX_TX_OUTPUTS == MAX_V2_TX_OUTPUTS);
+ 
+ // Returns true when the identity is the structural V2 TxId/TxHash. Returns
+-// false, after filling a flat fallback digest, when the transaction is not a
++// false, after filling a fallback digest, when the transaction is not a
+ // well-formed V2 transaction (ComputeTransactionIdentities fails on its
+ // content). The fallback only names such a transaction (logs, reject caches);
+ // validation rejects it with bad-txns-v2-identity, so it is never accepted.
+-static bool ComputeV2TxIdentities(const lotus::v2::Transaction &v2tx,
+-                                  uint32_t nVersion,
++//
++// The fallback must never equal the identity of a different transaction,
++// valid or not, or rejecting the invalid one could poison a reject cache
++// entry for the other. It therefore uses its own domain tag (never TxId or
++// TxHash), commits to the chain ID, and hashes the complete serialized
++// transaction, which is self-delimiting. TxId and TxHash are the same value:
++// a transaction that is not a V2 structure has no witness-free core, and
++// excluding any field would let two different transactions share a name.
++template <typename TxType>
++static bool ComputeV2TxIdentities(const TxType &tx,
+                                   lotus::v2::Hash32 &txid_out,
+                                   lotus::v2::Hash32 &txhash_out,
+                                   lotus::v2::Hash32 *outputs_root_out = nullptr) {
++    const uint32_t nVersion = tx.nVersion;
+     std::string err;
+     if (lotus::v2::ComputeTransactionIdentities(
+-            v2tx, lotus::v2::DefaultTxProfile, GetActiveV2ChainId(), txid_out,
+-            txhash_out, err, outputs_root_out)) {
++            tx.ToV2Transaction(), lotus::v2::DefaultTxProfile,
++            GetActiveV2ChainId(), txid_out, txhash_out, err,
++            outputs_root_out)) {
+         if (nVersion != 7) {
+             txid_out[0] ^= uint8_t(nVersion & 0xffU);
+             txhash_out[0] ^= uint8_t(nVersion & 0xffU);
+@@ -399,56 +409,19 @@ static bool ComputeV2TxIdentities(const lotus::v2::Transaction &v2tx,
+     if (outputs_root_out) {
+         *outputs_root_out = lotus::v2::Hash32{};
+     }
+-    std::vector<uint8_t> core_bytes;
+-    std::vector<uint8_t> full_bytes;
+-    for (unsigned i = 0; i < 4; ++i) {
+-        core_bytes.push_back(uint8_t(nVersion >> (8 * i)));
+-        full_bytes.push_back(uint8_t(nVersion >> (8 * i)));
+-    }
+-    for (unsigned i = 0; i < 8; ++i) {
+-        core_bytes.push_back(uint8_t(v2tx.lock >> (8 * i)));
+-        full_bytes.push_back(uint8_t(v2tx.lock >> (8 * i)));
+-    }
+-    for (const auto &in : v2tx.inputs) {
+-        core_bytes.insert(core_bytes.end(), in.prev_txid.begin(),
+-                          in.prev_txid.end());
+-        full_bytes.insert(full_bytes.end(), in.prev_txid.begin(),
+-                          in.prev_txid.end());
+-        for (unsigned i = 0; i < 4; ++i) {
+-            core_bytes.push_back(uint8_t(in.prev_index >> (8 * i)));
+-            full_bytes.push_back(uint8_t(in.prev_index >> (8 * i)));
+-            core_bytes.push_back(uint8_t(in.sequence >> (8 * i)));
+-            full_bytes.push_back(uint8_t(in.sequence >> (8 * i)));
+-        }
+-        core_bytes.push_back(in.flags);
+-        full_bytes.push_back(in.flags);
+-        if (!in.witnesses.empty()) {
+-            full_bytes.insert(full_bytes.end(), in.witnesses[0].script.begin(),
+-                              in.witnesses[0].script.end());
+-        }
+-        if (in.has_coinbase_data) {
+-            core_bytes.insert(core_bytes.end(), in.coinbase_data.begin(),
+-                              in.coinbase_data.end());
+-            full_bytes.insert(full_bytes.end(), in.coinbase_data.begin(),
+-                              in.coinbase_data.end());
+-        }
+-    }
+-    for (const auto &out : v2tx.outputs) {
+-        std::vector<uint8_t> owire;
+-        if (lotus::v2::EncodeOutput(out, owire, err)) {
+-            core_bytes.insert(core_bytes.end(), owire.begin(), owire.end());
+-            full_bytes.insert(full_bytes.end(), owire.begin(), owire.end());
+-        }
+-    }
+-    txid_out = lotus::v2::TaggedHash(lotus::v2::HashDomain::TxId, core_bytes);
+-    txhash_out =
+-        lotus::v2::TaggedHash(lotus::v2::HashDomain::TxHash, full_bytes);
++    const lotus::v2::ChainId &chain_id = GetActiveV2ChainId();
++    std::vector<uint8_t> preimage(chain_id.begin(), chain_id.end());
++    VectorWriter writer{preimage, preimage.size()};
++    SerializeTransaction(tx, writer);
++    txid_out =
++        lotus::v2::TaggedHash(lotus::v2::HashDomain::TxIdFallback, preimage);
++    txhash_out = txid_out;
+     return false;
+ }
+ 
+ TxId CMutableTransaction::GetId() const {
+     lotus::v2::Hash32 txid{}, txhash{};
+-    ComputeV2TxIdentities(ToV2Transaction(), nVersion, txid, txhash);
++    ComputeV2TxIdentities(*this, txid, txhash);
+     uint256 out;
+     std::memcpy(out.begin(), txid.data(), 32);
+     return TxId(out);
+@@ -456,7 +429,7 @@ TxId CMutableTransaction::GetId() const {
+ 
+ TxHash CMutableTransaction::GetHash() const {
+     lotus::v2::Hash32 txid{}, txhash{};
+-    ComputeV2TxIdentities(ToV2Transaction(), nVersion, txid, txhash);
++    ComputeV2TxIdentities(*this, txid, txhash);
+     uint256 out;
+     std::memcpy(out.begin(), txhash.data(), 32);
+     return TxHash(out);
+@@ -464,7 +437,7 @@ TxHash CMutableTransaction::GetHash() const {
+ 
+ uint256 CTransaction::ComputeHash() const {
+     lotus::v2::Hash32 txid{}, txhash{};
+-    ComputeV2TxIdentities(ToV2Transaction(), nVersion, txid, txhash);
++    ComputeV2TxIdentities(*this, txid, txhash);
+     uint256 out;
+     std::memcpy(out.begin(), txid.data(), 32);
+     return out;
+@@ -472,7 +445,7 @@ uint256 CTransaction::ComputeHash() const {
+ 
+ uint256 CTransaction::ComputeWitnessHash() const {
+     lotus::v2::Hash32 txid{}, txhash{};
+-    ComputeV2TxIdentities(ToV2Transaction(), nVersion, txid, txhash);
++    ComputeV2TxIdentities(*this, txid, txhash);
+     uint256 out;
+     std::memcpy(out.begin(), txhash.data(), 32);
+     return out;
+@@ -599,7 +572,7 @@ void CTransaction::InitHashes() {
+     }
+     lotus::v2::Hash32 txid{}, txhash{}, outputs_root{};
+     m_structural_v2_identity = ComputeV2TxIdentities(
+-        ToV2Transaction(), nVersion, txid, txhash, &outputs_root);
++        *this, txid, txhash, &outputs_root);
+     std::memcpy(hash.begin(), txid.data(), 32);
+     std::memcpy(m_witness_hash.begin(), txhash.data(), 32);
+     std::memcpy(m_outputs_hash.begin(), outputs_root.data(), 32);
+diff --git a/src/primitives/transaction.h b/src/primitives/transaction.h
+index 91464ce9bb863f25ea859d19e35f319eecee0574..b422dfd53fc9a421e79f915f58add4e16f7913ea 100644
+--- a/src/primitives/transaction.h
++++ b/src/primitives/transaction.h
+@@ -779,7 +779,7 @@ public:
+     const uint256 &GetOutputsHash() const { return m_outputs_hash; }
+     /**
+      * False when the transaction is not a well-formed V2 transaction and its
+-     * TxId/TxHash are the flat fallback digest; validation rejects such a
++     * TxId/TxHash are the fallback name; validation rejects such a
+      * transaction (bad-txns-v2-identity).
+      */
+     bool HasStructuralV2Identity() const { return m_structural_v2_identity; }
+diff --git a/src/test/transaction_tests.cpp b/src/test/transaction_tests.cpp
+index 74f941f358751b77a33bc8f866c84aa433936064..efbd5b8927d9aa6b7464aa614ee914f2b4824f72 100644
+--- a/src/test/transaction_tests.cpp
++++ b/src/test/transaction_tests.cpp
+@@ -18,6 +18,7 @@
+ #include <key.h>
+ #include <lotus_v2/commitment.h>
+ #include <lotus_v2/output.h>
++#include <lotus_v2/tagged_hash.h>
+ #include <lotus_v2/transaction.h>
+ #include <policy/policy.h>
+ #include <policy/settings.h>
+@@ -46,6 +47,7 @@
+ 
+ #include <atomic>
+ #include <map>
++#include <set>
+ #include <string>
+ #include <thread>
+ 
+@@ -1863,7 +1865,7 @@ BOOST_AUTO_TEST_CASE(v2_over_cap_identity_comes_from_bytes) {
+                       "bad-txns-v2-too-many-outputs");
+ }
+ 
+-// A transaction that is not a well-formed V2 transaction has only the flat
++// A transaction that is not a well-formed V2 transaction has only the
+ // fallback identity; validation rejects it explicitly instead of accepting it
+ // under that identity. A legacy-version transaction with 65,536 outputs passes
+ // every other context-free rule but cannot be counted by the u16 V2 header.
+@@ -1896,6 +1898,146 @@ BOOST_AUTO_TEST_CASE(v2_fallback_identity_is_rejected) {
+     BOOST_CHECK_EQUAL(state.GetRejectReason(), "bad-txns-vin-empty");
+ }
+ 
++namespace {
++/** Sets the active V2 chain ID for one scope, then restores the previous. */
++class ScopedTestV2ChainId {
++public:
++    explicit ScopedTestV2ChainId(const lotus::v2::ChainId &chain_id)
++        : m_previous(GetActiveV2ChainId()) {
++        SetActiveV2ChainId(chain_id);
++    }
++    ~ScopedTestV2ChainId() { SetActiveV2ChainId(m_previous); }
++
++private:
++    const lotus::v2::ChainId m_previous;
++};
++
++lotus::v2::Transaction FallbackIdentityBase() {
++    lotus::v2::Transaction tx;
++    for (uint8_t prev : {0x11, 0x22}) {
++        lotus::v2::Input in;
++        in.prev_txid.fill(prev);
++        in.sequence = CTxIn::SEQUENCE_FINAL;
++        in.flags = 1;
++        in.witnesses.push_back({{0x51}, {}, {}});
++        tx.inputs.push_back(in);
++    }
++    lotus::v2::Output out;
++    out.value = 1000;
++    out.branches.push_back(lotus::v2::Hash32{});
++    out.branches[0].fill(0x33);
++    out.paths.push_back({0});
++    tx.outputs.push_back(out);
++    return tx;
++}
++} // namespace
++
++// The fallback name of a transaction that is not a V2 structure commits to
++// every serialized field, so transactions that differ only in fields the
++// structural identity would also commit to (path index, extra witnesses,
++// siblings, arguments, an output that cannot be encoded) get different names,
++// and none equals a structural identity. Each variant below differs from the
++// first only in such a field; the previous flat fallback named them all the
++// same.
++BOOST_AUTO_TEST_CASE(v2_fallback_identity_is_unique) {
++    const lotus::v2::Transaction valid = FallbackIdentityBase();
++    const CTransaction valid_tx(CMutableTransaction::FromV2Transaction(valid));
++    BOOST_REQUIRE(valid_tx.HasStructuralV2Identity());
++
++    // Repeating the first outpoint makes it a non-structural transaction.
++    lotus::v2::Transaction invalid = valid;
++    invalid.inputs[1].prev_txid = invalid.inputs[0].prev_txid;
++
++    std::vector<lotus::v2::Transaction> variants{invalid};
++    variants.push_back(invalid);
++    variants.back().inputs[0].path_index = 1;
++    variants.push_back(invalid);
++    variants.back().inputs[0].witnesses.push_back({{0x52}, {}, {}});
++    variants.push_back(invalid);
++    variants.back().inputs[0].witnesses[0].siblings.push_back(
++        lotus::v2::Hash32{});
++    variants.push_back(invalid);
++    variants.back().inputs[0].witnesses[0].arguments.push_back({0x01});
++    variants.push_back(invalid);
++    variants.back().inputs[0].witnesses[0].arguments.push_back({0x02});
++    variants.push_back(invalid);
++    variants.back().inputs[1].witnesses[0].arguments.push_back({0x01});
++    // An output without branches cannot be encoded.
++    variants.push_back(invalid);
++    variants.back().outputs.push_back(lotus::v2::Output{});
++    variants.back().outputs.back().value = 5;
++    // Bytes moved across the script/argument boundary.
++    variants.push_back(invalid);
++    variants.back().inputs[0].witnesses[0].script = {0x51, 0x01};
++    variants.push_back(invalid);
++    variants.back().inputs[0].witnesses[0].arguments.push_back({0x01, 0x01});
++
++    std::set<uint256> names{valid_tx.GetId(), valid_tx.GetHash()};
++    for (const auto &variant : variants) {
++        const CMutableTransaction mtx =
++            CMutableTransaction::FromV2Transaction(variant);
++        const CTransaction tx(mtx);
++        BOOST_CHECK(!tx.HasStructuralV2Identity());
++        BOOST_CHECK(tx.GetId() == mtx.GetId());
++        BOOST_CHECK(tx.GetHash() == mtx.GetHash());
++        BOOST_CHECK(uint256(tx.GetId()) == uint256(tx.GetHash()));
++
++        // The name is the fallback tag over the chain ID and the complete
++        // serialization, never the TxId or TxHash tag.
++        const lotus::v2::ChainId &chain_id = GetActiveV2ChainId();
++        std::vector<uint8_t> preimage(chain_id.begin(), chain_id.end());
++        VectorWriter writer{preimage, preimage.size()};
++        SerializeTransaction(tx, writer);
++        const auto expected = lotus::v2::TaggedHash(
++            lotus::v2::HashDomain::TxIdFallback, preimage);
++        BOOST_CHECK(std::equal(expected.begin(), expected.end(),
++                               tx.GetId().begin()));
++        BOOST_CHECK(names.insert(tx.GetId()).second);
++
++        // Rejected (here by the more specific duplicate-input rule).
++        TxValidationState state;
++        BOOST_CHECK(!CheckRegularTransaction(tx, state));
++    }
++
++    // The name depends on the chain ID.
++    const CMutableTransaction mtx =
++        CMutableTransaction::FromV2Transaction(invalid);
++    const TxId mainnet_name = mtx.GetId();
++    lotus::v2::ChainId other_chain{};
++    other_chain.fill(0x44);
++    {
++        const ScopedTestV2ChainId scoped(other_chain);
++        BOOST_CHECK(mtx.GetId() != mainnet_name);
++    }
++    BOOST_CHECK(mtx.GetId() == mainnet_name);
++}
++
++// Cross-language vector: test_framework.messages.lotus_v2_compute_tx_identities
++// gives the same fallback name for this regtest (zero chain ID) transaction, a
++// version-7 legacy-framed transaction spending one outpoint twice.
++BOOST_AUTO_TEST_CASE(v2_fallback_identity_matches_test_framework) {
++    const ScopedTestV2ChainId scoped(lotus::v2::ChainId{});
++    CMutableTransaction mtx;
++    mtx.nVersion = 7;
++    mtx.vin.emplace_back(COutPoint(TxId(uint256S("11")), 0));
++    mtx.vin.emplace_back(COutPoint(TxId(uint256S("11")), 0));
++    mtx.vout.emplace_back(1000 * SATOSHI, CScript() << OP_TRUE);
++    const CTransaction tx(mtx);
++    DataStream stream{};
++    stream << tx;
++    BOOST_CHECK_EQUAL(
++        HexStr(stream),
++        "070000800211000000000000000000000000000000000000000000000000000000"
++        "000000000000000000ffffffff1100000000000000000000000000000000000000"
++        "0000000000000000000000000000000000ffffffff01e803000000000000015100"
++        "000000");
++    BOOST_CHECK(!tx.HasStructuralV2Identity());
++    BOOST_CHECK_EQUAL(
++        tx.GetId().GetHex(),
++        "690f32a7d8ea390fa29b15729cec2c3b6d84e10e07e78458adfbd98bf4f77e70");
++    BOOST_CHECK_EQUAL(tx.GetHash().GetHex(), tx.GetId().GetHex());
++}
++
+ BOOST_AUTO_TEST_CASE(v2_state_root_round_trip) {
+     lotus::v2::Output stateless;
+     stateless.value = 1000;
+diff --git a/test/functional/feature_v2_fallback_identity.py b/test/functional/feature_v2_fallback_identity.py
+new file mode 100755
+index 0000000000000000000000000000000000000000..a4a8ebd3e12222f17656997deb2683771a8c6ee4
+--- /dev/null
++++ b/test/functional/feature_v2_fallback_identity.py
+@@ -0,0 +1,55 @@
++#!/usr/bin/env python3
++# Copyright (c) 2026 The Lotus developers
++# Distributed under the MIT software license, see the accompanying
++# file COPYING or http://www.opensource.org/licenses/mit-license.php.
++"""Test the name of a transaction that is not a well-formed V2 structure.
++
++Such a transaction is named by the fallback tag over the chain ID and its
++complete serialization. The node and the test framework must agree on that
++name, and transactions differing in any serialized field must get different
++names, so rejecting one cannot poison a reject-cache entry for another.
++"""
++
++from test_framework.messages import COutPoint, CTransaction, CTxIn, CTxOut
++from test_framework.script import OP_TRUE, CScript
++from test_framework.test_framework import BitcoinTestFramework
++from test_framework.util import assert_equal
++
++
++def duplicate_input_tx(script_sig: bytes) -> CTransaction:
++    """A version-7 legacy-framed transaction spending one outpoint twice."""
++    tx = CTransaction()
++    tx.nVersion = 7
++    tx.vin = [
++        CTxIn(COutPoint(0x11, 0), nSequence=0xFFFFFFFF),
++        CTxIn(COutPoint(0x11, 0), script_sig, nSequence=0xFFFFFFFF),
++    ]
++    tx.vout = [CTxOut(1000, CScript([OP_TRUE]))]
++    return tx
++
++
++class V2FallbackIdentityTest(BitcoinTestFramework):
++    def set_test_params(self):
++        self.num_nodes = 1
++        self.setup_clean_chain = True
++
++    def run_test(self):
++        node = self.nodes[0]
++        names = set()
++        for script_sig in (b"", b"\x51", b"\x51\x51", b"\x52"):
++            tx = duplicate_input_tx(script_sig)
++            result = node.testmempoolaccept([tx.serialize().hex()])[0]
++            self.log.info(f"scriptSig {script_sig.hex() or '-'}: {result}")
++            assert_equal(result["allowed"], False)
++            # Node and framework name it identically.
++            assert_equal(result["txid"], tx.txid_hex)
++            names.add(result["txid"])
++            # It never decodes into the structural identity of the node.
++            assert_equal(
++                node.decoderawtransaction(tx.serialize().hex())["txid"], tx.txid_hex
++            )
++        assert_equal(len(names), 4)
++
++
++if __name__ == "__main__":
++    V2FallbackIdentityTest().main()
+diff --git a/test/functional/test_framework/messages.py b/test/functional/test_framework/messages.py
+index dfb1543051fd91223f157f533e5a2b6a9d62837b..a79836501fe1516d477fcda0bbffb6925d4581ac 100644
+--- a/test/functional/test_framework/messages.py
++++ b/test/functional/test_framework/messages.py
+@@ -1188,42 +1188,13 @@ def lotus_v2_compute_tx_identities(tx) -> tuple:
+             txhash_b[0] ^= nver & 0xFF
+         return (bytes(txid_b), bytes(txhash_b))
+ 
+-    core_bytes = bytearray(nver.to_bytes(4, "little") + lock.to_bytes(8, "little"))
+-    full_bytes = bytearray(core_bytes)
+-    for (
+-        prev_txid,
+-        prev_index,
+-        seq,
+-        flags,
+-        path_index,
+-        witnesses,
+-        has_cb,
+-        cb_data,
+-    ) in v2_inputs:
+-        core_bytes += prev_txid
+-        full_bytes += prev_txid
+-        for i in range(4):
+-            ib = (prev_index >> (8 * i)) & 0xFF
+-            sb = (seq >> (8 * i)) & 0xFF
+-            core_bytes.append(ib)
+-            full_bytes.append(ib)
+-            core_bytes.append(sb)
+-            full_bytes.append(sb)
+-        core_bytes.append(flags)
+-        full_bytes.append(flags)
+-        if witnesses:
+-            full_bytes += witnesses[0][0]
+-        if has_cb:
+-            core_bytes += cb_data
+-            full_bytes += cb_data
+-    for o in v2_outputs:
+-        ow = _lotus_v2_encode_output(o)
+-        if len(ow) <= 2186 and _lotus_v2_decode_output_bytes(ow) is not None:
+-            core_bytes += ow
+-            full_bytes += ow
+-    txid_b = lotus_v2_tagged_hash("Lotus/v2/txid", bytes(core_bytes))
+-    txhash_b = lotus_v2_tagged_hash("Lotus/v2/txhash", bytes(full_bytes))
+-    return (txid_b, txhash_b)
++    # Not a well-formed V2 structure: the node names it by its own domain
++    # tag over the chain ID and the complete serialized transaction, with
++    # TxId == TxHash (see ComputeV2TxIdentities).
++    fallback = lotus_v2_tagged_hash(
++        "Lotus/v2/txid/nonstructural", b"\x00" * 32 + tx.serialize()
++    )
++    return (fallback, fallback)
+ 
+ 
+ # The block id commits to the network's chain id (raw bytes, as in
+-- 
+2.50.1 (Apple Git-155)
+

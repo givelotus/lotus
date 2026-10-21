@@ -1,0 +1,378 @@
+From ea17a1d2749cc047adec219a20d06220b5238265 Mon Sep 17 00:00:00 2001
+From: Shammah Chancellor <shammah.chancellor@notvalid.com>
+Date: Sun, 18 Oct 2026 21:09:48 -0700
+Subject: [PATCH] net: grant inbound WebSocket peers permissions by TLS key
+
+-p2pwebsocketpeer=[permissions@]<pin> recognizes an inbound P2P WebSocket
+peer presenting a TLS client certificate with that public key (base64url
+SHA-256 of the SPKI) and grants it permissions, with -whitelist syntax and
+defaults. Setting it requests client certificates (as -tlsmutual), and
+accepts any certificate: the key, not a CA, identifies the peer.
+
+-p2pwebsocketrequirecert drops inbound WebSocket peers whose key is not
+listed (including ws:// peers, which have no certificate). Plain TCP
+peers are not affected. getpeerinfo's websocket.pinned reports a matched
+key for inbound peers.
+---
+ src/httpserver.cpp                         |   3 +-
+ src/init.cpp                               |  38 +++++++
+ src/net.cpp                                |  24 +++-
+ src/net.h                                  |  10 ++
+ src/net_permissions.cpp                    |  16 +++
+ src/net_permissions.h                      |  12 ++
+ src/net_websocket.h                        |   3 +-
+ src/rpc/net.cpp                            |   3 +-
+ test/functional/p2p_websocket_peer_keys.py | 123 +++++++++++++++++++++
+ 9 files changed, 227 insertions(+), 5 deletions(-)
+ create mode 100755 test/functional/p2p_websocket_peer_keys.py
+
+diff --git a/src/httpserver.cpp b/src/httpserver.cpp
+index 2e4e4359aa050b7506a62924667fe9ffb02f07d4..711aab8bf3943df61c0ffa1685758cd154946195 100644
+--- a/src/httpserver.cpp
++++ b/src/httpserver.cpp
+@@ -1570,7 +1570,8 @@ static bool InitTLS() {
+                   tls::ErrorString());
+         return false;
+     }
+-    if (gArgs.GetBoolArg("-tlsmutual", DEFAULT_HTTP_TLS_MUTUAL)) {
++    if (gArgs.GetBoolArg("-tlsmutual", DEFAULT_HTTP_TLS_MUTUAL) ||
++        gArgs.IsArgSet("-p2pwebsocketpeer")) {
+         // Ask for a client certificate, accept any (including self-signed
+         // node certificates); the fingerprint is exposed per request.
+         SSL_CTX_set_verify(ctx.get(), SSL_VERIFY_PEER,
+diff --git a/src/init.cpp b/src/init.cpp
+index ebe7820417054ca3db3d30217402516402e26e47..7a0054322a8290fcb0d448b74a9ac43ad4fcd587 100644
+--- a/src/init.cpp
++++ b/src/init.cpp
+@@ -1075,6 +1075,21 @@ void SetupServerArgs(NodeContext &node) {
+         "A URL can also carry one as wss://host/path#spki=<pin>. Can be "
+         "specified multiple times.",
+         ArgsManager::ALLOW_ANY, OptionsCategory::CONNECTION);
++    argsman.AddArg(
++        "-p2pwebsocketpeer=<[permissions@]pin>",
++        "Recognize inbound P2P WebSocket peers presenting a TLS client "
++        "certificate with this public key (base64url SHA-256 of the DER "
++        "SubjectPublicKeyInfo, as shown by getpeerinfo's websocket.peer_spki) "
++        "and grant them permissions, with the syntax of -whitelist. Turns on "
++        "-tlsmutual. Can be specified multiple times.",
++        ArgsManager::ALLOW_ANY, OptionsCategory::CONNECTION);
++    argsman.AddArg(
++        "-p2pwebsocketrequirecert",
++        strprintf("Only accept inbound P2P WebSocket peers whose TLS client "
++                  "certificate key is listed with -p2pwebsocketpeer (default: "
++                  "%d). Plain TCP peers are not affected.",
++                  false),
++        ArgsManager::ALLOW_ANY, OptionsCategory::CONNECTION);
+     argsman.AddArg(
+         "-p2pwebsocketbridge",
+         "Carry inbound P2P WebSocket peers through a socketpair bridge "
+@@ -3427,6 +3442,29 @@ bool AppInitMain(Config &config, RPCServer &rpcServer,
+         }
+     }
+ 
++    for (const auto &entry : args.GetArgs("-p2pwebsocketpeer")) {
++        NetKeyPermissions key;
++        bilingual_str error;
++        if (!NetKeyPermissions::TryParse(entry, key, error)) {
++            return InitError(error);
++        }
++        const auto spki{DecodeSpkiPin(key.m_key)};
++        if (!spki) {
++            return InitError(strprintf(
++                _("Invalid public key in -p2pwebsocketpeer: '%s'"), entry));
++        }
++        // Compare in the form getpeerinfo shows (unpadded base64url).
++        key.m_key = EncodeSpkiPin(*spki);
++        connOptions.vWhitelistedKeys.push_back(std::move(key));
++    }
++    connOptions.m_websocket_require_known_key =
++        args.GetBoolArg("-p2pwebsocketrequirecert", false);
++    if (connOptions.m_websocket_require_known_key &&
++        connOptions.vWhitelistedKeys.empty()) {
++        return InitError(_("-p2pwebsocketrequirecert needs at least one "
++                           "-p2pwebsocketpeer"));
++    }
++
+     connOptions.vSeedNodes = args.GetArgs("-seednode");
+ 
+     // Initiate outbound connections unless connect=0
+diff --git a/src/net.cpp b/src/net.cpp
+index 1934cbda5acdae56cb2cc06cd7cf3f2867206bc6..96f35b6984290dafefa7682b971b98f606de9786 100644
+--- a/src/net.cpp
++++ b/src/net.cpp
+@@ -1315,8 +1315,28 @@ CNode *CConnman::ConnectWebSocketNode(const std::string &url,
+ void CConnman::AcceptWebSocketPeer(
+     std::unique_ptr<Sock> &&sock, const CAddress &addr,
+     const CAddress &addr_bind, std::shared_ptr<WebSocketTransportInfo> info) {
+-    CreateNodeFromAcceptedSocket(std::move(sock), NetPermissionFlags::None,
+-                                 addr_bind, addr, std::move(info));
++    NetPermissionFlags flags{NetPermissionFlags::None};
++    bool known{false};
++    if (info && !info->peer_spki.empty()) {
++        for (const auto &key : vWhitelistedKeys) {
++            if (key.m_key == info->peer_spki) {
++                NetPermissions::AddFlag(flags, key.m_flags);
++                known = true;
++            }
++        }
++        info->pinned = known;
++    }
++    if (m_websocket_require_known_key && !known) {
++        LogDebug(BCLog::NET,
++                 "WebSocket peer %s dropped: %s (-p2pwebsocketrequirecert)\n",
++                 addr.ToStringAddrPort(),
++                 info && !info->peer_spki.empty()
++                     ? "its key is not listed in -p2pwebsocketpeer"
++                     : "no client certificate");
++        return;
++    }
++    CreateNodeFromAcceptedSocket(std::move(sock), flags, addr_bind, addr,
++                                 std::move(info));
+ }
+ 
+ void CConnman::CreateNodeFromAcceptedSocket(
+diff --git a/src/net.h b/src/net.h
+index a9eb70031660d5f2879bf3ec9cdbc53eb1286b25..1eefd65cf69bc8bf8eacdbc3e8fdd94fa9542cf8 100644
+--- a/src/net.h
++++ b/src/net.h
+@@ -878,6 +878,10 @@ public:
+         bool m_i2p_accept_incoming = true;
+         bool whitelist_forcerelay = DEFAULT_WHITELISTFORCERELAY;
+         bool whitelist_relay = DEFAULT_WHITELISTRELAY;
++        //! P2P WebSocket peers known by their TLS key (canonical pins)
++        std::vector<NetKeyPermissions> vWhitelistedKeys;
++        //! Drop inbound P2P WebSocket peers whose key is not listed above
++        bool m_websocket_require_known_key{false};
+     };
+ 
+     void Init(const Options &connOptions)
+@@ -920,6 +924,9 @@ public:
+         m_onion_binds = connOptions.onion_binds;
+         whitelist_forcerelay = connOptions.whitelist_forcerelay;
+         whitelist_relay = connOptions.whitelist_relay;
++        vWhitelistedKeys = connOptions.vWhitelistedKeys;
++        m_websocket_require_known_key =
++            connOptions.m_websocket_require_known_key;
+     }
+ 
+     CConnman(const Config &configIn, uint64_t seed0, uint64_t seed1,
+@@ -1272,6 +1279,9 @@ private:
+     std::vector<NetWhitelistPermissions> vWhitelistedRangeIncoming;
+     // Whitelisted ranges for outgoing connections.
+     std::vector<NetWhitelistPermissions> vWhitelistedRangeOutgoing;
++    // P2P WebSocket peers known by their TLS public key (-p2pwebsocketpeer)
++    std::vector<NetKeyPermissions> vWhitelistedKeys;
++    bool m_websocket_require_known_key{false};
+ 
+     unsigned int nSendBufferMaxSize{0};
+     unsigned int nReceiveFloodSize{0};
+diff --git a/src/net_permissions.cpp b/src/net_permissions.cpp
+index 4a66b086d038961f4f2c4829190d1861e445e16a..2534a4839e59b75a4fc90acbb8d79d143b698478 100644
+--- a/src/net_permissions.cpp
++++ b/src/net_permissions.cpp
+@@ -181,6 +181,22 @@ bool NetWhitebindPermissions::TryParse(const std::string &str,
+     return true;
+ }
+ 
++bool NetKeyPermissions::TryParse(const std::string &str,
++                                 NetKeyPermissions &output,
++                                 bilingual_str &error) {
++    NetPermissionFlags flags;
++    size_t offset;
++    if (!TryParsePermissionFlags(str, flags,
++                                 /*output_connection_direction=*/nullptr,
++                                 offset, error)) {
++        return false;
++    }
++    output.m_flags = flags;
++    output.m_key = str.substr(offset);
++    error = Untranslated("");
++    return true;
++}
++
+ bool NetWhitelistPermissions::TryParse(
+     const std::string &str, NetWhitelistPermissions &output,
+     ConnectionDirection &output_connection_direction, bilingual_str &error) {
+diff --git a/src/net_permissions.h b/src/net_permissions.h
+index 8b6bd5dbecc2e5067cd86d758e0d27846f429ab0..f842c401bf594ad32a73b53ebac38e9e14fbfdac 100644
+--- a/src/net_permissions.h
++++ b/src/net_permissions.h
+@@ -92,6 +92,18 @@ public:
+     CService m_service;
+ };
+ 
++/**
++ * Permissions for P2P WebSocket peers identified by their TLS public key:
++ * "[perm1,perm2@]<key>" (see -p2pwebsocketpeer). The key is kept as written;
++ * the caller validates it.
++ */
++class NetKeyPermissions : public NetPermissions {
++public:
++    static bool TryParse(const std::string &str, NetKeyPermissions &output,
++                         bilingual_str &error);
++    std::string m_key;
++};
++
+ class NetWhitelistPermissions : public NetPermissions {
+ public:
+     static bool TryParse(const std::string &str,
+diff --git a/src/net_websocket.h b/src/net_websocket.h
+index 2ba0db13d1cf93cc9e1e69252bf3e04bad7ca843..4bab1af59671a4899dda6c3988f06b9b20b8662d 100644
+--- a/src/net_websocket.h
++++ b/src/net_websocket.h
+@@ -73,7 +73,8 @@ struct WebSocketTransportInfo {
+     std::string peer_cert_fingerprint_hex;
+     //! base64url SHA-256 of the peer's public key (SPKI), if any
+     std::string peer_spki;
+-    //! The peer's key matched a configured pin
++    //! The peer's key matched a configured pin (outbound) or a
++    //! -p2pwebsocketpeer entry (inbound)
+     bool pinned{false};
+ };
+ 
+diff --git a/src/rpc/net.cpp b/src/rpc/net.cpp
+index d6b6503998d4aa091eefd47199d48fa7da856b86..c69136b029892066cf251465855f4ac2cd887902 100644
+--- a/src/rpc/net.cpp
++++ b/src/rpc/net.cpp
+@@ -199,7 +199,8 @@ static RPCHelpMan getpeerinfo() {
+                           "base64url SHA-256 of the peer's TLS public key, "
+                           "usable as a pin (-p2pwebsocketpin, #spki=)"},
+                          {RPCResult::Type::BOOL, "pinned",
+-                          "Whether the peer's key matched a configured pin"},
++                          "Whether the peer's key matched a configured pin "
++                          "(outbound) or -p2pwebsocketpeer entry (inbound)"},
+                      }},
+                     {RPCResult::Type::NUM, "startingheight",
+                      "The starting height (block) of the peer"},
+diff --git a/test/functional/p2p_websocket_peer_keys.py b/test/functional/p2p_websocket_peer_keys.py
+new file mode 100755
+index 0000000000000000000000000000000000000000..b370bff1bd61c615844d4d09be88eaf7cdad9ab2
+--- /dev/null
++++ b/test/functional/p2p_websocket_peer_keys.py
+@@ -0,0 +1,123 @@
++#!/usr/bin/env python3
++# Copyright (c) 2026 The Bitcoin developers
++# Distributed under the MIT software license, see the accompanying
++# file COPYING or http://www.opensource.org/licenses/mit-license.php.
++"""Test inbound P2P WebSocket peers known by their TLS client key.
++
++-p2pwebsocketpeer=[permissions@]<pin> grants permissions to an inbound wss://
++peer presenting a client certificate with that key, and
++-p2pwebsocketrequirecert drops WebSocket peers that are not listed.
++"""
++
++import base64
++import os
++
++from test_framework.test_framework import BitcoinTestFramework
++from test_framework.test_node import ErrorMatch
++from test_framework.util import assert_equal, p2p_port
++
++PUBLIC_PORT_INDEX = 40
++
++
++class P2PWebSocketPeerKeysTest(BitcoinTestFramework):
++    def set_test_params(self):
++        self.num_nodes = 2
++        self.setup_clean_chain = True
++
++    def setup_network(self):
++        self.public_port = p2p_port(PUBLIC_PORT_INDEX)
++        self.extra_args = [self.server_args("-tlsmutual"), []]
++        self.add_nodes(self.num_nodes, self.extra_args)
++        self.start_nodes()
++
++    def server_args(self, *extra):
++        return [f"-publicbind=127.0.0.1:{self.public_port}", *extra]
++
++    def url(self, scheme="wss"):
++        return f"{scheme}://localhost:{self.public_port}/p2p/ws"
++
++    def ws_peers(self, n):
++        return [p for p in self.nodes[n].getpeerinfo() if p["transport"] != "tcp"]
++
++    def connect(self, scheme="wss"):
++        self.nodes[1].addnode(node=self.url(scheme), command="onetry")
++        self.wait_until(lambda: len(self.ws_peers(0)) == 1)
++        return self.ws_peers(0)[0]
++
++    def disconnect_all(self):
++        for p in self.ws_peers(1):
++            self.nodes[1].disconnectnode(nodeid=p["id"])
++        self.wait_until(lambda: len(self.ws_peers(1)) == 0)
++        self.wait_until(lambda: len(self.ws_peers(0)) == 0)
++
++    def dropped(self, scheme, log):
++        with self.nodes[0].assert_debug_log([log]):
++            self.nodes[1].addnode(node=self.url(scheme), command="onetry")
++        assert_equal(self.ws_peers(0), [])
++
++    def run_test(self):
++        node0 = self.nodes[0]
++
++        self.log.info("-tlsmutual: the inbound peer's key is reported")
++        peer = self.connect()
++        spki = peer["websocket"]["peer_spki"]
++        assert_equal(len(base64.urlsafe_b64decode(spki + "=")), 32)
++        assert_equal(peer["websocket"]["pinned"], False)
++        assert_equal(peer["permissions"], [])
++        self.disconnect_all()
++        other = base64.urlsafe_b64encode(os.urandom(32)).decode().rstrip("=")
++
++        self.log.info("A listed key gets its permissions")
++        self.restart_node(0, self.server_args(f"-p2pwebsocketpeer=noban,mempool@{spki}"))
++        peer = self.connect()
++        assert_equal(peer["websocket"]["pinned"], True)
++        assert_equal(sorted(peer["permissions"]), ["download", "mempool", "noban"])
++        self.disconnect_all()
++
++        self.log.info("Without permissions@, the -whitelist defaults apply")
++        # Standard base64 with padding is accepted and normalized.
++        padded = base64.b64encode(base64.urlsafe_b64decode(spki + "=")).decode()
++        self.restart_node(0, self.server_args(f"-p2pwebsocketpeer={padded}"))
++        peer = self.connect()
++        assert_equal(peer["websocket"]["pinned"], True)
++        assert "noban" in peer["permissions"]
++        self.disconnect_all()
++
++        self.log.info("-p2pwebsocketrequirecert drops unlisted WebSocket peers")
++        self.restart_node(
++            0, self.server_args(f"-p2pwebsocketpeer={other}", "-p2pwebsocketrequirecert")
++        )
++        self.dropped("wss", "its key is not listed in -p2pwebsocketpeer")
++        self.dropped("ws", "no client certificate")
++        self.log.info("...plain TCP peers are not affected")
++        self.connect_nodes(1, 0)
++        self.disconnect_nodes(1, 0)
++
++        self.log.info("...and listed ones are accepted")
++        self.restart_node(
++            0,
++            self.server_args(
++                f"-p2pwebsocketpeer={other}",
++                f"-p2pwebsocketpeer=relay@{spki}",
++                "-p2pwebsocketrequirecert",
++            ),
++        )
++        peer = self.connect()
++        assert_equal(peer["websocket"]["pinned"], True)
++        assert_equal(peer["permissions"], ["relay"])
++        self.disconnect_all()
++
++        self.log.info("Invalid settings are startup errors")
++        self.stop_node(0)
++        for args, error in (
++            (["-p2pwebsocketrequirecert"], "needs at least one -p2pwebsocketpeer"),
++            (["-p2pwebsocketpeer=xyz"], "Invalid public key in -p2pwebsocketpeer"),
++            ([f"-p2pwebsocketpeer=bogus@{spki}"], "Invalid P2P permission"),
++        ):
++            node0.assert_start_raises_init_error(
++                self.server_args(*args), error, match=ErrorMatch.PARTIAL_REGEX
++            )
++
++
++if __name__ == "__main__":
++    P2PWebSocketPeerKeysTest().main()
+-- 
+2.50.1 (Apple Git-155)
+

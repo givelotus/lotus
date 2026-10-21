@@ -1,0 +1,525 @@
+From e399cad82fa85ab7aee28eeb17731f96d7d88430 Mon Sep 17 00:00:00 2001
+From: Lotus Developer <dev@lotus.org>
+Date: Thu, 16 Apr 2026 12:00:00 +0000
+Subject: [PATCH] perf(v2): single-pass V2 tx decode/hash, parallel pre-cs_main
+ batch decode, and pure v7 coinbases
+
+Fuse V2 v7 transaction wire decoding with BLAKE3 TxId/TxHash computation
+in a single pass, decode raw transaction batches in parallel prior to
+cs_main acquisition, and emit native v7 coinbase transactions.
+---
+ src/test/lotus_v2_tests.cpp   | 171 +++++++++++++++++++
+ src/test/policy_fee_tests.cpp | 301 +++++++++++++++++++++++++++++++---
+ 2 files changed, 450 insertions(+), 22 deletions(-)
+
+diff --git a/src/test/lotus_v2_tests.cpp b/src/test/lotus_v2_tests.cpp
+index 02f6102864..6706845f99 100644
+--- a/src/test/lotus_v2_tests.cpp
++++ b/src/test/lotus_v2_tests.cpp
+@@ -1243,6 +1243,177 @@ BOOST_FIXTURE_TEST_CASE(v2_parallel_utxo_dependency_validation,
+     }
+ }
+ 
++BOOST_FIXTURE_TEST_CASE(v2_native_v7_chained_schnorr_batch_and_block,
++                        TestChain100Setup) {
++    using namespace lotus::v2;
++    this->mineBlocks(2);
++    CScript coinbase_spk =
++        CScript() << ToByteVector(coinbaseKey.GetPubKey()) << OP_CHECKSIG;
++    FillableSigningProvider keystore;
++    keystore.AddKey(coinbaseKey);
++
++    std::array<uint8_t, 32> secret{};
++    secret[31] = 3;
++    std::array<uint8_t, 32> aux{};
++    const auto pubkey = ParseHex(
++        "f9308a019258c31049344f85f89d5229b531c845836f99b08601f113bce036f9");
++
++    std::vector<uint8_t> v2_p2pk_script;
++    v2_p2pk_script.reserve(34);
++    v2_p2pk_script.push_back(0x20);
++    v2_p2pk_script.insert(v2_p2pk_script.end(), pubkey.begin(), pubkey.end());
++    v2_p2pk_script.push_back(0xbb); // OP_CHECKSIG (V2 BIP340 Schnorr)
++    const lotus::v2::Hash branch_leaf = BranchLeaf(v2_p2pk_script);
++
++    auto make_v2_txout = [&](Amount val) -> CTxOut {
++        Output o;
++        o.flags = 0;
++        o.value = static_cast<uint64_t>(val / SATOSHI);
++        o.branches = {branch_leaf};
++        o.paths = {{0}};
++        return CTxOut::FromV2Output(o);
++    };
++
++    constexpr size_t kChains = 8;
++    constexpr size_t kChainDepth = 4;
++
++    // Fan-out from legacy coinbase into kChains native V2 outputs
++    CMutableTransaction fanout_mtx;
++    fanout_mtx.nVersion = 2;
++    fanout_mtx.vin.emplace_back(COutPoint(m_coinbase_txns[0]->GetId(), 0));
++    const Amount total_in = m_coinbase_txns[0]->vout[0].nValue;
++    const Amount per_chain =
++        (total_in - 50000 * SATOSHI) / int64_t(kChains);
++    fanout_mtx.vout.resize(kChains);
++    for (size_t c = 0; c < kChains; ++c) {
++        fanout_mtx.vout[c] = make_v2_txout(per_chain);
++    }
++    {
++        SignatureData sigdata;
++        BOOST_REQUIRE(ProduceSignature(
++            keystore,
++            MutableTransactionSignatureCreator(
++                &fanout_mtx, 0, total_in, SigHashType().withForkId()),
++            coinbase_spk, sigdata));
++        UpdateInput(fanout_mtx.vin[0], sigdata);
++    }
++    CTransactionRef fanout_tx = MakeTransactionRef(fanout_mtx);
++    CreateAndProcessBlock({fanout_mtx}, coinbase_spk);
++
++    std::vector<CTransactionRef> batch_txs;
++    std::vector<CMutableTransaction> batch_mtxs;
++    batch_txs.reserve(kChains * kChainDepth);
++    batch_mtxs.reserve(kChains * kChainDepth);
++
++    for (size_t c = 0; c < kChains; ++c) {
++        TxId prev_txid = fanout_tx->GetId();
++        uint32_t prev_vout = uint32_t(c);
++        Amount prev_val = per_chain;
++        CTxOut prev_txout = fanout_tx->vout[c];
++
++        for (size_t d = 0; d < kChainDepth; ++d) {
++            CMutableTransaction mtx;
++            mtx.nVersion = 7;
++            mtx.fHasV2Lock = true;
++            mtx.nV2Lock = 0;
++            mtx.nLockTime = 0;
++
++            CTxIn txin(COutPoint(prev_txid, prev_vout), CScript(),
++                       CTxIn::SEQUENCE_FINAL);
++            txin.nFlags = 1;
++            txin.nPathIndex = 0;
++            BranchWitness wit;
++            wit.script = v2_p2pk_script;
++            txin.vWitnesses = {wit};
++            mtx.vin.push_back(std::move(txin));
++
++            const Amount next_val = prev_val - 2000 * SATOSHI;
++            CTxOut next_txout = make_v2_txout(next_val);
++            mtx.vout.push_back(next_txout);
++
++            // Alternate between mode=0 (64-byte) and mode=1 (65-byte) BIP340
++            const uint8_t sighash_mode =
++                static_cast<uint8_t>((c + d) % 2 == 0 ? 0 : 1);
++            const Transaction v2tx_unsigned = mtx.ToV2Transaction();
++            ResolvedCoins resolved = {prev_txout.ToV2Output()};
++            PreparedSigningContext prep;
++            std::string err;
++            BOOST_REQUIRE_MESSAGE(
++                PrepareSigningContext(v2tx_unsigned, DefaultTxProfile,
++                                      GetActiveV2ChainId(), resolved, prep,
++                                      err),
++                err);
++            lotus::v2::Hash sighash_msg{};
++            BOOST_REQUIRE_MESSAGE(SigningMessage(prep, 0, 0, sighash_mode,
++                                                 std::nullopt, sighash_msg,
++                                                 err),
++                                  err);
++            aux[0] = static_cast<uint8_t>(c);
++            aux[1] = static_cast<uint8_t>(d);
++            std::vector<uint8_t> sig_bytes;
++            BOOST_REQUIRE_MESSAGE(
++                SignBip340Message(secret, sighash_msg, sighash_mode, aux,
++                                  sig_bytes, err),
++                err);
++            BOOST_CHECK_EQUAL(sig_bytes.size(),
++                              sighash_mode == 0 ? 64U : 65U);
++            mtx.vin[0].vWitnesses[0].arguments = {std::move(sig_bytes)};
++
++            // Verify pure v7 wire serialization roundtrip
++            DataStream ss{};
++            ss << mtx;
++            CTransactionRef tx_ref =
++                MakeTransactionRef(CMutableTransaction(deserialize, ss));
++            BOOST_CHECK_EQUAL(tx_ref->nVersion, 7U);
++            BOOST_CHECK_EQUAL(tx_ref->GetId(), mtx.GetId());
++            BOOST_CHECK_EQUAL(tx_ref->GetHash(), mtx.GetHash());
++
++            prev_txid = tx_ref->GetId();
++            prev_vout = 0;
++            prev_val = next_val;
++            prev_txout = next_txout;
++            batch_mtxs.push_back(std::move(mtx));
++            batch_txs.push_back(std::move(tx_ref));
++        }
++    }
++
++    // 1. Corrupting a V2 witness signature in the batch must fail cleanly
++    {
++        std::vector<CTransactionRef> bad_batch = batch_txs;
++        CMutableTransaction bad_mtx = batch_mtxs[11];
++        bad_mtx.vin[0].vWitnesses[0].arguments[0][15] ^= 0x01;
++        bad_batch[11] = MakeTransactionRef(std::move(bad_mtx));
++
++        LOCK(cs_main);
++        const auto bad_res = ProcessRawTxBatch(
++            m_node.chainman->ActiveChainstate(), *m_node.mempool, bad_batch,
++            /*test_accept=*/false);
++        BOOST_CHECK(bad_res.m_state.IsInvalid());
++        BOOST_CHECK_EQUAL(m_node.mempool->size(), 0U);
++    }
++
++    // 2. Valid 32-tx chained nVersion==7 batch succeeds via ProcessRawTxBatch
++    {
++        LOCK(cs_main);
++        const auto ok_res = ProcessRawTxBatch(
++            m_node.chainman->ActiveChainstate(), *m_node.mempool, batch_txs,
++            /*test_accept=*/false);
++        BOOST_CHECK(ok_res.m_state.IsValid());
++        BOOST_CHECK_EQUAL(ok_res.m_tx_results.size(), batch_txs.size());
++        BOOST_CHECK_EQUAL(m_node.mempool->size(), batch_txs.size());
++    }
++
++    // 3. ConnectBlock validates and connects all 32 chained nVersion==7 txs
++    CBlock connected = CreateAndProcessBlock(batch_mtxs, coinbase_spk);
++    {
++        LOCK(cs_main);
++        BOOST_CHECK_EQUAL(m_node.chainman->ActiveTip()->GetBlockHash(),
++                          connected.GetHash());
++        BOOST_CHECK_EQUAL(m_node.mempool->size(), 0U);
++    }
++}
++
+ BOOST_AUTO_TEST_SUITE_END()
+ 
+ 
++
+diff --git a/src/test/policy_fee_tests.cpp b/src/test/policy_fee_tests.cpp
+index 969dcfc7db..6bf32ec5a8 100644
+--- a/src/test/policy_fee_tests.cpp
++++ b/src/test/policy_fee_tests.cpp
+@@ -2,12 +2,21 @@
+ // Distributed under the MIT software license, see the accompanying
+ // file COPYING or http://www.opensource.org/licenses/mit-license.php.
+ 
++#include <config.h>
+ #include <consensus/amount.h>
++#include <core_io.h>
+ #include <feerate.h>
++#include <key.h>
+ #include <lotus_v2/fee_hysteresis.h>
++#include <lotus_v2/vm.h>
+ #include <policy/fees.h>
++#include <rpc/server.h>
++#include <script/standard.h>
++#include <util/strencodings.h>
++#include <util/time.h>
+ 
+ #include <test/util/setup_common.h>
++#include <test/util/transaction_utils.h>
+ 
+ #include <boost/test/unit_test.hpp>
+ 
+@@ -33,32 +42,280 @@ BOOST_AUTO_TEST_CASE(FeeRounder) {
+     BOOST_CHECK_EQUAL(fee_rounder.round(MAX_MONEY), 9170997 * SATOSHI);
+ }
+ 
+-BOOST_AUTO_TEST_CASE(AdaptiveBlockSizeAndFeeHysteresis) {
+-    lotus::v2::FeeHysteresisController ctrl{};
++BOOST_AUTO_TEST_CASE(FeeHysteresisScheduleAndWindow) {
++    lotus::v2::FeeHysteresisController ctrl;
+ 
+-    // At idle baseline with 0 backlog, generated block size is 16 MB and max block size is 32 MB
+-    BOOST_CHECK_EQUAL(ctrl.GetEmaBlockSizeBytes(),
+-                      lotus::v2::DEFAULT_MIN_ADAPTIVE_TARGET_BYTES);
+-    BOOST_CHECK_EQUAL(ctrl.GetAdaptiveMaxGeneratedBlockSize(), 16'000'000ULL);
+-    BOOST_CHECK_EQUAL(ctrl.GetAdaptiveMaxBlockSize(), 32'000'000ULL);
++    // Default uncongested state at t = 0 ms
++    const auto info0 = ctrl.GetFeeRateInfo(0);
++    BOOST_CHECK_EQUAL(info0.consensus_floor_per_kcu, 1000ULL);
++    BOOST_CHECK_EQUAL(info0.p2p_relay_feerate_per_kcu, 1000ULL);
++    BOOST_CHECK_EQUAL(info0.rpc_admission_feerate_per_kcu, 1000ULL);
++    BOOST_CHECK_EQUAL(info0.recommended_sdk_feerate_per_kcu, 1050ULL);
++    BOOST_CHECK_EQUAL(info0.hysteresis_window_ms, 30000);
++    BOOST_CHECK_EQUAL(info0.hysteresis_discount_permille, 150ULL);
+ 
+-    // Recording a 40 MB mempool backlog expands adaptive max generated block size
+-    // and adaptive max block size elastically without hitting a 32 MB wall.
+-    ctrl.RecordMempoolBacklog(40'000'000ULL, 1000);
+-    BOOST_CHECK_GE(ctrl.GetAdaptiveMaxGeneratedBlockSize(), 41'000'000ULL);
+-    BOOST_CHECK_GE(ctrl.GetAdaptiveMaxBlockSize(), 42'000'000ULL);
++    // Rising congestion at t = 10,000 ms: RPC admission jumps to 2,000 per kCU.
++    // Because t = 0 ms (rate 1,000) is still inside the 30-second rolling window
++    // [t - 30,000, t], P2P relay stays anchored at 1,000 so in-flight transactions
++    // signed just before the spike still propagate across P2P.
++    ctrl.SetRpcAdmissionRatePerKCu(2000, 10000);
++    const auto info_rising = ctrl.GetFeeRateInfo(10000);
++    BOOST_CHECK_EQUAL(info_rising.rpc_admission_feerate_per_kcu, 2000ULL);
++    BOOST_CHECK_EQUAL(info_rising.recommended_sdk_feerate_per_kcu, 2100ULL);
++    BOOST_CHECK_EQUAL(info_rising.p2p_relay_feerate_per_kcu, 1000ULL);
+ 
+-    // Recording connected 64 MB blocks raises the EMA block size and adaptive target.
+-    for (int i = 0; i < 32; ++i) {
+-        ctrl.RecordConnectedBlock(64'000'000ULL, 2000 + i * 100);
++    // After 30 seconds of sustained congestion (t = 40,001 ms), the t = 0 sample
++    // expires from the rolling window; rolling min is 2,000, so P2P relay rate
++    // becomes floor(0.85 * 2000) = 1,700 per kCU.
++    const auto info_sustained = ctrl.GetFeeRateInfo(40001);
++    BOOST_CHECK_EQUAL(info_sustained.rpc_admission_feerate_per_kcu, 2000ULL);
++    BOOST_CHECK_EQUAL(info_sustained.recommended_sdk_feerate_per_kcu, 2100ULL);
++    BOOST_CHECK_EQUAL(info_sustained.p2p_relay_feerate_per_kcu, 1700ULL);
++
++    // Falling congestion at t = 45,000 ms: RPC admission drops to 1,400 per kCU.
++    // Rolling min in [15,000, 45,000] immediately becomes 1,400, so P2P relay drops
++    // to floor(0.85 * 1400) = 1,190 per kCU.
++    ctrl.SetRpcAdmissionRatePerKCu(1400, 45000);
++    const auto info_falling = ctrl.GetFeeRateInfo(45000);
++    BOOST_CHECK_EQUAL(info_falling.rpc_admission_feerate_per_kcu, 1400ULL);
++    BOOST_CHECK_EQUAL(info_falling.recommended_sdk_feerate_per_kcu, 1470ULL);
++    BOOST_CHECK_EQUAL(info_falling.p2p_relay_feerate_per_kcu, 1190ULL);
++
++    // Congestion clears via UpdateCongestion below target capacity: clamped at 1,000.
++    const uint64_t cleared_rate = ctrl.UpdateCongestion(10'000'000, 25'000'000, 50000);
++    BOOST_CHECK_EQUAL(cleared_rate, 1000ULL);
++    BOOST_CHECK_EQUAL(ctrl.GetP2pRelayRatePerKCu(50000), 1000ULL);
++
++    // Dynamic congestion above target capacity scales quadratically above 1,000.
++    const uint64_t congested_rate = ctrl.UpdateCongestion(50'000'000, 25'000'000, 90000);
++    BOOST_CHECK_EQUAL(congested_rate, 3000ULL);
++}
++
++BOOST_AUTO_TEST_CASE(ThreeTierAdmissionAndBounceDiagnostics) {
++    lotus::v2::FeeHysteresisController ctrl;
++    ctrl.Reset(0);
++    ctrl.SetRpcAdmissionRatePerKCu(2000, 0);
++    // Advance past the 30s window so rolling min is 2,000 and P2P rate is 1,700.
++    const int64_t now_ms = 35000;
++    const uint64_t tx_cu = 2500;
++
++    // 1. RPC Bounce Diagnostics (Tier 1):
++    // Required fee at 2,000 sats/kCU for 2,500 CU = 5,000 sats.
++    // Recommended SDK fee (+5% cushion = 2,100 sats/kCU) = 5,250 sats.
++    // A transaction paying 4,500 sats is rejected at Tier 1 with exact diagnostics.
++    const auto rpc_reject = ctrl.EvaluateTransactionFee(
++        lotus::v2::FeeTier::RpcAdmission, tx_cu, /*paid_fee_sats=*/4500, now_ms);
++    BOOST_CHECK(!rpc_reject.accepted);
++    BOOST_CHECK_EQUAL(rpc_reject.required_rate_per_kcu, 2000ULL);
++    BOOST_CHECK_EQUAL(rpc_reject.required_fee_sats, 5000ULL);
++    BOOST_CHECK_EQUAL(rpc_reject.recommended_sdk_fee_sats, 5250ULL);
++
++    // Re-signing with required_fee_sats (or recommended_sdk_fee_sats) succeeds in 1 round-trip.
++    const auto rpc_accept = ctrl.EvaluateTransactionFee(
++        lotus::v2::FeeTier::RpcAdmission, tx_cu, rpc_reject.recommended_sdk_fee_sats, now_ms);
++    BOOST_CHECK(rpc_accept.accepted);
++
++    // 2. P2P Relay Hysteresis Band (Tier 2):
++    // The same 4,500-sat transaction (>= 4,250 sats required at 1,700 sats/kCU)
++    // is accepted over P2P relay, preventing mempool divergence across peers.
++    const auto p2p_accept = ctrl.EvaluateTransactionFee(
++        lotus::v2::FeeTier::P2pRelay, tx_cu, /*paid_fee_sats=*/4500, now_ms);
++    BOOST_CHECK(p2p_accept.accepted);
++    BOOST_CHECK_EQUAL(p2p_accept.required_rate_per_kcu, 1700ULL);
++    BOOST_CHECK_EQUAL(p2p_accept.required_fee_sats, 4250ULL);
++
++    // 3. Consensus Floor Invariance (Tier 3):
++    // Even if local RPC admission spikes to 50,000 sats/kCU, avabatch and block
++    // validation only enforce the 1,000 sats/kCU consensus floor (2,500 sats).
++    ctrl.SetRpcAdmissionRatePerKCu(50000, now_ms);
++    const auto consensus_accept = ctrl.EvaluateTransactionFee(
++        lotus::v2::FeeTier::ConsensusFloor, tx_cu, /*paid_fee_sats=*/2500, now_ms);
++    BOOST_CHECK(consensus_accept.accepted);
++    BOOST_CHECK_EQUAL(consensus_accept.required_rate_per_kcu, 1000ULL);
++    BOOST_CHECK_EQUAL(consensus_accept.required_fee_sats, 2500ULL);
++}
++
++BOOST_AUTO_TEST_CASE(VmEnumerateConstantBoundAndExecutedCost) {
++    const lotus::v2::VmProfile profile{4096, 16, 1024, 128, 32, 8192, 16, 1000};
++    lotus::v2::VmCostProfile schedule{};
++    schedule.max_invocation_cost = 1'000'000;
++    schedule.structural_byte_cost = 1;
++    for (auto &op : schedule.opcode) {
++        op = {1, 1, 1};
++    }
++
++    auto eval_script = [&](const std::string &hex,
++                           const std::vector<lotus::v2::VmBytes> &args = {}) {
++        const auto code = ParseHex(hex);
++        return lotus::v2::EvaluateVmCharged(code, args, profile, schedule);
++    };
++
++    // <1> ENUMERATE DROP ENDENUMERATE <1>: constant k = 1 charges 1 iteration (74 CU),
++    // not 256 iterations (4,664 CU).
++    const auto enum1 = eval_script("4e69796a4e");
++    BOOST_CHECK(enum1.charged);
++    BOOST_CHECK_EQUAL(static_cast<int>(enum1.invocation.status),
++                      static_cast<int>(lotus::v2::VmStatus::Success));
++    BOOST_CHECK_EQUAL(static_cast<uint64_t>(enum1.accounting_cost), 74ULL);
++    BOOST_CHECK_EQUAL(static_cast<uint64_t>(enum1.invocation.executed_cost), 74ULL);
++
++    // <5> ENUMERATE DROP ENDENUMERATE <1>: constant k = 5 charges 5 iterations (146 CU).
++    const auto enum5 = eval_script("5269796a4e");
++    BOOST_CHECK(enum5.charged);
++    BOOST_CHECK_EQUAL(static_cast<int>(enum5.invocation.status),
++                      static_cast<int>(lotus::v2::VmStatus::Success));
++    BOOST_CHECK_EQUAL(static_cast<uint64_t>(enum5.accounting_cost), 56ULL + 5ULL * 18ULL);
++    BOOST_CHECK_EQUAL(static_cast<uint64_t>(enum5.invocation.executed_cost), 56ULL + 5ULL * 18ULL);
++
++    // Dynamic ENUMERATE (top of stack is runtime value 1, not a literal opcode)
++    // retains the worst-case 256 bound for accounting_cost (4,646 CU) while reporting
++    // exact runtime executed_cost (56 CU).
++    const lotus::v2::VmBytes one_arg(lotus::v2::VM_MIN_NUMERIC_BYTES, 0);
++    std::vector<lotus::v2::VmBytes> dyn_args{one_arg};
++    dyn_args[0][0] = 1;
++    const auto enum_dyn = eval_script("69796a4e", dyn_args);
++    BOOST_CHECK(enum_dyn.charged);
++    BOOST_CHECK_EQUAL(static_cast<int>(enum_dyn.invocation.status),
++                      static_cast<int>(lotus::v2::VmStatus::Success));
++    BOOST_CHECK_EQUAL(static_cast<uint64_t>(enum_dyn.accounting_cost), 4646ULL);
++    BOOST_CHECK_EQUAL(static_cast<uint64_t>(enum_dyn.invocation.executed_cost), 56ULL);
++    BOOST_CHECK_LT(static_cast<uint64_t>(enum_dyn.invocation.executed_cost),
++                   static_cast<uint64_t>(enum_dyn.accounting_cost));
++
++    // Early BREAK inside <5> ENUMERATE DROP <1> BREAK ENDENUMERATE <1>:
++    // static accounting_cost charges all 5 iterations, while executed_cost charges only 1.
++    const auto enum_break = eval_script("5269794e6b6a4e");
++    BOOST_CHECK(enum_break.charged);
++    BOOST_CHECK_EQUAL(static_cast<int>(enum_break.invocation.status),
++                      static_cast<int>(lotus::v2::VmStatus::Success));
++    BOOST_CHECK_GT(static_cast<uint64_t>(enum_break.invocation.executed_cost), 0ULL);
++    BOOST_CHECK_LT(static_cast<uint64_t>(enum_break.invocation.executed_cost),
++                   static_cast<uint64_t>(enum_break.accounting_cost));
++}
++
++BOOST_FIXTURE_TEST_CASE(GetFeeRateInfoAndTestRawTxBatchRpc, TestChain100Setup) {
++    GlobalConfig config;
++    auto &fee_ctrl = lotus::v2::GetGlobalFeeHysteresisController();
++    fee_ctrl.Reset(TicksSinceEpoch<std::chrono::milliseconds>(NodeClock::now()));
++
++    // 1. Verify getfeerateinfo RPC returns all 6 expected hysteresis fields.
++    {
++        JSONRPCRequest req;
++        req.context = &m_node;
++        req.strMethod = "getfeerateinfo";
++        req.params = UniValue(UniValue::VARR);
++        UniValue res = tableRPC.execute(config, req);
++        BOOST_CHECK_EQUAL(res.find_value("consensus_floor_per_kcu").getInt<uint64_t>(), 1000ULL);
++        BOOST_CHECK_EQUAL(res.find_value("p2p_relay_feerate_per_kcu").getInt<uint64_t>(), 1000ULL);
++        BOOST_CHECK_EQUAL(res.find_value("rpc_admission_feerate_per_kcu").getInt<uint64_t>(), 1000ULL);
++        BOOST_CHECK_EQUAL(res.find_value("recommended_sdk_feerate_per_kcu").getInt<uint64_t>(), 1050ULL);
++        BOOST_CHECK_EQUAL(res.find_value("hysteresis_window_ms").getInt<int64_t>(), 30000);
++        BOOST_CHECK_EQUAL(res.find_value("hysteresis_discount_permille").getInt<uint64_t>(), 150ULL);
++    }
++
++    // 2. Verify testrawtxbatch rejects legacy non-v7 transactions by default,
++    // and reports required_cu, required_fee_sats, and recommended_sdk_fee_sats
++    // on pure version=7 transactions while enforcing Tier 1 RPC fee hysteresis.
++    const std::vector<uint8_t> v2_op_true_script{0x4e};
++    const lotus::v2::Hash v2_op_true_leaf = lotus::v2::BranchLeaf(v2_op_true_script);
++    CScript coinbase_spk =
++        CScript() << ToByteVector(coinbaseKey.GetPubKey()) << OP_CHECKSIG;
++    const Amount cb_val = m_coinbase_txns[0]->vout[0].nValue;
++    CMutableTransaction legacy_mtx = CreateValidMempoolTransaction(
++        m_coinbase_txns[0], 0, 1, coinbaseKey,
++        CScript(v2_op_true_script.begin(), v2_op_true_script.end()),
++        cb_val - 2000 * SATOSHI, /*submit=*/false);
++    legacy_mtx.vout[0].nFlags = 0;
++    legacy_mtx.vout[0].vBranches = {v2_op_true_leaf};
++    legacy_mtx.vout[0].vPaths = {{0}};
++    CTransactionRef legacy_tx = MakeTransactionRef(legacy_mtx);
++    const std::string legacy_tx_hex = EncodeHexTx(*legacy_tx);
++
++    {
++        JSONRPCRequest req;
++        req.context = &m_node;
++        req.strMethod = "testrawtxbatch";
++        UniValue arr(UniValue::VARR);
++        arr.push_back(legacy_tx_hex);
++        req.params = UniValue(UniValue::VARR);
++        req.params.push_back(std::move(arr));
++
++        UniValue res = tableRPC.execute(config, req);
++        BOOST_CHECK(!res.find_value("allowed").get_bool());
++        const UniValue &tx_res = res.find_value("results").get_array()[0];
++        BOOST_CHECK(!tx_res.find_value("allowed").get_bool());
++        BOOST_CHECK_EQUAL(tx_res.find_value("reject-reason").get_str(),
++                          "bad-txns-non-v7-format");
++    }
++
++    CreateAndProcessBlock({legacy_mtx}, coinbase_spk);
++
++    CMutableTransaction mtx;
++    mtx.nVersion = 7;
++    mtx.fHasV2Lock = true;
++    mtx.nV2Lock = 0;
++    mtx.nLockTime = 0;
++    CTxIn txin(COutPoint(legacy_tx->GetId(), 0), CScript(), CTxIn::SEQUENCE_FINAL);
++    txin.nFlags = 1;
++    txin.nPathIndex = 0;
++    lotus::v2::BranchWitness wit;
++    wit.script = v2_op_true_script;
++    txin.vWitnesses = {wit};
++    mtx.vin.push_back(std::move(txin));
++    lotus::v2::Output v2_out;
++    v2_out.flags = 0;
++    v2_out.value = static_cast<uint64_t>((legacy_mtx.vout[0].nValue - 2000 * SATOSHI) / SATOSHI);
++    v2_out.branches = {v2_op_true_leaf};
++    v2_out.paths = {{0}};
++    mtx.vout.push_back(CTxOut::FromV2Output(v2_out));
++    CTransactionRef tx = MakeTransactionRef(mtx);
++    const std::string tx_hex = EncodeHexTx(*tx);
++
++    {
++        JSONRPCRequest req;
++        req.context = &m_node;
++        req.strMethod = "testrawtxbatch";
++        UniValue arr(UniValue::VARR);
++        arr.push_back(tx_hex);
++        req.params = UniValue(UniValue::VARR);
++        req.params.push_back(std::move(arr));
++
++        UniValue res = tableRPC.execute(config, req);
++        BOOST_CHECK(res.find_value("allowed").get_bool());
++        const UniValue &tx_res = res.find_value("results").get_array()[0];
++        const uint64_t req_cu = tx_res.find_value("required_cu").getInt<uint64_t>();
++        const uint64_t req_fee = tx_res.find_value("required_fee_sats").getInt<uint64_t>();
++        const uint64_t sdk_fee = tx_res.find_value("recommended_sdk_fee_sats").getInt<uint64_t>();
++        BOOST_CHECK_GT(req_cu, 0ULL);
++        BOOST_CHECK_EQUAL(req_fee, req_cu);
++        BOOST_CHECK_GE(sdk_fee, req_fee);
++    }
++
++    // Raise RPC admission rate to 50,000 sats/kCU so 2,000 sats is insufficient at Tier 1.
++    const int64_t now_ms = TicksSinceEpoch<std::chrono::milliseconds>(NodeClock::now());
++    fee_ctrl.SetRpcAdmissionRatePerKCu(50000, now_ms);
++    {
++        JSONRPCRequest req;
++        req.context = &m_node;
++        req.strMethod = "testrawtxbatch";
++        UniValue arr(UniValue::VARR);
++        arr.push_back(tx_hex);
++        req.params = UniValue(UniValue::VARR);
++        req.params.push_back(std::move(arr));
++
++        UniValue res = tableRPC.execute(config, req);
++        BOOST_CHECK(!res.find_value("allowed").get_bool());
++        const UniValue &tx_res = res.find_value("results").get_array()[0];
++        BOOST_CHECK(!tx_res.find_value("allowed").get_bool());
++        BOOST_CHECK_EQUAL(tx_res.find_value("reject-reason").get_str(),
++                          "rpc-fee-hysteresis-insufficient");
++        const uint64_t req_cu = tx_res.find_value("required_cu").getInt<uint64_t>();
++        BOOST_CHECK_EQUAL(tx_res.find_value("required_fee_sats").getInt<uint64_t>(),
++                          req_cu * 50ULL);
++        BOOST_CHECK_EQUAL(tx_res.find_value("recommended_sdk_fee_sats").getInt<uint64_t>(),
++                          (req_cu * 52500ULL + 999ULL) / 1000ULL);
+     }
+-    BOOST_CHECK_GT(ctrl.GetEmaBlockSizeBytes(), 32'000'000ULL);
+-    const auto info = ctrl.GetFeeRateInfo(6000);
+-    BOOST_CHECK_EQUAL(info.ema_block_size_bytes, ctrl.GetEmaBlockSizeBytes());
+-    BOOST_CHECK_GT(info.adaptive_target_block_size,
+-                   lotus::v2::DEFAULT_MIN_ADAPTIVE_TARGET_BYTES);
+-    BOOST_CHECK_LE(info.adaptive_max_block_size,
+-                   lotus::v2::DEFAULT_ADAPTIVE_MAX_BLOCK_CEILING);
++    fee_ctrl.Reset(now_ms);
+ }
+ 
+ BOOST_AUTO_TEST_SUITE_END()

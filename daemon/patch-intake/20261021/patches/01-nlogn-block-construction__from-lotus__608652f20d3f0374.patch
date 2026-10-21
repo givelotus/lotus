@@ -1,0 +1,311 @@
+From 70c5baa1b6733b0ba3b34a88e484128b157d61dd Mon Sep 17 00:00:00 2001
+From: Shammah Chancellor <shammah.chancellor@notvalid.com>
+Date: Wed, 14 Oct 2026 09:35:34 -0700
+Subject: [PATCH] bchn: retain experimental static-package block construction
+ candidate
+
+Replace fee-index/direct-parent selection with a snapshot, ancestor-package
+accounting and dependency-ordered selection. The intent was to avoid repeated
+ancestor-score updates while preserving parent-before-child construction.
+
+This is an experimental historical candidate, not a validated optimization.
+The current payload has stale size, sigcheck and fee accounting and diamond
+double counting. Its claimed O(n log n) bound is not established. The pinned
+ABC build fails three existing mining assertions; BCHN needs a reviewed port.
+Keep it out of the default series. Metadata recovery does not repair its code.
+
+Metadata-backfill: This explanation and envelope are newly written; they do
+not claim recovery of a lost per-patch message or its original author/date.
+The source diff bytes are unchanged. Recorded port/import commit:
+578bbcddd210de1601b280967700e07420f23782 (Lotus monorepo).
+Historical lineage: import 9686d09aac0ebe58d4ad173b2fb12360776869de
+references schancel/bitcoin-abc simple-mining (D2866). That branch currently
+ends at c1bdbe00d29042af81e1846728088f32867c3498, whose original subject is
+"WIP: Stupidly simple mining." The modern port is not that historical diff.
+
+Validation: exact raw-diff and mailbox replays produce the same source tree.
+See daemon/docs/ecash-block-assembly-review.md and support-matrix.md for
+behavioral evidence and applicability limits; no new build is asserted here.
+
+diff --git a/src/miner.cpp b/src/miner.cpp
+index 121c87c..5b319b1 100644
+--- a/src/miner.cpp
++++ b/src/miner.cpp
+@@ -33,6 +33,7 @@
+ 
+ #include <algorithm>
+ #include <queue>
++#include <stack>
+ #include <unordered_map>
+ #include <unordered_set>
+ #include <utility>
+@@ -304,18 +305,172 @@ bool BlockAssembler::CheckTx(const CTransaction &tx) const {
+ }
+ 
+ /**
+- * addTxs includes transactions paying a fee by ensuring that
+- * the partial ordering of transactions is maintained.  That is to say
+- * children come after parents, despite having a potentially larger fee.
+- * @param nLimitTimePoint  A time point in the future (obtained via
+- *                         GetTimeMicros() + delta). If this argument is > 0,
+- *                         then stop looping after this time point elapses.
+- *                         Otherwise if <= 0, loop until the block template
+- *                         is filled to -[percent]blockmaxsize capacity (or
+- *                         until all tx's in mempool are added, whichever is
+- *                         smaller).
++ * addTxs selects transactions from the mempool for inclusion in a block.
++ *
++ * Algorithm overview (O(n log n) total):
++ *  1. Snapshot all mempool transactions in topological order (entry_id order —
++ *     parents always precede children).  O(n)
++ *  2. Forward-walk the snapshot to accumulate package fee/size/sigchecks for
++ *     each transaction from its in-mempool ancestors.  O(n + m)
++ *  3. Assign each transaction a scheduling "order":
++ *       order=0  → mine-first tier (package fee rate beats all ancestors)
++ *       order>0  → deeper ancestor chain must go in first
++ *     Sort ascending by order, then descending by fee rate.  O(n log n)
++ *  4. Visit transactions in sorted order; for each, DFS to add all
++ *     unconfirmed ancestors before the transaction itself.  O(n + m)
++ *
++ * @param nLimitTimePoint  Ignored by this algorithm (snapshot is taken upfront).
++ *                         Kept for API compatibility.
+  */
+ void BlockAssembler::addTxs(int64_t nLimitTimePoint) {
++    // ── 1. Snapshot mempool in topological (entry_id) order ──────────────────
++    std::vector<CBlockTemplateEntry> txPool;
++    txPool.reserve(mempool.mapTx.size());
++    std::unordered_map<TxId, size_t, SaltedTxIdHasher> txLocations;
++    size_t idx = 0;
++    for (const auto &entry : mempool.mapTx.get<entry_id>()) {
++        txPool.emplace_back(entry.GetSharedTx(),
++                            entry.GetFee(),
++                            entry.GetModifiedFee(),
++                            entry.GetTxSize(),
++                            entry.GetSigChecks());
++        txLocations[txPool.back().tx->GetId()] = idx++;
++    }
++
++    // ── 2. Accumulate package stats from parents ──────────────────────────────
++    // Single forward pass suffices because parents always appear before
++    // children in entry_id order. Diamond patterns are double-counted
++    // (acceptable: avoiding it isn't worth the extra complexity).
++    std::unordered_set<TxId, SaltedTxIdHasher> seen;
++    for (auto &entry : txPool) {
++        seen.clear();
++        for (const auto &txIn : entry.tx->vin) {
++            const TxId &parentId = txIn.prevout.GetTxId();
++            if (!seen.insert(parentId).second) {
++                continue; // skip duplicate direct parents
++            }
++            auto it = txLocations.find(parentId);
++            if (it == txLocations.end()) {
++                continue; // confirmed (not in mempool)
++            }
++            entry.AccountForParent(txPool[it->second]);
++        }
++    }
++
++    // ── 3. Sort: ascending order depth, descending fee rate within each tier ──
++    std::sort(txPool.begin(), txPool.end(),
++              [](const CBlockTemplateEntry &a, const CBlockTemplateEntry &b) {
++                  return a.GetOrder() == b.GetOrder()
++                             ? a.FeeRate() > b.FeeRate()
++                             : a.GetOrder() < b.GetOrder();
++              });
++
++    // Rebuild location index after sort.
++    idx = 0;
++    for (const auto &e : txPool) {
++        txLocations[e.tx->GetId()] = idx++;
++    }
++
++    // ── 4. Include transactions in sorted order via ancestor DFS ──────────────
++    // txIdsInBlock tracks added TxIds for O(1) membership tests inside DFS.
++    std::unordered_set<TxId, SaltedTxIdHasher> txIdsInBlock;
++    std::unordered_set<TxId, SaltedTxIdHasher> txnsInvalid;
++
++    for (const auto &entry : txPool) {
++        const TxId txId = entry.tx->GetId();
++
++        if (txIdsInBlock.count(txId) || txnsInvalid.count(txId)) {
++            continue;
++        }
++
++        // Skip packages below the min fee rate.
++        if (CFeeRate(entry.packageFees, entry.packageSize) < blockMinFeeRate) {
++            txnsInvalid.insert(txId);
++            continue;
++        }
++
++        // Quick package-level size/sigchecks check before the DFS.
++        if (!TestTx(entry.packageSize, entry.packageSigChecks)) {
++            continue;
++        }
++
++        // DFS: push ancestors onto addStack in reverse-topological order so
++        // that popping the stack yields topological (parents-first) order.
++        std::stack<std::reference_wrapper<const CBlockTemplateEntry>>
++            ancestorStack;
++        std::stack<std::reference_wrapper<const CBlockTemplateEntry>> addStack;
++        bool packageInvalid = false;
++
++        ancestorStack.push(std::cref(entry));
++        while (!ancestorStack.empty() && !packageInvalid) {
++            const CBlockTemplateEntry &ancestor = ancestorStack.top();
++            const TxId &ancestorId = ancestor.tx->GetId();
++            ancestorStack.pop();
++            addStack.push(std::cref(ancestor));
++
++            // Contextual check (locktime / finality).
++            if (!CheckTx(*ancestor.tx)) {
++                txnsInvalid.insert(ancestorId);
++                packageInvalid = true;
++                break;
++            }
++
++            for (const auto &txIn : ancestor.tx->vin) {
++                const TxId &parentId = txIn.prevout.GetTxId();
++                if (txIdsInBlock.count(parentId)) {
++                    continue; // already in block
++                }
++                if (txnsInvalid.count(parentId)) {
++                    txnsInvalid.insert(ancestorId);
++                    packageInvalid = true;
++                    break;
++                }
++                auto it = txLocations.find(parentId);
++                if (it == txLocations.end()) {
++                    continue; // confirmed parent
++                }
++                ancestorStack.push(std::cref(txPool[it->second]));
++            }
++        }
++
++        if (packageInvalid) {
++            // Propagate invalidity through addStack items.
++            while (!addStack.empty()) {
++                const CBlockTemplateEntry &child = addStack.top();
++                addStack.pop();
++                for (const auto &txIn : child.tx->vin) {
++                    if (txnsInvalid.count(txIn.prevout.GetTxId())) {
++                        txnsInvalid.insert(child.tx->GetId());
++                        break;
++                    }
++                }
++            }
++            continue;
++        }
++
++        // All ancestors passed — commit to block in topological order.
++        while (!addStack.empty()) {
++            const CBlockTemplateEntry &toAdd = addStack.top();
++            const TxId &addId = toAdd.tx->GetId();
++            addStack.pop();
++            if (txIdsInBlock.count(addId)) {
++                continue; // addStack can contain duplicates from DFS
++            }
++            auto optIter = mempool.GetIter(addId);
++            if (optIter) {
++                AddToBlock(*optIter);
++                txIdsInBlock.insert(addId);
++            }
++        }
++    }
++}
++
++/**
++ * accuratelyAddTxs: legacy O(n²) implementation.
++ * Kept for reference and benchmarking. Not called in production.
++ * @param nLimitTimePoint  Time point after which to stop (0 = no limit).
++ */
++void BlockAssembler::accuratelyAddTxs(int64_t nLimitTimePoint) {
+     using EntryPtrHasher = StdHashWrapper<const CTxMemPoolEntry *>;
+     using ParentCountMap = std::unordered_map<const CTxMemPoolEntry *, size_t, EntryPtrHasher>;
+     using ChildSet = std::unordered_set<const CTxMemPoolEntry *, EntryPtrHasher>;
+diff --git a/src/miner.h b/src/miner.h
+index dd40db0..999090e 100644
+--- a/src/miner.h
++++ b/src/miner.h
+@@ -32,8 +32,70 @@ struct CBlockTemplateEntry {
+     Amount fees;
+     int64_t sigChecks;
+ 
++    // Internal fields used during block assembly — not meaningful in final
++    // pblocktemplate->entries after CreateNewBlock returns.
++    Amount modifiedFee;
++    size_t txSize;
++    // Accumulated package totals (this tx + all unconfirmed ancestors).
++    size_t packageSize;
++    Amount packageFees;
++    int64_t packageSigChecks;
++    // Maximum fee rate seen across any ancestor package (used for ordering).
++    double maxPackageFeeRate;
++    // Scheduling depth: 0 means "mine me first", higher = deeper ancestor chain.
++    int order;
++
++    // Constructor for final block entries (backward compatible).
+     CBlockTemplateEntry(CTransactionRef _tx, Amount _fees, int64_t _sigChecks)
+-        : tx(_tx), fees(_fees), sigChecks(_sigChecks){};
++        : tx(_tx), fees(_fees), sigChecks(_sigChecks),
++          modifiedFee(_fees), txSize(0),
++          packageSize(0), packageFees(Amount::zero()), packageSigChecks(0),
++          maxPackageFeeRate(0.0), order(0) {}
++
++    // Constructor used internally by addTxs.
++    CBlockTemplateEntry(CTransactionRef _tx, Amount _fees, Amount _modFee,
++                        size_t _size, int64_t _sigChecks)
++        : tx(std::move(_tx)), fees(_fees), sigChecks(_sigChecks),
++          modifiedFee(_modFee), txSize(_size),
++          packageSize(_size), packageFees(_modFee), packageSigChecks(_sigChecks),
++          maxPackageFeeRate(_size > 0
++                                ? double(_modFee / SATOSHI) / double(_size)
++                                : 0.0),
++          order(0) {}
++
++    double FeeRate() const {
++        return packageSize > 0
++                   ? double(packageFees / SATOSHI) / double(packageSize)
++                   : 0.0;
++    }
++
++    int GetOrder() const { return order; }
++
++    /**
++     * Fold a parent's package totals into this entry's accumulators.
++     * If our effective package fee rate exceeds the best seen so far among
++     * ancestors, reset order to 0 so we sort to the front of our tier.
++     */
++    void AccountForParent(const CBlockTemplateEntry &parent) {
++        packageSize += parent.packageSize;
++        packageFees += parent.packageFees;
++        packageSigChecks += parent.packageSigChecks;
++
++        int parentOrder = parent.order + 1;
++        if (parentOrder > order) {
++            order = parentOrder;
++        }
++
++        double parentFeeRate = parent.FeeRate();
++        if (parentFeeRate > maxPackageFeeRate) {
++            maxPackageFeeRate = parentFeeRate;
++        }
++        // If our package is now the best, pull it to the front (order=0).
++        if (FeeRate() > maxPackageFeeRate) {
++            order = 0;
++            maxPackageFeeRate = FeeRate();
++        }
++    }
+ };
+ 
+ struct CBlockTemplate {
+@@ -138,6 +200,10 @@ private:
+ 
+     /// Check the transaction for finality, etc before adding to block
+     bool CheckTx(const CTransaction &tx) const;
++
++    // Legacy O(n²) implementation kept for comparison; not called in production.
++    void accuratelyAddTxs(int64_t nLimitTimePoint)
++        EXCLUSIVE_LOCKS_REQUIRED(mempool.cs);
+ };
+ 
+ /** Modify the extranonce in a block */

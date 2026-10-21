@@ -1,0 +1,740 @@
+diff --git a/src/CMakeLists.txt b/src/CMakeLists.txt
+index b3a0eae3d7..8219ac8735 100644
+--- a/src/CMakeLists.txt
++++ b/src/CMakeLists.txt
+@@ -694,6 +694,7 @@ add_library(server
+ 	node/miner.cpp
+ 	node/mining_pool.cpp
+ 	node/peerman_args.cpp
++	node/txadmission.cpp
+ 	node/psbt.cpp
+ 	node/transaction.cpp
+ 	node/ui_interface.cpp
+diff --git a/src/init.cpp b/src/init.cpp
+index 246a1e79f3..8c8f2cbcf8 100644
+--- a/src/init.cpp
++++ b/src/init.cpp
+@@ -68,6 +68,7 @@
+ #include <node/miner.h>
+ #include <node/mining_pool.h>
+ #include <node/peerman_args.h>
++#include <node/txadmission.h>
+ #include <node/ui_interface.h>
+ #include <policy/block/rtt.h>
+ #include <policy/policy.h>
+@@ -319,6 +320,11 @@ void Shutdown(NodeContext &node) {
+         node.validation_signals->UnregisterValidationInterface(
+             node.peerman.get());
+     }
++    // The admission thread holds CNode references; release them before the
++    // network deletes its nodes.
++    if (node.peerman) {
++        node.peerman->StopTxAdmission();
++    }
+     if (node.connman) {
+ #ifdef ENABLE_WEBTRANSPORT
+         InterruptNodeWebTransport();
+@@ -765,6 +771,22 @@ void SetupServerArgs(NodeContext &node) {
+                              "memory (default: %u)",
+                              DEFAULT_MAX_ORPHAN_TRANSACTIONS),
+                    ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
++    argsman.AddArg(
++        "-parallelmempool",
++        strprintf("Admit transactions received from peers on a separate "
++                  "thread, verifying their scripts on several threads "
++                  "without holding the chain lock; 0 admits them on the "
++                  "message handler thread (default: %u)",
++                  node::DEFAULT_PARALLEL_MEMPOOL),
++        ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
++    argsman.AddArg(
++        "-parallelmempoolthreads=<n>",
++        strprintf("Threads verifying transaction scripts for -parallelmempool, "
++                  "including the admission thread (0 = one per core, up to "
++                  "%d; default: %d)",
++                  node::MAX_PARALLEL_MEMPOOL_THREADS,
++                  node::DEFAULT_PARALLEL_MEMPOOL_THREADS),
++        ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
+     argsman.AddArg("-mempoolexpiry=<n>",
+                    strprintf("Do not keep transactions in the mempool longer "
+                              "than <n> hours (default: %u)",
+* Unmerged path src/net_processing.cpp
+* Unmerged path src/net_processing.h
+* Unmerged path src/node/peerman_args.cpp
+diff --git a/src/node/txadmission.cpp b/src/node/txadmission.cpp
+new file mode 100644
+index 0000000000..768b17c919
+--- /dev/null
++++ b/src/node/txadmission.cpp
+@@ -0,0 +1,139 @@
++// Copyright (c) 2026 The Lotus developers
++// Distributed under the MIT software license, see the accompanying
++// file COPYING or http://www.opensource.org/licenses/mit-license.php.
++
++#include <node/txadmission.h>
++
++#include <util/check.h>
++
++#include <algorithm>
++
++namespace node {
++
++bool TxAdmissionQueue::HasRoom(NodeId peer, size_t tx_bytes, bool count_full) {
++    LOCK(m_mutex);
++    const auto it = m_queues.find(peer);
++    const size_t mine = it == m_queues.end() ? 0 : it->second.size();
++    if (mine < m_limits.max_per_peer && m_count < m_limits.max_total &&
++        m_bytes <= m_limits.max_total_bytes &&
++        tx_bytes <= m_limits.max_total_bytes - m_bytes) {
++        return true;
++    }
++    if (count_full) {
++        ++m_full;
++    }
++    return false;
++}
++
++bool TxAdmissionQueue::Push(TxAdmissionItem item) {
++    {
++        LOCK(m_mutex);
++        const auto it = m_queues.find(item.peer);
++        const size_t mine = it == m_queues.end() ? 0 : it->second.size();
++        const size_t bytes = item.tx->GetTotalSize();
++        if (mine >= m_limits.max_per_peer || m_count >= m_limits.max_total ||
++            m_bytes > m_limits.max_total_bytes ||
++            bytes > m_limits.max_total_bytes - m_bytes) {
++            ++m_full;
++            return false;
++        }
++        auto &q = m_queues[item.peer];
++        if (q.empty()) {
++            m_order.push_back(item.peer);
++        }
++        m_bytes += item.tx->GetTotalSize();
++        ++m_count;
++        ++m_pushed;
++        q.push_back(std::move(item));
++    }
++    m_cv.notify_one();
++    return true;
++}
++
++std::vector<TxAdmissionItem>
++TxAdmissionQueue::TakeBatch(size_t max_items, std::chrono::milliseconds wait) {
++    std::vector<TxAdmissionItem> out;
++    WAIT_LOCK(m_mutex, lock);
++    m_cv.wait_for(lock, wait, [&]() EXCLUSIVE_LOCKS_REQUIRED(m_mutex) {
++        return m_interrupted || m_count > 0;
++    });
++    if (m_interrupted) {
++        return out;
++    }
++    out.reserve(std::min(max_items, m_count));
++    while (out.size() < max_items && !m_order.empty()) {
++        const NodeId peer = m_order.front();
++        m_order.pop_front();
++        auto it = m_queues.find(peer);
++        Assume(it != m_queues.end() && !it->second.empty());
++        out.push_back(std::move(it->second.front()));
++        it->second.pop_front();
++        m_bytes -= out.back().tx->GetTotalSize();
++        --m_count;
++        if (it->second.empty()) {
++            m_queues.erase(it);
++        } else {
++            m_order.push_back(peer);
++        }
++    }
++    m_taken += out.size();
++    return out;
++}
++
++std::vector<TxAdmissionItem> TxAdmissionQueue::TakeAll() {
++    std::vector<TxAdmissionItem> out;
++    LOCK(m_mutex);
++    for (auto &[peer, q] : m_queues) {
++        for (auto &item : q) {
++            out.push_back(std::move(item));
++        }
++    }
++    m_dropped += out.size();
++    m_queues.clear();
++    m_order.clear();
++    m_count = 0;
++    m_bytes = 0;
++    return out;
++}
++
++std::vector<TxAdmissionItem> TxAdmissionQueue::DropPeer(NodeId peer) {
++    std::vector<TxAdmissionItem> out;
++    LOCK(m_mutex);
++    auto it = m_queues.find(peer);
++    if (it == m_queues.end()) {
++        return out;
++    }
++    for (auto &item : it->second) {
++        m_bytes -= item.tx->GetTotalSize();
++        --m_count;
++        out.push_back(std::move(item));
++    }
++    m_queues.erase(it);
++    m_order.erase(std::remove(m_order.begin(), m_order.end(), peer),
++                  m_order.end());
++    m_dropped += out.size();
++    return out;
++}
++
++void TxAdmissionQueue::Interrupt() {
++    {
++        LOCK(m_mutex);
++        m_interrupted = true;
++    }
++    m_cv.notify_all();
++}
++
++TxAdmissionQueue::Stats TxAdmissionQueue::GetStats() const {
++    LOCK(m_mutex);
++    Stats s;
++    s.queued = m_count;
++    s.queued_bytes = m_bytes;
++    s.peers = m_queues.size();
++    s.pushed = m_pushed;
++    s.taken = m_taken;
++    s.dropped = m_dropped;
++    s.full = m_full;
++    return s;
++}
++
++} // namespace node
+diff --git a/src/node/txadmission.h b/src/node/txadmission.h
+new file mode 100644
+index 0000000000..2e5a3e0d62
+--- /dev/null
++++ b/src/node/txadmission.h
+@@ -0,0 +1,125 @@
++// Copyright (c) 2026 The Lotus developers
++// Distributed under the MIT software license, see the accompanying
++// file COPYING or http://www.opensource.org/licenses/mit-license.php.
++
++#ifndef BITCOIN_NODE_TXADMISSION_H
++#define BITCOIN_NODE_TXADMISSION_H
++
++#include <nodeid.h>
++#include <primitives/transaction.h>
++#include <sync.h>
++#include <util/time.h>
++
++#include <chrono>
++#include <condition_variable>
++#include <cstddef>
++#include <cstdint>
++#include <deque>
++#include <map>
++#include <memory>
++#include <vector>
++
++namespace node {
++
++/** Default for -parallelmempool. */
++static constexpr bool DEFAULT_PARALLEL_MEMPOOL{true};
++/** Default for -parallelmempoolthreads (0: one per core). */
++static constexpr int DEFAULT_PARALLEL_MEMPOOL_THREADS{0};
++/** Most script-check threads -parallelmempoolthreads may ask for. */
++static constexpr int MAX_PARALLEL_MEMPOOL_THREADS{64};
++
++/** A received transaction waiting for mempool admission. */
++struct TxAdmissionItem {
++    NodeId peer{-1};
++    CTransactionRef tx;
++    SteadyClock::time_point enqueued;
++    /** Whatever the producer needs back with the verdict. */
++    std::shared_ptr<void> owner;
++};
++
++/**
++ * Transactions received from peers, waiting for the admission thread.
++ *
++ * Each peer has its own FIFO; batches are taken round-robin across peers,
++ * one transaction per peer per turn, so a flooding peer cannot delay
++ * others by more than one slot per turn, and a peer's own transactions
++ * keep their order. The queue is bounded per peer and in total (count and
++ * serialized bytes); producers must check HasRoom() first and, when it
++ * says no, stop reading from that peer, which leaves its messages in the
++ * receive buffer and applies TCP backpressure.
++ *
++ * Thread-safe.
++ */
++class TxAdmissionQueue {
++public:
++    struct Limits {
++        size_t max_per_peer{256};
++        size_t max_total{16384};
++        size_t max_total_bytes{64 << 20};
++    };
++
++    struct Stats {
++        size_t queued{0};
++        size_t queued_bytes{0};
++        size_t peers{0};
++        uint64_t pushed{0};
++        uint64_t taken{0};
++        uint64_t dropped{0};
++        /** HasRoom() said no (a producer had to pause a peer). */
++        uint64_t full{0};
++    };
++
++    explicit TxAdmissionQueue(Limits limits) : m_limits{limits} {}
++
++    /**
++     * Whether `peer` may add one more transaction now. Counts a "full"
++     * event when it may not and count_full is set.
++     */
++    bool HasRoom(NodeId peer, size_t tx_bytes, bool count_full = true)
++        EXCLUSIVE_LOCKS_REQUIRED(!m_mutex);
++
++    /**
++     * Atomically check bounds and append, waking the consumer on success.
++     * HasRoom is advisory and does not reserve space for concurrent producers.
++     */
++    bool Push(TxAdmissionItem item) EXCLUSIVE_LOCKS_REQUIRED(!m_mutex);
++
++    /**
++     * Take up to `max_items`, round-robin over peers, waiting up to `wait`
++     * for the first one. Returns empty on timeout or after Interrupt().
++     */
++    std::vector<TxAdmissionItem> TakeBatch(size_t max_items,
++                                           std::chrono::milliseconds wait)
++        EXCLUSIVE_LOCKS_REQUIRED(!m_mutex);
++
++    /** Remove and return everything still queued, for every peer. */
++    std::vector<TxAdmissionItem> TakeAll() EXCLUSIVE_LOCKS_REQUIRED(!m_mutex);
++
++    /** Remove and return everything still queued for `peer`. */
++    std::vector<TxAdmissionItem> DropPeer(NodeId peer)
++        EXCLUSIVE_LOCKS_REQUIRED(!m_mutex);
++
++    /** Make waiting and future TakeBatch calls return immediately. */
++    void Interrupt() EXCLUSIVE_LOCKS_REQUIRED(!m_mutex);
++
++    Stats GetStats() const EXCLUSIVE_LOCKS_REQUIRED(!m_mutex);
++
++private:
++    const Limits m_limits;
++    mutable Mutex m_mutex;
++    std::condition_variable m_cv;
++    std::map<NodeId, std::deque<TxAdmissionItem>> m_queues GUARDED_BY(m_mutex);
++    /** Peers with queued items, in round-robin order. */
++    std::deque<NodeId> m_order GUARDED_BY(m_mutex);
++    size_t m_count GUARDED_BY(m_mutex){0};
++    size_t m_bytes GUARDED_BY(m_mutex){0};
++    bool m_interrupted GUARDED_BY(m_mutex){false};
++    uint64_t m_pushed GUARDED_BY(m_mutex){0};
++    uint64_t m_taken GUARDED_BY(m_mutex){0};
++    uint64_t m_dropped GUARDED_BY(m_mutex){0};
++    uint64_t m_full GUARDED_BY(m_mutex){0};
++};
++
++} // namespace node
++
++#endif // BITCOIN_NODE_TXADMISSION_H
+diff --git a/src/test/CMakeLists.txt b/src/test/CMakeLists.txt
+index 77abc38b0a..6163b3cca5 100644
+--- a/src/test/CMakeLists.txt
++++ b/src/test/CMakeLists.txt
+@@ -315,6 +315,7 @@ add_boost_unit_tests_to_suite(bitcoin test_bitcoin
+ 		t1_baseline_tests.cpp
+ 		translation_tests.cpp
+ 		txindex_tests.cpp
++		txadmission_queue_tests.cpp
+ 		txpackage_tests.cpp
+ 		txpool_tests.cpp
+ 		txrelay_tests.cpp
+diff --git a/src/test/txadmission_queue_tests.cpp b/src/test/txadmission_queue_tests.cpp
+new file mode 100644
+index 0000000000..f618bdbd69
+--- /dev/null
++++ b/src/test/txadmission_queue_tests.cpp
+@@ -0,0 +1,181 @@
++// Copyright (c) 2026 The Lotus developers
++// Distributed under the MIT software license, see the accompanying
++// file COPYING or http://www.opensource.org/licenses/mit-license.php.
++
++#include <node/txadmission.h>
++#include <primitives/transaction.h>
++#include <test/util/setup_common.h>
++
++#include <boost/test/unit_test.hpp>
++
++#include <atomic>
++#include <map>
++#include <thread>
++#include <vector>
++
++using node::TxAdmissionItem;
++using node::TxAdmissionQueue;
++
++namespace {
++
++CTransactionRef MakeTx(uint32_t n) {
++    CMutableTransaction mtx;
++    mtx.vin.emplace_back(COutPoint(TxId(uint256::ONE), n));
++    mtx.vout.emplace_back(Amount(int64_t(n) * SATOSHI), CScript());
++    return MakeTransactionRef(std::move(mtx));
++}
++
++TxAdmissionItem Item(NodeId peer, uint32_t n) {
++    return TxAdmissionItem{peer, MakeTx(n), SteadyClock::now(), nullptr};
++}
++
++} // namespace
++
++BOOST_FIXTURE_TEST_SUITE(txadmission_queue_tests, BasicTestingSetup)
++
++BOOST_AUTO_TEST_CASE(round_robin_keeps_per_peer_order) {
++    TxAdmissionQueue q{{}};
++    // Peer 1 floods, peers 2 and 3 send a little.
++    for (uint32_t i = 0; i < 10; ++i) {
++        q.Push(Item(1, 100 + i));
++    }
++    q.Push(Item(2, 200));
++    q.Push(Item(2, 201));
++    q.Push(Item(3, 300));
++    const auto batch = q.TakeBatch(6, std::chrono::milliseconds{0});
++    std::vector<std::pair<NodeId, Amount>> got;
++    for (const auto &item : batch) {
++        got.emplace_back(item.peer, item.tx->vout[0].nValue);
++    }
++    // One per peer per turn; each peer's own order preserved.
++    const std::vector<std::pair<NodeId, Amount>> expected{
++        {1, 100 * SATOSHI}, {2, 200 * SATOSHI}, {3, 300 * SATOSHI},
++        {1, 101 * SATOSHI}, {2, 201 * SATOSHI}, {1, 102 * SATOSHI}};
++    BOOST_CHECK(got == expected);
++    const auto rest = q.TakeBatch(100, std::chrono::milliseconds{0});
++    BOOST_REQUIRE_EQUAL(rest.size(), 7U);
++    for (size_t i = 0; i < rest.size(); ++i) {
++        BOOST_CHECK_EQUAL(rest[i].peer, 1);
++        BOOST_CHECK(rest[i].tx->vout[0].nValue == int64_t(103 + i) * SATOSHI);
++    }
++    BOOST_CHECK_EQUAL(q.GetStats().queued, 0U);
++}
++
++BOOST_AUTO_TEST_CASE(bounded_per_peer_total_and_bytes) {
++    TxAdmissionQueue::Limits limits;
++    limits.max_per_peer = 3;
++    limits.max_total = 5;
++    limits.max_total_bytes = 1 << 20;
++    TxAdmissionQueue q{limits};
++    for (uint32_t i = 0; i < 3; ++i) {
++        BOOST_CHECK(q.HasRoom(1, MakeTx(0)->GetTotalSize()));
++        q.Push(Item(1, i));
++    }
++    BOOST_CHECK(!q.HasRoom(1, MakeTx(0)->GetTotalSize()));
++    BOOST_CHECK(q.HasRoom(2, MakeTx(0)->GetTotalSize()));
++    q.Push(Item(2, 10));
++    q.Push(Item(2, 11));
++    // Total reached: nobody has room, including a new peer.
++    BOOST_CHECK(!q.HasRoom(3, MakeTx(0)->GetTotalSize()));
++    BOOST_CHECK(!q.HasRoom(2, MakeTx(0)->GetTotalSize(), /*count_full=*/false));
++    auto stats = q.GetStats();
++    BOOST_CHECK_EQUAL(stats.queued, 5U);
++    BOOST_CHECK_EQUAL(stats.full, 2U);
++    BOOST_CHECK_EQUAL(stats.peers, 2U);
++    BOOST_CHECK(stats.queued_bytes > 0);
++
++    // Bytes bound.
++    limits.max_total_bytes = MakeTx(0)->GetTotalSize() * 2;
++    TxAdmissionQueue small{limits};
++    BOOST_CHECK(!small.HasRoom(1, limits.max_total_bytes + 1));
++    small.Push(Item(1, 0));
++    BOOST_CHECK(!small.HasRoom(2, MakeTx(0)->GetTotalSize() + 1));
++    BOOST_CHECK(small.HasRoom(2, MakeTx(0)->GetTotalSize()));
++    small.Push(Item(2, 1));
++    BOOST_CHECK(!small.HasRoom(3, MakeTx(0)->GetTotalSize()));
++    BOOST_CHECK(!small.Push(Item(3, 2)));
++    BOOST_CHECK_EQUAL(small.GetStats().queued_bytes, limits.max_total_bytes);
++
++    // A stale positive availability check cannot overfill the queue.
++    TxAdmissionQueue race{{1, 1, 1 << 20}};
++    BOOST_CHECK(race.HasRoom(1, MakeTx(0)->GetTotalSize()));
++    BOOST_CHECK(race.HasRoom(2, MakeTx(0)->GetTotalSize()));
++    BOOST_CHECK(race.Push(Item(1, 0)));
++    BOOST_CHECK(!race.Push(Item(2, 1)));
++    BOOST_CHECK_EQUAL(race.GetStats().queued, 1U);
++}
++
++BOOST_AUTO_TEST_CASE(drop_peer_take_all_and_interrupt) {
++    TxAdmissionQueue q{{}};
++    q.Push(Item(1, 0));
++    q.Push(Item(2, 1));
++    q.Push(Item(1, 2));
++    const auto dropped = q.DropPeer(1);
++    BOOST_CHECK_EQUAL(dropped.size(), 2U);
++    BOOST_CHECK_EQUAL(q.GetStats().queued, 1U);
++    const auto batch = q.TakeBatch(10, std::chrono::milliseconds{0});
++    BOOST_REQUIRE_EQUAL(batch.size(), 1U);
++    BOOST_CHECK_EQUAL(batch[0].peer, 2);
++
++    q.Push(Item(3, 3));
++    q.Push(Item(4, 4));
++    BOOST_CHECK_EQUAL(q.TakeAll().size(), 2U);
++    BOOST_CHECK_EQUAL(q.GetStats().queued_bytes, 0U);
++
++    // A waiting consumer returns promptly when interrupted.
++    std::thread consumer([&] {
++        const auto none = q.TakeBatch(10, std::chrono::seconds{60});
++        BOOST_CHECK(none.empty());
++    });
++    q.Interrupt();
++    consumer.join();
++    q.Push(Item(5, 5));
++    BOOST_CHECK(q.TakeBatch(10, std::chrono::milliseconds{0}).empty());
++}
++
++BOOST_AUTO_TEST_CASE(concurrent_producers_and_consumer) {
++    // Several producers and one consumer: everything pushed is taken exactly
++    // once and each peer's order holds. Run under ThreadSanitizer.
++    TxAdmissionQueue::Limits limits;
++    limits.max_per_peer = 16;
++    limits.max_total = 40;
++    TxAdmissionQueue q{limits};
++    constexpr int PEERS = 4;
++    constexpr uint32_t PER_PEER = 500;
++    std::vector<std::thread> producers;
++    for (int p = 0; p < PEERS; ++p) {
++        producers.emplace_back([&, p] {
++            for (uint32_t i = 0; i < PER_PEER;) {
++                if (q.HasRoom(p, MakeTx(0)->GetTotalSize(),
++                              /*count_full=*/false)) {
++                    if (q.Push(Item(p, i))) {
++                        ++i;
++                    }
++                } else {
++                    std::this_thread::yield();
++                }
++            }
++        });
++    }
++    std::map<NodeId, int64_t> last;
++    size_t taken = 0;
++    while (taken < PEERS * PER_PEER) {
++        for (const auto &item :
++             q.TakeBatch(32, std::chrono::milliseconds{10})) {
++            const int64_t v = item.tx->vout[0].nValue / SATOSHI;
++            auto it = last.find(item.peer);
++            BOOST_CHECK(it == last.end() || it->second + 1 == v);
++            last[item.peer] = v;
++            ++taken;
++        }
++    }
++    for (auto &t : producers) {
++        t.join();
++    }
++    const auto stats = q.GetStats();
++    BOOST_CHECK_EQUAL(stats.pushed, uint64_t{PEERS * PER_PEER});
++    BOOST_CHECK_EQUAL(stats.taken, uint64_t{PEERS * PER_PEER});
++    BOOST_CHECK_EQUAL(stats.queued, 0U);
++}
++
++BOOST_AUTO_TEST_SUITE_END()
+diff --git a/test/functional/mempool_parallel_admission.py b/test/functional/mempool_parallel_admission.py
+new file mode 100755
+index 0000000000..b75a9db34d
+--- /dev/null
++++ b/test/functional/mempool_parallel_admission.py
+@@ -0,0 +1,197 @@
++#!/usr/bin/env python3
++# Copyright (c) 2026 The Lotus developers
++# Distributed under the MIT software license, see the accompanying
++# file COPYING or http://www.opensource.org/licenses/mit-license.php.
++"""Transactions from peers admitted on the admission thread (-parallelmempool).
++
++node0 admits peer transactions on its admission thread with scripts verified
++outside cs_main; node1 runs with -parallelmempool=0 (serial admission on the
++message handler thread). The nodes are not connected while transactions are
++sent, and every check that compares them sends both the same messages.
++
++Covered:
++- the same sequence of really signed transactions (valid, a dependent chain,
++  a child before its parent, a double spend, one below the relay fee, a
++  duplicate) gives the same mempool on both nodes;
++- a peer's later message waits for its transactions: when the pong for a
++  ping sent right after a transaction arrives, that transaction has a
++  verdict;
++- several peers at once, with the same transaction from all of them and a
++  double spend racing between two of them: every valid transaction is
++  admitted once, exactly one side of the double spend, nobody punished;
++- a transaction with an invalid signature gets its sender disconnected,
++  as with serial admission;
++- a block mined while transactions are in flight leaves a consistent
++  mempool (regtest checks it on every admission).
++"""
++
++from test_framework.messages import msg_tx
++from test_framework.p2p import P2PInterface
++from test_framework.test_framework import BitcoinTestFramework
++from test_framework.util import assert_equal
++from test_framework.wallet import MiniWallet, MiniWalletMode
++
++
++class MalformedTx(msg_tx):
++    def serialize(self):
++        return b"\x01"
++
++
++class ParallelAdmissionTest(BitcoinTestFramework):
++    num_nodes = 2
++    setup_clean_chain = True
++    extra_args = [
++        ["-parallelmempool=1", "-parallelmempoolthreads=4"],
++        ["-parallelmempool=0"],
++    ]
++
++    def fund(self, count):
++        """Split mature coinbases into `count` confirmed single-key outputs."""
++        node = self.nodes[0]
++        per_fanout = 50
++        fanouts = (count + per_fanout - 1) // per_fanout
++        self.generate(self.wallet, fanouts)
++        self.generate(node, 101)
++        self.wallet.rescan_utxos()
++        for _ in range(fanouts):
++            self.wallet.send_self_transfer_multi(
++                from_node=node,
++                utxos_to_spend=[self.wallet.get_utxo(confirmed_only=True)],
++                num_outputs=per_fanout,
++            )
++        self.generate(node, 1)
++        self.wallet.rescan_utxos()
++
++    def spend(self, **kwargs):
++        return self.wallet.create_self_transfer(**kwargs)
++
++    def send_all(self, peer, txs):
++        for tx in txs:
++            peer.send_without_ping(msg_tx(tx["tx"]))
++        peer.sync_with_ping()
++
++    def mempool(self, node):
++        return sorted(node.getrawmempool())
++
++    def run_test(self):
++        node0, node1 = self.nodes
++        self.wallet = MiniWallet(node0, mode=MiniWalletMode.RAW_P2PK)
++        self.fund(450)
++        self.sync_blocks()
++        self.disconnect_nodes(0, 1)
++
++        self.log.info("Same sequence, same mempool as serial admission")
++        independent = [self.spend() for _ in range(40)]
++        chain = self.wallet.create_self_transfer_chain(chain_length=5)
++        orphan_parent = self.spend()
++        orphan_child = self.spend(utxo_to_spend=orphan_parent["new_utxo"])
++        utxo = self.wallet.get_utxo()
++        first = self.spend(utxo_to_spend=utxo)
++        second = self.spend(utxo_to_spend=utxo, fee_rate=6000)
++        low_fee = self.spend(fee_rate=0)
++        sequence = (
++            independent[:20]
++            + chain
++            + [orphan_child, first]
++            + independent[20:]
++            + [second, orphan_parent, low_fee, independent[0]]
++        )
++        for node in (node0, node1):
++            peer = node.add_p2p_connection(P2PInterface())
++            self.send_all(peer, sequence)
++        expected = sorted(
++            [t["txid"] for t in independent + chain]
++            + [orphan_parent["txid"], orphan_child["txid"], first["txid"]]
++        )
++        for node in (node0, node1):
++            self.wait_until(lambda n=node: self.mempool(n) == expected)
++        assert_equal(self.mempool(node0), self.mempool(node1))
++        for node in (node0, node1):
++            assert node.p2ps[0].is_connected
++            node.disconnect_p2ps()
++
++        self.log.info("A ping after a transaction is answered after its verdict")
++        peer = node0.add_p2p_connection(P2PInterface())
++        for _ in range(20):
++            parent = self.spend()
++            child = self.spend(utxo_to_spend=parent["new_utxo"])
++            peer.send_without_ping(msg_tx(parent["tx"]))
++            peer.send_without_ping(msg_tx(child["tx"]))
++            peer.sync_with_ping()
++            mempool = set(node0.getrawmempool())
++            assert parent["txid"] in mempool and child["txid"] in mempool
++        node0.disconnect_p2ps()
++
++        self.log.info("Several peers at once, duplicates and a double spend race")
++        peers = [node0.add_p2p_connection(P2PInterface()) for _ in range(4)]
++        batch = [self.spend() for _ in range(120)]
++        duplicate = self.spend()
++        utxo = self.wallet.get_utxo()
++        side_a = self.spend(utxo_to_spend=utxo)
++        side_b = self.spend(utxo_to_spend=utxo, fee_rate=6000)
++        before = set(node0.getrawmempool())
++        for i, tx in enumerate(batch):
++            peers[i % 4].send_without_ping(msg_tx(tx["tx"]))
++        for p in peers:
++            p.send_without_ping(msg_tx(duplicate["tx"]))
++        peers[0].send_without_ping(msg_tx(side_a["tx"]))
++        peers[1].send_without_ping(msg_tx(side_b["tx"]))
++        for p in peers:
++            p.sync_with_ping()
++        mempool = set(node0.getrawmempool()) - before
++        assert {t["txid"] for t in batch} <= mempool
++        assert duplicate["txid"] in mempool
++        assert (side_a["txid"] in mempool) != (side_b["txid"] in mempool)
++        assert_equal(len(mempool), len(batch) + 2)
++        assert all(p.is_connected for p in peers)
++        node0.disconnect_p2ps()
++
++        self.log.info("Malformed tails preserve their already decoded valid prefix")
++        prefix = [self.spend() for _ in range(24)]
++        for node in (node0, node1):
++            peer = node.add_p2p_connection(P2PInterface())
++            payload = b"".join(peer.build_message(msg_tx(tx["tx"])) for tx in prefix)
++            payload += peer.build_message(MalformedTx())
++            peer.send_raw_message(payload)
++            self.wait_until(
++                lambda n=node: all(tx["txid"] in n.getrawmempool() for tx in prefix)
++            )
++            node.disconnect_p2ps()
++
++        self.log.info("An invalid signature disconnects its sender on both nodes")
++        bad = self.spend()
++        bad_tx = bad["tx"]
++        script_sig = bytearray(bad_tx.vin[0].scriptSig)
++        script_sig[10] ^= 0x01
++        bad_tx.vin[0].scriptSig = bytes(script_sig)
++        for node in (node0, node1):
++            peer = node.add_p2p_connection(P2PInterface())
++            with node.assert_debug_log(["mandatory-script-verify-flag-failed"]):
++                peer.send_without_ping(msg_tx(bad_tx))
++                peer.wait_for_disconnect()
++            assert bad_tx.txid_hex not in node.getrawmempool()
++
++        self.log.info("A block mined while transactions are in flight")
++        peers = [node0.add_p2p_connection(P2PInterface()) for _ in range(2)]
++        batch = [self.spend() for _ in range(150)]
++        for i, tx in enumerate(batch):
++            peers[i % 2].send_without_ping(msg_tx(tx["tx"]))
++            if i == 75:
++                self.generate(node0, 1, sync_fun=self.no_op)
++        for p in peers:
++            p.sync_with_ping()
++        tip = node0.getbestblockhash()
++        confirmed = set(node0.getblock(tip)["tx"])
++        mempool = set(node0.getrawmempool())
++        for tx in batch:
++            assert tx["txid"] in mempool or tx["txid"] in confirmed
++        assert all(p.is_connected for p in peers)
++
++        self.log.info("Shutdown fences admission producers with work in flight")
++        for i in range(40):
++            peers[i % 2].send_without_ping(msg_tx(self.spend()["tx"]))
++        self.stop_node(0)
++
++
++if __name__ == "__main__":
++    ParallelAdmissionTest().main()

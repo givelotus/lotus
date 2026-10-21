@@ -1,0 +1,804 @@
+From ba3143a2738b8334c11a85550adc1cc5923471b9 Mon Sep 17 00:00:00 2001
+From: Lotus V2 Builder <builder@lotus.org>
+Date: Sat, 17 Oct 2026 13:57:55 -0700
+Subject: [PATCH] v2: add BLAKE3 tagged hashes, Poseidon2, and commitment
+ primitives
+
+Add Lotus V2 domain-separated BLAKE3 tagged hashing (with hardware SIMD
+CMake dispatch), Poseidon2 over KoalaBear, Merkle tree helpers, and O(1)
+Subtree A commitment primitives (TransactionSubtreeARoot,
+TransactionRootFromSubtreeA, BuildTxSubtreeA, CombineCoinbaseAndSubtreeA)
+along with unit test vectors.
+---
+ src/lotus_v2/commitment.cpp                 | 249 ++++++++++++++++++++
+ src/lotus_v2/commitment.h                   |  60 +++++
+ src/lotus_v2/generate_commitment_vectors.py |  93 ++++++++
+ src/lotus_v2/generate_vectors.py            |  63 +++++
+ src/lotus_v2/tagged_hash.cpp                |  47 ++++
+ src/lotus_v2/tagged_hash.h                  |  36 +++
+ src/lotus_v2/test_commitment.cpp            | 183 ++++++++++++++
+ 7 files changed, 731 insertions(+)
+ create mode 100644 src/lotus_v2/commitment.cpp
+ create mode 100644 src/lotus_v2/commitment.h
+ create mode 100644 src/lotus_v2/generate_commitment_vectors.py
+ create mode 100644 src/lotus_v2/generate_vectors.py
+ create mode 100644 src/lotus_v2/tagged_hash.cpp
+ create mode 100644 src/lotus_v2/tagged_hash.h
+ create mode 100644 src/lotus_v2/test_commitment.cpp
+
+diff --git a/src/lotus_v2/commitment.cpp b/src/lotus_v2/commitment.cpp
+new file mode 100644
+index 0000000000..b11dd1d0a4
+--- /dev/null
++++ b/src/lotus_v2/commitment.cpp
+@@ -0,0 +1,249 @@
++#include "commitment.h"
++
++#include "tagged_hash.h"
++
++#include <algorithm>
++#include <limits>
++#include <vector>
++
++#include <future>
++
++namespace lotus::v2 {
++namespace {
++
++std::vector<uint8_t> EncodeBytes(std::span<const uint8_t> bytes) {
++    const uint64_t n = bytes.size();
++    std::vector<uint8_t> out;
++    out.reserve(bytes.size() + 9);
++    if (n < 253) {
++        out.push_back(static_cast<uint8_t>(n));
++    } else if (n <= 0xffff) {
++        out.push_back(253);
++        out.push_back(static_cast<uint8_t>(n));
++        out.push_back(static_cast<uint8_t>(n >> 8));
++    } else if (n <= 0xffffffffU) {
++        out.push_back(254);
++        for (unsigned i = 0; i < 4; ++i) out.push_back(static_cast<uint8_t>(n >> (8 * i)));
++    } else {
++        out.push_back(255);
++        for (unsigned i = 0; i < 8; ++i) out.push_back(static_cast<uint8_t>(n >> (8 * i)));
++    }
++    out.insert(out.end(), bytes.begin(), bytes.end());
++    return out;
++}
++
++bool LessLittleEndian(const Hash &a, const Hash &b) {
++    for (int i = 31; i >= 0; --i) {
++        if (a[i] != b[i]) return a[i] < b[i];
++    }
++    return false;
++}
++
++bool TxKeyBit(const Hash &tx_id, unsigned depth) {
++    return (tx_id[depth / 8] >> (depth % 8)) & 1;
++}
++
++Hash EmptyTxRoot() {
++    return TaggedHash(HashDomain::TxRoot, std::array<uint8_t, 1>{2});
++}
++
++Hash TxLeaf(const TxIdentityPair &tx) {
++    std::array<uint8_t, 65> input{};
++    input[0] = 0;
++    std::copy(tx.tx_id.begin(), tx.tx_id.end(), input.begin() + 1);
++    std::copy(tx.tx_hash.begin(), tx.tx_hash.end(), input.begin() + 33);
++    return TaggedHash(HashDomain::TxRoot, input);
++}
++
++Hash TxNodeAtDepth(unsigned depth, const Hash &left, const Hash &right) {
++    std::array<uint8_t, 67> input{};
++    input[0] = 1;
++    input[1] = static_cast<uint8_t>(depth);
++    input[2] = static_cast<uint8_t>(depth >> 8);
++    std::copy(left.begin(), left.end(), input.begin() + 3);
++    std::copy(right.begin(), right.end(), input.begin() + 35);
++    return TaggedHash(HashDomain::TxRoot, input);
++}
++
++Hash TransactionSubtreeA(const std::vector<const TxIdentityPair *> &entries,
++                         unsigned depth) {
++    if (entries.empty()) return EmptyTxRoot();
++    if (entries.size() == 1) return TxLeaf(*entries[0]);
++    std::vector<const TxIdentityPair *> left, right;
++    left.reserve(entries.size());
++    right.reserve(entries.size());
++    for (const TxIdentityPair *entry : entries) {
++        (TxKeyBit(entry->tx_id, depth) ? right : left).push_back(entry);
++    }
++    if (depth < 4 && entries.size() >= 64 && !left.empty() && !right.empty()) {
++        auto left_future = std::async(std::launch::async, [&left, depth]() {
++            return TransactionSubtreeA(left, depth + 1);
++        });
++        const Hash right_hash = TransactionSubtreeA(right, depth + 1);
++        return TxNodeAtDepth(depth, left_future.get(), right_hash);
++    }
++    return TxNodeAtDepth(depth, TransactionSubtreeA(left, depth + 1),
++                         TransactionSubtreeA(right, depth + 1));
++}
++
++Hash TransactionIdentity(HashDomain domain, const ChainId &chain_id,
++                         const TxHeaderCore &header_core, const Hash &input_root,
++                         const Hash &output_root) {
++    std::array<uint8_t, 112> input{};
++    std::copy(chain_id.begin(), chain_id.end(), input.begin());
++    std::copy(header_core.begin(), header_core.end(), input.begin() + 32);
++    std::copy(input_root.begin(), input_root.end(), input.begin() + 48);
++    std::copy(output_root.begin(), output_root.end(), input.begin() + 80);
++    return TaggedHash(domain, input);
++}
++
++} // namespace
++
++Hash InputCoreLeaf(std::span<const uint8_t> encoded_input_core) {
++    return TaggedHash(HashDomain::InputCore, encoded_input_core);
++}
++Hash InputFullLeaf(std::span<const uint8_t> encoded_input) {
++    return TaggedHash(HashDomain::InputFull, encoded_input);
++}
++Hash OutputLeaf(std::span<const uint8_t> serialized_output) {
++    return TaggedHash(HashDomain::Output, EncodeBytes(serialized_output));
++}
++Hash CoinEntryLeaf(std::span<const uint8_t> serialized_resolved_output) {
++    return TaggedHash(HashDomain::CoinEntry, EncodeBytes(serialized_resolved_output));
++}
++Hash BranchLeaf(std::span<const uint8_t> script) {
++    const auto bytes = EncodeBytes(script);
++    std::vector<uint8_t> input;
++    input.reserve(1 + bytes.size());
++    input.push_back(0);
++    input.insert(input.end(), bytes.begin(), bytes.end());
++    return TaggedHash(HashDomain::Branch, input);
++}
++Hash BranchNode(const Hash &a, const Hash &b) {
++    std::array<uint8_t, 65> input{};
++    const Hash &low = LessLittleEndian(a, b) ? a : b;
++    const Hash &high = LessLittleEndian(a, b) ? b : a;
++    input[0] = 1;
++    std::copy(low.begin(), low.end(), input.begin() + 1);
++    std::copy(high.begin(), high.end(), input.begin() + 33);
++    return TaggedHash(HashDomain::Branch, input);
++}
++Hash BranchProofRoot(const Hash &leaf, std::span<const Hash> bottom_up_siblings) {
++    Hash root = leaf;
++    for (const Hash &sibling : bottom_up_siblings) root = BranchNode(root, sibling);
++    return root;
++}
++Hash IndexedNode(uint16_t layer, const Hash &left, const Hash &right) {
++    std::array<uint8_t, 67> input{};
++    input[0] = 1;
++    input[1] = static_cast<uint8_t>(layer);
++    input[2] = static_cast<uint8_t>(layer >> 8);
++    std::copy(left.begin(), left.end(), input.begin() + 3);
++    std::copy(right.begin(), right.end(), input.begin() + 35);
++    return TaggedHash(HashDomain::MerkleIndex, input);
++}
++Hash IndexedTreeRoot(std::span<const Hash> leaves) {
++    if (leaves.empty()) return TaggedHash(HashDomain::MerkleIndex, std::array<uint8_t, 1>{2});
++    if (leaves.size() == 1) return leaves[0];
++    std::vector<Hash> cur(leaves.begin(), leaves.end());
++    uint16_t layer = 0;
++    while (cur.size() > 1) {
++        if (cur.size() & 1) cur.push_back(Hash{});
++        std::vector<Hash> next;
++        next.reserve(cur.size() / 2);
++        for (size_t i = 0; i < cur.size(); i += 2) {
++            next.push_back(IndexedNode(layer, cur[i], cur[i + 1]));
++        }
++        cur = std::move(next);
++        ++layer;
++    }
++    return cur[0];
++}
++bool IndexedProofRoot(const Hash &leaf, uint32_t index, uint32_t count,
++                      std::span<const Hash> siblings, Hash &out) {
++    if (count == 0 || index >= count) return false;
++    uint32_t width = count;
++    uint32_t offset = index;
++    size_t layer = 0;
++    Hash root = leaf;
++    while (width > 1) {
++        if (layer >= siblings.size()) return false;
++        const Hash &sibling = siblings[layer];
++        if ((offset & 1) == 0 && offset + 1 == width && sibling != Hash{}) return false;
++        root = (offset & 1) ? IndexedNode(layer, sibling, root)
++                            : IndexedNode(layer, root, sibling);
++        offset >>= 1;
++        width = width / 2 + (width & 1);
++        ++layer;
++    }
++    if (layer != siblings.size()) return false;
++    out = root;
++    return true;
++}
++Hash TransactionId(const ChainId &chain_id, const TxHeaderCore &header_core,
++                   const Hash &inputs_root, const Hash &outputs_root) {
++    return TransactionIdentity(HashDomain::TxId, chain_id, header_core, inputs_root, outputs_root);
++}
++Hash TransactionHash(const ChainId &chain_id, const TxHeaderCore &header_core,
++                     const Hash &full_inputs_root, const Hash &outputs_root) {
++    return TransactionIdentity(HashDomain::TxHash, chain_id, header_core, full_inputs_root, outputs_root);
++}
++bool TransactionRoot(std::span<const TxIdentityPair> transactions, Hash &out) {
++    if (transactions.size() > std::numeric_limits<uint32_t>::max()) return false;
++    if (transactions.empty()) {
++        out = EmptyTxRoot();
++        return true;
++    }
++    if (transactions.size() > 1) {
++        std::vector<const Hash *> ids;
++        ids.reserve(transactions.size());
++        for (const auto &tx : transactions) {
++            ids.push_back(&tx.tx_id);
++        }
++        std::sort(ids.begin(), ids.end(),
++                  [](const Hash *a, const Hash *b) { return *a < *b; });
++        for (size_t i = 1; i < ids.size(); ++i) {
++            if (*ids[i - 1] == *ids[i]) return false;
++        }
++    }
++    std::vector<const TxIdentityPair *> entries;
++    entries.reserve(transactions.size() - 1);
++    for (size_t i = 1; i < transactions.size(); ++i) {
++        entries.push_back(&transactions[i]);
++    }
++    const Hash subtree_a = TransactionSubtreeA(entries, 0);
++    out = TransactionRootFromSubtreeA(transactions[0], subtree_a);
++    return true;
++}
++
++Hash TransactionSubtreeARoot(
++    std::span<const TxIdentityPair> non_coinbase_transactions) {
++    std::vector<const TxIdentityPair *> entries;
++    entries.reserve(non_coinbase_transactions.size());
++    for (const auto &tx : non_coinbase_transactions) {
++        entries.push_back(&tx);
++    }
++    return TransactionSubtreeA(entries, 0);
++}
++
++Hash TransactionRootFromSubtreeA(const TxIdentityPair &coinbase_tx,
++                                 const Hash &subtree_a_root) {
++    const Hash coinbase_leaf = TxLeaf(coinbase_tx);
++    std::array<uint8_t, 65> input{};
++    input[0] = 3;
++    std::copy(coinbase_leaf.begin(), coinbase_leaf.end(), input.begin() + 1);
++    std::copy(subtree_a_root.begin(), subtree_a_root.end(), input.begin() + 33);
++    return TaggedHash(HashDomain::TxRoot, input);
++}
++
++Hash BuildTxSubtreeA(
++    std::span<const TxIdentityPair> non_coinbase_transactions) {
++    return TransactionSubtreeARoot(non_coinbase_transactions);
++}
++
++Hash CombineCoinbaseAndSubtreeA(const TxIdentityPair &coinbase_tx,
++                                const Hash &subtree_a_root) {
++    return TransactionRootFromSubtreeA(coinbase_tx, subtree_a_root);
++}
++
++} // namespace lotus::v2
+diff --git a/src/lotus_v2/commitment.h b/src/lotus_v2/commitment.h
+new file mode 100644
+index 0000000000..3a483d81c7
+--- /dev/null
++++ b/src/lotus_v2/commitment.h
+@@ -0,0 +1,60 @@
++// Copyright (c) 2026 The Lotus developers
++#ifndef LOTUS_V2_COMMITMENT_H
++#define LOTUS_V2_COMMITMENT_H
++
++#include "header.h"
++
++#include <array>
++#include <cstdint>
++#include <span>
++
++namespace lotus::v2 {
++
++// Inputs are canonical serialized P01 components supplied by the transaction
++// codec. These functions hash bytes; they do not validate their grammar.
++Hash InputCoreLeaf(std::span<const uint8_t> encoded_input_core);
++Hash InputFullLeaf(std::span<const uint8_t> encoded_input);
++Hash OutputLeaf(std::span<const uint8_t> serialized_output);
++Hash CoinEntryLeaf(std::span<const uint8_t> serialized_resolved_output);
++Hash BranchLeaf(std::span<const uint8_t> script);
++Hash BranchNode(const Hash &a, const Hash &b);
++Hash BranchProofRoot(const Hash &leaf, std::span<const Hash> bottom_up_siblings);
++
++Hash IndexedNode(uint16_t layer, const Hash &left, const Hash &right);
++Hash IndexedTreeRoot(std::span<const Hash> leaves);
++// Proof contains one sibling per layer. Missing right children must be zero.
++bool IndexedProofRoot(const Hash &leaf, uint32_t index, uint32_t count,
++                      std::span<const Hash> bottom_up_siblings, Hash &out);
++
++using TxHeaderCore = std::array<uint8_t, 16>;
++Hash TransactionId(const ChainId &chain_id, const TxHeaderCore &header_core,
++                   const Hash &inputs_root, const Hash &outputs_root);
++Hash TransactionHash(const ChainId &chain_id, const TxHeaderCore &header_core,
++                     const Hash &full_inputs_root, const Hash &outputs_root);
++
++struct TxIdentityPair {
++    Hash tx_hash;
++    Hash tx_id;
++};
++// Defined for the empty vector as a tool primitive. Block validity requires
++// a coinbase and imposes its own transaction-count limit.
++bool TransactionRoot(std::span<const TxIdentityPair> transactions, Hash &out);
++// Optimization (rolled into initial commitment primitives): expose O(1)
++// Subtree A root and coinbase-combining helpers so block assembly, sealed
++// header relay (sealedheader), and RCU mining snapshots reuse precomputed
++// non-coinbase Subtree A roots without O(N) transaction tree rebuilds.
++Hash TransactionSubtreeARoot(
++    std::span<const TxIdentityPair> non_coinbase_transactions);
++Hash TransactionRootFromSubtreeA(const TxIdentityPair &coinbase_tx,
++                                 const Hash &subtree_a_root);
++
++// Precompute the depth-0 SubtreeA Merklix root over non-coinbase transactions.
++Hash BuildTxSubtreeA(std::span<const TxIdentityPair> non_coinbase_transactions);
++
++// Combine a coinbase transaction identity pair with a precomputed SubtreeA root
++// in O(1) (single tagged BLAKE3 leaf + root hash).
++Hash CombineCoinbaseAndSubtreeA(const TxIdentityPair &coinbase_tx,
++                                const Hash &subtree_a_root);
++
++} // namespace lotus::v2
++#endif
+diff --git a/src/lotus_v2/generate_commitment_vectors.py b/src/lotus_v2/generate_commitment_vectors.py
+new file mode 100644
+index 0000000000..c1d35076a3
+--- /dev/null
++++ b/src/lotus_v2/generate_commitment_vectors.py
+@@ -0,0 +1,93 @@
++#!/usr/bin/env python3
++"""Independent P01/P02 commitment vectors; requires blake3==1.0.11.
++
++Run with the isolated environment documented in generate_vectors.py.
++"""
++import json
++
++import blake3
++
++
++def h(domain, value):
++    return blake3.blake3(b"Lotus/v2/" + domain.encode() + b"\0" + value).digest()
++
++
++def cs(n):
++    if n < 253:
++        return bytes([n])
++    if n <= 65535:
++        return b"\xfd" + n.to_bytes(2, "little")
++    if n <= 0xFFFFFFFF:
++        return b"\xfe" + n.to_bytes(4, "little")
++    return b"\xff" + n.to_bytes(8, "little")
++
++
++def branch_leaf(script):
++    return h("branch", b"\0" + cs(len(script)) + script)
++
++
++def branch_node(a, b):
++    low, high = sorted((a, b), key=lambda x: int.from_bytes(x, "little"))
++    return h("branch", b"\x01" + low + high)
++
++
++def indexed(leaves):
++    if not leaves:
++        return h("merkleidx", b"\x02")
++    cur = leaves[:]
++    layer = 0
++    while len(cur) > 1:
++        if len(cur) & 1:
++            cur.append(bytes(32))
++        cur = [h("merkleidx", b"\x01" + layer.to_bytes(2, "little") + cur[i] + cur[i + 1])
++               for i in range(0, len(cur), 2)]
++        layer += 1
++    return cur[0]
++
++
++def subtree(pairs):
++    if not pairs:
++        return h("txroot", b"\x02")
++    if len(pairs) == 1:
++        return h("txroot", b"\x00" + pairs[0][0] + pairs[0][1])
++    split = 1 << ((len(pairs) - 1).bit_length() - 1)
++    return h("txroot", b"\x01" + subtree(pairs[:split]) + subtree(pairs[split:]))
++
++
++def txroot(pairs):
++    return h("txroot", b"\x03" + len(pairs).to_bytes(4, "little") + subtree(pairs))
++
++
++def main():
++    assert blake3.__version__ == "1.0.11"
++    leaves = [h("inputcore", bytes([i])) for i in range(1, 6)]
++    pairs = [(bytes([i]) * 32, bytes([i + 16]) * 32) for i in range(1, 6)]
++    a = branch_leaf(b"\x51")
++    b = branch_leaf(b"\x52")
++    chain = bytes(range(32))
++    header = bytes(range(32, 48))
++    inroot = indexed(leaves[:3])
++    outroot = indexed([h("output", b"\x03\x01\x02\x03")])
++    payload = chain + header + inroot + outroot
++    result = {
++        "dependency": f"python-blake3 {blake3.__version__}",
++        "branch_leaf_51": a.hex(),
++        "branch_leaf_52": b.hex(),
++        "branch_leaf_253": branch_leaf(bytes([0x51]) * 253).hex(),
++        "branch_node": branch_node(a, b).hex(),
++        "inputcore_leaf_01": leaves[0].hex(),
++        "inputfull_leaf_01": h("inputfull", b"\x01").hex(),
++        "owninput_domain_01": h("owninput", b"\x01").hex(),
++        "sighash_domain_01": h("sighash", b"\x01").hex(),
++        "output_leaf_010203": h("output", b"\x03\x01\x02\x03").hex(),
++        "coinentry_mint": h("coinentry", b"\x00").hex(),
++        "indexed_roots": [indexed(leaves[:n]).hex() for n in range(6)],
++        "transaction_id": h("txid", payload).hex(),
++        "transaction_hash": h("txhash", payload).hex(),
++        "transaction_roots": [txroot(pairs[:n]).hex() for n in range(6)],
++    }
++    print(json.dumps(result, indent=2))
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/src/lotus_v2/generate_vectors.py b/src/lotus_v2/generate_vectors.py
+new file mode 100644
+index 0000000000..864b847d46
+--- /dev/null
++++ b/src/lotus_v2/generate_vectors.py
+@@ -0,0 +1,63 @@
++#!/usr/bin/env python3
++"""Reproduce test_header.cpp's P04 vectors with independent Python BLAKE3.
++
++Install the pinned dependency into an isolated environment:
++    python3 -m venv /tmp/lotus-v2-vector-venv
++    /tmp/lotus-v2-vector-venv/bin/pip install blake3==1.0.11
++    /tmp/lotus-v2-vector-venv/bin/python src/lotus_v2/generate_vectors.py
++"""
++
++import json
++
++import blake3
++
++
++def le(value: int, width: int) -> bytes:
++    return value.to_bytes(width, "little")
++
++
++def tagged(name: str, payload: bytes) -> bytes:
++    return blake3.blake3(name.encode("ascii") + b"\0" + payload).digest()
++
++
++def main() -> None:
++    assert blake3.__version__ == "1.0.11", blake3.__version__
++    chain_id = bytes(range(32))
++    prev_id = bytes(range(32, 64))
++    tx_root = bytes(range(64, 96))
++    state_root = bytes(range(96, 128))
++    bits = le(0x1D00FFFF, 4)
++    time = le(0x010203040506, 6)
++    body = (
++        le(2, 4)
++        + le(0x1122334455667788, 8)
++        + le(0x99AABBCCDDEEFF00, 8)
++        + tx_root
++        + state_root
++    )
++    body_hash = tagged("Lotus/v2/header/body", chain_id + body)
++    output = {
++        "dependency": f"python-blake3 {blake3.__version__}",
++        "chain_id": chain_id.hex(),
++        "body_hash": body_hash.hex(),
++        "cases": [],
++    }
++    for nonce in (0x08090A0B0C0D0E0F, 0x08090A0B0C0D0E10, 0xFFFFFFFFFFFFFFFF):
++        work = bits + time + le(nonce, 8) + body_hash
++        work_hash = tagged("Lotus/v2/header/work", work)
++        block_id = tagged("Lotus/v2/blockid", prev_id + work_hash)
++        header = prev_id + bits + time + le(nonce, 8) + body
++        assert len(header) == 134
++        output["cases"].append(
++            {
++                "nonce": nonce,
++                "header": header.hex(),
++                "work_hash": work_hash.hex(),
++                "block_id": block_id.hex(),
++            }
++        )
++    print(json.dumps(output, indent=2))
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/src/lotus_v2/tagged_hash.cpp b/src/lotus_v2/tagged_hash.cpp
+new file mode 100644
+index 0000000000..e11bb09132
+--- /dev/null
++++ b/src/lotus_v2/tagged_hash.cpp
+@@ -0,0 +1,47 @@
++#include "tagged_hash.h"
++
++#include "vendor/blake3/blake3.h"
++
++#include <cstdlib>
++#include <cstring>
++
++namespace lotus::v2 {
++namespace {
++const char *Tag(HashDomain domain) {
++    switch (domain) {
++    case HashDomain::HeaderBody: return "Lotus/v2/header/body";
++    case HashDomain::HeaderWork: return "Lotus/v2/header/work";
++    case HashDomain::BlockId: return "Lotus/v2/blockid";
++    case HashDomain::Branch: return "Lotus/v2/branch";
++    case HashDomain::InputCore: return "Lotus/v2/inputcore";
++    case HashDomain::InputFull: return "Lotus/v2/inputfull";
++    case HashDomain::OwnInput: return "Lotus/v2/owninput";
++    case HashDomain::Sighash: return "Lotus/v2/sighash";
++    case HashDomain::Output: return "Lotus/v2/output";
++    case HashDomain::CoinEntry: return "Lotus/v2/coinentry";
++    case HashDomain::MerkleIndex: return "Lotus/v2/merkleidx";
++    case HashDomain::TxId: return "Lotus/v2/txid";
++    case HashDomain::TxHash: return "Lotus/v2/txhash";
++    case HashDomain::TxRoot: return "Lotus/v2/txroot";
++    case HashDomain::OutpointKey: return "Lotus/v2/outpointkey";
++    case HashDomain::Utxo: return "Lotus/v2/utxo";
++    case HashDomain::State: return "Lotus/v2/state";
++    }
++    std::abort();
++}
++} // namespace
++
++Hash TaggedHash(HashDomain domain, std::span<const uint8_t> payload) {
++    const char *tag = Tag(domain);
++    blake3_hasher hasher;
++    blake3_hasher_init(&hasher);
++    blake3_hasher_update(&hasher, tag, std::strlen(tag));
++    constexpr uint8_t separator = 0;
++    blake3_hasher_update(&hasher, &separator, 1);
++    blake3_hasher_update(&hasher, payload.data(), payload.size());
++    Hash result;
++    blake3_hasher_finalize(&hasher, result.data(), result.size());
++    return result;
++}
++
++} // namespace lotus::v2
+diff --git a/src/lotus_v2/tagged_hash.h b/src/lotus_v2/tagged_hash.h
+new file mode 100644
+index 0000000000..2d2f6cb913
+--- /dev/null
++++ b/src/lotus_v2/tagged_hash.h
+@@ -0,0 +1,36 @@
++// Copyright (c) 2026 The Lotus developers
++#ifndef LOTUS_V2_TAGGED_HASH_H
++#define LOTUS_V2_TAGGED_HASH_H
++
++#include "header.h"
++
++#include <span>
++
++namespace lotus::v2 {
++
++enum class HashDomain {
++    HeaderBody,
++    HeaderWork,
++    BlockId,
++    Branch,
++    InputCore,
++    InputFull,
++    OwnInput,
++    Sighash,
++    Output,
++    CoinEntry,
++    MerkleIndex,
++    TxId,
++    TxHash,
++    TxRoot,
++    OutpointKey,
++    Utxo,
++    State,
++};
++
++// BLAKE3(ASCII(tag) || 00 || payload). Domain is selected from the P02/P04
++// registry, never supplied as caller-controlled text.
++Hash TaggedHash(HashDomain domain, std::span<const uint8_t> payload);
++
++} // namespace lotus::v2
++#endif
+diff --git a/src/lotus_v2/test_commitment.cpp b/src/lotus_v2/test_commitment.cpp
+new file mode 100644
+index 0000000000..ff512e8e6c
+--- /dev/null
++++ b/src/lotus_v2/test_commitment.cpp
+@@ -0,0 +1,183 @@
++#include "commitment.h"
++#include "tagged_hash.h"
++
++#include <algorithm>
++#include <array>
++#include <cstdlib>
++#include <iostream>
++#include <limits>
++#include <string>
++#include <vector>
++
++using namespace lotus::v2;
++
++namespace {
++void Check(bool condition, const char *message) {
++    if (!condition) {
++        std::cerr << "V2 commitment: " << message << '\n';
++        std::exit(1);
++    }
++}
++
++std::string Hex(const Hash &hash) {
++    constexpr char chars[] = "0123456789abcdef";
++    std::string result;
++    for (uint8_t byte : hash) {
++        result.push_back(chars[byte >> 4]);
++        result.push_back(chars[byte & 15]);
++    }
++    return result;
++}
++} // namespace
++
++int main() {
++    // Constants from generate_commitment_vectors.py, Python blake3 1.0.11.
++    const std::array<uint8_t, 1> script_a{0x51};
++    const std::array<uint8_t, 1> script_b{0x52};
++    const Hash a = BranchLeaf(script_a);
++    const Hash b = BranchLeaf(script_b);
++    Check(Hex(a) == "112bec3cbe47c045afc47092808c25f75028eab2992558d036dcce16170f68ad",
++          "branch leaf domain and Bytes prefix");
++    Check(Hex(b) == "3fa652740616a55f4b2916d429b1a714784776415a7f50ab43713b149e344f01",
++          "second branch leaf");
++    Check(Hex(BranchLeaf(std::vector<uint8_t>(253, 0x51))) ==
++              "47c9f907c4db2fd08781b286fc43d000c36ce657479ed0f7a4f3c1edfc004972",
++          "CompactSize 253 boundary");
++    Check(Hex(BranchNode(a, b)) ==
++              "fcaeff7068646f8fa9d94cbf75b2ed6903aa0b5861696687556a42621ec7fd5c",
++          "branch node little-endian sorted children");
++    Check(BranchNode(a, b) == BranchNode(b, a), "branch pair commutes");
++    Check(BranchProofRoot(a, {}) == a, "zero-sibling branch proof");
++    Check(BranchProofRoot(a, std::array<Hash, 1>{b}) == BranchNode(a, b),
++          "bottom-up branch proof");
++
++    const std::array<uint8_t, 1> one{1};
++    const std::array<uint8_t, 3> output{1, 2, 3};
++    Check(Hex(InputCoreLeaf(one)) ==
++              "a21f839febf04a7c01cfb92da2b64139fef2f3a0b4fd95aee20d68aaaab564e3",
++          "core input leaf");
++    Check(Hex(InputFullLeaf(one)) ==
++              "f6b2491ca3eddd54b2e507bf743e41a17ae5ccf3839c65a03aed150195cb82fb",
++          "full input leaf domain separation");
++    Check(Hex(OutputLeaf(output)) ==
++              "2a1a059e0bba7e8f104b20c957f0f513dc3e858c4e393fe9cf1bca13e5ca5481",
++          "output leaf Bytes prefix");
++    Check(Hex(CoinEntryLeaf({})) ==
++              "e52dcda03b190fbbf9aa3f01500b77571b4b20692ad12bef4f62bb4f65f85a01",
++          "mint coin entry is Bytes(empty)");
++    Check(OutputLeaf(output) != CoinEntryLeaf(output), "output and coin domains differ");
++    const Hash own_input = TaggedHash(HashDomain::OwnInput, one);
++    const Hash sighash = TaggedHash(HashDomain::Sighash, one);
++    Check(Hex(own_input) == "b2658f901ab19e72f66bedb13ed74ac4a13fbc0f8b7d1af17b695cbca53287e5",
++          "independent own-input tag vector");
++    Check(Hex(sighash) == "152e69663b11475f32adbe5b718e3fa817076b9017dfe8478c04d8d066afb76b",
++          "independent sighash tag vector");
++    Check(own_input != sighash && own_input != InputCoreLeaf(one),
++          "signing domains remain separated from each other and input core");
++
++    const char *indexed_expected[] = {
++        "42717c875691058000ff7d89bae835b2d60733fd2082c120aa813124f68cf638",
++        "a21f839febf04a7c01cfb92da2b64139fef2f3a0b4fd95aee20d68aaaab564e3",
++        "6f5aabd435d78ab6907939b84ba1918f0132ac19f92682ac2860724941bbb6b2",
++        "2441dcdcb316227c6f323b933dc3126b509f34cb09bf013e992f74e6b5f3ff75",
++        "7d5dcfaedc0466bc9e14eec742941d1df6cc345be9bf246450a1da0acccc7bec",
++        "0cf95145c656b9452d42b34672fae162fc4fde764175902397a2b06fc2390ea2",
++    };
++    std::vector<Hash> leaves;
++    for (unsigned i = 1; i <= 5; ++i) {
++        const std::array<uint8_t, 1> value{static_cast<uint8_t>(i)};
++        leaves.push_back(InputCoreLeaf(value));
++    }
++    for (size_t n = 0; n <= leaves.size(); ++n) {
++        Check(Hex(IndexedTreeRoot(std::span(leaves).first(n))) == indexed_expected[n],
++              "independent indexed root at every count 0..5");
++    }
++    Check(IndexedNode(0, leaves[0], leaves[1]) != IndexedNode(0, leaves[1], leaves[0]),
++          "indexed sibling order matters");
++    Check(IndexedNode(0, leaves[0], leaves[1]) != IndexedNode(1, leaves[0], leaves[1]),
++          "indexed layer domain matters");
++    std::array<Hash, 2> proof_for_last{Hash{}, IndexedNode(0, leaves[0], leaves[1])};
++    Hash proof_root;
++    Check(IndexedProofRoot(leaves[2], 2, 3, proof_for_last, proof_root) &&
++              proof_root == IndexedTreeRoot(std::span(leaves).first(3)),
++          "odd-tail indexed proof");
++    proof_for_last[0] = leaves[1];
++    proof_root.fill(0xa5);
++    Check(!IndexedProofRoot(leaves[2], 2, 3, proof_for_last, proof_root) && proof_root[0] == 0xa5,
++          "reject nonzero padding and preserve failure output");
++    proof_for_last[0] = Hash{};
++    Check(!IndexedProofRoot(leaves[2], 3, 3, proof_for_last, proof_root),
++          "reject out-of-range proof index");
++    Check(!IndexedProofRoot(leaves[2], 2, 3, std::span(proof_for_last).first(1), proof_root),
++          "reject missing proof sibling");
++    Check(!IndexedProofRoot(leaves[2], 0, 1, proof_for_last, proof_root),
++          "reject excess proof sibling");
++
++    // Exercise the public uint32 count domain without allocating billions of
++    // leaves. Ceil(width / 2) must not wrap at the first level.
++    const uint32_t maximum_count = std::numeric_limits<uint32_t>::max();
++    std::array<Hash, 32> maximum_proof{};
++    proof_root.fill(0xa5);
++    Check(!IndexedProofRoot(leaves[0], 0, maximum_count,
++                            std::span(maximum_proof).first(1), proof_root) &&
++              proof_root[0] == 0xa5,
++          "maximum count rejects a truncated proof without changing output");
++    Hash maximum_expected = leaves[0];
++    for (uint16_t layer = 0; layer < maximum_proof.size(); ++layer) {
++        maximum_expected = IndexedNode(layer, maximum_expected, maximum_proof[layer]);
++    }
++    Check(IndexedProofRoot(leaves[0], 0, maximum_count, maximum_proof, proof_root) &&
++              proof_root == maximum_expected,
++          "maximum count consumes all 32 proof levels");
++
++    ChainId chain;
++    TxHeaderCore header;
++    for (unsigned i = 0; i < 32; ++i) chain[i] = i;
++    for (unsigned i = 0; i < 16; ++i) header[i] = i + 32;
++    const Hash inputs = IndexedTreeRoot(std::span(leaves).first(3));
++    const Hash outputs = IndexedTreeRoot(std::array<Hash, 1>{OutputLeaf(output)});
++    Check(Hex(TransactionId(chain, header, inputs, outputs)) ==
++              "6f624e542cc6dd97e8bd6ca4e6f62334eaa2bb215de3cca4ef32a53705ad610b",
++          "112-byte TxID preimage");
++    Check(Hex(TransactionHash(chain, header, inputs, outputs)) ==
++              "b8a0ac4394cafdbf04368907385d071014a4cefc4265bc1bc2dac9750ed2aab7",
++          "112-byte TxHash preimage and domain separation");
++    const char *tx_expected[] = {
++        "24518f458e1e543b742619b81b0f24839a1753a447ff5322ca80fcfa705b0856",
++        "79ef432f88e47dc9ee21acfd5262e3b464974ceee7298a46a34c5bb6db16fa7a",
++        "f7c9fcf8c4e900a32619ff2ef62dcf49c2f48c5bb0d92e3765249aefbd55ebc1",
++        "c189e9f413ac1b2b7042af4d88f1bc1953144f472ceb62d3858693d33f146285",
++        "79745a49217a50d5b14f40d5f2773157254a239fb843cf82fd53b08236f986ce",
++        "1949ad5d15ae127397638bcf31321189819a47b9dd96d86c7e1e8f1146777a8b",
++    };
++    std::vector<TxIdentityPair> txs;
++    for (uint8_t i = 1; i <= 5; ++i) {
++        TxIdentityPair pair{};
++        pair.tx_hash.fill(i);
++        pair.tx_id.fill(i + 16);
++        txs.push_back(pair);
++    }
++    for (size_t n = 0; n <= txs.size(); ++n) {
++        Hash root;
++        Check(TransactionRoot(std::span(txs).first(n), root) && Hex(root) == tx_expected[n],
++              "independent Merklix transaction root 0..5");
++    }
++    Hash original;
++    TransactionRoot(std::span(txs).first(3), original);
++    std::swap(txs[1], txs[2]);
++    Hash subtree_reordered;
++    Check(TransactionRoot(std::span(txs).first(3), subtree_reordered) &&
++              subtree_reordered == original,
++          "non-coinbase Subtree A is TxID-keyed and order-independent");
++    std::swap(txs[1], txs[2]);
++    std::swap(txs[0], txs[1]);
++    Hash reordered;
++    TransactionRoot(std::span(txs).first(3), reordered);
++    Check(reordered != original, "coinbase leaf position is distinguished from Subtree A");
++    std::vector<TxIdentityPair> dup_txs = {txs[0], txs[1], txs[1]};
++    Hash untouched;
++    untouched.fill(0xa5);
++    Check(!TransactionRoot(dup_txs, untouched) && untouched[0] == 0xa5,
++          "reject duplicate TxID in TransactionRoot");
++    std::cout << "V2 commitment vectors and proof boundaries passed\n";
++}
+-- 
+2.50.1 (Apple Git-155)
+

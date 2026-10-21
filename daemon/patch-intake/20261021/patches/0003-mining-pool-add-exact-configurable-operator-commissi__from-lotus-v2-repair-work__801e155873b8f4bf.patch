@@ -1,0 +1,479 @@
+From f5bf24fcae8377d826c39d2476f155d78d71b4ae Mon Sep 17 00:00:00 2001
+From: Shammah Chancellor <shammah.chancellor@notvalid.com>
+Date: Tue, 20 Oct 2026 13:07:59 -0700
+Subject: [PATCH 3/3] mining pool: add exact configurable operator commission
+
+Add ordinary ABC poolfeepercent option, default zero; parse fixed decimal percent into integer basis points. Deduct floor commission only from the existing miner slice, retain worker remainder and immutable per-job terms, and pay the explicit native pooladdress. No parser, consensus or persistence changes.
+---
+ doc/mining-pool.md                            |  23 +++
+ src/init.cpp                                  |   6 +
+ src/node/mining_pool.cpp                      |  61 +++++++-
+ src/node/mining_pool.h                        |  11 ++
+ src/test/mining_pool_tests.cpp                | 133 ++++++++++++++++++
+ .../mining_pool_operator_commission.py        |  92 ++++++++++++
+ 6 files changed, 321 insertions(+), 5 deletions(-)
+ create mode 100644 test/functional/mining_pool_operator_commission.py
+
+diff --git a/doc/mining-pool.md b/doc/mining-pool.md
+index 7857b7f21a..dce887ed0c 100644
+--- a/doc/mining-pool.md
++++ b/doc/mining-pool.md
+@@ -37,3 +37,26 @@ Missing or invalid configuration leaves statistics available with
+ job. Unknown native policies for required legacy miner-fund/staking payees fail
+ closed. Configuration becomes immutable on first worker/job use. The pool does
+ not add a legacy signing bridge or change consensus reward policy.
++
++`poolfeepercent=1.25` (or `-poolfeepercent=1.25`) allocates 1.25% of the
++existing miner slice to the explicit native `pooladdress`; the default is 0.
++This is an ordinary Bitcoin ABC option: flat config keys, existing network
++sections (for example `[regtest]`), and command-line overrides retain their
++existing behavior. No new section syntax, dotted keys, or option aliases exist.
++The operator destination also receives symbolic/newsletter fallback payouts;
++address workers receive their PPLNS portion directly. Operators should publish
++these terms; workers can read the actual basis points and address in pool stats
++and each immutable job before hashing its committed coinbase/header.
++
++Fee input is an exact decimal percentage from 0 through 100, with at most two
++decimal places (no sign, exponent, or binary floating-point conversion). In
++integer atoms, operator commission is `floor(minerSlice * basisPoints / 10000)`;
++workers divide exactly the remainder through the existing PPLNS weighting.
++Any fractional commission atom remains with workers. Existing deterministic
++PPLNS rounding assigns the final remainder to the last recipient. Positive
++allocations are retained even when small; zero allocations are omitted, except
++an all-zero reward keeps one zero output. No pool-specific dust confiscation or
++fee redirection is added. Coinbase output totals are unchanged by commission,
++and this feature does not modify consensus burn/required-payee/reward rules.
++Configuration freezes on first use; changing the file requires restarting the
++node, and previously issued jobs retain their original outputs and fee terms.
+diff --git a/src/init.cpp b/src/init.cpp
+index 6293694e8d..77ac0e6384 100644
+--- a/src/init.cpp
++++ b/src/init.cpp
+@@ -1672,6 +1672,12 @@ void SetupServerArgs(NodeContext &node) {
+         "Explicit native Lotus address for this network for built-in mining "
+         "pool default, symbolic-worker and newsletter payouts (required for jobs)",
+         ArgsManager::ALLOW_ANY, OptionsCategory::BLOCK_CREATION);
++    argsman.AddArg(
++        "-poolfeepercent=<percent>",
++        "Operator commission from the built-in pool miner reward after required "
++        "payees: exact percent 0..100 with at most two decimals (default: 0). "
++        "Requires an explicit native -pooladdress, also used for fallback payouts",
++        ArgsManager::ALLOW_ANY, OptionsCategory::BLOCK_CREATION);
+     argsman.AddArg(
+         "-poolpplnswindow=<n>",
+         strprintf("Number of shares in the built-in mining pool sliding PPLNS "
+diff --git a/src/node/mining_pool.cpp b/src/node/mining_pool.cpp
+index f5ee1be7ab..0e96c4d09b 100644
+--- a/src/node/mining_pool.cpp
++++ b/src/node/mining_pool.cpp
+@@ -79,6 +79,41 @@ UniValue ShareSubmissionResult::ToUniValue() const {
+ 
+ MiningPoolManager::MiningPoolManager() = default;
+ 
++Amount MiningPoolManager::OperatorCommission(Amount miner_slice, uint16_t bps) {
++    if (miner_slice < Amount::zero() || bps > 10000)
++        throw std::invalid_argument("Invalid pool commission amount or basis points");
++    const int64_t sats = miner_slice / SATOSHI;
++    // Divide first so no intermediate exceeds the original nonnegative amount.
++    return ((sats / 10000) * bps + ((sats % 10000) * bps) / 10000) * SATOSHI;
++}
++
++uint16_t MiningPoolManager::ParseOperatorFeePercent(const std::string &percent) {
++    auto invalid = []() -> uint16_t {
++        throw std::invalid_argument("Pool fee percent must be 0..100 with at most two decimal places");
++    };
++    const auto dot = percent.find('.');
++    const size_t integer_end = dot == std::string::npos ? percent.size() : dot;
++    if (integer_end == 0) return invalid();
++    uint16_t whole = 0;
++    for (size_t i = 0; i < integer_end; ++i) {
++        if (percent[i] < '0' || percent[i] > '9') return invalid();
++        whole = whole * 10 + percent[i] - '0';
++        if (whole > 100) return invalid();
++    }
++    uint16_t fraction = 0;
++    if (dot != std::string::npos) {
++        const auto digits = percent.size() - dot - 1;
++        if (digits == 0 || digits > 2) return invalid();
++        for (size_t i = dot + 1; i < percent.size(); ++i) {
++            if (percent[i] < '0' || percent[i] > '9') return invalid();
++            fraction = fraction * 10 + percent[i] - '0';
++        }
++        if (digits == 1) fraction *= 10;
++    }
++    const uint16_t bps = whole * 100 + fraction;
++    return bps <= 10000 ? bps : invalid();
++}
++
+ void MiningPoolManager::Configure(const ArgsManager &args,
+                                   const Config &config) {
+     std::lock_guard<std::mutex> lock(m_mutex);
+@@ -88,6 +123,7 @@ void MiningPoolManager::Configure(const ArgsManager &args,
+     if (m_next_job_id != 1 || !m_workers.empty()) {
+         throw std::logic_error("Mining pool configuration is frozen after first use");
+     }
++    m_operator_fee_bps = ParseOperatorFeePercent(args.GetArg("-poolfeepercent", "0"));
+     m_treasury_rewards = args.GetBoolArg(
+         "-avalanchetreasury", args.GetBoolArg("-avalanchestakingrewards", true));
+     m_staking_rewards = args.GetBoolArg(
+@@ -467,7 +503,10 @@ UniValue MiningPoolManager::GetMiningJobJSON(const Config &config,
+         std::max(Amount::zero(),
+                  blockReward - minerFundAmount - stakingRewardsAmount);
+ 
+-    // Aggregate PPLNS payout weights by scriptPubKey in order of appearance
++    const Amount operatorCommission = OperatorCommission(minerSlice, m_operator_fee_bps);
++    const Amount workerReward = minerSlice - operatorCommission;
++
++    // Aggregate PPLNS payout weights by native policy in order of appearance
+     std::vector<std::pair<CTxOut, double>> pplns_payouts;
+     double total_weight = 0.0;
+     for (const PPLNSShare &share : m_pplns_window) {
+@@ -509,9 +548,9 @@ UniValue MiningPoolManager::GetMiningJobJSON(const Config &config,
+     if (pplns_payouts.empty() || total_weight <= 0.0) {
+         const CTxOut &recipient =
+             worker.is_newsletter_subscriber ? fallback : worker.payout;
+-        add_payout(minerSlice, recipient);
++        if (workerReward > Amount::zero()) add_payout(workerReward, recipient);
+     } else {
+-        const int64_t total_miner_sats = minerSlice / SATOSHI;
++        const int64_t total_miner_sats = workerReward / SATOSHI;
+         int64_t allocated_sats = 0;
+         for (size_t i = 0; i < pplns_payouts.size(); ++i) {
+             int64_t sats = 0;
+@@ -530,11 +569,13 @@ UniValue MiningPoolManager::GetMiningJobJSON(const Config &config,
+                 add_payout(sats * SATOSHI, pplns_payouts[i].first);
+             }
+         }
+-        if (coinbaseTx.vout.empty()) {
+-            add_payout(minerSlice, fallback);
++        if (coinbaseTx.vout.empty() && workerReward > Amount::zero()) {
++            add_payout(workerReward, fallback);
+         }
+     }
+ 
++    if (operatorCommission > Amount::zero()) add_payout(operatorCommission, fallback);
++    if (coinbaseTx.vout.empty()) add_payout(Amount::zero(), fallback);
+     ::node::SetCoinbaseOutputs(coinbaseTx, coinbaseTx.vout);
+     const std::vector<CTxOut> payouts = coinbaseTx.vout;
+     ::node::PadCoinbaseToMinSize(coinbaseTx);
+@@ -601,6 +642,10 @@ UniValue MiningPoolManager::GetMiningJobJSON(const Config &config,
+     job_slot.created_time = curtime;
+     job_slot.block_size = blocksize;
+     job_slot.block_reward = blockReward;
++    job_slot.operator_fee_bps = m_operator_fee_bps;
++    job_slot.operator_address = m_operator_fee_bps ? m_pool_address_arg : "";
++    job_slot.operator_commission = operatorCommission;
++    job_slot.worker_reward = workerReward;
+     job_slot.block_sealed = false;
+ 
+     if (out_job) {
+@@ -644,6 +689,10 @@ UniValue MiningPoolManager::GetMiningJobJSON(const Config &config,
+     result.pushKV("target", worker.share_target.GetHex());
+     result.pushKV("coinbase_tx_hex", EncodeHexTx(*coinbaseRef));
+     result.pushKV("coinbase_outputs", std::move(coinbase_outputs));
++    result.pushKV("operator_fee_bps", job_slot.operator_fee_bps);
++    result.pushKV("operator_address", job_slot.operator_address);
++    result.pushKV("operator_commission_sats", int64_t(operatorCommission / SATOSHI));
++    result.pushKV("worker_reward_sats", int64_t(workerReward / SATOSHI));
+     return result;
+ }
+ 
+@@ -854,6 +903,8 @@ UniValue MiningPoolManager::GetPoolInfoJSON() const {
+     obj.pushKV("payout_ready", m_fallback_payout.has_value());
+     obj.pushKV("payout_error", m_payout_error);
+     obj.pushKV("pool_address", m_pool_address_arg);
++    obj.pushKV("operator_fee_bps", m_operator_fee_bps);
++    obj.pushKV("operator_address", m_operator_fee_bps ? m_pool_address_arg : "");
+     obj.pushKV("active_operations", static_cast<uint64_t>(m_active_operations));
+     obj.pushKV("active_workers", static_cast<uint64_t>(m_workers.size()));
+     obj.pushKV("pool_hashrate", pool_hashrate);
+diff --git a/src/node/mining_pool.h b/src/node/mining_pool.h
+index 0bbdc56d17..02e73d01a7 100644
+--- a/src/node/mining_pool.h
++++ b/src/node/mining_pool.h
+@@ -62,6 +62,11 @@ struct PoolJob {
+     int64_t created_time{0};
+     uint64_t block_size{0};
+     Amount block_reward{Amount::zero()};
++    // Immutable economics committed by this job's coinbase/header.
++    uint16_t operator_fee_bps{0};
++    std::string operator_address;
++    Amount operator_commission{Amount::zero()};
++    Amount worker_reward{Amount::zero()};
+     bool block_sealed{false};
+     std::unordered_set<uint64_t> submitted_nonces;
+ };
+@@ -120,6 +125,11 @@ class MiningPoolManager {
+ public:
+     MiningPoolManager();
+ 
++    /** Exact floor commission; rejects negative amounts or bps above 10000. */
++    static Amount OperatorCommission(Amount miner_slice, uint16_t bps);
++    /** Parse 0..100 percent with at most two decimal places, exactly. */
++    static uint16_t ParseOperatorFeePercent(const std::string &percent);
++
+     /** Configure pool settings from CLI/config arguments. */
+     void Configure(const ArgsManager &args, const Config &config);
+ 
+@@ -190,6 +200,7 @@ private:
+     uint256 m_initial_share_target;
+     bool m_configured{false};
+     bool m_enabled{DEFAULT_MINING_POOL_ENABLED};
++    uint16_t m_operator_fee_bps{0};
+     std::string m_pool_address_arg;
+     std::optional<CTxOut> m_fallback_payout;
+     std::string m_payout_error;
+diff --git a/src/test/mining_pool_tests.cpp b/src/test/mining_pool_tests.cpp
+index e97bf42253..eae279d5e2 100644
+--- a/src/test/mining_pool_tests.cpp
++++ b/src/test/mining_pool_tests.cpp
+@@ -38,8 +38,10 @@
+ #include <atomic>
+ #include <chrono>
+ #include <cstdint>
++#include <cstdlib>
+ #include <cstring>
+ #include <future>
++#include <limits>
+ #include <string>
+ #include <thread>
+ 
+@@ -137,6 +139,137 @@ struct MiningPoolTestSetup : TestChain100Setup {
+ 
+ BOOST_FIXTURE_TEST_SUITE(mining_pool_tests, MiningPoolTestSetup)
+ 
++BOOST_AUTO_TEST_CASE(operator_commission_exact_percent_parser) {
++    using Pool = node::MiningPoolManager;
++    for (const auto &[text, bps] : std::vector<std::pair<std::string, int>>{
++        {"0", 0}, {"0.00", 0}, {"0.01", 1}, {"1.2", 120}, {"1.25", 125},
++        {"99.99", 9999}, {"100", 10000}, {"100.00", 10000}})
++        BOOST_CHECK_EQUAL(Pool::ParseOperatorFeePercent(text), bps);
++    for (const auto *text : {"", "-1", "100.01", "101", "nan", "1e1", "+1",
++                             ".5", "1.", "0.001", "1.2.3", "1%", " 1", "1 "})
++        BOOST_CHECK_THROW(Pool::ParseOperatorFeePercent(text), std::invalid_argument);
++}
++
++BOOST_AUTO_TEST_CASE(operator_commission_integer_rounding) {
++    using Pool = node::MiningPoolManager;
++    for (const uint16_t bps : {0, 1, 125, 9999, 10000}) {
++        for (const int64_t amount : {0LL, 1LL, 79LL, 80LL, 9999LL, 10000LL,
++                                    10001LL, 5000000000LL}) {
++            const auto fee = Pool::OperatorCommission(amount * SATOSHI, bps);
++            BOOST_CHECK_EQUAL(fee / SATOSHI, (amount * bps) / 10000);
++            BOOST_CHECK(fee >= Amount::zero());
++            BOOST_CHECK(fee <= amount * SATOSHI);
++            BOOST_CHECK_EQUAL(((amount * SATOSHI - fee) + fee) / SATOSHI, amount);
++        }
++    }
++    const int64_t huge = std::numeric_limits<int64_t>::max();
++    BOOST_CHECK_EQUAL(Pool::OperatorCommission(huge * SATOSHI, 10000) / SATOSHI, huge);
++    BOOST_CHECK_THROW(Pool::OperatorCommission(-SATOSHI, 100), std::invalid_argument);
++    BOOST_CHECK_THROW(Pool::OperatorCommission(SATOSHI, 10001), std::invalid_argument);
++}
++
++BOOST_AUTO_TEST_CASE(operator_commission_jobs_conserve_and_freeze) {
++    const Config &config = GetConfig();
++    CKey worker_key;
++    worker_key.MakeNewKey(true);
++    const auto worker_address = NativeAddress(worker_key);
++    const auto operator_address = NativeAddress(coinbaseKey);
++    for (const auto &[percent, bps] : std::vector<std::pair<std::string, int>>{
++            {"0", 0}, {"0.01", 1}, {"1.25", 125}, {"100", 10000}}) {
++        ArgsManager args;
++        args.ForceSetArg("-pooladdress", operator_address);
++        args.ForceSetArg("-poolfeepercent", percent);
++        node::MiningPoolManager pool;
++        pool.Configure(args, config);
++        lotus::v2::node::PoolJob cached;
++        const auto job = pool.GetMiningJobJSON(config, m_node, worker_address, &cached);
++        BOOST_CHECK_EQUAL(job.find_value("operator_fee_bps").getInt<int>(), bps);
++        const auto fee = node::MiningPoolManager::OperatorCommission(cached.block_reward, bps);
++        BOOST_CHECK_EQUAL(cached.operator_commission / SATOSHI, fee / SATOSHI);
++        BOOST_CHECK_EQUAL(cached.worker_reward / SATOSHI,
++                          (cached.block_reward - fee) / SATOSHI);
++        Amount total = Amount::zero(), worker_paid = Amount::zero(), operator_paid = Amount::zero();
++        for (const auto &output : cached.coinbase_tx->vout) {
++            BOOST_CHECK(!output.IsLegacy());
++            total += output.nValue;
++            if (output.vBranches == std::vector<lotus::v2::Hash32>{AddressRoot(worker_address)})
++                worker_paid += output.nValue;
++            else if (output.vBranches == std::vector<lotus::v2::Hash32>{AddressRoot(operator_address)})
++                operator_paid += output.nValue;
++            else BOOST_FAIL("Unexpected recipient");
++        }
++        BOOST_CHECK(total == cached.block_reward);
++        BOOST_CHECK(operator_paid == fee);
++        BOOST_CHECK(worker_paid == cached.worker_reward);
++        const auto wire_before = EncodeHexTx(*cached.coinbase_tx);
++        args.ForceSetArg("-poolfeepercent", "50");
++        BOOST_CHECK_THROW(pool.Configure(args, config), std::logic_error);
++        BOOST_CHECK_EQUAL(pool.GetPoolInfoJSON().find_value("operator_fee_bps").getInt<int>(), bps);
++        BOOST_CHECK_EQUAL(EncodeHexTx(*cached.coinbase_tx), wire_before);
++    }
++    for (const auto &address : {std::string(), std::string("invalid"),
++             EncodeDestination(PKHash(coinbaseKey.GetPubKey()), config)}) {
++        ArgsManager args;
++        args.ForceSetArg("-poolfeepercent", "1.25");
++        args.ForceSetArg("-pooladdress", address);
++        node::MiningPoolManager pool;
++        pool.Configure(args, config);
++        BOOST_CHECK(!pool.GetPoolInfoJSON().find_value("payout_ready").get_bool());
++        BOOST_CHECK_THROW(pool.GetMiningJobJSON(config, m_node, worker_address), std::runtime_error);
++    }
++    for (const auto *invalid : {"-1", "100.01", "1.234", "NaN"}) {
++        ArgsManager args;
++        args.ForceSetArg("-poolfeepercent", invalid);
++        node::MiningPoolManager pool;
++        BOOST_CHECK_THROW(pool.Configure(args, config), std::invalid_argument);
++    }
++}
++
++BOOST_AUTO_TEST_CASE(operator_commission_preserves_multi_worker_pplns_remainder) {
++    const Config &config = GetConfig();
++    ArgsManager args;
++    const auto operator_address = NativeAddress(coinbaseKey);
++    args.ForceSetArg("-pooladdress", operator_address);
++    args.ForceSetArg("-poolfeepercent", "1.25");
++    node::MiningPoolManager pool;
++    pool.Configure(args, config);
++    CKey a, b;
++    a.MakeNewKey(true);
++    b.MakeNewKey(true);
++    const auto address_a = NativeAddress(a), address_b = NativeAddress(b);
++    for (const auto &[address, count] :
++         std::vector<std::pair<std::string, int>>{{address_a, 3}, {address_b, 1}}) {
++        lotus::v2::node::PoolJob cached;
++        lotus::v2::node::PoolWorker worker;
++        pool.GetMiningJobJSON(config, m_node, address, &cached, &worker);
++        uint64_t cursor = 1;
++        for (int i = 0; i < count; ++i) {
++            pool.SetWorkerShareTarget(address, worker.share_target, config);
++            const auto nonce = FindShareNonce(cached.header_134, worker.nonce_prefix,
++                worker.share_target, cached.network_target, true, cursor);
++            cursor = (nonce & 0xFFFFFFFFFFULL) + 1;
++            const auto result = pool.SubmitShare(config, m_node, cached.job_id,
++                                                address, std::nullopt, nonce);
++            BOOST_REQUIRE(result.accepted);
++            BOOST_CHECK(!result.block_found);
++        }
++    }
++    lotus::v2::node::PoolJob final_job;
++    pool.GetMiningJobJSON(config, m_node, address_a, &final_job);
++    Amount paid_a = Amount::zero(), paid_b = Amount::zero(), paid_operator = Amount::zero();
++    for (const auto &output : final_job.coinbase_tx->vout) {
++        const auto &root = output.vBranches.at(0);
++        if (root == AddressRoot(address_a)) paid_a += output.nValue;
++        else if (root == AddressRoot(address_b)) paid_b += output.nValue;
++        else if (root == AddressRoot(operator_address)) paid_operator += output.nValue;
++        else BOOST_FAIL("Unexpected PPLNS recipient");
++    }
++    BOOST_CHECK(paid_operator == final_job.operator_commission);
++    BOOST_CHECK(paid_a + paid_b == final_job.worker_reward);
++    BOOST_CHECK(paid_a + paid_b + paid_operator == final_job.block_reward);
++    BOOST_CHECK_LE(std::abs((paid_a - 3 * paid_b) / SATOSHI), 2);
++}
++
+ BOOST_AUTO_TEST_CASE(native_payout_configuration_failclosed) {
+     const Config &config = GetConfig();
+     for (const auto &address : {std::string(), std::string("invalid"),
+diff --git a/test/functional/mining_pool_operator_commission.py b/test/functional/mining_pool_operator_commission.py
+new file mode 100644
+index 0000000000..45d52cebee
+--- /dev/null
++++ b/test/functional/mining_pool_operator_commission.py
+@@ -0,0 +1,92 @@
++#!/usr/bin/env python3
++# Copyright (c) 2026 The Lotus developers
++# Distributed under the MIT software license, see the accompanying
++# file COPYING or http://www.opensource.org/licenses/mit-license.php.
++"""Exact operator commission conserves rewards and pays spendable native coins."""
++
++from mining_pool_native_payouts import native_identity, signed_spend, solve_pool_job
++from test_framework.messages import CTransaction, FromHex
++from test_framework.test_framework import BitcoinTestFramework
++from test_framework.test_node import ErrorMatch
++from test_framework.util import assert_equal
++
++
++class MiningPoolOperatorCommissionTest(BitcoinTestFramework):
++    def set_test_params(self):
++        self.num_nodes = 1
++        self.setup_clean_chain = True
++        self.operator = native_identity(1)
++        self.worker = native_identity(2)
++        self.extra_args = [
++            [
++                f"-pooladdress={self.operator[0]}",
++                "-poolfeepercent=1.25",
++                "-gbtwithoutpeers=1",
++            ]
++        ]
++
++    def run_test(self):
++        node = self.nodes[0]
++        info = node.getpoolinfo()
++        assert_equal(info["operator_fee_bps"], 125)
++        assert_equal(info["operator_address"], self.operator[0])
++        job = node.getminingjob(self.worker[0])
++        assert_equal(job["operator_fee_bps"], 125)
++        assert_equal(job["operator_address"], self.operator[0])
++        coinbase = FromHex(CTransaction(), job["coinbase_tx_hex"])
++        assert_equal(len(coinbase.vout), 2)
++        total = sum(output.nValue for output in coinbase.vout)
++        assert_equal(job["operator_commission_sats"], total * 125 // 10000)
++        assert_equal(job["worker_reward_sats"], total - job["operator_commission_sats"])
++        assert_equal(coinbase.vout[0].nValue, job["worker_reward_sats"])
++        assert_equal(coinbase.vout[1].nValue, job["operator_commission_sats"])
++        for output, advertised in zip(coinbase.vout, job["coinbase_outputs"]):
++            assert_equal(advertised["value_sats"], output.nValue)
++        block = solve_pool_job(node, job, self.worker[0])
++        assert_equal(node.getblock(block)["tx"][0], coinbase.txid_hex)
++        spends = [
++            signed_spend(coinbase, 0, self.worker),
++            signed_spend(coinbase, 1, self.operator),
++        ]
++        for tx in spends:
++            assert not node.testmempoolaccept([tx.serialize().hex()])[0]["allowed"]
++        node.rpc.generatetoaddress(100, self.operator[0], 1_000_000, 7)
++        wrong = signed_spend(coinbase, 0, self.operator)
++        assert not node.testmempoolaccept([wrong.serialize().hex()])[0]["allowed"]
++        for tx in spends:
++            assert_equal(node.sendrawtransaction(tx.serialize().hex()), tx.txid_hex)
++        mined = node.rpc.generatetoaddress(1, self.operator[0], 1_000_000, 7)[0]
++        for tx in spends:
++            assert tx.txid_hex in node.getblock(mined)["tx"]
++
++        self.log.info("Stock network-section configuration and CLI precedence")
++        self.stop_node(0)
++        with open(node.bitcoinconf, "a", encoding="utf-8") as config:
++            config.write(
++                f"\n[regtest]\npooladdress={self.operator[0]}\npoolfeepercent=2.50\n"
++            )
++        self.start_node(0, ["-poolfeepercent=0"])
++        assert_equal(node.getpoolinfo()["operator_fee_bps"], 0)
++        zero = node.getminingjob(self.worker[0])
++        assert_equal(zero["operator_commission_sats"], 0)
++        assert_equal(zero["operator_address"], "")
++        assert_equal(len(FromHex(CTransaction(), zero["coinbase_tx_hex"]).vout), 1)
++        self.restart_node(0, [])
++        assert_equal(node.getpoolinfo()["operator_fee_bps"], 250)
++        self.restart_node(0, ["-poolfeepercent=100"])
++        all_fee = node.getminingjob(self.worker[0])
++        assert_equal(all_fee["worker_reward_sats"], 0)
++        assert_equal(len(FromHex(CTransaction(), all_fee["coinbase_tx_hex"]).vout), 1)
++        self.stop_node(0)
++        for invalid in ["-1", "100.01", "1.234", "NaN"]:
++            node.assert_start_raises_init_error(
++                extra_args=[f"-poolfeepercent={invalid}"],
++                expected_msg="Pool fee percent must be 0..100 with at most two decimal places",
++                match=ErrorMatch.PARTIAL_REGEX,
++            )
++        self.start_node(0, [])
++        assert node.verifychain(3, 10)
++
++
++if __name__ == "__main__":
++    MiningPoolOperatorCommissionTest().main()
+-- 
+2.50.1 (Apple Git-155)
+

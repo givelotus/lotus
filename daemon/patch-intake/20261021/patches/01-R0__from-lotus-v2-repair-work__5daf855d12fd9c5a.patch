@@ -1,0 +1,660 @@
+From f63341e08e3e975f360cef9b750e717bd9fbf8f9 Mon Sep 17 00:00:00 2001
+From: Canonical endpoint audit <audit@localhost>
+Date: Sun, 18 Oct 2026 21:10:03 -0700
+Subject: [PATCH] net: initiate capability-gated Merklix live-set
+ reconciliation
+
+---
+ src/init.cpp                                  |  8 ++
+ src/net/v2_protocol_handler.cpp               | 54 +++++++++++-
+ src/net/v2_protocol_handler.h                 | 14 +++
+ src/net_processing.cpp                        |  3 +
+ src/protocol.cpp                              |  5 +-
+ src/protocol.h                                |  5 ++
+ src/test/CMakeLists.txt                       |  1 +
+ src/test/merklix_wire_tests.cpp               | 27 ++++++
+ src/test/v2_protocol_handler_tests.cpp        | 87 ++++++++++++++++++-
+ test/functional/p2p_merklix_initiation.py     | 78 +++++++++++++++++
+ .../test_framework/merklix_relay.py           | 23 +++++
+ 11 files changed, 301 insertions(+), 4 deletions(-)
+ create mode 100644 src/test/merklix_wire_tests.cpp
+ create mode 100644 test/functional/p2p_merklix_initiation.py
+ create mode 100644 test/functional/test_framework/merklix_relay.py
+
+diff --git a/src/init.cpp b/src/init.cpp
+index f39a733f94..3a48587441 100644
+--- a/src/init.cpp
++++ b/src/init.cpp
+@@ -598,6 +598,10 @@ void SetupServerArgs(NodeContext &node) {
+         "pivot for shallow reorg safety (0 to peel all the way to Genesis, "
+         "default: 50)",
+         ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
++    argsman.AddArg(
++        "-merklixreconciliation",
++        "Advertise Merklix reconciliation and initiate changed-set announcements (default: 1)",
++        ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
+     argsman.AddArg(
+         "-serveutxoshards",
+         "Advertise NODE_UTXO_SHARD and serve Tachyon SnapSync UTXO shards and "
+@@ -3037,6 +3041,10 @@ bool AppInitMain(Config &config, RPCServer &rpcServer,
+         nLocalServices = ServiceFlags(nLocalServices | NODE_UTXO_SHARD);
+     }
+ 
++    if (args.GetBoolArg("-merklixreconciliation", true)) {
++        nLocalServices = ServiceFlags(nLocalServices | NODE_MERKLIX);
++    }
++
+     PeerManager::Options peerman_opts{};
+     ApplyArgsManOptions(args, peerman_opts);
+ 
+diff --git a/src/net/v2_protocol_handler.cpp b/src/net/v2_protocol_handler.cpp
+index d0afb7c99a..2320c906d5 100644
+--- a/src/net/v2_protocol_handler.cpp
++++ b/src/net/v2_protocol_handler.cpp
+@@ -346,7 +346,8 @@ bool V2PeerProtocolHandler::TryHandleMessage(
+         HandleMerklixSync(pfrom, vRecv, time_received);
+         return true;
+     }
+-    if (msg_type == NetMsgType::GETMERKLIXBUCK) {
++    if (msg_type == NetMsgType::GETMERKLIXBUCK ||
++        msg_type == NetMsgType::LEGACY_GETMERKLIXBUCK) {
+         HandleGetMerklixBuck(pfrom, vRecv, time_received);
+         return true;
+     }
+@@ -1201,6 +1202,56 @@ bool V2PeerProtocolHandler::IsHighBandwidthShortTxPeer(NodeId peer_id) const {
+     return m_high_bandwidth_shorttx_peers.count(peer_id) > 0;
+ }
+ 
++bool V2PeerProtocolHandler::MaybeSendSync(
++    CNode &peer, std::chrono::microseconds now, std::chrono::milliseconds cadence) {
++    if (!(GetPeerServices(peer.GetId()) & NODE_MERKLIX) ||
++        !peer.fSuccessfullyConnected || peer.fDisconnect ||
++        peer.IsBlockOnlyConn() || peer.IsAddrFetchConn()) {
++        return false;
++    }
++    const auto generation = m_mempool.GetTransactionsUpdated();
++    {
++        LOCK(m_mutex);
++        auto &state = m_sync_announcements[peer.GetId()];
++        if (now < state.next) {
++            return false;
++        }
++        state.next = now + std::max(cadence, std::chrono::milliseconds{100});
++        if (state.generation == generation &&
++            now - state.last_sent < std::chrono::seconds{1}) {
++            return false;
++        }
++        state.generation = generation;
++    }
++    // LIVE_MEMPOOL's null context is deliberately not cached as a scoped set:
++    // SHORTTX validation updates the real mempool, and later announcements
++    // reflect removals and tip changes as well as additions. Keep the existing
++    // wire encoding; capability advertisement opts peers into initiation.
++    std::optional<MerklixSyncSummary> cached;
++    {
++        LOCK(m_mutex);
++        if (m_live_sync_summary && m_live_sync_generation == generation) {
++            cached = m_live_sync_summary;
++        }
++    }
++    const auto summary = cached ? *cached :
++        BuildSyncSummary(ReconScope::LIVE_MEMPOOL, uint256{});
++    {
++        LOCK(m_mutex);
++        auto &state = m_sync_announcements[peer.GetId()];
++        m_live_sync_summary = summary;
++        m_live_sync_generation = generation;
++        if (state.root == summary.candidate_root &&
++            now - state.last_sent < std::chrono::seconds{1}) {
++            return false;
++        }
++        state.root = summary.candidate_root;
++        state.last_sent = now;
++    }
++    m_connman.PushMessage(&peer, NetMsg::Make(NetMsgType::MERKLIXSYNC, summary));
++    return true;
++}
++
+ void V2PeerProtocolHandler::RemovePeer(NodeId peer_id) {
+     LOCK(m_mutex);
+     for (auto it = m_pending_shorttx_requests.begin();
+@@ -1220,6 +1271,7 @@ void V2PeerProtocolHandler::RemovePeer(NodeId peer_id) {
+     m_peer_known_blocks.erase(peer_id);
+     m_peer_nodes.erase(peer_id);
+     m_peer_services.erase(peer_id);
++    m_sync_announcements.erase(peer_id);
+     if (m_swarm.state == FastSyncSwarmState::FETCHING_ROOTS ||
+         m_swarm.state == FastSyncSwarmState::FETCHING_SHARDS ||
+         m_swarm.state == FastSyncSwarmState::PIVOT_ACTIVE_PEELING) {
+diff --git a/src/net/v2_protocol_handler.h b/src/net/v2_protocol_handler.h
+index 020b9c37e2..4634ac55a6 100644
+--- a/src/net/v2_protocol_handler.h
++++ b/src/net/v2_protocol_handler.h
+@@ -527,6 +527,11 @@ public:
+     FastSyncSwarmStatus GetFastSyncSwarmStatus() const
+         EXCLUSIVE_LOCKS_REQUIRED(!m_mutex);
+ 
++    /** Announce a changed live set at most once per cadence to capable peers. */
++    bool MaybeSendSync(CNode &peer, std::chrono::microseconds now,
++                       std::chrono::milliseconds cadence = std::chrono::milliseconds{100})
++        EXCLUSIVE_LOCKS_REQUIRED(!m_mutex);
++
+     /**
+      * Register a candidate transaction overlay for O(1) sealedheader
+      * reconstruction keyed by the parent block hash (or block merkle root).
+@@ -753,6 +758,15 @@ private:
+     std::optional<bool> m_serve_utxo_shards_override GUARDED_BY(m_mutex);
+     std::unordered_map<NodeId, CNode *> m_peer_nodes GUARDED_BY(m_mutex);
+     std::unordered_map<NodeId, ServiceFlags> m_peer_services GUARDED_BY(m_mutex);
++    struct SyncAnnouncement {
++        std::chrono::microseconds next{};
++        std::optional<uint256> root;
++        std::optional<unsigned int> generation;
++        std::chrono::microseconds last_sent{};
++    };
++    std::unordered_map<NodeId, SyncAnnouncement> m_sync_announcements GUARDED_BY(m_mutex);
++    std::optional<MerklixSyncSummary> m_live_sync_summary GUARDED_BY(m_mutex);
++    unsigned int m_live_sync_generation GUARDED_BY(m_mutex){0};
+     FastSyncSwarmCoordinatorState m_swarm GUARDED_BY(m_mutex);
+     std::map<BlockHash, std::vector<CandidateOverlayEntry>>
+         m_candidate_overlays GUARDED_BY(m_mutex);
+diff --git a/src/net_processing.cpp b/src/net_processing.cpp
+index cd94257d33..411e5c9aa7 100644
+--- a/src/net_processing.cpp
++++ b/src/net_processing.cpp
+@@ -9302,6 +9302,9 @@ bool PeerManagerImpl::SendMessages(const Config &config, CNode *pto) {
+ 
+     const auto current_time{GetTime<std::chrono::microseconds>()};
+     m_v2_protocol_handler.CheckFastSyncTimeouts(pto->GetId(), current_time);
++    if (gArgs.GetBoolArg("-merklixreconciliation", true)) {
++        m_v2_protocol_handler.MaybeSendSync(*pto, current_time);
++    }
+ 
+     if (pto->IsAddrFetchConn() &&
+         current_time - pto->m_connected > 10 * AVG_ADDRESS_BROADCAST_INTERVAL) {
+diff --git a/src/protocol.cpp b/src/protocol.cpp
+index 7189cab689..a38ebbd11d 100644
+--- a/src/protocol.cpp
++++ b/src/protocol.cpp
+@@ -64,7 +64,8 @@ const char *MINEDHEADER = "minedheader";
+ const char *SEALEDHEADER = "sealedheader";
+ const char *SEALEDBLOCK = "sealedblock";
+ const char *MERKLIXSYNC = "merklixsync";
+-const char *GETMERKLIXBUCK = "getmerklixbuck";
++const char *LEGACY_GETMERKLIXBUCK = "getmerklixbuck";
++const char *GETMERKLIXBUCK = "getmrklbckt";
+ const char *MERKLIXBUCK = "merklixbuck";
+ const char *GETSHORTTX = "getshorttx";
+ const char *SHORTTX = "shorttx";
+@@ -280,6 +281,8 @@ static std::string serviceFlagToStr(const size_t bit) {
+             return "AVALANCHE";
+         case NODE_UTXO_SHARD:
+             return "UTXO_SHARD";
++        case NODE_MERKLIX:
++            return "MERKLIX";
+         default:
+             std::ostringstream stream;
+             stream.imbue(std::locale::classic());
+diff --git a/src/protocol.h b/src/protocol.h
+index 11e94eaea9..593e6567fa 100644
+--- a/src/protocol.h
++++ b/src/protocol.h
+@@ -341,6 +341,8 @@ extern const char *MERKLIXSYNC;
+  * Requests depth-8 sub-bucket algebraic syndromes for mismatched depth-4
+  * buckets.
+  */
++// Pre-capability name exceeded the 12-byte transport command limit.
++extern const char *LEGACY_GETMERKLIXBUCK;
+ extern const char *GETMERKLIXBUCK;
+ 
+ /**
+@@ -458,6 +460,9 @@ enum ServiceFlags : uint64_t {
+     // NODE_UTXO_SHARD means the node supports Tachyon SnapSync UTXO shard
+     // export, reverse block undo serving, and Avalanche state-anchor polling.
+     NODE_UTXO_SHARD = (1 << 25),
++
++    // Supports the original Merklix reconciliation message encodings.
++    NODE_MERKLIX = (1 << 26),
+ };
+ 
+ /**
+diff --git a/src/test/CMakeLists.txt b/src/test/CMakeLists.txt
+index a3947344b0..a3c6f4a49d 100644
+--- a/src/test/CMakeLists.txt
++++ b/src/test/CMakeLists.txt
+@@ -276,6 +276,7 @@ add_boost_unit_tests_to_suite(bitcoin test_bitcoin
+ 		validation_flush_tests.cpp
+ 		validation_tests.cpp
+ 		validationinterface_tests.cpp
++		merklix_wire_tests.cpp
+ 		blockindex_comparator_tests.cpp
+ 
+ 		# RPC Tests
+diff --git a/src/test/merklix_wire_tests.cpp b/src/test/merklix_wire_tests.cpp
+new file mode 100644
+index 0000000000..7d5b56b59f
+--- /dev/null
++++ b/src/test/merklix_wire_tests.cpp
+@@ -0,0 +1,27 @@
++// Copyright (c) 2026 The Lotus developers
++// Distributed under the MIT software license, see the accompanying
++// file COPYING or http://www.opensource.org/licenses/mit-license.php.
++#include <protocol.h>
++#include <streams.h>
++#include <boost/test/unit_test.hpp>
++BOOST_AUTO_TEST_SUITE(merklix_wire_tests)
++BOOST_AUTO_TEST_CASE(all_enumerated_commands_fit_and_roundtrip_transport_header) {
++    const CMessageHeader::MessageMagic magic{{1, 2, 3, 4}};
++    BOOST_CHECK_EQUAL(std::string(NetMsgType::GETMERKLIXBUCK), "getmrklbckt");
++    BOOST_CHECK_GT(std::string(NetMsgType::LEGACY_GETMERKLIXBUCK).size(),
++                   CMessageHeader::MESSAGE_TYPE_SIZE);
++    for (const auto &command : getAllNetMessageTypes()) {
++        BOOST_REQUIRE_LE(command.size(), CMessageHeader::MESSAGE_TYPE_SIZE);
++        CMessageHeader header(magic, command.c_str(), 42);
++        DataStream bytes;
++        bytes << header;
++        BOOST_CHECK_EQUAL(bytes.size(), CMessageHeader::HEADER_SIZE);
++        CMessageHeader parsed;
++        bytes >> parsed;
++        BOOST_CHECK(parsed.IsMessageTypeValid());
++        BOOST_CHECK_EQUAL(parsed.GetMessageType(), command);
++        BOOST_CHECK_EQUAL(parsed.nMessageSize, 42U);
++        BOOST_CHECK(parsed.pchMessageStart == magic);
++    }
++}
++BOOST_AUTO_TEST_SUITE_END()
+diff --git a/src/test/v2_protocol_handler_tests.cpp b/src/test/v2_protocol_handler_tests.cpp
+index 5b2d20a94a..b609503890 100644
+--- a/src/test/v2_protocol_handler_tests.cpp
++++ b/src/test/v2_protocol_handler_tests.cpp
+@@ -106,6 +106,8 @@ BOOST_AUTO_TEST_CASE(v2_protocol_message_types_and_headers) {
+     BOOST_CHECK_EQUAL(std::string(NetMsgType::SEALEDHEADER), "sealedheader");
+     BOOST_CHECK_EQUAL(std::string(NetMsgType::MERKLIXSYNC), "merklixsync");
+     BOOST_CHECK_EQUAL(std::string(NetMsgType::GETMERKLIXBUCK),
++                      "getmrklbckt");
++    BOOST_CHECK_EQUAL(std::string(NetMsgType::LEGACY_GETMERKLIXBUCK),
+                       "getmerklixbuck");
+     BOOST_CHECK_EQUAL(std::string(NetMsgType::MERKLIXBUCK), "merklixbuck");
+     BOOST_CHECK_EQUAL(std::string(NetMsgType::GETSHORTTX), "getshorttx");
+@@ -129,6 +131,14 @@ BOOST_AUTO_TEST_CASE(v2_protocol_message_types_and_headers) {
+         CMessageHeader hdr(Params().NetMagic(), msg, 42);
+         BOOST_CHECK(hdr.IsMessageTypeValid());
+         BOOST_CHECK_EQUAL(hdr.GetMessageType(), std::string(msg));
++        BOOST_CHECK_LE(std::string(msg).size(), CMessageHeader::MESSAGE_TYPE_SIZE);
++        DataStream wire{};
++        wire << hdr;
++        BOOST_CHECK_EQUAL(wire.size(), CMessageHeader::HEADER_SIZE);
++        CMessageHeader decoded;
++        wire >> decoded;
++        BOOST_CHECK(decoded.IsMessageTypeValid());
++        BOOST_CHECK_EQUAL(decoded.GetMessageType(), std::string(msg));
+     }
+ 
+ 
+@@ -202,6 +212,7 @@ BOOST_AUTO_TEST_CASE(sealedheader_fast_path_and_fallback_getdata) {
+                           *m_node.mempool, /*avalanche=*/nullptr, {});
+ 
+     CConnman::Options options;
++    options.nSendBufferMaxSize = DEFAULT_MAXSENDBUFFER * 1000;
+     options.m_msgproc = {peerman.get()};
+     options.nSendBufferMaxSize = 1024 * 1024;
+     connman->Init(options);
+@@ -243,6 +254,8 @@ BOOST_AUTO_TEST_CASE(sealedheader_fast_path_and_fallback_getdata) {
+     {
+         LOCK(peer_node.cs_vSend);
+         peer_node.vSendMsg.clear();
++        peer_node.nSendSize = 0;
++        peer_node.fPauseSend = false;
+     }
+ 
+     SealedHeader fallback_sealed(*fallback_block);
+@@ -267,6 +280,8 @@ BOOST_AUTO_TEST_CASE(sealedheader_fast_path_and_fallback_getdata) {
+         LOCK(peer_node.cs_vSend);
+         BOOST_CHECK(!peer_node.vSendMsg.empty());
+         peer_node.vSendMsg.clear();
++        peer_node.nSendSize = 0;
++        peer_node.fPauseSend = false;
+     }
+ 
+     // 2. Fast-path O(1) reconstruction: prepare a valid V2 block on top of
+@@ -308,6 +323,8 @@ BOOST_AUTO_TEST_CASE(sealedheader_fast_path_and_fallback_getdata) {
+     {
+         LOCK(peer_node.cs_vSend);
+         peer_node.vSendMsg.clear();
++        peer_node.nSendSize = 0;
++        peer_node.fPauseSend = false;
+     }
+     BOOST_REQUIRE(!peer_node.fPauseSend);
+     DataStream request{};
+@@ -352,6 +369,7 @@ BOOST_AUTO_TEST_CASE(merklix_reconciliation_all_scopes_and_limits) {
+                           *m_node.mempool, /*avalanche=*/nullptr, {});
+ 
+     CConnman::Options options;
++    options.nSendBufferMaxSize = DEFAULT_MAXSENDBUFFER * 1000;
+     options.m_msgproc = {peerman.get()};
+     connman->Init(options);
+ 
+@@ -372,6 +390,39 @@ BOOST_AUTO_TEST_CASE(merklix_reconciliation_all_scopes_and_limits) {
+     V2PeerProtocolHandler *v2_handler = peerman->GetV2ProtocolHandler();
+     BOOST_REQUIRE(v2_handler != nullptr);
+ 
++    // Initiation is capability-gated, cadence-bounded, and cleaned up on
++    // disconnect. Older peers retain the identical responder wire format.
++    {
++        LOCK(peer_node.cs_vSend);
++        peer_node.vSendMsg.clear();
++        peer_node.nSendSize = 0;
++        peer_node.fPauseSend = false;
++    }
++    BOOST_CHECK(!v2_handler->MaybeSendSync(peer_node, 1s));
++    v2_handler->SetPeerServices(peer_node.GetId(), NODE_MERKLIX);
++    BOOST_CHECK(v2_handler->MaybeSendSync(peer_node, 1s));
++    size_t initial_chunks;
++    {
++        LOCK(peer_node.cs_vSend);
++        initial_chunks = peer_node.vSendMsg.size();
++        BOOST_CHECK_GT(initial_chunks, 0U);
++        peer_node.vSendMsg.clear();
++        peer_node.nSendSize = 0;
++        peer_node.fPauseSend = false;
++    }
++    BOOST_CHECK(!v2_handler->MaybeSendSync(peer_node, 1050ms));
++    BOOST_CHECK(!v2_handler->MaybeSendSync(peer_node, 1200ms));
++    v2_handler->RemovePeer(peer_node.GetId());
++    v2_handler->SetPeerServices(peer_node.GetId(), NODE_MERKLIX);
++    BOOST_CHECK(v2_handler->MaybeSendSync(peer_node, 1200ms));
++    {
++        LOCK(peer_node.cs_vSend);
++        BOOST_CHECK_EQUAL(peer_node.vSendMsg.size() + initial_chunks, 2 * initial_chunks);
++        peer_node.vSendMsg.clear();
++        peer_node.nSendSize = 0;
++        peer_node.fPauseSend = false;
++    }
++
+     FastRandomContext rng(uint256{99});
+     std::atomic<bool> interrupt{false};
+     std::chrono::microseconds cur_time{10'000};
+@@ -510,9 +561,9 @@ BOOST_AUTO_TEST_CASE(merklix_reconciliation_all_scopes_and_limits) {
+     {
+         ShortTxRequest oversized_req;
+         oversized_req.scope = static_cast<uint8_t>(ReconScope::LIVE_MEMPOOL);
+-        oversized_req.short_ids.resize(ShortTxRequest::MAX_SHORT_IDS + 1, 1ULL);
+         DataStream ss{};
+-        ss << oversized_req;
++        ss << oversized_req.scope << oversized_req.context_id << oversized_req.salt_k0 << oversized_req.salt_k1;
++        WriteCompactSize(ss, ShortTxRequest::MAX_SHORT_IDS + 1);
+         peerman->ProcessMessage(config, peer_node, NetMsgType::GETSHORTTX, ss,
+                                 cur_time + 1us, interrupt);
+     }
+@@ -554,6 +605,7 @@ BOOST_AUTO_TEST_CASE(adversarial_c1_d1_d2_hardening_gates) {
+                           *m_node.mempool, /*avalanche=*/nullptr, {});
+ 
+     CConnman::Options options;
++    options.nSendBufferMaxSize = DEFAULT_MAXSENDBUFFER * 1000;
+     options.m_msgproc = {peerman.get()};
+     connman->Init(options);
+ 
+@@ -603,6 +655,8 @@ BOOST_AUTO_TEST_CASE(adversarial_c1_d1_d2_hardening_gates) {
+         {
+             LOCK(peer_node.cs_vSend);
+             peer_node.vSendMsg.clear();
++            peer_node.nSendSize = 0;
++            peer_node.fPauseSend = false;
+         }
+         DataStream ss{};
+         ss << oversized_sealed;
+@@ -1117,6 +1171,7 @@ BOOST_AUTO_TEST_CASE(
+                           *m_node.mempool, /*avalanche=*/nullptr, {});
+ 
+     CConnman::Options options;
++    options.nSendBufferMaxSize = DEFAULT_MAXSENDBUFFER * 1000;
+     options.m_msgproc = {peerman.get()};
+     connman->Init(options);
+ 
+@@ -1254,6 +1309,8 @@ BOOST_AUTO_TEST_CASE(
+         {
+             LOCK(peer_node.cs_vSend);
+             peer_node.vSendMsg.clear();
++            peer_node.nSendSize = 0;
++            peer_node.fPauseSend = false;
+         }
+ 
+         // Start reconciliation: remote sends MERKLIXSYNC to local.
+@@ -1281,6 +1338,8 @@ BOOST_AUTO_TEST_CASE(
+                 outbound_chunks.assign(peer_node.vSendMsg.begin(),
+                                        peer_node.vSendMsg.end());
+                 peer_node.vSendMsg.clear();
++                peer_node.nSendSize = 0;
++                peer_node.fPauseSend = false;
+             }
+ 
+             for (const auto &chunk : outbound_chunks) {
+@@ -1419,6 +1478,7 @@ BOOST_AUTO_TEST_CASE(outbound_inv_queue_suppression_window) {
+                                      /*avalanche=*/nullptr, peer_opts);
+ 
+     CConnman::Options options;
++    options.nSendBufferMaxSize = DEFAULT_MAXSENDBUFFER * 1000;
+     options.m_msgproc = {peerman.get()};
+     options.nSendBufferMaxSize = 1024 * 1024;
+     connman->Init(options);
+@@ -1445,6 +1505,8 @@ BOOST_AUTO_TEST_CASE(outbound_inv_queue_suppression_window) {
+     {
+         LOCK(peer_node.cs_vSend);
+         peer_node.vSendMsg.clear();
++        peer_node.nSendSize = 0;
++        peer_node.fPauseSend = false;
+     }
+ 
+     // Add two transactions to the mempool and queue both for relay to peer_node.
+@@ -1717,6 +1779,7 @@ BOOST_AUTO_TEST_CASE(tachyon_avalanche_snapsync_reverse_peel_and_opt_out) {
+                                      *m_node.chainman, *m_node.mempool,
+                                      /*avalanche=*/nullptr, peer_opts);
+     CConnman::Options options;
++    options.nSendBufferMaxSize = DEFAULT_MAXSENDBUFFER * 1000;
+     options.m_msgproc = {peerman.get()};
+     connman->Init(options);
+ 
+@@ -1868,10 +1931,14 @@ BOOST_AUTO_TEST_CASE(tachyon_avalanche_snapsync_reverse_peel_and_opt_out) {
+     {
+         LOCK(peer_bad.cs_vSend);
+         peer_bad.vSendMsg.clear();
++        peer_bad.nSendSize = 0;
++        peer_bad.fPauseSend = false;
+     }
+     {
+         LOCK(peer_honest.cs_vSend);
+         peer_honest.vSendMsg.clear();
++        peer_honest.nSendSize = 0;
++        peer_honest.fPauseSend = false;
+     }
+ 
+     std::string swarm_err;
+@@ -1996,6 +2063,8 @@ BOOST_AUTO_TEST_CASE(tachyon_avalanche_snapsync_reverse_peel_and_opt_out) {
+         {
+             LOCK(peer_honest.cs_vSend);
+             peer_honest.vSendMsg.clear();
++            peer_honest.nSendSize = 0;
++            peer_honest.fPauseSend = false;
+         }
+         {
+             const std::vector<uint8_t> encoded_ureq =
+@@ -2033,6 +2102,8 @@ BOOST_AUTO_TEST_CASE(tachyon_avalanche_snapsync_reverse_peel_and_opt_out) {
+                 }
+             }
+             peer_honest.vSendMsg.clear();
++            peer_honest.nSendSize = 0;
++            peer_honest.fPauseSend = false;
+         }
+         BOOST_REQUIRE(decoded_undo);
+ 
+@@ -2138,6 +2209,7 @@ BOOST_AUTO_TEST_CASE(shorttx_batch_admission_fallback_and_proactive_push) {
+                                      /*avalanche=*/nullptr, peer_opts);
+ 
+     CConnman::Options options;
++    options.nSendBufferMaxSize = DEFAULT_MAXSENDBUFFER * 1000;
+     options.m_msgproc = {peerman.get()};
+     connman->Init(options);
+ 
+@@ -2196,14 +2268,20 @@ BOOST_AUTO_TEST_CASE(shorttx_batch_admission_fallback_and_proactive_push) {
+     {
+         LOCK(peer_from.cs_vSend);
+         peer_from.vSendMsg.clear();
++        peer_from.nSendSize = 0;
++        peer_from.fPauseSend = false;
+     }
+     {
+         LOCK(peer_to.cs_vSend);
+         peer_to.vSendMsg.clear();
++        peer_to.nSendSize = 0;
++        peer_to.fPauseSend = false;
+     }
+     {
+         LOCK(peer_hb.cs_vSend);
+         peer_hb.vSendMsg.clear();
++        peer_hb.nSendSize = 0;
++        peer_hb.fPauseSend = false;
+     }
+ 
+     FastRandomContext rng(uint256{88});
+@@ -2443,6 +2521,7 @@ BOOST_AUTO_TEST_CASE(high_bandwidth_sealedheader_push_and_peer_cleanup) {
+                                      /*avalanche=*/nullptr, peer_opts);
+ 
+     CConnman::Options options;
++    options.nSendBufferMaxSize = DEFAULT_MAXSENDBUFFER * 1000;
+     options.m_msgproc = {peerman.get()};
+     options.m_max_outbound_full_relay = 8;
+     connman->Init(options);
+@@ -2485,6 +2564,8 @@ BOOST_AUTO_TEST_CASE(high_bandwidth_sealedheader_push_and_peer_cleanup) {
+         BOOST_CHECK(peerman->SendMessages(config, p));
+         LOCK(p->cs_vSend);
+         p->vSendMsg.clear();
++        p->nSendSize = 0;
++        p->fPauseSend = false;
+     }
+     for (CNode *p : {peer_sender, peer_hb, peer_normal}) {
+         connman->AddTestNode(*p);
+@@ -2617,6 +2698,8 @@ BOOST_AUTO_TEST_CASE(high_bandwidth_sealedheader_push_and_peer_cleanup) {
+     {
+         LOCK(peer_hb->cs_vSend);
+         peer_hb->vSendMsg.clear();
++        peer_hb->nSendSize = 0;
++        peer_hb->fPauseSend = false;
+     }
+     {
+         SealedHeader dup_sealed(*v2_block);
+diff --git a/test/functional/p2p_merklix_initiation.py b/test/functional/p2p_merklix_initiation.py
+new file mode 100644
+index 0000000000..a401ee62d0
+--- /dev/null
++++ b/test/functional/p2p_merklix_initiation.py
+@@ -0,0 +1,78 @@
++#!/usr/bin/env python3
++# Copyright (c) 2026 The Lotus developers
++# Distributed under the MIT software license, see the accompanying
++# file COPYING or http://www.opensource.org/licenses/mit-license.php.
++"""Divergent real mempools start reconciliation through the production sender.
++
++No RPC initiates reconciliation. RPC only seeds transactions while disconnected
++and observes convergence. Check wire counters so ordinary inv relay alone cannot
++make the test pass. This is a liveness test, not WAN performance evidence.
++"""
++from decimal import Decimal
++import time
++
++from test_framework.merklix_relay import (
++    FUNDING_DESCRIPTOR, VALUE_UNITS_PER_COIN, build_merklix_tx,
++)
++from test_framework.test_framework import BitcoinTestFramework
++
++
++class MerklixInitiationTest(BitcoinTestFramework):
++    def add_options(self, parser):
++        parser.add_argument("--legacy-control", action="store_true")
++
++    def set_test_params(self):
++        self.num_nodes = 3
++        self.setup_clean_chain = True
++        self.extra_args = [["-avalanche=0",
++                            f"-merklixreconciliation={int(not self.options.legacy_control)}"]
++                           for _ in range(self.num_nodes)]
++
++    def run_test(self):
++        self.generatetodescriptor(self.nodes[0], 120, FUNDING_DESCRIPTOR)
++        self.sync_all()
++        self.disconnect_nodes(0, 1)
++        self.disconnect_nodes(1, 2)
++        expected = set()
++        for i, node in enumerate(self.nodes):
++            for j in range(4):
++                block = node.getblock(node.getblockhash(4 * i + j + 1), 2)
++                cb = block["tx"][0]
++                out = cb["vout"][0]
++                value = int(Decimal(str(out["value"])) * VALUE_UNITS_PER_COIN)
++                # Two differences in each of two top-level buckets force the
++                # legal request alias across the actual TCP framing boundary.
++                for nonce in range(1000):
++                    tx = build_merklix_tx(int(cb["txid"], 16), 0,
++                                           [value - 10000 - nonce])
++                    if ((tx.txid_int & 255) >> 4) == (5 if j < 2 else 10):
++                        break
++                else:
++                    raise AssertionError("could not construct bucket fixture")
++                expected.add(node.sendrawtransaction(tx.serialize().hex()))
++        self.connect_nodes(0, 1)
++        self.connect_nodes(1, 2)
++        if self.options.legacy_control:
++            time.sleep(3)
++            assert all(len(n.getrawmempool()) == 4 for n in self.nodes)
++            self.log.info("Legacy control remains divergent after 3 seconds")
++            return
++        self.wait_until(lambda: all(set(n.getrawmempool()) == expected for n in self.nodes))
++        sent = {}
++        for node in self.nodes:
++            for peer in node.getpeerinfo():
++                for command, count in peer.get("bytessent_per_msg", {}).items():
++                    sent[command] = sent.get(command, 0) + count
++        # Accepted SHORTTX transactions are deliberately relayed onward by
++        # ordinary INV as well. The disabled-capability control isolates the
++        # initiation trigger; do not require zero secondary INV traffic.
++        assert sent.get("merklixsync", 0) > 0, sent
++        assert sent.get("getmrklbckt", 0) > 0, sent
++        assert sent.get("merklixbuck", 0) > 0, sent
++        assert sent.get("getshorttx", 0) > 0, sent
++        assert sent.get("shorttx", 0) > 0, sent
++        self.log.info("Production reconciliation bytes by message: %s", sent)
++
++
++if __name__ == "__main__":
++    MerklixInitiationTest().main()
+diff --git a/test/functional/test_framework/merklix_relay.py b/test/functional/test_framework/merklix_relay.py
+new file mode 100644
+index 0000000000..c4077fa2d9
+--- /dev/null
++++ b/test/functional/test_framework/merklix_relay.py
+@@ -0,0 +1,23 @@
++#!/usr/bin/env python3
++# Copyright (c) 2026 The Bitcoin developers
++# Distributed under the MIT software license, see the accompanying
++# file COPYING or http://www.opensource.org/licenses/mit-license.php.
++"""ABC funding and legacy transaction adapter for Merklix relay tests."""
++from test_framework.hash import hash160
++from test_framework.messages import COutPoint, CTransaction, CTxIn, CTxOut
++from test_framework.script import CScript, OP_DROP, OP_EQUAL, OP_HASH160, OP_TRUE
++
++# A padded redeem script keeps legacy transactions above the policy size floor.
++_REDEEM = CScript([b"\x42" * 48, OP_DROP, OP_TRUE])
++_OUTPUT = CScript([OP_HASH160, hash160(_REDEEM), OP_EQUAL])
++FUNDING_DESCRIPTOR = f"raw({_OUTPUT.hex()})"
++# eCash RPC amounts are XEC (100 satoshis), not consensus COIN (1e8).
++VALUE_UNITS_PER_COIN = 100
++
++
++def build_merklix_tx(prev_txid, prev_index, values):
++    tx = CTransaction()
++    tx.nVersion = 2
++    tx.vin = [CTxIn(COutPoint(prev_txid, prev_index), CScript([_REDEEM]), 0xffffffff)]
++    tx.vout = [CTxOut(value, _OUTPUT) for value in values]
++    return tx
+-- 
+2.50.1 (Apple Git-155)
+

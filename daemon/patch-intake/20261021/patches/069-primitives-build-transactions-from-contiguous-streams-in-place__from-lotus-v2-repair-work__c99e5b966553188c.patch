@@ -1,0 +1,321 @@
+From c173fb247344c8f96dc2ebd278e92eea3ac6fb91 Mon Sep 17 00:00:00 2001
+From: Shammah Chancellor <shammah.chancellor@notvalid.com>
+Date: Sun, 18 Oct 2026 20:33:08 -0700
+Subject: [PATCH] primitives: build transactions from contiguous streams in
+ place
+
+Every deserialized CTransaction first copied its bytes into a per-thread
+scratch buffer, then copied them again into its own storage. When the
+stream already holds its unread bytes in one buffer, as DataStream does for
+P2P messages and SpanReader does for in-memory blocks, the first copy is
+unnecessary.
+
+For such streams, ScanTransactionWire checks the transaction's structure
+where it lies, with the same ReadCompactSize calls and limits as
+ReadTransactionWire, and the transaction is built from those bytes. The
+stream is advanced only after the transaction has been built, because
+DataStream::ignore releases its buffer when it reaches the end. Other
+streams (files, hashing readers) keep the scratch-buffer path.
+
+SpanReader gains data() and ignore(), matching DataStream, so it takes
+this path as well.
+
+Block 413567 deserializes about 6% faster with software SHA-256 (about
+150 us of 2.5 ms per block); the saving does not depend on hashing.
+
+Tests: SpanReader, DataStream and a read-only stream accept and reject
+the same truncated, trailing, non-canonical and oversized inputs as
+CMutableTransaction; contiguous streams leave the scratch buffer
+untouched, consume exactly the transaction, and the result does not
+refer to the stream's bytes.
+
+diff --git a/src/primitives/transaction.cpp b/src/primitives/transaction.cpp
+index 4345b292bc3603a446a85a2391b0bfa5fd75a75e..8b962a692b2480f1e70b1eb83c8efbff5fe2fe54 100644
+--- a/src/primitives/transaction.cpp
++++ b/src/primitives/transaction.cpp
+@@ -308,6 +308,47 @@ void DeallocateTransactionStorage(void *p, size_t bytes) noexcept {
+     DeallocateStorage(p, bytes);
+ }
+ 
++TransactionWire ScanTransactionWire(Span<const uint8_t> bytes) {
++    size_t pos = 0;
++    auto skip = [&](uint64_t count) {
++        if (count > bytes.size() - pos) {
++            throw std::ios_base::failure("ScanTransactionWire(): end of data");
++        }
++        pos += count;
++    };
++    auto read_compact_size = [&]() {
++        SpanReader reader{bytes.subspan(pos)};
++        const uint64_t n = ReadCompactSize(reader);
++        pos = bytes.size() - reader.size();
++        return n;
++    };
++    TransactionWire wire;
++    auto skip_script = [&]() {
++        const uint64_t size = read_compact_size();
++        if (IsLongScript(size)) {
++            wire.long_script_bytes += size;
++        }
++        skip(size);
++    };
++    skip(sizeof(uint32_t));
++    const uint64_t n_inputs = read_compact_size();
++    for (uint64_t i = 0; i < n_inputs; ++i) {
++        skip(sizeof(uint256) + sizeof(uint32_t));
++        skip_script();
++        skip(sizeof(uint32_t));
++    }
++    const uint64_t n_outputs = read_compact_size();
++    for (uint64_t i = 0; i < n_outputs; ++i) {
++        skip(sizeof(int64_t));
++        skip_script();
++    }
++    skip(sizeof(uint32_t));
++    wire.bytes = bytes.first(pos);
++    wire.n_inputs = n_inputs;
++    wire.n_outputs = n_outputs;
++    return wire;
++}
++
+ size_t CTransaction::StorageSize(const TransactionWire &wire) {
+     return Offsets(wire.n_inputs, wire.n_outputs, wire.long_script_bytes).total;
+ }
+@@ -372,7 +413,8 @@ CTransaction::Layout CTransaction::Place(const TransactionWire &wire,
+     layout.vout = {
+         std::launder(reinterpret_cast<const CTxOut *>(base + offsets.vout)),
+         wire.n_outputs};
+-    // Hash now: the serialization is not kept.
++    // Hash now: the serialization is not kept, and a contiguous stream may
++    // release it as soon as this returns.
+     layout.hash = HashSerialization(bytes);
+     layout.serialize_size = bytes.size();
+     layout.long_script_bytes = wire.long_script_bytes;
+diff --git a/src/primitives/transaction.h b/src/primitives/transaction.h
+index 88ee66a0377576960649080d6c3df0cf97e8c5c0..7e876f2c39f53d45f6c6fa2b3d758ec7f1ba1939 100644
+--- a/src/primitives/transaction.h
++++ b/src/primitives/transaction.h
+@@ -15,6 +15,7 @@
+ #include <span.h>
+ 
+ #include <atomic>
++#include <concepts>
+ #include <cstddef>
+ #include <memory>
+ #include <vector>
+@@ -248,6 +249,20 @@ constexpr bool IsLongScript(uint64_t size) {
+ /** Per-thread scratch buffer for serialized transaction bytes. */
+ std::vector<uint8_t> &TransactionScratchBuffer();
+ 
++/**
++ * Find the serialized transaction at the start of bytes, checking its
++ * structure exactly like ReadTransactionWire, without copying it.
++ */
++TransactionWire ScanTransactionWire(Span<const uint8_t> bytes);
++
++/** Streams whose unread bytes are contiguous in memory, such as DataStream. */
++template <typename Stream>
++concept ContiguousReadStream = requires(Stream &s, size_t n) {
++    { UCharCast(s.data()) } -> std::convertible_to<const uint8_t *>;
++    { s.size() } -> std::convertible_to<size_t>;
++    s.ignore(n);
++};
++
+ /**
+  * Read one serialized transaction from s into buf, checking its structure
+  * exactly like CMutableTransaction deserialization does. buf is reused, so
+@@ -307,6 +322,24 @@ TransactionWire ReadTransactionWire(Stream &s, std::vector<uint8_t> &buf) {
+     return wire;
+ }
+ 
++/**
++ * Read one serialized transaction from s and return build(wire). Bytes of a
++ * contiguous stream are used where they are, and only consumed once build
++ * has returned; other streams are read into the per-thread scratch buffer.
++ */
++template <typename Stream, typename Build>
++auto ReadTransactionWith(Stream &s, Build &&build) {
++    if constexpr (ContiguousReadStream<Stream>) {
++        const TransactionWire wire =
++            ScanTransactionWire({UCharCast(s.data()), size_t(s.size())});
++        auto result = build(wire);
++        s.ignore(wire.bytes.size());
++        return result;
++    } else {
++        return build(ReadTransactionWire(s, TransactionScratchBuffer()));
++    }
++}
++
+ /**
+  * The basic transaction that is broadcasted on the network and contained in
+  * blocks. A transaction can contain multiple inputs and outputs.
+@@ -369,8 +402,7 @@ public:
+      */
+     template <typename Stream>
+     CTransaction(deserialize_type, Stream &s)
+-        : CTransaction(OwnedLayout(
+-              ReadTransactionWire(s, TransactionScratchBuffer()))) {}
++        : CTransaction(ReadTransactionWith(s, &CTransaction::OwnedLayout)) {}
+ 
+     bool IsNull() const { return vin.empty() && vout.empty(); }
+ 
+@@ -585,8 +617,9 @@ CTransactionRef MakeTransactionRef(const CMutableTransaction &tx);
+  */
+ template <> struct SharedPtrDeserializer<CTransaction> {
+     template <typename Stream> static CTransactionRef Make(Stream &s) {
+-        return MakeTransactionRef(
+-            ReadTransactionWire(s, TransactionScratchBuffer()));
++        return ReadTransactionWith(s, [](const TransactionWire &wire) {
++            return MakeTransactionRef(wire);
++        });
+     }
+ };
+ 
+diff --git a/src/streams.h b/src/streams.h
+index d1d961da7abdcf5ca63896e9ba5e0f647b6c1057..c8c51a8f7dfb94286932d511ad3c9fff5aa21e60 100644
+--- a/src/streams.h
++++ b/src/streams.h
+@@ -93,6 +93,15 @@ public:
+ 
+     size_t size() const { return m_data.size(); }
+     bool empty() const { return m_data.empty(); }
++    /** The unread bytes. */
++    const uint8_t *data() const { return m_data.data(); }
++
++    void ignore(size_t num_ignore) {
++        if (num_ignore > m_data.size()) {
++            throw std::ios_base::failure("SpanReader::ignore(): end of data");
++        }
++        m_data = m_data.subspan(num_ignore);
++    }
+ 
+     void read(Span<std::byte> dst) {
+         if (dst.size() == 0) {
+diff --git a/src/test/transaction_tests.cpp b/src/test/transaction_tests.cpp
+index 063fa59c0e79fd0e0f235c6047b5df98d45808ca..8286ec178aa865e4f2bd12bd1a80ff5c2f2b1ba5 100644
+--- a/src/test/transaction_tests.cpp
++++ b/src/test/transaction_tests.cpp
+@@ -1148,6 +1148,23 @@ BOOST_AUTO_TEST_CASE(precomputed_data_concurrent_first_use) {
+     }
+ }
+ 
++/** A stream that only supports reading, so its bytes are never contiguous. */
++class SequentialReader {
++    SpanReader m_reader;
++
++public:
++    explicit SequentialReader(Span<const uint8_t> data) : m_reader(data) {}
++    void read(Span<std::byte> dst) { m_reader.read(dst); }
++    size_t size() const { return m_reader.size(); }
++    template <typename T> SequentialReader &operator>>(T &&obj) {
++        ::Unserialize(*this, obj);
++        return *this;
++    }
++};
++static_assert(ContiguousReadStream<SpanReader>);
++static_assert(ContiguousReadStream<DataStream>);
++static_assert(!ContiguousReadStream<SequentialReader>);
++
+ static CScript RawScript(const std::vector<uint8_t> &bytes) {
+     return CScript(bytes.begin(), bytes.end());
+ }
+@@ -1265,8 +1282,8 @@ BOOST_AUTO_TEST_CASE(serialized_storage_rejects_like_mutable) {
+                                      UCharCast(full.data()) + full.size());
+ 
+     auto check = [](const std::vector<uint8_t> &data) {
+-        bool mutable_ok = true, ref_ok = true;
+-        size_t mutable_left = 0, ref_left = 0;
++        bool mutable_ok = true;
++        size_t mutable_left = 0;
+         try {
+             SpanReader reader{data};
+             CMutableTransaction m{deserialize, reader};
+@@ -1274,16 +1291,29 @@ BOOST_AUTO_TEST_CASE(serialized_storage_rejects_like_mutable) {
+         } catch (const std::ios_base::failure &) {
+             mutable_ok = false;
+         }
+-        try {
+-            SpanReader reader{data};
+-            CTransactionRef ref;
+-            reader >> ref;
+-            ref_left = reader.size();
+-        } catch (const std::ios_base::failure &) {
+-            ref_ok = false;
+-        }
+-        BOOST_CHECK_EQUAL(mutable_ok, ref_ok);
+-        BOOST_CHECK_EQUAL(mutable_left, ref_left);
++        // Scanned in place (SpanReader, DataStream) and copied through the
++        // scratch buffer (any other stream).
++        auto read_ref = [&](auto &stream) {
++            bool ok = true;
++            size_t left = 0;
++            try {
++                CTransactionRef ref;
++                stream >> ref;
++                left = stream.size();
++            } catch (const std::ios_base::failure &) {
++                ok = false;
++            }
++            BOOST_CHECK_EQUAL(mutable_ok, ok);
++            if (ok) {
++                BOOST_CHECK_EQUAL(mutable_left, left);
++            }
++        };
++        SpanReader span_reader{data};
++        DataStream data_stream{data};
++        SequentialReader sequential_reader{data};
++        read_ref(span_reader);
++        read_ref(data_stream);
++        read_ref(sequential_reader);
+     };
+     // Every truncation, and trailing data.
+     for (size_t len = 0; len <= bytes.size(); ++len) {
+@@ -1303,4 +1333,48 @@ BOOST_AUTO_TEST_CASE(serialized_storage_rejects_like_mutable) {
+     check(huge_script);
+ }
+ 
++BOOST_AUTO_TEST_CASE(contiguous_streams_are_read_in_place) {
++    // Bytes of a contiguous stream go straight into the transaction storage;
++    // only other streams pass through the per-thread scratch buffer.
++    CMutableTransaction mtx;
++    mtx.vin.emplace_back(TxId{uint256::ONE}, 0,
++                         RawScript(std::vector<uint8_t>(107, 1)));
++    mtx.vout.emplace_back(SATOSHI, RawScript(std::vector<uint8_t>(25, 2)));
++    DataStream serialized{};
++    serialized << mtx << uint8_t{0x42};
++    const std::vector<uint8_t> bytes(UCharCast(serialized.data()),
++                                     UCharCast(serialized.data()) +
++                                         serialized.size());
++
++    std::vector<uint8_t> &scratch = TransactionScratchBuffer();
++    const std::vector<uint8_t> sentinel(8, 0xee);
++    auto check = [&](auto &stream, bool in_place) {
++        scratch = sentinel;
++        CTransactionRef ref;
++        stream >> ref;
++        BOOST_CHECK(ref->GetId() == mtx.GetId());
++        // Exactly the transaction was consumed.
++        BOOST_CHECK_EQUAL(stream.size(), 1U);
++        BOOST_CHECK_EQUAL(scratch == sentinel, in_place);
++        // The long script was copied out of the stream's bytes.
++        const uint8_t *script = ref->vin[0].scriptSig.data();
++        BOOST_CHECK(script < bytes.data() ||
++                    script >= bytes.data() + bytes.size());
++    };
++    SpanReader span_reader{bytes};
++    DataStream data_stream{bytes};
++    SequentialReader sequential_reader{bytes};
++    check(span_reader, /*in_place=*/true);
++    check(data_stream, /*in_place=*/true);
++    check(sequential_reader, /*in_place=*/false);
++
++    // The deserializing constructor takes the same path.
++    SpanReader reader{bytes};
++    scratch = sentinel;
++    const CTransaction tx{deserialize, reader};
++    BOOST_CHECK(tx.GetId() == mtx.GetId());
++    BOOST_CHECK_EQUAL(reader.size(), 1U);
++    BOOST_CHECK(scratch == sentinel);
++}
++
+ BOOST_AUTO_TEST_SUITE_END()

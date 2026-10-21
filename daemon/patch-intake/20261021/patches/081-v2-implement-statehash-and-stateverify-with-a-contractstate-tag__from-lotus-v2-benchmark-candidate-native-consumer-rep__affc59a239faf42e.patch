@@ -1,0 +1,413 @@
+From be51ba0a2fd6f1672781d6191a9228158161750a Mon Sep 17 00:00:00 2001
+From: Shammah Chancellor <shammah.chancellor@notvalid.com>
+Date: Mon, 19 Oct 2026 05:39:34 -0700
+Subject: [PATCH] v2: implement STATEHASH and STATEVERIFY with a contractstate
+ tag
+
+c3 STATEHASH pops N(k) and then k items (item_1 deepest) and pushes
+TaggedHash("Lotus/v2/contractstate", CS(k) || for each item CS(len) ||
+item) with shortest-form CompactSize. k must be 0..64 and the stack must
+hold the items. Per decision I-13 the digest uses its own domain tag,
+HashDomain::ContractState, rather than the block StateRoot's
+"Lotus/v2/state". ContractStateHash streams the preimage into BLAKE3
+without building it. The opcode is context-free.
+
+ed STATEVERIFY pops a 32-byte root and requires the running invocation
+to be a spend whose coin has HAS_STATE and exactly that state_root; a
+mint, a coin without state, a wrong width or a mismatch is an error.
+
+Costs: STATEHASH charges per_operand_byte over the items, the count and
+the CompactSize framing (so the charge covers the whole preimage). The
+size pass uses the literal count when the preceding instruction is a
+numeric push, else the 64-item worst case (WorstOpCost now covers 65
+operands plus framing for c3). With a literal count, static accounting
+equals the executed cost.
+
+Digest vectors for k = 0, 1, 2, 3 and 64 come from the Python reference
+in test_framework.messages; native tests also check streaming against
+the materialized tagged hash for 300- and 2000-byte items.
+
+Tier: V2
+---
+ src/lotus_v2/tagged_hash.cpp              |  31 +++++
+ src/lotus_v2/tagged_hash.h                |   7 ++
+ src/lotus_v2/test_vm.cpp                  | 133 +++++++++++++++++++++-
+ src/lotus_v2/vm.cpp                       |  42 +++++++
+ src/lotus_v2/vm_cost.inc                  |  15 +++
+ src/lotus_v2/vm_test/opcode_coverage.json |   4 +-
+ 6 files changed, 228 insertions(+), 4 deletions(-)
+
+diff --git a/src/lotus_v2/tagged_hash.cpp b/src/lotus_v2/tagged_hash.cpp
+index d8c68d06c020faa8a33c29063d20e8a02941e54f..853639715214f262ec19c84b7975e7f5313b7740 100644
+--- a/src/lotus_v2/tagged_hash.cpp
++++ b/src/lotus_v2/tagged_hash.cpp
+@@ -27,6 +27,7 @@ constexpr std::string_view TagView(HashDomain domain) noexcept {
+     case HashDomain::Utxo: return "Lotus/v2/utxo";
+     case HashDomain::PreconsensusBatch: return "lotus.v2.preconsensus.batch";
+     case HashDomain::State: return "Lotus/v2/state";
++    case HashDomain::ContractState: return "Lotus/v2/contractstate";
+     }
+     std::abort();
+ }
+@@ -55,4 +56,34 @@ Hash TaggedHash(HashDomain domain, std::span<const uint8_t> payload) {
+     return result;
+ }
+ 
++Hash ContractStateHash(std::span<const std::vector<uint8_t>> items) {
++    const std::string_view tag = TagView(HashDomain::ContractState);
++    blake3_hasher hasher;
++    blake3_hasher_init(&hasher);
++    blake3_hasher_update(&hasher, tag.data(), tag.size());
++    constexpr uint8_t separator = 0;
++    blake3_hasher_update(&hasher, &separator, 1);
++    auto compact = [&](uint64_t value) {
++        uint8_t buffer[9];
++        size_t size = 0;
++        if (value < 253) {
++            buffer[size++] = uint8_t(value);
++        } else {
++            const size_t width = value <= 0xffff ? 2 : value <= 0xffffffff ? 4 : 8;
++            buffer[size++] = width == 2 ? 253 : width == 4 ? 254 : 255;
++            for (size_t i = 0; i < width; ++i)
++                buffer[size++] = uint8_t(value >> (8 * i));
++        }
++        blake3_hasher_update(&hasher, buffer, size);
++    };
++    compact(items.size());
++    for (const auto &item : items) {
++        compact(item.size());
++        if (!item.empty()) blake3_hasher_update(&hasher, item.data(), item.size());
++    }
++    Hash result;
++    blake3_hasher_finalize(&hasher, result.data(), result.size());
++    return result;
++}
++
+ } // namespace lotus::v2
+diff --git a/src/lotus_v2/tagged_hash.h b/src/lotus_v2/tagged_hash.h
+index 2587f92fc4d219c49bc51bbce9e50867e7ad20da..573072be50729e6f8f4e64d95f6a5b98f945b70d 100644
+--- a/src/lotus_v2/tagged_hash.h
++++ b/src/lotus_v2/tagged_hash.h
+@@ -6,6 +6,7 @@
+ #include <cstddef>
+ #include <cstdint>
+ #include <span>
++#include <vector>
+ 
+ namespace lotus::v2 {
+ 
+@@ -32,11 +33,17 @@ enum class HashDomain {
+     Utxo,
+     State,
+     PreconsensusBatch,
++    ContractState,
+ };
+ 
+ // Hardware-accelerated BIP-340 style tagged SHA-256:
+ // SHA256(SHA256(tag) || SHA256(tag) || payload).
+ Hash TaggedHash(HashDomain domain, std::span<const uint8_t> payload);
+ 
++// STATEHASH digest over item_1..item_k (item_1 first, i.e. deepest on the
++// stack): TaggedHash(ContractState, CS(k) || for each item CS(len) || item),
++// with shortest-form CompactSize. Streams the preimage without building it.
++Hash ContractStateHash(std::span<const std::vector<uint8_t>> items);
++
+ } // namespace lotus::v2
+ #endif
+diff --git a/src/lotus_v2/test_vm.cpp b/src/lotus_v2/test_vm.cpp
+index 104fda6b5f34ec8e802d216c476d9398585cb182..62e71c5018eec5f175524a8dfe443302117b2b55 100644
+--- a/src/lotus_v2/test_vm.cpp
++++ b/src/lotus_v2/test_vm.cpp
+@@ -1,6 +1,7 @@
+ #include "vm.h"
+ 
+ #include "field_size.h"
++#include "tagged_hash.h"
+ 
+ #include <algorithm>
+ #include <iostream>
+@@ -127,8 +128,8 @@ void RegistryAllocation() {
+     // Newly registered bytes are assigned: never success. Without an
+     // authenticated context (or before their semantics land) they are
+     // Unsupported; three index operands are supplied for the readers.
+-    for (uint8_t b : {0xc3, 0xde, 0xdf, 0xeb, 0xec, 0xed, 0xee, 0xef, 0xf5,
+-                      0xf6})
++    // STATEHASH (c3) is context-free and covered by StateHashAndVerify.
++    for (uint8_t b : {0xde, 0xdf, 0xeb, 0xec, 0xed, 0xee, 0xef, 0xf5, 0xf6})
+         CHECK(EvaluateVm(VmBytes{b, 0x4e}, {Number(0), Number(0), Number(0)},
+                          PROFILE)
+                   .status == VmStatus::Unsupported);
+@@ -891,6 +892,133 @@ void InputWitnessArg() {
+     CHECK(tight.invocation.executed_cost <= tight.accounting_cost);
+     Expect("df", VmStatus::Unsupported, {Number(0), Number(0), Number(0)});
+ }
++void StateHashAndVerify() {
++    // STATEHASH (c3): item_1..item_k N(k) -> Hash32 under the
++    // Lotus/v2/contractstate tag. Expected digests come from the Python
++    // reference (test_framework.messages.lotus_v2_tagged_hash).
++    const VmProfile wide{8192, 64, 8192, 256, 256, 1048576, 64, 100000};
++    auto check = [&](const std::string &pushes, const std::string &digest) {
++        const auto script = Hex(pushes + "c3 20" + digest + "92 4e");
++        const auto result = EvaluateVm(script, {}, wide);
++        if (result.status != VmStatus::Success)
++            throw std::runtime_error("STATEHASH " + pushes + ": " + result.error);
++    };
++    check("00", "593ba2e63160ffe5a848e607a2c8d2bb2aef41e2956facd1b888178b0e170484");
++    check("4c00 4e",
++          "df8a9562ee5772b99d5cc7bcee85abd81aa0e78e8556676e9c622aca0369ac5b");
++    check("01aa 10000102030405060708090a0b0c0d0e0f 4f",
++          "6e84c64bbe536e5d14d89ee55c0c81fa8cf9ce41430b22e9dc7909d35ec3b77c");
++    check("0101 4c00 020203 50",
++          "43f4bb1049bc44deee1b79c758100b8e417d872cd35422143c10e92c356b66ef");
++    std::string sixty_four;
++    for (int i = 0; i < 64; ++i) sixty_four += "4c00";
++    const std::string n64 = "10 40000000000000000000000000000000";
++    check(sixty_four + n64,
++          "894f918b4e09176295283b91e943d64d8aaa3cb2ea4736bc2abe7d50480522ce");
++    // k outside 0..64, or more items than the stack holds, is an error.
++    CHECK(EvaluateVm(Hex(sixty_four + "4c00 10 41000000000000000000000000000000 c3 4e"),
++                     {}, wide)
++              .error == "STATEHASH item count");
++    CHECK(EvaluateVm(Hex("4d c3 4e"), {}, wide).error == "STATEHASH item count");
++    CHECK(EvaluateVm(Hex("01aa 4f c3 4e"), {}, wide).error == "stack underflow");
++    // The streamed digest equals the materialized tagged hash, including
++    // multi-chunk items and three-byte CompactSize lengths.
++    for (const size_t length : {size_t(0), size_t(300), size_t(2000)}) {
++        std::vector<VmBytes> items{VmBytes(length, 0x5c), Hex("01")};
++        VmBytes preimage{2};
++        for (const auto &item : items) {
++            if (item.size() < 253)
++                preimage.push_back(uint8_t(item.size()));
++            else
++                preimage.insert(preimage.end(), {253, uint8_t(item.size()),
++                                                 uint8_t(item.size() >> 8)});
++            preimage.insert(preimage.end(), item.begin(), item.end());
++        }
++        CHECK(ContractStateHash(items) ==
++              TaggedHash(HashDomain::ContractState, preimage));
++        CHECK(ContractStateHash(items) !=
++              TaggedHash(HashDomain::State, preimage)); // separate tag (I-13)
++    }
++    // Static cost: a literal count gives exact sizes, so accounting equals
++    // the executed cost; a dynamic count is bounded by the 64-item worst case.
++    VmCostProfile cost;
++    cost.max_invocation_cost = 100000000;
++    cost.structural_byte_cost = 1;
++    for (auto &op : cost.opcode) op = {1, 1, 1};
++    const auto exact = EvaluateVmCharged(
++        Hex("01aa 10000102030405060708090a0b0c0d0e0f 4f c3 79 4e"), {}, wide,
++        cost);
++    CHECK(exact.invocation.status == VmStatus::Success && exact.charged &&
++          exact.accounting_cost == exact.invocation.executed_cost);
++    const auto dynamic = EvaluateVmCharged(Hex("c3 79 4e"),
++                                           {Hex("aa"), Number(1)}, wide, cost);
++    CHECK(dynamic.invocation.status == VmStatus::Success && dynamic.charged &&
++          dynamic.accounting_cost > dynamic.invocation.executed_cost);
++
++    // STATEVERIFY (ed): Hash32 ->, against the spent coin's state root.
++    const TxProfile tx_profile{32, 32, 8, 8192, 16, 8192, 64};
++    ChainId chain{};
++    Transaction tx;
++    Input spend;
++    spend.flags = 1;
++    spend.prev_txid.fill(0x51);
++    spend.sequence = UINT32_MAX;
++    spend.witnesses = {BranchWitness{Hex("4e"), {}, {}}};
++    Input mint;
++    mint.flags = 3;
++    mint.sequence = UINT32_MAX;
++    mint.witnesses = {BranchWitness{Hex("4e"), {}, {}}};
++    tx.inputs = {spend, mint};
++    Output coin;
++    coin.value = 700;
++    coin.branches = {Hash{}};
++    coin.paths = {{0}};
++    coin.flags = 4;
++    const std::vector<VmBytes> state_items{Hex("01"), Hex("0203")};
++    coin.state_root = ContractStateHash(state_items);
++    ResolvedCoins resolved{coin, std::nullopt};
++    Output pay = coin;
++    pay.flags = 0;
++    pay.state_root = Hash{};
++    pay.branches[0].fill(0x46);
++    tx.outputs = {pay};
++    auto run = [&](size_t input, const VmBytes &script) {
++        tx.inputs[input].witnesses[0].script = script;
++        resolved[0]->branches[0] = BranchLeaf(tx.inputs[0].witnesses[0].script);
++        tx.inputs[1].prev_txid = BranchLeaf(tx.inputs[1].witnesses[0].script);
++        PositiveDelta delta{};
++        delta[0] = 1;
++        VmExecutionContext ctx{tx, tx_profile, chain, resolved, input, 0,
++                               input == 1 ? std::optional(delta)
++                                          : std::nullopt};
++        return EvaluateVmWithContext(script, {}, PROFILE, ctx);
++    };
++    VmBytes push_root{32};
++    push_root.insert(push_root.end(), coin.state_root.begin(),
++                     coin.state_root.end());
++    auto with = [](VmBytes a, const std::string &tail) {
++        const auto b = Hex(tail);
++        a.insert(a.end(), b.begin(), b.end());
++        return a;
++    };
++    CHECK(run(0, with(push_root, "ed 4e")).status == VmStatus::Success);
++    // STATEHASH then STATEVERIFY: commit to the items behind the root.
++    CHECK(run(0, Hex("0101 020203 4f c3 ed 4e")).status == VmStatus::Success);
++    CHECK(run(0, Hex("0101 020204 4f c3 ed 4e")).error ==
++          "STATEVERIFY mismatch");
++    auto wrong = push_root;
++    wrong.back() ^= 1;
++    CHECK(run(0, with(wrong, "ed 4e")).error == "STATEVERIFY mismatch");
++    CHECK(run(0, Hex("1f" + std::string(62, '0') + "ed 4e")).error ==
++          "STATEVERIFY root width");
++    CHECK(run(1, with(push_root, "ed 4e")).error ==
++          "STATEVERIFY requires spend");
++    resolved[0]->flags = 0;
++    resolved[0]->state_root = Hash{};
++    CHECK(run(0, with(push_root, "ed 4e")).error ==
++          "STATEVERIFY coin lacks state");
++    Expect("ed", VmStatus::Unsupported, {VmBytes(32)});
++}
+ void ChargedAccounting() {
+     auto schedule = IllustrativeCost();
+     auto charge = [&](const std::string &script,
+@@ -1711,6 +1839,7 @@ int main() {
+     StateAndActiveIndexOpcodes();
+     TokenBalance();
+     InputWitnessArg();
++    StateHashAndVerify();
+     HashAndBounds();
+     ChargedAccounting();
+     EnumerateIdiom();
+diff --git a/src/lotus_v2/vm.cpp b/src/lotus_v2/vm.cpp
+index 31033b5f3776b2c86ee5c626df5fdc5d59c4e062..131294efbeef4db9054f969d7ee3c157b3aa0ee0 100644
+--- a/src/lotus_v2/vm.cpp
++++ b/src/lotus_v2/vm.cpp
+@@ -2,6 +2,7 @@
+ 
+ #include "commitment.h"
+ #include "field_size.h"
++#include "tagged_hash.h"
+ #include "vendor/blake3/blake3.h"
+ 
+ #include <openssl/bn.h>
+@@ -611,6 +612,17 @@ namespace {
+     Int Numeric(const VmBytes &bytes) {
+         return NumericBig(bytes).ToClampedInt128();
+     }
++    constexpr size_t VM_STATEHASH_MAX_ITEMS = 64;
++    size_t CompactSizeBytes(uint64_t value) {
++        return value < 253 ? 1 : value <= 0xffff ? 3 : value <= 0xffffffff ? 5 : 9;
++    }
++    // CS(k) plus CS(len) for every item: the STATEHASH preimage bytes that
++    // are not item payload.
++    size_t StateHashFramingBytes(const std::vector<VmBytes> &items) {
++        size_t total = CompactSizeBytes(items.size());
++        for (const auto &item : items) total += CompactSizeBytes(item.size());
++        return total;
++    }
+     VmBytes Number(Int number) {
+         UInt value = UInt(number);
+         VmBytes bytes(16);
+@@ -1995,6 +2007,21 @@ namespace {
+                         if (op == 0xbb) Push(Number(1));
+                         break;
+                     }
++                    case 0xc3: { // STATEHASH: item_1..item_k N(k) -> Hash32
++                        const Int k = Numeric(Pop());
++                        if (k < 0 || k > Int(VM_STATEHASH_MAX_ITEMS))
++                            throw VmFailure("STATEHASH item count");
++                        Require(size_t(k));
++                        std::vector<VmBytes> items(static_cast<size_t>(k));
++                        for (size_t i = size_t(k); i-- > 0;) items[i] = Pop();
++                        // Charge the CompactSize framing on top of the items.
++                        if (tracking_step)
++                            step_operands.push_back(
++                                StateHashFramingBytes(items));
++                        const Hash digest = ContractStateHash(items);
++                        Push(VmBytes(digest.begin(), digest.end()));
++                        break;
++                    }
+                     case 0xc8:
+                         Context();
+                         Push(Number(7));
+@@ -2205,6 +2232,21 @@ namespace {
+                         Push(Number(Int(value.outputs)));
+                         break;
+                     }
++                    case 0xed: { // STATEVERIFY: Hash32 ->
++                        const VmBytes root = Pop();
++                        const auto &ctx = Context();
++                        if (ctx.tx.inputs[ctx.input_index].flags != 1)
++                            throw VmFailure("STATEVERIFY requires spend");
++                        if (root.size() != 32)
++                            throw VmFailure("STATEVERIFY root width");
++                        const auto &coin = CoinAt(Int(ctx.input_index));
++                        if (!coin.HasState())
++                            throw VmFailure("STATEVERIFY coin lacks state");
++                        if (!std::equal(root.begin(), root.end(),
++                                        coin.state_root.begin()))
++                            throw VmFailure("STATEVERIFY mismatch");
++                        break;
++                    }
+                     case 0xee: { // UTXOSTATEROOT: zeros without HAS_STATE
+                         const auto &coin = CoinAt(Numeric(Pop()));
+                         Push(coin.HasState() ? VmBytes(coin.state_root.begin(),
+diff --git a/src/lotus_v2/vm_cost.inc b/src/lotus_v2/vm_cost.inc
+index 5d979b69803cc4e761600dd028be226fa5148af8..dfd8a521c41c2e04bfd918dcf9a2ad541a2c9fd0 100644
+--- a/src/lotus_v2/vm_cost.inc
++++ b/src/lotus_v2/vm_cost.inc
+@@ -79,6 +79,11 @@ VmCostUnits OpCost(VmOpcode op, std::span<const size_t> operands,
+ VmCostUnits WorstOpCost(VmOpcode op, size_t limit,
+                         const VmCostProfile &profile) {
+     std::vector<size_t> operands(6, limit);
++    if (op == 0xc3) { // STATEHASH: 64 items, the count and their framing
++        operands.assign(VM_STATEHASH_MAX_ITEMS + 1, limit);
++        operands.push_back(CompactSizeBytes(VM_STATEHASH_MAX_ITEMS) +
++                           VM_STATEHASH_MAX_ITEMS * CompactSizeBytes(limit));
++    }
+     if (op == 0xa0 || op == 0xa1 || op == 0xa2 || op == 0xb2 || op == 0xb3 ||
+         op == 0xb4) {
+         const size_t max_limbs = std::max<size_t>(
+@@ -483,6 +488,16 @@ class SizePass {
+                 pop();
+                 pop();
+                 push(16);
++            } else if (op == 0xc3) { // STATEHASH
++                const auto k = LiteralValue(previous);
++                if (!k || *k < 0 || *k > Int(VM_STATEHASH_MAX_ITEMS))
++                    return {UnknownSizes(), Worst(op)};
++                pop();
++                size_t framing = CompactSizeBytes(uint64_t(*k));
++                for (Int i = 0; i < *k; ++i)
++                    framing += CompactSizeBytes(pop());
++                operands.push_back(framing);
++                push(32);
+             } else if (op == 0xdf) { // INPUTWITNESSARG
+                 pop();
+                 pop();
+diff --git a/src/lotus_v2/vm_test/opcode_coverage.json b/src/lotus_v2/vm_test/opcode_coverage.json
+index ce34a9fec9b4d88e1d5bb6ac436e4c48325c3d01..27af6a82ea7e8713fb715cbe570698c88e7d5063 100644
+--- a/src/lotus_v2/vm_test/opcode_coverage.json
++++ b/src/lotus_v2/vm_test/opcode_coverage.json
+@@ -1062,7 +1062,7 @@
+       "byte": "c3",
+       "name": "STATEHASH",
+       "group": "cryptography",
+-      "status": "unsupported"
++      "status": "implemented"
+     },
+     {
+       "byte": "c8",
+@@ -1290,7 +1290,7 @@
+       "byte": "ed",
+       "name": "STATEVERIFY",
+       "group": "output",
+-      "status": "unsupported"
++      "status": "implemented"
+     },
+     {
+       "byte": "ee",
+-- 
+2.50.1 (Apple Git-155)
+

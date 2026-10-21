@@ -1,0 +1,2518 @@
+From 7d096f52b034dd8a64a9142c8cfe8e93cfa28b55 Mon Sep 17 00:00:00 2001
+From: Lotus V2 Builder <builder@lotus.org>
+Date: Sat, 17 Oct 2026 13:58:25 -0700
+Subject: [PATCH] perf(v2): lazy Merklix arena/disk digests, in-txn node_cache,
+ hardware PCLMUL/PMULL GF64, batched P2P/mempool signals, and zero-copy GBT
+ state roots
+
+Defer interior Merklix digest recomputation via dirty flags until root
+query, add an in-transaction MDBX node_cache, accelerate GF(2^64) syndrome
+math with ARM64 PMULL / x86 PCLMULQDQ intrinsics, batch P2P/mempool
+notifications, and serve zero-copy state roots in getblocktemplate.
+---
+ src/avalanche/processor.cpp                   |   3 +-
+ src/consensus/tx_verify.cpp                   |  92 ++--
+ src/lotus_v2/commitment.cpp                   |  38 +-
+ src/lotus_v2/disk_state.cpp                   | 358 ++++++++++++---
+ src/lotus_v2/mempool_overlay.cpp              | 422 +++++++++++++++---
+ src/lotus_v2/mempool_overlay.h                |  15 +-
+ src/lotus_v2/set_reconciliation.cpp           |  52 +++
+ src/lotus_v2/signing.cpp                      |   6 +-
+ src/lotus_v2/sparse_state.cpp                 |  18 +-
+ src/lotus_v2/tagged_hash.cpp                  |  22 +-
+ src/net_processing.cpp                        |  85 +++-
+ src/net_processing.h                          |  19 +
+ src/node/snapshot.cpp                         |  66 ++-
+ src/node/snapshot.h                           |   5 +-
+ src/primitives/block.cpp                      |  47 +-
+ src/rpc/mempool.cpp                           |  12 +-
+ src/rpc/mining.cpp                            |   3 +-
+ src/validation.cpp                            | 156 +++++--
+ src/validationinterface.cpp                   |  24 +
+ src/validationinterface.h                     |   7 +
+ .../lotus_v2_loopback_tps_stress.py           |   4 +-
+ 21 files changed, 1197 insertions(+), 257 deletions(-)
+
+diff --git a/src/avalanche/processor.cpp b/src/avalanche/processor.cpp
+index 55de3bca24..bd876c8683 100644
+--- a/src/avalanche/processor.cpp
++++ b/src/avalanche/processor.cpp
+@@ -2012,8 +2012,7 @@ void Processor::updatedBlockTip() {
+ }
+ 
+ void Processor::transactionAddedToMempool(const CTransactionRef &tx) {
+-    if (isPreconsensusActivated(
+-            WITH_LOCK(cs_main, return chainman.ActiveTip()))) {
++    if (isPreconsensusActivated(nullptr)) {
+         addToReconcile(tx);
+     }
+ }
+diff --git a/src/consensus/tx_verify.cpp b/src/consensus/tx_verify.cpp
+index c7a6e5d487..6fac047509 100644
+--- a/src/consensus/tx_verify.cpp
++++ b/src/consensus/tx_verify.cpp
+@@ -187,25 +187,46 @@ bool SequenceLocks(const CTransaction &tx, int flags,
+ }
+ 
+ namespace Consensus {
++static inline bool ExtractTokenIdAndValue(const CTxOut &txout, uint256 &tok_id,
++                                          uint64_t &val) {
++    if (!txout.vBranches.empty()) {
++        if ((txout.nFlags & 0x01U) == 0) {
++            return false;
++        }
++        tok_id = txout.tokenId;
++        val = static_cast<uint64_t>(
++            std::max<int64_t>(0, txout.nValue / SATOSHI));
++        return true;
++    }
++    if (txout.scriptPubKey.size() >= 43) {
++        const lotus::v2::Output v2out = txout.ToV2Output();
++        if (v2out.HasToken()) {
++            std::memcpy(tok_id.begin(), v2out.token_id.data(), 32);
++            val = v2out.value;
++            return true;
++        }
++    }
++    return false;
++}
++
+ bool CheckTxInputs(const CTransaction &tx, TxValidationState &state,
+                    const CCoinsViewCache &inputs, int nSpendHeight,
+                    Amount &txfee) {
+-    // are the actual inputs available?
+-    if (!inputs.HaveInputs(tx)) {
+-        return state.Invalid(TxValidationResult::TX_MISSING_INPUTS,
+-                             "bad-txns-inputs-missingorspent",
+-                             strprintf("%s: inputs missing/spent", __func__));
+-    }
+-
+     Amount nValueIn = Amount::zero();
+     std::map<uint256, std::pair<__uint128_t, __uint128_t>> tokenTotals;
++    bool has_authority_input = false;
+     for (const auto &in : tx.vin) {
+         if (in.nFlags == 3) {
++            has_authority_input = true;
+             continue;
+         }
+         const COutPoint &prevout = in.prevout;
+         const Coin &coin = inputs.AccessCoin(prevout);
+-        assert(!coin.IsSpent());
++        if (coin.IsSpent()) {
++            return state.Invalid(TxValidationResult::TX_MISSING_INPUTS,
++                                 "bad-txns-inputs-missingorspent",
++                                 strprintf("%s: inputs missing/spent", __func__));
++        }
+ 
+         // If prev is coinbase, check that it's matured
+         if (coin.IsCoinBase() &&
+@@ -217,58 +238,59 @@ bool CheckTxInputs(const CTransaction &tx, TxValidationState &state,
+                           nSpendHeight - coin.GetHeight()));
+         }
+ 
+-        const lotus::v2::Output v2in_out = coin.GetTxOut().ToV2Output();
+-        if (v2in_out.HasToken()) {
+-            if (coin.GetTxOut().nValue < Amount::zero()) {
++        const CTxOut &prev_txout = coin.GetTxOut();
++        uint256 tok_id;
++        uint64_t tok_val = 0;
++        if (ExtractTokenIdAndValue(prev_txout, tok_id, tok_val)) {
++            if (prev_txout.nValue < Amount::zero()) {
+                 return state.Invalid(TxValidationResult::TX_CONSENSUS,
+                                      "bad-txns-inputvalues-outofrange");
+             }
+-            uint256 tok_id;
+-            std::memcpy(tok_id.begin(), v2in_out.token_id.data(), 32);
+-            tokenTotals[tok_id].first += v2in_out.value;
++            tokenTotals[tok_id].first += tok_val;
+             continue;
+         }
+ 
+         // Check for negative or overflow input values
+-        nValueIn += coin.GetTxOut().nValue;
+-        if (!MoneyRange(coin.GetTxOut().nValue) || !MoneyRange(nValueIn)) {
++        nValueIn += prev_txout.nValue;
++        if (!MoneyRange(prev_txout.nValue) || !MoneyRange(nValueIn)) {
+             return state.Invalid(TxValidationResult::TX_CONSENSUS,
+                                  "bad-txns-inputvalues-outofrange");
+         }
+     }
+ 
+     for (const auto &out : tx.vout) {
+-        const lotus::v2::Output v2out = out.ToV2Output();
+-        if (v2out.HasToken()) {
++        uint256 tok_id;
++        uint64_t tok_val = 0;
++        if (ExtractTokenIdAndValue(out, tok_id, tok_val)) {
+             if (out.nValue < Amount::zero()) {
+                 return state.Invalid(TxValidationResult::TX_CONSENSUS,
+                                      "bad-txns-vout-negative");
+             }
+-            uint256 tok_id;
+-            std::memcpy(tok_id.begin(), v2out.token_id.data(), 32);
+-            tokenTotals[tok_id].second += v2out.value;
++            tokenTotals[tok_id].second += tok_val;
+         }
+     }
+ 
+-    std::set<uint256> positiveTokenDeltas;
+-    for (const auto &[tokenId, totals] : tokenTotals) {
+-        if (totals.second > totals.first) {
+-            positiveTokenDeltas.insert(tokenId);
++    if (!tokenTotals.empty() || has_authority_input) {
++        std::set<uint256> positiveTokenDeltas;
++        for (const auto &[tokenId, totals] : tokenTotals) {
++            if (totals.second > totals.first) {
++                positiveTokenDeltas.insert(tokenId);
++            }
+         }
+-    }
+-    for (const auto &in : tx.vin) {
+-        if (in.nFlags != 3) {
+-            continue;
++        for (const auto &in : tx.vin) {
++            if (in.nFlags != 3) {
++                continue;
++            }
++            if (positiveTokenDeltas.erase(uint256(in.prevout.GetTxId())) != 1) {
++                return state.Invalid(TxValidationResult::TX_CONSENSUS,
++                                     "bad-txns-mint-without-positive-delta");
++            }
+         }
+-        if (positiveTokenDeltas.erase(uint256(in.prevout.GetTxId())) != 1) {
++        if (!positiveTokenDeltas.empty()) {
+             return state.Invalid(TxValidationResult::TX_CONSENSUS,
+-                                 "bad-txns-mint-without-positive-delta");
++                                 "bad-txns-token-inflation");
+         }
+     }
+-    if (!positiveTokenDeltas.empty()) {
+-        return state.Invalid(TxValidationResult::TX_CONSENSUS,
+-                             "bad-txns-token-inflation");
+-    }
+ 
+     const Amount value_out = tx.GetValueOut();
+     if (nValueIn < value_out) {
+diff --git a/src/lotus_v2/commitment.cpp b/src/lotus_v2/commitment.cpp
+index b11dd1d0a4..9fc5207dfe 100644
+--- a/src/lotus_v2/commitment.cpp
++++ b/src/lotus_v2/commitment.cpp
+@@ -44,7 +44,9 @@ bool TxKeyBit(const Hash &tx_id, unsigned depth) {
+ }
+ 
+ Hash EmptyTxRoot() {
+-    return TaggedHash(HashDomain::TxRoot, std::array<uint8_t, 1>{2});
++    static const Hash kEmpty =
++        TaggedHash(HashDomain::TxRoot, std::array<uint8_t, 1>{2});
++    return kEmpty;
+ }
+ 
+ Hash TxLeaf(const TxIdentityPair &tx) {
+@@ -106,12 +108,46 @@ Hash InputFullLeaf(std::span<const uint8_t> encoded_input) {
+     return TaggedHash(HashDomain::InputFull, encoded_input);
+ }
+ Hash OutputLeaf(std::span<const uint8_t> serialized_output) {
++    if (serialized_output.size() < 253) {
++        std::array<uint8_t, 253> buf{};
++        buf[0] = static_cast<uint8_t>(serialized_output.size());
++        if (!serialized_output.empty()) {
++            std::memcpy(buf.data() + 1, serialized_output.data(),
++                        serialized_output.size());
++        }
++        return TaggedHash(
++            HashDomain::Output,
++            std::span<const uint8_t>(buf.data(), 1 + serialized_output.size()));
++    }
+     return TaggedHash(HashDomain::Output, EncodeBytes(serialized_output));
+ }
+ Hash CoinEntryLeaf(std::span<const uint8_t> serialized_resolved_output) {
++    if (serialized_resolved_output.size() < 253) {
++        std::array<uint8_t, 253> buf{};
++        buf[0] = static_cast<uint8_t>(serialized_resolved_output.size());
++        if (!serialized_resolved_output.empty()) {
++            std::memcpy(buf.data() + 1, serialized_resolved_output.data(),
++                        serialized_resolved_output.size());
++        }
++        return TaggedHash(
++            HashDomain::CoinEntry,
++            std::span<const uint8_t>(buf.data(),
++                                     1 + serialized_resolved_output.size()));
++    }
+     return TaggedHash(HashDomain::CoinEntry, EncodeBytes(serialized_resolved_output));
+ }
+ Hash BranchLeaf(std::span<const uint8_t> script) {
++    if (script.size() < 253) {
++        std::array<uint8_t, 254> buf{};
++        buf[0] = 0;
++        buf[1] = static_cast<uint8_t>(script.size());
++        if (!script.empty()) {
++            std::memcpy(buf.data() + 2, script.data(), script.size());
++        }
++        return TaggedHash(
++            HashDomain::Branch,
++            std::span<const uint8_t>(buf.data(), 2 + script.size()));
++    }
+     const auto bytes = EncodeBytes(script);
+     std::vector<uint8_t> input;
+     input.reserve(1 + bytes.size());
+diff --git a/src/lotus_v2/disk_state.cpp b/src/lotus_v2/disk_state.cpp
+index 9f00922ab6..c510302cf4 100644
+--- a/src/lotus_v2/disk_state.cpp
++++ b/src/lotus_v2/disk_state.cpp
+@@ -202,25 +202,33 @@ struct Path {
+         // Bit-reversing each byte maps tree bit (depth % 8 == 0) to MSB 0x80
+         // so that deep SMT ancestors share a lexicographic prefix in 4 KB
+         // libmdbx B+Tree pages without changing Bit() or UtxoNode hashes.
+-        Bytes key;
+-        key.reserve(35);
+-        key.push_back('N');
+-        for (uint8_t b : prefix) key.push_back(static_cast<char>(ReverseByte(b)));
+-        Put(key, depth, 2);
+-        return key;
++        char buf[35];
++        buf[0] = 'N';
++        for (size_t i = 0; i < 32; ++i) {
++            buf[1 + i] = static_cast<char>(ReverseByte(prefix[i]));
++        }
++        buf[33] = static_cast<char>(depth & 0xffu);
++        buf[34] = static_cast<char>((depth >> 8) & 0xffu);
++        return Bytes(buf, 35);
+     }
+     bool Contains(const Hash &key) const {
+         for (unsigned d = 0; d < depth; ++d) if (Bit(key, d) != Bit(prefix, d)) return false;
+         return true;
+     }
++    bool operator==(const Path &o) const noexcept {
++        return depth == o.depth && prefix == o.prefix;
++    }
+ };
+ Bytes CoinKey(const Outpoint &outpoint) {
+-    Bytes key;
+-    key.reserve(37);
+-    key.push_back('C');
+-    for (uint8_t b : outpoint.tx_id) key.push_back(static_cast<char>(ReverseByte(b)));
+-    Put(key, outpoint.index, 4);
+-    return key;
++    char buf[37];
++    buf[0] = 'C';
++    for (size_t i = 0; i < 32; ++i) {
++        buf[1 + i] = static_cast<char>(ReverseByte(outpoint.tx_id[i]));
++    }
++    for (unsigned i = 0; i < 4; ++i) {
++        buf[33 + i] = static_cast<char>((outpoint.index >> (8 * i)) & 0xffu);
++    }
++    return Bytes(buf, 37);
+ }
+ Bytes UndoKey(const Hash &tip) { Bytes key(1, 'U'); PutHash(key, tip); return key; }
+ Bytes CoinBytes(const Coin &coin) {
+@@ -277,10 +285,15 @@ Summary GetSummary(Reader &r) {
+ struct Node {
+     Summary summary;
+     std::optional<Coin> coin;
++    Bytes coin_bytes;
++    Hash coin_outpoint_key{};
+     std::array<Summary, 2> children;
+ };
+-Node Leaf(const Coin &coin) {
++Node Leaf(const Coin &coin, Bytes encoded = {}) {
+     Node node; node.summary.kind = 1; node.coin = coin;
++    if (encoded.empty()) encoded = CoinBytes(coin);
++    node.coin_bytes = std::move(encoded);
++    node.coin_outpoint_key = OutpointKey(coin.outpoint);
+     if (!UtxoLeaf(coin, node.summary.digest)) Fail(DiskStateErrorCode::InvalidCoin, "invalid leaf");
+     return node;
+ }
+@@ -296,8 +309,12 @@ Node Branch(unsigned depth, const Summary &left, const Summary &right) {
+ Bytes EncodeNode(const Node &node) {
+     Bytes bytes;
+     PutSummary(bytes, node.summary);
+-    if (node.summary.kind == 1) PutBlob(bytes, CoinBytes(*node.coin));
+-    else { PutSummary(bytes, node.children[0]); PutSummary(bytes, node.children[1]); }
++    if (node.summary.kind == 1) {
++        PutBlob(bytes, node.coin_bytes.empty() ? CoinBytes(*node.coin) : node.coin_bytes);
++    } else {
++        PutSummary(bytes, node.children[0]);
++        PutSummary(bytes, node.children[1]);
++    }
+     return bytes;
+ }
+ Node ParseNode(BytesView bytes, const Path &path, const Summary &expected) {
+@@ -307,8 +324,9 @@ Node ParseNode(BytesView bytes, const Path &path, const Summary &expected) {
+     Require(stored == expected && stored.kind != 0, "node/head disagreement");
+     Node node;
+     if (stored.kind == 1) {
+-        node = Leaf(ParseCoin(r.BlobView(MAX_COIN_BYTES)));
+-        Require(path.Contains(OutpointKey(node.coin->outpoint)), "leaf path mismatch");
++        const BytesView cb = r.BlobView(MAX_COIN_BYTES);
++        node = Leaf(ParseCoin(cb), Bytes(cb));
++        Require(path.Contains(node.coin_outpoint_key), "leaf path mismatch");
+     } else {
+         auto left = GetSummary(r); auto right = GetSummary(r);
+         node = Branch(path.depth, left, right);
+@@ -1405,15 +1423,45 @@ struct DiskStateStore::Impl {
+ };
+ 
+ struct DiskStateTransaction::Impl {
++    struct PathHash {
++        size_t operator()(const Path &p) const noexcept {
++            uint64_t h0 = 0, h1 = 0, h2 = 0, h3 = 0;
++            std::memcpy(&h0, p.prefix.data(), 8);
++            std::memcpy(&h1, p.prefix.data() + 8, 8);
++            std::memcpy(&h2, p.prefix.data() + 16, 8);
++            std::memcpy(&h3, p.prefix.data() + 24, 8);
++            uint64_t z = h0 ^ (h1 * 0x9e3779b97f4a7c15ULL) ^
++                         (h2 * 0xbf58476d1ce4e5b9ULL) ^
++                         (h3 * 0x94d049bb133111ebULL) ^
++                         (static_cast<uint64_t>(p.depth) * 0xd6e8feb86659fd93ULL);
++            z ^= z >> 30;
++            z *= 0xbf58476d1ce4e5b9ULL;
++            z ^= z >> 27;
++            z *= 0x94d049bb133111ebULL;
++            z ^= z >> 31;
++            return static_cast<size_t>(z);
++        }
++    };
++    struct CachedNode {
++        std::optional<Node> node;
++        bool dirty{false};
++        bool digest_dirty{false};
++        bool in_db{false};
++        Value db_before;
++    };
+     std::shared_ptr<DiskStateStore::Impl> store;
+-    Head head;
+-    Changes changes;
++    mutable Head head;
++    mutable Changes changes;
++    mutable std::unordered_map<Path, CachedNode, PathHash> node_cache;
++    mutable bool has_dirty_nodes{false};
+     mutable DiskStateStats stats;
+     bool failed{};
+     bool finished{};
+     std::optional<DiskRecoveryUpdate> recovery_update;
+     explicit Impl(std::shared_ptr<DiskStateStore::Impl> owner)
+-        : store(std::move(owner)), head(store->head) {}
++        : store(std::move(owner)), head(store->head) {
++        node_cache.reserve(16384);
++    }
+     ~Impl() { if (!finished) store->active = false; }
+     void Usable() const {
+         store->Usable();
+@@ -1435,7 +1483,26 @@ struct DiskStateTransaction::Impl {
+         ++stats.database_reads;
+         return store->Read(key);
+     }
+-    void Set(const Bytes &key, Value value) {
++    void SetWithBefore(const Bytes &key, Value before, Value value) const {
++        Usable();
++        auto it = changes.find(key);
++        if (it == changes.end()) {
++            if (before == value) return;
++            stats.pending_bytes += key.size() + (before ? 2 * before->size() : 0);
++            it = changes.emplace(key, Change{before, before}).first;
++        }
++        if (it->second.after) stats.pending_bytes -= it->second.after->size();
++        it->second.after = std::move(value);
++        if (it->second.after) stats.pending_bytes += it->second.after->size();
++        if (it->second.before == it->second.after) {
++            stats.pending_bytes -= key.size() + (it->second.before ? it->second.before->size() : 0) +
++                                   (it->second.after ? it->second.after->size() : 0);
++            changes.erase(it);
++        }
++        if (stats.pending_bytes > store->options.max_pending_bytes)
++            Fail(DiskStateErrorCode::Resource, "transaction exceeds operational memory limit");
++    }
++    void Set(const Bytes &key, Value value) const {
+         Usable();
+         auto it = changes.find(key);
+         if (it == changes.end()) {
+@@ -1455,17 +1522,140 @@ struct DiskStateTransaction::Impl {
+         if (stats.pending_bytes > store->options.max_pending_bytes)
+             Fail(DiskStateErrorCode::Resource, "transaction exceeds operational memory limit");
+     }
+-    Node GetNode(const Path &path, const Summary &summary) const {
++    void EnsureBranchDigestsAt(const Path &path, Summary &summary) const {
++        if (summary.kind != 2) return;
++        auto it = node_cache.find(path);
++        if (it == node_cache.end() || !it->second.node.has_value() || !it->second.digest_dirty) {
++            return;
++        }
++        Node &node = *it->second.node;
++        if (node.children[0].kind == 2) {
++            EnsureBranchDigestsAt(path.Child(0), node.children[0]);
++        }
++        if (node.children[1].kind == 2) {
++            EnsureBranchDigestsAt(path.Child(1), node.children[1]);
++        }
++        Require(UtxoNode(path.depth, node.children[0].digest, node.children[1].digest, node.summary.digest), "node hash");
++        summary.digest = node.summary.digest;
++        it->second.digest_dirty = false;
++    }
++    void EnsureBranchDigests() const {
++        if (!has_dirty_nodes) return;
++        EnsureBranchDigestsAt(Path{}, head.root);
++    }
++    void FlushNodes() const {
++        if (!has_dirty_nodes) return;
++        EnsureBranchDigests();
++        for (auto &[path, entry] : node_cache) {
++            if (!entry.dirty) continue;
++            entry.dirty = false;
++            Value after = entry.node ? Value(EncodeNode(*entry.node)) : std::nullopt;
++            SetWithBefore(path.Key(), entry.in_db ? entry.db_before : std::nullopt, std::move(after));
++        }
++        has_dirty_nodes = false;
++    }
++    const Node &GetNode(const Path &path, const Summary &summary) const {
+         Require(summary.kind != 0, "read empty node");
+-        const ValueView bytes = ReadView(path.Key()); Require(bytes.has_value(), "missing tree node");
+-        return ParseNode(*bytes, path, summary);
++        const auto cit = node_cache.find(path);
++        if (cit != node_cache.end()) {
++            Require(cit->second.node.has_value(), "missing tree node");
++            Require(cit->second.node->summary.kind == summary.kind &&
++                    (cit->second.digest_dirty || cit->second.node->summary.digest == summary.digest),
++                    "corrupt node summary");
++            return *cit->second.node;
++        }
++        const Bytes key = path.Key();
++        const ValueView bytes = ReadView(key);
++        Require(bytes.has_value(), "missing tree node");
++        Node parsed = ParseNode(*bytes, path, summary);
++        auto [it, _] = node_cache.emplace(path, CachedNode{std::move(parsed), false, false, true, Bytes(*bytes)});
++        return *it->second.node;
++    }
++    Summary SetNode(const Path &path, Node node) {
++        const Summary s = node.summary;
++        auto it = node_cache.find(path);
++        if (it != node_cache.end()) {
++            it->second.node = std::move(node);
++            it->second.dirty = true;
++            it->second.digest_dirty = false;
++        } else {
++            node_cache.emplace(path, CachedNode{std::move(node), true, false, false, std::nullopt});
++        }
++        has_dirty_nodes = true;
++        return s;
++    }
++    Summary SetBranchLazy(const Path &path, const Summary &left, const Summary &right) {
++        Require(path.depth < 256, "branch depth");
++        Require((left.kind != 0 || right.kind != 0) &&
++                !(left.kind == 0 && right.kind == 1) && !(left.kind == 1 && right.kind == 0),
++                "uncollapsed branch");
++        Node node;
++        node.summary.kind = 2;
++        node.summary.digest = Hash{};
++        node.children = {left, right};
++        const Summary s = node.summary;
++        auto it = node_cache.find(path);
++        if (it != node_cache.end()) {
++            it->second.node = std::move(node);
++            it->second.dirty = true;
++            it->second.digest_dirty = true;
++        } else {
++            node_cache.emplace(path, CachedNode{std::move(node), true, true, false, std::nullopt});
++        }
++        has_dirty_nodes = true;
++        return s;
+     }
+-    Summary SetNode(const Path &path, const Node &node) {
+-        Set(path.Key(), EncodeNode(node)); return node.summary;
++    void ClearNode(const Path &path) {
++        auto it = node_cache.find(path);
++        if (it != node_cache.end()) {
++            if (!it->second.in_db) {
++                node_cache.erase(it);
++                return;
++            }
++            it->second.node.reset();
++            it->second.dirty = true;
++            it->second.digest_dirty = false;
++            has_dirty_nodes = true;
++            return;
++        }
++        node_cache.emplace(path, CachedNode{std::nullopt, true, false, false, std::nullopt});
++        has_dirty_nodes = true;
++    }
++    void AuthCheckCoin(const Outpoint &outpoint, const Hash &key, bool &out_present) const {
++        Usable();
++        Path path;
++        Summary summary = head.root;
++        out_present = false;
++        uint8_t last_sibling_kind = 0;
++        bool has_parent = false;
++        while (summary.kind) {
++            const Node &node = GetNode(path, summary);
++            if (summary.kind == 1) {
++                const auto coin = ReadView(CoinKey(node.coin->outpoint));
++                Require(coin && BytesView(*coin) == node.coin_bytes, "coin/tree proof disagreement");
++                if (node.coin->outpoint == outpoint) {
++                    out_present = true;
++                } else {
++                    Require(node.coin_outpoint_key != key, "generated proof mismatch");
++                    out_present = false;
++                }
++                return;
++            }
++            const bool bit = Bit(key, path.depth);
++            last_sibling_kind = node.children[1 - bit].kind;
++            has_parent = true;
++            summary = node.children[bit];
++            path = path.Child(bit);
++        }
++        if (has_parent) {
++            Require(last_sibling_kind != 0, "generated proof mismatch");
++        }
++        const auto raw = ReadView(CoinKey(outpoint));
++        Require(!raw.has_value(), "coin membership disagreement");
+     }
+     Summary Join(const Path &path, const Node &old, const Node &added) {
+-        const Hash old_key = OutpointKey(old.coin->outpoint);
+-        const Hash key = OutpointKey(added.coin->outpoint);
++        const Hash &old_key = old.coin_outpoint_key;
++        const Hash &key = added.coin_outpoint_key;
+         Require(key != old_key, "leaf key collision");
+         const bool old_bit = Bit(old_key, path.depth), bit = Bit(key, path.depth);
+         std::array<Summary, 2> children;
+@@ -1474,46 +1664,51 @@ struct DiskStateTransaction::Impl {
+             children[old_bit] = SetNode(path.Child(old_bit), old);
+             children[bit] = SetNode(path.Child(bit), added);
+         }
+-        return SetNode(path, Branch(path.depth, children[0], children[1]));
++        return SetBranchLazy(path, children[0], children[1]);
+     }
+     Summary InsertAt(const Path &path, const Summary &summary, const Node &added) {
+         if (!summary.kind) return SetNode(path, added);
+-        Node old = GetNode(path, summary);
+-        if (old.summary.kind == 1) {
+-            if (OutpointKey(old.coin->outpoint) == OutpointKey(added.coin->outpoint))
++        const Node &old_ref = GetNode(path, summary);
++        if (old_ref.summary.kind == 1) {
++            if (old_ref.coin_outpoint_key == added.coin_outpoint_key)
+                 Fail(DiskStateErrorCode::Duplicate, "occupied outpoint key");
+-            return Join(path, old, added);
++            Node old_copy = old_ref;
++            return Join(path, old_copy, added);
+         }
+-        const bool bit = Bit(OutpointKey(added.coin->outpoint), path.depth);
+-        old.children[bit] = InsertAt(path.Child(bit), old.children[bit], added);
+-        return SetNode(path, Branch(path.depth, old.children[0], old.children[1]));
++        std::array<Summary, 2> children = old_ref.children;
++        const bool bit = Bit(added.coin_outpoint_key, path.depth);
++        children[bit] = InsertAt(path.Child(bit), children[bit], added);
++        return SetBranchLazy(path, children[0], children[1]);
+     }
+-    Summary EraseAt(const Path &path, const Summary &summary, const Outpoint &outpoint) {
++    Summary EraseAt(const Path &path, const Summary &summary, const Outpoint &outpoint, const Hash &outpoint_key) {
+         if (!summary.kind) Fail(DiskStateErrorCode::Missing, "missing leaf");
+-        Node old = GetNode(path, summary);
+-        if (old.summary.kind == 1) {
+-            Require(old.coin->outpoint == outpoint, "coin/tree disagreement");
+-            Set(path.Key(), std::nullopt); return {};
+-        }
+-        const bool bit = Bit(OutpointKey(outpoint), path.depth);
++        const Node &old_ref = GetNode(path, summary);
++        if (old_ref.summary.kind == 1) {
++            Require(old_ref.coin->outpoint == outpoint, "coin/tree disagreement");
++            ClearNode(path);
++            return {};
++        }
++        std::array<Summary, 2> children = old_ref.children;
++        const bool bit = Bit(outpoint_key, path.depth);
+         // Child digests are authenticated by UtxoNode, but cardinality kinds
+         // are not. Authenticate the unchanged sibling's actual record before
+         // trusting its kind to retain a branch or collapse a singleton. The
+         // changed child's returned summary is derived from validated records.
+-        if (old.children[!bit].kind)
+-            (void)GetNode(path.Child(!bit), old.children[!bit]);
+-        old.children[bit] = EraseAt(path.Child(bit), old.children[bit], outpoint);
+-        const auto left = old.children[0].kind, right = old.children[1].kind;
++        if (children[!bit].kind)
++            (void)GetNode(path.Child(!bit), children[!bit]);
++        children[bit] = EraseAt(path.Child(bit), children[bit], outpoint, outpoint_key);
++        const auto left = children[0].kind, right = children[1].kind;
+         if ((left == 0 && right == 1) || (left == 1 && right == 0)) {
+             const bool survivor = right == 1;
+-            Node leaf = GetNode(path.Child(survivor), old.children[survivor]);
+-            Set(path.Child(survivor).Key(), std::nullopt);
+-            return SetNode(path, leaf);
++            Node leaf = GetNode(path.Child(survivor), children[survivor]);
++            ClearNode(path.Child(survivor));
++            return SetNode(path, std::move(leaf));
+         }
+-        return SetNode(path, Branch(path.depth, old.children[0], old.children[1]));
++        return SetBranchLazy(path, children[0], children[1]);
+     }
+     void End() { finished = true; store->active = false; }
+     DiskStateStats Stats() const {
++        FlushNodes();
+         auto result = stats;
+         for (const auto &[key, change] : changes) {
+             (void)change;
+@@ -1544,7 +1739,7 @@ template <typename Read> void Prove(Read read, const Head &head, const Outpoint
+             proof.coin = node.coin;
+             proof.presence = proof.coin->outpoint == query ? ProofPresence::Present : ProofPresence::OtherLeaf;
+             const auto coin = read(CoinKey(proof.coin->outpoint));
+-            Require(coin && BytesView(*coin) == CoinBytes(*proof.coin), "coin/tree proof disagreement");
++            Require(coin && BytesView(*coin) == node.coin_bytes, "coin/tree proof disagreement");
+             break;
+         }
+         const bool bit = Bit(key, path.depth);
+@@ -2326,6 +2521,7 @@ bool DiskStateStore::ImportFastSyncPivot(const DiskStateMetadata &pivot_metadata
+         } catch (const std::exception &e) {
+             Fail(DiskStateErrorCode::Corruption, e.what());
+         }
++        tx.FlushNodes();
+         Require(StateRoot(impl_->options.identity, pivot_header.height, tx.head.root.digest, mon) ==
+                 pivot_header.state_root,
+                 "pivot state_root mismatch");
+@@ -2391,19 +2587,21 @@ bool DiskStateStore::PeelBlockStateReverse(
+                 "reverse peel parent header/metadata binding");
+         DiskStateTransaction::Impl tx(impl_);
+         for (const Outpoint &op : net_created_to_erase) {
+-            std::optional<Coin> existing;
+-            AuthReadCoin([&](const Bytes &key) { return tx.ReadView(key); }, tx.head, op, existing);
++            const Hash key = OutpointKey(op);
++            bool existing = false;
++            tx.AuthCheckCoin(op, key, existing);
+             if (!existing) Fail(DiskStateErrorCode::Missing, "reverse peel missing created coin");
+-            tx.head.root = tx.EraseAt(Path{}, tx.head.root, op);
++            tx.head.root = tx.EraseAt(Path{}, tx.head.root, op, key);
+             tx.Set(CoinKey(op), std::nullopt);
+         }
+         for (const Coin &coin : prior_spent_to_insert) {
+-            const Bytes bytes = CoinBytes(coin);
+-            std::optional<Coin> existing;
+-            AuthReadCoin([&](const Bytes &key) { return tx.ReadView(key); }, tx.head, coin.outpoint, existing);
++            Node leaf = Leaf(coin);
++            bool existing = false;
++            tx.AuthCheckCoin(coin.outpoint, leaf.coin_outpoint_key, existing);
+             if (existing) Fail(DiskStateErrorCode::Duplicate, "reverse peel prior spent coin already present");
+-            tx.head.root = tx.InsertAt(Path{}, tx.head.root, Leaf(coin));
+-            tx.Set(CoinKey(coin.outpoint), bytes);
++            Bytes bytes = leaf.coin_bytes;
++            tx.head.root = tx.InsertAt(Path{}, tx.head.root, leaf);
++            tx.Set(CoinKey(coin.outpoint), std::move(bytes));
+         }
+         MonetaryState parent_mon{};
+         try {
+@@ -2411,6 +2609,7 @@ bool DiskStateStore::PeelBlockStateReverse(
+         } catch (const std::exception &e) {
+             Fail(DiskStateErrorCode::Corruption, e.what());
+         }
++        tx.FlushNodes();
+         if (StateRoot(impl_->options.identity, parent_header.height, tx.head.root.digest, parent_mon) !=
+             parent_header.state_root) {
+             Fail(DiskStateErrorCode::UndoMismatch, "reverse peel parent state_root mismatch");
+@@ -2730,8 +2929,8 @@ bool DiskStateStore::PrefetchOutpointsAsync(
+         MDBX_txn *rtxn = impl_->EnsureReadTxn();
+         constexpr uintptr_t kPageMask = ~uintptr_t(4095);
+ 
+-        auto madvise_val = [kPageMask](const MDBX_val &val,
+-                                       uintptr_t &last_page) noexcept {
++        auto madvise_val = [](const MDBX_val &val,
++                              uintptr_t &last_page) noexcept {
+             if (!val.iov_base || val.iov_len == 0) {
+                 return;
+             }
+@@ -2848,29 +3047,38 @@ bool DiskStateStore::CommitFinalizedOverlay(
+     }
+     return txn.Commit(next, fully_connected, error);
+ }
+-Hash DiskStateTransaction::Root() const { return impl_ ? impl_->head.root.digest : EmptyUtxoRoot(); }
++Hash DiskStateTransaction::Root() const {
++    if (!impl_) return EmptyUtxoRoot();
++    impl_->EnsureBranchDigests();
++    return impl_->head.root.digest;
++}
+ DiskStateStats DiskStateTransaction::Stats() const { return impl_ ? impl_->Stats() : DiskStateStats{}; }
+ bool DiskStateTransaction::ReadCoin(const Outpoint &outpoint, std::optional<Coin> &out, DiskStateError &error) const {
+     return Guard(error, [&] {
+         if (!impl_) Fail(DiskStateErrorCode::Closed, "closed transaction");
++        impl_->FlushNodes();
+         ::lotus::v2::AuthReadCoin([&](const Bytes &key) { return impl_->ReadView(key); }, impl_->head, outpoint, out);
+     });
+ }
+ bool DiskStateTransaction::Prove(const Outpoint &query, CoinProof &out, DiskStateError &error) const {
+     return Guard(error, [&] {
+         if (!impl_) Fail(DiskStateErrorCode::Closed, "closed transaction");
+-        impl_->Usable(); ::lotus::v2::Prove([&](const Bytes &key) { return impl_->ReadView(key); }, impl_->head, query, out);
++        impl_->Usable();
++        impl_->FlushNodes();
++        ::lotus::v2::Prove([&](const Bytes &key) { return impl_->ReadView(key); }, impl_->head, query, out);
+     });
+ }
+ bool DiskStateTransaction::Insert(const Coin &coin, DiskStateError &error) {
+     const bool ok = Guard(error, [&] {
+         if (!impl_) Fail(DiskStateErrorCode::Closed, "closed transaction");
+-        impl_->Usable(); const Bytes bytes = CoinBytes(coin);
+-        std::optional<Coin> existing;
+-        AuthReadCoin([&](const Bytes &key) { return impl_->ReadView(key); }, impl_->head, coin.outpoint, existing);
++        impl_->Usable();
++        Node leaf = Leaf(coin);
++        bool existing = false;
++        impl_->AuthCheckCoin(coin.outpoint, leaf.coin_outpoint_key, existing);
+         if (existing) Fail(DiskStateErrorCode::Duplicate, "duplicate coin");
+-        impl_->head.root = impl_->InsertAt(Path{}, impl_->head.root, Leaf(coin));
+-        impl_->Set(CoinKey(coin.outpoint), bytes);
++        Bytes bytes = leaf.coin_bytes;
++        impl_->head.root = impl_->InsertAt(Path{}, impl_->head.root, leaf);
++        impl_->Set(CoinKey(coin.outpoint), std::move(bytes));
+     });
+     if (!ok && impl_ && error.code != DiskStateErrorCode::Duplicate && error.code != DiskStateErrorCode::InvalidCoin)
+         impl_->failed = true;
+@@ -2879,10 +3087,12 @@ bool DiskStateTransaction::Insert(const Coin &coin, DiskStateError &error) {
+ bool DiskStateTransaction::Erase(const Outpoint &outpoint, DiskStateError &error) {
+     const bool ok = Guard(error, [&] {
+         if (!impl_) Fail(DiskStateErrorCode::Closed, "closed transaction");
+-        impl_->Usable(); std::optional<Coin> existing;
+-        AuthReadCoin([&](const Bytes &key) { return impl_->ReadView(key); }, impl_->head, outpoint, existing);
++        impl_->Usable();
++        const Hash key = OutpointKey(outpoint);
++        bool existing = false;
++        impl_->AuthCheckCoin(outpoint, key, existing);
+         if (!existing) Fail(DiskStateErrorCode::Missing, "missing coin");
+-        impl_->head.root = impl_->EraseAt(Path{}, impl_->head.root, outpoint);
++        impl_->head.root = impl_->EraseAt(Path{}, impl_->head.root, outpoint, key);
+         impl_->Set(CoinKey(outpoint), std::nullopt);
+     });
+     if (!ok && impl_ && error.code != DiskStateErrorCode::Missing) impl_->failed = true;
+@@ -2900,7 +3110,9 @@ bool DiskStateTransaction::CommitImpl(const DiskStateMetadata &next, const Heade
+                                       DiskStateError &error) {
+     return Guard(error, [&] {
+         if (!impl_) Fail(DiskStateErrorCode::Closed, "closed transaction");
+-        impl_->Usable(); auto &store = *impl_->store;
++        impl_->Usable();
++        impl_->FlushNodes();
++        auto &store = *impl_->store;
+         const uint64_t commit_reads_before = store.stats.database_reads;
+         if (impl_->recovery_update) {
+             store.RecoveryFence(*impl_->recovery_update, true);
+diff --git a/src/lotus_v2/mempool_overlay.cpp b/src/lotus_v2/mempool_overlay.cpp
+index 8dcd3a1ddc..597e9f1300 100644
+--- a/src/lotus_v2/mempool_overlay.cpp
++++ b/src/lotus_v2/mempool_overlay.cpp
+@@ -634,6 +634,9 @@ TxOverlayArena::TxOverlayArena() {
+ 
+ void TxOverlayArena::Reset() {
+     nodes_.clear();
++    if (nodes_.capacity() < 512) {
++        nodes_.reserve(512);
++    }
+     TxOverlayNode sentinel{};
+     sentinel.digest = EmptyTxRoot();
+     nodes_.push_back(sentinel);
+@@ -664,12 +667,49 @@ Hash TxOverlayArena::ChildHash(uint32_t idx) const {
+     return idx != kNullIdx ? nodes_[idx].digest : EmptyTxRoot();
+ }
+ 
+-void TxOverlayArena::RefreshNode(uint32_t idx, unsigned depth) {
++void TxOverlayArena::RefreshNode(uint32_t idx, unsigned depth) const {
+     const uint32_t l = nodes_[idx].left;
+     const uint32_t r = nodes_[idx].right;
+     const Hash lh = ChildHash(l);
+     const Hash rh = ChildHash(r);
+     nodes_[idx].digest = ComputeTxNodeHash(depth, lh, rh);
++    nodes_[idx].digest_dirty = false;
++}
++
++void TxOverlayArena::EnsureDigest(uint32_t idx, unsigned depth) const {
++    if (idx == kNullIdx || nodes_[idx].is_leaf || !nodes_[idx].digest_dirty) {
++        return;
++    }
++    if (depth == 0 && nodes_[idx].count >= 256) {
++        std::array<uint32_t, 16> shard_roots{};
++        shard_roots.fill(kNullIdx);
++        std::array<bool, 16> active{};
++        unsigned active_count = 0;
++        auto collect = [&](auto &self, uint32_t n_idx, unsigned d, unsigned prefix) -> void {
++            if (n_idx == kNullIdx || nodes_[n_idx].is_leaf || !nodes_[n_idx].digest_dirty) {
++                return;
++            }
++            if (d == 4) {
++                shard_roots[prefix] = n_idx;
++                active[prefix] = true;
++                ++active_count;
++                return;
++            }
++            self(self, nodes_[n_idx].left, d + 1, prefix);
++            self(self, nodes_[n_idx].right, d + 1, prefix | (1u << d));
++        };
++        collect(collect, idx, 0, 0);
++        if (active_count >= 8) {
++            ParallelFor16Shards(active, [&](unsigned s) {
++                EnsureDigest(shard_roots[s], 4);
++            });
++        }
++    }
++    const uint32_t l = nodes_[idx].left;
++    const uint32_t r = nodes_[idx].right;
++    EnsureDigest(l, depth + 1);
++    EnsureDigest(r, depth + 1);
++    RefreshNode(idx, depth);
+ }
+ 
+ uint32_t TxOverlayArena::JoinLeaves(uint32_t existing_idx, uint32_t added_idx,
+@@ -684,6 +724,7 @@ uint32_t TxOverlayArena::JoinLeaves(uint32_t existing_idx, uint32_t added_idx,
+     TxOverlayNode branch{};
+     branch.count = 2;
+     branch.is_leaf = false;
++    branch.digest_dirty = true;
+     if (TxKeyBit(existing_key, split)) {
+         branch.left = added_idx;
+         branch.right = existing_idx;
+@@ -692,19 +733,18 @@ uint32_t TxOverlayArena::JoinLeaves(uint32_t existing_idx, uint32_t added_idx,
+         branch.right = added_idx;
+     }
+     uint32_t subtree_idx = AllocNode(branch);
+-    RefreshNode(subtree_idx, split);
+ 
+     for (unsigned d = split; d-- > depth;) {
+         TxOverlayNode parent{};
+         parent.count = 2;
+         parent.is_leaf = false;
++        parent.digest_dirty = true;
+         if (TxKeyBit(existing_key, d)) {
+             parent.right = subtree_idx;
+         } else {
+             parent.left = subtree_idx;
+         }
+         subtree_idx = AllocNode(parent);
+-        RefreshNode(subtree_idx, d);
+     }
+     return subtree_idx;
+ }
+@@ -742,9 +782,8 @@ uint32_t TxOverlayArena::InsertAt(uint32_t node_idx, const Hash &tx_id,
+     const uint32_t lc = copy.left != kNullIdx ? nodes_[copy.left].count : 0;
+     const uint32_t rc = copy.right != kNullIdx ? nodes_[copy.right].count : 0;
+     copy.count = lc + rc;
+-    const uint32_t next_idx = AllocNode(copy);
+-    RefreshNode(next_idx, depth);
+-    return next_idx;
++    copy.digest_dirty = true;
++    return AllocNode(copy);
+ }
+ 
+ uint32_t TxOverlayArena::EraseAt(uint32_t node_idx, const Hash &tx_id,
+@@ -782,9 +821,8 @@ uint32_t TxOverlayArena::EraseAt(uint32_t node_idx, const Hash &tx_id,
+         copy.left = new_child;
+     }
+     copy.count = total_count;
+-    const uint32_t next_idx = AllocNode(copy);
+-    RefreshNode(next_idx, depth);
+-    return next_idx;
++    copy.digest_dirty = true;
++    return AllocNode(copy);
+ }
+ 
+ uint32_t TxOverlayArena::InsertTxLeaf(uint32_t root_idx, const Hash &tx_id,
+@@ -803,6 +841,7 @@ uint32_t TxOverlayArena::InsertBatchParallel(
+     if (txs.empty()) {
+         return root_idx;
+     }
++    EnsureDigest(root_idx, 0);
+ 
+     std::vector<Hash> leaf_hashes(txs.size());
+     ParallelForRange(txs.size(), 32, [&](size_t begin, size_t end) {
+@@ -1048,7 +1087,11 @@ uint32_t TxOverlayArena::InsertBatchParallel(
+ }
+ 
+ Hash TxOverlayArena::SubtreeARoot(uint32_t root_idx) const {
+-    return root_idx != kNullIdx ? nodes_[root_idx].digest : EmptyTxRoot();
++    if (root_idx == kNullIdx) {
++        return EmptyTxRoot();
++    }
++    EnsureDigest(root_idx, 0);
++    return nodes_[root_idx].digest;
+ }
+ 
+ uint32_t TxOverlayArena::Count(uint32_t root_idx) const noexcept {
+@@ -1069,6 +1112,9 @@ UtxoOverlayArena::UtxoOverlayArena(std::shared_ptr<const SmtNode> base_root) {
+ 
+ void UtxoOverlayArena::Reset(std::shared_ptr<const SmtNode> base_root) {
+     nodes_.clear();
++    if (nodes_.capacity() < 512) {
++        nodes_.reserve(512);
++    }
+     UtxoOverlayNode sentinel{};
+     sentinel.digest = EmptyUtxoRoot();
+     nodes_.push_back(sentinel);
+@@ -1100,7 +1146,7 @@ UtxoOverlayArena::ImportSmtNode(const std::shared_ptr<const SmtNode> &smt_node)
+     node.key = smt_node->key;
+     node.is_leaf = smt_node->IsLeaf();
+     if (node.is_leaf && smt_node->coin) {
+-        node.coin = *smt_node->coin;
++        node.coin = smt_node->coin;
+     } else {
+         node.base_child[0] = smt_node->child[0];
+         node.base_child[1] = smt_node->child[1];
+@@ -1110,14 +1156,17 @@ UtxoOverlayArena::ImportSmtNode(const std::shared_ptr<const SmtNode> &smt_node)
+ 
+ std::shared_ptr<const SmtNode>
+ UtxoOverlayArena::ExportSmtNode(uint32_t node_idx) const {
++    if (node_idx == kNullIdx) {
++        return nullptr;
++    }
+     const UtxoOverlayNode &n = nodes_[node_idx];
+     auto smt = std::make_shared<SmtNode>();
+     smt->digest = n.digest;
+     smt->count = n.count;
+     if (n.is_leaf) {
+-        smt->total_value = n.coin.output.value;
++        smt->total_value = n.coin ? n.coin->output.value : 0;
+         smt->key = n.key;
+-        smt->coin = std::make_shared<const Coin>(n.coin);
++        smt->coin = n.coin;
+         return smt;
+     }
+     smt->child[0] =
+@@ -1135,7 +1184,7 @@ uint32_t UtxoOverlayArena::MakeLeaf(const Coin &coin, const Hash &key,
+     leaf.digest = leaf_hash;
+     leaf.count = 1;
+     leaf.key = key;
+-    leaf.coin = coin;
++    leaf.coin = std::make_shared<const Coin>(coin);
+     leaf.is_leaf = true;
+     return AllocNode(leaf);
+ }
+@@ -1162,12 +1211,49 @@ uint32_t UtxoOverlayArena::ChildCount(const UtxoOverlayNode &node,
+     return 0;
+ }
+ 
+-void UtxoOverlayArena::RefreshNode(uint32_t idx, unsigned depth) {
++void UtxoOverlayArena::RefreshNode(uint32_t idx, unsigned depth) const {
+     const Hash lh = ChildHash(nodes_[idx], 0);
+     const Hash rh = ChildHash(nodes_[idx], 1);
+     const bool ok = UtxoNode(depth, lh, rh, nodes_[idx].digest);
+     assert(ok);
+     (void)ok;
++    nodes_[idx].digest_dirty = false;
++}
++
++void UtxoOverlayArena::EnsureDigest(uint32_t idx, unsigned depth) const {
++    if (idx == kNullIdx || nodes_[idx].is_leaf || !nodes_[idx].digest_dirty) {
++        return;
++    }
++    if (depth == 0 && nodes_[idx].count >= 256) {
++        std::array<uint32_t, 16> shard_roots{};
++        shard_roots.fill(kNullIdx);
++        std::array<bool, 16> active{};
++        unsigned active_count = 0;
++        auto collect = [&](auto &self, uint32_t n_idx, unsigned d, unsigned prefix) -> void {
++            if (n_idx == kNullIdx || nodes_[n_idx].is_leaf || !nodes_[n_idx].digest_dirty) {
++                return;
++            }
++            if (d == 4) {
++                shard_roots[prefix] = n_idx;
++                active[prefix] = true;
++                ++active_count;
++                return;
++            }
++            self(self, nodes_[n_idx].child[0], d + 1, prefix);
++            self(self, nodes_[n_idx].child[1], d + 1, prefix | (1u << d));
++        };
++        collect(collect, idx, 0, 0);
++        if (active_count >= 8) {
++            ParallelFor16Shards(active, [&](unsigned s) {
++                EnsureDigest(shard_roots[s], 4);
++            });
++        }
++    }
++    const uint32_t c0 = nodes_[idx].child[0];
++    const uint32_t c1 = nodes_[idx].child[1];
++    EnsureDigest(c0, depth + 1);
++    EnsureDigest(c1, depth + 1);
++    RefreshNode(idx, depth);
+ }
+ 
+ uint32_t UtxoOverlayArena::EnsureChildLoaded(uint32_t node_idx, unsigned bit) {
+@@ -1196,19 +1282,19 @@ uint32_t UtxoOverlayArena::JoinLeaves(uint32_t existing_idx, uint32_t added_idx,
+     UtxoOverlayNode branch{};
+     branch.count = 2;
+     branch.is_leaf = false;
++    branch.digest_dirty = true;
+     const unsigned old_bit = SmtKeyBit(existing_key, split);
+     branch.child[old_bit] = existing_idx;
+     branch.child[1 - old_bit] = added_idx;
+     uint32_t subtree_idx = AllocNode(branch);
+-    RefreshNode(subtree_idx, split);
+ 
+     for (unsigned d = split; d-- > depth;) {
+         UtxoOverlayNode parent{};
+         parent.count = 2;
+         parent.is_leaf = false;
++        parent.digest_dirty = true;
+         parent.child[SmtKeyBit(existing_key, d)] = subtree_idx;
+         subtree_idx = AllocNode(parent);
+-        RefreshNode(subtree_idx, d);
+     }
+     return subtree_idx;
+ }
+@@ -1233,16 +1319,16 @@ uint32_t UtxoOverlayArena::InsertAt(uint32_t node_idx, const Coin &coin,
+     const uint32_t old_child = EnsureChildLoaded(node_idx, bit);
+     const uint32_t new_child = InsertAt(old_child, coin, key, leaf_hash,
+                                         depth + 1);
+-    if (new_child == old_child) {
++    if (new_child == old_child &&
++        (new_child == kNullIdx || !nodes_[new_child].digest_dirty)) {
+         return node_idx;
+     }
+-    UtxoOverlayNode copy = nodes_[node_idx];
+-    copy.child[bit] = new_child;
+-    copy.base_child[bit].reset();
+-    copy.count = ChildCount(copy, 0) + ChildCount(copy, 1);
+-    const uint32_t next_idx = AllocNode(copy);
+-    RefreshNode(next_idx, depth);
+-    return next_idx;
++    nodes_[node_idx].child[bit] = new_child;
++    nodes_[node_idx].base_child[bit].reset();
++    nodes_[node_idx].count =
++        ChildCount(nodes_[node_idx], 0) + ChildCount(nodes_[node_idx], 1);
++    nodes_[node_idx].digest_dirty = true;
++    return node_idx;
+ }
+ 
+ uint32_t UtxoOverlayArena::EraseAt(uint32_t node_idx, const Outpoint &outpoint,
+@@ -1251,8 +1337,8 @@ uint32_t UtxoOverlayArena::EraseAt(uint32_t node_idx, const Outpoint &outpoint,
+         return kNullIdx;
+     }
+     if (nodes_[node_idx].is_leaf) {
+-        if (nodes_[node_idx].key != key ||
+-            nodes_[node_idx].coin.outpoint != outpoint) {
++        if (nodes_[node_idx].key != key || !nodes_[node_idx].coin ||
++            nodes_[node_idx].coin->outpoint != outpoint) {
+             return node_idx;
+         }
+         return kNullIdx;
+@@ -1260,23 +1346,26 @@ uint32_t UtxoOverlayArena::EraseAt(uint32_t node_idx, const Outpoint &outpoint,
+     const unsigned bit = SmtKeyBit(key, depth);
+     const uint32_t old_child = EnsureChildLoaded(node_idx, bit);
+     const uint32_t new_child = EraseAt(old_child, outpoint, key, depth + 1);
+-    if (new_child == old_child) {
++    if (new_child == old_child &&
++        (new_child == kNullIdx || !nodes_[new_child].digest_dirty)) {
+         return node_idx;
+     }
+-    UtxoOverlayNode copy = nodes_[node_idx];
+-    copy.child[bit] = new_child;
+-    copy.base_child[bit].reset();
+-    const uint32_t new_count = ChildCount(copy, 0) + ChildCount(copy, 1);
++    nodes_[node_idx].child[bit] = new_child;
++    nodes_[node_idx].base_child[bit].reset();
++    const uint32_t new_count =
++        ChildCount(nodes_[node_idx], 0) + ChildCount(nodes_[node_idx], 1);
++    if (new_count == 0) {
++        return kNullIdx;
++    }
+     if (new_count == 1) {
+         if (new_child != kNullIdx) {
+             return new_child;
+         }
+         return EnsureChildLoaded(node_idx, 1 - bit);
+     }
+-    copy.count = new_count;
+-    const uint32_t next_idx = AllocNode(copy);
+-    RefreshNode(next_idx, depth);
+-    return next_idx;
++    nodes_[node_idx].count = new_count;
++    nodes_[node_idx].digest_dirty = true;
++    return node_idx;
+ }
+ 
+ void UtxoOverlayArena::InsertCoin(const Coin &coin) {
+@@ -1284,6 +1373,9 @@ void UtxoOverlayArena::InsertCoin(const Coin &coin) {
+     if (!UtxoLeaf(coin, leaf_hash)) {
+         return;
+     }
++    if (nodes_.capacity() < nodes_.size() + 32) {
++        nodes_.reserve(std::max<size_t>(nodes_.capacity() * 2, 1024));
++    }
+     const Hash key = OutpointKey(coin.outpoint);
+     root_idx_ = InsertAt(root_idx_, coin, key, leaf_hash, 0);
+     // [Optimization — Rolls into Patch 020]: Defer SmtNode export until GetSmtRoot()
+@@ -1291,6 +1383,9 @@ void UtxoOverlayArena::InsertCoin(const Coin &coin) {
+ }
+ 
+ void UtxoOverlayArena::EraseOutpoint(const Outpoint &outpoint) {
++    if (nodes_.capacity() < nodes_.size() + 32) {
++        nodes_.reserve(std::max<size_t>(nodes_.capacity() * 2, 1024));
++    }
+     const Hash key = OutpointKey(outpoint);
+     root_idx_ = EraseAt(root_idx_, outpoint, key, 0);
+     // [Optimization — Rolls into Patch 020]: Defer SmtNode export until GetSmtRoot()
+@@ -1303,6 +1398,11 @@ void UtxoOverlayArena::BatchUpdateParallel(
+     if (erased.empty() && inserted.empty()) {
+         return;
+     }
++    EnsureDigest(root_idx_, 0);
++    const size_t needed = nodes_.size() + (erased.size() + inserted.size()) * 4 + 64;
++    if (nodes_.capacity() < needed) {
++        nodes_.reserve(std::max<size_t>(nodes_.capacity() * 2, needed));
++    }
+ 
+     std::vector<Hash> erased_keys(erased.size());
+     ParallelForRange(erased.size(), 32, [&](size_t begin, size_t end) {
+@@ -1390,7 +1490,7 @@ void UtxoOverlayArena::BatchUpdateParallel(
+             node.key = smt_node->key;
+             node.is_leaf = smt_node->IsLeaf();
+             if (node.is_leaf && smt_node->coin) {
+-                node.coin = *smt_node->coin;
++                node.coin = smt_node->coin;
+             } else {
+                 node.base_child[0] = smt_node->child[0];
+                 node.base_child[1] = smt_node->child[1];
+@@ -1450,7 +1550,7 @@ void UtxoOverlayArena::BatchUpdateParallel(
+             leaf.digest = leaf_hash;
+             leaf.count = 1;
+             leaf.key = key;
+-            leaf.coin = coin;
++            leaf.coin = std::make_shared<const Coin>(coin);
+             leaf.is_leaf = true;
+             return alloc_local(leaf);
+         };
+@@ -1497,7 +1597,7 @@ void UtxoOverlayArena::BatchUpdateParallel(
+                     if (node_idx & kLocalBit) {
+                         UtxoOverlayNode &mut = loc[node_idx & ~kLocalBit];
+                         mut.digest = leaf_hash;
+-                        mut.coin = coin;
++                        mut.coin = std::make_shared<const Coin>(coin);
+                         return node_idx;
+                     }
+                     return make_leaf_local(coin, key, leaf_hash);
+@@ -1548,7 +1648,8 @@ void UtxoOverlayArena::BatchUpdateParallel(
+             }
+             const UtxoOverlayNode &cur_ref = get_node(node_idx);
+             if (cur_ref.is_leaf) {
+-                if (cur_ref.key != key || cur_ref.coin.outpoint != outpoint) {
++                if (cur_ref.key != key || !cur_ref.coin ||
++                    cur_ref.coin->outpoint != outpoint) {
+                     return node_idx;
+                 }
+                 return kNullIdx;
+@@ -1694,6 +1795,7 @@ void UtxoOverlayArena::BatchUpdateParallel(
+ 
+ const std::shared_ptr<const SmtNode> &UtxoOverlayArena::GetSmtRoot() const {
+     if (smt_root_dirty_) {
++        EnsureDigest(root_idx_, 0);
+         current_smt_root_ = ExportSmtNode(root_idx_);
+         smt_root_dirty_ = false;
+     }
+@@ -1701,7 +1803,213 @@ const std::shared_ptr<const SmtNode> &UtxoOverlayArena::GetSmtRoot() const {
+ }
+ 
+ Hash UtxoOverlayArena::RootDigest() const {
+-    return root_idx_ != kNullIdx ? nodes_[root_idx_].digest : EmptyUtxoRoot();
++    if (root_idx_ == kNullIdx) {
++        return EmptyUtxoRoot();
++    }
++    EnsureDigest(root_idx_, 0);
++    return nodes_[root_idx_].digest;
++}
++
++Hash UtxoOverlayArena::RootDigestWithExtraCoins(
++    std::span<const Coin> extra_coins) const {
++    EnsureDigest(root_idx_, 0);
++    if (extra_coins.empty()) {
++        return root_idx_ != kNullIdx ? nodes_[root_idx_].digest
++                                     : EmptyUtxoRoot();
++    }
++
++    constexpr uint32_t kLocalBit = 0x80000000u;
++    std::vector<UtxoOverlayNode> loc;
++    loc.reserve(extra_coins.size() * 8 + 16);
++
++    auto get_node = [&](uint32_t idx) -> const UtxoOverlayNode & {
++        return (idx & kLocalBit) ? loc[idx & ~kLocalBit] : nodes_[idx];
++    };
++    auto alloc_local = [&](const UtxoOverlayNode &n) -> uint32_t {
++        const uint32_t idx = kLocalBit | static_cast<uint32_t>(loc.size());
++        loc.push_back(n);
++        return idx;
++    };
++    auto import_smt_local =
++        [&](const std::shared_ptr<const SmtNode> &smt_node) -> uint32_t {
++        if (!smt_node) {
++            return kNullIdx;
++        }
++        UtxoOverlayNode node{};
++        node.digest = smt_node->digest;
++        node.count = static_cast<uint32_t>(smt_node->count);
++        node.key = smt_node->key;
++        node.is_leaf = smt_node->IsLeaf();
++        if (node.is_leaf && smt_node->coin) {
++            node.coin = smt_node->coin;
++        } else {
++            node.base_child[0] = smt_node->child[0];
++            node.base_child[1] = smt_node->child[1];
++        }
++        return alloc_local(node);
++    };
++    auto ensure_child_local = [&](uint32_t node_idx, unsigned bit) -> uint32_t {
++        const UtxoOverlayNode &cur_ref = get_node(node_idx);
++        if (cur_ref.child[bit] != kNullIdx) {
++            return cur_ref.child[bit];
++        }
++        if (!cur_ref.base_child[bit]) {
++            return kNullIdx;
++        }
++        const std::shared_ptr<const SmtNode> base_ptr = cur_ref.base_child[bit];
++        const uint32_t imported = import_smt_local(base_ptr);
++        if (node_idx & kLocalBit) {
++            UtxoOverlayNode &mut = loc[node_idx & ~kLocalBit];
++            mut.child[bit] = imported;
++            mut.base_child[bit].reset();
++        }
++        return imported;
++    };
++    auto child_hash_local = [&](const UtxoOverlayNode &node,
++                                unsigned bit) -> Hash {
++        if (node.child[bit] != kNullIdx) {
++            return get_node(node.child[bit]).digest;
++        }
++        if (node.base_child[bit]) {
++            return node.base_child[bit]->digest;
++        }
++        return EmptyUtxoRoot();
++    };
++    auto child_count_local = [&](const UtxoOverlayNode &node,
++                                 unsigned bit) -> uint32_t {
++        if (node.child[bit] != kNullIdx) {
++            return get_node(node.child[bit]).count;
++        }
++        if (node.base_child[bit]) {
++            return static_cast<uint32_t>(node.base_child[bit]->count);
++        }
++        return 0;
++    };
++    auto make_leaf_local = [&](const Coin &coin, const Hash &key,
++                               const Hash &leaf_hash) -> uint32_t {
++        UtxoOverlayNode leaf{};
++        leaf.digest = leaf_hash;
++        leaf.count = 1;
++        leaf.key = key;
++        leaf.coin = std::make_shared<const Coin>(coin);
++        leaf.is_leaf = true;
++        return alloc_local(leaf);
++    };
++    auto join_leaves_local = [&](uint32_t existing_idx, uint32_t added_idx,
++                                 unsigned depth) -> uint32_t {
++        const Hash existing_key = get_node(existing_idx).key;
++        const Hash added_key = get_node(added_idx).key;
++        unsigned split = depth;
++        while (split < 256 &&
++               SmtKeyBit(existing_key, split) == SmtKeyBit(added_key, split)) {
++            ++split;
++        }
++        UtxoOverlayNode branch{};
++        branch.count = 2;
++        branch.is_leaf = false;
++        const unsigned old_bit = SmtKeyBit(existing_key, split);
++        branch.child[old_bit] = existing_idx;
++        branch.child[1 - old_bit] = added_idx;
++        uint32_t subtree_idx = alloc_local(branch);
++
++        for (unsigned d = split; d-- > depth;) {
++            UtxoOverlayNode parent{};
++            parent.count = 2;
++            parent.is_leaf = false;
++            parent.child[SmtKeyBit(existing_key, d)] = subtree_idx;
++            subtree_idx = alloc_local(parent);
++        }
++        return subtree_idx;
++    };
++    auto insert_at_local = [&](auto &self, uint32_t node_idx, const Coin &coin,
++                               const Hash &key, const Hash &leaf_hash,
++                               unsigned depth) -> uint32_t {
++        if (node_idx == kNullIdx) {
++            return make_leaf_local(coin, key, leaf_hash);
++        }
++        const UtxoOverlayNode &cur_ref = get_node(node_idx);
++        if (cur_ref.is_leaf) {
++            if (cur_ref.key == key) {
++                if (cur_ref.digest == leaf_hash) {
++                    return node_idx;
++                }
++                if (node_idx & kLocalBit) {
++                    UtxoOverlayNode &mut = loc[node_idx & ~kLocalBit];
++                    mut.digest = leaf_hash;
++                    mut.coin = std::make_shared<const Coin>(coin);
++                    return node_idx;
++                }
++                return make_leaf_local(coin, key, leaf_hash);
++            }
++            const uint32_t added_idx = make_leaf_local(coin, key, leaf_hash);
++            return join_leaves_local(node_idx, added_idx, depth);
++        }
++        if (depth >= 256) {
++            return node_idx;
++        }
++        const unsigned bit = SmtKeyBit(key, depth);
++        const uint32_t old_child = ensure_child_local(node_idx, bit);
++        const uint32_t new_child =
++            self(self, old_child, coin, key, leaf_hash, depth + 1);
++        const bool child_dirty =
++            (new_child != old_child) ||
++            (new_child != kNullIdx && (new_child & kLocalBit) &&
++             loc[new_child & ~kLocalBit].digest == Hash{});
++        if (!child_dirty) {
++            return node_idx;
++        }
++        if (node_idx & kLocalBit) {
++            UtxoOverlayNode &mut = loc[node_idx & ~kLocalBit];
++            mut.child[bit] = new_child;
++            mut.base_child[bit].reset();
++            mut.count = child_count_local(mut, 0) + child_count_local(mut, 1);
++            mut.digest = Hash{};
++            return node_idx;
++        }
++        const UtxoOverlayNode &src = get_node(node_idx);
++        UtxoOverlayNode copy{};
++        copy.child[0] = src.child[0];
++        copy.child[1] = src.child[1];
++        copy.base_child[1 - bit] = src.base_child[1 - bit];
++        copy.child[bit] = new_child;
++        copy.is_leaf = false;
++        copy.count = child_count_local(copy, 0) + child_count_local(copy, 1);
++        return alloc_local(copy);
++    };
++    auto finalize_local = [&](auto &self, uint32_t idx, unsigned depth) -> void {
++        if (idx == kNullIdx || !(idx & kLocalBit)) {
++            return;
++        }
++        const uint32_t local_pos = idx & ~kLocalBit;
++        if (loc[local_pos].is_leaf || loc[local_pos].digest != Hash{}) {
++            return;
++        }
++        const uint32_t c0 = loc[local_pos].child[0];
++        const uint32_t c1 = loc[local_pos].child[1];
++        self(self, c0, depth + 1);
++        self(self, c1, depth + 1);
++        loc[local_pos].count =
++            child_count_local(loc[local_pos], 0) +
++            child_count_local(loc[local_pos], 1);
++        const Hash lh = child_hash_local(loc[local_pos], 0);
++        const Hash rh = child_hash_local(loc[local_pos], 1);
++        const bool ok = UtxoNode(depth, lh, rh, loc[local_pos].digest);
++        assert(ok);
++        (void)ok;
++    };
++
++    uint32_t cur_root = root_idx_;
++    for (const Coin &coin : extra_coins) {
++        Hash leaf_hash{};
++        if (!UtxoLeaf(coin, leaf_hash)) {
++            continue;
++        }
++        const Hash key = OutpointKey(coin.outpoint);
++        cur_root = insert_at_local(insert_at_local, cur_root, coin, key,
++                                   leaf_hash, 0);
++    }
++    finalize_local(finalize_local, cur_root, 0);
++    return cur_root != kNullIdx ? get_node(cur_root).digest : EmptyUtxoRoot();
+ }
+ 
+ // ============================================================================
+@@ -1810,15 +2118,15 @@ size_t MempoolOverlayLayer::AddTransactionBatch(
+                    : 0;
+     }
+ 
++    created_coins_.reserve(created_coins_.size() + entries.size() * 2);
++    spent_outpoints_.reserve(spent_outpoints_.size() + entries.size() * 2);
++
+     std::vector<std::pair<Hash, Hash>> tx_leaves;
+     tx_leaves.reserve(entries.size());
+ 
+     std::vector<Outpoint> newly_spent_ops;
+     newly_spent_ops.reserve(entries.size() * 2);
+ 
+-    std::unordered_map<Outpoint, bool, OutpointHasher> batch_created_ops;
+-    batch_created_ops.reserve(entries.size() * 2);
+-
+     std::vector<Coin> batch_created_list;
+     batch_created_list.reserve(entries.size() * 2);
+ 
+@@ -1840,7 +2148,6 @@ size_t MempoolOverlayLayer::AddTransactionBatch(
+ 
+         for (const auto &coin : entry.created_coins) {
+             created_coins_[coin.outpoint] = coin;
+-            batch_created_ops[coin.outpoint] = true;
+             batch_created_list.push_back(coin);
+         }
+ 
+@@ -1861,19 +2168,26 @@ size_t MempoolOverlayLayer::AddTransactionBatch(
+         }
+     }
+ 
+-    std::vector<Outpoint> erased_for_arena;
+-    erased_for_arena.reserve(newly_spent_ops.size());
+-    for (const auto &op : newly_spent_ops) {
+-        if (batch_created_ops.find(op) == batch_created_ops.end()) {
+-            erased_for_arena.push_back(op);
+-        }
+-    }
+-
+     std::vector<Coin> inserted_for_arena;
+     inserted_for_arena.reserve(batch_created_list.size());
++    std::unordered_map<Outpoint, bool, OutpointHasher> ephemeral_in_batch;
+     for (const auto &coin : batch_created_list) {
+         if (spent_outpoints_.find(coin.outpoint) == spent_outpoints_.end()) {
+             inserted_for_arena.push_back(coin);
++        } else {
++            ephemeral_in_batch.emplace(coin.outpoint, true);
++        }
++    }
++
++    std::vector<Outpoint> erased_for_arena;
++    if (ephemeral_in_batch.empty()) {
++        erased_for_arena = std::move(newly_spent_ops);
++    } else {
++        erased_for_arena.reserve(newly_spent_ops.size());
++        for (const auto &op : newly_spent_ops) {
++            if (ephemeral_in_batch.find(op) == ephemeral_in_batch.end()) {
++                erased_for_arena.push_back(op);
++            }
+         }
+     }
+ 
+@@ -2072,6 +2386,8 @@ bool MerklixOverlayManager::RemoveTransaction(const Hash &tx_id) {
+ }
+ 
+ const MempoolOverlayLayer &MerklixOverlayManager::FreezeEpochBatch() {
++    (void)speculative_layer_.GetSubtreeARoot();
++    (void)speculative_layer_.GetUtxoRootDigest();
+     frozen_epochs_.push_back(speculative_layer_);
+     ++next_epoch_id_;
+     return frozen_epochs_.back();
+diff --git a/src/lotus_v2/mempool_overlay.h b/src/lotus_v2/mempool_overlay.h
+index e61b5591cd..05c92ee724 100644
+--- a/src/lotus_v2/mempool_overlay.h
++++ b/src/lotus_v2/mempool_overlay.h
+@@ -72,6 +72,7 @@ struct TxOverlayNode {
+     Hash key{};
+     Hash tx_hash{};
+     bool is_leaf{false};
++    bool digest_dirty{false};
+ };
+ 
+ /**
+@@ -107,7 +108,7 @@ public:
+     size_t ArenaNodeCount() const noexcept { return nodes_.size(); }
+ 
+ private:
+-    std::vector<TxOverlayNode> nodes_;
++    mutable std::vector<TxOverlayNode> nodes_;
+ 
+     uint32_t AllocNode(const TxOverlayNode &node);
+     uint32_t MakeLeaf(const Hash &tx_id, const Hash &tx_hash,
+@@ -119,7 +120,8 @@ private:
+                       unsigned depth);
+     uint32_t EraseAt(uint32_t node_idx, const Hash &tx_id, unsigned depth);
+     Hash ChildHash(uint32_t idx) const;
+-    void RefreshNode(uint32_t idx, unsigned depth);
++    void RefreshNode(uint32_t idx, unsigned depth) const;
++    void EnsureDigest(uint32_t idx, unsigned depth) const;
+ };
+ 
+ /**
+@@ -132,8 +134,9 @@ struct UtxoOverlayNode {
+     std::array<uint32_t, 2> child{{0, 0}};
+     std::array<std::shared_ptr<const SmtNode>, 2> base_child{{nullptr, nullptr}};
+     Hash key{};
+-    Coin coin{};
++    std::shared_ptr<const Coin> coin;
+     bool is_leaf{false};
++    bool digest_dirty{false};
+ };
+ 
+ /**
+@@ -169,6 +172,7 @@ public:
+         std::span<const Coin> inserted);
+ 
+     Hash RootDigest() const;
++    Hash RootDigestWithExtraCoins(std::span<const Coin> extra_coins) const;
+     uint32_t RootIdx() const noexcept { return root_idx_; }
+     const std::shared_ptr<const SmtNode> &GetSmtRoot() const;
+     const std::shared_ptr<const SmtNode> &GetBaseSmtRoot() const noexcept {
+@@ -177,7 +181,7 @@ public:
+     size_t ArenaNodeCount() const noexcept { return nodes_.size(); }
+ 
+ private:
+-    std::vector<UtxoOverlayNode> nodes_;
++    mutable std::vector<UtxoOverlayNode> nodes_;
+     uint32_t root_idx_{kNullIdx};
+     std::shared_ptr<const SmtNode> base_smt_root_;
+     mutable std::shared_ptr<const SmtNode> current_smt_root_;
+@@ -196,7 +200,8 @@ private:
+                      const Hash &key, unsigned depth);
+     Hash ChildHash(const UtxoOverlayNode &node, unsigned bit) const;
+     uint32_t ChildCount(const UtxoOverlayNode &node, unsigned bit) const;
+-    void RefreshNode(uint32_t idx, unsigned depth);
++    void RefreshNode(uint32_t idx, unsigned depth) const;
++    void EnsureDigest(uint32_t idx, unsigned depth) const;
+ };
+ 
+ Hash EmptyTxRoot();
+diff --git a/src/lotus_v2/set_reconciliation.cpp b/src/lotus_v2/set_reconciliation.cpp
+index 299c9d69d3..ca87ada896 100644
+--- a/src/lotus_v2/set_reconciliation.cpp
++++ b/src/lotus_v2/set_reconciliation.cpp
+@@ -91,7 +91,58 @@ uint64_t ComputeShortTxId(uint64_t k0, uint64_t k1,
+     return out != 0 ? out : 1ULL;
+ }
+ 
++#if defined(__aarch64__) && defined(__ARM_FEATURE_CRYPTO)
++#include <arm_neon.h>
++#define LOTUS_GF64_USE_ARM_PMULL 1
++#elif defined(__x86_64__) && defined(__PCLMUL__)
++#include <wmmintrin.h>
++#define LOTUS_GF64_USE_X86_PCLMUL 1
++#endif
++
+ uint64_t GF64Mul(uint64_t a, uint64_t b) noexcept {
++#if defined(LOTUS_GF64_USE_ARM_PMULL)
++    const poly128_t p = vmull_p64(static_cast<poly64_t>(a),
++                                  static_cast<poly64_t>(b));
++    uint64_t lo = 0;
++    uint64_t hi = 0;
++    uint8_t bytes[16];
++    std::memcpy(bytes, &p, 16);
++    std::memcpy(&lo, bytes, 8);
++    std::memcpy(&hi, bytes + 8, 8);
++    // Reduce hi * x^64 modulo x^64 + x^4 + x^3 + x + 1 (0x1B).
++    // Since hi < 2^64 and degree(0x1B) == 4, r1 = hi * 0x1B is at most 68 bits:
++    // its low 64 bits (r1_lo) are degrees 0..63, and its high 4 bits (r1_hi)
++    // are degrees 64..67 which are reduced a second time by multiplying by 0x1B.
++    const poly128_t r1 = vmull_p64(static_cast<poly64_t>(hi),
++                                   static_cast<poly64_t>(kGF64Modulus));
++    uint64_t r1_lo = 0;
++    uint64_t r1_hi = 0;
++    uint8_t r1_bytes[16];
++    std::memcpy(r1_bytes, &r1, 16);
++    std::memcpy(&r1_lo, r1_bytes, 8);
++    std::memcpy(&r1_hi, r1_bytes + 8, 8);
++    const poly128_t r2 = vmull_p64(static_cast<poly64_t>(r1_hi),
++                                   static_cast<poly64_t>(kGF64Modulus));
++    uint64_t r2_lo = 0;
++    std::memcpy(&r2_lo, &r2, 8);
++    return lo ^ r1_lo ^ r2_lo;
++#elif defined(LOTUS_GF64_USE_X86_PCLMUL)
++    const __m128i va = _mm_cvtsi64_si128(static_cast<long long>(a));
++    const __m128i vb = _mm_cvtsi64_si128(static_cast<long long>(b));
++    const __m128i prod = _mm_clmulepi64_si128(va, vb, 0x00);
++    const uint64_t lo = static_cast<uint64_t>(_mm_cvtsi128_si64(prod));
++    const uint64_t hi =
++        static_cast<uint64_t>(_mm_extract_epi64(prod, 1));
++    const __m128i vmod = _mm_cvtsi64_si128(static_cast<long long>(kGF64Modulus));
++    const __m128i r1 = _mm_clmulepi64_si128(
++        _mm_cvtsi64_si128(static_cast<long long>(hi)), vmod, 0x00);
++    const uint64_t r1_lo = static_cast<uint64_t>(_mm_cvtsi128_si64(r1));
++    const uint64_t r1_hi = static_cast<uint64_t>(_mm_extract_epi64(r1, 1));
++    const __m128i r2 = _mm_clmulepi64_si128(
++        _mm_cvtsi64_si128(static_cast<long long>(r1_hi)), vmod, 0x00);
++    return lo ^ r1_lo ^
++           static_cast<uint64_t>(_mm_cvtsi128_si64(r2));
++#else
+     uint64_t res = 0;
+     for (int i = 0; i < 64 && b != 0; ++i) {
+         if (b & 1ULL) {
+@@ -105,6 +156,7 @@ uint64_t GF64Mul(uint64_t a, uint64_t b) noexcept {
+         b >>= 1;
+     }
+     return res;
++#endif
+ }
+ 
+ uint64_t GF64Sqr(uint64_t a) noexcept {
+diff --git a/src/lotus_v2/signing.cpp b/src/lotus_v2/signing.cpp
+index fb15184a2e..f3fdaa0404 100644
+--- a/src/lotus_v2/signing.cpp
++++ b/src/lotus_v2/signing.cpp
+@@ -747,13 +747,13 @@ private:
+ };
+ 
+ size_t EffectiveBatchThreads(size_t total_items, size_t requested_threads) {
+-    if (total_items < 64) return 1;
++    if (total_items < 32) return 1;
+     size_t hw = requested_threads;
+     if (hw == 0) {
+         hw = std::min<size_t>(
+-            std::max<size_t>(std::thread::hardware_concurrency(), 1), 8);
++            std::max<size_t>(std::thread::hardware_concurrency(), 1), 16);
+     }
+-    return std::min<size_t>(hw, (total_items + 31) / 32);
++    return std::min<size_t>(hw, (total_items + 15) / 16);
+ }
+ } // namespace
+ 
+diff --git a/src/lotus_v2/sparse_state.cpp b/src/lotus_v2/sparse_state.cpp
+index c2847777b1..66a64355af 100644
+--- a/src/lotus_v2/sparse_state.cpp
++++ b/src/lotus_v2/sparse_state.cpp
+@@ -178,12 +178,28 @@ Hash OutpointKey(const Outpoint &outpoint) {
+     return key;
+ }
+ 
+-Hash EmptyUtxoRoot() { return TaggedHash(HashDomain::Utxo, std::array<uint8_t, 1>{2}); }
++Hash EmptyUtxoRoot() {
++    static const Hash kEmpty =
++        TaggedHash(HashDomain::Utxo, std::array<uint8_t, 1>{2});
++    return kEmpty;
++}
+ 
+ bool UtxoLeaf(const Coin &coin, Hash &out) {
+     std::vector<uint8_t> serialized;
++    serialized.reserve(128);
+     if (!EncodeCoin(coin, serialized)) return false;
+     const Hash key = OutpointKey(coin.outpoint);
++    if (serialized.size() < 253) {
++        std::array<uint8_t, 1 + 32 + 1 + 252> stack_buf{};
++        stack_buf[0] = 0;
++        std::memcpy(stack_buf.data() + 1, key.data(), 32);
++        stack_buf[33] = static_cast<uint8_t>(serialized.size());
++        std::memcpy(stack_buf.data() + 34, serialized.data(), serialized.size());
++        out = TaggedHash(HashDomain::Utxo,
++                         std::span<const uint8_t>(stack_buf.data(),
++                                                  34 + serialized.size()));
++        return true;
++    }
+     std::vector<uint8_t> input;
+     input.reserve(1 + 32 + 9 + serialized.size());
+     input.push_back(0);
+diff --git a/src/lotus_v2/tagged_hash.cpp b/src/lotus_v2/tagged_hash.cpp
+index e11bb09132..e46ba3ef4c 100644
+--- a/src/lotus_v2/tagged_hash.cpp
++++ b/src/lotus_v2/tagged_hash.cpp
+@@ -7,7 +7,7 @@
+ 
+ namespace lotus::v2 {
+ namespace {
+-const char *Tag(HashDomain domain) {
++constexpr std::string_view TagView(HashDomain domain) noexcept {
+     switch (domain) {
+     case HashDomain::HeaderBody: return "Lotus/v2/header/body";
+     case HashDomain::HeaderWork: return "Lotus/v2/header/work";
+@@ -32,13 +32,23 @@ const char *Tag(HashDomain domain) {
+ } // namespace
+ 
+ Hash TaggedHash(HashDomain domain, std::span<const uint8_t> payload) {
+-    const char *tag = Tag(domain);
++    const std::string_view tag = TagView(domain);
+     blake3_hasher hasher;
+     blake3_hasher_init(&hasher);
+-    blake3_hasher_update(&hasher, tag, std::strlen(tag));
+-    constexpr uint8_t separator = 0;
+-    blake3_hasher_update(&hasher, &separator, 1);
+-    blake3_hasher_update(&hasher, payload.data(), payload.size());
++    if (payload.size() <= 960) {
++        uint8_t combined[1024];
++        std::memcpy(combined, tag.data(), tag.size());
++        combined[tag.size()] = 0;
++        if (!payload.empty()) {
++            std::memcpy(combined + tag.size() + 1, payload.data(), payload.size());
++        }
++        blake3_hasher_update(&hasher, combined, tag.size() + 1 + payload.size());
++    } else {
++        blake3_hasher_update(&hasher, tag.data(), tag.size());
++        constexpr uint8_t separator = 0;
++        blake3_hasher_update(&hasher, &separator, 1);
++        blake3_hasher_update(&hasher, payload.data(), payload.size());
++    }
+     Hash result;
+     blake3_hasher_finalize(&hasher, result.data(), result.size());
+     return result;
+diff --git a/src/net_processing.cpp b/src/net_processing.cpp
+index 99b9a25e49..4c67b74d90 100644
+--- a/src/net_processing.cpp
++++ b/src/net_processing.cpp
+@@ -849,6 +849,8 @@ public:
+     void SendPings() override EXCLUSIVE_LOCKS_REQUIRED(!m_peer_mutex);
+     void RelayTransaction(const TxId &txid) override
+         EXCLUSIVE_LOCKS_REQUIRED(!m_peer_mutex);
++    void RelayTransactionBatch(std::span<const CTransactionRef> txs) override
++        EXCLUSIVE_LOCKS_REQUIRED(!m_peer_mutex);
+     void RelayProof(const avalanche::ProofId &proofid) override
+         EXCLUSIVE_LOCKS_REQUIRED(!m_peer_mutex);
+     void SetBestHeight(int height) override { m_best_height = height; };
+@@ -878,6 +880,9 @@ public:
+             Misbehaving(*peer, reason);
+         }
+     }
++    void MarkPeerKnownTxBatch(NodeId peer_id,
++                              std::span<const CTransactionRef> txs) override
++        EXCLUSIVE_LOCKS_REQUIRED(!m_peer_mutex);
+ 
+ private:
+     /**
+@@ -3316,6 +3321,35 @@ void PeerManagerImpl::RelayTransaction(const TxId &txid) {
+     }
+ }
+ 
++void PeerManagerImpl::RelayTransactionBatch(
++    std::span<const CTransactionRef> txs) {
++    if (txs.empty()) {
++        return;
++    }
++    LOCK(m_peer_mutex);
++    for (auto &it : m_peer_map) {
++        Peer &peer = *it.second;
++        auto tx_relay = peer.GetTxRelay();
++        if (!tx_relay) {
++            continue;
++        }
++        LOCK(tx_relay->m_tx_inventory_mutex);
++        if (tx_relay->m_next_inv_send_time == 0s) {
++            continue;
++        }
++        for (const auto &tx : txs) {
++            if (!tx) {
++                continue;
++            }
++            const TxId &txid = tx->GetId();
++            if (!tx_relay->m_tx_inventory_known_filter.contains(txid) ||
++                tx_relay->m_avalanche_stalled_txids.count(txid) > 0) {
++                tx_relay->m_tx_inventory_to_send.insert(txid);
++            }
++        }
++    }
++}
++
+ void PeerManagerImpl::MarkPeerKnownTx(NodeId peer_id, const TxId &txid) {
+     if (PeerRef peer = GetPeerRef(peer_id)) {
+         AddKnownTx(*peer, txid);
+@@ -3323,6 +3357,34 @@ void PeerManagerImpl::MarkPeerKnownTx(NodeId peer_id, const TxId &txid) {
+     WITH_LOCK(cs_main, m_txrequest.ForgetInvId(txid));
+ }
+ 
++void PeerManagerImpl::MarkPeerKnownTxBatch(
++    NodeId peer_id, std::span<const CTransactionRef> txs) {
++    if (txs.empty()) {
++        return;
++    }
++    if (PeerRef peer = GetPeerRef(peer_id)) {
++        if (auto tx_relay = peer->GetTxRelay()) {
++            LOCK(tx_relay->m_tx_inventory_mutex);
++            for (const auto &tx : txs) {
++                if (!tx) {
++                    continue;
++                }
++                const TxId &txid = tx->GetId();
++                tx_relay->m_tx_inventory_known_filter.insert(txid);
++                tx_relay->m_tx_inventory_to_send.erase(txid);
++            }
++        }
++    }
++    LOCK(cs_main);
++    if (m_txrequest.Size() > 0) {
++        for (const auto &tx : txs) {
++            if (tx) {
++                m_txrequest.ForgetInvId(tx->GetId());
++            }
++        }
++    }
++}
++
+ void PeerManagerImpl::RelayProof(const avalanche::ProofId &proofid) {
+     LOCK(m_peer_mutex);
+     for (auto &it : m_peer_map) {
+@@ -4760,14 +4822,29 @@ void PeerManagerImpl::ProcessTxBatch(
+                 m_chainman.ActiveChainstate(), m_mempool, batch_candidates,
+                 /*test_accept=*/false);
+             if (batch_res.m_state.IsValid()) {
++                if (auto tx_relay = peer.GetTxRelay()) {
++                    LOCK(tx_relay->m_tx_inventory_mutex);
++                    for (const auto &ptx : batch_candidates) {
++                        const TxId &txid = ptx->GetId();
++                        tx_relay->m_tx_inventory_known_filter.insert(txid);
++                        tx_relay->m_tx_inventory_to_send.erase(txid);
++                    }
++                }
+                 for (const auto &ptx : batch_candidates) {
+                     const TxId &txid = ptx->GetId();
+-                    AddKnownTx(peer, txid);
+                     m_txrequest.ReceivedResponse(pfrom.GetId(), txid);
+-                    if (m_mempool.exists(txid)) {
+-                        ProcessValidTx(pfrom.GetId(), ptx);
+-                    }
++                    m_txrequest.ForgetInvId(txid);
+                 }
++                m_mempool.withOrphanage([&batch_candidates](TxOrphanage &orphanage) {
++                    if (orphanage.Size() == 0) {
++                        return;
++                    }
++                    for (const auto &ptx : batch_candidates) {
++                        orphanage.AddChildrenToWorkSet(*ptx);
++                        orphanage.EraseTx(ptx->GetId());
++                    }
++                });
++                RelayTransactionBatch(batch_candidates);
+                 pfrom.m_last_tx_time = GetTime<std::chrono::seconds>();
+             } else {
+                 for (const auto &ptx : batch_candidates) {
+diff --git a/src/net_processing.h b/src/net_processing.h
+index 5d18f958a0..56ebded4bf 100644
+--- a/src/net_processing.h
++++ b/src/net_processing.h
+@@ -161,6 +161,15 @@ public:
+     /** Relay transaction to all peers. */
+     virtual void RelayTransaction(const TxId &txid) = 0;
+ 
++    /** Relay a batch of transactions to all peers under a single peer-map lock. */
++    virtual void RelayTransactionBatch(std::span<const CTransactionRef> txs) {
++        for (const auto &tx : txs) {
++            if (tx) {
++                RelayTransaction(tx->GetId());
++            }
++        }
++    }
++
+     /** Relay proof to all peers */
+     virtual void RelayProof(const avalanche::ProofId &proofid) = 0;
+ 
+@@ -204,6 +213,16 @@ public:
+     /** Mark a peer for discouragement/disconnection due to protocol misbehavior. */
+     virtual void DiscouragePeer(NodeId peer_id,
+                                 const std::string &reason = "") {}
++
++    /** Mark a batch of transactions as known by a specific peer under a single lock acquisition. */
++    virtual void MarkPeerKnownTxBatch(NodeId peer_id,
++                                      std::span<const CTransactionRef> txs) {
++        for (const auto &tx : txs) {
++            if (tx) {
++                MarkPeerKnownTx(peer_id, tx->GetId());
++            }
++        }
++    }
+ };
+ 
+ #endif // BITCOIN_NET_PROCESSING_H
+diff --git a/src/node/snapshot.cpp b/src/node/snapshot.cpp
+index 95d9a98836..4673c3ed49 100644
+--- a/src/node/snapshot.cpp
++++ b/src/node/snapshot.cpp
+@@ -231,6 +231,16 @@ void PopulateMiningTemplate(ChainAndMempoolSnapshot &snap,
+         bool used_ctor_overlay_selection = false;
+         if (mempool_locked->mapDeltas.empty() &&
+             spec_overlay.GetTxCount() == mempool_locked->mapTx.size()) {
++            const bool can_reuse_prev_check =
++                prev && prev->mining_template.template_valid &&
++                prev->mining_template.prev_block_hash == tmpl.prev_block_hash &&
++                prev->mining_template.next_height == tmpl.next_height &&
++                prev->mining_template.parent_mtp == tmpl.parent_mtp;
++            const auto *prev_txs_ptr =
++                can_reuse_prev_check ? &prev->mining_template.non_coinbase_txs
++                                     : nullptr;
++            size_t prev_check_idx = 0;
++
+             bool all_eligible = true;
+             for (const auto &[_, oentry] : spec_overlay.GetOrderedTxs()) {
+                 auto tx = std::static_pointer_cast<const CTransaction>(
+@@ -247,12 +257,27 @@ void PopulateMiningTemplate(ChainAndMempoolSnapshot &snap,
+                     all_eligible = false;
+                     break;
+                 }
+-                TxValidationState tx_state;
+-                if (!ContextualCheckTransaction(*snap.consensus_params, *tx,
+-                                                tx_state, tmpl.next_height,
+-                                                tmpl.parent_mtp)) {
+-                    all_eligible = false;
+-                    break;
++                bool already_checked = false;
++                if (prev_txs_ptr) {
++                    const TxId &target_id = tx->GetId();
++                    while (prev_check_idx < prev_txs_ptr->size() &&
++                           (*prev_txs_ptr)[prev_check_idx]->GetId() <
++                               target_id) {
++                        ++prev_check_idx;
++                    }
++                    if (prev_check_idx < prev_txs_ptr->size() &&
++                        (*prev_txs_ptr)[prev_check_idx].get() == tx.get()) {
++                        already_checked = true;
++                    }
++                }
++                if (!already_checked) {
++                    TxValidationState tx_state;
++                    if (!ContextualCheckTransaction(
++                            *snap.consensus_params, *tx, tx_state,
++                            tmpl.next_height, tmpl.parent_mtp)) {
++                        all_eligible = false;
++                        break;
++                    }
+                 }
+                 blockFitter.addTx(tx_size, oentry.sigchecks, fee);
+                 tmpl.total_fees += fee;
+@@ -349,8 +374,9 @@ void PopulateMiningTemplate(ChainAndMempoolSnapshot &snap,
+         tmpl.tx_sigchecks.reserve(selected.size());
+         tmpl.tx_hex.reserve(selected.size());
+ 
+-        // [Patch 036 optimization] Reuse pre-serialized tx_hex from the
+-        // previous snapshot via an O(M) merge-scan over TxId-sorted vectors.
++        // [Patch 036 optimization] Carry forward any already-built tx_hex from
++        // the previous snapshot and defer hex-encoding of new transactions
++        // until EnsureTxHex() is called by getblocktemplate.
+         const bool can_reuse_prev_hex =
+             prev && prev->mining_template.template_valid &&
+             prev->mining_template.non_coinbase_txs.size() ==
+@@ -366,14 +392,15 @@ void PopulateMiningTemplate(ChainAndMempoolSnapshot &snap,
+                     ++prev_idx;
+                 }
+                 if (prev_idx < prev_txs.size() &&
+-                    prev_txs[prev_idx].get() == item.tx.get()) {
++                    prev_txs[prev_idx].get() == item.tx.get() &&
++                    !prev->mining_template.tx_hex[prev_idx].empty()) {
+                     tmpl.tx_hex.push_back(
+                         prev->mining_template.tx_hex[prev_idx]);
+                 } else {
+-                    tmpl.tx_hex.push_back(SerializeTxToHex(*item.tx));
++                    tmpl.tx_hex.emplace_back();
+                 }
+             } else {
+-                tmpl.tx_hex.push_back(SerializeTxToHex(*item.tx));
++                tmpl.tx_hex.emplace_back();
+             }
+             tmpl.non_coinbase_txs.push_back(std::move(item.tx));
+             tmpl.tx_fees.push_back(item.fee);
+@@ -404,6 +431,7 @@ void PopulateMiningTemplate(ChainAndMempoolSnapshot &snap,
+             tmpl.non_coinbase_txs.size() == spec_overlay.GetTxCount() &&
+             tmpl.non_coinbase_txs.size() == mempool_locked->mapTx.size()) {
+             tmpl.subtree_a_root = spec_overlay.GetSubtreeARoot();
++            (void)spec_overlay.GetUtxoRootDigest();
+             tmpl.v2_base_state.utxo_arena =
+                 std::make_shared<const lotus::v2::UtxoOverlayArena>(
+                     spec_overlay.GetUtxoArena());
+@@ -439,6 +467,22 @@ void PopulateMiningTemplate(ChainAndMempoolSnapshot &snap,
+ 
+ } // namespace
+ 
++const std::vector<std::string> &MiningTemplateSnapshot::EnsureTxHex() const {
++    if (!tx_hex_mutex) {
++        return tx_hex;
++    }
++    std::lock_guard<std::mutex> lock(*tx_hex_mutex);
++    if (tx_hex.size() < non_coinbase_txs.size()) {
++        tx_hex.resize(non_coinbase_txs.size());
++    }
++    for (size_t i = 0; i < non_coinbase_txs.size(); ++i) {
++        if (tx_hex[i].empty() && non_coinbase_txs[i]) {
++            tx_hex[i] = SerializeTxToHex(*non_coinbase_txs[i]);
++        }
++    }
++    return tx_hex;
++}
++
+ SnapshotPublisher::SnapshotPublisher() {
+     auto empty = std::make_shared<const ChainAndMempoolSnapshot>();
+     std::atomic_store_explicit(&m_ring[0], std::move(empty),
+diff --git a/src/node/snapshot.h b/src/node/snapshot.h
+index 28385fecac..f550d20803 100644
+--- a/src/node/snapshot.h
++++ b/src/node/snapshot.h
+@@ -111,10 +111,13 @@ struct MiningTemplateSnapshot {
+     std::vector<CTransactionRef> non_coinbase_txs;
+     std::vector<Amount> tx_fees;
+     std::vector<int64_t> tx_sigchecks;
+-    std::vector<std::string> tx_hex;
++    mutable std::vector<std::string> tx_hex;
++    std::shared_ptr<std::mutex> tx_hex_mutex{std::make_shared<std::mutex>()};
+     lotus::v2::Hash subtree_a_root{};
+     V2TemplateBaseState v2_base_state{};
+     bool template_valid{false};
++
++    const std::vector<std::string> &EnsureTxHex() const;
+ };
+ 
+ /**
+diff --git a/src/primitives/block.cpp b/src/primitives/block.cpp
+index 96f2b9d8a0..465d44d458 100644
+--- a/src/primitives/block.cpp
++++ b/src/primitives/block.cpp
+@@ -811,23 +811,21 @@ uint256 ComputeV2StateRootFromOverlay(
+     std::vector<lotus::v2::Coin> cb_coins;
+ 
+     if (!record) {
+-        lotus::v2::UtxoOverlayArena arena = overlay.GetUtxoArena();
+         for (size_t j = 0; j < coinbase_tx.vout.size(); ++j) {
+             if (coinbase_tx.vout[j].scriptPubKey.IsUnspendable()) {
+                 continue;
+             }
+             const lotus::v2::Output v2out = coinbase_tx.vout[j].ToV2Output();
+             if (!v2out.IsBurn()) {
+-                lotus::v2::Coin coin{
++                cb_coins.push_back(lotus::v2::Coin{
+                     {cb_txid, static_cast<uint32_t>(j)},
+                     v2out,
+                     nHeight,
+                     nParentMtp,
+-                    true};
+-                arena.InsertCoin(coin);
++                    true});
+             }
+         }
+-        utxo_digest = arena.RootDigest();
++        utxo_digest = overlay.GetUtxoArena().RootDigestWithExtraCoins(cb_coins);
+     } else {
+         final_utxo_root = overlay.GetUtxoRoot();
+         for (size_t j = 0; j < coinbase_tx.vout.size(); ++j) {
+@@ -949,7 +947,33 @@ size_t AddTransactionsToOverlayBatch(
+         }
+     };
+ 
+-    extract_range(0, txs.size());
++    if (txs.size() >= 64) {
++        const unsigned hw = std::thread::hardware_concurrency();
++        const size_t num_workers = std::min<size_t>(
++            std::max<unsigned>(1, hw == 0 ? 4 : hw),
++            (txs.size() + 31) / 32);
++        if (num_workers <= 1) {
++            extract_range(0, txs.size());
++        } else {
++            const size_t chunk = (txs.size() + num_workers - 1) / num_workers;
++            std::vector<std::thread> workers;
++            workers.reserve(num_workers - 1);
++            for (size_t w = 1; w < num_workers; ++w) {
++                const size_t begin = w * chunk;
++                if (begin >= txs.size()) {
++                    break;
++                }
++                const size_t end = std::min(txs.size(), begin + chunk);
++                workers.emplace_back(extract_range, begin, end);
++            }
++            extract_range(0, std::min(txs.size(), chunk));
++            for (auto &t : workers) {
++                t.join();
++            }
++        }
++    } else {
++        extract_range(0, txs.size());
++    }
+ 
+     size_t write_idx = 0;
+     for (size_t i = 0; i < entries.size(); ++i) {
+@@ -1061,7 +1085,8 @@ uint256 ComputeV2StateRootFromTemplate(
+         lotus::v2::Hash txid{};
+         std::memcpy(txid.data(), coinbase_tx.GetId().begin(), 32);
+         if (base_state.utxo_arena) {
+-            lotus::v2::UtxoOverlayArena arena = *base_state.utxo_arena;
++            std::vector<lotus::v2::Coin> cb_coins;
++            cb_coins.reserve(coinbase_tx.vout.size());
+             for (size_t j = 0; j < coinbase_tx.vout.size(); ++j) {
+                 if (coinbase_tx.vout[j].scriptPubKey.IsUnspendable()) {
+                     continue;
+@@ -1069,16 +1094,16 @@ uint256 ComputeV2StateRootFromTemplate(
+                 const lotus::v2::Output v2out =
+                     coinbase_tx.vout[j].ToV2Output();
+                 if (!v2out.IsBurn()) {
+-                    lotus::v2::Coin coin{
++                    cb_coins.push_back(lotus::v2::Coin{
+                         {txid, static_cast<uint32_t>(j)},
+                         v2out,
+                         base_state.height,
+                         base_state.parent_mtp,
+-                        true};
+-                    arena.InsertCoin(coin);
++                        true});
+                 }
+             }
+-            utxo_root_hash = arena.RootDigest();
++            utxo_root_hash =
++                base_state.utxo_arena->RootDigestWithExtraCoins(cb_coins);
+         } else {
+             std::shared_ptr<const SmtNode> utxo_root = base_state.utxo_root;
+             for (size_t j = 0; j < coinbase_tx.vout.size(); ++j) {
+diff --git a/src/rpc/mempool.cpp b/src/rpc/mempool.cpp
+index f5bb77b2b1..7e09b67d2a 100644
+--- a/src/rpc/mempool.cpp
++++ b/src/rpc/mempool.cpp
+@@ -1633,7 +1633,6 @@ static RPCHelpMan submitrawtxbatch() {
+             NodeContext &node = EnsureAnyNodeContext(request.context);
+             CTxMemPool &mempool = EnsureMemPool(node);
+             ChainstateManager &chainman = EnsureChainman(node);
+-            Chainstate &chainstate = chainman.ActiveChainstate();
+ 
+             const bool has_disallowed_non_v7 = std::any_of(
+                 txns.begin(), txns.end(), [&](const CTransactionRef &tx) {
+@@ -1649,6 +1648,7 @@ static RPCHelpMan submitrawtxbatch() {
+ 
+             const PackageMempoolAcceptResult package_result = [&] {
+                 LOCK(::cs_main);
++                Chainstate &chainstate = chainman.ActiveChainstate();
+                 CTxMemPool::ScopedSnapshotDefer snap_defer(mempool);
+                 // [Patch 036 optimization] Single-pass two-phase batch
+                 // validation and commit under cs_main + ScopedSnapshotDefer:
+@@ -1792,10 +1792,8 @@ static RPCHelpMan submitrawtxbatch() {
+                             return;
+                         }
+                         if (node.peerman) {
+-                            for (const auto &tx : txns) {
+-                                node.peerman->MarkPeerKnownTx(pnode->GetId(),
+-                                                              tx->GetId());
+-                            }
++                            node.peerman->MarkPeerKnownTxBatch(pnode->GetId(),
++                                                               txns);
+                         }
+                         for (size_t offset = 0; offset < txns.size();
+                              offset +=
+@@ -1817,9 +1815,7 @@ static RPCHelpMan submitrawtxbatch() {
+                     });
+                 }
+                 if (node.peerman) {
+-                    for (const auto &tx : txns) {
+-                        node.peerman->RelayTransaction(tx->GetId());
+-                    }
++                    node.peerman->RelayTransactionBatch(txns);
+                 }
+             }
+ 
+diff --git a/src/rpc/mining.cpp b/src/rpc/mining.cpp
+index 709203fe27..6390f19ffe 100644
+--- a/src/rpc/mining.cpp
++++ b/src/rpc/mining.cpp
+@@ -1374,12 +1374,13 @@ static RPCHelpMan getblocktemplate() {
+ 
+                 UniValue transactions(UniValue::VARR);
+                 if (!compact_template) {
++                    const auto &tx_hex_vec = tmpl.EnsureTxHex();
+                     transactions.reserve(tmpl.non_coinbase_txs.size());
+                     for (size_t i = 0; i < tmpl.non_coinbase_txs.size(); ++i) {
+                         const CTransaction &tx = *tmpl.non_coinbase_txs[i];
+                         UniValue entry(UniValue::VOBJ);
+                         entry.reserve(5);
+-                        entry.pushKVEnd("data", tmpl.tx_hex[i]);
++                        entry.pushKVEnd("data", tx_hex_vec[i]);
+                         entry.pushKVEnd("txid", tx.GetId().GetHex());
+                         entry.pushKVEnd("hash", tx.GetHash().GetHex());
+                         entry.pushKVEnd("fee", tmpl.tx_fees[i] / SATOSHI);
+diff --git a/src/validation.cpp b/src/validation.cpp
+index 86ea8ed019..7401aa5bb5 100644
+--- a/src/validation.cpp
++++ b/src/validation.cpp
+@@ -189,6 +189,13 @@ std::optional<LockPoints> CalculateLockPointsAtTip(CBlockIndex *tip,
+                                                    const CCoinsView &coins_view,
+                                                    const CTransaction &tx) {
+     assert(tip);
++    if (tx.nVersion == CTransaction::CURRENT_VERSION && !tx.vin.empty() &&
++        (tx.vin[0].nFlags == 1 || tx.vin[0].nFlags == 3)) {
++        // Pure V2 transactions always set nSequence = SEQUENCE_FINAL
++        // (SEQUENCE_LOCKTIME_DISABLE_FLAG set), so BIP68 relative lock points
++        // are always {-1, -1} without deep-copying input Coins from coins_view.
++        return LockPoints{};
++    }
+ 
+     auto prev_heights{CalculatePrevHeights(*tip, coins_view, tx)};
+     if (!prev_heights.has_value()) {
+@@ -328,13 +335,17 @@ std::optional<ParallelTxScriptError> VerifyTxScriptsFromResolvedCoins(
+         }
+     }
+ 
++    static const CTxOut kEmptyTxOut{};
+     int nSigChecksTotal = 0;
+     for (size_t i = 0; i < tx.vin.size(); i++) {
+-        CTxOut prev_txout;
+         if (tx.vin[i].nFlags != 3) {
+             assert(!resolved_inputs[i].IsSpent());
+-            prev_txout = resolved_inputs[i].GetTxOut();
+         }
++        const CTxOut &prev_txout =
++            (tx.vin[i].nFlags == 3 ||
++             (v2_resolved_coins && tx.vin[i].nFlags == 1))
++                ? kEmptyTxOut
++                : resolved_inputs[i].GetTxOut();
+ 
+         CScriptCheck check(prev_txout, tx, signature_cache, i, flags,
+                            sigCacheStore, txdata, &txLimitSigChecks,
+@@ -643,7 +654,9 @@ private:
+     // Try to add the transaction to the mempool, removing any conflicts first.
+     // Returns true if the transaction is in the mempool after any size
+     // limiting is performed, false otherwise.
+-    bool Finalize(const ATMPArgs &args, Workspace &ws)
++    bool Finalize(const ATMPArgs &args, Workspace &ws,
++                  std::vector<ValidationSignals::MempoolAddedBatchItem>
++                      *batch_signals = nullptr)
+         EXCLUSIVE_LOCKS_REQUIRED(cs_main, m_pool.cs);
+ 
+     // Submit all transactions to the mempool and call ConsensusScriptChecks to
+@@ -807,12 +820,6 @@ bool MemPoolAccept::PreChecks(ATMPArgs &args, Workspace &ws,
+         }
+     }
+ 
+-    // Are the actual inputs available?
+-    if (!m_view.HaveInputs(tx)) {
+-        return state.Invalid(TxValidationResult::TX_MEMPOOL_POLICY,
+-                             "bad-txns-inputs-spent");
+-    }
+-
+     // Bring the best block into scope.
+     m_view.GetBestBlock();
+ 
+@@ -981,7 +988,9 @@ bool MemPoolAccept::ConsensusScriptChecks(const ATMPArgs &args, Workspace &ws) {
+     return true;
+ }
+ 
+-bool MemPoolAccept::Finalize(const ATMPArgs &args, Workspace &ws) {
++bool MemPoolAccept::Finalize(
++    const ATMPArgs &args, Workspace &ws,
++    std::vector<ValidationSignals::MempoolAddedBatchItem> *batch_signals) {
+     AssertLockHeld(cs_main);
+     AssertLockHeld(m_pool.cs);
+     const TxId &txid = ws.m_ptx->GetId();
+@@ -1006,9 +1015,14 @@ bool MemPoolAccept::Finalize(const ATMPArgs &args, Workspace &ws) {
+                     std::move(*spentCoins));
+             }
+         }
+-        m_pool.m_opts.signals->TransactionAddedToMempool(
+-            ws.m_ptx, std::move(spent_coins_ptr),
+-            m_pool.GetAndIncrementSequence());
++        const uint64_t seq = m_pool.GetAndIncrementSequence();
++        if (batch_signals != nullptr) {
++            batch_signals->push_back(ValidationSignals::MempoolAddedBatchItem{
++                ws.m_ptx, std::move(spent_coins_ptr), seq});
++        } else {
++            m_pool.m_opts.signals->TransactionAddedToMempool(
++                ws.m_ptx, std::move(spent_coins_ptr), seq);
++        }
+     }
+ 
+     // Trim mempool and check if tx was trimmed.
+@@ -1048,6 +1062,13 @@ bool MemPoolAccept::SubmitPackage(
+         [this](const auto &ws) { return !m_pool.exists(ws.m_ptx->GetId()); }));
+ 
+     bool all_submitted = true;
++    std::vector<ValidationSignals::MempoolAddedBatchItem> batch_signals;
++    if (m_pool.m_opts.signals && workspaces.size() > 1) {
++        batch_signals.reserve(workspaces.size());
++    }
++    auto *batch_signals_ptr =
++        (m_pool.m_opts.signals && workspaces.size() > 1) ? &batch_signals
++                                                         : nullptr;
+     // ConsensusScriptChecks adds to the script cache and is therefore
+     // consensus-critical; CheckInputsFromMempoolAndCache asserts that
+     // transactions only spend coins available from the mempool or UTXO set.
+@@ -1074,7 +1095,7 @@ bool MemPoolAccept::SubmitPackage(
+         // Instead, allow the mempool to temporarily bypass limits, the maximum
+         // package size) while submitting transactions individually and then
+         // trim at the very end.
+-        if (!Finalize(args, ws)) {
++        if (!Finalize(args, ws, batch_signals_ptr)) {
+             results.emplace(ws.m_ptx->GetId(),
+                             MempoolAcceptResult::Failure(ws.m_state));
+             // Since LimitMempoolSize() won't be called, this should never fail.
+@@ -1085,15 +1106,22 @@ bool MemPoolAccept::SubmitPackage(
+         }
+     }
+ 
++    if (batch_signals_ptr != nullptr && !batch_signals.empty()) {
++        m_pool.m_opts.signals->TransactionsAddedToMempoolBatch(
++            std::move(batch_signals));
++    }
++
+     // It may or may not be the case that all the transactions made it into the
+     // mempool. Regardless, make sure we haven't exceeded max mempool size.
+     m_pool.LimitSize(m_active_chainstate.CoinsTip());
+ 
+     std::vector<TxId> all_package_txids;
+-    all_package_txids.reserve(workspaces.size());
+-    std::transform(workspaces.cbegin(), workspaces.cend(),
+-                   std::back_inserter(all_package_txids),
+-                   [](const auto &ws) { return ws.m_ptx->GetId(); });
++    if (args.m_package_feerates) {
++        all_package_txids.reserve(workspaces.size());
++        std::transform(workspaces.cbegin(), workspaces.cend(),
++                       std::back_inserter(all_package_txids),
++                       [](const auto &ws) { return ws.m_ptx->GetId(); });
++    }
+ 
+     // Add successful results. The returned results may change later if
+     // LimitMempoolSize() evicts them.
+@@ -1447,37 +1475,84 @@ PackageMempoolAcceptResult MemPoolAccept::AcceptRawTxBatch(
+             return PackageMempoolAcceptResult(package_state, {});
+         }
+ 
+-        std::unordered_set<TxId, SaltedTxIdHasher> later_txids;
+-        later_txids.reserve(batch_count);
+-        for (const auto &tx : txns) {
+-            later_txids.insert(tx->GetId());
++        size_t txid_cap = 16;
++        while (txid_cap < batch_count * 2) {
++            txid_cap <<= 1;
+         }
+-        if (later_txids.size() != batch_count) {
+-            package_state.Invalid(PackageValidationResult::PCKG_POLICY,
+-                                  "package-contains-duplicates");
+-            return PackageMempoolAcceptResult(package_state, {});
++        const size_t txid_mask = txid_cap - 1;
++        struct TxIdIndexSlot {
++            TxId txid;
++            size_t index{0};
++            bool occupied{false};
++        };
++        std::vector<TxIdIndexSlot> txid_table(txid_cap);
++        size_t total_inputs = 0;
++        for (size_t i = 0; i < batch_count; ++i) {
++            const TxId &id = txns[i]->GetId();
++            total_inputs += txns[i]->vin.size();
++            size_t slot = id.GetUint64(0) & txid_mask;
++            while (txid_table[slot].occupied) {
++                if (txid_table[slot].txid == id) {
++                    package_state.Invalid(PackageValidationResult::PCKG_POLICY,
++                                          "package-contains-duplicates");
++                    return PackageMempoolAcceptResult(package_state, {});
++                }
++                slot = (slot + 1) & txid_mask;
++            }
++            txid_table[slot].txid = id;
++            txid_table[slot].index = i;
++            txid_table[slot].occupied = true;
+         }
+ 
+-        std::unordered_set<COutPoint, SaltedOutpointHasher> inputs_seen;
+-        inputs_seen.reserve(batch_count * 2);
+-        for (const auto &tx : txns) {
++        size_t in_cap = 16;
++        while (in_cap < (total_inputs + 1) * 2) {
++            in_cap <<= 1;
++        }
++        const size_t in_mask = in_cap - 1;
++        struct OutpointSlot {
++            COutPoint outpoint;
++            bool occupied{false};
++        };
++        std::vector<OutpointSlot> inputs_seen(in_cap);
++        for (size_t i = 0; i < batch_count; ++i) {
++            const auto &tx = txns[i];
+             for (const auto &input : tx->vin) {
+                 if (input.nFlags == 3) {
+                     continue;
+                 }
+-                if (later_txids.find(input.prevout.GetTxId()) !=
+-                    later_txids.end()) {
+-                    package_state.Invalid(PackageValidationResult::PCKG_POLICY,
+-                                          "package-not-sorted");
+-                    return PackageMempoolAcceptResult(package_state, {});
++                const TxId &prev_txid = input.prevout.GetTxId();
++                size_t tslot = prev_txid.GetUint64(0) & txid_mask;
++                while (txid_table[tslot].occupied) {
++                    if (txid_table[tslot].txid == prev_txid) {
++                        if (txid_table[tslot].index >= i) {
++                            package_state.Invalid(
++                                PackageValidationResult::PCKG_POLICY,
++                                "package-not-sorted");
++                            return PackageMempoolAcceptResult(package_state,
++                                                              {});
++                        }
++                        break;
++                    }
++                    tslot = (tslot + 1) & txid_mask;
+                 }
+-                if (!inputs_seen.insert(input.prevout).second) {
+-                    package_state.Invalid(PackageValidationResult::PCKG_POLICY,
+-                                          "conflict-in-package");
+-                    return PackageMempoolAcceptResult(package_state, {});
++
++                const uint64_t ohash =
++                    prev_txid.GetUint64(0) ^
++                    (static_cast<uint64_t>(input.prevout.GetN()) *
++                     0x9e3779b97f4a7c15ULL);
++                size_t islot = static_cast<size_t>(ohash) & in_mask;
++                while (inputs_seen[islot].occupied) {
++                    if (inputs_seen[islot].outpoint == input.prevout) {
++                        package_state.Invalid(
++                            PackageValidationResult::PCKG_POLICY,
++                            "conflict-in-package");
++                        return PackageMempoolAcceptResult(package_state, {});
++                    }
++                    islot = (islot + 1) & in_mask;
+                 }
++                inputs_seen[islot].outpoint = input.prevout;
++                inputs_seen[islot].occupied = true;
+             }
+-            later_txids.erase(tx->GetId());
+         }
+     }
+ 
+@@ -3570,7 +3645,8 @@ bool Chainstate::ConnectBlock(const CBlock &block, BlockValidationState &state,
+         prevheights.resize(tx.vin.size());
+         for (size_t j = 0; j < tx.vin.size(); j++) {
+             prevheights[j] =
+-                (tx.vin[j].nFlags == 3)
++                (tx.vin[j].nFlags == 3 ||
++                 (tx.vin[j].nSequence & CTxIn::SEQUENCE_LOCKTIME_DISABLE_FLAG))
+                     ? 0
+                     : view.AccessCoin(tx.vin[j].prevout).GetHeight();
+         }
+diff --git a/src/validationinterface.cpp b/src/validationinterface.cpp
+index 3c8ff041ea..0ef35bb6aa 100644
+--- a/src/validationinterface.cpp
++++ b/src/validationinterface.cpp
+@@ -209,6 +209,30 @@ void ValidationSignals::TransactionAddedToMempool(
+                           tx->GetId().ToString());
+ }
+ 
++void ValidationSignals::TransactionsAddedToMempoolBatch(
++    std::vector<MempoolAddedBatchItem> &&items) {
++    if (items.empty()) {
++        return;
++    }
++    if (items.size() == 1) {
++        TransactionAddedToMempool(items[0].tx, std::move(items[0].spent_coins),
++                                  items[0].mempool_sequence);
++        return;
++    }
++    auto shared_items =
++        std::make_shared<std::vector<MempoolAddedBatchItem>>(std::move(items));
++    const size_t count = shared_items->size();
++    auto event = [shared_items, this] {
++        m_internals->Iterate([&](CValidationInterface &callbacks) {
++            for (const auto &item : *shared_items) {
++                callbacks.TransactionAddedToMempool(item.tx, item.spent_coins,
++                                                    item.mempool_sequence);
++            }
++        });
++    };
++    ENQUEUE_AND_LOG_EVENT(event, "%s: count=%zu", __func__, count);
++}
++
+ void ValidationSignals::TransactionRemovedFromMempool(
+     const CTransactionRef &tx, MemPoolRemovalReason reason,
+     uint64_t mempool_sequence) {
+diff --git a/src/validationinterface.h b/src/validationinterface.h
+index a68b4790ff..1eb1142127 100644
+--- a/src/validationinterface.h
++++ b/src/validationinterface.h
+@@ -240,6 +240,13 @@ public:
+     void TransactionAddedToMempool(const CTransactionRef &,
+                                    std::shared_ptr<const std::vector<Coin>>,
+                                    uint64_t mempool_sequence);
++    struct MempoolAddedBatchItem {
++        CTransactionRef tx;
++        std::shared_ptr<const std::vector<Coin>> spent_coins;
++        uint64_t mempool_sequence{0};
++    };
++    void TransactionsAddedToMempoolBatch(
++        std::vector<MempoolAddedBatchItem> &&items);
+     void TransactionRemovedFromMempool(const CTransactionRef &,
+                                        MemPoolRemovalReason,
+                                        uint64_t mempool_sequence);
+diff --git a/test/functional/lotus_v2_loopback_tps_stress.py b/test/functional/lotus_v2_loopback_tps_stress.py
+index f150292bb0..b9d7c0b11c 100755
+--- a/test/functional/lotus_v2_loopback_tps_stress.py
++++ b/test/functional/lotus_v2_loopback_tps_stress.py
+@@ -925,7 +925,7 @@ def main():
+                 n2_done_t = now
+             if n1_done_t is not None and n2_done_t is not None:
+                 break
+-            time.sleep(0.01)
++            time.sleep(0.001)
+ 
+         p2p_n1_sec = (n1_done_t or time.perf_counter()) - t_p2p0
+         p2p_n2_sec = (n2_done_t or time.perf_counter()) - t_p2p0
+@@ -1007,7 +1007,7 @@ def main():
+                         b3_node_done_t[node_idx] = time.perf_counter()
+             if all(t is not None for t in b3_node_done_t):
+                 break
+-            time.sleep(0.01)
++            time.sleep(0.001)
+ 
+         b3_n0_sec = (b3_node_done_t[0] or time.perf_counter()) - t_b3_0
+         b3_n1_sec = (b3_node_done_t[1] or time.perf_counter()) - t_b3_0
+-- 
+2.50.1 (Apple Git-155)
+

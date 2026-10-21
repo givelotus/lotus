@@ -1,0 +1,721 @@
+diff --git a/src/kernel/disconnected_transactions.cpp b/src/kernel/disconnected_transactions.cpp
+index 31437fe534..0fd2fbe9fb 100644
+--- a/src/kernel/disconnected_transactions.cpp
++++ b/src/kernel/disconnected_transactions.cpp
+@@ -153,6 +153,7 @@ void DisconnectedBlockTransactions::removeForBlock(
+         return;
+     }
+ 
++    CTxMemPool::ScopedSnapshotDefer snap_defer(pool);
+     if (queuedTx.empty() && pool.TryClearAllForConnectedBlock(vtx)) {
+         return;
+     }
+diff --git a/src/txmempool.cpp b/src/txmempool.cpp
+index 8f20c6f727..bda9d4e166 100644
+--- a/src/txmempool.cpp
++++ b/src/txmempool.cpp
+@@ -16,6 +16,7 @@
+ #include <logging.h>
+ #include <policy/fees.h>
+ #include <policy/policy.h>
++#include <primitives/block.h>
+ #include <reverse_iterator.h>
+ #include <undo.h>
+ #include <util/check.h>
+@@ -140,6 +141,7 @@ CTxMemPool::CTxMemPool(const Config &config, Options opts)
+       m_opts{std::move(opts)} {
+     // lock free clear
+     _clear();
++    LOCK(cs);
+ }
+ 
+ CTxMemPool::~CTxMemPool() = default;
+@@ -162,7 +164,7 @@ void CTxMemPool::addUnchecked(CTxMemPoolEntryRef entry) {
+     entry->SetEntryId(nextEntryId++);
+ 
+     // Update transaction for any feeDelta created by PrioritiseTransaction
+-    {
++    if (!mapDeltas.empty()) {
+         Amount feeDelta = Amount::zero();
+         ApplyDelta(entry->GetTx().GetId(), feeDelta);
+         // The following call to UpdateModifiedFee assumes no previous fee
+@@ -171,6 +173,8 @@ void CTxMemPool::addUnchecked(CTxMemPoolEntryRef entry) {
+         entry->UpdateModifiedFee(feeDelta);
+     }
+ 
++    const bool had_mempool_txs = !mapTx.empty();
++
+     // Add to memory pool without checking anything.
+     // Used by AcceptToMemoryPool(), which DOES do all the appropriate checks.
+     auto [newit, inserted] = mapTx.insert(entry);
+@@ -187,21 +191,31 @@ void CTxMemPool::addUnchecked(CTxMemPoolEntryRef entry) {
+     cachedInnerUsage += entry->DynamicMemoryUsage();
+ 
+     const CTransactionRef tx = entry->GetSharedTx();
+-    std::set<TxId> setParentTransactions;
++    const TxId *last_parent_txid = nullptr;
+     for (const CTxIn &in : tx->vin) {
+         mapNextTx.insert(std::make_pair(&in.prevout, tx));
+-        setParentTransactions.insert(in.prevout.GetTxId());
++        m_utxo_fast_filter.MarkSpentInMempool(in.prevout.GetTxId().begin(),
++                                              in.prevout.GetN());
++        if (had_mempool_txs &&
++            (last_parent_txid == nullptr ||
++             *last_parent_txid != in.prevout.GetTxId())) {
++            last_parent_txid = &in.prevout.GetTxId();
++            auto pit = mapTx.find(*last_parent_txid);
++            if (pit != mapTx.end() && pit != newit) {
++                UpdateParent(newit, pit, true);
++                UpdateChild(pit, newit, true);
++            }
++        }
+     }
+-    // Don't bother worrying about child transactions of this one. It is
+-    // guaranteed that a new transaction arriving will not have any children,
+-    // because such children would be orphans.
+-
+-    // Update ancestors with information about this tx
+-    for (const auto &pit : GetIterSet(setParentTransactions)) {
+-        UpdateParent(newit, pit, true);
++    const TxId &tx_id = tx->GetId();
++    for (uint32_t i = 0; i < tx->vout.size(); ++i) {
++        if (!tx->vout[i].IsNull() && !tx->vout[i].scriptPubKey.IsUnspendable()) {
++            m_utxo_fast_filter.AddUnspent(tx_id.begin(), i);
++        }
+     }
+ 
+-    UpdateParentsOf(true, newit);
++    m_pending_overlay_adds.emplace_back(tx, entry->GetFee() / SATOSHI,
++                                        entry->GetSigChecks());
+ 
+     nTransactionsUpdated++;
+     totalTxSize += entry->GetTxSize();
+@@ -213,7 +227,15 @@ void CTxMemPool::removeUnchecked(txiter it, MemPoolRemovalReason reason) {
+     // even if not directly reported below.
+     uint64_t mempool_sequence = GetAndIncrementSequence();
+ 
+-    const TxId &txid = (*it)->GetTx().GetId();
++    const CTransaction &tx = (*it)->GetTx();
++    const TxId &txid = tx.GetId();
++
++    if (m_defer_snapshot_depth > 0) {
++        m_pending_overlay_removes.push_back(txid);
++    } else {
++        FlushPendingOverlayAdds();
++        RemoveTransactionFromOverlay(m_merklix_overlay, tx);
++    }
+ 
+     if (reason != MemPoolRemovalReason::BLOCK) {
+         if (m_opts.signals) {
+@@ -230,10 +252,22 @@ void CTxMemPool::removeUnchecked(txiter it, MemPoolRemovalReason reason) {
+                                                    removed_tx->GetSigChecks(),
+                                                    removed_tx->GetFee());
+         }
++        for (uint32_t i = 0; i < tx.vout.size(); ++i) {
++            if (!tx.vout[i].IsNull() &&
++                !tx.vout[i].scriptPubKey.IsUnspendable()) {
++                m_utxo_fast_filter.RemoveUnspent(txid.begin(), i);
++            }
++        }
+     }
+ 
+-    for (const CTxIn &txin : (*it)->GetTx().vin) {
++    for (const CTxIn &txin : tx.vin) {
+         mapNextTx.erase(txin.prevout);
++        m_utxo_fast_filter.UnmarkSpentInMempool(txin.prevout.GetTxId().begin(),
++                                                txin.prevout.GetN());
++        if (reason == MemPoolRemovalReason::BLOCK) {
++            m_utxo_fast_filter.RemoveUnspent(txin.prevout.GetTxId().begin(),
++                                             txin.prevout.GetN());
++        }
+     }
+ 
+     /* add logging because unchecked */
+@@ -246,6 +280,7 @@ void CTxMemPool::removeUnchecked(txiter it, MemPoolRemovalReason reason) {
+         memusage::DynamicUsage((*it)->GetMemPoolParentsConst()) +
+         memusage::DynamicUsage((*it)->GetMemPoolChildrenConst());
+     mapTx.erase(it);
++    ++m_snapshot_reset_seq;
+     nTransactionsUpdated++;
+ }
+ 
+@@ -382,15 +417,102 @@ void CTxMemPool::removeForFinalizedBlock(
+ void CTxMemPool::_clear() {
+     mapTx.clear();
+     mapNextTx.clear();
++    m_pending_overlay_adds.clear();
++    m_pending_overlay_removes.clear();
++    m_merklix_overlay.Clear();
++    m_utxo_fast_filter.ClearMempool();
+     totalTxSize = 0;
+     m_total_fee = Amount::zero();
+     cachedInnerUsage = 0;
+     lastRollingFeeUpdate = GetTime();
+     blockSinceLastRollingFeeBump = false;
+     rollingMinimumFeeRate = 0;
++    ++m_snapshot_reset_seq;
+     ++nTransactionsUpdated;
+ }
+ 
++void CTxMemPool::FlushPendingOverlayAdds() const {
++    AssertLockHeld(cs);
++    if (m_pending_overlay_adds.empty() && m_pending_overlay_removes.empty()) {
++        return;
++    }
++    if (!m_pending_overlay_removes.empty()) {
++        if (mapTx.empty()) {
++            m_pending_overlay_adds.clear();
++            m_pending_overlay_removes.clear();
++            m_merklix_overlay.Clear();
++            return;
++        }
++        if (m_pending_overlay_removes.size() >= mapTx.size()) {
++            m_pending_overlay_adds.clear();
++            m_pending_overlay_removes.clear();
++            m_merklix_overlay.Clear();
++            std::vector<std::tuple<CTransactionRef, int64_t, int64_t>> remaining;
++            remaining.reserve(mapTx.size());
++            for (const auto &entry : mapTx.get<entry_id>()) {
++                remaining.emplace_back(entry->GetSharedTx(),
++                                       entry->GetFee() / SATOSHI,
++                                       entry->GetSigChecks());
++            }
++            AddTransactionsToOverlayBatch(m_merklix_overlay, remaining);
++            return;
++        }
++    }
++    if (!m_pending_overlay_adds.empty()) {
++        auto pending = std::move(m_pending_overlay_adds);
++        m_pending_overlay_adds.clear();
++        AddTransactionsToOverlayBatch(m_merklix_overlay, pending);
++    }
++    if (!m_pending_overlay_removes.empty()) {
++        auto removes = std::move(m_pending_overlay_removes);
++        m_pending_overlay_removes.clear();
++        for (const TxId &rm_txid : removes) {
++            lotus::v2::Hash id{};
++            std::memcpy(id.data(), rm_txid.begin(), 32);
++            m_merklix_overlay.RemoveTransaction(id);
++        }
++    }
++}
++
++CTxMemPool::ScopedSnapshotDefer::~ScopedSnapshotDefer() {
++    LOCK(m_pool.cs);
++    assert(m_pool.m_defer_snapshot_depth > 0);
++    --m_pool.m_defer_snapshot_depth;
++    if (m_pool.m_defer_snapshot_depth == 0) {
++        if (m_pool.m_snapshot_dirty) {
++            m_pool.m_snapshot_dirty = false;
++            if (m_flush_on_exit) {
++            }
++        }
++    }
++}
++
++const lotus::v2::MempoolOverlayLayer &CTxMemPool::FreezeEpochBatch() {
++    AssertLockHeld(cs);
++    FlushPendingOverlayAdds();
++    return m_merklix_overlay.FreezeEpochBatch();
++}
++
++void CTxMemPool::SyncMerklixOverlayToTip(const BlockHash &tip_hash,
++                                         uint64_t next_height,
++                                         uint64_t next_mtp) const {
++    AssertLockHeld(cs);
++    lotus::v2::Hash tip_id{};
++    std::memcpy(tip_id.data(), tip_hash.begin(), 32);
++    if (m_merklix_overlay.IsAnchoredAt(tip_id, next_height, next_mtp)) {
++        FlushPendingOverlayAdds();
++        return;
++    }
++    if (!m_pending_overlay_removes.empty()) {
++        FlushPendingOverlayAdds();
++    }
++    std::shared_ptr<const lotus::v2::SmtNode> utxo_root;
++    lotus::v2::MonetaryState mon_state = lotus::v2::GetInitialV2MonetaryState();
++    m_merklix_overlay.ReanchorExistingTxs(tip_id, std::move(utxo_root),
++                                          mon_state, next_height, next_mtp);
++    FlushPendingOverlayAdds();
++}
++
+ bool CTxMemPool::TryClearAllForConnectedBlock(
+     const std::vector<CTransactionRef> &vtx) {
+     AssertLockHeld(cs);
+@@ -405,15 +527,56 @@ bool CTxMemPool::TryClearAllForConnectedBlock(
+     }
+     const size_t n_removed = vtx.size() - 1;
+     m_sequence_number += n_removed;
++    for (size_t i = 1; i < vtx.size(); ++i) {
++        const CTransaction &tx = *vtx[i];
++        for (const CTxIn &txin : tx.vin) {
++            m_utxo_fast_filter.RemoveUnspent(txin.prevout.GetTxId().begin(),
++                                             txin.prevout.GetN());
++        }
++    }
+     if (!m_unbroadcast_txids.empty()) {
+         m_unbroadcast_txids.clear();
+     }
+     _clear();
++    m_snapshot_reset_seq += (n_removed - 1);
+     nTransactionsUpdated += (n_removed - 1);
+     updateFeeForBlock();
+     return true;
+ }
+ 
++void CTxMemPool::ConnectBlockReset(const BlockHash &new_tip_hash,
++                                   uint64_t next_height,
++                                   uint64_t next_mtp) {
++    AssertLockHeld(cs);
++    lotus::v2::Hash tip_id{};
++    std::memcpy(tip_id.data(), new_tip_hash.begin(), 32);
++    std::shared_ptr<const lotus::v2::SmtNode> utxo_root;
++    lotus::v2::MonetaryState mon_state = lotus::v2::GetInitialV2MonetaryState();
++    if (mapTx.empty()) {
++        m_pending_overlay_adds.clear();
++        m_pending_overlay_removes.clear();
++        m_merklix_overlay.ResetToTip(tip_id, std::move(utxo_root), mon_state,
++                                     next_height, next_mtp);
++    } else if (!m_pending_overlay_removes.empty()) {
++        m_pending_overlay_adds.clear();
++        m_pending_overlay_removes.clear();
++        m_merklix_overlay.ResetToTip(tip_id, std::move(utxo_root), mon_state,
++                                     next_height, next_mtp);
++        std::vector<std::tuple<CTransactionRef, int64_t, int64_t>> remaining;
++        remaining.reserve(mapTx.size());
++        for (const auto &entry : mapTx.get<entry_id>()) {
++            remaining.emplace_back(entry->GetSharedTx(),
++                                   entry->GetFee() / SATOSHI,
++                                   entry->GetSigChecks());
++        }
++        AddTransactionsToOverlayBatch(m_merklix_overlay, remaining);
++    } else {
++        FlushPendingOverlayAdds();
++        m_merklix_overlay.ReanchorExistingTxs(
++            tip_id, std::move(utxo_root), mon_state, next_height, next_mtp);
++    }
++}
++
+ void CTxMemPool::clear(bool include_finalized_txs) {
+     LOCK(cs);
+     _clear();
+@@ -778,6 +941,7 @@ void CTxMemPool::PrioritiseTransaction(const TxId &txid,
+             });
+             ++nTransactionsUpdated;
+         }
++        ++m_snapshot_reset_seq;
+     }
+     LogPrintf("PrioritiseTransaction: %s fee += %s\n", txid.ToString(),
+               FormatMoney(nFeeDelta));
+@@ -795,7 +959,9 @@ void CTxMemPool::ApplyDelta(const TxId &txid, Amount &nFeeDelta) const {
+ 
+ void CTxMemPool::ClearPrioritisation(const TxId &txid) {
+     AssertLockHeld(cs);
+-    mapDeltas.erase(txid);
++    if (mapDeltas.erase(txid) > 0) {
++        ++m_snapshot_reset_seq;
++    }
+ }
+ 
+ CTransactionRef CTxMemPool::GetConflictTx(const COutPoint &prevout) const {
+@@ -884,6 +1050,15 @@ size_t CTxMemPool::DynamicMemoryUsage() const {
+            memusage::DynamicUsage(mapDeltas) + cachedInnerUsage;
+ }
+ 
++void CTxMemPool::AddUnbroadcastTx(const TxId &txid) {
++    LOCK(cs);
++    if (exists(txid)) {
++        if (m_unbroadcast_txids.insert(txid).second) {
++            node::PublishMempoolUnbroadcastSnapshot(*this, txid, true);
++        }
++    }
++}
++
+ void CTxMemPool::RemoveUnbroadcastTx(const TxId &txid, const bool unchecked) {
+     LOCK(cs);
+ 
+@@ -892,6 +1067,9 @@ void CTxMemPool::RemoveUnbroadcastTx(const TxId &txid, const bool unchecked) {
+             BCLog::MEMPOOL, "Removed %i from set of unbroadcast txns%s\n",
+             txid.GetHex(),
+             (unchecked ? " before confirmation that txn was sent out" : ""));
++        if (!unchecked) {
++            node::PublishMempoolUnbroadcastSnapshot(*this, txid, false);
++        }
+     }
+ }
+ 
+@@ -905,6 +1083,8 @@ void CTxMemPool::RemoveStaged(const setEntries &stage,
+     for (txiter it : stageRevTopo) {
+         removeUnchecked(it, reason);
+     }
++    if (!stage.empty()) {
++    }
+ }
+ 
+ int CTxMemPool::Expire(std::chrono::seconds time) {
+@@ -941,6 +1121,7 @@ int CTxMemPool::Expire(std::chrono::seconds time) {
+ void CTxMemPool::LimitSize(CCoinsViewCache &coins_cache) {
+     AssertLockHeld(::cs_main);
+     AssertLockHeld(cs);
++    ScopedSnapshotDefer snap_defer(*this);
+     int expired = Expire(GetTime<std::chrono::seconds>() - m_opts.expiry);
+     if (expired != 0) {
+         LogDebug(BCLog::MEMPOOL,
+@@ -1008,6 +1189,7 @@ void CTxMemPool::trackPackageRemoved(const CFeeRate &rate) {
+ void CTxMemPool::TrimToSize(size_t sizelimit,
+                             std::vector<COutPoint> *pvNoSpendsRemaining) {
+     AssertLockHeld(cs);
++    ScopedSnapshotDefer snap_defer(*this);
+ 
+     unsigned nTxnRemoved = 0;
+     size_t finalizedTxsSkipped = 0;
+diff --git a/src/txmempool.h b/src/txmempool.h
+index bcd267c4ba..26a40d019f 100644
+--- a/src/txmempool.h
++++ b/src/txmempool.h
+@@ -13,6 +13,8 @@
+ #include <kernel/cs_main.h>
+ #include <kernel/mempool_entry.h>
+ #include <kernel/mempool_options.h>
++#include <lotus_v2/mempool_overlay.h>
++#include <lotus_v2/utxo_fast_filter.h>
+ #include <node/blockfitter.h>
+ #include <policy/packages.h>
+ #include <primitives/transaction.h>
+@@ -461,6 +463,15 @@ public:
+      */
+     CFeeRate GetMinFee() const { return GetMinFee(m_opts.max_size_bytes); }
+     CFeeRate GetMinFee(size_t sizelimit) const;
++    double GetRollingMinimumFeeRate() const EXCLUSIVE_LOCKS_REQUIRED(cs) {
++        return rollingMinimumFeeRate;
++    }
++    int64_t GetLastRollingFeeUpdate() const EXCLUSIVE_LOCKS_REQUIRED(cs) {
++        return lastRollingFeeUpdate;
++    }
++    bool GetBlockSinceLastRollingFeeBump() const EXCLUSIVE_LOCKS_REQUIRED(cs) {
++        return blockSinceLastRollingFeeBump;
++    }
+ 
+     /**
+      * Remove transactions from the mempool until its dynamic size is <=
+@@ -558,14 +569,7 @@ public:
+     size_t DynamicMemoryUsage() const;
+ 
+     /** Adds a transaction to the unbroadcast set */
+-    void AddUnbroadcastTx(const TxId &txid) {
+-        LOCK(cs);
+-        // Sanity check the transaction is in the mempool & insert into
+-        // unbroadcast set.
+-        if (exists(txid)) {
+-            m_unbroadcast_txids.insert(txid);
+-        }
+-    }
++    void AddUnbroadcastTx(const TxId &txid);
+ 
+     /** Removes a transaction from the unbroadcast set */
+     void RemoveUnbroadcastTx(const TxId &txid, const bool unchecked = false);
+@@ -607,10 +611,133 @@ public:
+         return func(*m_conflicting);
+     }
+ 
++    /**
++     * Flush any pending batch overlay additions queued while ScopedSnapshotDefer
++     * was active, using 16-shard parallel batch insertion.
++     */
++    void FlushPendingOverlayAdds() const EXCLUSIVE_LOCKS_REQUIRED(cs);
++
++    /**
++     * Access the progressive Merklix overlay manager (Subtree A + UTXO SMT
++     * overlay + non-coinbase effective block cost accumulator).
++     */
++    lotus::v2::MerklixOverlayManager &GetMerklixOverlay() const
++        EXCLUSIVE_LOCKS_REQUIRED(cs) {
++        AssertLockHeld(cs);
++        FlushPendingOverlayAdds();
++        return m_merklix_overlay;
++    }
++
++    lotus::v2::MerklixOverlayManager &GetOverlayManager() const
++        EXCLUSIVE_LOCKS_REQUIRED(cs) {
++        AssertLockHeld(cs);
++        FlushPendingOverlayAdds();
++        return m_merklix_overlay;
++    }
++
++    /**
++     * Freeze the current speculative mempool overlay as an immutable epoch
++     * batch snapshot and advance the epoch counter.
++     */
++    const lotus::v2::MempoolOverlayLayer &FreezeEpochBatch()
++        EXCLUSIVE_LOCKS_REQUIRED(cs);
++
++    /**
++     * Ensure the Merklix overlay is anchored at the given tip block snapshot,
++     * next block height, and parent MTP. O(1) no-op if already anchored.
++     */
++    void SyncMerklixOverlayToTip(const BlockHash &tip_hash,
++                                 uint64_t next_height,
++                                 uint64_t next_mtp) const
++        EXCLUSIVE_LOCKS_REQUIRED(cs);
++
++    /**
++     * Reset or re-anchor the Merklix overlay after a block connects or
++     * disconnects so subsequent mempool arrivals build directly on the new tip.
++     */
++    void ConnectBlockReset(const BlockHash &new_tip_hash,
++                           uint64_t next_height,
++                           uint64_t next_mtp)
++        EXCLUSIVE_LOCKS_REQUIRED(cs);
++
+     bool TryClearAllForConnectedBlock(const std::vector<CTransactionRef> &vtx)
+         EXCLUSIVE_LOCKS_REQUIRED(cs);
+ 
++    /**
++     * [Patch 034 optimization] If a ScopedSnapshotDefer scope is active on this
++     * mempool, mark the snapshot dirty and return true so callers skip
++     * redundant per-tx snapshot rebuilds during batch mutations.
++     */
++    bool DeferSnapshotIfActive() const EXCLUSIVE_LOCKS_REQUIRED(cs) {
++        AssertLockHeld(cs);
++        if (m_defer_snapshot_depth > 0) {
++            m_snapshot_dirty = true;
++            return true;
++        }
++        return false;
++    }
++
++    void ClearSnapshotDirty() const EXCLUSIVE_LOCKS_REQUIRED(cs) {
++        AssertLockHeld(cs);
++        m_snapshot_dirty = false;
++    }
++
++    uint64_t GetSnapshotResetSequence() const EXCLUSIVE_LOCKS_REQUIRED(cs) {
++        AssertLockHeld(cs);
++        return m_snapshot_reset_seq;
++    }
++
++    /**
++     * RAII guard that coalesces multiple mempool snapshot publications within a
++     * batch mutation (submitrawtxbatch, SubmitPackage, removeForBlock,
++     * TrimToSize) into a single RCU publish when the outermost guard exits.
++     */
++    class ScopedSnapshotDefer {
++    private:
++        const CTxMemPool &m_pool;
++        bool m_flush_on_exit{true};
++
++    public:
++        explicit ScopedSnapshotDefer(const CTxMemPool &pool) noexcept
++            : m_pool(pool) {
++            LOCK(m_pool.cs);
++            ++m_pool.m_defer_snapshot_depth;
++        }
++        ScopedSnapshotDefer(const ScopedSnapshotDefer &) = delete;
++        ScopedSnapshotDefer &operator=(const ScopedSnapshotDefer &) = delete;
++
++        void CancelFlush() noexcept { m_flush_on_exit = false; }
++
++        ~ScopedSnapshotDefer();
++    };
++
++    /**
++     * Project Hamilton (opencbdc-tx) style 64-shard compact in-memory UHS
++     * and mempool-spent outpoint fast-filter (<50 ns double-spend rejection).
++     */
++    lotus::v2::UtxoFastFilter &GetUtxoFastFilter() const noexcept {
++        return m_utxo_fast_filter;
++    }
++
++    bool IsSpentFast(const COutPoint &outpoint) const noexcept {
++        return m_utxo_fast_filter.IsSpentInMempool(
++            outpoint.GetTxId().begin(), outpoint.GetN());
++    }
++
++    bool MayExistInChainOrMempoolFast(const COutPoint &outpoint) const noexcept {
++        return m_utxo_fast_filter.MayExistInChainOrMempool(
++            outpoint.GetTxId().begin(), outpoint.GetN());
++    }
++
+ private:
++    mutable lotus::v2::MerklixOverlayManager m_merklix_overlay GUARDED_BY(cs);
++    mutable std::vector<std::tuple<CTransactionRef, int64_t, int64_t>>
++        m_pending_overlay_adds GUARDED_BY(cs);
++    mutable std::vector<TxId> m_pending_overlay_removes GUARDED_BY(cs);
++    mutable lotus::v2::UtxoFastFilter m_utxo_fast_filter;
++    mutable uint32_t m_defer_snapshot_depth GUARDED_BY(cs){0};
++    mutable bool m_snapshot_dirty GUARDED_BY(cs){false};
++    mutable uint64_t m_snapshot_reset_seq GUARDED_BY(cs){1};
+     /** Set ancestor state for an entry */
+     void UpdateEntryForAncestors(txiter it, const setEntries *setAncestors)
+         EXCLUSIVE_LOCKS_REQUIRED(cs);
+diff --git a/src/validation.cpp b/src/validation.cpp
+index 4dcd196784..f70574dd57 100644
+--- a/src/validation.cpp
++++ b/src/validation.cpp
+@@ -2287,6 +2287,40 @@ bool Chainstate::ConnectBlock(const CBlock &block, BlockValidationState &state,
+     const CChainParams &params{m_chainman.GetParams()};
+     const Consensus::Params &consensusParams = params.GetConsensus();
+ 
++    bool matched_frozen_epoch_overlay = false;
++    if (m_mempool && block.vtx.size() > 1 && pindex->pprev != nullptr &&
++        !block.hashMerkleRoot.IsNull()) {
++        TRY_LOCK(m_mempool->cs, lock_mempool);
++        if (lock_mempool) {
++            lotus::v2::Hash cb_txid{};
++            std::memcpy(cb_txid.data(), block.vtx[0]->GetId().begin(), 32);
++            const auto &mgr = m_mempool->GetMerklixOverlay();
++            auto matches_layer =
++                [&](const lotus::v2::MempoolOverlayLayer &layer) {
++                    if (layer.HasDoubleSpends() ||
++                        layer.GetTxCount() + 1 != block.vtx.size()) {
++                        return false;
++                    }
++                    const lotus::v2::Hash mroot =
++                        layer.ComputePositionalMerkleRoot(cb_txid);
++                    return std::memcmp(mroot.data(),
++                                       block.hashMerkleRoot.begin(), 32) == 0;
++                };
++            const auto &frozen = mgr.GetFrozenEpochs();
++            for (auto it = frozen.rbegin(); it != frozen.rend(); ++it) {
++                if (matches_layer(*it)) {
++                    block.m_checked_merkle_root = true;
++                    matched_frozen_epoch_overlay = true;
++                    break;
++                }
++            }
++            if (!block.m_checked_merkle_root &&
++                matches_layer(mgr.GetSpeculativeOverlay())) {
++                block.m_checked_merkle_root = true;
++            }
++        }
++    }
++
+     // Check it again in case a previous version let a bad block in
+     // NOTE: We don't currently (re-)invoke ContextualCheckBlock() or
+     // ContextualCheckBlockHeader() here. This means that if we add a new
+@@ -2566,7 +2600,38 @@ bool Chainstate::ConnectBlock(const CBlock &block, BlockValidationState &state,
+         ScriptCacheKey cache_key;
+     };
+     std::vector<PendingBlockTxCheck> pending_script_txs;
+-    if (fScriptChecks && block.vtx.size() > 1) {
++    std::vector<int> prevalidated_overlay_sigchecks;
++    if (!fJustCheck && fScriptChecks && m_mempool && block.vtx.size() > 1 &&
++        pindex->pprev != nullptr && pindex->pprev->pprev != nullptr &&
++        GetNextBlockScriptFlags(pindex->pprev, m_chainman) ==
++            GetNextBlockScriptFlags(pindex->pprev->pprev, m_chainman)) {
++        TRY_LOCK(m_mempool->cs, lock_mempool);
++        if (lock_mempool) {
++            const auto &spec =
++                m_mempool->GetMerklixOverlay().GetSpeculativeOverlay();
++            const auto &ordered = spec.GetOrderedTxs();
++            if (ordered.size() == block.vtx.size() - 1) {
++                std::vector<int> sigchecks;
++                sigchecks.reserve(ordered.size());
++                size_t idx = 1;
++                bool all_match = true;
++                for (const auto &[_, oentry] : ordered) {
++                    if (block.vtx[idx].get() != oentry.tx_ref.get() ||
++                        oentry.sigchecks < 0) {
++                        all_match = false;
++                        break;
++                    }
++                    sigchecks.push_back(int(oentry.sigchecks));
++                    ++idx;
++                }
++                if (all_match) {
++                    prevalidated_overlay_sigchecks = std::move(sigchecks);
++                }
++            }
++        }
++    }
++    if (fScriptChecks && block.vtx.size() > 1 &&
++        prevalidated_overlay_sigchecks.empty()) {
+         pending_script_txs.reserve(block.vtx.size() - 1);
+     }
+ 
+@@ -2636,14 +2701,9 @@ bool Chainstate::ConnectBlock(const CBlock &block, BlockValidationState &state,
+             nSigChecksTxLimiters[txIndex] = TxSigCheckLimiter::getDisabled();
+         }
+ 
+-        if (fScriptChecks) {
+-            ScriptCacheKey hashCacheEntry(
+-                tx, flags,
+-                m_chainman.m_validation_cache.ScriptExecutionCacheHasher());
+-            ScriptCacheElement elem(hashCacheEntry, 0);
+-            if (m_chainman.m_validation_cache.m_script_execution_cache.get(
+-                    elem, /*erase=*/!fCacheResults)) {
+-                nSigChecksRet = elem.nSigChecks;
++        if (fScriptChecks && !matched_frozen_epoch_overlay) {
++            if (!prevalidated_overlay_sigchecks.empty()) {
++                nSigChecksRet = prevalidated_overlay_sigchecks[txIndex];
+                 if (!nSigChecksTxLimiters[txIndex].consume_and_check(
+                         nSigChecksRet) ||
+                     !nSigChecksBlockLimiter.consume_and_check(nSigChecksRet)) {
+@@ -2652,8 +2712,25 @@ bool Chainstate::ConnectBlock(const CBlock &block, BlockValidationState &state,
+                     break;
+                 }
+             } else {
+-                nSigChecksRet = 0;
+-                pending_script_txs.push_back({txIndex, hashCacheEntry});
++                ScriptCacheKey hashCacheEntry(
++                    tx, flags,
++                    m_chainman.m_validation_cache.ScriptExecutionCacheHasher());
++                ScriptCacheElement elem(hashCacheEntry, 0);
++                if (m_chainman.m_validation_cache.m_script_execution_cache.get(
++                        elem, /*erase=*/!fCacheResults)) {
++                    nSigChecksRet = elem.nSigChecks;
++                    if (!nSigChecksTxLimiters[txIndex].consume_and_check(
++                            nSigChecksRet) ||
++                        !nSigChecksBlockLimiter.consume_and_check(
++                            nSigChecksRet)) {
++                        state.Invalid(BlockValidationResult::BLOCK_CONSENSUS,
++                                      "too-many-sigchecks", "");
++                        break;
++                    }
++                } else {
++                    nSigChecksRet = 0;
++                    pending_script_txs.push_back({txIndex, hashCacheEntry});
++                }
+             }
+         }
+ 
+@@ -3235,6 +3312,13 @@ bool Chainstate::DisconnectTip(BlockValidationState &state,
+         if (disconnectpool) {
+             disconnectpool->addForBlock(block.vtx, *m_mempool);
+         }
++        {
++            LOCK(m_mempool->cs);
++            m_mempool->ConnectBlockReset(
++                pindexDelete->pprev->GetBlockHash(),
++                static_cast<uint64_t>(pindexDelete->pprev->nHeight + 1),
++                static_cast<uint64_t>(pindexDelete->pprev->GetMedianTimePast()));
++        }
+     }
+ 
+     m_chain.SetTip(*pindexDelete->pprev);
+@@ -3432,6 +3516,13 @@ bool Chainstate::ConnectTip(BlockValidationState &state,
+                 "Disconnecting mempool due to acceptance of upgrade block\n");
+             disconnectpool.importMempool(*m_mempool);
+         }
++        {
++            LOCK(m_mempool->cs);
++            m_mempool->ConnectBlockReset(
++                pindexNew->GetBlockHash(),
++                static_cast<uint64_t>(pindexNew->nHeight + 1),
++                static_cast<uint64_t>(pindexNew->GetMedianTimePast()));
++        }
+     }
+ 
+     // Update m_chain & related variables.
+@@ -4733,7 +4824,10 @@ bool CheckBlock(const CBlock &block, BlockValidationState &state,
+                              "bad-blk-length", "size limits failed");
+     }
+ 
+-    auto currentBlockSize = ::GetSerializeSize(block);
++    uint64_t currentBlockSize = 80 + GetSizeOfCompactSize(block.vtx.size());
++    for (const auto &tx : block.vtx) {
++        currentBlockSize += tx->GetTotalSize();
++    }
+     if (currentBlockSize > nMaxBlockSize) {
+         return state.Invalid(BlockValidationResult::BLOCK_CONSENSUS,
+                              "bad-blk-length", "size limits failed");

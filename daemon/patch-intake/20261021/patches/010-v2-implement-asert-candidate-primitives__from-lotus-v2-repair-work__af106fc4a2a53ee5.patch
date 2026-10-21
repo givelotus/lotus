@@ -1,0 +1,468 @@
+From 1a5b2c6a3259f7e324cbb3e0d1e3716ca5f696d6 Mon Sep 17 00:00:00 2001
+From: Shammah Chancellor <shammah.chancellor@notvalid.com>
+Date: Sun, 18 Oct 2026 01:33:30 -0700
+Subject: [PATCH] v2: implement ASERT candidate primitives
+
+Extract this concern so its mechanism can be reviewed and measured independently.
+No source semantics are added or removed by this history operation.
+
+Original patch rationale (describes the unsplit source, not every extracted part):
+Add the 134-byte Lotus V2 block header schema, log2 work-adjusted monetary
+issuance/burn state machine, and integer ASERT difficulty calculation.
+
+Original-Commit: 6e7cfb7ee0e4705edaae31acd3a8edc9130e75d2
+Original-Patch: v2/008
+Split-Concern: asert
+
+Historical compilation prerequisites are tracked separately in daemon/patch-audit;
+this provenance-preserving split does not imply standalone build validation.
+
+(cherry picked from commit 5c16ec09a936a377cc2d50ff0c3875c3d94f2b42)
+
+Canonical-Source-Commit: 5c16ec09a936a377cc2d50ff0c3875c3d94f2b42
+---
+ src/lotus_v2/asert_candidate.cpp       | 150 ++++++++++++++++++++
+ src/lotus_v2/asert_candidate.h         |  58 ++++++++
+ src/lotus_v2/asert_test/CMakeLists.txt |  19 +++
+ src/lotus_v2/test_asert_candidate.cpp  | 181 +++++++++++++++++++++++++
+ 4 files changed, 408 insertions(+)
+ create mode 100644 src/lotus_v2/asert_candidate.cpp
+ create mode 100644 src/lotus_v2/asert_candidate.h
+ create mode 100644 src/lotus_v2/asert_test/CMakeLists.txt
+ create mode 100644 src/lotus_v2/test_asert_candidate.cpp
+
+diff --git a/src/lotus_v2/asert_candidate.cpp b/src/lotus_v2/asert_candidate.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..9f29ba6d11c7a6db7a018884b7cdcee5e5dd11b0
+--- /dev/null
++++ b/src/lotus_v2/asert_candidate.cpp
+@@ -0,0 +1,150 @@
++// Copyright (c) 2026 The Lotus developers
++// Genesis-anchored ASERT candidate. Does not call CalculateASERT.
++#include "asert_candidate.h"
++
++namespace lotus::v2 {
++namespace {
++
++constexpr int64_t kFixedPoint = 65536;
++constexpr unsigned kWordBits = 256;
++
++std::size_t BitLength(const AsertInteger &value) {
++    if (value <= 0) return 0;
++    return static_cast<std::size_t>(boost::multiprecision::msb(value)) + 1;
++}
++
++bool FitsUnsignedWord(const AsertInteger &value) {
++    return value > 0 && BitLength(value) <= kWordBits;
++}
++
++// Floor division. cpp_int operator/ truncates toward zero, which is a
++// different operation for a negative numerator.
++AsertInteger FloorDiv(const AsertInteger &numerator,
++                      const AsertInteger &denominator) {
++    AsertInteger quotient = numerator / denominator;
++    if (numerator < 0 && numerator % denominator != 0) {
++        --quotient;
++    }
++    return quotient;
++}
++
++AsertInteger PolynomialFactor(uint32_t fractional) {
++    const AsertInteger f = fractional;
++    const AsertInteger square = f * f;
++    const AsertInteger cube = square * f;
++    // Same coefficients as src/pow/aserti32d.cpp. The anchor is not that one.
++    const AsertInteger scaled = AsertInteger(195766423245049ull) * f +
++                                AsertInteger(971821376ull) * square +
++                                AsertInteger(5127ull) * cube +
++                                (AsertInteger(1) << 47);
++    return AsertInteger(kFixedPoint) + (scaled >> 48);
++}
++
++} // namespace
++
++std::optional<uint32_t> EncodeCompactTarget(const AsertInteger &target) {
++    if (!FitsUnsignedWord(target)) return std::nullopt;
++    unsigned exponent =
++        static_cast<unsigned>((BitLength(target) + 7) / 8);
++    AsertInteger mantissa;
++    if (exponent <= 3) {
++        mantissa = target << (8u * (3u - exponent));
++    } else {
++        mantissa = target >> (8u * (exponent - 3u));
++    }
++    // Bit 23 is the compact sign bit. Shift it out so the encoding is
++    // nonnegative. That drops the low eight bits of the mantissa.
++    if ((mantissa & (AsertInteger(1) << 23)) != 0) {
++        mantissa >>= 8;
++        ++exponent;
++    }
++    if (exponent > 255 || mantissa < 0 || mantissa >= (AsertInteger(1) << 23)) {
++        return std::nullopt;
++    }
++    const auto significand = mantissa.convert_to<uint32_t>();
++    return (static_cast<uint32_t>(exponent) << 24) | significand;
++}
++
++std::optional<AsertInteger> DecodeCompactTarget(uint32_t bits,
++                                                const AsertInteger &pow_limit) {
++    if (pow_limit < 1 || BitLength(pow_limit) > kWordBits) return std::nullopt;
++    if ((bits & 0x00800000u) != 0) return std::nullopt;
++    const unsigned exponent = bits >> 24;
++    const uint32_t significand = bits & 0x007fffffu;
++    if (significand == 0) return std::nullopt;
++    AsertInteger target;
++    if (exponent <= 3) {
++        target = AsertInteger(significand) >> (8u * (3u - exponent));
++    } else {
++        const unsigned shift = 8u * (exponent - 3u);
++        // A shift of 256 or more cannot fit in an unsigned 256-bit target.
++        if (shift >= kWordBits) return std::nullopt;
++        target = AsertInteger(significand) << shift;
++        if (BitLength(target) > kWordBits) return std::nullopt;
++    }
++    if (target <= 0 || target > pow_limit) return std::nullopt;
++    const auto encoded = EncodeCompactTarget(target);
++    if (!encoded || *encoded != bits) return std::nullopt;
++    return target;
++}
++
++std::optional<AsertCandidateResult> RequiredAsertCandidateBits(
++    int64_t half_life_seconds, int64_t spacing_seconds,
++    const AsertInteger &genesis_target, uint64_t genesis_time,
++    const AsertInteger &pow_limit, AsertParent parent) {
++    if (half_life_seconds <= 0 || spacing_seconds <= 0 || !FitsUnsignedWord(genesis_target)) {
++        return std::nullopt;
++    }
++    if (pow_limit < 1 || BitLength(pow_limit) > kWordBits) return std::nullopt;
++
++    // Signed drift. Timestamp and height fields are not subtracted as uint64.
++    const AsertInteger drift =
++        AsertInteger(parent.time) - AsertInteger(genesis_time) -
++        AsertInteger(spacing_seconds) * AsertInteger(parent.height);
++    // Toward zero, matching the candidate. Floor is used only to split q.
++    // For parent.height >= 1 this exponent equals the historical
++    // CalculateASERT exponent with height difference parent.height - 1.
++    // Height 0 is evaluated here; that call would need a negative height
++    // difference. This translation unit does not call it.
++    const AsertInteger exponent =
++        (AsertInteger(kFixedPoint) * drift) / AsertInteger(half_life_seconds);
++    const AsertInteger quotient = FloorDiv(exponent, AsertInteger(kFixedPoint));
++    const AsertInteger fractional =
++        exponent - AsertInteger(kFixedPoint) * quotient;
++    if (fractional < 0 || fractional >= kFixedPoint) return std::nullopt;
++
++    const auto f = fractional.convert_to<uint32_t>();
++    const AsertInteger factor = PolynomialFactor(f);
++    const AsertInteger scaled = genesis_target * factor;
++    AsertInteger raw;
++    if (quotient >= AsertInteger(kWordBits + 16)) {
++        // Nonnegative shift of at least 256 saturates before the shift.
++        raw = pow_limit;
++    } else if (quotient >= 16) {
++        const auto shift = (quotient - 16).convert_to<unsigned>();
++        raw = scaled << shift;
++    } else {
++        const AsertInteger magnitude = AsertInteger(16) - quotient;
++        if (magnitude >= AsertInteger(BitLength(scaled))) {
++            raw = 0;
++        } else {
++            raw = scaled >> magnitude.convert_to<unsigned>();
++        }
++    }
++
++    AsertInteger clamped = raw;
++    if (clamped < 1) clamped = 1;
++    if (clamped > pow_limit) clamped = pow_limit;
++    const auto bits = EncodeCompactTarget(clamped);
++    if (!bits) return std::nullopt;
++    AsertCandidateResult result;
++    result.exponent = exponent;
++    result.quotient = quotient;
++    result.fractional = f;
++    result.raw_target = raw;
++    result.clamped_target = clamped;
++    result.bits = *bits;
++    return result;
++}
++
++} // namespace lotus::v2
+diff --git a/src/lotus_v2/asert_candidate.h b/src/lotus_v2/asert_candidate.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..e9f0bc8f56a2be1a115ae504f074cb4a44de1fa0
+--- /dev/null
++++ b/src/lotus_v2/asert_candidate.h
+@@ -0,0 +1,58 @@
++// Copyright (c) 2026 The Lotus developers
++// P04 ASERT candidate. Not frozen mainnet consensus and not called from lotusd.
++#ifndef LOTUS_V2_ASERT_CANDIDATE_H
++#define LOTUS_V2_ASERT_CANDIDATE_H
++
++#include <boost/multiprecision/cpp_int.hpp>
++
++#include <cstdint>
++#include <optional>
++
++namespace lotus::v2 {
++
++// Wide integer for targets and drift. Not a consensus global.
++using AsertInteger = boost::multiprecision::cpp_int;
++
++// Parent of the block whose required bits are being computed.
++// Genesis itself is not an input to this candidate.
++struct AsertParent {
++    uint64_t time = 0;
++    uint64_t height = 0;
++};
++
++// Half-life, spacing, genesis target, genesis time, and pow limit are
++// caller arguments. This library does not store a half-life or spacing.
++struct AsertCandidateResult {
++    // Truncated toward zero. Not the floor used for the quotient.
++    AsertInteger exponent;
++    // floor(exponent / 65536). Negative exponents still yield fractional
++    // in 0..65535.
++    AsertInteger quotient;
++    uint32_t fractional = 0;
++    // floor(V * 2^(quotient-16)). A nonnegative shift of 256 or more stores
++    // pow_limit and does not materialize the shift. A negative shift whose
++    // magnitude is at least the bit length of V stores 0.
++    AsertInteger raw_target;
++    // min(pow_limit, max(1, raw_target)), then encoded in bits.
++    AsertInteger clamped_target;
++    uint32_t bits = 0;
++};
++
++// Canonical compact target. Rejects the sign bit, zero, a value that does
++// not fit in 256 bits, a value above pow_limit, and a non-canonical encoding.
++// Accepted bits re-encode to themselves.
++std::optional<AsertInteger> DecodeCompactTarget(uint32_t bits,
++                                                const AsertInteger &pow_limit);
++std::optional<uint32_t> EncodeCompactTarget(const AsertInteger &target);
++
++// Required compact bits of the child of `parent`. Not ConnectTip.
++// Returns nullopt for a non-positive half-life or spacing, a non-positive genesis
++// target, or a pow limit below 1 or wider than 256 bits.
++std::optional<AsertCandidateResult> RequiredAsertCandidateBits(
++    int64_t half_life_seconds, int64_t spacing_seconds,
++    const AsertInteger &genesis_target, uint64_t genesis_time,
++    const AsertInteger &pow_limit, AsertParent parent);
++
++} // namespace lotus::v2
++
++#endif
+diff --git a/src/lotus_v2/asert_test/CMakeLists.txt b/src/lotus_v2/asert_test/CMakeLists.txt
+new file mode 100644
+index 0000000000000000000000000000000000000000..6cdee7f4d62d6c3235465dcd59fa505273b7318d
+--- /dev/null
++++ b/src/lotus_v2/asert_test/CMakeLists.txt
+@@ -0,0 +1,19 @@
++cmake_minimum_required(VERSION 3.18)
++project(lotus_v2_asert_candidate LANGUAGES CXX)
++set(CMAKE_CXX_STANDARD 20)
++set(CMAKE_CXX_STANDARD_REQUIRED ON)
++# Standalone P04 candidate. lotusd does not link this target.
++find_path(LOTUS_BOOST_INCLUDE boost/multiprecision/cpp_int.hpp
++    PATHS /opt/homebrew/opt/boost/include)
++if(NOT LOTUS_BOOST_INCLUDE)
++    message(FATAL_ERROR "Set LOTUS_BOOST_INCLUDE to Boost headers")
++endif()
++add_executable(lotus_v2_asert_test
++    ../asert_candidate.cpp
++    ../test_asert_candidate.cpp)
++target_include_directories(lotus_v2_asert_test SYSTEM PRIVATE
++    "${LOTUS_BOOST_INCLUDE}")
++target_compile_options(lotus_v2_asert_test PRIVATE
++    -Wall -Wextra -Wpedantic -Werror)
++enable_testing()
++add_test(NAME lotus_v2_asert_test COMMAND lotus_v2_asert_test)
+diff --git a/src/lotus_v2/test_asert_candidate.cpp b/src/lotus_v2/test_asert_candidate.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..3a2f02c8602784bb8288df358d0f7a0071cc6fe6
+--- /dev/null
++++ b/src/lotus_v2/test_asert_candidate.cpp
+@@ -0,0 +1,181 @@
++// Copyright (c) 2026 The Lotus developers
++// Standalone P04 candidate checks. This does not start lotusd.
++#include "asert_candidate.h"
++
++#include <cstdint>
++#include <iostream>
++#include <limits>
++#include <stdexcept>
++
++using namespace lotus::v2;
++
++namespace {
++
++// Working candidate supplied by the caller. Not a consensus global and
++// not written into chainparams. Half-life is two days; spacing is 120s.
++constexpr int64_t kWorkingCandidateHalfLifeSeconds = 172800;
++constexpr int64_t kWorkingCandidateSpacingSeconds = 120;
++
++void Check(bool ok, const char *message) {
++    if (!ok) throw std::runtime_error(message);
++}
++
++AsertInteger Factor(uint32_t fractional) {
++    const AsertInteger f = fractional;
++    const AsertInteger square = f * f;
++    const AsertInteger scaled = AsertInteger(195766423245049ull) * f +
++                                AsertInteger(971821376ull) * square +
++                                AsertInteger(5127ull) * square * f +
++                                (AsertInteger(1) << 47);
++    return AsertInteger(65536) + (scaled >> 48);
++}
++
++std::optional<AsertCandidateResult> Child(const AsertInteger &genesis_target,
++                                          uint64_t genesis_time,
++                                          const AsertInteger &pow_limit,
++                                          uint64_t parent_time,
++                                          uint64_t parent_height) {
++    return RequiredAsertCandidateBits(
++        kWorkingCandidateHalfLifeSeconds, kWorkingCandidateSpacingSeconds,
++        genesis_target, genesis_time, pow_limit,
++        AsertParent{parent_time, parent_height});
++}
++
++} // namespace
++
++int main() {
++    try {
++        const AsertInteger wide_limit = (AsertInteger(1) << 256) - 1;
++        const auto genesis = DecodeCompactTarget(0x1d00ffffu, wide_limit);
++        Check(genesis.has_value(), "decode development-genesis bits");
++        const AsertInteger genesis_target = *genesis;
++        Check(EncodeCompactTarget(genesis_target) == 0x1d00ffffu,
++              "development-genesis bits round-trip");
++        Check(genesis_target == (AsertInteger(0xffff) << 208),
++              "development-genesis target value");
++
++        const AsertInteger pow_limit = genesis_target;
++        constexpr uint64_t kGenesisTime = 1000000000;
++        const auto height_zero =
++            Child(genesis_target, kGenesisTime, pow_limit, kGenesisTime, 0);
++        Check(height_zero && height_zero->exponent == 0 &&
++                  height_zero->raw_target == genesis_target &&
++                  height_zero->clamped_target == genesis_target &&
++                  height_zero->bits == 0x1d00ffffu,
++              "height 0 at genesis time keeps T0");
++
++        constexpr uint64_t kHeight = 9;
++        const uint64_t on_schedule =
++            kGenesisTime +
++            static_cast<uint64_t>(kWorkingCandidateSpacingSeconds) * kHeight;
++        const auto scheduled =
++            Child(genesis_target, kGenesisTime, wide_limit, on_schedule, kHeight);
++        Check(scheduled && scheduled->exponent == 0 &&
++                  scheduled->raw_target == genesis_target &&
++                  scheduled->bits == 0x1d00ffffu,
++              "on-schedule parent keeps T0");
++
++        const uint64_t doubled_time =
++            kGenesisTime +
++            static_cast<uint64_t>(kWorkingCandidateHalfLifeSeconds);
++        const auto doubled =
++            Child(genesis_target, kGenesisTime, wide_limit, doubled_time, 0);
++        Check(doubled && doubled->exponent == 65536 && doubled->quotient == 1 &&
++                  doubled->fractional == 0 &&
++                  doubled->raw_target == genesis_target * 2 &&
++                  doubled->clamped_target == genesis_target * 2 &&
++                  doubled->bits == 0x1d01fffeu,
++              "exact +half-life doubles before compact rounding");
++        const auto clamped_double =
++            Child(genesis_target, kGenesisTime, pow_limit, doubled_time, 0);
++        Check(clamped_double && clamped_double->raw_target == genesis_target * 2 &&
++                  clamped_double->clamped_target == pow_limit &&
++                  clamped_double->bits == 0x1d00ffffu,
++              "exact +half-life clamps at pow_limit");
++
++        const uint64_t halved_time =
++            kGenesisTime -
++            static_cast<uint64_t>(kWorkingCandidateHalfLifeSeconds);
++        const auto halved =
++            Child(genesis_target, kGenesisTime, pow_limit, halved_time, 0);
++        Check(halved && halved->exponent == -65536 && halved->quotient == -1 &&
++                  halved->fractional == 0 &&
++                  halved->raw_target == genesis_target / 2 &&
++                  halved->clamped_target == genesis_target / 2 &&
++                  halved->bits == 0x1c7fff80u,
++              "exact -half-life halves the target");
++
++        // parent.time < genesis time. Unsigned subtraction would wrap.
++        constexpr uint64_t kEarlierParent = kGenesisTime - 3;
++        const auto negative = Child(genesis_target, kGenesisTime, wide_limit,
++                                    kEarlierParent, 0);
++        const AsertInteger negative_raw = (genesis_target * Factor(65535)) >> 17;
++        Check(negative && negative->exponent == -1 && negative->quotient == -1 &&
++                  negative->fractional == 65535 &&
++                  negative->raw_target == negative_raw &&
++                  negative->clamped_target == negative_raw &&
++                  negative_raw > 1 && negative_raw < genesis_target,
++              "negative fractional exponent keeps f in 0..65535");
++
++        constexpr uint64_t kAnchorHeight = 4;
++        const uint64_t anchor_time =
++            kGenesisTime +
++            static_cast<uint64_t>(kWorkingCandidateSpacingSeconds) * kAnchorHeight -
++            3;
++        const auto anchored = Child(genesis_target, kGenesisTime, wide_limit,
++                                    anchor_time, kAnchorHeight);
++        const int64_t time_diff = static_cast<int64_t>(anchor_time) -
++                                  static_cast<int64_t>(kGenesisTime);
++        const int64_t height_diff = static_cast<int64_t>(kAnchorHeight) - 1;
++        const int64_t historical_exponent =
++            ((time_diff - kWorkingCandidateSpacingSeconds * (height_diff + 1)) *
++             65536) /
++            kWorkingCandidateHalfLifeSeconds;
++        Check(anchored && height_diff >= 0 &&
++                  anchored->exponent == historical_exponent &&
++                  anchored->quotient == -1 && anchored->fractional == 65535,
++              "height >= 1 matches the historical exponent anchor");
++
++        const auto minimum = Child(genesis_target, kGenesisTime, pow_limit,
++                                   kGenesisTime,
++                                   std::numeric_limits<uint64_t>::max());
++        Check(minimum && minimum->raw_target == 0 &&
++                  minimum->clamped_target == 1 && minimum->bits == 0x01010000u,
++              "large negative drift clamps to target 1");
++
++        const auto saturated =
++            Child(genesis_target, 0, pow_limit,
++                  std::numeric_limits<uint64_t>::max(), 0);
++        Check(saturated && saturated->quotient - 16 >= 256 &&
++                  saturated->raw_target == pow_limit &&
++                  saturated->clamped_target == pow_limit &&
++                  saturated->bits == 0x1d00ffffu,
++              "large positive drift saturates without a giant shift");
++
++        const AsertInteger awkward(0x800001);
++        Check(EncodeCompactTarget(awkward) == 0x04008000u,
++              "compact rounding drops the low byte");
++        const auto rounded = DecodeCompactTarget(0x04008000u, awkward);
++        Check(rounded && *rounded == 0x800000 &&
++                  EncodeCompactTarget(*rounded) == 0x04008000u,
++              "rounded compact bits round-trip");
++        Check(!DecodeCompactTarget(0x1d80ffffu, wide_limit), "reject sign bit");
++        Check(!DecodeCompactTarget(0x1d000000u, wide_limit), "reject zero");
++        Check(!DecodeCompactTarget(0x22010000u, wide_limit),
++              "reject overflow beyond 256 bits");
++        Check(!DecodeCompactTarget(0x03000001u, wide_limit),
++              "reject noncanonical compact");
++        Check(!DecodeCompactTarget(0x1d00ffffu, AsertInteger(1)),
++              "reject target above pow_limit");
++        Check(!RequiredAsertCandidateBits(0, kWorkingCandidateSpacingSeconds,
++                                          genesis_target, kGenesisTime, pow_limit,
++                                          AsertParent{kGenesisTime, 0}),
++              "reject a non-positive half-life");
++
++        std::cout << "V2 ASERT candidate checks passed\n";
++        return 0;
++    } catch (const std::exception &error) {
++        std::cerr << error.what() << '\n';
++        return 1;
++    }
++}
+-- 
+2.50.1 (Apple Git-155)
+

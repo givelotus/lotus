@@ -1,0 +1,1396 @@
+From 50f02d22a66f875ad220030e5cd881169b45b4c4 Mon Sep 17 00:00:00 2001
+From: Shammah Chancellor <shammah.chancellor@notvalid.com>
+Date: Mon, 19 Oct 2026 19:11:09 -0700
+Subject: [PATCH] validation: prefetch an arriving block's coins in the
+ background
+
+ConnectBlock prefetches the coins a block spends (patch 039's
+PrefetchOutpointsAsync), but despite its name the prefetch runs on the
+validating thread, inside ConnectBlock, as a sorted cursor walk: each seek
+faults in its B-tree pages one at a time. On a cold page cache that walk is
+most of ConnectBlock (here 20-50 us per input, ~400-1000 ms for a
+20,000-input block), and it only starts after the Merkle check, CheckBlock
+and writing the block to disk are done.
+
+Now, when a full block arrives, its coins are read on background threads:
+
+- node::BlockPrefetcher (node/blockprefetch.{h,cpp}): collects the block's
+  spent outpoints, leaving out spends of transactions in the same block,
+  turns them into sorted, unique coin keys, and walks them in up to
+  -blockprefetch stripes (default 4 threads, stripes of at least 256 keys)
+  so that several reads are outstanding at once. Bounded: at most 2 blocks
+  in flight; a further block is dropped, not queued; each block is started
+  once (the last 8 hashes are remembered); blocks with fewer than 9
+  transactions are skipped, as in ConnectBlock. Threads start at the first
+  large block. -blockprefetch=0 disables it (debug option, 0-16).
+- Started from net_processing as soon as a block is deserialized (BLOCK,
+  before IsBlockMutated, for blocks we requested or whose header claims
+  the anti-DoS work), after a BLOCKTXN reconstruction, and after an
+  optimistic compact-block reconstruction; and from ProcessNewBlock's entry
+  (RPC submitblock, -loadblock/reindex), deduplicated. ChainstateManager::
+  PrefetchBlockCoins also requires the header's proof of work to be valid,
+  so a peer cannot make the node read the disk for free.
+- The workers never take cs_main. The caller, which holds cs_main briefly
+  anyway at each of these points, passes a DBBackgroundHandle of the
+  active coins database. The handle (dbwrapper.h) runs a function only
+  while the database is open; ~CDBWrapper first detaches it, then waits for
+  running uses, so a cache resize (which reopens the database), snapshot
+  activation or shutdown can never close the environment under a walk.
+  CDBWrapper::PrefetchSortedRawKeys is the existing walk, split out of
+  PrefetchRawKeys; it takes its own read transaction and cursor from the
+  mutex-guarded pools, and the environment is opened with
+  MDBX_NOSTICKYTHREADS, so a read transaction may run on a thread other
+  than the one that created it, concurrently with the writer (MDBX readers
+  see a snapshot). The workers only read, and only to warm the OS page
+  cache: validation reads every coin itself, so results cannot change.
+  Errors are caught and counted.
+- ConnectBlock's own prefetch is unchanged and remains the fallback; it is
+  cheap once the pages are resident.
+- Metrics (in the fullnode_ namespace the metrics are moving to):
+  fullnode_block_prefetch_started_total, _dropped_total, _outpoints_total,
+  _errors_total and the fullnode_block_prefetch_duration_seconds histogram
+  (arrival to end of prefetch). -debug=bench logs each prefetch.
+
+Mempool admission path: not changed, decided by the A/B below. The
+patched-1thread arm (background prefetch with one thread, i.e. moving the
+same single walk off-thread and starting it early) is no faster than base
+(1.00x ConnectBlock total); the gain comes from several walks outstanding
+at once. Admission needs each input right away, its prefetch batches are
+small (>= 8 cold inputs), and the warm walk costs 0.5-0.6 us per outpoint
+(CoinsPrefetchWalk), so moving that walk to another thread has nothing to
+overlap with; striping a large cold admission batch is possible future
+work.
+
+A/B (contrib/bench/block-validation/ab_block_connect.py; base = the tier
+plus the benchmark commit; same fixture: 2,000,000 coins, 6 blocks of
+10,000 two-input transactions spending random coins; -dbcache=4;
+mdbx.dat evicted before each block, 0% resident by mincore; 7 interleaved
+rounds; ms; median [min-max]):
+
+| metric | base | patched | patched -blockprefetch=0 | patched -blockprefetch=1 |
+|---|---|---|---|---|
+| ConnectBlock, 6 blocks | 4483 [3883-5880] | 1665 [935-2426] (0.37x) | 4823 [2540-10710] (1.08x) | 4493 [2272-6012] (1.00x) |
+| ConnectBlock, median block | 798 [657-1004] | 282 [159-434] (0.35x) | 820 [395-1771] (1.03x) | 681 [369-897] (0.85x) |
+| submitblock, 6 blocks | 4858 [4251-6409] | 1998 [1168-2817] (0.41x) | 5203 [2820-11221] (1.07x) | 4919 [2508-6265] (1.01x) |
+
+Warm page cache (--warm, same rounds and arms but the 1-thread one):
+
+| metric | base | patched | patched -blockprefetch=0 |
+|---|---|---|---|
+| ConnectBlock, 6 blocks | 630 [553-653] | 636 [592-813] (1.01x) | 622 [553-915] (0.99x) |
+| submitblock, 6 blocks | 957 [851-999] | 1011 [939-1209] (1.06x) | 955 [876-1255] (1.00x) |
+
+So: cold, ConnectBlock takes ~0.37x the time; warm, the background walk
+(about 12 ms of CPU for 20,000 keys, on 4 threads) costs up to ~5% of
+submitblock time on this loaded machine, with overlapping ranges.
+
+How to reproduce:
+  Build the benchmark commit (base) and this commit (patched), targets
+  bitcoind and bitcoin-bench, then:
+  contrib/bench/block-validation/ab_block_connect.py fixture \
+      --bitcoind $BASE/build --dir /tmp/block-connect-fixture
+  contrib/bench/block-validation/ab_block_connect.py run \
+      --fixture /tmp/block-connect-fixture --rounds 7 \
+      --arm base=$BASE/build --arm patched=$PATCHED/build \
+      --arm "patched-off=$PATCHED/build -blockprefetch=0" \
+      --arm "patched-1thread=$PATCHED/build -blockprefetch=1" \
+      --out cold.json
+  (and again with --warm). Output: a Markdown table of
+  submitblock/connectblock/connecttip totals and per-block medians, each
+  "median [min-max] n=7", plus ratios to base.
+
+Tests:
+- New blockprefetch_tests: bounded (third block dropped while two are in
+  flight, then accepted once they finish), deduplicated, small and null
+  blocks skipped, disabled with 0 threads; only coins from outside the
+  block are read, duplicate spends deduplicated, coins unchanged; a job
+  queued before its database is closed completes as "closed" and the
+  handle refuses further use; ~CDBWrapper waits for a running Use();
+  three threads walking while 40 MB are written (several MDBX file
+  growths), all values intact; and through TestChain100Setup, a
+  ProcessNewBlock of an 11-transaction block (one intra-block spend) is
+  connected normally with exactly 10 coins prefetched, while a small block
+  is not prefetched.
+- interface_http_metrics.py: the counters are 0 after small blocks; one
+  11-transaction block gives started 1, errors 0, 1-10 outpoints, one
+  duration sample.
+- Pass: blockprefetch_tests, blockprefetch_chain_tests, dbwrapper_tests,
+  coins_tests, validation_block_tests, metrics_tests (rings_prepared_and_
+  reused failed once in a combined run, 0/20 alone; it is known to be
+  flaky under this machine's load), p2p_compactblocks.py,
+  interface_http_metrics.py.
+
+Not tested: the full unit and functional suites (one sweep runs at the end
+of the series); a P2P-delivered block in the A/B (it submits by RPC, so
+the early net_processing start points are covered by p2p_compactblocks
+only functionally); a ThreadSanitizer build; Linux; a real mainnet
+UTXO set or disk; behaviour under a reorg storm beyond the in-flight
+bound; a quiet machine (load average 40-90 during every run).
+
+Coordinator integration provenance (network403):
+Union native MDBX/DB metrics and bounded prefetch lifetime handles without replacing either initializer/member; register direct fullnode metrics without migration wording.
+Original scripted commands/hashes above are original-author provenance; modified parent/tool/catalog hashes are not claimed to reproduce this composition. Exact coordinator adaptation scripts and ordered tree proof are in composed403-network-metrics-delivery. Build/runtime/benchmarks NOT_RUN for this composition under user compile-first policy.
+
+Coordinator integration provenance (reference405):
+Preserve earlier purposeful source repairs through downstream consumer/context adaptations; exact conflict ledger retained.
+All60 authored input payloads retained, with prerequisite-aware same-purpose splits; distinct legacy-index and inherited CXX compatibility remain independent. Pre-format source equals exact403+all60 control tree95718fceff83364b74294a751bd752b2f1a4e384. Only pinnedRuff import/format cleanup follows. Original author commands/hashes are historical reference evidence, not combined405 approval. Reference OFF/native/Rust full gates are preserved separately; combined compile/runtime NOT_RUN.
+---
+ src/CMakeLists.txt                        |   2 +
+ src/dbwrapper.cpp                         |  17 +-
+ src/dbwrapper.h                           |  72 +++++
+ src/init.cpp                              |  10 +
+ src/kernel/chainstatemanager_opts.h       |   5 +
+ src/net_processing.cpp                    |  24 +-
+ src/node/blockprefetch.cpp                | 248 +++++++++++++++++
+ src/node/blockprefetch.h                  | 122 +++++++++
+ src/node/chainstatemanager_args.cpp       |   9 +
+ src/node/metrics.cpp                      |  23 +-
+ src/node/metrics.h                        |   7 +
+ src/test/CMakeLists.txt                   |   1 +
+ src/test/blockprefetch_tests.cpp          | 315 ++++++++++++++++++++++
+ src/txdb.cpp                              |   8 +-
+ src/txdb.h                                |   8 +
+ src/validation.cpp                        |  41 ++-
+ src/validation.h                          |  21 ++
+ test/functional/interface_http_metrics.py |  22 ++
+ 18 files changed, 946 insertions(+), 9 deletions(-)
+ create mode 100644 src/node/blockprefetch.cpp
+ create mode 100644 src/node/blockprefetch.h
+ create mode 100644 src/test/blockprefetch_tests.cpp
+
+diff --git a/src/CMakeLists.txt b/src/CMakeLists.txt
+index f3e9841e2a63df6e0e94cb0f1c2a56ece4508761..8172d197ea6417fb7797769792351e59f25b44fc 100644
+--- a/src/CMakeLists.txt
++++ b/src/CMakeLists.txt
+@@ -678,6 +678,7 @@ add_library(server
+ 	node/abort.cpp
+ 	node/blockfitter.cpp
+ 	node/blockmanager_args.cpp
++	node/blockprefetch.cpp
+ 	node/blockstorage.cpp
+ 	node/caches.cpp
+ 	node/chainstate.cpp
+@@ -930,6 +931,7 @@ if(BUILD_CHAINSTATE)
+ 		networks/abc/chainparamsconstants.cpp
+ 		networks/abc/checkpoints.cpp
+ 		node/blockfitter.cpp
++		node/blockprefetch.cpp
+ 		node/blockstorage.cpp
+ 		node/chainstate.cpp
+ 		node/snapshot.cpp
+diff --git a/src/dbwrapper.cpp b/src/dbwrapper.cpp
+index 3b0997fa5cc483a4d06a97ebfc099b7585cc5b07..21f46e96738fb74e9581e07903d4a3cb2da3e065 100644
+--- a/src/dbwrapper.cpp
++++ b/src/dbwrapper.cpp
+@@ -300,7 +300,8 @@ Status DestroyDB(const std::string &path_str, const DestroyOptions &) {
+ CDBWrapper::CDBWrapper(const DBParams &params)
+     : m_name{fs::PathToString(params.path.stem())}, m_path{params.path},
+       m_is_memory{params.memory_only},
+-      m_metric_db{node::MetricDatabaseIndex(fs::PathToString(params.path))} {
++      m_metric_db{node::MetricDatabaseIndex(fs::PathToString(params.path))},
++      m_background_handle{std::make_shared<DBBackgroundHandle>(*this)} {
+     if (m_is_memory) {
+         const uint64_t id = ++g_mem_db_counter;
+         m_active_path =
+@@ -434,6 +435,9 @@ CDBWrapper::CDBWrapper(const DBParams &params)
+ }
+ 
+ CDBWrapper::~CDBWrapper() {
++    // No background reader may start or still run once the environment
++    // closes below.
++    m_background_handle->Detach();
+     {
+         std::lock_guard<std::mutex> lock(m_read_txn_mutex);
+         for (MDBX_cursor *cursor : m_read_cursor_pool) {
+@@ -588,7 +592,18 @@ void CDBWrapper::PrefetchRawKeys(
+     }
+     std::sort(keys.begin(), keys.end());
+     keys.erase(std::unique(keys.begin(), keys.end()), keys.end());
++    PrefetchSortedRawKeys(keys);
++}
+ 
++void CDBWrapper::PrefetchSortedRawKeys(
++    Span<const std::vector<uint8_t>> keys) const {
++    if (keys.empty() || !m_env) {
++        return;
++    }
++    // Read transactions and cursors come from mutex-guarded pools, and the
++    // environment is opened with MDBX_NOSTICKYTHREADS, so this may run on
++    // any thread, concurrently with readers and the writer of other threads
++    // (each uses its own transaction; MDBX readers see a snapshot).
+     MDBX_txn *txn = AcquireReadTxn();
+     MDBX_cursor *cursor = AcquireReadCursor(txn);
+     constexpr uintptr_t kPageMask = ~uintptr_t(4095);
+diff --git a/src/dbwrapper.h b/src/dbwrapper.h
+index 612a0e8d9341a3a250b1a3556e766e4473feb1c4..06a000a5e1a3f474e976e7f481c6c3f1fc21c362 100644
+--- a/src/dbwrapper.h
++++ b/src/dbwrapper.h
+@@ -13,8 +13,10 @@
+ #include <util/fs.h>
+ #include <util/strencodings.h>
+ 
++#include <condition_variable>
+ #include <cstddef>
+ #include <cstdint>
++#include <memory>
+ #include <mutex>
+ #include <optional>
+ #include <stdexcept>
+@@ -61,6 +63,61 @@ public:
+ 
+ class CDBWrapper;
+ 
++/**
++ * Lets threads that do not own a CDBWrapper read from it while it may be
++ * destroyed meanwhile (e.g. a background prefetch racing a cache resize or
++ * shutdown). Use() runs its function only while the database is open; the
++ * database's destructor first stops new uses, then waits for running ones.
++ * Holding the handle never keeps the database alive.
++ */
++class DBBackgroundHandle {
++public:
++    explicit DBBackgroundHandle(const CDBWrapper &db) : m_db{&db} {}
++
++    /** Run f(db) if the database is still open. Returns whether it ran.
++     * f must not take locks held by whoever destroys the database. */
++    template <typename F> bool Use(F &&f) {
++        {
++            std::lock_guard<std::mutex> lock(m_mutex);
++            if (!m_db) {
++                return false;
++            }
++            ++m_active;
++        }
++        struct Done {
++            DBBackgroundHandle &h;
++            ~Done() {
++                std::lock_guard<std::mutex> lock(h.m_mutex);
++                if (--h.m_active == 0) {
++                    h.m_idle.notify_all();
++                }
++            }
++        } done{*this};
++        f(*m_db);
++        return true;
++    }
++
++    /** Whether the database is still open. */
++    bool IsOpen() const {
++        std::lock_guard<std::mutex> lock(m_mutex);
++        return m_db != nullptr;
++    }
++
++private:
++    friend class CDBWrapper;
++    //! Called by the database's destructor.
++    void Detach() {
++        std::unique_lock<std::mutex> lock(m_mutex);
++        m_db = nullptr;
++        m_idle.wait(lock, [this] { return m_active == 0; });
++    }
++
++    mutable std::mutex m_mutex;
++    std::condition_variable m_idle;
++    const CDBWrapper *m_db;
++    size_t m_active{0};
++};
++
+ namespace dbwrapper {
+ struct DestroyOptions {};
+ struct Status {
+@@ -276,6 +333,8 @@ private:
+ 
+     //! Label index of this database in the metrics (MetricDatabaseIndex)
+     size_t m_metric_db;
++    //! Shared with background users; detached first in the destructor.
++    std::shared_ptr<DBBackgroundHandle> m_background_handle;
+ 
+     bool ReadRaw(Span<const uint8_t> key, std::vector<uint8_t> &value) const;
+     bool ExistsRaw(Span<const uint8_t> key) const;
+@@ -338,7 +397,20 @@ public:
+ 
+     void WriteBatch(CDBBatch &batch, bool fSync = false);
+ 
++    /** Sort and deduplicate keys, then walk them (PrefetchSortedRawKeys). */
+     void PrefetchRawKeys(std::vector<std::vector<uint8_t>> &keys) const;
++    /**
++     * Seek a read cursor to each of keys (ascending) and hint the kernel to
++     * read the pages holding them (posix_madvise WILLNEED). The seeks fault
++     * in the B-tree pages synchronously on the calling thread. Thread-safe:
++     * uses its own pooled read transaction and cursor.
++     */
++    void PrefetchSortedRawKeys(Span<const std::vector<uint8_t>> keys) const;
++
++    /** Handle for using this database from threads that do not own it. */
++    std::shared_ptr<DBBackgroundHandle> GetBackgroundHandle() const {
++        return m_background_handle;
++    }
+ 
+     void Sync();
+ 
+diff --git a/src/init.cpp b/src/init.cpp
+index fed2d2b7c5070e18d99bf19aa22d4655bbe68ef2..0307972a96ed14477eb102a37e811571b51d5851 100644
+--- a/src/init.cpp
++++ b/src/init.cpp
+@@ -50,6 +50,7 @@
+ #include <net_zstd_independent.h>
+ #include <netbase.h>
+ #include <node/blockmanager_args.h>
++#include <node/blockprefetch.h>
+ #include <node/blockstorage.h>
+ #include <node/caches.h>
+ #include <node/chainstate.h>
+@@ -774,6 +775,15 @@ void SetupServerArgs(NodeContext &node) {
+             testnetChainParams->GetConsensus().nMinimumChainWork.GetHex()),
+         ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY,
+         OptionsCategory::OPTIONS);
++    argsman.AddArg(
++        "-blockprefetch=<n>",
++        strprintf("Threads reading the UTXO database pages of the coins an "
++                  "arriving block spends, in the background, before it is "
++                  "connected (0 to disable, up to %d, default: %d)",
++                  node::MAX_BLOCK_PREFETCH_THREADS,
++                  node::DEFAULT_BLOCK_PREFETCH_THREADS),
++        ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY,
++        OptionsCategory::OPTIONS);
+     argsman.AddArg(
+         "-par=<n>",
+         strprintf("Set the number of script verification threads (0 = auto, "
+diff --git a/src/kernel/chainstatemanager_opts.h b/src/kernel/chainstatemanager_opts.h
+index 41c6419ca72369b6b5eca2400d2e5da762d06455..92c48294bcdb4ec5316479e19be40f9cb3baa151 100644
+--- a/src/kernel/chainstatemanager_opts.h
++++ b/src/kernel/chainstatemanager_opts.h
+@@ -70,6 +70,11 @@ struct ChainstateManagerOpts {
+     //! If set, store and load the last few block headers reception time to
+     //! speed up RTT bootstraping
+     bool store_recent_headers_time{DEFAULT_STORE_RECENT_HEADERS_TIME};
++
++    //! Threads prefetching the coins of arriving blocks in the background
++    //! (node/blockprefetch.h). Zero disables the background prefetch.
++    //! Default: node::DEFAULT_BLOCK_PREFETCH_THREADS (node/blockprefetch.h).
++    int block_prefetch_threads{4};
+ };
+ 
+ } // namespace kernel
+diff --git a/src/net_processing.cpp b/src/net_processing.cpp
+index 2a83402ed7a3d7c7d772f299c94dbe2c07fe4ed6..fb24cf72d61a90dca2cfbd9a2a75e1f4b5b215ef 100644
+--- a/src/net_processing.cpp
++++ b/src/net_processing.cpp
+@@ -7428,6 +7428,7 @@ void PeerManagerImpl::ProcessMessage(
+                 LOCK(cs_main);
+                 mapBlockSource.emplace(pblock->GetHash(),
+                                        std::make_pair(pfrom.GetId(), false));
++                m_chainman.PrefetchBlockCoinsLocked(pblock);
+             }
+             // Setting force_processing to true means that we bypass some of
+             // our anti-DoS protections in AcceptBlock, which filters
+@@ -7546,6 +7547,8 @@ void PeerManagerImpl::ProcessMessage(
+                 // it is now an empty pointer
+                 RemoveBlockRequest(resp.blockhash, pfrom.GetId());
+                 fBlockRead = true;
++                // We requested it: start reading the coins it spends.
++                m_chainman.PrefetchBlockCoinsLocked(pblock);
+                 // mapBlockSource is used for potentially punishing peers and
+                 // updating which peers send us compact blocks, so the race
+                 // between here and cs_main in ProcessNewBlock is fine.
+@@ -7639,10 +7642,23 @@ void PeerManagerImpl::ProcessMessage(
+             .Field(BCLog::LogField::BlockHash, pblock->GetHash())
+             .Field(BCLog::LogField::PeerId, pfrom.GetId());
+ 
+-        const CBlockIndex *prev_block{
+-            WITH_LOCK(m_chainman.GetMutex(),
+-                      return m_chainman.m_blockman.LookupBlockIndex(
+-                          pblock->hashPrevBlock))};
++        const CBlockIndex *prev_block{nullptr};
++        {
++            LOCK(m_chainman.GetMutex());
++            prev_block =
++                m_chainman.m_blockman.LookupBlockIndex(pblock->hashPrevBlock);
++            // Start reading the coins it spends now, so the disk reads overlap
++            // with the Merkle check, CheckBlock and storing the block. Only
++            // for blocks we asked for or whose header claims enough work
++            // (PrefetchBlockCoinsLocked also checks its proof of work).
++            if (IsBlockRequested(pblock->GetHash()) ||
++                (prev_block &&
++                 prev_block->nChainWork + CalculateClaimedHeadersWork(
++                                              {pblock->GetBlockHeader()}) >=
++                     GetAntiDoSWorkThreshold())) {
++                m_chainman.PrefetchBlockCoinsLocked(pblock);
++            }
++        }
+ 
+         if (IsBlockMutated(/*block=*/*pblock)) {
+             LogPrintLevel(BCLog::NET, BCLog::Level::Debug,
+diff --git a/src/node/blockprefetch.cpp b/src/node/blockprefetch.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..d67ca91cb4a6043578158ab8ad4dcbe940c945d5
+--- /dev/null
++++ b/src/node/blockprefetch.cpp
+@@ -0,0 +1,248 @@
++// Copyright (c) 2026 The Bitcoin developers
++// Distributed under the MIT software license, see the accompanying
++// file COPYING or http://www.opensource.org/licenses/mit-license.php.
++
++#include <node/blockprefetch.h>
++
++#include <dbwrapper.h>
++#include <logging.h>
++#include <node/metrics.h>
++#include <primitives/block.h>
++#include <txdb.h>
++#include <util/hasher.h>
++#include <util/threadnames.h>
++
++#include <algorithm>
++#include <atomic>
++#include <chrono>
++#include <exception>
++#include <string>
++#include <unordered_set>
++
++namespace node {
++
++struct BlockPrefetcher::Job {
++    std::shared_ptr<const CBlock> block;
++    std::shared_ptr<DBBackgroundHandle> db;
++    std::chrono::steady_clock::time_point started;
++    //! Sorted, deduplicated coin keys; written before any stripe runs
++    std::vector<std::vector<uint8_t>> keys;
++    size_t stripes{1};
++    std::atomic<size_t> stripes_left{1};
++    std::atomic<bool> closed{false};
++    std::atomic<bool> failed{false};
++};
++
++BlockPrefetcher::BlockPrefetcher(Options options)
++    : m_options{std::move(options)} {}
++
++BlockPrefetcher::~BlockPrefetcher() {
++    {
++        std::lock_guard<std::mutex> lock(m_mutex);
++        m_stopping = true;
++        m_tasks.clear();
++    }
++    m_work.notify_all();
++    for (auto &t : m_threads) {
++        t.join();
++    }
++}
++
++BlockPrefetcher::Result
++BlockPrefetcher::Start(std::shared_ptr<const CBlock> block,
++                       std::shared_ptr<DBBackgroundHandle> db) {
++    if (!Enabled() || !block || !db) {
++        return Result::DISABLED;
++    }
++    if (block->vtx.size() < m_options.min_txs) {
++        return Result::SMALL;
++    }
++    const BlockHash hash{block->GetHash()};
++    std::unique_lock<std::mutex> lock(m_mutex);
++    if (m_stopping) {
++        return Result::DISABLED;
++    }
++    if (std::find(m_recent.begin(), m_recent.end(), hash) != m_recent.end()) {
++        ++m_stats.duplicates;
++        return Result::DUPLICATE;
++    }
++    if (m_in_flight >= m_options.max_in_flight) {
++        ++m_stats.dropped;
++        if (auto *m{GetNodeMetrics()}) {
++            m->block_prefetch_dropped.Inc();
++        }
++        return Result::DROPPED;
++    }
++    m_recent[m_recent_next] = hash;
++    m_recent_next = (m_recent_next + 1) % m_recent.size();
++    ++m_in_flight;
++    ++m_stats.started;
++    if (auto *m{GetNodeMetrics()}) {
++        m->block_prefetch_started.Inc();
++    }
++    auto job{std::make_shared<Job>()};
++    job->block = std::move(block);
++    job->db = std::move(db);
++    job->started = std::chrono::steady_clock::now();
++    Post(lock, [this, job] { RunJob(job); });
++    return Result::STARTED;
++}
++
++void BlockPrefetcher::Post(std::unique_lock<std::mutex> &lock,
++                           std::function<void()> task) {
++    if (m_stopping) {
++        return;
++    }
++    m_tasks.push_back(std::move(task));
++    // Threads start on first use, so that a node (or test) that never sees
++    // a large block never runs them. They are only created here, under
++    // m_mutex and before m_stopping, so the destructor joins all of them.
++    if (m_threads.empty()) {
++        for (size_t id = 0; id < m_options.threads; ++id) {
++            m_threads.emplace_back([this, id] { WorkerLoop(id); });
++        }
++    }
++    lock.unlock();
++    m_work.notify_one();
++    lock.lock();
++}
++
++void BlockPrefetcher::WorkerLoop(size_t id) {
++    util::ThreadRename("blkprefetch." + std::to_string(id));
++    for (;;) {
++        std::function<void()> task;
++        {
++            std::unique_lock<std::mutex> lock(m_mutex);
++            m_work.wait(lock, [this] {
++                return m_stopping || (!m_paused && !m_tasks.empty());
++            });
++            if (m_stopping) {
++                return;
++            }
++            task = std::move(m_tasks.front());
++            m_tasks.pop_front();
++        }
++        task();
++    }
++}
++
++void BlockPrefetcher::RunJob(const std::shared_ptr<Job> &job) {
++    const CBlock &block{*job->block};
++    try {
++        // Coins created in the block itself are not in the database.
++        std::unordered_set<TxId, SaltedTxIdHasher> in_block;
++        in_block.reserve(block.vtx.size());
++        for (const auto &tx : block.vtx) {
++            in_block.insert(tx->GetId());
++        }
++        std::vector<COutPoint> outpoints;
++        outpoints.reserve(block.vtx.size() * 2);
++        for (size_t i = 1; i < block.vtx.size(); ++i) {
++            for (const auto &in : block.vtx[i]->vin) {
++                if (!in_block.count(in.prevout.GetTxId())) {
++                    outpoints.push_back(in.prevout);
++                }
++            }
++        }
++        job->keys = CCoinsViewDB::CoinKeys(outpoints);
++        std::sort(job->keys.begin(), job->keys.end());
++        job->keys.erase(std::unique(job->keys.begin(), job->keys.end()),
++                        job->keys.end());
++    } catch (const std::exception &e) {
++        LogPrintLevel(BCLog::VALIDATION, BCLog::Level::Warning,
++                      "block prefetch: %s\n", e.what());
++        job->keys.clear();
++        job->failed = true;
++    }
++    const size_t n{job->keys.size()};
++    const size_t min_stripe{std::max<size_t>(1, m_options.min_stripe_keys)};
++    job->stripes = std::clamp<size_t>((n + min_stripe - 1) / min_stripe, 1,
++                                      std::max<size_t>(1, m_options.threads));
++    job->stripes_left.store(job->stripes, std::memory_order_relaxed);
++    {
++        std::unique_lock<std::mutex> lock(m_mutex);
++        m_stats.outpoints += n;
++        for (size_t s = 1; s < job->stripes && !m_stopping; ++s) {
++            Post(lock, [this, job, s] { RunStripe(job, s); });
++        }
++    }
++    RunStripe(job, 0);
++}
++
++void BlockPrefetcher::RunStripe(const std::shared_ptr<Job> &job,
++                                size_t stripe) {
++    const size_t n{job->keys.size()};
++    const size_t begin{n * stripe / job->stripes};
++    const size_t end{n * (stripe + 1) / job->stripes};
++    if (begin < end) {
++        try {
++            const Span<const std::vector<uint8_t>> keys{
++                job->keys.data() + begin, end - begin};
++            if (!job->db->Use([&](const CDBWrapper &db) {
++                    db.PrefetchSortedRawKeys(keys);
++                })) {
++                job->closed = true;
++            }
++        } catch (const std::exception &e) {
++            LogPrintLevel(BCLog::VALIDATION, BCLog::Level::Warning,
++                          "block prefetch: %s\n", e.what());
++            job->failed = true;
++        }
++    }
++    FinishStripe(job);
++}
++
++void BlockPrefetcher::FinishStripe(const std::shared_ptr<Job> &job) {
++    if (job->stripes_left.fetch_sub(1, std::memory_order_acq_rel) != 1) {
++        return;
++    }
++    const auto elapsed{std::chrono::steady_clock::now() - job->started};
++    if (auto *m{GetNodeMetrics()}) {
++        m->block_prefetch_outpoints.Add(0, job->keys.size());
++        m->block_prefetch_seconds.RecordDuration(elapsed);
++        if (job->failed) {
++            m->block_prefetch_errors.Inc();
++        }
++    }
++    LogDebug(BCLog::BENCH,
++             "Block prefetch %s: %u coins in %u stripes, %.2fms%s\n",
++             job->block->GetHash().ToString(), job->keys.size(), job->stripes,
++             std::chrono::duration<double, std::milli>(elapsed).count(),
++             job->closed ? " (database closed)" : "");
++    // Release the block and keys before the job is counted as done.
++    job->keys = {};
++    job->block.reset();
++    {
++        std::lock_guard<std::mutex> lock(m_mutex);
++        --m_in_flight;
++        ++m_stats.completed;
++        m_stats.errors += job->failed ? 1 : 0;
++        m_stats.closed += job->closed ? 1 : 0;
++    }
++    m_idle.notify_all();
++}
++
++void BlockPrefetcher::WaitIdle() {
++    std::unique_lock<std::mutex> lock(m_mutex);
++    m_idle.wait(lock, [this] { return m_in_flight == 0 || m_stopping; });
++}
++
++void BlockPrefetcher::Pause() {
++    std::lock_guard<std::mutex> lock(m_mutex);
++    m_paused = true;
++}
++
++void BlockPrefetcher::Resume() {
++    {
++        std::lock_guard<std::mutex> lock(m_mutex);
++        m_paused = false;
++    }
++    m_work.notify_all();
++}
++
++BlockPrefetcher::Stats BlockPrefetcher::GetStats() const {
++    std::lock_guard<std::mutex> lock(m_mutex);
++    return m_stats;
++}
++
++} // namespace node
+diff --git a/src/node/blockprefetch.h b/src/node/blockprefetch.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..13e6a22ea55b7b5920e79ecb3866625bf1834430
+--- /dev/null
++++ b/src/node/blockprefetch.h
+@@ -0,0 +1,122 @@
++// Copyright (c) 2026 The Bitcoin developers
++// Distributed under the MIT software license, see the accompanying
++// file COPYING or http://www.opensource.org/licenses/mit-license.php.
++
++#ifndef BITCOIN_NODE_BLOCKPREFETCH_H
++#define BITCOIN_NODE_BLOCKPREFETCH_H
++
++#include <primitives/blockhash.h>
++
++#include <array>
++#include <condition_variable>
++#include <cstddef>
++#include <cstdint>
++#include <deque>
++#include <functional>
++#include <memory>
++#include <mutex>
++#include <thread>
++#include <vector>
++
++class CBlock;
++class DBBackgroundHandle;
++
++namespace node {
++
++//! Default for -blockprefetch: background prefetch threads (0 disables).
++static constexpr int DEFAULT_BLOCK_PREFETCH_THREADS{4};
++//! Upper bound accepted for -blockprefetch.
++static constexpr int MAX_BLOCK_PREFETCH_THREADS{16};
++//! Blocks prefetched at once; further blocks are dropped, not queued.
++static constexpr size_t BLOCK_PREFETCH_MAX_IN_FLIGHT{2};
++//! Blocks with fewer transactions are not prefetched (as in ConnectBlock).
++static constexpr size_t BLOCK_PREFETCH_MIN_TXS{9};
++//! A block's sorted keys are walked in up to `threads` stripes of at least
++//! this many keys each, so that several reads are outstanding at once.
++static constexpr size_t BLOCK_PREFETCH_MIN_STRIPE_KEYS{256};
++
++/**
++ * Reads the UTXO database pages of the coins a block spends, on background
++ * threads, as soon as the block arrives, so that the disk reads overlap with
++ * the block's earlier checks (Merkle root, CheckBlock, writing it to disk)
++ * instead of starting inside ConnectBlock.
++ *
++ * - Bounded: at most max_in_flight blocks at once; others are dropped.
++ * - The workers never take cs_main: they only read the coins database
++ *   through a DBBackgroundHandle (own MDBX read transaction and cursor),
++ *   which turns into a no-op if the database is closed or reopened.
++ * - Results only warm the OS page cache: nothing it does changes what
++ *   validation reads or decides. ConnectBlock still issues its own
++ *   (then cheap) prefetch.
++ */
++class BlockPrefetcher {
++public:
++    struct Options {
++        size_t threads{DEFAULT_BLOCK_PREFETCH_THREADS};
++        size_t max_in_flight{BLOCK_PREFETCH_MAX_IN_FLIGHT};
++        size_t min_txs{BLOCK_PREFETCH_MIN_TXS};
++        size_t min_stripe_keys{BLOCK_PREFETCH_MIN_STRIPE_KEYS};
++    };
++    enum class Result { STARTED, DISABLED, SMALL, DUPLICATE, DROPPED };
++    struct Stats {
++        uint64_t started{0};
++        uint64_t dropped{0};
++        uint64_t duplicates{0};
++        uint64_t completed{0};
++        uint64_t outpoints{0};
++        uint64_t errors{0};
++        //! Jobs that found the database closed (detached handle)
++        uint64_t closed{0};
++    };
++
++    explicit BlockPrefetcher(Options options);
++    ~BlockPrefetcher();
++    BlockPrefetcher(const BlockPrefetcher &) = delete;
++    BlockPrefetcher &operator=(const BlockPrefetcher &) = delete;
++
++    bool Enabled() const { return m_options.threads > 0; }
++    const Options &GetOptions() const { return m_options; }
++
++    /**
++     * Start prefetching the coins the block spends from db, unless the
++     * block is small, was started recently, or max_in_flight blocks are
++     * being prefetched. Never blocks on I/O.
++     */
++    Result Start(std::shared_ptr<const CBlock> block,
++                 std::shared_ptr<DBBackgroundHandle> db);
++
++    /** Wait until no block is being prefetched (tests). */
++    void WaitIdle();
++    /** Hold queued work (tests): workers start nothing until Resume(). */
++    void Pause();
++    void Resume();
++
++    Stats GetStats() const;
++
++private:
++    struct Job;
++    void Post(std::unique_lock<std::mutex> &lock, std::function<void()> task);
++    void RunJob(const std::shared_ptr<Job> &job);
++    void RunStripe(const std::shared_ptr<Job> &job, size_t stripe);
++    void FinishStripe(const std::shared_ptr<Job> &job);
++    void WorkerLoop(size_t id);
++
++    const Options m_options;
++
++    mutable std::mutex m_mutex;
++    std::condition_variable m_work;
++    std::condition_variable m_idle;
++    std::deque<std::function<void()>> m_tasks;
++    std::vector<std::thread> m_threads;
++    size_t m_in_flight{0};
++    bool m_stopping{false};
++    bool m_paused{false};
++    //! Recently started blocks, to start each only once
++    std::array<BlockHash, 8> m_recent;
++    size_t m_recent_next{0};
++    Stats m_stats;
++};
++
++} // namespace node
++
++#endif // BITCOIN_NODE_BLOCKPREFETCH_H
+diff --git a/src/node/chainstatemanager_args.cpp b/src/node/chainstatemanager_args.cpp
+index 648021ecc8f5e50599e979526389acdd5443de03..eb5658786b8a6877fe4c87c317c8b2602759be65 100644
+--- a/src/node/chainstatemanager_args.cpp
++++ b/src/node/chainstatemanager_args.cpp
+@@ -74,6 +74,15 @@ ApplyArgsManOptions(const ArgsManager &args, ChainstateManager::Options &opts) {
+     // Subtract 1 because the main thread counts towards the par threads.
+     opts.worker_threads_num = script_threads - 1;
+ 
++    if (auto value{args.GetIntArg("-blockprefetch")}) {
++        if (*value < 0 || *value > node::MAX_BLOCK_PREFETCH_THREADS) {
++            return strprintf(
++                Untranslated("-blockprefetch must be between 0 and %d"),
++                MAX_BLOCK_PREFETCH_THREADS);
++        }
++        opts.block_prefetch_threads = int(*value);
++    }
++
+     if (auto value{args.GetBoolArg("-persistrecentheaderstime")}) {
+         opts.store_recent_headers_time = *value;
+     }
+diff --git a/src/node/metrics.cpp b/src/node/metrics.cpp
+index b34809867ebf52a7379128208fb790a3ed525db6..0bad99f08fb8609c570085ad922556203122b459 100644
+--- a/src/node/metrics.cpp
++++ b/src/node/metrics.cpp
+@@ -556,8 +556,27 @@ NodeMetrics::NodeMetrics(std::vector<std::string> rpc_methods)
+           "Time to connect a block to the chain tip (ConnectBlock: "
+           "validating it and updating the UTXO view).",
+           BLOCK_CONNECT_BUCKETS, /*divisor=*/1e9)},
+-      mempool_transactions{Add<Gauge>(registry,
+-                                      MetricName("mempool_transactions"),
++      block_prefetch_started{Add<Counter>(
++          registry, MetricName("block_prefetch_started_total"),
++          "Blocks whose spent coins were prefetched from the UTXO database "
++          "in the background on arrival.")},
++      block_prefetch_dropped{Add<Counter>(
++          registry, MetricName("block_prefetch_dropped_total"),
++          "Block prefetches not started because the maximum number were "
++          "already running.")},
++      block_prefetch_outpoints{Add<Counter>(
++          registry, MetricName("block_prefetch_outpoints_total"),
++          "Coins (distinct database keys) read by block prefetches.")},
++      block_prefetch_errors{Add<Counter>(
++          registry, MetricName("block_prefetch_errors_total"),
++          "Block prefetches that hit a database error (validation is not "
++          "affected; it reads the coins itself).")},
++      block_prefetch_seconds{Add<EventHistogram>(
++          registry, MetricName("block_prefetch_duration_seconds"),
++          "Time from a block's arrival to the end of the background "
++          "prefetch of its spent coins.",
++          BLOCK_CONNECT_BUCKETS, /*divisor=*/1e9)},
++      mempool_transactions{Add<Gauge>(registry, MetricName("mempool_transactions"),
+                                       "Transactions in the mempool.")},
+       mempool_bytes{Add<Gauge>(registry, MetricName("mempool_bytes"),
+                                "Total size of the mempool's transactions.")},
+diff --git a/src/node/metrics.h b/src/node/metrics.h
+index 7d7ae0eac01b6be331ab00eeb47d776099330bf1..b3bbb4df5bb711a4d10eba4bb7eb5474f987e4c5 100644
+--- a/src/node/metrics.h
++++ b/src/node/metrics.h
+@@ -167,6 +167,13 @@ struct NodeMetrics {
+     metrics::Gauge &initial_block_download;
+     metrics::EventHistogram &block_connect_seconds;
+ 
++    // Background prefetch of the coins a block spends (node/blockprefetch.h)
++    metrics::Counter &block_prefetch_started;
++    metrics::Counter &block_prefetch_dropped;
++    metrics::Counter &block_prefetch_outpoints;
++    metrics::Counter &block_prefetch_errors;
++    metrics::EventHistogram &block_prefetch_seconds;
++
+     // Mempool
+     metrics::Gauge &mempool_transactions;
+     metrics::Gauge &mempool_bytes;
+diff --git a/src/test/CMakeLists.txt b/src/test/CMakeLists.txt
+index b8609760f952b609e65e326d2e7aedc5f4fea35b..8d75729ef36982430f02f934bf061ccc358191a0 100644
+--- a/src/test/CMakeLists.txt
++++ b/src/test/CMakeLists.txt
+@@ -160,6 +160,7 @@ add_boost_unit_tests_to_suite(bitcoin test_bitcoin
+ 		bitmanip_tests.cpp
+ 		blockchain_tests.cpp
+ 		blockcheck_tests.cpp
++		blockprefetch_tests.cpp
+ 		blockencodings_tests.cpp
+ 		rpc_snapshot_mining_tests.cpp
+ 		blockfilter_tests.cpp
+diff --git a/src/test/blockprefetch_tests.cpp b/src/test/blockprefetch_tests.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..0021dd9cff814ff7ca22d78ab8c589b1b976a287
+--- /dev/null
++++ b/src/test/blockprefetch_tests.cpp
+@@ -0,0 +1,315 @@
++// Copyright (c) 2026 The Bitcoin developers
++// Distributed under the MIT software license, see the accompanying
++// file COPYING or http://www.opensource.org/licenses/mit-license.php.
++
++#include <node/blockprefetch.h>
++
++#include <coins.h>
++#include <dbwrapper.h>
++#include <primitives/block.h>
++#include <script/standard.h>
++#include <txdb.h>
++#include <validation.h>
++
++#include <test/util/random.h>
++#include <test/util/setup_common.h>
++
++#include <boost/test/unit_test.hpp>
++
++#include <atomic>
++#include <chrono>
++#include <memory>
++#include <thread>
++#include <vector>
++
++using node::BlockPrefetcher;
++
++namespace {
++
++std::unique_ptr<CCoinsViewDB> MakeCoinsDB(std::vector<COutPoint> &coins,
++                                          size_t n, FastRandomContext &rng) {
++    DBParams params{};
++    params.path = fs::path("blockprefetch_test");
++    params.cache_bytes = 1 << 20;
++    params.memory_only = true;
++    auto db{std::make_unique<CCoinsViewDB>(params, CoinsViewOptions{})};
++    CCoinsViewCache cache{db.get()};
++    for (size_t i = 0; i < n; ++i) {
++        const COutPoint op{TxId(rng.rand256()), uint32_t(i % 3)};
++        cache.AddCoin(
++            op,
++            Coin{CTxOut{int64_t(i + 1) * SATOSHI, CScript() << OP_1}, 1, false},
++            false);
++        coins.push_back(op);
++    }
++    cache.SetBestBlock(BlockHash{rng.rand256()});
++    cache.Flush();
++    return db;
++}
++
++//! A block (PoW not checked here) whose transactions spend `spends`, one
++//! input each, after a coinbase.
++std::shared_ptr<const CBlock> MakeBlock(const std::vector<COutPoint> &spends,
++                                        FastRandomContext &rng) {
++    auto block{std::make_shared<CBlock>()};
++    block->nNonce = uint32_t(rng.rand32());
++    CMutableTransaction cb;
++    cb.vin.resize(1);
++    cb.vin[0].prevout = COutPoint{};
++    cb.vout.resize(1);
++    block->vtx.push_back(MakeTransactionRef(std::move(cb)));
++    for (const COutPoint &op : spends) {
++        CMutableTransaction mtx;
++        mtx.vin.resize(1);
++        mtx.vin[0].prevout = op;
++        mtx.vout.resize(1);
++        mtx.vout[0].nValue = SATOSHI;
++        block->vtx.push_back(MakeTransactionRef(std::move(mtx)));
++    }
++    return block;
++}
++
++BlockPrefetcher::Options SmallOptions() {
++    BlockPrefetcher::Options opts;
++    opts.threads = 2;
++    opts.max_in_flight = 2;
++    opts.min_txs = 3;
++    opts.min_stripe_keys = 4;
++    return opts;
++}
++
++} // namespace
++
++BOOST_FIXTURE_TEST_SUITE(blockprefetch_tests, BasicTestingSetup)
++
++BOOST_AUTO_TEST_CASE(bounded_deduplicated_and_skips_small_blocks) {
++    FastRandomContext rng{/*fDeterministic=*/true};
++    std::vector<COutPoint> coins;
++    auto db{MakeCoinsDB(coins, 1000, rng)};
++    BlockPrefetcher prefetcher{SmallOptions()};
++    using R = BlockPrefetcher::Result;
++
++    const auto a{MakeBlock({coins.begin(), coins.begin() + 20}, rng)};
++    const auto b{MakeBlock({coins.begin() + 20, coins.begin() + 40}, rng)};
++    const auto c{MakeBlock({coins.begin() + 40, coins.begin() + 60}, rng)};
++    const auto small{MakeBlock({coins[60]}, rng)};
++    auto handle{db->GetBackgroundHandle()};
++
++    prefetcher.Pause();
++    BOOST_CHECK(prefetcher.Start(a, handle) == R::STARTED);
++    BOOST_CHECK(prefetcher.Start(a, handle) == R::DUPLICATE);
++    BOOST_CHECK(prefetcher.Start(b, handle) == R::STARTED);
++    // Two in flight: the third is dropped, not queued.
++    BOOST_CHECK(prefetcher.Start(c, handle) == R::DROPPED);
++    BOOST_CHECK(prefetcher.Start(small, handle) == R::SMALL);
++    BOOST_CHECK(prefetcher.Start(nullptr, handle) == R::DISABLED);
++    prefetcher.Resume();
++    prefetcher.WaitIdle();
++
++    // Room again once the first two are done; c was dropped, not recorded.
++    BOOST_CHECK(prefetcher.Start(c, handle) == R::STARTED);
++    prefetcher.WaitIdle();
++
++    const auto stats{prefetcher.GetStats()};
++    BOOST_CHECK_EQUAL(stats.started, 3U);
++    BOOST_CHECK_EQUAL(stats.completed, 3U);
++    BOOST_CHECK_EQUAL(stats.dropped, 1U);
++    BOOST_CHECK_EQUAL(stats.duplicates, 1U);
++    BOOST_CHECK_EQUAL(stats.outpoints, 60U);
++    BOOST_CHECK_EQUAL(stats.errors, 0U);
++    BOOST_CHECK_EQUAL(stats.closed, 0U);
++
++    BlockPrefetcher disabled{BlockPrefetcher::Options{.threads = 0}};
++    BOOST_CHECK(!disabled.Enabled());
++    BOOST_CHECK(disabled.Start(a, handle) == R::DISABLED);
++}
++
++BOOST_AUTO_TEST_CASE(reads_only_coins_from_outside_the_block) {
++    FastRandomContext rng{/*fDeterministic=*/true};
++    std::vector<COutPoint> coins;
++    auto db{MakeCoinsDB(coins, 200, rng)};
++    BlockPrefetcher prefetcher{SmallOptions()};
++
++    // 30 database coins, one of them spent twice (an invalid block, which
++    // the prefetch must handle all the same), plus spends of outputs of
++    // transactions in the block itself.
++    std::vector<COutPoint> spends{coins.begin(), coins.begin() + 30};
++    spends.push_back(coins[0]);
++    auto block{std::make_shared<CBlock>(*MakeBlock(spends, rng))};
++    for (size_t i = 1; i <= 5; ++i) {
++        CMutableTransaction mtx;
++        mtx.vin.resize(1);
++        mtx.vin[0].prevout = COutPoint{block->vtx[i]->GetId(), 0};
++        mtx.vout.resize(1);
++        block->vtx.push_back(MakeTransactionRef(std::move(mtx)));
++    }
++    BOOST_CHECK(prefetcher.Start(block, db->GetBackgroundHandle()) ==
++                BlockPrefetcher::Result::STARTED);
++    prefetcher.WaitIdle();
++    BOOST_CHECK_EQUAL(prefetcher.GetStats().outpoints, 30U);
++    BOOST_CHECK_EQUAL(prefetcher.GetStats().completed, 1U);
++
++    // The prefetch only reads: every coin is still there and unchanged.
++    for (size_t i = 0; i < coins.size(); ++i) {
++        const auto coin{db->GetCoin(coins[i])};
++        BOOST_REQUIRE(coin);
++        BOOST_CHECK_EQUAL(coin->GetTxOut().nValue, int64_t(i + 1) * SATOSHI);
++    }
++}
++
++BOOST_AUTO_TEST_CASE(database_closed_before_or_during_prefetch) {
++    FastRandomContext rng{/*fDeterministic=*/true};
++    std::vector<COutPoint> coins;
++    auto db{MakeCoinsDB(coins, 500, rng)};
++    BlockPrefetcher prefetcher{SmallOptions()};
++
++    // Queued, then the database is closed (as on a cache resize, which
++    // reopens it, or shutdown): the job finds the handle detached.
++    prefetcher.Pause();
++    BOOST_CHECK(
++        prefetcher.Start(MakeBlock(coins, rng), db->GetBackgroundHandle()) ==
++        BlockPrefetcher::Result::STARTED);
++    auto handle{db->GetBackgroundHandle()};
++    BOOST_CHECK(handle->IsOpen());
++    db.reset();
++    BOOST_CHECK(!handle->IsOpen());
++    prefetcher.Resume();
++    prefetcher.WaitIdle();
++    BOOST_CHECK_EQUAL(prefetcher.GetStats().completed, 1U);
++    BOOST_CHECK_EQUAL(prefetcher.GetStats().closed, 1U);
++    BOOST_CHECK(!handle->Use([](const CDBWrapper &) { BOOST_ERROR("ran"); }));
++}
++
++BOOST_AUTO_TEST_CASE(database_destructor_waits_for_running_use) {
++    DBParams params{};
++    params.path = fs::path("blockprefetch_wait");
++    params.cache_bytes = 1 << 20;
++    params.memory_only = true;
++    auto db{std::make_unique<CDBWrapper>(params)};
++    db->Write(uint256::ONE, uint64_t{7});
++    auto handle{db->GetBackgroundHandle()};
++
++    std::atomic<bool> entered{false}, finished{false};
++    std::thread reader{[&] {
++        handle->Use([&](const CDBWrapper &d) {
++            entered = true;
++            std::this_thread::sleep_for(std::chrono::milliseconds{100});
++            uint64_t v{0};
++            BOOST_CHECK(d.Read(uint256::ONE, v));
++            BOOST_CHECK_EQUAL(v, 7U);
++            finished = true;
++        });
++    }};
++    while (!entered) {
++        std::this_thread::yield();
++    }
++    db.reset();
++    // The destructor returned only after the reader was done with it.
++    BOOST_CHECK(finished);
++    reader.join();
++}
++
++BOOST_AUTO_TEST_CASE(prefetch_concurrent_with_database_writes) {
++    // Background walks while the owner keeps writing (and the MDBX file
++    // grows several times): each side uses its own transaction.
++    FastRandomContext rng{/*fDeterministic=*/true};
++    DBParams params{};
++    params.path = fs::path("blockprefetch_concurrent");
++    params.cache_bytes = 1 << 20;
++    params.memory_only = true;
++    CDBWrapper db{params};
++
++    std::vector<uint256> keys;
++    for (int i = 0; i < 2000; ++i) {
++        keys.push_back(rng.rand256());
++        db.Write(keys.back(), uint64_t(i));
++    }
++    std::vector<std::vector<uint8_t>> raw;
++    for (const uint256 &k : keys) {
++        DataStream s{};
++        s << k;
++        const auto span{MakeUCharSpan(s)};
++        raw.emplace_back(span.begin(), span.end());
++    }
++    std::sort(raw.begin(), raw.end());
++
++    std::atomic<bool> stop{false};
++    std::atomic<uint64_t> walks{0};
++    std::vector<std::thread> readers;
++    for (int t = 0; t < 3; ++t) {
++        readers.emplace_back([&] {
++            while (!stop) {
++                db.GetBackgroundHandle()->Use(
++                    [&](const CDBWrapper &d) { d.PrefetchSortedRawKeys(raw); });
++                ++walks;
++            }
++        });
++    }
++    // About 40 MB of new entries, in batches.
++    const std::vector<uint8_t> value(1000, 0x5a);
++    for (int b = 0; b < 40; ++b) {
++        CDBBatch batch{db};
++        for (int i = 0; i < 1000; ++i) {
++            batch.Write(rng.rand256(), value);
++        }
++        db.WriteBatch(batch);
++    }
++    stop = true;
++    for (auto &t : readers) {
++        t.join();
++    }
++    BOOST_CHECK(walks > 0);
++    for (size_t i = 0; i < keys.size(); ++i) {
++        uint64_t v{0};
++        BOOST_REQUIRE(db.Read(keys[i], v));
++        BOOST_CHECK_EQUAL(v, i);
++    }
++}
++
++BOOST_AUTO_TEST_SUITE_END()
++
++BOOST_FIXTURE_TEST_SUITE(blockprefetch_chain_tests, TestChain100Setup)
++
++BOOST_AUTO_TEST_CASE(process_new_block_prefetches_spent_coins) {
++    // Ten spends of mature coinbases plus one spend of a transaction in the
++    // same block: the block is connected as usual and its ten database
++    // coins were prefetched in the background.
++    // Mature the first ten coinbases.
++    mineBlocks(10);
++    std::vector<CMutableTransaction> txs;
++    const CScript p2pk{CScript()
++                       << ToByteVector(coinbaseKey.GetPubKey()) << OP_CHECKSIG};
++    for (int i = 0; i < 10; ++i) {
++        txs.push_back(CreateValidMempoolTransaction(
++            m_coinbase_txns[i], 0, i + 1, coinbaseKey, p2pk, 10 * COIN,
++            /*submit=*/false));
++    }
++    txs.push_back(CreateValidMempoolTransaction(
++        MakeTransactionRef(txs[0]), 0, 111, coinbaseKey, p2pk, 5 * COIN,
++        /*submit=*/false));
++
++    auto &prefetcher{m_node.chainman->GetBlockPrefetcher()};
++    BOOST_CHECK(prefetcher.Enabled());
++    const int height{
++        WITH_LOCK(::cs_main, return m_node.chainman->ActiveHeight())};
++    const CBlock block{CreateAndProcessBlock(txs, p2pk)};
++    BOOST_CHECK_EQUAL(
++        WITH_LOCK(::cs_main,
++                  return m_node.chainman->ActiveTip()->GetBlockHash()),
++        block.GetHash());
++    BOOST_CHECK_EQUAL(
++        WITH_LOCK(::cs_main, return m_node.chainman->ActiveHeight()),
++        height + 1);
++    prefetcher.WaitIdle();
++    const auto stats{prefetcher.GetStats()};
++    BOOST_CHECK_EQUAL(stats.started, 1U);
++    BOOST_CHECK_EQUAL(stats.completed, 1U);
++    BOOST_CHECK_EQUAL(stats.outpoints, 10U);
++    BOOST_CHECK_EQUAL(stats.errors, 0U);
++
++    // A block too small to prefetch is not started.
++    CreateAndProcessBlock({}, p2pk);
++    BOOST_CHECK_EQUAL(prefetcher.GetStats().started, 1U);
++}
++
++BOOST_AUTO_TEST_SUITE_END()
+diff --git a/src/txdb.cpp b/src/txdb.cpp
+index f8ae2157f63758f6eddcff0da99fde9be19f841c..bb4febab32f8ce38117915fd1aa1d684a3d6dae9 100644
+--- a/src/txdb.cpp
++++ b/src/txdb.cpp
+@@ -118,6 +118,12 @@ void CCoinsViewDB::PrefetchOutpointsAsync(
+     if (outpoints.empty() || !m_db) {
+         return;
+     }
++    std::vector<std::vector<uint8_t>> keys{CoinKeys(outpoints)};
++    m_db->PrefetchRawKeys(keys);
++}
++
++std::vector<std::vector<uint8_t>>
++CCoinsViewDB::CoinKeys(Span<const COutPoint> outpoints) {
+     std::vector<std::vector<uint8_t>> keys;
+     keys.reserve(outpoints.size());
+     DataStream ssKey{};
+@@ -128,7 +134,7 @@ void CCoinsViewDB::PrefetchOutpointsAsync(
+         const auto key_span = MakeUCharSpan(ssKey);
+         keys.emplace_back(key_span.begin(), key_span.end());
+     }
+-    m_db->PrefetchRawKeys(keys);
++    return keys;
+ }
+ 
+ BlockHash CCoinsViewDB::GetBestBlock() const {
+diff --git a/src/txdb.h b/src/txdb.h
+index b49286e6da0dcfd8f273b48bbf3aabf37ea76f54..29bbce5caab75fdd8989dbd96929d909ffb5865e 100644
+--- a/src/txdb.h
++++ b/src/txdb.h
+@@ -64,6 +64,14 @@ public:
+     CCoinsViewCursor *Cursor() const override;
+     void PrefetchOutpointsAsync(
+         const std::vector<COutPoint> &outpoints) const override;
++    /** Database keys of these coins (unsorted, in order). */
++    static std::vector<std::vector<uint8_t>>
++    CoinKeys(Span<const COutPoint> outpoints);
++    /** For reading the database from threads that do not own it. The
++     * handle detaches when the database is closed or reopened. */
++    std::shared_ptr<DBBackgroundHandle> GetBackgroundHandle() const {
++        return m_db->GetBackgroundHandle();
++    }
+ 
+     // One MDBX transaction publishes both the verified replacement UTXO set
+     // and its provisional pivot marker. The old database survives aborts.
+diff --git a/src/validation.cpp b/src/validation.cpp
+index 596e3c5af0caa172c0fde4a2c9d61061d952faf6..35fce3c61b89508f0068be17cebcced33dc8328a 100644
+--- a/src/validation.cpp
++++ b/src/validation.cpp
+@@ -6530,6 +6530,10 @@ bool ChainstateManager::ProcessNewBlock(
+         // CheckBlock() call as well.
+         LOCK(cs_main);
+ 
++        // Usually already started when the block arrived (net_processing);
++        // this covers the other sources (RPC, -loadblock). Deduplicated.
++        PrefetchBlockCoinsLocked(block);
++
+         // Skipping AcceptBlock() for CheckBlock() failures means that we will
+         // never mark a block as invalid if CheckBlock() fails.  This is
+         // protective against consensus failure if there are any unknown form
+@@ -8827,7 +8831,42 @@ ChainstateManager::ChainstateManager(
+       m_interrupt{interrupt}, m_options{Flatten(std::move(options))},
+       m_blockman{interrupt, std::move(blockman_options)},
+       m_validation_cache{m_options.script_execution_cache_bytes,
+-                         m_options.signature_cache_bytes} {}
++                         m_options.signature_cache_bytes},
++      m_block_prefetcher{std::make_unique<node::BlockPrefetcher>(
++          node::BlockPrefetcher::Options{
++              .threads = size_t(std::clamp(m_options.block_prefetch_threads, 0,
++                                           node::MAX_BLOCK_PREFETCH_THREADS)),
++          })} {}
++
++void ChainstateManager::PrefetchBlockCoins(
++    const std::shared_ptr<const CBlock> &block) {
++    if (!m_block_prefetcher->Enabled() || !block ||
++        block->vtx.size() < m_block_prefetcher->GetOptions().min_txs) {
++        return;
++    }
++    LOCK(::cs_main);
++    PrefetchBlockCoinsLocked(block);
++}
++
++void ChainstateManager::PrefetchBlockCoinsLocked(
++    const std::shared_ptr<const CBlock> &block) {
++    AssertLockHeld(::cs_main);
++    if (!m_block_prefetcher->Enabled() || !block ||
++        block->vtx.size() < m_block_prefetcher->GetOptions().min_txs) {
++        return;
++    }
++    // Reading coins costs disk I/O: only for blocks whose header has real
++    // proof of work (which also makes a junk block expensive to send).
++    if (!CheckProofOfWork(block->GetHash(), block->nBits, GetConsensus())) {
++        return;
++    }
++    Chainstate *chainstate{m_active_chainstate};
++    if (!chainstate || !chainstate->HasCoinsViews()) {
++        return;
++    }
++    m_block_prefetcher->Start(block,
++                              chainstate->CoinsDB().GetBackgroundHandle());
++}
+ 
+ bool ChainstateManager::DetectSnapshotChainstate(CTxMemPool *mempool) {
+     assert(!m_snapshot_chainstate);
+diff --git a/src/validation.h b/src/validation.h
+index 7af685446179d94e4a5da1395500f53aa9c35636..3e95712237d2d5b3696e25db3a8ae5aadfa4920f 100644
+--- a/src/validation.h
++++ b/src/validation.h
+@@ -29,6 +29,7 @@
+ #include <kernel/chainstatemanager_opts.h>
+ #include <kernel/cs_main.h>
+ #include <lotus_v2/fast_sync.h>
++#include <node/blockprefetch.h>
+ #include <node/blockstorage.h>
+ #include <policy/packages.h>
+ #include <script/script_error.h>
+@@ -1732,6 +1733,22 @@ public:
+      * was first received via this call.
+      * @returns     If the block was processed, independently of block validity
+      */
++    /**
++     * Start reading the UTXO database pages of the coins this block spends
++     * on background threads (see node::BlockPrefetcher), if the block is
++     * large enough and its header has valid proof of work. Never affects
++     * validation; costs a brief cs_main lock to find the coins database.
++     * Called as soon as a block is received, and again (deduplicated) by
++     * ProcessNewBlock.
++     */
++    void PrefetchBlockCoins(const std::shared_ptr<const CBlock> &block)
++        EXCLUSIVE_LOCKS_REQUIRED(!::cs_main);
++    //! As PrefetchBlockCoins, with cs_main already held by the caller.
++    void PrefetchBlockCoinsLocked(const std::shared_ptr<const CBlock> &block)
++        EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
++    //! The background prefetcher (for tests and statistics).
++    node::BlockPrefetcher &GetBlockPrefetcher() { return *m_block_prefetcher; }
++
+     bool ProcessNewBlock(const std::shared_ptr<const CBlock> &block,
+                          bool force_processing, bool min_pow_checked,
+                          bool *new_block,
+@@ -1879,6 +1896,10 @@ public:
+     /** Load the recent block headers reception time from a file. */
+     bool LoadRecentHeadersTime(const fs::path &filePath)
+         EXCLUSIVE_LOCKS_REQUIRED(GetMutex());
++
++private:
++    //! Declared last, so destroyed (its threads joined) first.
++    std::unique_ptr<node::BlockPrefetcher> m_block_prefetcher;
+ };
+ 
+ /** Deployment* info via ChainstateManager */
+diff --git a/test/functional/interface_http_metrics.py b/test/functional/interface_http_metrics.py
+index d304f1a05cd723212014885c524330e30d3235f0..260256097a1e3fcd1525cf0465ffd50e32f722fe 100755
+--- a/test/functional/interface_http_metrics.py
++++ b/test/functional/interface_http_metrics.py
+@@ -173,6 +173,28 @@ class HTTPMetricsTest(BitcoinTestFramework):
+         self.generate(node, 1)
+         self.wait_until(lambda: self.scrape().value(m("mempool_transactions")) == 0)
+ 
++        self.log.info("Block coin prefetch")
++        # Blocks so far had at most two transactions: below the prefetch's
++        # minimum, so none was prefetched.
++        samples = self.scrape()
++        assert_equal(samples[("fullnode_block_prefetch_started_total", ())], 0)
++        assert_equal(samples[("fullnode_block_prefetch_dropped_total", ())], 0)
++        assert_equal(samples[("fullnode_block_prefetch_errors_total", ())], 0)
++        for _ in range(10):
++            wallet.send_self_transfer(from_node=node)
++        self.generate(node, 1)
++        self.wait_until(
++            lambda: (
++                self.scrape()[("fullnode_block_prefetch_duration_seconds_count", ())]
++                == 1
++            )
++        )
++        samples = self.scrape()
++        assert_equal(samples[("fullnode_block_prefetch_started_total", ())], 1)
++        assert_equal(samples[("fullnode_block_prefetch_errors_total", ())], 0)
++        # Spends of coins created in the same block are not read.
++        assert 1 <= samples[("fullnode_block_prefetch_outpoints_total", ())] <= 10
++
+         self.log.info("HTTP and RPC requests")
+         # Baselines exclude completed setup RPCs and the one-second scrape cache.
+         time.sleep(1.1)
+-- 
+2.50.1 (Apple Git-155)
+

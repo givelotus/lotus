@@ -1,0 +1,1018 @@
+From 04cea867f3d73b6011a7247c399e2fdb1445ed6a Mon Sep 17 00:00:00 2001
+From: Shammah Chancellor <shammah.chancellor@notvalid.com>
+Date: Sun, 18 Oct 2026 01:33:30 -0700
+Subject: [PATCH] policy: derive adaptive capacity from active-chain history
+
+Track connected block-size EMA and local congestion fee recommendations.
+Advance the chain-derived estimate only when publishing an active tip; restore
+an ancestor's estimate on reorg and reconstruct it at restart. A bounded recent
+cache accelerates normal extension and rollback without retaining orphan state.
+Local mempool demand affects mining/fee policy, never accepted-block capacity.
+
+eCash block validity remains the configured ABC limit. Block-bearing P2P and
+raw disk payload bounds follow current adaptive capacity plus 256 KiB, not the
+unused 1 GB ceiling; explicit excessiveblocksize settings remain authoritative.
+Development block-index record tag 320401 retains nSize after pruning and reads
+legacy conditional-size records. Missing old-pruned/header-only size history
+is explicitly unavailable: retain baseline capacity, warn, and require complete
+ancestry plus restart for exact reconstruction. Do not infer sizes from headers.
+
+Test real two-node reorg/restart convergence, resource bounds, pruned-index size
+retention, cache eviction and conservative unavailable-history behavior. RPC
+method-dependent tests belong in the following RPC patch, not this prerequisite.
+
+Original-Commit: 1e3b144a4d743cf802e0a3a90e9a4367da034b77
+Original-Patch: ecash/029
+Split-Concern: policy
+
+diff --git a/src/CMakeLists.txt b/src/CMakeLists.txt
+index 49c99efc3799dc96c96b2f25f531dee044df3f9c..47c4a8f7271f9066b92719089edf8316148eda1a 100644
+--- a/src/CMakeLists.txt
++++ b/src/CMakeLists.txt
+@@ -347,18 +347,18 @@ function(find_git_head_logs_file RESULT)
+ 	find_package(Git)
+ 	if(GIT_FOUND)
+ 		execute_process(
+-			COMMAND "${GIT_EXECUTABLE}" "rev-parse" "--show-toplevel"
++			COMMAND "${GIT_EXECUTABLE}" "rev-parse" "--absolute-git-dir"
+ 			WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+-			OUTPUT_VARIABLE GIT_ROOT
++			OUTPUT_VARIABLE GIT_DIR
+ 			RESULT_VARIABLE GIT_RESULT
+ 			OUTPUT_STRIP_TRAILING_WHITESPACE
+ 			ERROR_QUIET
+ 		)
+ 
+ 		if(GIT_RESULT EQUAL 0)
+-			set(GIT_LOGS_DIR "${GIT_ROOT}/.git/logs")
++			set(GIT_LOGS_DIR "${GIT_DIR}/logs")
+ 			set(GIT_HEAD_LOGS_FILE "${GIT_LOGS_DIR}/HEAD")
+-			# If the .git/logs/HEAD does not exist, create it
++			# If the logs/HEAD does not exist, create it
+ 			if(NOT EXISTS "${GIT_HEAD_LOGS_FILE}")
+ 				file(MAKE_DIRECTORY "${GIT_LOGS_DIR}")
+ 				file(TOUCH "${GIT_HEAD_LOGS_FILE}")
+diff --git a/src/chain.h b/src/chain.h
+index d69d144a4df5700e379560da3546038c10e2523d..c1cd832551103613a07d0d5b6ec67b5bfdf158eb 100644
+--- a/src/chain.h
++++ b/src/chain.h
+@@ -67,14 +67,11 @@ bool AreOnTheSameFork(const CBlockIndex *pa, const CBlockIndex *pb);
+ 
+ /** Used to marshal pointers into hashes for db storage. */
+ class CDiskBlockIndex : public CBlockIndex {
+-    /**
+-     * Historically CBlockLocator's version field has been written to disk
+-     * streams as the client version, but the value has never been used.
+-     *
+-     * Hard-code to the highest client version ever written.
+-     * SerParams can be used if the field requires any meaning in the future.
+-     **/
+-    static constexpr int DUMMY_VERSION = 320400;
++    /** Legacy records use the historical client-version tag (up to 320400).
++     * Development tag 320401 retains block sizes after pruning for deterministic
++     * adaptive-policy reconstruction; old conditional-size records remain readable.
++     */
++    static constexpr int DUMMY_VERSION = 320401;
+ 
+ public:
+     BlockHash hashPrev;
+@@ -89,12 +86,15 @@ public:
+         LOCK(::cs_main);
+         int _nVersion = DUMMY_VERSION;
+         READWRITE(VARINT_MODE(_nVersion, VarIntMode::NONNEGATIVE_SIGNED));
++        if (_nVersion > DUMMY_VERSION) throw std::ios_base::failure("unknown block-index record format");
+ 
+         READWRITE(VARINT_MODE(obj.nHeight, VarIntMode::NONNEGATIVE_SIGNED));
+         READWRITE(obj.nStatus);
+         READWRITE(VARINT(obj.nTx));
+ 
+-        if (obj.nStatus.hasData()) {
++        // Adaptive policy reconstruction needs sizes even after block files are pruned.
++        // 320400 stored the size only while hasData; 320401 always preserves it.
++        if (_nVersion >= 320401 || obj.nStatus.hasData()) {
+             READWRITE(VARINT(obj.nSize));
+         }
+ 
+diff --git a/src/config.cpp b/src/config.cpp
+index a00ce057517fb29a92fa7b45a69be60f283e4935..10abfa8efec990cfbe629d6b650452eeabab3fad 100644
+--- a/src/config.cpp
++++ b/src/config.cpp
+@@ -6,6 +6,7 @@
+ 
+ #include <consensus/consensus.h> // DEFAULT_MAX_BLOCK_SIZE
+ 
++
+ GlobalConfig::GlobalConfig()
+     : useCashAddr(false), nMaxBlockSize(DEFAULT_MAX_BLOCK_SIZE) {}
+ 
+diff --git a/src/lotus_v2/fee_hysteresis.cpp b/src/lotus_v2/fee_hysteresis.cpp
+index 1156ef8476087a4d5070a1eb3b2f9165bf8a82fb..a22fcab232d0f67b710d270a5ff73439c98ad8d7 100644
+--- a/src/lotus_v2/fee_hysteresis.cpp
++++ b/src/lotus_v2/fee_hysteresis.cpp
+@@ -5,6 +5,8 @@
+ #include "fee_hysteresis.h"
+ 
+ #include <arith_uint256.h>
++#include <chain.h>
++#include <vector>
+ 
+ #include <algorithm>
+ #include <limits>
+@@ -37,6 +39,24 @@ FeeHysteresisController::FeeHysteresisController(FeeHysteresisConfig config)
+     if (config_.hysteresis_discount_permille > 1000) {
+         config_.hysteresis_discount_permille = 1000;
+     }
++    if (config_.min_adaptive_target_bytes == 0) {
++        config_.min_adaptive_target_bytes = DEFAULT_MIN_ADAPTIVE_TARGET_BYTES;
++    }
++    if (config_.min_adaptive_max_block_bytes < config_.min_adaptive_target_bytes) {
++        config_.min_adaptive_max_block_bytes =
++            std::max<uint64_t>(DEFAULT_MIN_ADAPTIVE_MAX_BLOCK_BYTES,
++                               config_.min_adaptive_target_bytes * 2);
++    }
++    if (config_.max_adaptive_block_bytes < config_.min_adaptive_max_block_bytes) {
++        config_.max_adaptive_block_bytes = config_.min_adaptive_max_block_bytes;
++    }
++    if (config_.adaptive_headroom_multiplier == 0) {
++        config_.adaptive_headroom_multiplier = DEFAULT_ADAPTIVE_HEADROOM_MULTIPLIER;
++    }
++    if (config_.adaptive_ema_shift > 16) {
++        config_.adaptive_ema_shift = 16;
++    }
++    ema_block_size_bytes_ = config_.min_adaptive_target_bytes;
+     samples_.push_back(RateSample{0, current_rpc_rate_per_kcu_});
+ }
+ 
+@@ -44,6 +64,76 @@ uint64_t FeeHysteresisController::GetConsensusFloorPerKCu() const noexcept {
+     return config_.consensus_floor_per_kcu;
+ }
+ 
++uint64_t FeeHysteresisController::ComputeAdaptiveTargetLocked() const noexcept {
++    return std::clamp(ema_block_size_bytes_,
++                      config_.min_adaptive_target_bytes,
++                      config_.max_adaptive_block_bytes);
++}
++
++uint64_t FeeHysteresisController::ComputeAdaptiveMaxGeneratedBlockSizeLocked()
++    const noexcept {
++    const uint64_t target = ComputeAdaptiveTargetLocked();
++    const uint64_t demand_headroom =
++        mempool_backlog_bytes_ > 0
++            ? ClampU128ToU64(UInt128(mempool_backlog_bytes_) + 1'000'000)
++            : 0ULL;
++    const uint64_t ema_expanded =
++        ema_block_size_bytes_ > config_.min_adaptive_target_bytes
++            ? ClampU128ToU64(UInt128(target) * 2)
++            : target;
++    const uint64_t desired = std::max(ema_expanded, demand_headroom);
++    const uint64_t upper =
++        config_.max_adaptive_block_bytes > 1000
++            ? config_.max_adaptive_block_bytes - 1000
++            : config_.max_adaptive_block_bytes;
++    return std::clamp(desired, config_.min_adaptive_target_bytes, upper);
++}
++
++uint64_t FeeHysteresisController::ComputeAdaptiveMaxBlockSizeLocked()
++    const noexcept {
++    const uint64_t target = ComputeAdaptiveTargetLocked();
++    const uint64_t ema_headroom =
++        ema_block_size_bytes_ > config_.min_adaptive_target_bytes
++            ? ClampU128ToU64(
++                  UInt128(target) * UInt128(config_.adaptive_headroom_multiplier))
++            : config_.min_adaptive_max_block_bytes;
++    // Capacity is a function of active-chain history, never local mempool contents.
++    const uint64_t desired = std::max(config_.min_adaptive_max_block_bytes, ema_headroom);
++    return std::clamp(desired, config_.min_adaptive_max_block_bytes,
++                      config_.max_adaptive_block_bytes);
++}
++
++bool FeeHysteresisController::HasCompleteAdaptiveHistory() const noexcept {
++    std::lock_guard<std::mutex> lock(mutex_);
++    return adaptive_history_available_;
++}
++
++uint64_t FeeHysteresisController::GetEmaBlockSizeBytes() const noexcept {
++    std::lock_guard<std::mutex> lock(mutex_);
++    return ema_block_size_bytes_;
++}
++
++uint64_t FeeHysteresisController::GetAdaptiveTargetBlockSize() const noexcept {
++    std::lock_guard<std::mutex> lock(mutex_);
++    return ComputeAdaptiveTargetLocked();
++}
++
++uint64_t FeeHysteresisController::GetAdaptiveMaxBlockSize() const noexcept {
++    std::lock_guard<std::mutex> lock(mutex_);
++    return ComputeAdaptiveMaxBlockSizeLocked();
++}
++
++uint64_t
++FeeHysteresisController::GetAdaptiveMaxGeneratedBlockSize() const noexcept {
++    std::lock_guard<std::mutex> lock(mutex_);
++    return ComputeAdaptiveMaxGeneratedBlockSizeLocked();
++}
++
++uint64_t FeeHysteresisController::GetMempoolBacklogBytes() const noexcept {
++    std::lock_guard<std::mutex> lock(mutex_);
++    return mempool_backlog_bytes_;
++}
++
+ void FeeHysteresisController::PruneLocked(int64_t now_ms) const {
+     const int64_t cutoff_ms = now_ms - config_.hysteresis_window_ms;
+     while (!samples_.empty() && samples_.front().timestamp_ms < cutoff_ms) {
+@@ -99,14 +189,27 @@ FeeRateInfo FeeHysteresisController::GetFeeRateInfo(int64_t now_ms) const {
+         (arith_uint256{1000} + arith_uint256{config_.sdk_cushion_permille});
+     const uint64_t sdk_rate = ClampWideToU64(
+         (sdk_num + arith_uint256{999}) / arith_uint256{1000});
++    const uint64_t active_cost =
++        std::max(last_block_size_bytes_, mempool_backlog_bytes_);
++    const uint64_t marginal_burn = ComputeMarginalBurnFeeRatePerKCu(
++        active_cost, ema_block_size_bytes_, config_.burn_linear_shift,
++        config_.burn_quad_shift, config_.burn_ema_min);
+ 
+     return FeeRateInfo{
+         .consensus_floor_per_kcu = config_.consensus_floor_per_kcu,
+         .p2p_relay_feerate_per_kcu = p2p_rate,
+         .rpc_admission_feerate_per_kcu = rpc_rate,
+         .recommended_sdk_feerate_per_kcu = sdk_rate,
++        .marginal_burn_feerate_per_kcu = marginal_burn,
++        .adaptive_history_available = adaptive_history_available_,
+         .hysteresis_window_ms = config_.hysteresis_window_ms,
+         .hysteresis_discount_permille = config_.hysteresis_discount_permille,
++        .ema_block_size_bytes = ema_block_size_bytes_,
++        .adaptive_target_block_size = ComputeAdaptiveTargetLocked(),
++        .adaptive_max_block_size = ComputeAdaptiveMaxBlockSizeLocked(),
++        .adaptive_max_generated_block_size =
++            ComputeAdaptiveMaxGeneratedBlockSizeLocked(),
++        .mempool_backlog_bytes = mempool_backlog_bytes_,
+     };
+ }
+ 
+@@ -127,8 +230,24 @@ void FeeHysteresisController::SetRpcAdmissionRatePerKCu(
+ uint64_t FeeHysteresisController::UpdateCongestion(uint64_t active_utilization,
+                                                    uint64_t target_capacity,
+                                                    int64_t now_ms) {
+-    const uint64_t target =
+-        target_capacity > 0 ? target_capacity : config_.target_utilization_cu;
++    uint64_t target = target_capacity;
++    uint64_t marginal_burn = 0;
++    {
++        std::lock_guard<std::mutex> lock(mutex_);
++        if (target == 0) {
++            const uint64_t adaptive_target = ComputeAdaptiveTargetLocked();
++            target = ema_block_size_bytes_ > config_.target_utilization_cu
++                         ? std::max(config_.target_utilization_cu,
++                                    adaptive_target)
++                         : (config_.target_utilization_cu > 0
++                                ? config_.target_utilization_cu
++                                : adaptive_target);
++        }
++        marginal_burn = ComputeMarginalBurnFeeRatePerKCu(
++            active_utilization, ema_block_size_bytes_,
++            config_.burn_linear_shift, config_.burn_quad_shift,
++            config_.burn_ema_min);
++    }
+     uint64_t next_rate = config_.consensus_floor_per_kcu;
+     if (target > 0 && active_utilization > target) {
+         const arith_uint256 excess{active_utilization - target};
+@@ -139,14 +258,123 @@ uint64_t FeeHysteresisController::UpdateCongestion(uint64_t active_utilization,
+             (floor * excess * excess) / (capacity * capacity);
+         next_rate = ClampWideToU64(floor + linear_term + quad_term);
+     }
++    next_rate = std::max(next_rate, marginal_burn);
+     SetRpcAdmissionRatePerKCu(next_rate, now_ms);
+     return next_rate;
+ }
+ 
++uint64_t FeeHysteresisController::RecordConnectedBlock(
++    uint64_t block_size_bytes, int64_t now_ms) {
++    uint64_t target_after = 0;
++    uint64_t adaptive_max = 0;
++    uint64_t active_utilization = block_size_bytes;
++    {
++        std::lock_guard<std::mutex> lock(mutex_);
++        last_block_size_bytes_ = block_size_bytes;
++        AdvanceEmaLocked(block_size_bytes);
++        if (mempool_backlog_bytes_ > block_size_bytes) {
++            mempool_backlog_bytes_ -= block_size_bytes;
++        } else {
++            mempool_backlog_bytes_ = 0;
++        }
++        target_after = ComputeAdaptiveTargetLocked();
++        adaptive_max = ComputeAdaptiveMaxBlockSizeLocked();
++        active_utilization =
++            std::max(last_block_size_bytes_, mempool_backlog_bytes_);
++    }
++    UpdateCongestion(active_utilization, target_after, now_ms);
++    return adaptive_max;
++}
++
++void FeeHysteresisController::AdvanceEmaLocked(uint64_t block_size_bytes) {
++    const uint32_t shift = config_.adaptive_ema_shift;
++    if (block_size_bytes > ema_block_size_bytes_) {
++        const uint32_t up_shift = std::max<uint32_t>(1, shift / 2);
++        const uint64_t delta =
++            (block_size_bytes - ema_block_size_bytes_) >> up_shift;
++        ema_block_size_bytes_ = std::max(
++            ema_block_size_bytes_ + std::max<uint64_t>(1, delta),
++            block_size_bytes / 2);
++    } else if (block_size_bytes < ema_block_size_bytes_) {
++        const uint64_t delta =
++            (ema_block_size_bytes_ - block_size_bytes) >> shift;
++        ema_block_size_bytes_ =
++            ema_block_size_bytes_ > delta
++                ? ema_block_size_bytes_ - delta
++                : config_.min_adaptive_target_bytes;
++    }
++    ema_block_size_bytes_ = std::clamp(
++        ema_block_size_bytes_, config_.min_adaptive_target_bytes,
++        config_.max_adaptive_block_bytes);
++}
++
++void FeeHysteresisController::SyncActiveTip(const CBlockIndex *tip, int64_t now_ms) {
++    if (!tip) return;
++    uint64_t target, utilization;
++    {
++        std::lock_guard<std::mutex> lock(mutex_);
++        if (active_tip_hash_ == tip->GetBlockHash()) return;
++        const bool extends = tip->pprev && active_tip_hash_ == tip->pprev->GetBlockHash();
++        if (!extends) {
++            // An orphan's fee history must not survive a rollback or a restart.
++            samples_.clear();
++            current_rpc_rate_per_kcu_ = config_.consensus_floor_per_kcu;
++        }
++        std::vector<const CBlockIndex *> missing;
++        const CBlockIndex *ancestor = tip;
++        while (ancestor && !chain_ema_cache_.count(ancestor->GetBlockHash())) {
++            missing.push_back(ancestor);
++            ancestor = ancestor->pprev;
++        }
++        adaptive_history_available_ = ancestor ? chain_ema_cache_.at(ancestor->GetBlockHash()).complete : true;
++        ema_block_size_bytes_ = ancestor ? chain_ema_cache_.at(ancestor->GetBlockHash()).ema
++                                        : config_.min_adaptive_target_bytes;
++        for (auto it = missing.rbegin(); it != missing.rend(); ++it) {
++            if ((*it)->nHeight > 0 && (*it)->nSize == 0) adaptive_history_available_ = false;
++            if (adaptive_history_available_) AdvanceEmaLocked((*it)->nSize);
++            else ema_block_size_bytes_ = config_.min_adaptive_target_bytes;
++            const auto hash = (*it)->GetBlockHash();
++            chain_ema_cache_.emplace(hash, ChainEma{ema_block_size_bytes_, adaptive_history_available_});
++            chain_ema_cache_order_.push_back(hash);
++            // Bounded memory; old/deep reorgs rebuild from immutable block-index sizes.
++            if (chain_ema_cache_order_.size() > 4096) {
++                chain_ema_cache_.erase(chain_ema_cache_order_.front());
++                chain_ema_cache_order_.pop_front();
++            }
++        }
++        last_block_size_bytes_ = tip->nSize;
++        active_tip_hash_ = tip->GetBlockHash();
++        target = ComputeAdaptiveTargetLocked();
++        utilization = std::max(last_block_size_bytes_, mempool_backlog_bytes_);
++    }
++    UpdateCongestion(utilization, target, now_ms);
++}
++
++void FeeHysteresisController::RecordMempoolBacklog(uint64_t mempool_bytes,
++                                                   int64_t now_ms) {
++    uint64_t target = 0;
++    uint64_t active_utilization = mempool_bytes;
++    {
++        std::lock_guard<std::mutex> lock(mutex_);
++        mempool_backlog_bytes_ = mempool_bytes;
++        target = ComputeAdaptiveTargetLocked();
++        active_utilization =
++            std::max(last_block_size_bytes_, mempool_backlog_bytes_);
++    }
++    UpdateCongestion(active_utilization, target, now_ms);
++}
++
+ void FeeHysteresisController::Reset(int64_t now_ms) {
+     std::lock_guard<std::mutex> lock(mutex_);
+     samples_.clear();
++    chain_ema_cache_.clear();
++    chain_ema_cache_order_.clear();
++    active_tip_hash_.SetNull();
++    adaptive_history_available_ = true;
+     current_rpc_rate_per_kcu_ = config_.consensus_floor_per_kcu;
++    ema_block_size_bytes_ = config_.min_adaptive_target_bytes;
++    last_block_size_bytes_ = 0;
++    mempool_backlog_bytes_ = 0;
+     samples_.push_back(RateSample{now_ms, current_rpc_rate_per_kcu_});
+ }
+ 
+@@ -159,6 +387,29 @@ uint64_t FeeHysteresisController::ComputeFeeForCu(
+     return ClampU128ToU64((prod + 999) / 1000);
+ }
+ 
++uint64_t FeeHysteresisController::ComputeMarginalBurnFeeRatePerKCu(
++    uint64_t active_block_cost, uint64_t ema_block_cost, uint32_t linear_shift,
++    uint32_t quad_shift, uint64_t ema_min) noexcept {
++    const uint64_t eff_ema = std::max(ema_block_cost, ema_min);
++    auto burn_at = [&](uint64_t cost) -> UInt128 {
++        const UInt128 c = UInt128(cost);
++        const UInt128 e = UInt128(eff_ema);
++        const UInt128 lin =
++            linear_shift >= 128 ? UInt128(0) : ((c * e) >> linear_shift);
++        const UInt128 quad =
++            quad_shift >= 128 ? UInt128(0) : ((c * c) >> quad_shift);
++        return lin + quad;
++    };
++    const uint64_t next_cost =
++        active_block_cost > std::numeric_limits<uint64_t>::max() - 1000
++            ? std::numeric_limits<uint64_t>::max()
++            : active_block_cost + 1000;
++    const UInt128 delta_burn = burn_at(next_cost) - burn_at(active_block_cost);
++    // 50% of ordinary fees are burned (burned_fees = remaining - remaining / 2),
++    // so total fee rate per 1,000 CU must be 2 * delta_burn to cover marginal burn.
++    return ClampU128ToU64(delta_burn * 2);
++}
++
+ FeeCheckResult FeeHysteresisController::EvaluateTransactionFee(
+     FeeTier tier, uint64_t tx_cu, uint64_t paid_fee_sats,
+     int64_t now_ms) const {
+diff --git a/src/lotus_v2/fee_hysteresis.h b/src/lotus_v2/fee_hysteresis.h
+index d0da0078f25da866dc734b40c685090edd41e1ea..1b5b190ab1e8c327259da9e73f785edb21de7385 100644
+--- a/src/lotus_v2/fee_hysteresis.h
++++ b/src/lotus_v2/fee_hysteresis.h
+@@ -8,6 +8,11 @@
+ #include <cstdint>
+ #include <deque>
+ #include <mutex>
++#include <map>
++#include <primitives/blockhash.h>
++
++class CBlockIndex;
++class Config;
+ 
+ namespace lotus::v2 {
+ 
+@@ -23,6 +28,14 @@ constexpr int64_t DEFAULT_HYSTERESIS_WINDOW_MS = 30000;
+ constexpr uint64_t DEFAULT_HYSTERESIS_DISCOUNT_PERMILLE = 150;
+ constexpr uint64_t DEFAULT_SDK_CUSHION_PERMILLE = 50;
+ constexpr uint64_t DEFAULT_TARGET_UTILIZATION_CU = 25'000'000;
++constexpr uint64_t DEFAULT_MIN_ADAPTIVE_TARGET_BYTES = 16'000'000;
++constexpr uint64_t DEFAULT_MIN_ADAPTIVE_MAX_BLOCK_BYTES = 32'000'000;
++constexpr uint64_t DEFAULT_ADAPTIVE_MAX_BLOCK_CEILING = 1'000'000'000;
++constexpr uint64_t DEFAULT_ADAPTIVE_HEADROOM_MULTIPLIER = 4;
++constexpr uint32_t DEFAULT_ADAPTIVE_EMA_SHIFT = 4;
++constexpr uint32_t DEFAULT_BURN_LINEAR_SHIFT = 32;
++constexpr uint32_t DEFAULT_BURN_QUAD_SHIFT = 60;
++constexpr uint64_t DEFAULT_BURN_EMA_MIN = 4;
+ 
+ struct FeeHysteresisConfig {
+     uint64_t consensus_floor_per_kcu = DEFAULT_CONSENSUS_FLOOR_PER_KCU;
+@@ -30,6 +43,14 @@ struct FeeHysteresisConfig {
+     uint64_t hysteresis_discount_permille = DEFAULT_HYSTERESIS_DISCOUNT_PERMILLE;
+     uint64_t sdk_cushion_permille = DEFAULT_SDK_CUSHION_PERMILLE;
+     uint64_t target_utilization_cu = DEFAULT_TARGET_UTILIZATION_CU;
++    uint64_t min_adaptive_target_bytes = DEFAULT_MIN_ADAPTIVE_TARGET_BYTES;
++    uint64_t min_adaptive_max_block_bytes = DEFAULT_MIN_ADAPTIVE_MAX_BLOCK_BYTES;
++    uint64_t max_adaptive_block_bytes = DEFAULT_ADAPTIVE_MAX_BLOCK_CEILING;
++    uint64_t adaptive_headroom_multiplier = DEFAULT_ADAPTIVE_HEADROOM_MULTIPLIER;
++    uint32_t adaptive_ema_shift = DEFAULT_ADAPTIVE_EMA_SHIFT;
++    uint32_t burn_linear_shift = DEFAULT_BURN_LINEAR_SHIFT;
++    uint32_t burn_quad_shift = DEFAULT_BURN_QUAD_SHIFT;
++    uint64_t burn_ema_min = DEFAULT_BURN_EMA_MIN;
+ };
+ 
+ struct FeeRateInfo {
+@@ -37,8 +58,15 @@ struct FeeRateInfo {
+     uint64_t p2p_relay_feerate_per_kcu = DEFAULT_CONSENSUS_FLOOR_PER_KCU;
+     uint64_t rpc_admission_feerate_per_kcu = DEFAULT_CONSENSUS_FLOOR_PER_KCU;
+     uint64_t recommended_sdk_feerate_per_kcu = 1050;
++    uint64_t marginal_burn_feerate_per_kcu = 0;
++    bool adaptive_history_available = true;
+     int64_t hysteresis_window_ms = DEFAULT_HYSTERESIS_WINDOW_MS;
+     uint64_t hysteresis_discount_permille = DEFAULT_HYSTERESIS_DISCOUNT_PERMILLE;
++    uint64_t ema_block_size_bytes = DEFAULT_MIN_ADAPTIVE_TARGET_BYTES;
++    uint64_t adaptive_target_block_size = DEFAULT_MIN_ADAPTIVE_TARGET_BYTES;
++    uint64_t adaptive_max_block_size = DEFAULT_MIN_ADAPTIVE_MAX_BLOCK_BYTES;
++    uint64_t adaptive_max_generated_block_size = DEFAULT_MIN_ADAPTIVE_TARGET_BYTES;
++    uint64_t mempool_backlog_bytes = 0;
+ };
+ 
+ struct FeeCheckResult {
+@@ -61,10 +89,21 @@ public:
+     uint64_t GetRecommendedSdkRatePerKCu(int64_t now_ms) const;
+     uint64_t GetP2pRelayRatePerKCu(int64_t now_ms) const;
+ 
++    bool HasCompleteAdaptiveHistory() const noexcept;
++    uint64_t GetEmaBlockSizeBytes() const noexcept;
++    uint64_t GetAdaptiveTargetBlockSize() const noexcept;
++    uint64_t GetAdaptiveMaxBlockSize() const noexcept;
++    uint64_t GetAdaptiveMaxGeneratedBlockSize() const noexcept;
++    uint64_t GetMempoolBacklogBytes() const noexcept;
++
+     FeeRateInfo GetFeeRateInfo(int64_t now_ms) const;
+ 
+     uint64_t UpdateCongestion(uint64_t active_utilization,
+                               uint64_t target_capacity, int64_t now_ms);
++    uint64_t RecordConnectedBlock(uint64_t block_size_bytes, int64_t now_ms);
++    /** Publish active ancestry only; callers hold cs_main. Cache misses rebuild deterministically. */
++    void SyncActiveTip(const CBlockIndex *tip, int64_t now_ms);
++    void RecordMempoolBacklog(uint64_t mempool_bytes, int64_t now_ms);
+     void SetRpcAdmissionRatePerKCu(uint64_t rpc_rate_per_kcu, int64_t now_ms);
+     void Reset(int64_t now_ms = 0);
+ 
+@@ -74,6 +113,11 @@ public:
+ 
+     static uint64_t ComputeFeeForCu(uint64_t tx_cu,
+                                     uint64_t rate_per_kcu) noexcept;
++    static uint64_t ComputeMarginalBurnFeeRatePerKCu(
++        uint64_t active_block_cost, uint64_t ema_block_cost,
++        uint32_t linear_shift = DEFAULT_BURN_LINEAR_SHIFT,
++        uint32_t quad_shift = DEFAULT_BURN_QUAD_SHIFT,
++        uint64_t ema_min = DEFAULT_BURN_EMA_MIN) noexcept;
+ 
+ private:
+     struct RateSample {
+@@ -83,15 +127,31 @@ private:
+ 
+     void PruneLocked(int64_t now_ms) const;
+     uint64_t RollingMinRpcRateLocked(int64_t now_ms) const;
++    uint64_t ComputeAdaptiveTargetLocked() const noexcept;
++    uint64_t ComputeAdaptiveMaxBlockSizeLocked() const noexcept;
++    uint64_t ComputeAdaptiveMaxGeneratedBlockSizeLocked() const noexcept;
++
++    void AdvanceEmaLocked(uint64_t block_size_bytes);
++    struct ChainEma { uint64_t ema; bool complete; };
++    bool adaptive_history_available_{true};
++    std::map<BlockHash, ChainEma> chain_ema_cache_;
++    std::deque<BlockHash> chain_ema_cache_order_;
++    BlockHash active_tip_hash_;
+ 
+     FeeHysteresisConfig config_;
+     mutable std::mutex mutex_;
+     mutable std::deque<RateSample> samples_;
+     uint64_t current_rpc_rate_per_kcu_ = DEFAULT_CONSENSUS_FLOOR_PER_KCU;
++    uint64_t ema_block_size_bytes_ = DEFAULT_MIN_ADAPTIVE_TARGET_BYTES;
++    uint64_t last_block_size_bytes_ = 0;
++    uint64_t mempool_backlog_bytes_ = 0;
+ };
+ 
+ FeeHysteresisController &GetGlobalFeeHysteresisController();
+ 
++/** Resource bound for block-bearing messages and raw disk payloads, with 256 KiB headroom. */
++uint64_t GetBlockPayloadLimit(const Config &config);
++
+ } // namespace lotus::v2
+ 
+ #endif // LOTUS_V2_FEE_HYSTERESIS_H
+diff --git a/src/node/blockfitter.cpp b/src/node/blockfitter.cpp
+index 8673c85652c18b84801bf6f003b6107449f5b58e..62be77c8d825bb9ff01830d5a220180e6f70cfeb 100644
+--- a/src/node/blockfitter.cpp
++++ b/src/node/blockfitter.cpp
+@@ -7,6 +7,7 @@
+ #include <common/args.h>
+ #include <config.h>
+ #include <consensus/consensus.h>
++#include <lotus_v2/fee_hysteresis.h>
+ #include <policy/policy.h>
+ #include <util/moneystr.h>
+ 
+@@ -40,7 +41,7 @@ BlockFitter::BlockFitter(const Options &options) {
+ void ApplyArgsManOptions(const ArgsManager &args, const Config &config,
+                          BlockFitter::Options &options) {
+     // Block resource limits
+-    // If -blockmaxsize is not given, limit to DEFAULT_MAX_GENERATED_BLOCK_SIZE
++    // If -blockmaxsize is not given, limit to adaptive max generated block size
+     // If only one is given, only restrict the specified resource.
+     // If both are given, restrict both.
+     options.nExcessiveBlockSize = config.GetMaxBlockSize();
+@@ -48,6 +49,11 @@ void ApplyArgsManOptions(const ArgsManager &args, const Config &config,
+     if (gArgs.IsArgSet("-blockmaxsize")) {
+         options.nMaxGeneratedBlockSize =
+             gArgs.GetIntArg("-blockmaxsize", DEFAULT_MAX_GENERATED_BLOCK_SIZE);
++    } else if (gArgs.GetBoolArg("-adaptiveblocksize", true)) {
++        options.nMaxGeneratedBlockSize = std::max(
++            DEFAULT_MAX_GENERATED_BLOCK_SIZE,
++            lotus::v2::GetGlobalFeeHysteresisController()
++                .GetAdaptiveMaxGeneratedBlockSize());
+     }
+ 
+     Amount n = Amount::zero();
+diff --git a/src/node/blockstorage.cpp b/src/node/blockstorage.cpp
+index 771355367d2be67ab21bfdcc479d5b67b86a0f31..d142117707ea0b9135ac38489c36d081e9a2bd9a 100644
+--- a/src/node/blockstorage.cpp
++++ b/src/node/blockstorage.cpp
+@@ -3,6 +3,7 @@
+ // file COPYING or http://www.opensource.org/licenses/mit-license.php.
+ 
+ #include <node/blockstorage.h>
++#include <lotus_v2/fee_hysteresis.h>
+ 
+ #include <avalanche/processor.h>
+ #include <blockindexcomparators.h>
+@@ -1012,10 +1013,12 @@ bool BlockManager::ReadRawBlock(std::vector<uint8_t> &block,
+             return false;
+         }
+ 
+-        if (blk_size > MAX_SIZE) {
++        const uint64_t max_blk_size =
++            lotus::v2::GetBlockPayloadLimit(GetConfig());
++        if (blk_size > max_blk_size) {
+             LogError("%s: Block data is larger than maximum deserialization "
+                      "size for %s: %s versus %s\n",
+-                     __func__, pos.ToString(), blk_size, MAX_SIZE);
++                     __func__, pos.ToString(), blk_size, max_blk_size);
+             return false;
+         }
+ 
+diff --git a/src/protocol.cpp b/src/protocol.cpp
+index 055fc81e7f1bff27d6133db79af2338e8e24f52d..58a37522fc46b767ee69ce66f13854bc47035c45 100644
+--- a/src/protocol.cpp
++++ b/src/protocol.cpp
+@@ -6,11 +6,15 @@
+ #include <protocol.h>
+ 
+ #include <chainparams.h>
++#include <common/args.h>
+ #include <common/system.h>
+ #include <config.h>
+ #include <logging.h>
++#include <lotus_v2/fee_hysteresis.h>
+ 
++#include <algorithm>
+ #include <atomic>
++#include <limits>
+ 
+ static std::atomic<bool> g_initial_block_download_completed(false);
+ 
+@@ -181,13 +185,23 @@ bool CMessageHeader::IsMessageTypeValid() const {
+     return true;
+ }
+ 
++uint64_t lotus::v2::GetBlockPayloadLimit(const Config &config) {
++    uint64_t capacity = config.GetMaxBlockSize();
++    if (!gArgs.IsArgSet("-excessiveblocksize") && gArgs.GetBoolArg("-adaptiveblocksize", true)) {
++        capacity = std::max(capacity, GetGlobalFeeHysteresisController().GetAdaptiveMaxBlockSize());
++    }
++    constexpr uint64_t margin = 256 * 1024;
++    return capacity > std::numeric_limits<uint64_t>::max() - margin
++               ? std::numeric_limits<uint64_t>::max() : capacity + margin;
++}
++
+ bool CMessageHeader::IsOversized(const Config &config) const {
+     // Scale the maximum accepted size with the block size for messages with
+     // block content
+     if (NetMsgType::IsBlockLike(GetMessageType())) {
+         // Keep some headroom (256 KiB) so we can detect bugs where a node is
+         // producing a slightly oversized block.
+-        return nMessageSize > config.GetMaxBlockSize() + 256 * 1024;
++        return nMessageSize > lotus::v2::GetBlockPayloadLimit(config);
+     }
+ 
+     return nMessageSize > MAX_PROTOCOL_MESSAGE_LENGTH;
+diff --git a/src/test/policy_fee_tests.cpp b/src/test/policy_fee_tests.cpp
+index 72403612e02c939e0d811e0b80c9096c2c7a481e..6d5eba472718a70116a16996515214f15faba782 100644
+--- a/src/test/policy_fee_tests.cpp
++++ b/src/test/policy_fee_tests.cpp
+@@ -2,9 +2,21 @@
+ // Distributed under the MIT software license, see the accompanying
+ // file COPYING or http://www.opensource.org/licenses/mit-license.php.
+ 
++#include <config.h>
++#include <protocol.h>
++#include <streams.h>
++#include <common/args.h>
++#include <consensus/consensus.h>
++#include <validation.h>
+ #include <consensus/amount.h>
+ #include <feerate.h>
++#include <lotus_v2/fee_hysteresis.h>
+ #include <policy/fees.h>
++#include <rpc/server.h>
++#include <txmempool.h>
++#include <univalue.h>
++#include <util/moneystr.h>
++#include <util/time.h>
+ 
+ #include <test/util/setup_common.h>
+ 
+@@ -32,4 +44,168 @@ BOOST_AUTO_TEST_CASE(FeeRounder) {
+     BOOST_CHECK_EQUAL(fee_rounder.round(MAX_MONEY), 9170997 * SATOSHI);
+ }
+ 
++BOOST_AUTO_TEST_CASE(AdaptiveBlockSizeAndFeeHysteresis) {
++    lotus::v2::FeeHysteresisController ctrl{};
++
++    // At idle baseline with 0 backlog, generated block size is 16 MB and max block size is 32 MB
++    BOOST_CHECK_EQUAL(ctrl.GetEmaBlockSizeBytes(),
++                      lotus::v2::DEFAULT_MIN_ADAPTIVE_TARGET_BYTES);
++    BOOST_CHECK_EQUAL(ctrl.GetAdaptiveMaxGeneratedBlockSize(), 16'000'000ULL);
++    BOOST_CHECK_EQUAL(ctrl.GetAdaptiveMaxBlockSize(), 32'000'000ULL);
++
++    // Recording a 40 MB mempool backlog expands adaptive max generated block size
++    // while accepted block capacity remains independent of local demand.
++    ctrl.RecordMempoolBacklog(40'000'000ULL, 1000);
++    BOOST_CHECK_GE(ctrl.GetAdaptiveMaxGeneratedBlockSize(), 41'000'000ULL);
++    BOOST_CHECK_EQUAL(ctrl.GetAdaptiveMaxBlockSize(), 32'000'000ULL);
++
++    // Recording connected 64 MB blocks raises the EMA block size and adaptive target.
++    for (int i = 0; i < 32; ++i) {
++        ctrl.RecordConnectedBlock(64'000'000ULL, 2000 + i * 100);
++    }
++    BOOST_CHECK_GT(ctrl.GetEmaBlockSizeBytes(), 32'000'000ULL);
++    const auto info = ctrl.GetFeeRateInfo(6000);
++    BOOST_CHECK_EQUAL(info.ema_block_size_bytes, ctrl.GetEmaBlockSizeBytes());
++    BOOST_CHECK_GT(info.adaptive_target_block_size,
++                   lotus::v2::DEFAULT_MIN_ADAPTIVE_TARGET_BYTES);
++    BOOST_CHECK_LE(info.adaptive_max_block_size,
++                   lotus::v2::DEFAULT_ADAPTIVE_MAX_BLOCK_CEILING);
++
++    // Recording an empty mempool backlog immediately after a 128 MB connected
++    // block must not overwrite the congestion rate induced by the connected block.
++    ctrl.RecordConnectedBlock(128'000'000ULL, 7000);
++    const uint64_t rate_after_block = ctrl.GetRpcAdmissionRatePerKCu(7000);
++    BOOST_CHECK_GT(rate_after_block, 1000ULL);
++    ctrl.RecordMempoolBacklog(0ULL, 7001);
++    BOOST_CHECK_EQUAL(ctrl.GetRpcAdmissionRatePerKCu(7001), rate_after_block);
++
++    // Marginal P05 burn fee rate rises with block cost and EMA under tight shifts
++    const uint64_t burn_rate_1gb =
++        lotus::v2::FeeHysteresisController::ComputeMarginalBurnFeeRatePerKCu(
++            1'000'000'000ULL, 1'000'000'000ULL, /*linear_shift=*/24,
++            /*quad_shift=*/44, /*ema_min=*/4);
++    BOOST_CHECK_GT(burn_rate_1gb, 100'000ULL);
++}
++
++BOOST_AUTO_TEST_CASE(adaptive_history_reorg_cache_eviction_and_unavailable_ancestry) {
++    std::vector<CBlockIndex> chain(4098);
++    std::vector<BlockHash> hashes(chain.size());
++    for (size_t i = 0; i < chain.size(); ++i) {
++        uint256 value;
++        WriteLE64(value.begin(), i + 1);
++        hashes[i] = BlockHash(value);
++        chain[i].phashBlock = &hashes[i];
++        chain[i].pprev = i ? &chain[i - 1] : nullptr;
++        chain[i].nHeight = i;
++        chain[i].nSize = 17'000'000;
++    }
++    lotus::v2::FeeHysteresisController a, b;
++    a.SyncActiveTip(&chain.back(), 1000);
++    b.SyncActiveTip(&chain[1], 1000);
++    // Ancestor 1 has been evicted: rollback must reconstruct, not retain the tip EMA.
++    a.SyncActiveTip(&chain[1], 2000);
++    BOOST_CHECK_EQUAL(a.GetEmaBlockSizeBytes(), b.GetEmaBlockSizeBytes());
++    BOOST_CHECK(a.HasCompleteAdaptiveHistory());
++    chain[2].nSize = 0;
++    a.Reset(3000);
++    a.SyncActiveTip(&chain.back(), 3000);
++    BOOST_CHECK(!a.HasCompleteAdaptiveHistory());
++    BOOST_CHECK(!a.GetFeeRateInfo(3000).adaptive_history_available);
++    BOOST_CHECK_EQUAL(a.GetAdaptiveMaxBlockSize(), 32'000'000);
++    BOOST_CHECK_EQUAL(a.GetEmaBlockSizeBytes(), 16'000'000);
++    // Restoring complete ancestry and rebuilding (as at restart) recovers history.
++    chain[2].nSize = 17'000'000;
++    a.Reset(4000);
++    a.SyncActiveTip(&chain.back(), 4000);
++    BOOST_CHECK(a.HasCompleteAdaptiveHistory());
++    BOOST_CHECK_GT(a.GetAdaptiveMaxBlockSize(), 32'000'000);
++}
++
++BOOST_AUTO_TEST_CASE(adaptive_ancestry_size_survives_pruned_index_roundtrip) {
++    LOCK(cs_main);
++    CBlockIndex index;
++    index.nHeight = 123;
++    index.nSize = 17'000'000;
++    index.nStatus = index.nStatus.withData(false);
++    CDiskBlockIndex stored(&index), loaded;
++    DataStream stream;
++    stream << stored;
++    stream >> loaded;
++    BOOST_CHECK_EQUAL(loaded.nSize, index.nSize);
++
++    // Legacy unpruned records have the same payload with the old version tag.
++    index.nStatus = index.nStatus.withData(true);
++    CDiskBlockIndex unpruned(&index), legacy_loaded;
++    DataStream legacy, old_tag;
++    legacy << unpruned;
++    int old_version = 320400;
++    old_tag << VARINT_MODE(old_version, VarIntMode::NONNEGATIVE_SIGNED);
++    std::copy(old_tag.begin(), old_tag.end(), legacy.begin());
++    legacy >> legacy_loaded;
++    BOOST_CHECK_EQUAL(legacy_loaded.nSize, index.nSize);
++
++    // Old pruned records omitted size entirely: decode it as unavailable, not zero history.
++    index.nStatus = index.nStatus.withData(false);
++    CDiskBlockIndex pruned(&index), old_pruned;
++    DataStream old_pruned_bytes, prefix, encoded_size;
++    old_pruned_bytes << pruned;
++    int version = 320401;
++    prefix << VARINT_MODE(version, VarIntMode::NONNEGATIVE_SIGNED)
++           << VARINT_MODE(pruned.nHeight, VarIntMode::NONNEGATIVE_SIGNED)
++           << pruned.nStatus << VARINT(pruned.nTx);
++    encoded_size << VARINT(pruned.nSize);
++    old_pruned_bytes.erase(old_pruned_bytes.begin() + prefix.size(),
++                           old_pruned_bytes.begin() + prefix.size() + encoded_size.size());
++    std::copy(old_tag.begin(), old_tag.end(), old_pruned_bytes.begin());
++    old_pruned_bytes >> old_pruned;
++    BOOST_CHECK_EQUAL(old_pruned.nSize, 0);
++    BOOST_CHECK(old_pruned_bytes.empty());
++
++    DataStream future, future_tag;
++    future << unpruned;
++    version = 320402;
++    future_tag << VARINT_MODE(version, VarIntMode::NONNEGATIVE_SIGNED);
++    std::copy(future_tag.begin(), future_tag.end(), future.begin());
++    BOOST_CHECK_THROW(future >> legacy_loaded, std::ios_base::failure);
++}
++
++BOOST_AUTO_TEST_CASE(adaptive_block_message_bound_tracks_current_capacity) {
++    GlobalConfig config;
++    auto &controller = lotus::v2::GetGlobalFeeHysteresisController();
++    controller.Reset(0);
++    const auto size = controller.GetAdaptiveMaxBlockSize() + 256 * 1024 + 1;
++    CMessageHeader header(config.GetChainParams().NetMagic(), NetMsgType::BLOCK, size);
++    BOOST_CHECK(header.IsOversized(config));
++    for (int i = 0; i < 32; ++i) controller.RecordConnectedBlock(64'000'000, i);
++    BOOST_CHECK(!header.IsOversized(config));
++    controller.Reset(0);
++}
++
++BOOST_AUTO_TEST_CASE(adaptive_policy_preserves_ecash_block_validity_limit) {
++    GlobalConfig config;
++    auto &controller = lotus::v2::GetGlobalFeeHysteresisController();
++    controller.Reset(0);
++    controller.RecordConnectedBlock(64'000'000, 1000);
++    BOOST_CHECK_GT(controller.GetAdaptiveMaxBlockSize(), DEFAULT_MAX_BLOCK_SIZE);
++    BOOST_CHECK_EQUAL(config.GetMaxBlockSize(), DEFAULT_MAX_BLOCK_SIZE);
++    CMutableTransaction cb;
++    cb.vin.resize(1);
++    cb.vin[0].scriptSig = CScript() << OP_0 << OP_0;
++    cb.vout.emplace_back(SATOSHI, CScript() << OP_TRUE);
++    while (::GetSerializeSize(cb) < MIN_TRANSACTION_SIZE) cb.vout[0].scriptPubKey << OP_NOP;
++    CMutableTransaction tx;
++    tx.vin.emplace_back(COutPoint(TxId(uint256S("11")), 0), CScript() << OP_TRUE);
++    tx.vout.emplace_back(SATOSHI, CScript() << OP_TRUE);
++    while (::GetSerializeSize(tx) < MIN_TRANSACTION_SIZE) tx.vout[0].scriptPubKey << OP_NOP;
++    CBlock block;
++    block.nBits = 0x207fffff;
++    block.vtx.assign(DEFAULT_MAX_BLOCK_SIZE / MIN_TRANSACTION_SIZE + 1, MakeTransactionRef(tx));
++    block.vtx[0] = MakeTransactionRef(cb);
++    BlockValidationState state;
++    const BlockValidationOptions options(DEFAULT_MAX_BLOCK_SIZE, false, false);
++    BOOST_CHECK(!CheckBlock(block, state, config.GetChainParams().GetConsensus(), options));
++    BOOST_CHECK_EQUAL(state.GetRejectReason(), "bad-blk-length");
++    controller.Reset(0);
++}
++
+ BOOST_AUTO_TEST_SUITE_END()
+diff --git a/src/txmempool.cpp b/src/txmempool.cpp
+index 4c81381834c2e639b2a9eb13492f49a14b57fef9..a3df694ee8862b3ec960bdc9ff9d6d6589374533 100644
+--- a/src/txmempool.cpp
++++ b/src/txmempool.cpp
+@@ -14,6 +14,7 @@
+ #include <consensus/tx_verify.h>
+ #include <consensus/validation.h>
+ #include <logging.h>
++#include <lotus_v2/fee_hysteresis.h>
+ #include <node/snapshot.h>
+ #include <policy/fees.h>
+ #include <policy/policy.h>
+@@ -820,13 +821,21 @@ TxMempoolInfo CTxMemPool::info(const TxId &txid) const {
+ }
+ 
+ CFeeRate CTxMemPool::estimateFee() const {
++    const int64_t now_ms =
++        TicksSinceEpoch<std::chrono::milliseconds>(NodeClock::now());
++    const uint64_t rpc_rate_per_kcu =
++        lotus::v2::GetGlobalFeeHysteresisController().GetRpcAdmissionRatePerKCu(
++            now_ms);
++    const CFeeRate hysteresis_feerate(
++        Amount(static_cast<int64_t>(rpc_rate_per_kcu) * SATOSHI));
++
+     LOCK(cs);
+ 
+     // minerPolicy uses recent blocks to figure out a reasonable fee.  This
+     // may disagree with the rollingMinimumFeerate under certain scenarios
+     // where the mempool  increases rapidly, or blocks are being mined which
+     // do not contain propagated transactions.
+-    return std::max(m_opts.min_relay_feerate, GetMinFee());
++    return std::max({m_opts.min_relay_feerate, GetMinFee(), hysteresis_feerate});
+ }
+ 
+ void CTxMemPool::PrioritiseTransaction(const TxId &txid,
+diff --git a/src/validation.cpp b/src/validation.cpp
+index d2b1e8c58b939ab4cf4c96e89fba73a8230a8e38..7e394b086d402e32724e5842ecc0a9936f543726 100644
+--- a/src/validation.cpp
++++ b/src/validation.cpp
+@@ -21,6 +21,7 @@
+ #include <chainparams.h>
+ #include <checkpoints.h>
+ #include <checkqueue.h>
++#include <common/args.h>
+ #include <config.h>
+ #include <consensus/activation.h>
+ #include <consensus/amount.h>
+@@ -32,6 +33,7 @@
+ #include <kernel/notifications_interface.h>
+ #include <logging.h>
+ #include <logging/timer.h>
++#include <lotus_v2/fee_hysteresis.h>
+ #include <lotus_v2/signing.h>
+ #include <minerfund.h>
+ #include <node/blockstorage.h>
+@@ -3640,6 +3642,17 @@ static void UpdateTipLog(const CCoinsViewCache &coins_tip,
+         coins_tip.GetCacheSize());
+ }
+ 
++static void SyncAdaptiveCapacityTip(const CBlockIndex *tip)
++    EXCLUSIVE_LOCKS_REQUIRED(::cs_main) {
++    auto &controller = lotus::v2::GetGlobalFeeHysteresisController();
++    const bool available = controller.HasCompleteAdaptiveHistory();
++    controller.SyncActiveTip(tip, TicksSinceEpoch<std::chrono::milliseconds>(NodeClock::now()));
++    if (available && !controller.HasCompleteAdaptiveHistory()) {
++        LogWarning("Adaptive capacity history unavailable (missing ancestor block size); "
++                   "using configured baseline capacity. Complete ancestry and restart to reconstruct.\n");
++    }
++}
++
+ void Chainstate::UpdateTip(const CBlockIndex *pindexNew) {
+     AssertLockHeld(::cs_main);
+     const auto &coins_tip = CoinsTip();
+@@ -3659,6 +3672,8 @@ void Chainstate::UpdateTip(const CBlockIndex *pindexNew) {
+         return;
+     }
+ 
++    SyncAdaptiveCapacityTip(pindexNew);
++
+     // New best block
+     if (m_mempool) {
+         m_mempool->AddTransactionsUpdated(1);
+@@ -5300,6 +5315,7 @@ bool CheckBlock(const CBlock &block, BlockValidationState &state,
+     // Size limits.
+     auto nMaxBlockSize = validationOptions.getExcessiveBlockSize();
+ 
++
+     // Bail early if there is no way this block is of reasonable size.
+     if ((block.vtx.size() * MIN_TRANSACTION_SIZE) > nMaxBlockSize) {
+         return state.Invalid(BlockValidationResult::BLOCK_CONSENSUS,
+@@ -6167,6 +6183,9 @@ bool Chainstate::LoadChainTip() {
+     PruneBlockIndexCandidates();
+ 
+     tip = m_chain.Tip();
++    if (this == &m_chainman.ActiveChainstate()) {
++        SyncAdaptiveCapacityTip(tip);
++    }
+     LogPrintf(
+         "Loaded best chain: hashBestChain=%s height=%d date=%s progress=%f\n",
+         tip->GetBlockHash().ToString(), m_chain.Height(),
+diff --git a/test/functional/feature_adaptive_reorg.py b/test/functional/feature_adaptive_reorg.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..ab2a2afb13f732c3fe61fd6cecbf7308c9d79e00
+--- /dev/null
++++ b/test/functional/feature_adaptive_reorg.py
+@@ -0,0 +1,53 @@
++#!/usr/bin/env python3
++"""Chain-equivalent nodes must recover identical adaptive capacity after reorg."""
++from test_framework.blocktools import create_block, create_coinbase
++from test_framework.messages import CTxOut, ToHex
++from test_framework.script import CScript, OP_RETURN
++from test_framework.test_framework import BitcoinTestFramework
++from test_framework.util import assert_equal
++from test_framework.wallet import MiniWallet
++
++
++class AdaptiveReorgTest(BitcoinTestFramework):
++    def set_test_params(self):
++        self.num_nodes = 2
++        self.setup_clean_chain = True
++        self.extra_args = [["-avalanche=0", "-snapsync=0", "-adaptiveblocksize=1"]] * 2
++
++    def run_test(self):
++        a, b = self.nodes
++        wallet = MiniWallet(a)
++        self.generate(wallet, 131)
++        self.disconnect_nodes(0, 1)
++        parent = a.getbestblockhash()
++        now = a.getblockheader(parent)["time"] + 1
++        txs = []
++        for _ in range(31):
++            tx = wallet.create_self_transfer(fee_rate=0)["tx"]
++            tx.vout.extend(CTxOut(0, CScript([OP_RETURN, b"x" * 9990])) for _ in range(90))
++            txs.append(tx)
++        orphan = create_block(int(parent, 16), create_coinbase(132), now, txlist=txs)
++        orphan.solve()
++        assert_equal(a.submitblock(ToHex(orphan)), None)
++        grown = a.getfeerateinfo()["ema_block_size_bytes"]
++        assert grown > b.getfeerateinfo()["ema_block_size_bytes"]
++        a.invalidateblock(orphan.hash_hex)
++        for height in (132, 133):
++            block = create_block(int(parent, 16), create_coinbase(height), now + height)
++            block.solve()
++            raw = ToHex(block)
++            assert_equal(a.submitblock(raw), None)
++            assert_equal(b.submitblock(raw), None)
++            parent = block.hash_hex
++        assert_equal(a.getbestblockhash(), b.getbestblockhash())
++        keys = ("ema_block_size_bytes", "adaptive_target_block_size", "adaptive_max_block_size")
++        for key in keys:
++            assert_equal(a.getfeerateinfo()[key], b.getfeerateinfo()[key])
++        expected = {key: a.getfeerateinfo()[key] for key in keys}
++        self.restart_node(0)
++        for key in keys:
++            assert_equal(a.getfeerateinfo()[key], expected[key])
++
++
++if __name__ == "__main__":
++    AdaptiveReorgTest().main()

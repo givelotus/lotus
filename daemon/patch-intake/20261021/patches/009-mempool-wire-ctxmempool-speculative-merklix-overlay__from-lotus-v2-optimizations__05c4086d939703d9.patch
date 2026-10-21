@@ -1,0 +1,208 @@
+From 21fac70b528a8c17e33f2b443fc49dda8baf19e6 Mon Sep 17 00:00:00 2001
+From: Shammah Chancellor <shammah.chancellor@notvalid.com>
+Date: Sun, 18 Oct 2026 01:33:29 -0700
+Subject: [PATCH] mempool: wire CTxMemPool speculative Merklix overlay
+
+Hook MerklixOverlayManager into CTxMemPool::addUnchecked, removeUnchecked,
+and block connect reset.
+
+Original-Commit: 2283e3f138ebb4a05ae9c52555f037f031e23bb3
+Original-Patch: ecash/007
+Split-Concern: whole
+
+Historical compilation prerequisites are tracked separately in daemon/patch-audit;
+this provenance-preserving split does not imply standalone build validation.
+
+Candidate-Repair: Complete the shared eCash mempool overlay integration and its native add/remove/freeze/reanchor/clear regression. Keep eager incremental overlay maintenance here; assign premature filter, RCU/deferred mutation, parent-link, cached-size and mining-reuse hunks to their purposeful feature owners in purpose-redistribution.json. Preserve eCash script and block validity checks.
+---
+ src/test/mempool_overlay_tests.cpp | 32 ++++++++++++++++++++++++++++++
+ src/txmempool.cpp                  | 31 +++++++++++++++++++++++++++++
+ src/txmempool.h                    | 23 +++++++++++++++++++++
+ src/validation.cpp                 | 14 +++++++++++++
+ 4 files changed, 100 insertions(+)
+
+diff --git a/src/test/mempool_overlay_tests.cpp b/src/test/mempool_overlay_tests.cpp
+index fb8629106f..732c52cd83 100644
+--- a/src/test/mempool_overlay_tests.cpp
++++ b/src/test/mempool_overlay_tests.cpp
+@@ -241,4 +241,36 @@ BOOST_AUTO_TEST_CASE(positional_merkle_root_and_syndromes) {
+     BOOST_CHECK(spec_a.GetUtxoRootDigest() == eager_layer.GetUtxoRootDigest());
+ }
+ 
++BOOST_AUTO_TEST_CASE(mempool_overlay_tracks_admission_removal_and_tip) {
++    auto &pool = *Assert(m_node.mempool);
++    LOCK2(cs_main, pool.cs);
++    const BlockHash tip(uint256S("11"));
++    pool.ConnectBlockReset(tip, 100, 1000);
++    auto &manager = pool.GetMerklixOverlay();
++    lotus::v2::Hash tip_id{};
++    std::copy(tip.begin(), tip.end(), tip_id.begin());
++    BOOST_CHECK(manager.IsAnchoredAt(tip_id, 100, 1000));
++    const auto parent_tx = MakeTestSpendTx(COutPoint(TxId(uint256S("22")), 0),
++                                          1, 10000 * SATOSHI);
++    const auto child_tx = MakeTestSpendTx(COutPoint(parent_tx->GetId(), 0),
++                                         2, 9000 * SATOSHI);
++    TestMemPoolEntryHelper entry;
++    pool.addUnchecked(entry.Fee(500 * SATOSHI).FromTx(parent_tx));
++    pool.addUnchecked(entry.Fee(600 * SATOSHI).FromTx(child_tx));
++    BOOST_CHECK_EQUAL(manager.GetSpeculativeOverlay().GetTxCount(), 2U);
++    BOOST_CHECK_EQUAL(manager.GetSpeculativeOverlay().GetTotalFeesSats(), 1100);
++    const auto frozen_root = pool.FreezeEpochBatch().GetSubtreeARoot();
++    pool.removeRecursive(*child_tx, MemPoolRemovalReason::CONFLICT);
++    BOOST_CHECK_EQUAL(manager.GetSpeculativeOverlay().GetTxCount(), 1U);
++    BOOST_REQUIRE_EQUAL(manager.GetFrozenEpochs().size(), 1U);
++    BOOST_CHECK(manager.GetFrozenEpochs().back().GetSubtreeARoot() == frozen_root);
++    const BlockHash next_tip(uint256S("33"));
++    pool.ConnectBlockReset(next_tip, 101, 1010);
++    BOOST_CHECK(manager.GetFrozenEpochs().empty());
++    BOOST_CHECK_EQUAL(manager.GetSpeculativeOverlay().GetTxCount(), 1U);
++    BOOST_CHECK_EQUAL(manager.GetSpeculativeOverlay().GetHeight(), 101U);
++    pool.clear();
++    BOOST_CHECK_EQUAL(manager.GetSpeculativeOverlay().GetTxCount(), 0U);
++}
++
+ BOOST_AUTO_TEST_SUITE_END()
+diff --git a/src/txmempool.cpp b/src/txmempool.cpp
+index 03c111840c..8016d5ed2e 100644
+--- a/src/txmempool.cpp
++++ b/src/txmempool.cpp
+@@ -16,6 +16,7 @@
+ #include <logging.h>
+ #include <policy/fees.h>
+ #include <policy/policy.h>
++#include <primitives/block.h>
+ #include <reverse_iterator.h>
+ #include <undo.h>
+ #include <util/check.h>
+@@ -202,6 +203,8 @@ void CTxMemPool::addUnchecked(CTxMemPoolEntryRef entry) {
+     }
+ 
+     UpdateParentsOf(true, newit);
++    AddTransactionToOverlay(m_merklix_overlay, tx,
++                            entry->GetFee() / SATOSHI, entry->GetSigChecks());
+ 
+     nTransactionsUpdated++;
+     totalTxSize += entry->GetTxSize();
+@@ -214,6 +217,7 @@ void CTxMemPool::removeUnchecked(txiter it, MemPoolRemovalReason reason) {
+     uint64_t mempool_sequence = GetAndIncrementSequence();
+ 
+     const TxId &txid = (*it)->GetTx().GetId();
++    RemoveTransactionFromOverlay(m_merklix_overlay, (*it)->GetTx());
+ 
+     if (reason != MemPoolRemovalReason::BLOCK) {
+         if (m_opts.signals) {
+@@ -380,6 +384,7 @@ void CTxMemPool::removeForFinalizedBlock(
+ }
+ 
+ void CTxMemPool::_clear() {
++    m_merklix_overlay.Clear();
+     mapTx.clear();
+     mapNextTx.clear();
+     totalTxSize = 0;
+@@ -391,6 +396,32 @@ void CTxMemPool::_clear() {
+     ++nTransactionsUpdated;
+ }
+ 
++const lotus::v2::MempoolOverlayLayer &CTxMemPool::FreezeEpochBatch() {
++    AssertLockHeld(cs);
++    return m_merklix_overlay.FreezeEpochBatch();
++}
++
++void CTxMemPool::SyncMerklixOverlayToTip(const BlockHash &tip_hash,
++                                       uint64_t next_height,
++                                       uint64_t parent_mtp) const {
++    AssertLockHeld(cs);
++    lotus::v2::Hash tip_id{};
++    std::copy(tip_hash.begin(), tip_hash.end(), tip_id.begin());
++    if (!m_merklix_overlay.IsAnchoredAt(tip_id, next_height, parent_mtp)) {
++        // eCash does not commit this arena's UTXO/monetary state in its header.
++        // These neutral adapter values never replace eCash consensus checks.
++        m_merklix_overlay.ReanchorExistingTxs(
++            tip_id, nullptr, lotus::v2::GetInitialV2MonetaryState(),
++            next_height, parent_mtp);
++    }
++}
++
++void CTxMemPool::ConnectBlockReset(const BlockHash &tip_hash,
++                                  uint64_t next_height,
++                                  uint64_t parent_mtp) {
++    SyncMerklixOverlayToTip(tip_hash, next_height, parent_mtp);
++}
++
+ void CTxMemPool::clear(bool include_finalized_txs) {
+     LOCK(cs);
+     _clear();
+diff --git a/src/txmempool.h b/src/txmempool.h
+index cb5c1fe728..bf93826c2d 100644
+--- a/src/txmempool.h
++++ b/src/txmempool.h
+@@ -13,6 +13,7 @@
+ #include <kernel/cs_main.h>
+ #include <kernel/mempool_entry.h>
+ #include <kernel/mempool_options.h>
++#include <lotus_v2/mempool_overlay.h>
+ #include <node/blockfitter.h>
+ #include <policy/packages.h>
+ #include <primitives/transaction.h>
+@@ -607,7 +608,29 @@ public:
+         return func(*m_conflicting);
+     }
+ 
++    /** Shared speculative transaction overlay; not proof of script validity. */
++    lotus::v2::MerklixOverlayManager &GetMerklixOverlay() const
++        EXCLUSIVE_LOCKS_REQUIRED(cs) {
++        AssertLockHeld(cs);
++        return m_merklix_overlay;
++    }
++
++    lotus::v2::MerklixOverlayManager &GetOverlayManager() const
++        EXCLUSIVE_LOCKS_REQUIRED(cs) {
++        return GetMerklixOverlay();
++    }
++
++    const lotus::v2::MempoolOverlayLayer &FreezeEpochBatch()
++        EXCLUSIVE_LOCKS_REQUIRED(cs);
++    void SyncMerklixOverlayToTip(const BlockHash &tip_hash,
++                                uint64_t next_height, uint64_t parent_mtp) const
++        EXCLUSIVE_LOCKS_REQUIRED(cs);
++    void ConnectBlockReset(const BlockHash &tip_hash,
++                           uint64_t next_height, uint64_t parent_mtp)
++        EXCLUSIVE_LOCKS_REQUIRED(cs);
++
+ private:
++    mutable lotus::v2::MerklixOverlayManager m_merklix_overlay GUARDED_BY(cs);
+     /** Set ancestor state for an entry */
+     void UpdateEntryForAncestors(txiter it, const setEntries *setAncestors)
+         EXCLUSIVE_LOCKS_REQUIRED(cs);
+diff --git a/src/validation.cpp b/src/validation.cpp
+index bac046c4bb..12d2615e0b 100644
+--- a/src/validation.cpp
++++ b/src/validation.cpp
+@@ -2947,6 +2947,13 @@ bool Chainstate::DisconnectTip(BlockValidationState &state,
+         if (disconnectpool) {
+             disconnectpool->addForBlock(block.vtx, *m_mempool);
+         }
++        {
++            LOCK(m_mempool->cs);
++            m_mempool->ConnectBlockReset(
++                pindexDelete->pprev->GetBlockHash(),
++                static_cast<uint64_t>(pindexDelete->pprev->nHeight + 1),
++                static_cast<uint64_t>(pindexDelete->pprev->GetMedianTimePast()));
++        }
+     }
+ 
+     m_chain.SetTip(*pindexDelete->pprev);
+@@ -3144,6 +3151,13 @@ bool Chainstate::ConnectTip(BlockValidationState &state,
+                 "Disconnecting mempool due to acceptance of upgrade block\n");
+             disconnectpool.importMempool(*m_mempool);
+         }
++        {
++            LOCK(m_mempool->cs);
++            m_mempool->ConnectBlockReset(
++                pindexNew->GetBlockHash(),
++                static_cast<uint64_t>(pindexNew->nHeight + 1),
++                static_cast<uint64_t>(pindexNew->GetMedianTimePast()));
++        }
+     }
+ 
+     // Update m_chain & related variables.

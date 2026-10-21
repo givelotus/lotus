@@ -1,0 +1,348 @@
+From ccbd5d727b76540399474c12c13c3fdfd627fee5 Mon Sep 17 00:00:00 2001
+From: Shammah Chancellor <shammah.chancellor@notvalid.com>
+Date: Mon, 19 Oct 2026 17:26:14 -0700
+Subject: [PATCH] metrics: MDBX database size and commit latency
+
+All of the node's databases (chainstate, block index, txindex,
+blockfilterindex, coinstatsindex) are MDBX environments behind
+CDBWrapper. How large they grow and how long their commits take - the
+cost of every UTXO flush and of each index write - was not visible.
+
+- fullnode_db_size_bytes{db}: the environment's current geometry
+  (mdbx_env_info_ex mi_geo.current, the data file's size), read after
+  each commit.
+- fullnode_db_commit_seconds{db}: from the write transaction's start to
+  its commit (and the sync, when the batch asked for one), in
+  CDBWrapper::WriteBatch, the only runtime write path. _count counts
+  commits.
+
+db is one of chainstate, block_index, txindex, blockfilterindex,
+coinstatsindex, other, classified once from the database's path when it
+opens (MetricDatabaseIndex). Two databases of one kind (a snapshot
+chainstate beside the background one) share a size series; the last
+commit sets it.
+
+Cardinality: 6 size series, 6 histogram label sets (20 buckets, 50 us to
+120 s).
+
+Hot paths: none per transaction. Each commit (one per index block, one
+per UTXO flush) adds two clock reads, a ring push and an mdbx_env_info_ex
+call with -metrics, and one acquire load without; no lock is added.
+
+Evidence:
+- metrics_tests/database_labels (each database's path), dbwrapper_tests
+  pass.
+- interface_metrics_storage.py: with the three indexes on, all six
+  database label values are present; after five blocks and
+  gettxoutsetinfo (a flush), chainstate, block_index, txindex and
+  coinstatsindex commit counts grew and their sizes are positive;
+  blockfilterindex committed; "other" did not.
+
+Not tested: sizes after compaction or growth steps; commit latency
+values themselves (only that they are recorded); the snapshot chainstate.
+---
+ doc/metrics.md                               |  7 +++
+ src/dbwrapper.cpp                            | 19 ++++++-
+ src/dbwrapper.h                              |  3 ++
+ src/node/metrics.cpp                         | 48 ++++++++++++++++++
+ src/node/metrics.h                           | 13 +++++
+ src/test/metrics_tests.cpp                   | 17 +++++++
+ test/functional/interface_metrics_storage.py | 53 ++++++++++++++++++++
+ 7 files changed, 159 insertions(+), 1 deletion(-)
+ create mode 100644 test/functional/interface_metrics_storage.py
+
+diff --git a/doc/metrics.md b/doc/metrics.md
+index 04f2ee71d9a3fc618e75fae5461335f971415d0b..3b235891ca682faf8de443a7604b01e4a93e397f 100644
+--- a/doc/metrics.md
++++ b/doc/metrics.md
+@@ -161,6 +161,13 @@ one `_bucket` per bound plus `+Inf`, a `_sum` and a `_count`.
+ | `fullnode_blocks_invalid_total` | counter | `source` (`validation`, `invalidateblock`) | 2 | Blocks marked invalid. |
+ | `fullnode_blocks_parked_total` | counter | `reason` (`policy`, `finalization_conflict`, `deep_reorg`, `requested`) | 4 | Blocks parked: a block policy failed, forks below the Avalanche-finalized tip, `-parkdeepreorg`, or `parkblock`/an Avalanche rejection. |
+ 
++### Storage
++
++| Name | Type | Labels | Max series | Meaning |
++|---|---|---|---|---|
++| `fullnode_db_size_bytes` | gauge | `db` (6) | 6 | Size of each MDBX database (the data file's current geometry), as of its last commit. Databases: `chainstate`, `block_index`, `txindex`, `blockfilterindex`, `coinstatsindex`, `other`. Two databases of one kind (e.g. a snapshot chainstate and the background one) share a series: the last commit sets it. |
++| `fullnode_db_commit_seconds` | histogram | `db` (6) | 6 | Time to write and commit a batch (and sync it when asked). `_count` counts commits. 50 µs to 120 s. |
++
+ 
+ ## Tests
+ 
+diff --git a/src/dbwrapper.cpp b/src/dbwrapper.cpp
+index fa9ec0a83dee26d5ea196dad0d6cf8fb5d770cf1..3b0997fa5cc483a4d06a97ebfc099b7585cc5b07 100644
+--- a/src/dbwrapper.cpp
++++ b/src/dbwrapper.cpp
+@@ -10,12 +10,14 @@
+ #include <leveldb/filter_policy.h>
+ #include <leveldb/write_batch.h>
+ #include <mdbx.h>
++#include <node/metrics.h>
+ #include <random.h>
+ #include <tinyformat.h>
+ #include <util/fs_helpers.h>
+ 
+ #include <algorithm>
+ #include <atomic>
++#include <chrono>
+ #include <cstdint>
+ #include <cstring>
+ #include <fstream>
+@@ -297,7 +299,8 @@ Status DestroyDB(const std::string &path_str, const DestroyOptions &) {
+ 
+ CDBWrapper::CDBWrapper(const DBParams &params)
+     : m_name{fs::PathToString(params.path.stem())}, m_path{params.path},
+-      m_is_memory{params.memory_only} {
++      m_is_memory{params.memory_only},
++      m_metric_db{node::MetricDatabaseIndex(fs::PathToString(params.path))} {
+     if (m_is_memory) {
+         const uint64_t id = ++g_mem_db_counter;
+         m_active_path =
+@@ -637,6 +640,10 @@ void CDBWrapper::WriteBatch(CDBBatch &batch, bool fSync) {
+                          });
+     }
+ 
++    auto *const metrics{node::GetNodeMetrics()};
++    const auto start{metrics ? std::chrono::steady_clock::now()
++                             : std::chrono::steady_clock::time_point{}};
++
+     MDBX_txn *txn = nullptr;
+     int rc = mdbx_txn_begin(m_env, nullptr, MDBX_TXN_READWRITE, &txn);
+     dbwrapper_private::HandleError(rc, "mdbx_txn_begin(write)");
+@@ -682,6 +689,16 @@ void CDBWrapper::WriteBatch(CDBBatch &batch, bool fSync) {
+     if (fSync) {
+         Sync();
+     }
++
++    if (metrics) {
++        metrics->db_commit_seconds.RecordDuration(
++            std::chrono::steady_clock::now() - start, m_metric_db);
++        MDBX_envinfo info{};
++        if (mdbx_env_info_ex(m_env, nullptr, &info, sizeof(info)) ==
++            MDBX_SUCCESS) {
++            metrics->db_size.Set(double(info.mi_geo.current), m_metric_db);
++        }
++    }
+ }
+ 
+ void CDBWrapper::Sync() {
+diff --git a/src/dbwrapper.h b/src/dbwrapper.h
+index abdf1cd753fc41269117fe409dfd336eda225246..612a0e8d9341a3a250b1a3556e766e4473feb1c4 100644
+--- a/src/dbwrapper.h
++++ b/src/dbwrapper.h
+@@ -274,6 +274,9 @@ private:
+     //! whether or not the database resides in memory
+     bool m_is_memory;
+ 
++    //! Label index of this database in the metrics (MetricDatabaseIndex)
++    size_t m_metric_db;
++
+     bool ReadRaw(Span<const uint8_t> key, std::vector<uint8_t> &value) const;
+     bool ExistsRaw(Span<const uint8_t> key) const;
+     size_t EstimateSizeBytes(Span<const uint8_t> key_begin,
+diff --git a/src/node/metrics.cpp b/src/node/metrics.cpp
+index ff1bfe55af4d106ec174e06b089c36bfaae54216..0149eacbe34287726e8939cc6612bbde15f697c0 100644
+--- a/src/node/metrics.cpp
++++ b/src/node/metrics.cpp
+@@ -114,6 +114,12 @@ namespace metric_labels {
+             "policy", "finalization_conflict", "deep_reorg", "requested"};
+         return labels;
+     }
++    const std::vector<std::string> &Databases() {
++        static const std::vector<std::string> labels{
++            "chainstate",       "block_index",    "txindex",
++            "blockfilterindex", "coinstatsindex", "other"};
++        return labels;
++    }
+     const std::vector<std::string> &HTTPCodeClasses() {
+         static const std::vector<std::string> labels{"1xx", "2xx", "3xx",
+                                                      "4xx", "5xx", "other"};
+@@ -160,6 +166,12 @@ namespace {
+     const std::vector<double> COUNT_BUCKETS{
+         1,   2,    4,    8,    16,   32,    64,    128,   256,
+         512, 1024, 2048, 4096, 8192, 16384, 32768, 65536, 131072};
++    //! Seconds; database commits, from a small index write to a large
++    //! UTXO flush with fsync
++    const std::vector<double> DB_COMMIT_BUCKETS{
++        0.00005, 0.0001, 0.00025, 0.0005, 0.001, 0.0025, 0.005,
++        0.01,    0.025,  0.05,    0.1,    0.25,  0.5,    1,
++        2.5,     5,      10,      30,     120};
+     //! Blocks
+     const std::vector<double> REORG_DEPTH_BUCKETS{1, 2,  3,  4,  5,   6,
+                                                   8, 10, 20, 50, 100, 1000};
+@@ -194,6 +206,31 @@ namespace {
+     }
+ } // namespace
+ 
++size_t MetricDatabaseIndex(const std::string &path) noexcept {
++    const auto has{[&](std::string_view part) {
++        return path.find(part) != std::string::npos;
++    }};
++    if (has("indexes/txindex")) {
++        return 2;
++    }
++    if (has("indexes/blockfilter")) {
++        return 3;
++    }
++    if (has("indexes/coinstats")) {
++        return 4;
++    }
++    if (path.ends_with("blocks/index") || path.ends_with("blocks/index/")) {
++        return 1;
++    }
++    const size_t slash{path.find_last_of('/', path.size() - 2)};
++    const std::string_view last{std::string_view{path}.substr(
++        slash == std::string::npos ? 0 : slash + 1)};
++    if (last.starts_with("chainstate")) {
++        return 0;
++    }
++    return 5;
++}
++
+ void RecordTxPoolRemovals(std::string_view pool_kind, unsigned expired,
+                           unsigned evicted) noexcept {
+     if (auto *m{GetNodeMetrics()}) {
+@@ -532,6 +569,17 @@ NodeMetrics::NodeMetrics(std::vector<std::string> rpc_methods)
+           "deep_reorg (-parkdeepreorg), requested (parkblock, or an "
+           "Avalanche rejection).",
+           std::vector<LabelDim>{{"reason", L::BlockParkReasons()}})},
++      db_size{Add<Gauge>(
++          registry, MetricName("db_size_bytes"),
++          "Size of each MDBX database (its data file's current geometry), "
++          "as of its last commit.",
++          std::vector<LabelDim>{{"db", L::Databases()}})},
++      db_commit_seconds{Add<EventHistogram>(
++          registry, MetricName("db_commit_seconds"),
++          "Time to write and commit a batch to an MDBX database (and sync "
++          "it when asked), by database. _count is the number of commits.",
++          DB_COMMIT_BUCKETS, /*divisor=*/1e9,
++          std::vector<LabelDim>{{"db", L::Databases()}})},
+       m_rpc_methods{SortedWithOther(std::move(rpc_methods))} {
+     build_info.Set(1);
+     registry.Add(std::make_unique<metrics::FunctionCounter>(
+diff --git a/src/node/metrics.h b/src/node/metrics.h
+index 03939e0be16b5dee007253ac73ca9ca222d1ea04..da2219d2a8ebac5e58c9e9a4bd59d09105bced6d 100644
+--- a/src/node/metrics.h
++++ b/src/node/metrics.h
+@@ -97,6 +97,8 @@ namespace metric_labels {
+     const std::vector<std::string> &BlockStages();
+     //! Index = BlockParkReason
+     const std::vector<std::string> &BlockParkReasons();
++    //! Databases, index = MetricDatabaseIndex()
++    const std::vector<std::string> &Databases();
+ } // namespace metric_labels
+ 
+ enum class HTTPEndpoint : size_t {
+@@ -207,6 +209,10 @@ struct NodeMetrics {
+     //! By BlockParkReason
+     metrics::Counter &blocks_parked;
+ 
++    // Storage (MDBX), by database (MetricDatabaseIndex)
++    metrics::Gauge &db_size;
++    metrics::EventHistogram &db_commit_seconds;
++
+     /** Label index of an RPC method ("other" if not in the set) */
+     size_t RPCMethodIndex(std::string_view method) const noexcept;
+ 
+@@ -314,6 +320,13 @@ inline void CountValidationCacheLookup(bool script_execution,
+     }
+ }
+ 
++/**
++ * Label index (metric_labels::Databases) of a database from its path:
++ * chainstate, block_index, txindex, blockfilterindex, coinstatsindex,
++ * other.
++ */
++size_t MetricDatabaseIndex(const std::string &path) noexcept;
++
+ /** Count a transaction pool's (orphans, conflicting) removals */
+ void RecordTxPoolRemovals(std::string_view pool_kind, unsigned expired,
+                           unsigned evicted) noexcept;
+diff --git a/src/test/metrics_tests.cpp b/src/test/metrics_tests.cpp
+index 7a5e2f2009406a46ae0be8147bb5420a29ef91d4..bf3b15ca52551687cc7280f196b7d3195c413bf8 100644
+--- a/src/test/metrics_tests.cpp
++++ b/src/test/metrics_tests.cpp
+@@ -458,4 +458,21 @@ BOOST_AUTO_TEST_CASE(block_labels) {
+                       size_t(node::BlockParkReason::REQUESTED) + 1);
+ }
+ 
++BOOST_AUTO_TEST_CASE(database_labels) {
++    const auto label{[](const std::string &path) {
++        return node::metric_labels::Databases()[node::MetricDatabaseIndex(
++            path)];
++    }};
++    BOOST_CHECK_EQUAL(label("/d/regtest/chainstate"), "chainstate");
++    BOOST_CHECK_EQUAL(label("/d/regtest/chainstate_snapshot"), "chainstate");
++    BOOST_CHECK_EQUAL(label("/d/regtest/blocks/index"), "block_index");
++    BOOST_CHECK_EQUAL(label("/d/regtest/indexes/txindex"), "txindex");
++    BOOST_CHECK_EQUAL(label("/d/regtest/indexes/blockfilter/basic/db"),
++                      "blockfilterindex");
++    BOOST_CHECK_EQUAL(label("/d/regtest/indexes/coinstats/db"),
++                      "coinstatsindex");
++    BOOST_CHECK_EQUAL(label("/tmp/test_x"), "other");
++    BOOST_CHECK_EQUAL(label(""), "other");
++}
++
+ BOOST_AUTO_TEST_SUITE_END()
+diff --git a/test/functional/interface_metrics_storage.py b/test/functional/interface_metrics_storage.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..7efcdbe389c40e9024995ed7cd9b4ca3d204b00a
+--- /dev/null
++++ b/test/functional/interface_metrics_storage.py
+@@ -0,0 +1,53 @@
++#!/usr/bin/env python3
++# Copyright (c) 2026 The Lotus developers
++# Distributed under the MIT software license, see the accompanying
++# file COPYING or http://www.opensource.org/licenses/mit-license.php.
++"""Test the storage metrics at /metrics: MDBX database sizes and commit
++latency, per database."""
++
++import time
++
++from test_framework.metrics import m, scrape
++from test_framework.test_framework import BitcoinTestFramework
++from test_framework.util import assert_equal
++
++DATABASES = {
++    "chainstate",
++    "block_index",
++    "txindex",
++    "blockfilterindex",
++    "coinstatsindex",
++    "other",
++}
++
++
++class StorageMetricsTest(BitcoinTestFramework):
++    num_nodes = 1
++    extra_args = [
++        ["-metrics", "-txindex", "-coinstatsindex", "-blockfilterindex"],
++    ]
++
++    def run_test(self):
++        node = self.nodes[0]
++        self.wait_until(lambda: all(i["synced"] for i in node.getindexinfo().values()))
++        before = scrape(node)
++        assert_equal(before.label_values(m("db_size_bytes"), "db"), DATABASES)
++        assert_equal(before.label_values(m("db_commit_seconds_count"), "db"), DATABASES)
++
++        self.log.info("Indexes commit per block; a flush commits the chainstate")
++        self.generate(node, 5)
++        self.wait_until(lambda: all(i["synced"] for i in node.getindexinfo().values()))
++        node.gettxoutsetinfo()  # flushes the chainstate and the block index
++        time.sleep(1.05)  # past the rendering cache
++        s = scrape(node)
++        for db in ("chainstate", "block_index", "txindex", "coinstatsindex"):
++            name = m("db_commit_seconds_count")
++            assert s.value(name, db=db) > before.value(name, db=db), db
++            assert s.value(m("db_size_bytes"), db=db) > 0, db
++        assert s.value(m("db_commit_seconds_sum"), db="txindex") > 0
++        assert s.value(m("db_commit_seconds_count"), db="blockfilterindex") > 0
++        assert_equal(s.value(m("db_commit_seconds_count"), db="other"), 0)
++
++
++if __name__ == "__main__":
++    StorageMetricsTest().main()
+-- 
+2.50.1 (Apple Git-155)
+

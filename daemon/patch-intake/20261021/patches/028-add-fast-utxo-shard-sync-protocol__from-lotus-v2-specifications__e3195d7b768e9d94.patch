@@ -1,0 +1,1714 @@
+From 183dfdcc944b22f216bbecb7fd3417defb5c644a Mon Sep 17 00:00:00 2001
+From: Shammah Chancellor <shammah.chancellor@notvalid.com>
+Date: Fri, 16 Oct 2026 18:20:37 -0700
+Subject: 028-add-fast-utxo-shard-sync-protocol: add Fast UTXO Shard Sync
+ protocol and Holes 11/13/14/15 defenses
+
+Adds 256-shard Sparse Merkle Tree UTXO download (GETUTXOROOTS, UTXOROOTS,
+GETUTXOSHARD, UTXOSHARD), interior branch verification, and unit tests in
+fast_sync_shard_tests.cpp.
+---
+ src/lotus_v2/CMakeLists.txt        |   44 +-
+ src/lotus_v2/fast_sync.cpp         | 1022 ++++++++++++++++++++++++++++
+ src/lotus_v2/fast_sync.h           |  173 +++++
+ src/net/v2_protocol_handler.cpp    |   91 +++
+ src/test/CMakeLists.txt            |    1 +
+ src/test/fast_sync_shard_tests.cpp |  297 ++++++++
+ 6 files changed, 1623 insertions(+), 5 deletions(-)
+ create mode 100644 src/lotus_v2/fast_sync.cpp
+ create mode 100644 src/lotus_v2/fast_sync.h
+ create mode 100644 src/test/fast_sync_shard_tests.cpp
+
+diff --git a/src/lotus_v2/CMakeLists.txt b/src/lotus_v2/CMakeLists.txt
+index 6e9e03c8db..3e2e8b9e8e 100644
+--- a/src/lotus_v2/CMakeLists.txt
++++ b/src/lotus_v2/CMakeLists.txt
+@@ -1,14 +1,48 @@
+ # V2 candidate components; the explicit development command links validation.
+ # These targets do not activate a network or change the mainnet chain path.
++# Optimization (rolled into initial vendor commit): enable hardware SIMD
++# dispatch for BLAKE3 (NEON on aarch64/arm64; SSE2/SSE4.1/AVX2/AVX-512 on
++# x86_64) directly in lotus_v2_blake3.
+ add_library(lotus_v2_blake3 STATIC
+     vendor/blake3/blake3.c
+     vendor/blake3/blake3_dispatch.c
+     vendor/blake3/blake3_portable.c
+ )
+-target_compile_definitions(lotus_v2_blake3 PRIVATE
+-    BLAKE3_NO_SSE2 BLAKE3_NO_SSE41 BLAKE3_NO_AVX2 BLAKE3_NO_AVX512
+-    BLAKE3_USE_NEON=0
+-)
++if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(arm64|ARM64|aarch64|AArch64)$")
++    target_sources(lotus_v2_blake3 PRIVATE
++        vendor/blake3/blake3_neon.c
++    )
++    target_compile_definitions(lotus_v2_blake3 PRIVATE
++        BLAKE3_NO_SSE2 BLAKE3_NO_SSE41 BLAKE3_NO_AVX2 BLAKE3_NO_AVX512
++        BLAKE3_USE_NEON=1
++    )
++elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|amd64)$")
++    target_sources(lotus_v2_blake3 PRIVATE
++        vendor/blake3/blake3_sse2.c
++        vendor/blake3/blake3_sse41.c
++        vendor/blake3/blake3_avx2.c
++        vendor/blake3/blake3_avx512.c
++    )
++    target_compile_definitions(lotus_v2_blake3 PRIVATE
++        BLAKE3_USE_NEON=0
++    )
++    if(MSVC AND NOT CMAKE_C_COMPILER_ID STREQUAL "Clang")
++        set_source_files_properties(vendor/blake3/blake3_sse2.c PROPERTIES COMPILE_OPTIONS "/arch:SSE2")
++        set_source_files_properties(vendor/blake3/blake3_sse41.c PROPERTIES COMPILE_OPTIONS "/arch:AVX")
++        set_source_files_properties(vendor/blake3/blake3_avx2.c PROPERTIES COMPILE_OPTIONS "/arch:AVX2")
++        set_source_files_properties(vendor/blake3/blake3_avx512.c PROPERTIES COMPILE_OPTIONS "/arch:AVX512")
++    else()
++        set_source_files_properties(vendor/blake3/blake3_sse2.c PROPERTIES COMPILE_OPTIONS "-msse2")
++        set_source_files_properties(vendor/blake3/blake3_sse41.c PROPERTIES COMPILE_OPTIONS "-msse4.1")
++        set_source_files_properties(vendor/blake3/blake3_avx2.c PROPERTIES COMPILE_OPTIONS "-mavx2")
++        set_source_files_properties(vendor/blake3/blake3_avx512.c PROPERTIES COMPILE_OPTIONS "-mavx512f;-mavx512vl")
++    endif()
++else()
++    target_compile_definitions(lotus_v2_blake3 PRIVATE
++        BLAKE3_NO_SSE2 BLAKE3_NO_SSE41 BLAKE3_NO_AVX2 BLAKE3_NO_AVX512
++        BLAKE3_USE_NEON=0
++    )
++endif()
+ target_include_directories(lotus_v2_blake3 PUBLIC vendor/blake3)
+ 
+ if(NOT TARGET Boost::headers)
+@@ -116,7 +150,7 @@ add_library(lotus_v2_validation STATIC
+     transaction.cpp signing.cpp vm.cpp field_size.cpp ordinary_validation.cpp
+     monetary.cpp block_wire.cpp block_cost.cpp header_context.cpp
+     asert_candidate.cpp block_transition.cpp block_assembler.cpp disk_state.cpp candidate_store.cpp disk_block.cpp development_chain.cpp disk_body.cpp
+-    chain_index.cpp header_admission.cpp)
++    chain_index.cpp header_admission.cpp fast_sync.cpp)
+ target_link_libraries(lotus_v2_validation PUBLIC
+     lotus_v2_block_template lotus_v2_sparse_state lotus_v2_incremental_utxo lotus_v2_mdbx Boost::headers secp256k1 leveldb OpenSSL::Crypto crypto)
+ 
+diff --git a/src/lotus_v2/fast_sync.cpp b/src/lotus_v2/fast_sync.cpp
+new file mode 100644
+index 0000000000..f63e0eb9d9
+--- /dev/null
++++ b/src/lotus_v2/fast_sync.cpp
+@@ -0,0 +1,1022 @@
++// Copyright (c) 2026 The Lotus developers
++#include "fast_sync.h"
++#include "disk_block.h"
++
++#include <algorithm>
++#include <cstring>
++#include <limits>
++#include <map>
++#include <set>
++
++namespace lotus::v2 {
++namespace {
++
++bool KeyBitAt(const Hash &key, uint8_t depth) {
++    return ((key[depth / 8] >> (depth % 8)) & 1u) != 0;
++}
++
++void WriteLE16(std::vector<uint8_t> &out, uint16_t val) {
++    out.push_back(static_cast<uint8_t>(val & 0xFFu));
++    out.push_back(static_cast<uint8_t>((val >> 8) & 0xFFu));
++}
++
++void WriteLE64(std::vector<uint8_t> &out, uint64_t val) {
++    for (unsigned i = 0; i < 8; ++i) {
++        out.push_back(static_cast<uint8_t>((val >> (8 * i)) & 0xFFu));
++    }
++}
++
++uint16_t ReadLE16(const uint8_t *p) {
++    return static_cast<uint16_t>(p[0]) | (static_cast<uint16_t>(p[1]) << 8);
++}
++
++uint64_t ReadLE64(const uint8_t *p) {
++    uint64_t v = 0;
++    for (unsigned i = 0; i < 8; ++i) {
++        v |= static_cast<uint64_t>(p[i]) << (8 * i);
++    }
++    return v;
++}
++
++void WriteCompactSize(std::vector<uint8_t> &out, uint64_t n) {
++    if (n < 253) {
++        out.push_back(static_cast<uint8_t>(n));
++    } else if (n <= 0xFFFFu) {
++        out.push_back(253);
++        WriteLE16(out, static_cast<uint16_t>(n));
++    } else if (n <= 0xFFFFFFFFULL) {
++        out.push_back(254);
++        for (unsigned i = 0; i < 4; ++i) {
++            out.push_back(static_cast<uint8_t>((n >> (8 * i)) & 0xFFu));
++        }
++    } else {
++        out.push_back(255);
++        WriteLE64(out, n);
++    }
++}
++
++bool ReadCompactSize(const std::vector<uint8_t> &bytes, size_t &offset,
++                     uint64_t max_val, uint64_t &out) {
++    if (offset >= bytes.size()) return false;
++    const uint8_t lead = bytes[offset++];
++    if (lead < 253) {
++        out = lead;
++    } else if (lead == 253) {
++        if (bytes.size() - offset < 2) return false;
++        out = ReadLE16(bytes.data() + offset);
++        offset += 2;
++        if (out < 253) return false;
++    } else if (lead == 254) {
++        if (bytes.size() - offset < 4) return false;
++        uint64_t v = 0;
++        for (unsigned i = 0; i < 4; ++i) {
++            v |= static_cast<uint64_t>(bytes[offset + i]) << (8 * i);
++        }
++        offset += 4;
++        if (v < 0x10000ULL) return false;
++        out = v;
++    } else {
++        if (bytes.size() - offset < 8) return false;
++        out = ReadLE64(bytes.data() + offset);
++        offset += 8;
++        if (out < 0x100000000ULL) return false;
++    }
++    return out <= max_val;
++}
++
++bool DecodeCanonicalCoinBytes(const uint8_t *data, size_t len, Coin &out,
++                              std::string &error) {
++    if (len < 54 || len > MAX_COIN_BYTES) {
++        error = "invalid coin byte length";
++        return false;
++    }
++    std::copy_n(data, 32, out.outpoint.tx_id.begin());
++    out.outpoint.index = static_cast<uint32_t>(data[32]) |
++                         (static_cast<uint32_t>(data[33]) << 8) |
++                         (static_cast<uint32_t>(data[34]) << 16) |
++                         (static_cast<uint32_t>(data[35]) << 24);
++    std::vector<uint8_t> buf(data, data + len);
++    size_t offset = 36;
++    uint64_t out_len = 0;
++    if (!ReadCompactSize(buf, offset, MAX_OUTPUT_BYTES, out_len) ||
++        buf.size() - offset < out_len ||
++        buf.size() - (offset + static_cast<size_t>(out_len)) != 17) {
++        error = "invalid coin output framing";
++        return false;
++    }
++    std::vector<uint8_t> output_bytes(buf.begin() + offset,
++                                      buf.begin() + offset + static_cast<size_t>(out_len));
++    if (!DecodeOutput(output_bytes, out.output, error)) {
++        return false;
++    }
++    offset += static_cast<size_t>(out_len);
++    out.creation_height = ReadLE64(buf.data() + offset);
++    out.creation_parent_mtp = ReadLE64(buf.data() + offset + 8);
++    const uint8_t cb_flag = buf[offset + 16];
++    if (cb_flag > 1) {
++        error = "invalid coinbase flag in coin";
++        return false;
++    }
++    out.coinbase = (cb_flag == 1);
++
++    std::vector<uint8_t> reencoded;
++    if (!EncodeCoin(out, reencoded) || reencoded != buf) {
++        error = "non-canonical coin encoding";
++        return false;
++    }
++    return true;
++}
++
++struct KeyedCoinRef {
++    Hash key{};
++    const Coin *coin = nullptr;
++};
++
++bool ComputeSubtreeEntry(const std::vector<KeyedCoinRef> &entries,
++                         unsigned depth, ShardRootEntry &out) {
++    if (entries.empty()) {
++        out = {0, EmptyUtxoRoot()};
++        return true;
++    }
++    if (entries.size() == 1) {
++        out.cardinality_tag = 1;
++        return UtxoLeaf(*entries[0].coin, out.subtree_root);
++    }
++    if (depth >= 256) {
++        return false;
++    }
++    std::vector<KeyedCoinRef> left;
++    std::vector<KeyedCoinRef> right;
++    left.reserve(entries.size());
++    right.reserve(entries.size());
++    for (const auto &entry : entries) {
++        if (KeyBitAt(entry.key, static_cast<uint8_t>(depth))) {
++            right.push_back(entry);
++        } else {
++            left.push_back(entry);
++        }
++    }
++    ShardRootEntry left_entry, right_entry;
++    if (!ComputeSubtreeEntry(left, depth + 1, left_entry) ||
++        !ComputeSubtreeEntry(right, depth + 1, right_entry)) {
++        return false;
++    }
++    return FoldShardPair(static_cast<uint8_t>(depth), left_entry, right_entry, out);
++}
++
++bool SplitAndExportShardsRecursive(
++    const UtxoSet &utxo, const Hash &pivot_block_id,
++    const std::vector<KeyedCoinRef> &entries, uint8_t depth,
++    uint16_t prefix_bits, size_t max_shard_leaves,
++    std::vector<UtxoShardMessage> &out, std::string &error) {
++    if (entries.empty()) {
++        return true;
++    }
++    if (entries.size() <= max_shard_leaves) {
++        UtxoShardMessage msg;
++        if (!ExportUtxoShard(utxo, pivot_block_id, depth, prefix_bits, msg,
++                             error, max_shard_leaves)) {
++            return false;
++        }
++        out.push_back(std::move(msg));
++        return true;
++    }
++    if (depth >= kMaxUtxoShardPrefixDepth) {
++        error = "sub-shard at maximum depth 16 still exceeds leaf limit";
++        return false;
++    }
++    std::vector<KeyedCoinRef> left;
++    std::vector<KeyedCoinRef> right;
++    for (const auto &e : entries) {
++        if (KeyBitAt(e.key, depth)) {
++            right.push_back(e);
++        } else {
++            left.push_back(e);
++        }
++    }
++    const uint16_t left_prefix = prefix_bits;
++    const uint16_t right_prefix =
++        static_cast<uint16_t>(prefix_bits | (uint16_t{1} << depth));
++    return SplitAndExportShardsRecursive(utxo, pivot_block_id, left,
++                                         static_cast<uint8_t>(depth + 1),
++                                         left_prefix, max_shard_leaves, out,
++                                         error) &&
++           SplitAndExportShardsRecursive(utxo, pivot_block_id, right,
++                                         static_cast<uint8_t>(depth + 1),
++                                         right_prefix, max_shard_leaves, out,
++                                         error);
++}
++
++} // namespace
++
++bool CheckFastSyncPivotEligibility(const FastSyncPivotCandidate &candidate,
++                                   std::string &error) {
++    if (!candidate.has_minimum_chain_work) {
++        error = "pivot does not meet minimum chain work";
++        return false;
++    }
++    if (candidate.pivot_height > candidate.best_header_height) {
++        error = "pivot height exceeds best header height";
++        return false;
++    }
++    if (!candidate.is_avalanche_finalized) {
++        // Hole 13: Dual Pivot Authentication Gate.
++        if (candidate.buried_blocks < kFastSyncMinBuriedBlocks ||
++            candidate.distinct_netgroup_confirmations <
++                kFastSyncMinNetgroupConfirmations) {
++            error = "unfinalized pivot lacks 100 buried blocks across >= 3 distinct netgroups";
++            return false;
++        }
++        // Hole 14: Pivot Safety Cushion.
++        if (candidate.best_header_height - candidate.pivot_height <
++            kFastSyncPivotSafetyCushion) {
++            error = "unfinalized pivot violates 10-block safety cushion below tip";
++            return false;
++        }
++    }
++    error.clear();
++    return true;
++}
++
++uint16_t OutpointPrefixBits(const Hash &outpoint_key, uint8_t prefix_depth) {
++    uint16_t bits = 0;
++    const uint8_t limit = std::min<uint8_t>(prefix_depth, 16);
++    for (uint8_t d = 0; d < limit; ++d) {
++        if (KeyBitAt(outpoint_key, d)) {
++            bits |= static_cast<uint16_t>(uint16_t{1} << d);
++        }
++    }
++    return bits;
++}
++
++bool IsValidShardRootEntry(const ShardRootEntry &entry) {
++    if (entry.cardinality_tag > 2) return false;
++    if (entry.cardinality_tag == 0) {
++        return entry.subtree_root == EmptyUtxoRoot();
++    }
++    return entry.subtree_root != EmptyUtxoRoot();
++}
++
++bool FoldShardPair(uint8_t depth, const ShardRootEntry &left,
++                   const ShardRootEntry &right, ShardRootEntry &out) {
++    if (!IsValidShardRootEntry(left) || !IsValidShardRootEntry(right)) {
++        return false;
++    }
++    if (left.cardinality_tag == 0 && right.cardinality_tag == 0) {
++        out = {0, EmptyUtxoRoot()};
++        return true;
++    }
++    if (left.cardinality_tag == 1 && right.cardinality_tag == 0) {
++        out = {1, left.subtree_root};
++        return true;
++    }
++    if (left.cardinality_tag == 0 && right.cardinality_tag == 1) {
++        out = {1, right.subtree_root};
++        return true;
++    }
++    out.cardinality_tag = 2;
++    return UtxoNode(depth, left.subtree_root, right.subtree_root,
++                    out.subtree_root);
++}
++
++std::optional<Hash> FoldDepth8ShardRoots(
++    const std::array<ShardRootEntry, kFastSyncShardCount> &shards,
++    std::string *error) {
++    for (size_t i = 0; i < shards.size(); ++i) {
++        if (!IsValidShardRootEntry(shards[i])) {
++            if (error) *error = "invalid shard root entry tag or empty digest mismatch";
++            return std::nullopt;
++        }
++    }
++    std::vector<ShardRootEntry> current(shards.begin(), shards.end());
++    for (int d = 7; d >= 0; --d) {
++        const size_t half = static_cast<size_t>(1u << d);
++        std::vector<ShardRootEntry> next(half);
++        for (size_t prefix = 0; prefix < half; ++prefix) {
++            const ShardRootEntry &left = current[prefix];
++            const ShardRootEntry &right = current[prefix | half];
++            if (!FoldShardPair(static_cast<uint8_t>(d), left, right,
++                               next[prefix])) {
++                if (error) *error = "failed to fold shard pair";
++                return std::nullopt;
++            }
++        }
++        current = std::move(next);
++    }
++    if (error) error->clear();
++    return current[0].subtree_root;
++}
++
++bool VerifyUtxoRootsAgainstHeader(const Header &pivot_header,
++                                  const ChainId &chain_id,
++                                  const UtxoRootsMessage &msg,
++                                  std::string &error) {
++    Hash expected_pivot_id{};
++    if (!BlockId(chain_id, pivot_header, expected_pivot_id) ||
++        msg.pivot_block_id != expected_pivot_id) {
++        error = "utxoroots pivot_block_id does not match authenticated pivot header";
++        return false;
++    }
++    if (msg.height != pivot_header.height) {
++        error = "utxoroots height does not match pivot header height";
++        return false;
++    }
++    MonetaryState decoded_monetary{};
++    try {
++        decoded_monetary = DecodeMonetaryState(
++            std::vector<uint8_t>(msg.monetary_state.begin(),
++                                 msg.monetary_state.end()));
++    } catch (const std::exception &e) {
++        error = std::string("invalid utxoroots monetary_state: ") + e.what();
++        return false;
++    }
++    const auto folded_utxo_root = FoldDepth8ShardRoots(msg.shards, &error);
++    if (!folded_utxo_root) {
++        return false;
++    }
++    const Hash computed_state_root = StateRoot(
++        chain_id, pivot_header.height, *folded_utxo_root, decoded_monetary);
++    if (computed_state_root != pivot_header.state_root) {
++        error = "utxoroots folded StateRoot does not match pivot header state_root";
++        return false;
++    }
++    error.clear();
++    return true;
++}
++
++bool VerifyAndBuildUtxoShard(const ShardRootEntry &expected_depth8_entry,
++                             uint64_t pivot_height,
++                             const UtxoShardMessage &shard,
++                             ShardRootEntry *computed_subshard_out,
++                             std::string &error) {
++    if (!IsValidShardRootEntry(expected_depth8_entry)) {
++        error = "invalid expected depth-8 shard root entry";
++        return false;
++    }
++    if (shard.prefix_depth < kMinUtxoShardPrefixDepth ||
++        shard.prefix_depth > kMaxUtxoShardPrefixDepth) {
++        error = "utxoshard prefix_depth out of range [8..16]";
++        return false;
++    }
++    if (shard.prefix_depth < 16 &&
++        (shard.prefix_bits >> shard.prefix_depth) != 0) {
++        error = "utxoshard prefix_bits has non-zero bits above prefix_depth";
++        return false;
++    }
++    const size_t expected_siblings =
++        static_cast<size_t>(shard.prefix_depth - kMinUtxoShardPrefixDepth);
++    if (shard.boundary_siblings.size() != expected_siblings) {
++        error = "utxoshard boundary_siblings length does not match prefix_depth - 8";
++        return false;
++    }
++    // Hole 15: Strict leaf cap.
++    if (shard.coins.size() > kMaxUtxoShardLeaves) {
++        error = "utxoshard exceeds maximum allowed 4096 leaves";
++        return false;
++    }
++
++    std::vector<KeyedCoinRef> keyed;
++    keyed.reserve(shard.coins.size());
++    Hash prev_key{};
++    for (size_t i = 0; i < shard.coins.size(); ++i) {
++        const Coin &coin = shard.coins[i];
++        // Hole 11: Reject burn outputs (C17) and invalid coins.
++        if (coin.output.IsBurn()) {
++            error = "utxoshard contains unspendable burn output";
++            return false;
++        }
++        if (coin.creation_height > pivot_height) {
++            error = "utxoshard coin creation_height exceeds pivot height";
++            return false;
++        }
++        Hash leaf_hash{};
++        if (!UtxoLeaf(coin, leaf_hash)) {
++            error = "utxoshard coin failed canonical UtxoLeaf validation";
++            return false;
++        }
++        const Hash key = OutpointKey(coin.outpoint);
++        // Hole 11: Strict prefix enforcement against cross-shard key smuggling.
++        if (OutpointPrefixBits(key, shard.prefix_depth) != shard.prefix_bits) {
++            error = "utxoshard coin OutpointKey does not match shard prefix_bits";
++            return false;
++        }
++        // Strict ascending key order (also prevents duplicate keys).
++        if (i > 0 && !(prev_key < key)) {
++            error = "utxoshard coins are not in strictly ascending OutpointKey order";
++            return false;
++        }
++        prev_key = key;
++        keyed.push_back(KeyedCoinRef{key, &coin});
++    }
++
++    ShardRootEntry sub_entry{};
++    if (!ComputeSubtreeEntry(keyed, shard.prefix_depth, sub_entry)) {
++        error = "utxoshard failed to build Merklix subtree";
++        return false;
++    }
++    if (computed_subshard_out) {
++        *computed_subshard_out = sub_entry;
++    }
++
++    // Fold from depth (prefix_depth - 1) down to depth 8 using boundary_siblings.
++    ShardRootEntry cur = sub_entry;
++    for (size_t i = 0; i < expected_siblings; ++i) {
++        const uint8_t d =
++            static_cast<uint8_t>((shard.prefix_depth - 1) - i);
++        const Hash &sib_hash = shard.boundary_siblings[i];
++        const bool bit_is_right = ((shard.prefix_bits >> d) & 1u) != 0;
++
++        ShardRootEntry sib_entry{};
++        if (sib_hash == EmptyUtxoRoot()) {
++            sib_entry = {0, EmptyUtxoRoot()};
++        } else if (cur.cardinality_tag >= 1) {
++            // Whenever cur has >= 1 leaf and sibling is non-empty, the parent
++            // at depth d has >= 2 leaves (cardinality_tag = 2), so sib's tag
++            // (1 or 2) produces the exact same UtxoNode(d, left, right) hash.
++            sib_entry = {2, sib_hash};
++        } else {
++            // cur is empty (0 leaves), sibling is non-empty.
++            // If expected_depth8_entry has cardinality_tag == 1 and all higher
++            // siblings are empty, sibling is a single collapsed leaf (tag 1).
++            bool higher_all_empty = true;
++            for (size_t j = i + 1; j < expected_siblings; ++j) {
++                if (shard.boundary_siblings[j] != EmptyUtxoRoot()) {
++                    higher_all_empty = false;
++                    break;
++                }
++            }
++            const uint8_t inferred_tag =
++                (expected_depth8_entry.cardinality_tag == 1 && higher_all_empty)
++                    ? 1
++                    : 2;
++            sib_entry = {inferred_tag, sib_hash};
++        }
++
++        const ShardRootEntry &left = bit_is_right ? sib_entry : cur;
++        const ShardRootEntry &right = bit_is_right ? cur : sib_entry;
++        ShardRootEntry next{};
++        if (!FoldShardPair(d, left, right, next)) {
++            error = "utxoshard failed folding boundary sibling at depth " +
++                    std::to_string(d);
++            return false;
++        }
++        cur = next;
++    }
++
++    if (cur != expected_depth8_entry) {
++        error = "utxoshard folded depth-8 entry does not match authenticated ShardRootEntry";
++        return false;
++    }
++    error.clear();
++    return true;
++}
++
++std::vector<uint8_t> EncodeGetUtxoRootsRequest(const GetUtxoRootsRequest &req) {
++    return std::vector<uint8_t>(req.pivot_block_id.begin(),
++                                req.pivot_block_id.end());
++}
++
++bool DecodeGetUtxoRootsRequest(const std::vector<uint8_t> &bytes,
++                               GetUtxoRootsRequest &out,
++                               std::string &error) {
++    if (bytes.size() != 32) {
++        error = "invalid getutxoroots request size";
++        return false;
++    }
++    std::copy_n(bytes.data(), 32, out.pivot_block_id.begin());
++    error.clear();
++    return true;
++}
++
++std::vector<uint8_t> EncodeUtxoRootsMessage(const UtxoRootsMessage &msg) {
++    std::vector<uint8_t> out;
++    out.reserve(32 + 8 + 56 + kFastSyncShardCount * 33);
++    out.insert(out.end(), msg.pivot_block_id.begin(), msg.pivot_block_id.end());
++    WriteLE64(out, msg.height);
++    out.insert(out.end(), msg.monetary_state.begin(), msg.monetary_state.end());
++    for (const auto &shard : msg.shards) {
++        out.push_back(shard.cardinality_tag);
++        out.insert(out.end(), shard.subtree_root.begin(),
++                   shard.subtree_root.end());
++    }
++    return out;
++}
++
++bool DecodeUtxoRootsMessage(const std::vector<uint8_t> &bytes,
++                            UtxoRootsMessage &out,
++                            std::string &error) {
++    constexpr size_t kExpectedSize = 32 + 8 + 56 + kFastSyncShardCount * 33;
++    if (bytes.size() != kExpectedSize) {
++        error = "invalid utxoroots message size";
++        return false;
++    }
++    UtxoRootsMessage parsed;
++    std::copy_n(bytes.data(), 32, parsed.pivot_block_id.begin());
++    parsed.height = ReadLE64(bytes.data() + 32);
++    std::copy_n(bytes.data() + 40, 56, parsed.monetary_state.begin());
++    size_t offset = 96;
++    for (size_t i = 0; i < kFastSyncShardCount; ++i) {
++        parsed.shards[i].cardinality_tag = bytes[offset++];
++        std::copy_n(bytes.data() + offset, 32,
++                    parsed.shards[i].subtree_root.begin());
++        offset += 32;
++        if (!IsValidShardRootEntry(parsed.shards[i])) {
++            error = "utxoroots contains invalid shard root entry";
++            return false;
++        }
++    }
++    out = parsed;
++    error.clear();
++    return true;
++}
++
++bool EncodeGetUtxoShardRequest(const GetUtxoShardRequest &req,
++                               std::vector<uint8_t> &out,
++                               std::string &error) {
++    if (req.prefix_depth < kMinUtxoShardPrefixDepth ||
++        req.prefix_depth > kMaxUtxoShardPrefixDepth) {
++        error = "getutxoshard prefix_depth out of range [8..16]";
++        return false;
++    }
++    if (req.prefix_depth < 16 && (req.prefix_bits >> req.prefix_depth) != 0) {
++        error = "getutxoshard prefix_bits out of range for prefix_depth";
++        return false;
++    }
++    out.clear();
++    out.reserve(35);
++    out.insert(out.end(), req.pivot_block_id.begin(), req.pivot_block_id.end());
++    out.push_back(req.prefix_depth);
++    WriteLE16(out, req.prefix_bits);
++    error.clear();
++    return true;
++}
++
++bool DecodeGetUtxoShardRequest(const std::vector<uint8_t> &bytes,
++                               GetUtxoShardRequest &out,
++                               std::string &error) {
++    if (bytes.size() != 35) {
++        error = "invalid getutxoshard request size";
++        return false;
++    }
++    GetUtxoShardRequest parsed;
++    std::copy_n(bytes.data(), 32, parsed.pivot_block_id.begin());
++    parsed.prefix_depth = bytes[32];
++    parsed.prefix_bits = ReadLE16(bytes.data() + 33);
++    if (parsed.prefix_depth < kMinUtxoShardPrefixDepth ||
++        parsed.prefix_depth > kMaxUtxoShardPrefixDepth) {
++        error = "getutxoshard prefix_depth out of range [8..16]";
++        return false;
++    }
++    if (parsed.prefix_depth < 16 &&
++        (parsed.prefix_bits >> parsed.prefix_depth) != 0) {
++        error = "getutxoshard prefix_bits out of range for prefix_depth";
++        return false;
++    }
++    out = parsed;
++    error.clear();
++    return true;
++}
++
++bool EncodeUtxoShardMessage(const UtxoShardMessage &msg,
++                            std::vector<uint8_t> &out,
++                            std::string &error) {
++    if (msg.prefix_depth < kMinUtxoShardPrefixDepth ||
++        msg.prefix_depth > kMaxUtxoShardPrefixDepth) {
++        error = "utxoshard prefix_depth out of range [8..16]";
++        return false;
++    }
++    if (msg.prefix_depth < 16 && (msg.prefix_bits >> msg.prefix_depth) != 0) {
++        error = "utxoshard prefix_bits out of range for prefix_depth";
++        return false;
++    }
++    const size_t expected_siblings =
++        static_cast<size_t>(msg.prefix_depth - kMinUtxoShardPrefixDepth);
++    if (msg.boundary_siblings.size() != expected_siblings) {
++        error = "utxoshard boundary_siblings count mismatch";
++        return false;
++    }
++    if (msg.coins.size() > kMaxUtxoShardLeaves) {
++        error = "utxoshard coins exceed 4096 limit";
++        return false;
++    }
++    std::vector<uint8_t> buf;
++    buf.reserve(35 + expected_siblings * 32 + msg.coins.size() * 64);
++    buf.insert(buf.end(), msg.pivot_block_id.begin(), msg.pivot_block_id.end());
++    buf.push_back(msg.prefix_depth);
++    WriteLE16(buf, msg.prefix_bits);
++    for (const Hash &sib : msg.boundary_siblings) {
++        buf.insert(buf.end(), sib.begin(), sib.end());
++    }
++    WriteCompactSize(buf, msg.coins.size());
++    for (const Coin &coin : msg.coins) {
++        std::vector<uint8_t> encoded_coin;
++        if (!EncodeCoin(coin, encoded_coin)) {
++            error = "utxoshard failed to encode coin";
++            return false;
++        }
++        WriteCompactSize(buf, encoded_coin.size());
++        buf.insert(buf.end(), encoded_coin.begin(), encoded_coin.end());
++    }
++    out = std::move(buf);
++    error.clear();
++    return true;
++}
++
++bool DecodeUtxoShardMessage(const std::vector<uint8_t> &bytes,
++                            UtxoShardMessage &out,
++                            std::string &error) {
++    if (bytes.size() < 36) {
++        error = "truncated utxoshard message header";
++        return false;
++    }
++    UtxoShardMessage parsed;
++    std::copy_n(bytes.data(), 32, parsed.pivot_block_id.begin());
++    parsed.prefix_depth = bytes[32];
++    parsed.prefix_bits = ReadLE16(bytes.data() + 33);
++    if (parsed.prefix_depth < kMinUtxoShardPrefixDepth ||
++        parsed.prefix_depth > kMaxUtxoShardPrefixDepth) {
++        error = "utxoshard prefix_depth out of range [8..16]";
++        return false;
++    }
++    if (parsed.prefix_depth < 16 &&
++        (parsed.prefix_bits >> parsed.prefix_depth) != 0) {
++        error = "utxoshard prefix_bits out of range for prefix_depth";
++        return false;
++    }
++    const size_t expected_siblings =
++        static_cast<size_t>(parsed.prefix_depth - kMinUtxoShardPrefixDepth);
++    size_t offset = 35;
++    if (bytes.size() - offset < expected_siblings * 32) {
++        error = "truncated utxoshard boundary_siblings";
++        return false;
++    }
++    parsed.boundary_siblings.resize(expected_siblings);
++    for (size_t i = 0; i < expected_siblings; ++i) {
++        std::copy_n(bytes.data() + offset, 32,
++                    parsed.boundary_siblings[i].begin());
++        offset += 32;
++    }
++    uint64_t coin_count = 0;
++    if (!ReadCompactSize(bytes, offset, kMaxUtxoShardLeaves, coin_count)) {
++        error = "invalid or excessive utxoshard coin count";
++        return false;
++    }
++    parsed.coins.resize(static_cast<size_t>(coin_count));
++    for (size_t i = 0; i < parsed.coins.size(); ++i) {
++        uint64_t coin_len = 0;
++        if (!ReadCompactSize(bytes, offset, MAX_COIN_BYTES, coin_len) ||
++            bytes.size() - offset < coin_len) {
++            error = "truncated utxoshard coin record";
++            return false;
++        }
++        if (!DecodeCanonicalCoinBytes(bytes.data() + offset,
++                                      static_cast<size_t>(coin_len),
++                                      parsed.coins[i], error)) {
++            return false;
++        }
++        offset += static_cast<size_t>(coin_len);
++    }
++    if (offset != bytes.size()) {
++        error = "trailing bytes in utxoshard message";
++        return false;
++    }
++    out = std::move(parsed);
++    error.clear();
++    return true;
++}
++
++bool ExportUtxoRoots(const UtxoSet &utxo, const ChainId &chain_id,
++                     const Header &pivot_header, const MonetaryState &monetary,
++                     UtxoRootsMessage &out, std::string &error) {
++    Hash pivot_id{};
++    if (!BlockId(chain_id, pivot_header, pivot_id)) {
++        error = "invalid pivot header for ExportUtxoRoots";
++        return false;
++    }
++    if (StateRoot(chain_id, pivot_header.height, utxo.Root(), monetary) !=
++        pivot_header.state_root) {
++        error = "utxo and monetary state do not match pivot_header.state_root";
++        return false;
++    }
++
++    std::array<std::vector<KeyedCoinRef>, kFastSyncShardCount> buckets;
++    for (const Coin &coin : utxo.Coins()) {
++        const Hash key = OutpointKey(coin.outpoint);
++        const uint8_t shard_idx = key[0];
++        buckets[shard_idx].push_back(KeyedCoinRef{key, &coin});
++    }
++    for (auto &b : buckets) {
++        std::sort(b.begin(), b.end(),
++                  [](const KeyedCoinRef &a, const KeyedCoinRef &c) {
++                      return a.key < c.key;
++                  });
++    }
++
++    UtxoRootsMessage msg;
++    msg.pivot_block_id = pivot_id;
++    msg.height = pivot_header.height;
++    msg.monetary_state = EncodeMonetaryState(monetary);
++    for (size_t s = 0; s < kFastSyncShardCount; ++s) {
++        if (!ComputeSubtreeEntry(buckets[s], kMinUtxoShardPrefixDepth,
++                                 msg.shards[s])) {
++            error = "failed to compute depth-8 shard root entry";
++            return false;
++        }
++    }
++
++    const auto folded = FoldDepth8ShardRoots(msg.shards, &error);
++    if (!folded || *folded != utxo.Root()) {
++        error = "folded depth-8 shard roots do not match UtxoSet::Root()";
++        return false;
++    }
++    out = msg;
++    error.clear();
++    return true;
++}
++
++bool ExportUtxoShard(const UtxoSet &utxo, const Hash &pivot_block_id,
++                     uint8_t prefix_depth, uint16_t prefix_bits,
++                     UtxoShardMessage &out, std::string &error,
++                     size_t max_shard_leaves) {
++    if (prefix_depth < kMinUtxoShardPrefixDepth ||
++        prefix_depth > kMaxUtxoShardPrefixDepth) {
++        error = "prefix_depth out of range [8..16]";
++        return false;
++    }
++    if (prefix_depth < 16 && (prefix_bits >> prefix_depth) != 0) {
++        error = "prefix_bits has bits set above prefix_depth";
++        return false;
++    }
++
++    const uint8_t depth8_idx = static_cast<uint8_t>(prefix_bits & 0xFFu);
++    std::vector<KeyedCoinRef> depth8_entries;
++    for (const Coin &coin : utxo.Coins()) {
++        const Hash key = OutpointKey(coin.outpoint);
++        if (key[0] == depth8_idx) {
++            depth8_entries.push_back(KeyedCoinRef{key, &coin});
++        }
++    }
++    std::sort(depth8_entries.begin(), depth8_entries.end(),
++              [](const KeyedCoinRef &a, const KeyedCoinRef &b) {
++                  return a.key < b.key;
++              });
++
++    // Walk from depth 8 to prefix_depth, recording boundary sibling hashes.
++    std::vector<Hash> siblings_top_down;
++    siblings_top_down.reserve(prefix_depth - kMinUtxoShardPrefixDepth);
++    std::vector<KeyedCoinRef> current = std::move(depth8_entries);
++    for (uint8_t d = kMinUtxoShardPrefixDepth; d < prefix_depth; ++d) {
++        const bool target_bit = ((prefix_bits >> d) & 1u) != 0;
++        std::vector<KeyedCoinRef> target_side;
++        std::vector<KeyedCoinRef> sibling_side;
++        for (const auto &e : current) {
++            if (KeyBitAt(e.key, d) == target_bit) {
++                target_side.push_back(e);
++            } else {
++                sibling_side.push_back(e);
++            }
++        }
++        ShardRootEntry sib_entry{};
++        if (!ComputeSubtreeEntry(sibling_side, d + 1, sib_entry)) {
++            error = "failed computing boundary sibling subtree";
++            return false;
++        }
++        siblings_top_down.push_back(sib_entry.subtree_root);
++        current = std::move(target_side);
++    }
++
++    if (current.size() > max_shard_leaves ||
++        current.size() > kMaxUtxoShardLeaves) {
++        error = "requested shard exceeds maximum leaf count; split to deeper prefix_depth";
++        return false;
++    }
++
++    UtxoShardMessage msg;
++    msg.pivot_block_id = pivot_block_id;
++    msg.prefix_depth = prefix_depth;
++    msg.prefix_bits = prefix_bits;
++    // Order boundary_siblings from depth (prefix_depth - 1) down to depth 8.
++    msg.boundary_siblings.assign(siblings_top_down.rbegin(),
++                                 siblings_top_down.rend());
++    msg.coins.reserve(current.size());
++    for (const auto &e : current) {
++        msg.coins.push_back(*e.coin);
++    }
++    out = std::move(msg);
++    error.clear();
++    return true;
++}
++
++bool ExportAdaptiveUtxoShards(const UtxoSet &utxo, const Hash &pivot_block_id,
++                              std::vector<UtxoShardMessage> &out,
++                              std::string &error, size_t max_shard_leaves) {
++    if (max_shard_leaves == 0 || max_shard_leaves > kMaxUtxoShardLeaves) {
++        error = "invalid max_shard_leaves parameter";
++        return false;
++    }
++    std::array<std::vector<KeyedCoinRef>, kFastSyncShardCount> buckets;
++    for (const Coin &coin : utxo.Coins()) {
++        const Hash key = OutpointKey(coin.outpoint);
++        buckets[key[0]].push_back(KeyedCoinRef{key, &coin});
++    }
++    for (auto &b : buckets) {
++        std::sort(b.begin(), b.end(),
++                  [](const KeyedCoinRef &a, const KeyedCoinRef &c) {
++                      return a.key < c.key;
++                  });
++    }
++    std::vector<UtxoShardMessage> shards;
++    for (uint16_t s = 0; s < kFastSyncShardCount; ++s) {
++        if (buckets[s].empty()) continue;
++        if (!SplitAndExportShardsRecursive(utxo, pivot_block_id, buckets[s],
++                                           kMinUtxoShardPrefixDepth, s,
++                                           max_shard_leaves, shards, error)) {
++            return false;
++        }
++    }
++    out = std::move(shards);
++    error.clear();
++    return true;
++}
++
++bool AssembleAndVerifyFastSyncPivot(
++    const Header &pivot_header, const ChainId &chain_id,
++    const UtxoRootsMessage &roots_msg,
++    const std::vector<UtxoShardMessage> &shards, UtxoSet &out_utxo,
++    MonetaryState &out_monetary, std::string &error) {
++    if (!VerifyUtxoRootsAgainstHeader(pivot_header, chain_id, roots_msg,
++                                      error)) {
++        return false;
++    }
++
++    std::array<std::vector<const UtxoShardMessage *>, kFastSyncShardCount>
++        by_depth8;
++    for (const auto &shard : shards) {
++        if (shard.pivot_block_id != roots_msg.pivot_block_id) {
++            error = "utxoshard pivot_block_id mismatch";
++            return false;
++        }
++        if (shard.prefix_depth < kMinUtxoShardPrefixDepth ||
++            shard.prefix_depth > kMaxUtxoShardPrefixDepth) {
++            error = "utxoshard prefix_depth out of range";
++            return false;
++        }
++        const uint8_t s = static_cast<uint8_t>(shard.prefix_bits & 0xFFu);
++        by_depth8[s].push_back(&shard);
++    }
++
++    UtxoSet assembled;
++    for (size_t s = 0; s < kFastSyncShardCount; ++s) {
++        const ShardRootEntry &expected = roots_msg.shards[s];
++        const auto &subshards = by_depth8[s];
++        if (expected.cardinality_tag == 0) {
++            for (const auto *sub : subshards) {
++                ShardRootEntry sub_out{};
++                if (!VerifyAndBuildUtxoShard(expected, pivot_header.height,
++                                             *sub, &sub_out, error)) {
++                    return false;
++                }
++                if (!sub->coins.empty()) {
++                    error = "non-empty utxoshard supplied for empty depth-8 shard";
++                    return false;
++                }
++            }
++            continue;
++        }
++
++        if (subshards.empty()) {
++            error = "missing utxoshard for non-empty depth-8 shard " +
++                    std::to_string(s);
++            return false;
++        }
++
++        // Verify each subshard individually against the depth-8 entry and
++        // collect all coins for depth-8 shard s to ensure no missing sub-branches.
++        std::vector<KeyedCoinRef> shard_coins;
++        std::set<std::pair<uint8_t, uint16_t>> seen_prefixes;
++        for (const auto *sub : subshards) {
++            if (!seen_prefixes
++                     .emplace(sub->prefix_depth, sub->prefix_bits)
++                     .second) {
++                error = "duplicate utxoshard prefix";
++                return false;
++            }
++            ShardRootEntry sub_out{};
++            if (!VerifyAndBuildUtxoShard(expected, pivot_header.height, *sub,
++                                         &sub_out, error)) {
++                return false;
++            }
++            for (const Coin &coin : sub->coins) {
++                if (!assembled.Insert(coin)) {
++                    error = "overlapping or invalid coin across subshards";
++                    return false;
++                }
++                shard_coins.push_back(
++                    KeyedCoinRef{OutpointKey(coin.outpoint), &coin});
++            }
++        }
++        std::sort(shard_coins.begin(), shard_coins.end(),
++                  [](const KeyedCoinRef &a, const KeyedCoinRef &b) {
++                      return a.key < b.key;
++                  });
++        ShardRootEntry combined_depth8{};
++        if (!ComputeSubtreeEntry(shard_coins, kMinUtxoShardPrefixDepth,
++                                 combined_depth8) ||
++            combined_depth8 != expected) {
++            error = "incomplete subshard coverage for depth-8 shard " +
++                    std::to_string(s);
++            return false;
++        }
++    }
++
++    MonetaryState mon = DecodeMonetaryState(
++        std::vector<uint8_t>(roots_msg.monetary_state.begin(),
++                             roots_msg.monetary_state.end()));
++    if (StateRoot(chain_id, pivot_header.height, assembled.Root(), mon) !=
++        pivot_header.state_root) {
++        error = "assembled fast-sync UtxoSet root does not match pivot header state_root";
++        return false;
++    }
++
++    out_utxo = std::move(assembled);
++    out_monetary = mon;
++    error.clear();
++    return true;
++}
++
++bool ExportDiskUtxoRoots(const DiskStateStore &store, const ChainId &chain_id,
++                         UtxoRootsMessage &out, std::string &error) {
++    if (!store.IsOpen()) {
++        error = "disk state store is closed";
++        return false;
++    }
++    const DiskStateMetadata meta = store.Metadata();
++    Header pivot_header{};
++    if (!ParseHeader(meta.header.data(), meta.header.size(), pivot_header)) {
++        error = "failed to parse pivot header from store metadata";
++        return false;
++    }
++    MonetaryState mon{};
++    try {
++        mon = DecodeMonetaryState(meta.monetary);
++    } catch (const std::exception &e) {
++        error = e.what();
++        return false;
++    }
++    std::vector<Coin> coins;
++    DiskStateError disk_err;
++    if (!store.ExportCoins(coins, disk_err)) {
++        error = disk_err.message;
++        return false;
++    }
++    UtxoSet utxo;
++    for (const Coin &c : coins) {
++        if (!utxo.Insert(c)) {
++            error = "failed to insert exported disk coin into UtxoSet";
++            return false;
++        }
++    }
++    return ExportUtxoRoots(utxo, chain_id, pivot_header, mon, out, error);
++}
++
++bool ImportVerifiedFastSyncPivotToDisk(
++    const Header &pivot_header, const ChainId &chain_id,
++    const std::vector<Header> &history, const UtxoRootsMessage &roots_msg,
++    const std::vector<UtxoShardMessage> &shards, DiskStateStore &store,
++    std::string &error) {
++    UtxoSet verified_utxo;
++    MonetaryState verified_monetary{};
++    if (!AssembleAndVerifyFastSyncPivot(pivot_header, chain_id, roots_msg,
++                                        shards, verified_utxo,
++                                        verified_monetary, error)) {
++        return false;
++    }
++    DiskStateMetadata meta;
++    meta.tip = roots_msg.pivot_block_id;
++    std::array<uint8_t, HEADER_SIZE> raw_hdr{};
++    if (!SerializeHeader(pivot_header, raw_hdr)) {
++        error = "failed to serialize pivot header";
++        return false;
++    }
++    meta.header.assign(raw_hdr.begin(), raw_hdr.end());
++    meta.monetary.assign(roots_msg.monetary_state.begin(),
++                         roots_msg.monetary_state.end());
++    if (!history.empty()) {
++        try {
++            meta.auxiliary = EncodeDiskChainContext(history, {});
++        } catch (const std::exception &e) {
++            error = e.what();
++            return false;
++        }
++    }
++    DiskStateError disk_err;
++    if (!store.ImportFastSyncPivot(meta, pivot_header, verified_utxo.Coins(),
++                                   disk_err)) {
++        error = disk_err.message;
++        return false;
++    }
++    error.clear();
++    return true;
++}
++
++} // namespace lotus::v2
+diff --git a/src/lotus_v2/fast_sync.h b/src/lotus_v2/fast_sync.h
+new file mode 100644
+index 0000000000..c46c1c7eec
+--- /dev/null
++++ b/src/lotus_v2/fast_sync.h
+@@ -0,0 +1,173 @@
++// Copyright (c) 2026 The Lotus developers
++// Fast UTXO Shard Sync protocol, cryptographic verification, and pivot eligibility.
++#ifndef LOTUS_V2_FAST_SYNC_H
++#define LOTUS_V2_FAST_SYNC_H
++
++#include "disk_state.h"
++#include "header.h"
++#include "monetary.h"
++#include "sparse_state.h"
++
++#include <array>
++#include <cstddef>
++#include <cstdint>
++#include <optional>
++#include <string>
++#include <vector>
++
++namespace lotus::v2 {
++
++inline constexpr size_t kFastSyncShardCount = 256;
++inline constexpr uint8_t kMinUtxoShardPrefixDepth = 8;
++inline constexpr uint8_t kMaxUtxoShardPrefixDepth = 16;
++inline constexpr size_t kMaxUtxoShardLeaves = 4096;
++inline constexpr uint64_t kFastSyncMinBuriedBlocks = 100;
++inline constexpr size_t kFastSyncMinNetgroupConfirmations = 3;
++inline constexpr uint64_t kFastSyncPivotSafetyCushion = 10;
++
++// Cardinality tag for P02 single-leaf collapse verification (Hole 11 defense):
++// 0 = Empty (subtree_root == EmptyUtxoRoot())
++// 1 = SingleLeaf (subtree_root == UtxoLeaf(coin), collapsed without UtxoNode hashing)
++// 2 = InteriorNode (>= 2 leaves, subtree_root == UtxoNode(depth, left, right))
++struct ShardRootEntry {
++    uint8_t cardinality_tag = 0;
++    Hash subtree_root = EmptyUtxoRoot();
++    bool operator==(const ShardRootEntry &) const = default;
++};
++
++struct GetUtxoRootsRequest {
++    Hash pivot_block_id{};
++    bool operator==(const GetUtxoRootsRequest &) const = default;
++};
++
++struct UtxoRootsMessage {
++    Hash pivot_block_id{};
++    uint64_t height = 0;
++    std::array<uint8_t, 56> monetary_state{};
++    std::array<ShardRootEntry, kFastSyncShardCount> shards{};
++    bool operator==(const UtxoRootsMessage &) const = default;
++};
++
++struct GetUtxoShardRequest {
++    Hash pivot_block_id{};
++    uint8_t prefix_depth = kMinUtxoShardPrefixDepth;
++    uint16_t prefix_bits = 0;
++    bool operator==(const GetUtxoShardRequest &) const = default;
++};
++
++struct UtxoShardMessage {
++    Hash pivot_block_id{};
++    uint8_t prefix_depth = kMinUtxoShardPrefixDepth;
++    uint16_t prefix_bits = 0;
++    // Ordered from depth (prefix_depth - 1) down to depth 8.
++    std::vector<Hash> boundary_siblings;
++    // Sorted by OutpointKey(coin.outpoint), max kMaxUtxoShardLeaves (4096).
++    std::vector<Coin> coins;
++};
++
++// Hole 13 & Hole 14: Dual Pivot Authentication Gate and Pivot Safety Cushion.
++struct FastSyncPivotCandidate {
++    uint64_t pivot_height = 0;
++    uint64_t best_header_height = 0;
++    bool has_minimum_chain_work = false;
++    bool is_avalanche_finalized = false;
++    uint64_t buried_blocks = 0;
++    size_t distinct_netgroup_confirmations = 0;
++};
++
++bool CheckFastSyncPivotEligibility(const FastSyncPivotCandidate &candidate,
++                                   std::string &error);
++
++// Extracts the little-endian prefix bits of outpoint_key for depths [0 .. prefix_depth - 1].
++// For prefix_depth == 8, this equals uint16_t(outpoint_key[0]).
++uint16_t OutpointPrefixBits(const Hash &outpoint_key, uint8_t prefix_depth);
++
++bool IsValidShardRootEntry(const ShardRootEntry &entry);
++
++// Folds two sibling subtrees at parent `depth` using exact P02 single-leaf collapse rules.
++bool FoldShardPair(uint8_t depth, const ShardRootEntry &left,
++                   const ShardRootEntry &right, ShardRootEntry &out);
++
++// Folds 256 depth-8 ShardRootEntries from depth d = 7 down to d = 0 (Hole 11 defense).
++std::optional<Hash> FoldDepth8ShardRoots(
++    const std::array<ShardRootEntry, kFastSyncShardCount> &shards,
++    std::string *error = nullptr);
++
++// Verifies UtxoRootsMessage against an authenticated pivot header's state_root.
++bool VerifyUtxoRootsAgainstHeader(const Header &pivot_header,
++                                  const ChainId &chain_id,
++                                  const UtxoRootsMessage &msg,
++                                  std::string &error);
++
++// Verifies a UtxoShardMessage (depth k in [8..16], max 4096 leaves, strict prefix
++// membership, strict ascending OutpointKey order, no burn outputs, creation_height <= pivot_height,
++// and boundary-sibling folding up to depth 8) before any disk write (Holes 11 & 15 defense).
++bool VerifyAndBuildUtxoShard(const ShardRootEntry &expected_depth8_entry,
++                             uint64_t pivot_height,
++                             const UtxoShardMessage &shard,
++                             ShardRootEntry *computed_subshard_out,
++                             std::string &error);
++
++// Wire serialization for P2P messages (getutxoroots, utxoroots, getutxoshard, utxoshard).
++std::vector<uint8_t> EncodeGetUtxoRootsRequest(const GetUtxoRootsRequest &req);
++bool DecodeGetUtxoRootsRequest(const std::vector<uint8_t> &bytes,
++                               GetUtxoRootsRequest &out,
++                               std::string &error);
++
++std::vector<uint8_t> EncodeUtxoRootsMessage(const UtxoRootsMessage &msg);
++bool DecodeUtxoRootsMessage(const std::vector<uint8_t> &bytes,
++                            UtxoRootsMessage &out,
++                            std::string &error);
++
++bool EncodeGetUtxoShardRequest(const GetUtxoShardRequest &req,
++                               std::vector<uint8_t> &out,
++                               std::string &error);
++bool DecodeGetUtxoShardRequest(const std::vector<uint8_t> &bytes,
++                               GetUtxoShardRequest &out,
++                               std::string &error);
++
++bool EncodeUtxoShardMessage(const UtxoShardMessage &msg,
++                            std::vector<uint8_t> &out,
++                            std::string &error);
++bool DecodeUtxoShardMessage(const std::vector<uint8_t> &bytes,
++                            UtxoShardMessage &out,
++                            std::string &error);
++
++// Export 256 depth-8 ShardRootEntries and 56-byte MonetaryState from a UtxoSet or DiskStateStore.
++bool ExportUtxoRoots(const UtxoSet &utxo, const ChainId &chain_id,
++                     const Header &pivot_header, const MonetaryState &monetary,
++                     UtxoRootsMessage &out, std::string &error);
++
++bool ExportUtxoShard(const UtxoSet &utxo, const Hash &pivot_block_id,
++                     uint8_t prefix_depth, uint16_t prefix_bits,
++                     UtxoShardMessage &out, std::string &error,
++                     size_t max_shard_leaves = kMaxUtxoShardLeaves);
++
++// Exports all non-empty shards for a pivot UtxoSet, adaptively splitting any shard
++// exceeding `max_shard_leaves` down to depth k in [8..16].
++bool ExportAdaptiveUtxoShards(const UtxoSet &utxo, const Hash &pivot_block_id,
++                              std::vector<UtxoShardMessage> &out,
++                              std::string &error,
++                              size_t max_shard_leaves = kMaxUtxoShardLeaves);
++
++// Assembles and cryptographically verifies a complete set of UTXO shards against
++// the pivot header and UtxoRootsMessage, producing the authenticated UtxoSet and MonetaryState.
++bool AssembleAndVerifyFastSyncPivot(
++    const Header &pivot_header, const ChainId &chain_id,
++    const UtxoRootsMessage &roots_msg,
++    const std::vector<UtxoShardMessage> &shards, UtxoSet &out_utxo,
++    MonetaryState &out_monetary, std::string &error);
++
++// DiskStateStore helpers for exporting and importing fast-sync pivot state.
++bool ExportDiskUtxoRoots(const DiskStateStore &store, const ChainId &chain_id,
++                         UtxoRootsMessage &out, std::string &error);
++
++bool ImportVerifiedFastSyncPivotToDisk(
++    const Header &pivot_header, const ChainId &chain_id,
++    const std::vector<Header> &history, const UtxoRootsMessage &roots_msg,
++    const std::vector<UtxoShardMessage> &shards, DiskStateStore &store,
++    std::string &error);
++
++} // namespace lotus::v2
++
++#endif // LOTUS_V2_FAST_SYNC_H
+diff --git a/src/net/v2_protocol_handler.cpp b/src/net/v2_protocol_handler.cpp
+index 02d16edf2e..ed4ad36b1e 100644
+--- a/src/net/v2_protocol_handler.cpp
++++ b/src/net/v2_protocol_handler.cpp
+@@ -348,6 +348,97 @@ std::shared_ptr<const CBlock> V2PeerProtocolHandler::MatchCandidateOverlay(
+         return nullptr;
+     }
+ 
++    uint64_t parent_mtp = 0;
++    if (!header.hashStateRoot.IsNull()) {
++        LOCK(cs_main);
++        const CBlockIndex *pindex_prev =
++            m_chainman.m_blockman.LookupBlockIndex(header.hashPrevBlock);
++        if (pindex_prev) {
++            parent_mtp =
++                static_cast<uint64_t>(pindex_prev->GetMedianTimePast());
++        }
++    }
++
++    lotus::v2::Hash cb_tx_id{};
++    std::memcpy(cb_tx_id.data(), coinbase_tx->GetId().begin(), 32);
++    lotus::v2::Hash prev_block_id{};
++    std::memcpy(prev_block_id.data(), header.hashPrevBlock.begin(), 32);
++
++    // Check progressive Merklix overlay layers (finalized epoch layers L_k and
++    // live speculative layer L_spec) in O(1) using pre-computed Subtree A and
++    // UTXO overlay roots before falling back to explicit candidates.
++    {
++        LOCK(m_mempool.cs);
++        auto try_match_layer = [&](const lotus::v2::MempoolOverlayLayer &layer)
++            -> std::shared_ptr<const CBlock> {
++            const uint256 expected_merkle_root =
++                lotus::v2::net::ComputeV2TxRootFromSubtreeA(
++                    *coinbase_tx, layer.GetSubtreeARoot());
++            if (expected_merkle_root != header.hashMerkleRoot ||
++                layer.Contains(cb_tx_id)) {
++                return nullptr;
++            }
++            if (!header.hashStateRoot.IsNull() &&
++                layer.GetParentBlockId() == prev_block_id &&
++                layer.GetHeight() == static_cast<uint64_t>(header.nHeight) &&
++                layer.GetParentMtp() == parent_mtp) {
++                const uint256 expected_state_root =
++                    ComputeV2StateRootFromOverlay(
++                        *coinbase_tx, layer, header.nBits,
++                        static_cast<uint64_t>(header.nHeight), parent_mtp,
++                        /*record=*/false);
++                if (expected_state_root != header.hashStateRoot) {
++                    return nullptr;
++                }
++            }
++            auto block = std::make_shared<CBlock>(header);
++            block->vtx.reserve(1 + layer.GetTxCount());
++            block->vtx.push_back(coinbase_tx);
++            for (const auto &[_, oentry] : layer.GetOrderedTxs()) {
++                CTransactionRef tx =
++                    std::static_pointer_cast<const CTransaction>(oentry.tx_ref);
++                if (!tx) {
++                    uint256 raw_id;
++                    std::memcpy(raw_id.begin(), oentry.tx_id.data(), 32);
++                    tx = m_mempool.get(TxId(raw_id));
++                }
++                if (!tx) {
++                    return nullptr;
++                }
++                block->vtx.push_back(std::move(tx));
++            }
++            if (!header.hashStateRoot.IsNull() &&
++                !(layer.GetParentBlockId() == prev_block_id &&
++                  layer.GetHeight() == static_cast<uint64_t>(header.nHeight) &&
++                  layer.GetParentMtp() == parent_mtp)) {
++                const uint256 expected_state_root = ComputeV2BlockStateRoot(
++                    *block, header.hashPrevBlock,
++                    static_cast<uint64_t>(header.nHeight), parent_mtp,
++                    /*record=*/false);
++                if (expected_state_root != header.hashStateRoot) {
++                    return nullptr;
++                }
++            }
++            return block;
++        };
++
++        // Optimization (rolled into initial V2 protocol handler): query
++        // CTxMemPool::GetOverlayManager()'s frozen pre-consensus epoch layers
++        // (L_k) and speculative mempool layer (L_spec) in O(1) via precomputed
++        // Subtree A and UTXO overlay roots before scanning explicit candidates.
++        auto &overlay_mgr = m_mempool.GetOverlayManager();
++        const auto &frozen_epochs = overlay_mgr.GetFrozenEpochs();
++        for (auto it = frozen_epochs.rbegin(); it != frozen_epochs.rend();
++             ++it) {
++            if (auto matched = try_match_layer(*it)) {
++                return matched;
++            }
++        }
++        if (auto matched = try_match_layer(overlay_mgr.GetSpeculativeOverlay())) {
++            return matched;
++        }
++    }
++
+     std::vector<CandidateOverlayEntry> candidates;
+     {
+         LOCK(m_mutex);
+diff --git a/src/test/CMakeLists.txt b/src/test/CMakeLists.txt
+index ac0db01c35..04dc06f14c 100644
+--- a/src/test/CMakeLists.txt
++++ b/src/test/CMakeLists.txt
+@@ -176,6 +176,7 @@ add_boost_unit_tests_to_suite(bitcoin test_bitcoin
+ 		dstencode_tests.cpp
+ 		feefrac_tests.cpp
+ 		feerate_tests.cpp
++		fast_sync_shard_tests.cpp
+ 		flatfile_tests.cpp
+ 		fs_tests.cpp
+ 		getarg_tests.cpp
+diff --git a/src/test/fast_sync_shard_tests.cpp b/src/test/fast_sync_shard_tests.cpp
+new file mode 100644
+index 0000000000..18bc05559a
+--- /dev/null
++++ b/src/test/fast_sync_shard_tests.cpp
+@@ -0,0 +1,297 @@
++// Copyright (c) 2026 The Lotus developers
++// Distributed under the MIT software license, see the accompanying
++// file COPYING or http://www.opensource.org/licenses/mit-license.php.
++
++#include <lotus_v2/fast_sync.h>
++#include <protocol.h>
++#include <test/util/setup_common.h>
++
++#include <boost/test/unit_test.hpp>
++
++#include <algorithm>
++#include <filesystem>
++
++using namespace lotus::v2;
++
++namespace {
++
++Output MakeSpendableOutput(uint64_t value) {
++    Output o;
++    o.value = value;
++    o.flags = 0;
++    o.branches = {BranchLeaf(std::vector<uint8_t>{0x4e})};
++    o.paths = {{0}};
++    return o;
++}
++
++lotus::v2::Coin MakeCoinWithIndex(uint8_t tx_seed, uint32_t index,
++                                  uint64_t value, uint64_t height = 10) {
++    lotus::v2::Coin c;
++    c.outpoint.tx_id.fill(0);
++    c.outpoint.tx_id[0] = tx_seed;
++    c.outpoint.tx_id[1] = static_cast<uint8_t>((index * 37u + tx_seed) & 0xFFu);
++    c.outpoint.tx_id[2] = static_cast<uint8_t>((index >> 8) & 0xFFu);
++    c.outpoint.index = index;
++    c.output = MakeSpendableOutput(value);
++    c.creation_height = height;
++    c.creation_parent_mtp = 1000 + height * 120;
++    c.coinbase = (index == 0);
++    return c;
++}
++
++MonetaryState MakeTestMonetaryState() {
++    MonetaryState m{};
++    m.bootstrap_reserve = 500000000;
++    m.tail_subsidy = 94;
++    m.prev_work[0] = 2;
++    m.ema_block_cost = 4000;
++    return m;
++}
++
++Header MakePivotHeader(const ChainId &chain_id, uint64_t height,
++                       const lotus::v2::Hash &utxo_root,
++                       const MonetaryState &monetary) {
++    Header h{};
++    h.version = 2;
++    h.prev_id.fill(0x11);
++    h.bits = 0x207fffff;
++    h.time = 1000 + height * 120;
++    h.nonce = 42;
++    h.size = HEADER_SIZE + 4;
++    h.height = height;
++    h.tx_root.fill(0x22);
++    h.state_root = StateRoot(chain_id, height, utxo_root, monetary);
++    return h;
++}
++
++} // namespace
++
++BOOST_FIXTURE_TEST_SUITE(fast_sync_shard_tests, BasicTestingSetup)
++
++BOOST_AUTO_TEST_CASE(protocol_message_types_and_wire_roundtrip) {
++    const auto &all_types = getAllNetMessageTypes();
++    BOOST_CHECK(std::find(all_types.begin(), all_types.end(),
++                          std::string(NetMsgType::GETUTXOROOTS)) !=
++                all_types.end());
++    BOOST_CHECK(std::find(all_types.begin(), all_types.end(),
++                          std::string(NetMsgType::UTXOROOTS)) !=
++                all_types.end());
++    BOOST_CHECK(std::find(all_types.begin(), all_types.end(),
++                          std::string(NetMsgType::GETUTXOSHARD)) !=
++                all_types.end());
++    BOOST_CHECK(std::find(all_types.begin(), all_types.end(),
++                          std::string(NetMsgType::UTXOSHARD)) !=
++                all_types.end());
++
++    GetUtxoRootsRequest req{};
++    req.pivot_block_id.fill(0xAB);
++    const auto req_bytes = EncodeGetUtxoRootsRequest(req);
++    GetUtxoRootsRequest decoded_req{};
++    std::string error;
++    BOOST_CHECK(DecodeGetUtxoRootsRequest(req_bytes, decoded_req, error));
++    BOOST_CHECK(decoded_req == req);
++
++    GetUtxoShardRequest sreq{};
++    sreq.pivot_block_id.fill(0xCD);
++    sreq.prefix_depth = 11;
++    sreq.prefix_bits = 0x05A2;
++    std::vector<uint8_t> sreq_bytes;
++    BOOST_CHECK(EncodeGetUtxoShardRequest(sreq, sreq_bytes, error));
++    GetUtxoShardRequest decoded_sreq{};
++    BOOST_CHECK(DecodeGetUtxoShardRequest(sreq_bytes, decoded_sreq, error));
++    BOOST_CHECK(decoded_sreq == sreq);
++}
++
++BOOST_AUTO_TEST_CASE(depth8_shard_roots_export_fold_and_adaptive_subshards) {
++    ChainId chain_id{};
++    chain_id[0] = 0x77;
++    const uint64_t pivot_height = 150;
++    const MonetaryState monetary = MakeTestMonetaryState();
++
++    UtxoSet utxo;
++    // Populate shard 0x05 with a single leaf (cardinality_tag = 1).
++    BOOST_REQUIRE(utxo.Insert(MakeCoinWithIndex(0x05, 1, 1000, 10)));
++    // Populate shard 0x2A with 20 leaves so we can test adaptive splitting at max_shard_leaves = 6.
++    for (uint32_t i = 0; i < 20; ++i) {
++        BOOST_REQUIRE(utxo.Insert(MakeCoinWithIndex(0x2A, i + 1, 500 + i, 20)));
++    }
++    // Populate shard 0xFE with 3 leaves (cardinality_tag = 2).
++    for (uint32_t i = 0; i < 3; ++i) {
++        BOOST_REQUIRE(utxo.Insert(MakeCoinWithIndex(0xFE, i + 1, 900 + i, 30)));
++    }
++
++    const Header pivot_header =
++        MakePivotHeader(chain_id, pivot_height, utxo.Root(), monetary);
++
++    UtxoRootsMessage roots_msg{};
++    std::string error;
++    BOOST_REQUIRE(ExportUtxoRoots(utxo, chain_id, pivot_header, monetary,
++                                  roots_msg, error));
++    BOOST_CHECK_EQUAL(roots_msg.shards[0x05].cardinality_tag, 1);
++    BOOST_CHECK_EQUAL(roots_msg.shards[0x2A].cardinality_tag, 2);
++    BOOST_CHECK_EQUAL(roots_msg.shards[0xFE].cardinality_tag, 2);
++    BOOST_CHECK_EQUAL(roots_msg.shards[0x00].cardinality_tag, 0);
++
++    // Wire roundtrip of UtxoRootsMessage.
++    const auto roots_wire = EncodeUtxoRootsMessage(roots_msg);
++    UtxoRootsMessage decoded_roots{};
++    BOOST_REQUIRE(DecodeUtxoRootsMessage(roots_wire, decoded_roots, error));
++    BOOST_REQUIRE(VerifyUtxoRootsAgainstHeader(pivot_header, chain_id,
++                                               decoded_roots, error));
++
++    // Export adaptive sub-shards with max_shard_leaves = 6 so shard 0x2A splits to depth > 8.
++    std::vector<UtxoShardMessage> shards;
++    BOOST_REQUIRE(ExportAdaptiveUtxoShards(utxo, roots_msg.pivot_block_id,
++                                           shards, error,
++                                           /*max_shard_leaves=*/6));
++    bool saw_deeper_subshard = false;
++    for (const auto &s : shards) {
++        if (s.prefix_depth > 8) saw_deeper_subshard = true;
++        std::vector<uint8_t> swire;
++        BOOST_REQUIRE(EncodeUtxoShardMessage(s, swire, error));
++        UtxoShardMessage sdecoded{};
++        BOOST_REQUIRE(DecodeUtxoShardMessage(swire, sdecoded, error));
++        const uint8_t d8 = static_cast<uint8_t>(sdecoded.prefix_bits & 0xFFu);
++        BOOST_REQUIRE(VerifyAndBuildUtxoShard(decoded_roots.shards[d8],
++                                              pivot_height, sdecoded, nullptr,
++                                              error));
++    }
++    BOOST_CHECK(saw_deeper_subshard);
++
++    // Assemble full pivot UtxoSet and import into DiskStateStore.
++    UtxoSet assembled;
++    MonetaryState assembled_monetary{};
++    BOOST_REQUIRE(AssembleAndVerifyFastSyncPivot(
++        pivot_header, chain_id, decoded_roots, shards, assembled,
++        assembled_monetary, error));
++    BOOST_CHECK(assembled.Root() == utxo.Root());
++    BOOST_CHECK_EQUAL(assembled.Size(), utxo.Size());
++
++    const auto temp_dir = m_args.GetDataDirNet() / "fast_sync_disk_test";
++    std::filesystem::create_directories(temp_dir);
++    DiskStateOptions opts{};
++    opts.identity = chain_id;
++    opts.profile_digest.fill(0x33);
++    DiskStateStore store;
++    DiskStateError disk_err{};
++    BOOST_REQUIRE(
++        DiskStateStore::Open(temp_dir.string(), opts, {}, store, disk_err));
++    BOOST_REQUIRE(ImportVerifiedFastSyncPivotToDisk(
++        pivot_header, chain_id, {}, decoded_roots, shards, store, error));
++    BOOST_CHECK(store.Root() == utxo.Root());
++
++    UtxoRootsMessage exported_from_disk{};
++    BOOST_REQUIRE(
++        ExportDiskUtxoRoots(store, chain_id, exported_from_disk, error));
++    BOOST_CHECK(exported_from_disk == decoded_roots);
++}
++
++BOOST_AUTO_TEST_CASE(adversarial_hole_11_13_14_15_defenses) {
++    ChainId chain_id{};
++    chain_id[0] = 0x99;
++    const uint64_t pivot_height = 200;
++    const MonetaryState monetary = MakeTestMonetaryState();
++
++    UtxoSet utxo;
++    const lotus::v2::Coin coin_s1 = MakeCoinWithIndex(0x01, 1, 2000, 50);
++    const lotus::v2::Coin coin_s2_a = MakeCoinWithIndex(0x02, 1, 3000, 60);
++    const lotus::v2::Coin coin_s2_b = MakeCoinWithIndex(0x02, 2, 4000, 70);
++    BOOST_REQUIRE(utxo.Insert(coin_s1));
++    BOOST_REQUIRE(utxo.Insert(coin_s2_a));
++    BOOST_REQUIRE(utxo.Insert(coin_s2_b));
++
++    const Header pivot_header =
++        MakePivotHeader(chain_id, pivot_height, utxo.Root(), monetary);
++    UtxoRootsMessage roots_msg{};
++    std::string error;
++    BOOST_REQUIRE(ExportUtxoRoots(utxo, chain_id, pivot_header, monetary,
++                                  roots_msg, error));
++
++    // Hole 11a: Spoofing cardinality_tag (1 -> 2) on single-leaf shard 0x01 must fail header verification.
++    {
++        UtxoRootsMessage spoofed = roots_msg;
++        spoofed.shards[0x01].cardinality_tag = 2;
++        BOOST_CHECK(!VerifyUtxoRootsAgainstHeader(pivot_header, chain_id,
++                                                  spoofed, error));
++    }
++
++    UtxoShardMessage shard_s2{};
++    BOOST_REQUIRE(ExportUtxoShard(utxo, roots_msg.pivot_block_id, 8, 0x02,
++                                  shard_s2, error));
++
++    // Hole 11b: Cross-shard key smuggling (injecting coin from shard 0x01 into shard 0x02).
++    {
++        UtxoShardMessage smuggled = shard_s2;
++        smuggled.coins.push_back(coin_s1);
++        BOOST_CHECK(!VerifyAndBuildUtxoShard(
++            roots_msg.shards[0x02], pivot_height, smuggled, nullptr, error));
++    }
++
++    // Hole 11c: Unsorted / duplicate coin keys in shard.
++    {
++        UtxoShardMessage unsorted = shard_s2;
++        std::reverse(unsorted.coins.begin(), unsorted.coins.end());
++        BOOST_CHECK(!VerifyAndBuildUtxoShard(
++            roots_msg.shards[0x02], pivot_height, unsorted, nullptr, error));
++    }
++
++    // Hole 11d: Burn output (flags & 0x02) smuggled in shard.
++    {
++        UtxoShardMessage burned = shard_s2;
++        burned.coins[0].output.flags = 0x02;
++        burned.coins[0].output.paths.clear();
++        BOOST_CHECK(!VerifyAndBuildUtxoShard(
++            roots_msg.shards[0x02], pivot_height, burned, nullptr, error));
++    }
++
++    // Hole 11e: Coin creation_height > pivot_height.
++    {
++        UtxoShardMessage future_coin = shard_s2;
++        future_coin.coins[0].creation_height = pivot_height + 1;
++        BOOST_CHECK(!VerifyAndBuildUtxoShard(roots_msg.shards[0x02],
++                                             pivot_height, future_coin, nullptr,
++                                             error));
++    }
++
++    // Hole 15: Exceeding 4096 leaves or invalid prefix_depth.
++    {
++        UtxoShardMessage oversized = shard_s2;
++        oversized.coins.resize(kMaxUtxoShardLeaves + 1, coin_s2_a);
++        BOOST_CHECK(!VerifyAndBuildUtxoShard(
++            roots_msg.shards[0x02], pivot_height, oversized, nullptr, error));
++
++        UtxoShardMessage bad_depth = shard_s2;
++        bad_depth.prefix_depth = 17;
++        BOOST_CHECK(!VerifyAndBuildUtxoShard(
++            roots_msg.shards[0x02], pivot_height, bad_depth, nullptr, error));
++    }
++
++    // Holes 13 & 14: Dual Pivot Authentication Gate and 10-block Pivot Safety Cushion.
++    {
++        FastSyncPivotCandidate cand{};
++        cand.pivot_height = 500;
++        cand.best_header_height = 600;
++        cand.has_minimum_chain_work = false;
++        cand.is_avalanche_finalized = true;
++        BOOST_CHECK(!CheckFastSyncPivotEligibility(cand, error));
++
++        cand.has_minimum_chain_work = true;
++        cand.is_avalanche_finalized = false;
++        cand.buried_blocks = 99;
++        cand.distinct_netgroup_confirmations = 3;
++        BOOST_CHECK(!CheckFastSyncPivotEligibility(cand, error));
++
++        cand.buried_blocks = 100;
++        cand.distinct_netgroup_confirmations = 2;
++        BOOST_CHECK(!CheckFastSyncPivotEligibility(cand, error));
++
++        cand.distinct_netgroup_confirmations = 3;
++        cand.pivot_height = 595; // Only 5 blocks below tip (< 10 cushion).
++        BOOST_CHECK(!CheckFastSyncPivotEligibility(cand, error));
++
++        cand.pivot_height = 500;
++        BOOST_CHECK(CheckFastSyncPivotEligibility(cand, error));
++    }
++}
++
++BOOST_AUTO_TEST_SUITE_END()
+-- 
+2.50.1 (Apple Git-155)
+

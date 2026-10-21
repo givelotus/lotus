@@ -1,0 +1,310 @@
+diff --cc src/net_processing.cpp
+index ba266a7bf8,4652fc56b2..0000000000
+--- a/src/net_processing.cpp
++++ b/src/net_processing.cpp
+@@@ -3177,12 -3076,162 +3281,171 @@@ PeerManagerImpl::PeerManagerImpl(CConnm
+        m_chainparams(chainman.GetParams()), m_connman(connman),
+        m_addrman(addrman), m_banman(banman), m_chainman(chainman),
+        m_mempool(pool), m_avalanche(avalanche), m_opts{opts},
+++<<<<<<< HEAD
+ +      m_txrelay_index{opts.txrelay_shortid_bits},
+ +      m_v2_protocol_handler{m_chainman, m_mempool, m_connman, *this},
+ +      m_block_messages{opts.block_message_cache_bytes} {
+ +    m_v2_protocol_handler.SetTxRelayEpochProvider(this);
+ +    m_v2_protocol_handler.SetServeUtxoShards(
+ +        gArgs.GetBoolArg("-serveutxoshards", true));
+++=======
++       m_v2_protocol_handler{m_chainman, m_mempool, m_connman, *this} {
++     m_v2_protocol_handler.SetAvalancheProcessor(m_avalanche);
++     if (m_opts.parallel_admission) {
++         m_tx_admission_queue = std::make_unique<node::TxAdmissionQueue>(
++             node::TxAdmissionQueue::Limits{});
++         m_tx_admission_running = true;
++         m_tx_admission_thread = std::thread(&util::TraceThread, "txadmit",
++                                             [this] { ThreadTxAdmission(); });
++     }
++ }
++ 
++ void PeerManagerImpl::StopTxAdmission() {
++     if (!m_tx_admission_queue) {
++         return;
++     }
++     {
++         // Fence producers before draining their CNode references. A message
++         // turn that already observed "running" must finish queueing before
++         // we stop; subsequent turns select the serial path.
++         LOCK(g_msgproc_mutex);
++         m_tx_admission_running = false;
++     }
++     m_tx_admission_queue->Interrupt();
++     if (m_tx_admission_thread.joinable()) {
++         m_tx_admission_thread.join();
++     }
++     // Release the CNode references of everything not handled yet, before
++     // CConnman deletes its nodes. The message thread falls back to serial
++     // handling from here on.
++     m_tx_admission_queue->TakeAll();
++     LOCK(m_tx_admission_done_mutex);
++     m_tx_admission_done.clear();
++ }
++ 
++ void PeerManagerImpl::ThreadTxAdmission() {
++     const size_t threads =
++         m_opts.parallel_admission_threads > 0
++             ? size_t(m_opts.parallel_admission_threads)
++             : size_t(std::max(1U, std::thread::hardware_concurrency()));
++     StagedAdmissionOptions options;
++     options.script_threads = threads;
++     // Serial handling checks "already have" right before admitting; repeat
++     // that check at the commit point (the transaction may have arrived by
++     // another route since it was queued).
++     options.skip_at_commit =
++         [this](const CTransactionRef &tx) EXCLUSIVE_LOCKS_REQUIRED(
++             ::cs_main, !m_recent_confirmed_transactions_mutex) {
++             AssertLockHeld(::cs_main);
++             return AlreadyHaveTx(tx->GetId(), /*include_reconsiderable=*/true);
++         };
++     while (m_tx_admission_running) {
++         std::vector<node::TxAdmissionItem> items =
++             m_tx_admission_queue->TakeBatch(TX_ADMISSION_MAX_BATCH,
++                                             TX_ADMISSION_IDLE_WAIT);
++         if (items.empty()) {
++             continue;
++         }
++         std::vector<CTransactionRef> txs;
++         std::vector<size_t> admitted_index(items.size(), SIZE_MAX);
++         for (size_t i = 0; i < items.size(); ++i) {
++             const auto *sender =
++                 static_cast<const TxAdmissionSender *>(items[i].owner.get());
++             // Like the unread messages of a disconnecting peer.
++             if (!sender->node.fDisconnect) {
++                 admitted_index[i] = txs.size();
++                 txs.push_back(items[i].tx);
++             }
++         }
++         std::vector<std::optional<MempoolAcceptResult>> results;
++         if (!txs.empty()) {
++             results = AcceptToMemoryPoolStaged(m_chainman, txs, options);
++         }
++         {
++             LOCK(m_tx_admission_done_mutex);
++             for (size_t i = 0; i < items.size(); ++i) {
++                 TxAdmissionDone done{
++                     TxAdmissionDone::Kind::DROPPED,
++                     std::static_pointer_cast<TxAdmissionSender>(
++                         std::move(items[i].owner)),
++                     std::move(items[i].tx), std::nullopt};
++                 if (admitted_index[i] != SIZE_MAX) {
++                     auto &result = results[admitted_index[i]];
++                     if (result) {
++                         done.kind = TxAdmissionDone::Kind::RESULT;
++                         done.result.emplace(std::move(*result));
++                     } else {
++                         done.kind = TxAdmissionDone::Kind::REPLAY;
++                     }
++                 }
++                 m_tx_admission_done.push_back(std::move(done));
++             }
++         }
++         m_connman.WakeMessageHandler();
++     }
++ }
++ 
++ bool PeerManagerImpl::QueueTxForAdmission(CNode &pfrom, const PeerRef &peer,
++                                           const CTransactionRef &ptx,
++                                           bool count_full) {
++     AssertLockHeld(g_msgproc_mutex);
++     AssertLockHeld(cs_main);
++     const TxId &txid = ptx->GetId();
++     if (m_tx_admission_inflight.count(txid)) {
++         return false;
++     }
++     if (!m_tx_admission_queue->HasRoom(pfrom.GetId(), ptx->GetTotalSize(),
++                                        count_full)) {
++         return false;
++     }
++     if (!PrepareTxAdmission(pfrom, ptx)) {
++         return true;
++     }
++     m_tx_admission_inflight.insert(txid);
++     ++peer->m_tx_admission_pending;
++     // g_msgproc_mutex serializes every producer; only the consumer can
++     // change queue capacity after HasRoom, and it can only free space.
++     const bool pushed = m_tx_admission_queue->Push(node::TxAdmissionItem{
++         pfrom.GetId(), ptx, SteadyClock::now(),
++         std::make_shared<TxAdmissionSender>(pfrom, peer)});
++     Assert(pushed);
++     return true;
++ }
++ 
++ bool PeerManagerImpl::ProcessTxAdmissionDone() {
++     AssertLockHeld(g_msgproc_mutex);
++     std::deque<TxAdmissionDone> done;
++     {
++         LOCK(m_tx_admission_done_mutex);
++         done.swap(m_tx_admission_done);
++     }
++     if (done.empty()) {
++         return false;
++     }
++     LOCK(cs_main);
++     for (TxAdmissionDone &d : done) {
++         CNode &node = d.sender->node;
++         Peer &peer = *d.sender->peer;
++         switch (d.kind) {
++             case TxAdmissionDone::Kind::RESULT:
++                 FinishTxAdmission(node, peer, d.tx, *d.result);
++                 break;
++             case TxAdmissionDone::Kind::REPLAY:
++                 if (PrepareTxAdmission(node, d.tx)) {
++                     const MempoolAcceptResult result =
++                         m_chainman.ProcessTransaction(d.tx);
++                     FinishTxAdmission(node, peer, d.tx, result);
++                 }
++                 break;
++             case TxAdmissionDone::Kind::DROPPED:
++                 break;
++         }
++         m_tx_admission_inflight.erase(d.tx->GetId());
++         Assume(peer.m_tx_admission_pending > 0);
++         --peer.m_tx_admission_pending;
++     }
++     return true;
+++>>>>>>> 65cd666007 (net: admit peer transactions on an admission thread (-parallelmempool))
+  }
+  
+  void PeerManagerImpl::StartScheduledTasks(CScheduler &scheduler) {
+diff --cc src/net_processing.h
+index 490c46fd02,253bb0804e..0000000000
+--- a/src/net_processing.h
++++ b/src/net_processing.h
+@@@ -187,29 -131,14 +187,40 @@@ public
+          //! Whether or not the internal RNG behaves deterministically (this is
+          //! a test-only option).
+          bool deterministic_rng{false};
+++<<<<<<< HEAD
+ +        //! Bytes of recently served block messages kept, with their
+ +        //! checksums, for the next peers asking for them (0 disables)
+ +        size_t block_message_cache_bytes{size_t(DEFAULT_BLOCK_MESSAGE_CACHE_MB)
+ +                                         << 20};
+ +
+ +        //! Interval of the transaction relay tick (-txrelaytick)
+ +        std::chrono::milliseconds txrelay_tick{DEFAULT_TXRELAY_TICK};
+ +        //! Fan-out of relayed transactions (see TxRelayFanout)
+ +        size_t txrelay_fanout_min{DEFAULT_TXRELAY_FANOUT_MIN};
+ +        double txrelay_fanout_pct{DEFAULT_TXRELAY_FANOUT_PCT};
+ +        size_t txrelay_fanout_max{DEFAULT_TXRELAY_FANOUT_MAX};
+ +        //! Per-peer announcements per second (-txrelayratemax)
+ +        uint64_t txrelay_rate_max{DEFAULT_TXRELAY_RATE_MAX};
+ +        //! Offer and use short-id announcements (-txrelayshortids)
+ +        bool txrelay_shortids{DEFAULT_TXRELAY_SHORTIDS};
+ +        //! Short id width; below 64 only in tests, to force collisions
+ +        unsigned txrelay_shortid_bits{64};
+ +        //! Push bodies to high-bandwidth peers (-txrelaypushhb)
+ +        bool txrelay_push_hb{DEFAULT_TXRELAY_PUSH_HB};
+ +        //! Reconcile with the next peer every interval; 0 = off
+ +        std::chrono::milliseconds txrecon_interval{DEFAULT_TXRECON_INTERVAL};
+ +        //! Reconciliation set: transactions admitted within this window
+ +        std::chrono::seconds txrecon_window{DEFAULT_TXRECON_WINDOW};
+++=======
++ 
++         //! Admit transactions received from peers on a separate admission
++         //! thread, verifying their scripts outside cs_main
++         //! (-parallelmempool).
++         bool parallel_admission{false};
++         //! Threads verifying scripts for parallel admission, counting the
++         //! admission thread itself (0: one per core).
++         int parallel_admission_threads{0};
+++>>>>>>> 65cd666007 (net: admit peer transactions on an admission thread (-parallelmempool))
+      };
+  
+      static std::unique_ptr<PeerManager>
+diff --cc src/node/peerman_args.cpp
+index 3a16628202,7879427d83..0000000000
+--- a/src/node/peerman_args.cpp
++++ b/src/node/peerman_args.cpp
+@@@ -1,11 -1,8 +1,15 @@@
+  #include <node/peerman_args.h>
+  
+ +#include <chainparams.h>
+  #include <common/args.h>
+  #include <net_processing.h>
+++<<<<<<< HEAD
+ +#include <util/chaintype.h>
+ +#include <util/strencodings.h>
+ +#include <util/time.h>
+++=======
++ #include <node/txadmission.h>
+++>>>>>>> 65cd666007 (net: admit peer transactions on an admission thread (-parallelmempool))
+  
+  #include <algorithm>
+  #include <limits>
+@@@ -36,55 -34,16 +41,68 @@@ void ApplyArgsManOptions(const ArgsMana
+          options.max_addr_to_send = size_t(std::max(int64_t{0}, *value));
+      }
+  
+++<<<<<<< HEAD
+ +    if (auto value{argsman.GetIntArg("-blockmessagecache")}) {
+ +        options.block_message_cache_bytes =
+ +            size_t(std::clamp<int64_t>(*value, 0, 65536)) << 20;
+ +    }
+ +
+ +    if (auto value{argsman.GetIntArg("-txrelaytick")}) {
+ +        options.txrelay_tick = std::chrono::milliseconds{
+ +            std::clamp<int64_t>(*value, count_milliseconds(MIN_TXRELAY_TICK),
+ +                                count_milliseconds(MAX_TXRELAY_TICK))};
+ +    }
+ +
+ +    if (auto value{argsman.GetIntArg("-txrelayfanoutmin")}) {
+ +        options.txrelay_fanout_min =
+ +            size_t(std::clamp<int64_t>(*value, 0, 1000));
+ +    }
+ +    if (auto value{argsman.GetArg("-txrelayfanoutpct")}) {
+ +        int64_t millionths{0};
+ +        if (ParseFixedPoint(*value, 6, &millionths)) {
+ +            options.txrelay_fanout_pct =
+ +                std::clamp(double(millionths) / 1e6, 0.0, 1.0);
+ +        }
+ +    }
+ +    if (auto value{argsman.GetIntArg("-txrelayfanoutmax")}) {
+ +        options.txrelay_fanout_max =
+ +            size_t(std::clamp<int64_t>(*value, 0, 100000));
+ +    }
+ +    if (auto value{argsman.GetIntArg("-txrelayratemax")}) {
+ +        options.txrelay_rate_max = uint64_t(std::max<int64_t>(*value, 1));
+ +    }
+ +
+ +    if (auto value{argsman.GetBoolArg("-txrelayshortids")}) {
+ +        options.txrelay_shortids = *value;
+ +    }
+ +    if (auto value{argsman.GetIntArg("-txrelaytestshortidbits")};
+ +        value && Params().GetChainType() == ChainType::REGTEST) {
+ +        options.txrelay_shortid_bits =
+ +            unsigned(std::clamp<int64_t>(*value, 1, 64));
+ +    }
+ +
+ +    if (auto value{argsman.GetBoolArg("-txrelaypushhb")}) {
+ +        options.txrelay_push_hb = *value;
+ +    }
+ +    if (auto value{argsman.GetIntArg("-txreconinterval")}) {
+ +        options.txrecon_interval = std::chrono::milliseconds{
+ +            std::clamp<int64_t>(*value, 0, 3'600'000)};
+ +    }
+ +    if (auto value{argsman.GetIntArg("-txreconwindow")}) {
+ +        options.txrecon_window =
+ +            std::chrono::seconds{std::clamp<int64_t>(*value, 1, 86'400)};
+++=======
++     options.parallel_admission =
++         argsman.GetBoolArg("-parallelmempool", node::DEFAULT_PARALLEL_MEMPOOL);
++     options.parallel_admission_threads = int(std::clamp<int64_t>(
++         argsman.GetIntArg("-parallelmempoolthreads",
++                           node::DEFAULT_PARALLEL_MEMPOOL_THREADS),
++         0, node::MAX_PARALLEL_MEMPOOL_THREADS));
++     if (options.parallel_admission_threads == 0) {
++         options.parallel_admission_threads =
++             std::min(int(std::max(1U, std::thread::hardware_concurrency())),
++                      node::MAX_PARALLEL_MEMPOOL_THREADS);
+++>>>>>>> 65cd666007 (net: admit peer transactions on an admission thread (-parallelmempool))
+      }
+  
+      if (auto value{argsman.GetIntArg("-avacooldown")}) {

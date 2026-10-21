@@ -1,0 +1,433 @@
+From 8b5e062bae303a8cbe691151b0c6cc6dadecbd8b Mon Sep 17 00:00:00 2001
+From: Lotus V2 Builder <builder@lotus.org>
+Date: Sat, 17 Oct 2026 13:57:59 -0700
+Subject: [PATCH] mempool: wire CTxMemPool speculative Merklix overlay
+
+Maintain a live speculative Merklix overlay in CTxMemPool across
+transaction admission, removal, and block disconnection, and add
+comprehensive unit tests in mempool_overlay_tests.cpp.
+---
+ src/test/mempool_overlay_tests.cpp | 183 +++++++++++++++++++++++++++++
+ src/txmempool.cpp                  |  45 +++++++
+ src/txmempool.h                    |  62 ++++++++--
+ src/validation.cpp                 |  12 ++
+ 4 files changed, 294 insertions(+), 8 deletions(-)
+
+diff --git a/src/test/mempool_overlay_tests.cpp b/src/test/mempool_overlay_tests.cpp
+index b915278141..023686f5dd 100644
+--- a/src/test/mempool_overlay_tests.cpp
++++ b/src/test/mempool_overlay_tests.cpp
+@@ -11,6 +11,8 @@
+ #include <script/script.h>
+ #include <test/util/random.h>
+ #include <test/util/setup_common.h>
++#include <test/util/txmempool.h>
++#include <txmempool.h>
+ 
+ #include <boost/test/unit_test.hpp>
+ 
+@@ -401,4 +403,185 @@ BOOST_AUTO_TEST_CASE(disk_state_commit_finalized_overlay) {
+     BOOST_CHECK(store.Root() == b1_root);
+ }
+ 
++BOOST_FIXTURE_TEST_CASE(txmempool_speculative_merklix_overlay, TestingSetup) {
++    CBlock b1;
++    b1.nHeaderVersion = 1;
++    b1.nHeight = 1;
++    b1.nBits = 0x207fffff;
++    b1.SetBlockTime(1000);
++    b1.vtx.push_back(MakeCoinbaseTx(1));
++    std::vector<COutPoint> b1_coins;
++    for (uint32_t i = 0; i < 12; ++i) {
++        TxId dummy_prev{FastRandomContext().rand256()};
++        auto tx = MakeSpendTx(COutPoint(dummy_prev, 0), i + 1, 100 * SATOSHI, 2);
++        b1.vtx.push_back(tx);
++        b1_coins.emplace_back(tx->GetId(), 0);
++    }
++    std::sort(b1.vtx.begin() + 1, b1.vtx.end(),
++              [](const CTransactionRef &a, const CTransactionRef &b) {
++                  return a->GetId() < b->GetId();
++              });
++    b1.hashMerkleRoot = BlockMerkleRoot(b1);
++    b1.hashStateRoot = ComputeV2BlockStateRoot(b1, BlockHash{}, 1, 900, false);
++    b1.nSize = ::GetSerializeSize(b1);
++    const BlockHash b1_hash = b1.GetHash();
++    RecordV2BlockState(b1, b1_hash, BlockHash{}, 1, 900);
++
++    CTxMemPool &pool = *m_node.mempool;
++    TestMemPoolEntryHelper entry;
++    LOCK2(cs_main, pool.cs);
++    pool.clear();
++    pool.ConnectBlockReset(b1_hash, /*next_height=*/2, /*next_mtp=*/1000);
++
++    std::vector<CTransactionRef> epoch1_txs;
++    for (size_t i = 0; i < 6; ++i) {
++        auto tx = MakeSpendTx(b1_coins[i], static_cast<uint32_t>(100 + i),
++                              40 * SATOSHI, 2);
++        pool.addUnchecked(entry.Fee(1000 * SATOSHI).FromTx(tx));
++        epoch1_txs.push_back(tx);
++    }
++
++    const auto &frozen_epoch1 = pool.FreezeEpochBatch();
++    BOOST_CHECK_EQUAL(frozen_epoch1.GetTxCount(), 6U);
++
++    // Add 4 more txs (including a child of epoch1_txs[0]) and remove 1 tx
++    std::vector<CTransactionRef> extra_txs;
++    auto child_tx = MakeSpendTx(COutPoint(epoch1_txs[0]->GetId(), 0), 200,
++                                35 * SATOSHI, 1);
++    pool.addUnchecked(entry.Fee(1000 * SATOSHI).FromTx(child_tx));
++    extra_txs.push_back(child_tx);
++
++    for (size_t i = 6; i < 9; ++i) {
++        auto tx = MakeSpendTx(b1_coins[i], static_cast<uint32_t>(300 + i),
++                              40 * SATOSHI, 2);
++        pool.addUnchecked(entry.Fee(1000 * SATOSHI).FromTx(tx));
++        extra_txs.push_back(tx);
++    }
++
++    // Remove extra_txs.back() from mempool and verify overlay reflects removal
++    pool.removeRecursive(*extra_txs.back(), MemPoolRemovalReason::CONFLICT);
++    extra_txs.pop_back();
++
++    // Frozen epoch 1 must remain unaffected at 6 txs
++    BOOST_CHECK_EQUAL(
++        pool.GetMerklixOverlay().GetFrozenEpochs().front().GetTxCount(), 6U);
++
++    // Speculative overlay must have 6 + 3 = 9 txs in exact CTOR order
++    const auto &spec = pool.GetMerklixOverlay().GetSpeculativeOverlay();
++    BOOST_CHECK_EQUAL(spec.GetTxCount(), 9U);
++
++    CBlock b2;
++    b2.nHeaderVersion = 1;
++    b2.hashPrevBlock = b1_hash;
++    b2.nHeight = 2;
++    b2.nBits = 0x207fffff;
++    b2.SetBlockTime(1120);
++    b2.vtx.push_back(MakeCoinbaseTx(2));
++    for (const auto &[_, oentry] : spec.GetOrderedTxs()) {
++        b2.vtx.push_back(
++            std::static_pointer_cast<const CTransaction>(oentry.tx_ref));
++    }
++
++    const uint256 expected_merkle = BlockMerkleRoot(b2);
++    const uint256 overlay_merkle =
++        ComputeV2TxRootFromSubtreeA(*b2.vtx[0], spec.GetSubtreeARoot());
++    BOOST_CHECK_EQUAL(overlay_merkle, expected_merkle);
++
++    const uint256 expected_state =
++        ComputeV2BlockStateRoot(b2, b1_hash, 2, 1000, false);
++    const uint256 overlay_state =
++        ComputeV2StateRootFromOverlay(*b2.vtx[0], spec, b2.nBits, 2, 1000);
++    BOOST_CHECK_EQUAL(overlay_state, expected_state);
++
++    // Exercise arena Reserve, UtxoOverlayArena(root) constructor,
++    // GetDefaultV2MonetaryProfile, and MerklixOverlayManager::RemoveTransaction
++    BOOST_CHECK_EQUAL(lotus::v2::GetDefaultV2MonetaryProfile().ema_min, 4U);
++    lotus::v2::TxOverlayArena tx_arena;
++    tx_arena.Reserve(64);
++    lotus::v2::UtxoOverlayArena utxo_arena(spec.GetUtxoRoot());
++    utxo_arena.Reserve(64);
++    BOOST_CHECK(utxo_arena.RootDigest() == spec.GetUtxoRootDigest());
++
++    lotus::v2::Hash rem_txid{};
++    std::memcpy(rem_txid.data(), extra_txs.back()->GetId().begin(), 32);
++    BOOST_CHECK(pool.GetOverlayManager().RemoveTransaction(rem_txid));
++    BOOST_CHECK(!pool.GetOverlayManager().RemoveTransaction(rem_txid));
++
++    // Exercise SmtInsert/SmtErase duplicate/noop paths, invalid coin rejection,
++    // TxOverlayArena/UtxoOverlayArena duplicate/noop paths, and frozen epoch re-anchoring
++    {
++        std::shared_ptr<const lotus::v2::SmtNode> smt_root;
++        lotus::v2::Coin invalid_coin{};
++        lotus::v2::SmtInsert(smt_root, invalid_coin);
++        BOOST_CHECK(smt_root == nullptr);
++
++        const auto net_coins = spec.GetNetInsertedCoins();
++        BOOST_REQUIRE_GE(net_coins.size(), 2U);
++        const lotus::v2::Coin c1 = net_coins[0];
++        const lotus::v2::Coin c2 = net_coins[1];
++        lotus::v2::SmtInsert(smt_root, c1);
++        // Re-inserting identical single leaf returns the same node
++        lotus::v2::SmtInsert(smt_root, c1);
++        // Erasing non-existent outpoint on single leaf returns the same node
++        lotus::v2::SmtErase(smt_root, c2.outpoint);
++        lotus::v2::SmtInsert(smt_root, c2);
++        // Re-inserting identical leaf in branch returns the same node
++        lotus::v2::SmtInsert(smt_root, c2);
++        // Erasing non-existent outpoint in branch returns the same node
++        lotus::v2::SmtErase(smt_root, lotus::v2::Outpoint{lotus::v2::Hash{}, 999});
++
++        lotus::v2::Hash h1{}, h2{}, h3{}, h_alt{};
++        h1[0] = 1;
++        h2[0] = 2;
++        h3[0] = 3;
++        h_alt[0] = 9;
++        uint32_t tx_root = lotus::v2::TxOverlayArena::kNullIdx;
++        BOOST_CHECK_EQUAL(tx_arena.EraseTxLeaf(tx_root, h1),
++                          lotus::v2::TxOverlayArena::kNullIdx);
++        tx_root = tx_arena.InsertTxLeaf(tx_root, h1, h1);
++        // Duplicate same tx_hash on single leaf
++        tx_root = tx_arena.InsertTxLeaf(tx_root, h1, h1);
++        // Updated tx_hash on single leaf
++        tx_root = tx_arena.InsertTxLeaf(tx_root, h1, h_alt);
++        // Erase non-existent on single leaf
++        BOOST_CHECK_EQUAL(tx_arena.EraseTxLeaf(tx_root, h2), tx_root);
++        tx_root = tx_arena.InsertTxLeaf(tx_root, h2, h2);
++        // Duplicate same tx_hash on branch
++        BOOST_CHECK_EQUAL(tx_arena.InsertTxLeaf(tx_root, h2, h2), tx_root);
++        // Erase non-existent on branch
++        BOOST_CHECK_EQUAL(tx_arena.EraseTxLeaf(tx_root, h3), tx_root);
++
++        lotus::v2::UtxoOverlayArena u_arena;
++        u_arena.InsertCoin(invalid_coin);
++        u_arena.InsertCoin(c1);
++        // Duplicate same coin on single leaf
++        u_arena.InsertCoin(c1);
++        lotus::v2::Coin c1_mod = c1;
++        c1_mod.output.value += 500;
++        // Updated coin on single leaf
++        u_arena.InsertCoin(c1_mod);
++        u_arena.InsertCoin(c2);
++        // Duplicate same coin on branch
++        u_arena.InsertCoin(c2);
++
++        // Frozen epoch re-anchoring on same-tip / unset-tip overlay manager
++        lotus::v2::MerklixOverlayManager mgr;
++        BOOST_CHECK(mgr.AddTransaction(h1, h1, 100, {c1.outpoint}, {c2}, 10, 1));
++        BOOST_CHECK(!mgr.AddTransaction(h1, h1, 100, {c1.outpoint}, {c2}, 10, 1));
++        mgr.FreezeEpochBatch();
++        BOOST_CHECK_EQUAL(mgr.GetFrozenEpochs().size(), 1U);
++        mgr.ReanchorExistingTxs(h3, smt_root,
++                                lotus::v2::GetInitialV2MonetaryState(), 10,
++                                2000);
++        // Re-anchoring with identical anchor parameters is a no-op
++        mgr.ReanchorExistingTxs(h3, smt_root,
++                                lotus::v2::GetInitialV2MonetaryState(), 10,
++                                2000);
++        BOOST_CHECK_EQUAL(mgr.GetFrozenEpochs().size(), 1U);
++        BOOST_CHECK_EQUAL(mgr.GetFrozenEpochs()[0].GetHeight(), 10U);
++    }
++}
++
++
+ BOOST_AUTO_TEST_SUITE_END()
++
+diff --git a/src/txmempool.cpp b/src/txmempool.cpp
+index 720d12c501..0a5c939c1b 100644
+--- a/src/txmempool.cpp
++++ b/src/txmempool.cpp
+@@ -16,6 +16,7 @@
+ #include <logging.h>
+ #include <policy/fees.h>
+ #include <policy/policy.h>
++#include <primitives/block.h>
+ #include <reverse_iterator.h>
+ #include <undo.h>
+ #include <util/check.h>
+@@ -26,6 +27,7 @@
+ 
+ #include <algorithm>
+ #include <cmath>
++#include <cstring>
+ #include <limits>
+ #include <vector>
+ 
+@@ -193,6 +195,10 @@ void CTxMemPool::addUnchecked(CTxMemPoolEntryRef entry) {
+ 
+     UpdateParentsOf(true, newit);
+ 
++    AddTransactionToOverlay(m_merklix_overlay, tx,
++                            entry->GetFee() / SATOSHI,
++                            entry->GetSigChecks());
++
+     nTransactionsUpdated++;
+     totalTxSize += entry->GetTxSize();
+     m_total_fee += entry->GetFee();
+@@ -205,6 +211,8 @@ void CTxMemPool::removeUnchecked(txiter it, MemPoolRemovalReason reason) {
+ 
+     const TxId &txid = (*it)->GetTx().GetId();
+ 
++    RemoveTransactionFromOverlay(m_merklix_overlay, (*it)->GetTx());
++
+     if (reason != MemPoolRemovalReason::BLOCK) {
+         if (m_opts.signals) {
+             // Notify clients that a transaction has been removed from the
+@@ -375,6 +383,7 @@ void CTxMemPool::removeForFinalizedBlock(
+ void CTxMemPool::_clear() {
+     mapTx.clear();
+     mapNextTx.clear();
++    m_merklix_overlay.Clear();
+     totalTxSize = 0;
+     m_total_fee = Amount::zero();
+     cachedInnerUsage = 0;
+@@ -384,6 +393,42 @@ void CTxMemPool::_clear() {
+     ++nTransactionsUpdated;
+ }
+ 
++const lotus::v2::MempoolOverlayLayer &CTxMemPool::FreezeEpochBatch() {
++    AssertLockHeld(cs);
++    return m_merklix_overlay.FreezeEpochBatch();
++}
++
++void CTxMemPool::SyncMerklixOverlayToTip(const BlockHash &tip_hash,
++                                         uint64_t next_height,
++                                         uint64_t next_mtp) const {
++    AssertLockHeld(cs);
++    lotus::v2::Hash tip_id{};
++    std::memcpy(tip_id.data(), tip_hash.begin(), 32);
++    std::shared_ptr<const lotus::v2::SmtNode> utxo_root;
++    lotus::v2::MonetaryState mon_state = lotus::v2::GetInitialV2MonetaryState();
++    GetV2BlockStateSnapshot(tip_hash, utxo_root, mon_state);
++    m_merklix_overlay.ReanchorExistingTxs(tip_id, std::move(utxo_root),
++                                          mon_state, next_height, next_mtp);
++}
++
++void CTxMemPool::ConnectBlockReset(const BlockHash &new_tip_hash,
++                                   uint64_t next_height,
++                                   uint64_t next_mtp) {
++    AssertLockHeld(cs);
++    lotus::v2::Hash tip_id{};
++    std::memcpy(tip_id.data(), new_tip_hash.begin(), 32);
++    std::shared_ptr<const lotus::v2::SmtNode> utxo_root;
++    lotus::v2::MonetaryState mon_state = lotus::v2::GetInitialV2MonetaryState();
++    GetV2BlockStateSnapshot(new_tip_hash, utxo_root, mon_state);
++    if (mapTx.empty()) {
++        m_merklix_overlay.ResetToTip(tip_id, std::move(utxo_root), mon_state,
++                                     next_height, next_mtp);
++    } else {
++        m_merklix_overlay.ReanchorExistingTxs(
++            tip_id, std::move(utxo_root), mon_state, next_height, next_mtp);
++    }
++}
++
+ void CTxMemPool::clear(bool include_finalized_txs) {
+     LOCK(cs);
+     _clear();
+diff --git a/src/txmempool.h b/src/txmempool.h
+index 8a8c24ca6f..a4a57b5dbe 100644
+--- a/src/txmempool.h
++++ b/src/txmempool.h
+@@ -13,6 +13,7 @@
+ #include <kernel/cs_main.h>
+ #include <kernel/mempool_entry.h>
+ #include <kernel/mempool_options.h>
++#include <lotus_v2/mempool_overlay.h>
+ #include <node/blockfitter.h>
+ #include <policy/packages.h>
+ #include <primitives/transaction.h>
+@@ -455,6 +456,15 @@ public:
+      */
+     CFeeRate GetMinFee() const { return GetMinFee(m_opts.max_size_bytes); }
+     CFeeRate GetMinFee(size_t sizelimit) const;
++    double GetRollingMinimumFeeRate() const EXCLUSIVE_LOCKS_REQUIRED(cs) {
++        return rollingMinimumFeeRate;
++    }
++    int64_t GetLastRollingFeeUpdate() const EXCLUSIVE_LOCKS_REQUIRED(cs) {
++        return lastRollingFeeUpdate;
++    }
++    bool GetBlockSinceLastRollingFeeBump() const EXCLUSIVE_LOCKS_REQUIRED(cs) {
++        return blockSinceLastRollingFeeBump;
++    }
+ 
+     /**
+      * Remove transactions from the mempool until its dynamic size is <=
+@@ -552,14 +562,7 @@ public:
+     size_t DynamicMemoryUsage() const;
+ 
+     /** Adds a transaction to the unbroadcast set */
+-    void AddUnbroadcastTx(const TxId &txid) {
+-        LOCK(cs);
+-        // Sanity check the transaction is in the mempool & insert into
+-        // unbroadcast set.
+-        if (exists(txid)) {
+-            m_unbroadcast_txids.insert(txid);
+-        }
+-    }
++    void AddUnbroadcastTx(const TxId &txid);
+ 
+     /** Removes a transaction from the unbroadcast set */
+     void RemoveUnbroadcastTx(const TxId &txid, const bool unchecked = false);
+@@ -601,7 +604,50 @@ public:
+         return func(*m_conflicting);
+     }
+ 
++    /**
++     * Access the progressive Merklix overlay manager (Subtree A + UTXO SMT
++     * overlay + non-coinbase effective block cost accumulator).
++     */
++    lotus::v2::MerklixOverlayManager &GetMerklixOverlay() const
++        EXCLUSIVE_LOCKS_REQUIRED(cs) {
++        AssertLockHeld(cs);
++        return m_merklix_overlay;
++    }
++
++    lotus::v2::MerklixOverlayManager &GetOverlayManager() const
++        EXCLUSIVE_LOCKS_REQUIRED(cs) {
++        AssertLockHeld(cs);
++        return m_merklix_overlay;
++    }
++
++    /**
++     * Freeze the current speculative mempool overlay as an immutable epoch
++     * batch snapshot and advance the epoch counter.
++     */
++    const lotus::v2::MempoolOverlayLayer &FreezeEpochBatch()
++        EXCLUSIVE_LOCKS_REQUIRED(cs);
++
++    /**
++     * Ensure the Merklix overlay is anchored at the given tip block snapshot,
++     * next block height, and parent MTP. O(1) no-op if already anchored.
++     */
++    void SyncMerklixOverlayToTip(const BlockHash &tip_hash,
++                                 uint64_t next_height,
++                                 uint64_t next_mtp) const
++        EXCLUSIVE_LOCKS_REQUIRED(cs);
++
++    /**
++     * Reset or re-anchor the Merklix overlay after a block connects or
++     * disconnects so subsequent mempool arrivals build directly on the new tip.
++     */
++    void ConnectBlockReset(const BlockHash &new_tip_hash,
++                           uint64_t next_height,
++                           uint64_t next_mtp)
++        EXCLUSIVE_LOCKS_REQUIRED(cs);
++
+ private:
++    mutable lotus::v2::MerklixOverlayManager m_merklix_overlay GUARDED_BY(cs);
++
+     /** Set ancestor state for an entry */
+     void UpdateEntryForAncestors(txiter it, const setEntries *setAncestors)
+         EXCLUSIVE_LOCKS_REQUIRED(cs);
+diff --git a/src/validation.cpp b/src/validation.cpp
+index f71b7af20c..3396e2912d 100644
+--- a/src/validation.cpp
++++ b/src/validation.cpp
+@@ -3098,6 +3098,12 @@ bool Chainstate::DisconnectTip(BlockValidationState &state,
+     m_chain.SetTip(*pindexDelete->pprev);
+ 
+     UpdateTip(pindexDelete->pprev);
++    if (m_mempool) {
++        m_mempool->ConnectBlockReset(
++            pindexDelete->pprev->GetBlockHash(),
++            static_cast<uint64_t>(pindexDelete->pprev->nHeight + 1),
++            static_cast<uint64_t>(pindexDelete->pprev->GetMedianTimePast()));
++    }
+     // Let wallets know transactions went from 1-confirmed to
+     // 0-confirmed or conflicted:
+     if (m_chainman.m_options.signals) {
+@@ -3295,6 +3301,12 @@ bool Chainstate::ConnectTip(BlockValidationState &state,
+     // Update m_chain & related variables.
+     m_chain.SetTip(*pindexNew);
+     UpdateTip(pindexNew);
++    if (m_mempool) {
++        m_mempool->ConnectBlockReset(
++            pindexNew->GetBlockHash(),
++            static_cast<uint64_t>(pindexNew->nHeight + 1),
++            static_cast<uint64_t>(pindexNew->GetMedianTimePast()));
++    }
+ 
+     const auto time_6{SteadyClock::now()};
+     m_chainman.time_post_connect += time_6 - time_5;
+-- 
+2.50.1 (Apple Git-155)
+

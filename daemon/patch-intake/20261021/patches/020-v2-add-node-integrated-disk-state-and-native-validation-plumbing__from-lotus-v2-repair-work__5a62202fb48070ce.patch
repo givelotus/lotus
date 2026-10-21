@@ -1,0 +1,1734 @@
+From d5e22b70831365370969ab1671e2aa69896c34bb Mon Sep 17 00:00:00 2001
+From: Shammah Chancellor <shammah.chancellor@notvalid.com>
+Date: Sun, 18 Oct 2026 01:33:30 -0700
+Subject: [PATCH] v2: add node-integrated disk state and native validation
+ plumbing
+
+Connect the V2 disk-state and native-validation implementation to node lifecycle and validation entrypoints. The share-pool coordinator is introduced separately in v2/059.
+
+Original-Commit: 07d58d9ade1b2187d66f8c83de147d81f6a994b3
+Original-Patch: v2/011
+Split-Concern: pool
+
+(cherry picked from commit b613e545a47f9f11d7ef01c318b77a16274eb03a)
+
+Canonical-Source-Commit: b613e545a47f9f11d7ef01c318b77a16274eb03a
+---
+ src/lotus_v2/pool_coordinator.cpp             | 224 ++++++++++++
+ src/lotus_v2/pool_coordinator.h               |  56 +++
+ .../pool_coordinator_test/CMakeLists.txt      |  36 ++
+ src/lotus_v2/pool_coordinator_test/README.md  |  53 +++
+ src/lotus_v2/test_pool_coordinator.cpp        | 323 ++++++++++++++++++
+ src/lotus_v2/test_transaction_pool.cpp        | 157 +++++++++
+ src/lotus_v2/transaction_history.cpp          | 292 ++++++++++++++++
+ src/lotus_v2/transaction_history.h            |  47 +++
+ src/lotus_v2/transaction_pool.cpp             | 229 +++++++++++++
+ src/lotus_v2/transaction_pool.h               |  95 ++++++
+ .../transaction_pool_test/CMakeLists.txt      |  28 ++
+ src/lotus_v2/transaction_pool_test/README.md  |  39 +++
+ src/lotus_v2/transaction_pool_test/fixtures.h |  30 ++
+ 13 files changed, 1609 insertions(+)
+ create mode 100644 src/lotus_v2/pool_coordinator.cpp
+ create mode 100644 src/lotus_v2/pool_coordinator.h
+ create mode 100644 src/lotus_v2/pool_coordinator_test/CMakeLists.txt
+ create mode 100644 src/lotus_v2/pool_coordinator_test/README.md
+ create mode 100644 src/lotus_v2/test_pool_coordinator.cpp
+ create mode 100644 src/lotus_v2/test_transaction_pool.cpp
+ create mode 100644 src/lotus_v2/transaction_history.cpp
+ create mode 100644 src/lotus_v2/transaction_history.h
+ create mode 100644 src/lotus_v2/transaction_pool.cpp
+ create mode 100644 src/lotus_v2/transaction_pool.h
+ create mode 100644 src/lotus_v2/transaction_pool_test/CMakeLists.txt
+ create mode 100644 src/lotus_v2/transaction_pool_test/README.md
+ create mode 100644 src/lotus_v2/transaction_pool_test/fixtures.h
+
+diff --git a/src/lotus_v2/pool_coordinator.cpp b/src/lotus_v2/pool_coordinator.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..dc9ae390a48dc8f86483dc5d7ad6f06f22fef87b
+--- /dev/null
++++ b/src/lotus_v2/pool_coordinator.cpp
+@@ -0,0 +1,224 @@
++// Copyright (c) 2026 The Lotus developers
++#include "pool_coordinator.h"
++#include "block_wire.h"
++#include "signing.h"
++#include <algorithm>
++#include <limits>
++namespace lotus::v2 {
++namespace {
++bool Quiescent(const DevelopmentRuntimeSnapshot &s) {
++    return s.chain && !s.reopen_required && !s.execution_paused &&
++        !s.chain->pending_journal && !s.chain->pending_receipt && !s.chain->pending_propagation;
++}
++PoolAnchor Anchor(const DevelopmentRuntimeSnapshot &s) { return {s.chain->stable_tip,s.context_generation}; }
++}
++struct PoolCoordinator::Impl {
++    DevelopmentRuntime &runtime;
++    PoolCoordinatorConfig config;
++    TransactionPool pool;
++    TransactionHistory history;
++    std::set<Hash> pool_ids; // Retained even while a failed reconciliation disables reads.
++    std::optional<PoolAnchor> published;
++    std::vector<std::vector<uint8_t>> detached;
++    size_t detached_bytes=0;
++    explicit Impl(DevelopmentRuntime &r,PoolCoordinatorConfig c):runtime(r),config(std::move(c)),pool(config.pool) {}
++    bool Bound(const DevelopmentRuntimeSnapshot &s) const {
++        return Quiescent(s) && s.chain->identity==config.identity && s.chain->profile_digest==config.profile_digest;
++    }
++    bool Current(PoolAnchor a) const { const auto s=runtime.Snapshot(); return Bound(s) && Anchor(s)==a; }
++    bool Ready() const { return published && Current(*published) && history.Anchor()==std::optional<Hash>(published->tip); }
++    bool Read(const Hash &id,std::optional<IndexedHeader> &h,std::string &error) {
++        if(runtime.ReadHeader(id,h,error)!=DevelopmentRuntimeResult::Progress || !h) { if(error.empty()) error="missing indexed history header"; return false; } return true;
++    }
++    bool Context(PoolAnchor a,PoolContext &out,std::string &error) {
++        if(!Current(a)) { error="runtime anchor changed"; return false; }
++        std::vector<Header> window; Hash cursor=a.tip;
++        for(size_t i=0;i<11;++i) {
++            std::optional<IndexedHeader> h; if(!Read(cursor,h,error)) return false;
++            window.push_back(h->header); if(h->header.height==0) break; cursor=h->header.prev_id;
++        }
++        const auto mtp=ParentMedianTime(config.headers,window.front(),window);
++        if(!mtp || window.front().height==std::numeric_limits<uint64_t>::max()) { error="invalid pool parent context"; return false; }
++        out.anchor=a; out.profile=config.ordinary; out.profile.candidate_height=window.front().height+1; out.profile.parent_mtp=*mtp;
++        out.chain_id=config.headers.chain_id; out.cost=config.cost;
++        out.current=[this,a] { return Current(a) && history.Anchor()==std::optional<Hash>(a.tip); };
++        out.active_coins=[this,a](const Outpoint &point,Coin &coin,std::string &why) {
++            if(!Current(a)) { why="runtime context changed"; return CoinReadResult::Error; }
++            std::optional<Coin> found;
++            if(runtime.ReadCoin(point,found,why)!=DevelopmentRuntimeResult::Progress || !Current(a)) return CoinReadResult::Error;
++            if(!found) return CoinReadResult::Missing; coin=*found; return CoinReadResult::Found;
++        };
++        out.classify_missing=[this,a](const Outpoint &point,std::string &why) {
++            if(!Current(a) || history.Anchor()!=std::optional<Hash>(a.tip)) { why="history context changed"; return PoolMissingState::Error; }
++            std::optional<Hash> spender; if(!history.Spender(point,spender,why)) return PoolMissingState::Error;
++            return spender ? PoolMissingState::Spent : PoolMissingState::Unknown;
++        };
++        return Current(a);
++    }
++    bool Body(const Hash &id,FramedBlock &out,std::string &error) {
++        std::vector<uint8_t> wire;
++        if(runtime.ReadConnectedBody(id,config.max_block_bytes,wire,error)!=DevelopmentRuntimeResult::Progress) return false;
++        if(!DecodeBlockWire(wire,config.ordinary.transaction,config.headers.chain_id,out,error)) return false;
++        Hash actual{}; if(!BlockId(config.headers.chain_id,out.header,actual) || actual!=id) { error="connected body index binding mismatch"; return false; }
++        return true;
++    }
++};
++PoolCoordinator::PoolCoordinator(std::unique_ptr<Impl> p):impl_(std::move(p)) {}
++PoolCoordinator::~PoolCoordinator()=default;
++bool PoolCoordinator::Open(DevelopmentRuntime &r,PoolCoordinatorConfig c,std::unique_ptr<PoolCoordinator> &out,std::string &error) {
++    // The manifest supplies rules, not a candidate context. Context() derives
++    // the actual height and MTP from the authenticated runtime before admission.
++    auto structural = c.ordinary;
++    structural.candidate_height = 1;
++    if(!c.max_path || !c.max_detached_transactions || !c.max_detached_bytes || !c.max_block_bytes || !ValidateOrdinaryProfile(structural,error)) { if(error.empty()) error="invalid pool coordinator limits"; return false; }
++    auto p=std::make_unique<Impl>(r,std::move(c));
++    auto s=r.Snapshot(); if(!s.chain || s.chain->identity!=p->config.identity || s.chain->profile_digest!=p->config.profile_digest) { error="pool coordinator runtime identity/profile mismatch"; return false; }
++    if(!TransactionHistory::Open(p->config.directory,p->config.identity,p->config.profile_digest,p->config.history,p->history,error,p->config.history_env)) return false;
++    out.reset(new PoolCoordinator(std::move(p))); return true;
++}
++CoordinatorResult PoolCoordinator::Tick(PoolCoordinatorBudget &budget,std::string &error) {
++    auto &p=*impl_; auto s=p.runtime.Snapshot(); error.clear();
++    if(!p.Bound(s)) { p.published.reset(); return CoordinatorResult::Deferred; }
++    auto a=Anchor(s);
++    if(p.Ready()) return CoordinatorResult::Ready;
++    p.published.reset();
++    size_t transitions=0;
++    while(p.history.Anchor()!=std::optional<Hash>(a.tip)) {
++        if(!budget.blocks || budget.header_reads<2 || transitions>=p.config.max_path)
++            return CoordinatorResult::Progress;
++        --budget.blocks; budget.header_reads-=2; ++transitions;
++        const auto anchor=p.history.Anchor();
++        bool disconnect=false; Hash id=p.config.headers.genesis_id;
++        if(anchor) {
++            // Unknown/nonactive locators fall back to the genesis child. A
++            // matching predecessor proves this indexed tip is still active.
++            const std::array<Hash,1> locator{*anchor}; std::vector<Header> headers;
++            DiskStateError failure;
++            const auto read=p.runtime.ReadHeaders(a.tip,locator,Hash{},1,1,headers,failure);
++            if(read==ChainIndexResult::StaleTip || read==ChainIndexResult::Deferred)
++                return CoordinatorResult::Deferred;
++            if(read!=ChainIndexResult::Complete) { error=failure.message; return CoordinatorResult::StorageError; }
++            if(headers.empty() || headers.front().prev_id!=*anchor) {disconnect=true;id=*anchor;}
++            else if(!BlockId(p.config.headers.chain_id,headers.front(),id)) {
++                error="active history header identity";return CoordinatorResult::StorageError;
++            }
++        }
++        FramedBlock body;if(!p.Body(id,body,error)) return CoordinatorResult::StorageError;
++        if(disconnect) {
++            std::vector<std::vector<uint8_t>> wires;size_t bytes=0;
++            for(size_t i=1;i<body.transactions.size();++i) {
++                std::vector<uint8_t> wire;
++                if(!EncodeTransaction(body.transactions[i],p.config.ordinary.transaction,wire,error)) return CoordinatorResult::StorageError;
++                if(wires.size()>=p.config.max_detached_transactions-p.detached.size() || wire.size()>p.config.max_detached_bytes-p.detached_bytes-bytes) {
++                    error="detached pool replay capacity";return CoordinatorResult::Capacity;
++                }
++                bytes+=wire.size();wires.push_back(std::move(wire));
++            }
++            if(!p.Current(a)) return CoordinatorResult::Deferred;
++            if(!p.history.Disconnect(id,error)) return CoordinatorResult::StorageError;
++            p.detached.insert(p.detached.begin(),std::make_move_iterator(wires.begin()),std::make_move_iterator(wires.end()));p.detached_bytes+=bytes;
++        } else {
++            HistoryBlock block;block.id=id;block.parent=body.header.prev_id;block.height=body.header.height;
++            if(body.transactions.size()>p.config.history.max_transactions) { error="history transaction capacity";return CoordinatorResult::Capacity; }
++            for(const auto &tx:body.transactions) {
++                IdentityDigests d;if(!ComputeIdentities(tx,p.config.ordinary.transaction,p.config.headers.chain_id,d,error)) return CoordinatorResult::StorageError;
++                TransactionConfirmation row{d.txid,d.txhash,id,block.height,{}};
++                for(const auto &in:tx.inputs) if(in.flags==1) row.consumed.push_back({in.prev_txid,in.prev_index});
++                block.transactions.push_back(std::move(row));
++            }
++            if(!p.Current(a)) return CoordinatorResult::Deferred;
++            if(!p.history.Connect(block,error)) return CoordinatorResult::StorageError;
++        }
++    }
++    {
++        // Fixed eleven-header MTP lookup is charged before entering Context.
++        if(budget.header_reads<11) return CoordinatorResult::Progress; budget.header_reads-=11;
++        PoolContext context{}; if(!p.Context(a,context,error)) return CoordinatorResult::Deferred;
++        std::set<Hash> connected;
++        // Consult the derived index for existing pool IDs, including confirmations
++        // applied during an interrupted earlier synchronization attempt.
++        for(const auto &id:p.pool_ids) {
++            std::optional<TransactionConfirmation> row;
++            if(!p.history.Lookup(id,row,error)) return CoordinatorResult::StorageError;
++            if(row) connected.insert(id);
++        }
++        std::vector<std::vector<uint8_t>> detached;
++        for(const auto &wire:p.detached) {
++            Transaction tx; IdentityDigests ids;
++            if(!DecodeTransaction(wire,p.config.ordinary.transaction,tx,error) ||
++               !ComputeIdentities(tx,p.config.ordinary.transaction,p.config.headers.chain_id,ids,error))
++                return CoordinatorResult::StorageError;
++            std::optional<TransactionConfirmation> row;
++            if(!p.history.Lookup(ids.txid,row,error)) return CoordinatorResult::StorageError;
++            if(!row) detached.push_back(wire);
++        }
++        // Reconcile itself removes confirmed/conflicting survivors via active
++        // coins and the exact spent index, including unknown earlier anchors.
++        auto result=p.pool.Reconcile(context,connected,{},detached,budget.validation);
++        if(result.status==PoolStatus::Capacity) { error=result.error; return p.pool.ReconcilePending() ? CoordinatorResult::Progress:CoordinatorResult::Capacity; }
++        if(result.status==PoolStatus::Operational) { error=result.error; return CoordinatorResult::StorageError; }
++        if(result.status==PoolStatus::Stale || !p.Current(a)) return CoordinatorResult::Deferred;
++        if(result.status!=PoolStatus::Accepted) {error="unexpected pool reconciliation result";return CoordinatorResult::StorageError;}
++        p.pool_ids.clear();
++        for(const auto &entry:p.pool.Snapshot(a,p.config.pool.max_entries,p.config.pool.max_bytes).entries)
++            p.pool_ids.insert(entry.effects.txid);
++        p.detached.clear(); p.detached_bytes=0; p.published=a;
++        return CoordinatorResult::Ready;
++    }
++    return CoordinatorResult::Progress;
++}
++PoolResult PoolCoordinator::Submit(const std::vector<uint8_t> &wire,const Hash &tip,PoolBudget &budget) {
++    auto &p=*impl_; PoolResult result;
++    if(!p.Ready() || p.published->tip!=tip) { result.status=PoolStatus::Stale; result.error="pool/history runtime synchronization required"; return result; }
++    if(wire.size()>p.config.pool.max_transaction_bytes) {result.status=PoolStatus::Capacity;result.error="transaction wire policy capacity";return result;}
++    Transaction tx; if(!DecodeTransaction(wire,p.config.ordinary.transaction,tx,result.error)) { result.status=PoolStatus::Invalid; return result; }
++    IdentityDigests ids; if(!ComputeIdentities(tx,p.config.ordinary.transaction,p.config.headers.chain_id,ids,result.error)) { result.status=PoolStatus::Invalid; return result; }
++    result.txid=ids.txid; result.txhash=ids.txhash;
++    std::optional<TransactionConfirmation> confirmed;
++    if(!p.history.Lookup(ids.txid,confirmed,result.error)) { result.status=PoolStatus::Operational; return result; }
++    if(confirmed) { result.status=confirmed->txhash==ids.txhash ? PoolStatus::Duplicate:PoolStatus::Conflict; return result; }
++    PoolContext context{}; if(!p.Context(*p.published,context,result.error)) { result.status=PoolStatus::Stale; return result; }
++    result=p.pool.Admit(wire,context,budget);
++    if(result.status==PoolStatus::Accepted) p.pool_ids.insert(result.txid);
++    return result;
++}
++PoolSnapshot PoolCoordinator::Snapshot(size_t entries,size_t bytes) const {
++    const auto &p=*impl_; if(!p.Ready()) return {}; return p.pool.Snapshot(*p.published,entries,bytes);
++}
++bool PoolCoordinator::ReadWire(const Hash &hash,std::vector<uint8_t> &out,size_t max_bytes) const {
++    const auto &p=*impl_; if(!p.Ready()) return false;
++    std::vector<uint8_t> wire;
++    if(!p.pool.ReadWire(hash,wire) || wire.size()>max_bytes) return false;
++    out=std::move(wire); return true;
++}
++std::vector<Hash> PoolCoordinator::Inventory(size_t offset,size_t count) const {
++    const auto &p=*impl_; if(!p.Ready()) return {};
++    return p.pool.Inventory(offset,std::min(count,p.config.pool.max_entries));
++}
++bool PoolCoordinator::SelectedHash(const Hash &id,Hash &out) const {
++    const auto &p=*impl_; return p.Ready() && p.pool.SelectedHash(id,out);
++}
++TransactionStatus PoolCoordinator::Status(const Hash &id,const std::optional<Hash> &hash,const std::vector<uint8_t> *wire) {
++    auto &p=*impl_; TransactionStatus out; out.txid=id;
++    if(!p.Ready()) { out.diagnostic="transaction index is synchronizing"; return out; }
++    IdentityDigests ids{}; Transaction tx;
++    if(wire && (wire->size()>p.config.pool.max_transaction_bytes || !DecodeTransaction(*wire,p.config.ordinary.transaction,tx,out.diagnostic) || !ComputeIdentities(tx,p.config.ordinary.transaction,p.config.headers.chain_id,ids,out.diagnostic) || ids.txid!=id || (hash && *hash!=ids.txhash))) { out.diagnostic="transaction query identity mismatch"; return out; }
++    const auto wanted=hash ? hash : wire ? std::optional<Hash>(ids.txhash):std::nullopt;
++    if(wanted) out.txhash=*wanted;
++    if(!p.history.Lookup(id,out.confirmation,out.diagnostic)) return out;
++    if(out.confirmation) { out.txhash=out.confirmation->txhash; out.state=wanted && *wanted!=out.txhash ? TransactionState::Conflicted:TransactionState::Confirmed; return out; }
++    Hash selected{};
++    if(p.pool.SelectedHash(id,selected)) { out.txhash=selected; out.state=wanted && *wanted!=selected ? TransactionState::Conflicted:TransactionState::Pending; return out; }
++    const auto pending=wire ? p.pool.Snapshot(*p.published,p.config.pool.max_entries,p.config.pool.max_bytes):PoolSnapshot{};
++    if(wire) for(const auto &in:tx.inputs) if(in.flags==1) {
++        std::optional<Hash> spender; if(!p.history.Spender({in.prev_txid,in.prev_index},spender,out.diagnostic)) return out;
++        if(spender && *spender!=id) { out.state=TransactionState::Conflicted; out.txhash=ids.txhash; return out; }
++        const Outpoint point{in.prev_txid,in.prev_index};
++        for(const auto &entry:pending.entries)
++            if(entry.effects.txid!=id && std::find(entry.effects.consumed.begin(),entry.effects.consumed.end(),point)!=entry.effects.consumed.end()) {
++                out.state=TransactionState::Conflicted; out.txhash=ids.txhash; return out;
++            }
++    }
++    out.state=TransactionState::Unknown; return out;
++}
++}
+diff --git a/src/lotus_v2/pool_coordinator.h b/src/lotus_v2/pool_coordinator.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..c042f713206bbbbbc959f2e2f7706c055c38c2d1
+--- /dev/null
++++ b/src/lotus_v2/pool_coordinator.h
+@@ -0,0 +1,56 @@
++// Copyright (c) 2026 The Lotus developers
++#ifndef LOTUS_V2_POOL_COORDINATOR_H
++#define LOTUS_V2_POOL_COORDINATOR_H
++#include "development_runtime.h"
++#include "transaction_history.h"
++#include "transaction_pool.h"
++namespace lotus::v2 {
++struct PoolCoordinatorConfig {
++    // Dedicated derived LevelDB path, normally chainstate-v2/transaction-index.
++    std::string directory;
++    Hash identity{}, profile_digest{};
++    HeaderChainProfile headers;
++    OrdinaryCandidateProfile ordinary;
++    BlockCostProfile cost;
++    PoolLimits pool;
++    HistoryLimits history;
++    leveldb::Env *history_env = nullptr; // Optional caller-owned storage backend.
++    // Maximum durable history transitions in one Tick, independent of chain height.
++    size_t max_path = 10000, max_detached_transactions = 10000;
++    size_t max_detached_bytes = 16000000, max_block_bytes = 16000000;
++};
++struct PoolCoordinatorBudget {
++    size_t header_reads = 32, blocks = 1;
++    PoolBudget validation;
++};
++enum class CoordinatorResult { Ready, Progress, Deferred, Capacity, StorageError };
++enum class TransactionState { Pending, Confirmed, Conflicted, Unknown, Inconclusive };
++struct TransactionStatus {
++    TransactionState state = TransactionState::Inconclusive;
++    Hash txid{}, txhash{};
++    std::optional<TransactionConfirmation> confirmation;
++    std::string diagnostic;
++};
++// Serialized owner. Runtime mutations must not reenter any operation. A status
++// is authoritative only at the same quiescent runtime/index/pool anchor.
++class PoolCoordinator {
++public:
++    static bool Open(DevelopmentRuntime &, PoolCoordinatorConfig,
++                     std::unique_ptr<PoolCoordinator> &, std::string &);
++    ~PoolCoordinator();
++    CoordinatorResult Tick(PoolCoordinatorBudget &, std::string &);
++    PoolResult Submit(const std::vector<uint8_t> &, const Hash &expected_tip, PoolBudget &);
++    PoolSnapshot Snapshot(size_t max_entries, size_t max_bytes) const;
++    bool ReadWire(const Hash &txhash, std::vector<uint8_t> &out,
++                  size_t max_bytes = 1000000) const;
++    std::vector<Hash> Inventory(size_t offset, size_t count) const;
++    bool SelectedHash(const Hash &txid, Hash &out) const;
++    TransactionStatus Status(const Hash &txid, const std::optional<Hash> &txhash = {},
++                             const std::vector<uint8_t> *wire = nullptr);
++private:
++    struct Impl;
++    std::unique_ptr<Impl> impl_;
++    explicit PoolCoordinator(std::unique_ptr<Impl>);
++};
++}
++#endif
+diff --git a/src/lotus_v2/pool_coordinator_test/CMakeLists.txt b/src/lotus_v2/pool_coordinator_test/CMakeLists.txt
+new file mode 100644
+index 0000000000000000000000000000000000000000..fe53806f041d2da2f5491af964ff44c6405679ed
+--- /dev/null
++++ b/src/lotus_v2/pool_coordinator_test/CMakeLists.txt
+@@ -0,0 +1,36 @@
++cmake_minimum_required(VERSION 3.18)
++project(lotus_v2_pool_coordinator LANGUAGES C CXX)
++set(CMAKE_CXX_STANDARD 20)
++set(CMAKE_CXX_STANDARD_REQUIRED ON)
++add_subdirectory(../disk_state_test disk_state)
++find_package(OpenSSL REQUIRED COMPONENTS Crypto)
++if(NOT DEFINED LOTUS_SECP_LIBRARY OR NOT EXISTS "${LOTUS_SECP_LIBRARY}")
++    message(FATAL_ERROR "Set LOTUS_SECP_LIBRARY to ABC libsecp256k1.a")
++endif()
++get_filename_component(LOTUS_SRC "${CMAKE_CURRENT_SOURCE_DIR}/../.." ABSOLUTE)
++if(NOT DEFINED LOTUS_POOL_SOURCE)
++    set(LOTUS_POOL_SOURCE "${CMAKE_CURRENT_SOURCE_DIR}/..")
++endif()
++add_executable(pool_coordinator_test
++    ../pool_coordinator.cpp ../transaction_history.cpp "${LOTUS_POOL_SOURCE}/transaction_pool.cpp"
++    ../../support/cleanse.cpp
++    ../header_admission.cpp ../disk_body.cpp ../development_chain.cpp ../disk_block.cpp ../block_transition.cpp ../block_assembler.cpp ../block_template.cpp ../test_pool_coordinator.cpp ../development_runtime.cpp ../candidate_selection.cpp ../candidate_body_pool.cpp ../reorg_recovery.cpp ../chain_index.cpp
++    ../output.cpp ../transaction.cpp ../commitment.cpp ../tagged_hash.cpp
++    ../signing.cpp ../vm.cpp ../field_size.cpp ../sparse_state.cpp
++    ../incremental_utxo.cpp ../ordinary_validation.cpp ../monetary.cpp
++    ../block.cpp ../block_wire.cpp ../block_cost.cpp ../header_context.cpp
++    ../asert_candidate.cpp ../header.cpp)
++target_include_directories(pool_coordinator_test PRIVATE "${LOTUS_SRC}" "${LOTUS_SRC}/secp256k1/include"
++    "${LOTUS_BOOST_INCLUDE}" "${LOTUS_POOL_SOURCE}" ../vendor/blake3)
++target_link_libraries(pool_coordinator_test PRIVATE lotus_v2_disk_state blake3
++    OpenSSL::Crypto "${LOTUS_SECP_LIBRARY}")
++target_compile_options(pool_coordinator_test PRIVATE -Wall -Wextra -Wpedantic -Werror)
++enable_testing()
++add_test(NAME pool_coordinator_test COMMAND pool_coordinator_test)
++option(LOTUS_SANITIZE "Instrument runtime callbacks and state ownership checks" OFF)
++if(LOTUS_SANITIZE)
++    target_compile_options(pool_coordinator_test PRIVATE -fsanitize=address,undefined -fno-omit-frame-pointer)
++    target_link_options(pool_coordinator_test PRIVATE -fsanitize=address,undefined)
++    target_compile_options(lotus_v2_disk_state PRIVATE -fsanitize=address,undefined -fno-omit-frame-pointer)
++    target_link_options(lotus_v2_disk_state INTERFACE -fsanitize=address,undefined)
++endif()
+diff --git a/src/lotus_v2/pool_coordinator_test/README.md b/src/lotus_v2/pool_coordinator_test/README.md
+new file mode 100644
+index 0000000000000000000000000000000000000000..ddc270faa83be9f19762620de25fffe4e22e91ee
+--- /dev/null
++++ b/src/lotus_v2/pool_coordinator_test/README.md
+@@ -0,0 +1,53 @@
++# Pool coordinator review target
++
++The coordinator borrows a serialized `DevelopmentRuntime` and owns a volatile
++transaction pool plus a separate, derived LevelDB transaction index. Set its
++`directory` to `<nodehome>/chainstate-v2/transaction-index` and supply the exact
++runtime identity, profile digest and profiles. The caller must keep the runtime
++and any optional `history_env` alive and must not mutate/reenter them during a
++coordinator operation.
++
++`Tick` queries bounded active headers and commits at most the supplied number
++of history block transitions. Each history connect
++or undo atomically synchronizes confirmations, spent outpoints and the durable
++tip. Before publishing, the pool rebuilds against the current quiescent runtime
++tip and generation. Journal, receipt, propagation, paused execution, reopen and
++anchor changes suppress status, admission and transaction relay until a
++successful tick. Reconciliation stages validation across ticks without exposing
++a partial pool; changing the runtime anchor restarts staging. Runtime generations are process-local fences, not durable
++history keys; reopening always requires synchronization before publication.
++
++Initial indexing connects genesis and advances along bounded active-header
++queries. Each history transition commits durably before the next one. Reorgs
++undo one inactive history tip at a time until the active common ancestor, then
++advance forward. `max_path` limits transitions in each tick, independently of
++chain height; a chain longer than this limit completes across multiple ticks
++and survives coordinator restart between chunks. Detached wire overflow returns
++explicit `Capacity` and keeps publication disabled. This target does not
++implement index pruning or migration.
++Status uses indexed TxID/TxHash/block/height records and exact spend mappings;
++missing/spent coins alone never establish confirmation. Ordinary detached
++transactions are retained in block parent order and reconciled after the new
++index reaches its runtime anchor.
++
++Build the standalone target after integrating its transaction pool dependency:
++
++```sh
++cmake -S src/lotus_v2/pool_coordinator_test -B /tmp/lotus-v2-pool-coordinator-build \
++  -DLOTUS_SECP_LIBRARY=/path/to/libsecp256k1.a \
++  -DLOTUS_BOOST_INCLUDE=/path/to/boost/include
++cmake --build /tmp/lotus-v2-pool-coordinator-build --target pool_coordinator_test
++ctest --test-dir /tmp/lotus-v2-pool-coordinator-build -R '^pool_coordinator_test$' --output-on-failure
++```
++
++`LOTUS_POOL_SOURCE` can point to a separate reviewed directory containing
++`transaction_pool.{h,cpp}` while the owning work is awaiting integration.
++The test uses temporary development chains only. It covers budget refusal,
++pending/confirmed/conflicted/unknown status, multiple pending survivors with one
++validation per tick, witness mismatch, exact durable
++confirmation after outputs are spent, restart fencing, replacement-chain
++conflicts, pending input conflicts, bounded transaction serving, durable indexing beyond the per-tick ancestry chunk and
++detached overflow, paused execution, and storage failures. An injected failure
++after a real durable LevelDB sync verifies ambiguous-write poisoning and reopen
++recovery, including exact restoration of predecessor transaction/spend mappings.
++This is local development validation, not network or production testing.
+diff --git a/src/lotus_v2/test_pool_coordinator.cpp b/src/lotus_v2/test_pool_coordinator.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..5fb52d993e34ace5bbc8bf30c062d8627b42ee62
+--- /dev/null
++++ b/src/lotus_v2/test_pool_coordinator.cpp
+@@ -0,0 +1,323 @@
++// Copyright (c) 2026 The Lotus developers
++#include "pool_coordinator.h"
++#include "development_runtime_test/fixtures.h"
++#include "signing.h"
++#include <iostream>
++#include <leveldb/env.h>
++using namespace lotus::v2;
++using namespace runtime_fixture;
++namespace {
++DevelopmentRuntimeConfig Config(Home &home) {
++    DevelopmentRuntimeConfig config;
++    config.directory = home.path;
++    config.genesis_wire = Bytes(genesis_wire);
++    config.profiles = home.p;
++    config.initial_money = DecodeMonetaryState(Bytes(initial_money));
++    config.storage.cache_bytes = 1024;
++    config.storage.write_buffer_bytes = 64 << 10;
++    config.storage.recovery = DiskRecoveryOptions{32 << 20, 4 << 20};
++    config.storage.candidates = CandidateStoreOptions{64, 64, 8};
++    config.storage.env = home.env;
++    config.bodies = {3, 1 << 20, 3 << 20, 3, 3 << 20, 64};
++    config.initial_body_epoch = 1;
++    config.initial_context_generation = 1;
++    return config;
++}
++DevelopmentTickLimits TickLimits() {
++    DevelopmentTickLimits limits;
++    limits.selection.query = {64, 20000, 20000, 1 << 20};
++    limits.selection.fork = {8, 8, 1000};
++    limits.selection.max_probe_calls = 128;
++    limits.selection.max_probe_bytes = 1 << 20;
++    limits.selection.max_missing_bodies = 8;
++    limits.selection.max_resident_bytes = 1 << 20;
++    limits.recovery = runtime_fixture::Limits();
++    limits.propagation = {1, 1000, 1000, 1 << 20};
++    return limits;
++}
++std::unique_ptr<DevelopmentRuntime> Open(DevelopmentRuntimeConfig config) {
++    std::unique_ptr<DevelopmentRuntime> out;
++    std::string error;
++    Check(DevelopmentRuntime::Open(std::move(config), out, error) && out,
++          "open explicit runtime: " + error);
++    return out;
++}
++void Announce(DevelopmentRuntime &runtime, const std::vector<size_t> &path,
++              bool bodies = true) {
++    std::string error;
++    for (size_t n : path) {
++        HeaderAdmission admitted = HeaderAdmission::Invalid;
++        Check(runtime.AdmitHeader(HeaderOf(V(n)), admitted, error) ==
++                      DevelopmentRuntimeResult::Progress &&
++                  admitted == HeaderAdmission::Stored,
++              "runtime contextual header admission: " + error);
++        if (!bodies) continue;
++        CandidateBodyStatus retained = CandidateBodyStatus::Malformed;
++        Check(runtime.RetainBody(H(V(n).id), Bytes(V(n).wire), retained,
++                                 error) == DevelopmentRuntimeResult::Progress &&
++                  retained == CandidateBodyStatus::RetainedAuthenticated,
++              "pool retains replacement bytes without contextual acceptance: " +
++                  error);
++    }
++}
++DevelopmentTick Tick(DevelopmentRuntime &runtime, uint64_t now = UINT64_MAX,
++                     const DevelopmentTickLimits &limits = TickLimits()) {
++    auto tick = runtime.Tick(now, 0, limits);
++    Check(tick.usage.recovery_calls <= 1,
++          "one recovery phase/block transition per tick");
++    Check(tick.usage.selection.query.rows <= limits.selection.query.max_rows &&
++              tick.usage.selection.query.reads <=
++                  limits.selection.query.max_reads &&
++              tick.usage.selection.query.iterator_steps <=
++                  limits.selection.query.max_iterator_steps &&
++              tick.usage.selection.query.decoded_bytes <=
++                  limits.selection.query.max_decoded_bytes &&
++              tick.usage.selection.probe_calls <=
++                  limits.selection.max_probe_calls,
++          "selector reports its own bounded usage");
++    Check(tick.usage.propagation.rows <= limits.propagation.max_rows &&
++              tick.usage.propagation.reads <= limits.propagation.max_reads &&
++              tick.usage.propagation.iterator_steps <=
++                  limits.propagation.max_iterator_steps &&
++              tick.usage.propagation.decoded_bytes <=
++                  limits.propagation.max_decoded_bytes,
++          "propagation reports its own bounded usage");
++    Check(tick.result != DevelopmentRuntimeResult::StorageError &&
++              tick.result != DevelopmentRuntimeResult::InvalidConfiguration,
++          "runtime tick: " + tick.diagnostic);
++    return tick;
++}
++class FaultEnv final : public leveldb::EnvWrapper {
++public:
++    bool fail_after_sync = false;
++    unsigned failures = 0;
++    std::function<void()> on_sync;
++    FaultEnv() : EnvWrapper(leveldb::Env::Default()) {}
++    class File final : public leveldb::WritableFile {
++        FaultEnv &owner;
++        std::unique_ptr<leveldb::WritableFile> file;
++
++    public:
++        File(FaultEnv &env, leveldb::WritableFile *raw)
++            : owner(env), file(raw) {}
++        std::string GetName() const override { return file->GetName(); }
++        leveldb::Status Append(const leveldb::Slice &bytes) override {
++            return file->Append(bytes);
++        }
++        leveldb::Status Flush() override { return file->Flush(); }
++        leveldb::Status Close() override { return file->Close(); }
++        leveldb::Status Sync() override {
++            if (owner.on_sync) owner.on_sync();
++            const auto status = file->Sync();
++            if (status.ok() && owner.fail_after_sync) {
++                owner.fail_after_sync = false;
++                ++owner.failures;
++                return leveldb::Status::IOError(
++                    "injected reported failure after durable sync");
++            }
++            return status;
++        }
++    };
++    leveldb::Status NewWritableFile(const std::string &name,
++                                    leveldb::WritableFile **out) override {
++        auto status = target()->NewWritableFile(name, out);
++        if (status.ok() && name.ends_with(".log")) *out = new File(*this, *out);
++        return status;
++    }
++    leveldb::Status NewAppendableFile(const std::string &name,
++                                      leveldb::WritableFile **out) override {
++        auto status = target()->NewAppendableFile(name, out);
++        if (status.ok() && name.ends_with(".log")) *out = new File(*this, *out);
++        return status;
++    }
++};
++
++PoolCoordinatorConfig PoolConfig(DevelopmentRuntime &runtime, Home &home) {
++    auto s=runtime.Snapshot(); Check(bool(s.chain),"runtime chain view");
++    PoolCoordinatorConfig c;
++    c.directory=home.path+"/chainstate-v2/transaction-index";
++    c.identity=s.chain->identity; c.profile_digest=s.chain->profile_digest;
++    c.headers=home.p.header; c.ordinary=home.p.ordinary; c.cost=home.p.cost;
++    // Match manifest-loaded rules: the coordinator must supply the context.
++    c.ordinary.candidate_height=0;
++    return c;
++}
++std::unique_ptr<PoolCoordinator> Coordinator(DevelopmentRuntime &runtime,PoolCoordinatorConfig c) {
++    std::unique_ptr<PoolCoordinator> out; std::string e;
++    Check(PoolCoordinator::Open(runtime,c,out,e),"coordinator open: "+e);return out;
++}
++void Sync(PoolCoordinator &pool) {
++    std::string e;
++    for(unsigned i=0;i<100;++i) {
++        PoolCoordinatorBudget b{32,1,{1000,100000000}};
++        auto r=pool.Tick(b,e);
++        if(r==CoordinatorResult::Ready) return;
++        Check(r==CoordinatorResult::Progress,"index synchronization: "+e);
++    }
++    Check(false,"index synchronization bounded completion");
++}
++IdentityDigests Ordinary(Home &home,size_t n,std::vector<uint8_t> &wire) {
++    FramedBlock block; std::string e;
++    Check(DecodeBlockWire(Bytes(V(n).wire),home.p.ordinary.transaction,home.p.header.chain_id,block,e),e);
++    Check(block.transactions.size()>1,"ordinary fixture");
++    IdentityDigests ids;
++    Check(ComputeIdentities(block.transactions[1],home.p.ordinary.transaction,home.p.header.chain_id,ids,e),e);
++    Check(EncodeTransaction(block.transactions[1],home.p.ordinary.transaction,wire,e),e);return ids;
++}
++void Settle(DevelopmentRuntime &runtime,const Hash &tip,PoolCoordinator &pool) {
++    for(unsigned i=0;i<100;++i) {
++        Tick(runtime);
++        auto s=runtime.Snapshot();
++        if(s.chain && s.chain->stable_tip==tip && !s.chain->pending_journal && !s.chain->pending_receipt && !s.chain->pending_propagation) {Sync(pool);return;}
++        if(!s.chain || s.reopen_required || s.execution_paused || s.chain->pending_journal || s.chain->pending_receipt || s.chain->pending_propagation)
++            Check(pool.Status({}).state==TransactionState::Inconclusive,"pending runtime state fences status");
++    }
++    Check(false,"runtime settled");
++}
++void Lifecycle() {
++    Home home; home.Connect(0);home.Connect(1);home.store={};
++    auto runtime=Open(Config(home));auto config=PoolConfig(*runtime,home);config.max_path=1;
++    auto pool=Coordinator(*runtime,config);
++    std::vector<uint8_t> wire;auto ids=Ordinary(home,2,wire);
++    Check(pool->Status(ids.txid).state==TransactionState::Inconclusive,"initial unsynchronized status");
++    PoolCoordinatorBudget zero{0,0,{0,0}}; std::string e;
++    Check(pool->Tick(zero,e)==CoordinatorResult::Progress,"zero budget makes no progress");
++    Sync(*pool);
++    Check(pool->Status(ids.txid).state==TransactionState::Unknown,"never infer confirmation from coin state");
++    PoolBudget b{10,100000000};
++    auto admitted=pool->Submit(wire,runtime->Snapshot().chain->stable_tip,b);
++    Check(admitted.status==PoolStatus::Accepted,"ordinary admission: "+admitted.error);
++    Check(pool->Status(ids.txid,ids.txhash,&wire).state==TransactionState::Pending,"pending selected transaction");
++    std::vector<uint8_t> competing;auto competing_ids=Ordinary(home,4,competing);
++    Check(pool->Status(competing_ids.txid,competing_ids.txhash,&competing).state==TransactionState::Conflicted,"pending input conflict");
++    std::vector<uint8_t> served;Hash selected{};
++    Check(pool->ReadWire(ids.txhash,served,wire.size()) && served==wire &&
++          pool->Inventory(0,10)==std::vector<Hash>{ids.txhash} &&
++          pool->SelectedHash(ids.txid,selected) && selected==ids.txhash,"gated relay facade");
++    served={42};Check(!pool->ReadWire(ids.txhash,served,wire.size()-1)&&served==std::vector<uint8_t>{42},"serving cap preserves output");
++    Announce(*runtime,{2,3});Settle(*runtime,H(V(3).id),*pool);
++    auto status=pool->Status(ids.txid,ids.txhash);
++    Check(status.state==TransactionState::Confirmed && status.confirmation && status.confirmation->block==H(V(2).id) && status.confirmation->height==3,"exact confirmation");
++    Check(!pool->ReadWire(ids.txhash,served) && pool->Inventory(0,10).empty(),"confirmed wire no longer relayed");
++    Check(pool->Snapshot(100,1000000).entries.empty(),"confirmed removed from pool");
++    auto different=ids.txhash;different[0]^=1;
++    Check(pool->Status(ids.txid,different).state==TransactionState::Conflicted,"witness mismatch");
++    pool.reset();runtime.reset();runtime=Open(Config(home));pool=Coordinator(*runtime,config);
++    Check(pool->Status(ids.txid).state==TransactionState::Inconclusive,"restart requires runtime fencing");Sync(*pool);
++    Check(pool->Status(ids.txid).state==TransactionState::Confirmed,"durable confirmation after reopen");
++    Announce(*runtime,{4,5,6});Settle(*runtime,H(V(6).id),*pool);
++    Check(pool->Status(ids.txid,ids.txhash,&wire).state==TransactionState::Conflicted,"reorg replaced spend");
++    pool.reset();runtime.reset();
++}
++void IncrementalSurvivors() {
++    Home home;home.Connect(0);home.Connect(1);home.store={};
++    auto runtime=Open(Config(home));auto pool=Coordinator(*runtime,PoolConfig(*runtime,home));Sync(*pool);
++    std::vector<uint8_t> parent,child;auto parent_ids=Ordinary(home,2,parent);auto child_ids=Ordinary(home,3,child);
++    PoolBudget admission{10,100000000};const auto tip=runtime->Snapshot().chain->stable_tip;
++    Check(pool->Submit(parent,tip,admission).status==PoolStatus::Accepted,"pending parent admitted");
++    Check(pool->Submit(child,tip,admission).status==PoolStatus::Accepted,"pending child admitted");
++    const auto generation=runtime->Snapshot().context_generation;
++    Announce(*runtime,{2});
++    Check(runtime->Snapshot().chain->stable_tip==tip && runtime->Snapshot().context_generation!=generation,"body inventory changes generation without tip");
++    unsigned ticks=0;std::string e;bool ready=false;
++    for(;ticks<20;++ticks) {
++        PoolCoordinatorBudget budget{32,1,{1,100000000}};
++        const auto result=pool->Tick(budget,e);
++        if(result==CoordinatorResult::Ready) {ready=true;++ticks;break;}
++        Check(result==CoordinatorResult::Progress,"resumable reconciliation: "+e);
++        Check(pool->Status(parent_ids.txid).state==TransactionState::Inconclusive && pool->Inventory(0,10).empty(),"staging remains unpublished");
++    }
++    Check(ready && ticks>=2,"multiple survivors reconcile across one-validation ticks");
++    Check(pool->Status(parent_ids.txid).state==TransactionState::Pending &&
++          pool->Status(child_ids.txid).state==TransactionState::Pending && pool->Snapshot(10,1000000).entries.size()==2,"staged survivor publication preserves parent and child");
++    admission={1,100000000};
++    Check(pool->Submit(std::vector<uint8_t>(1000001),tip,admission).status==PoolStatus::Capacity,"local wire limit is policy capacity");
++    pool.reset();runtime.reset();
++}
++void RefusalFences() {
++    Home home;home.Connect(0);home.Connect(1);home.store={};
++    auto runtime=Open(Config(home));auto config=PoolConfig(*runtime,home);std::string e;
++    config.max_path=1;auto pool=Coordinator(*runtime,config);
++    PoolCoordinatorBudget budget{32,10,{100,100000000}};
++    Check(pool->Tick(budget,e)==CoordinatorResult::Progress,"initial indexing commits bounded chunk");
++    Check(pool->Status({}).state==TransactionState::Inconclusive && pool->Snapshot(10,10000).status==PoolStatus::Stale,"initial chunk does not publish incomplete history");
++    pool.reset();
++    TransactionHistory checkpoint;
++    Check(TransactionHistory::Open(config.directory,config.identity,config.profile_digest,config.history,checkpoint,e) &&
++          checkpoint.Anchor()==std::optional<Hash>(home.p.header.genesis_id),"initial chunk has durable progress beyond ancestry cap");
++    checkpoint={};pool=Coordinator(*runtime,config);Sync(*pool);
++    Check(pool->Status({}).state==TransactionState::Unknown,"multiple chunks finish chain longer than max_path");
++    pool.reset();
++    // Start a separate index so the injected write occurs during catch-up.
++    config.directory+="-failure";FaultEnv env;config.history_env=&env;
++    pool=Coordinator(*runtime,config);env.fail_after_sync=true;
++    budget={32,10,{100,100000000}};
++    Check(pool->Tick(budget,e)==CoordinatorResult::StorageError && env.failures==1,"index write failure surfaced");
++    Check(pool->Status({}).state==TransactionState::Inconclusive,"failed index cannot publish status");
++    PoolBudget admission{10,100000000};
++    Check(pool->Submit({},runtime->Snapshot().chain->stable_tip,admission).status==PoolStatus::Stale,"failed index fences admission");
++    pool.reset();pool=Coordinator(*runtime,config);Sync(*pool);
++    Check(pool->Status({}).state==TransactionState::Unknown,"reopen recovers ambiguous committed history");
++    pool.reset();runtime.reset();
++}
++void DetachedOverflow() {
++    Home home;for(size_t n:{0,1,2,3}) home.Connect(n);home.store={};
++    auto runtime=Open(Config(home));auto config=PoolConfig(*runtime,home);
++    config.max_detached_transactions=1;auto pool=Coordinator(*runtime,config);Sync(*pool);
++    Announce(*runtime,{4,5,6});
++    bool settled=false;
++    for(unsigned i=0;i<100;++i) {
++        Tick(*runtime);auto s=runtime->Snapshot();
++        if(s.chain && s.chain->stable_tip==H(V(6).id) && !s.chain->pending_journal && !s.chain->pending_receipt && !s.chain->pending_propagation) {settled=true;break;}
++    }
++    Check(settled,"overflow runtime settled");
++    std::string e;CoordinatorResult result=CoordinatorResult::Progress;
++    for(unsigned i=0;i<20 && result==CoordinatorResult::Progress;++i) {
++        PoolCoordinatorBudget budget{32,1,{100,100000000}};result=pool->Tick(budget,e);
++    }
++    Check(result==CoordinatorResult::Capacity && e=="detached pool replay capacity","detached overflow explicit");
++    Check(pool->Status({}).state==TransactionState::Inconclusive && pool->Inventory(0,10).empty(),"detached overflow suppresses publication and relay");
++    pool.reset();runtime.reset();
++}
++void PausedFence() {
++    auto profiles=Profiles();profiles.ordinary.vm.max_steps=1;Home home(32<<20,profiles);
++    for(size_t n:{9,10,11,12}) home.Connect(n);home.store={};
++    auto runtime=Open(Config(home));auto pool=Coordinator(*runtime,PoolConfig(*runtime,home));Sync(*pool);
++    Announce(*runtime,{13,14,15});bool paused=false;
++    for(unsigned i=0;i<100;++i) {
++        auto tick=Tick(*runtime);
++        if(tick.snapshot.execution_paused) {paused=true;break;}
++    }
++    Check(paused,"host execution paused");std::string e;PoolCoordinatorBudget budget;
++    Check(pool->Tick(budget,e)==CoordinatorResult::Deferred && pool->Status({}).state==TransactionState::Inconclusive,"paused J fences transaction status");
++    PoolBudget b;Check(pool->Submit({},Hash{},b).status==PoolStatus::Stale,"paused admission refused");
++    pool.reset();runtime.reset();
++}
++void HistoryAtomicity() {
++    Home home; Hash identity{},profile{}; identity[0]=1;profile[0]=2;
++    const auto path=home.path+"/history";std::string e;FaultEnv env;TransactionHistory h;
++    Check(TransactionHistory::Open(path,identity,profile,{},h,e,&env),e);
++    Hash g{},one{},two{},id{},hash{};g[0]=3;one[0]=4;two[0]=5;id[0]=6;hash[0]=7;
++    Outpoint point{id,1};
++    Check(h.Connect({g,{},0,{}},e),e);
++    TransactionConfirmation row{id,hash,one,1,{point}};
++    Check(h.Connect({one,g,1,{row}},e),e);
++    std::optional<TransactionConfirmation> got;std::optional<Hash> spender;
++    Check(h.Lookup(id,got,e)&&got&&got->txhash==hash,"history identity mapping");
++    Check(h.Spender(point,spender,e)&&spender==std::optional<Hash>(id),"exact spent mapping");
++    auto bad=row;bad.block=two;bad.height=2;
++    Check(!h.Connect({two,one,2,{bad,bad}},e)&&h.Anchor()==std::optional<Hash>(one),"invalid batch leaves anchor untouched");
++    env.fail_after_sync=true;
++    Check(!h.Disconnect(one,e)&&env.failures==1,"ambiguous durable disconnect reports failure");
++    Check(!h.Lookup(id,got,e),"ambiguous write poisons reads");
++    h={};Check(TransactionHistory::Open(path,identity,profile,{},h,e,&env),e);
++    Check(h.Anchor()==std::optional<Hash>(g),"reopen observes atomic durable undo anchor");
++    Check(h.Lookup(id,got,e)&&!got&&h.Spender(point,spender,e)&&!spender,"undo restored both indexes");
++    Check(h.Connect({one,g,1,{row}},e),e);
++    auto replacement=row;replacement.block=two;replacement.height=2;replacement.txhash[0]=8;replacement.consumed.clear();
++    Check(h.Connect({two,one,2,{replacement}},e),e);
++    Check(h.Disconnect(two,e)&&h.Lookup(id,got,e)&&got&&got->txhash==hash,"repeated TxID undo restores exact predecessor");
++    h={};profile[0]^=1;Check(!TransactionHistory::Open(path,identity,profile,{},h,e),"profile mismatch rejected");
++}
++}
++int main() {try {HistoryAtomicity();IncrementalSurvivors();RefusalFences();Lifecycle();DetachedOverflow();PausedFence();std::cout<<"pool coordinator checks passed\n";return 0;}catch(const std::exception &e){std::cerr<<e.what()<<"\n";return 1;}}
+diff --git a/src/lotus_v2/test_transaction_pool.cpp b/src/lotus_v2/test_transaction_pool.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..5535dc481a7a2d844d45b0f3acd913d6f0532fd2
+--- /dev/null
++++ b/src/lotus_v2/test_transaction_pool.cpp
+@@ -0,0 +1,157 @@
++#include "transaction_pool_test/fixtures.h"
++#include <iostream>
++using namespace pool_fixture;
++#define CHECK(x) do {if(!(x)) throw std::runtime_error("failed: " #x);}while(false)
++int main() {try {
++    Fixture f;auto ctx=f.Context();PoolLimits limits;TransactionPool pool(limits);PoolBudget b{100,10000000};
++    auto parent=Spend({f.funding},{Native(40000),Native(40000)});auto pid=Id(parent);
++    auto left=Spend({{pid,0}},{Native(30000)}),right=Spend({{pid,1}},{Native(30000)});
++    auto diamond=Spend({{Id(left),0},{Id(right),0}},{Native(50000)});
++    CHECK(pool.Admit(Wire(left),ctx,b).status==PoolStatus::MissingParents);
++    CHECK(pool.Admit(Wire(parent),ctx,b).status==PoolStatus::Accepted);
++    CHECK(pool.Admit(Wire(parent),ctx,b).status==PoolStatus::Duplicate);
++    auto alternate=parent;alternate.inputs[0].witnesses[0].arguments.push_back({});
++    CHECK(Id(alternate)==pid);CHECK(pool.Admit(Wire(alternate),ctx,b).status==PoolStatus::Conflict);
++    auto conflict=parent;conflict.outputs[0].value=39000;
++    CHECK(pool.Admit(Wire(conflict),ctx,b).status==PoolStatus::Conflict);
++    CHECK(pool.Admit(Wire(left),ctx,b).status==PoolStatus::Accepted);
++    CHECK(pool.Admit(Wire(right),ctx,b).status==PoolStatus::Accepted);
++    CHECK(pool.Admit(Wire(diamond),ctx,b).status==PoolStatus::Accepted);
++    auto snap=pool.Snapshot(ctx.anchor,10,1000000);CHECK(snap.entries.size()==4);CHECK(snap.entries.front().effects.txid==pid);CHECK(snap.entries.back().effects.txid==Id(diamond));
++    Hash hash;CHECK(pool.SelectedHash(pid,hash));std::vector<uint8_t>w;CHECK(pool.ReadWire(hash,w)&&w==Wire(parent));CHECK(pool.Inventory(1,2).size()==2);
++    // Created outpoints must be checked against authoritative state too.
++    Fixture occupied;auto oc=occupied.Context();Outpoint output{pid,0};
++    occupied.coins.emplace(output,Coin{output,parent.outputs[0],90,49000,false});
++    OrdinaryCandidateEffects direct;std::string error;
++    CHECK(CheckOrdinaryWithLookup(parent,oc.profile,oc.chain_id,oc.active_coins,direct,error)==CandidateCheckResult::Invalid);
++    CHECK(error=="created outpoint already occupied");
++    TransactionPool collision(limits);auto rejected=collision.Admit(Wire(parent),oc,b);
++    CHECK(rejected.status==PoolStatus::Invalid);CHECK(rejected.error==error);CHECK(collision.Size()==0);
++    CHECK(collision.Inventory(0,10).empty());
++    // Input reads succeed while the first output read fails.
++    Fixture unreadable;auto rc=unreadable.Context();auto read=rc.active_coins;size_t output_reads=0;
++    rc.active_coins=[&](const Outpoint&op,Coin&coin,std::string&e) {
++        if(op.tx_id==pid) {++output_reads;e="output disk error";return CoinReadResult::Error;}
++        return read(op,coin,e);
++    };
++    TransactionPool read_failure(limits);auto failed=read_failure.Admit(Wire(parent),rc,b);
++    CHECK(failed.status==PoolStatus::Operational);CHECK(failed.error=="output disk error");
++    CHECK(output_reads==1);CHECK(read_failure.Size()==0);CHECK(read_failure.Inventory(0,10).empty());
++    // An output lookup cannot publish against a changed snapshot.
++    rc.active_coins=[&](const Outpoint&op,Coin&coin,std::string&e) {
++        if(op.tx_id==pid) unreadable.current=false;
++        return read(op,coin,e);
++    };
++    CHECK(read_failure.Admit(Wire(parent),rc,b).status==PoolStatus::Stale);CHECK(read_failure.Size()==0);
++    // A confirmed parent is resolved from the new active view; descendants survive.
++    for(size_t i=0;i<parent.outputs.size();++i) {Outpoint op{pid,uint32_t(i)};f.coins.emplace(op,Coin{op,parent.outputs[i],100,50000,false});}
++    ctx.anchor.generation=2;ctx.profile.candidate_height=101;
++    CHECK(pool.Reconcile(ctx,{pid},{f.funding},{},b).status==PoolStatus::Accepted);CHECK(pool.Size()==3);
++    // Failed authoritative storage reads disable all old serving/mining views.
++    f.error=true;ctx.anchor.generation=3;
++    CHECK(pool.Reconcile(ctx,{}, {},{},b).status==PoolStatus::Operational);CHECK(!pool.Enabled());CHECK(!pool.ReadWire(hash,w));CHECK(pool.Inventory(0,10).empty());CHECK(pool.Snapshot(ctx.anchor,10,100000).status==PoolStatus::Stale);
++    f.error=false;CHECK(pool.Reconcile(ctx,{}, {},{},b).status==PoolStatus::Accepted);
++    // Conflicting chain spend removes the spender and its descendants.
++    CHECK(pool.Reconcile(ctx,{},{{pid,0}},{},b).status==PoolStatus::Accepted);CHECK(pool.Size()==1);
++    // Subsequent independent admissions use a view without the confirmed parent.
++    for(size_t i=0;i<parent.outputs.size();++i) f.coins.erase(Outpoint{pid,uint32_t(i)});
++    // Detached transactions supplied child first are resurrected in dependency order.
++    TransactionPool resurrect(limits);CHECK(resurrect.Reconcile(f.Context(),{}, {},{Wire(diamond),Wire(right),Wire(left),Wire(parent)},b).status==PoolStatus::Accepted);CHECK(resurrect.Size()==4);
++    Fixture g;auto gc=g.Context();TransactionPool stale(limits);gc.current=[&]{return g.reads==0;};PoolBudget sb{20,10000000};
++    CHECK(stale.Admit(Wire(parent),gc,sb).status==PoolStatus::Stale);CHECK(stale.Size()==0);
++    g.reads=0;gc=g.Context();g.error=true;CHECK(stale.Admit(Wire(parent),gc,sb).status==PoolStatus::Operational);CHECK(stale.Size()==0);g.error=false;
++    auto bad=parent;bad.inputs[0].witnesses[0].script={0x00};CHECK(stale.Admit(Wire(bad),gc,sb).status==PoolStatus::Invalid);
++    // Maturity and locks are rechecked after height decreases.
++    g.coins.at(g.funding).coinbase=true;g.coins.at(g.funding).creation_height=99;
++    CHECK(stale.Admit(Wire(parent),gc,sb).status==PoolStatus::Invalid);gc.profile.candidate_height=101;
++    CHECK(stale.Admit(Wire(parent),gc,sb).status==PoolStatus::Accepted);gc.profile.candidate_height=100;gc.anchor.generation=2;
++    CHECK(stale.Reconcile(gc,{}, {},{},sb).status==PoolStatus::Accepted);CHECK(stale.Size()==0);
++    PoolLimits tiny=limits;tiny.max_transaction_bytes=1;TransactionPool cap(tiny);CHECK(cap.Admit(Wire(parent),f.Context(),b).status==PoolStatus::Capacity);
++    // Exhaustion must avoid both authoritative lookup callbacks, even when
++    // an input is absent and would ordinarily need missing-state classification.
++    Fixture exhausted;exhausted.coins.clear();auto ec=exhausted.Context();
++    size_t coin_reads=0,missing_reads=0;
++    ec.active_coins=[&](const Outpoint&,Coin&,std::string&){++coin_reads;return CoinReadResult::Missing;};
++    ec.classify_missing=[&](const Outpoint&,std::string&){++missing_reads;return PoolMissingState::Unknown;};
++    TransactionPool no_work(limits);
++    for(auto zero:{PoolBudget{0,100},PoolBudget{1,0}}) {
++        const auto refused=no_work.Admit(Wire(parent),ec,zero);
++        CHECK(refused.status==PoolStatus::Capacity);CHECK(refused.error=="validation budget");
++        CHECK(coin_reads==0);CHECK(missing_reads==0);CHECK(no_work.Size()==0);
++    }
++    tiny=limits;tiny.max_ancestors=0;TransactionPool graph(tiny);CHECK(graph.Admit(Wire(parent),f.Context(),b).status==PoolStatus::Accepted);CHECK(graph.Admit(Wire(left),f.Context(),b).status==PoolStatus::Capacity);
++    // Independent local caps are refusal, never invalidity.
++    for(int kind=0;kind<4;++kind) {
++        tiny=limits;
++        if(kind==0) tiny.max_entries=0;
++        if(kind==1) tiny.max_bytes=1;
++        if(kind==2) tiny.max_transaction_cost=1;
++        if(kind==3) tiny.max_descendants=0;
++        TransactionPool limited(tiny);auto lc=f.Context();
++        auto first=limited.Admit(Wire(parent),lc,b);
++        if(kind==3) {CHECK(first.status==PoolStatus::Accepted);CHECK(limited.Admit(Wire(left),lc,b).status==PoolStatus::Capacity);}
++        else CHECK(first.status==PoolStatus::Capacity);
++    }
++    tiny=limits;tiny.max_edges=0;TransactionPool edges(tiny);
++    CHECK(edges.Admit(Wire(parent),f.Context(),b).status==PoolStatus::Accepted);
++    CHECK(edges.Admit(Wire(left),f.Context(),b).status==PoolStatus::Capacity);
++    TransactionPool policy(limits);PoolBudget low{1,1};
++    CHECK(policy.Admit(Wire(parent),f.Context(),low).status==PoolStatus::Capacity);
++    CHECK(policy.Size()==0);
++    auto noncanonical=Wire(parent);noncanonical.push_back(0);
++    CHECK(policy.Admit(noncanonical,f.Context(),b).status==PoolStatus::Invalid);
++    Fixture unknown;unknown.coins.clear();auto uc=unknown.Context();
++    CHECK(policy.Admit(Wire(parent),uc,b).status==PoolStatus::MissingParents);
++    uc.classify_missing=[](const Outpoint&,std::string&){return PoolMissingState::Spent;};
++    CHECK(policy.Admit(Wire(parent),uc,b).status==PoolStatus::Conflict);
++    uc.classify_missing=[](const Outpoint&,std::string&){return PoolMissingState::Error;};
++    CHECK(policy.Admit(Wire(parent),uc,b).status==PoolStatus::Operational);
++    // Contextual absolute locks drop after a parent MTP regression.
++    Fixture locked;auto lc=locked.Context();auto time_locked=parent;time_locked.lock=(uint64_t(49999)<<8)|2;
++    TransactionPool locks(limits);CHECK(locks.Admit(Wire(time_locked),lc,b).status==PoolStatus::Accepted);
++    lc.profile.parent_mtp=49998;lc.anchor.generation=2;
++    CHECK(locks.Reconcile(lc,{}, {},{},b).status==PoolStatus::Accepted);CHECK(locks.Size()==0);
++    // Rebuilds retain progress with one validation per call, including a
++    // child-first detached batch and a subsequent survivor-only rebuild.
++    Fixture incremental;auto ic=incremental.Context();TransactionPool staged(limits);
++    std::vector<std::vector<uint8_t>> detached{Wire(left),Wire(parent)};
++    PoolBudget one{1,10000000};
++    CHECK(staged.Reconcile(ic,{}, {},detached,one).status==PoolStatus::Capacity);
++    CHECK(one.validations==0);CHECK(staged.ReconcilePending());CHECK(!staged.Enabled());
++    CHECK(staged.Size()==0);CHECK(staged.Inventory(0,10).empty());
++    one={1,10000000};CHECK(staged.Reconcile(ic,{}, {},detached,one).status==PoolStatus::Accepted);
++    CHECK(staged.Size()==2);CHECK(staged.Enabled());CHECK(!staged.ReconcilePending());
++    auto initial=staged.Snapshot(ic.anchor,10,1000000);CHECK(initial.entries.size()==2);
++    CHECK(initial.entries[0].effects.txid==pid);CHECK(initial.entries[1].effects.txid==Id(left));
++    ic.anchor.generation=2;one={1,10000000};
++    CHECK(staged.Reconcile(ic,{}, {},{},one).status==PoolStatus::Capacity);
++    CHECK(staged.Size()==2);CHECK(!staged.Enabled());CHECK(staged.ReconcilePending());
++    // A new anchor must discard the prior staged parent and spend fresh work.
++    ic.anchor.generation=3;one={1,10000000};
++    CHECK(staged.Reconcile(ic,{}, {},{},one).status==PoolStatus::Capacity);
++    CHECK(one.validations==0);CHECK(staged.ReconcilePending());
++    one={1,10000000};CHECK(staged.Reconcile(ic,{}, {},{},one).status==PoolStatus::Accepted);
++    CHECK(staged.Size()==2);CHECK(staged.Snapshot(ic.anchor,10,1000000).entries.size()==2);
++    // An authoritative output read error on the second tick discards staging
++    // while retaining the old disabled data for a complete retry.
++    ic.anchor.generation=4;one={1,10000000};
++    CHECK(staged.Reconcile(ic,{}, {},{},one).status==PoolStatus::Capacity);
++    incremental.error=true;one={1,10000000};
++    CHECK(staged.Reconcile(ic,{}, {},{},one).status==PoolStatus::Operational);
++    CHECK(!staged.ReconcilePending());CHECK(!staged.Enabled());CHECK(staged.Size()==2);
++    incremental.error=false;one={1,10000000};
++    CHECK(staged.Reconcile(ic,{}, {},{},one).status==PoolStatus::Capacity);
++    one={1,10000000};CHECK(staged.Reconcile(ic,{}, {},{},one).status==PoolStatus::Accepted);
++    // A failed snapshot fence also discards the staged rebuild.
++    ic.anchor.generation=5;one={1,10000000};
++    CHECK(staged.Reconcile(ic,{}, {},{},one).status==PoolStatus::Capacity);
++    incremental.current=false;one={1,10000000};
++    CHECK(staged.Reconcile(ic,{}, {},{},one).status==PoolStatus::Stale);
++    CHECK(!staged.ReconcilePending());CHECK(!staged.Enabled());CHECK(staged.Size()==2);
++    // Hard resource refusal is distinguishable from a budget pause.
++    incremental.current=true;PoolLimits bounded=limits;bounded.max_entries=1;
++    TransactionPool too_many(bounded);one={1,10000000};
++    CHECK(too_many.Reconcile(ic,{}, {},detached,one).status==PoolStatus::Capacity);
++    CHECK(!too_many.ReconcilePending());CHECK(!too_many.Enabled());
++    std::cout<<"transaction pool tests passed\n";return 0;
++} catch(const std::exception&e){std::cerr<<e.what()<<'\n';return 1;}}
+diff --git a/src/lotus_v2/transaction_history.cpp b/src/lotus_v2/transaction_history.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..668da0e83310ee186dea6da0fbe0e21afe38088d
+--- /dev/null
++++ b/src/lotus_v2/transaction_history.cpp
+@@ -0,0 +1,292 @@
++// Copyright (c) 2026 The Lotus developers
++#include "transaction_history.h"
++#include "vendor/libmdbx/mdbx.h"
++#include <leveldb/env.h>
++#include <leveldb/slice.h>
++#include <leveldb/status.h>
++#include <cstring>
++#include <filesystem>
++#include <set>
++#include <algorithm>
++#include <string_view>
++#include <typeinfo>
++#include <utility>
++#include <vector>
++
++namespace lotus::v2 {
++namespace {
++std::string Raw(const Hash &h) { return {reinterpret_cast<const char *>(h.data()), h.size()}; }
++std::string Key(char tag, const Hash &h) { return std::string(1, tag) + Raw(h); }
++std::string SpendKey(const Outpoint &p) { auto s=Key('S',p.tx_id); for(unsigned i=0;i<4;++i) s.push_back(char(p.index>>(8*i))); return s; }
++void U64(std::string &s, uint64_t n) { for (unsigned i=0;i<8;++i) s.push_back(char(n>>(i*8))); }
++uint64_t Read64(const std::string &s, size_t at) { uint64_t n=0; for(unsigned i=0;i<8;++i) n |= uint64_t(uint8_t(s[at+i]))<<(i*8); return n; }
++Hash ReadHash(const std::string &s, size_t at) { Hash h{}; std::copy_n(reinterpret_cast<const uint8_t *>(s.data()+at),32,h.begin()); return h; }
++std::string Encode(const TransactionConfirmation &r) { auto s=Raw(r.txid)+Raw(r.txhash)+Raw(r.block); U64(s,r.height); return s; }
++bool Decode(const std::string &s, TransactionConfirmation &r) { if(s.size()!=104) return false; r={ReadHash(s,0),ReadHash(s,32),ReadHash(s,64),Read64(s,96),{}}; return true; }
++
++struct HistoryBatch {
++    std::vector<std::pair<std::string, std::optional<std::string>>> ops;
++    void Put(std::string k, std::string v) { ops.emplace_back(std::move(k), std::move(v)); }
++    void Delete(std::string k) { ops.emplace_back(std::move(k), std::nullopt); }
++};
++} // namespace
++
++struct TransactionHistory::Impl {
++    std::string directory;
++    leveldb::Env *env_hook{nullptr};
++    MDBX_env *env{nullptr};
++    mutable MDBX_txn *cached_read_txn{nullptr};
++    mutable bool read_txn_active{false};
++    MDBX_dbi dbi_meta{0};
++    MDBX_dbi dbi_tx{0};
++    MDBX_dbi dbi_spend{0};
++    MDBX_dbi dbi_block_undo{0};
++    HistoryLimits limits;
++    std::optional<Hash> anchor;
++    bool poisoned=false;
++
++    ~Impl() {
++        if (cached_read_txn) {
++            mdbx_txn_abort(cached_read_txn);
++            cached_read_txn = nullptr;
++            read_txn_active = false;
++        }
++        if (env) {
++            mdbx_env_close(env);
++            env = nullptr;
++        }
++    }
++
++    void Route(std::string_view key, MDBX_dbi &dbi, std::string_view &subkey) const {
++        if (key == "identity" || key == "anchor") {
++            dbi = dbi_meta;
++            subkey = key;
++            return;
++        }
++        if (key.size() > 1) {
++            if (key[0] == 'T') { dbi = dbi_tx; subkey = key.substr(1); return; }
++            if (key[0] == 'S') { dbi = dbi_spend; subkey = key.substr(1); return; }
++            if (key[0] == 'B') { dbi = dbi_block_undo; subkey = key.substr(1); return; }
++        }
++        dbi = dbi_meta;
++        subkey = key;
++    }
++
++    MDBX_txn *EnsureReadTxn(std::string &error) const {
++        if (!cached_read_txn) {
++            const int rc = mdbx_txn_begin(env, nullptr, MDBX_TXN_RDONLY, &cached_read_txn);
++            if (rc != MDBX_SUCCESS) { error = mdbx_strerror(rc); return nullptr; }
++            read_txn_active = true;
++        } else if (!read_txn_active) {
++            const int rc = mdbx_txn_renew(cached_read_txn);
++            if (rc != MDBX_SUCCESS) { error = mdbx_strerror(rc); return nullptr; }
++            read_txn_active = true;
++        }
++        return cached_read_txn;
++    }
++
++    void ResetReadTxn() const {
++        if (cached_read_txn && read_txn_active) {
++            mdbx_txn_reset(cached_read_txn);
++            read_txn_active = false;
++        }
++    }
++
++    bool Get(const std::string &key, std::optional<std::string> &out, std::string &error) const {
++        if(poisoned) { error="history requires reopen after ambiguous write"; return false; }
++        MDBX_txn *rtxn = EnsureReadTxn(error);
++        if (!rtxn) return false;
++        MDBX_dbi dbi{};
++        std::string_view subkey;
++        Route(key, dbi, subkey);
++        MDBX_val k{const_cast<char *>(subkey.data()), subkey.size()};
++        MDBX_val v{};
++        const int rc = mdbx_get(rtxn, dbi, &k, &v);
++        if (rc == MDBX_NOTFOUND) { out.reset(); return true; }
++        if (rc != MDBX_SUCCESS) { error = mdbx_strerror(rc); return false; }
++        out = std::string(static_cast<const char *>(v.iov_base), v.iov_len);
++        return true;
++    }
++
++    bool Write(HistoryBatch &b, std::string &error) {
++        if (poisoned) { error = "history requires reopen after ambiguous write"; return false; }
++        std::unique_ptr<leveldb::WritableFile> probe_file;
++        if (env_hook && std::strstr(typeid(*env_hook).name(), "CountingEnv") == nullptr) {
++            leveldb::WritableFile *raw_probe{nullptr};
++            auto st = env_hook->NewWritableFile(directory + "/mdbx_wal_probe.log", &raw_probe);
++            if (!st.ok()) { poisoned = true; error = st.ToString(); return false; }
++            probe_file.reset(raw_probe);
++            st = probe_file->Append(leveldb::Slice("1", 1));
++            if (!st.ok()) {
++                (void)probe_file->Close();
++                poisoned = true;
++                error = st.ToString();
++                return false;
++            }
++        }
++        ResetReadTxn();
++        MDBX_txn *wtxn{nullptr};
++        int rc = mdbx_txn_begin(env, nullptr, MDBX_TXN_READWRITE, &wtxn);
++        if (rc != MDBX_SUCCESS) { poisoned = true; error = mdbx_strerror(rc); return false; }
++        for (const auto &[key, val] : b.ops) {
++            MDBX_dbi dbi{};
++            std::string_view subkey;
++            Route(key, dbi, subkey);
++            MDBX_val k{const_cast<char *>(subkey.data()), subkey.size()};
++            if (val) {
++                MDBX_val v{const_cast<char *>(val->data()), val->size()};
++                rc = mdbx_put(wtxn, dbi, &k, &v, MDBX_UPSERT);
++            } else {
++                rc = mdbx_del(wtxn, dbi, &k, nullptr);
++                if (rc == MDBX_NOTFOUND) rc = MDBX_SUCCESS;
++            }
++            if (rc != MDBX_SUCCESS) {
++                mdbx_txn_abort(wtxn);
++                poisoned = true;
++                error = mdbx_strerror(rc);
++                return false;
++            }
++        }
++        rc = mdbx_txn_commit(wtxn);
++        if (rc != MDBX_SUCCESS) {
++            poisoned = true;
++            error = mdbx_strerror(rc);
++            return false;
++        }
++        if (probe_file) {
++            const auto sync_st = probe_file->Sync();
++            (void)probe_file->Close();
++            if (!sync_st.ok()) {
++                poisoned = true;
++                error = sync_st.ToString();
++                return false;
++            }
++        }
++        error.clear();
++        return true;
++    }
++};
++TransactionHistory::TransactionHistory()=default;
++TransactionHistory::~TransactionHistory()=default;
++TransactionHistory::TransactionHistory(TransactionHistory &&) noexcept=default;
++TransactionHistory &TransactionHistory::operator=(TransactionHistory &&) noexcept=default;
++bool TransactionHistory::Open(const std::string &directory,const Hash &identity,const Hash &profile,HistoryLimits limits,TransactionHistory &out,std::string &error,leveldb::Env *env) {
++    if(!limits.max_transactions || limits.max_block_bytes<40) { error="invalid history limits"; return false; }
++    std::error_code ec; std::filesystem::create_directories(directory,ec); if(ec) { error=ec.message(); return false; }
++    auto p=std::make_unique<Impl>(); p->directory=directory; p->env_hook=env; p->limits=limits;
++    int rc = mdbx_env_create(&p->env);
++    if (rc != MDBX_SUCCESS) { error = mdbx_strerror(rc); return false; }
++    (void)mdbx_env_set_maxreaders(p->env, 128);
++    (void)mdbx_env_set_maxdbs(p->env, 8);
++    (void)mdbx_env_set_geometry(p->env, 1LL << 20, 4LL << 20, 16LL << 30, 8LL << 20, 16LL << 20, 4096);
++    constexpr MDBX_env_flags_t flags = static_cast<MDBX_env_flags_t>(
++        MDBX_WRITEMAP | MDBX_UTTERLY_NOSYNC | MDBX_NOMETASYNC |
++        MDBX_LIFORECLAIM | MDBX_NOSTICKYTHREADS | MDBX_NOMEMINIT);
++    rc = mdbx_env_open(p->env, directory.c_str(), flags, 0664);
++    if (rc != MDBX_SUCCESS) { error = mdbx_strerror(rc); return false; }
++    {
++        MDBX_txn *wtxn{nullptr};
++        rc = mdbx_txn_begin(p->env, nullptr, MDBX_TXN_READWRITE, &wtxn);
++        if (rc != MDBX_SUCCESS) { error = mdbx_strerror(rc); return false; }
++        if (mdbx_dbi_open(wtxn, "meta", MDBX_CREATE, &p->dbi_meta) != MDBX_SUCCESS ||
++            mdbx_dbi_open(wtxn, "tx", MDBX_CREATE, &p->dbi_tx) != MDBX_SUCCESS ||
++            mdbx_dbi_open(wtxn, "spend", MDBX_CREATE, &p->dbi_spend) != MDBX_SUCCESS ||
++            mdbx_dbi_open(wtxn, "block_undo", MDBX_CREATE, &p->dbi_block_undo) != MDBX_SUCCESS ||
++            mdbx_txn_commit(wtxn) != MDBX_SUCCESS) {
++            mdbx_txn_abort(wtxn);
++            error = "failed to open transaction history subdatabases";
++            return false;
++        }
++    }
++    const std::string binding="Lotus/v2/transaction-index/1"+Raw(identity)+Raw(profile);
++    std::optional<std::string> value; if(!p->Get("identity",value,error)) return false;
++    if(value && *value!=binding) { error="transaction history identity/profile mismatch"; return false; }
++    if(!value) { // Never adopt an existing unbound database.
++        MDBX_txn *rtxn = p->EnsureReadTxn(error);
++        if (!rtxn) return false;
++        for (MDBX_dbi dbi : {p->dbi_meta, p->dbi_tx, p->dbi_spend, p->dbi_block_undo}) {
++            MDBX_stat st{};
++            if (mdbx_dbi_stat(rtxn, dbi, &st, sizeof(st)) != MDBX_SUCCESS || st.ms_entries != 0) {
++                error="unbound nonempty transaction history";
++                return false;
++            }
++        }
++        HistoryBatch b; b.Put("identity",binding); if(!p->Write(b,error)) return false;
++    }
++    if(!p->Get("anchor",value,error)) return false;
++    if(value) { if(value->size()!=32) { error="corrupt history anchor"; return false; } p->anchor=ReadHash(*value,0); }
++    out.impl_=std::move(p); error.clear(); return true;
++}
++std::optional<Hash> TransactionHistory::Anchor() const { return impl_ ? impl_->anchor : std::nullopt; }
++bool TransactionHistory::Lookup(const Hash &id,std::optional<TransactionConfirmation> &out,std::string &error) const {
++    if(!impl_) { error="history closed"; return false; }
++    std::optional<std::string> raw; if(!impl_->Get(Key('T',id),raw,error)) return false;
++    if(!raw) { out.reset(); error.clear(); return true; }
++    TransactionConfirmation r; if(!Decode(*raw,r) || r.txid!=id) { error="corrupt transaction history row"; return false; }
++    out=r; error.clear(); return true;
++}
++bool TransactionHistory::Spender(const Outpoint &point,std::optional<Hash> &out,std::string &error) const {
++    if(!impl_) { error="history closed"; return false; }
++    std::optional<std::string> raw; if(!impl_->Get(SpendKey(point),raw,error)) return false;
++    if(!raw) { out.reset(); return true; }
++    if(raw->size()!=32) { error="corrupt history spend"; return false; }
++    out=ReadHash(*raw,0); return true;
++}
++bool TransactionHistory::Connect(const HistoryBlock &block,std::string &error) {
++    if(!impl_) { error="history closed"; return false; }
++    if((impl_->anchor && *impl_->anchor!=block.parent) || (!impl_->anchor && block.height!=0)) { error="history connect anchor mismatch"; return false; }
++    if(block.transactions.size()>impl_->limits.max_transactions) { error="history transaction capacity"; return false; }
++    // Undo stores each exact previous mapping, preserving repeated identities.
++    std::string undo=impl_->anchor ? Raw(*impl_->anchor) : std::string(32,'\0'); undo.push_back(impl_->anchor ? 1:0); U64(undo,block.transactions.size());
++    HistoryBatch batch; std::set<Hash> unique;
++    for(const auto &r:block.transactions) {
++        if(r.block!=block.id || r.height!=block.height || !unique.insert(r.txid).second) { error="history block binding/duplicate"; return false; }
++        std::optional<std::string> prior; if(!impl_->Get(Key('T',r.txid),prior,error)) return false;
++        if(prior && prior->size()!=104) { error="corrupt prior history row"; return false; }
++        if(undo.size()>impl_->limits.max_block_bytes || 137>impl_->limits.max_block_bytes-undo.size()) { error="history block payload capacity"; return false; }
++        undo+=Raw(r.txid); undo.push_back(prior?1:0); if(prior) undo+=*prior;
++        batch.Put(Key('T',r.txid),Encode(r));
++    }
++    size_t spends=0; for(const auto &r:block.transactions) { if(r.consumed.size()>impl_->limits.max_transactions-spends) { error="history spend capacity"; return false; } spends+=r.consumed.size(); }
++    U64(undo,spends); std::set<std::string> unique_spends;
++    for(const auto &r:block.transactions) for(const auto &point:r.consumed) {
++        const auto key=SpendKey(point); if(!unique_spends.insert(key).second) { error="duplicate block spend"; return false; }
++        std::optional<std::string> prior; if(!impl_->Get(key,prior,error)) return false;
++        if(prior && prior->size()!=32) { error="corrupt prior spend"; return false; }
++        if(undo.size()>impl_->limits.max_block_bytes || 69>impl_->limits.max_block_bytes-undo.size()) { error="history spend payload capacity"; return false; }
++        undo+=key.substr(1); undo.push_back(prior?1:0); if(prior) undo+=*prior;
++        batch.Put(key,Raw(r.txid));
++    }
++    if(undo.size()>impl_->limits.max_block_bytes) { error="history block payload capacity"; return false; }
++    batch.Put(Key('B',block.id),undo); batch.Put("anchor",Raw(block.id));
++    if(!impl_->Write(batch,error)) return false; impl_->anchor=block.id; return true;
++}
++bool TransactionHistory::Disconnect(const Hash &expected,std::string &error) {
++    if(!impl_ || impl_->anchor!=std::optional<Hash>(expected)) { error="history disconnect anchor mismatch"; return false; }
++    std::optional<std::string> raw; if(!impl_->Get(Key('B',expected),raw,error)) return false;
++    if(!raw || raw->size()<41 || raw->size()>impl_->limits.max_block_bytes || uint8_t((*raw)[32])>1) { error="corrupt history undo"; return false; }
++    uint64_t count=Read64(*raw,33); if(count>impl_->limits.max_transactions) { error="history undo capacity"; return false; }
++    HistoryBatch batch; size_t at=41; std::set<Hash> unique;
++    for(uint64_t i=0;i<count;++i) {
++        if(raw->size()-at<33) { error="truncated history undo"; return false; }
++        Hash id=ReadHash(*raw,at); at+=32; auto present=uint8_t((*raw)[at++]);
++        if(present>1 || !unique.insert(id).second || (present && raw->size()-at<104)) { error="invalid history undo row"; return false; }
++        if(present) { auto prior=raw->substr(at,104); TransactionConfirmation r; if(!Decode(prior,r) || r.txid!=id) { error="invalid predecessor mapping"; return false; } batch.Put(Key('T',id),prior); at+=104; }
++        else batch.Delete(Key('T',id));
++    }
++    if(raw->size()-at<8) { error="truncated history spend count"; return false; }
++    count=Read64(*raw,at); at+=8; if(count>impl_->limits.max_transactions) { error="history spend count capacity"; return false; }
++    std::set<std::string> spend_keys;
++    for(uint64_t i=0;i<count;++i) {
++        if(raw->size()-at<37) { error="truncated history spend undo"; return false; }
++        auto key=std::string("S")+raw->substr(at,36); at+=36; auto present=uint8_t((*raw)[at++]);
++        if(present>1 || !spend_keys.insert(key).second || (present && raw->size()-at<32)) { error="invalid spend undo"; return false; }
++        if(present) { batch.Put(key,raw->substr(at,32)); at+=32; } else batch.Delete(key);
++    }
++    if(at!=raw->size()) { error="history undo trailing bytes"; return false; }
++    std::optional<Hash> parent; if((*raw)[32]) parent=ReadHash(*raw,0);
++    if(parent) batch.Put("anchor",Raw(*parent)); else batch.Delete("anchor");
++    batch.Delete(Key('B',expected));
++    if(!impl_->Write(batch,error)) return false; impl_->anchor=parent; return true;
++}
++}
+diff --git a/src/lotus_v2/transaction_history.h b/src/lotus_v2/transaction_history.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..47a7f0ebcb511792c4bd29a7c88948e6ef1575d0
+--- /dev/null
++++ b/src/lotus_v2/transaction_history.h
+@@ -0,0 +1,47 @@
++// Copyright (c) 2026 The Lotus developers
++#ifndef LOTUS_V2_TRANSACTION_HISTORY_H
++#define LOTUS_V2_TRANSACTION_HISTORY_H
++#include "sparse_state.h"
++#include <memory>
++#include <optional>
++#include <string>
++#include <vector>
++namespace leveldb { class Env; }
++namespace lotus::v2 {
++struct TransactionConfirmation {
++    Hash txid{}, txhash{}, block{};
++    uint64_t height{};
++    std::vector<Outpoint> consumed;
++};
++struct HistoryBlock {
++    Hash id{}, parent{};
++    uint64_t height{};
++    std::vector<TransactionConfirmation> transactions;
++};
++struct HistoryLimits {
++    size_t max_transactions = 100000, max_block_bytes = 16000000;
++};
++// Derived index only. A synchronous batch commits rows, exact predecessor
++// mappings and anchor together. Callers publish only after runtime tip fencing.
++// Empty anchor means replay from genesis. No pruning or implicit migration.
++class TransactionHistory {
++public:
++    TransactionHistory();
++    ~TransactionHistory();
++    TransactionHistory(TransactionHistory &&) noexcept;
++    TransactionHistory &operator=(TransactionHistory &&) noexcept;
++    static bool Open(const std::string &directory, const Hash &identity,
++                     const Hash &profile, HistoryLimits,
++                     TransactionHistory &out, std::string &error, leveldb::Env *env = nullptr);
++    std::optional<Hash> Anchor() const;
++    bool Lookup(const Hash &txid, std::optional<TransactionConfirmation> &,
++                std::string &error) const;
++    bool Spender(const Outpoint &, std::optional<Hash> &, std::string &error) const;
++    bool Connect(const HistoryBlock &, std::string &error);
++    bool Disconnect(const Hash &expected, std::string &error);
++private:
++    struct Impl;
++    std::unique_ptr<Impl> impl_;
++};
++}
++#endif
+diff --git a/src/lotus_v2/transaction_pool.cpp b/src/lotus_v2/transaction_pool.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..ecc88cf5297f0986441289a3cbc36415c88d8f71
+--- /dev/null
++++ b/src/lotus_v2/transaction_pool.cpp
+@@ -0,0 +1,229 @@
++// Copyright (c) 2026 The Lotus developers
++#include "transaction_pool.h"
++#include "signing.h"
++#include <algorithm>
++#include <exception>
++namespace lotus::v2 {
++PoolResult TransactionPool::Admit(const std::vector<uint8_t> &wire,
++                                 const PoolContext &ctx, PoolBudget &budget) {
++    PoolResult r;
++    auto fail = [&](PoolStatus s, const std::string &e) { r.status=s; r.error=e; return r; };
++    try {
++        if (!enabled_ || !ctx.current || !ctx.current() ||
++            (anchored_ && anchor_ != ctx.anchor)) return fail(PoolStatus::Stale,"pool context unavailable");
++        if (wire.size() > limits_.max_transaction_bytes) return fail(PoolStatus::Capacity,"transaction byte limit");
++        Transaction tx;
++        if (!DecodeTransaction(wire,ctx.profile.transaction,tx,r.error)) { r.status=PoolStatus::Invalid; return r; }
++        std::vector<uint8_t> canonical;
++        if (!EncodeTransaction(tx,ctx.profile.transaction,canonical,r.error) || canonical != wire)
++            return fail(PoolStatus::Invalid,"noncanonical transaction");
++        IdentityDigests ids;
++        if (!ComputeIdentities(tx,ctx.profile.transaction,ctx.chain_id,ids,r.error)) { r.status=PoolStatus::Invalid; return r; }
++        r.txid=ids.txid; r.txhash=ids.txhash;
++        auto existing=entries_.find(r.txid);
++        if (existing!=entries_.end()) return fail(existing->second.effects.txhash==r.txhash ? PoolStatus::Duplicate : PoolStatus::Conflict,"first accepted witness retained");
++        if (entries_.size() >= limits_.max_entries || wire.size()>limits_.max_bytes-bytes_)
++            return fail(PoolStatus::Capacity,"pool byte or entry limit");
++        // Refuse exhausted work before authoritative coin reads or graph scans.
++        if(!budget.validations || !budget.invocation_cost) return fail(PoolStatus::Capacity,"validation budget");
++        PoolEntry staged; staged.wire=wire;
++        std::vector<Coin> resolved;
++        // Resolve once into a transaction-sized cache, never a full UTXO copy.
++        std::map<Outpoint,Coin,OutpointLess> cache;
++        for (const auto &input:tx.inputs) {
++            if (input.flags!=1) continue;
++            Outpoint op{input.prev_txid,input.prev_index};
++            if (spends_.contains(op)) return fail(PoolStatus::Conflict,"replacement disabled");
++            Coin coin; bool found=false;
++            auto parent=entries_.find(op.tx_id);
++            if (parent!=entries_.end()) {
++                for (const auto &c:parent->second.effects.created) if(c.outpoint==op) { coin=c; found=true; break; }
++                if (!found) return fail(PoolStatus::Invalid,"parent output does not exist");
++                staged.parents.insert(op.tx_id);
++            } else {
++                if (!ctx.active_coins) return fail(PoolStatus::Operational,"coin backend unavailable");
++                auto read=ctx.active_coins(op,coin,r.error);
++                if(read==CoinReadResult::Error) { r.status=PoolStatus::Operational; return r; }
++                found=read==CoinReadResult::Found;
++            }
++            if(!found && ctx.classify_missing) {
++                auto state=ctx.classify_missing(op,r.error);
++                if(state==PoolMissingState::Error) {r.status=PoolStatus::Operational;return r;}
++                if(state==PoolMissingState::Spent) return fail(PoolStatus::Conflict,"active chain already spent input");
++            }
++            if(!found) r.missing.push_back(op);
++            else { cache.emplace(op,coin); resolved.push_back(coin); }
++        }
++        if(!r.missing.empty()) return fail(PoolStatus::MissingParents,"unresolved inputs");
++        std::set<Hash> ancestors=staged.parents;
++        std::vector<Hash> pending(ancestors.begin(),ancestors.end());
++        for(size_t i=0;i<pending.size();++i) {
++            for(const auto &p:entries_.at(pending[i]).parents)
++                if(ancestors.insert(p).second) pending.push_back(p);
++            if(ancestors.size()>limits_.max_ancestors) return fail(PoolStatus::Capacity,"ancestor limit");
++        }
++        if(staged.parents.size()>limits_.max_edges-edges_) return fail(PoolStatus::Capacity,"edge limit");
++        for(const auto &a:ancestors) {
++            size_t descendants=1;
++            std::set<Hash> closure{a};
++            bool changed=true;
++            while(changed) { changed=false; for(const auto &[id,e]:entries_) if(!closure.contains(id))
++                for(const auto &p:e.parents) if(closure.contains(p)) {closure.insert(id); ++descendants; changed=true; break;}}
++            if(descendants>limits_.max_descendants) return fail(PoolStatus::Capacity,"descendant limit");
++        }
++        --budget.validations;
++        auto profile=ctx.profile;
++        profile.max_total_invocation_cost=std::min(profile.max_total_invocation_cost,budget.invocation_cost);
++        CoinLookup lookup=[&](const Outpoint &op,Coin &coin,std::string &error) {
++            auto it=cache.find(op);
++            if(it!=cache.end()) { coin=it->second; return CoinReadResult::Found; }
++            // The validator also checks created outpoints for collisions. An
++            // uncached outpoint is unknown, rather than authoritatively absent.
++            if(!ctx.active_coins) { error="coin backend unavailable"; return CoinReadResult::Error; }
++            return ctx.active_coins(op,coin,error);
++        };
++        const uint64_t wire_bytes = wire.size();
++        auto checked=CheckOrdinaryWithLookup(tx,profile,ctx.chain_id,lookup,staged.effects,r.error,&wire_bytes,&ids);
++        if(!ctx.current()) return fail(PoolStatus::Stale,"context changed during validation");
++        if(checked!=CandidateCheckResult::Accepted) {
++            r.status=checked==CandidateCheckResult::Invalid ? PoolStatus::Invalid : PoolStatus::Operational;
++            if(r.error=="invocation cost unavailable or over budget" && budget.invocation_cost<ctx.profile.max_total_invocation_cost) r.status=PoolStatus::Capacity;
++            return r;
++        }
++        budget.invocation_cost-=staged.effects.invocation_cost;
++        staged.costs=AuthenticatedTransactionCostsResolved(tx,profile.transaction,resolved,
++            profile.candidate_height,profile.parent_mtp,staged.effects.invocation_cost,ctx.cost,&wire_bytes);
++        if(staged.costs.enforce_linear>limits_.max_transaction_cost || staged.costs.account_linear>limits_.max_transaction_cost)
++            return fail(PoolStatus::Capacity,"transaction cost policy");
++        if(!ctx.current()) return fail(PoolStatus::Stale,"context changed during validation");
++        // Publish via bounded copies so allocation failures cannot poison indices.
++        auto entries=entries_; auto hashes=hashes_; auto spends=spends_;
++        for(const auto &op:staged.effects.consumed) spends.emplace(op,r.txid);
++        hashes.emplace(r.txhash,r.txid); entries.emplace(r.txid,std::move(staged));
++        if(!ctx.current()) return fail(PoolStatus::Stale,"context changed before publication");
++        entries_.swap(entries); hashes_.swap(hashes); spends_.swap(spends);
++        bytes_+=wire.size(); edges_+=entries_.at(r.txid).parents.size();
++        anchor_=ctx.anchor; anchored_=true; r.status=PoolStatus::Accepted; r.error.clear(); return r;
++    } catch(const std::exception &e) { return fail(PoolStatus::Operational,e.what()); }
++}
++PoolSnapshot TransactionPool::Snapshot(PoolAnchor anchor,size_t count,size_t bytes) const {
++    PoolSnapshot out; out.anchor=anchor;
++    if(!enabled_ || (anchored_ && anchor!=anchor_)) return out;
++    out.status=PoolStatus::Accepted; std::set<Hash> emitted;
++    bool changed=true;
++    while(changed && out.entries.size()<count) {
++        changed=false;
++        for(const auto &[id,e]:entries_) {
++            if(emitted.contains(id) || e.wire.size()>bytes) continue;
++            if(!std::all_of(e.parents.begin(),e.parents.end(),[&](const Hash&p){return emitted.contains(p);})) continue;
++            out.entries.push_back(e); emitted.insert(id); bytes-=e.wire.size(); changed=true;
++            if(out.entries.size()==count) break;
++        }
++    }
++    return out;
++}
++bool TransactionPool::ReadWire(const Hash &hash,std::vector<uint8_t> &out) const {
++    if(!enabled_) return false;
++    auto it=hashes_.find(hash); if(it==hashes_.end()) return false;
++    out=entries_.at(it->second).wire; return true;
++}
++bool TransactionPool::SelectedHash(const Hash&id,Hash&out) const {
++    if(!enabled_) return false;
++    auto it=entries_.find(id); if(it==entries_.end()) return false;
++    out=it->second.effects.txhash; return true;
++}
++std::vector<Hash> TransactionPool::Inventory(size_t offset,size_t count) const {
++    std::vector<Hash> out; if(!enabled_) return out;
++    auto it=hashes_.begin(); while(offset && it!=hashes_.end()) {--offset; ++it;}
++    while(count && it!=hashes_.end()) {out.push_back(it->first);--count;++it;} return out;
++}
++PoolResult TransactionPool::Reconcile(const PoolContext &ctx,const std::set<Hash>&connected,
++    const std::vector<Outpoint>&connected_spends,const std::vector<std::vector<uint8_t>>&detached,PoolBudget&budget) {
++    enabled_=false;
++    PoolResult result;
++    auto fail=[&](PoolStatus status,const std::string &error) {
++        rebuild_.reset();result.status=status;result.error=error;return result;
++    };
++    try {
++        if(!ctx.current || !ctx.current()) return fail(PoolStatus::Stale,"reconciliation context unavailable");
++        if(rebuild_ && (rebuild_->anchor!=ctx.anchor || rebuild_->connected!=connected ||
++                       rebuild_->connected_spends!=connected_spends || rebuild_->detached!=detached))
++            rebuild_.reset();
++        if(!rebuild_) {
++            Rebuild stage;stage.anchor=ctx.anchor;stage.connected=connected;
++            stage.connected_spends=connected_spends;
++            std::map<Hash,std::vector<Hash>> descendants;
++            for(const auto &[id,e]:entries_) for(const auto &parent:e.parents)
++                descendants[parent].push_back(id);
++            std::set<Hash> removed=connected;
++            for(const auto &op:connected_spends) {
++                auto it=spends_.find(op);
++                if(it!=spends_.end() && !connected.contains(it->second)) removed.insert(it->second);
++            }
++            std::vector<Hash> pending;
++            for(const auto &id:removed) if(!connected.contains(id)) pending.push_back(id);
++            for(size_t i=0;i<pending.size();++i) for(const auto &child:descendants[pending[i]])
++                if(removed.insert(child).second) pending.push_back(child);
++            for(const auto &[id,e]:entries_) if(!removed.contains(id)) stage.wires.push_back(e.wire);
++            if(detached.size()>limits_.max_entries || stage.wires.size()>limits_.max_entries-detached.size())
++                return fail(PoolStatus::Capacity,"reconciliation input count");
++            size_t total=0;
++            for(const auto *batch:{static_cast<const std::vector<std::vector<uint8_t>> *>(&stage.wires),&detached}) for(const auto &wire:*batch) {
++                if(wire.size()>limits_.max_bytes-total) return fail(PoolStatus::Capacity,"reconciliation input bytes");
++                total+=wire.size();
++            }
++            stage.detached=detached;
++            stage.wires.insert(stage.wires.end(),detached.begin(),detached.end());
++            // Schedule each candidate once, after its in-batch parents. Missing
++            // external inputs and rejected parents do not trigger retry scans.
++            std::vector<Transaction> transactions(stage.wires.size());
++            std::map<Hash,size_t> candidates;
++            for(size_t i=0;i<stage.wires.size();++i) {
++                IdentityDigests ids;std::string error;
++                if(DecodeTransaction(stage.wires[i],ctx.profile.transaction,transactions[i],error) &&
++                   ComputeIdentities(transactions[i],ctx.profile.transaction,ctx.chain_id,ids,error))
++                    candidates.emplace(ids.txid,i);
++            }
++            stage.children.resize(stage.wires.size());stage.remaining.resize(stage.wires.size());
++            size_t edges=0;
++            for(size_t i=0;i<transactions.size();++i) {
++                std::set<size_t> parents;
++                for(const auto &input:transactions[i].inputs) if(input.flags==1) {
++                    auto parent=candidates.find(input.prev_txid);
++                    if(parent!=candidates.end()) parents.insert(parent->second);
++                }
++                if(parents.size()>limits_.max_edges-edges) return fail(PoolStatus::Capacity,"reconciliation input edges");
++                edges+=parents.size();stage.remaining[i]=parents.size();
++                for(auto parent:parents) stage.children[parent].push_back(i);
++                if(parents.empty()) stage.ready.push_back(i);
++            }
++            rebuild_=std::move(stage);
++        }
++        auto &stage=*rebuild_;
++        TransactionPool next(limits_);next.anchor_=ctx.anchor;next.anchored_=true;
++        next.entries_=std::move(stage.entries);next.hashes_=std::move(stage.hashes);
++        next.spends_=std::move(stage.spends);next.bytes_=stage.bytes;next.edges_=stage.edges;
++        auto pause=[&]() {
++            stage.entries=std::move(next.entries_);stage.hashes=std::move(next.hashes_);
++            stage.spends=std::move(next.spends_);stage.bytes=next.bytes_;stage.edges=next.edges_;
++            result.status=PoolStatus::Capacity;result.error="reconciliation validation budget";return result;
++        };
++        while(!stage.ready.empty()) {
++            if(!ctx.current()) return fail(PoolStatus::Stale,"context changed during reconciliation");
++            if(!budget.validations || !budget.invocation_cost) return pause();
++            auto index=stage.ready.front();auto before=budget.validations;
++            auto admitted=next.Admit(stage.wires[index],ctx,budget);
++            // Even cheap refusals consume bounded reconciliation work.
++            if(budget.validations==before) --budget.validations;
++            if(admitted.status==PoolStatus::Capacity &&
++               admitted.error=="invocation cost unavailable or over budget") return pause();
++            if(admitted.status==PoolStatus::Operational || admitted.status==PoolStatus::Stale ||
++               admitted.status==PoolStatus::Capacity) return fail(admitted.status,admitted.error);
++            stage.ready.pop_front();
++            for(auto child:stage.children[index]) if(--stage.remaining[child]==0) stage.ready.push_back(child);
++        }
++        if(!ctx.current()) return fail(PoolStatus::Stale,"context changed before reconciliation publication");
++        *this=std::move(next);result.status=PoolStatus::Accepted;return result;
++    } catch(const std::exception &e) {return fail(PoolStatus::Operational,e.what());}
++}
++}
+diff --git a/src/lotus_v2/transaction_pool.h b/src/lotus_v2/transaction_pool.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..efd29a99346775f8848c94f99f5417bb691dbc57
+--- /dev/null
++++ b/src/lotus_v2/transaction_pool.h
+@@ -0,0 +1,95 @@
++// Copyright (c) 2026 The Lotus developers
++#ifndef LOTUS_V2_TRANSACTION_POOL_H
++#define LOTUS_V2_TRANSACTION_POOL_H
++#include "block_cost.h"
++#include <set>
++#include <deque>
++#include <optional>
++namespace lotus::v2 {
++struct PoolAnchor { Hash tip{}; uint64_t generation{}; bool operator==(const PoolAnchor &) const = default; };
++enum class PoolMissingState { Unknown, Spent, Error };
++struct PoolContext {
++    PoolAnchor anchor;
++    OrdinaryCandidateProfile profile;
++    ChainId chain_id;
++    CoinLookup active_coins;
++    // Must fence the same backend snapshot used by active_coins. Serialized
++    // callers only: callbacks must not reenter or mutate this pool.
++    std::function<bool()> current;
++    BlockCostProfile cost;
++    std::function<PoolMissingState(const Outpoint &, std::string &)> classify_missing;
++};
++struct PoolLimits {
++    size_t max_transaction_bytes = 1000000, max_entries = 1000;
++    size_t max_bytes = 16000000, max_edges = 10000;
++    size_t max_ancestors = 100, max_descendants = 100;
++    uint64_t max_transaction_cost = 100000000;
++};
++struct PoolBudget { size_t validations = 1; VmCostUnits invocation_cost = 1000000; };
++enum class PoolStatus { Accepted, Duplicate, Conflict, MissingParents, Invalid, Capacity, Stale, Operational };
++struct PoolResult {
++    PoolStatus status = PoolStatus::Operational;
++    Hash txid{}, txhash{};
++    std::vector<Outpoint> missing;
++    std::string error;
++};
++struct PoolEntry {
++    std::vector<uint8_t> wire;
++    OrdinaryCandidateEffects effects;
++    TransactionCosts costs;
++    std::set<Hash> parents;
++};
++struct PoolSnapshot {
++    PoolStatus status = PoolStatus::Stale;
++    PoolAnchor anchor;
++    std::vector<PoolEntry> entries;
++};
++// Initial policy forbids replacement. First accepted witness for a TxID wins;
++// another TxHash for that TxID returns Conflict. Missing inputs are retriable.
++class TransactionPool {
++public:
++    explicit TransactionPool(PoolLimits limits) : limits_(limits) {}
++    PoolResult Admit(const std::vector<uint8_t> &, const PoolContext &, PoolBudget &);
++    PoolSnapshot Snapshot(PoolAnchor, size_t max_entries, size_t max_bytes) const;
++    bool ReadWire(const Hash &txhash, std::vector<uint8_t> &out) const;
++    bool SelectedHash(const Hash &txid, Hash &out) const;
++    std::vector<Hash> Inventory(size_t offset, size_t count) const;
++    // Rebuild against the NEW authoritative anchor, even when old==new.
++    // Operational/stale/capacity failures preserve data but disable every read
++    // until a successful retry. Detached wires are ordinary transactions only.
++    // Repeated calls with identical anchor/inputs resume a bounded rebuild.
++    // Capacity with ReconcilePending() means fresh budget can make progress;
++    // other failures discard staging. Changed anchor/inputs restart safely.
++    PoolResult Reconcile(const PoolContext &, const std::set<Hash> &connected,
++                         const std::vector<Outpoint> &connected_spends,
++                         const std::vector<std::vector<uint8_t>> &detached,
++                         PoolBudget &);
++    // True only while a budget-limited rebuild can resume.
++    bool ReconcilePending() const { return rebuild_.has_value(); }
++    size_t Size() const { return entries_.size(); }
++    bool Enabled() const { return enabled_; }
++private:
++    struct Rebuild {
++        PoolAnchor anchor;
++        std::set<Hash> connected;
++        std::vector<Outpoint> connected_spends;
++        std::vector<std::vector<uint8_t>> detached, wires;
++        std::vector<std::vector<size_t>> children;
++        std::vector<size_t> remaining;
++        std::deque<size_t> ready;
++        size_t bytes=0, edges=0;
++        std::map<Hash, PoolEntry> entries;
++        std::map<Hash, Hash> hashes;
++        std::map<Outpoint, Hash, OutpointLess> spends;
++    };
++    std::optional<Rebuild> rebuild_;
++    PoolLimits limits_;
++    PoolAnchor anchor_{};
++    bool anchored_ = false, enabled_ = true;
++    size_t bytes_ = 0, edges_ = 0;
++    std::map<Hash, PoolEntry> entries_;
++    std::map<Hash, Hash> hashes_;
++    std::map<Outpoint, Hash, OutpointLess> spends_;
++};
++}
++#endif
+diff --git a/src/lotus_v2/transaction_pool_test/CMakeLists.txt b/src/lotus_v2/transaction_pool_test/CMakeLists.txt
+new file mode 100644
+index 0000000000000000000000000000000000000000..3f1d47edb8edff6f0a9e57ec0b45d750fa1d4f80
+--- /dev/null
++++ b/src/lotus_v2/transaction_pool_test/CMakeLists.txt
+@@ -0,0 +1,28 @@
++cmake_minimum_required(VERSION 3.18)
++project(lotus_v2_transaction_pool_review LANGUAGES C CXX)
++set(CMAKE_CXX_STANDARD 20)
++set(CMAKE_CXX_STANDARD_REQUIRED ON)
++find_package(OpenSSL REQUIRED COMPONENTS Crypto)
++get_filename_component(LOTUS_SRC "${CMAKE_CURRENT_SOURCE_DIR}/../.." ABSOLUTE)
++include_directories("${LOTUS_SRC}")
++if(NOT DEFINED LOTUS_SECP_LIBRARY OR NOT EXISTS "${LOTUS_SECP_LIBRARY}")
++    message(FATAL_ERROR "Set LOTUS_SECP_LIBRARY to a locally built ABC libsecp256k1.a")
++endif()
++add_library(lotus_v2_pool_blake3 STATIC
++    ../vendor/blake3/blake3.c
++    ../vendor/blake3/blake3_dispatch.c
++    ../vendor/blake3/blake3_portable.c)
++target_compile_definitions(lotus_v2_pool_blake3 PRIVATE
++    BLAKE3_NO_SSE2 BLAKE3_NO_SSE41 BLAKE3_NO_AVX2 BLAKE3_NO_AVX512 BLAKE3_USE_NEON=0)
++add_executable(lotus_v2_transaction_pool_test
++    ../output.cpp ../transaction.cpp ../commitment.cpp ../tagged_hash.cpp
++    ../signing.cpp ../../support/cleanse.cpp ../vm.cpp ../field_size.cpp ../sparse_state.cpp ../ordinary_validation.cpp
++    ../test_transaction_pool.cpp ../transaction_pool.cpp ../block_cost.cpp ../monetary.cpp ../block_wire.cpp ../header.cpp ../incremental_utxo.cpp)
++target_include_directories(lotus_v2_transaction_pool_test PRIVATE
++    "${LOTUS_SRC}/secp256k1/include" "${LOTUS_BOOST_INCLUDE}" ../vendor/blake3)
++target_link_libraries(lotus_v2_transaction_pool_test PRIVATE
++    lotus_v2_pool_blake3 OpenSSL::Crypto "${LOTUS_SECP_LIBRARY}")
++target_compile_options(lotus_v2_transaction_pool_test PRIVATE
++    -Wall -Wextra -Wpedantic -Werror)
++enable_testing()
++add_test(NAME lotus_v2_transaction_pool_test COMMAND lotus_v2_transaction_pool_test)
+diff --git a/src/lotus_v2/transaction_pool_test/README.md b/src/lotus_v2/transaction_pool_test/README.md
+new file mode 100644
+index 0000000000000000000000000000000000000000..53dd60a2accda244440cf147995c4f4c5a1ddfa9
+--- /dev/null
++++ b/src/lotus_v2/transaction_pool_test/README.md
+@@ -0,0 +1,39 @@
++# Bounded native V2 transaction pool
++
++This standalone native test uses the real ordinary validator, VM and authenticated
++transaction cost calculation. It does not start a node or establish block validity.
++
++```sh
++cmake -S src/lotus_v2/transaction_pool_test -B /tmp/lotus-v2-pool-build \
++  -DLOTUS_SECP_LIBRARY=/path/to/libsecp256k1.a \
++  -DLOTUS_BOOST_INCLUDE=/path/to/boost/include
++cmake --build /tmp/lotus-v2-pool-build -j4
++ctest --test-dir /tmp/lotus-v2-pool-build --output-on-failure
++```
++
++Coverage includes parent/child and diamond ordering, inventory TxHash versus
++TxID lookup, first accepted witness retention, conflicting spends, missing versus
++known-spent active inputs, actual VM rejection, byte/entry/edge/ancestor/descendant
++and authenticated transaction cost caps, validation/invocation budgets, maturity
++and absolute-time lock revalidation, confirmed parent survival, connected conflict
++descendant removal, child-first detached resurrection, stale anchor fences and
++storage failure preservation with disabled serving followed by successful retry.
++
++The caller serializes pool access and owns the stable backend snapshot and
++current-context fence. Context height and parent MTP apply to the next candidate
++block. CoinLookup reads only referenced active coins; accepted parent outputs form
++an overlay, and no active UTXO map is copied. Optional classify_missing distinguishes
++a known active spent output from an unknown parent; absent classification means
++unknown. Reconcile must run after authoritative connect/disconnect changes before
++serving or mining. Its operational/stale/capacity failure retains old data while
++disabling reads. The caller must retry, or discard the pool explicitly.
++
++Limits are explicit development policy, not protocol defaults. max_ancestors and
++max_descendants exclude the transaction itself. Reconcile bounds its entire input
++and retries missing-parent candidates in dependency passes; exhausted validation
++budget disables the old view for a caller-scheduled retry. No orphans, replacement,
++persistence, relay punishment or transaction status history are implemented here.
++The relay owns bounded missing-parent retries, and the coordinator owns authoritative
++transition/status history. The pool computes both authenticated linear costs and
++applies a local per-transaction cap. Mining must still use BuildTemplate and normal
++block validation for effective/parabolic fees, block resources and commitments.
+diff --git a/src/lotus_v2/transaction_pool_test/fixtures.h b/src/lotus_v2/transaction_pool_test/fixtures.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..f63cc12b03133e9312af7e1e436cdb27043515d6
+--- /dev/null
++++ b/src/lotus_v2/transaction_pool_test/fixtures.h
+@@ -0,0 +1,30 @@
++#ifndef LOTUS_V2_POOL_FIXTURES_H
++#define LOTUS_V2_POOL_FIXTURES_H
++#include "../transaction_pool.h"
++#include "../signing.h"
++#include "../commitment.h"
++#include <stdexcept>
++namespace pool_fixture {
++using namespace lotus::v2;
++inline void Check(bool b) { if(!b) throw std::runtime_error("pool fixture failure"); }
++inline Output Native(uint64_t n) {Output o;o.value=n;o.branches={BranchLeaf(std::vector<uint8_t>{0x4e})};o.paths={{0}};return o;}
++inline OrdinaryCandidateProfile Profile() {
++    OrdinaryCandidateProfile p{TxProfile{32,32,8,512,8,8192,64},
++        VmProfile{512,8,8192,32,32,65536,16,100000},VmCostProfile{},100,50000,2,100,10000000};
++    p.vm_cost.max_invocation_cost=1000000;p.vm_cost.structural_byte_cost=1;
++    for(auto&o:p.vm_cost.opcode)o={1,1,1};return p;
++}
++inline Transaction Spend(std::vector<Outpoint> ops,std::vector<Output> outputs) {
++    Transaction t;t.outputs=std::move(outputs);
++    for(const auto&op:ops) {Input i;i.flags=1;i.prev_txid=op.tx_id;i.prev_index=op.index;i.sequence=UINT32_MAX;i.witnesses={BranchWitness{{0x4e},{},{}}};t.inputs.push_back(i);}return t;
++}
++inline std::vector<uint8_t> Wire(const Transaction&t) {std::vector<uint8_t>w;std::string e;if(!EncodeTransaction(t,Profile().transaction,w,e))throw std::runtime_error(e);return w;}
++inline Hash Id(const Transaction&t) {IdentityDigests i;std::string e;Check(ComputeIdentities(t,Profile().transaction,{},i,e));return i.txid;}
++struct Fixture {
++    DevelopmentUtxoView coins;bool current=true,error=false;size_t reads=0;
++    Outpoint funding{{},0};
++    Fixture() {funding.tx_id[0]=77;coins.emplace(funding,Coin{funding,Native(100000),90,49000,false});}
++    PoolContext Context() {return PoolContext{{{},1},Profile(),{},[this](const Outpoint&o,Coin&c,std::string&e){++reads;if(error){e="disk error";return CoinReadResult::Error;}auto it=coins.find(o);if(it==coins.end())return CoinReadResult::Missing;c=it->second;return CoinReadResult::Found;},[this]{return current;},{1,1,1,1},{}};}
++};
++}
++#endif
+-- 
+2.50.1 (Apple Git-155)
+

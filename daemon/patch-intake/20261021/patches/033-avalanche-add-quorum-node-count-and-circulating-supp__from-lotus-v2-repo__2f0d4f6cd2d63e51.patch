@@ -1,0 +1,543 @@
+From 40c23ffc77951958c92e816f035c0518e1d924d0 Mon Sep 17 00:00:00 2001
+From: Lotus V2 Builder <builder@lotus.org>
+Date: Sat, 17 Oct 2026 13:58:05 -0700
+Subject: [PATCH] avalanche: add quorum node-count and circulating-supply
+ activation gates
+
+Enforce >= 8 quorum nodes and >= 10% circulating supply (or 1,000,000 XPI
+dev floor) before activating staking rewards, treasury, or preconsensus
+policies, freeze the speculative Merklix overlay upon finalizeMempoolBatch,
+and add unit tests in processor_tests.cpp and preconsensus_batch_tests.cpp.
+---
+ src/avalanche/processor.cpp                   | 166 +++++++++++++-----
+ src/avalanche/processor.h                     |  34 ++--
+ .../test/preconsensus_batch_tests.cpp         |  22 ++-
+ src/avalanche/test/processor_tests.cpp        | 111 ++++++++++++
+ 4 files changed, 274 insertions(+), 59 deletions(-)
+
+diff --git a/src/avalanche/processor.cpp b/src/avalanche/processor.cpp
+index 380c11ad43..8f94d5dae4 100644
+--- a/src/avalanche/processor.cpp
++++ b/src/avalanche/processor.cpp
+@@ -17,8 +17,10 @@
+ #include <net.h>
+ #include <netbase.h>
+ #include <netmessagemaker.h>
++#include <node/snapshot.h>
+ #include <policy/block/stakingrewards.h>
+ #include <scheduler.h>
++#include <txmempool.h>
+ #include <util/bitmanip.h>
+ #include <util/moneystr.h>
+ #include <util/time.h>
+@@ -155,7 +157,8 @@ Processor::Processor(Config avaconfigIn, interfaces::Chain &chain,
+                      std::unique_ptr<PeerData> peerDataIn, CKey sessionKeyIn,
+                      uint32_t minQuorumTotalScoreIn,
+                      double minQuorumConnectedScoreRatioIn,
+-                     int64_t minAvaproofsNodeCountIn,
++                     int64_t minAvaproofsNodeCountIn, size_t minQuorumNodesIn,
++                     uint64_t minQuorumSupplyPermilleIn,
+                      uint32_t staleVoteThresholdIn, uint32_t staleVoteFactorIn,
+                      Amount stakeUtxoDustThreshold, bool preConsensus,
+                      bool stakingPreConsensus, size_t maxElementPoll)
+@@ -167,11 +170,21 @@ Processor::Processor(Config avaconfigIn, interfaces::Chain &chain,
+       peerData(std::move(peerDataIn)), sessionKey(std::move(sessionKeyIn)),
+       minQuorumScore(minQuorumTotalScoreIn),
+       minQuorumConnectedScoreRatio(minQuorumConnectedScoreRatioIn),
++      minQuorumNodes(minQuorumNodesIn),
++      minQuorumSupplyPermille(minQuorumSupplyPermilleIn),
+       minAvaproofsNodeCount(minAvaproofsNodeCountIn),
+       staleVoteThreshold(staleVoteThresholdIn),
+       staleVoteFactor(staleVoteFactorIn), m_preConsensus(preConsensus),
+       m_stakingPreConsensus(stakingPreConsensus),
+       m_maxElementPoll(maxElementPoll) {
++    {
++        LOCK(cs_main);
++        if (const CBlockIndex *tip = chainman.ActiveTip()) {
++            LOCK(cs_activeTipHash);
++            m_activeTipHash = tip->GetBlockHash();
++        }
++    }
++
+     // Make sure we get notified of chain state changes.
+     chainNotificationsHandler =
+         chain.handleNotifications(std::make_shared<NotificationsHandler>(this));
+@@ -377,6 +390,22 @@ Processor::MakeProcessor(const ArgsManager &argsman, interfaces::Chain &chain,
+         return nullptr;
+     }
+ 
++    int64_t minQuorumNodes = argsman.GetIntArg(
++        "-avaminquorumnodes", AVALANCHE_DEFAULT_MIN_QUORUM_NODES);
++    if (minQuorumNodes < 0) {
++        error = _("The minimum number of quorum nodes should be non-negative");
++        return nullptr;
++    }
++
++    int64_t minQuorumSupplyPermille = argsman.GetIntArg(
++        "-avaminquorumsupplypermille",
++        AVALANCHE_DEFAULT_MIN_QUORUM_SUPPLY_PERMILLE);
++    if (minQuorumSupplyPermille < 0 || minQuorumSupplyPermille > 1000) {
++        error = _(
++            "The avalanche min quorum supply permille must be between 0 and 1000");
++        return nullptr;
++    }
++
+     // Determine voting parameters
+     int64_t staleVoteThreshold = argsman.GetIntArg(
+         "-avastalevotethreshold", AVALANCHE_VOTE_STALE_THRESHOLD);
+@@ -424,8 +453,9 @@ Processor::MakeProcessor(const ArgsManager &argsman, interfaces::Chain &chain,
+         std::move(avaconfig), chain, connman, chainman, mempool, scheduler,
+         std::move(peerData), std::move(sessionKey),
+         Proof::amountToScore(minQuorumStake), minQuorumConnectedStakeRatio,
+-        minAvaproofsNodeCount, staleVoteThreshold, staleVoteFactor,
+-        stakeUtxoDustThreshold,
++        minAvaproofsNodeCount, static_cast<size_t>(minQuorumNodes),
++        static_cast<uint64_t>(minQuorumSupplyPermille), staleVoteThreshold,
++        staleVoteFactor, stakeUtxoDustThreshold,
+         argsman.GetBoolArg("-avalanchepreconsensus",
+                            DEFAULT_AVALANCHE_PRECONSENSUS),
+         argsman.GetBoolArg("-avalanchestakingpreconsensus",
+@@ -878,29 +908,24 @@ void Processor::avaproofsSent(NodeId nodeid) {
+  * Returns a bool indicating whether we have a usable Avalanche quorum enabling
+  * us to take decisions based on polls.
+  */
+-bool Processor::isQuorumEstablished() {
+-    AssertLockNotHeld(cs_main);
+-
+-    {
+-        LOCK(cs_peerManager);
+-        if (peerManager->getNodeCount() < 8) {
+-            // There is no point polling if we know the vote cannot converge
+-            return false;
+-        }
++bool Processor::isQuorumEstablished() const NO_THREAD_SAFETY_ANALYSIS {
++    if (peerManager->getAtomicNodeCount() < minQuorumNodes) {
++        // There is no point polling if we know the vote cannot converge
++        return false;
+     }
+ 
+     /*
+-     * The following parameters can naturally go temporarly below the threshold
++     * The following parameters can naturally go temporarily below the threshold
+      * under normal circumstances, like during a proof replacement with a lower
+-     * stake amount, or the discovery of a new proofs for which we don't have a
++     * stake amount, or the discovery of a new proof for which we don't have a
+      * node yet.
+      * In order to prevent our node from starting and stopping the polls
+-     * spuriously on such event, the quorum establishement is latched. The only
+-     * parameters that should not latched is the minimum node count, as this
++     * spuriously on such event, the quorum establishment is latched. The only
++     * parameter that should not be latched is the minimum node count, as this
+      * would cause the poll to be inconclusive anyway and should not happen
+      * under normal circumstances.
+      */
+-    if (quorumIsEstablished) {
++    if (quorumIsEstablished.load()) {
+         return true;
+     }
+ 
+@@ -909,28 +934,22 @@ bool Processor::isQuorumEstablished() {
+         return false;
+     }
+ 
+-    if (avaproofsNodeCounter < minAvaproofsNodeCount) {
++    if (avaproofsNodeCounter.load() < minAvaproofsNodeCount) {
+         return false;
+     }
+ 
+     auto localProof = getLocalProof();
+ 
+     // Get the registered proof score and registered score we have nodes for
+-    uint32_t totalPeersScore;
+-    uint32_t connectedPeersScore;
+-    {
+-        LOCK(cs_peerManager);
+-        totalPeersScore = peerManager->getTotalPeersScore();
+-        connectedPeersScore = peerManager->getConnectedPeersScore();
+-
+-        // Consider that we are always connected to our proof, even if we are
+-        // the single node using that proof.
+-        if (localProof &&
+-            peerManager->forPeer(localProof->getId(), [](const Peer &peer) {
+-                return peer.node_count == 0;
+-            })) {
+-            connectedPeersScore += localProof->getScore();
+-        }
++    uint32_t totalPeersScore = peerManager->getAtomicTotalPeersScore();
++    uint32_t connectedPeersScore = peerManager->getAtomicConnectedPeersScore();
++    int64_t totalStakedSatoshis =
++        peerManager->getAtomicTotalPeersStakedSatoshis();
++
++    // Consider that we are always connected to our proof, even if we are
++    // the single node using that proof.
++    if (localProof && peerManager->getAtomicLocalProofHasNoNode()) {
++        connectedPeersScore += localProof->getScore();
+     }
+ 
+     // Ensure enough is being staked overall
+@@ -945,20 +964,48 @@ bool Processor::isQuorumEstablished() {
+         return false;
+     }
+ 
+-    quorumIsEstablished = true;
++    // Ensure staked amount meets the circulating supply threshold (if enabled)
++    if (minQuorumSupplyPermille > 0) {
++        const BlockHash tipHash =
++            WITH_LOCK(cs_activeTipHash, return m_activeTipHash);
++        const uint64_t circulatingSupply =
++            GetV2BlockCirculatingSupply(tipHash);
++        if (circulatingSupply > 0 &&
++            uint64_t(std::max<int64_t>(0, totalStakedSatoshis)) * 1000 <
++                circulatingSupply * minQuorumSupplyPermille) {
++            return false;
++        }
++    }
+ 
+-    // Attempt to compute the staking rewards winner now so we don't have to
+-    // wait for a block if we already have all the prerequisites.
+-    const CBlockIndex *pprev = WITH_LOCK(cs_main, return chainman.ActiveTip());
+-    bool computedRewards = false;
+-    if (pprev && IsStakingRewardsActivated(chainman.GetConsensus(), pprev)) {
+-        computedRewards = computeStakingReward(pprev);
++    quorumIsEstablished.store(true);
++    return true;
++}
++
++bool Processor::isQuorumEstablished() NO_THREAD_SAFETY_ANALYSIS {
++    AssertLockNotHeld(cs_main);
++
++    const bool wasEstablished = quorumIsEstablished.load();
++    if (!std::as_const(*this).isQuorumEstablished()) {
++        return false;
+     }
+-    if (pprev && isStakingPreconsensusActivated(pprev) && !computedRewards) {
+-        // It's possible to have quorum shortly after startup if peers were
+-        // loaded from disk, but staking rewards may not be ready yet. In this
+-        // case, we can still promote and poll for contenders.
+-        promoteAndPollStakeContenders(pprev);
++
++    if (!wasEstablished) {
++        // Attempt to compute the staking rewards winner now so we don't have to
++        // wait for a block if we already have all the prerequisites.
++        const CBlockIndex *pprev =
++            WITH_LOCK(cs_main, return chainman.ActiveTip());
++        bool computedRewards = false;
++        if (pprev &&
++            IsStakingRewardsActivated(chainman.GetConsensus(), pprev)) {
++            computedRewards = computeStakingReward(pprev);
++        }
++        if (pprev && isStakingPreconsensusActivated(pprev) &&
++            !computedRewards) {
++            // It's possible to have quorum shortly after startup if peers were
++            // loaded from disk, but staking rewards may not be ready yet. In
++            // this case, we can still promote and poll for contenders.
++            promoteAndPollStakeContenders(pprev);
++        }
+     }
+ 
+     return true;
+@@ -1504,8 +1551,29 @@ void Processor::finalizeMempoolBatch(const uint256 &batchId) {
+         }
+     }
+ 
+-    if (newlyFinalized && cb) {
+-        cb(batch);
++    if (newlyFinalized) {
++        if (mempool) {
++            LOCK(mempool->cs);
++            lotus::v2::Hash target_root{};
++            std::memcpy(target_root.data(), batch.subtree_a_root.begin(), 32);
++            auto &overlay_mgr = mempool->GetOverlayManager();
++            bool already_frozen = false;
++            for (const auto &frozen_layer : overlay_mgr.GetFrozenEpochs()) {
++                if (frozen_layer.GetSubtreeARoot() == target_root) {
++                    already_frozen = true;
++                    break;
++                }
++            }
++            if (!already_frozen &&
++                overlay_mgr.GetSpeculativeOverlay().GetSubtreeARoot() ==
++                    target_root) {
++                overlay_mgr.FreezeEpochBatch();
++            }
++            node::PublishMempoolSnapshot(*mempool);
++        }
++        if (cb) {
++            cb(batch);
++        }
+     }
+ }
+ 
+@@ -1590,6 +1658,10 @@ void Processor::updatedBlockTip() {
+ 
+     const CBlockIndex *activeTip =
+         WITH_LOCK(cs_main, return chainman.ActiveTip());
++    if (activeTip) {
++        WITH_LOCK(cs_activeTipHash,
++                  m_activeTipHash = activeTip->GetBlockHash());
++    }
+     if (activeTip && isStakingPreconsensusActivated(activeTip)) {
+         promoteAndPollStakeContenders(activeTip);
+     }
+diff --git a/src/avalanche/processor.h b/src/avalanche/processor.h
+index 77fc9726c3..7cd6cf9f98 100644
+--- a/src/avalanche/processor.h
++++ b/src/avalanche/processor.h
+@@ -5,6 +5,7 @@
+ #ifndef BITCOIN_AVALANCHE_PROCESSOR_H
+ #define BITCOIN_AVALANCHE_PROCESSOR_H
+ 
++#include <avalanche/avalanche.h>
+ #include <avalanche/config.h>
+ #include <avalanche/node.h>
+ #include <avalanche/preconsensus.h>
+@@ -240,7 +241,10 @@ class Processor final : public NetEventsInterface {
+      */
+     uint32_t minQuorumScore;
+     double minQuorumConnectedScoreRatio;
+-    std::atomic<bool> quorumIsEstablished{false};
++    size_t minQuorumNodes{AVALANCHE_DEFAULT_MIN_QUORUM_NODES};
++    uint64_t minQuorumSupplyPermille{
++        AVALANCHE_DEFAULT_MIN_QUORUM_SUPPLY_PERMILLE};
++    mutable std::atomic<bool> quorumIsEstablished{false};
+     std::atomic<bool> m_canShareLocalProof{false};
+     int64_t minAvaproofsNodeCount;
+     std::atomic<int64_t> avaproofsNodeCounter{0};
+@@ -256,6 +260,9 @@ class Processor final : public NetEventsInterface {
+     mutable Mutex cs_finalizationTip;
+     const CBlockIndex *finalizationTip GUARDED_BY(cs_finalizationTip){nullptr};
+ 
++    mutable Mutex cs_activeTipHash;
++    BlockHash m_activeTipHash GUARDED_BY(cs_activeTipHash);
++
+     mutable Mutex cs_delayedAvahelloNodeIds;
+     /**
+      * A list of the nodes that did not get our proof announced via avahello
+@@ -302,10 +309,11 @@ private:
+               CScheduler &scheduler, std::unique_ptr<PeerData> peerDataIn,
+               CKey sessionKeyIn, uint32_t minQuorumTotalScoreIn,
+               double minQuorumConnectedScoreRatioIn,
+-              int64_t minAvaproofsNodeCountIn, uint32_t staleVoteThresholdIn,
+-              uint32_t staleVoteFactorIn, Amount stakeUtxoDustThresholdIn,
+-              bool preConsensus, bool stakingPreConsensus,
+-              size_t maxElementPoll);
++              int64_t minAvaproofsNodeCountIn, size_t minQuorumNodesIn,
++              uint64_t minQuorumSupplyPermilleIn,
++              uint32_t staleVoteThresholdIn, uint32_t staleVoteFactorIn,
++              Amount stakeUtxoDustThresholdIn, bool preConsensus,
++              bool stakingPreConsensus, size_t maxElementPoll);
+ 
+     const bool m_preConsensus{false};
+     // Not const for testing purpose
+@@ -347,7 +355,8 @@ public:
+                        std::vector<VoteItemUpdate> &updates, bool &disconnect,
+                        std::string &error)
+         EXCLUSIVE_LOCKS_REQUIRED(!cs_peerManager, !cs_finalizedItems,
+-                                 !cs_invalidatedBlocks, !cs_finalizationTip);
++                                 !cs_invalidatedBlocks, !cs_finalizationTip,
++                                 !cs_treasury, !cs_mempoolBatches);
+ 
+     template <typename Callable>
+     auto withPeerManager(Callable &&func) const
+@@ -391,14 +400,16 @@ public:
+     int64_t getAvaproofsNodeCounter() const {
+         return avaproofsNodeCounter.load();
+     }
++    bool isQuorumEstablished() const
++        EXCLUSIVE_LOCKS_REQUIRED(!cs_activeTipHash);
+     bool isQuorumEstablished() LOCKS_EXCLUDED(cs_main)
+         EXCLUSIVE_LOCKS_REQUIRED(!cs_peerManager, !cs_stakingRewards,
+-                                 !cs_finalizedItems);
++                                 !cs_finalizedItems, !cs_activeTipHash);
+     bool canShareLocalProof();
+ 
+     bool computeStakingReward(const CBlockIndex *pindex)
+         EXCLUSIVE_LOCKS_REQUIRED(!cs_peerManager, !cs_stakingRewards,
+-                                 !cs_finalizedItems);
++                                 !cs_finalizedItems, !cs_activeTipHash);
+     bool eraseStakingRewardWinner(const BlockHash &prevBlockHash)
+         EXCLUSIVE_LOCKS_REQUIRED(!cs_stakingRewards);
+     void cleanupStakingRewards(const int minHeight)
+@@ -447,7 +458,7 @@ public:
+     /** Promote stake contender cache entries to a given block and then poll */
+     void promoteAndPollStakeContenders(const CBlockIndex *pprev)
+         EXCLUSIVE_LOCKS_REQUIRED(!cs_stakingRewards, !cs_peerManager,
+-                                 !cs_finalizedItems);
++                                 !cs_finalizedItems, !cs_activeTipHash);
+ 
+     /** Track votes and winners on treasury contenders */
+     bool addTreasuryContender(const BlockHash &prevBlockHash,
+@@ -536,12 +547,13 @@ private:
+     void updatedBlockTip()
+         EXCLUSIVE_LOCKS_REQUIRED(!cs_peerManager, !cs_finalizedItems,
+                                  !cs_finalizationTip, !cs_stakingRewards,
+-                                 !cs_treasury);
++                                 !cs_activeTipHash, !cs_treasury);
+     void transactionAddedToMempool(const CTransactionRef &tx)
+         EXCLUSIVE_LOCKS_REQUIRED(!cs_finalizedItems, !cs_finalizationTip);
+     void runEventLoop()
+         EXCLUSIVE_LOCKS_REQUIRED(!cs_peerManager, !cs_stakingRewards,
+-                                 !cs_finalizedItems, !cs_mempoolBatches);
++                                 !cs_finalizedItems, !cs_activeTipHash,
++                                 !cs_mempoolBatches);
+     void clearInvsNotWorthPolling()
+         EXCLUSIVE_LOCKS_REQUIRED(!cs_peerManager, !cs_finalizedItems);
+     void clearTimedoutRequests()
+diff --git a/src/avalanche/test/preconsensus_batch_tests.cpp b/src/avalanche/test/preconsensus_batch_tests.cpp
+index bf2b96d676..b1437e6306 100644
+--- a/src/avalanche/test/preconsensus_batch_tests.cpp
++++ b/src/avalanche/test/preconsensus_batch_tests.cpp
+@@ -316,9 +316,29 @@ BOOST_FIXTURE_TEST_CASE(
+         peerBatch, /*locallyAccepted=*/false));
+     BOOST_CHECK(m_node.avalanche->isMempoolBatchLocallyAccepted(peerBatchId));
+ 
+-    // Finalize peerBatch
++    // Populate m_node.mempool with {tx1, tx2} anchored at chaintip so
++    // finalizeMempoolBatch freezes the matching speculative overlay into L_1.
++    {
++        TestMemPoolEntryHelper entry;
++        LOCK2(cs_main, m_node.mempool->cs);
++        m_node.mempool->clear();
++        m_node.mempool->ConnectBlockReset(
++            chaintip->GetBlockHash(), uint64_t(chaintip->nHeight + 1),
++            uint64_t(chaintip->GetMedianTimePast()));
++        m_node.mempool->addUnchecked(entry.Fee(1000 * SATOSHI).FromTx(tx1));
++        m_node.mempool->addUnchecked(entry.Fee(1000 * SATOSHI).FromTx(tx2));
++        BOOST_CHECK(
++            m_node.mempool->GetOverlayManager().GetFrozenEpochs().empty());
++    }
++
++    // Finalize peerBatch -> freezes L_spec into L_1 and publishes RCU snapshot
+     m_node.avalanche->finalizeMempoolBatch(peerBatchId);
+     BOOST_CHECK(m_node.avalanche->isMempoolBatchFinalized(peerBatchId));
++    {
++        LOCK(m_node.mempool->cs);
++        BOOST_CHECK_EQUAL(
++            m_node.mempool->GetOverlayManager().GetFrozenEpochs().size(), 1U);
++    }
+ 
+     // 2. PreConsensusPolicy enforcement against finalized MempoolBatchAnnouncement
+     CMutableTransaction cbMtx;
+diff --git a/src/avalanche/test/processor_tests.cpp b/src/avalanche/test/processor_tests.cpp
+index f1560fb8a4..d711d70302 100644
+--- a/src/avalanche/test/processor_tests.cpp
++++ b/src/avalanche/test/processor_tests.cpp
+@@ -3124,4 +3124,115 @@ BOOST_AUTO_TEST_CASE(stake_contender_local_winners) {
+     }
+ }
+ 
++BOOST_AUTO_TEST_CASE(quorum_node_count_and_circulating_supply_gate) {
++    setArg("-persistavapeers", "0");
++    ChainstateManager &chainman = *Assert(m_node.chainman);
++    Chainstate &active_chainstate = chainman.ActiveChainstate();
++    const CBlockIndex *chaintip =
++        WITH_LOCK(chainman.GetMutex(), return chainman.ActiveTip());
++    const BlockHash tipHash = chaintip->GetBlockHash();
++
++    // 1. Validate parameter range checks for -avaminquorumnodes and
++    // -avaminquorumsupplypermille
++    {
++        setArg("-avaminquorumnodes", "-1");
++        bilingual_str error;
++        BOOST_CHECK(Processor::MakeProcessor(
++                        *m_node.args, *m_node.chain, m_node.connman.get(),
++                        chainman, m_node.mempool.get(), *m_node.scheduler,
++                        error) == nullptr);
++        BOOST_CHECK(!error.empty());
++        setArg("-avaminquorumnodes", "8");
++    }
++    {
++        setArg("-avaminquorumsupplypermille", "1001");
++        bilingual_str error;
++        BOOST_CHECK(Processor::MakeProcessor(
++                        *m_node.args, *m_node.chain, m_node.connman.get(),
++                        chainman, m_node.mempool.get(), *m_node.scheduler,
++                        error) == nullptr);
++        BOOST_CHECK(!error.empty());
++        setArg("-avaminquorumsupplypermille", "0");
++    }
++
++    // 2. Test -avaminquorumnodes=10 gate
++    {
++        setArg("-avaminquorumnodes", "10");
++        setArg("-avaminquorumsupplypermille", "0");
++        bilingual_str error;
++        auto processor = Processor::MakeProcessor(
++            *m_node.args, *m_node.chain, m_node.connman.get(), chainman,
++            m_node.mempool.get(), *m_node.scheduler, error);
++        BOOST_REQUIRE(processor != nullptr);
++
++        auto proof =
++            buildRandomProof(active_chainstate, MIN_VALID_PROOF_SCORE * 10);
++        processor->withPeerManager([&](avalanche::PeerManager &pm) {
++            BOOST_CHECK(pm.registerProof(proof));
++            for (NodeId n = 0; n < 9; n++) {
++                BOOST_CHECK(pm.addNode(n, proof->getId(),
++                                       DEFAULT_AVALANCHE_MAX_ELEMENT_POLL));
++            }
++        });
++        // 9 nodes < 10 required
++        BOOST_CHECK(!processor->isQuorumEstablished());
++
++        // Add 10th node -> quorum established
++        processor->withPeerManager([&](avalanche::PeerManager &pm) {
++            BOOST_CHECK(pm.addNode(9, proof->getId(),
++                                   DEFAULT_AVALANCHE_MAX_ELEMENT_POLL));
++        });
++        BOOST_CHECK(processor->isQuorumEstablished());
++
++        // Remove 10th node -> drops below minQuorumNodes again
++        processor->withPeerManager(
++            [&](avalanche::PeerManager &pm) { BOOST_CHECK(pm.removeNode(9)); });
++        BOOST_CHECK(!processor->isQuorumEstablished());
++    }
++
++    // 3. Test -avaminquorumsupplypermille gate (10 permille = 1.0% of supply)
++    {
++        setArg("-avaminquorumnodes", "8");
++        setArg("-avaminquorumsupplypermille", "10");
++        // Set circulating supply to 200 * PROOF_DUST_THRESHOLD -> 1% (10
++        // permille) is 2 * PROOF_DUST_THRESHOLD.
++        const uint64_t supplySatoshis =
++            200ULL * uint64_t(PROOF_DUST_THRESHOLD / SATOSHI);
++        SetV2BlockCirculatingSupplyForTest(tipHash, supplySatoshis);
++
++        bilingual_str error;
++        auto processor = Processor::MakeProcessor(
++            *m_node.args, *m_node.chain, m_node.connman.get(), chainman,
++            m_node.mempool.get(), *m_node.scheduler, error);
++        BOOST_REQUIRE(processor != nullptr);
++
++        // Register 1 proof with MIN_VALID_PROOF_SCORE (1 * PROOF_DUST_THRESHOLD
++        // < 1% of 200 * PROOF_DUST_THRESHOLD)
++        auto proof1 = buildRandomProof(active_chainstate, MIN_VALID_PROOF_SCORE);
++        processor->withPeerManager([&](avalanche::PeerManager &pm) {
++            BOOST_CHECK(pm.registerProof(proof1));
++            for (NodeId n = 0; n < 8; n++) {
++                BOOST_CHECK(pm.addNode(n, proof1->getId(),
++                                       DEFAULT_AVALANCHE_MAX_ELEMENT_POLL));
++            }
++        });
++        // Node count (8) is met, but staked supply < required (2 *
++        // PROOF_DUST_THRESHOLD)
++        BOOST_CHECK(!processor->isQuorumEstablished());
++
++        // Register a second proof with MIN_VALID_PROOF_SCORE (total 2 *
++        // PROOF_DUST_THRESHOLD >= 1% of 200 * PROOF_DUST_THRESHOLD)
++        auto proof2 = buildRandomProof(active_chainstate, MIN_VALID_PROOF_SCORE);
++        processor->withPeerManager([&](avalanche::PeerManager &pm) {
++            BOOST_CHECK(pm.registerProof(proof2));
++            BOOST_CHECK(pm.addNode(8, proof2->getId(),
++                                   DEFAULT_AVALANCHE_MAX_ELEMENT_POLL));
++        });
++        BOOST_CHECK(processor->isQuorumEstablished());
++
++        SetV2BlockCirculatingSupplyForTest(tipHash, 0);
++        setArg("-avaminquorumsupplypermille", "0");
++    }
++}
++
+ BOOST_AUTO_TEST_SUITE_END()
+-- 
+2.50.1 (Apple Git-155)
+

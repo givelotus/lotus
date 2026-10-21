@@ -1,0 +1,360 @@
+From 9d8fa7c8cfccc34829bbc127b5baecbb1aabc7b4 Mon Sep 17 00:00:00 2001
+From: Shammah Chancellor <shammah.chancellor@notvalid.com>
+Date: Wed, 14 Oct 2026 09:40:29 -0700
+Subject: [PATCH] [mining] Build templates from a dependency snapshot and ready
+ heap
+
+Retain an independent snapshot assembler while fixing the original static-package candidate. Snapshot each mempool entry and its unique direct-parent edges, then select ready transactions by individual modified fee rate. Queue each transaction once and release each dependency edge only after successful parent inclusion.
+
+Check actual size, sigchecks, finality and minimum fee against the live block before each inclusion. Do not charge included ancestors again, reuse their fees for descendants, repeatedly expand diamond paths, or depend on child-container iteration order. Keep snapshot bookkeeping local rather than extending final block-template entries.
+
+The expected bound is O(n + m + n log n) time and O(n + m) space for n entries and m dependency edges with salted hash lookups. Modern upstream ABC already has efficient direct-parent selection; this patch claims no asymptotic or measured speedup over it. Its distinct design uses a flat graph and one highest-feerate-ready heap instead of the maintained fee index, skipped-entry maps and backlog.
+
+Regression coverage includes strict one-byte and one-sigcheck boundaries, layered diamonds, repeated inputs from one parent, ready-sibling priority under scarce capacity, invalid-parent exclusion, and inherited fee/prioritization checks. The final tests fail eight assertions with the historical candidate and pass with this corrected custom implementation; the full native check-bitcoin suite passes at ABC252182. This is one reviewed replacement diff, not an upstream restoration plus a corrective follow-up.
+---
+ src/node/miner.cpp       | 162 ++++++++++++++-------------------------
+ src/test/miner_tests.cpp | 140 +++++++++++++++++++++++++++++++++
+ 2 files changed, 198 insertions(+), 104 deletions(-)
+
+diff --git a/src/node/miner.cpp b/src/node/miner.cpp
+index f6fc09b155..e950e5dae4 100644
+--- a/src/node/miner.cpp
++++ b/src/node/miner.cpp
+@@ -264,128 +264,82 @@ bool BlockAssembler::CheckTx(const CTransaction &tx) const {
+ }
+ 
+ /**
+- * addTxs includes transactions paying a fee by ensuring that
+- * the partial ordering of transactions is maintained.  That is to say
+- * children come after parents, despite having a potentially larger fee.
++ * Build a dependency snapshot and select the highest-feerate ready transaction.
++ * Each transaction is queued at most once and each direct-parent edge is
++ * updated once: expected O(n + m + n log n) time and O(n + m) space for n
++ * entries and m dependency edges. Hash lookups use the salted transaction ID
++ * hasher. This is not an assertion of a speedup over upstream's assembler.
+  */
+ void BlockAssembler::addTxs(const CTxMemPool &mempool) {
+-    // mapped_value is the number of mempool parents that are still needed for
+-    // the entry. We decrement this count each time we add a parent of the entry
+-    // to the block.
+-    std::unordered_map<CTxMemPoolEntryRef, size_t> missingParentCount;
+-    missingParentCount.reserve(mempool.size() / 2);
+-
+-    // set of children we skipped because we have not yet added their parents
+-    std::unordered_set<CTxMemPoolEntryRef> skippedChildren;
+-
+-    auto hasMissingParents =
+-        [&missingParentCount](const CTxMemPoolEntryRef &entry)
+-            EXCLUSIVE_LOCKS_REQUIRED(mempool.cs) {
+-                // If we've added any of this tx's parents already, then
+-                // missingParentCount will have the current count
+-                if (auto pcIt = missingParentCount.find(entry);
+-                    pcIt != missingParentCount.end()) {
+-                    // when pcIt->second reaches 0, we have added all of this
+-                    // tx's parents
+-                    return pcIt->second != 0;
+-                }
+-                return !entry->GetMemPoolParentsConst().empty();
+-            };
+-
+-    // Limit the number of attempts to add transactions to the block when it is
+-    // close to full; this is just a simple heuristic to finish quickly if the
+-    // mempool has a lot of entries.
+-    const int64_t MAX_CONSECUTIVE_FAILURES = 1000;
+-    int64_t nConsecutiveFailed = 0;
+-
+-    // Transactions where a parent has been added and need to be checked for
+-    // inclusion.
+-    std::queue<CTxMemPoolEntryRef> backlog;
+-    auto mi = mempool.mapTx.get<modified_feerate>().begin();
+-
+-    auto nextEntry = [&backlog, &mi](bool &isFromBacklog) {
+-        if (backlog.empty()) {
+-            return *mi++;
++    struct SnapshotEntry {
++        CTxMemPoolEntryRef entry;
++        size_t missingParents;
++        std::vector<size_t> children;
++    };
++    std::vector<SnapshotEntry> snapshot;
++    snapshot.reserve(mempool.mapTx.size());
++    std::unordered_map<TxId, size_t, SaltedTxIdHasher> locations;
++    locations.reserve(mempool.mapTx.size());
++    for (const auto &entry : mempool.mapTx.get<entry_id>()) {
++        locations.emplace(entry->GetTx().GetId(), snapshot.size());
++        snapshot.push_back({entry, entry->GetMemPoolParentsConst().size(), {}});
++    }
++    // Parent sets deduplicate multiple inputs spending one parent, and a
++    // shared ancestor is represented only by its direct dependency edges.
++    for (size_t child = 0; child < snapshot.size(); ++child) {
++        for (const auto &parent : snapshot[child].entry->GetMemPoolParentsConst()) {
++            const auto position = locations.find(parent.get()->GetTx().GetId());
++            assert(position != locations.end());
++            snapshot[position->second].children.push_back(child);
+         }
+-
+-        auto &entry = backlog.front();
+-        backlog.pop();
+-
+-        isFromBacklog = true;
+-
+-        return entry;
++    }
++    auto lowerPriority = [&snapshot](size_t a, size_t b) {
++        return CompareTxMemPoolEntryByModifiedFeeRate{}(snapshot[b].entry,
++                                                       snapshot[a].entry);
+     };
++    std::priority_queue<size_t, std::vector<size_t>, decltype(lowerPriority)>
++        ready(lowerPriority);
++    for (size_t i = 0; i < snapshot.size(); ++i) {
++        if (snapshot[i].missingParents == 0) {
++            ready.push(i);
++        }
++    }
+ 
+-    while (!backlog.empty() ||
+-           mi != mempool.mapTx.get<modified_feerate>().end()) {
+-        // Get a new or old transaction in mapTx to evaluate.
+-        bool isFromBacklog = false;
+-        const CTxMemPoolEntryRef &entry = nextEntry(isFromBacklog);
+-
++    const int64_t MAX_CONSECUTIVE_FAILURES = 1000;
++    int64_t consecutiveFailures = 0;
++    while (!ready.empty()) {
++        const size_t index = ready.top();
++        ready.pop();
++        const auto &entry = snapshot[index].entry;
++        // Individual modified fees preserve the existing no-CPFP policy:
++        // already selected ancestors cannot subsidize a free descendant.
+         if (blockFitter.isBelowBlockMinFeeRate(entry->GetModifiedFeeRate())) {
+-            // Since the txs are sorted by fee, bail early if there is none that
+-            // can be included in the block anymore.
++            // All remaining ready entries have no higher fee rate, and their
++            // descendants cannot become ready without including them.
+             break;
+         }
+-
+-        // Check whether all of this tx's parents are already in the block. If
+-        // not, pass on it until later.
+-        //
+-        // If it's from the backlog, then we know all parents are already in
+-        // the block.
+-        if (!isFromBacklog && hasMissingParents(entry)) {
+-            skippedChildren.insert(entry);
+-            continue;
+-        }
+-
+-        // Check whether the tx will exceed the block limits.
+-        if (!blockFitter.testTxFits(entry->GetTxSize(),
+-                                    entry->GetSigChecks())) {
+-            ++nConsecutiveFailed;
+-            if (nConsecutiveFailed > MAX_CONSECUTIVE_FAILURES &&
++        // Recheck this transaction's actual resources against the live block;
++        // ancestors are already included and must not be charged twice.
++        if (!blockFitter.testTxFits(entry->GetTxSize(), entry->GetSigChecks())) {
++            ++consecutiveFailures;
++            if (consecutiveFailures > MAX_CONSECUTIVE_FAILURES &&
+                 blockFitter.nBlockSize >
+                     blockFitter.getMaxGeneratedBlockSize() - 1000) {
+-                // Give up if we're close to full and haven't succeeded in a
+-                // while.
+                 break;
+             }
+             continue;
+         }
+-
+-        // Test transaction finality (locktime)
+         if (!CheckTx(entry->GetTx())) {
+             continue;
+         }
+-
+-        // This transaction will make it in; reset the failed counter.
+-        nConsecutiveFailed = 0;
+-
+-        // Tx can be added.
++        consecutiveFailures = 0;
+         AddToBlock(entry);
+-
+-        // This tx's children may now be candidates for addition if they have
+-        // higher scores than the tx at the cursor. We can only process a
+-        // child once all of that tx's parents have been added, though. To
+-        // avoid O(n^2) checking of dependencies, we store and decrement the
+-        // number of mempool parents for each child. Although this code
+-        // ends up taking O(n) time to process a single tx with n children,
+-        // that's okay because the amount of time taken is proportional to the
+-        // tx's byte size and fee paid.
+-        for (const auto &child : entry->GetMemPoolChildrenConst()) {
+-            // Remember this tx has missing parents.
+-            // Create the map entry if it doesn't exist already, and init with
+-            // the number of parents.
+-            const auto &[parentCount, _] = missingParentCount.try_emplace(
+-                child, child.get()->GetMemPoolParentsConst().size());
+-            // We just added one parent, so decrement the counter and check if
+-            // we have any missing parent remaining.
+-            const bool allParentsAdded = --parentCount->second == 0;
+-
+-            // If all parents have been added to the block, and if this child
+-            // has been previously skipped due to missing parents, enqueue it
+-            // (if it hasn't been skipped it will come up in a later iteration)
+-            if (allParentsAdded && skippedChildren.count(child) > 0) {
+-                backlog.push(child);
++        // Only successful inclusion releases children. A nonfinal, low-fee,
++        // or non-fitting ancestor therefore also excludes its descendants.
++        for (const size_t child : snapshot[index].children) {
++            assert(snapshot[child].missingParents > 0);
++            if (--snapshot[child].missingParents == 0) {
++                ready.push(child);
+             }
+         }
+     }
+diff --git a/src/test/miner_tests.cpp b/src/test/miner_tests.cpp
+index 878952a81f..dc4ff95741 100644
+--- a/src/test/miner_tests.cpp
++++ b/src/test/miner_tests.cpp
+@@ -235,6 +235,146 @@ void MinerTestingSetup::TestPackageSelection(
+         BOOST_CHECK(txn->GetId() != freeTxId);
+         BOOST_CHECK(txn->GetId() != highFeeDecendantTxId);
+     }
++
++    if (m_preconsensus) {
++        return;
++    }
++
++    // Once a parent is included, charge only the child's remaining resources.
++    // Both paid transactions must fit with exactly one byte of spare capacity.
++    // The large outputs also make the derived sigcheck budget exceed the
++    // coinbase reservation; this test isolates block-size accounting.
++    m_node.mempool->clear(/*include_finalized_txs=*/true);
++    tx.vout.emplace_back(Amount::zero(),
++                         CScript() << OP_RETURN << std::vector<uint8_t>(8000));
++    tx.vin[0].prevout = COutPoint(txFirst[0]->GetId(), 0);
++    tx.vout[0].nValue = txFirst[0]->vout[0].nValue - 20000 * SATOSHI;
++    const auto fittingParent = MakeTransactionRef(tx);
++    AddUnchecked(entry.Fee(20000 * SATOSHI).FromTx(tx));
++    tx.vin[0].prevout = COutPoint(fittingParent->GetId(), 0);
++    tx.vout[0].nValue -= 10000 * SATOSHI;
++    const auto fittingChild = MakeTransactionRef(tx);
++    AddUnchecked(entry.Fee(10000 * SATOSHI).FromTx(tx));
++
++    BlockFitter::Options fitter_options;
++    fitter_options.blockMinFeeRate = blockMinFeeRate;
++    fitter_options.nMaxGeneratedBlockSize =
++        BlockFitter::COINBASE_RESERVED_SIZE +
++        ::GetSerializeSize(*fittingParent) + ::GetSerializeSize(*fittingChild) + 1;
++    BlockAssembler::Options assembler_options;
++    assembler_options.add_finalized_txs = false;
++    auto constrained_assembler = BlockAssembler{
++        BlockFitter(fitter_options), m_node.chainman->ActiveChainstate(),
++        m_node.mempool.get(), assembler_options, m_node.avalanche.get()};
++    pblocktemplate = constrained_assembler.CreateNewBlock(scriptPubKey);
++    BOOST_CHECK_EQUAL(pblocktemplate->block.vtx.size(), 3U);
++    const auto &selected = pblocktemplate->block.vtx;
++    BOOST_CHECK(std::any_of(selected.begin(), selected.end(), [&](const auto &txref) {
++        return txref->GetId() == fittingChild->GetId();
++    }));
++
++    // The same live-resource rule applies at the sigcheck boundary. Leave one
++    // sigcheck spare; the parent must not be charged again for its child.
++    m_node.mempool->clear(/*include_finalized_txs=*/true);
++    AddUnchecked(entry.Fee(20000 * SATOSHI).SigChecks(1).FromTx(fittingParent));
++    const auto childSigChecks =
++        GetMaxBlockSigChecksCount(fitter_options.nMaxGeneratedBlockSize) -
++        BlockFitter::COINBASE_RESERVED_SIGCHECKS - 2;
++    AddUnchecked(entry.Fee(10000 * SATOSHI)
++                     .SigChecks(childSigChecks)
++                     .FromTx(fittingChild));
++    auto sigcheck_assembler = BlockAssembler{
++        BlockFitter(fitter_options), m_node.chainman->ActiveChainstate(),
++        m_node.mempool.get(), assembler_options, m_node.avalanche.get()};
++    BOOST_CHECK_EQUAL(sigcheck_assembler.CreateNewBlock(scriptPubKey)
++                          ->block.vtx.size(),
++                      3U);
++
++    // A layered diamond has exponentially many ancestry paths but only a
++    // linear number of direct edges. Multiple inputs spending one parent
++    // must also release the child exactly once, not leave it blocked.
++    m_node.mempool->clear(/*include_finalized_txs=*/true);
++    auto addSplit = [&](const std::vector<COutPoint> &inputs, Amount value,
++                        Amount fee = 10000 * SATOSHI, size_t padding = 100) NO_THREAD_SAFETY_ANALYSIS {
++        CMutableTransaction split;
++        for (const auto &prevout : inputs) {
++            CTxIn input;
++            input.prevout = prevout;
++            input.scriptSig = CScript() << OP_1;
++            split.vin.push_back(input);
++        }
++        const int64_t available = (value - fee) / SATOSHI;
++        split.vout.emplace_back((available / 2) * SATOSHI, CScript() << OP_TRUE);
++        split.vout.emplace_back((available - available / 2) * SATOSHI,
++                                CScript() << OP_TRUE);
++        split.vout.emplace_back(Amount::zero(),
++                                CScript() << OP_RETURN << std::vector<uint8_t>(padding));
++        const auto result = MakeTransactionRef(split);
++        AddUnchecked(entry.Fee(fee).SigChecks(0).FromTx(result));
++        return result;
++    };
++    const auto root = addSplit({COutPoint(txFirst[0]->GetId(), 0)},
++                               txFirst[0]->vout[0].nValue);
++    auto left = addSplit({COutPoint(root->GetId(), 0)}, root->vout[0].nValue);
++    auto right = addSplit({COutPoint(root->GetId(), 1)}, root->vout[1].nValue);
++    for (int layer = 0; layer < 10; ++layer) {
++        const auto nextLeft = addSplit(
++            {COutPoint(left->GetId(), 0), COutPoint(right->GetId(), 0)},
++            left->vout[0].nValue + right->vout[0].nValue);
++        const auto nextRight = addSplit(
++            {COutPoint(left->GetId(), 1), COutPoint(right->GetId(), 1)},
++            left->vout[1].nValue + right->vout[1].nValue);
++        left = nextLeft;
++        right = nextRight;
++    }
++    const auto repeatedParent = addSplit(
++        {COutPoint(left->GetId(), 0), COutPoint(left->GetId(), 1)},
++        left->vout[0].nValue + left->vout[1].nValue);
++    const auto diamond = AssemblerForTest(chainparams).CreateNewBlock(scriptPubKey);
++    BOOST_CHECK_EQUAL(diamond->block.vtx.size(), 25U);
++    BOOST_CHECK(std::any_of(diamond->block.vtx.begin(), diamond->block.vtx.end(),
++                           [&](const auto &txref) {
++                               return txref->GetId() == repeatedParent->GetId();
++                           }));
++
++    // Newly ready siblings compete by their own modified fee rate, not by
++    // the parent's child-container iteration order. Only one child fits.
++    m_node.mempool->clear(/*include_finalized_txs=*/true);
++    const auto siblingParent = addSplit({COutPoint(txFirst[0]->GetId(), 0)},
++                                        txFirst[0]->vout[0].nValue, 20000 * SATOSHI, 8000);
++    const auto lowerFee = addSplit({COutPoint(siblingParent->GetId(), 0)},
++                                   siblingParent->vout[0].nValue, 30000 * SATOSHI, 8000);
++    const auto higherFee = addSplit({COutPoint(siblingParent->GetId(), 1)},
++                                    siblingParent->vout[1].nValue, 50000 * SATOSHI, 8000);
++    fitter_options.nMaxGeneratedBlockSize =
++        BlockFitter::COINBASE_RESERVED_SIZE +
++        ::GetSerializeSize(*siblingParent) + ::GetSerializeSize(*higherFee) + 1;
++    auto sibling_assembler = BlockAssembler{
++        BlockFitter(fitter_options), m_node.chainman->ActiveChainstate(),
++        m_node.mempool.get(), assembler_options, m_node.avalanche.get()};
++    const auto siblings = sibling_assembler.CreateNewBlock(scriptPubKey);
++    BOOST_CHECK_EQUAL(siblings->block.vtx.size(), 3U);
++    BOOST_CHECK(std::any_of(siblings->block.vtx.begin(), siblings->block.vtx.end(),
++                           [&](const auto &txref) {
++                               return txref->GetId() == higherFee->GetId();
++                           }));
++    BOOST_CHECK(std::none_of(siblings->block.vtx.begin(), siblings->block.vtx.end(),
++                            [&](const auto &txref) {
++                                return txref->GetId() == lowerFee->GetId();
++                            }));
++
++    // A high-fee child must not bypass a nonfinal parent.
++    m_node.mempool->clear(/*include_finalized_txs=*/true);
++    CMutableTransaction lockedParent(*siblingParent);
++    lockedParent.nLockTime = m_node.chainman->ActiveTip()->nHeight + 1;
++    lockedParent.vin[0].nSequence = 0;
++    const auto locked = MakeTransactionRef(lockedParent);
++    AddUnchecked(entry.Fee(20000 * SATOSHI).SigChecks(0).FromTx(locked));
++    addSplit({COutPoint(locked->GetId(), 0)}, locked->vout[0].nValue,
++             50000 * SATOSHI, 8000);
++    BOOST_CHECK_EQUAL(AssemblerForTest(chainparams).CreateNewBlock(scriptPubKey)
++                          ->block.vtx.size(),
++                      1U);
+ }
+ 
+ static void TestCoinbaseMessageEB(uint64_t eb, std::string cbmsg,

@@ -1,0 +1,2183 @@
+From 38584624b2be238295cc60fa9c41ced7e6068e12 Mon Sep 17 00:00:00 2001
+From: Shammah Chancellor <shammah.chancellor@gmail.com>
+Date: Mon, 19 Oct 2026 18:42:18 -0700
+Subject: [PATCH] bench: signed-transaction flood and A/B driver for mempool
+ admission
+
+Why: mempool admission is a candidate throughput ceiling for a high-TPS
+node, and changing it (parallel script checks, an admission thread) needs
+numbers from realistic load before and after. MiniWallet's anyone-can-spend
+outputs cost nothing to verify, so they cannot show where admission time
+goes. Nothing in the tree measured admission of really signed transactions
+from several peers, and the V2 p2p-load client depends on the V2 transport.
+
+What:
+- contrib/bench/mempool-admission/make_fixture.py builds a reusable
+  regtest fixture: confirmed P2PKH outputs and a flood of signed P2PKH
+  spends (35% ECDSA, 35% Schnorr, 15% 2-5 input mixed, 15% dependent
+  chains of 2-8), signed in worker processes.
+- flood.py runs one flood against a fresh clone of the fixture from N raw
+  P2P peers (one process each) or N RPC sendrawtransaction clients, with a
+  ZMQ `sequence` subscriber (libzmq through ctypes) timestamping every
+  mempool add. It reports accepted tx/s, sender-to-mempool latency
+  percentiles, node CPU, load average and the node's mempool metrics, and
+  can run macOS `sample` on the node at a chosen mempool size.
+- ab.py runs configurations interleaved over rounds (rotating the first
+  configuration each round), resumes, and prints medians with min-max.
+- sample_summary.py reduces a `sample` call tree to inclusive/self shares
+  and direct callers for one thread.
+- src/bench/mempool_admission.cpp: MempoolAdmissionSignedSerial admits
+  2000 never-seen signed transactions per iteration (cold signature
+  cache), in process, without networking.
+- src/test/util/admission.{h,cpp}: helpers that fund a P2PKH wallet from a
+  TestChain100Setup coinbase and build ECDSA/Schnorr-signed spends and
+  children, shared by the benchmark and the admission tests that follow.
+
+Evidence (base, this tree, 200k-transaction fixture, 8 P2P peers, macOS
+arm64 with 18 logical CPUs at load average 55-75 from other builds):
+- The flood completes with every transaction accepted. Message-handler
+  thread profile while the mempool grew from 150k: 75% in
+  MempoolOverlayLayer::AddTransactionBatch (26% memmove in
+  TxOverlayArena::InsertBatchParallel), 9% script verification,
+  7% SendMessages. Early in the flood (mempool below 30k): 30% script
+  verification, 22% overlay publication, 25% SendMessages.
+- Accepted rate falls from about 4k tx/s at the start to about 1k tx/s
+  at 190k mempool entries; 2.0-2.6k tx/s over the whole run.
+- MempoolAdmissionSignedSerial: about 41 us per transaction.
+These are shared-host numbers; see the README for a quiet rerun.
+
+How to reproduce:
+    ninja -C build bitcoind bitcoin-bench
+    contrib/bench/mempool-admission/make_fixture.py \
+        --bitcoind build/src/bitcoind --out FX --txs 200000
+    contrib/bench/mempool-admission/flood.py --bitcoind build/src/bitcoind \
+        --fixture FX --workdir RUN --peers 8 \
+        --sample-seconds 10 --sample-at-size 150000
+    contrib/bench/mempool-admission/sample_summary.py RUN/sample.txt
+    build/src/bench/bitcoin-bench -filter='MempoolAdmission.*'
+flood.py prints one JSON object (tps_10_90, tps_total, latency.p50_ms,
+latency.p99_ms, node_cpu_s, accepted_zmq, complete, metrics, ...);
+ab.py prints a Markdown table of medians (min-max) per configuration.
+
+Not tested: Linux (the profile helper is macOS-only; flood.py itself uses
+only the standard library and libzmq), WAN conditions, real peer mixes.
+
+Coordinator ordered integration (2026-10-20):
+Existing causal fixes and mechanical namespace/format adaptations are folded at their first responsible owner. Exact inputs and prefix adaptations are recorded in integration-next final delivery; original author provenance is retained.
+---
+ contrib/bench/mempool-admission/README.md     | 135 +++++
+ contrib/bench/mempool-admission/ab.py         | 272 ++++++++++
+ .../mempool-admission/admission_common.py     | 403 ++++++++++++++
+ contrib/bench/mempool-admission/flood.py      | 498 ++++++++++++++++++
+ .../bench/mempool-admission/make_fixture.py   | 247 +++++++++
+ .../bench/mempool-admission/sample_summary.py | 134 +++++
+ .../mempool-admission/test_accounting.py      |  28 +
+ src/bench/CMakeLists.txt                      |   1 +
+ src/bench/crypto_hash.cpp                     |  26 +
+ src/bench/mempool_admission.cpp               |  71 +++
+ src/test/CMakeLists.txt                       |   1 +
+ src/test/util/admission.cpp                   | 105 ++++
+ src/test/util/admission.h                     |  70 +++
+ 13 files changed, 1991 insertions(+)
+ create mode 100644 contrib/bench/mempool-admission/README.md
+ create mode 100755 contrib/bench/mempool-admission/ab.py
+ create mode 100644 contrib/bench/mempool-admission/admission_common.py
+ create mode 100755 contrib/bench/mempool-admission/flood.py
+ create mode 100755 contrib/bench/mempool-admission/make_fixture.py
+ create mode 100755 contrib/bench/mempool-admission/sample_summary.py
+ create mode 100755 contrib/bench/mempool-admission/test_accounting.py
+ create mode 100644 src/bench/mempool_admission.cpp
+ create mode 100644 src/test/util/admission.cpp
+ create mode 100644 src/test/util/admission.h
+
+diff --git a/contrib/bench/mempool-admission/README.md b/contrib/bench/mempool-admission/README.md
+new file mode 100644
+index 0000000000000000000000000000000000000000..19517fff64079c0e61a2c0b1048df6b6c4d5d0e4
+--- /dev/null
++++ b/contrib/bench/mempool-admission/README.md
+@@ -0,0 +1,135 @@
++# Mempool admission benchmark
++
++Measures how fast a node admits a flood of **really signed** transactions
++arriving from several P2P peers (or from RPC clients), and how long each
++transaction takes from leaving the sender to entering the mempool.
++
++Script verification is a large part of admission cost, so the transactions
++are ordinary P2PKH spends with real signatures:
++
++| kind | share | inputs | signatures |
++|---|---|---|---|
++| `ecdsa1` | 35% | 1 | DER ECDSA |
++| `schnorr1` | 35% | 1 | 64-byte Schnorr |
++| `multi` | 15% | 2-5 | mixed ECDSA/Schnorr |
++| `chain` | 15% | 1 each | mixed; chains of 2-8 dependent transactions |
++
++(`--mix` changes the shares.) A chain always goes to one sender, in order, so
++children arrive after their parents from the same peer, as from a wallet.
++
++## Files
++
++- `make_fixture.py` starts an isolated regtest node, mines and fans out
++  confirmed P2PKH outputs, stops the node, and signs the flood in worker
++  processes. The stopped datadir plus `flood.jsonl` and `manifest.json` is
++  the fixture.
++- `flood.py` runs one flood against a fresh clone (APFS `cp -c` on macOS) of
++  the fixture datadir and prints a JSON result.
++- `ab.py` runs configurations interleaved over several rounds and prints a
++  table of medians with min-max spread.
++- `sample_summary.py` summarizes a macOS `sample` profile of one node thread
++  (`flood.py --sample-seconds N [--sample-at-size M]` records one).
++- `admission_common.py` holds the shared node/RPC/P2P/ZMQ helpers.
++
++Only the Python standard library and `test/functional/test_framework` are
++used. The ZMQ subscriber uses `libzmq` through `ctypes` (no pyzmq); pass
++`--libzmq PATH` if it is not in a standard location.
++
++## How it measures
++
++- Each sender is its own process. P2P senders complete version/verack, then
++  write `tx` messages as fast as the node reads them (`--rate 0`, a flood) or
++  at a fixed total rate (`--rate N` tx/s). Received messages are drained and
++  discarded. RPC senders call `sendrawtransaction` on persistent connections.
++- A ZMQ `sequence` subscriber timestamps every mempool addition. Latency is
++  the time from a sender starting the socket write (P2P) or issuing
++  the RPC, to its mempool-add notification, on the host's monotonic clock.
++  In flood mode latency is dominated by queueing in socket buffers; use
++  `--rate` below capacity for service latency.
++- Throughput `tps_10_90` is accepted transactions per second between the 10%
++  and 90% points of the acceptance timeline (ramp-up and tail excluded);
++  `tps_total` is accepted / time of last acceptance.
++- `node_cpu_s` is process CPU time (`ps`) until mempool completion/stall.
++  Relay work still pending after that point is outside this interval; it is
++  not a measurement of total CPU cost to finish propagating the flood.
++- The node runs with `-checkmempool=0 -checkblockindex=0` (regtest otherwise
++  runs a full mempool consistency check on every admission, which is
++  quadratic and not what a production node does), `-whitelist=noban@127.0.0.1`,
++  `-persistmempool=0` and `-metrics=1`; the `fullnode_mempool*` metrics are
++  scraped at the end of the run.
++- Ports are `47000 + 4 * portseed` onwards (outside 20000-34999).
++
++## How to reproduce
++
++Build (any build directory; the scripts take binaries as arguments):
++
++    cmake -GNinja -S . -B build -DCMAKE_BUILD_TYPE=Release
++    ninja -C build bitcoind bitcoin-bench
++
++Create a fixture once (about 3 minutes of signing on 8 processes for 200k
++transactions):
++
++    contrib/bench/mempool-admission/make_fixture.py \
++        --bitcoind build/src/bitcoind --out /path/to/fx-200k --txs 200000
++
++One run:
++
++    contrib/bench/mempool-admission/flood.py --bitcoind build/src/bitcoind \
++        --fixture /path/to/fx-200k --workdir /path/to/run --peers 8
++
++prints JSON such as
++
++    {"mode": "p2p", "peers": 8, "accepted_zmq": 200000, "complete": true,
++     "tps_10_90": 3648.3, "latency": {"p50_ms": ..., "p99_ms": ...},
++     "node_cpu_s": 26.9, "metrics": {...}, ...}
++
++Interleaved A/B (5 rounds):
++
++    contrib/bench/mempool-admission/ab.py \
++        --bitcoind old=/old/build/src/bitcoind --bitcoind new=build/src/bitcoind \
++        --config old=old --config new=new \
++        --fixture /path/to/fx-200k --workdir /path/to/ab --rounds 5 --peers 8
++
++prints a Markdown table (also written to `SUMMARY.md`):
++
++    | config | runs | complete | accepted tx/s (10-90%) | ... |
++    | old | 5 | 5/5 | 3650 (3401-3812) | ... |
++
++Profile the message handler late in a flood:
++
++    flood.py ... --sample-seconds 10 --sample-at-size 150000
++    sample_summary.py /path/to/run/sample.txt --thread b-msghand
++
++In-process microbenchmark (no networking or relay):
++
++    build/src/bench/bitcoin-bench -filter='MempoolAdmission.*'
++
++## Limits
++
++- Regtest on loopback, one host: no WAN latency, no real peer mix.
++- The flood peers never request anything; relay work is the node announcing
++  accepted transactions to the other flood peers.
++- On a shared host other processes compete for cores; record the load
++  average (`loadavg_start` is in every result) and rerun on a quiet machine
++  before drawing small-difference conclusions.
++
++A run is complete only when every fixture transaction was sent exactly once,
++its mempool-add notification was observed, and the final mempool contains
++exactly the fixture set, with no RPC rejects, removals or failed sender
++processes. Incomplete runs remain in attempt/completion counts and are excluded
++from performance statistics. Inspect every incomplete run before comparing
++configurations. The runner pins binary and fixture SHA256 plus run settings;
++resuming with changed inputs requires a new work directory.
++
++Verify reporting with:
++
++    python3 contrib/bench/mempool-admission/test_accounting.py
++
++The subscriber rejects duplicate add notifications and gaps in ZMQ's publisher
++sequence. Notification delivery time includes validation-queue and subscriber
++scheduling delay; it is not a timestamp taken inside the mempool commit.
++Negative latency samples are reported and invalidate a run. Histogram timing
++statistics are omitted when the metrics subsystem reports dropped event
++samples; transaction throughput remains independently checked against ZMQ and
++the exact final mempool set. Host filesystem/page caches are not flushed
++between fresh datadir clones.
+diff --git a/contrib/bench/mempool-admission/ab.py b/contrib/bench/mempool-admission/ab.py
+new file mode 100755
+index 0000000000000000000000000000000000000000..6d968c9fe4032494efd11c3fe43f1fb5208402ed
+--- /dev/null
++++ b/contrib/bench/mempool-admission/ab.py
+@@ -0,0 +1,272 @@
++#!/usr/bin/env python3
++# Copyright (c) 2026 The Lotus developers
++# Distributed under the MIT software license, see the accompanying
++# file COPYING or http://www.opensource.org/licenses/mit-license.php.
++"""Interleaved A/B runner for flood.py.
++
++Each round runs every configuration once, rotating the starting
++configuration from round to round so slow drifts in machine load (shared
++hosts) spread over all configurations. Every run is a fresh clone of the
++fixture, so no run inherits a prior run's mempool. Host filesystem/page
++caches are shared and are not flushed. Results are appended to
++results.jsonl in --workdir (re-running resumes: completed (round, config)
++pairs are skipped) and summarized as medians with min-max spread.
++
++Configurations are NAME=BINARY_LABEL[:NODEARG,NODEARG...], e.g.
++
++  ab.py --bitcoind base=/b0/src/bitcoind --bitcoind new=/b1/src/bitcoind \\
++      --fixture FX --workdir OUT --rounds 5 \\
++      --config base=base \\
++      --config serial=new:-parallelmempool=0 \\
++      --config par8=new:-parallelmempool=1,-parallelmempoolthreads=8
++
++Use --summarize to print the table of an existing results.jsonl.
++"""
++
++import argparse
++import hashlib
++import json
++import os
++import statistics
++import subprocess
++import sys
++from pathlib import Path
++
++HERE = Path(__file__).resolve().parent
++
++
++def parse_config(text, binaries):
++    name, rest = text.split("=", 1)
++    if ":" in rest:
++        label, args = rest.split(":", 1)
++        node_args = [a for a in args.split(",") if a]
++    else:
++        label, node_args = rest, []
++    if label not in binaries:
++        sys.exit(f"config {name}: unknown binary label {label}")
++    return {"name": name, "binary": label, "node_args": node_args}
++
++
++def load_results(path):
++    out = []
++    if path.exists():
++        for line in path.read_text().splitlines():
++            if line.strip():
++                out.append(json.loads(line))
++    return out
++
++
++def fmt_spread(values, digits=0):
++    if not values:
++        return "-"
++    med = statistics.median(values)
++    lo, hi = min(values), max(values)
++    f = f"{{:.{digits}f}}"
++    return f"{f.format(med)} ({f.format(lo)}-{f.format(hi)})"
++
++
++def summarize(results, config_order):
++    by = {}
++    for r in results:
++        by.setdefault(r["config"], []).append(r)
++    lines = [
++        "| config | runs | complete | accepted tx/s (10-90%) | tx/s (all) "
++        "| latency p50 ms | latency p99 ms | node CPU s | CPU us/tx "
++        "| cs_main hold us/tx | cs_main wait us/tx | queue full events |",
++        "|---|---|---|---|---|---|---|---|---|---|---|---|",
++    ]
++    for name in config_order:
++        rs = by.get(name, [])
++        if not rs:
++            continue
++        valid = [r for r in rs if r.get("complete")]
++        tps = [r["tps_10_90"] for r in valid if r.get("tps_10_90")]
++        tps_all = [r["tps_total"] for r in valid if r.get("tps_total")]
++        p50 = [r["latency"]["p50_ms"] for r in valid if r.get("latency")]
++        p99 = [r["latency"]["p99_ms"] for r in valid if r.get("latency")]
++        cpu = [r["node_cpu_s"] for r in valid if r.get("node_cpu_s")]
++        cpu_per = [
++            1e6 * r["node_cpu_s"] / r["accepted_zmq"]
++            for r in valid
++            if r.get("node_cpu_s") and r.get("accepted_zmq")
++        ]
++        hold = []
++        full = []
++        wait = []
++        for r in valid:
++            m = r.get("metrics", {})
++            s = m.get("fullnode_mempool_admission_lock_hold_seconds_sum")
++            c = m.get("fullnode_mempool_admission_lock_hold_seconds_count")
++            if s is not None and c and r.get("metrics_complete"):
++                hold.append(1e6 * s / r["accepted_zmq"])
++            ws = m.get("fullnode_mempool_admission_lock_wait_seconds_sum")
++            if ws is not None and r.get("metrics_complete"):
++                wait.append(1e6 * ws / r["accepted_zmq"])
++            q = m.get("fullnode_mempool_admission_queue_full_total")
++            if q is not None:
++                full.append(q)
++        complete = sum(1 for r in valid if r.get("complete"))
++        lines.append(
++            f"| {name} | {len(rs)} | {complete}/{len(rs)} | {fmt_spread(tps)} "
++            f"| {fmt_spread(tps_all)} | {fmt_spread(p50, 1)} | {fmt_spread(p99, 1)} "
++            f"| {fmt_spread(cpu, 1)} | {fmt_spread(cpu_per, 1)} "
++            f"| {fmt_spread(hold, 2) if hold else '-'} "
++            f"| {fmt_spread(wait, 2) if wait else '-'} "
++            f"| {fmt_spread(full) if full else '-'} |"
++        )
++    lines += [
++        "",
++        "Performance statistics include only complete runs; every incomplete run remains in the run/completion counts.",
++    ]
++    loads = [r["loadavg_start"][0] for r in results if r.get("loadavg_start")]
++    if loads:
++        lines.append("")
++        lines.append(
++            f"Host 1-minute load average at run start: median "
++            f"{statistics.median(loads):.1f}, range {min(loads):.1f}-{max(loads):.1f} "
++            f"on {results[0].get('host_cpus')} logical CPUs."
++        )
++    return "\n".join(lines)
++
++
++def main():
++    ap = argparse.ArgumentParser(
++        description=__doc__.split("\n")[0],
++        formatter_class=argparse.RawDescriptionHelpFormatter,
++        epilog=__doc__,
++    )
++    ap.add_argument(
++        "--bitcoind", action="append", default=[], help="LABEL=PATH (repeatable)"
++    )
++    ap.add_argument(
++        "--config",
++        action="append",
++        default=[],
++        help="NAME=LABEL[:NODEARG,...] (repeatable)",
++    )
++    ap.add_argument("--fixture", type=Path)
++    ap.add_argument("--workdir", type=Path, required=True)
++    ap.add_argument("--rounds", type=int, default=5)
++    ap.add_argument("--peers", type=int, default=8)
++    ap.add_argument("--mode", choices=("p2p", "rpc"), default="p2p")
++    ap.add_argument("--rate", type=float, default=0.0)
++    ap.add_argument("--no-relay", action="store_true")
++    ap.add_argument("--unit-limit", type=int)
++    ap.add_argument("--portseed", type=int, default=621)
++    ap.add_argument("--libzmq")
++    ap.add_argument("--timeout", type=float, default=600)
++    ap.add_argument("--summarize", action="store_true")
++    args = ap.parse_args()
++
++    args.workdir.mkdir(parents=True, exist_ok=True)
++    results_path = args.workdir / "results.jsonl"
++    binaries = {}
++    for b in args.bitcoind:
++        label, path = b.split("=", 1)
++        binaries[label] = path
++    configs = [parse_config(c, binaries) for c in args.config]
++    order = [c["name"] for c in configs]
++
++    if args.summarize:
++        results = load_results(results_path)
++        if not order:
++            order = list(dict.fromkeys(r["config"] for r in results))
++        print(summarize(results, order))
++        return
++
++    if not args.fixture or not configs:
++        sys.exit("--fixture and at least one --config are required")
++    done = {(r["round"], r["config"]) for r in load_results(results_path)}
++    meta = {
++        "binaries": binaries,
++        "configs": configs,
++        "peers": args.peers,
++        "mode": args.mode,
++        "rate": args.rate,
++        "no_relay": args.no_relay,
++        "fixture": str(args.fixture),
++        "host_cpus": os.cpu_count(),
++        "tool_sha256": {
++            name: hashlib.sha256((HERE / name).read_bytes()).hexdigest()
++            for name in ("ab.py", "flood.py", "admission_common.py")
++        },
++        "binary_sha256": {
++            k: hashlib.sha256(Path(v).read_bytes()).hexdigest()
++            for k, v in binaries.items()
++        },
++        "fixture_sha256": hashlib.sha256(
++            (args.fixture / "flood.jsonl").read_bytes()
++        ).hexdigest(),
++        "unit_limit": args.unit_limit,
++        "timeout": args.timeout,
++        "portseed": args.portseed,
++    }
++    config_path = args.workdir / "ab-config.json"
++    if config_path.exists() and json.loads(config_path.read_text()) != meta:
++        sys.exit("run provenance changed; choose a fresh --workdir")
++    config_path.write_text(json.dumps(meta, indent=2) + "\n")
++
++    for rnd in range(args.rounds):
++        rotated = configs[rnd % len(configs) :] + configs[: rnd % len(configs)]
++        for cfg in rotated:
++            if (rnd, cfg["name"]) in done:
++                continue
++            run_dir = args.workdir / f"r{rnd}-{cfg['name']}"
++            result_file = run_dir.with_suffix(".json")
++            cmd = [
++                sys.executable,
++                str(HERE / "flood.py"),
++                "--bitcoind",
++                binaries[cfg["binary"]],
++                "--fixture",
++                str(args.fixture),
++                "--workdir",
++                str(run_dir),
++                "--peers",
++                str(args.peers),
++                "--mode",
++                args.mode,
++                "--rate",
++                str(args.rate),
++                "--portseed",
++                str(args.portseed),
++                "--label",
++                cfg["name"],
++                "--timeout",
++                str(args.timeout),
++                "--result",
++                str(result_file),
++            ]
++            if args.no_relay:
++                cmd.append("--no-relay")
++            if args.unit_limit:
++                cmd += ["--unit-limit", str(args.unit_limit)]
++            if args.libzmq:
++                cmd += ["--libzmq", args.libzmq]
++            for a in cfg["node_args"]:
++                cmd.append(f"--node-arg={a}")
++            print(f"round {rnd} {cfg['name']}: {' '.join(cmd)}", flush=True)
++            r = subprocess.run(cmd, stdout=subprocess.DEVNULL)
++            if r.returncode != 0 or not result_file.exists():
++                print(f"  FAILED (exit {r.returncode}); see {run_dir}", flush=True)
++                res = {"complete": False, "runner_exitcode": r.returncode}
++            else:
++                res = json.loads(result_file.read_text())
++            res["round"] = rnd
++            res["config"] = cfg["name"]
++            res.pop("timeline", None)
++            with open(results_path, "a") as f:
++                f.write(json.dumps(res) + "\n")
++            print(
++                f"  tps_10_90={res.get('tps_10_90')} p50={res.get('latency', {}).get('p50_ms')}ms "
++                f"p99={res.get('latency', {}).get('p99_ms')}ms cpu={res.get('node_cpu_s')}s "
++                f"complete={res.get('complete')}",
++                flush=True,
++            )
++    table = summarize(load_results(results_path), order)
++    (args.workdir / "SUMMARY.md").write_text(table + "\n")
++    print(table)
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/contrib/bench/mempool-admission/admission_common.py b/contrib/bench/mempool-admission/admission_common.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..9b9873e3e27d1c78a32aaae29b0a2890bcc9e0f2
+--- /dev/null
++++ b/contrib/bench/mempool-admission/admission_common.py
+@@ -0,0 +1,403 @@
++# Copyright (c) 2026 The Lotus developers
++# Distributed under the MIT software license, see the accompanying
++# file COPYING or http://www.opensource.org/licenses/mit-license.php.
++"""Shared helpers for the mempool admission benchmark.
++
++Only the Python standard library and the in-tree functional test framework
++(test/functional/test_framework) are used. Binaries and directories are
++always passed in by the caller; nothing here guesses a build location.
++"""
++
++import base64
++import hashlib
++import http.client
++import json
++import os
++import shutil
++import socket
++import struct
++import subprocess
++import sys
++import time
++from pathlib import Path
++
++SOURCE_ROOT = Path(__file__).resolve().parents[3]
++sys.path.insert(0, str(SOURCE_ROOT / "test" / "functional"))
++
++from test_framework.key import ECKey  # noqa: E402
++from test_framework.messages import (  # noqa: E402
++    COutPoint,
++    CTransaction,
++    CTxIn,
++    CTxOut,
++    hash256,
++    msg_verack,
++    msg_version,
++)
++from test_framework.script import (  # noqa: E402
++    OP_CHECKSIG,
++    OP_DUP,
++    OP_EQUALVERIFY,
++    OP_HASH160,
++    CScript,
++)
++from test_framework.signature_hash import (  # noqa: E402
++    SIGHASH_ALL,
++    SIGHASH_FORKID,
++    SignatureHashForkId,
++)
++
++REGTEST_MAGIC = b"\xda\xb5\xbf\xfa"
++P2P_VERSION = 70017
++RPC_USER = "admissionbench"
++RPC_PASS = "admissionbench"
++HASHTYPE = SIGHASH_ALL | SIGHASH_FORKID
++
++
++def hash160(data: bytes) -> bytes:
++    return hashlib.new("ripemd160", hashlib.sha256(data).digest()).digest()
++
++
++def derive_key(seed: str, index: int) -> ECKey:
++    secret = hashlib.sha256(f"{seed}:{index}".encode()).digest()
++    key = ECKey()
++    key.set(secret, True)
++    return key
++
++
++def p2pkh_script(pubkey: bytes) -> CScript:
++    return CScript([OP_DUP, OP_HASH160, hash160(pubkey), OP_EQUALVERIFY, OP_CHECKSIG])
++
++
++def sign_p2pkh_inputs(tx: CTransaction, spent, keys, schnorr_flags):
++    """Sign every input of tx as P2PKH.
++
++    spent[i] = (scriptPubKey bytes, amount sats), keys[i] = (ECKey, pubkey),
++    schnorr_flags[i] selects a 64-byte Schnorr or a DER ECDSA signature.
++    """
++    for i, ((spk, amount), (key, pub), schnorr) in enumerate(
++        zip(spent, keys, schnorr_flags)
++    ):
++        sighash = SignatureHashForkId(CScript(spk), tx, i, HASHTYPE, amount)
++        if schnorr:
++            sig = key.sign_schnorr(sighash)
++        else:
++            sig = key.sign_ecdsa(sighash)
++        tx.vin[i].scriptSig = CScript([sig + bytes([HASHTYPE]), pub])
++
++
++def build_tx(prevouts, outputs):
++    tx = CTransaction()
++    tx.nVersion = 2
++    for txid_hex, n in prevouts:
++        tx.vin.append(CTxIn(COutPoint(int(txid_hex, 16), n), b"", 0xFFFFFFFF))
++    for spk, amount in outputs:
++        tx.vout.append(CTxOut(amount, spk))
++    return tx
++
++
++# ---------------------------------------------------------------- node control
++
++
++class RPC:
++    def __init__(self, port: int, timeout: float = 300.0):
++        self.port = port
++        self.timeout = timeout
++        self.auth = (
++            "Basic " + base64.b64encode(f"{RPC_USER}:{RPC_PASS}".encode()).decode()
++        )
++        self.conn = None
++
++    def _connect(self):
++        self.conn = http.client.HTTPConnection(
++            "127.0.0.1", self.port, timeout=self.timeout
++        )
++
++    def call(self, method, *params):
++        body = json.dumps(
++            {"jsonrpc": "1.0", "id": method, "method": method, "params": list(params)}
++        )
++        for attempt in range(2):
++            if self.conn is None:
++                self._connect()
++            try:
++                self.conn.request(
++                    "POST",
++                    "/",
++                    body,
++                    {"Authorization": self.auth, "Content-Type": "application/json"},
++                )
++                resp = self.conn.getresponse()
++                data = resp.read()
++                break
++            except (ConnectionError, http.client.HTTPException, OSError):
++                self.conn = None
++                if attempt:
++                    raise
++        reply = json.loads(data)
++        if reply.get("error"):
++            raise RuntimeError(f"{method}: {reply['error']}")
++        return reply["result"]
++
++
++def ports_for(portseed: int):
++    """Ports outside 20000-34999; one block of 4 per seed starting at 47000."""
++    if not 0 <= portseed < 2000:
++        raise ValueError("portseed must be in [0, 2000)")
++    base = 47000 + 4 * portseed
++    return {"p2p": base, "rpc": base + 1, "zmq": base + 2}
++
++
++def start_node(bitcoind, datadir, ports, extra_args=(), log_path=None):
++    datadir = Path(datadir)
++    datadir.mkdir(parents=True, exist_ok=True)
++    args = [
++        str(bitcoind),
++        "-regtest",
++        f"-datadir={datadir}",
++        f"-port={ports['p2p']}",
++        f"-rpcport={ports['rpc']}",
++        "-bind=127.0.0.1",
++        "-rpcbind=127.0.0.1",
++        "-rpcallowip=127.0.0.1",
++        f"-rpcuser={RPC_USER}",
++        f"-rpcpassword={RPC_PASS}",
++        "-listen=1",
++        "-listenonion=0",
++        "-discover=0",
++        "-dnsseed=0",
++        "-fixedseeds=0",
++        "-connect=0",
++        "-server=1",
++        "-printtoconsole=0",
++        "-rpcthreads=16",
++        "-rpcworkqueue=256",
++        "-whitelist=noban@127.0.0.1",
++        "-maxmempool=2000",
++        "-dbcache=1024",
++        "-shrinkdebugfile=0",
++    ] + list(extra_args)
++    out = open(log_path, "wb") if log_path else subprocess.DEVNULL
++    proc = subprocess.Popen(args, stdout=out, stderr=subprocess.STDOUT)
++    rpc = RPC(ports["rpc"])
++    deadline = time.time() + 180
++    while True:
++        if proc.poll() is not None:
++            raise RuntimeError(f"node exited early with {proc.returncode}: {args}")
++        try:
++            rpc.call("getblockcount")
++            break
++        except Exception:
++            if time.time() > deadline:
++                proc.kill()
++                raise
++            time.sleep(0.25)
++    return proc, rpc, args
++
++
++def stop_node(proc, rpc, timeout=120):
++    try:
++        rpc.call("stop")
++    except Exception:
++        pass
++    try:
++        proc.wait(timeout)
++    except subprocess.TimeoutExpired:
++        proc.kill()
++        proc.wait()
++
++
++def clone_tree(src, dst):
++    """APFS clone copy when available (cp -c), otherwise an ordinary copy."""
++    dst = Path(dst)
++    if dst.exists():
++        shutil.rmtree(dst)
++    if sys.platform == "darwin":
++        r = subprocess.run(["cp", "-c", "-R", str(src), str(dst)])
++        if r.returncode == 0:
++            return
++    shutil.copytree(src, dst)
++
++
++# ---------------------------------------------------------------- raw P2P
++
++
++def p2p_frame(msgtype: bytes, payload: bytes) -> bytes:
++    return (
++        REGTEST_MAGIC
++        + msgtype
++        + b"\x00" * (12 - len(msgtype))
++        + struct.pack("<I", len(payload))
++        + hash256(payload)[:4]
++        + payload
++    )
++
++
++def p2p_connect(port: int, timeout: float = 30.0, relay: bool = True) -> socket.socket:
++    """Connect and finish version/verack; returns a blocking socket.
++
++    relay=False sets the version relay flag to 0: the node then announces no
++    transactions to this peer (it still accepts transactions from it).
++    """
++    sock = socket.create_connection(("127.0.0.1", port), timeout=timeout)
++    sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
++    v = msg_version()
++    v.nVersion = P2P_VERSION
++    v.nServices = 1
++    v.strSubVer = "/admission-bench:0.1/"
++    v.relay = 1 if relay else 0
++    v.addrTo.ip = "127.0.0.1"
++    v.addrTo.port = port
++    v.addrFrom.ip = "0.0.0.0"
++    v.addrFrom.port = 0
++    sock.sendall(p2p_frame(b"version", v.serialize()))
++    got_version = got_verack = False
++    buf = b""
++    deadline = time.time() + timeout
++    while not (got_version and got_verack):
++        if time.time() > deadline:
++            raise TimeoutError("p2p handshake")
++        chunk = sock.recv(65536)
++        if not chunk:
++            raise ConnectionError("node closed during handshake")
++        buf += chunk
++        while len(buf) >= 24:
++            length = struct.unpack("<I", buf[16:20])[0]
++            if len(buf) < 24 + length:
++                break
++            cmd = buf[4:16].rstrip(b"\x00")
++            buf = buf[24 + length :]
++            if cmd == b"version":
++                got_version = True
++                sock.sendall(p2p_frame(b"verack", msg_verack().serialize()))
++            elif cmd == b"verack":
++                got_verack = True
++    return sock
++
++
++# ---------------------------------------------------------------- ZMQ (ctypes)
++
++
++class ZmqSub:
++    """Minimal libzmq SUB socket over ctypes (no pyzmq dependency)."""
++
++    ZMQ_SUB = 2
++    ZMQ_SUBSCRIBE = 6
++    ZMQ_RCVHWM = 24
++    ZMQ_RCVTIMEO = 27
++    ZMQ_RCVMORE = 13
++
++    def __init__(self, libpath, endpoint, topic=b"sequence"):
++        import ctypes
++
++        self.ct = ctypes
++        self.lib = ctypes.CDLL(libpath)
++        self.lib.zmq_ctx_new.restype = ctypes.c_void_p
++        self.lib.zmq_socket.restype = ctypes.c_void_p
++        self.lib.zmq_socket.argtypes = [ctypes.c_void_p, ctypes.c_int]
++        self.lib.zmq_setsockopt.argtypes = [
++            ctypes.c_void_p,
++            ctypes.c_int,
++            ctypes.c_void_p,
++            ctypes.c_size_t,
++        ]
++        self.lib.zmq_getsockopt.argtypes = [
++            ctypes.c_void_p,
++            ctypes.c_int,
++            ctypes.c_void_p,
++            ctypes.POINTER(ctypes.c_size_t),
++        ]
++        self.lib.zmq_connect.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
++        self.lib.zmq_recv.argtypes = [
++            ctypes.c_void_p,
++            ctypes.c_void_p,
++            ctypes.c_size_t,
++            ctypes.c_int,
++        ]
++        self.lib.zmq_close.argtypes = [ctypes.c_void_p]
++        self.lib.zmq_ctx_term.argtypes = [ctypes.c_void_p]
++        self.ctx = self.lib.zmq_ctx_new()
++        self.sock = self.lib.zmq_socket(self.ctx, self.ZMQ_SUB)
++        hwm = ctypes.c_int(0)
++        self.lib.zmq_setsockopt(
++            self.sock, self.ZMQ_RCVHWM, ctypes.byref(hwm), ctypes.sizeof(hwm)
++        )
++        tmo = ctypes.c_int(200)
++        self.lib.zmq_setsockopt(
++            self.sock, self.ZMQ_RCVTIMEO, ctypes.byref(tmo), ctypes.sizeof(tmo)
++        )
++        self.lib.zmq_setsockopt(self.sock, self.ZMQ_SUBSCRIBE, topic, len(topic))
++        if self.lib.zmq_connect(self.sock, endpoint.encode()) != 0:
++            raise RuntimeError("zmq_connect failed")
++        self.buf = ctypes.create_string_buffer(256)
++
++    def recv_multipart(self):
++        """Returns a list of frames, or None on timeout."""
++        frames = []
++        while True:
++            n = self.lib.zmq_recv(self.sock, self.buf, 256, 0)
++            if n < 0:
++                if frames:
++                    continue
++                return None
++            frames.append(self.buf.raw[: min(n, 256)])
++            more = self.ct.c_int(0)
++            size = self.ct.c_size_t(self.ct.sizeof(more))
++            self.lib.zmq_getsockopt(
++                self.sock, self.ZMQ_RCVMORE, self.ct.byref(more), self.ct.byref(size)
++            )
++            if not more.value:
++                return frames
++
++    def close(self):
++        self.lib.zmq_close(self.sock)
++        self.lib.zmq_ctx_term(self.ctx)
++
++
++def find_libzmq(explicit=None):
++    if explicit:
++        return explicit
++    for cand in (
++        os.environ.get("LIBZMQ"),
++        "/opt/homebrew/lib/libzmq.dylib",
++        "/usr/local/lib/libzmq.dylib",
++        "/usr/lib/x86_64-linux-gnu/libzmq.so.5",
++        "/usr/lib/aarch64-linux-gnu/libzmq.so.5",
++    ):
++        if cand and Path(cand).exists():
++            return cand
++    raise FileNotFoundError("libzmq not found; pass --libzmq")
++
++
++def percentile(values, q):
++    if not values:
++        return None
++    s = sorted(values)
++    k = (len(s) - 1) * q
++    lo = int(k)
++    hi = min(lo + 1, len(s) - 1)
++    return s[lo] + (s[hi] - s[lo]) * (k - lo)
++
++
++def scrape_metrics(port, path="/metrics"):
++    """Fetch Prometheus text from the RPC port (requires -metrics=1)."""
++    try:
++        conn = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
++        auth = "Basic " + base64.b64encode(f"{RPC_USER}:{RPC_PASS}".encode()).decode()
++        conn.request("GET", path, headers={"Authorization": auth})
++        resp = conn.getresponse()
++        if resp.status != 200:
++            return {}
++        text = resp.read().decode()
++    except Exception:
++        return {}
++    out = {}
++    for line in text.splitlines():
++        if not line or line.startswith("#"):
++            continue
++        try:
++            name, value = line.rsplit(" ", 1)
++            out[name] = float(value)
++        except ValueError:
++            continue
++    return out
+diff --git a/contrib/bench/mempool-admission/flood.py b/contrib/bench/mempool-admission/flood.py
+new file mode 100755
+index 0000000000000000000000000000000000000000..929240f2e9e662bcd561cadcee2eff8145728073
+--- /dev/null
++++ b/contrib/bench/mempool-admission/flood.py
+@@ -0,0 +1,498 @@
++#!/usr/bin/env python3
++# Copyright (c) 2026 The Lotus developers
++# Distributed under the MIT software license, see the accompanying
++# file COPYING or http://www.opensource.org/licenses/mit-license.php.
++"""Run one signed-transaction flood against a fresh clone of a fixture.
++
++Transactions from flood.jsonl are split by unit (a dependent chain is one
++unit and always goes to one sender, in order) across --peers senders. Each
++sender is a separate process: either a raw P2P peer sending TX messages, or
++an RPC client calling sendrawtransaction. A ZMQ `sequence` subscriber
++timestamps every mempool addition, so admission latency is measured from the
++moment a sender starts the socket write (P2P) or issues the
++RPC, to the node's mempool-add notification. Clocks are the host's monotonic
++clock in every process.
++
++Prints one JSON object (and writes it to --result if given).
++
++Usage:
++  flood.py --bitcoind BUILD/src/bitcoind --fixture FIXTURE_DIR \
++      --workdir SCRATCH [--peers 8] [--mode p2p|rpc] [--rate 0] \
++      [--node-arg=-parallelmempool=0 ...]
++"""
++
++import argparse
++import hashlib
++import json
++import multiprocessing
++import os
++import select
++import struct
++import subprocess
++import threading
++import time
++from pathlib import Path
++
++import admission_common as ac
++
++
++def load_units(fixture, peers, peer_index, limit=None):
++    units = []
++    with open(Path(fixture) / "flood.jsonl") as f:
++        for line in f:
++            u = json.loads(line)
++            if limit is not None and u["unit"] >= limit:
++                break
++            if u["unit"] % peers == peer_index:
++                units.append(u)
++    return units
++
++
++def _drain(sock, stop):
++    # The socket stays blocking (a timeout would make it non-blocking for
++    # the sender as well, which blocks while the node applies backpressure);
++    # wait for readability with select instead.
++    buf = b""
++    while not stop.is_set():
++        try:
++            readable, _, _ = select.select([sock], [], [], 0.2)
++            if not readable:
++                continue
++            chunk = sock.recv(1 << 16)
++        except OSError:
++            return
++        if not chunk:
++            return
++        buf += chunk
++        while len(buf) >= 24:
++            length = struct.unpack("<I", buf[16:20])[0]
++            if len(buf) < 24 + length:
++                break
++            # Discard everything. Pings go unanswered: the node only drops a
++            # peer after a 20 minute ping timeout, and a second writer would
++            # interleave frames with the sender.
++            buf = buf[24 + length :]
++
++
++def sender(cfg, peer_index, ready_q, start_ev, stop_ev):
++    units = load_units(cfg["fixture"], cfg["peers"], peer_index, cfg["unit_limit"])
++    items = []
++    for u in units:
++        for hx in u["txs"]:
++            raw = bytes.fromhex(hx)
++            txid = ac.hash256(raw)[::-1].hex()
++            items.append((txid, hx, ac.p2p_frame(b"tx", raw)))
++    per_peer_rate = cfg["rate"] / cfg["peers"] if cfg["rate"] else 0.0
++    sends = []
++    errors = 0
++    rejected = {}
++    if cfg["mode"] == "p2p":
++        sock = ac.p2p_connect(cfg["p2p_port"], relay=cfg["peer_relay"])
++        sock.settimeout(None)
++        drain_stop = threading.Event()
++        drainer = threading.Thread(target=_drain, args=(sock, drain_stop), daemon=True)
++        drainer.start()
++        ready_q.put(peer_index)
++        start_ev.wait()
++        t0 = time.monotonic()
++        for i, (txid, _, frame) in enumerate(items):
++            if per_peer_rate:
++                due = t0 + i / per_peer_rate
++                now = time.monotonic()
++                if due > now:
++                    time.sleep(due - now)
++            t_send = time.monotonic()
++            sock.sendall(frame)
++            sends.append((txid, t_send))
++        stop_ev.wait()
++        drain_stop.set()
++        sock.close()
++    else:
++        rpc = ac.RPC(cfg["rpc_port"])
++        rpc.call("getblockcount")
++        ready_q.put(peer_index)
++        start_ev.wait()
++        t0 = time.monotonic()
++        for i, (txid, hx, _) in enumerate(items):
++            if per_peer_rate:
++                due = t0 + i / per_peer_rate
++                now = time.monotonic()
++                if due > now:
++                    time.sleep(due - now)
++            t_send = time.monotonic()
++            try:
++                rpc.call("sendrawtransaction", hx)
++            except RuntimeError as e:
++                errors += 1
++                reason = str(e)[:120]
++                rejected[reason] = rejected.get(reason, 0) + 1
++            t_done = time.monotonic()
++            sends.append((txid, t_send, t_done))
++    out = Path(cfg["workdir"]) / f"sender-{peer_index}.json"
++    out.write_text(json.dumps({"sends": sends, "errors": errors, "rejected": rejected}))
++
++
++def zmq_listener(cfg, ready_q, stop_ev):
++    sub = ac.ZmqSub(cfg["libzmq"], f"tcp://127.0.0.1:{cfg['zmq_port']}")
++    adds = {}
++    removes = 0
++    duplicate_adds = 0
++    sequence_gaps = 0
++    previous_sequence = None
++    ready_q.put("zmq")
++    while not stop_ev.is_set():
++        frames = sub.recv_multipart()
++        if frames is None or len(frames) < 2:
++            continue
++        if len(frames) >= 3 and len(frames[2]) == 4:
++            sequence = struct.unpack("<I", frames[2])[0]
++            if previous_sequence is not None:
++                sequence_gaps += (sequence - previous_sequence - 1) & 0xFFFFFFFF
++            previous_sequence = sequence
++        body = frames[1]
++        if len(body) < 33:
++            continue
++        label = body[32:33]
++        if label == b"A":
++            txid = body[:32].hex()
++            duplicate_adds += txid in adds
++            adds[txid] = time.monotonic()
++        elif label == b"R":
++            removes += 1
++    sub.close()
++    out = Path(cfg["workdir"]) / "zmq.json"
++    out.write_text(
++        json.dumps(
++            {
++                "adds": adds,
++                "removes": removes,
++                "duplicate_adds": duplicate_adds,
++                "sequence_gaps": sequence_gaps,
++            }
++        )
++    )
++
++
++def cpu_seconds(pid):
++    r = subprocess.run(
++        ["ps", "-o", "time=", "-p", str(pid)], capture_output=True, text=True
++    )
++    t = r.stdout.strip()
++    if not t:
++        return None
++    parts = t.replace("-", ":").split(":")
++    secs = 0.0
++    for p in parts:
++        secs = secs * 60 + float(p)
++    return secs
++
++
++def summarize_latency(values):
++    if not values:
++        return {}
++    ms = [v * 1000 for v in values]
++    return {
++        "n": len(ms),
++        "p50_ms": round(ac.percentile(ms, 0.50), 3),
++        "p90_ms": round(ac.percentile(ms, 0.90), 3),
++        "p99_ms": round(ac.percentile(ms, 0.99), 3),
++        "max_ms": round(max(ms), 3),
++    }
++
++
++def run(args):
++    workdir = Path(args.workdir)
++    workdir.mkdir(parents=True, exist_ok=True)
++    datadir = workdir / "datadir"
++    ac.clone_tree(Path(args.fixture) / "datadir", datadir)
++    for stale in ("debug.log", "mempool.dat"):
++        p = datadir / "regtest" / stale
++        if p.exists():
++            p.unlink()
++    manifest = json.loads((Path(args.fixture) / "manifest.json").read_text())
++    fixture_hash = hashlib.sha256(
++        (Path(args.fixture) / "flood.jsonl").read_bytes()
++    ).hexdigest()
++    if fixture_hash != manifest["flood_sha256"]:
++        raise ValueError("fixture flood.jsonl differs from manifest")
++    ports = ac.ports_for(args.portseed)
++    node_args = [
++        f"-zmqpubsequence=tcp://127.0.0.1:{ports['zmq']}",
++        "-zmqpubsequencehwm=0",
++        "-metrics=1",
++        "-persistmempool=0",
++        # regtest defaults to a full mempool consistency check per admission
++        # (quadratic in pool size) and block-index checks; neither is what a
++        # production node runs.
++        "-checkmempool=0",
++        "-checkblockindex=0",
++    ] + list(args.node_arg)
++    proc, rpc, argv = ac.start_node(
++        args.bitcoind, datadir, ports, node_args, log_path=workdir / "node.out"
++    )
++    cfg = {
++        "fixture": str(args.fixture),
++        "peers": args.peers,
++        "mode": args.mode,
++        "rate": args.rate,
++        "p2p_port": ports["p2p"],
++        "rpc_port": ports["rpc"],
++        "zmq_port": ports["zmq"],
++        "workdir": str(workdir),
++        "libzmq": ac.find_libzmq(args.libzmq),
++        "unit_limit": args.unit_limit,
++        "peer_relay": not args.no_relay,
++    }
++    expected = 0
++    expected_ids = set()
++    with open(Path(args.fixture) / "flood.jsonl") as f:
++        for line in f:
++            u = json.loads(line)
++            if args.unit_limit is not None and u["unit"] >= args.unit_limit:
++                break
++            expected += len(u["txs"])
++            expected_ids.update(
++                ac.hash256(bytes.fromhex(hx))[::-1].hex() for hx in u["txs"]
++            )
++    if len(expected_ids) != expected:
++        raise ValueError("fixture contains duplicate transactions")
++    result = {
++        "mode": args.mode,
++        "peers": args.peers,
++        "rate": args.rate,
++        "peer_relay": not args.no_relay,
++        "node_args": node_args,
++        "label": args.label,
++        "fixture_txs": expected,
++        "fixture_sha256": manifest.get("flood_sha256"),
++        "host_cpus": os.cpu_count(),
++        "loadavg_start": list(os.getloadavg()),
++    }
++    ctx = multiprocessing.get_context("spawn")
++    ready_q = ctx.Queue()
++    start_ev = ctx.Event()
++    stop_ev = ctx.Event()
++    zmq_stop = ctx.Event()
++    procs = []
++    sampler = None
++    zp = None
++    try:
++        zp = ctx.Process(target=zmq_listener, args=(cfg, ready_q, zmq_stop))
++        zp.start()
++        assert ready_q.get(timeout=60) == "zmq"
++        time.sleep(0.5)  # ZMQ slow-joiner: let the subscription propagate
++        for i in range(args.peers):
++            p = ctx.Process(target=sender, args=(cfg, i, ready_q, start_ev, stop_ev))
++            p.start()
++            procs.append(p)
++        for _ in range(args.peers):
++            ready_q.get(timeout=300)
++        time.sleep(0.5)
++        cpu0 = cpu_seconds(proc.pid)
++        t0 = time.monotonic()
++        start_ev.set()
++        last_size, last_change = -1, time.monotonic()
++        timeline = []
++        size = 0
++        while True:
++            if args.sample_seconds and sampler is None and size >= args.sample_at_size:
++                sampler = subprocess.Popen(
++                    [
++                        "sample",
++                        str(proc.pid),
++                        str(args.sample_seconds),
++                        "-file",
++                        str(workdir / "sample.txt"),
++                    ],
++                    stdout=subprocess.DEVNULL,
++                    stderr=subprocess.DEVNULL,
++                )
++                result["sample_started_at_size"] = size
++            time.sleep(0.25)
++            size = rpc.call("getmempoolinfo")["size"]
++            now = time.monotonic()
++            timeline.append((round(now - t0, 3), size))
++            if size != last_size:
++                last_size, last_change = size, now
++            if size >= expected:
++                break
++            if now - last_change > args.stall_seconds:
++                break
++            if now - t0 > args.timeout:
++                break
++        t_end = time.monotonic()
++        cpu1 = cpu_seconds(proc.pid)
++        if args.mode == "rpc":
++            for p in procs:
++                p.join(timeout=60)
++        stop_ev.set()
++        for p in procs:
++            p.join(timeout=60)
++        time.sleep(1.0)  # let trailing notifications arrive
++        zmq_stop.set()
++        zp.join(timeout=30)
++        metrics = ac.scrape_metrics(ports["rpc"])
++        if sampler:
++            sampler.wait(timeout=args.sample_seconds + 60)
++        final_ids = set(rpc.call("getrawmempool"))
++        final_size = len(final_ids)
++    finally:
++        stop_ev.set()
++        zmq_stop.set()
++        for p in procs + ([zp] if zp is not None else []):
++            if p.is_alive():
++                p.terminate()
++            p.join(timeout=5)
++        if sampler and sampler.poll() is None:
++            sampler.terminate()
++            sampler.wait(timeout=5)
++        ac.stop_node(proc, rpc)
++
++    zmq = json.loads((workdir / "zmq.json").read_text())
++    adds = zmq["adds"]
++    lat = []
++    rpc_lat = []
++    sent = 0
++    sent_ids = set()
++    negative_latencies = 0
++    errors = 0
++    rejected = {}
++    for i in range(args.peers):
++        s = json.loads((workdir / f"sender-{i}.json").read_text())
++        errors += s["errors"]
++        for reason, n in s["rejected"].items():
++            rejected[reason] = rejected.get(reason, 0) + n
++        for item in s["sends"]:
++            sent += 1
++            txid, t_send = item[0], item[1]
++            sent_ids.add(txid)
++            t_add = adds.get(txid)
++            if t_add is None:
++                t_add = adds.get(bytes.fromhex(txid)[::-1].hex())
++            if t_add is not None:
++                if t_add < t_send:
++                    negative_latencies += 1
++                else:
++                    lat.append(t_add - t_send)
++            if len(item) > 2:
++                rpc_lat.append(item[2] - t_send)
++    add_times = sorted(t - t0 for t in adds.values())
++    accepted = len(add_times)
++    result.update(
++        {
++            "sent": sent,
++            "accepted_mempool": final_size,
++            "accepted_zmq": accepted,
++            "rpc_errors": errors,
++            "rpc_rejects": rejected,
++            "complete": (
++                final_ids == expected_ids
++                and sent_ids == expected_ids
++                and sent == expected
++                and accepted == expected
++                and len(lat) == expected
++                and errors == 0
++                and metrics.get("fullnode_mempool_admission_dropped_total", 0) == 0
++                and zmq["removes"] == 0
++                and zmq["duplicate_adds"] == 0
++                and zmq["sequence_gaps"] == 0
++                and all(p.exitcode == 0 for p in procs)
++                and zp.exitcode == 0
++            ),
++            "missing_mempool": len(expected_ids - final_ids),
++            "unexpected_mempool": len(final_ids - expected_ids),
++            "missing_notifications": expected - len(lat),
++            "negative_latency_samples": negative_latencies,
++            "zmq_removes": zmq["removes"],
++            "zmq_duplicate_adds": zmq["duplicate_adds"],
++            "zmq_sequence_gaps": zmq["sequence_gaps"],
++            "sender_exitcodes": [p.exitcode for p in procs],
++            "elapsed_s": round(t_end - t0, 3),
++            "node_cpu_s": round(cpu1 - cpu0, 2)
++            if cpu0 is not None and cpu1 is not None
++            else None,
++            "loadavg_end": list(os.getloadavg()),
++        }
++    )
++    if accepted:
++        t_last = add_times[-1]
++        result["tps_total"] = round(accepted / t_last, 1) if t_last > 0 else None
++        lo = add_times[int(accepted * 0.1)]
++        hi = add_times[min(accepted - 1, int(accepted * 0.9))]
++        if hi > lo:
++            result["tps_10_90"] = round(
++                (int(accepted * 0.9) - int(accepted * 0.1)) / (hi - lo), 1
++            )
++        result["first_add_s"] = round(add_times[0], 4)
++        result["last_add_s"] = round(t_last, 4)
++    result["latency"] = summarize_latency(lat)
++    if rpc_lat:
++        result["rpc_roundtrip"] = summarize_latency(rpc_lat)
++    result["metrics_complete"] = (
++        bool(metrics) and metrics.get("fullnode_metrics_dropped_samples_total", 0) == 0
++    )
++    result["metrics"] = {
++        k: v
++        for k, v in metrics.items()
++        if "mempool_admission" in k
++        or k.startswith("fullnode_mempool")
++        or k == "fullnode_metrics_dropped_samples_total"
++    }
++    result["timeline"] = timeline[:: max(1, len(timeline) // 200)]
++    if not args.keep_datadir:
++        import shutil
++
++        shutil.rmtree(datadir, ignore_errors=True)
++    return result
++
++
++def main():
++    ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
++    ap.add_argument("--bitcoind", required=True, type=Path)
++    ap.add_argument("--fixture", required=True, type=Path)
++    ap.add_argument("--workdir", required=True, type=Path)
++    ap.add_argument("--peers", type=int, default=8)
++    ap.add_argument("--mode", choices=("p2p", "rpc"), default="p2p")
++    ap.add_argument(
++        "--rate",
++        type=float,
++        default=0.0,
++        help="total offered tx/s (0: send as fast as accepted)",
++    )
++    ap.add_argument("--node-arg", action="append", default=[])
++    ap.add_argument("--portseed", type=int, default=611)
++    ap.add_argument("--libzmq")
++    ap.add_argument("--label", default="")
++    ap.add_argument("--timeout", type=float, default=600)
++    ap.add_argument("--stall-seconds", type=float, default=20)
++    ap.add_argument("--unit-limit", type=int, default=None)
++    ap.add_argument(
++        "--sample-seconds",
++        type=int,
++        default=0,
++        help="macOS: run `sample` on the node for N seconds",
++    )
++    ap.add_argument(
++        "--sample-at-size",
++        type=int,
++        default=0,
++        help="start sampling once the mempool holds N transactions",
++    )
++    ap.add_argument(
++        "--no-relay",
++        action="store_true",
++        help="P2P senders ask not to be sent transactions (version relay=0), "
++        "so the node announces nothing: admission without relay work",
++    )
++    ap.add_argument("--keep-datadir", action="store_true")
++    ap.add_argument("--result", type=Path)
++    args = ap.parse_args()
++    result = run(args)
++    text = json.dumps(result, indent=1)
++    if args.result:
++        args.result.write_text(text + "\n")
++    print(text)
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/contrib/bench/mempool-admission/make_fixture.py b/contrib/bench/mempool-admission/make_fixture.py
+new file mode 100755
+index 0000000000000000000000000000000000000000..cd7f6c57e8dd4a634554a7d10a0554414e59b67b
+--- /dev/null
++++ b/contrib/bench/mempool-admission/make_fixture.py
+@@ -0,0 +1,247 @@
++#!/usr/bin/env python3
++# Copyright (c) 2026 The Lotus developers
++# Distributed under the MIT software license, see the accompanying
++# file COPYING or http://www.opensource.org/licenses/mit-license.php.
++"""Build a reusable signed-transaction flood fixture.
++
++1. Start an isolated regtest node from the given binary.
++2. Mine coinbases to deterministic P2PKH keys, mature them, and fan them
++   out into many confirmed P2PKH outputs (signed, one block).
++3. Stop the node. The stopped datadir is the fixture; every benchmark run
++   clones it, so each run starts from identical chain state and an empty
++   mempool and signature cache.
++4. Write flood.jsonl: real P2PKH transactions spending those outputs, signed
++   with ECDSA and with Schnorr, some with several inputs and some as
++   dependent chains. Signing runs in worker processes.
++
++Usage:
++  make_fixture.py --bitcoind BUILD/src/bitcoind --out DIR [--txs 60000]
++"""
++
++import argparse
++import hashlib
++import json
++import multiprocessing
++import random
++import sys
++import time
++from pathlib import Path
++
++import admission_common as ac
++
++NUM_KEYS = 64
++FANOUT = 500
++FEE_PER_BYTE = 2
++DUST = 1000
++
++
++def est_size(n_in, n_out):
++    return 10 + 148 * n_in + 34 * n_out
++
++
++_KEYS = None
++
++
++def _keys(seed):
++    global _KEYS
++    if _KEYS is None:
++        _KEYS = []
++        for i in range(NUM_KEYS):
++            k = ac.derive_key(seed, i)
++            pub = k.get_pubkey().get_bytes()
++            _KEYS.append((k, pub, bytes(ac.p2pkh_script(pub))))
++    return _KEYS
++
++
++def sign_unit(task):
++    """task = (seed, kind, inputs, sig_schnorr, out_keys).
++
++    inputs: list of (txid_hex, n, amount, key_index).
++    Returns (kind, [tx_hex...]).
++    """
++    seed, kind, inputs, schnorr, out_keys = task
++    keys = _keys(seed)
++    txs = []
++    if kind == "chain":
++        txid, n, amount, kidx = inputs[0]
++        for depth, (use_schnorr, okidx) in enumerate(zip(schnorr, out_keys)):
++            fee = FEE_PER_BYTE * est_size(1, 1)
++            out_amount = amount - fee
++            tx = ac.build_tx([(txid, n)], [(keys[okidx][2], out_amount)])
++            ac.sign_p2pkh_inputs(
++                tx,
++                [(keys[kidx][2], amount)],
++                [(keys[kidx][0], keys[kidx][1])],
++                [use_schnorr],
++            )
++            txs.append(tx.serialize().hex())
++            txid, n, amount, kidx = tx.txid_hex, 0, out_amount, okidx
++        return kind, txs
++    total = sum(a for _, _, a, _ in inputs)
++    n_out = len(out_keys)
++    fee = FEE_PER_BYTE * est_size(len(inputs), n_out)
++    per_out = (total - fee) // n_out
++    tx = ac.build_tx(
++        [(t, n) for t, n, _, _ in inputs],
++        [(keys[k][2], per_out) for k in out_keys],
++    )
++    ac.sign_p2pkh_inputs(
++        tx,
++        [(keys[k][2], a) for _, _, a, k in inputs],
++        [(keys[k][0], keys[k][1]) for _, _, _, k in inputs],
++        schnorr,
++    )
++    txs.append(tx.serialize().hex())
++    return kind, txs
++
++
++def plan_units(rng, n_txs, mix):
++    """Return a list of (kind, n_inputs, n_txs) until n_txs transactions."""
++    kinds = list(mix)
++    # Weights are shares of transactions; a chain unit holds 5 on average.
++    weights = [mix[k] / (5.0 if k == "chain" else 1.0) for k in kinds]
++    units = []
++    count = 0
++    while count < n_txs:
++        kind = rng.choices(kinds, weights)[0]
++        if kind == "multi":
++            units.append((kind, rng.randint(2, 5), 1))
++            count += 1
++        elif kind == "chain":
++            d = rng.randint(2, 8)
++            units.append((kind, 1, d))
++            count += d
++        else:
++            units.append((kind, 1, 1))
++            count += 1
++    return units
++
++
++def main():
++    ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
++    ap.add_argument("--bitcoind", required=True, type=Path)
++    ap.add_argument("--out", required=True, type=Path)
++    ap.add_argument("--txs", type=int, default=60000)
++    ap.add_argument("--seed", default="admission-bench-1")
++    ap.add_argument("--jobs", type=int, default=8)
++    ap.add_argument("--portseed", type=int, default=601)
++    ap.add_argument(
++        "--mix",
++        default="ecdsa1=35,schnorr1=35,multi=15,chain=15",
++        help="relative transaction shares (chain units hold 2-8 dependent txs)",
++    )
++    args = ap.parse_args()
++
++    mix = {}
++    for part in args.mix.split(","):
++        k, v = part.split("=")
++        if k not in ("ecdsa1", "schnorr1", "multi", "chain"):
++            sys.exit(f"unknown kind {k}")
++        mix[k] = float(v)
++
++    rng = random.Random(args.seed)
++    units = plan_units(rng, args.txs, mix)
++    needed = sum(u[1] for u in units)
++    n_fanouts = (needed + FANOUT - 1) // FANOUT
++    print(
++        f"{len(units)} units, {sum(u[2] for u in units)} txs, "
++        f"{needed} funding outputs, {n_fanouts} fanout txs"
++    )
++
++    if args.out.exists():
++        sys.exit(f"{args.out} exists; choose a new directory")
++    args.out.mkdir(parents=True)
++    datadir = args.out / "datadir"
++    ports = ac.ports_for(args.portseed)
++    keys = _keys(args.seed)
++    proc, rpc, _ = ac.start_node(
++        args.bitcoind, datadir, ports, log_path=args.out / "fixture-node.log"
++    )
++    try:
++        spk0 = keys[0][2].hex()
++        desc = rpc.call("getdescriptorinfo", f"raw({spk0})")["descriptor"]
++        rpc.call("generatetodescriptor", n_fanouts, desc)
++        rpc.call("generatetodescriptor", 101, desc)
++        coinbases = []
++        for h in range(1, n_fanouts + 1):
++            blk = rpc.call("getblock", rpc.call("getblockhash", h), 2)
++            cb = blk["tx"][0]
++            vout = next(v for v in cb["vout"] if v["scriptPubKey"]["hex"] == spk0)
++            coinbases.append((cb["txid"], vout["n"], round(vout["value"] * 100)))
++
++        funding = []
++        for i, (txid, n, amount) in enumerate(coinbases):
++            fee = FEE_PER_BYTE * est_size(1, FANOUT)
++            per_out = (amount - fee) // FANOUT
++            if per_out < 50 * DUST:
++                sys.exit(f"coinbase {amount} too small for fanout")
++            out_keys = [(i * FANOUT + j) % NUM_KEYS for j in range(FANOUT)]
++            tx = ac.build_tx([(txid, n)], [(keys[k][2], per_out) for k in out_keys])
++            ac.sign_p2pkh_inputs(
++                tx, [(keys[0][2], amount)], [(keys[0][0], keys[0][1])], [False]
++            )
++            got = rpc.call("sendrawtransaction", tx.serialize().hex())
++            assert got == tx.txid_hex, (got, tx.txid_hex)
++            funding.extend((tx.txid_hex, j, per_out, k) for j, k in enumerate(out_keys))
++        rpc.call("generatetodescriptor", 1, desc)
++        assert rpc.call("getmempoolinfo")["size"] == 0
++        tip = rpc.call("getbestblockhash")
++        height = rpc.call("getblockcount")
++    finally:
++        ac.stop_node(proc, rpc)
++
++    rng.shuffle(funding)
++    tasks = []
++    pos = 0
++    for kind, n_in, n_tx in units:
++        inputs = funding[pos : pos + n_in]
++        pos += n_in
++        if kind == "ecdsa1":
++            schnorr = [False]
++        elif kind == "schnorr1":
++            schnorr = [True]
++        else:
++            schnorr = [rng.random() < 0.5 for _ in range(max(n_in, n_tx))]
++        if kind == "chain":
++            out_keys = [rng.randrange(NUM_KEYS) for _ in range(n_tx)]
++        elif kind == "multi":
++            out_keys = [rng.randrange(NUM_KEYS)]
++        else:
++            out_keys = [rng.randrange(NUM_KEYS) for _ in range(2)]
++        tasks.append((args.seed, kind, inputs, schnorr, out_keys))
++
++    t0 = time.time()
++    flood_path = args.out / "flood.jsonl"
++    stats = {"ecdsa1": 0, "schnorr1": 0, "multi": 0, "chain": 0}
++    n_written = 0
++    sigs = 0
++    h = hashlib.sha256()
++    with multiprocessing.Pool(args.jobs) as pool, open(flood_path, "w") as f:
++        for i, (kind, txs) in enumerate(pool.imap(sign_unit, tasks, chunksize=8)):
++            line = json.dumps({"unit": i, "kind": kind, "txs": txs}) + "\n"
++            h.update(line.encode())
++            f.write(line)
++            stats[kind] += len(txs)
++            n_written += len(txs)
++            sigs += len(tasks[i][2]) if kind != "chain" else len(txs)
++            if i % 2000 == 0:
++                print(f"  signed {n_written} txs ({time.time() - t0:.0f}s)")
++    manifest = {
++        "seed": args.seed,
++        "units": len(tasks),
++        "txs": n_written,
++        "signatures": sigs,
++        "txs_by_kind": stats,
++        "funding_outputs": needed,
++        "fixture_height": height,
++        "fixture_tip": tip,
++        "flood_sha256": h.hexdigest(),
++        "bitcoind": str(args.bitcoind),
++        "sign_seconds": round(time.time() - t0, 1),
++    }
++    (args.out / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
++    print(json.dumps(manifest, indent=2))
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/contrib/bench/mempool-admission/sample_summary.py b/contrib/bench/mempool-admission/sample_summary.py
+new file mode 100755
+index 0000000000000000000000000000000000000000..5260368676f462f3593893806344ab0234b5475b
+--- /dev/null
++++ b/contrib/bench/mempool-admission/sample_summary.py
+@@ -0,0 +1,134 @@
++#!/usr/bin/env python3
++# Copyright (c) 2026 The Lotus developers
++# Distributed under the MIT software license, see the accompanying
++# file COPYING or http://www.opensource.org/licenses/mit-license.php.
++"""Summarize a macOS `sample` call tree for one thread.
++
++Prints inclusive sample counts per function (each function counted once per
++stack, at its outermost frame) and self counts, as a share of the thread's
++samples. Use it on the sample.txt that flood.py --sample-seconds writes.
++
++Usage:
++  sample_summary.py SAMPLE.txt [--thread b-msghand] [--top 40]
++                   [--match REGEX ...]
++"""
++
++import argparse
++import re
++from collections import defaultdict
++
++LINE = re.compile(
++    r"^(?P<indent>[ +!:|]*)(?P<count>\d+) (?P<name>.*?)(\s+\(in [^)]*\).*)?$"
++)
++
++
++def short(name):
++    name = re.sub(r"\(anonymous namespace\)::", "", name)
++    name = re.sub(r"\[abi:[^\]]*\]", "", name)
++    # drop argument lists, keep qualified name
++    depth = 0
++    out = []
++    for ch in name:
++        if ch == "(" and not out[-8:] == list("operator"):
++            if depth == 0 and out:
++                break
++        out.append(ch)
++    return "".join(out).strip()
++
++
++def parse_thread(path, thread):
++    lines = open(path).read().splitlines()
++    start = None
++    for i, line in enumerate(lines):
++        if "Thread_" in line and thread in line:
++            start = i
++            break
++    if start is None:
++        raise SystemExit(f"thread {thread!r} not found")
++    root = LINE.match(lines[start])
++    total = int(root.group("count"))
++    root_depth = len(root.group("indent"))
++    nodes = []  # (depth, count, name)
++    for line in lines[start + 1 :]:
++        m = LINE.match(line)
++        if not m:
++            break
++        depth = len(m.group("indent"))
++        if depth <= root_depth:
++            break
++        nodes.append((depth, int(m.group("count")), short(m.group("name"))))
++    return total, nodes
++
++
++def main():
++    ap = argparse.ArgumentParser()
++    ap.add_argument("sample")
++    ap.add_argument("--thread", default="b-msghand")
++    ap.add_argument("--top", type=int, default=40)
++    ap.add_argument("--match", action="append", default=[])
++    ap.add_argument("--callers", help="print the direct callers of FUNC")
++    ap.add_argument(
++        "--root",
++        help="only count samples under frames named FUNC (shares are of those)",
++    )
++    args = ap.parse_args()
++    total, nodes = parse_thread(args.sample, args.thread)
++    if args.root:
++        kept = []
++        root_depth = None
++        for depth, count, name in nodes:
++            if root_depth is not None and depth <= root_depth:
++                root_depth = None
++            if root_depth is None and name == args.root:
++                root_depth = depth
++            if root_depth is not None:
++                kept.append((depth, count, name))
++        nodes = kept
++        total = sum(c for d, c, n in nodes if n == args.root)
++    inclusive = defaultdict(int)
++    selfc = defaultdict(int)
++    callers = defaultdict(int)
++    stack = []  # (depth, name)
++    for idx, (depth, count, name) in enumerate(nodes):
++        while stack and stack[-1][0] >= depth:
++            stack.pop()
++        if name not in (n for _, n in stack):
++            inclusive[name] += count
++        if args.callers and name == args.callers and stack:
++            callers[stack[-1][1]] += count
++        # self = count - sum(direct children)
++        direct = 0
++        j = idx + 1
++        child_depth = None
++        while j < len(nodes) and nodes[j][0] > depth:
++            if child_depth is None:
++                child_depth = nodes[j][0]
++            if nodes[j][0] == child_depth:
++                direct += nodes[j][1]
++            j += 1
++        selfc[name] += count - direct
++        stack.append((depth, name))
++    print(f"thread {args.thread}: {total} samples")
++    if args.callers:
++        for k, v in sorted(callers.items(), key=lambda kv: -kv[1])[: args.top]:
++            print(f"  {100.0 * v / total:6.1f}%  {k}")
++        return
++    if args.match:
++        for pat in args.match:
++            rx = re.compile(pat)
++            hits = sorted(
++                ((v, k) for k, v in inclusive.items() if rx.search(k)), reverse=True
++            )
++            for v, k in hits[:10]:
++                print(f"  {100.0 * v / total:6.1f}%  {k}")
++        return
++    print("inclusive:")
++    for k, v in sorted(inclusive.items(), key=lambda kv: -kv[1])[: args.top]:
++        print(f"  {100.0 * v / total:6.1f}%  {k}")
++    print("self:")
++    for k, v in sorted(selfc.items(), key=lambda kv: -kv[1])[: args.top // 2]:
++        print(f"  {100.0 * v / total:6.1f}%  {k}")
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/contrib/bench/mempool-admission/test_accounting.py b/contrib/bench/mempool-admission/test_accounting.py
+new file mode 100755
+index 0000000000000000000000000000000000000000..452687896df793e103385483c874ace9e2574cf4
+--- /dev/null
++++ b/contrib/bench/mempool-admission/test_accounting.py
+@@ -0,0 +1,28 @@
++#!/usr/bin/env python3
++# Copyright (c) 2026 The Lotus developers
++# Distributed under the MIT software license, see the accompanying
++# file COPYING or http://www.opensource.org/licenses/mit-license.php.
++"""Guard A/B reporting against incomplete-flood survivor bias."""
++
++import unittest
++
++from ab import summarize
++
++
++class AccountingTests(unittest.TestCase):
++    def test_incomplete_run_counted_but_not_averaged(self):
++        rows = [
++            {"config": "a", "complete": True, "tps_10_90": 100},
++            {"config": "a", "complete": False, "tps_10_90": 1000000},
++        ]
++        table = summarize(rows, ["a"])
++        self.assertIn("| a | 2 | 1/2 | 100 (100-100)", table)
++        self.assertNotIn("1000000", table)
++
++    def test_failed_runs_have_no_performance_claim(self):
++        table = summarize([{"config": "a", "complete": False}], ["a"])
++        self.assertIn("| a | 1 | 0/1 | - |", table)
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/src/bench/CMakeLists.txt b/src/bench/CMakeLists.txt
+index da5c9713c48363311a72b5d72c7185efdd9da9a1..b039f9182759245b7dc93a318f46c7860f22d302 100644
+--- a/src/bench/CMakeLists.txt
++++ b/src/bench/CMakeLists.txt
+@@ -57,6 +57,7 @@ add_executable(bitcoin-bench
+ 	load_external.cpp
+ 	lockedpool.cpp
+ 	logging.cpp
++	mempool_admission.cpp
+ 	mempool_eviction.cpp
+ 	mempool_stress.cpp
+ 	merkle_root.cpp
+diff --git a/src/bench/crypto_hash.cpp b/src/bench/crypto_hash.cpp
+index 20651ee1c22a84ddf241b9bf9c8d00807055df64..e55528065fca3ea1263251c9395273f1cddbcade 100644
+--- a/src/bench/crypto_hash.cpp
++++ b/src/bench/crypto_hash.cpp
+@@ -13,6 +13,7 @@
+ #include <hash.h>
+ #include <random.h>
+ #include <uint256.h>
++#include <util/hasher.h>
+ 
+ #include <string>
+ 
+@@ -148,3 +149,28 @@ BENCHMARK(MuHashMul);
+ BENCHMARK(MuHashDiv);
+ BENCHMARK(MuHashPrecompute);
+ BENCHMARK(MuHashFinalize);
++
++/** Every coins view and mempool admission constructs a few of these. */
++static void SaltedOutpointHasherConstruct(benchmark::Bench &bench) {
++    uint64_t sink = 0;
++    bench.run([&] {
++        SaltedOutpointHasher hasher;
++        sink += hasher(COutPoint());
++    });
++    ankerl::nanobench::doNotOptimizeAway(sink);
++}
++BENCHMARK(SaltedOutpointHasherConstruct);
++
++/** Reference cost of independently seeding each salt word. */
++static void SaltedOutpointHasherTwoContexts(benchmark::Bench &bench) {
++    uint64_t sink = 0;
++    bench.run([&] {
++        const uint64_t k0 = FastRandomContext().rand64();
++        const uint64_t k1 = FastRandomContext().rand64();
++        const COutPoint outpoint;
++        sink +=
++            SipHashUint256Extra(k0, k1, outpoint.GetTxId(), outpoint.GetN());
++    });
++    ankerl::nanobench::doNotOptimizeAway(sink);
++}
++BENCHMARK(SaltedOutpointHasherTwoContexts);
+diff --git a/src/bench/mempool_admission.cpp b/src/bench/mempool_admission.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..084d756284b520b27ce8caee711529793c29bbd6
+--- /dev/null
++++ b/src/bench/mempool_admission.cpp
+@@ -0,0 +1,71 @@
++// Copyright (c) 2026 The Lotus developers
++// Distributed under the MIT software license, see the accompanying
++// file COPYING or http://www.opensource.org/licenses/mit-license.php.
++
++#include <bench/bench.h>
++#include <kernel/mempool_entry.h>
++#include <test/util/admission.h>
++#include <test/util/setup_common.h>
++#include <txmempool.h>
++#include <util/check.h>
++#include <util/time.h>
++#include <validation.h>
++
++#include <vector>
++
++/**
++ * Mempool admission of independently signed P2PKH transactions (half ECDSA,
++ * half Schnorr). Every iteration admits a set of transactions that has never
++ * been verified before, so the signature cache starts cold, as it does for
++ * transactions first seen from the network. The mempool is cleared between
++ * iterations; the cost reported is per transaction.
++ */
++namespace {
++
++constexpr size_t TXS_PER_SET = 2000;
++constexpr size_t SETS = 12;
++
++struct SignedSets {
++    std::vector<std::vector<CTransactionRef>> sets;
++};
++
++SignedSets MakeSets(TestChain100Setup &setup) {
++    admission_test::Wallet wallet = admission_test::MakeWallet();
++    admission_test::FundWallet(setup, wallet, TXS_PER_SET);
++    SignedSets out;
++    for (size_t s = 0; s < SETS; ++s) {
++        std::vector<CTransactionRef> set;
++        set.reserve(TXS_PER_SET);
++        for (size_t i = 0; i < TXS_PER_SET; ++i) {
++            set.push_back(admission_test::SignedSpend(
++                wallet, {wallet.outputs[i]}, 2, /*schnorr=*/i % 2 == 1,
++                /*salt=*/uint32_t(s)));
++        }
++        out.sets.push_back(std::move(set));
++    }
++    return out;
++}
++
++} // namespace
++
++static void MempoolAdmissionSignedSerial(benchmark::Bench &bench) {
++    auto setup = MakeNoLogFileContext<TestChain100Setup>();
++    const SignedSets sets = MakeSets(*setup);
++    Chainstate &chainstate = setup->m_node.chainman->ActiveChainstate();
++    CTxMemPool &mempool = *setup->m_node.mempool;
++    size_t next = 0;
++    bench.epochs(SETS).epochIterations(1).batch(TXS_PER_SET).unit("tx");
++    bench.run([&] {
++        const auto &set = sets.sets.at(next++ % SETS);
++        LOCK(::cs_main);
++        for (const auto &tx : set) {
++            const MempoolAcceptResult result = AcceptToMemoryPool(
++                chainstate, tx, GetTime(), /*bypass_limits=*/false);
++            Assert(result.m_result_type ==
++                   MempoolAcceptResult::ResultType::VALID);
++        }
++        mempool.clear();
++    });
++}
++
++BENCHMARK(MempoolAdmissionSignedSerial);
+diff --git a/src/test/CMakeLists.txt b/src/test/CMakeLists.txt
+index 8d75729ef36982430f02f934bf061ccc358191a0..9e5e2fa5e2bc75cc124c2598dee83ae8926863e5 100644
+--- a/src/test/CMakeLists.txt
++++ b/src/test/CMakeLists.txt
+@@ -47,6 +47,7 @@ add_dependencies(check check-bitcoin)
+ 
+ # An utility library for bitcoin related test suites.
+ add_library(testutil OBJECT
++	util/admission.cpp
+ 	util/blockfilter.cpp
+ 	util/blockindex.cpp
+ 	util/coins.cpp
+diff --git a/src/test/util/admission.cpp b/src/test/util/admission.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..608f8cdfdcbbe1efc10d802e9a9f8717af026ca5
+--- /dev/null
++++ b/src/test/util/admission.cpp
+@@ -0,0 +1,105 @@
++// Copyright (c) 2026 The Lotus developers
++// Distributed under the MIT software license, see the accompanying
++// file COPYING or http://www.opensource.org/licenses/mit-license.php.
++
++#include <test/util/admission.h>
++
++#include <script/interpreter.h>
++#include <script/sighashtype.h>
++#include <script/standard.h>
++#include <test/util/setup_common.h>
++#include <util/check.h>
++
++namespace admission_test {
++
++static constexpr Amount FEE_PER_INPUT = 400 * SATOSHI;
++static constexpr Amount FEE_BASE = 300 * SATOSHI;
++
++Wallet MakeWallet() {
++    Wallet wallet;
++    wallet.key.MakeNewKey(true);
++    wallet.script_pub_key =
++        GetScriptForDestination(PKHash(wallet.key.GetPubKey()));
++    return wallet;
++}
++
++void SignP2PKH(CMutableTransaction &tx, const Wallet &wallet,
++               const std::vector<Amount> &spent_amounts, bool schnorr) {
++    Assert(spent_amounts.size() == tx.vin.size());
++    const SigHashType sighash_type = SigHashType().withForkId();
++    const CPubKey pub = wallet.key.GetPubKey();
++    const std::vector<uint8_t> pubkey(pub.begin(), pub.end());
++    for (size_t i = 0; i < tx.vin.size(); ++i) {
++        const uint256 hash = SignatureHash(wallet.script_pub_key, tx, i,
++                                           sighash_type, spent_amounts[i]);
++        std::vector<uint8_t> sig;
++        if (schnorr) {
++            Assert(wallet.key.SignSchnorr(hash, sig));
++        } else {
++            Assert(wallet.key.SignECDSA(hash, sig));
++        }
++        sig.push_back(uint8_t(sighash_type.getRawSigHashType()));
++        tx.vin[i].scriptSig = CScript() << sig << pubkey;
++    }
++}
++
++void FundWallet(TestChain100Setup &setup, Wallet &wallet, size_t count,
++                size_t coinbase_index) {
++    const CTransactionRef &coinbase = setup.m_coinbase_txns.at(coinbase_index);
++    const CScript coinbase_spk = coinbase->vout[0].scriptPubKey;
++    const Amount coinbase_value = coinbase->vout[0].nValue;
++    const Amount fee = 10000 * SATOSHI + int64_t(count) * 50 * SATOSHI;
++    const Amount per_output = (coinbase_value - fee) / int64_t(count);
++
++    CMutableTransaction tx;
++    tx.vin.emplace_back(COutPoint(coinbase->GetId(), 0));
++    for (size_t i = 0; i < count; ++i) {
++        tx.vout.emplace_back(per_output, wallet.script_pub_key);
++    }
++    // Coinbase outputs of TestChain100Setup are P2PK to coinbaseKey.
++    const SigHashType sighash_type = SigHashType().withForkId();
++    const uint256 hash =
++        SignatureHash(coinbase_spk, tx, 0, sighash_type, coinbase_value);
++    std::vector<uint8_t> sig;
++    Assert(setup.coinbaseKey.SignECDSA(hash, sig));
++    sig.push_back(uint8_t(sighash_type.getRawSigHashType()));
++    tx.vin[0].scriptSig = CScript() << sig;
++
++    const TxId funding_id = CTransaction(tx).GetId();
++    setup.CreateAndProcessBlock({tx}, wallet.script_pub_key);
++    for (uint32_t i = 0; i < count; ++i) {
++        wallet.outputs.push_back({COutPoint(funding_id, i), per_output});
++    }
++}
++
++CTransactionRef SignedSpend(const Wallet &wallet,
++                            const std::vector<SpendableOutput> &inputs,
++                            size_t n_outputs, bool schnorr, uint32_t salt) {
++    Assert(!inputs.empty() && n_outputs > 0);
++    CMutableTransaction tx;
++    tx.nVersion = 2;
++    Amount total = Amount::zero();
++    std::vector<Amount> amounts;
++    for (const auto &in : inputs) {
++        tx.vin.emplace_back(in.outpoint);
++        total += in.amount;
++        amounts.push_back(in.amount);
++    }
++    const Amount fee = FEE_BASE + int64_t(inputs.size()) * FEE_PER_INPUT +
++                       int64_t(salt) * SATOSHI;
++    const Amount per_output = (total - fee) / int64_t(n_outputs);
++    for (size_t i = 0; i < n_outputs; ++i) {
++        tx.vout.emplace_back(per_output, wallet.script_pub_key);
++    }
++    SignP2PKH(tx, wallet, amounts, schnorr);
++    return MakeTransactionRef(std::move(tx));
++}
++
++CTransactionRef SignedChild(const Wallet &wallet, const CTransactionRef &parent,
++                            uint32_t n, bool schnorr, uint32_t salt) {
++    return SignedSpend(
++        wallet, {{COutPoint(parent->GetId(), n), parent->vout[n].nValue}}, 1,
++        schnorr, salt);
++}
++
++} // namespace admission_test
+diff --git a/src/test/util/admission.h b/src/test/util/admission.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..4df08f18ce3b9dc03a1e364b21f06225b0ac042c
+--- /dev/null
++++ b/src/test/util/admission.h
+@@ -0,0 +1,70 @@
++// Copyright (c) 2026 The Lotus developers
++// Distributed under the MIT software license, see the accompanying
++// file COPYING or http://www.opensource.org/licenses/mit-license.php.
++
++#ifndef BITCOIN_TEST_UTIL_ADMISSION_H
++#define BITCOIN_TEST_UTIL_ADMISSION_H
++
++#include <consensus/amount.h>
++#include <key.h>
++#include <primitives/transaction.h>
++#include <script/script.h>
++
++#include <cstdint>
++#include <utility>
++#include <vector>
++
++struct TestChain100Setup;
++
++/**
++ * Helpers that build realistically signed transactions for mempool admission
++ * tests and benchmarks: P2PKH spends with real ECDSA or Schnorr signatures,
++ * so script verification costs what it costs on a live node.
++ */
++namespace admission_test {
++
++struct SpendableOutput {
++    COutPoint outpoint;
++    Amount amount;
++};
++
++struct Wallet {
++    CKey key;
++    CScript script_pub_key;
++    std::vector<SpendableOutput> outputs;
++};
++
++/** A fresh key and its P2PKH script. */
++Wallet MakeWallet();
++
++/**
++ * Spend coinbase m_coinbase_txns[coinbase_index] of the setup into `count`
++ * P2PKH outputs of `wallet` and mine it, so the outputs are confirmed.
++ */
++void FundWallet(TestChain100Setup &setup, Wallet &wallet, size_t count,
++                size_t coinbase_index = 0);
++
++/**
++ * Sign every input of tx as a P2PKH spend of wallet.script_pub_key.
++ * spent_amounts[i] is the value of input i; schnorr selects the signature
++ * type for all inputs.
++ */
++void SignP2PKH(CMutableTransaction &tx, const Wallet &wallet,
++               const std::vector<Amount> &spent_amounts, bool schnorr);
++
++/**
++ * Build a signed transaction spending `inputs` into `n_outputs` equal P2PKH
++ * outputs back to the wallet. `salt` perturbs the fee so repeated calls over
++ * the same inputs yield distinct transactions (and distinct signatures).
++ */
++CTransactionRef SignedSpend(const Wallet &wallet,
++                            const std::vector<SpendableOutput> &inputs,
++                            size_t n_outputs, bool schnorr, uint32_t salt = 0);
++
++/** A signed child spending output `n` of `parent` (paying to the wallet). */
++CTransactionRef SignedChild(const Wallet &wallet, const CTransactionRef &parent,
++                            uint32_t n, bool schnorr, uint32_t salt = 0);
++
++} // namespace admission_test
++
++#endif // BITCOIN_TEST_UTIL_ADMISSION_H
+-- 
+2.50.1 (Apple Git-155)
+

@@ -1,0 +1,1644 @@
+diff --git a/packages/bot-framework/src/bot-host.ts b/packages/bot-framework/src/bot-host.ts
+index 5026206f..464a5318 100644
+--- a/packages/bot-framework/src/bot-host.ts
++++ b/packages/bot-framework/src/bot-host.ts
+@@ -70,7 +70,6 @@ import { LoopGuard } from "./loop-guard";
+ import { PeerLaneQueue } from "./peer-queue";
+ import { LevelSubscriptionManager } from "./subscription-manager";
+ import { BotScheduler } from "./scheduler";
+-import { NativeGrants } from "./native-grants";
+ 
+ // A retained message that fetches stop returning is never dropped on a guess; it waits. Twenty
+ // default poll intervals is past any brief relay or directory lapse and soon enough to act on.
+@@ -96,9 +95,7 @@ export const FAILED_REPLY_TEXT =
+ // starting from nothing draw under 10 MON.
+ const TOP_UP_BELOW_WEI = 300_000_000_000_000_000n;
+ const TOP_UP_TO_WEI = 500_000_000_000_000_000n;
+-// What bot top-ups leave in the shared funding wallet: the faucet pays its grants from the same
+-// wallet and keeps this reserve itself (`FAUCET_MIN_RESERVE_WEI`, 0.1 MON when unset; the
+-// faucet's own default lives in packages/bot/src/bots/faucet-bot.ts and must stay the same figure).
++// What bot top-ups leave in the shared funding wallet, independently of each bot's reserve.
+ const FUNDING_RESERVE_WEI = 100_000_000_000_000_000n;
+ // The account a bot's wallet pays message stamps from spends far less.
+ const STAMP_TOP_UP_BELOW_WEI = 100_000_000_000_000_000n;
+@@ -476,8 +473,22 @@ export class FrankBotHost {
+ 
+       // 6. Fund the bot from the shared funding wallet, if there is one. The same top-up runs
+       // again on the poll whenever a balance has fallen under the threshold.
+-      // The faucet sends its grants straight from the funding wallet, so its identity address
+-      // needs nothing; its messages are still paid from its own receive address.
++      // The faucet grants through messages, so only its message payer needs a top-up.
++      const paidFunding = definition.paidMessageFunding;
++      if (
++        paidFunding &&
++        (paidFunding.belowWei < 0n || paidFunding.toWei < paidFunding.belowWei)
++      )
++        throw new Error(
++          `Bot "${definition.id}" has invalid paid-message funding balances`
++        );
++      // Keep the existing stamp threshold as gas headroom above the bot's requested totals.
++      const requestedBelow = paidFunding
++        ? paidFunding.belowWei + STAMP_TOP_UP_BELOW_WEI
++        : 0n;
++      const requestedTo = paidFunding
++        ? paidFunding.toWei + STAMP_TOP_UP_BELOW_WEI
++        : 0n;
+       const fundingTargets: FundingTarget[] = this.fundingWallet
+         ? [
+             ...(definition.id === "faucet"
+@@ -495,8 +506,14 @@ export class FrankBotHost {
+               // Pays the stamps on the bot's messages.
+               addr: (await wallet.getReceiveAddress()).raw,
+               label: "EVM main account",
+-              belowWei: STAMP_TOP_UP_BELOW_WEI,
+-              toWei: STAMP_TOP_UP_TO_WEI,
++              belowWei:
++                requestedBelow > STAMP_TOP_UP_BELOW_WEI
++                  ? requestedBelow
++                  : STAMP_TOP_UP_BELOW_WEI,
++              toWei:
++                requestedTo > STAMP_TOP_UP_TO_WEI
++                  ? requestedTo
++                  : STAMP_TOP_UP_TO_WEI,
+             },
+           ].filter(
+             // One account under two names is topped up once, by the larger rule (the first).
+@@ -551,9 +568,6 @@ export class FrankBotHost {
+       );
+ 
+       const context: BotContext = {
+-        ...(definition.id === "faucet"
+-          ? { nativeGrants: new NativeGrants(state.sublevel("native-grants"), wallet) }
+-          : {}),
+         botId: definition.id,
+         address: botAddress,
+         subject: botSubject,
+@@ -773,9 +787,7 @@ export class FrankBotHost {
+           if (address) {
+             return this.provider.getBalance(address);
+           }
+-          if (definition.id === "faucet" && this.fundingWallet) {
+-            return this.provider.getBalance(this.fundingWallet.address);
+-          }
++          if (definition.id === "faucet") return wallet.getBalance();
+           return this.provider.getBalance(botAddress);
+         },
+ 
+diff --git a/packages/bot-framework/src/native-grants.ts b/packages/bot-framework/src/native-grants.ts
+deleted file mode 100644
+index 2ddb578e..00000000
+--- a/packages/bot-framework/src/native-grants.ts
++++ /dev/null
+@@ -1,316 +0,0 @@
+-import { getAddress } from "ethers";
+-import {
+-  NativeReserveExceededError,
+-  type NativeWalletHandle,
+-} from "@frank/wallet/chain/chain-wallet";
+-import type { EvmNativeOperation } from "@frank/wallet/storage/evm-native-operation-journal";
+-import { LevelBotStateStore } from "./state-store";
+-
+-export interface NativeGrantRequest {
+-  to: string;
+-  valueWei: bigint;
+-  minReserveWei: bigint;
+-  maxFeeWei: bigint;
+-}
+-export interface NativeGrantResult {
+-  state: "low" | "pending" | "submitted" | "confirmed" | "failed";
+-  already: boolean;
+-  txHash?: string;
+-}
+-export interface NativeGrantCapability {
+-  grant(request: NativeGrantRequest): Promise<NativeGrantResult>;
+-  resume(): Promise<void>;
+-}
+-interface GrantIntent {
+-  version: 2;
+-  chainIdentifier: string;
+-  walletAddress: string;
+-  recipient: string;
+-  valueWei: string;
+-  minReserveWei: string;
+-  maxFeeWei: string;
+-  previousOperationIds: string[];
+-  operationId: string | null;
+-}
+-
+-/** Owns once-per-recipient authorization only. The wallet owns every transaction, input claim,
+- * signed byte and inclusion observation. This store must be retained with that wallet's state. */
+-export class NativeGrants implements NativeGrantCapability {
+-  private readonly active = new Map<string, Promise<NativeGrantResult>>();
+-
+-  constructor(
+-    private readonly state: LevelBotStateStore,
+-    private readonly wallet: NativeWalletHandle
+-  ) {
+-    if (
+-      wallet.family !== "evm" ||
+-      !wallet.getNativeOperations ||
+-      !wallet.resumeNativeOperation
+-    )
+-      throw new Error(
+-        "Faucet requires a wallet with durable native operations"
+-      );
+-  }
+-
+-  private rows(): readonly EvmNativeOperation[] {
+-    return this.wallet.getNativeOperations!();
+-  }
+-
+-  private parse(raw: string): GrantIntent {
+-    let row: GrantIntent;
+-    try {
+-      row = JSON.parse(raw) as GrantIntent;
+-    } catch {
+-      throw new Error(
+-        "Invalid faucet grant intent; preserve state for recovery"
+-      );
+-    }
+-    if (
+-      !row ||
+-      row.version !== 2 ||
+-      row.chainIdentifier !== this.wallet.chainIdentifier ||
+-      row.walletAddress !==
+-        getAddress(this.wallet.identity.address.raw).toLowerCase() ||
+-      typeof row.recipient !== "string" ||
+-      getAddress(row.recipient).toLowerCase() !== row.recipient ||
+-      typeof row.valueWei !== "string" ||
+-      !/^[1-9][0-9]*$/.test(row.valueWei) ||
+-      typeof row.minReserveWei !== "string" ||
+-      !/^(0|[1-9][0-9]*)$/.test(row.minReserveWei) ||
+-      typeof row.maxFeeWei !== "string" ||
+-      !/^(0|[1-9][0-9]*)$/.test(row.maxFeeWei) ||
+-      !Array.isArray(row.previousOperationIds) ||
+-      row.previousOperationIds.some((id) => typeof id !== "string") ||
+-      (row.operationId !== null && typeof row.operationId !== "string")
+-    )
+-      throw new Error(
+-        "Invalid or foreign faucet grant intent; preserve state for recovery"
+-      );
+-    return row;
+-  }
+-
+-  private matches(
+-    intent: Pick<GrantIntent, "chainIdentifier" | "recipient" | "valueWei">,
+-    row: EvmNativeOperation
+-  ): boolean {
+-    return (
+-      row.binding.chainIdentifier === intent.chainIdentifier &&
+-      row.kind === "native" &&
+-      row.recipient.toLowerCase() === intent.recipient &&
+-      row.intendedValueWei === intent.valueWei
+-    );
+-  }
+-
+-  private async save(key: string, intent: GrantIntent): Promise<void> {
+-    await this.state.durableBatch([
+-      { type: "put", key, value: JSON.stringify(intent) },
+-    ]);
+-  }
+-
+-  grant(request: NativeGrantRequest): Promise<NativeGrantResult> {
+-    const recipient = getAddress(request.to).toLowerCase();
+-    request = { ...request, to: recipient };
+-    if (
+-      request.valueWei <= 0n ||
+-      request.minReserveWei < 0n ||
+-      request.maxFeeWei < 0n
+-    )
+-      return Promise.reject(new Error("Invalid faucet amount or reserve"));
+-    const running = this.active.get(recipient);
+-    // Still check immutable authorization when two callers use the same recipient at once.
+-    const run = (
+-      running ? running.catch(() => undefined) : Promise.resolve()
+-    ).then(() => this.run(recipient, request));
+-    this.active.set(recipient, run);
+-    void run
+-      .finally(() => {
+-        if (this.active.get(recipient) === run) this.active.delete(recipient);
+-      })
+-      .catch(() => undefined);
+-    return run;
+-  }
+-
+-  private result(row: EvmNativeOperation, already: boolean): NativeGrantResult {
+-    const member = row.members[row.members.length - 1];
+-    const txHash = member?.signed?.transactionHash;
+-    const state =
+-      row.cancelled ||
+-      row.members.some((m) => m.observation.state === "included-revert")
+-        ? "failed"
+-        : row.members.every((m) => m.observation.state === "included-success")
+-        ? "confirmed"
+-        : row.members.every((m) => m.exposed)
+-        ? "submitted"
+-        : "pending";
+-    return { state, already, ...(txHash ? { txHash } : {}) };
+-  }
+-
+-  private async run(
+-    recipient: string,
+-    request: NativeGrantRequest
+-  ): Promise<NativeGrantResult> {
+-    const key = `grant:${recipient}`;
+-    const raw = await this.state.get(key);
+-    let intent: GrantIntent;
+-    const already = raw !== undefined;
+-    if (raw !== undefined) {
+-      intent = this.parse(raw);
+-      if (
+-        intent.recipient !== recipient ||
+-        intent.valueWei !== request.valueWei.toString() ||
+-        intent.minReserveWei !== request.minReserveWei.toString() ||
+-        intent.maxFeeWei !== request.maxFeeWei.toString()
+-      )
+-        throw new Error(
+-          "Faucet grant authorization changed; original intent retained"
+-        );
+-    } else {
+-      // Fast conservative precheck; authoritative fresh, unreserved value and actual fee are
+-      // checked by the wallet owner under its allocation lock before reservation/signing.
+-      if (
+-        (await this.wallet.getBalance()) <
+-        request.valueWei + request.minReserveWei + request.maxFeeWei
+-      )
+-        return { state: "low", already: false };
+-      intent = {
+-        version: 2,
+-        chainIdentifier: this.wallet.chainIdentifier,
+-        walletAddress: getAddress(
+-          this.wallet.identity.address.raw
+-        ).toLowerCase(),
+-        recipient,
+-        valueWei: request.valueWei.toString(),
+-        minReserveWei: request.minReserveWei.toString(),
+-        maxFeeWei: request.maxFeeWei.toString(),
+-        previousOperationIds: this.rows()
+-          .filter((row) =>
+-            this.matches(
+-              {
+-                chainIdentifier: this.wallet.chainIdentifier,
+-                recipient,
+-                valueWei: request.valueWei.toString(),
+-              },
+-              row
+-            )
+-          )
+-          .map((row) => row.operationId),
+-        operationId: null,
+-      };
+-      await this.save(key, intent);
+-    }
+-
+-    // The wallet may have signed just before a crash, before our callback could bind its ID.
+-    // Never assume an absent business binding means nothing was constructed or submitted.
+-    let operation =
+-      intent.operationId === null
+-        ? undefined
+-        : this.rows().find((row) => row.operationId === intent.operationId);
+-    if (intent.operationId !== null && !operation)
+-      throw new Error(
+-        "Faucet wallet operation missing; preserve state for recovery"
+-      );
+-    if (intent.operationId === null) {
+-      const candidates = this.rows().filter(
+-        (row) =>
+-          !intent.previousOperationIds.includes(row.operationId) &&
+-          this.matches(intent, row)
+-      );
+-      if (candidates.length > 1)
+-        throw new Error(
+-          "Ambiguous faucet wallet operations; preserve state for recovery"
+-        );
+-      operation = candidates[0];
+-      if (operation) {
+-        intent.operationId = operation.operationId;
+-        await this.save(key, intent);
+-      }
+-    }
+-    if (operation && !this.matches(intent, operation))
+-      throw new Error(
+-        "Faucet wallet operation does not match its authorization"
+-      );
+-    if (operation && BigInt(operation.maximumFeeWei) > BigInt(intent.maxFeeWei))
+-      throw new Error("Faucet operation exceeds its authorized fee budget");
+-    // Cancellation is an owner decision; chain inclusion is only an observation. Recheck even
+-    // successful or reverted receipts through the wallet so an orphaned block cannot freeze
+-    // the business intent as settled or cause a newly signed replacement.
+-    if (operation?.cancelled) return this.result(operation, already);
+-
+-    let bindingPersisted = intent.operationId !== null;
+-    try {
+-      if (operation) {
+-        await this.wallet.resumeNativeOperation!(operation.operationId);
+-      } else {
+-        await this.wallet.sendNative({
+-          recipient: { raw: recipient },
+-          value: request.valueWei,
+-          maxFee: request.maxFeeWei,
+-          minimumRemainingBalance: request.minReserveWei,
+-          onSigned: async (signed) => {
+-            const candidates = this.rows().filter(
+-              (row) =>
+-                !intent.previousOperationIds.includes(row.operationId) &&
+-                this.matches(intent, row) &&
+-                row.members[row.members.length - 1]?.signed?.transactionHash ===
+-                  signed.txHash
+-            );
+-            if (candidates.length !== 1)
+-              throw new Error(
+-                "Faucet signed operation cannot be uniquely bound"
+-              );
+-            intent.operationId = candidates[0]!.operationId;
+-            await this.save(key, intent); // Awaited by the wallet BEFORE external exposure.
+-            bindingPersisted = true;
+-          },
+-        });
+-      }
+-    } catch (error) {
+-      // Unknown submission is still the ORIGINAL operation. Persist failures stay visible;
+-      // a later invocation adopts/resumes that row without signing a replacement payment.
+-      if (!bindingPersisted && error instanceof NativeReserveExceededError)
+-        return { state: "low", already };
+-      if (!bindingPersisted || intent.operationId === null) throw error;
+-      const current = this.rows().find(
+-        (row) => row.operationId === intent.operationId
+-      );
+-      if (!current || !this.matches(intent, current)) throw error;
+-      const result = this.result(current, already);
+-      return result.state === "failed"
+-        ? result
+-        : { ...result, state: "pending" };
+-    }
+-    const current = this.rows().find(
+-      (row) => row.operationId === intent.operationId
+-    );
+-    if (!current || !this.matches(intent, current))
+-      throw new Error("Faucet wallet operation disappeared after submission");
+-    return this.result(current, already);
+-  }
+-
+-  async resume(): Promise<void> {
+-    const entries = await this.state.readEntries("grant:", 2049);
+-    if (entries.length > 2048)
+-      throw new Error("Faucet recovery scan capacity exceeded");
+-    const failures: unknown[] = [];
+-    for (const [key, raw] of entries) {
+-      try {
+-        const intent = this.parse(raw);
+-        if (key !== `grant:${intent.recipient}`)
+-          throw new Error("Faucet grant key mismatch");
+-        await this.grant({
+-          to: intent.recipient,
+-          valueWei: BigInt(intent.valueWei),
+-          minReserveWei: BigInt(intent.minReserveWei),
+-          maxFeeWei: BigInt(intent.maxFeeWei),
+-        });
+-      } catch (error) {
+-        failures.push(error);
+-      }
+-    }
+-    if (failures.length)
+-      throw new AggregateError(
+-        failures,
+-        "Some faucet grants could not be recovered"
+-      );
+-  }
+-}
+diff --git a/packages/bot-framework/src/types.ts b/packages/bot-framework/src/types.ts
+index f1ec4ff0..88d609c7 100644
+--- a/packages/bot-framework/src/types.ts
++++ b/packages/bot-framework/src/types.ts
+@@ -162,8 +162,6 @@ export interface BotContext {
+   ): void;
+ 
+   // --- Financial & Transaction Operations ---
+-  /** Faucet-only once-per-recipient grants through the wallet operation owner. */
+-  readonly nativeGrants?: import("./native-grants").NativeGrantCapability;
+   /** Wallet-owned receipt evidence for this chain and message; stated amounts are not receipts. */
+   checkMessagePayment(payloadDigest: string): Promise<MessagePayment>;
+   sendTransfer(params: {
+@@ -223,6 +221,9 @@ export interface FrankBotDefinition {
+   /** The largest single transfer this bot can owe from its own account (a game's biggest
+    * payout), in wei. The host warns at registration when its top-up cannot cover it. */
+   readonly maxPayoutWei?: bigint;
++  /** Total receive-account balances requested for paid messages, before the host's existing
++   * gas headroom: top up below `belowWei` to `toWei`. Not a per-message transfer amount. */
++  readonly paidMessageFunding?: { belowWei: bigint; toWei: bigint };
+   readonly schedules?: BotScheduleDefinition[];
+   getProfile(): BotProfile;
+   onStart?(ctx: BotContext): Promise<void>;
+diff --git a/packages/bot-framework/test/bot-host-multi.jest.test.ts b/packages/bot-framework/test/bot-host-multi.jest.test.ts
+index 942c5792..27448ab1 100644
+--- a/packages/bot-framework/test/bot-host-multi.jest.test.ts
++++ b/packages/bot-framework/test/bot-host-multi.jest.test.ts
+@@ -11,6 +11,7 @@ import { join } from "path";
+ import { Wallet, getBytes } from "ethers";
+ import type { MonadRootBundle } from "@frank/wallet/monad-wallet-material";
+ import { FrankBotHost } from "../src/bot-host";
++import { FaucetBot } from "../../bot/src/bots/faucet-bot";
+ import { EVMNonceSequencer } from "../src/nonce-sequencer";
+ import type { FrankBotDefinition } from "../src/types";
+ 
+@@ -333,6 +334,111 @@ describe("several bots on one host", () => {
+     expect(provider.getTransactionCount).toHaveBeenCalledTimes(1);
+   });
+ 
++  // Narrow composition unit: real host registration/context/Outbox, with wallet/RPC effects
++  // stubbed below their existing seams. This does not establish real chain/relay acceptance.
++  it.each([0n, 100_000_000_000_000_000n])(
++    "funds the paid welcome payer for a configured 1-coin grant with reserve %s",
++    async (reserve) => {
++      process.env.FAUCET_BOT_IDENTITY_JSON = join(
++        stateDir,
++        "unused-faucet-identity.json"
++      );
++      newHost({ fundingPrivateKeyHex: "0x" + "22".repeat(32) });
++      const amount = 1_000_000_000_000_000_000n;
++      const gasBuffer = 100_000_000_000_000_000n;
++      const receive = "0x3333333333333333333333333333333333333333";
++      const funder = "0x1111111111111111111111111111111111111111";
++      let payerBalance = 500_000_000_000_000_000n;
++      let fundingAvailable = false;
++      const transfers: { to: string; value: bigint }[] = [];
++      const provider = {
++        getBalance: jest.fn(async (address: string) =>
++          address === funder ? 20n * amount : payerBalance
++        ),
++        getTransactionCount: jest.fn(async () => 7),
++      };
++      (host as any).provider = provider;
++      (host as any).fundingWallet = {
++        address: funder,
++        sendTransaction: jest.fn(async ({ to, value }) => {
++          if (!fundingAvailable)
++            throw new Error("top-up temporarily unavailable");
++          transfers.push({ to, value });
++          payerBalance += value;
++          return { wait: async () => undefined };
++        }),
++      };
++      (host as any).nonceSequencer = new EVMNonceSequencer(
++        provider as never,
++        funder
++      );
++      const chain = (host as any).chain;
++      const createWallet = chain.createWallet.getMockImplementation();
++      chain.createWallet.mockImplementationOnce(
++        async (roots: MonadRootBundle) => ({
++          ...(await createWallet(roots)),
++          getReceiveAddress: async () => ({ raw: receive }),
++          getBalance: jest.fn(async () => payerBalance),
++        })
++      );
++      chain.directMessages.minimumStamp = async () => 10_000_000_000_000_000n;
++      const faucet = new FaucetBot({
++        amountWei: amount,
++        minReserveWei: reserve,
++      });
++      await host!.register(faucet);
++      const instance = instanceOf("faucet");
++      expect(await instance.context.getBalance()).toBe(payerBalance);
++      await faucet.onNewUser(
++        { address: peer.address, registeredAtMs: 1 },
++        instance.context
++      );
++      expect(mockSend).not.toHaveBeenCalled();
++      expect(
++        await instance.state.get(`funded:${peer.address.toLowerCase()}`)
++      ).toBeUndefined();
++      expect(instance.fundingTargets).toEqual([
++        {
++          addr: receive,
++          label: "EVM main account",
++          belowWei: amount + reserve + gasBuffer,
++          toWei: amount + reserve + gasBuffer,
++        },
++      ]);
++      fundingAvailable = true;
++      await (host as any).fundBot("faucet", instance.fundingTargets);
++      expect(transfers).toEqual([
++        {
++          to: receive,
++          value: amount + reserve + gasBuffer - 500_000_000_000_000_000n,
++        },
++      ]);
++      mockSend.mockImplementation(async (params) => {
++        expect(params.wallet).toBe(instance.wallet);
++        expect(payerBalance).toBeGreaterThan(params.stampValue + reserve);
++        payerBalance -= params.stampValue + 10_000_000_000_000_000n;
++        return {
++          payloadDigest: "ab".repeat(32),
++          stampValueWei: params.stampValue,
++        };
++      });
++      await faucet.onNewUser(
++        { address: peer.address, registeredAtMs: 1 },
++        instance.context
++      );
++      expect(mockSend).toHaveBeenCalledTimes(1);
++      expect(mockSend.mock.calls[0][0]).toMatchObject({
++        recipient: { raw: peer.address },
++        stampValue: amount,
++        settlement: true,
++        messageId: expect.any(String),
++        items: [{ type: "text", text: expect.stringContaining("Frank faucet") }],
++      });
++      expect(transfers.every(({ to }) => to === receive)).toBe(true);
++      expect(payerBalance).toBeGreaterThanOrEqual(reserve);
++    }
++  );
++
+   // On 16218e9f a payout the bot could not cover made the shared funding wallet send the
+   // shortfall plus 0.05 MON, an amount the handler chose, and waited for it without a limit
+   // inside the shared sequence.
+diff --git a/packages/bot-framework/test/native-grants.jest.test.ts b/packages/bot-framework/test/native-grants.jest.test.ts
+deleted file mode 100644
+index 4f8c0fc2..00000000
+--- a/packages/bot-framework/test/native-grants.jest.test.ts
++++ /dev/null
+@@ -1,487 +0,0 @@
+-import { mkdir, mkdtemp, rm } from "fs/promises";
+-import { tmpdir } from "os";
+-import { join } from "path";
+-import { Wallet, Transaction, keccak256, type Provider } from "ethers";
+-import { NativeGrants } from "../src/native-grants";
+-import { LevelBotStateStore } from "../src/state-store";
+-import { EvmNativeOperationJournal } from "@frank/wallet/storage/evm-native-operation-journal";
+-import { EvmLegacyConsolidator } from "@frank/wallet/chain/evm-legacy-consolidator";
+-import { summarizeEvmNativeOperation } from "@frank/wallet/chain/evm-native-operation-status";
+-import { NativeEvmTransactionBuilder } from "@frank/wallet/chain/evm-transaction-builder";
+-import type { NativeWalletHandle } from "@frank/wallet/chain/chain-wallet";
+-
+-const signer = new Wallet("0x" + "11".repeat(32));
+-const secondSigner = new Wallet("0x" + "44".repeat(32));
+-const recipient = new Wallet("0x" + "22".repeat(32)).address.toLowerCase();
+-const other = new Wallet("0x" + "33".repeat(32)).address.toLowerCase();
+-const binding = {
+-  chainIdentifier: "monad-testnet",
+-  nativeChainId: "10143",
+-  publicTuple: "synthetic-faucet-test",
+-};
+-const request = {
+-  to: recipient,
+-  valueWei: 100_000n,
+-  minReserveWei: 20_000n,
+-  maxFeeWei: 21_000n,
+-};
+-
+-/** Real durable wallet owner and bot LevelDB. Only the external chain is simulated; transactions
+- * are actually built, signed, journalled and replayed by the production native executor. */
+-describe("durable faucet grant / native wallet boundary", () => {
+-  let directory: string;
+-  let state: LevelBotStateStore;
+-  let journal: EvmNativeOperationJournal;
+-  let owner: EvmLegacyConsolidator;
+-  let wallet: NativeWalletHandle;
+-  let grants: NativeGrants;
+-  let raws: string[];
+-  let recipientBalance: bigint;
+-  let nonce: number;
+-  let secondNonce: number;
+-  let senderBalance: bigint;
+-  let secondBalance: bigint;
+-  let feePerGas: bigint;
+-  let mine: boolean;
+-  let loseResponse: boolean;
+-  let receipts: Map<string, object>;
+-  let transactions: Map<string, object>;
+-  let signCount: number;
+-  let blockUnavailable: boolean;
+-  let blockHash = "0x" + "aa".repeat(32);
+-  const provider = {
+-    getBlock: async () => {
+-      if (blockUnavailable) throw new Error("Block RPC unavailable");
+-      return { hash: blockHash, number: 1 };
+-    },
+-    getBalance: async (address: string) =>
+-      address.toLowerCase() === signer.address.toLowerCase()
+-        ? senderBalance
+-        : address.toLowerCase() === secondSigner.address.toLowerCase()
+-        ? secondBalance
+-        : recipientBalance,
+-    getTransactionCount: async (address: string) =>
+-      address.toLowerCase() === secondSigner.address.toLowerCase()
+-        ? secondNonce
+-        : nonce,
+-    getFeeData: async () => ({
+-      maxFeePerGas: feePerGas,
+-      maxPriorityFeePerGas: feePerGas,
+-      gasPrice: feePerGas,
+-    }),
+-    estimateGas: async () => 21_000n,
+-    call: async () => "0x",
+-    getTransaction: async (hash: string) => transactions.get(hash) ?? null,
+-    getTransactionReceipt: async (hash: string) => receipts.get(hash) ?? null,
+-    broadcastTransaction: async (raw: string) => {
+-      raws.push(raw);
+-      const tx = Transaction.from(raw);
+-      if (mine && !receipts.has(tx.hash!)) {
+-        const cost = tx.value + tx.gasLimit * (tx.maxFeePerGas ?? tx.gasPrice!);
+-        if (tx.from!.toLowerCase() === secondSigner.address.toLowerCase()) {
+-          secondNonce = tx.nonce + 1;
+-          secondBalance -= cost;
+-        } else {
+-          nonce = tx.nonce + 1;
+-          senderBalance -= cost;
+-        }
+-        recipientBalance += tx.value;
+-        transactions.set(
+-          tx.hash!,
+-          Object.assign(tx, { blockHash, blockNumber: 1, index: 0 })
+-        );
+-        receipts.set(tx.hash!, {
+-          hash: tx.hash,
+-          from: tx.from,
+-          to: tx.to,
+-          status: 1,
+-          blockHash,
+-          blockNumber: 1,
+-          index: 0,
+-          gasUsed: 21_000n,
+-          gasPrice: feePerGas,
+-        });
+-      }
+-      if (loseResponse) throw new Error("RPC response lost after handoff");
+-      return { hash: keccak256(raw) };
+-    },
+-  };
+-
+-  async function open() {
+-    state = await LevelBotStateStore.open(join(directory, "bot"));
+-    await mkdir(join(directory, "wallet"), { recursive: true });
+-    journal = new EvmNativeOperationJournal({
+-      location: join(directory, "wallet"),
+-      binding,
+-    });
+-    await journal.Open();
+-    owner = new EvmLegacyConsolidator({
+-      journal,
+-      provider: provider as unknown as Provider,
+-      transactionBuilder: new NativeEvmTransactionBuilder(),
+-      getSources: async () => [
+-        {
+-          kind: "identity" as const,
+-          address: signer.address.toLowerCase(),
+-          identityPublicKey: signer.signingKey.publicKey,
+-        },
+-        ...(secondBalance > 0n
+-          ? [
+-              {
+-                kind: "main" as const,
+-                address: secondSigner.address.toLowerCase(),
+-              },
+-            ]
+-          : []),
+-      ],
+-      sign: async (source, raw) => {
+-        signCount++;
+-        const key =
+-          source.address === secondSigner.address.toLowerCase()
+-            ? secondSigner
+-            : signer;
+-        return key.signTransaction(Transaction.from(raw));
+-      },
+-    });
+-    wallet = {
+-      family: "evm",
+-      chainIdentifier: binding.chainIdentifier,
+-      networkId: "testnet",
+-      identity: {
+-        address: { raw: signer.address },
+-        displayAddress: signer.address,
+-      },
+-      getReceiveAddress: async () => ({ raw: signer.address }),
+-      getBalance: async () => senderBalance + secondBalance,
+-      getNativeOperations: () => owner.listOperations(),
+-      resumeNativeOperation: (id) => owner.resumeOperation(id),
+-      sendNative: (params) => owner.sendNative(params),
+-    };
+-    grants = new NativeGrants(state, wallet);
+-  }
+-  async function restart() {
+-    await state.close();
+-    await journal.Close();
+-    await open();
+-  }
+-  beforeEach(async () => {
+-    directory = await mkdtemp(join(tmpdir(), "frank-faucet-recovery-"));
+-    blockHash = "0x" + "aa".repeat(32);
+-    raws = [];
+-    recipientBalance = 0n;
+-    nonce = 0;
+-    secondNonce = 0;
+-    senderBalance = 10_000_000n;
+-    secondBalance = 0n;
+-    feePerGas = 1n;
+-    mine = true;
+-    loseResponse = false;
+-    receipts = new Map();
+-    transactions = new Map();
+-    signCount = 0;
+-    blockUnavailable = false;
+-    await open();
+-  });
+-  afterEach(async () => {
+-    await state.close();
+-    await journal.Close();
+-    await rm(directory, { recursive: true, force: true });
+-  });
+-
+-  test("landed grant spent before restart never pays twice, even when response was lost", async () => {
+-    loseResponse = true;
+-    expect((await grants.grant(request)).state).toBe("pending");
+-    expect(recipientBalance).toBe(request.valueWei);
+-    recipientBalance = 0n; // The customer's current balance is NOT completion evidence.
+-    await restart();
+-    loseResponse = false;
+-    expect(await grants.grant(request)).toMatchObject({
+-      state: "confirmed",
+-      already: true,
+-    });
+-    expect(signCount).toBe(1);
+-    expect(raws).toHaveLength(1);
+-    expect(journal.list()).toHaveLength(1);
+-  });
+-
+-  test("unknown transaction after lost handoff replays the original signed bytes after restart", async () => {
+-    mine = false;
+-    loseResponse = true;
+-    await grants.grant(request);
+-    const original = raws[0];
+-    await restart();
+-    loseResponse = false;
+-    await grants.resume();
+-    expect(raws).toEqual([original, original]);
+-    expect(signCount).toBe(1);
+-    expect(journal.list()).toHaveLength(1);
+-  });
+-
+-  test("crash after signing before business binding adopts the wallet's original operation", async () => {
+-    const real = state.durableBatch.bind(state);
+-    jest.spyOn(state, "durableBatch").mockImplementation(async (ops) => {
+-      const value =
+-        ops[0]?.type === "put" ? JSON.parse(ops[0].value) : undefined;
+-      if (value?.operationId !== null)
+-        throw new Error("crash before binding durable write");
+-      await real(ops);
+-    });
+-    await expect(grants.grant(request)).rejects.toThrow("crash before binding");
+-    expect(raws).toHaveLength(0);
+-    expect(signCount).toBe(1);
+-    expect(journal.list()[0]!.members[0]!.signed).not.toBeNull();
+-    await restart();
+-    await grants.grant(request);
+-    expect(raws).toHaveLength(1);
+-    expect(signCount).toBe(1);
+-    expect(journal.list()).toHaveLength(1);
+-  });
+-
+-  test("crash after durable binding but before exposure resumes exactly that operation", async () => {
+-    const send = wallet.sendNative;
+-    wallet.sendNative = (params) =>
+-      send({
+-        ...params,
+-        onSigned: async (signed) => {
+-          await params.onSigned!(signed);
+-          throw new Error("crash after binding before exposure");
+-        },
+-      });
+-    expect((await grants.grant(request)).state).toBe("pending");
+-    expect(raws).toHaveLength(0);
+-    expect(signCount).toBe(1);
+-    await restart();
+-    await grants.grant(request);
+-    expect(raws).toHaveLength(1);
+-    expect(signCount).toBe(1);
+-    expect(journal.list()).toHaveLength(1);
+-  });
+-
+-  test("a reverted original grant remains failed and never authorizes a replacement", async () => {
+-    await grants.grant(request);
+-    const hash = keccak256(raws[0]!);
+-    receipts.set(hash, { ...receipts.get(hash), status: 0 });
+-    await restart();
+-    expect((await grants.grant(request)).state).toBe("failed");
+-    expect(signCount).toBe(1);
+-    expect(raws).toHaveLength(1);
+-  });
+-
+-  test("failure to persist intent prevents even signing", async () => {
+-    jest
+-      .spyOn(state, "durableBatch")
+-      .mockRejectedValue(new Error("disk unavailable"));
+-    await expect(grants.grant(request)).rejects.toThrow("disk unavailable");
+-    expect(signCount).toBe(0);
+-    expect(raws).toHaveLength(0);
+-    expect(journal.list()).toHaveLength(0);
+-  });
+-
+-  test("crash with intent but no wallet operation retries only its original authorization", async () => {
+-    const originalSend = wallet.sendNative;
+-    wallet.sendNative = async () => {
+-      throw new Error("crash before wallet planning");
+-    };
+-    await expect(grants.grant(request)).rejects.toThrow("crash before wallet");
+-    wallet.sendNative = originalSend;
+-    await restart();
+-    await grants.grant(request);
+-    expect(signCount).toBe(1);
+-    expect(raws).toHaveLength(1);
+-  });
+-
+-  test("concurrent duplicate requests have one operation and distinct recipients remain independent", async () => {
+-    await Promise.all([
+-      grants.grant(request),
+-      grants.grant(request),
+-      grants.grant({ ...request, to: other }),
+-    ]);
+-    expect(journal.list()).toHaveLength(2);
+-    expect(signCount).toBe(2);
+-    expect(new Set(raws).size).toBe(2);
+-  });
+-
+-  test("changed authorization and foreign chain fail before another payment", async () => {
+-    await grants.grant(request);
+-    await expect(
+-      grants.grant({ ...request, valueWei: request.valueWei + 1n })
+-    ).rejects.toThrow("authorization changed");
+-    wallet = { ...wallet, chainIdentifier: "monad-mainnet" };
+-    await expect(
+-      new NativeGrants(state, wallet).grant(request)
+-    ).rejects.toThrow("foreign faucet");
+-    expect(signCount).toBe(1);
+-    expect(raws).toHaveLength(1);
+-  });
+-
+-  test.each([1, 0])(
+-    "rechecks an orphaned cached receipt (status %s) and replays only original bytes",
+-    async (status) => {
+-      await grants.grant(request);
+-      const original = raws[0]!;
+-      const hash = keccak256(original);
+-      receipts.set(hash, { ...receipts.get(hash), status });
+-      expect((await grants.grant(request)).state).toBe(
+-        status === 1 ? "confirmed" : "failed"
+-      );
+-      expect(journal.list()[0]!.members[0]!.observation.state).toBe(
+-        status === 1 ? "included-success" : "included-revert"
+-      );
+-      // The old block is orphaned. Neither the receipt nor transaction remains canonical.
+-      receipts.clear();
+-      transactions.clear();
+-      nonce = 0;
+-      recipientBalance = 0n;
+-      blockHash = "0x" + "bb".repeat(32);
+-      mine = false;
+-      await restart();
+-      const result = await grants.grant(request);
+-      expect(["confirmed", "failed"]).not.toContain(result.state);
+-      expect(raws).toEqual([original, original]);
+-      expect(signCount).toBe(1);
+-      expect(journal.list()).toHaveLength(1);
+-    }
+-  );
+-
+-  test.each([1, 0])(
+-    "canonical contradiction invalidates retained orphan receipt status %s across restarts",
+-    async (status) => {
+-      await grants.grant(request);
+-      const original = raws[0]!;
+-      const hash = keccak256(original);
+-      receipts.set(hash, { ...receipts.get(hash), status });
+-      expect((await grants.grant(request)).state).toBe(
+-        status === 1 ? "confirmed" : "failed"
+-      );
+-      // The RPC still serves the old transaction and receipt, but its canonical block changed.
+-      nonce = 0;
+-      recipientBalance = 0n;
+-      blockHash = "0x" + "bb".repeat(32);
+-      mine = false;
+-      await restart();
+-      expect((await grants.grant(request)).state).toBe("submitted");
+-      expect(journal.list()[0]!.members[0]!.observation.state).toBe("unknown");
+-      expect(journal.list()[0]!.members[0]!.exposed).toBe(true);
+-      expect(journal.canSelect(signer.address.toLowerCase(), 0)).toBe(false);
+-      expect(summarizeEvmNativeOperation(journal.list()[0]!).payment).toBe("unknown");
+-      await restart();
+-      expect((await grants.grant(request)).state).toBe("submitted");
+-      expect(raws).toEqual([original, original, original]);
+-      expect(signCount).toBe(1);
+-      expect(journal.list()).toHaveLength(1);
+-      // The original transaction may then land on the replacement canonical chain.
+-      receipts.clear();
+-      transactions.clear();
+-      mine = true;
+-      expect((await grants.grant(request)).state).toBe("submitted");
+-      expect((await grants.grant(request)).state).toBe("confirmed");
+-      expect(raws).toEqual([original, original, original, original]);
+-      expect(signCount).toBe(1);
+-      expect(summarizeEvmNativeOperation(journal.list()[0]!).payment).toBe("included");
+-      await restart();
+-      expect((await grants.grant(request)).state).toBe("confirmed");
+-      expect(raws).toHaveLength(4);
+-    }
+-  );
+-
+-  test.each([1, 0])(
+-    "unavailable canonical block reads preserve cached receipt status %s across restart",
+-    async (status) => {
+-      await grants.grant(request);
+-      const original = raws[0]!;
+-      receipts.set(keccak256(original), {
+-        ...receipts.get(keccak256(original)),
+-        status,
+-      });
+-      await grants.grant(request);
+-      blockUnavailable = true;
+-      await restart();
+-      expect((await grants.grant(request)).state).toBe(
+-        status === 1 ? "confirmed" : "failed"
+-      );
+-      expect(raws).toEqual([original]);
+-      expect(signCount).toBe(1);
+-    }
+-  );
+-
+-  test("an RPC fee above the configured ceiling is refused before reservation or signing", async () => {
+-    feePerGas = 2n;
+-    await expect(grants.grant(request)).rejects.toThrow("network fee rose");
+-    expect(signCount).toBe(0);
+-    expect(raws).toHaveLength(0);
+-    expect(journal.list()).toHaveLength(0);
+-    await restart();
+-    await expect(
+-      grants.grant({ ...request, maxFeeWei: request.maxFeeWei + 1n })
+-    ).rejects.toThrow("authorization changed");
+-    feePerGas = 1n;
+-    await grants.grant(request);
+-    expect(journal.list()[0]!.maximumFeeWei).toBe(request.maxFeeWei.toString());
+-    expect(signCount).toBe(1);
+-  });
+-
+-  test("fresh owner balance includes the maximum fee in the reserve despite a stale host balance", async () => {
+-    senderBalance =
+-      request.valueWei + request.minReserveWei + request.maxFeeWei - 1n;
+-    wallet.getBalance = async () => 10_000_000n; // A display balance is not allocation authority.
+-    expect((await grants.grant(request)).state).toBe("low");
+-    expect(signCount).toBe(0);
+-    expect(journal.list()).toHaveLength(0);
+-    senderBalance++;
+-    loseResponse = true;
+-    await grants.grant(request);
+-    expect(senderBalance).toBe(request.minReserveWei);
+-    await restart();
+-    loseResponse = false;
+-    expect((await grants.grant(request)).state).toBe("confirmed");
+-    expect(senderBalance).toBe(request.minReserveWei);
+-    expect(signCount).toBe(1);
+-    expect(raws).toHaveLength(1);
+-  });
+-
+-  test("concurrent grants cannot use another pending account to satisfy the reserve", async () => {
+-    senderBalance = 100_000n;
+-    secondBalance = 100_000n;
+-    mine = false;
+-    loseResponse = true;
+-    const budget = { ...request, valueWei: 40_000n, minReserveWei: 100_000n };
+-    const results = await Promise.all([
+-      grants.grant(budget),
+-      grants.grant({ ...budget, to: other }),
+-    ]);
+-    expect(results.map((result) => result.state).sort()).toEqual([
+-      "low",
+-      "pending",
+-    ]);
+-    const original = raws[0]!;
+-    expect(signCount).toBe(1);
+-    expect(journal.list()).toHaveLength(1);
+-    await restart();
+-    loseResponse = false;
+-    await grants.resume();
+-    expect(raws.every((raw) => raw === original)).toBe(true);
+-    expect(signCount).toBe(1);
+-    expect(journal.list()).toHaveLength(1);
+-    mine = true;
+-    await grants.resume();
+-    expect(senderBalance + secondBalance).toBe(139_000n);
+-    expect(signCount).toBe(1);
+-  });
+-
+-  test("caller mutation cannot change an already authorized grant", async () => {
+-    const mutable = { ...request };
+-    const pending = grants.grant(mutable);
+-    mutable.valueWei *= 2n;
+-    mutable.to = other;
+-    await pending;
+-    expect(Transaction.from(raws[0]!).value).toBe(request.valueWei);
+-    expect(Transaction.from(raws[0]!).to!.toLowerCase()).toBe(recipient);
+-  });
+-
+-  test("corrupt business state fails visibly, not as an empty grant", async () => {
+-    await state.put(`grant:${recipient}`, "pending");
+-    await expect(grants.grant(request)).rejects.toThrow("Invalid faucet grant");
+-    expect(signCount).toBe(0);
+-    expect(raws).toHaveLength(0);
+-  });
+-});
+diff --git a/packages/bot/src/bots/faucet-bot.jest.test.ts b/packages/bot/src/bots/faucet-bot.jest.test.ts
+index 3a439fd9..da6e2767 100644
+--- a/packages/bot/src/bots/faucet-bot.jest.test.ts
++++ b/packages/bot/src/bots/faucet-bot.jest.test.ts
+@@ -1,150 +1,208 @@
+-import type { BotContext } from "@frank/bot-framework";
+ import { harness, PLAYER } from "./bot-harness.testutil";
+ import { FaucetBot, MAX_AMOUNT_WEI } from "./faucet-bot";
+ 
+ const AMOUNT = 50_000_000_000_000_000n;
+ const RESERVE = 100_000_000_000_000_000n;
+-
+-/** A faucet wallet holding `funds`, and what it transferred. */
+-function faucet(funds = 10n ** 18n) {
+-  const h = harness();
+-  const transfers: { to: string; valueWei: bigint }[] = [];
+-  const balances = new Map<string, bigint>();
+-  let fails = false;
+-  const grants = new Map<string, string>();
+-  const ctx = {
+-    ...h.ctx,
+-    getBalance: async (address?: string) =>
+-      address ? balances.get(address.toLowerCase()) ?? 0n : funds,
+-    sendTransfer: async () => {
+-      throw new Error("Faucet must use durable grant capability");
+-    },
+-    nativeGrants: {
+-      resume: jest.fn(async () => undefined),
+-      grant: jest.fn(
+-        async ({
+-          to,
+-          valueWei,
+-          minReserveWei,
+-        }: {
+-          to: string;
+-          valueWei: bigint;
+-          minReserveWei: bigint;
+-        }) => {
+-          if (fails) throw new Error("rpc down");
+-          const txHash = grants.get(to.toLowerCase());
+-          if (txHash) return { state: "confirmed", already: true, txHash };
+-          if (funds < valueWei + minReserveWei)
+-            return { state: "low", already: false };
+-          funds -= valueWei;
+-          transfers.push({ to, valueWei });
+-          const hash = "0x" + transfers.length.toString(16).padStart(64, "0");
+-          grants.set(to.toLowerCase(), hash);
+-          return { state: "confirmed", already: false, txHash: hash };
+-        }
+-      ),
+-    },
+-  } as unknown as BotContext;
+-  return { ...h, ctx, transfers, failTransfers: (on: boolean) => (fails = on) };
+-}
+-
++const OTHER = "0x" + "a2".repeat(20);
+ const bot = () => new FaucetBot({ amountWei: AMOUNT, minReserveWei: RESERVE });
++const user = (address = PLAYER) => ({ address, registeredAtMs: 1 });
++const message = (f: ReturnType<typeof harness>, address = PLAYER) =>
++  f.message([{ type: "text", text: "hello" }], [], address);
++const startup = (b: FaucetBot, f: ReturnType<typeof harness>) =>
++  b.schedules[0].handler(f.ctx);
+ 
+-describe("FaucetBot", () => {
+-  test("grants a new profile once and says where the money went", async () => {
+-    const f = faucet();
++// The existing unit wallet seam enforces one attempt per ID and survives bot restarts.
++// This is not evidence about a real relay or chain.
++describe("FaucetBot paid welcome", () => {
++  test("a new user receives the grant in the welcome stamp, once", async () => {
++    const f = harness();
+     const b = bot();
+-    await b.onNewUser({ address: PLAYER, registeredAtMs: 1 }, f.ctx);
+-    await b.onNewUser({ address: PLAYER, registeredAtMs: 2 }, f.ctx);
+-    expect(f.transfers).toEqual([{ to: PLAYER, valueWei: AMOUNT }]);
++    await b.onNewUser(user(), f.ctx);
++    await b.onNewUser(user(), f.ctx);
+     expect(f.sent).toHaveLength(1);
+-    expect(f.item("text").text).toContain(`profile address ${PLAYER}`);
++    expect(f.sent[0]).toMatchObject({
++      to: PLAYER,
++      valueWei: AMOUNT,
++      settlement: true,
++      hostStamp: false,
++    });
++    expect(f.sent[0].messageId).toBeDefined();
++    expect(f.item("text").text).toBe(
++      "This is the Frank faucet. This message includes 0.05 MONT for you to start messaging."
++    );
++    expect(f.item("text").text).not.toMatch(/profile|cordoned|transaction/);
+   });
+ 
+-  test("a message from a profile that was never granted is granted once; afterwards it is told so", async () => {
+-    const f = faucet();
++  test("a first manual request gets a paid welcome in its conversation; later replies are free", async () => {
++    const f = harness();
+     const b = bot();
+-    await b.onMessage(
+-      f.message([{ type: "text", text: "funds please" }]),
+-      f.ctx
+-    );
+-    await b.onMessage(f.message([{ type: "text", text: "again" }]), f.ctx);
+-    expect(f.transfers).toHaveLength(1);
+-    expect(f.sent[1].items[0]).toMatchObject({
+-      text: expect.stringContaining("already received"),
++    const request = message(f);
++    await b.onMessage(request, f.ctx);
++    await b.onMessage(message(f), f.ctx);
++    expect(f.sent[0]).toMatchObject({
++      valueWei: AMOUNT,
++      conversationId: request.conversationId,
+     });
++    expect(f.sent[1]).toMatchObject({ valueWei: 0n, hostStamp: false });
++    expect(f.item("text").text).toContain("already received");
++    expect(f.paidOut()).toBe(AMOUNT);
+   });
+ 
+-  test("two requests at once for one profile grant once", async () => {
+-    const f = faucet();
++  test("simultaneous registration and case-equivalent manual identity pay only once", async () => {
++    const f = harness();
+     const b = bot();
+     await Promise.all([
+-      b.onNewUser({ address: PLAYER, registeredAtMs: 1 }, f.ctx),
+-      b.onMessage(f.message([{ type: "text", text: "hi" }]), f.ctx),
++      b.onNewUser(user(), f.ctx),
++      b.onMessage(message(f, `0x${PLAYER.slice(2).toUpperCase()}`), f.ctx),
+     ]);
+-    expect(f.transfers).toHaveLength(1);
+-  });
+-
+-  test("configured fee and reserve are passed to the durable wallet authorization", async () => {
+-    const f = faucet();
+-    await new FaucetBot({
+-      amountWei: AMOUNT,
+-      minReserveWei: RESERVE,
+-      maxFeeWei: 123n,
+-    }).onNewUser({ address: PLAYER, registeredAtMs: 1 }, f.ctx);
+-    expect(f.ctx.nativeGrants!.grant).toHaveBeenCalledWith({
+-      to: PLAYER,
+-      valueWei: AMOUNT,
+-      minReserveWei: RESERVE,
+-      maxFeeWei: 123n,
+-    });
++    expect(f.settlements()).toEqual([AMOUNT]);
++    expect(f.data.get(`funded:${PLAYER}`)).toBe(`grant:${PLAYER}`);
+   });
+ 
+-  test("the reserve is kept on both paths", async () => {
+-    const f = faucet(AMOUNT + RESERVE - 1n);
++  test("new and manual grants keep the reserve", async () => {
++    const f = harness();
++    f.ctx.getBalance = async () => AMOUNT + RESERVE - 1n;
+     const b = bot();
+-    await b.onNewUser({ address: PLAYER, registeredAtMs: 1 }, f.ctx);
+-    await b.onMessage(f.message([{ type: "text", text: "hi" }]), f.ctx);
+-    expect(f.transfers).toHaveLength(0);
++    await b.onNewUser(user(), f.ctx);
++    await b.onMessage(message(f), f.ctx);
++    expect(f.paidOut()).toBe(0n);
++    expect(f.data.has(`funded:${PLAYER}`)).toBe(false);
+     expect(f.item("text").text).toContain("reserve");
+   });
+ 
+-  test("a transfer that failed is not counted as a grant", async () => {
+-    const f = faucet();
++  test("zero reserve still requires the wallet's fee headroom before committing a grant", async () => {
++    const f = harness();
++    f.ctx.getBalance = async () => AMOUNT;
++    f.feeFloor(1n);
++    await new FaucetBot({ amountWei: AMOUNT, minReserveWei: 0n }).onNewUser(
++      user(),
++      f.ctx
++    );
++    expect(f.data.has(`funded:${PLAYER}`)).toBe(false);
++    expect(f.paidOut()).toBe(0n);
++  });
++
++  test("owed grants are deducted before another user can consume the reserve", async () => {
++    const f = harness();
++    f.ctx.getBalance = async () => AMOUNT + RESERVE;
++    f.wallet("refuse");
+     const b = bot();
+-    f.failTransfers(true);
+-    await b.onMessage(f.message([{ type: "text", text: "hi" }]), f.ctx);
+-    expect(f.item("text").text).toContain("could not send");
+-    f.failTransfers(false);
+-    // Also after a restart: the unfinished record does not block the grant.
+-    await bot().onMessage(f.message([{ type: "text", text: "hi" }]), f.ctx);
+-    expect(f.transfers).toHaveLength(1);
++    await Promise.all([
++      b.onNewUser(user(), f.ctx),
++      b.onNewUser(user(OTHER), f.ctx),
++    ]);
++    expect(f.data.has(`funded:${PLAYER}`)).toBe(true);
++    expect(f.data.has(`funded:${OTHER}`)).toBe(false);
++    expect(JSON.parse(f.data.get("outbox:index")!).owed).toEqual([
++      `grant:${PLAYER}`,
++    ]);
++  });
++
++  test("a persisted welcome refused before submission is sent after restart without a new grant", async () => {
++    const f = harness();
++    f.wallet("refuse");
++    await bot().onNewUser(user(), f.ctx);
++    const owedBefore = f.data.get(`outbox:owed:grant:${PLAYER}`);
++    expect(owedBefore).toBeDefined();
++    expect(f.sent).toHaveLength(0);
++    f.wallet("deliver");
++    await startup(bot(), f);
++    await bot().onNewUser(user(), f.ctx);
++    expect(f.settlements()).toEqual([AMOUNT]);
++    expect(f.data.get(`outbox:sent:grant:${PLAYER}`)).toBeDefined();
+   });
+ 
+-  test("an old pending grant never authorizes a fresh payment, regardless of recipient balance", async () => {
+-    const f = faucet();
+-    await bot().onMessage(f.message([{ type: "text", text: "hi" }]), f.ctx);
+-    f.data.set(`funded:${PLAYER}`, "pending");
+-    await bot().onMessage(f.message([{ type: "text", text: "hi" }]), f.ctx);
+-    expect(f.transfers).toHaveLength(1);
+-    expect(f.item("text").text).toContain("could not send");
++  test("failure of the atomic journal write exposes no payment and can be retried", async () => {
++    const f = harness();
++    const batch = f.ctx.state.batch;
++    f.ctx.state.batch = async () => {
++      throw new Error("state unavailable");
++    };
++    await bot().onNewUser(user(), f.ctx);
++    expect(f.sent).toHaveLength(0);
++    expect(f.data.has(`funded:${PLAYER}`)).toBe(false);
++    f.ctx.state.batch = batch;
++    await bot().onNewUser(user(), f.ctx);
++    expect(f.settlements()).toEqual([AMOUNT]);
+   });
+ 
+-  test("startup and scheduled recovery resume existing grants without new registration", async () => {
+-    const f = faucet();
+-    await bot().schedules[0]!.handler(f.ctx);
+-    expect(f.ctx.nativeGrants!.resume).toHaveBeenCalledTimes(1);
+-    expect(f.transfers).toHaveLength(0);
++  test("ambiguous submission keeps the same message ID across restart and repeated requests", async () => {
++    const f = harness();
++    const ids: (string | undefined)[] = [];
++    const send = f.ctx.sendMessage;
++    f.ctx.sendMessage = async (...args) => {
++      ids.push(args[3]?.messageId);
++      return send(...args);
++    };
++    f.wallet("live");
++    await bot().onNewUser(user(), f.ctx);
++    await bot().onMessage(message(f), f.ctx);
++    expect(ids).toHaveLength(2);
++    expect(new Set(ids).size).toBe(1);
++    expect(f.sent).toHaveLength(0);
++    await startup(bot(), f);
++    f.deliverLive();
++    f.wallet("deliver");
++    await startup(bot(), f);
++    await bot().onMessage(message(f), f.ctx);
++    expect(f.settlements()).toEqual([AMOUNT]);
++    expect(f.data.has(`outbox:owed:grant:${PLAYER}`)).toBe(false);
+   });
+ 
+-  test("every setting is enforced: there is no cap that is read and ignored", () => {
++  test("delivery followed by lost response recovers the original attempt after restart", async () => {
++    const f = harness();
++    const send = f.ctx.sendMessage;
++    const ids: (string | undefined)[] = [];
++    f.ctx.sendMessage = async (...args) => {
++      ids.push(args[3]?.messageId);
++      await send(...args);
++      throw new Error("response lost after delivery");
++    };
++    await bot().onNewUser(user(), f.ctx);
++    await startup(bot(), f);
++    expect(ids).toHaveLength(2);
++    expect(ids[0]).toBe(ids[1]);
++    expect(f.settlements()).toEqual([AMOUNT]);
++    expect(f.data.has(`outbox:sent:grant:${PLAYER}`)).toBe(true);
++  });
++
++  test.each(["0xold-confirmed-transfer", "pending"])(
++    "preserves legacy %s records even after funds were spent",
++    async (record) => {
++      const f = harness();
++      f.data.set(`funded:${PLAYER}`, record);
++      f.ctx.getBalance = async (address) => (address ? 0n : 10n ** 18n);
++      await bot().onNewUser(user(), f.ctx);
++      await bot().onMessage(message(f), f.ctx);
++      expect(f.paidOut()).toBe(0n);
++      expect(f.data.get(`funded:${PLAYER}`)).toBe(record);
++      expect(f.item("text").text).toContain(
++        record === "pending" ? "needs to be checked" : "already received"
++      );
++    }
++  );
++
++  test("a relay-ended grant remains failed across requests and restart, without a fresh payment", async () => {
++    const f = harness();
++    f.wallet("dead");
++    await bot().onNewUser(user(), f.ctx);
++    await startup(bot(), f);
++    f.wallet("deliver");
++    await bot().onMessage(message(f), f.ctx);
++    expect(f.settlements()).toEqual([]);
++    expect(f.data.has(`outbox:failed:grant:${PLAYER}`)).toBe(true);
++    expect(f.item("text").text).toContain("needs to be checked");
++  });
++
++  test("the configured grant uses the host chain unit", async () => {
++    const f = harness(new Map(), "ethereum-sepolia");
++    await bot().onNewUser(user(), f.ctx);
++    expect(f.item("text").text).toContain(f.ctx.formatAmount(AMOUNT));
++    expect(f.item("text").text).not.toContain("MONT");
++  });
++
++  test("invalid grant configuration cannot empty the wallet", () => {
+     expect(() => new FaucetBot({ amountWei: MAX_AMOUNT_WEI + 1n })).toThrow();
+     expect(() => new FaucetBot({ amountWei: 0n })).toThrow();
+-    expect(() => new FaucetBot({ minReserveWei: -1n })).toThrow();
+-    expect(() => new FaucetBot({ maxFeeWei: -1n })).toThrow();
+-    expect(() => new FaucetBot({ maxFeeWei: MAX_AMOUNT_WEI + 1n })).toThrow();
+-    expect(Object.keys(bot())).not.toEqual(
+-      expect.arrayContaining(["maxPerDay", "maxPerRun"])
+-    );
+   });
+ });
+diff --git a/packages/bot/src/bots/faucet-bot.ts b/packages/bot/src/bots/faucet-bot.ts
+index 3e332dd5..0d7c1408 100644
+--- a/packages/bot/src/bots/faucet-bot.ts
++++ b/packages/bot/src/bots/faucet-bot.ts
+@@ -4,13 +4,13 @@ import type {
+   BotContext,
+   BotMessageContext,
+   NewUserEvent,
++  BotScheduleDefinition,
+ } from "@frank/bot-framework";
+ import { ACCOUNT_TYPE_SERVICE, BOT_ROLE_FAUCET } from "@frank/codec";
+ import { generateAvatarPng } from "../../bot-directory";
+-import { replyFree, sendFree } from "./money";
++import { Outbox, replyFree } from "./money";
+ 
+ export const FAUCET_DEFAULT_AMOUNT_WEI = 50_000_000_000_000_000n; // 0.05 MON
+-export const FAUCET_DEFAULT_MAX_FEE_WEI = 10_000_000_000_000_000n; // 0.01 MON
+ export const FAUCET_DEFAULT_MIN_RESERVE_WEI = 100_000_000_000_000_000n; // 0.1 MON
+ /** The most one grant may be configured to: a misconfigured amount must not empty the wallet. */
+ export const MAX_AMOUNT_WEI = 1_000_000_000_000_000_000n; // 1 MON
+@@ -20,27 +20,22 @@ export interface FaucetBotOptions {
+   amountWei?: bigint;
+   /** The faucet wallet keeps at least this (`FAUCET_MIN_RESERVE_WEI`). */
+   minReserveWei?: bigint;
+-  /** Maximum native fee authorized for each original grant (`FAUCET_MAX_FEE_WEI`). */
+-  maxFeeWei?: bigint;
+ }
+ 
+-/**
+- * Grants each profile testnet funds once: when it registers, or when it asks.
+- *
+- * The grant goes to the profile's own address, the only address of a user a sender can learn:
+- * nothing a profile or a message carries names a wallet's separate deposit address. The wallet
+- * counts money there in its balance and spends from it like from any other coin it holds. The
+- * welcome message says where the money went.
+- */
++/** Grants each account once, as the payment carried by its welcome message. */
+ export class FaucetBot implements FrankBotDefinition {
+   readonly id = "faucet";
+   readonly label = "Monad Faucet";
+   readonly defaultIdentityPath =
+     process.env.FAUCET_BOT_IDENTITY_JSON ?? "/tmp/faucet-bot-identity.json";
+ 
++  private readonly outbox = new Outbox("faucet");
++  readonly schedules: BotScheduleDefinition[] = [this.outbox.schedule];
++
+   private readonly amountWei: bigint;
+   private readonly minReserveWei: bigint;
+-  private readonly maxFeeWei: bigint;
++  /** Grants are decided one at a time: two for one profile never both pass the check. */
++  private turn: Promise<unknown> = Promise.resolve();
+ 
+   constructor(options?: FaucetBotOptions) {
+     this.amountWei =
+@@ -57,19 +52,11 @@ export class FaucetBot implements FrankBotDefinition {
+       (process.env.FAUCET_MIN_RESERVE_WEI
+         ? BigInt(process.env.FAUCET_MIN_RESERVE_WEI)
+         : FAUCET_DEFAULT_MIN_RESERVE_WEI);
+-    this.maxFeeWei =
+-      options?.maxFeeWei ??
+-      (process.env.FAUCET_MAX_FEE_WEI
+-        ? BigInt(process.env.FAUCET_MAX_FEE_WEI)
+-        : FAUCET_DEFAULT_MAX_FEE_WEI);
+-    if (
+-      this.minReserveWei < 0n ||
+-      this.maxFeeWei < 0n ||
+-      this.maxFeeWei > MAX_AMOUNT_WEI
+-    )
+-      throw new Error(
+-        "Faucet reserve must be nonnegative and maximum fee between zero and 1 MON"
+-      );
++  }
++
++  get paidMessageFunding(): { belowWei: bigint; toWei: bigint } {
++    const required = this.amountWei + this.minReserveWei;
++    return { belowWei: required, toWei: required };
+   }
+ 
+   getProfile(): BotProfile {
+@@ -83,103 +70,96 @@ export class FaucetBot implements FrankBotDefinition {
+     };
+   }
+ 
+-  readonly schedules = [
+-    {
+-      id: "recover-grants",
+-      intervalMs: 15_000,
+-      runOnStartup: true,
+-      handler: async (ctx: BotContext) => {
+-        if (!ctx.nativeGrants)
+-          throw new Error("Durable faucet grant capability unavailable");
+-        await ctx.nativeGrants.resume();
+-      },
+-    },
+-  ];
+-
+-  private async grant(ctx: BotContext, address: string) {
+-    // Old development grant records lack a binding to the wallet's signed operation. Never
+-    // turn that uncertainty into permission to pay again, even when the recipient spent it.
+-    if ((await ctx.state.get(`funded:${address.toLowerCase()}`)) !== undefined)
+-      throw new Error(
+-        "Legacy faucet grant requires explicit reconciliation; preserve state"
+-      );
+-    if (!ctx.nativeGrants)
+-      throw new Error("Durable faucet grant capability unavailable");
+-    return ctx.nativeGrants.grant({
+-      to: address,
+-      valueWei: this.amountWei,
+-      minReserveWei: this.minReserveWei,
+-      maxFeeWei: this.maxFeeWei,
+-    });
+-  }
+-
+-  private sentText(
++  /** Existing funded records remain authoritative, including ambiguous old bare transfers.
++   * New grant ownership and its owed welcome are committed atomically before any send. */
++  private grant(
+     ctx: BotContext,
+     address: string,
+-    txHash: string,
+-    confirmed: boolean
+-  ): string {
+-    return `${confirmed ? "Sent" : "Submitted"} ${ctx.formatAmount(
+-      this.amountWei
+-    )} to your profile address ${address} (transaction ${txHash}). ${
+-      confirmed
+-        ? "It is part of the balance your wallet shows."
+-        : "Confirmation is still pending."
+-    }`;
+-  }
+-
+-  async onNewUser(user: NewUserEvent, ctx: BotContext): Promise<void> {
+-    try {
+-      const result = await this.grant(ctx, user.address);
+-      if (result.state === "low")
+-        console.warn(`[faucet] At the reserve; ${user.address} not funded`);
++    conversationId?: string
++  ): Promise<"queued" | "already" | "unresolved" | "failed" | "low"> {
++    const run = async () => {
++      const user = address.toLowerCase();
++      const key = `funded:${user}`;
++      const id = `grant:${user}`;
++      const record = await ctx.state.get(key);
++      if (record === "pending") return "unresolved" as const;
++      if (await this.outbox.has(ctx, id)) {
++        if (await this.outbox.failed(ctx, id)) return "failed" as const;
++        return (await this.outbox.sent(ctx, id))
++          ? ("already" as const)
++          : ("queued" as const);
++      }
++      if (record !== undefined) return "already" as const;
++      const spoken = await this.outbox.owedWei(ctx);
++      const fee = (await ctx.minimumStampWei?.()) ?? 0n;
+       if (
+-        result.already ||
+-        !result.txHash ||
+-        (result.state !== "submitted" && result.state !== "confirmed")
++        (await ctx.getBalance()) <
++        spoken + this.amountWei + this.minReserveWei + fee
+       )
+-        return;
+-      console.log(`[faucet] Funded ${user.address} (tx: ${result.txHash})`);
+-      await sendFree(ctx, user.address, [
++        return "low" as const;
++      await this.outbox.owe(
++        ctx,
++        id,
+         {
+-          type: "text",
+-          text: `Welcome to Frank. ${this.sentText(
+-            ctx,
+-            user.address,
+-            result.txHash,
+-            result.state === "confirmed"
+-          )}`,
++          to: address,
++          conversationId,
++          items: [
++            {
++              type: "text",
++              text: `This is the Frank faucet. This message includes ${ctx.formatAmount(
++                this.amountWei
++              )} for you to start messaging.`,
++            },
++          ],
++          valueWei: this.amountWei,
+         },
+-      ]);
++        { writes: [{ type: "put", key, value: id }] }
++      );
++      return "queued" as const;
++    };
++    const next = this.turn.then(run, run);
++    this.turn = next.catch(() => undefined);
++    return next;
++  }
++
++  async onNewUser(user: NewUserEvent, ctx: BotContext): Promise<void> {
++    try {
++      const outcome = await this.grant(ctx, user.address);
++      if (outcome === "queued") await this.outbox.settle(ctx);
++      if (outcome === "low" || outcome === "unresolved" || outcome === "failed")
++        console.warn(`[faucet] Grant for ${user.address}: ${outcome}`);
+     } catch (err) {
+-      console.error(`[faucet] Failed to fund or greet ${user.address}:`, err);
++      console.error(
++        `[faucet] Failed to queue welcome for ${user.address}:`,
++        err
++      );
+     }
+   }
+ 
+   async onMessage(msgCtx: BotMessageContext, ctx: BotContext): Promise<void> {
+     let text: string;
+     try {
+-      const result = await this.grant(ctx, msgCtx.peerAddress);
++      const outcome = await this.grant(
++        ctx,
++        msgCtx.peerAddress,
++        msgCtx.conversationId
++      );
++      if (outcome === "queued") {
++        await this.outbox.settle(ctx);
++        return;
++      }
+       text =
+-        result.state === "confirmed" && result.already
++        outcome === "already"
+           ? "You have already received funds from the faucet. It grants once per account."
+-          : (result.state === "confirmed" || result.state === "submitted") &&
+-            result.txHash
+-          ? this.sentText(
+-              ctx,
+-              msgCtx.peerAddress,
+-              result.txHash,
+-              result.state === "confirmed"
+-            )
+-          : result.state === "low"
+-          ? "The faucet is at its reserve. Please check back later."
+-          : result.state === "failed"
+-          ? "Your original faucet grant needs review. No replacement payment was created."
+-          : "Your original faucet grant is being checked. Sending another message will check the same payment.";
++          : outcome === "failed"
++          ? "Your faucet welcome could not be delivered and needs to be checked. It will not be paid again automatically."
++          : outcome === "unresolved"
++          ? "Your earlier faucet grant needs to be checked. It will not be sent again automatically."
++          : "The faucet is at its reserve. Please check back later.";
+     } catch (err) {
+       console.error(`[faucet] Grant to ${msgCtx.peerAddress} failed:`, err);
+       text =
+-        "The faucet could not send your grant just now. Send any message to try again.";
++        "The faucet could not queue your grant just now. Please try again later.";
+     }
+     await replyFree(msgCtx, [{ type: "text", text }]);
+   }
+diff --git a/packages/bot/src/bots/satoshi-dice-bot.ts b/packages/bot/src/bots/satoshi-dice-bot.ts
+index bd37a8cd..e4a1dc5d 100644
+--- a/packages/bot/src/bots/satoshi-dice-bot.ts
++++ b/packages/bot/src/bots/satoshi-dice-bot.ts
+@@ -44,7 +44,7 @@ export function diceHelp(tableLimit: string): string {
+ 
+ How a roll is fair: I publish the hash of a secret before you bet. Your bet adds a random value of your own. The number is derived from both, and I reveal the secret with the result, so the app can check that the secret matches the hash and that the number, outcome and payout follow from it.
+ 
+-Your stake is what your bet message pays me. Amounts typed in chat are not bets. Use the card below.`;
++Your stake is what your bet message pays me. Amounts typed in chat are not bets. Use the game controls to place a bet.`;
+ }
+ 
+ interface OfferedRoll {

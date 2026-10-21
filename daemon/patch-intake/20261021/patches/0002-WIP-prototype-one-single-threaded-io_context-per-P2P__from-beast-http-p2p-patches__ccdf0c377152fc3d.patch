@@ -1,0 +1,199 @@
+From 0e731b7d6a6904c2609331fa3a8a933e007b0a34 Mon Sep 17 00:00:00 2001
+From: Shammah Chancellor <shammah.chancellor@gmail.com>
+Date: Mon, 19 Oct 2026 01:19:56 -0700
+Subject: [PATCH 2/2] WIP/prototype: one single-threaded io_context per P2P I/O
+ thread
+
+Measured on loopback: a shared io_context run by two threads added a few
+microseconds per ping RTT, as Asio wakes a second thread (to resume the
+reactor) before running each completion. Give every I/O thread its own
+io_context (concurrency hint 1) and assign peers round robin; each peer's
+handlers then always run on one thread.
+
+Also drop the extra recv() that only observed EAGAIN after a short read:
+Asio's async_wait re-arms the descriptor (kevent EV_ADD / EPOLL_CTL_MOD),
+which reports data already waiting, so a short read is enough.
+---
+ src/net.cpp         |  6 +++-
+ src/net.h           |  3 +-
+ src/net_eventio.cpp | 71 +++++++++++++++++++++++++++++++--------------
+ src/net_eventio.h   |  8 +++--
+ 4 files changed, 62 insertions(+), 26 deletions(-)
+
+diff --git a/src/net.cpp b/src/net.cpp
+index aa6e398ed3..2c840887de 100644
+--- a/src/net.cpp
++++ b/src/net.cpp
+@@ -1896,7 +1896,11 @@ CConnman::IoRecvResult CConnman::IoRecvOnce(CNode &node) {
+             node.MarkReceivedMsgsForProcessing();
+             WakeMessageHandler();
+         }
+-        return node.fDisconnect ? IoRecvResult::CLOSED : IoRecvResult::DATA;
++        if (node.fDisconnect) {
++            return IoRecvResult::CLOSED;
++        }
++        return size_t(nBytes) == sizeof(pchBuf) ? IoRecvResult::DATA_FULL
++                                                : IoRecvResult::DATA;
+     }
+     if (nBytes == 0) {
+         // socket closed gracefully
+diff --git a/src/net.h b/src/net.h
+index 008ec65ef6..9d6f1596dd 100644
+--- a/src/net.h
++++ b/src/net.h
+@@ -1310,7 +1310,8 @@ private:
+     // PROTOTYPE event-driven I/O entry points, used by NodeIo on the peer's
+     // strand (net_eventio.cpp). Same locking as the poll loop.
+     friend class NodeIoImpl;
+-    enum class IoRecvResult { DATA, WOULD_BLOCK, CLOSED };
++    //! DATA_FULL: the receive buffer was filled, more may be waiting.
++    enum class IoRecvResult { DATA, DATA_FULL, WOULD_BLOCK, CLOSED };
+     /** One recv() into the peer's deserializer (the poll loop's receive). */
+     IoRecvResult IoRecvOnce(CNode &node) EXCLUSIVE_LOCKS_REQUIRED(!mutexMsgProc);
+     /** Whether the peer may read now (fPauseRecv, inflight throttling). */
+diff --git a/src/net_eventio.cpp b/src/net_eventio.cpp
+index 0ef974a4d9..f531cb5fe8 100644
+--- a/src/net_eventio.cpp
++++ b/src/net_eventio.cpp
+@@ -32,11 +32,24 @@ namespace asio = boost::asio;
+ class NodeIoImpl;
+ 
+ struct P2PEventLoop::Impl {
+-    explicit Impl(int threads) : m_threads{std::max(1, threads)} {}
++    explicit Impl(int threads) {
++        for (int i = 0; i < std::max(1, threads); ++i) {
++            // One single-threaded io_context per thread: Asio then never
++            // wakes a second thread before running a completion (which a
++            // shared multi-threaded io_context does, on the latency path).
++            m_contexts.push_back(std::make_unique<asio::io_context>(1));
++        }
++    }
+ 
+-    const int m_threads;
+-    asio::io_context m_io;
+-    std::optional<asio::executor_work_guard<asio::io_context::executor_type>>
++    //! Pick a context for a new peer; its handlers all run on that thread.
++    asio::io_context &NextContext() {
++        return *m_contexts[m_next++ % m_contexts.size()];
++    }
++
++    std::vector<std::unique_ptr<asio::io_context>> m_contexts;
++    std::atomic<size_t> m_next{0};
++    std::vector<
++        asio::executor_work_guard<asio::io_context::executor_type>>
+         m_work;
+     std::vector<std::thread> m_thread_handles;
+ 
+@@ -156,15 +169,21 @@ private:
+                 if (res == CConnman::IoRecvResult::CLOSED) {
+                     return;
+                 }
+-                if (res == CConnman::IoRecvResult::WOULD_BLOCK) {
+-                    ArmReadWait();
+-                    TryWrite();
+-                    return;
+-                }
+                 if (!m_connman.IoWantRecv(m_node)) {
+                     // Paused (flood protection) or throttled: the bytes stay
+                     // in the kernel; RequestRead() resumes with a read.
+-                    TryWrite();
++                    MaybeFlushReplies();
++                    return;
++                }
++                // A short read means the kernel buffer was drained, unless
++                // the socket implementation buffered data itself. No extra
++                // recv() to observe EAGAIN is needed: Asio's async_wait
++                // re-arms the descriptor (kevent EV_ADD / EPOLL_CTL_MOD),
++                // which reports data that is already there.
++                if (res != CConnman::IoRecvResult::DATA_FULL &&
++                    !m_sock->HasBufferedRecv()) {
++                    ArmReadWait();
++                    MaybeFlushReplies();
+                     return;
+                 }
+             }
+@@ -174,12 +193,19 @@ private:
+                 self->m_read_scheduled = false;
+                 self->TryRead();
+             });
+-            TryWrite();
++            MaybeFlushReplies();
+             return;
+         }
+         ArmReadWait();
+     }
+ 
++    /** Control replies (WebSocket pong/close) queued by a read */
++    void MaybeFlushReplies() {
++        if (m_sock->PendingEvents() & Sock::SEND) {
++            TryWrite();
++        }
++    }
++
+     void ArmReadWait() {
+         if (m_closed || m_read_waiting) {
+             return;
+@@ -262,7 +288,8 @@ std::shared_ptr<NodeIo> NodeIo::Attach(P2PEventLoop &loop, CConnman &connman,
+     }
+     auto &impl{loop.GetImpl()};
+     auto io{
+-        std::make_shared<NodeIoImpl>(impl.m_io, connman, node, std::move(sock))};
++        std::make_shared<NodeIoImpl>(impl.NextContext(), connman, node,
++                                     std::move(sock))};
+     if (!io->Assign()) {
+         LogDebug(BCLog::NET,
+                  "event I/O unavailable for peer=%d, using the poll loop\n",
+@@ -313,20 +340,22 @@ P2PEventLoop::~P2PEventLoop() {
+ 
+ void P2PEventLoop::Start() {
+     auto &impl{*m_impl};
+-    impl.m_io.restart();
+-    impl.m_work.emplace(impl.m_io.get_executor());
+-    for (int i = 0; i < impl.m_threads; ++i) {
+-        impl.m_thread_handles.emplace_back(
+-            &util::TraceThread, strprintf("p2pio.%d", i), [&impl] {
+-                impl.m_io.run();
+-            });
++    for (size_t i = 0; i < impl.m_contexts.size(); ++i) {
++        auto &io{*impl.m_contexts[i]};
++        io.restart();
++        impl.m_work.push_back(asio::make_work_guard(io));
++        impl.m_thread_handles.emplace_back(&util::TraceThread,
++                                           strprintf("p2pio.%d", i),
++                                           [&io] { io.run(); });
+     }
+ }
+ 
+ void P2PEventLoop::Stop() {
+     auto &impl{*m_impl};
+-    impl.m_work.reset();
+-    impl.m_io.stop();
++    impl.m_work.clear();
++    for (auto &io : impl.m_contexts) {
++        io->stop();
++    }
+     for (auto &t : impl.m_thread_handles) {
+         if (t.joinable()) {
+             t.join();
+diff --git a/src/net_eventio.h b/src/net_eventio.h
+index b04e63cc16..57a3a6e761 100644
+--- a/src/net_eventio.h
++++ b/src/net_eventio.h
+@@ -14,9 +14,11 @@ class Sock;
+ /**
+  * PROTOTYPE: event-driven socket I/O for CConnman.
+  *
+- * A small pool of threads runs a Boost.Asio io_context. Each attached peer
+- * gets one strand and a readiness watch on its native socket descriptor.
+- * Readiness handlers run on the peer's strand, so all byte-level work for
++ * A small pool of threads (-p2piothreads), each running its own
++ * single-threaded Boost.Asio io_context. Each attached peer is assigned to
++ * one context (round robin) and gets a strand there plus a readiness watch
++ * on its native socket descriptor. Readiness handlers run on the peer's
++ * strand (in practice: always the same thread), so all byte-level work for
+  * one peer (recv, TLS, WebSocket deframing, decompression, P2P message
+  * deserialization into vRecvMsg/m_msg_process_queue, flushing the send
+  * queue) is serialized per peer while different peers proceed in parallel.
+-- 
+2.50.1 (Apple Git-155)
+

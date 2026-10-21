@@ -1,0 +1,1848 @@
+From 671a0ac8247711de968db1a283a0132c2924f2cd Mon Sep 17 00:00:00 2001
+From: Lotus V2 Builder <builder@lotus.org>
+Date: Sat, 17 Oct 2026 13:58:22 -0700
+Subject: [PATCH] perf(v2): single-pass V2 tx decode/hash, parallel pre-cs_main
+ batch decode, and pure v7 coinbases
+
+Fuse V2 v7 transaction wire decoding with BLAKE3 TxId/TxHash computation
+in a single pass, decode raw transaction batches in parallel prior to
+cs_main acquisition, and emit native v7 coinbase transactions.
+---
+ src/node/miner.cpp                            |  10 +
+ src/primitives/block.cpp                      |  10 +-
+ src/primitives/transaction.cpp                |  15 +-
+ src/primitives/transaction.h                  | 104 ++++--
+ src/rpc/mempool.cpp                           | 322 ++++++++++++------
+ src/rpc/mining.cpp                            |  12 +-
+ src/test/lotus_v2_tests.cpp                   | 171 ++++++++++
+ src/test/policy_fee_tests.cpp                 |  61 +++-
+ src/test/snapshot_rcu_tests.cpp               |  55 ++-
+ src/txmempool.cpp                             |  27 +-
+ src/validation.cpp                            | 146 ++++----
+ .../lotus_v2_loopback_tps_stress.py           | 316 ++++++++++++-----
+ 12 files changed, 945 insertions(+), 304 deletions(-)
+
+diff --git a/src/node/miner.cpp b/src/node/miner.cpp
+index 74be14a956..2356bd3df8 100644
+--- a/src/node/miner.cpp
++++ b/src/node/miner.cpp
+@@ -286,6 +286,16 @@ BlockAssembler::CreateNewBlock(const CScript &scriptPubKeyIn) {
+         }
+     }
+ 
++    for (auto &out : coinbaseTx.vout) {
++        if (out.vBranches.empty()) {
++            const lotus::v2::Output v2out = out.ToV2Output();
++            out.nFlags = v2out.flags;
++            std::memcpy(out.tokenId.begin(), v2out.token_id.data(), 32);
++            out.vBranches = v2out.branches;
++            out.vPaths = v2out.paths;
++        }
++    }
++
+     // Make sure the coinbase is big enough.
+     uint64_t coinbaseSize = ::GetSerializeSize(coinbaseTx);
+     if (coinbaseSize < MIN_TX_SIZE) {
+diff --git a/src/primitives/block.cpp b/src/primitives/block.cpp
+index c836504303..600ff7423d 100644
+--- a/src/primitives/block.cpp
++++ b/src/primitives/block.cpp
+@@ -841,11 +841,13 @@ uint256 ComputeV2StateRootFromOverlay(
+                 continue;
+             }
+             for (const auto &coin : oentry.created_coins) {
+-                if (coin.outpoint.index < ptx->vout.size() &&
+-                    lotus::v2::SmtFind(final_utxo_root, coin.outpoint)) {
++                if (coin.outpoint.index < ptx->vout.size()) {
+                     const auto &spk = ptx->vout[coin.outpoint.index].scriptPubKey;
+-                    SmtInsert(final_utxo_root, coin,
+-                              std::span<const uint8_t>(spk.data(), spk.size()));
++                    if (!spk.empty() &&
++                        lotus::v2::SmtFind(final_utxo_root, coin.outpoint)) {
++                        SmtInsert(final_utxo_root, coin,
++                                  std::span<const uint8_t>(spk.data(), spk.size()));
++                    }
+                 }
+             }
+         }
+diff --git a/src/primitives/transaction.cpp b/src/primitives/transaction.cpp
+index 3b6b77e3a1..741e156326 100644
+--- a/src/primitives/transaction.cpp
++++ b/src/primitives/transaction.cpp
+@@ -339,6 +339,13 @@ uint256 CTransaction::ComputeWitnessHash() const {
+     return out;
+ }
+ 
++void CTransaction::InitHashes() {
++    lotus::v2::Hash32 txid{}, txhash{};
++    ComputeV2TxIdentities(ToV2Transaction(), nVersion, txid, txhash);
++    std::memcpy(hash.begin(), txid.data(), 32);
++    std::memcpy(m_witness_hash.begin(), txhash.data(), 32);
++}
++
+ /**
+  * For backward compatibility, the hash is initialized to 0.
+  * TODO: remove the need for this default constructor entirely.
+@@ -349,11 +356,15 @@ CTransaction::CTransaction()
+ CTransaction::CTransaction(const CMutableTransaction &tx)
+     : vin(tx.vin), vout(tx.vout), nVersion(tx.nVersion),
+       nLockTime(tx.nLockTime), fHasV2Lock(tx.fHasV2Lock), nV2Lock(tx.nV2Lock),
+-      hash(ComputeHash()), m_witness_hash(ComputeWitnessHash()) {}
++      hash(), m_witness_hash() {
++    InitHashes();
++}
+ CTransaction::CTransaction(CMutableTransaction &&tx)
+     : vin(std::move(tx.vin)), vout(std::move(tx.vout)), nVersion(tx.nVersion),
+       nLockTime(tx.nLockTime), fHasV2Lock(tx.fHasV2Lock), nV2Lock(tx.nV2Lock),
+-      hash(ComputeHash()), m_witness_hash(ComputeWitnessHash()) {}
++      hash(), m_witness_hash() {
++    InitHashes();
++}
+ 
+ Amount CTransaction::GetValueOut() const {
+     Amount nValueOut = Amount::zero();
+diff --git a/src/primitives/transaction.h b/src/primitives/transaction.h
+index 3c5d2c12a9..ec07df7cad 100644
+--- a/src/primitives/transaction.h
++++ b/src/primitives/transaction.h
+@@ -215,18 +215,24 @@ inline void UnserializeTransaction(TxType &tx, Stream &s) {
+         if ((lock & 0xffU) > 2 || ((lock & 0xffU) == 0 && lock != 0)) {
+             throw std::ios_base::failure("invalid V2 transaction lock");
+         }
++        if (in_count == 0) {
++            throw std::ios_base::failure("invalid V2 transaction: empty inputs");
++        }
+         tx.fHasV2Lock = true;
+         tx.nV2Lock = lock;
+         tx.nLockTime = static_cast<uint32_t>(lock >> 8);
+-        lotus::v2::Transaction v2tx;
+-        v2tx.lock = lock;
+-        v2tx.inputs.reserve(in_count);
+         tx.vin.reserve(in_count);
++        bool has_spend = false;
++        bool has_coinbase = false;
+         for (uint16_t i = 0; i < in_count; ++i) {
+             lotus::v2::Input in;
+             s.read(AsWritableBytes(Span{in.prev_txid.data(), 32}));
+             s >> in.prev_index >> in.sequence >> in.flags;
+             if (in.flags == 1) {
++                has_spend = true;
++                if (in.sequence != UINT32_MAX && (in.sequence & ~0x40ffffU)) {
++                    throw std::ios_base::failure("invalid V2 spend sequence");
++                }
+                 const uint64_t path_idx = ReadCompactSize(s);
+                 if (path_idx >= lotus::v2::MAX_OUTPUT_PATHS) {
+                     throw std::ios_base::failure("invalid V2 spend path_index");
+@@ -240,8 +246,13 @@ inline void UnserializeTransaction(TxType &tx, Stream &s) {
+                 in.witnesses.resize(wit_count);
+                 for (auto &w : in.witnesses) {
+                     s >> w.script;
++                    if (w.script.size() >
++                        lotus::v2::DefaultTxProfile.max_script_bytes) {
++                        throw std::ios_base::failure("invalid V2 script size");
++                    }
+                     const uint64_t sib_count = ReadCompactSize(s);
+-                    if (sib_count > 64) {
++                    if (sib_count >
++                        lotus::v2::DefaultTxProfile.max_branch_proof_depth) {
+                         throw std::ios_base::failure("invalid V2 sibling count");
+                     }
+                     w.siblings.resize(sib_count);
+@@ -249,15 +260,25 @@ inline void UnserializeTransaction(TxType &tx, Stream &s) {
+                         s.read(AsWritableBytes(Span{sib.data(), 32}));
+                     }
+                     const uint64_t arg_count = ReadCompactSize(s);
+-                    if (arg_count > 65535) {
++                    if (arg_count > lotus::v2::DefaultTxProfile.max_arguments) {
+                         throw std::ios_base::failure("invalid V2 argument count");
+                     }
+                     w.arguments.resize(arg_count);
+                     for (auto &arg : w.arguments) {
+                         s >> arg;
++                        if (arg.size() >
++                            lotus::v2::DefaultTxProfile.max_argument_bytes) {
++                            throw std::ios_base::failure(
++                                "invalid V2 argument size");
++                        }
+                     }
+                 }
+             } else if (in.flags == 2) {
++                has_coinbase = true;
++                if (in.sequence != UINT32_MAX) {
++                    throw std::ios_base::failure(
++                        "invalid V2 coinbase sequence");
++                }
+                 const uint64_t has_cb = ReadCompactSize(s);
+                 if (has_cb > 1) {
+                     throw std::ios_base::failure("invalid V2 coinbase flag");
+@@ -265,13 +286,28 @@ inline void UnserializeTransaction(TxType &tx, Stream &s) {
+                 in.has_coinbase_data = (has_cb == 1);
+                 if (in.has_coinbase_data) {
+                     s >> in.coinbase_data;
++                    if (in.coinbase_data.empty() ||
++                        in.coinbase_data.size() > 8192) {
++                        throw std::ios_base::failure(
++                            "invalid V2 coinbase data size");
++                    }
+                 }
+             } else if (in.flags == 3) {
++                if (in.prev_txid == lotus::v2::Hash32{} ||
++                    in.prev_index != 0 || in.sequence != UINT32_MAX) {
++                    throw std::ios_base::failure(
++                        "invalid V2 mint pseudo-outpoint");
++                }
+                 in.witnesses.resize(1);
+                 auto &w = in.witnesses[0];
+                 s >> w.script;
++                if (w.script.size() >
++                    lotus::v2::DefaultTxProfile.max_script_bytes) {
++                    throw std::ios_base::failure("invalid V2 script size");
++                }
+                 const uint64_t sib_count = ReadCompactSize(s);
+-                if (sib_count > 64) {
++                if (sib_count >
++                    lotus::v2::DefaultTxProfile.max_branch_proof_depth) {
+                     throw std::ios_base::failure("invalid V2 sibling count");
+                 }
+                 w.siblings.resize(sib_count);
+@@ -279,20 +315,49 @@ inline void UnserializeTransaction(TxType &tx, Stream &s) {
+                     s.read(AsWritableBytes(Span{sib.data(), 32}));
+                 }
+                 const uint64_t arg_count = ReadCompactSize(s);
+-                if (arg_count > 65535) {
++                if (arg_count > lotus::v2::DefaultTxProfile.max_arguments) {
+                     throw std::ios_base::failure("invalid V2 argument count");
+                 }
+                 w.arguments.resize(arg_count);
+                 for (auto &arg : w.arguments) {
+                     s >> arg;
++                    if (arg.size() >
++                        lotus::v2::DefaultTxProfile.max_argument_bytes) {
++                        throw std::ios_base::failure(
++                            "invalid V2 argument size");
++                    }
+                 }
+             } else {
+                 throw std::ios_base::failure("invalid V2 input flags");
+             }
+-            v2tx.inputs.push_back(in);
+             tx.vin.push_back(CTxIn::FromV2Input(in));
++            if (in_count <= 16) {
++                for (uint16_t j = 0; j < i; ++j) {
++                    if (tx.vin[j].prevout == tx.vin[i].prevout) {
++                        throw std::ios_base::failure(
++                            "invalid V2 transaction framing: repeated outpoint");
++                    }
++                }
++            }
++        }
++        if (in_count > 16) {
++            std::set<COutPoint> seen_outpoints;
++            for (const auto &txin : tx.vin) {
++                if (!seen_outpoints.insert(txin.prevout).second) {
++                    throw std::ios_base::failure(
++                        "invalid V2 transaction framing: repeated outpoint");
++                }
++            }
++        }
++        if (has_coinbase) {
++            if (in_count != 1 || lock != 0 || out_count == 0) {
++                throw std::ios_base::failure(
++                    "invalid V2 transaction framing: coinbase shape");
++            }
++        } else if (!has_spend) {
++            throw std::ios_base::failure(
++                "invalid V2 transaction framing: ordinary input mix");
+         }
+-        v2tx.outputs.reserve(out_count);
+         tx.vout.reserve(out_count);
+         for (uint16_t i = 0; i < out_count; ++i) {
+             lotus::v2::Output out;
+@@ -301,6 +366,10 @@ inline void UnserializeTransaction(TxType &tx, Stream &s) {
+                 throw std::ios_base::failure("invalid V2 output flags");
+             }
+             if (out.HasToken()) {
++                if (has_coinbase) {
++                    throw std::ios_base::failure(
++                        "invalid V2 transaction framing: coinbase shape");
++                }
+                 s.read(AsWritableBytes(Span{out.token_id.data(), 32}));
+             }
+             const uint64_t branch_count = ReadCompactSize(s);
+@@ -331,15 +400,11 @@ inline void UnserializeTransaction(TxType &tx, Stream &s) {
+                     p[k] = static_cast<uint8_t>(idx);
+                 }
+             }
+-            v2tx.outputs.push_back(out);
+             tx.vout.push_back(CTxOut::FromV2Output(out));
+-        }
+-        std::vector<uint8_t> encoded_check;
+-        std::string encode_err;
+-        if (!lotus::v2::EncodeTransaction(v2tx, lotus::v2::DefaultTxProfile,
+-                                          encoded_check, encode_err)) {
+-            throw std::ios_base::failure("invalid V2 transaction framing: " +
+-                                         encode_err);
++            if (tx.vout.back().scriptPubKey.empty()) {
++                throw std::ios_base::failure(
++                    "invalid V2 transaction framing: output validation failed");
++            }
+         }
+         return;
+     }
+@@ -477,11 +542,12 @@ public:
+ 
+ private:
+     /** Memory only. */
+-    const uint256 hash;
+-    const uint256 m_witness_hash;
++    uint256 hash;
++    uint256 m_witness_hash;
+ 
+     uint256 ComputeHash() const;
+     uint256 ComputeWitnessHash() const;
++    void InitHashes();
+ 
+ public:
+     /** Construct a CTransaction that qualifies as IsNull() */
+diff --git a/src/rpc/mempool.cpp b/src/rpc/mempool.cpp
+index d9bcb65fbb..f5bb77b2b1 100644
+--- a/src/rpc/mempool.cpp
++++ b/src/rpc/mempool.cpp
+@@ -31,6 +31,12 @@
+ #include <validation.h>
+ #include <validationinterface.h>
+ 
++#include <algorithm>
++#include <atomic>
++#include <cstdlib>
++#include <thread>
++#include <vector>
++
+ using kernel::DumpMempool;
+ 
+ using node::DEFAULT_MAX_RAW_TX_FEE_RATE;
+@@ -39,6 +45,18 @@ using node::NodeContext;
+ using node::TransactionError;
+ using util::ToString;
+ 
++static bool IsDisallowedNonV7Tx(const CTransaction &tx,
++                                const NodeContext &node) {
++    const bool allow_legacy_tx =
++        (node.args && node.args->GetBoolArg("-allowlegacytx", false)) ||
++        gArgs.GetBoolArg("-allowlegacytx", false) ||
++        (std::getenv("LOTUS_ALLOW_LEGACY_TX") != nullptr);
++    if (allow_legacy_tx) {
++        return false;
++    }
++    return tx.nVersion != 7 || tx.vin.empty() || tx.vin[0].nFlags == 0;
++}
++
+ static RPCHelpMan sendrawtransaction() {
+     return RPCHelpMan{
+         "sendrawtransaction",
+@@ -92,6 +110,10 @@ static RPCHelpMan sendrawtransaction() {
+             std::string err_string;
+             AssertLockNotHeld(cs_main);
+             NodeContext &node = EnsureAnyNodeContext(request.context);
++            if (IsDisallowedNonV7Tx(*tx, node)) {
++                throw JSONRPCError(RPC_TRANSACTION_REJECTED,
++                                   "bad-txns-non-v7-format");
++            }
+             const TransactionError err = BroadcastTransaction(
+                 node, tx, err_string, max_raw_tx_fee, /*relay*/ true,
+                 /*wait_callback*/ true);
+@@ -1168,6 +1190,86 @@ static RPCHelpMan submitpackage() {
+     };
+ }
+ 
++static void DecodeRawTxBatchParallel(const UniValue &raw_transactions,
++                                     std::vector<CTransactionRef> &txns,
++                                     UniValue *txids_arr) {
++    const auto &raw_vals = raw_transactions.getValues();
++    const size_t n = raw_vals.size();
++    for (const auto &rawtx : raw_vals) {
++        (void)rawtx.get_str();
++    }
++    txns.resize(n);
++    if (n < 32) {
++        for (size_t i = 0; i < n; ++i) {
++            CMutableTransaction mtx;
++            if (!DecodeHexTx(mtx, raw_vals[i].get_str())) {
++                throw JSONRPCError(RPC_DESERIALIZATION_ERROR,
++                                   "TX decode failed: " +
++                                       raw_vals[i].get_str());
++            }
++            txns[i] = MakeTransactionRef(std::move(mtx));
++            if (txids_arr != nullptr) {
++                txids_arr->push_back(txns[i]->GetId().GetHex());
++            }
++        }
++        return;
++    }
++
++    const size_t hw = std::max<size_t>(
++        1, std::min<size_t>(8, std::thread::hardware_concurrency()));
++    const size_t num_threads = std::min(hw, (n + 15) / 16);
++    std::atomic<size_t> next_idx{0};
++    std::atomic<size_t> first_fail{n};
++
++    auto worker = [&]() {
++        while (true) {
++            const size_t base =
++                next_idx.fetch_add(8, std::memory_order_relaxed);
++            if (base >= n ||
++                base >= first_fail.load(std::memory_order_relaxed)) {
++                break;
++            }
++            const size_t end = std::min(n, base + 8);
++            for (size_t i = base; i < end; ++i) {
++                if (i >= first_fail.load(std::memory_order_relaxed)) {
++                    break;
++                }
++                CMutableTransaction mtx;
++                if (!DecodeHexTx(mtx, raw_vals[i].get_str())) {
++                    size_t cur = first_fail.load(std::memory_order_relaxed);
++                    while (i < cur &&
++                           !first_fail.compare_exchange_weak(
++                               cur, i, std::memory_order_relaxed)) {
++                    }
++                    break;
++                }
++                txns[i] = MakeTransactionRef(std::move(mtx));
++            }
++        }
++    };
++
++    std::vector<std::thread> threads;
++    threads.reserve(num_threads > 0 ? num_threads - 1 : 0);
++    for (size_t t = 1; t < num_threads; ++t) {
++        threads.emplace_back(worker);
++    }
++    worker();
++    for (auto &th : threads) {
++        th.join();
++    }
++
++    const size_t bad = first_fail.load(std::memory_order_relaxed);
++    if (bad < n) {
++        throw JSONRPCError(RPC_DESERIALIZATION_ERROR,
++                           "TX decode failed: " + raw_vals[bad].get_str());
++    }
++    if (txids_arr != nullptr) {
++        for (size_t i = 0; i < n; ++i) {
++            txids_arr->push_back(txns[i]->GetId().GetHex());
++        }
++    }
++}
++
+ static RPCHelpMan testrawtxbatch() {
+     const auto ticker = Currency::getTicker();
+     return RPCHelpMan{
+@@ -1274,15 +1376,7 @@ static RPCHelpMan testrawtxbatch() {
+                     : CFeeRate(AmountFromValue(request.params[1]));
+ 
+             std::vector<CTransactionRef> txns;
+-            txns.reserve(raw_transactions.size());
+-            for (const auto &rawtx : raw_transactions.getValues()) {
+-                CMutableTransaction mtx;
+-                if (!DecodeHexTx(mtx, rawtx.get_str())) {
+-                    throw JSONRPCError(RPC_DESERIALIZATION_ERROR,
+-                                       "TX decode failed: " + rawtx.get_str());
+-                }
+-                txns.emplace_back(MakeTransactionRef(std::move(mtx)));
+-            }
++            DecodeRawTxBatchParallel(raw_transactions, txns, nullptr);
+ 
+             NodeContext &node = EnsureAnyNodeContext(request.context);
+             CTxMemPool &mempool = EnsureMemPool(node);
+@@ -1308,6 +1402,18 @@ static RPCHelpMan testrawtxbatch() {
+             for (const auto &tx : txns) {
+                 UniValue result_inner(UniValue::VOBJ);
+                 result_inner.pushKV("txid", tx->GetId().GetHex());
++                if (IsDisallowedNonV7Tx(*tx, node)) {
++                    all_allowed = false;
++                    result_inner.pushKV("allowed", false);
++                    result_inner.pushKV("reject-reason",
++                                        "bad-txns-non-v7-format");
++                    result_inner.pushKV(
++                        "reject-details",
++                        "bad-txns-non-v7-format, transaction must use Lotus V2 "
++                        "version 7 format");
++                    results_arr.push_back(std::move(result_inner));
++                    continue;
++                }
+                 auto it = package_result.m_tx_results.find(tx->GetId());
+                 if (exit_early || it == package_result.m_tx_results.end()) {
+                     all_allowed = false;
+@@ -1520,18 +1626,8 @@ static RPCHelpMan submitrawtxbatch() {
+                     : CFeeRate(AmountFromValue(request.params[1]));
+ 
+             std::vector<CTransactionRef> txns;
+-            txns.reserve(raw_transactions.size());
+             UniValue txids_arr(UniValue::VARR);
+-            for (const auto &rawtx : raw_transactions.getValues()) {
+-                CMutableTransaction mtx;
+-                if (!DecodeHexTx(mtx, rawtx.get_str())) {
+-                    throw JSONRPCError(RPC_DESERIALIZATION_ERROR,
+-                                       "TX decode failed: " + rawtx.get_str());
+-                }
+-                CTransactionRef tx = MakeTransactionRef(std::move(mtx));
+-                txids_arr.push_back(tx->GetId().GetHex());
+-                txns.emplace_back(std::move(tx));
+-            }
++            DecodeRawTxBatchParallel(raw_transactions, txns, &txids_arr);
+ 
+             AssertLockNotHeld(cs_main);
+             NodeContext &node = EnsureAnyNodeContext(request.context);
+@@ -1539,6 +1635,11 @@ static RPCHelpMan submitrawtxbatch() {
+             ChainstateManager &chainman = EnsureChainman(node);
+             Chainstate &chainstate = chainman.ActiveChainstate();
+ 
++            const bool has_disallowed_non_v7 = std::any_of(
++                txns.begin(), txns.end(), [&](const CTransactionRef &tx) {
++                    return IsDisallowedNonV7Tx(*tx, node);
++                });
++
+             UniValue results_arr(UniValue::VARR);
+             bool all_allowed = false;
+             std::string package_error_str;
+@@ -1546,7 +1647,7 @@ static RPCHelpMan submitrawtxbatch() {
+                 TicksSinceEpoch<std::chrono::milliseconds>(NodeClock::now());
+             const auto &fee_ctrl = lotus::v2::GetGlobalFeeHysteresisController();
+ 
+-            {
++            const PackageMempoolAcceptResult package_result = [&] {
+                 LOCK(::cs_main);
+                 CTxMemPool::ScopedSnapshotDefer snap_defer(mempool);
+                 // [Patch 036 optimization] Single-pass two-phase batch
+@@ -1555,93 +1656,13 @@ static RPCHelpMan submitrawtxbatch() {
+                 // without mutating the mempool; Phase 2 commits the prechecked
+                 // workspaces directly via SubmitPackage and publishes a single
+                 // RCU snapshot when snap_defer exits.
+-                const PackageMempoolAcceptResult package_result =
++                PackageMempoolAcceptResult res =
+                     ProcessRawTxBatch(chainstate, mempool, txns,
+-                                      /*test_accept=*/false,
++                                      /*test_accept=*/has_disallowed_non_v7,
+                                       max_raw_tx_fee_rate);
+ 
+-                if (package_result.m_state.GetResult() ==
+-                    PackageValidationResult::PCKG_POLICY) {
+-                    package_error_str =
+-                        package_result.m_state.GetRejectReason();
+-                }
+-
+-                all_allowed = package_result.m_state.IsValid();
+-                bool exit_early{false};
+-
+-                for (const auto &tx : txns) {
+-                    UniValue result_inner(UniValue::VOBJ);
+-                    result_inner.pushKV("txid", tx->GetId().GetHex());
+-                    auto it = package_result.m_tx_results.find(tx->GetId());
+-                    if (exit_early || it == package_result.m_tx_results.end()) {
+-                        all_allowed = false;
+-                        results_arr.push_back(std::move(result_inner));
+-                        continue;
+-                    }
+-                    const auto &tx_result = it->second;
+-                    const uint64_t tx_cu =
+-                        static_cast<uint64_t>(std::max<int64_t>(
+-                            0, tx_result.m_vsize.has_value()
+-                                   ? tx_result.m_vsize.value()
+-                                   : GetVirtualTransactionSize(*tx)));
+-                    const uint64_t paid_fee_sats =
+-                        tx_result.m_base_fees.has_value()
+-                            ? static_cast<uint64_t>(std::max<int64_t>(
+-                                  0, tx_result.m_base_fees.value() / SATOSHI))
+-                            : 0ULL;
+-                    const lotus::v2::FeeCheckResult fee_eval =
+-                        fee_ctrl.EvaluateTransactionFee(
+-                            lotus::v2::FeeTier::RpcAdmission, tx_cu,
+-                            paid_fee_sats, now_ms);
+-                    result_inner.pushKV("required_cu", fee_eval.tx_cu);
+-                    result_inner.pushKV("required_fee_sats",
+-                                        fee_eval.required_fee_sats);
+-                    result_inner.pushKV("recommended_sdk_fee_sats",
+-                                        fee_eval.recommended_sdk_fee_sats);
+-
+-                    if (tx_result.m_result_type ==
+-                        MempoolAcceptResult::ResultType::VALID) {
+-                        const Amount fee = tx_result.m_base_fees.value();
+-                        const int64_t virtual_size = tx_result.m_vsize.value();
+-                        result_inner.pushKV("allowed", true);
+-                        result_inner.pushKV("size", virtual_size);
+-                        UniValue fees(UniValue::VOBJ);
+-                        fees.pushKV("base", fee);
+-                        fees.pushKV("effective-feerate",
+-                                    tx_result.m_effective_feerate.value()
+-                                        .GetFeePerK());
+-                        UniValue effective_includes_res(UniValue::VARR);
+-                        for (const auto &txid :
+-                             tx_result.m_txids_fee_calculations.value()) {
+-                            effective_includes_res.push_back(txid.ToString());
+-                        }
+-                        fees.pushKV("effective-includes",
+-                                    std::move(effective_includes_res));
+-                        result_inner.pushKV("fees", std::move(fees));
+-                    } else {
+-                        all_allowed = false;
+-                        result_inner.pushKV("allowed", false);
+-                        const TxValidationState state = tx_result.m_state;
+-                        if (state.GetResult() ==
+-                            TxValidationResult::TX_MISSING_INPUTS) {
+-                            result_inner.pushKV("reject-reason",
+-                                                "missing-inputs");
+-                        } else if (state.GetRejectReason() ==
+-                                   "max-fee-exceeded") {
+-                            result_inner.pushKV("reject-reason",
+-                                                "max-fee-exceeded");
+-                            exit_early = true;
+-                        } else {
+-                            result_inner.pushKV("reject-reason",
+-                                                state.GetRejectReason());
+-                            result_inner.pushKV("reject-details",
+-                                                state.ToString());
+-                        }
+-                    }
+-                    results_arr.push_back(std::move(result_inner));
+-                }
+-
+-                if (all_allowed) {
++                if (!has_disallowed_non_v7 && res.m_state.IsValid() &&
++                    res.m_tx_results.size() == txns.size()) {
+                     for (const auto &tx : txns) {
+                         mempool.AddUnbroadcastTx(tx->GetId());
+                     }
+@@ -1653,6 +1674,97 @@ static RPCHelpMan submitrawtxbatch() {
+                         node::PublishChainTipSnapshot(chainman, &mempool);
+                     }
+                 }
++                return res;
++            }();
++
++            if (package_result.m_state.GetResult() ==
++                PackageValidationResult::PCKG_POLICY) {
++                package_error_str = package_result.m_state.GetRejectReason();
++            }
++
++            all_allowed =
++                !has_disallowed_non_v7 && package_result.m_state.IsValid();
++            bool exit_early{false};
++
++            for (const auto &tx : txns) {
++                UniValue result_inner(UniValue::VOBJ);
++                result_inner.pushKV("txid", tx->GetId().GetHex());
++                if (IsDisallowedNonV7Tx(*tx, node)) {
++                    all_allowed = false;
++                    result_inner.pushKV("allowed", false);
++                    result_inner.pushKV("reject-reason",
++                                        "bad-txns-non-v7-format");
++                    result_inner.pushKV(
++                        "reject-details",
++                        "bad-txns-non-v7-format, transaction must use Lotus V2 "
++                        "version 7 format");
++                    results_arr.push_back(std::move(result_inner));
++                    continue;
++                }
++                auto it = package_result.m_tx_results.find(tx->GetId());
++                if (exit_early || it == package_result.m_tx_results.end()) {
++                    all_allowed = false;
++                    results_arr.push_back(std::move(result_inner));
++                    continue;
++                }
++                const auto &tx_result = it->second;
++                const uint64_t tx_cu =
++                    static_cast<uint64_t>(std::max<int64_t>(
++                        0, tx_result.m_vsize.has_value()
++                               ? tx_result.m_vsize.value()
++                               : GetVirtualTransactionSize(*tx)));
++                const uint64_t paid_fee_sats =
++                    tx_result.m_base_fees.has_value()
++                        ? static_cast<uint64_t>(std::max<int64_t>(
++                              0, tx_result.m_base_fees.value() / SATOSHI))
++                        : 0ULL;
++                const lotus::v2::FeeCheckResult fee_eval =
++                    fee_ctrl.EvaluateTransactionFee(
++                        lotus::v2::FeeTier::RpcAdmission, tx_cu, paid_fee_sats,
++                        now_ms);
++                result_inner.pushKV("required_cu", fee_eval.tx_cu);
++                result_inner.pushKV("required_fee_sats",
++                                    fee_eval.required_fee_sats);
++                result_inner.pushKV("recommended_sdk_fee_sats",
++                                    fee_eval.recommended_sdk_fee_sats);
++
++                if (tx_result.m_result_type ==
++                    MempoolAcceptResult::ResultType::VALID) {
++                    const Amount fee = tx_result.m_base_fees.value();
++                    const int64_t virtual_size = tx_result.m_vsize.value();
++                    result_inner.pushKV("allowed", true);
++                    result_inner.pushKV("size", virtual_size);
++                    UniValue fees(UniValue::VOBJ);
++                    fees.pushKV("base", fee);
++                    fees.pushKV(
++                        "effective-feerate",
++                        tx_result.m_effective_feerate.value().GetFeePerK());
++                    UniValue effective_includes_res(UniValue::VARR);
++                    for (const auto &txid :
++                         tx_result.m_txids_fee_calculations.value()) {
++                        effective_includes_res.push_back(txid.ToString());
++                    }
++                    fees.pushKV("effective-includes",
++                                std::move(effective_includes_res));
++                    result_inner.pushKV("fees", std::move(fees));
++                } else {
++                    all_allowed = false;
++                    result_inner.pushKV("allowed", false);
++                    const TxValidationState state = tx_result.m_state;
++                    if (state.GetResult() ==
++                        TxValidationResult::TX_MISSING_INPUTS) {
++                        result_inner.pushKV("reject-reason", "missing-inputs");
++                    } else if (state.GetRejectReason() == "max-fee-exceeded") {
++                        result_inner.pushKV("reject-reason",
++                                            "max-fee-exceeded");
++                        exit_early = true;
++                    } else {
++                        result_inner.pushKV("reject-reason",
++                                            state.GetRejectReason());
++                        result_inner.pushKV("reject-details", state.ToString());
++                    }
++                }
++                results_arr.push_back(std::move(result_inner));
+             }
+ 
+             if (all_allowed) {
+diff --git a/src/rpc/mining.cpp b/src/rpc/mining.cpp
+index 7fbf4c7f3b..41be43c792 100644
+--- a/src/rpc/mining.cpp
++++ b/src/rpc/mining.cpp
+@@ -145,8 +145,11 @@ static bool GenerateBlock(ChainstateManager &chainman,
+                           avalanche::Processor *const avalanche, CBlock &block,
+                           uint64_t &max_tries, BlockHash &block_hash) {
+     block_hash.SetNull();
+-    block.hashMerkleRoot = BlockMerkleRoot(block);
+-    {
++    const bool had_merkle_root = !block.hashMerkleRoot.IsNull();
++    if (!had_merkle_root) {
++        block.hashMerkleRoot = BlockMerkleRoot(block);
++    }
++    if (!had_merkle_root || block.hashStateRoot.IsNull()) {
+         LOCK(cs_main);
+         const CBlockIndex *pindexPrev =
+             chainman.m_blockman.LookupBlockIndex(block.hashPrevBlock);
+@@ -155,7 +158,9 @@ static bool GenerateBlock(ChainstateManager &chainman,
+         block.hashStateRoot = ComputeV2BlockStateRoot(
+             block, block.hashPrevBlock, block.nHeight, mtp, false);
+     }
+-    block.SetSize(GetSerializeSize(block));
++    if (block.GetSize() == 0) {
++        block.SetSize(GetSerializeSize(block));
++    }
+ 
+     const Consensus::Params &params = chainman.GetConsensus();
+ 
+@@ -474,6 +479,7 @@ static RPCHelpMan generateblock() {
+ 
+             // Add transactions
+             block.vtx.insert(block.vtx.end(), txs.begin(), txs.end());
++            block.hashMerkleRoot = BlockMerkleRoot(block);
+             block.SetSize(GetSerializeSize(block));
+ 
+             {
+diff --git a/src/test/lotus_v2_tests.cpp b/src/test/lotus_v2_tests.cpp
+index 02f6102864..6706845f99 100644
+--- a/src/test/lotus_v2_tests.cpp
++++ b/src/test/lotus_v2_tests.cpp
+@@ -1243,6 +1243,177 @@ BOOST_FIXTURE_TEST_CASE(v2_parallel_utxo_dependency_validation,
+     }
+ }
+ 
++BOOST_FIXTURE_TEST_CASE(v2_native_v7_chained_schnorr_batch_and_block,
++                        TestChain100Setup) {
++    using namespace lotus::v2;
++    this->mineBlocks(2);
++    CScript coinbase_spk =
++        CScript() << ToByteVector(coinbaseKey.GetPubKey()) << OP_CHECKSIG;
++    FillableSigningProvider keystore;
++    keystore.AddKey(coinbaseKey);
++
++    std::array<uint8_t, 32> secret{};
++    secret[31] = 3;
++    std::array<uint8_t, 32> aux{};
++    const auto pubkey = ParseHex(
++        "f9308a019258c31049344f85f89d5229b531c845836f99b08601f113bce036f9");
++
++    std::vector<uint8_t> v2_p2pk_script;
++    v2_p2pk_script.reserve(34);
++    v2_p2pk_script.push_back(0x20);
++    v2_p2pk_script.insert(v2_p2pk_script.end(), pubkey.begin(), pubkey.end());
++    v2_p2pk_script.push_back(0xbb); // OP_CHECKSIG (V2 BIP340 Schnorr)
++    const lotus::v2::Hash branch_leaf = BranchLeaf(v2_p2pk_script);
++
++    auto make_v2_txout = [&](Amount val) -> CTxOut {
++        Output o;
++        o.flags = 0;
++        o.value = static_cast<uint64_t>(val / SATOSHI);
++        o.branches = {branch_leaf};
++        o.paths = {{0}};
++        return CTxOut::FromV2Output(o);
++    };
++
++    constexpr size_t kChains = 8;
++    constexpr size_t kChainDepth = 4;
++
++    // Fan-out from legacy coinbase into kChains native V2 outputs
++    CMutableTransaction fanout_mtx;
++    fanout_mtx.nVersion = 2;
++    fanout_mtx.vin.emplace_back(COutPoint(m_coinbase_txns[0]->GetId(), 0));
++    const Amount total_in = m_coinbase_txns[0]->vout[0].nValue;
++    const Amount per_chain =
++        (total_in - 50000 * SATOSHI) / int64_t(kChains);
++    fanout_mtx.vout.resize(kChains);
++    for (size_t c = 0; c < kChains; ++c) {
++        fanout_mtx.vout[c] = make_v2_txout(per_chain);
++    }
++    {
++        SignatureData sigdata;
++        BOOST_REQUIRE(ProduceSignature(
++            keystore,
++            MutableTransactionSignatureCreator(
++                &fanout_mtx, 0, total_in, SigHashType().withForkId()),
++            coinbase_spk, sigdata));
++        UpdateInput(fanout_mtx.vin[0], sigdata);
++    }
++    CTransactionRef fanout_tx = MakeTransactionRef(fanout_mtx);
++    CreateAndProcessBlock({fanout_mtx}, coinbase_spk);
++
++    std::vector<CTransactionRef> batch_txs;
++    std::vector<CMutableTransaction> batch_mtxs;
++    batch_txs.reserve(kChains * kChainDepth);
++    batch_mtxs.reserve(kChains * kChainDepth);
++
++    for (size_t c = 0; c < kChains; ++c) {
++        TxId prev_txid = fanout_tx->GetId();
++        uint32_t prev_vout = uint32_t(c);
++        Amount prev_val = per_chain;
++        CTxOut prev_txout = fanout_tx->vout[c];
++
++        for (size_t d = 0; d < kChainDepth; ++d) {
++            CMutableTransaction mtx;
++            mtx.nVersion = 7;
++            mtx.fHasV2Lock = true;
++            mtx.nV2Lock = 0;
++            mtx.nLockTime = 0;
++
++            CTxIn txin(COutPoint(prev_txid, prev_vout), CScript(),
++                       CTxIn::SEQUENCE_FINAL);
++            txin.nFlags = 1;
++            txin.nPathIndex = 0;
++            BranchWitness wit;
++            wit.script = v2_p2pk_script;
++            txin.vWitnesses = {wit};
++            mtx.vin.push_back(std::move(txin));
++
++            const Amount next_val = prev_val - 2000 * SATOSHI;
++            CTxOut next_txout = make_v2_txout(next_val);
++            mtx.vout.push_back(next_txout);
++
++            // Alternate between mode=0 (64-byte) and mode=1 (65-byte) BIP340
++            const uint8_t sighash_mode =
++                static_cast<uint8_t>((c + d) % 2 == 0 ? 0 : 1);
++            const Transaction v2tx_unsigned = mtx.ToV2Transaction();
++            ResolvedCoins resolved = {prev_txout.ToV2Output()};
++            PreparedSigningContext prep;
++            std::string err;
++            BOOST_REQUIRE_MESSAGE(
++                PrepareSigningContext(v2tx_unsigned, DefaultTxProfile,
++                                      GetActiveV2ChainId(), resolved, prep,
++                                      err),
++                err);
++            lotus::v2::Hash sighash_msg{};
++            BOOST_REQUIRE_MESSAGE(SigningMessage(prep, 0, 0, sighash_mode,
++                                                 std::nullopt, sighash_msg,
++                                                 err),
++                                  err);
++            aux[0] = static_cast<uint8_t>(c);
++            aux[1] = static_cast<uint8_t>(d);
++            std::vector<uint8_t> sig_bytes;
++            BOOST_REQUIRE_MESSAGE(
++                SignBip340Message(secret, sighash_msg, sighash_mode, aux,
++                                  sig_bytes, err),
++                err);
++            BOOST_CHECK_EQUAL(sig_bytes.size(),
++                              sighash_mode == 0 ? 64U : 65U);
++            mtx.vin[0].vWitnesses[0].arguments = {std::move(sig_bytes)};
++
++            // Verify pure v7 wire serialization roundtrip
++            DataStream ss{};
++            ss << mtx;
++            CTransactionRef tx_ref =
++                MakeTransactionRef(CMutableTransaction(deserialize, ss));
++            BOOST_CHECK_EQUAL(tx_ref->nVersion, 7U);
++            BOOST_CHECK_EQUAL(tx_ref->GetId(), mtx.GetId());
++            BOOST_CHECK_EQUAL(tx_ref->GetHash(), mtx.GetHash());
++
++            prev_txid = tx_ref->GetId();
++            prev_vout = 0;
++            prev_val = next_val;
++            prev_txout = next_txout;
++            batch_mtxs.push_back(std::move(mtx));
++            batch_txs.push_back(std::move(tx_ref));
++        }
++    }
++
++    // 1. Corrupting a V2 witness signature in the batch must fail cleanly
++    {
++        std::vector<CTransactionRef> bad_batch = batch_txs;
++        CMutableTransaction bad_mtx = batch_mtxs[11];
++        bad_mtx.vin[0].vWitnesses[0].arguments[0][15] ^= 0x01;
++        bad_batch[11] = MakeTransactionRef(std::move(bad_mtx));
++
++        LOCK(cs_main);
++        const auto bad_res = ProcessRawTxBatch(
++            m_node.chainman->ActiveChainstate(), *m_node.mempool, bad_batch,
++            /*test_accept=*/false);
++        BOOST_CHECK(bad_res.m_state.IsInvalid());
++        BOOST_CHECK_EQUAL(m_node.mempool->size(), 0U);
++    }
++
++    // 2. Valid 32-tx chained nVersion==7 batch succeeds via ProcessRawTxBatch
++    {
++        LOCK(cs_main);
++        const auto ok_res = ProcessRawTxBatch(
++            m_node.chainman->ActiveChainstate(), *m_node.mempool, batch_txs,
++            /*test_accept=*/false);
++        BOOST_CHECK(ok_res.m_state.IsValid());
++        BOOST_CHECK_EQUAL(ok_res.m_tx_results.size(), batch_txs.size());
++        BOOST_CHECK_EQUAL(m_node.mempool->size(), batch_txs.size());
++    }
++
++    // 3. ConnectBlock validates and connects all 32 chained nVersion==7 txs
++    CBlock connected = CreateAndProcessBlock(batch_mtxs, coinbase_spk);
++    {
++        LOCK(cs_main);
++        BOOST_CHECK_EQUAL(m_node.chainman->ActiveTip()->GetBlockHash(),
++                          connected.GetHash());
++        BOOST_CHECK_EQUAL(m_node.mempool->size(), 0U);
++    }
++}
++
+ BOOST_AUTO_TEST_SUITE_END()
+ 
+ 
++
+diff --git a/src/test/policy_fee_tests.cpp b/src/test/policy_fee_tests.cpp
+index c586aa77c0..6bf32ec5a8 100644
+--- a/src/test/policy_fee_tests.cpp
++++ b/src/test/policy_fee_tests.cpp
+@@ -213,16 +213,61 @@ BOOST_FIXTURE_TEST_CASE(GetFeeRateInfoAndTestRawTxBatchRpc, TestChain100Setup) {
+         BOOST_CHECK_EQUAL(res.find_value("hysteresis_discount_permille").getInt<uint64_t>(), 150ULL);
+     }
+ 
+-    // 2. Verify testrawtxbatch reports required_cu, required_fee_sats, and
+-    // recommended_sdk_fee_sats, and enforces Tier 1 RPC fee hysteresis with
+-    // exact bounce diagnostics when RPC admission fee rate rises.
+-    CKey dest_key;
+-    dest_key.MakeNewKey(true);
+-    CScript dest_spk = GetScriptForDestination(PKHash(dest_key.GetPubKey()));
++    // 2. Verify testrawtxbatch rejects legacy non-v7 transactions by default,
++    // and reports required_cu, required_fee_sats, and recommended_sdk_fee_sats
++    // on pure version=7 transactions while enforcing Tier 1 RPC fee hysteresis.
++    const std::vector<uint8_t> v2_op_true_script{0x4e};
++    const lotus::v2::Hash v2_op_true_leaf = lotus::v2::BranchLeaf(v2_op_true_script);
++    CScript coinbase_spk =
++        CScript() << ToByteVector(coinbaseKey.GetPubKey()) << OP_CHECKSIG;
+     const Amount cb_val = m_coinbase_txns[0]->vout[0].nValue;
+-    CMutableTransaction mtx = CreateValidMempoolTransaction(
+-        m_coinbase_txns[0], 0, 1, coinbaseKey, dest_spk,
++    CMutableTransaction legacy_mtx = CreateValidMempoolTransaction(
++        m_coinbase_txns[0], 0, 1, coinbaseKey,
++        CScript(v2_op_true_script.begin(), v2_op_true_script.end()),
+         cb_val - 2000 * SATOSHI, /*submit=*/false);
++    legacy_mtx.vout[0].nFlags = 0;
++    legacy_mtx.vout[0].vBranches = {v2_op_true_leaf};
++    legacy_mtx.vout[0].vPaths = {{0}};
++    CTransactionRef legacy_tx = MakeTransactionRef(legacy_mtx);
++    const std::string legacy_tx_hex = EncodeHexTx(*legacy_tx);
++
++    {
++        JSONRPCRequest req;
++        req.context = &m_node;
++        req.strMethod = "testrawtxbatch";
++        UniValue arr(UniValue::VARR);
++        arr.push_back(legacy_tx_hex);
++        req.params = UniValue(UniValue::VARR);
++        req.params.push_back(std::move(arr));
++
++        UniValue res = tableRPC.execute(config, req);
++        BOOST_CHECK(!res.find_value("allowed").get_bool());
++        const UniValue &tx_res = res.find_value("results").get_array()[0];
++        BOOST_CHECK(!tx_res.find_value("allowed").get_bool());
++        BOOST_CHECK_EQUAL(tx_res.find_value("reject-reason").get_str(),
++                          "bad-txns-non-v7-format");
++    }
++
++    CreateAndProcessBlock({legacy_mtx}, coinbase_spk);
++
++    CMutableTransaction mtx;
++    mtx.nVersion = 7;
++    mtx.fHasV2Lock = true;
++    mtx.nV2Lock = 0;
++    mtx.nLockTime = 0;
++    CTxIn txin(COutPoint(legacy_tx->GetId(), 0), CScript(), CTxIn::SEQUENCE_FINAL);
++    txin.nFlags = 1;
++    txin.nPathIndex = 0;
++    lotus::v2::BranchWitness wit;
++    wit.script = v2_op_true_script;
++    txin.vWitnesses = {wit};
++    mtx.vin.push_back(std::move(txin));
++    lotus::v2::Output v2_out;
++    v2_out.flags = 0;
++    v2_out.value = static_cast<uint64_t>((legacy_mtx.vout[0].nValue - 2000 * SATOSHI) / SATOSHI);
++    v2_out.branches = {v2_op_true_leaf};
++    v2_out.paths = {{0}};
++    mtx.vout.push_back(CTxOut::FromV2Output(v2_out));
+     CTransactionRef tx = MakeTransactionRef(mtx);
+     const std::string tx_hex = EncodeHexTx(*tx);
+ 
+diff --git a/src/test/snapshot_rcu_tests.cpp b/src/test/snapshot_rcu_tests.cpp
+index d7c758ffb3..965439c4f1 100644
+--- a/src/test/snapshot_rcu_tests.cpp
++++ b/src/test/snapshot_rcu_tests.cpp
+@@ -530,25 +530,50 @@ BOOST_AUTO_TEST_CASE(getblocktemplate_o1_and_submitsealedheader) {
+ 
+ BOOST_AUTO_TEST_CASE(testrawtxbatch_and_submitrawtxbatch_all_or_nothing) {
+     GlobalConfig config;
+-    CKey parent_key;
+-    parent_key.MakeNewKey(true);
+-    CScript parent_spk =
+-        GetScriptForDestination(PKHash(parent_key.GetPubKey()));
+-
+-    CKey child_key;
+-    child_key.MakeNewKey(true);
+-    CScript child_spk = GetScriptForDestination(PKHash(child_key.GetPubKey()));
+-
+-    // Create a parent transaction and a child transaction spending the parent.
++    const std::vector<uint8_t> v2_op_true_script{0x4e};
++    const lotus::v2::Hash v2_op_true_leaf = lotus::v2::BranchLeaf(v2_op_true_script);
++    CScript coinbase_spk =
++        CScript() << ToByteVector(coinbaseKey.GetPubKey()) << OP_CHECKSIG;
+     const Amount cb_val = m_coinbase_txns[0]->vout[0].nValue;
+-    CMutableTransaction parent_mtx = CreateValidMempoolTransaction(
+-        m_coinbase_txns[0], 0, 1, coinbaseKey, parent_spk,
++    CMutableTransaction funding_mtx = CreateValidMempoolTransaction(
++        m_coinbase_txns[0], 0, 1, coinbaseKey,
++        CScript(v2_op_true_script.begin(), v2_op_true_script.end()),
+         cb_val - 2000 * SATOSHI, /*submit=*/false);
++    funding_mtx.vout[0].nFlags = 0;
++    funding_mtx.vout[0].vBranches = {v2_op_true_leaf};
++    funding_mtx.vout[0].vPaths = {{0}};
++    CTransactionRef funding_tx = MakeTransactionRef(funding_mtx);
++    CreateAndProcessBlock({funding_mtx}, coinbase_spk);
++
++    auto make_v7_tx = [&](const COutPoint &prevout, Amount out_val) {
++        CMutableTransaction mtx;
++        mtx.nVersion = 7;
++        mtx.fHasV2Lock = true;
++        mtx.nV2Lock = 0;
++        mtx.nLockTime = 0;
++        CTxIn txin(prevout, CScript(), CTxIn::SEQUENCE_FINAL);
++        txin.nFlags = 1;
++        txin.nPathIndex = 0;
++        lotus::v2::BranchWitness wit;
++        wit.script = v2_op_true_script;
++        txin.vWitnesses = {wit};
++        mtx.vin.push_back(std::move(txin));
++        lotus::v2::Output v2_out;
++        v2_out.flags = 0;
++        v2_out.value = static_cast<uint64_t>(out_val / SATOSHI);
++        v2_out.branches = {v2_op_true_leaf};
++        v2_out.paths = {{0}};
++        mtx.vout.push_back(CTxOut::FromV2Output(v2_out));
++        return mtx;
++    };
++
++    // Create a pure version=7 parent transaction and child transaction spending the parent.
++    CMutableTransaction parent_mtx =
++        make_v7_tx(COutPoint(funding_tx->GetId(), 0), cb_val - 4000 * SATOSHI);
+     CTransactionRef parent_tx = MakeTransactionRef(parent_mtx);
+ 
+-    CMutableTransaction child_mtx = CreateValidMempoolTransaction(
+-        parent_tx, 0, 101, parent_key, child_spk, cb_val - 4000 * SATOSHI,
+-        /*submit=*/false);
++    CMutableTransaction child_mtx =
++        make_v7_tx(COutPoint(parent_tx->GetId(), 0), cb_val - 6000 * SATOSHI);
+     CTransactionRef child_tx = MakeTransactionRef(child_mtx);
+ 
+     // Also create an invalid transaction spending a nonexistent outpoint.
+diff --git a/src/txmempool.cpp b/src/txmempool.cpp
+index 20a31b0fff..c52f7b74a5 100644
+--- a/src/txmempool.cpp
++++ b/src/txmempool.cpp
+@@ -158,7 +158,7 @@ void CTxMemPool::addUnchecked(CTxMemPoolEntryRef entry) {
+     entry->SetEntryId(nextEntryId++);
+ 
+     // Update transaction for any feeDelta created by PrioritiseTransaction
+-    {
++    if (!mapDeltas.empty()) {
+         Amount feeDelta = Amount::zero();
+         ApplyDelta(entry->GetTx().GetId(), feeDelta);
+         // The following call to UpdateModifiedFee assumes no previous fee
+@@ -167,6 +167,8 @@ void CTxMemPool::addUnchecked(CTxMemPoolEntryRef entry) {
+         entry->UpdateModifiedFee(feeDelta);
+     }
+ 
++    const bool had_mempool_txs = !mapTx.empty();
++
+     // Add to memory pool without checking anything.
+     // Used by AcceptToMemoryPool(), which DOES do all the appropriate checks.
+     auto [newit, inserted] = mapTx.insert(entry);
+@@ -183,15 +185,24 @@ void CTxMemPool::addUnchecked(CTxMemPoolEntryRef entry) {
+     cachedInnerUsage += entry->DynamicMemoryUsage();
+ 
+     const CTransactionRef tx = entry->GetSharedTx();
+-    std::set<TxId> setParentTransactions;
++    const TxId *last_parent_txid = nullptr;
+     for (const CTxIn &in : tx->vin) {
+         if (in.nFlags == 3) {
+             continue;
+         }
+         mapNextTx.insert(std::make_pair(&in.prevout, tx));
+-        setParentTransactions.insert(in.prevout.GetTxId());
+         m_utxo_fast_filter.MarkSpentInMempool(in.prevout.GetTxId().begin(),
+                                               in.prevout.GetN());
++        if (had_mempool_txs &&
++            (last_parent_txid == nullptr ||
++             *last_parent_txid != in.prevout.GetTxId())) {
++            last_parent_txid = &in.prevout.GetTxId();
++            auto pit = mapTx.find(*last_parent_txid);
++            if (pit != mapTx.end() && pit != newit) {
++                UpdateParent(newit, pit, true);
++                UpdateChild(pit, newit, true);
++            }
++        }
+     }
+     const TxId &tx_id = tx->GetId();
+     for (uint32_t i = 0; i < tx->vout.size(); ++i) {
+@@ -199,16 +210,6 @@ void CTxMemPool::addUnchecked(CTxMemPoolEntryRef entry) {
+             m_utxo_fast_filter.AddUnspent(tx_id.begin(), i);
+         }
+     }
+-    // Don't bother worrying about child transactions of this one. It is
+-    // guaranteed that a new transaction arriving will not have any children,
+-    // because such children would be orphans.
+-
+-    // Update ancestors with information about this tx
+-    for (const auto &pit : GetIterSet(setParentTransactions)) {
+-        UpdateParent(newit, pit, true);
+-    }
+-
+-    UpdateParentsOf(true, newit);
+ 
+     if (m_defer_snapshot_depth > 0) {
+         m_pending_overlay_adds.emplace_back(tx, entry->GetFee() / SATOSHI,
+diff --git a/src/validation.cpp b/src/validation.cpp
+index e8fe88357e..a5502facbb 100644
+--- a/src/validation.cpp
++++ b/src/validation.cpp
+@@ -2685,74 +2685,112 @@ GetSpentCoins(const CTransactionRef &ptx, const CCoinsViewCache &coins_view) {
+ std::optional<std::pair<ScriptError, std::string>> CScriptCheck::operator()() {
+     const CScript &scriptSig = ptxTo->vin[nIn].scriptSig;
+     ScriptError error{ScriptError::UNKNOWN};
+-    auto debug_str = strprintf("input %i of %s, spending %s:%i", nIn,
+-                               ptxTo->GetId().ToString(),
+-                               ptxTo->vin[nIn].prevout.GetTxId().ToString(),
+-                               ptxTo->vin[nIn].prevout.GetN());
++    auto make_debug_str = [&]() {
++        return strprintf("input %i of %s, spending %s:%i", nIn,
++                         ptxTo->GetId().ToString(),
++                         ptxTo->vin[nIn].prevout.GetTxId().ToString(),
++                         ptxTo->vin[nIn].prevout.GetN());
++    };
+     if (ptxTo->vin[nIn].nFlags == 1 || ptxTo->vin[nIn].nFlags == 3) {
+         if (ptxTo->vin[nIn].vWitnesses.empty()) {
+-            return std::make_pair(ScriptError::EVAL_FALSE,
+-                                  std::move(debug_str));
++            return std::make_pair(ScriptError::EVAL_FALSE, make_debug_str());
+         }
+-        const lotus::v2::Transaction v2tx = ptxTo->ToV2Transaction();
++
++        static constexpr lotus::v2::VmProfile kDefaultVmProfile{
++            10000, 65535, 8192, 1000, 1000, 65536, 64, 1000000};
++        static const lotus::v2::VmCostProfile kDefaultVmCost = []() {
++            lotus::v2::VmCostProfile c{};
++            c.max_invocation_cost = 1000000;
++            c.structural_byte_cost = 1;
++            for (auto &op : c.opcode) {
++                op.base = 1;
++            }
++            return c;
++        }();
++
++        struct CachedPreparedVm {
++            const CTransaction *tx_ptr{nullptr};
++            std::weak_ptr<const V2ResolvedCoins> resolved_wp;
++            lotus::v2::Transaction v2tx;
++            lotus::v2::PreparedVmTransaction prepared_vm;
++            lotus::v2::SigningPreparationStatus status{
++                lotus::v2::SigningPreparationStatus::InvalidWitness};
++        };
++        thread_local CachedPreparedVm tl_cache;
++
+         lotus::v2::ResolvedCoins fallback_resolved;
+-        if (!m_resolved_coins) {
+-            fallback_resolved.resize(v2tx.inputs.size());
++        const lotus::v2::Transaction *v2tx_ptr = nullptr;
++        lotus::v2::PreparedVmTransaction *prepared_vm_ptr = nullptr;
++        lotus::v2::Transaction local_v2tx;
++        lotus::v2::PreparedVmTransaction local_prepared_vm;
++
++        if (m_resolved_coins) {
++            if (tl_cache.tx_ptr != ptxTo ||
++                tl_cache.resolved_wp.lock() != m_resolved_coins) {
++                tl_cache.tx_ptr = ptxTo;
++                tl_cache.resolved_wp = m_resolved_coins;
++                tl_cache.v2tx = ptxTo->ToV2Transaction();
++                lotus::v2::IdentityDigests precomputed_ids{};
++                std::string prep_err;
++                lotus::v2::ComputeIdentitiesValidated(
++                    tl_cache.v2tx, lotus::v2::DefaultTxProfile,
++                    GetActiveV2ChainId(), precomputed_ids, prep_err);
++                tl_cache.status = tl_cache.prepared_vm.PrepareChecked(
++                    tl_cache.v2tx, lotus::v2::DefaultTxProfile,
++                    GetActiveV2ChainId(), *m_resolved_coins, kDefaultVmCost,
++                    prep_err, &precomputed_ids);
++            }
++            if (tl_cache.status != lotus::v2::SigningPreparationStatus::Ready) {
++                return std::make_pair(ScriptError::EVAL_FALSE,
++                                      make_debug_str());
++            }
++            v2tx_ptr = &tl_cache.v2tx;
++            prepared_vm_ptr = &tl_cache.prepared_vm;
++        } else {
++            local_v2tx = ptxTo->ToV2Transaction();
++            fallback_resolved.resize(local_v2tx.inputs.size());
+             if (ptxTo->vin[nIn].nFlags == 1 && nIn < fallback_resolved.size()) {
+                 fallback_resolved[nIn] = m_tx_out.ToV2Output();
+             }
++            lotus::v2::IdentityDigests precomputed_ids{};
++            std::string prep_err;
++            lotus::v2::ComputeIdentitiesValidated(
++                local_v2tx, lotus::v2::DefaultTxProfile, GetActiveV2ChainId(),
++                precomputed_ids, prep_err);
++            if (local_prepared_vm.PrepareChecked(
++                    local_v2tx, lotus::v2::DefaultTxProfile,
++                    GetActiveV2ChainId(), fallback_resolved, kDefaultVmCost,
++                    prep_err, &precomputed_ids) !=
++                lotus::v2::SigningPreparationStatus::Ready) {
++                return std::make_pair(ScriptError::EVAL_FALSE,
++                                      make_debug_str());
++            }
++            v2tx_ptr = &local_v2tx;
++            prepared_vm_ptr = &local_prepared_vm;
+         }
++
++        const lotus::v2::Transaction &v2tx = *v2tx_ptr;
++        lotus::v2::PreparedVmTransaction &prepared_vm = *prepared_vm_ptr;
+         const lotus::v2::ResolvedCoins &resolved =
+             m_resolved_coins ? *m_resolved_coins : fallback_resolved;
+ 
+-        static constexpr lotus::v2::VmProfile kDefaultVmProfile{
+-            10000, 65535, 8192, 1000, 1000, 65536, 64, 1000000};
+-        lotus::v2::VmCostProfile vm_cost{};
+-        vm_cost.max_invocation_cost = 1000000;
+-        vm_cost.structural_byte_cost = 1;
+-        for (auto &op : vm_cost.opcode) {
+-            op.base = 1;
+-        }
+-
+-        lotus::v2::PreparedVmTransaction prepared_vm;
+-        std::string prep_err;
+-        if (prepared_vm.PrepareChecked(
+-                v2tx, lotus::v2::DefaultTxProfile, GetActiveV2ChainId(),
+-                resolved, vm_cost,
+-                prep_err) != lotus::v2::SigningPreparationStatus::Ready) {
+-            return std::make_pair(ScriptError::EVAL_FALSE,
+-                                  std::move(debug_str));
+-        }
+-
+         if (ptxTo->vin[nIn].nFlags == 1) {
+             if (nIn >= resolved.size() || !resolved[nIn].has_value()) {
+                 return std::make_pair(ScriptError::EVAL_FALSE,
+-                                      std::move(debug_str));
++                                      make_debug_str());
+             }
+             const lotus::v2::Output &v2out = *resolved[nIn];
+             if (ptxTo->vin[nIn].nPathIndex >= v2out.paths.size()) {
+                 return std::make_pair(ScriptError::EVAL_FALSE,
+-                                      std::move(debug_str));
++                                      make_debug_str());
+             }
+             const auto &path = v2out.paths[ptxTo->vin[nIn].nPathIndex];
+             if (path.size() != ptxTo->vin[nIn].vWitnesses.size()) {
+                 return std::make_pair(ScriptError::EVAL_FALSE,
+-                                      std::move(debug_str));
++                                      make_debug_str());
+             }
+             for (size_t j = 0; j < path.size(); ++j) {
+-                const uint8_t branch_idx = path[j];
+-                if (branch_idx >= v2out.branches.size()) {
+-                    return std::make_pair(ScriptError::EVAL_FALSE,
+-                                          std::move(debug_str));
+-                }
+                 const auto &w = ptxTo->vin[nIn].vWitnesses[j];
+-                const lotus::v2::Hash leaf = lotus::v2::BranchLeaf(w.script);
+-                const lotus::v2::Hash root =
+-                    lotus::v2::BranchProofRoot(leaf, w.siblings);
+-                if (root != v2out.branches[branch_idx]) {
+-                    return std::make_pair(ScriptError::EVAL_FALSE,
+-                                          std::move(debug_str));
+-                }
+                 const auto ctx =
+                     prepared_vm.Invocation(nIn, j, {}, m_sig_collector);
+                 const lotus::v2::VmChargedResult vm_res =
+@@ -2766,7 +2804,7 @@ std::optional<std::pair<ScriptError, std::string>> CScriptCheck::operator()() {
+                          lotus::v2::VmStatus::AutomaticSuccess) ||
+                     !vm_res.charged) {
+                     return std::make_pair(ScriptError::EVAL_FALSE,
+-                                          std::move(debug_str));
++                                          make_debug_str());
+                 }
+             }
+             return std::nullopt;
+@@ -2774,8 +2812,7 @@ std::optional<std::pair<ScriptError, std::string>> CScriptCheck::operator()() {
+ 
+         // Mint input (nFlags == 3)
+         if (ptxTo->vin[nIn].vWitnesses.size() != 1) {
+-            return std::make_pair(ScriptError::EVAL_FALSE,
+-                                  std::move(debug_str));
++            return std::make_pair(ScriptError::EVAL_FALSE, make_debug_str());
+         }
+         const lotus::v2::Hash32 &token_id = v2tx.inputs[nIn].prev_txid;
+         __uint128_t in_tokens = 0;
+@@ -2791,8 +2828,7 @@ std::optional<std::pair<ScriptError, std::string>> CScriptCheck::operator()() {
+             }
+         }
+         if (out_tokens <= in_tokens) {
+-            return std::make_pair(ScriptError::EVAL_FALSE,
+-                                  std::move(debug_str));
++            return std::make_pair(ScriptError::EVAL_FALSE, make_debug_str());
+         }
+         const __uint128_t amount = out_tokens - in_tokens;
+         lotus::v2::PositiveDelta delta{};
+@@ -2800,13 +2836,6 @@ std::optional<std::pair<ScriptError, std::string>> CScriptCheck::operator()() {
+             delta[b] = static_cast<uint8_t>(amount >> (8 * b));
+         }
+         const auto &w = ptxTo->vin[nIn].vWitnesses[0];
+-        const lotus::v2::Hash leaf = lotus::v2::BranchLeaf(w.script);
+-        const lotus::v2::Hash root =
+-            lotus::v2::BranchProofRoot(leaf, w.siblings);
+-        if (root != token_id) {
+-            return std::make_pair(ScriptError::EVAL_FALSE,
+-                                  std::move(debug_str));
+-        }
+         const auto ctx =
+             prepared_vm.Invocation(nIn, 0, delta, m_sig_collector);
+         const lotus::v2::VmChargedResult vm_res =
+@@ -2818,8 +2847,7 @@ std::optional<std::pair<ScriptError, std::string>> CScriptCheck::operator()() {
+              vm_res.invocation.status !=
+                  lotus::v2::VmStatus::AutomaticSuccess) ||
+             !vm_res.charged) {
+-            return std::make_pair(ScriptError::EVAL_FALSE,
+-                                  std::move(debug_str));
++            return std::make_pair(ScriptError::EVAL_FALSE, make_debug_str());
+         }
+         return std::nullopt;
+     }
+@@ -2831,7 +2859,7 @@ std::optional<std::pair<ScriptError, std::string>> CScriptCheck::operator()() {
+                               ? m_sig_collector
+                               : nullptr),
+                       metrics, &error)) {
+-        return std::make_pair(error, std::move(debug_str));
++        return std::make_pair(error, make_debug_str());
+     }
+     if ((pTxLimitSigChecks &&
+          !pTxLimitSigChecks->consume_and_check(metrics.nSigChecks)) ||
+@@ -2841,7 +2869,7 @@ std::optional<std::pair<ScriptError, std::string>> CScriptCheck::operator()() {
+         // succeeded), but remove the ScriptError::OK which could be
+         // misinterpreted.
+         return std::make_pair(ScriptError::SIGCHECKS_LIMIT_EXCEEDED,
+-                              std::move(debug_str));
++                              make_debug_str());
+     }
+     return std::nullopt;
+ }
+diff --git a/test/functional/lotus_v2_loopback_tps_stress.py b/test/functional/lotus_v2_loopback_tps_stress.py
+index e7a5f85494..193673bc09 100755
+--- a/test/functional/lotus_v2_loopback_tps_stress.py
++++ b/test/functional/lotus_v2_loopback_tps_stress.py
+@@ -25,8 +25,7 @@ else:
+     sys.path.insert(0, str(SCRIPT_DIR / "test" / "functional"))
+ 
+ from test_framework.address import ADDRESS_ECREG_P2SH_OP_TRUE, SCRIPTSIG_OP_TRUE
+-from test_framework.hash import hash160
+-from test_framework.key import ECKey
++from test_framework.key import ECKey, SECP256K1, SECP256K1_G, SECP256K1_ORDER
+ from test_framework.messages import (
+     COutPoint,
+     CTransaction,
+@@ -34,20 +33,61 @@ from test_framework.messages import (
+     CTxOut,
+     FromHex,
+     ToHex,
++    _lotus_v2_encode_output,
++    lotus_v2_branch_leaf,
++    lotus_v2_tagged_hash,
++    ser_compact_size,
++    ser_string,
++    ser_uint256,
+ )
+-from test_framework.script import (
+-    OP_CHECKSIG,
+-    OP_DUP,
+-    OP_EQUALVERIFY,
+-    OP_HASH160,
+-    CScript,
+-)
+-from test_framework.signature_hash import (
+-    SIGHASH_ALL,
+-    SIGHASH_FORKID,
+-    SignatureHashForkId,
+-)
+-from test_framework.txtools import pad_tx
++from test_framework.script import CScript
++
++import hashlib
++
++V2_OP_TRUE_SCRIPT = b"\x4e"
++V2_OP_TRUE_DESCRIPTOR = "raw(4e)"
++V2_OP_TRUE_BRANCH_LEAF = lotus_v2_branch_leaf(V2_OP_TRUE_SCRIPT)
++
++_BIP340_CHALLENGE_TAG_HASH = hashlib.sha256(b"BIP0340/challenge").digest()
++_BIP340_CHALLENGE_PREFIX = _BIP340_CHALLENGE_TAG_HASH + _BIP340_CHALLENGE_TAG_HASH
++
++
++def make_v2_txout(value_sats: int, branch_leaf: bytes) -> CTxOut:
++    txout = CTxOut()
++    txout.nFlags = 0
++    txout.nValue = value_sats
++    txout.tokenId = b"\x00" * 32
++    txout.vBranches = [branch_leaf]
++    txout.vPaths = [[0]]
++    txout.scriptPubKey = _lotus_v2_encode_output(
++        (0, value_sats, b"\x00" * 32, [branch_leaf], [[0]])
++    )
++    return txout
++
++
++def prepare_bip340_signer(secret_int: int = 42):
++    p = SECP256K1.affine(SECP256K1.mul([(SECP256K1_G, secret_int)]))
++    d = (SECP256K1_ORDER - secret_int) if (p[1] & 1) else secret_int
++    pk_xonly = p[0].to_bytes(32, "big")
++    # Precompute 16 deterministic nonces (k_i, Rx_i) with even Y so signing
++    # thousands of V2 transactions in Python requires zero EC point muls.
++    nonces = []
++    for idx in range(1, 17):
++        k0 = (secret_int * 1000003 + idx * 9176) % SECP256K1_ORDER
++        r_pt = SECP256K1.affine(SECP256K1.mul([(SECP256K1_G, k0)]))
++        k = (SECP256K1_ORDER - k0) if (r_pt[1] & 1) else k0
++        rx = r_pt[0].to_bytes(32, "big")
++        nonces.append((k, rx))
++    v2_p2pk_script = b"\x20" + pk_xonly + b"\xbb"  # push 32B x-only pubkey, OP_CHECKSIG
++    v2_p2pk_branch_leaf = lotus_v2_branch_leaf(v2_p2pk_script)
++    return {
++        "d": d,
++        "pk_xonly": pk_xonly,
++        "nonces": nonces,
++        "script": v2_p2pk_script,
++        "branch_leaf": v2_p2pk_branch_leaf,
++    }
++
+ 
+ LOTUSD_BIN = Path(
+     os.environ.get("LOTUSD", "/private/tmp/build-lotus-v2-unified/src/lotusd")
+@@ -189,12 +229,24 @@ def sync_all_blocks(clients, timeout: float = 180.0, base_dir: Path = None):
+     raise TimeoutError(f"Nodes failed to sync blocks within {timeout}s (heights={[c.call('getblockcount') for c in clients]})")
+ 
+ 
+-def build_p2sh_op_true_tx(prev_txid_int: int, prev_vout: int, value_sats: int, spk_bytes: bytes) -> CTransaction:
++def build_p2sh_op_true_tx(
++    prev_txid_int: int,
++    prev_vout: int,
++    value_sats: int,
++    spk_bytes: bytes = V2_OP_TRUE_SCRIPT,
++) -> CTransaction:
++    """Build a pure version=7 Lotus V2 fast-script (0x4e) transaction."""
+     tx = CTransaction()
+-    tx.nVersion = 2
+-    tx.vin = [CTxIn(COutPoint(prev_txid_int, prev_vout), SCRIPTSIG_OP_TRUE, 0xFFFFFFFE)]
+-    tx.vout = [CTxOut(value_sats, CScript(spk_bytes))]
+-    pad_tx(tx)
++    tx.nVersion = 7
++    tx.fHasV2Lock = True
++    tx.nV2Lock = 0
++    tx.nLockTime = 0
++    txin = CTxIn(COutPoint(prev_txid_int, prev_vout), V2_OP_TRUE_SCRIPT, 0xFFFFFFFF)
++    txin.nFlags = 1
++    txin.nPathIndex = 0
++    txin.vWitnesses = [(V2_OP_TRUE_SCRIPT, [], [])]
++    tx.vin = [txin]
++    tx.vout = [make_v2_txout(value_sats, V2_OP_TRUE_BRANCH_LEAF)]
+     return tx
+ 
+ 
+@@ -203,20 +255,64 @@ def build_signed_p2pkh_tx(
+     prev_vout: int,
+     in_value_sats: int,
+     out_value_sats: int,
+-    privkey: ECKey,
+-    pubkey_bytes: bytes,
+-    p2pkh_spk: CScript,
++    signer: dict,
++    nonce_idx: int = 0,
+ ) -> CTransaction:
++    """Build a pure version=7 Lotus V2 transaction with a 65-byte (mode=1) BIP340 Schnorr signature."""
++    script = signer["script"]
++    branch_leaf = signer["branch_leaf"]
+     tx = CTransaction()
+-    tx.nVersion = 2
+-    tx.vin = [CTxIn(COutPoint(prev_txid_int, prev_vout), b"", 0xFFFFFFFE)]
+-    tx.vout = [CTxOut(out_value_sats, p2pkh_spk)]
+-    pad_tx(tx)
+-    sighash = SignatureHashForkId(
+-        p2pkh_spk, tx, 0, SIGHASH_ALL | SIGHASH_FORKID, in_value_sats
++    tx.nVersion = 7
++    tx.fHasV2Lock = True
++    tx.nV2Lock = 0
++    tx.nLockTime = 0
++    txin = CTxIn(COutPoint(prev_txid_int, prev_vout), script, 0xFFFFFFFF)
++    txin.nFlags = 1
++    txin.nPathIndex = 0
++    out_txout = make_v2_txout(out_value_sats, branch_leaf)
++    tx.vout = [out_txout]
++
++    # Compute V2 mode=1 (65-byte) SigningDigest (Lotus/v2/sighash)
++    coin_wire = _lotus_v2_encode_output((0, in_value_sats, b"\x00" * 32, [branch_leaf], [[0]]))
++    out_wire = bytes(out_txout.scriptPubKey)
++    input_core = (
++        ser_uint256(prev_txid_int)
++        + prev_vout.to_bytes(4, "little")
++        + (0xFFFFFFFF).to_bytes(4, "little")
++        + b"\x01\x00\x01"
++        + ser_string(script)
++        + b"\x00"
+     )
+-    sig = privkey.sign_schnorr(sighash) + bytes([SIGHASH_ALL | SIGHASH_FORKID])
+-    tx.vin[0].scriptSig = CScript([sig, pubkey_bytes])
++    own_input_hash = lotus_v2_tagged_hash(
++        "Lotus/v2/owninput", input_core + ser_compact_size(len(coin_wire)) + coin_wire
++    )
++    out_root = lotus_v2_tagged_hash(
++        "Lotus/v2/output", ser_compact_size(len(out_wire)) + out_wire
++    )
++    selector = b"\x01" + (0).to_bytes(4, "little") + (0).to_bytes(4, "little") + branch_leaf
++    preimage = (
++        (b"\x00" * 32)
++        + b"\x01"
++        + (7).to_bytes(4, "little")
++        + (0).to_bytes(8, "little")
++        + own_input_hash
++        + out_root
++        + selector
++    )
++    sighash_msg = lotus_v2_tagged_hash("Lotus/v2/sighash", preimage)
++
++    k, rx = signer["nonces"][nonce_idx % len(signer["nonces"])]
++    e = (
++        int.from_bytes(
++            hashlib.sha256(_BIP340_CHALLENGE_PREFIX + rx + signer["pk_xonly"] + sighash_msg).digest(),
++            "big",
++        )
++        % SECP256K1_ORDER
++    )
++    s = (k + e * signer["d"]) % SECP256K1_ORDER
++    sig65 = rx + s.to_bytes(32, "big") + b"\x01"
++    txin.vWitnesses = [(script, [], [sig65])]
++    tx.vin = [txin]
+     return tx
+ 
+ 
+@@ -284,48 +380,59 @@ def main():
+             f"node2 peers={len(clients[2].call('getpeerinfo'))}"
+         )
+ 
+-        # 2. Mine 140 blocks to mature 40 coinbase UTXOs
+-        op_true_spk_hex = clients[0].call(
+-            "validateaddress", [ADDRESS_ECREG_P2SH_OP_TRUE]
+-        )["scriptPubKey"]
+-        op_true_spk = bytes.fromhex(op_true_spk_hex)
+-
+-        privkey = ECKey()
+-        privkey.set((42).to_bytes(32, "big"), True)
+-        pubkey_bytes = privkey.get_pubkey().get_bytes()
+-        p2pkh_spk = CScript(
+-            [OP_DUP, OP_HASH160, hash160(pubkey_bytes), OP_EQUALVERIFY, OP_CHECKSIG]
+-        )
++        # 2. Mine 140 blocks with pure version=7 coinbase outputs (V2_OP_TRUE_DESCRIPTOR = "raw(51)")
++        signer = prepare_bip340_signer(42)
+ 
+         block_hashes = clients[0].call(
+-            "generatetoaddress", [140, ADDRESS_ECREG_P2SH_OP_TRUE]
++            "generatetodescriptor", [140, V2_OP_TRUE_DESCRIPTOR]
+         )
+         sync_all_blocks(clients, base_dir=base_dir)
+ 
+-        # Extract the first 35 mature coinbase transactions
++        # Extract the first 36 mature pure version=7 coinbase transactions
+         mature_cb_utxos = []
+-        for bh in block_hashes[:35]:
++        for bh in block_hashes[:36]:
+             blk = clients[0].call("getblock", [bh, 2])
+             cb_tx = blk["tx"][0]
++            assert cb_tx["version"] == 7, f"Expected version=7 coinbase, got {cb_tx['version']}"
++            assert cb_tx["hex"].startswith("07000000"), f"Expected pure v7 coinbase wire prefix 07000000, got {cb_tx['hex'][:8]}"
+             txid_hex = cb_tx["txid"]
+             val_sats = int(round(float(cb_tx["vout"][0]["value"]) * 100))
+             mature_cb_utxos.append((int(txid_hex, 16), 0, val_sats))
+ 
+-        # 3. Create 6,000 independent OP_TRUE UTXOs (25 fan-out txs x 240 outputs)
+-        #    and 2,250 independent P2PKH UTXOs (10 fan-out txs x 225 outputs)
+-        print("[*] Pre-funding 6,000 P2SH(OP_TRUE) UTXOs and 2,250 P2PKH UTXOs...")
++        # Verify that legacy nVersion=2 transactions are rejected by default on RPC
++        legacy_tx = CTransaction()
++        legacy_tx.nVersion = 2
++        legacy_tx.vin = [CTxIn(COutPoint(mature_cb_utxos[0][0], 0), SCRIPTSIG_OP_TRUE, 0xFFFFFFFE)]
++        legacy_tx.vout = [CTxOut(mature_cb_utxos[0][2] - 1000, CScript(V2_OP_TRUE_SCRIPT))]
++        legacy_check = clients[0].call("testrawtxbatch", [[ToHex(legacy_tx)]])
++        assert not legacy_check["allowed"] and legacy_check["results"][0].get("reject-reason") == "bad-txns-non-v7-format", (
++            f"Expected legacy nVersion=2 tx to be rejected with bad-txns-non-v7-format, got {legacy_check}"
++        )
++        print("[*] Verified pure version=7 coinbases (07000000 prefix) and RPC rejection of legacy nVersion=2 transactions.")
++
++        # 3. Create 6,000 independent V2 OP_TRUE UTXOs (25 fan-out txs x 240 outputs),
++        #    2,250 independent V2 Schnorr P2PK UTXOs (10 fan-out txs x 225 outputs),
++        #    and 250 independent V2 Schnorr P2PK chain roots (1 fan-out tx x 250 outputs)
++        print("[*] Pre-funding 6,000 V2 OP_TRUE UTXOs, 2,250 V2 Schnorr UTXOs, and 250 V2 chain roots (all version=7)...")
+         op_true_utxos = []
+         p2pkh_utxos = []
++        chain_root_utxos = []
+ 
+         fanout_hex_batch = []
+         for i in range(25):
+             cb_txid_int, cb_vout, cb_sats = mature_cb_utxos[i]
+             tx = CTransaction()
+-            tx.nVersion = 2
+-            tx.vin = [CTxIn(COutPoint(cb_txid_int, cb_vout), SCRIPTSIG_OP_TRUE, 0xFFFFFFFE)]
++            tx.nVersion = 7
++            tx.fHasV2Lock = True
++            tx.nV2Lock = 0
++            tx.nLockTime = 0
++            txin = CTxIn(COutPoint(cb_txid_int, cb_vout), V2_OP_TRUE_SCRIPT, 0xFFFFFFFF)
++            txin.nFlags = 1
++            txin.nPathIndex = 0
++            txin.vWitnesses = [(V2_OP_TRUE_SCRIPT, [], [])]
++            tx.vin = [txin]
+             per_out = (cb_sats - 200_000) // 240
+-            tx.vout = [CTxOut(per_out, CScript(op_true_spk)) for _ in range(240)]
+-            pad_tx(tx)
++            tx.vout = [make_v2_txout(per_out, V2_OP_TRUE_BRANCH_LEAF) for _ in range(240)]
+             fanout_hex_batch.append(ToHex(tx))
+             txid_int = tx.txid_int
+             for vout_idx in range(240):
+@@ -334,24 +441,49 @@ def main():
+         for i in range(25, 35):
+             cb_txid_int, cb_vout, cb_sats = mature_cb_utxos[i]
+             tx = CTransaction()
+-            tx.nVersion = 2
+-            tx.vin = [CTxIn(COutPoint(cb_txid_int, cb_vout), SCRIPTSIG_OP_TRUE, 0xFFFFFFFE)]
++            tx.nVersion = 7
++            tx.fHasV2Lock = True
++            tx.nV2Lock = 0
++            tx.nLockTime = 0
++            txin = CTxIn(COutPoint(cb_txid_int, cb_vout), V2_OP_TRUE_SCRIPT, 0xFFFFFFFF)
++            txin.nFlags = 1
++            txin.nPathIndex = 0
++            txin.vWitnesses = [(V2_OP_TRUE_SCRIPT, [], [])]
++            tx.vin = [txin]
+             per_out = (cb_sats - 200_000) // 225
+-            tx.vout = [CTxOut(per_out, p2pkh_spk) for _ in range(225)]
+-            pad_tx(tx)
++            tx.vout = [make_v2_txout(per_out, signer["branch_leaf"]) for _ in range(225)]
+             fanout_hex_batch.append(ToHex(tx))
+             txid_int = tx.txid_int
+             for vout_idx in range(225):
+                 p2pkh_utxos.append((txid_int, vout_idx, per_out))
+ 
++        # 36th mature coinbase -> 250 chain root UTXOs for [A4] depth-4 chains
++        cb_txid_int, cb_vout, cb_sats = mature_cb_utxos[35]
++        tx_chain_fanout = CTransaction()
++        tx_chain_fanout.nVersion = 7
++        tx_chain_fanout.fHasV2Lock = True
++        tx_chain_fanout.nV2Lock = 0
++        tx_chain_fanout.nLockTime = 0
++        txin_cf = CTxIn(COutPoint(cb_txid_int, cb_vout), V2_OP_TRUE_SCRIPT, 0xFFFFFFFF)
++        txin_cf.nFlags = 1
++        txin_cf.nPathIndex = 0
++        txin_cf.vWitnesses = [(V2_OP_TRUE_SCRIPT, [], [])]
++        tx_chain_fanout.vin = [txin_cf]
++        per_chain_out = (cb_sats - 200_000) // 250
++        tx_chain_fanout.vout = [make_v2_txout(per_chain_out, signer["branch_leaf"]) for _ in range(250)]
++        fanout_hex_batch.append(ToHex(tx_chain_fanout))
++        cf_txid_int = tx_chain_fanout.txid_int
++        for vout_idx in range(250):
++            chain_root_utxos.append((cf_txid_int, vout_idx, per_chain_out))
++
+         for chunk_start in range(0, len(fanout_hex_batch), 10):
+             res = clients[0].call("submitrawtxbatch", [fanout_hex_batch[chunk_start : chunk_start + 10]])
+             assert res["accepted"], f"Fan-out batch failed: {res}"
+-        clients[0].call("generatetoaddress", [1, ADDRESS_ECREG_P2SH_OP_TRUE])
++        clients[0].call("generatetodescriptor", [1, V2_OP_TRUE_DESCRIPTOR])
+         sync_all_blocks(clients, base_dir=base_dir)
+         print(
+-            f"[*] Funded and synced {len(op_true_utxos)} OP_TRUE UTXOs and "
+-            f"{len(p2pkh_utxos)} P2PKH UTXOs across all 3 nodes at height "
++            f"[*] Funded and synced {len(op_true_utxos)} V2 OP_TRUE UTXOs, "
++            f"{len(p2pkh_utxos)} V2 Schnorr UTXOs, and {len(chain_root_utxos)} V2 chain roots across all 3 nodes at height "
+             f"{clients[0].call('getblockcount')}."
+         )
+ 
+@@ -364,38 +496,55 @@ def main():
+                 supports_large_batch = False
+         print(f"[*] Native >50 tx batch support: {supports_large_batch}")
+ 
+-        # 4. Pre-construct & pre-sign all transactions in memory BEFORE starting clocks
+-        print("[*] Pre-constructing 12,000 OP_TRUE txs and 2,250 Schnorr-signed P2PKH txs in memory...")
++        # 4. Pre-construct & pre-sign all pure version=7 transactions in memory BEFORE starting clocks
++        print("[*] Pre-constructing 12,000 V2 OP_TRUE txs, 2,250 V2 BIP340 Schnorr txs, and 1,000 chained V2 BIP340 Schnorr txs (all version=7)...")
+         t_prep0 = time.perf_counter()
+         prebuilt_op_true_hex = []
+         prebuilt_op_true_next_utxos = []
+         for txid_int, vout_idx, sats in op_true_utxos:
+             next_sats = sats - 1000
+-            tx = build_p2sh_op_true_tx(txid_int, vout_idx, next_sats, op_true_spk)
++            tx = build_p2sh_op_true_tx(txid_int, vout_idx, next_sats)
+             prebuilt_op_true_hex.append(ToHex(tx))
+             prebuilt_op_true_next_utxos.append((tx.txid_int, 0, next_sats))
+ 
+-        # Also pre-build Round 2 of 6,000 OP_TRUE txs spending Round 1 outputs
++        # Also pre-build Round 2 of 6,000 V2 OP_TRUE txs spending Round 1 outputs
+         prebuilt_op_true_r2_hex = []
+         for txid_int, vout_idx, sats in prebuilt_op_true_next_utxos:
+             next_sats = sats - 1000
+-            tx = build_p2sh_op_true_tx(txid_int, vout_idx, next_sats, op_true_spk)
++            tx = build_p2sh_op_true_tx(txid_int, vout_idx, next_sats)
+             prebuilt_op_true_r2_hex.append(ToHex(tx))
+ 
+         prebuilt_p2pkh_hex = []
+-        for txid_int, vout_idx, sats in p2pkh_utxos:
++        for idx, (txid_int, vout_idx, sats) in enumerate(p2pkh_utxos):
+             next_sats = sats - 1000
+             tx = build_signed_p2pkh_tx(
+-                txid_int, vout_idx, sats, next_sats, privkey, pubkey_bytes, p2pkh_spk
++                txid_int, vout_idx, sats, next_sats, signer, idx
+             )
+             prebuilt_p2pkh_hex.append(ToHex(tx))
++
++        # Pre-build 1,000 chained pure version=7 BIP340 Schnorr-signed txs (250 chains of depth 4)
++        prebuilt_chained_v7_hex = []
++        for c_idx, (root_txid_int, root_vout, root_sats) in enumerate(chain_root_utxos):
++            cur_txid_int = root_txid_int
++            cur_vout = root_vout
++            cur_sats = root_sats
++            for depth in range(4):
++                next_sats = cur_sats - 1000
++                tx = build_signed_p2pkh_tx(
++                    cur_txid_int, cur_vout, cur_sats, next_sats, signer, c_idx * 4 + depth
++                )
++                prebuilt_chained_v7_hex.append(ToHex(tx))
++                cur_txid_int = tx.txid_int
++                cur_vout = 0
++                cur_sats = next_sats
++
+         t_prep1 = time.perf_counter()
+         print(
+-            f"[*] Pre-constructed {len(prebuilt_op_true_hex) + len(prebuilt_op_true_r2_hex) + len(prebuilt_p2pkh_hex)} transactions in {t_prep1 - t_prep0:.2f}s "
+-            f"(avg P2PKH tx={len(prebuilt_p2pkh_hex[0]) // 2}B, OP_TRUE tx={len(prebuilt_op_true_hex[0]) // 2}B)."
++            f"[*] Pre-constructed {len(prebuilt_op_true_hex) + len(prebuilt_op_true_r2_hex) + len(prebuilt_p2pkh_hex) + len(prebuilt_chained_v7_hex)} pure version=7 transactions in {t_prep1 - t_prep0:.2f}s "
++            f"(avg V2 Schnorr tx={len(prebuilt_p2pkh_hex[0]) // 2}B, V2 OP_TRUE tx={len(prebuilt_op_true_hex[0]) // 2}B)."
+         )
+ 
+-        results = {"supports_large_batch": supports_large_batch}
++        results = {"supports_large_batch": supports_large_batch, "pure_v7_transactions": True}
+ 
+         # =====================================================================
+         # BENCHMARK A: Batch RPC Ingestion & Validation TPS
+@@ -491,7 +640,7 @@ def main():
+             time.sleep(0.05)
+ 
+         # Mine a block to clear the 500 P2PKH txs before testing batch size scaling
+-        clients[0].call("generatetoaddress", [1, ADDRESS_ECREG_P2SH_OP_TRUE])
++        clients[0].call("generatetodescriptor", [1, V2_OP_TRUE_DESCRIPTOR])
+         sync_all_blocks(clients, base_dir=base_dir)
+ 
+         # A2: Compare single sendrawtransaction (batch=1) vs submitrawtxbatch (batch=50, 100, 250, 500)
+@@ -711,7 +860,7 @@ def main():
+         )
+ 
+         t_mine0 = time.perf_counter()
+-        mined_hashes = clients[0].call("generatetoaddress", [1, ADDRESS_ECREG_P2SH_OP_TRUE])
++        mined_hashes = clients[0].call("generatetodescriptor", [1, V2_OP_TRUE_DESCRIPTOR])
+         t_mine1 = time.perf_counter()
+         mined_bh = mined_hashes[0]
+         sync_all_blocks(clients, base_dir=base_dir)
+@@ -817,7 +966,7 @@ def main():
+         )
+ 
+         # Mine a block to clear B1 & B2 so all 3 nodes start B3 with 0 mempool txs at the same tip
+-        clients[0].call("generatetoaddress", [1, ADDRESS_ECREG_P2SH_OP_TRUE])
++        clients[0].call("generatetodescriptor", [1, V2_OP_TRUE_DESCRIPTOR])
+         sync_all_blocks(clients, base_dir=base_dir)
+ 
+         # B3: Disjoint 3-Node Ingestion & Merklix Convergence (750 Schnorr-signed P2PKH txs:
+@@ -901,7 +1050,7 @@ def main():
+         )
+ 
+         if supports_large_batch:
+-            clients[0].call("generatetoaddress", [1, ADDRESS_ECREG_P2SH_OP_TRUE])
++            clients[0].call("generatetodescriptor", [1, V2_OP_TRUE_DESCRIPTOR])
+             sync_all_blocks(clients, base_dir=base_dir)
+             burst_txs = (
+                 prebuilt_op_true_hex[500:1000]
+@@ -917,7 +1066,7 @@ def main():
+                 f"{res_burst['tps']:.1f} tx/s | batch p50={res_burst['batch_p50_ms']:.2f}ms "
+                 f"p95={res_burst['batch_p95_ms']:.2f}ms | per-tx p50={res_burst['per_tx_p50_us']:.1f}us"
+             )
+-            clients[0].call("generatetoaddress", [1, ADDRESS_ECREG_P2SH_OP_TRUE])
++            clients[0].call("generatetodescriptor", [1, V2_OP_TRUE_DESCRIPTOR])
+             sync_all_blocks(clients, base_dir=base_dir)
+             res_a1_1000 = run_batch_ingestion(
+                 prebuilt_p2pkh_hex[500:1500], batch_size=200, num_workers=8, target_port=NODES_CFG[0]["rpc_port"]
+@@ -929,10 +1078,25 @@ def main():
+                 f"p95={res_a1_1000['batch_p95_ms']:.2f}ms p99={res_a1_1000['batch_p99_ms']:.2f}ms"
+             )
+ 
++            # A4: 1,000 Chained Pure version=7 BIP340 Schnorr-Signed Transactions (250 chains of depth 4)
++            clients[0].call("generatetodescriptor", [1, V2_OP_TRUE_DESCRIPTOR])
++            sync_all_blocks(clients, base_dir=base_dir)
++            res_a4_chained = run_batch_ingestion(
++                prebuilt_chained_v7_hex, batch_size=200, num_workers=8, target_port=NODES_CFG[0]["rpc_port"]
++            )
++            results["bench_a4_chained_v7_1000_b200"] = res_a4_chained
++            print(
++                f"[A4] Chained Pure version=7 BIP340 Schnorr (1000 txs, 250x4 chains, batch=200, 8 workers): "
++                f"{res_a4_chained['tps']:.1f} tx/s | batch p50={res_a4_chained['batch_p50_ms']:.2f}ms "
++                f"p95={res_a4_chained['batch_p95_ms']:.2f}ms p99={res_a4_chained['batch_p99_ms']:.2f}ms"
++            )
++            clients[0].call("generatetodescriptor", [1, V2_OP_TRUE_DESCRIPTOR])
++            sync_all_blocks(clients, base_dir=base_dir)
++
+             # Dedicated post-benchmark CPU hotspot profiling pass on 5,000 Round-2 txs
+             sample_out = Path("/private/tmp/lotus-v2-node0-sample.txt")
+             if not sample_out.exists():
+-                clients[0].call("generatetoaddress", [1, ADDRESS_ECREG_P2SH_OP_TRUE])
++                clients[0].call("generatetodescriptor", [1, V2_OP_TRUE_DESCRIPTOR])
+                 sync_all_blocks(clients, base_dir=base_dir)
+                 sample_proc = None
+                 try:
+-- 
+2.50.1 (Apple Git-155)
+

@@ -1,0 +1,799 @@
+From bf80de60e6e6c9d46f82ce4983e985d9ba7294e8 Mon Sep 17 00:00:00 2001
+From: Shammah Chancellor <shammah.chancellor@notvalid.com>
+Date: Mon, 19 Oct 2026 11:29:21 -0700
+Subject: [PATCH] v2: move native and token conservation into deferred check
+ kinds
+
+Value conservation and the per-transaction script rules are now the same
+mechanism: a counter (accumulator) with contributions and a final rule.
+NativeConservation (inputs add, outputs subtract, the remainder is the
+fee, which must be >= 0) and TokenConservation (one counter per token id;
+each positive delta needs exactly one mint input, and each mint input
+needs a positive delta) are DeferredAccumulators in
+lotus_v2/deferred_checks.h. Their contributions are structural, so they
+are applied, and their final rules decided, when the transaction is
+prepared, before any script runs.
+
+Every conservation site now feeds these kinds instead of its own map:
+
+- the ordinary V2 path (VerifyOrdinaryUncached), which keeps the zero
+  token id as native, as TXTOKENBALANCE does;
+- Consensus::CheckTxInputs and CheckTxInputsFromSpentCoins;
+- CheckTxInputsFromResolvedCoins.
+
+The three node variants share Consensus::FinishTxConservation.
+
+Results are identical. Each caller keeps its reject reasons and its
+precedence: the node checks the token rules, then native, then the fee
+range; the ordinary path checks native, then the fee floors, then the
+token rules. Range checks on individual values (MoneyRange, negative
+values) stay where they were. The kinds' 128-bit sums are checked for
+overflow and report it as an out-of-range value, which cannot happen
+with at most 256 inputs and outputs.
+
+Tests: test_lotus_v2_deferred_checks covers each kind passing and
+failing: fees, inflation, overflow, a mint without a positive delta, a
+second mint of one token, and token burns below inputs. The existing
+ordinary, monetary, block and node mempool and validation suites pass
+unchanged.
+
+Tier: V2
+
+Coordinator integration provenance (network403):
+Resolve integration context by retaining the incoming purposeful change together with existing shared/native consumers; exact old/new patch and file inventory is retained in owner-adaptations.json. No authored purpose or removed downstream behavior restored.
+Original scripted commands/hashes above are original-author provenance; modified parent/tool/catalog hashes are not claimed to reproduce this composition. Exact coordinator adaptation scripts and ordered tree proof are in composed403-network-metrics-delivery. Build/runtime/benchmarks NOT_RUN for this composition under user compile-first policy.
+
+Coordinator integration provenance (reference405):
+Preserve earlier purposeful source repairs through downstream consumer/context adaptations; exact conflict ledger retained.
+All60 authored input payloads retained, with prerequisite-aware same-purpose splits; distinct legacy-index and inherited CXX compatibility remain independent. Pre-format source equals exact403+all60 control tree95718fceff83364b74294a751bd752b2f1a4e384. Only pinnedRuff import/format cleanup follows. Original author commands/hashes are historical reference evidence, not combined405 approval. Reference OFF/native/Rust full gates are preserved separately; combined compile/runtime NOT_RUN.
+---
+ src/consensus/tx_verify.cpp           | 157 +++++++++++---------------
+ src/consensus/tx_verify.h             |  24 ++++
+ src/lotus_v2/deferred_checks.cpp      |  68 +++++++++++
+ src/lotus_v2/deferred_checks.h        |  63 +++++++++++
+ src/lotus_v2/ordinary_validation.cpp  |  62 +++++-----
+ src/lotus_v2/test_deferred_checks.cpp |  45 ++++++++
+ src/validation.cpp                    |  55 ++-------
+ 7 files changed, 308 insertions(+), 166 deletions(-)
+
+diff --git a/src/consensus/tx_verify.cpp b/src/consensus/tx_verify.cpp
+index b1130102b1707f086b1f9fb54b8db6da7eed271d..8168c05379d3d1e44496d5dad2dd12bfe62f50ae 100644
+--- a/src/consensus/tx_verify.cpp
++++ b/src/consensus/tx_verify.cpp
+@@ -12,12 +12,15 @@
+ #include <consensus/consensus.h>
+ #include <consensus/params.h>
+ #include <consensus/validation.h>
++#include <lotus_v2/deferred_checks.h>
+ #include <lotus_v2/lock.h>
+ #include <primitives/transaction.h>
+ #include <script/script_flags.h>
+ #include <util/check.h>
+ #include <util/moneystr.h> // For FormatMoney
+ 
++#include <cstring>
++
+ static bool IsFinalTx(const CTransaction &tx, int nBlockHeight,
+                       int64_t nBlockTime) {
+     // A transaction in the v7 wire format carries the V2 lock, whose value
+@@ -235,15 +238,58 @@ static inline bool ExtractTokenIdAndValue(const CTxOut &txout, uint256 &tok_id,
+     return false;
+ }
+ 
++std::array<uint8_t, 32> TokenKey(const uint256 &id) {
++    std::array<uint8_t, 32> key;
++    std::memcpy(key.data(), id.begin(), key.size());
++    return key;
++}
++
++bool FinishTxConservation(const CTransaction &tx,
++                          lotus::v2::NativeConservation &native,
++                          const lotus::v2::TokenConservation &tokens,
++                          const Amount &nValueIn, TxValidationState &state,
++                          Amount &txfee) {
++    switch (tokens.Check()) {
++        case lotus::v2::ConservationFailure::None:
++            break;
++        case lotus::v2::ConservationFailure::MintWithoutDelta:
++            return state.Invalid(TxValidationResult::TX_CONSENSUS,
++                                 "bad-txns-mint-without-positive-delta");
++        default:
++            return state.Invalid(TxValidationResult::TX_CONSENSUS,
++                                 "bad-txns-token-inflation");
++    }
++
++    const Amount value_out = tx.GetValueOut();
++    native.AddOutput(uint64_t(value_out / SATOSHI));
++    if (native.Check() != lotus::v2::ConservationFailure::None) {
++        return state.Invalid(
++            TxValidationResult::TX_CONSENSUS, "bad-txns-in-belowout",
++            strprintf("value in (%s) < value out (%s)", FormatMoney(nValueIn),
++                      FormatMoney(value_out)));
++    }
++
++    // Tally transaction fees
++    const Amount txfee_aux = nValueIn - value_out;
++    if (!MoneyRange(txfee_aux)) {
++        return state.Invalid(TxValidationResult::TX_CONSENSUS,
++                             "bad-txns-fee-outofrange");
++    }
++
++    txfee = txfee_aux;
++    return true;
++}
++
+ bool CheckTxInputs(const CTransaction &tx, TxValidationState &state,
+                    const CCoinsViewCache &inputs, int nSpendHeight,
+                    Amount &txfee) {
+     Amount nValueIn = Amount::zero();
+-    std::map<uint256, std::pair<__uint128_t, __uint128_t>> tokenTotals;
+-    bool has_authority_input = false;
++    // Structural contributions to the conservation kinds.
++    lotus::v2::NativeConservation native;
++    lotus::v2::TokenConservation tokens;
+     for (const auto &in : tx.vin) {
+         if (in.nFlags == 3) {
+-            has_authority_input = true;
++            tokens.AddMint(Consensus::TokenKey(uint256(in.prevout.GetTxId())));
+             continue;
+         }
+         const COutPoint &prevout = in.prevout;
+@@ -278,11 +324,11 @@ bool CheckTxInputs(const CTransaction &tx, TxValidationState &state,
+         uint256 tok_id;
+         uint64_t tok_val = 0;
+         if (ExtractTokenIdAndValue(prev_txout, tok_id, tok_val)) {
+-            if (prev_txout.nValue < Amount::zero()) {
++            if (prev_txout.nValue < Amount::zero() ||
++                !tokens.AddInput(Consensus::TokenKey(tok_id), tok_val)) {
+                 return state.Invalid(TxValidationResult::TX_CONSENSUS,
+                                      "bad-txns-inputvalues-outofrange");
+             }
+-            tokenTotals[tok_id].first += tok_val;
+             continue;
+         }
+ 
+@@ -292,59 +338,22 @@ bool CheckTxInputs(const CTransaction &tx, TxValidationState &state,
+             return state.Invalid(TxValidationResult::TX_CONSENSUS,
+                                  "bad-txns-inputvalues-outofrange");
+         }
++        native.AddInput(uint64_t(prev_txout.nValue / SATOSHI));
+     }
+ 
+     for (const auto &out : tx.vout) {
+         uint256 tok_id;
+         uint64_t tok_val = 0;
+         if (ExtractTokenIdAndValue(out, tok_id, tok_val)) {
+-            if (out.nValue < Amount::zero()) {
++            if (out.nValue < Amount::zero() ||
++                !tokens.AddOutput(Consensus::TokenKey(tok_id), tok_val)) {
+                 return state.Invalid(TxValidationResult::TX_CONSENSUS,
+                                      "bad-txns-vout-negative");
+             }
+-            tokenTotals[tok_id].second += tok_val;
+-        }
+-    }
+-
+-    if (!tokenTotals.empty() || has_authority_input) {
+-        std::set<uint256> positiveTokenDeltas;
+-        for (const auto &[tokenId, totals] : tokenTotals) {
+-            if (totals.second > totals.first) {
+-                positiveTokenDeltas.insert(tokenId);
+-            }
+         }
+-        for (const auto &in : tx.vin) {
+-            if (in.nFlags != 3) {
+-                continue;
+-            }
+-            if (positiveTokenDeltas.erase(uint256(in.prevout.GetTxId())) != 1) {
+-                return state.Invalid(TxValidationResult::TX_CONSENSUS,
+-                                     "bad-txns-mint-without-positive-delta");
+-            }
+-        }
+-        if (!positiveTokenDeltas.empty()) {
+-            return state.Invalid(TxValidationResult::TX_CONSENSUS,
+-                                 "bad-txns-token-inflation");
+-        }
+-    }
+-
+-    const Amount value_out = tx.GetValueOut();
+-    if (nValueIn < value_out) {
+-        return state.Invalid(
+-            TxValidationResult::TX_CONSENSUS, "bad-txns-in-belowout",
+-            strprintf("value in (%s) < value out (%s)", FormatMoney(nValueIn),
+-                      FormatMoney(value_out)));
+-    }
+-
+-    // Tally transaction fees
+-    const Amount txfee_aux = nValueIn - value_out;
+-    if (!MoneyRange(txfee_aux)) {
+-        return state.Invalid(TxValidationResult::TX_CONSENSUS,
+-                             "bad-txns-fee-outofrange");
+     }
+ 
+-    txfee = txfee_aux;
+-    return true;
++    return FinishTxConservation(tx, native, tokens, nValueIn, state, txfee);
+ }
+ 
+ bool CheckTxInputsFromSpentCoins(const CTransaction &tx,
+@@ -354,11 +363,12 @@ bool CheckTxInputsFromSpentCoins(const CTransaction &tx,
+     assert(spent_coins.size() == tx.vin.size());
+ 
+     Amount nValueIn = Amount::zero();
+-    std::map<uint256, std::pair<__uint128_t, __uint128_t>> tokenTotals;
+-    bool has_authority_input = false;
++    // Structural contributions to the conservation kinds.
++    lotus::v2::NativeConservation native;
++    lotus::v2::TokenConservation tokens;
+     for (size_t i = 0; i < tx.vin.size(); ++i) {
+         if (tx.vin[i].nFlags == 3) {
+-            has_authority_input = true;
++            tokens.AddMint(Consensus::TokenKey(uint256(tx.vin[i].prevout.GetTxId())));
+             continue;
+         }
+         const Coin &coin = spent_coins[i];
+@@ -392,11 +402,11 @@ bool CheckTxInputsFromSpentCoins(const CTransaction &tx,
+         uint256 tok_id;
+         uint64_t tok_val = 0;
+         if (ExtractTokenIdAndValue(prev_txout, tok_id, tok_val)) {
+-            if (prev_txout.nValue < Amount::zero()) {
++            if (prev_txout.nValue < Amount::zero() ||
++                !tokens.AddInput(Consensus::TokenKey(tok_id), tok_val)) {
+                 return state.Invalid(TxValidationResult::TX_CONSENSUS,
+                                      "bad-txns-inputvalues-outofrange");
+             }
+-            tokenTotals[tok_id].first += tok_val;
+             continue;
+         }
+ 
+@@ -406,58 +416,21 @@ bool CheckTxInputsFromSpentCoins(const CTransaction &tx,
+             return state.Invalid(TxValidationResult::TX_CONSENSUS,
+                                  "bad-txns-inputvalues-outofrange");
+         }
++        native.AddInput(uint64_t(prev_txout.nValue / SATOSHI));
+     }
+ 
+     for (const auto &out : tx.vout) {
+         uint256 tok_id;
+         uint64_t tok_val = 0;
+         if (ExtractTokenIdAndValue(out, tok_id, tok_val)) {
+-            if (out.nValue < Amount::zero()) {
++            if (out.nValue < Amount::zero() ||
++                !tokens.AddOutput(Consensus::TokenKey(tok_id), tok_val)) {
+                 return state.Invalid(TxValidationResult::TX_CONSENSUS,
+                                      "bad-txns-vout-negative");
+             }
+-            tokenTotals[tok_id].second += tok_val;
+-        }
+-    }
+-
+-    if (!tokenTotals.empty() || has_authority_input) {
+-        std::set<uint256> positiveTokenDeltas;
+-        for (const auto &[tokenId, totals] : tokenTotals) {
+-            if (totals.second > totals.first) {
+-                positiveTokenDeltas.insert(tokenId);
+-            }
+-        }
+-        for (const auto &in : tx.vin) {
+-            if (in.nFlags != 3) {
+-                continue;
+-            }
+-            if (positiveTokenDeltas.erase(uint256(in.prevout.GetTxId())) != 1) {
+-                return state.Invalid(TxValidationResult::TX_CONSENSUS,
+-                                     "bad-txns-mint-without-positive-delta");
+-            }
+         }
+-        if (!positiveTokenDeltas.empty()) {
+-            return state.Invalid(TxValidationResult::TX_CONSENSUS,
+-                                 "bad-txns-token-inflation");
+-        }
+-    }
+-
+-    const Amount value_out = tx.GetValueOut();
+-    if (nValueIn < value_out) {
+-        return state.Invalid(
+-            TxValidationResult::TX_CONSENSUS, "bad-txns-in-belowout",
+-            strprintf("value in (%s) < value out (%s)", FormatMoney(nValueIn),
+-                      FormatMoney(value_out)));
+-    }
+-
+-    // Tally transaction fees
+-    const Amount txfee_aux = nValueIn - value_out;
+-    if (!MoneyRange(txfee_aux)) {
+-        return state.Invalid(TxValidationResult::TX_CONSENSUS,
+-                             "bad-txns-fee-outofrange");
+     }
+ 
+-    txfee = txfee_aux;
+-    return true;
++    return FinishTxConservation(tx, native, tokens, nValueIn, state, txfee);
+ }
+ } // namespace Consensus
+diff --git a/src/consensus/tx_verify.h b/src/consensus/tx_verify.h
+index 544b639bb45d2170e1a6ea9cbe21433617fb23a0..386d8040f464bcac8ac9b3a0d715da53ff330daf 100644
+--- a/src/consensus/tx_verify.h
++++ b/src/consensus/tx_verify.h
+@@ -8,15 +8,22 @@
+ #include <kernel/cs_main.h>
+ #include <threadsafety.h>
+ 
++#include <array>
+ #include <cstdint>
+ #include <vector>
+ 
++namespace lotus::v2 {
++class NativeConservation;
++class TokenConservation;
++} // namespace lotus::v2
++
+ struct Amount;
+ class CBlockIndex;
+ class CCoinsViewCache;
+ class Coin;
+ class CTransaction;
+ class TxValidationState;
++class uint256;
+ 
+ namespace Consensus {
+ struct Params;
+@@ -48,6 +55,23 @@ bool CheckTxInputsFromSpentCoins(const CTransaction &tx,
+                                  TxValidationState &state, int nSpendHeight,
+                                  Amount &txfee);
+ 
++//! The conservation kinds' token key for a token id or mint input txid.
++std::array<uint8_t, 32> TokenKey(const uint256 &id);
++
++/**
++ * The final rules of the native and token conservation kinds
++ * (lotus_v2/deferred_checks.h) over the contributions the caller collected
++ * from the spent coins and outputs, with the node's reject reasons and
++ * precedence: token rules, then native, then the fee range.
++ * @param[in] nValueIn The native input total the caller range-checked.
++ * @param[out] txfee Set to the transaction fee if successful.
++ */
++bool FinishTxConservation(const CTransaction &tx,
++                          lotus::v2::NativeConservation &native,
++                          const lotus::v2::TokenConservation &tokens,
++                          const Amount &nValueIn, TxValidationState &state,
++                          Amount &txfee);
++
+ } // namespace Consensus
+ 
+ /**
+diff --git a/src/lotus_v2/deferred_checks.cpp b/src/lotus_v2/deferred_checks.cpp
+index 84d59e0cc81abb578c93ac9b5ae44e7cfb76d7f1..e9a15ea6197f1ae35ba1a80f3e8fe865b0d3dd2c 100644
+--- a/src/lotus_v2/deferred_checks.cpp
++++ b/src/lotus_v2/deferred_checks.cpp
+@@ -5,6 +5,7 @@
+ #include "deferred_checks.h"
+ 
+ #include <algorithm>
++#include <set>
+ 
+ namespace lotus::v2 {
+ 
+@@ -257,4 +258,71 @@ const DeferredCheckRegistry &DeferredCheckRegistry::Consensus() {
+     return registry;
+ }
+ 
++// ---------------------------------------------------------------------------
++
++namespace {
++    bool CheckedAdd(__uint128_t &total, __uint128_t value) {
++        if (total + value < total) return false;
++        total += value;
++        return true;
++    }
++} // namespace
++
++bool NativeConservation::AddInput(__uint128_t value) {
++    return CheckedAdd(inputs_, value);
++}
++bool NativeConservation::AddOutput(__uint128_t value) {
++    return CheckedAdd(outputs_, value);
++}
++const char *ConservationFailureName(ConservationFailure failure) {
++    switch (failure) {
++    case ConservationFailure::None:
++        return "";
++    case ConservationFailure::Overflow:
++        return "conservation-overflow";
++    case ConservationFailure::NativeInflation:
++        return "native-inflation";
++    case ConservationFailure::MintWithoutDelta:
++        return "mint-without-positive-delta";
++    case ConservationFailure::TokenInflation:
++        return "token-inflation";
++    }
++    return "conservation-unknown";
++}
++
++bool NativeConservation::Final(std::string &error) {
++    const auto failure = Check();
++    error = ConservationFailureName(failure);
++    return failure == ConservationFailure::None;
++}
++bool TokenConservation::Final(std::string &error) {
++    const auto failure = Check();
++    error = ConservationFailureName(failure);
++    return failure == ConservationFailure::None;
++}
++
++ConservationFailure NativeConservation::Check() const {
++    return inputs_ < outputs_ ? ConservationFailure::NativeInflation
++                              : ConservationFailure::None;
++}
++
++bool TokenConservation::AddInput(const Hash32 &token, __uint128_t value) {
++    return CheckedAdd(totals_[token].inputs, value);
++}
++bool TokenConservation::AddOutput(const Hash32 &token, __uint128_t value) {
++    return CheckedAdd(totals_[token].outputs, value);
++}
++ConservationFailure TokenConservation::Check() const {
++    std::set<Hash32> positive;
++    for (const auto &[token, totals] : totals_)
++        if (totals.outputs > totals.inputs) positive.insert(token);
++    // Mint inputs in transaction order; a second mint of one token finds
++    // its delta already taken.
++    for (const Hash32 &token : mints_)
++        if (positive.erase(token) != 1)
++            return ConservationFailure::MintWithoutDelta;
++    return positive.empty() ? ConservationFailure::None
++                            : ConservationFailure::TokenInflation;
++}
++
+ } // namespace lotus::v2
+diff --git a/src/lotus_v2/deferred_checks.h b/src/lotus_v2/deferred_checks.h
+index 6429367ce3e2843bb431dc31fde9c735a1d0f993..3e9eb1125fea6d00d1f6632ac19ca7f7fa5ab810 100644
+--- a/src/lotus_v2/deferred_checks.h
++++ b/src/lotus_v2/deferred_checks.h
+@@ -33,6 +33,7 @@
+ #include <atomic>
+ #include <cstddef>
+ #include <cstdint>
++#include <map>
+ #include <memory>
+ #include <optional>
+ #include <span>
+@@ -264,6 +265,68 @@ std::vector<OutputClaim> OutputClaimsOf(const DeferredRecords &records);
+ std::vector<StateAuthorization>
+ StateAuthorizationsOf(const DeferredRecords &records);
+ 
++// ---------------------------------------------------------------------------
++// Conservation kinds. Their contributions are structural (input and output
++// values), applied when the transaction is prepared; no script contributes,
++// so their final rules are decided before any input runs, by the caller
++// that prepares the transaction (the ordinary V2 path and the node's
++// CheckTxInputs variants). Each caller keeps its own reject reasons and its
++// historical precedence between these and its other structural rules: the
++// failure code below is mapped by the caller.
++
++enum class ConservationFailure {
++    None,
++    Overflow,              // a running total does not fit
++    NativeInflation,       // native outputs exceed native inputs
++    MintWithoutDelta,      // a mint input whose token has no positive delta
++    TokenInflation,        // a positive token delta without a mint input
++};
++
++// Generic names of the conservation failures (callers may map the code to
++// their own reasons instead).
++const char *ConservationFailureName(ConservationFailure failure);
++
++// Native conservation: one counter per transaction. Inputs add, outputs
++// (including burns) subtract; the remainder is the fee and must be >= 0.
++class NativeConservation final : public DeferredAccumulator {
++public:
++    bool AddInput(__uint128_t value);
++    bool AddOutput(__uint128_t value);
++    ConservationFailure Check() const;
++    bool Final(std::string &error) override;
++    __uint128_t Inputs() const { return inputs_; }
++    __uint128_t Outputs() const { return outputs_; }
++    // Valid when Check() passes.
++    __uint128_t Fee() const { return inputs_ - outputs_; }
++
++private:
++    __uint128_t inputs_ = 0;
++    __uint128_t outputs_ = 0;
++};
++
++// Token conservation: one counter per token id. Spent amounts add, outputs
++// (including burns) subtract. Final: every token whose outputs exceed its
++// inputs (a positive delta) is matched by exactly one mint input for that
++// token, and every mint input names a token with a positive delta.
++class TokenConservation final : public DeferredAccumulator {
++public:
++    struct Totals {
++        __uint128_t inputs = 0;
++        __uint128_t outputs = 0;
++    };
++    bool AddInput(const Hash32 &token, __uint128_t value);
++    bool AddOutput(const Hash32 &token, __uint128_t value);
++    // Mint inputs in transaction order.
++    void AddMint(const Hash32 &token) { mints_.push_back(token); }
++    ConservationFailure Check() const;
++    bool Final(std::string &error) override;
++    const std::map<Hash32, Totals> &PerToken() const { return totals_; }
++
++private:
++    std::map<Hash32, Totals> totals_;
++    std::vector<Hash32> mints_;
++};
++
+ } // namespace lotus::v2
+ 
+ #endif
+diff --git a/src/lotus_v2/ordinary_validation.cpp b/src/lotus_v2/ordinary_validation.cpp
+index 3e909111f2d0f1384e8f0f3e13594501d8809389..b91672e16eb359a287de364349aef623a0bfb847 100644
+--- a/src/lotus_v2/ordinary_validation.cpp
++++ b/src/lotus_v2/ordinary_validation.cpp
+@@ -17,7 +17,6 @@ using Wide = __uint128_t;
+ constexpr Wide MAX_WIDE = ~Wide{0};
+ constexpr size_t MAX_ORDINARY_VALIDATION_CACHE_ENTRIES = 8192;
+ 
+-using Totals = VmAssetTotals;
+ 
+ bool Add(Wide &sum, Wide value) {
+     if (sum > MAX_WIDE - value) return false;
+@@ -308,27 +307,39 @@ CandidateCheckResult VerifyOrdinaryUncached(
+     std::string &error, BatchSigCollector *batch_sigs) {
+     try {
+         ValidatedOrdinaryCache::Instance().RecordMiss();
+-        // Same per-asset totals TXTOKENBALANCE reads (zero key = native).
+-        VmAssetTotalsMap tokens;
++        // Structural deferred kinds: native and token conservation take
++        // their contributions from the spent coins and the outputs, before
++        // any script runs. The asset key is the one TXTOKENBALANCE reads: a
++        // zero token id is native.
++        NativeConservation native_conservation;
++        TokenConservation token_conservation;
++        auto contribute = [&](const Output &output, bool input) {
++            const bool ok =
++                output.HasToken() && output.token_id != Hash32{}
++                    ? (input ? token_conservation.AddInput(output.token_id,
++                                                           output.value)
++                             : token_conservation.AddOutput(output.token_id,
++                                                            output.value))
++                    : (input ? native_conservation.AddInput(output.value)
++                             : native_conservation.AddOutput(output.value));
++            if (!ok) error = "asset sum overflow";
++            return ok;
++        };
+         for (const Coin &coin : spent) {
+-            if (!AddVmAssetTotal(tokens, coin.output, true, error))
++            if (!contribute(coin.output, true))
+                 return CandidateCheckResult::Invalid;
+         }
+         size_t token_output_count = 0;
+         for (const Output &output : tx.outputs) {
+             token_output_count += output.HasToken();
+-            if (!AddVmAssetTotal(tokens, output, false, error))
++            if (!contribute(output, false))
+                 return CandidateCheckResult::Invalid;
+         }
+-        const Totals native = tokens[Hash32{}];
+-        tokens.erase(Hash32{});
+-        const Wide native_inputs = native.inputs;
+-        const Wide native_outputs = native.outputs;
+-        if (native_inputs < native_outputs) {
++        if (native_conservation.Check() != ConservationFailure::None) {
+             error = "native inflation";
+             return CandidateCheckResult::Invalid;
+         }
+-        const Wide native_fee = native_inputs - native_outputs;
++        const Wide native_fee = native_conservation.Fee();
+         Wide token_floor;
+         if (!Multiply(Wide{2} * profile.dust_limit, token_output_count,
+                       token_floor)) {
+@@ -347,26 +358,19 @@ CandidateCheckResult VerifyOrdinaryUncached(
+             return CandidateCheckResult::Invalid;
+         }
+ 
+-        std::map<Hash32, PositiveDelta> positive_deltas;
+-        for (const auto &[token_id, totals] : tokens) {
+-            if (totals.outputs <= totals.inputs) continue;
+-            const Wide delta = totals.outputs - totals.inputs;
+-            PositiveDelta encoded{};
+-            for (size_t b = 0; b < encoded.size(); ++b)
+-                encoded[b] = uint8_t(delta >> (8 * b));
+-            positive_deltas.emplace(token_id, encoded);
+-        }
+-        for (const Input &input : tx.inputs) {
+-            if (input.flags != 3) continue;
+-            if (positive_deltas.erase(input.prev_txid) != 1) {
+-                error = "mint without matching positive token delta";
+-                return CandidateCheckResult::Invalid;
+-            }
+-        }
+-        if (!positive_deltas.empty()) {
++        for (const Input &input : tx.inputs)
++            if (input.flags == 3) token_conservation.AddMint(input.prev_txid);
++        switch (token_conservation.Check()) {
++        case ConservationFailure::None:
++            break;
++        case ConservationFailure::MintWithoutDelta:
++            error = "mint without matching positive token delta";
++            return CandidateCheckResult::Invalid;
++        default:
+             error = "positive token delta lacks mint input";
+             return CandidateCheckResult::Invalid;
+         }
++        const auto &tokens = token_conservation.PerToken();
+ 
+         PreparedVmTransaction prepared_vm;
+         const auto preparation =
+@@ -390,7 +394,7 @@ CandidateCheckResult VerifyOrdinaryUncached(
+             const Input &input = tx.inputs[i];
+             std::optional<PositiveDelta> delta;
+             if (input.flags == 3) {
+-                const Totals &totals = tokens.at(input.prev_txid);
++                const auto &totals = tokens.at(input.prev_txid);
+                 const Wide amount = totals.outputs - totals.inputs;
+                 PositiveDelta encoded{};
+                 for (size_t b = 0; b < encoded.size(); ++b)
+diff --git a/src/lotus_v2/test_deferred_checks.cpp b/src/lotus_v2/test_deferred_checks.cpp
+index e3311eac6a7d53796262b53481e8f50bfe709520..603939f646dd0daa7a85d66db041ae5190d35ce6 100644
+--- a/src/lotus_v2/test_deferred_checks.cpp
++++ b/src/lotus_v2/test_deferred_checks.cpp
+@@ -338,6 +338,50 @@ void ConsensusKinds() {
+     }
+ }
+ 
++void ConservationKinds() {
++    std::string error;
++    // Native: inputs add, outputs subtract, the remainder is the fee.
++    {
++        NativeConservation native;
++        CHECK(native.AddInput(700) && native.AddInput(300));
++        CHECK(native.AddOutput(990));
++        CHECK(native.Check() == ConservationFailure::None &&
++              native.Fee() == 10 && native.Final(error));
++        CHECK(native.AddOutput(11));
++        CHECK(native.Check() == ConservationFailure::NativeInflation &&
++              !native.Final(error) && error == "native-inflation");
++        NativeConservation huge;
++        CHECK(huge.AddInput(~__uint128_t{0}) && !huge.AddInput(1));
++    }
++    Hash32 a{}, b{};
++    a.fill(0xaa);
++    b.fill(0xbb);
++    // Token: balanced transfers pass; a positive delta needs one mint.
++    {
++        TokenConservation token;
++        CHECK(token.AddInput(a, 50) && token.AddOutput(a, 30) &&
++              token.AddOutput(a, 20));
++        CHECK(token.Check() == ConservationFailure::None);
++        CHECK(token.AddOutput(a, 1)); // a: 51 out of 50 in
++        CHECK(token.Check() == ConservationFailure::TokenInflation &&
++              !token.Final(error) && error == "token-inflation");
++        token.AddMint(a);
++        CHECK(token.Check() == ConservationFailure::None);
++        token.AddMint(a); // a second mint of a finds its delta taken
++        CHECK(token.Check() == ConservationFailure::MintWithoutDelta);
++    }
++    {
++        // A mint whose token has no positive delta, and burns (outputs) of
++        // a token below its inputs.
++        TokenConservation token;
++        CHECK(token.AddInput(b, 10) && token.AddOutput(b, 4));
++        CHECK(token.Check() == ConservationFailure::None);
++        token.AddMint(b);
++        CHECK(token.Check() == ConservationFailure::MintWithoutDelta &&
++              !token.Final(error) && error == "mint-without-positive-delta");
++    }
++}
++
+ class CountingHook final : public DeferredBlockHook {
+ public:
+     explicit CountingHook(bool fail) : fail_(fail) {}
+@@ -385,6 +429,7 @@ int main() {
+         FinalRulesAndFailFast();
+         FailedInputsNeverReachPhaseTwo();
+         ConsensusKinds();
++        ConservationKinds();
+         BlockHook();
+     } catch (const std::exception &error) {
+         std::cerr << error.what() << '\n';
+diff --git a/src/validation.cpp b/src/validation.cpp
+index 3b8b6c07f43ec7445f38c04f28d242eb1083f3c5..d23a171eb6d5ba2b9cd2ee1d43d4773dbcd77ff8 100644
+--- a/src/validation.cpp
++++ b/src/validation.cpp
+@@ -761,12 +761,13 @@ bool CheckTxInputsFromResolvedCoins(const CTransaction &tx,
+                                     const std::vector<Coin> &resolved_inputs,
+                                     int nSpendHeight, Amount &txfee) {
+     Amount nValueIn = Amount::zero();
+-    std::map<uint256, std::pair<__uint128_t, __uint128_t>> tokenTotals;
+-    bool has_authority_input = false;
++    // Structural contributions to the conservation kinds.
++    lotus::v2::NativeConservation native;
++    lotus::v2::TokenConservation tokens;
+     for (size_t i = 0; i < tx.vin.size(); ++i) {
+         const auto &in = tx.vin[i];
+         if (in.nFlags == 3) {
+-            has_authority_input = true;
++            tokens.AddMint(Consensus::TokenKey(uint256(in.prevout.GetTxId())));
+             continue;
+         }
+         const Coin &coin = resolved_inputs[i];
+@@ -787,11 +788,11 @@ bool CheckTxInputsFromResolvedCoins(const CTransaction &tx,
+         uint256 tok_id;
+         uint64_t tok_val = 0;
+         if (ExtractTokenIdAndValueFast(prev_txout, tok_id, tok_val)) {
+-            if (prev_txout.nValue < Amount::zero()) {
++            if (prev_txout.nValue < Amount::zero() ||
++                !tokens.AddInput(Consensus::TokenKey(tok_id), tok_val)) {
+                 return state.Invalid(TxValidationResult::TX_CONSENSUS,
+                                      "bad-txns-inputvalues-outofrange");
+             }
+-            tokenTotals[tok_id].first += tok_val;
+             continue;
+         }
+         nValueIn += prev_txout.nValue;
+@@ -799,58 +800,22 @@ bool CheckTxInputsFromResolvedCoins(const CTransaction &tx,
+             return state.Invalid(TxValidationResult::TX_CONSENSUS,
+                                  "bad-txns-inputvalues-outofrange");
+         }
++        native.AddInput(uint64_t(prev_txout.nValue / SATOSHI));
+     }
+ 
+     for (const auto &out : tx.vout) {
+         uint256 tok_id;
+         uint64_t tok_val = 0;
+         if (ExtractTokenIdAndValueFast(out, tok_id, tok_val)) {
+-            if (out.nValue < Amount::zero()) {
++            if (out.nValue < Amount::zero() ||
++                !tokens.AddOutput(Consensus::TokenKey(tok_id), tok_val)) {
+                 return state.Invalid(TxValidationResult::TX_CONSENSUS,
+                                      "bad-txns-vout-negative");
+             }
+-            tokenTotals[tok_id].second += tok_val;
+         }
+     }
+ 
+-    if (!tokenTotals.empty() || has_authority_input) {
+-        std::set<uint256> positiveTokenDeltas;
+-        for (const auto &[tokenId, totals] : tokenTotals) {
+-            if (totals.second > totals.first) {
+-                positiveTokenDeltas.insert(tokenId);
+-            }
+-        }
+-        for (const auto &in : tx.vin) {
+-            if (in.nFlags != 3) {
+-                continue;
+-            }
+-            if (positiveTokenDeltas.erase(uint256(in.prevout.GetTxId())) != 1) {
+-                return state.Invalid(TxValidationResult::TX_CONSENSUS,
+-                                     "bad-txns-mint-without-positive-delta");
+-            }
+-        }
+-        if (!positiveTokenDeltas.empty()) {
+-            return state.Invalid(TxValidationResult::TX_CONSENSUS,
+-                                 "bad-txns-token-inflation");
+-        }
+-    }
+-
+-    const Amount value_out = tx.GetValueOut();
+-    if (nValueIn < value_out) {
+-        return state.Invalid(
+-            TxValidationResult::TX_CONSENSUS, "bad-txns-in-belowout",
+-            strprintf("value in (%s) < value out (%s)", FormatMoney(nValueIn),
+-                      FormatMoney(value_out)));
+-    }
+-
+-    const Amount txfee_aux = nValueIn - value_out;
+-    if (!MoneyRange(txfee_aux)) {
+-        return state.Invalid(TxValidationResult::TX_CONSENSUS,
+-                             "bad-txns-fee-outofrange");
+-    }
+-
+-    txfee = txfee_aux;
+-    return true;
++    return Consensus::FinishTxConservation(tx, native, tokens, nValueIn, state, txfee);
+ }
+ 
+ bool AreInputsStandardFromResolvedCoins(
+-- 
+2.50.1 (Apple Git-155)
+

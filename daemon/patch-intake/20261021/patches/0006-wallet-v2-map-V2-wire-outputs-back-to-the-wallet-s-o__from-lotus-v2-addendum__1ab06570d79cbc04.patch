@@ -1,0 +1,445 @@
+From 437c8bc2a4814e2ee5a7226cd93c7fba09a42cce Mon Sep 17 00:00:00 2001
+From: Shammah Chancellor <shammah.chancellor@notvalid.com>
+Date: Mon, 19 Oct 2026 12:14:38 -0700
+Subject: [PATCH] wallet(v2): map V2 wire outputs back to the wallet's own
+ scripts
+
+After a restart, a wallet that had mined 101 blocks and sent a few
+transactions listed only the sends in listtransactions, while
+getwalletinfo still counted every transaction. Its balance was zero,
+gettransaction showed coinbases with no details, and rescanblockchain
+found nothing.
+
+The miner adapts its coinbase outputs to V2 form: the in-memory CTxOut
+keeps the legacy scriptPubKey alongside a single branch,
+BranchLeaf(script). The V2 wire serialization (v2/031) carries only the
+branch, so every deserialized copy of such an output (the wallet
+database on load, a block read from disk while the wallet catches up or
+rescans, a block or transaction from a peer) has the synthetic 45-byte
+wire script from CTxOut::FromV2Output (v2/045). The inherited wallet
+only knows its legacy scripts, so IsMine failed for these outputs. Before
+the restart the wallet still held the miner's in-memory transactions,
+which is why the problem appeared only afterwards. Transactions the
+wallet creates are unaffected: their outputs have no branches and are
+serialized with their scripts.
+
+Each ScriptPubKeyMan now answers GetScriptForV2Branch from an index of
+the scripts it recognizes, rebuilt when they change. For the legacy
+manager these are P2PK and P2PKH for every key and watched pubkey, P2SH
+for every redeem script, and every watch-only script; for the
+descriptor manager, its scriptPubKey map. CWallet::WithV2OutputScripts
+restores the script of each plain single-branch output that the wallet
+knows. This leaves the TxId, TxHash and wire bytes unchanged, which the
+function checks. AddToWalletIfInvolvingMe applies it to every incoming
+transaction, and LoadWallet applies it to every loaded transaction
+once keys and scripts are loaded, since transaction records come
+first in the database.
+
+wallet_v2_output_scripts.py checks, across a restart with the same
+datadir, that listtransactions is unchanged and agrees with txcount,
+and that balances survive. It also checks that a restored coinbase can
+be spent, that blocks mined while the wallet was unloaded are found on
+load, and that a rescan from disk lists the same transactions. Without
+this change the test fails at the first check (6 entries instead of
+107).
+
+Tier: V2 (fixup to v2/031)
+---
+ src/wallet/scriptpubkeyman.cpp              | 75 +++++++++++++++++
+ src/wallet/scriptpubkeyman.h                | 31 +++++++
+ src/wallet/wallet.cpp                       | 55 ++++++++++++-
+ src/wallet/wallet.h                         | 12 +++
+ test/functional/wallet_v2_output_scripts.py | 89 +++++++++++++++++++++
+ 5 files changed, 261 insertions(+), 1 deletion(-)
+ create mode 100755 test/functional/wallet_v2_output_scripts.py
+
+diff --git a/src/wallet/scriptpubkeyman.cpp b/src/wallet/scriptpubkeyman.cpp
+index 3d596a11c3..d0776f94ef 100644
+--- a/src/wallet/scriptpubkeyman.cpp
++++ b/src/wallet/scriptpubkeyman.cpp
+@@ -6,6 +6,7 @@
+ #include <common/args.h>
+ #include <config.h>
+ #include <key_io.h>
++#include <lotus_v2/commitment.h>
+ #include <logging.h>
+ #include <node/types.h>
+ #include <outputtype.h>
+@@ -156,6 +157,58 @@ IsMineResult IsMineInner(const LegacyScriptPubKeyMan &keystore,
+ 
+ } // namespace
+ 
++namespace {
++uint256 V2BranchOf(const CScript &script) {
++    const lotus::v2::Hash leaf = lotus::v2::BranchLeaf(
++        std::span<const uint8_t>(script.data(), script.size()));
++    uint256 branch;
++    std::copy(leaf.begin(), leaf.end(), branch.begin());
++    return branch;
++}
++} // namespace
++
++std::optional<CScript>
++LegacyScriptPubKeyMan::GetScriptForV2Branch(const uint256 &branch) const {
++    LOCK(cs_KeyStore);
++    const std::array<size_t, 6> state{
++        mapKeys.size(),      mapCryptedKeys.size(), mapScripts.size(),
++        setWatchOnly.size(), mapWatchKeys.size(),   m_watch_only_removals};
++    if (state != m_v2_branch_index_state) {
++        // The scripts IsMine can recognize from what is stored: pay-to-pubkey
++        // and pay-to-pubkey-hash for every key, pay-to-script-hash for every
++        // redeem script, and every watch-only script.
++        m_v2_branch_scripts.clear();
++        const auto add = [&](const CScript &script) {
++            m_v2_branch_scripts.emplace(V2BranchOf(script), script);
++        };
++        const auto add_pubkey = [&](const CPubKey &pubkey) {
++            add(GetScriptForRawPubKey(pubkey));
++            add(GetScriptForDestination(PKHash(pubkey)));
++        };
++        for (const auto &[keyid, key] : mapKeys) {
++            add_pubkey(key.GetPubKey());
++        }
++        for (const auto &[keyid, crypted] : mapCryptedKeys) {
++            add_pubkey(crypted.first);
++        }
++        for (const auto &[keyid, pubkey] : mapWatchKeys) {
++            add_pubkey(pubkey);
++        }
++        for (const auto &[scriptid, script] : mapScripts) {
++            add(GetScriptForDestination(ScriptHash(script)));
++        }
++        for (const CScript &script : setWatchOnly) {
++            add(script);
++        }
++        m_v2_branch_index_state = state;
++    }
++    const auto it = m_v2_branch_scripts.find(branch);
++    if (it == m_v2_branch_scripts.end()) {
++        return std::nullopt;
++    }
++    return it->second;
++}
++
+ isminetype LegacyScriptPubKeyMan::IsMine(const CScript &script) const {
+     switch (IsMineInner(*this, script, IsMineSigVersion::TOP)) {
+         case IsMineResult::INVALID:
+@@ -822,6 +875,7 @@ bool LegacyScriptPubKeyMan::RemoveWatchOnly(const CScript &dest) {
+     {
+         LOCK(cs_KeyStore);
+         setWatchOnly.erase(dest);
++        ++m_watch_only_removals;
+         CPubKey pubKey;
+         if (ExtractPubKey(dest, pubKey)) {
+             mapWatchKeys.erase(pubKey.GetID());
+@@ -1710,6 +1764,25 @@ DescriptorScriptPubKeyMan::GetNewDestination(const OutputType type) {
+     }
+ }
+ 
++std::optional<CScript>
++DescriptorScriptPubKeyMan::GetScriptForV2Branch(const uint256 &branch) const {
++    LOCK(cs_desc_man);
++    // The map only grows between descriptor updates (which reset the
++    // index), so its size identifies its contents.
++    if (m_v2_branch_index_size != m_map_script_pub_keys.size()) {
++        m_v2_branch_scripts.clear();
++        for (const auto &[script, index] : m_map_script_pub_keys) {
++            m_v2_branch_scripts.emplace(V2BranchOf(script), script);
++        }
++        m_v2_branch_index_size = m_map_script_pub_keys.size();
++    }
++    const auto it = m_v2_branch_scripts.find(branch);
++    if (it == m_v2_branch_scripts.end()) {
++        return std::nullopt;
++    }
++    return it->second;
++}
++
+ isminetype DescriptorScriptPubKeyMan::IsMine(const CScript &script) const {
+     LOCK(cs_desc_man);
+     if (m_map_script_pub_keys.count(script) > 0) {
+@@ -2409,6 +2482,8 @@ void DescriptorScriptPubKeyMan::UpdateWalletDescriptor(
+ 
+     m_map_pubkeys.clear();
+     m_map_script_pub_keys.clear();
++    m_v2_branch_scripts.clear();
++    m_v2_branch_index_size = 0;
+     m_max_cached_index = -1;
+     m_wallet_descriptor = descriptor;
+ }
+diff --git a/src/wallet/scriptpubkeyman.h b/src/wallet/scriptpubkeyman.h
+index e61792a332..94673fd4bf 100644
+--- a/src/wallet/scriptpubkeyman.h
++++ b/src/wallet/scriptpubkeyman.h
+@@ -21,7 +21,10 @@
+ 
+ #include <boost/signals2/signal.hpp>
+ 
++#include <array>
+ #include <functional>
++#include <map>
++#include <optional>
+ #include <unordered_map>
+ 
+ enum class OutputType;
+@@ -179,6 +182,17 @@ public:
+     }
+     virtual isminetype IsMine(const CScript &script) const { return ISMINE_NO; }
+ 
++    /**
++     * A script this ScriptPubKeyMan recognizes whose V2 branch leaf
++     * (lotus::v2::BranchLeaf) is `branch`, if any. On the V2 wire a
++     * single-branch output commits to BranchLeaf(script) instead of carrying
++     * the script, so a deserialized output must be mapped back to it.
++     */
++    virtual std::optional<CScript>
++    GetScriptForV2Branch(const uint256 &branch) const {
++        return std::nullopt;
++    }
++
+     //! Check that the given decryption key is valid for this ScriptPubKeyMan,
+     //! i.e. it decrypts all of the keys handled by it.
+     virtual bool CheckDecryptionKey(const CKeyingMaterial &master_key,
+@@ -333,6 +347,15 @@ private:
+ 
+     int64_t nTimeFirstKey GUARDED_BY(cs_KeyStore) = 0;
+ 
++    //! Scripts by V2 branch leaf (see GetScriptForV2Branch), rebuilt when
++    //! the key, script or watch-only sets change.
++    mutable std::map<uint256, CScript>
++        m_v2_branch_scripts GUARDED_BY(cs_KeyStore);
++    mutable std::array<size_t, 6>
++        m_v2_branch_index_state GUARDED_BY(cs_KeyStore){};
++    //! Counts watch-only removals so the index sees a remove plus an add.
++    size_t m_watch_only_removals GUARDED_BY(cs_KeyStore) = 0;
++
+     bool AddKeyPubKeyInner(const CKey &key, const CPubKey &pubkey);
+     bool AddCryptedKeyInner(const CPubKey &vchPubKey,
+                             const std::vector<uint8_t> &vchCryptedSecret);
+@@ -433,6 +456,8 @@ public:
+     util::Result<CTxDestination>
+     GetNewDestination(const OutputType type) override;
+     isminetype IsMine(const CScript &script) const override;
++    std::optional<CScript>
++    GetScriptForV2Branch(const uint256 &branch) const override;
+ 
+     bool CheckDecryptionKey(const CKeyingMaterial &master_key,
+                             bool accept_no_keys = false) override;
+@@ -664,6 +689,10 @@ private:
+     using KeyMap = std::map<CKeyID, CKey>;
+ 
+     ScriptPubKeyMap m_map_script_pub_keys GUARDED_BY(cs_desc_man);
++    //! m_map_script_pub_keys by V2 branch leaf, rebuilt when it grows.
++    mutable std::map<uint256, CScript>
++        m_v2_branch_scripts GUARDED_BY(cs_desc_man);
++    mutable size_t m_v2_branch_index_size GUARDED_BY(cs_desc_man) = 0;
+     PubKeyMap m_map_pubkeys GUARDED_BY(cs_desc_man);
+     int32_t m_max_cached_index = -1;
+ 
+@@ -708,6 +737,8 @@ public:
+     util::Result<CTxDestination>
+     GetNewDestination(const OutputType type) override;
+     isminetype IsMine(const CScript &script) const override;
++    std::optional<CScript>
++    GetScriptForV2Branch(const uint256 &branch) const override;
+ 
+     bool CheckDecryptionKey(const CKeyingMaterial &master_key,
+                             bool accept_no_keys = false) override;
+diff --git a/src/wallet/wallet.cpp b/src/wallet/wallet.cpp
+index afd2d1f654..62c40068ea 100644
+--- a/src/wallet/wallet.cpp
++++ b/src/wallet/wallet.cpp
+@@ -1172,11 +1172,54 @@ bool CWallet::LoadToWallet(const TxId &txid, const UpdateWalletTxFn &fill_wtx) {
+     return true;
+ }
+ 
+-bool CWallet::AddToWalletIfInvolvingMe(const CTransactionRef &ptx,
++CTransactionRef CWallet::WithV2OutputScripts(const CTransactionRef &tx) const {
++    AssertLockHeld(cs_wallet);
++    std::optional<CMutableTransaction> restored;
++    for (size_t i = 0; i < tx->vout.size(); ++i) {
++        const CTxOut &out = tx->vout[i];
++        // The synthetic wire script of a plain single-branch output:
++        // flags 0, value, one branch, one path {0} (see CTxOut::FromV2Output).
++        const CScript &spk = out.scriptPubKey;
++        if (out.vBranches.size() != 1 || spk.size() != 45 || spk[0] != 0x00 ||
++            spk[9] != 0x01 || spk[42] != 0x01 || spk[43] != 0x01 ||
++            spk[44] != 0x00 ||
++            !std::equal(out.vBranches[0].begin(), out.vBranches[0].end(),
++                        spk.begin() + 10)) {
++            continue;
++        }
++        uint256 branch;
++        std::copy(out.vBranches[0].begin(), out.vBranches[0].end(),
++                  branch.begin());
++        for (const auto &spk_man_pair : m_spk_managers) {
++            if (auto script =
++                    spk_man_pair.second->GetScriptForV2Branch(branch)) {
++                if (!restored) {
++                    restored.emplace(*tx);
++                }
++                restored->vout[i].scriptPubKey = std::move(*script);
++                break;
++            }
++        }
++    }
++    if (!restored) {
++        return tx;
++    }
++    CTransactionRef result = MakeTransactionRef(std::move(*restored));
++    // The script is not part of the V2 wire or identity, so this cannot
++    // change; never substitute a different transaction if it somehow did.
++    if (result->GetId() != tx->GetId() || result->GetHash() != tx->GetHash()) {
++        return tx;
++    }
++    return result;
++}
++
++bool CWallet::AddToWalletIfInvolvingMe(const CTransactionRef &ptx_wire,
+                                        CWalletTx::Confirmation confirm,
+                                        bool fUpdate) {
+     AssertLockHeld(cs_wallet);
+ 
++    const CTransactionRef ptx = WithV2OutputScripts(ptx_wire);
++
+     const TxId &txid = ptx->GetId();
+ 
+     if (!confirm.hashBlock.IsNull()) {
+@@ -2278,6 +2321,16 @@ DBErrors CWallet::LoadWallet() {
+         return nLoadWalletRet;
+     }
+ 
++    // Transactions are read before the keys and scripts that recognize their
++    // outputs, so restore V2 output scripts once everything is loaded.
++    for (auto &[txid, wtx] : mapWallet) {
++        CTransactionRef tx = WithV2OutputScripts(wtx.tx);
++        if (tx != wtx.tx) {
++            wtx.tx = std::move(tx);
++            wtx.MarkDirty();
++        }
++    }
++
+     return DBErrors::LOAD_OK;
+ }
+ 
+diff --git a/src/wallet/wallet.h b/src/wallet/wallet.h
+index 85acc17483..11f3f4c14b 100644
+--- a/src/wallet/wallet.h
++++ b/src/wallet/wallet.h
+@@ -325,6 +325,18 @@ private:
+                                   CWalletTx::Confirmation confirm, bool fUpdate)
+         EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
+ 
++    /**
++     * A V2 output on the wire commits to BranchLeaf(script) instead of
++     * carrying its script, so a deserialized transaction (from the wallet
++     * database, a block read from disk or the network, or the mempool) has a
++     * synthetic scriptPubKey there. Returns tx with each such output's script
++     * restored when a ScriptPubKeyMan knows it, so that IsMine, balances and
++     * signing see the same script as for the transaction before it was
++     * serialized. The identity and wire bytes are unchanged.
++     */
++    CTransactionRef WithV2OutputScripts(const CTransactionRef &tx) const
++        EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
++
+     /**
+      * Mark a transaction (and its in-wallet descendants) as conflicting with a
+      * particular block.
+diff --git a/test/functional/wallet_v2_output_scripts.py b/test/functional/wallet_v2_output_scripts.py
+new file mode 100755
+index 0000000000..9dd7a30a80
+--- /dev/null
++++ b/test/functional/wallet_v2_output_scripts.py
+@@ -0,0 +1,89 @@
++#!/usr/bin/env python3
++# Copyright (c) 2026 The Lotus developers
++# Distributed under the MIT software license, see the accompanying
++# file COPYING or http://www.opensource.org/licenses/mit-license.php.
++"""Test that the wallet recognizes its V2 outputs after deserialization.
++
++A V2 single-branch output on the wire commits to BranchLeaf(script) instead of
++carrying the script. The coinbases a wallet mines are V2 outputs, so after a
++restart (wallet database), and for blocks read back from disk while the wallet
++was unloaded, the wallet only sees the synthetic wire script. It must map it
++back to its own script: listtransactions must agree with txcount and with what
++it listed before the restart, the balance must survive, and the restored
++coins must stay spendable.
++"""
++
++from decimal import Decimal
++
++from test_framework.test_framework import BitcoinTestFramework
++from test_framework.util import assert_equal
++
++
++def listing(wallet):
++    return sorted(
++        (e["txid"], e["category"], e.get("vout", -1), str(e["amount"]))
++        for e in wallet.listtransactions("*", 10_000)
++    )
++
++
++class WalletV2OutputScriptsTest(BitcoinTestFramework):
++    def set_test_params(self):
++        self.num_nodes = 1
++        self.setup_clean_chain = True
++
++    def skip_test_if_missing_module(self):
++        self.skip_if_no_wallet()
++
++    def check_consistent(self, wallet):
++        info = wallet.getwalletinfo()
++        txids = {e["txid"] for e in wallet.listtransactions("*", 10_000)}
++        assert_equal(len(txids), info["txcount"])
++
++    def run_test(self):
++        node = self.nodes[0]
++        wallet = node.get_wallet_rpc(self.default_wallet_name)
++        mine_to = wallet.getnewaddress()
++        self.generatetoaddress(node, 101, mine_to)
++        for _ in range(3):
++            wallet.sendtoaddress(wallet.getnewaddress(), Decimal("1000000"))
++        self.generatetoaddress(node, 1, mine_to)
++
++        before = listing(wallet)
++        info = wallet.getwalletinfo()
++        assert_equal(info["txcount"], 105)
++        self.check_consistent(wallet)
++
++        self.log.info("Restart the node with the same datadir")
++        self.restart_node(0)
++        wallet = node.get_wallet_rpc(self.default_wallet_name)
++        assert_equal(listing(wallet), before)
++        after = wallet.getwalletinfo()
++        assert_equal(after["txcount"], info["txcount"])
++        assert_equal(after["balance"], info["balance"])
++        assert_equal(after["immature_balance"], info["immature_balance"])
++        self.check_consistent(wallet)
++
++        self.log.info("Coins restored from the database stay spendable")
++        txid = wallet.sendtoaddress(wallet.getnewaddress(), Decimal("1000000"))
++        self.generatetoaddress(node, 1, mine_to)
++        assert_equal(wallet.gettransaction(txid)["confirmations"], 1)
++        self.check_consistent(wallet)
++
++        self.log.info("Blocks connected while the wallet is unloaded")
++        count = wallet.getwalletinfo()["txcount"]
++        node.unloadwallet(self.default_wallet_name)
++        node.createwallet("other")
++        self.generatetoaddress(node, 5, mine_to)
++        node.loadwallet(self.default_wallet_name)
++        wallet = node.get_wallet_rpc(self.default_wallet_name)
++        assert_equal(wallet.getwalletinfo()["txcount"], count + 5)
++        self.check_consistent(wallet)
++
++        self.log.info("A rescan from disk finds the same transactions")
++        before = listing(wallet)
++        wallet.rescanblockchain()
++        assert_equal(listing(wallet), before)
++
++
++if __name__ == "__main__":
++    WalletV2OutputScriptsTest().main()
+-- 
+2.50.1 (Apple Git-155)
+

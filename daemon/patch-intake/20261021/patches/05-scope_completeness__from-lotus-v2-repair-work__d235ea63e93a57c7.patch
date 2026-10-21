@@ -1,0 +1,482 @@
+From 5a3e5aa79bdd2ce17b6591816a3249d8d54f25e4 Mon Sep 17 00:00:00 2001
+From: Canonical endpoint audit <audit@localhost>
+Date: Sun, 18 Oct 2026 21:26:15 -0700
+Subject: [PATCH] net: reject incomplete reconciliation scopes without
+ truncating roots
+
+---
+ src/net/v2_protocol_handler.cpp        | 88 ++++++++++++++++++++++----
+ src/net/v2_protocol_handler.h          | 10 ++-
+ src/test/CMakeLists.txt                |  1 +
+ src/test/merklix_scope_tests.cpp       | 57 +++++++++++++++++
+ src/test/v2_protocol_handler_tests.cpp | 59 ++++++++---------
+ 5 files changed, 170 insertions(+), 45 deletions(-)
+ create mode 100644 src/test/merklix_scope_tests.cpp
+
+diff --git a/src/net/v2_protocol_handler.cpp b/src/net/v2_protocol_handler.cpp
+index 45eadedd23..3336442a9c 100644
+--- a/src/net/v2_protocol_handler.cpp
++++ b/src/net/v2_protocol_handler.cpp
+@@ -51,9 +51,6 @@ NormalizeCtorTxList(const std::vector<CTransactionRef> &txs) {
+                         return a->GetId() == b->GetId();
+                     }),
+         sorted.end());
+-    if (sorted.size() > V2PeerProtocolHandler::MAX_SCOPED_TXS) {
+-        sorted.resize(V2PeerProtocolHandler::MAX_SCOPED_TXS);
+-    }
+     return sorted;
+ }
+ 
+@@ -349,7 +346,12 @@ bool V2PeerProtocolHandler::TryHandleMessage(
+         msg_type == NetMsgType::GETSHORTTX || msg_type == NetMsgType::SHORTTX;
+     if (recon) {
+         if (AdmitReconMessage(pfrom, msg_type, vRecv, time_received)) {
+-            DispatchReconMessage(pfrom, msg_type, vRecv, time_received);
++            try {
++                DispatchReconMessage(pfrom, msg_type, vRecv, time_received);
++            } catch (const std::length_error &) {
++                // A concurrently grown live set no longer fits a complete
++                // scope; ordinary transaction relay remains enabled.
++            }
+         }
+         return true;
+     }
+@@ -410,6 +412,9 @@ bool V2PeerProtocolHandler::DispatchReconMessage(
+ bool V2PeerProtocolHandler::AdmitReconMessage(
+     CNode &peer, const std::string &type, DataStream &stream,
+     std::chrono::microseconds now) {
++    if (type != NetMsgType::SHORTTX && m_mempool.size() > MAX_SCOPED_TXS) {
++        return false; // Existing INV/getdata relay remains the fallback.
++    }
+     const bool payload = type == NetMsgType::SHORTTX;
+     // Charge scans independently of wire bytes: tiny requests can otherwise
+     // repeatedly trigger an expensive full-set walk. R3 replaces these walks.
+@@ -465,7 +470,11 @@ void V2PeerProtocolHandler::DrainReconMessages(
+             ++m_stats.recon_drained;
+         }
+         DataStream stream{Span{next->bytes}};
+-        DispatchReconMessage(peer, next->type, stream, now);
++        try {
++            DispatchReconMessage(peer, next->type, stream, now);
++        } catch (const std::length_error &) {
++            // Complete live scope grew beyond capacity while queued.
++        }
+     }
+ }
+ 
+@@ -516,18 +525,38 @@ bool V2PeerProtocolHandler::CheckPeerShardRateLimit(
+ 
+ void V2PeerProtocolHandler::RegisterCandidateOverlay(
+     const BlockHash &prev_block_hash, std::vector<CTransactionRef> txs) {
++    // Cache only complete candidates, without changing ABC merkle metadata.
++    if (txs.size() > MAX_SCOPED_TXS) return;
++    size_t bytes = 0;
++    for (const auto &tx : txs) {
++        if (!tx) continue;
++        bytes += GetSerializeSize(*tx);
++        if (bytes > MAX_SCOPED_TX_BYTES) return;
++    }
+     CandidateOverlayEntry entry = BuildCandidateOverlayEntry(txs);
++    entry.bytes = bytes;
+     LOCK(m_mutex);
++    while (!m_candidate_overlays.empty() &&
++           (m_candidate_cache_bytes + entry.bytes > MAX_SCOPED_CACHE_BYTES ||
++            (!m_candidate_overlays.count(prev_block_hash) &&
++             m_candidate_overlays.size() >= MAX_TRACKED_RECON_SCOPES))) {
++        const auto victim = m_candidate_overlays.begin();
++        for (const auto &old : victim->second) m_candidate_cache_bytes -= old.bytes;
++        m_candidate_overlays.erase(victim);
++    }
+     auto &vec = m_candidate_overlays[prev_block_hash];
+     if (vec.size() >= MAX_OVERLAYS_PER_PREV) {
++        m_candidate_cache_bytes -= vec.front().bytes;
+         vec.erase(vec.begin());
+     }
++    m_candidate_cache_bytes += entry.bytes;
+     vec.push_back(std::move(entry));
+ }
+ 
+ void V2PeerProtocolHandler::ClearCandidateOverlays() {
+     LOCK(m_mutex);
+     m_candidate_overlays.clear();
++    m_candidate_cache_bytes = 0;
+ }
+ 
+ std::shared_ptr<const CBlock> V2PeerProtocolHandler::MatchCandidateOverlay(
+@@ -844,21 +873,36 @@ void V2PeerProtocolHandler::HandleSealedHeader(CNode &pfrom,
+                              std::vector<CInv>{fallback_inv}));
+ }
+ 
+-void V2PeerProtocolHandler::SetScopedTransactions(
++bool V2PeerProtocolHandler::SetScopedTransactions(
+     ReconScope scope, const uint256 &context_id,
+     std::vector<CTransactionRef> txs) {
++    // Reject before sorting, copying, or hashing untrusted collections. An
++    // overflow is an unsupported complete scope, never a partial commitment.
++    if (txs.size() > MAX_SCOPED_TXS) return false;
++    size_t bytes = 0;
++    for (const auto &tx : txs) {
++        if (!tx) continue;
++        bytes += GetSerializeSize(*tx);
++        if (bytes > MAX_SCOPED_TX_BYTES) return false;
++    }
+     ScopedTxSetEntry entry;
++    entry.bytes = bytes;
+     entry.txs = NormalizeCtorTxList(txs);
+     entry.subtree_a_root = ComputeSubtreeAHash(entry.txs);
+     lotus::v2::ComputeNullMerkleRootAndBranch(entry.txs, entry.null_merkle_root,
+                                               entry.coinbase_merkle_branch);
+     LOCK(m_mutex);
+     const ScopeKey key{scope, context_id};
+-    if (m_scoped_txs.find(key) == m_scoped_txs.end() &&
+-        m_scoped_txs.size() >= MAX_TRACKED_RECON_SCOPES) {
++    const auto previous = m_scoped_txs.find(key);
++    const size_t old_bytes = previous == m_scoped_txs.end() ? 0 : previous->second.bytes;
++    if (m_scoped_cache_bytes - old_bytes + bytes > MAX_SCOPED_CACHE_BYTES) return false;
++    if (previous == m_scoped_txs.end() && m_scoped_txs.size() >= MAX_TRACKED_RECON_SCOPES) {
++        m_scoped_cache_bytes -= m_scoped_txs.begin()->second.bytes;
+         m_scoped_txs.erase(m_scoped_txs.begin());
+     }
++    m_scoped_cache_bytes = m_scoped_cache_bytes - old_bytes + bytes;
+     m_scoped_txs[key] = std::move(entry);
++    return true;
+ }
+ 
+ void V2PeerProtocolHandler::GetScopedTransactionsAndRoot(
+@@ -877,7 +921,10 @@ void V2PeerProtocolHandler::GetScopedTransactionsAndRoot(
+         std::vector<CTransactionRef> mempool_txs;
+         {
+             LOCK(m_mempool.cs);
+-            if (m_mempool.mapTx.size() <= MAX_SCOPED_TXS) {
++            if (m_mempool.mapTx.size() > MAX_SCOPED_TXS ||
++                m_mempool.GetTotalTxSize() > MAX_SCOPED_TX_BYTES)
++                throw std::length_error("Merklix complete live scope exceeds reconciliation capacity");
++            {
+                 const auto &layer =
+                     m_mempool.GetMerklixOverlay().GetSpeculativeOverlay();
+                 const auto &ordered = layer.GetOrderedTxs();
+@@ -1059,6 +1106,9 @@ MerklixSubBucketSummary V2PeerProtocolHandler::BuildSubBucketSummary(
+         }
+         const uint8_t sb = GetMerklixNibble(txid, child_nibble_idx);
+         const uint64_t sid = ComputeMerklixShortId(salt_k0, salt_k1, txid);
++        if (sub.sub_buckets[sb].count == std::numeric_limits<uint16_t>::max()) {
++            throw std::length_error("Merklix cell count exceeds legacy wire capacity");
++        }
+         sub.sub_buckets[sb].count += 1;
+         sub.sub_buckets[sb].s1 ^= sid;
+         sub.sub_buckets[sb].s3 ^= GF64Cube(sid);
+@@ -1288,6 +1338,7 @@ bool V2PeerProtocolHandler::MaybeSendSync(
+         peer.IsBlockOnlyConn() || peer.IsAddrFetchConn()) {
+         return false;
+     }
++    if (m_mempool.size() > MAX_SCOPED_TXS) return false;
+     const auto generation = m_mempool.GetTransactionsUpdated();
+     {
+         LOCK(m_mutex);
+@@ -1313,8 +1364,12 @@ bool V2PeerProtocolHandler::MaybeSendSync(
+             cached = m_live_sync_summary;
+         }
+     }
+-    const auto summary = cached ? *cached :
+-        BuildSyncSummary(ReconScope::LIVE_MEMPOOL, uint256{});
++    MerklixSyncSummary summary;
++    try {
++        summary = cached ? *cached : BuildSyncSummary(ReconScope::LIVE_MEMPOOL, uint256{});
++    } catch (const std::length_error &) {
++        return false;
++    }
+     {
+         LOCK(m_mutex);
+         auto &state = m_sync_announcements[peer.GetId()];
+@@ -1861,7 +1916,16 @@ void V2PeerProtocolHandler::HandleShortTx(
+         std::vector<CTransactionRef> merged =
+             GetScopedTransactions(scope, resp.context_id);
+         merged.insert(merged.end(), valid_txs.begin(), valid_txs.end());
+-        SetScopedTransactions(scope, resp.context_id, std::move(merged));
++        if (!SetScopedTransactions(scope, resp.context_id, std::move(merged))) {
++            // Accepted transactions remain in the real mempool and ordinary
++            // relay continues. Do not retain a partial scoped commitment.
++            LOCK(m_mutex);
++            const auto found = m_scoped_txs.find(ScopeKey{scope, resp.context_id});
++            if (found != m_scoped_txs.end()) {
++                m_scoped_cache_bytes -= found->second.bytes;
++                m_scoped_txs.erase(found);
++            }
++        }
+     }
+ 
+     m_peerman.RelayTransactionBatch(accepted_txs);
+diff --git a/src/net/v2_protocol_handler.h b/src/net/v2_protocol_handler.h
+index c57f2f32cc..e770aae972 100644
+--- a/src/net/v2_protocol_handler.h
++++ b/src/net/v2_protocol_handler.h
+@@ -97,6 +97,7 @@ struct CandidateOverlayEntry {
+     lotus::v2::Hash subtree_a_root{};
+     uint256 null_merkle_root{};
+     std::vector<uint256> coinbase_merkle_branch{};
++    size_t bytes{0};
+ };
+ 
+ /**
+@@ -417,7 +418,9 @@ public:
+     static constexpr size_t MAX_SEALEDHEADER_COINBASE_BYTES =
+         MAX_MINEDHEADER_COINBASE_BYTES;
+     static constexpr size_t MAX_TRACKED_RECON_SCOPES = 64;
+-    static constexpr size_t MAX_SCOPED_TXS = 4096;
++    static constexpr size_t MAX_SCOPED_TXS = 65536;
++    static constexpr size_t MAX_SCOPED_TX_BYTES = 32 * 1024 * 1024;
++    static constexpr size_t MAX_SCOPED_CACHE_BYTES = 64 * 1024 * 1024;
+ 
+     V2PeerProtocolHandler(ChainstateManager &chainman, CTxMemPool &mempool,
+                           CConnman &connman, PeerManager &peerman);
+@@ -575,7 +578,7 @@ public:
+      * the handler also reads directly from m_mempool when no explicit set is
+      * registered.
+      */
+-    void SetScopedTransactions(ReconScope scope, const uint256 &context_id,
++    [[nodiscard]] bool SetScopedTransactions(ReconScope scope, const uint256 &context_id,
+                                std::vector<CTransactionRef> txs)
+         EXCLUSIVE_LOCKS_REQUIRED(!m_mutex);
+ 
+@@ -778,6 +781,7 @@ private:
+     std::optional<MerklixSyncSummary> m_live_sync_summary GUARDED_BY(m_mutex);
+     unsigned int m_live_sync_generation GUARDED_BY(m_mutex){0};
+     FastSyncSwarmCoordinatorState m_swarm GUARDED_BY(m_mutex);
++    size_t m_candidate_cache_bytes GUARDED_BY(m_mutex){0};
+     std::map<BlockHash, std::vector<CandidateOverlayEntry>>
+         m_candidate_overlays GUARDED_BY(m_mutex);
+ 
+@@ -794,11 +798,13 @@ private:
+         }
+     };
+     struct ScopedTxSetEntry {
++        size_t bytes{0};
+         std::vector<CTransactionRef> txs;
+         lotus::v2::Hash subtree_a_root{};
+         uint256 null_merkle_root{};
+         std::vector<uint256> coinbase_merkle_branch{};
+     };
++    size_t m_scoped_cache_bytes GUARDED_BY(m_mutex){0};
+     std::map<ScopeKey, ScopedTxSetEntry>
+         m_scoped_txs GUARDED_BY(m_mutex);
+ 
+diff --git a/src/test/CMakeLists.txt b/src/test/CMakeLists.txt
+index 52013755e3..c4e8087224 100644
+--- a/src/test/CMakeLists.txt
++++ b/src/test/CMakeLists.txt
+@@ -276,6 +276,7 @@ add_boost_unit_tests_to_suite(bitcoin test_bitcoin
+ 		validation_flush_tests.cpp
+ 		validation_tests.cpp
+ 		validationinterface_tests.cpp
++		merklix_scope_tests.cpp
+ 		merklix_cost_budget_tests.cpp
+ 		merklix_wire_tests.cpp
+ 		blockindex_comparator_tests.cpp
+diff --git a/src/test/merklix_scope_tests.cpp b/src/test/merklix_scope_tests.cpp
+new file mode 100644
+index 0000000000..d886787537
+--- /dev/null
++++ b/src/test/merklix_scope_tests.cpp
+@@ -0,0 +1,57 @@
++// Copyright (c) 2026 The Lotus developers
++// Distributed under the MIT software license, see the accompanying
++// file COPYING or http://www.opensource.org/licenses/mit-license.php.
++#include <net/v2_protocol_handler.h>
++#include <net_processing.h>
++#include <net.h>
++#include <validation.h>
++#include <test/util/net.h>
++#include <test/util/setup_common.h>
++#include <primitives/transaction.h>
++#include <script/script.h>
++#include <boost/test/unit_test.hpp>
++using namespace lotus::v2::net;
++BOOST_FIXTURE_TEST_SUITE(merklix_scope_tests, RegTestingSetup)
++BOOST_AUTO_TEST_CASE(complete_scope_boundaries_and_ten_thousand_summary) {
++    const auto &config = m_node.chainman->GetConfig();
++    ConnmanTestMsg connman(config, 1, 2, *m_node.addrman);
++    auto peerman = PeerManager::make(connman, *m_node.addrman, nullptr,
++                                     *m_node.chainman, *m_node.mempool, nullptr, {});
++    auto *handler = peerman->GetV2ProtocolHandler();
++    BOOST_REQUIRE(handler);
++    std::vector<CTransactionRef> txs;
++    for (size_t i = 0; i <= V2PeerProtocolHandler::MAX_SCOPED_TXS; ++i) {
++        CMutableTransaction tx;
++        tx.nVersion = 2;
++        tx.vin.resize(1);
++        uint256 id;
++        for (unsigned byte = 0; byte < 8; ++byte)
++            id.begin()[byte] = static_cast<uint8_t>((i + 1) >> (8 * byte));
++        tx.vin[0].prevout = COutPoint(TxId(id), 0);
++        tx.vout.emplace_back(1000 * SATOSHI, CScript() << OP_TRUE);
++        txs.push_back(MakeTransactionRef(std::move(tx)));
++    }
++    const auto scope = ReconScope::BLOCK_RECON;
++    const uint256 context{123};
++    std::vector<CTransactionRef> ten_k(txs.begin(), txs.begin() + 10000);
++    BOOST_REQUIRE(handler->SetScopedTransactions(scope, context, ten_k));
++    const auto summary = handler->BuildSyncSummary(scope, context);
++    size_t count = 0;
++    for (const auto &bucket : summary.buckets) count += bucket.count;
++    BOOST_CHECK_EQUAL(count, 10000U);
++    BOOST_CHECK(summary.candidate_root == ComputeScopedMerklixRoot(ten_k));
++    std::vector<CTransactionRef> below(txs.begin(), txs.end() - 2);
++    BOOST_REQUIRE(handler->SetScopedTransactions(scope, context, below));
++    BOOST_CHECK_EQUAL(handler->GetScopedTransactions(scope, context).size(),
++                      V2PeerProtocolHandler::MAX_SCOPED_TXS - 1);
++    std::vector<CTransactionRef> at(txs.begin(), txs.end() - 1);
++    BOOST_REQUIRE(handler->SetScopedTransactions(scope, context, at));
++    const auto root = handler->BuildSyncSummary(scope, context).candidate_root;
++    BOOST_CHECK(!handler->SetScopedTransactions(scope, context, txs));
++    BOOST_CHECK_EQUAL(handler->GetScopedTransactions(scope, context).size(),
++                      V2PeerProtocolHandler::MAX_SCOPED_TXS);
++    BOOST_CHECK(root == handler->BuildSyncSummary(scope, context).candidate_root);
++    // Full-set normalization is independent of the recon resource bound.
++    BOOST_CHECK(ComputeScopedMerklixRoot(txs) != root);
++}
++BOOST_AUTO_TEST_SUITE_END()
+diff --git a/src/test/v2_protocol_handler_tests.cpp b/src/test/v2_protocol_handler_tests.cpp
+index 5faface933..0349b18181 100644
+--- a/src/test/v2_protocol_handler_tests.cpp
++++ b/src/test/v2_protocol_handler_tests.cpp
+@@ -458,10 +458,10 @@ BOOST_AUTO_TEST_CASE(merklix_reconciliation_all_scopes_and_limits) {
+         const auto [salt_k0, salt_k1] =
+             DeriveReconSipHashKey(scope, context_id, 0);
+ 
+-        v2_handler->SetScopedTransactions(scope, context_id, {shared_tx});
+-        remote_handler.SetScopedTransactions(
++        BOOST_REQUIRE(v2_handler->SetScopedTransactions(scope, context_id, {shared_tx}));
++        BOOST_REQUIRE(remote_handler.SetScopedTransactions(
+             scope, context_id,
+-            {shared_tx, single_missing_tx, pair_missing_tx1, pair_missing_tx2});
++            {shared_tx, single_missing_tx, pair_missing_tx1, pair_missing_tx2}));
+ 
+         // Step 1: Remote builds depth-4 MerklixSyncSummary and sends it to
+         // local handler.
+@@ -740,11 +740,11 @@ BOOST_AUTO_TEST_CASE(adversarial_c1_d1_d2_hardening_gates) {
+                                          {overlay_tx});
+     v2_handler->RegisterCandidateOverlay(
+         BlockHash(overlay_block->hashMerkleRoot), {overlay_tx});
+-    v2_handler->SetScopedTransactions(ReconScope::BLOCK_RECON,
++    BOOST_REQUIRE(v2_handler->SetScopedTransactions(ReconScope::BLOCK_RECON,
+                                       overlay_block->hashPrevBlock,
+-                                      {overlay_tx});
+-    v2_handler->SetScopedTransactions(ReconScope::BLOCK_RECON,
+-                                      overlay_block->GetHash(), {overlay_tx});
++                                      {overlay_tx}));
++    BOOST_REQUIRE(v2_handler->SetScopedTransactions(ReconScope::BLOCK_RECON,
++                                      overlay_block->GetHash(), {overlay_tx}));
+     {
+         auto matched_explicit = v2_handler->MatchCandidateOverlay(
+             *overlay_block, overlay_block->vtx[0], overlay_cb_branch);
+@@ -774,10 +774,10 @@ BOOST_AUTO_TEST_CASE(adversarial_c1_d1_d2_hardening_gates) {
+                         dup_cb_blk, overlay_tx, overlay_cb_branch) == nullptr);
+     }
+     v2_handler->ClearCandidateOverlays();
+-    v2_handler->SetScopedTransactions(ReconScope::BLOCK_RECON,
+-                                      overlay_block->hashPrevBlock, {});
+-    v2_handler->SetScopedTransactions(ReconScope::BLOCK_RECON,
+-                                      overlay_block->GetHash(), {});
++    BOOST_REQUIRE(v2_handler->SetScopedTransactions(ReconScope::BLOCK_RECON,
++                                      overlay_block->hashPrevBlock, {}));
++    BOOST_REQUIRE(v2_handler->SetScopedTransactions(ReconScope::BLOCK_RECON,
++                                      overlay_block->GetHash(), {}));
+     {
+         TestMemPoolEntryHelper entry;
+         LOCK2(cs_main, m_node.mempool->cs);
+@@ -856,8 +856,8 @@ BOOST_AUTO_TEST_CASE(adversarial_c1_d1_d2_hardening_gates) {
+         const uint256 ctx_id = rng.rand256();
+         const auto [k0, k1] =
+             DeriveReconSipHashKey(ReconScope::BLOCK_RECON, ctx_id, 0);
+-        v2_handler->SetScopedTransactions(ReconScope::BLOCK_RECON, ctx_id,
+-                                          {overlay_tx});
++        BOOST_REQUIRE(v2_handler->SetScopedTransactions(ReconScope::BLOCK_RECON, ctx_id,
++                                          {overlay_tx}));
+         MerklixSyncSummary summary_with_forged_root =
+             v2_handler->BuildSyncSummary(ReconScope::BLOCK_RECON, ctx_id, k0,
+                                          k1);
+@@ -875,8 +875,8 @@ BOOST_AUTO_TEST_CASE(adversarial_c1_d1_d2_hardening_gates) {
+     cur_time += 2'000'000us;
+     {
+         const uint256 recon_ctx = rng.rand256();
+-        v2_handler->SetScopedTransactions(ReconScope::BLOCK_RECON, recon_ctx,
+-                                          {});
++        BOOST_REQUIRE(v2_handler->SetScopedTransactions(ReconScope::BLOCK_RECON, recon_ctx,
++                                          {}));
+ 
+         // Create an invalid transaction spending a non-existent UTXO (not in
+         // CoinsTip or mempool).
+@@ -916,8 +916,8 @@ BOOST_AUTO_TEST_CASE(adversarial_c1_d1_d2_hardening_gates) {
+         // Bounded m_scoped_txs eviction (MAX_TRACKED_RECON_SCOPES == 64)
+         for (size_t i = 0; i < V2PeerProtocolHandler::MAX_TRACKED_RECON_SCOPES + 2;
+              ++i) {
+-            v2_handler->SetScopedTransactions(ReconScope::BLOCK_RECON,
+-                                              rng.rand256(), {overlay_tx});
++            BOOST_REQUIRE(v2_handler->SetScopedTransactions(ReconScope::BLOCK_RECON,
++                                              rng.rand256(), {overlay_tx}));
+         }
+         BOOST_CHECK(
+             v2_handler
+@@ -925,8 +925,8 @@ BOOST_AUTO_TEST_CASE(adversarial_c1_d1_d2_hardening_gates) {
+                 .empty());
+ 
+         const uint256 z_ctx = rng.rand256();
+-        v2_handler->SetScopedTransactions(ReconScope::BLOCK_RECON, z_ctx,
+-                                          {overlay_tx});
++        BOOST_REQUIRE(v2_handler->SetScopedTransactions(ReconScope::BLOCK_RECON, z_ctx,
++                                          {overlay_tx}));
+         MerklixSyncSummary z_sync =
+             v2_handler->BuildSyncSummary(ReconScope::BLOCK_RECON, z_ctx, 0, 0);
+         z_sync.salt_k0 = 0;
+@@ -1124,7 +1124,7 @@ BOOST_AUTO_TEST_CASE(adversarial_c1_d1_d2_hardening_gates) {
+         BOOST_CHECK_EQUAL(sym2_diff.missing_short_ids.size(), 1U);
+         BOOST_CHECK_EQUAL(sym2_diff.missing_short_ids[0], remote_only_sid);
+ 
+-        // SetScopedTransactions cap at MAX_SCOPED_TXS (4096)
++        // An oversized complete scope is rejected, never silently truncated.
+         std::vector<CTransactionRef> many_txs;
+         many_txs.reserve(V2PeerProtocolHandler::MAX_SCOPED_TXS + 2);
+         CMutableTransaction base_mtx(*overlay_tx);
+@@ -1133,12 +1133,9 @@ BOOST_AUTO_TEST_CASE(adversarial_c1_d1_d2_hardening_gates) {
+             many_txs.push_back(MakeTransactionRef(base_mtx));
+         }
+         const uint256 cap_ctx = rng.rand256();
+-        v2_handler->SetScopedTransactions(ReconScope::BLOCK_RECON, cap_ctx,
+-                                          std::move(many_txs));
+-        BOOST_CHECK_EQUAL(
+-            v2_handler->GetScopedTransactions(ReconScope::BLOCK_RECON, cap_ctx)
+-                .size(),
+-            V2PeerProtocolHandler::MAX_SCOPED_TXS);
++        BOOST_CHECK(!v2_handler->SetScopedTransactions(ReconScope::BLOCK_RECON, cap_ctx,
++                                          std::move(many_txs)));
++        BOOST_CHECK(v2_handler->GetScopedTransactions(ReconScope::BLOCK_RECON, cap_ctx).empty());
+ 
+         // Rate-limit exhaustion across GETMERKLIXBUCK, MERKLIXBUCK, GETSHORTTX, SHORTTX
+         cur_time += 5'000'000us;
+@@ -1266,9 +1263,9 @@ BOOST_AUTO_TEST_CASE(
+ 
+         // Local has 1 extra tx (chosen[3]); Remote has 3 missing txs
+         // (chosen[0], chosen[1], chosen[2]). Count delta is +3 - 1 = +2.
+-        local_handler->SetScopedTransactions(scope, ctx_id, {chosen[3]});
+-        remote_handler.SetScopedTransactions(
+-            scope, ctx_id, {chosen[0], chosen[1], chosen[2]});
++        BOOST_REQUIRE(local_handler->SetScopedTransactions(scope, ctx_id, {chosen[3]}));
++        BOOST_REQUIRE(remote_handler.SetScopedTransactions(
++            scope, ctx_id, {chosen[0], chosen[1], chosen[2]}));
+ 
+         const MerklixSubBucketSummary remote_sub8 =
+             remote_handler.BuildSubBucketSummary(scope, ctx_id, k0, k1, 0x5);
+@@ -1306,8 +1303,8 @@ BOOST_AUTO_TEST_CASE(
+             remote_txs.push_back(tx);
+         }
+ 
+-        local_handler->SetScopedTransactions(scope, ctx_id, {shared_tx});
+-        remote_handler.SetScopedTransactions(scope, ctx_id, remote_txs);
++        BOOST_REQUIRE(local_handler->SetScopedTransactions(scope, ctx_id, {shared_tx}));
++        BOOST_REQUIRE(remote_handler.SetScopedTransactions(scope, ctx_id, remote_txs));
+ 
+         {
+             LOCK(peer_node.cs_vSend);
+-- 
+2.50.1 (Apple Git-155)
+

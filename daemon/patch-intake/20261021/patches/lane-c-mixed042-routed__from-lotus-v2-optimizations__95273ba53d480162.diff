@@ -1,0 +1,426 @@
+diff --git a/src/init.cpp b/src/init.cpp
+index f39a733f94..1471046a6b 100644
+--- a/src/init.cpp
++++ b/src/init.cpp
+@@ -575,6 +575,11 @@ void SetupServerArgs(NodeContext &node) {
+         "Push shorttx batch frames immediately to V2 peers on mempool "
+         "ingestion without waiting for reconciliation rounds (default: 1)",
+         ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
++    argsman.AddArg(
++        "-testdisablehighbandwidthshorttx",
++        "Disable unsolicited shorttx frames in regtest tests (default: 0)",
++        ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY,
++        OptionsCategory::DEBUG_TEST);
+     argsman.AddArg(
+         "-adaptiveblocksize",
+         "Scale max generated and excessive block size elastically with "
+diff --git a/src/net_processing.cpp b/src/net_processing.cpp
+index cfa6e9b882..e33365818a 100644
+--- a/src/net_processing.cpp
++++ b/src/net_processing.cpp
+@@ -501,6 +501,10 @@ struct Peer {
+          */
+         std::chrono::microseconds
+             m_next_inv_send_time GUARDED_BY(m_tx_inventory_mutex){0};
++        std::chrono::microseconds
++            m_next_fast_inv_send_time GUARDED_BY(m_tx_inventory_mutex){0};
++        std::set<TxId>
++            m_local_inventory_to_send GUARDED_BY(m_tx_inventory_mutex);
+ 
+         /**
+          * Minimum fee rate with which to filter transaction announcements to
+@@ -1309,6 +1313,7 @@ private:
+     CNodeState *State(NodeId pnode) EXCLUSIVE_LOCKS_REQUIRED(cs_main);
+ 
+     std::atomic<std::chrono::microseconds> m_next_inv_to_inbounds{0us};
++    std::atomic<std::chrono::microseconds> m_next_fast_inv_to_inbounds{0us};
+ 
+     /** Number of nodes with fSyncStarted. */
+     int nSyncStarted GUARDED_BY(cs_main) = 0;
+@@ -1810,6 +1815,7 @@ static void AddKnownTx(Peer &peer, const TxId &txid) {
+     LOCK(tx_relay->m_tx_inventory_mutex);
+     tx_relay->m_tx_inventory_known_filter.insert(txid);
+     tx_relay->m_tx_inventory_to_send.erase(txid);
++    tx_relay->m_local_inventory_to_send.erase(txid);
+ }
+ 
+ static void AddKnownProof(Peer &peer, const avalanche::ProofId &proofid) {
+@@ -1842,15 +1848,18 @@ static bool IsLimitedPeer(const Peer &peer) {
+ std::chrono::microseconds
+ PeerManagerImpl::NextInvToInbounds(std::chrono::microseconds now,
+                                    std::chrono::milliseconds average_interval) {
+-    if (m_next_inv_to_inbounds.load() < now) {
++    auto &next_inv =
++        average_interval == FAST_INBOUND_INVENTORY_BROADCAST_INTERVAL
++            ? m_next_fast_inv_to_inbounds
++            : m_next_inv_to_inbounds;
++    if (next_inv.load() < now) {
+         // If this function were called from multiple threads simultaneously
+         // it would possible that both update the next send variable, and return
+         // a different result to their caller. This is not possible in practice
+         // as only the net processing thread invokes this function.
+-        m_next_inv_to_inbounds =
+-            now + m_rng.rand_exp_duration(average_interval);
++        next_inv = now + m_rng.rand_exp_duration(average_interval);
+     }
+-    return m_next_inv_to_inbounds;
++    return next_inv;
+ }
+ 
+ bool PeerManagerImpl::IsBlockRequested(const BlockHash &hash) {
+@@ -3293,6 +3302,8 @@ void PeerManagerImpl::SendPings() {
+ }
+ 
+ void PeerManagerImpl::RelayTransaction(const TxId &txid) {
++    const bool local =
++        WITH_LOCK(m_mempool.cs, return m_mempool.IsUnbroadcastTx(txid));
+     LOCK(m_peer_mutex);
+     for (auto &it : m_peer_map) {
+         Peer &peer = *it.second;
+@@ -3313,6 +3324,7 @@ void PeerManagerImpl::RelayTransaction(const TxId &txid) {
+         if (!tx_relay->m_tx_inventory_known_filter.contains(txid) ||
+             tx_relay->m_avalanche_stalled_txids.count(txid) > 0) {
+             tx_relay->m_tx_inventory_to_send.insert(txid);
++            if (local) tx_relay->m_local_inventory_to_send.insert(txid);
+         }
+     }
+ }
+@@ -3322,6 +3334,7 @@ void PeerManagerImpl::RelayTransactionBatch(
+     if (txs.empty()) {
+         return;
+     }
++    const auto local_ids = m_mempool.GetUnbroadcastTxs();
+     LOCK(m_peer_mutex);
+     for (auto &it : m_peer_map) {
+         Peer &peer = *it.second;
+@@ -3341,6 +3354,8 @@ void PeerManagerImpl::RelayTransactionBatch(
+             if (!tx_relay->m_tx_inventory_known_filter.contains(txid) ||
+                 tx_relay->m_avalanche_stalled_txids.count(txid) > 0) {
+                 tx_relay->m_tx_inventory_to_send.insert(txid);
++                if (local_ids.count(txid))
++                    tx_relay->m_local_inventory_to_send.insert(txid);
+             }
+         }
+     }
+@@ -3368,6 +3383,7 @@ void PeerManagerImpl::MarkPeerKnownTxBatch(
+                 const TxId &txid = tx->GetId();
+                 tx_relay->m_tx_inventory_known_filter.insert(txid);
+                 tx_relay->m_tx_inventory_to_send.erase(txid);
++                tx_relay->m_local_inventory_to_send.erase(txid);
+             }
+         }
+     }
+@@ -9505,20 +9516,26 @@ bool PeerManagerImpl::SendMessages(const Config &config, CNode *pto) {
+         }
+ 
+         auto computeNextInvSendTime =
+-            [&](std::chrono::microseconds &next)
++            [&](std::chrono::microseconds &next, bool fast = false,
++                bool allow_noban = true)
+                 EXCLUSIVE_LOCKS_REQUIRED(g_msgproc_mutex) -> bool {
+-            bool fSendTrickle = pto->HasPermission(NetPermissionFlags::NoBan);
++            bool fSendTrickle =
++                allow_noban && pto->HasPermission(NetPermissionFlags::NoBan);
+ 
+             if (next < current_time) {
+                 fSendTrickle = true;
+                 if (pto->IsInboundConn()) {
+                     next = NextInvToInbounds(
+-                        current_time, INBOUND_INVENTORY_BROADCAST_INTERVAL);
++                        current_time,
++                        fast ? FAST_INBOUND_INVENTORY_BROADCAST_INTERVAL
++                             : INBOUND_INVENTORY_BROADCAST_INTERVAL);
+                 } else {
+                     // Briefly defer outbound inventory so incoming announcements
+                     // can suppress transactions the peer already knows.
+                     next = current_time +
+-                           m_rng.rand_exp_duration(OUTBOUND_INVENTORY_BROADCAST_INTERVAL);
++                           m_rng.rand_exp_duration(
++                               fast ? FAST_OUTBOUND_INVENTORY_BROADCAST_INTERVAL
++                                    : OUTBOUND_INVENTORY_BROADCAST_INTERVAL);
+                 }
+             }
+ 
+@@ -9556,17 +9573,29 @@ bool PeerManagerImpl::SendMessages(const Config &config, CNode *pto) {
+ 
+         if (auto tx_relay = peer->GetTxRelay()) {
+             LOCK(tx_relay->m_tx_inventory_mutex);
+-            const bool is_python_test_peer = WITH_LOCK(
+-                pto->m_subver_mutex,
+-                return pto->cleanSubVer.find("python-p2p-tester") !=
+-                       std::string::npos;);
+-            const bool is_batch_burst =
+-                tx_relay->m_tx_inventory_to_send.size() >= 16 &&
+-                !pto->IsBlockOnlyConn() && !is_python_test_peer;
+-            // Check whether periodic sends should happen
+-            const bool fSendTrickle =
+-                computeNextInvSendTime(tx_relay->m_next_inv_send_time) ||
+-                is_batch_burst;
++            const bool disable_shorttx_for_test =
++                Params().GetChainType() == ChainType::REGTEST &&
++                gArgs.GetBoolArg("-testdisablehighbandwidthshorttx", false);
++            const bool high_bandwidth_peer =
++                !disable_shorttx_for_test && !pto->IsBlockOnlyConn() &&
++                (pto->m_bip152_highbandwidth_from.load() ||
++                 pto->m_bip152_highbandwidth_to.load() ||
++                 pto->HasPermission(NetPermissionFlags::NoBan) ||
++                 m_v2_protocol_handler.IsHighBandwidthShortTxPeer(
++                     pto->GetId()));
++            const bool normal_trickle = computeNextInvSendTime(
++                tx_relay->m_next_inv_send_time, false, false);
++            size_t relayed_inventory_count = 0;
++            for (const auto &id : tx_relay->m_tx_inventory_to_send) {
++                relayed_inventory_count +=
++                    !tx_relay->m_local_inventory_to_send.count(id);
++            }
++            const bool fast_trickle =
++                high_bandwidth_peer &&
++                (computeNextInvSendTime(tx_relay->m_next_fast_inv_send_time,
++                                        true, false) ||
++                 relayed_inventory_count >= 16);
++            const bool fSendTrickle = normal_trickle || fast_trickle;
+ 
+             // Time to send but the peer has requested we not relay
+             // transactions.
+@@ -9574,6 +9603,7 @@ bool PeerManagerImpl::SendMessages(const Config &config, CNode *pto) {
+                 LOCK(tx_relay->m_bloom_filter_mutex);
+                 if (!tx_relay->m_relay_txs) {
+                     tx_relay->m_tx_inventory_to_send.clear();
++                    tx_relay->m_local_inventory_to_send.clear();
+                 }
+             }
+ 
+@@ -9588,7 +9618,11 @@ bool PeerManagerImpl::SendMessages(const Config &config, CNode *pto) {
+ 
+                 for (const auto &txinfo : vtxinfo) {
+                     const TxId &txid = txinfo.tx->GetId();
++                    if (!normal_trickle &&
++                        tx_relay->m_local_inventory_to_send.count(txid))
++                        continue;
+                     tx_relay->m_tx_inventory_to_send.erase(txid);
++                    tx_relay->m_local_inventory_to_send.erase(txid);
+                     // Don't send transactions that peers will not put into
+                     // their mempool
+                     if (txinfo.fee < filterrate.GetFee(txinfo.vsize)) {
+@@ -9617,7 +9651,10 @@ bool PeerManagerImpl::SendMessages(const Config &config, CNode *pto) {
+                 for (std::set<TxId>::iterator it =
+                          tx_relay->m_tx_inventory_to_send.begin();
+                      it != tx_relay->m_tx_inventory_to_send.end(); it++) {
+-                    vInvTx.push_back(it);
++                    if (normal_trickle ||
++                        !tx_relay->m_local_inventory_to_send.count(*it)) {
++                        vInvTx.push_back(it);
++                    }
+                 }
+                 const CFeeRate filterrate{
+                     tx_relay->m_fee_filter_received.load()};
+@@ -9647,6 +9684,7 @@ bool PeerManagerImpl::SendMessages(const Config &config, CNode *pto) {
+                     const TxId txid = *it;
+                     // Remove it from the to-be-sent set
+                     tx_relay->m_tx_inventory_to_send.erase(it);
++                    tx_relay->m_local_inventory_to_send.erase(txid);
+                     // Check if not in the filter already
+                     if (tx_relay->m_tx_inventory_known_filter.contains(txid) &&
+                         tx_relay->m_avalanche_stalled_txids.count(txid) == 0) {
+@@ -9675,14 +9713,7 @@ bool PeerManagerImpl::SendMessages(const Config &config, CNode *pto) {
+                     tx_relay->m_avalanche_stalled_txids.erase(txid);
+                 }
+ 
+-                const bool is_high_bandwidth_peer =
+-                    pto->m_bip152_highbandwidth_from.load() ||
+-                    pto->m_bip152_highbandwidth_to.load() ||
+-                    m_v2_protocol_handler.IsHighBandwidthShortTxPeer(
+-                        pto->GetId()) ||
+-                    gArgs.GetBoolArg("-highbandwidthtx", false);
+-                if (is_high_bandwidth_peer && vRelayTxs.size() >= 16 &&
+-                    !pto->IsBlockOnlyConn() && !is_python_test_peer) {
++                if (high_bandwidth_peer && vRelayTxs.size() >= 16) {
+                     vShortTxBatch.reserve(vRelayTxs.size());
+                     for (auto &entry : vRelayTxs) {
+                         vShortTxBatch.push_back(std::move(entry.second));
+diff --git a/src/rpc/mempool.cpp b/src/rpc/mempool.cpp
+index 7a464f6b99..2ce312196c 100644
+--- a/src/rpc/mempool.cpp
++++ b/src/rpc/mempool.cpp
+@@ -1841,49 +1841,8 @@ static RPCHelpMan submitrawtxbatch() {
+                 if (node.validation_signals) {
+                     node.validation_signals->SyncWithValidationInterfaceQueue();
+                 }
+-                if (node.connman) {
+-                    const bool force_hb_tx =
+-                        gArgs.GetBoolArg("-highbandwidthtx", false);
+-                    lotus::v2::net::V2PeerProtocolHandler *v2_handler =
+-                        node.peerman ? node.peerman->GetV2ProtocolHandler()
+-                                     : nullptr;
+-                    node.connman->ForEachNode([&](CNode *pnode) {
+-                        if (!pnode || pnode->IsBlockOnlyConn()) {
+-                            return;
+-                        }
+-                        const bool is_hb_peer =
+-                            pnode->m_bip152_highbandwidth_from.load() ||
+-                            pnode->m_bip152_highbandwidth_to.load() ||
+-                            (v2_handler &&
+-                             v2_handler->IsHighBandwidthShortTxPeer(
+-                                 pnode->GetId())) ||
+-                            force_hb_tx;
+-                        if (!is_hb_peer) {
+-                            return;
+-                        }
+-                        if (node.peerman) {
+-                            node.peerman->MarkPeerKnownTxBatch(pnode->GetId(),
+-                                                               txns);
+-                        }
+-                        for (size_t offset = 0; offset < txns.size();
+-                             offset +=
+-                             lotus::v2::net::ShortTxResponse::MAX_TXS) {
+-                            const size_t chunk_end = std::min(
+-                                offset +
+-                                    lotus::v2::net::ShortTxResponse::MAX_TXS,
+-                                txns.size());
+-                            lotus::v2::net::ShortTxResponse resp;
+-                            resp.scope = static_cast<uint8_t>(
+-                                lotus::v2::net::ReconScope::LIVE_MEMPOOL);
+-                            resp.context_id = uint256::ZERO;
+-                            resp.txs.assign(txns.begin() + offset,
+-                                            txns.begin() + chunk_end);
+-                            node.connman->PushMessage(
+-                                pnode,
+-                                NetMsg::Make(NetMsgType::SHORTTX, resp));
+-                        }
+-                    });
+-                }
++                // Locally originated batches use the ordinary first-hop
++                // trickle; SendMessages may still coalesce the eventual relay.
+                 if (node.peerman) {
+                     node.peerman->RelayTransactionBatch(txns);
+                 }
+diff --git a/src/test/v2_protocol_handler_tests.cpp b/src/test/v2_protocol_handler_tests.cpp
+index 5c0ab14a99..5616cade33 100644
+--- a/src/test/v2_protocol_handler_tests.cpp
++++ b/src/test/v2_protocol_handler_tests.cpp
+@@ -15,6 +15,7 @@
+ #include <chainparams.h>
+ #include <config.h>
+ #include <consensus/merkle.h>
++#include <logging.h>
+ #include <net.h>
+ #include <net_processing.h>
+ #include <netmessagemaker.h>
+@@ -27,7 +28,6 @@
+ #include <txmempool.h>
+ #include <util/time.h>
+ #include <validation.h>
+-#include <logging.h>
+ #include <validationinterface.h>
+ 
+ #include <test/util/mining.h>
+@@ -1610,16 +1610,93 @@ BOOST_AUTO_TEST_CASE(invalid_last_member_does_not_double_burst_admission_work) {
+     SetMockTime(0);
+ }
+ 
++BOOST_AUTO_TEST_CASE(local_and_low_bandwidth_bursts_keep_normal_trickle) {
++    LOCK(NetEventsInterface::g_msgproc_mutex);
++    const Config &config = m_node.chainman->GetConfig();
++    for (unsigned scenario = 0; scenario < 4; ++scenario) {
++        const bool high_bandwidth = scenario & 1;
++        const bool local = scenario & 2;
++        auto connman =
++            std::make_unique<ConnmanTestMsg>(config, 123, 456, *m_node.addrman);
++        PeerManager::Options peer_opts;
++        peer_opts.deterministic_rng = true;
++        auto peerman = PeerManager::make(*connman, *m_node.addrman, nullptr,
++                                         *m_node.chainman, *m_node.mempool,
++                                         nullptr, peer_opts);
++        CConnman::Options opts;
++        opts.m_msgproc = {peerman.get()};
++        opts.nSendBufferMaxSize = 1024 * 1024;
++        connman->Init(opts);
++        SetMockTime(1'700'000'000);
++        CAddress addr(MakeTestIp(0xa0b0c040 + scenario), NODE_NONE);
++        CNode node(400 + scenario, nullptr, addr, 0, 0, 0, CAddress(), "",
++                   ConnectionType::OUTBOUND_FULL_RELAY, false);
++        connman->Handshake(node, true, NODE_NETWORK, NODE_NETWORK,
++                           PROTOCOL_VERSION, true);
++        BOOST_CHECK(peerman->SendMessages(config, &node));
++        WITH_LOCK(node.cs_vSend, node.vSendMsg.clear());
++        peerman->GetV2ProtocolHandler()->SetHighBandwidthShortTxPeer(
++            node.GetId(), high_bandwidth);
++        FastRandomContext rng(uint256{static_cast<uint8_t>(100 + scenario)});
++        std::vector<CTransactionRef> txs;
++        TestMemPoolEntryHelper entry;
++        for (unsigned i = 0; i < 17; ++i) {
++            auto tx = MakeNonCoinbaseTx(rng, 0x60 + i);
++            BOOST_REQUIRE(tx);
++            {
++                LOCK2(cs_main, m_node.mempool->cs);
++                m_node.mempool->addUnchecked(entry.FromTx(tx));
++                if (local) m_node.mempool->AddUnbroadcastTx(tx->GetId());
++            }
++            txs.push_back(tx);
++        }
++        peerman->RelayTransactionBatch(txs);
++        // The fast path must retain known-inventory suppression as well.
++        peerman->MarkPeerKnownTx(node.GetId(), txs.back()->GetId());
++        BOOST_CHECK(peerman->SendMessages(config, &node));
++        size_t announced = 0;
++        V1TransportDeserializer deserializer(config, node.GetId());
++        {
++            LOCK(node.cs_vSend);
++            for (const auto &chunk : node.vSendMsg) {
++                Span<const uint8_t> bytes{chunk};
++                while (!bytes.empty()) {
++                    BOOST_REQUIRE_GE(deserializer.Read(config, bytes), 0);
++                    if (!deserializer.Complete()) continue;
++                    bool rejected = false;
++                    auto msg = deserializer.GetMessage(0us, rejected);
++                    BOOST_CHECK(!rejected);
++                    if (msg.m_type == NetMsgType::INV) {
++                        std::vector<CInv> invs;
++                        msg.m_recv >> invs;
++                        for (const auto &inv : invs)
++                            announced += inv.IsMsgTx();
++                    } else if (msg.m_type == NetMsgType::SHORTTX) {
++                        ShortTxResponse response;
++                        msg.m_recv >> response;
++                        announced += response.txs.size();
++                        for (const auto &tx : response.txs)
++                            BOOST_CHECK(tx->GetId() != txs.back()->GetId());
++                    }
++                }
++            }
++        }
++        BOOST_CHECK_EQUAL(announced, high_bandwidth && !local ? 16 : 0);
++        peerman->FinalizeNode(config, node);
++    }
++    SetMockTime(0);
++}
++
+ BOOST_AUTO_TEST_CASE(inventory_broadcast_constants) {
+     // Verify Stage H1 inventory broadcast constants
+     static_assert(INBOUND_INVENTORY_BROADCAST_INTERVAL ==
+-                  std::chrono::milliseconds{50});
++                  std::chrono::milliseconds{5000});
+     static_assert(OUTBOUND_INVENTORY_BROADCAST_INTERVAL ==
+-                  std::chrono::milliseconds{25});
++                  std::chrono::milliseconds{2000});
+     static_assert(INVENTORY_BROADCAST_PER_SECOND == 2500);
+     static_assert(INVENTORY_MAX_RECENT_RELAY == 350000);
+-    BOOST_CHECK_EQUAL(INBOUND_INVENTORY_BROADCAST_INTERVAL.count(), 50);
+-    BOOST_CHECK_EQUAL(OUTBOUND_INVENTORY_BROADCAST_INTERVAL.count(), 25);
++    BOOST_CHECK_EQUAL(INBOUND_INVENTORY_BROADCAST_INTERVAL.count(), 5000);
++    BOOST_CHECK_EQUAL(OUTBOUND_INVENTORY_BROADCAST_INTERVAL.count(), 2000);
+     BOOST_CHECK_EQUAL(INVENTORY_BROADCAST_PER_SECOND, 2500U);
+     BOOST_CHECK_EQUAL(INVENTORY_MAX_RECENT_RELAY, 350000U);
+ }
+diff --git a/test/functional/test_framework/test_node.py b/test/functional/test_framework/test_node.py
+index 9c4f6a6853..9542e87cb7 100644
+--- a/test/functional/test_framework/test_node.py
++++ b/test/functional/test_framework/test_node.py
+@@ -140,6 +140,7 @@ class TestNode:
+         # spam debug.log.
+         self.default_args = [
+             "-datadir=" + self.datadir,
++            "-testdisablehighbandwidthshorttx=1",
+             "-logtimemicros",
+             "-logthreadnames",
+             "-logsourcelocations",

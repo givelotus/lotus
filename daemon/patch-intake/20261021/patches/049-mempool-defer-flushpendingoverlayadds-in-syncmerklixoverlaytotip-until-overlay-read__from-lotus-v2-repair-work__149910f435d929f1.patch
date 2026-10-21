@@ -1,0 +1,208 @@
+From 2d2c89a2955fece00ab1bbe9f3359c16e43a7929 Mon Sep 17 00:00:00 2001
+From: Shammah Chancellor <shammah.chancellor@notvalid.com>
+Date: Sun, 18 Oct 2026 01:33:30 -0700
+Subject: [PATCH] mempool: defer FlushPendingOverlayAdds in
+ SyncMerklixOverlayToTip until overlay read
+
+Keep SyncMerklixOverlayToTip O(1) during block connect and tip updates by
+deferring pending Merklix overlay flushes until a template or sync reader
+queries the overlay.
+
+Original-Commit: 182b61908f156c240116fd49f53abc4220f95831
+Original-Patch: ecash/038
+Split-Concern: whole
+
+Historical compilation prerequisites are tracked separately in daemon/patch-audit;
+this provenance-preserving split does not imply standalone build validation.
+
+Candidate-Application-Repair: Preserve original endpoint warm-overlay/tip-reset implementation and supply its missing declaration/atomic warm flag at first owner. Keep the existing single generic bulk-clear implementation; omit the second accidental duplicate definition containing V2 token-input nFlags (absent in eCash). Token-input adapter is tracked for actual V2 transaction owner. Retain COW publication bookkeeping and every original assertion.
+
+Plan-v2 owner repair: B6: a contended overlay warm logs its deferred status; readers flush pending changes.
+
+diff --git a/src/test/mempool_tests.cpp b/src/test/mempool_tests.cpp
+index 765d63c0f7..9750a98c13 100644
+--- a/src/test/mempool_tests.cpp
++++ b/src/test/mempool_tests.cpp
+@@ -3,6 +3,7 @@
+ // file COPYING or http://www.opensource.org/licenses/mit-license.php.
+ 
+ #include <txmempool.h>
++#include <test/util/logging.h>
+ #include <node/snapshot.h>
+ 
+ #include <common/system.h>
+@@ -1055,4 +1056,29 @@ BOOST_AUTO_TEST_CASE(deferred_overlay_randomized_operations_match_full_rebuild)
+     }
+ }
+ 
++BOOST_AUTO_TEST_CASE(contended_overlay_warm_reports_skip_and_reader_flushes) {
++    CTxMemPool &pool = *m_node.mempool;
++    LOCK2(cs_main, pool.cs);
++    TestMemPoolEntryHelper entry;
++    CMutableTransaction tx;
++    tx.vin.emplace_back(TxId{uint256{uint8_t(1)}}, 0);
++    tx.vout.emplace_back(1000 * SATOSHI, CScript() << OP_TRUE);
++    auto ref = MakeTransactionRef(tx);
++    pool.addUnchecked(entry.FromTx(ref));
++    bool logged = false;
++    const bool was_enabled = LogInstance().WillLogCategory(BCLog::MEMPOOL);
++    LogInstance().EnableCategory(BCLog::MEMPOOL);
++    {
++        DebugLogHelper capture("Merklix overlay warm deferred: mempool lock busy",
++            [&](const std::string *line) { if (line) logged = true; return false; });
++        std::thread warmer([&] {
++            pool.WarmMerklixOverlayIfNeeded(BlockHash(uint256{uint8_t(1)}), 1, 0);
++        });
++        warmer.join();
++    }
++    if (!was_enabled) LogInstance().DisableCategory(BCLog::MEMPOOL);
++    BOOST_CHECK(logged);
++    BOOST_CHECK_EQUAL(pool.GetMerklixOverlay().GetSpeculativeOverlay().GetTxCount(), 1U);
++}
++
+ BOOST_AUTO_TEST_SUITE_END()
+diff --git a/src/txmempool.cpp b/src/txmempool.cpp
+index f2f6501571..674041eca5 100644
+--- a/src/txmempool.cpp
++++ b/src/txmempool.cpp
+@@ -215,6 +215,7 @@ void CTxMemPool::addUnchecked(CTxMemPoolEntryRef entry) {
+     UpdateParentsOf(true, newit);
+     m_pending_overlay_adds.emplace_back(tx, entry->GetFee() / SATOSHI,
+                                        entry->GetSigChecks());
++    m_overlay_warm.store(false, std::memory_order_relaxed);
+ 
+     nTransactionsUpdated++;
+     totalTxSize += entry->GetTxSize();
+@@ -230,6 +231,7 @@ void CTxMemPool::removeUnchecked(txiter it, MemPoolRemovalReason reason) {
+ 
+     const CTransaction &tx = (*it)->GetTx();
+     const TxId &txid = tx.GetId();
++    m_overlay_warm.store(false, std::memory_order_relaxed);
+     MarkSnapshotEntryChanged(txid);
+ 
+     if (m_snapshot_defer_depth > 0) {
+@@ -421,6 +423,7 @@ void CTxMemPool::_clear() {
+     m_pending_overlay_adds.clear();
+     m_pending_overlay_removes.clear();
+     m_merklix_overlay.Clear();
++    m_overlay_warm.store(true, std::memory_order_relaxed);
+     mapTx.clear();
+     mapNextTx.clear();
+     m_utxo_fast_filter.ClearMempool();
+@@ -495,25 +498,82 @@ const lotus::v2::MempoolOverlayLayer &CTxMemPool::FreezeEpochBatch() {
+ }
+ 
+ void CTxMemPool::SyncMerklixOverlayToTip(const BlockHash &tip_hash,
+-                                       uint64_t next_height,
+-                                       uint64_t parent_mtp) const {
++                                         uint64_t next_height,
++                                         uint64_t next_mtp) const {
+     AssertLockHeld(cs);
++    lotus::v2::Hash tip_id{};
++    std::memcpy(tip_id.data(), tip_hash.begin(), 32);
++    if (m_merklix_overlay.IsAnchoredAt(tip_id, next_height, next_mtp)) {
++        FlushPendingOverlayAdds();
++        return;
++    }
++    if (m_merklix_overlay.GetSpeculativeOverlay().GetTxCount() > 0 ||
++        !m_pending_overlay_removes.empty()) {
++        FlushPendingOverlayAdds();
++    }
++    std::shared_ptr<const lotus::v2::SmtNode> utxo_root;
++    lotus::v2::MonetaryState mon_state = lotus::v2::GetInitialV2MonetaryState();
++    m_merklix_overlay.ReanchorExistingTxs(tip_id, std::move(utxo_root),
++                                          mon_state, next_height, next_mtp);
+     FlushPendingOverlayAdds();
++}
++
++void CTxMemPool::ConnectBlockReset(const BlockHash &new_tip_hash,
++                                   uint64_t next_height,
++                                   uint64_t next_mtp) {
++    AssertLockHeld(cs);
++    m_overlay_warm.store(false, std::memory_order_relaxed);
+     lotus::v2::Hash tip_id{};
+-    std::copy(tip_hash.begin(), tip_hash.end(), tip_id.begin());
+-    if (!m_merklix_overlay.IsAnchoredAt(tip_id, next_height, parent_mtp)) {
+-        // eCash does not commit this arena's UTXO/monetary state in its header.
+-        // These neutral adapter values never replace eCash consensus checks.
++    std::memcpy(tip_id.data(), new_tip_hash.begin(), 32);
++    std::shared_ptr<const lotus::v2::SmtNode> utxo_root;
++    lotus::v2::MonetaryState mon_state = lotus::v2::GetInitialV2MonetaryState();
++    if (mapTx.empty()) {
++        m_pending_overlay_adds.clear();
++        m_pending_overlay_removes.clear();
++        m_merklix_overlay.ResetToTip(tip_id, std::move(utxo_root), mon_state,
++                                     next_height, next_mtp);
++        m_overlay_warm.store(true, std::memory_order_release);
++    } else if (!m_pending_overlay_removes.empty()) {
++        m_pending_overlay_adds.clear();
++        m_pending_overlay_removes.clear();
++        m_merklix_overlay.ResetToTip(tip_id, std::move(utxo_root), mon_state,
++                                     next_height, next_mtp);
++        std::vector<std::tuple<CTransactionRef, int64_t, int64_t>> remaining;
++        remaining.reserve(mapTx.size());
++        for (const auto &entry : mapTx.get<entry_id>()) {
++            remaining.emplace_back(entry->GetSharedTx(),
++                                   entry->GetFee() / SATOSHI,
++                                   entry->GetSigChecks());
++        }
++        AddTransactionsToOverlayBatch(m_merklix_overlay, remaining);
++    } else {
++        FlushPendingOverlayAdds();
+         m_merklix_overlay.ReanchorExistingTxs(
+-            tip_id, nullptr, lotus::v2::GetInitialV2MonetaryState(),
+-            next_height, parent_mtp);
++            tip_id, std::move(utxo_root), mon_state, next_height, next_mtp);
+     }
+ }
+ 
+-void CTxMemPool::ConnectBlockReset(const BlockHash &tip_hash,
+-                                  uint64_t next_height,
+-                                  uint64_t parent_mtp) {
+-    SyncMerklixOverlayToTip(tip_hash, next_height, parent_mtp);
++void CTxMemPool::WarmMerklixOverlayIfNeeded(const BlockHash &tip_hash,
++                                            uint64_t next_height,
++                                            uint64_t next_mtp) const {
++    if (m_overlay_warm.load(std::memory_order_acquire) || tip_hash.IsNull()) {
++        return;
++    }
++    TRY_LOCK(cs, lock_mp);
++    if (!lock_mp) {
++        LogDebug(BCLog::MEMPOOL, "Merklix overlay warm deferred: mempool lock busy\n");
++        return;
++    }
++    if (mapTx.empty()) {
++        m_overlay_warm.store(true, std::memory_order_release);
++        return;
++    }
++    SyncMerklixOverlayToTip(tip_hash, next_height, next_mtp);
++    FlushPendingOverlayAdds();
++    const auto &spec = m_merklix_overlay.GetSpeculativeOverlay();
++    (void)spec.GetSubtreeARoot();
++    (void)spec.GetUtxoRoot();
++    m_overlay_warm.store(true, std::memory_order_release);
+ }
+ 
+ bool CTxMemPool::TryClearAllForConnectedBlock(
+diff --git a/src/txmempool.h b/src/txmempool.h
+index 2701db78bc..52b966683e 100644
+--- a/src/txmempool.h
++++ b/src/txmempool.h
+@@ -607,6 +607,9 @@ public:
+     }
+ 
+     void FlushPendingOverlayAdds() const EXCLUSIVE_LOCKS_REQUIRED(cs);
++    void WarmMerklixOverlayIfNeeded(const BlockHash &tip_hash,
++                                   uint64_t next_height, uint64_t next_mtp) const;
++
+ 
+     /** Shared speculative transaction overlay; not proof of script validity. */
+     lotus::v2::MerklixOverlayManager &GetMerklixOverlay() const
+@@ -695,6 +698,7 @@ private:
+     mutable std::vector<std::tuple<CTransactionRef, int64_t, int64_t>>
+         m_pending_overlay_adds GUARDED_BY(cs);
+     mutable std::vector<TxId> m_pending_overlay_removes GUARDED_BY(cs);
++    mutable std::atomic<bool> m_overlay_warm{false};
+     /** Set ancestor state for an entry */
+     void UpdateEntryForAncestors(txiter it, const setEntries *setAncestors)
+         EXCLUSIVE_LOCKS_REQUIRED(cs);

@@ -1,0 +1,369 @@
+From 7e85235fa32712cf3ef5f4a325fd1d4f9b1a764e Mon Sep 17 00:00:00 2001
+From: Canonical endpoint audit <audit@localhost>
+Date: Sun, 18 Oct 2026 21:16:15 -0700
+Subject: [PATCH] avalanche: bound epoch cadence by population p90 RTT and tail
+ capacity
+
+---
+ src/avalanche/processor.cpp                   | 96 ++++++++++++++-----
+ src/avalanche/processor.h                     | 27 ++++--
+ .../test/preconsensus_batch_tests.cpp         | 34 ++++++-
+ src/init.cpp                                  |  4 +
+ src/net_processing.cpp                        |  5 +-
+ src/rpc/avalanche.cpp                         | 13 +++
+ 6 files changed, 140 insertions(+), 39 deletions(-)
+
+diff --git a/src/avalanche/processor.cpp b/src/avalanche/processor.cpp
+index 98058ace32..0924bb6e65 100644
+--- a/src/avalanche/processor.cpp
++++ b/src/avalanche/processor.cpp
+@@ -447,7 +447,7 @@ Processor::MakeProcessor(const ArgsManager &argsman, interfaces::Chain &chain,
+     }
+ 
+     // We can't use std::make_unique with a private constructor
+-    return std::unique_ptr<Processor>(new Processor(
++    auto processor = std::unique_ptr<Processor>(new Processor(
+         std::move(avaconfig), chain, connman, chainman, mempool, scheduler,
+         std::move(peerData), std::move(sessionKey),
+         Proof::amountToScore(minQuorumStake), minQuorumConnectedStakeRatio,
+@@ -460,6 +460,13 @@ Processor::MakeProcessor(const ArgsManager &argsman, interfaces::Chain &chain,
+                            DEFAULT_AVALANCHE_STAKING_PRECONSENSUS),
+         // This is safe because we ensure size_t is >= 32 bits in assumptions.h
+         static_cast<size_t>(maxElementPoll)));
++    const auto epochMinMs = argsman.GetIntArg("-epochminms", 100);
++    if (epochMinMs < 1 || epochMinMs > 1000) {
++        error = _("The -epochminms value must be between 1 and 1000.");
++        return nullptr;
++    }
++    processor->getAdaptiveEpochController().setMinWindowMs(epochMinMs);
++    return processor;
+ }
+ 
+ static bool isNull(const AnyVoteItem &item) {
+@@ -635,7 +642,7 @@ bool Processor::registerVotes(NodeId nodeid, const Response &response,
+     const auto now = Now<SteadyMilliseconds>();
+     const auto sentTime = queryTimeout - avaconfig.queryTimeoutDuration;
+     if (now >= sentTime) {
+-        m_adaptiveEpochController.recordPollRtt(now - sentTime);
++        m_adaptiveEpochController.recordPollRtt(now - sentTime, nodeid);
+     }
+ 
+     // Verify that the request and the vote are consistent.
+@@ -1185,6 +1192,7 @@ void Processor::FinalizeNode(const ::Config &config, const CNode &node) {
+     AssertLockNotHeld(cs_main);
+ 
+     const NodeId nodeid = node.GetId();
++    m_adaptiveEpochController.removePeer(nodeid);
+     WITH_LOCK(cs_peerManager, peerManager->removeNode(nodeid));
+     WITH_LOCK(cs_delayedAvahelloNodeIds, delayedAvahelloNodeIds.erase(nodeid));
+ }
+@@ -1280,35 +1288,76 @@ bool Processor::setContenderStatusForLocalWinners(
+         pindex, winners, AVALANCHE_CONTENDER_MAX_POLLABLE, pollableContenders);
+ }
+ 
++double Processor::AdaptiveEpochController::rttFloorLocked() const {
++    AssertLockHeld(m_cs);
++    std::vector<double> samples;
++    for (const auto &[_, rtt] : m_peerRtts) {
++        samples.push_back(rtt);
++    }
++    if (samples.empty()) {
++        return m_minWindowMs;
++    }
++    std::sort(samples.begin(), samples.end());
++    const size_t index = (9 * samples.size() + 9) / 10 - 1;
++    return std::clamp(samples[index], m_minWindowMs, 1000.0);
++}
++
+ void Processor::AdaptiveEpochController::recordPollRtt(
+-    std::chrono::milliseconds rtt) {
+-    recordPollRttMs(static_cast<double>(rtt.count()));
++    std::chrono::milliseconds rtt, NodeId peer) {
++    recordPollRttMs(static_cast<double>(rtt.count()), peer);
+ }
+ 
+-void Processor::AdaptiveEpochController::recordPollRttMs(double rttMs) {
+-    LOCK(m_cs);
+-    const double clampedRtt = std::max(0.1, rttMs);
+-    if (m_rttSampleCount == 0) {
+-        m_rttEwmaMs = clampedRtt;
+-        if (m_settlingWindowMs <= 0.0) {
+-            m_settlingWindowMs = clampedRtt;
+-        }
+-    } else {
+-        m_rttEwmaMs =
+-            (1.0 - m_ewmaAlpha) * m_rttEwmaMs + m_ewmaAlpha * clampedRtt;
+-        if (m_settlingWindowMs < m_rttEwmaMs) {
+-            m_settlingWindowMs = m_rttEwmaMs;
+-        }
++void Processor::AdaptiveEpochController::recordPollRttMs(double rttMs, NodeId peer) {
++    if (!std::isfinite(rttMs) || rttMs < 0.0) {
++        return;
+     }
++    LOCK(m_cs);
++    const double clampedRtt = std::clamp(rttMs, 0.1, 1000.0);
++    m_rttEwmaMs = m_rttSampleCount == 0 ? clampedRtt :
++        (1.0 - m_ewmaAlpha) * m_rttEwmaMs + m_ewmaAlpha * clampedRtt;
++    // One observation per connected peer, so a frequently polled fast peer
++    // does not dominate the population percentile. Bound unsolicited state.
++    if (!m_peerRtts.count(peer) && m_peerRtts.size() >= 256) {
++        m_peerRtts.erase(m_peerRtts.begin());
++    }
++    m_peerRtts[peer] = clampedRtt;
++    m_settlingWindowMs = std::max(m_settlingWindowMs, rttFloorLocked());
+     ++m_rttSampleCount;
+ }
+ 
++void Processor::AdaptiveEpochController::removePeer(NodeId peer) {
++    LOCK(m_cs);
++    m_peerRtts.erase(peer);
++}
++
++void Processor::AdaptiveEpochController::setMinWindowMs(double ms) {
++    LOCK(m_cs);
++    m_minWindowMs = std::isfinite(ms) ? std::clamp(ms, 1.0, 1000.0) : 100.0;
++    m_settlingWindowMs = std::clamp(m_settlingWindowMs, rttFloorLocked(), 1000.0);
++}
++
++double Processor::AdaptiveEpochController::getRttP90Ms() const {
++    LOCK(m_cs);
++    return rttFloorLocked();
++}
++
++uint64_t Processor::AdaptiveEpochController::getFreezeCount() const {
++    LOCK(m_cs);
++    return m_freezeCount;
++}
++
++double Processor::AdaptiveEpochController::getFreezeRateHz() const {
++    LOCK(m_cs);
++    const auto elapsed = (Now<SteadyMilliseconds>() - m_createdAt).count();
++    return elapsed > 0 ? 1000.0 * m_freezeCount / elapsed : 0.0;
++}
++
+ void Processor::AdaptiveEpochController::recordCleanFastPath() {
+     LOCK(m_cs);
+     ++m_fastPathFinalizedCount;
+     m_missRateEwma = (1.0 - m_ewmaAlpha) * m_missRateEwma;
+ 
+-    const double floorMs = std::max(0.1, m_rttEwmaMs);
++    const double floorMs = rttFloorLocked();
+     if (m_settlingWindowMs > floorMs) {
+         const double delta = std::max(floorMs * m_ewmaAlpha,
+                                       (m_settlingWindowMs - floorMs) * 0.25);
+@@ -1323,9 +1372,8 @@ void Processor::AdaptiveEpochController::recordMissOrConflict() {
+     ++m_conflictOrMissCount;
+     m_missRateEwma = (1.0 - m_ewmaAlpha) * m_missRateEwma + m_ewmaAlpha * 1.0;
+ 
+-    const double baseMs = std::max({0.1, m_settlingWindowMs, m_rttEwmaMs});
+-    const double maxWindowMs =
+-        static_cast<double>(AVALANCHE_DEFAULT_QUERY_TIMEOUT.count());
++    const double baseMs = std::max(m_settlingWindowMs, rttFloorLocked());
++    const double maxWindowMs = 1000.0;
+     m_settlingWindowMs = std::min(maxWindowMs, 2.0 * baseMs);
+ }
+ 
+@@ -1333,6 +1381,7 @@ void Processor::AdaptiveEpochController::recordBatchFrozen(
+     SteadyMilliseconds now) {
+     LOCK(m_cs);
+     m_lastFreezeTime = now;
++    ++m_freezeCount;
+ }
+ 
+ bool Processor::AdaptiveEpochController::shouldPipelineNextBatch(
+@@ -1344,9 +1393,6 @@ bool Processor::AdaptiveEpochController::shouldPipelineNextBatch(
+     if (unfrozenTailTxCount >= m_minBatchTxCount) {
+         return true;
+     }
+-    if (m_lastFreezeTime.time_since_epoch().count() == 0) {
+-        return true;
+-    }
+     const double elapsedMs =
+         static_cast<double>((now - m_lastFreezeTime).count());
+     return elapsedMs >= m_settlingWindowMs;
+diff --git a/src/avalanche/processor.h b/src/avalanche/processor.h
+index ab0ade9b91..c4002d1ae7 100644
+--- a/src/avalanche/processor.h
++++ b/src/avalanche/processor.h
+@@ -311,11 +311,10 @@ public:
+      * batches.
+      *
+      * Replaces fixed periodic batch timers with:
+-     *  1. Event-driven back-to-back pipelining when an epoch batch finalizes
+-     *     and the speculative mempool tail has accumulated >= minBatchTxCount
+-     *     transactions (or the adaptive settling window has elapsed).
++     *  1. Pipeline a nonempty speculative tail once the settling window has
++     *     elapsed, or early at the 10,000-transaction memory cap.
+      *  2. An AIMD settling window (tau_settle) coupled directly to live network
+-     *     telemetry: the EWMA of observed peer poll round-trip times (RTT_poll)
++     *     telemetry: the population p90 of observed peer poll RTTs (RTT_poll)
+      *     and the observed batch reconciliation / conflict miss rate (r_miss).
+      *     - Clean 1-RTT fast-path finalization -> Additive Decrease toward
+      *       RTT_poll.
+@@ -327,21 +326,31 @@ public:
+         mutable Mutex m_cs;
+         double m_rttEwmaMs GUARDED_BY(m_cs){0.0};
+         double m_missRateEwma GUARDED_BY(m_cs){0.0};
+-        double m_settlingWindowMs GUARDED_BY(m_cs){0.0};
++        double m_settlingWindowMs GUARDED_BY(m_cs){100.0};
++        double m_minWindowMs GUARDED_BY(m_cs){100.0};
++        std::map<NodeId, double> m_peerRtts GUARDED_BY(m_cs);
++        double rttFloorLocked() const EXCLUSIVE_LOCKS_REQUIRED(m_cs);
++        uint64_t m_freezeCount GUARDED_BY(m_cs){0};
++        SteadyMilliseconds m_createdAt{Now<SteadyMilliseconds>()};
+         double m_ewmaAlpha GUARDED_BY(m_cs){0.125};
+-        size_t m_minBatchTxCount GUARDED_BY(m_cs){1};
++        size_t m_minBatchTxCount GUARDED_BY(m_cs){10000};
+         uint64_t m_rttSampleCount GUARDED_BY(m_cs){0};
+         uint64_t m_fastPathFinalizedCount GUARDED_BY(m_cs){0};
+         uint64_t m_conflictOrMissCount GUARDED_BY(m_cs){0};
+-        SteadyMilliseconds m_lastFreezeTime GUARDED_BY(m_cs){};
++        SteadyMilliseconds m_lastFreezeTime GUARDED_BY(m_cs){Now<SteadyMilliseconds>()};
+         bool m_autoPipelineEnabled GUARDED_BY(m_cs){true};
+ 
+     public:
+         AdaptiveEpochController() = default;
+ 
+-        void recordPollRtt(std::chrono::milliseconds rtt)
++        void recordPollRtt(std::chrono::milliseconds rtt, NodeId peer = -1)
+             EXCLUSIVE_LOCKS_REQUIRED(!m_cs);
+-        void recordPollRttMs(double rttMs) EXCLUSIVE_LOCKS_REQUIRED(!m_cs);
++        void recordPollRttMs(double rttMs, NodeId peer = -1) EXCLUSIVE_LOCKS_REQUIRED(!m_cs);
++        void removePeer(NodeId peer) EXCLUSIVE_LOCKS_REQUIRED(!m_cs);
++        void setMinWindowMs(double ms) EXCLUSIVE_LOCKS_REQUIRED(!m_cs);
++        double getRttP90Ms() const EXCLUSIVE_LOCKS_REQUIRED(!m_cs);
++        uint64_t getFreezeCount() const EXCLUSIVE_LOCKS_REQUIRED(!m_cs);
++        double getFreezeRateHz() const EXCLUSIVE_LOCKS_REQUIRED(!m_cs);
+ 
+         void recordCleanFastPath() EXCLUSIVE_LOCKS_REQUIRED(!m_cs);
+         void recordMissOrConflict() EXCLUSIVE_LOCKS_REQUIRED(!m_cs);
+diff --git a/src/avalanche/test/preconsensus_batch_tests.cpp b/src/avalanche/test/preconsensus_batch_tests.cpp
+index f3626656e7..cc9d7e6722 100644
+--- a/src/avalanche/test/preconsensus_batch_tests.cpp
++++ b/src/avalanche/test/preconsensus_batch_tests.cpp
+@@ -726,6 +726,32 @@ BOOST_FIXTURE_TEST_CASE(mysticeti_contention_fallback_to_metastable_snowball,
+         m_node.avalanche->getConfidence(MempoolBatchVoteItem(batchC)), 1);
+ }
+ 
++BOOST_AUTO_TEST_CASE(epoch_controller_population_p90_and_memory_cap) {
++    avalanche::Processor::AdaptiveEpochController ctrl;
++    const SteadyMilliseconds start{std::chrono::milliseconds{1000}};
++    ctrl.recordBatchFrozen(start);
++    BOOST_CHECK(!ctrl.shouldPipelineNextBatch(1, start + std::chrono::milliseconds{99}));
++    BOOST_CHECK(ctrl.shouldPipelineNextBatch(1, start + std::chrono::milliseconds{100}));
++    BOOST_CHECK(!ctrl.shouldPipelineNextBatch(0, start + std::chrono::seconds{1}));
++    BOOST_CHECK(ctrl.shouldPipelineNextBatch(10000, start));
++    for (NodeId peer = 0; peer < 10; ++peer) {
++        ctrl.recordPollRttMs(peer >= 8 ? 240.0 : 2.0, peer);
++    }
++    for (int sample = 0; sample < 100; ++sample) {
++        ctrl.recordPollRttMs(1.0, 0);
++    }
++    BOOST_CHECK_EQUAL(ctrl.getRttP90Ms(), 240.0);
++    BOOST_CHECK(!ctrl.shouldPipelineNextBatch(1, start + std::chrono::milliseconds{239}));
++    BOOST_CHECK(ctrl.shouldPipelineNextBatch(1, start + std::chrono::milliseconds{240}));
++    for (int i = 0; i < 10; ++i) ctrl.recordMissOrConflict();
++    BOOST_CHECK_EQUAL(ctrl.getSettlingWindowMs(), 1000.0);
++    ctrl.removePeer(8);
++    ctrl.removePeer(9);
++    for (int i = 0; i < 50; ++i) ctrl.recordCleanFastPath();
++    BOOST_CHECK_EQUAL(ctrl.getSettlingWindowMs(), 100.0);
++    BOOST_CHECK_EQUAL(ctrl.getFreezeCount(), 1U);
++}
++
+ BOOST_FIXTURE_TEST_CASE(
+     adaptive_epoch_controller_aimd_and_back_to_back_pipelining,
+     AvalancheTestChain100Setup) {
+@@ -738,15 +764,15 @@ BOOST_FIXTURE_TEST_CASE(
+     auto &ctrl = m_node.avalanche->getAdaptiveEpochController();
+     ctrl.recordPollRtt(std::chrono::milliseconds(20));
+     BOOST_CHECK_CLOSE(ctrl.getRttEwmaMs(), 20.0, 1e-3);
+-    BOOST_CHECK_CLOSE(ctrl.getSettlingWindowMs(), 20.0, 1e-3);
++    BOOST_CHECK_CLOSE(ctrl.getSettlingWindowMs(), 100.0, 1e-3);
+ 
+     // Simulated miss/conflict events multiplicatively back off tau_settle (2x)
+     ctrl.recordMissOrConflict();
+-    BOOST_CHECK_CLOSE(ctrl.getSettlingWindowMs(), 40.0, 1e-3);
++    BOOST_CHECK_CLOSE(ctrl.getSettlingWindowMs(), 200.0, 1e-3);
+     BOOST_CHECK_GT(ctrl.getMissRateEwma(), 0.0);
+ 
+     ctrl.recordMissOrConflict();
+-    BOOST_CHECK_CLOSE(ctrl.getSettlingWindowMs(), 80.0, 1e-3);
++    BOOST_CHECK_CLOSE(ctrl.getSettlingWindowMs(), 400.0, 1e-3);
+ 
+     // Clean 1-RTT fast-path finalizations additively shrink tau_settle back
+     // toward the observed peer RTT EWMA (20ms).
+@@ -758,7 +784,7 @@ BOOST_FIXTURE_TEST_CASE(
+         BOOST_CHECK_GE(curWindow, ctrl.getRttEwmaMs());
+         prevWindow = curWindow;
+     }
+-    BOOST_CHECK_CLOSE(ctrl.getSettlingWindowMs(), ctrl.getRttEwmaMs(), 1.0);
++    BOOST_CHECK_CLOSE(ctrl.getSettlingWindowMs(), 100.0, 1.0);
+ 
+     // 2. Verify event-driven back-to-back epoch batch pipelining upon finality
+     auto proof = buildRandomProof(active_chainstate, MIN_VALID_PROOF_SCORE);
+diff --git a/src/init.cpp b/src/init.cpp
+index 3abcb1e55f..2323c13ff4 100644
+--- a/src/init.cpp
++++ b/src/init.cpp
+@@ -597,6 +597,10 @@ void SetupServerArgs(NodeContext &node) {
+         "pivot for shallow reorg safety (0 to peel all the way to Genesis, "
+         "default: 50)",
+         ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
++    argsman.AddArg(
++        "-epochminms=<n>",
++        "Minimum adaptive epoch settling window in milliseconds (1..1000, default: 100)",
++        ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
+     argsman.AddArg(
+         "-merklixreconciliation",
+         "Advertise Merklix reconciliation and initiate changed-set announcements (default: 1)",
+diff --git a/src/net_processing.cpp b/src/net_processing.cpp
+index 62fc5b9031..f8cc297778 100644
+--- a/src/net_processing.cpp
++++ b/src/net_processing.cpp
+@@ -9416,7 +9416,10 @@ bool PeerManagerImpl::SendMessages(const Config &config, CNode *pto) {
+     const auto current_time{GetTime<std::chrono::microseconds>()};
+     m_v2_protocol_handler.CheckFastSyncTimeouts(pto->GetId(), current_time);
+     if (gArgs.GetBoolArg("-merklixreconciliation", true)) {
+-        m_v2_protocol_handler.MaybeSendSync(*pto, current_time);
++        const auto cadence = m_avalanche
++            ? m_avalanche->getAdaptiveEpochController().getSettlingWindow()
++            : std::chrono::milliseconds{100};
++        m_v2_protocol_handler.MaybeSendSync(*pto, current_time, cadence);
+     }
+ 
+     if (pto->IsAddrFetchConn() &&
+diff --git a/src/rpc/avalanche.cpp b/src/rpc/avalanche.cpp
+index 58832e4377..762e09c060 100644
+--- a/src/rpc/avalanche.cpp
++++ b/src/rpc/avalanche.cpp
+@@ -637,6 +637,12 @@ static RPCHelpMan getavalancheinfo() {
+             {
+                 {RPCResult::Type::BOOL, "ready_to_poll",
+                  "Whether the node is ready to start polling and voting."},
++                {RPCResult::Type::OBJ, "epochs", "Adaptive epoch cadence", {
++                    {RPCResult::Type::NUM, "window_ms", "Current settling window in milliseconds"},
++                    {RPCResult::Type::NUM, "rtt_p90_floor_ms", "Population RTT p90 clamped to configured cadence bounds"},
++                    {RPCResult::Type::NUM, "freeze_count", "Number of controller-recorded freezes"},
++                    {RPCResult::Type::NUM, "freeze_rate_hz", "Recorded freezes per second since controller creation"},
++                }},
+                 {RPCResult::Type::OBJ,
+                  "local",
+                  "Only available if -avaproof has been supplied to the node",
+@@ -727,6 +733,13 @@ static RPCHelpMan getavalancheinfo() {
+ 
+             UniValue ret(UniValue::VOBJ);
+             ret.pushKV("ready_to_poll", avalanche.isQuorumEstablished());
++            const auto &epochs = avalanche.getAdaptiveEpochController();
++            UniValue epochInfo(UniValue::VOBJ);
++            epochInfo.pushKV("window_ms", epochs.getSettlingWindowMs());
++            epochInfo.pushKV("rtt_p90_floor_ms", epochs.getRttP90Ms());
++            epochInfo.pushKV("freeze_count", epochs.getFreezeCount());
++            epochInfo.pushKV("freeze_rate_hz", epochs.getFreezeRateHz());
++            ret.pushKV("epochs", epochInfo);
+ 
+             auto localProof = avalanche.getLocalProof();
+             if (localProof != nullptr) {
+-- 
+2.50.1 (Apple Git-155)
+

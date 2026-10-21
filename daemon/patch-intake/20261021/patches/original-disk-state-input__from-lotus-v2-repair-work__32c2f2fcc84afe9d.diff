@@ -1,0 +1,377 @@
+diff --git a/src/lotus_v2/disk_state.cpp b/src/lotus_v2/disk_state.cpp
+index c510302cf4..0ad6076db2 100644
+--- a/src/lotus_v2/disk_state.cpp
++++ b/src/lotus_v2/disk_state.cpp
+@@ -18,12 +18,14 @@
+ #include <cstdio>
+ #include <cstring>
+ #include <filesystem>
++#include <future>
+ #include <limits>
+ #include <map>
+ #include <mutex>
+ #include <set>
+ #include <stdexcept>
+ #include <string_view>
++#include <thread>
+ #include <typeinfo>
+ #include <utility>
+ 
+@@ -285,12 +287,14 @@ Summary GetSummary(Reader &r) {
+ struct Node {
+     Summary summary;
+     std::optional<Coin> coin;
++    Outpoint coin_outpoint{};
+     Bytes coin_bytes;
+     Hash coin_outpoint_key{};
+     std::array<Summary, 2> children;
+ };
+ Node Leaf(const Coin &coin, Bytes encoded = {}) {
+     Node node; node.summary.kind = 1; node.coin = coin;
++    node.coin_outpoint = coin.outpoint;
+     if (encoded.empty()) encoded = CoinBytes(coin);
+     node.coin_bytes = std::move(encoded);
+     node.coin_outpoint_key = OutpointKey(coin.outpoint);
+@@ -334,6 +338,35 @@ Node ParseNode(BytesView bytes, const Path &path, const Summary &expected) {
+     r.End(); Require(node.summary == stored, "node hash mismatch");
+     return node;
+ }
++Node ParseNodeFast(BytesView bytes, const Path &path, const Summary &expected) {
++    Require(bytes.size() <= MAX_COIN_BYTES + 41, "node size");
++    Reader r{bytes};
++    const Summary stored = GetSummary(r);
++    Require(stored == expected && stored.kind != 0, "node/head disagreement");
++    Node node;
++    node.summary = stored;
++    if (stored.kind == 1) {
++        const BytesView cb = r.BlobView(MAX_COIN_BYTES);
++        Require(cb.size() >= 37, "coin size");
++        Reader cr{cb};
++        node.coin_outpoint.tx_id = cr.Digest();
++        node.coin_outpoint.index = static_cast<uint32_t>(cr.Int(4));
++        node.coin_bytes.assign(cb.data(), cb.size());
++        node.coin_outpoint_key = OutpointKey(node.coin_outpoint);
++        Require(path.Contains(node.coin_outpoint_key), "leaf path mismatch");
++    } else {
++        const Summary left = GetSummary(r);
++        const Summary right = GetSummary(r);
++        Require(path.depth < 256, "branch depth");
++        Require((left.kind != 0 || right.kind != 0) &&
++                !(left.kind == 0 && right.kind == 1) &&
++                !(left.kind == 1 && right.kind == 0),
++                "uncollapsed branch");
++        node.children = {left, right};
++    }
++    r.End();
++    return node;
++}
+ struct Head { Summary root; DiskStateMetadata metadata; };
+ Bytes Schema(const DiskStateOptions &options) {
+     Bytes bytes("LotusV2State\1", 13);
+@@ -1567,7 +1600,7 @@ struct DiskStateTransaction::Impl {
+         const Bytes key = path.Key();
+         const ValueView bytes = ReadView(key);
+         Require(bytes.has_value(), "missing tree node");
+-        Node parsed = ParseNode(*bytes, path, summary);
++        Node parsed = ParseNodeFast(*bytes, path, summary);
+         auto [it, _] = node_cache.emplace(path, CachedNode{std::move(parsed), false, false, true, Bytes(*bytes)});
+         return *it->second.node;
+     }
+@@ -1631,9 +1664,9 @@ struct DiskStateTransaction::Impl {
+         while (summary.kind) {
+             const Node &node = GetNode(path, summary);
+             if (summary.kind == 1) {
+-                const auto coin = ReadView(CoinKey(node.coin->outpoint));
++                const auto coin = ReadView(CoinKey(node.coin_outpoint));
+                 Require(coin && BytesView(*coin) == node.coin_bytes, "coin/tree proof disagreement");
+-                if (node.coin->outpoint == outpoint) {
++                if (node.coin_outpoint == outpoint) {
+                     out_present = true;
+                 } else {
+                     Require(node.coin_outpoint_key != key, "generated proof mismatch");
+@@ -1680,23 +1713,47 @@ struct DiskStateTransaction::Impl {
+         children[bit] = InsertAt(path.Child(bit), children[bit], added);
+         return SetBranchLazy(path, children[0], children[1]);
+     }
+-    Summary EraseAt(const Path &path, const Summary &summary, const Outpoint &outpoint, const Hash &outpoint_key) {
+-        if (!summary.kind) Fail(DiskStateErrorCode::Missing, "missing leaf");
++    Summary EraseAt(const Path &path, const Summary &summary, const Outpoint &outpoint,
++                    const Hash &outpoint_key, bool authenticate_coin_row = true,
++                    Bytes *erased_coin_bytes = nullptr) {
++        if (!summary.kind) {
++            if (authenticate_coin_row) {
++                Require(!ReadView(CoinKey(outpoint)).has_value(), "coin membership disagreement");
++            }
++            Fail(DiskStateErrorCode::Missing, "missing coin");
++        }
+         const Node &old_ref = GetNode(path, summary);
+         if (old_ref.summary.kind == 1) {
+-            Require(old_ref.coin->outpoint == outpoint, "coin/tree disagreement");
++            if (old_ref.coin_outpoint != outpoint) {
++                Require(old_ref.coin_outpoint_key != outpoint_key, "coin/tree disagreement");
++                if (authenticate_coin_row) {
++                    const auto coin = ReadView(CoinKey(old_ref.coin_outpoint));
++                    Require(coin && BytesView(*coin) == old_ref.coin_bytes, "coin/tree proof disagreement");
++                    Require(!ReadView(CoinKey(outpoint)).has_value(), "coin membership disagreement");
++                }
++                Fail(DiskStateErrorCode::Missing, "missing coin");
++            }
++            if (authenticate_coin_row) {
++                const auto coin = ReadView(CoinKey(outpoint));
++                Require(coin && BytesView(*coin) == old_ref.coin_bytes, "coin/tree proof disagreement");
++            }
++            if (erased_coin_bytes) {
++                *erased_coin_bytes = old_ref.coin_bytes;
++            }
+             ClearNode(path);
+             return {};
+         }
+         std::array<Summary, 2> children = old_ref.children;
+         const bool bit = Bit(outpoint_key, path.depth);
+         // Child digests are authenticated by UtxoNode, but cardinality kinds
+-        // are not. Authenticate the unchanged sibling's actual record before
+-        // trusting its kind to retain a branch or collapse a singleton. The
+-        // changed child's returned summary is derived from validated records.
+-        if (children[!bit].kind)
++        // are not. When the target child is empty (before or after EraseAt),
++        // authenticate the unchanged sibling's actual record before trusting
++        // its kind to retain a branch or collapse a singleton.
++        if (!children[bit].kind && children[!bit].kind) {
+             (void)GetNode(path.Child(!bit), children[!bit]);
+-        children[bit] = EraseAt(path.Child(bit), children[bit], outpoint, outpoint_key);
++        }
++        children[bit] = EraseAt(path.Child(bit), children[bit], outpoint, outpoint_key,
++                                authenticate_coin_row, erased_coin_bytes);
+         const auto left = children[0].kind, right = children[1].kind;
+         if ((left == 0 && right == 1) || (left == 1 && right == 0)) {
+             const bool survivor = right == 1;
+@@ -1704,6 +1761,9 @@ struct DiskStateTransaction::Impl {
+             ClearNode(path.Child(survivor));
+             return SetNode(path, std::move(leaf));
+         }
++        if (children[bit].kind == 0 && children[!bit].kind) {
++            (void)GetNode(path.Child(!bit), children[!bit]);
++        }
+         return SetBranchLazy(path, children[0], children[1]);
+     }
+     void End() { finished = true; store->active = false; }
+@@ -2989,27 +3049,80 @@ bool DiskStateStore::CommitFinalizedOverlay(
+     if (erased.size() >= 8) {
+         (void)PrefetchOutpointsAsync(erased, error);
+     }
++    const auto inserted = overlay.GetNetInsertedCoins();
+     DiskStateTransaction txn;
+     if (!Begin(txn, error)) {
+         return false;
+     }
+-    for (const auto &op : erased) {
+-        if (!txn.Erase(op, error)) {
+-            txn.Abort();
+-            return false;
++    const bool staged_ok = Guard(error, [&] {
++        std::vector<Hash> erased_keys(erased.size());
++        const size_t total_inserted = inserted.size() + coinbase_coins.size();
++        std::vector<Node> prepared_leaves(total_inserted);
++        if (erased.size() + total_inserted >= 32) {
++            const unsigned hw = std::thread::hardware_concurrency();
++            const size_t num_workers =
++                std::min<size_t>(hw > 1 ? hw : 4, 8);
++            const size_t total_items = erased.size() + total_inserted;
++            const size_t chunk = (total_items + num_workers - 1) / num_workers;
++            std::vector<std::future<void>> futures;
++            futures.reserve(num_workers);
++            for (size_t w = 0; w < num_workers; ++w) {
++                const size_t begin = w * chunk;
++                if (begin >= total_items) {
++                    break;
++                }
++                const size_t end = std::min(total_items, begin + chunk);
++                futures.push_back(
++                    std::async(std::launch::async, [&, begin, end]() {
++                        for (size_t idx = begin; idx < end; ++idx) {
++                            if (idx < erased.size()) {
++                                erased_keys[idx] = OutpointKey(erased[idx]);
++                            } else {
++                                const size_t ins_idx = idx - erased.size();
++                                const Coin &c =
++                                    ins_idx < inserted.size()
++                                        ? inserted[ins_idx]
++                                        : coinbase_coins[ins_idx -
++                                                         inserted.size()];
++                                prepared_leaves[ins_idx] = Leaf(c);
++                            }
++                        }
++                    }));
++            }
++            for (auto &f : futures) {
++                f.get();
++            }
++        } else {
++            for (size_t i = 0; i < erased.size(); ++i) {
++                erased_keys[i] = OutpointKey(erased[i]);
++            }
++            for (size_t i = 0; i < inserted.size(); ++i) {
++                prepared_leaves[i] = Leaf(inserted[i]);
++            }
++            for (size_t i = 0; i < coinbase_coins.size(); ++i) {
++                prepared_leaves[inserted.size() + i] = Leaf(coinbase_coins[i]);
++            }
+         }
+-    }
+-    for (const auto &coin : overlay.GetNetInsertedCoins()) {
+-        if (!txn.Insert(coin, error)) {
+-            txn.Abort();
+-            return false;
++        for (size_t i = 0; i < erased.size(); ++i) {
++            Bytes erased_bytes;
++            txn.impl_->head.root = txn.impl_->EraseAt(
++                Path{}, txn.impl_->head.root, erased[i], erased_keys[i],
++                /*authenticate_coin_row=*/false, &erased_bytes);
++            txn.impl_->SetWithBefore(CoinKey(erased[i]),
++                                     std::move(erased_bytes), std::nullopt);
+         }
+-    }
+-    for (const auto &cb_coin : coinbase_coins) {
+-        if (!txn.Insert(cb_coin, error)) {
+-            txn.Abort();
+-            return false;
++        for (Node &leaf : prepared_leaves) {
++            Bytes bytes = leaf.coin_bytes;
++            const Outpoint op = leaf.coin_outpoint;
++            txn.impl_->head.root =
++                txn.impl_->InsertAt(Path{}, txn.impl_->head.root, leaf);
++            txn.impl_->SetWithBefore(CoinKey(op), std::nullopt,
++                                     std::move(bytes));
+         }
++    });
++    if (!staged_ok) {
++        txn.Abort();
++        return false;
+     }
+     return txn.Commit(next, error);
+ }
+@@ -3023,27 +3136,80 @@ bool DiskStateStore::CommitFinalizedOverlay(
+     if (erased.size() >= 8) {
+         (void)PrefetchOutpointsAsync(erased, error);
+     }
++    const auto inserted = overlay.GetNetInsertedCoins();
+     DiskStateTransaction txn;
+     if (!Begin(txn, error)) {
+         return false;
+     }
+-    for (const auto &op : erased) {
+-        if (!txn.Erase(op, error)) {
+-            txn.Abort();
+-            return false;
++    const bool staged_ok = Guard(error, [&] {
++        std::vector<Hash> erased_keys(erased.size());
++        const size_t total_inserted = inserted.size() + coinbase_coins.size();
++        std::vector<Node> prepared_leaves(total_inserted);
++        if (erased.size() + total_inserted >= 32) {
++            const unsigned hw = std::thread::hardware_concurrency();
++            const size_t num_workers =
++                std::min<size_t>(hw > 1 ? hw : 4, 8);
++            const size_t total_items = erased.size() + total_inserted;
++            const size_t chunk = (total_items + num_workers - 1) / num_workers;
++            std::vector<std::future<void>> futures;
++            futures.reserve(num_workers);
++            for (size_t w = 0; w < num_workers; ++w) {
++                const size_t begin = w * chunk;
++                if (begin >= total_items) {
++                    break;
++                }
++                const size_t end = std::min(total_items, begin + chunk);
++                futures.push_back(
++                    std::async(std::launch::async, [&, begin, end]() {
++                        for (size_t idx = begin; idx < end; ++idx) {
++                            if (idx < erased.size()) {
++                                erased_keys[idx] = OutpointKey(erased[idx]);
++                            } else {
++                                const size_t ins_idx = idx - erased.size();
++                                const Coin &c =
++                                    ins_idx < inserted.size()
++                                        ? inserted[ins_idx]
++                                        : coinbase_coins[ins_idx -
++                                                         inserted.size()];
++                                prepared_leaves[ins_idx] = Leaf(c);
++                            }
++                        }
++                    }));
++            }
++            for (auto &f : futures) {
++                f.get();
++            }
++        } else {
++            for (size_t i = 0; i < erased.size(); ++i) {
++                erased_keys[i] = OutpointKey(erased[i]);
++            }
++            for (size_t i = 0; i < inserted.size(); ++i) {
++                prepared_leaves[i] = Leaf(inserted[i]);
++            }
++            for (size_t i = 0; i < coinbase_coins.size(); ++i) {
++                prepared_leaves[inserted.size() + i] = Leaf(coinbase_coins[i]);
++            }
+         }
+-    }
+-    for (const auto &coin : overlay.GetNetInsertedCoins()) {
+-        if (!txn.Insert(coin, error)) {
+-            txn.Abort();
+-            return false;
++        for (size_t i = 0; i < erased.size(); ++i) {
++            Bytes erased_bytes;
++            txn.impl_->head.root = txn.impl_->EraseAt(
++                Path{}, txn.impl_->head.root, erased[i], erased_keys[i],
++                /*authenticate_coin_row=*/false, &erased_bytes);
++            txn.impl_->SetWithBefore(CoinKey(erased[i]),
++                                     std::move(erased_bytes), std::nullopt);
+         }
+-    }
+-    for (const auto &cb_coin : coinbase_coins) {
+-        if (!txn.Insert(cb_coin, error)) {
+-            txn.Abort();
+-            return false;
++        for (Node &leaf : prepared_leaves) {
++            Bytes bytes = leaf.coin_bytes;
++            const Outpoint op = leaf.coin_outpoint;
++            txn.impl_->head.root =
++                txn.impl_->InsertAt(Path{}, txn.impl_->head.root, leaf);
++            txn.impl_->SetWithBefore(CoinKey(op), std::nullopt,
++                                     std::move(bytes));
+         }
++    });
++    if (!staged_ok) {
++        txn.Abort();
++        return false;
+     }
+     return txn.Commit(next, fully_connected, error);
+ }
+@@ -3073,12 +3239,9 @@ bool DiskStateTransaction::Insert(const Coin &coin, DiskStateError &error) {
+         if (!impl_) Fail(DiskStateErrorCode::Closed, "closed transaction");
+         impl_->Usable();
+         Node leaf = Leaf(coin);
+-        bool existing = false;
+-        impl_->AuthCheckCoin(coin.outpoint, leaf.coin_outpoint_key, existing);
+-        if (existing) Fail(DiskStateErrorCode::Duplicate, "duplicate coin");
+         Bytes bytes = leaf.coin_bytes;
+         impl_->head.root = impl_->InsertAt(Path{}, impl_->head.root, leaf);
+-        impl_->Set(CoinKey(coin.outpoint), std::move(bytes));
++        impl_->SetWithBefore(CoinKey(coin.outpoint), std::nullopt, std::move(bytes));
+     });
+     if (!ok && impl_ && error.code != DiskStateErrorCode::Duplicate && error.code != DiskStateErrorCode::InvalidCoin)
+         impl_->failed = true;
+@@ -3089,11 +3252,10 @@ bool DiskStateTransaction::Erase(const Outpoint &outpoint, DiskStateError &error
+         if (!impl_) Fail(DiskStateErrorCode::Closed, "closed transaction");
+         impl_->Usable();
+         const Hash key = OutpointKey(outpoint);
+-        bool existing = false;
+-        impl_->AuthCheckCoin(outpoint, key, existing);
+-        if (!existing) Fail(DiskStateErrorCode::Missing, "missing coin");
+-        impl_->head.root = impl_->EraseAt(Path{}, impl_->head.root, outpoint, key);
+-        impl_->Set(CoinKey(outpoint), std::nullopt);
++        Bytes erased_bytes;
++        impl_->head.root = impl_->EraseAt(Path{}, impl_->head.root, outpoint, key,
++                                          /*authenticate_coin_row=*/true, &erased_bytes);
++        impl_->SetWithBefore(CoinKey(outpoint), std::move(erased_bytes), std::nullopt);
+     });
+     if (!ok && impl_ && error.code != DiskStateErrorCode::Missing) impl_->failed = true;
+     return ok;

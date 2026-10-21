@@ -1,0 +1,2082 @@
+From 032f097b86c4eeee3d667455e3eb319eaf522b04 Mon Sep 17 00:00:00 2001
+From: Shammah Chancellor <shammah.chancellor@notvalid.com>
+Date: Sun, 18 Oct 2026 01:33:30 -0700
+Subject: [PATCH] rpc(v2): publish native state roots and snapshot metadata
+
+Extract this concern so its mechanism can be reviewed and measured independently.
+No source semantics are added or removed by this history operation.
+
+Original patch rationale (describes the unsplit source, not every extracted part):
+Adapt ChainAndMempoolSnapshot, O(1) getblocktemplate, submitminedheader,
+and batch mempool RPCs to V2 headers and v7 transactions.
+
+Original-Commit: 789346a15d4342235e25878b24bf45aaabb1b71e
+Original-Patch: v2/020
+Split-Concern: snapshot
+
+Historical compilation prerequisites are tracked separately in daemon/patch-audit;
+this provenance-preserving split does not imply standalone build validation.
+---
+ src/node/snapshot.cpp           | 855 ++++++++++++++++++++------------
+ src/node/snapshot.h             |  52 +-
+ src/test/snapshot_rcu_tests.cpp | 750 ++++++++++++++++------------
+ src/validation.cpp              |  16 +-
+ 4 files changed, 998 insertions(+), 675 deletions(-)
+
+diff --git a/src/node/snapshot.cpp b/src/node/snapshot.cpp
+index 5cfcbd2d4a561b761711bd545877e720fcd9c3d2..1aea86cd31b39a25976933c8bb029a3097c7395a 100644
+--- a/src/node/snapshot.cpp
++++ b/src/node/snapshot.cpp
+@@ -12,23 +12,23 @@
+ #include <consensus/consensus.h>
+ #include <consensus/tx_verify.h>
+ #include <consensus/validation.h>
+-#include <crypto/sha256.h>
++#include <lotus_v2/commitment.h>
+ #include <lotus_v2/fee_hysteresis.h>
+-#include <lotus_v2/mempool_overlay.h>
+ #include <node/blockfitter.h>
+ #include <node/blockstorage.h>
+ #include <policy/policy.h>
+ #include <pow/pow.h>
++#include <rpc/async_waiter.h>
+ #include <streams.h>
+ #include <timedata.h>
+ #include <txmempool.h>
+ #include <util/strencodings.h>
++#include <util/time.h>
+ #include <validation.h>
+ 
+ #include <algorithm>
+ #include <cstring>
+ #include <queue>
+-#include <set>
+ #include <unordered_map>
+ 
+ namespace node {
+@@ -54,33 +54,6 @@ std::string SerializeTxToHex(const CTransaction &tx) {
+     return HexStr(ssTx);
+ }
+ 
+-std::vector<lotus::v2::Hash>
+-ComputeCoinbaseMerkleBranch(const std::vector<CTransactionRef> &non_cb_txs) {
+-    std::vector<lotus::v2::Hash> branch;
+-    if (non_cb_txs.empty()) {
+-        return branch;
+-    }
+-    std::vector<lotus::v2::Hash> level;
+-    level.reserve(non_cb_txs.size() + 1);
+-    level.push_back(lotus::v2::Hash{}); // Slot 0: coinbase placeholder
+-    for (const auto &tx : non_cb_txs) {
+-        lotus::v2::Hash txid_bytes{};
+-        const TxId &txid = tx->GetId();
+-        std::memcpy(txid_bytes.data(), txid.begin(), 32);
+-        level.push_back(txid_bytes);
+-    }
+-    while (level.size() > 1) {
+-        branch.push_back(level[1]);
+-        if (level.size() & 1U) {
+-            level.push_back(level.back());
+-        }
+-        const size_t pairs = level.size() / 2;
+-        SHA256D64(level[0].data(), level[0].data(), pairs);
+-        level.resize(pairs);
+-    }
+-    return branch;
+-}
+-
+ std::optional<int> ComputePruneHeight(const BlockManager &blockman,
+                                       const CChain &chain)
+     EXCLUSIVE_LOCKS_REQUIRED(::cs_main) {
+@@ -122,6 +95,76 @@ BlockHeaderSnapshot MakeBlockHeaderSnapshot(const CBlockIndex &blockindex)
+     return hdr;
+ }
+ 
++std::shared_ptr<ChainAndMempoolSnapshot>
++CloneChainStateOnly(const ChainAndMempoolSnapshot *prev) {
++    auto next = std::make_shared<ChainAndMempoolSnapshot>();
++    if (!prev) {
++        return next;
++    }
++    next->chainman_ptr = prev->chainman_ptr;
++    next->chain_valid = prev->chain_valid;
++    next->height = prev->height;
++    next->headers_height = prev->headers_height;
++    next->best_block_hash = prev->best_block_hash;
++    next->finalized_block_hash = prev->finalized_block_hash;
++    next->difficulty = prev->difficulty;
++    next->time = prev->time;
++    next->mediantime = prev->mediantime;
++    next->verification_progress = prev->verification_progress;
++    next->initial_block_download = prev->initial_block_download;
++    next->chainwork = prev->chainwork;
++    next->size_on_disk = prev->size_on_disk;
++    next->pruned = prev->pruned;
++    next->has_prune_height = prev->has_prune_height;
++    next->prune_height = prev->prune_height;
++    next->automatic_pruning = prev->automatic_pruning;
++    next->prune_target_size = prev->prune_target_size;
++    next->fast_sync_active = prev->fast_sync_active;
++    next->earliest_verified_height = prev->earliest_verified_height;
++    next->chain_type_string = prev->chain_type_string;
++    next->nBits = prev->nBits;
++    next->next_nBits = prev->next_nBits;
++    next->next_subsidy = prev->next_subsidy;
++    next->consensus_params = prev->consensus_params;
++    next->prev_header_received_time = prev->prev_header_received_time;
++    next->active_chain = prev->active_chain;
++    next->has_utxo_snapshot = prev->has_utxo_snapshot;
++    next->tip_utxo_root = prev->tip_utxo_root;
++    next->tip_mon_state = prev->tip_mon_state;
++    return next;
++}
++
++MempoolEntrySnapshot MakeMempoolEntrySnapshot(const CTxMemPoolEntry &e,
++                                              const CTxMemPool &mempool)
++    EXCLUSIVE_LOCKS_REQUIRED(mempool.cs) {
++    MempoolEntrySnapshot entry_snap{};
++    entry_snap.txid = e.GetTx().GetId();
++    entry_snap.tx = e.GetSharedTx();
++    entry_snap.fee = e.GetFee();
++    entry_snap.modified_fee = e.GetModifiedFee();
++    entry_snap.tx_size = e.GetTxSize();
++    entry_snap.time = count_seconds(e.GetTime());
++    entry_snap.height = static_cast<int>(e.GetHeight());
++
++    const auto &parents = e.GetMemPoolParentsConst();
++    if (!parents.empty()) {
++        std::set<std::string> set_depends;
++        for (const auto &parent : parents) {
++            set_depends.insert(parent.get()->GetTx().GetId().ToString());
++        }
++        entry_snap.depends.assign(set_depends.begin(), set_depends.end());
++    }
++
++    const auto &children = e.GetMemPoolChildrenConst();
++    entry_snap.spentby.reserve(children.size());
++    for (const auto &child : children) {
++        entry_snap.spentby.push_back(
++            child.get()->GetTx().GetId().ToString());
++    }
++    entry_snap.unbroadcast = mempool.IsUnbroadcastTx(entry_snap.txid);
++    return entry_snap;
++}
++
+ void PopulateMempoolScalarsLocked(ChainAndMempoolSnapshot &snap,
+                                   const CTxMemPool &mempool)
+     EXCLUSIVE_LOCKS_REQUIRED(mempool.cs) {
+@@ -159,37 +202,6 @@ void PopulateMempoolScalarsLocked(ChainAndMempoolSnapshot &snap,
+         snap.mempool_bytes, now_ms);
+ }
+ 
+-MempoolEntrySnapshot MakeMempoolEntrySnapshot(const CTxMemPoolEntry &e,
+-                                              const CTxMemPool &mempool)
+-    EXCLUSIVE_LOCKS_REQUIRED(mempool.cs) {
+-    MempoolEntrySnapshot entry_snap{};
+-    entry_snap.txid = e.GetTx().GetId();
+-    entry_snap.tx = e.GetSharedTx();
+-    entry_snap.fee = e.GetFee();
+-    entry_snap.modified_fee = e.GetModifiedFee();
+-    entry_snap.tx_size = e.GetTxSize();
+-    entry_snap.time = count_seconds(e.GetTime());
+-    entry_snap.height = static_cast<int>(e.GetHeight());
+-
+-    const auto &parents = e.GetMemPoolParentsConst();
+-    if (!parents.empty()) {
+-        std::set<std::string> set_depends;
+-        for (const auto &parent : parents) {
+-            set_depends.insert(parent.get()->GetTx().GetId().ToString());
+-        }
+-        entry_snap.depends.assign(set_depends.begin(), set_depends.end());
+-    }
+-
+-    const auto &children = e.GetMemPoolChildrenConst();
+-    entry_snap.spentby.reserve(children.size());
+-    for (const auto &child : children) {
+-        entry_snap.spentby.push_back(
+-            child.get()->GetTx().GetId().ToString());
+-    }
+-    entry_snap.unbroadcast = mempool.IsUnbroadcastTx(entry_snap.txid);
+-    return entry_snap;
+-}
+-
+ void PopulateMempoolVectorsLocked(ChainAndMempoolSnapshot &snap,
+                                   const CTxMemPool &mempool,
+                                   const ChainAndMempoolSnapshot *prev)
+@@ -198,17 +210,6 @@ void PopulateMempoolVectorsLocked(ChainAndMempoolSnapshot &snap,
+     const bool can_reuse_prev =
+         prev && prev->mempool_valid && prev->mempool_ptr == &mempool &&
+         prev->mempool_vectors_ready;
+-    if (can_reuse_prev &&
+-        prev->transactions_updated == snap.transactions_updated &&
+-        prev->mempool_size == snap.mempool_size &&
+-        prev->mempool_entries.size() == snap.mempool_size) {
+-        snap.mempool_txids = prev->mempool_txids;
+-        snap.mempool_entries = prev->mempool_entries;
+-        snap.mempool_spent_outpoints = prev->mempool_spent_outpoints;
+-        snap.mempool_vectors_ready = true;
+-        return;
+-    }
+-
+     if (can_reuse_prev && prev->mempool_reset_seq == snap.mempool_reset_seq &&
+         mempool.mapDeltas.empty() && prev->last_mempool_entry_id != 0 &&
+         id_idx.size() >= prev->mempool_entries.size() &&
+@@ -313,8 +314,16 @@ void PopulateMempoolVectorsLocked(ChainAndMempoolSnapshot &snap,
+ 
+         const auto &parents = e->GetMemPoolParentsConst();
+         const auto &children = e->GetMemPoolChildrenConst();
+-        if (can_reuse_prev) {
+-            const MempoolEntrySnapshot *prev_entry = prev->FindMempoolEntry(txid);
++        if (can_reuse_prev && prev->mempool_vectors_ready) {
++            const auto it = std::lower_bound(
++                prev->mempool_entries.begin(), prev->mempool_entries.end(), txid,
++                [](const MempoolEntrySnapshot &entry, const TxId &id) {
++                    return entry.txid < id;
++                });
++            const MempoolEntrySnapshot *prev_entry =
++                (it != prev->mempool_entries.end() && it->txid == txid)
++                    ? &(*it)
++                    : nullptr;
+             if (prev_entry && prev_entry->tx.get() == &tx &&
+                 prev_entry->modified_fee == e->GetModifiedFee() &&
+                 prev_entry->depends.size() == parents.size() &&
+@@ -344,80 +353,22 @@ void PopulateMempoolFieldsLocked(ChainAndMempoolSnapshot &snap,
+     PopulateMempoolVectorsLocked(snap, mempool, prev);
+ }
+ 
+-std::shared_ptr<ChainAndMempoolSnapshot>
+-CloneChainStateOnly(const ChainAndMempoolSnapshot *prev) {
+-    auto next = std::make_shared<ChainAndMempoolSnapshot>();
+-    if (!prev) {
+-        return next;
+-    }
+-    next->chainman_ptr = prev->chainman_ptr;
+-    next->mempool_ptr = prev->mempool_ptr;
+-    next->chain_valid = prev->chain_valid;
+-    next->height = prev->height;
+-    next->headers_height = prev->headers_height;
+-    next->best_block_hash = prev->best_block_hash;
+-    next->finalized_block_hash = prev->finalized_block_hash;
+-    next->difficulty = prev->difficulty;
+-    next->time = prev->time;
+-    next->mediantime = prev->mediantime;
+-    next->verification_progress = prev->verification_progress;
+-    next->initial_block_download = prev->initial_block_download;
+-    next->chainwork = prev->chainwork;
+-    next->size_on_disk = prev->size_on_disk;
+-    next->pruned = prev->pruned;
+-    next->has_prune_height = prev->has_prune_height;
+-    next->prune_height = prev->prune_height;
+-    next->automatic_pruning = prev->automatic_pruning;
+-    next->prune_target_size = prev->prune_target_size;
+-    next->fast_sync_active = prev->fast_sync_active;
+-    next->earliest_verified_height = prev->earliest_verified_height;
+-    next->chain_type_string = prev->chain_type_string;
+-    next->nBits = prev->nBits;
+-    next->next_nBits = prev->next_nBits;
+-    next->next_subsidy = prev->next_subsidy;
+-    next->consensus_params = prev->consensus_params;
+-    next->prev_header_received_time = prev->prev_header_received_time;
+-    next->active_chain = prev->active_chain;
+-    next->has_utxo_snapshot = prev->has_utxo_snapshot;
+-    next->tip_utxo_root = prev->tip_utxo_root;
+-    return next;
+-}
+-
+ void PopulateMiningTemplate(ChainAndMempoolSnapshot &snap,
+                             const CTxMemPool *mempool_locked,
+                             const ChainAndMempoolSnapshot *prev,
+                             SnapshotPublisher &publisher)
+-    NO_THREAD_SAFETY_ANALYSIS {
++     NO_THREAD_SAFETY_ANALYSIS {
+     if (!snap.chain_valid || snap.height < 0 || !snap.consensus_params) {
+         return;
+     }
+ 
+-    // Fast path: if the tip and mempool have not changed since the previous
+-    // snapshot, reuse the already-assembled mining template in O(1).
+-    if (prev && prev->mining_template.template_valid &&
+-        prev->mining_template_ready &&
+-        prev->mining_template.prev_block_hash == snap.best_block_hash &&
+-        prev->mining_template.next_height == snap.height + 1 &&
+-        prev->mining_template.nBits == snap.next_nBits &&
+-        prev->mining_template.parent_mtp == snap.mediantime &&
+-        prev->mempool_ptr == mempool_locked &&
+-        (!mempool_locked ||
+-         (prev->transactions_updated == snap.transactions_updated &&
+-          prev->mempool_size == snap.mempool_size &&
+-          prev->mining_template.non_coinbase_txs.size() ==
+-              snap.mempool_size))) {
+-        snap.mining_template = prev->mining_template;
+-        snap.mining_template_ready = true;
+-        return;
+-    }
+-
+     MiningTemplateSnapshot tmpl{};
+     tmpl.template_id = snap.mining_template.template_id != 0
+                            ? snap.mining_template.template_id
+                            : publisher.AllocateTemplateId();
+     tmpl.prev_block_hash = snap.best_block_hash;
+     tmpl.next_height = snap.height + 1;
+-    tmpl.nHeaderVersion = 2;
++    tmpl.nHeaderVersion = lotus::v2::kHeaderVersion;
+     if (snap.consensus_params->fPowAllowMinDifficultyBlocks) {
+         tmpl.nHeaderVersion =
+             gArgs.GetIntArg("-blockversion", tmpl.nHeaderVersion);
+@@ -427,6 +378,14 @@ void PopulateMiningTemplate(ChainAndMempoolSnapshot &snap,
+     tmpl.min_time = snap.mediantime + 1;
+     tmpl.total_fees = Amount::zero();
+     tmpl.non_cb_serialized_size = 0;
++    tmpl.total_sigchecks = 0;
++    tmpl.tip_utxo_root = snap.tip_utxo_root;
++    tmpl.tip_mon_state = snap.tip_mon_state;
++    tmpl.has_tip_utxo_snapshot = snap.has_utxo_snapshot;
++    tmpl.roots_ready = false;
++
++    BlockFitter blockFitter(GetConfig());
++    tmpl.max_generated_block_size = blockFitter.getMaxGeneratedBlockSize();
+ 
+     if (mempool_locked && !mempool_locked->mapTx.empty()) {
+         struct SelectedEntry {
+@@ -434,159 +393,329 @@ void PopulateMiningTemplate(ChainAndMempoolSnapshot &snap,
+             Amount fee;
+             int64_t sigchecks;
+         };
+-        BlockFitter blockFitter(GetConfig());
+-        std::vector<SelectedEntry> selected;
+-        selected.reserve(mempool_locked->mapTx.size());
+-
+-        lotus::v2::Hash tip_id{};
+-        std::memcpy(tip_id.data(), snap.best_block_hash.begin(), 32);
+-        const auto &spec_overlay =
+-            mempool_locked->GetMerklixOverlay().GetSpeculativeOverlay();
+-
+-        bool min_fee_ok = true;
+-        const auto &fee_sorted = mempool_locked->mapTx.get<modified_feerate>();
+-        if (!fee_sorted.empty()) {
+-            auto lowest_it = fee_sorted.end();
+-            --lowest_it;
+-            if (blockFitter.isBelowBlockMinFeeRate(
+-                    (*lowest_it)->GetModifiedFeeRate())) {
+-                min_fee_ok = false;
+-            }
+-        }
+ 
+-        const bool use_overlay_fast_path =
+-            min_fee_ok &&
+-            mempool_locked->GetMerklixOverlay().IsAnchoredAt(
+-                tip_id, uint64_t(tmpl.next_height), uint64_t(tmpl.parent_mtp)) &&
+-            !spec_overlay.HasDoubleSpends() &&
+-            spec_overlay.GetTxCount() == mempool_locked->mapTx.size() &&
+-            blockFitter.testTxFits(spec_overlay.GetTotalBytes(),
+-                                   spec_overlay.GetTotalSigChecks());
+-
+-        if (use_overlay_fast_path) {
+-            const auto &ordered = spec_overlay.GetOrderedTxs();
+-            tmpl.non_coinbase_txs.reserve(ordered.size());
+-            tmpl.tx_fees.reserve(ordered.size());
+-            tmpl.tx_sigchecks.reserve(ordered.size());
+-            for (const auto &[tx_id, oentry] : ordered) {
+-                auto tx_ref =
+-                    std::static_pointer_cast<const CTransaction>(oentry.tx_ref);
+-                if (!tx_ref) {
+-                    TxId id;
+-                    std::memcpy(id.begin(), tx_id.data(), 32);
+-                    tx_ref = mempool_locked->get(id);
++        const auto &id_idx = mempool_locked->mapTx.get<entry_id>();
++        const bool can_reuse_prev_check =
++            prev && prev->mining_template.template_valid &&
++            prev->mining_template_ready &&
++            prev->mining_template.prev_block_hash == tmpl.prev_block_hash &&
++            prev->mining_template.next_height == tmpl.next_height &&
++            prev->mining_template.parent_mtp == tmpl.parent_mtp &&
++            prev->mining_template.max_generated_block_size ==
++                tmpl.max_generated_block_size;
++
++        // Fast O(delta) append path when only new transactions were added since
++        // `prev` and all previous mempool transactions fit in `prev->mining_template`.
++        bool used_delta_selection = false;
++        if (can_reuse_prev_check && prev->mempool_valid &&
++            prev->mempool_vectors_ready &&
++            prev->mempool_ptr == mempool_locked &&
++            prev->mempool_reset_seq == snap.mempool_reset_seq &&
++            mempool_locked->mapDeltas.empty() &&
++            prev->last_mempool_entry_id != 0 &&
++            !prev->mempool_entries.empty() &&
++            prev->mining_template.non_coinbase_txs.size() ==
++                prev->mempool_entries.size() &&
++            id_idx.size() >= prev->mempool_entries.size()) {
++            const size_t delta_count =
++                id_idx.size() - prev->mempool_entries.size();
++            const auto new_begin = std::prev(id_idx.end(), delta_count);
++            if (new_begin != id_idx.begin() &&
++                (*std::prev(new_begin))->GetEntryId() ==
++                    prev->last_mempool_entry_id) {
++                blockFitter.nBlockSize +=
++                    prev->mining_template.non_cb_serialized_size;
++                blockFitter.nBlockTx +=
++                    prev->mining_template.non_coinbase_txs.size();
++                blockFitter.nBlockSigChecks +=
++                    uint64_t(prev->mining_template.total_sigchecks);
++                blockFitter.nFees += prev->mining_template.total_fees;
++
++                std::vector<SelectedEntry> delta_selected;
++                delta_selected.reserve(delta_count);
++                bool all_delta_eligible = true;
++                for (auto it = new_begin; it != id_idx.end(); ++it) {
++                    const CTxMemPoolEntry &e = **it;
++                    const uint64_t tx_size = e.GetTxSize();
++                    const int64_t tx_sigchecks = e.GetSigChecks();
++                    const Amount fee = e.GetFee();
++                    if (blockFitter.isBelowBlockMinFeeRate(
++                            e.GetModifiedFeeRate()) ||
++                        !blockFitter.testTxFits(tx_size, tx_sigchecks)) {
++                        all_delta_eligible = false;
++                        break;
++                    }
++                    TxValidationState tx_state;
++                    if (!ContextualCheckTransaction(
++                            *snap.consensus_params, e.GetTx(), tx_state,
++                            tmpl.next_height, tmpl.parent_mtp)) {
++                        all_delta_eligible = false;
++                        break;
++                    }
++                    blockFitter.addTx(tx_size, tx_sigchecks, fee);
++                    delta_selected.push_back(
++                        {e.GetSharedTx(), fee, tx_sigchecks});
+                 }
+-                if (!tx_ref) {
+-                    continue;
++
++                if (all_delta_eligible) {
++                    std::sort(delta_selected.begin(), delta_selected.end(),
++                              [](const SelectedEntry &a,
++                                 const SelectedEntry &b) {
++                                  return a.tx->GetId() < b.tx->GetId();
++                              });
++
++                    const auto &prev_tmpl = prev->mining_template;
++                    const size_t total_count =
++                        prev_tmpl.non_coinbase_txs.size() +
++                        delta_selected.size();
++                    tmpl.non_coinbase_txs.reserve(total_count);
++                    tmpl.tx_fees.reserve(total_count);
++                    tmpl.tx_sigchecks.reserve(total_count);
++                    tmpl.tx_hex.reserve(total_count);
++                    tmpl.total_fees = blockFitter.nFees;
++                    tmpl.non_cb_serialized_size =
++                        blockFitter.nBlockSize -
++                        BlockFitter::COINBASE_RESERVED_SIZE;
++                    tmpl.total_sigchecks =
++                        int64_t(blockFitter.nBlockSigChecks -
++                                BlockFitter::COINBASE_RESERVED_SIGCHECKS);
++
++                    const bool prev_has_hex =
++                        prev_tmpl.tx_hex.size() ==
++                        prev_tmpl.non_coinbase_txs.size();
++                    size_t i = 0;
++                    size_t j = 0;
++                    while (i < prev_tmpl.non_coinbase_txs.size() &&
++                           j < delta_selected.size()) {
++                        if (prev_tmpl.non_coinbase_txs[i]->GetId() <
++                            delta_selected[j].tx->GetId()) {
++                            tmpl.non_coinbase_txs.push_back(
++                                prev_tmpl.non_coinbase_txs[i]);
++                            tmpl.tx_fees.push_back(prev_tmpl.tx_fees[i]);
++                            tmpl.tx_sigchecks.push_back(
++                                prev_tmpl.tx_sigchecks[i]);
++                            tmpl.tx_hex.push_back(
++                                prev_has_hex ? prev_tmpl.tx_hex[i]
++                                             : std::string());
++                            ++i;
++                        } else {
++                            tmpl.non_coinbase_txs.push_back(
++                                std::move(delta_selected[j].tx));
++                            tmpl.tx_fees.push_back(delta_selected[j].fee);
++                            tmpl.tx_sigchecks.push_back(
++                                delta_selected[j].sigchecks);
++                            tmpl.tx_hex.emplace_back();
++                            ++j;
++                        }
++                    }
++                    while (i < prev_tmpl.non_coinbase_txs.size()) {
++                        tmpl.non_coinbase_txs.push_back(
++                            prev_tmpl.non_coinbase_txs[i]);
++                        tmpl.tx_fees.push_back(prev_tmpl.tx_fees[i]);
++                        tmpl.tx_sigchecks.push_back(prev_tmpl.tx_sigchecks[i]);
++                        tmpl.tx_hex.push_back(
++                            prev_has_hex ? prev_tmpl.tx_hex[i] : std::string());
++                        ++i;
++                    }
++                    while (j < delta_selected.size()) {
++                        tmpl.non_coinbase_txs.push_back(
++                            std::move(delta_selected[j].tx));
++                        tmpl.tx_fees.push_back(delta_selected[j].fee);
++                        tmpl.tx_sigchecks.push_back(
++                            delta_selected[j].sigchecks);
++                        tmpl.tx_hex.emplace_back();
++                        ++j;
++                    }
++                    if (delta_selected.empty() && prev_tmpl.roots_ready) {
++                        tmpl.subtree_a_root = prev_tmpl.subtree_a_root;
++                        tmpl.v2_base_state = prev_tmpl.v2_base_state;
++                        tmpl.roots_ready = true;
++                    }
++                    used_delta_selection = true;
++                } else {
++                    blockFitter.resetBlock();
+                 }
+-                const Amount fee = oentry.fee_sats * SATOSHI;
+-                tmpl.total_fees += fee;
+-                tmpl.non_cb_serialized_size += oentry.linear_cost;
+-                tmpl.non_coinbase_txs.push_back(std::move(tx_ref));
+-                tmpl.tx_fees.push_back(fee);
+-                tmpl.tx_sigchecks.push_back(oentry.sigchecks);
+             }
+-            tmpl.v2_base_state.sum_non_cb_effective_cost =
+-                spec_overlay.GetSumNonCbEffectiveCost();
+-            tmpl.roots_ready = false;
+-        } else {
+-            struct DepNode {
+-                CTxMemPoolEntryRef entry;
+-                size_t missing_parents;
+-                std::vector<size_t> children;
+-            };
+-            std::vector<DepNode> nodes;
+-            nodes.reserve(mempool_locked->mapTx.size());
+-            std::unordered_map<TxId, size_t, SaltedTxIdHasher> locations;
+-            locations.reserve(mempool_locked->mapTx.size());
+-            for (const auto &entry : mempool_locked->mapTx.get<entry_id>()) {
+-                locations.emplace(entry->GetTx().GetId(), nodes.size());
+-                nodes.push_back(
+-                    {entry, entry->GetMemPoolParentsConst().size(), {}});
+-            }
+-            for (size_t child = 0; child < nodes.size(); ++child) {
+-                for (const auto &parent :
+-                     nodes[child].entry->GetMemPoolParentsConst()) {
+-                    const auto pos =
+-                        locations.find(parent.get()->GetTx().GetId());
+-                    if (pos != locations.end()) {
+-                        nodes[pos->second].children.push_back(child);
++        }
++
++        if (!used_delta_selection) {
++            std::vector<SelectedEntry> selected;
++            selected.reserve(mempool_locked->mapTx.size());
++
++            bool used_all_eligible_selection = false;
++            if (mempool_locked->mapDeltas.empty()) {
++                bool all_eligible = true;
++                for (const auto &entry : id_idx) {
++                    const uint64_t tx_size = entry->GetTxSize();
++                    const int64_t tx_sigchecks = entry->GetSigChecks();
++                    const Amount fee = entry->GetFee();
++                    if (blockFitter.isBelowBlockMinFeeRate(
++                            entry->GetModifiedFeeRate()) ||
++                        !blockFitter.testTxFits(tx_size, tx_sigchecks)) {
++                        all_eligible = false;
++                        break;
++                    }
++                    TxValidationState tx_state;
++                    if (!ContextualCheckTransaction(
++                            *snap.consensus_params, entry->GetTx(), tx_state,
++                            tmpl.next_height, tmpl.parent_mtp)) {
++                        all_eligible = false;
++                        break;
+                     }
++                    blockFitter.addTx(tx_size, tx_sigchecks, fee);
++                    tmpl.total_fees += fee;
++                    tmpl.total_sigchecks += tx_sigchecks;
++                    selected.push_back(
++                        {entry->GetSharedTx(), fee, tx_sigchecks});
+                 }
+-            }
+-            auto lowerPriority = [&nodes](size_t a, size_t b) {
+-                return CompareTxMemPoolEntryByModifiedFeeRate{}(
+-                    nodes[b].entry, nodes[a].entry);
+-            };
+-            std::priority_queue<size_t, std::vector<size_t>,
+-                                decltype(lowerPriority)>
+-                ready(lowerPriority);
+-            for (size_t i = 0; i < nodes.size(); ++i) {
+-                if (nodes[i].missing_parents == 0) {
+-                    ready.push(i);
++                if (all_eligible) {
++                    std::sort(selected.begin(), selected.end(),
++                              [](const SelectedEntry &a,
++                                 const SelectedEntry &b) {
++                                  return a.tx->GetId() < b.tx->GetId();
++                              });
++                    used_all_eligible_selection = true;
++                    tmpl.mempool_ptr = mempool_locked;
++                } else {
++                    blockFitter.resetBlock();
++                    tmpl.total_fees = Amount::zero();
++                    tmpl.total_sigchecks = 0;
++                    selected.clear();
+                 }
+             }
+ 
+-            while (!ready.empty()) {
+-                const size_t idx = ready.top();
+-                ready.pop();
+-                const auto &entry = nodes[idx].entry;
+-                if (blockFitter.isBelowBlockMinFeeRate(
+-                        entry->GetModifiedFeeRate())) {
+-                    break;
++            if (!used_all_eligible_selection) {
++                struct DepNode {
++                    CTxMemPoolEntryRef entry;
++                    size_t missing_parents;
++                    std::vector<size_t> children;
++                };
++                std::vector<DepNode> nodes;
++                nodes.reserve(mempool_locked->mapTx.size());
++                std::unordered_map<TxId, size_t, SaltedTxIdHasher> locations;
++                locations.reserve(mempool_locked->mapTx.size());
++                for (const auto &entry : id_idx) {
++                    locations.emplace(entry->GetTx().GetId(), nodes.size());
++                    nodes.push_back(
++                        {entry, entry->GetMemPoolParentsConst().size(), {}});
+                 }
+-                const uint64_t tx_size = entry->GetTxSize();
+-                const int64_t tx_sigchecks = entry->GetSigChecks();
+-                if (!blockFitter.testTxFits(tx_size, tx_sigchecks)) {
+-                    continue;
++                for (size_t child = 0; child < nodes.size(); ++child) {
++                    for (const auto &parent :
++                         nodes[child].entry->GetMemPoolParentsConst()) {
++                        const auto pos =
++                            locations.find(parent.get()->GetTx().GetId());
++                        if (pos != locations.end()) {
++                            nodes[pos->second].children.push_back(child);
++                        }
++                    }
+                 }
+-                TxValidationState tx_state;
+-                if (!ContextualCheckTransaction(*snap.consensus_params,
+-                                                entry->GetTx(), tx_state,
+-                                                tmpl.next_height,
+-                                                tmpl.parent_mtp)) {
+-                    continue;
++                auto lowerPriority = [&nodes](size_t a, size_t b) {
++                    return CompareTxMemPoolEntryByModifiedFeeRate{}(
++                        nodes[b].entry, nodes[a].entry);
++                };
++                std::priority_queue<size_t, std::vector<size_t>,
++                                    decltype(lowerPriority)>
++                    ready(lowerPriority);
++                for (size_t i = 0; i < nodes.size(); ++i) {
++                    if (nodes[i].missing_parents == 0) {
++                        ready.push(i);
++                    }
+                 }
+-                blockFitter.addTx(tx_size, tx_sigchecks, entry->GetFee());
+-                tmpl.total_fees += entry->GetFee();
+-                selected.push_back(
+-                    {entry->GetSharedTx(), entry->GetFee(), tx_sigchecks});
+-                for (const size_t child : nodes[idx].children) {
+-                    if (nodes[child].missing_parents > 0 &&
+-                        --nodes[child].missing_parents == 0) {
+-                        ready.push(child);
++
++                while (!ready.empty()) {
++                    const size_t idx = ready.top();
++                    ready.pop();
++                    const auto &entry = nodes[idx].entry;
++                    if (blockFitter.isBelowBlockMinFeeRate(
++                            entry->GetModifiedFeeRate())) {
++                        break;
++                    }
++                    const uint64_t tx_size = entry->GetTxSize();
++                    const int64_t tx_sigchecks = entry->GetSigChecks();
++                    if (!blockFitter.testTxFits(tx_size, tx_sigchecks)) {
++                        continue;
++                    }
++                    TxValidationState tx_state;
++                    if (!ContextualCheckTransaction(*snap.consensus_params,
++                                                    entry->GetTx(), tx_state,
++                                                    tmpl.next_height,
++                                                    tmpl.parent_mtp)) {
++                        continue;
++                    }
++                    blockFitter.addTx(tx_size, tx_sigchecks, entry->GetFee());
++                    tmpl.total_fees += entry->GetFee();
++                    tmpl.total_sigchecks += tx_sigchecks;
++                    selected.push_back(
++                        {entry->GetSharedTx(), entry->GetFee(), tx_sigchecks});
++                    for (const size_t child : nodes[idx].children) {
++                        if (nodes[child].missing_parents > 0 &&
++                            --nodes[child].missing_parents == 0) {
++                            ready.push(child);
++                        }
+                     }
+                 }
+-            }
+ 
+-            std::sort(selected.begin(), selected.end(),
+-                      [](const SelectedEntry &a, const SelectedEntry &b) {
+-                          return a.tx->GetId() < b.tx->GetId();
+-                      });
++                std::sort(selected.begin(), selected.end(),
++                          [](const SelectedEntry &a, const SelectedEntry &b) {
++                              return a.tx->GetId() < b.tx->GetId();
++                          });
++            }
+ 
+             tmpl.non_coinbase_txs.reserve(selected.size());
+             tmpl.tx_fees.reserve(selected.size());
+             tmpl.tx_sigchecks.reserve(selected.size());
+-
++            tmpl.tx_hex.reserve(selected.size());
++
++            // [Patch 036 optimization] Carry forward any already-built tx_hex from
++            // the previous snapshot and defer hex-encoding of new transactions
++            // until EnsureTxHex() is called by getblocktemplate.
++            const bool can_reuse_prev_hex =
++                prev && prev->mining_template.template_valid &&
++                prev->mining_template_ready &&
++                prev->mining_template.non_coinbase_txs.size() ==
++                    prev->mining_template.tx_hex.size();
++            size_t prev_idx = 0;
+             for (auto &item : selected) {
+-                const uint64_t sz = item.tx->GetTotalSize();
+-                tmpl.non_cb_serialized_size += sz;
++                tmpl.non_cb_serialized_size += item.tx->GetTotalSize();
++                if (can_reuse_prev_hex) {
++                    const auto &prev_txs =
++                        prev->mining_template.non_coinbase_txs;
++                    const TxId &target_id = item.tx->GetId();
++                    while (prev_idx < prev_txs.size() &&
++                           prev_txs[prev_idx]->GetId() < target_id) {
++                        ++prev_idx;
++                    }
++                    if (prev_idx < prev_txs.size() &&
++                        prev_txs[prev_idx].get() == item.tx.get() &&
++                        !prev->mining_template.tx_hex[prev_idx].empty()) {
++                        tmpl.tx_hex.push_back(
++                            prev->mining_template.tx_hex[prev_idx]);
++                    } else {
++                        tmpl.tx_hex.emplace_back();
++                    }
++                } else {
++                    tmpl.tx_hex.emplace_back();
++                }
+                 tmpl.non_coinbase_txs.push_back(std::move(item.tx));
+                 tmpl.tx_fees.push_back(item.fee);
+                 tmpl.tx_sigchecks.push_back(item.sigchecks);
+             }
+-            tmpl.roots_ready = false;
+         }
+-    } else {
++    }
++
++    tmpl.block_reward = tmpl.total_fees + snap.next_subsidy;
++
++    if (tmpl.non_coinbase_txs.empty() &&
++        (tmpl.has_tip_utxo_snapshot || tmpl.next_height <= 1)) {
+         tmpl.subtree_a_root = lotus::v2::EmptyTxRoot();
+-        tmpl.coinbase_merkle_branch.clear();
++        tmpl.v2_base_state = V2TemplateBaseState{};
++        tmpl.v2_base_state.utxo_root = tmpl.tip_utxo_root;
++        tmpl.v2_base_state.mon_state = tmpl.tip_mon_state;
++        tmpl.v2_base_state.height = uint64_t(tmpl.next_height);
++        tmpl.v2_base_state.parent_mtp = uint64_t(tmpl.parent_mtp);
+         tmpl.roots_ready = true;
+     }
+ 
+-    tmpl.block_reward = tmpl.total_fees + snap.next_subsidy;
+-    tmpl.v2_base_state.non_cb_tx_count = tmpl.non_coinbase_txs.size();
+-    tmpl.v2_base_state.height = uint64_t(tmpl.next_height);
+-    tmpl.v2_base_state.parent_mtp = uint64_t(tmpl.parent_mtp);
+     tmpl.template_valid = true;
+ 
+     snap.mining_template = std::move(tmpl);
+@@ -623,7 +752,7 @@ void InitLazyMiningTemplateStub(ChainAndMempoolSnapshot &snap,
+     tmpl.template_id = publisher.AllocateTemplateId();
+     tmpl.prev_block_hash = snap.best_block_hash;
+     tmpl.next_height = snap.height + 1;
+-    tmpl.nHeaderVersion = 2;
++    tmpl.nHeaderVersion = lotus::v2::kHeaderVersion;
+     if (snap.consensus_params->fPowAllowMinDifficultyBlocks) {
+         tmpl.nHeaderVersion =
+             gArgs.GetIntArg("-blockversion", tmpl.nHeaderVersion);
+@@ -634,8 +763,10 @@ void InitLazyMiningTemplateStub(ChainAndMempoolSnapshot &snap,
+     tmpl.total_fees = Amount::zero();
+     tmpl.block_reward = snap.next_subsidy;
+     tmpl.non_cb_serialized_size = 0;
+-    tmpl.v2_base_state.height = uint64_t(tmpl.next_height);
+-    tmpl.v2_base_state.parent_mtp = uint64_t(tmpl.parent_mtp);
++    tmpl.total_sigchecks = 0;
++    tmpl.tip_utxo_root = snap.tip_utxo_root;
++    tmpl.tip_mon_state = snap.tip_mon_state;
++    tmpl.has_tip_utxo_snapshot = snap.has_utxo_snapshot;
+     tmpl.roots_ready = false;
+     tmpl.template_valid = true;
+     snap.mining_template = std::move(tmpl);
+@@ -644,50 +775,6 @@ void InitLazyMiningTemplateStub(ChainAndMempoolSnapshot &snap,
+ 
+ } // namespace
+ 
+-const std::vector<std::string> &MiningTemplateSnapshot::EnsureTxHex() const {
+-    if (!tx_hex_mutex) {
+-        return tx_hex;
+-    }
+-    std::lock_guard<std::mutex> lock(*tx_hex_mutex);
+-    if (tx_hex.size() == non_coinbase_txs.size()) {
+-        return tx_hex;
+-    }
+-    tx_hex.clear();
+-    tx_hex.reserve(non_coinbase_txs.size());
+-    for (const auto &tx : non_coinbase_txs) {
+-        tx_hex.push_back(SerializeTxToHex(*tx));
+-    }
+-    return tx_hex;
+-}
+-
+-void MiningTemplateSnapshot::EnsureTemplateRoots() const {
+-    if (!tx_hex_mutex) {
+-        return;
+-    }
+-    std::lock_guard<std::mutex> lock(*tx_hex_mutex);
+-    if (roots_ready) {
+-        return;
+-    }
+-    if (non_coinbase_txs.empty()) {
+-        subtree_a_root = lotus::v2::EmptyTxRoot();
+-        coinbase_merkle_branch.clear();
+-        roots_ready = true;
+-        return;
+-    }
+-    lotus::v2::TxOverlayArena tx_arena;
+-    uint32_t tx_root_idx = lotus::v2::TxOverlayArena::kNullIdx;
+-    for (const auto &tx : non_coinbase_txs) {
+-        lotus::v2::Hash tx_id{};
+-        lotus::v2::Hash tx_hash{};
+-        std::memcpy(tx_id.data(), tx->GetId().begin(), 32);
+-        std::memcpy(tx_hash.data(), tx->GetHash().begin(), 32);
+-        tx_root_idx = tx_arena.InsertTxLeaf(tx_root_idx, tx_id, tx_hash);
+-    }
+-    subtree_a_root = tx_arena.SubtreeARoot(tx_root_idx);
+-    coinbase_merkle_branch = ComputeCoinbaseMerkleBranch(non_coinbase_txs);
+-    roots_ready = true;
+-}
+-
+ void ChainAndMempoolSnapshot::EnsureMempoolVectors() const
+     NO_THREAD_SAFETY_ANALYSIS {
+     if (!mempool_vectors_mutex) {
+@@ -720,6 +807,121 @@ void ChainAndMempoolSnapshot::EnsureMiningTemplate() const
+     publisher.RecordMiningTemplate(mining_template);
+ }
+ 
++const std::vector<std::string> &MiningTemplateSnapshot::EnsureTxHex() const {
++    if (!tx_hex_mutex) {
++        return tx_hex;
++    }
++    std::lock_guard<std::mutex> lock(*tx_hex_mutex);
++    if (tx_hex.size() < non_coinbase_txs.size()) {
++        tx_hex.resize(non_coinbase_txs.size());
++    }
++    for (size_t i = 0; i < non_coinbase_txs.size(); ++i) {
++        if (tx_hex[i].empty() && non_coinbase_txs[i]) {
++            tx_hex[i] = SerializeTxToHex(*non_coinbase_txs[i]);
++        }
++    }
++    return tx_hex;
++}
++
++void MiningTemplateSnapshot::EnsureRoots() const {
++    if (!tx_hex_mutex) {
++        return;
++    }
++    std::lock_guard<std::mutex> lock(*tx_hex_mutex);
++    if (roots_ready) {
++        return;
++    }
++    if (non_coinbase_txs.empty()) {
++        subtree_a_root = lotus::v2::EmptyTxRoot();
++        if (has_tip_utxo_snapshot || next_height <= 1) {
++            v2_base_state = V2TemplateBaseState{};
++            v2_base_state.utxo_root = tip_utxo_root;
++            v2_base_state.mon_state = tip_mon_state;
++            v2_base_state.height = uint64_t(next_height);
++            v2_base_state.parent_mtp = uint64_t(parent_mtp);
++        } else {
++            v2_base_state = BuildV2TemplateBaseState(
++                non_coinbase_txs, prev_block_hash, uint64_t(next_height),
++                uint64_t(parent_mtp));
++        }
++        roots_ready = true;
++        return;
++    }
++
++    if (has_tip_utxo_snapshot &&
++        (tip_utxo_root != nullptr || next_height <= 1)) {
++        if (mempool_ptr != nullptr) {
++            TRY_LOCK(mempool_ptr->cs, lock_mp);
++            if (lock_mp && mempool_ptr->size() == non_coinbase_txs.size()) {
++                mempool_ptr->SyncMerklixOverlayToTip(
++                    prev_block_hash, uint64_t(next_height),
++                    uint64_t(parent_mtp));
++                const auto &overlay =
++                    mempool_ptr->GetMerklixOverlay().GetSpeculativeOverlay();
++                if (overlay.GetTxCount() == non_coinbase_txs.size()) {
++                    subtree_a_root = overlay.GetSubtreeARoot();
++                    (void)overlay.GetUtxoRootDigest();
++                    v2_base_state = V2TemplateBaseState{};
++                    v2_base_state.utxo_arena =
++                        std::make_shared<const lotus::v2::UtxoOverlayArena>(
++                            overlay.GetUtxoArena());
++                    v2_base_state.mon_state = overlay.GetBaseMonetaryState();
++                    v2_base_state.non_cb_tx_count = overlay.GetTxCount();
++                    v2_base_state.sum_non_cb_effective_cost =
++                        overlay.GetSumNonCbEffectiveCost();
++                    v2_base_state.height = uint64_t(next_height);
++                    v2_base_state.parent_mtp = uint64_t(parent_mtp);
++                    roots_ready = true;
++                    return;
++                }
++            }
++        }
++        lotus::v2::Hash parent_id{};
++        std::memcpy(parent_id.data(), prev_block_hash.begin(), 32);
++        lotus::v2::MempoolOverlayLayer overlay(
++            parent_id, tip_utxo_root, tip_mon_state, uint64_t(next_height),
++            uint64_t(parent_mtp));
++        std::vector<std::tuple<CTransactionRef, int64_t, int64_t>> batch;
++        batch.reserve(non_coinbase_txs.size());
++        for (size_t i = 0; i < non_coinbase_txs.size(); ++i) {
++            const int64_t fee_sats =
++                i < tx_fees.size() ? tx_fees[i] / SATOSHI : 0;
++            const int64_t sigchecks =
++                i < tx_sigchecks.size() ? tx_sigchecks[i] : 0;
++            batch.emplace_back(non_coinbase_txs[i], fee_sats, sigchecks);
++        }
++        AddTransactionsToOverlayBatch(overlay, batch);
++        subtree_a_root = overlay.GetSubtreeARoot();
++        (void)overlay.GetUtxoRootDigest();
++        v2_base_state = V2TemplateBaseState{};
++        v2_base_state.utxo_arena =
++            std::make_shared<const lotus::v2::UtxoOverlayArena>(
++                overlay.GetUtxoArena());
++        v2_base_state.mon_state = overlay.GetBaseMonetaryState();
++        v2_base_state.non_cb_tx_count = overlay.GetTxCount();
++        v2_base_state.sum_non_cb_effective_cost =
++            overlay.GetSumNonCbEffectiveCost();
++        v2_base_state.height = uint64_t(next_height);
++        v2_base_state.parent_mtp = uint64_t(parent_mtp);
++        roots_ready = true;
++        return;
++    }
++
++    std::vector<lotus::v2::TxIdentityPair> id_pairs;
++    id_pairs.reserve(non_coinbase_txs.size());
++    for (const auto &ptx : non_coinbase_txs) {
++        lotus::v2::TxIdentityPair pair{};
++        std::memcpy(pair.tx_hash.data(), ptx->GetHash().begin(), 32);
++        std::memcpy(pair.tx_id.data(), ptx->GetId().begin(), 32);
++        id_pairs.push_back(pair);
++    }
++    subtree_a_root = lotus::v2::TransactionSubtreeARoot(id_pairs);
++    v2_base_state = BuildV2TemplateBaseState(
++        non_coinbase_txs, prev_block_hash, uint64_t(next_height),
++        uint64_t(parent_mtp));
++    roots_ready = true;
++}
++
+ SnapshotPublisher::SnapshotPublisher() {
+     auto empty = std::make_shared<const ChainAndMempoolSnapshot>();
+     std::atomic_store_explicit(&m_ring[0], std::move(empty),
+@@ -764,14 +966,14 @@ SnapshotPublisher::FindMiningTemplate(uint64_t template_id,
+             (prev_block_hash.IsNull() ||
+              current->mining_template.prev_block_hash == prev_block_hash)) {
+             current->EnsureMiningTemplate();
+-            current->mining_template.EnsureTemplateRoots();
++            current->mining_template.EnsureRoots();
+             return current->mining_template;
+         }
+         if (template_id == 0 &&
+             (prev_block_hash.IsNull() ||
+              current->mining_template.prev_block_hash == prev_block_hash)) {
+             current->EnsureMiningTemplate();
+-            current->mining_template.EnsureTemplateRoots();
++            current->mining_template.EnsureRoots();
+             return current->mining_template;
+         }
+     }
+@@ -783,23 +985,21 @@ SnapshotPublisher::FindMiningTemplate(uint64_t template_id,
+             const auto &entry =
+                 m_template_history[(m_template_history_pos - offset) %
+                                    kTemplateHistorySize];
+-            if (template_id != 0 && entry.template_id == template_id &&
+-                (prev_block_hash.IsNull() ||
+-                 entry.prev_block_hash == prev_block_hash)) {
+-                entry.EnsureTemplateRoots();
++            if (template_id != 0 && entry.template_id == template_id) {
++                entry.EnsureRoots();
+                 return entry;
+             }
+             if (template_id == 0 &&
+                 (prev_block_hash.IsNull() ||
+                  entry.prev_block_hash == prev_block_hash)) {
+-                entry.EnsureTemplateRoots();
++                entry.EnsureRoots();
+                 return entry;
+             }
+         }
+     }
+     if (template_id == 0 && current && current->mining_template.template_valid) {
+         current->EnsureMiningTemplate();
+-        current->mining_template.EnsureTemplateRoots();
++        current->mining_template.EnsureRoots();
+         return current->mining_template;
+     }
+     return std::nullopt;
+@@ -875,10 +1075,7 @@ void PublishChainTipSnapshot(ChainstateManager &chainman,
+ 
+     CBlockHeader dummyHeader;
+     dummyHeader.hashPrevBlock = tip->GetBlockHash();
+-    const int64_t now_time =
+-        TicksSinceEpoch<std::chrono::seconds>(GetAdjustedTime());
+-    dummyHeader.nTime =
+-        static_cast<uint32_t>(std::max<int64_t>(tip->GetMedianTimePast() + 1, now_time));
++    dummyHeader.SetBlockTime(tip->GetBlockTime());
+     next->next_nBits = GetNextWorkRequired(tip, &dummyHeader, chainparams);
+     next->next_subsidy =
+         GetBlockSubsidy(tip->nHeight + 1, *next->consensus_params);
+@@ -920,8 +1117,16 @@ void PublishChainTipSnapshot(ChainstateManager &chainman,
+         }
+     }
+     next->active_chain = std::move(active_chain_snap);
+-    next->tip_utxo_root.reset();
+-    next->has_utxo_snapshot = false;
++
++    if (tip->nHeight == 0) {
++        next->tip_utxo_root.reset();
++        next->tip_mon_state = lotus::v2::GetInitialV2MonetaryState();
++        next->has_utxo_snapshot = true;
++    } else {
++        next->tip_mon_state = lotus::v2::GetInitialV2MonetaryState();
++        next->has_utxo_snapshot = GetV2BlockStateSnapshot(
++            tip->GetBlockHash(), next->tip_utxo_root, next->tip_mon_state);
++    }
+ 
+     if (mempool) {
+         LOCK(mempool->cs);
+@@ -948,9 +1153,14 @@ void PublishMempoolSnapshot(const CTxMemPool &mempool)
+     auto prev = publisher.Load();
+     auto next = CloneChainStateOnly(prev.get());
+ 
+-    PopulateMempoolScalarsLocked(*next, mempool);
+-    next->mempool_vectors_ready = false;
+-    InitLazyMiningTemplateStub(*next, mempool, prev.get(), publisher);
++    if (mempool.mapTx.size() <= 64) {
++        PopulateMempoolFieldsLocked(*next, mempool, prev.get());
++        PopulateMiningTemplate(*next, &mempool, prev.get(), publisher);
++    } else {
++        PopulateMempoolScalarsLocked(*next, mempool);
++        next->mempool_vectors_ready = false;
++        InitLazyMiningTemplateStub(*next, mempool, prev.get(), publisher);
++    }
+ 
+     publisher.Publish(std::move(next));
+ }
+@@ -991,3 +1201,4 @@ void PublishMempoolUnbroadcastSnapshot(const CTxMemPool &mempool,
+ }
+ 
+ } // namespace node
++
+diff --git a/src/node/snapshot.h b/src/node/snapshot.h
+index 9977dc62796f84388902723b26b1c3bb3a917fd4..9e18f23f8fb0a1b77c24493ab3de00246571d52c 100644
+--- a/src/node/snapshot.h
++++ b/src/node/snapshot.h
+@@ -9,8 +9,7 @@
+ #include <consensus/params.h>
+ #include <feerate.h>
+ #include <flatfile.h>
+-#include <lotus_v2/sparse_state.h>
+-#include <lotus_v2/tagged_hash.h>
++#include <lotus_v2/header.h>
+ #include <primitives/block.h>
+ #include <primitives/blockhash.h>
+ #include <primitives/transaction.h>
+@@ -32,21 +31,6 @@
+ class ChainstateManager;
+ class CTxMemPool;
+ 
+-namespace lotus::v2 {
+-struct SmtNode;
+-class UtxoOverlayArena;
+-} // namespace lotus::v2
+-
+-struct V2TemplateBaseState {
+-    std::shared_ptr<const lotus::v2::SmtNode> utxo_root;
+-    std::shared_ptr<const lotus::v2::UtxoOverlayArena> utxo_arena;
+-    lotus::v2::MonetaryState mon_state{};
+-    size_t non_cb_tx_count{0};
+-    uint64_t sum_non_cb_effective_cost{0};
+-    uint64_t height{0};
+-    uint64_t parent_mtp{0};
+-};
+-
+ namespace node {
+ 
+ /**
+@@ -117,35 +101,31 @@ struct MiningTemplateSnapshot {
+     uint64_t template_id{0};
+     BlockHash prev_block_hash{};
+     int next_height{0};
+-    uint32_t nHeaderVersion{2};
++    uint32_t nHeaderVersion{lotus::v2::kHeaderVersion};
+     uint32_t nBits{0};
+     int64_t min_time{0};
+     int64_t parent_mtp{0};
+     Amount total_fees{Amount::zero()};
+     Amount block_reward{Amount::zero()};
+     uint64_t non_cb_serialized_size{0};
++    uint64_t max_generated_block_size{0};
++    int64_t total_sigchecks{0};
+     std::vector<CTransactionRef> non_coinbase_txs;
+     std::vector<Amount> tx_fees;
+     std::vector<int64_t> tx_sigchecks;
+     mutable std::vector<std::string> tx_hex;
+     std::shared_ptr<std::mutex> tx_hex_mutex{std::make_shared<std::mutex>()};
++    std::shared_ptr<const lotus::v2::SmtNode> tip_utxo_root;
++    lotus::v2::MonetaryState tip_mon_state{};
++    bool has_tip_utxo_snapshot{false};
+     mutable lotus::v2::Hash subtree_a_root{};
+-    mutable std::vector<lotus::v2::Hash> coinbase_merkle_branch;
++    mutable V2TemplateBaseState v2_base_state{};
+     mutable bool roots_ready{false};
+-    V2TemplateBaseState v2_base_state{};
+     bool template_valid{false};
++    const CTxMemPool *mempool_ptr{nullptr};
+ 
+-    /**
+-     * Lazily populate tx_hex on demand (only needed when a caller invokes
+-     * legacy full-hex getblocktemplate rather than mode="compact_template").
+-     */
+     const std::vector<std::string> &EnsureTxHex() const;
+-
+-    /**
+-     * Lazily compute subtree_a_root and coinbase_merkle_branch on demand so
+-     * snapshot publication does not hash transactions while holding mempool.cs.
+-     */
+-    void EnsureTemplateRoots() const;
++    void EnsureRoots() const;
+ };
+ 
+ /**
+@@ -186,6 +166,7 @@ struct ChainAndMempoolSnapshot {
+     std::shared_ptr<const ActiveChainSnapshot> active_chain;
+     bool has_utxo_snapshot{false};
+     std::shared_ptr<const lotus::v2::SmtNode> tip_utxo_root;
++    lotus::v2::MonetaryState tip_mon_state{};
+ 
+     // Mempool state
+     bool mempool_valid{false};
+@@ -242,8 +223,6 @@ struct ChainAndMempoolSnapshot {
+     }
+ };
+ 
+-using ChainTipSnapshot = ChainAndMempoolSnapshot;
+-
+ /**
+  * Lock-free RCU publisher for ChainAndMempoolSnapshot.
+  * Readers call Load() which performs an atomic acquire load on the ring index
+@@ -298,10 +277,6 @@ public:
+ std::shared_ptr<SnapshotPublisher> GetGlobalSnapshotPublisherPtr();
+ SnapshotPublisher &GetGlobalSnapshotPublisher();
+ 
+-inline std::shared_ptr<const ChainTipSnapshot> GetChainTipSnapshot() noexcept {
+-    return GetGlobalSnapshotPublisher().Load();
+-}
+-
+ /**
+  * Publish an updated chain + template snapshot when the active tip changes.
+  * Must be called with ::cs_main held.
+@@ -309,11 +284,6 @@ inline std::shared_ptr<const ChainTipSnapshot> GetChainTipSnapshot() noexcept {
+ void PublishChainTipSnapshot(ChainstateManager &chainman,
+                              const CTxMemPool *mempool);
+ 
+-inline void UpdateChainTipSnapshot(ChainstateManager &chainman,
+-                                   const CTxMemPool *mempool) {
+-    PublishChainTipSnapshot(chainman, mempool);
+-}
+-
+ /**
+  * Publish an updated mempool + template snapshot when the mempool changes.
+  * Must be called with mempool.cs held.
+diff --git a/src/test/snapshot_rcu_tests.cpp b/src/test/snapshot_rcu_tests.cpp
+index 4af5ded039a716909d433c91574ebfcf5583cd5c..3eac139aaff68f9c154ad21ba3bcdb869038350b 100644
+--- a/src/test/snapshot_rcu_tests.cpp
++++ b/src/test/snapshot_rcu_tests.cpp
+@@ -12,7 +12,6 @@
+ #include <node/snapshot.h>
+ #include <pow/pow.h>
+ #include <primitives/block.h>
+-#include <rpc/async_waiter.h>
+ #include <rpc/blockchain.h>
+ #include <rpc/server.h>
+ #include <script/standard.h>
+@@ -26,6 +25,7 @@
+ #include <boost/asio/co_spawn.hpp>
+ #include <boost/asio/detached.hpp>
+ #include <boost/asio/thread_pool.hpp>
++#include <boost/asio/use_future.hpp>
+ #include <boost/test/unit_test.hpp>
+ 
+ #include <atomic>
+@@ -161,7 +161,7 @@ BOOST_AUTO_TEST_CASE(lockfree_rpc_reads_while_cs_main_and_mempool_locked) {
+ 
+     locks_acquired.get_future().wait();
+ 
+-    // All migrated read-only RPCs must complete without blocking on cs_main
++    // All 12 migrated read-only RPCs must complete without blocking on cs_main
+     // or mempool.cs while both locks are held exclusively by `locker`.
+     const auto start = std::chrono::steady_clock::now();
+     const UniValue count_res = call_rpc("getblockcount");
+@@ -198,6 +198,13 @@ BOOST_AUTO_TEST_CASE(lockfree_rpc_reads_while_cs_main_and_mempool_locked) {
+     const UniValue hdr_hex_res =
+         call_rpc_params("getblockheader", std::move(hdr_hex_params));
+ 
++    UniValue txout_confirmed_params(UniValue::VARR);
++    txout_confirmed_params.push_back(confirmed_txid);
++    txout_confirmed_params.push_back(0);
++    txout_confirmed_params.push_back(true);
++    const UniValue txout_confirmed_res =
++        call_rpc_params("gettxout", std::move(txout_confirmed_params));
++
+     UniValue txout_mempool_params(UniValue::VARR);
+     txout_mempool_params.push_back(mempool_txid);
+     txout_mempool_params.push_back(0);
+@@ -252,6 +259,10 @@ BOOST_AUTO_TEST_CASE(lockfree_rpc_reads_while_cs_main_and_mempool_locked) {
+     BOOST_CHECK_EQUAL(hdr_verbose_res.find_value("previousblockhash").get_str(),
+                       block1_hash);
+     BOOST_CHECK(!hdr_hex_res.get_str().empty());
++    BOOST_CHECK(txout_confirmed_res.isObject());
++    BOOST_CHECK_EQUAL(
++        txout_confirmed_res.find_value("confirmations").getInt<int>(), 99);
++    BOOST_CHECK(txout_confirmed_res.find_value("coinbase").get_bool());
+     BOOST_CHECK(txout_mempool_res.isObject());
+     BOOST_CHECK_EQUAL(
+         txout_mempool_res.find_value("confirmations").getInt<int>(), 0);
+@@ -267,27 +278,351 @@ BOOST_AUTO_TEST_CASE(lockfree_rpc_reads_while_cs_main_and_mempool_locked) {
+                       99);
+ }
+ 
+-BOOST_AUTO_TEST_CASE(testrawtxbatch_and_submitrawtxbatch_all_or_nothing) {
++BOOST_AUTO_TEST_CASE(coro_50_waiters_non_blocking_on_4_threads) {
+     GlobalConfig config;
+-    CKey parent_key;
+-    parent_key.MakeNewKey(true);
+-    CScript parent_spk =
+-        GetScriptForDestination(PKHash(parent_key.GetPubKey()));
++    StartRPC();
++    {
++        LOCK(::cs_main);
++        RPCNotifyBlockChange(m_node.chainman->ActiveChain().Tip());
++    }
++    boost::asio::thread_pool pool(4);
++
++    constexpr int kNumWaiters = 50;
++    std::vector<std::future<UniValue>> waiter_futures;
++    waiter_futures.reserve(kNumWaiters);
++
++    for (int i = 0; i < kNumWaiters; ++i) {
++        JSONRPCRequest req;
++        req.context = &m_node;
++        req.strMethod = "waitfornewblock";
++        req.params = UniValue(UniValue::VARR);
++        req.params.push_back(5000);
++        waiter_futures.push_back(boost::asio::co_spawn(
++            pool,
++            [&, req = std::move(req)]() -> boost::asio::awaitable<UniValue> {
++                co_return co_await tableRPC.executeAsync(config, req,
++                                                         pool.get_executor());
++            },
++            boost::asio::use_future));
++    }
++
++    // Give the 4 worker threads a brief moment to suspend all 50 coroutines.
++    std::this_thread::sleep_for(std::chrono::milliseconds(50));
++
++    // Even with 50 waitfornewblock coroutines suspended on the 4-thread pool,
++    // a 51st coroutine executing getblockcount must run immediately without
++    // head-of-line blocking.
++    const auto start = std::chrono::steady_clock::now();
++    JSONRPCRequest count_req;
++    count_req.context = &m_node;
++    count_req.strMethod = "getblockcount";
++    count_req.params = UniValue(UniValue::VARR);
++    auto count_fut = boost::asio::co_spawn(
++        pool, tableRPC.executeAsync(config, count_req, pool.get_executor()),
++        boost::asio::use_future);
++    BOOST_REQUIRE(count_fut.wait_for(std::chrono::milliseconds(500)) ==
++                  std::future_status::ready);
++    const auto elapsed_ms =
++        std::chrono::duration_cast<std::chrono::milliseconds>(
++            std::chrono::steady_clock::now() - start)
++            .count();
++    BOOST_CHECK_LT(elapsed_ms, 50);
++    BOOST_CHECK_EQUAL(count_fut.get().getInt<int>(), 100);
++
++    // Mine a block and notify RPC waiters, then verify all 50 suspended
++    // waitfornewblock coroutines wake up and return the new tip.
++    CScript pubKeyScript = GetScriptForRawPubKey(coinbaseKey.GetPubKey());
++    CreateAndProcessBlock({}, pubKeyScript);
++    {
++        LOCK(::cs_main);
++        RPCNotifyBlockChange(m_node.chainman->ActiveChain().Tip());
++    }
++
++    for (auto &fut : waiter_futures) {
++        BOOST_REQUIRE(fut.wait_for(std::chrono::seconds(2)) ==
++                      std::future_status::ready);
++        UniValue res = fut.get();
++        BOOST_CHECK_EQUAL(res.find_value("height").getInt<int>(), 101);
++    }
++
++    pool.join();
++    InterruptRPC();
++    StopRPC();
++}
++
++BOOST_AUTO_TEST_CASE(getblocktemplate_o1_and_submitsealedheader) {
++    GlobalConfig config;
++    gArgs.ForceSetArg("-gbtwithoutpeers", "1");
++    if (m_node.args) {
++        m_node.args->ForceSetArg("-gbtwithoutpeers", "1");
++    }
++    CScript pubKeyScript = GetScriptForRawPubKey(coinbaseKey.GetPubKey());
++
++    // Add 1 valid transaction to the mempool and refresh snapshot.
++    CMutableTransaction mempool_mtx = CreateValidMempoolTransaction(
++        m_coinbase_txns[0], 0, 1, coinbaseKey, pubKeyScript,
++        50 * COIN - 1000 * SATOSHI, /*submit=*/true);
++    {
++        LOCK(::cs_main);
++        node::PublishMempoolSnapshot(*m_node.mempool);
++        node::PublishChainTipSnapshot(*m_node.chainman, m_node.mempool.get());
++    }
++
++    auto call_gbt = [&](const std::string &mode) -> UniValue {
++        JSONRPCRequest req;
++        req.context = &m_node;
++        req.strMethod = "getblocktemplate";
++        UniValue param(UniValue::VOBJ);
++        param.pushKV("mode", mode);
++        req.params = UniValue(UniValue::VARR);
++        req.params.push_back(std::move(param));
++        return tableRPC.execute(config, req);
++    };
+ 
+-    CKey child_key;
+-    child_key.MakeNewKey(true);
+-    CScript child_spk = GetScriptForDestination(PKHash(child_key.GetPubKey()));
++    const UniValue tmpl_full = call_gbt("template");
++    const UniValue tmpl_compact = call_gbt("compact_template");
+ 
+-    // Create a parent transaction and a child transaction spending the parent.
++    BOOST_CHECK(tmpl_full.exists("transactions"));
++    BOOST_CHECK_EQUAL(tmpl_full.find_value("transactions").get_array().size(),
++                      1U);
++    BOOST_CHECK(!tmpl_compact.exists("transactions"));
++
++    const uint64_t template_id =
++        tmpl_compact.find_value("templateid").getInt<uint64_t>();
++    BOOST_CHECK_GT(template_id, 0U);
++    BOOST_CHECK_EQUAL(tmpl_full.find_value("subtreearoot").get_str(),
++                      tmpl_compact.find_value("subtreearoot").get_str());
++    BOOST_CHECK_EQUAL(tmpl_full.find_value("stateroot").get_str(),
++                      tmpl_compact.find_value("stateroot").get_str());
++    BOOST_CHECK_EQUAL(tmpl_full.find_value("merkleroot").get_str(),
++                      tmpl_compact.find_value("merkleroot").get_str());
++
++    // Reconstruct the exact dummy coinbase transaction used by getblocktemplate
++    // and mine a block using submitsealedheader.
++    const auto cached_tmpl =
++        node::GetGlobalSnapshotPublisher().FindMiningTemplate(template_id);
++    BOOST_REQUIRE(cached_tmpl.has_value());
++
++    const Consensus::Params &consensusParams =
++        config.GetChainParams().GetConsensus();
++    CMutableTransaction coinbaseTx;
++    coinbaseTx.vin.resize(1);
++    coinbaseTx.vin[0].prevout =
++        COutPoint(TxId(cached_tmpl->prev_block_hash),
++                  static_cast<uint32_t>(cached_tmpl->next_height));
++    coinbaseTx.vin[0].nFlags = 2;
++    coinbaseTx.vout.resize(1);
++    coinbaseTx.vout[0].scriptPubKey = CScript() << OP_TRUE;
++    coinbaseTx.vout[0].nValue = cached_tmpl->block_reward;
++    coinbaseTx.vin[0].scriptSig =
++        CScript() << cached_tmpl->next_height << OP_0;
++    coinbaseTx.vin[0].fHasCoinbaseData = true;
++    coinbaseTx.vin[0].vCoinbaseData.assign(coinbaseTx.vin[0].scriptSig.begin(),
++                                           coinbaseTx.vin[0].scriptSig.end());
++    const auto minerFundWhitelist = GetMinerFundWhitelist(consensusParams);
++    if (!minerFundWhitelist.empty()) {
++        const Amount minerFundAmount = GetMinerFundAmount(
++            consensusParams, cached_tmpl->block_reward, nullptr);
++        coinbaseTx.vout[0].nValue -= minerFundAmount;
++        coinbaseTx.vout.emplace_back(
++            minerFundAmount,
++            GetScriptForDestination(*minerFundWhitelist.begin()));
++    }
++    uint64_t coinbaseSize = ::GetSerializeSize(coinbaseTx);
++    if (coinbaseSize < MIN_TX_SIZE) {
++        coinbaseTx.vin[0].scriptSig
++            << std::vector<uint8_t>(MIN_TX_SIZE - coinbaseSize - 1);
++        coinbaseTx.vin[0].vCoinbaseData.assign(
++            coinbaseTx.vin[0].scriptSig.begin(),
++            coinbaseTx.vin[0].scriptSig.end());
++    }
++
++    CBlockHeader header;
++    header.nHeaderVersion =
++        tmpl_compact.find_value("version").getInt<uint32_t>();
++    header.hashPrevBlock = cached_tmpl->prev_block_hash;
++    header.hashMerkleRoot =
++        uint256S(tmpl_compact.find_value("merkleroot").get_str());
++    header.hashStateRoot =
++        uint256S(tmpl_compact.find_value("stateroot").get_str());
++    header.SetBlockTime(tmpl_compact.find_value("curtime").getInt<uint64_t>());
++    header.nBits = cached_tmpl->nBits;
++    header.nHeight = cached_tmpl->next_height;
++    header.nSize =
++        ::GetSerializeSize(header) +
++        GetSizeOfCompactSize(1 + cached_tmpl->non_coinbase_txs.size()) +
++        ::GetSerializeSize(coinbaseTx) + cached_tmpl->non_cb_serialized_size;
++    header.nNonce = 0;
++
++    while (!CheckProofOfWork(header.GetHash(), header.nBits, consensusParams)) {
++        ++header.nNonce;
++    }
++
++    DataStream ss_header{};
++    ss_header << header;
++    const std::string header_hex = HexStr(ss_header);
++    const std::string coinbase_hex = EncodeHexTx(CTransaction(coinbaseTx));
++
++    JSONRPCRequest submit_req;
++    submit_req.context = &m_node;
++    submit_req.strMethod = "submitsealedheader";
++    submit_req.params = UniValue(UniValue::VARR);
++    submit_req.params.push_back(header_hex);
++    submit_req.params.push_back(coinbase_hex);
++    submit_req.params.push_back(template_id);
++
++    UniValue submit_res = tableRPC.execute(config, submit_req);
++    BOOST_CHECK(submit_res.isNull());
++
++    JSONRPCRequest count_req;
++    count_req.context = &m_node;
++    count_req.strMethod = "getblockcount";
++    count_req.params = UniValue(UniValue::VARR);
++    BOOST_CHECK_EQUAL(tableRPC.execute(config, count_req).getInt<int>(), 101);
++
++    // Also test getblocktemplate with mineraddress + ready-to-hash headerhex /
++    // coinbasetxhex / v2target / chainid + submitsealedblock directly.
++    const std::string miner_addr =
++        EncodeDestination(PKHash(coinbaseKey.GetPubKey()), config);
++    JSONRPCRequest gbt2_req;
++    gbt2_req.context = &m_node;
++    gbt2_req.strMethod = "getblocktemplate";
++    UniValue gbt2_param(UniValue::VOBJ);
++    gbt2_param.pushKV("mode", "compact_template");
++    gbt2_param.pushKV("mineraddress", miner_addr);
++    gbt2_req.params = UniValue(UniValue::VARR);
++    gbt2_req.params.push_back(std::move(gbt2_param));
++    const UniValue tmpl_v2 = tableRPC.execute(config, gbt2_req);
++
++    BOOST_CHECK(tmpl_v2.exists("headerhex"));
++    BOOST_CHECK(tmpl_v2.exists("coinbasetxhex"));
++    BOOST_CHECK(tmpl_v2.exists("chainid"));
++    BOOST_CHECK(tmpl_v2.exists("v2target"));
++    BOOST_CHECK(tmpl_v2.exists("blocksize"));
++    BOOST_CHECK_EQUAL(tmpl_v2.find_value("headerhex").get_str().size(),
++                      lotus::v2::HEADER_SIZE * 2);
++    BOOST_CHECK_EQUAL(tmpl_v2.find_value("chainid").get_str().size(), 64U);
++    BOOST_CHECK_EQUAL(tmpl_v2.find_value("v2target").get_str().size(), 64U);
++
++    CBlockHeader v2_hdr;
++    BOOST_REQUIRE(
++        DecodeHexBlockHeader(v2_hdr, tmpl_v2.find_value("headerhex").get_str()));
++    while (!CheckProofOfWork(v2_hdr.GetHash(), v2_hdr.nBits, consensusParams)) {
++        ++v2_hdr.nNonce;
++    }
++    DataStream ss_v2_hdr{};
++    ss_v2_hdr << v2_hdr;
++
++    JSONRPCRequest sealed_blk_req;
++    sealed_blk_req.context = &m_node;
++    sealed_blk_req.strMethod = "submitsealedblock";
++    sealed_blk_req.params = UniValue(UniValue::VARR);
++    sealed_blk_req.params.push_back(HexStr(ss_v2_hdr));
++    sealed_blk_req.params.push_back(
++        tmpl_v2.find_value("coinbasetxhex").get_str());
++    sealed_blk_req.params.push_back(
++        tmpl_v2.find_value("templateid").getInt<uint64_t>());
++
++    UniValue sealed_blk_res = tableRPC.execute(config, sealed_blk_req);
++    BOOST_CHECK(sealed_blk_res.isNull());
++    BOOST_CHECK_EQUAL(tableRPC.execute(config, count_req).getInt<int>(), 102);
++
++    // Passing a valid template_id from height 101 with a header from height 102
++    // must return "template-prevblock-mismatch".
++    JSONRPCRequest mismatch_req;
++    mismatch_req.context = &m_node;
++    mismatch_req.strMethod = "submitsealedblock";
++    mismatch_req.params = UniValue(UniValue::VARR);
++    mismatch_req.params.push_back(HexStr(ss_v2_hdr));
++    mismatch_req.params.push_back(
++        tmpl_v2.find_value("coinbasetxhex").get_str());
++    mismatch_req.params.push_back(template_id);
++    UniValue mismatch_res = tableRPC.execute(config, mismatch_req);
++    BOOST_CHECK_EQUAL(mismatch_res.get_str(), "template-prevblock-mismatch");
++
++    // Empty or invalid mineraddress string must throw RPC_INVALID_ADDRESS_OR_KEY,
++    // and non-string mineraddress must throw RPC_INVALID_PARAMETER.
++    for (const std::string &bad_addr :
++         {std::string(""), std::string("invalid_lotus_address")}) {
++        JSONRPCRequest bad_addr_req;
++        bad_addr_req.context = &m_node;
++        bad_addr_req.strMethod = "getblocktemplate";
++        UniValue bad_param(UniValue::VOBJ);
++        bad_param.pushKV("mode", "compact_template");
++        bad_param.pushKV("mineraddress", bad_addr);
++        bad_addr_req.params = UniValue(UniValue::VARR);
++        bad_addr_req.params.push_back(std::move(bad_param));
++        BOOST_CHECK_EXCEPTION(
++            tableRPC.execute(config, bad_addr_req), UniValue,
++            [](const UniValue &e) {
++                return e.find_value("code").getInt<int>() ==
++                       RPC_INVALID_ADDRESS_OR_KEY;
++            });
++    }
++    {
++        JSONRPCRequest nonstr_addr_req;
++        nonstr_addr_req.context = &m_node;
++        nonstr_addr_req.strMethod = "getblocktemplate";
++        UniValue bad_param(UniValue::VOBJ);
++        bad_param.pushKV("mode", "compact_template");
++        bad_param.pushKV("mineraddress", 12345);
++        nonstr_addr_req.params = UniValue(UniValue::VARR);
++        nonstr_addr_req.params.push_back(std::move(bad_param));
++        BOOST_CHECK_EXCEPTION(
++            tableRPC.execute(config, nonstr_addr_req), UniValue,
++            [](const UniValue &e) {
++                return e.find_value("code").getInt<int>() ==
++                       RPC_INVALID_PARAMETER;
++            });
++    }
++}
++
++BOOST_AUTO_TEST_CASE(testrawtxbatch_and_submitrawtxbatch_all_or_nothing) {
++    GlobalConfig config;
++    const std::vector<uint8_t> v2_op_true_script{0x4e};
++    const lotus::v2::Hash v2_op_true_leaf = lotus::v2::BranchLeaf(v2_op_true_script);
++    CScript coinbase_spk =
++        CScript() << ToByteVector(coinbaseKey.GetPubKey()) << OP_CHECKSIG;
+     const Amount cb_val = m_coinbase_txns[0]->vout[0].nValue;
+-    CMutableTransaction parent_mtx = CreateValidMempoolTransaction(
+-        m_coinbase_txns[0], 0, 1, coinbaseKey, parent_spk,
++    CMutableTransaction funding_mtx = CreateValidMempoolTransaction(
++        m_coinbase_txns[0], 0, 1, coinbaseKey,
++        CScript(v2_op_true_script.begin(), v2_op_true_script.end()),
+         cb_val - 2000 * SATOSHI, /*submit=*/false);
++    funding_mtx.vout[0].nFlags = 0;
++    funding_mtx.vout[0].vBranches = {v2_op_true_leaf};
++    funding_mtx.vout[0].vPaths = {{0}};
++    CTransactionRef funding_tx = MakeTransactionRef(funding_mtx);
++    CreateAndProcessBlock({funding_mtx}, coinbase_spk);
++
++    auto make_v7_tx = [&](const COutPoint &prevout, Amount out_val) {
++        CMutableTransaction mtx;
++        mtx.nVersion = 7;
++        mtx.fHasV2Lock = true;
++        mtx.nV2Lock = 0;
++        mtx.nLockTime = 0;
++        CTxIn txin(prevout, CScript(), CTxIn::SEQUENCE_FINAL);
++        txin.nFlags = 1;
++        txin.nPathIndex = 0;
++        lotus::v2::BranchWitness wit;
++        wit.script = v2_op_true_script;
++        txin.vWitnesses = {wit};
++        mtx.vin.push_back(std::move(txin));
++        lotus::v2::Output v2_out;
++        v2_out.flags = 0;
++        v2_out.value = static_cast<uint64_t>(out_val / SATOSHI);
++        v2_out.branches = {v2_op_true_leaf};
++        v2_out.paths = {{0}};
++        mtx.vout.push_back(CTxOut::FromV2Output(v2_out));
++        return mtx;
++    };
++
++    // Create a pure version=7 parent transaction and child transaction spending the parent.
++    CMutableTransaction parent_mtx =
++        make_v7_tx(COutPoint(funding_tx->GetId(), 0), cb_val - 4000 * SATOSHI);
+     CTransactionRef parent_tx = MakeTransactionRef(parent_mtx);
+ 
+-    CMutableTransaction child_mtx = CreateValidMempoolTransaction(
+-        parent_tx, 0, 101, parent_key, child_spk, cb_val - 4000 * SATOSHI,
+-        /*submit=*/false);
++    CMutableTransaction child_mtx =
++        make_v7_tx(COutPoint(parent_tx->GetId(), 0), cb_val - 6000 * SATOSHI);
+     CTransactionRef child_tx = MakeTransactionRef(child_mtx);
+ 
+     // Also create an invalid transaction spending a nonexistent outpoint.
+@@ -460,6 +795,11 @@ BOOST_AUTO_TEST_CASE(snapshot_prune_height_and_difficulty_shift_branches) {
+     BOOST_REQUIRE(snap3 != nullptr);
+     BOOST_CHECK_EQUAL(snap3->prune_height, tip->nHeight + 1);
+ 
++    // 4. Chain at genesis (chain[1] == nullptr) -> ComputePruneHeight returns std::nullopt
++    chain.SetTip(*chain[0]);
++    node::PublishChainTipSnapshot(*m_node.chainman, nullptr);
++    chain.SetTip(*tip);
++
+     // Restore block statuses and options
+     tip->nStatus = orig_tip_status;
+     for (int h = 1; h <= 50; ++h) {
+@@ -491,10 +831,30 @@ BOOST_AUTO_TEST_CASE(
+ 
+     node::SnapshotPublisher &publisher = node::GetGlobalSnapshotPublisher();
+ 
++    // Exercise PublishMempoolUnbroadcastSnapshot fallback when prev->mempool_valid is false
++    // and PopulateMiningTemplate when prev->mining_template.template_valid is false
++    {
++        auto invalid_prev = std::make_shared<node::ChainAndMempoolSnapshot>(
++            *publisher.Load());
++        invalid_prev->mempool_valid = false;
++        invalid_prev->mining_template.template_valid = false;
++        publisher.Publish(std::move(invalid_prev));
++        m_node.mempool->AddUnbroadcastTx(block_txs[0]->GetId());
++        BOOST_CHECK(publisher.Load()->mempool_valid);
++    }
++
++    // Exercise blockFitter.testTxFits false branch when -blockmaxsize=1000
++    {
++        gArgs.ForceSetArg("-blockmaxsize", "1000");
++        LOCK(m_node.mempool->cs);
++        node::PublishMempoolSnapshot(*m_node.mempool);
++        gArgs.ClearForcedArg("-blockmaxsize");
++        node::PublishMempoolSnapshot(*m_node.mempool);
++    }
++
+     // Exercise lightweight PublishMempoolUnbroadcastSnapshot on AddUnbroadcastTx / RemoveUnbroadcastTx
+     m_node.mempool->AddUnbroadcastTx(block_txs[0]->GetId());
+-    m_node.mempool->RemoveUnbroadcastTx(block_txs[0]->GetId(),
+-                                        /*unchecked=*/false);
++    m_node.mempool->RemoveUnbroadcastTx(block_txs[0]->GetId(), /*unchecked=*/false);
+     m_node.mempool->AddUnbroadcastTx(block_txs[0]->GetId());
+ 
+     // 1. ClearPrioritisation on an unprioritized transaction must NOT publish
+@@ -534,303 +894,71 @@ BOOST_AUTO_TEST_CASE(
+                           snap_before->mining_template.template_id + 1);
+         disconnectpool.clear();
+     }
+-}
+-
+-BOOST_AUTO_TEST_CASE(coro_50_waiters_non_blocking_on_4_threads) {
+-    GlobalConfig config;
+-    StartRPC();
+-    {
+-        LOCK(::cs_main);
+-        RPCNotifyBlockChange(m_node.chainman->ActiveChain().Tip());
+-    }
+-
+-    boost::asio::thread_pool pool(4);
+-    constexpr int kNumWaiters = 50;
+-    std::atomic<int> waiters_completed{0};
+-
+-    BlockHash target_block_hash{};
+-    {
+-        uint256 dummy = uint256S("000000000000000000000000000000000000000000000000000000000000beef");
+-        target_block_hash = BlockHash(dummy);
+-    }
+-
+-    for (int i = 0; i < kNumWaiters; ++i) {
+-        boost::asio::co_spawn(
+-            pool,
+-            [this, &config, &pool, &waiters_completed, i, target_block_hash]()
+-                -> boost::asio::awaitable<void> {
+-                JSONRPCRequest req;
+-                req.context = &m_node;
+-                req.params = UniValue(UniValue::VARR);
+-                if (i % 3 == 0) {
+-                    req.strMethod = "waitfornewblock";
+-                    req.params.push_back(5000);
+-                } else if (i % 3 == 1) {
+-                    req.strMethod = "waitforblockheight";
+-                    req.params.push_back(101);
+-                    req.params.push_back(5000);
+-                } else {
+-                    req.strMethod = "waitforblock";
+-                    req.params.push_back(target_block_hash.GetHex());
+-                    req.params.push_back(5000);
+-                }
+-                UniValue res = co_await tableRPC.executeAsync(
+-                    config, req, pool.get_executor());
+-                if (res.find_value("height").getInt<int>() >= 100) {
+-                    waiters_completed.fetch_add(1, std::memory_order_relaxed);
+-                }
+-            },
+-            boost::asio::detached);
+-    }
+-
+-    while (GetRPCBlockChangeWaiter().WaiterCount() <
+-           static_cast<size_t>(kNumWaiters)) {
+-        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+-    }
+-
+-    // All 50 waiters are suspended on the 4-thread pool. Fast RPCs dispatched
+-    // onto the same 4-thread pool must execute immediately without starvation.
+-    constexpr int kFastCalls = 20;
+-    std::atomic<int> fast_completed{0};
+-    std::promise<void> all_fast_done;
+-    auto all_fast_future = all_fast_done.get_future();
+-
+-    for (int i = 0; i < kFastCalls; ++i) {
+-        boost::asio::co_spawn(
+-            pool,
+-            [this, &config, &pool, &fast_completed, &all_fast_done]()
+-                -> boost::asio::awaitable<void> {
+-                JSONRPCRequest req;
+-                req.context = &m_node;
+-                req.strMethod = "getblockcount";
+-                req.params = UniValue(UniValue::VARR);
+-                UniValue res = co_await tableRPC.executeAsync(
+-                    config, req, pool.get_executor());
+-                if (res.getInt<int>() == 100) {
+-                    if (fast_completed.fetch_add(1,
+-                                                 std::memory_order_acq_rel) +
+-                            1 ==
+-                        kFastCalls) {
+-                        all_fast_done.set_value();
+-                    }
+-                }
+-            },
+-            boost::asio::detached);
+-    }
+-
+-    const auto status =
+-        all_fast_future.wait_for(std::chrono::milliseconds(500));
+-    BOOST_REQUIRE(status == std::future_status::ready);
+-    BOOST_CHECK_EQUAL(fast_completed.load(), kFastCalls);
+-    BOOST_CHECK_EQUAL(waiters_completed.load(), 0);
+-
+-    // Wake all 50 suspended coroutines via RPCNotifyBlockChange.
+-    CBlockIndex fake_tip;
+-    fake_tip.nHeight = 101;
+-    fake_tip.phashBlock = &target_block_hash;
+-    RPCNotifyBlockChange(&fake_tip);
+-
+-    pool.join();
+-    BOOST_CHECK_EQUAL(waiters_completed.load(), kNumWaiters);
+-
+-    {
+-        LOCK(::cs_main);
+-        RPCNotifyBlockChange(m_node.chainman->ActiveChain().Tip());
+-    }
+-    InterruptRPC();
+-    StopRPC();
+-}
+-
+-BOOST_AUTO_TEST_CASE(getblocktemplate_o1_and_submitsealedheader) {
+-    GlobalConfig config;
+-    CScript pubKeyScript = GetScriptForRawPubKey(coinbaseKey.GetPubKey());
+-    CMutableTransaction mempool_mtx = CreateValidMempoolTransaction(
+-        m_coinbase_txns[0], 0, 1, coinbaseKey, pubKeyScript,
+-        50 * COIN - 2000 * SATOSHI, /*submit=*/true);
+-    const std::string mempool_txid = mempool_mtx.GetId().GetHex();
+-
+-    {
+-        LOCK(::cs_main);
+-        node::PublishChainTipSnapshot(*m_node.chainman, m_node.mempool.get());
+-    }
+-
+-    // 1. Call getblocktemplate via executeAsync ( hits O(1) snapshot fast path)
+-    boost::asio::thread_pool pool(2);
+-    std::promise<UniValue> gbt_promise;
+-    auto gbt_future = gbt_promise.get_future();
+-
+-    boost::asio::co_spawn(
+-        pool,
+-        [this, &config, &pool, &gbt_promise]() -> boost::asio::awaitable<void> {
+-            JSONRPCRequest req;
+-            req.context = &m_node;
+-            req.strMethod = "getblocktemplate";
+-            req.params = UniValue(UniValue::VARR);
+-            UniValue res = co_await tableRPC.executeAsync(
+-                config, req, pool.get_executor());
+-            gbt_promise.set_value(std::move(res));
+-        },
+-        boost::asio::detached);
+-
+-    UniValue gbt_res = gbt_future.get();
+-    pool.join();
+-
+-    BOOST_CHECK_EQUAL(gbt_res.find_value("height").getInt<int>(), 101);
+-    const uint64_t template_id =
+-        gbt_res.find_value("templateid").getInt<uint64_t>();
+-    BOOST_CHECK_GT(template_id, 0U);
+-    const UniValue &txs_arr = gbt_res.find_value("transactions").get_array();
+-    BOOST_REQUIRE_EQUAL(txs_arr.size(), 1U);
+-    BOOST_CHECK_EQUAL(txs_arr[0].find_value("txid").get_str(), mempool_txid);
+-    BOOST_CHECK_EQUAL(gbt_res.find_value("subtreearoot").get_str().size(), 64U);
+-    BOOST_CHECK_EQUAL(gbt_res.find_value("merkleroot").get_str().size(), 64U);
+-
+-    // 2. Construct coinbase transaction and 80-byte solved header for
+-    // submitsealedheader without re-uploading non-coinbase transactions.
+-    const auto snap = node::GetGlobalSnapshotPublisher().Load();
+-    BOOST_REQUIRE(snap != nullptr);
+-    const auto &tmpl = snap->mining_template;
+-    BOOST_REQUIRE(tmpl.template_valid);
+-    BOOST_CHECK_EQUAL(tmpl.template_id, template_id);
+-
+-    const Consensus::Params &consensusParams =
+-        config.GetChainParams().GetConsensus();
+-    CMutableTransaction coinbaseTx;
+-    coinbaseTx.vin.resize(1);
+-    coinbaseTx.vin[0].prevout = COutPoint();
+-    coinbaseTx.vout.resize(1);
+-    coinbaseTx.vout[0].scriptPubKey = CScript() << OP_TRUE;
+-    coinbaseTx.vout[0].nValue =
+-        gbt_res.find_value("coinbasevalue").getInt<int64_t>() * SATOSHI;
+-    coinbaseTx.vin[0].scriptSig = CScript() << tmpl.next_height << OP_0;
+-
+-    const auto whitelisted = GetMinerFundWhitelist(consensusParams);
+-    if (!whitelisted.empty()) {
+-        const Amount fund = GetMinerFundAmount(
+-            consensusParams, coinbaseTx.vout[0].nValue, nullptr);
+-        coinbaseTx.vout[0].nValue -= fund;
+-        coinbaseTx.vout.emplace_back(
+-            fund, GetScriptForDestination(*whitelisted.begin()));
+-    }
+-    uint64_t cb_size = ::GetSerializeSize(coinbaseTx);
+-    if (cb_size < MIN_TX_SIZE) {
+-        coinbaseTx.vin[0].scriptSig
+-            << std::vector<uint8_t>(MIN_TX_SIZE - cb_size - 1);
+-    }
+-
+-    CBlockHeader header;
+-    header.nVersion = gbt_res.find_value("version").getInt<int32_t>();
+-    header.hashPrevBlock = tmpl.prev_block_hash;
+-    header.hashMerkleRoot =
+-        uint256S(gbt_res.find_value("merkleroot").get_str());
+-    header.nTime =
+-        static_cast<uint32_t>(gbt_res.find_value("curtime").getInt<int64_t>());
+-    header.nBits = tmpl.nBits;
+-    header.nNonce = 0;
+-
+-    while (!CheckProofOfWork(header.GetHash(), header.nBits, consensusParams)) {
+-        ++header.nNonce;
+-    }
+-
+-    DataStream ss_hdr{};
+-    ss_hdr << header;
+-    const std::string header_hex = HexStr(ss_hdr);
+-    BOOST_CHECK_EQUAL(header_hex.size(), 160U); // 80-byte CBlockHeader
+-    const std::string coinbase_hex = EncodeHexTx(CTransaction(coinbaseTx));
+-
+-    JSONRPCRequest submit_req;
+-    submit_req.context = &m_node;
+-    submit_req.strMethod = "submitsealedheader";
+-    submit_req.params = UniValue(UniValue::VARR);
+-    submit_req.params.push_back(header_hex);
+-    submit_req.params.push_back(coinbase_hex);
+-    submit_req.params.push_back(template_id);
+-
+-    UniValue submit_res = tableRPC.execute(config, submit_req);
+-    BOOST_CHECK_MESSAGE(submit_res.isNull(), submit_res.write());
+-
+-    // Block 101 is now active tip and mempool transaction was mined.
+-    JSONRPCRequest count_req;
+-    count_req.context = &m_node;
+-    count_req.strMethod = "getblockcount";
+-    count_req.params = UniValue(UniValue::VARR);
+-    BOOST_CHECK_EQUAL(tableRPC.execute(config, count_req).getInt<int>(), 101);
+-}
+-
+-BOOST_AUTO_TEST_CASE(getblocktemplate_mineraddress_and_submitsealedblock) {
+-    GlobalConfig config;
+-    const CChainParams &chainparams = config.GetChainParams();
+-
+-    CKey minerKey;
+-    minerKey.MakeNewKey(true);
+-    const PKHash minerDest(minerKey.GetPubKey());
+-    const std::string minerAddr = EncodeDestination(minerDest, config);
+-    const CScript expectedMinerSpk = GetScriptForDestination(minerDest);
+ 
++    // 4. Incremental O(delta) snapshot append across >20 transactions + lazy
++    // EnsureRoots() must remain 100% lock-free while cs_main and mempool.cs
++    // are held by a concurrent writer thread.
+     {
+-        LOCK(::cs_main);
+-        node::PublishChainTipSnapshot(*m_node.chainman, m_node.mempool.get());
+-    }
+-
+-    boost::asio::thread_pool pool(2);
+-    std::promise<UniValue> gbt_promise;
+-    auto gbt_future = gbt_promise.get_future();
+-
+-    boost::asio::co_spawn(
+-        pool,
+-        [this, &config, &pool, &gbt_promise,
+-         &minerAddr]() -> boost::asio::awaitable<void> {
+-            JSONRPCRequest req;
+-            req.context = &m_node;
+-            req.strMethod = "getblocktemplate";
+-            UniValue tmpl_req(UniValue::VOBJ);
+-            tmpl_req.pushKV("mode", "compact_template");
+-            tmpl_req.pushKV("mineraddress", minerAddr);
+-            req.params = UniValue(UniValue::VARR);
+-            req.params.push_back(std::move(tmpl_req));
+-            UniValue res = co_await tableRPC.executeAsync(
+-                config, req, pool.get_executor());
+-            gbt_promise.set_value(std::move(res));
+-        },
+-        boost::asio::detached);
+-
+-    UniValue gbt_res = gbt_future.get();
+-    pool.join();
+-
+-    // Verify 80-byte CBlockHeader (160 hex chars), coinbasetxhex, and blocksize
+-    const std::string header_hex = gbt_res.find_value("headerhex").get_str();
+-    const std::string cb_hex = gbt_res.find_value("coinbasetxhex").get_str();
+-    BOOST_CHECK_EQUAL(header_hex.size(), 160U);
+-    BOOST_CHECK(!cb_hex.empty());
+-    BOOST_CHECK_GT(gbt_res.find_value("blocksize").getInt<int64_t>(), 80);
+-
+-    CMutableTransaction decoded_cb;
+-    BOOST_REQUIRE(DecodeHexTx(decoded_cb, cb_hex));
+-    BOOST_REQUIRE(!decoded_cb.vout.empty());
+-    BOOST_CHECK(decoded_cb.vout[0].scriptPubKey == expectedMinerSpk);
++        gArgs.ForceSetArg("-gbtwithoutpeers", "1");
++        if (m_node.args) {
++            m_node.args->ForceSetArg("-gbtwithoutpeers", "1");
++        }
++        GlobalConfig config;
++        {
++            LOCK(::cs_main);
++            node::PublishChainTipSnapshot(*m_node.chainman, m_node.mempool.get());
++        }
++        CTransactionRef chain_prev = m_coinbase_txns[0];
++        int chain_prev_height = 1;
++        Amount chain_val = chain_prev->vout[0].nValue;
++        for (size_t i = 0; i < 24; ++i) {
++            chain_val -= 2000 * SATOSHI;
++            CMutableTransaction mtx = CreateValidMempoolTransaction(
++                chain_prev, 0, chain_prev_height, coinbaseKey, spk, chain_val,
++                /*submit=*/true);
++            chain_prev = MakeTransactionRef(mtx);
++            chain_prev_height = 101;
++        }
++        BOOST_CHECK_EQUAL(m_node.mempool->size(), 24U);
++        auto snap24 = publisher.Load();
++        BOOST_REQUIRE(snap24 != nullptr);
++        BOOST_CHECK_EQUAL(snap24->mempool_size, 24U);
++        BOOST_CHECK_EQUAL(snap24->mempool_entries.size(), 24U);
++        BOOST_CHECK_EQUAL(snap24->mining_template.non_coinbase_txs.size(), 24U);
++        BOOST_CHECK(!snap24->mining_template.roots_ready);
++
++        std::promise<void> locks_held;
++        std::promise<void> release_locks;
++        auto release_fut = release_locks.get_future();
++        std::thread holder([&]() {
++            LOCK2(::cs_main, m_node.mempool->cs);
++            locks_held.set_value();
++            release_fut.wait();
++        });
++        locks_held.get_future().wait();
+ 
+-    CBlockHeader header;
+-    BOOST_REQUIRE(DecodeHexBlockHeader(header, header_hex));
+-    const Consensus::Params &consensusParams = chainparams.GetConsensus();
+-    while (!CheckProofOfWork(header.GetHash(), header.nBits, consensusParams)) {
+-        ++header.nNonce;
++        JSONRPCRequest mp_req;
++        mp_req.context = &m_node;
++        mp_req.strMethod = "getrawmempool";
++        mp_req.params = UniValue(UniValue::VARR);
++        UniValue raw_mp = tableRPC.execute(config, mp_req);
++        BOOST_CHECK_EQUAL(raw_mp.get_array().size(), 24U);
++
++        JSONRPCRequest gbt_req;
++        gbt_req.context = &m_node;
++        gbt_req.strMethod = "getblocktemplate";
++        UniValue gbt_param(UniValue::VOBJ);
++        gbt_param.pushKV("mode", "compact_template");
++        gbt_req.params = UniValue(UniValue::VARR);
++        gbt_req.params.push_back(std::move(gbt_param));
++        UniValue gbt_res = tableRPC.execute(config, gbt_req);
++        BOOST_CHECK(gbt_res.exists("merkleroot"));
++        BOOST_CHECK(gbt_res.exists("stateroot"));
++        BOOST_CHECK(snap24->mining_template.roots_ready);
++
++        release_locks.set_value();
++        holder.join();
+     }
+-
+-    DataStream ss_solved{};
+-    ss_solved << header;
+-    const uint64_t template_id =
+-        gbt_res.find_value("templateid").getInt<uint64_t>();
+-
+-    JSONRPCRequest submit_req;
+-    submit_req.context = &m_node;
+-    submit_req.strMethod = "submitsealedblock";
+-    submit_req.params = UniValue(UniValue::VARR);
+-    submit_req.params.push_back(HexStr(ss_solved));
+-    submit_req.params.push_back(cb_hex);
+-    submit_req.params.push_back(template_id);
+-
+-    UniValue submit_res = tableRPC.execute(config, submit_req);
+-    BOOST_CHECK_MESSAGE(submit_res.isNull(), submit_res.write());
+ }
+ 
+ BOOST_AUTO_TEST_SUITE_END()
+diff --git a/src/validation.cpp b/src/validation.cpp
+index 19bbbbe5a7a1d16d537a6c32c0ce4251dcdabb7f..1acdfde9491bdc304c89ab51d85da843349e43bf 100644
+--- a/src/validation.cpp
++++ b/src/validation.cpp
+@@ -40,13 +40,13 @@
+ #include <policy/block/preconsensus.h>
+ #include <policy/block/rtt.h>
+ #include <policy/block/stakingrewards.h>
+-#include <policy/block/treasury.h>
+ #include <policy/policy.h>
+ #include <policy/settings.h>
+ #include <pow/pow.h>
+ #include <primitives/block.h>
+ #include <primitives/transaction.h>
+ #include <lotus_v2/fast_sync.h>
++#include <lotus_v2/fee_hysteresis.h>
+ #include <lotus_v2/tagged_hash.h>
+ #include <lotus_v2/vm.h>
+ #include <random.h>
+@@ -4654,6 +4654,20 @@ bool Chainstate::ConnectBlock(const CBlock &block, BlockValidationState &state,
+ 
+     // add this block to the view's block chain
+     view.SetBestBlock(pindex->GetBlockHash());
++    {
++        uint64_t connected_bytes = pindex->nSize;
++        if (connected_bytes == 0) {
++            connected_bytes =
++                GetSerializeSize(block.GetBlockHeader()) +
++                GetSizeOfCompactSize(block.vtx.size());
++            for (const auto &tx : block.vtx) {
++                connected_bytes += tx->GetTotalSize();
++            }
++        }
++        lotus::v2::GetGlobalFeeHysteresisController().RecordConnectedBlock(
++            connected_bytes,
++            TicksSinceEpoch<std::chrono::milliseconds>(NodeClock::now()));
++    }
+ 
+     const auto time_5{SteadyClock::now()};
+     m_chainman.time_index += time_5 - time_4;
+-- 
+2.50.1 (Apple Git-155)
+

@@ -1,0 +1,1896 @@
+From 01bce5837007cee70244ade2f7d9fd67c2061fa7 Mon Sep 17 00:00:00 2001
+From: Shammah Chancellor <shammah.chancellor@notvalid.com>
+Date: Mon, 19 Oct 2026 02:52:56 -0700
+Subject: [PATCH 18/18] WIP logging: structured log events with a field
+ registry
+
+Work in progress, not ready for review. Handed over before completion.
+
+Adds the structured logging API alongside the existing macros:
+- src/logging/fields.h: the field registry (typed keys in
+  BCLog::LogField, generic snake_case names, ECS and OpenTelemetry names
+  where a standard exists).
+- src/logging/event.h/.cpp: LogEvent/LogInfoEvent/... builder macros (an
+  if/else, so disabled categories evaluate nothing), binary field
+  encoding into the caller's ring record (numbers, LogStatic literals by
+  pointer, copied strings truncated and marked, hashes, durations,
+  LogValue<T> packed values, LogRef<T> shared references released by the
+  logger thread), message templates with {field} placeholders.
+- src/logging/values.h: CNetAddr/CService (raw bytes, rendered
+  canonically) and CTransaction (by reference, rendered as txid).
+- Text and generic JSON encoders render events; JSON has "event" and
+  each field as a typed top-level value.
+- -debuglogjsonfile: a secondary generic JSON log, for the test
+  framework's structured matching (framework helpers not written yet).
+- src/test/logging_event_tests.cpp: rendering in both formats,
+  escaping, disabled cost (no evaluation), dangling else, reference
+  lifetime, copied strings, truncation, registry sanity.
+
+Missing (see HANDOFF-STATE.md): benchmarks of the new API, framework
+assert_debug_log dict matching, doc/logging.md (glossary and per-category
+conventions), the per-format name mappings beyond ECS/OTel columns.
+---
+ src/CMakeLists.txt               |   2 +
+ src/init/common.cpp              |  12 +
+ src/logging.cpp                  | 351 +++++++++++++++++++++++++---
+ src/logging.h                    |  38 ++++
+ src/logging/encoder.cpp          |  75 +++++-
+ src/logging/encoder.h            |   7 +
+ src/logging/event.cpp            | 234 +++++++++++++++++++
+ src/logging/event.h              | 379 +++++++++++++++++++++++++++++++
+ src/logging/fields.h             | 134 +++++++++++
+ src/logging/values.h             |  77 +++++++
+ src/netaddress.cpp               |   9 +
+ src/netaddress.h                 |  13 ++
+ src/test/CMakeLists.txt          |   1 +
+ src/test/logging_event_tests.cpp | 250 ++++++++++++++++++++
+ 14 files changed, 1547 insertions(+), 35 deletions(-)
+ create mode 100644 src/logging/event.cpp
+ create mode 100644 src/logging/event.h
+ create mode 100644 src/logging/fields.h
+ create mode 100644 src/logging/values.h
+ create mode 100644 src/test/logging_event_tests.cpp
+
+diff --git a/src/CMakeLists.txt b/src/CMakeLists.txt
+index 85dc69abce..237ece01d5 100644
+--- a/src/CMakeLists.txt
++++ b/src/CMakeLists.txt
+@@ -412,6 +412,7 @@ add_library(util
+ 	interfaces/handler.cpp
+ 	logging.cpp
+ 	logging/encoder.cpp
++	logging/event.cpp
+ 	metrics/metrics.cpp
+ 	random.cpp
+ 	randomenv.cpp
+@@ -892,6 +893,7 @@ if(BUILD_CHAINSTATE)
+ 		key.cpp
+ 		logging.cpp
+ 		logging/encoder.cpp
++		logging/event.cpp
+ 		networks/abc/chainparamsconstants.cpp
+ 		networks/abc/checkpoints.cpp
+ 		node/blockfitter.cpp
+diff --git a/src/init/common.cpp b/src/init/common.cpp
+index f0f8815845..bc3f4a65dc 100644
+--- a/src/init/common.cpp
++++ b/src/init/common.cpp
+@@ -32,6 +32,14 @@ void AddLoggingArgs(ArgsManager &argsman) {
+                   "Pass -nodebuglogfile to disable writing the log to a file.)",
+                   DEFAULT_DEBUGLOGFILE),
+         ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
++    argsman.AddArg(
++        "-debuglogjsonfile=<file>",
++        "Also write the log as generic JSON lines (as -logformat=json, with "
++        "source locations) to this file, whatever -logformat is. Relative "
++        "paths are prefixed by the net-specific datadir. Meant for tests and "
++        "tools that match structured fields.",
++        ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY,
++        OptionsCategory::DEBUG_TEST);
+     argsman.AddArg("-debug=<category>",
+                    "Output debug and trace logging (default: -nodebug, "
+                    "supplying <category> is optional). "
+@@ -136,6 +144,10 @@ void SetLoggingOptions(const ArgsManager &args) {
+     LogInstance().m_print_to_file = !args.IsArgNegated("-debuglogfile");
+     LogInstance().m_file_path = AbsPathForConfigVal(
+         args, args.GetPathArg("-debuglogfile", DEFAULT_DEBUGLOGFILE));
++    if (const fs::path json_path{args.GetPathArg("-debuglogjsonfile")};
++        !json_path.empty()) {
++        LogInstance().m_json_file_path = AbsPathForConfigVal(args, json_path);
++    }
+ 
+     LogInstance().m_print_to_console =
+         args.GetBoolArg("-printtoconsole", !args.GetBoolArg("-daemon", false));
+diff --git a/src/logging.cpp b/src/logging.cpp
+index 124fff202c..d6a4b2450e 100644
+--- a/src/logging.cpp
++++ b/src/logging.cpp
+@@ -119,6 +119,12 @@ bool BCLog::Logger::StartLogging() {
+             // the last one.
+             FileWriteStr("\n\n\n\n\n", m_fileout);
+         }
++        if (!m_json_file_path.empty()) {
++            m_json_fileout = OpenLogFile(m_json_file_path);
++            if (!m_json_fileout) {
++                return false;
++            }
++        }
+ 
+         // Dump buffered messages from before we opened the log.
+         if (m_buffer_lines_discarded > 0) {
+@@ -129,20 +135,27 @@ bool BCLog::Logger::StartLogging() {
+         }
+         while (!m_msgs_before_open.empty()) {
+             const auto &buflog = m_msgs_before_open.front();
+-            Encode(LogLine{.time = buflog.now,
+-                           .mocktime = buflog.mocktime,
+-                           .level = buflog.level,
+-                           .category = buflog.category,
+-                           .thread = buflog.threadname,
+-                           .loc = buflog.source_loc,
+-                           .message = buflog.str});
+-            WriteLine(m_line_buf, /*to_file=*/true);
++            if (buflog.record) {
++                WriteRecord(*buflog.record);
++            } else {
++                WriteLogLine(LogLine{.time = buflog.now,
++                                     .mocktime = buflog.mocktime,
++                                     .level = buflog.level,
++                                     .category = buflog.category,
++                                     .thread = buflog.threadname,
++                                     .loc = buflog.source_loc,
++                                     .message = buflog.str},
++                             /*to_file=*/true);
++            }
+             m_msgs_before_open.pop_front();
+         }
+         m_cur_buffer_memusage = 0;
+         if (m_fileout) {
+             fflush(m_fileout);
+         }
++        if (m_json_fileout) {
++            fflush(m_json_fileout);
++        }
+         if (m_print_to_console) {
+             fflush(stdout);
+         }
+@@ -168,6 +181,10 @@ void BCLog::Logger::DisconnectTestLogger() {
+         fclose(m_fileout);
+     }
+     m_fileout = nullptr;
++    if (m_json_fileout != nullptr) {
++        fclose(m_json_fileout);
++    }
++    m_json_fileout = nullptr;
+     m_print_callbacks.clear();
+     m_has_callbacks = false;
+     m_max_buffer_memusage = DEFAULT_MAX_LOG_BUFFER;
+@@ -785,11 +802,19 @@ void BCLog::Logger::Enqueue(std::string_view str, std::string *owned,
+ }
+ 
+ void BCLog::Logger::ReopenIfRequested() {
+-    if (m_reopen_file && m_fileout) {
++    if (m_reopen_file && (m_fileout || m_json_fileout)) {
+         m_reopen_file = false;
+-        if (FILE * new_fileout{OpenLogFile(m_file_path)}) {
+-            fclose(m_fileout);
+-            m_fileout = new_fileout;
++        if (m_fileout) {
++            if (FILE * new_fileout{OpenLogFile(m_file_path)}) {
++                fclose(m_fileout);
++                m_fileout = new_fileout;
++            }
++        }
++        if (m_json_fileout) {
++            if (FILE * new_fileout{OpenLogFile(m_json_file_path)}) {
++                fclose(m_json_fileout);
++                m_json_fileout = new_fileout;
++            }
+         }
+     }
+ }
+@@ -806,29 +831,286 @@ void BCLog::Logger::WriteLine(const std::string &line, bool to_file) {
+     }
+ }
+ 
+-void BCLog::Logger::WriteRecord(LogRecord &rec) {
+-    std::string *spill{nullptr};
+-    std::string_view msg;
+-    if (rec.flags & LogRecord::SPILLED) {
+-        std::memcpy(&spill, rec.payload, sizeof(spill));
+-        msg = *spill;
+-    } else {
+-        msg = std::string_view{reinterpret_cast<const char *>(rec.payload),
+-                               rec.size};
++void BCLog::Logger::WriteLogLine(const LogLine &line, bool to_file) {
++    Encode(line);
++    WriteLine(m_line_buf, to_file);
++    if (m_json_fileout && to_file) {
++        const LogOptions opts{.timestamps = true,
++                              .time_micros = true,
++                              .threadnames = true,
++                              .sourcelocations = true};
++        m_json_encoder.Encode(line, opts, m_json_buf);
++        FileWriteStr(m_json_buf, m_json_fileout);
+     }
+-    Encode(LogLine{
++}
++
++std::string
++BCLog::Logger::SuppressionNotice(const std::source_location &loc) const {
++    const LogRateLimiter *limiter{m_limiter.get()};
++    return strprintf(
++        "Excessive logging detected from %s:%d (%s): >%d bytes logged during "
++        "the last time window of %is. Suppressing logging to disk from this "
++        "source location until time window resets. Console logging "
++        "unaffected. Last log entry.\n",
++        loc.file_name(), loc.line(), loc.function_name(),
++        limiter ? limiter->m_max_bytes : 0,
++        limiter ? Ticks<std::chrono::seconds>(limiter->m_reset_window) : 0);
++}
++
++void BCLog::Logger::WriteRecord(LogRecord &rec) {
++    LogLine line{
+         .time = SystemClock::time_point{std::chrono::microseconds{rec.time_us}},
+         .mocktime = std::chrono::seconds{rec.mocktime_s},
+         .level = rec.level,
+         .category = rec.category,
+         .thread = rec.thread,
+         .loc = rec.loc,
+-        .message = msg,
+         .continued = (rec.flags & LogRecord::CONTINUED) != 0,
+         .ratelimited = (rec.flags & LogRecord::SUPPRESSIONS) != 0,
+-    });
++    };
++    if (rec.flags & LogRecord::SUPPRESSION_NOTICE) {
++        // (A plain message's call site logs its notice itself.)
++        const std::string notice{SuppressionNotice(rec.loc)};
++        WriteLogLine(LogLine{.time = line.time,
++                             .mocktime = line.mocktime,
++                             .level = Level::Warning,
++                             .category = LogFlags::ALL,
++                             .thread = line.thread,
++                             .loc = std::source_location::current(),
++                             .message = notice,
++                             .ratelimited = true},
++                     /*to_file=*/true);
++    }
++    const bool to_file{!(rec.flags & LogRecord::NO_FILE)};
++    if (rec.event) {
++        line.event = static_cast<const LogEventSite *>(rec.event);
++        line.fields = FieldList{
++            std::span<const std::byte>{rec.payload, rec.size}, rec.num_fields};
++        line.fields_truncated = (rec.flags & LogRecord::FIELDS_TRUNCATED) != 0;
++        WriteLogLine(line, to_file);
++        ReleaseFields(line.fields);
++        rec.num_fields = 0;
++        return;
++    }
++    std::string *spill{nullptr};
++    if (rec.flags & LogRecord::SPILLED) {
++        std::memcpy(&spill, rec.payload, sizeof(spill));
++        line.message = *spill;
++    } else {
++        line.message = std::string_view{
++            reinterpret_cast<const char *>(rec.payload), rec.size};
++    }
++    WriteLogLine(line, to_file);
+     delete spill;
+-    WriteLine(m_line_buf, !(rec.flags & LogRecord::NO_FILE));
++}
++
++void BCLog::Logger::RecordDeleter::operator()(LogRecord *rec) const {
++    if (rec->event) {
++        ReleaseFields(
++            FieldList{std::span<const std::byte>{rec->payload, rec->size},
++                      rec->num_fields});
++    }
++    delete rec;
++}
++
++namespace {
++//! Fill what every record carries (producer side)
++void FillRecordHeader(BCLog::LogRecord &rec, const std::source_location &loc,
++                      BCLog::LogFlags category, BCLog::Level level) {
++    rec.time_us =
++        TicksSinceEpoch<std::chrono::microseconds>(SystemClock::now());
++    rec.mocktime_s = count_seconds(GetMockTime());
++    rec.loc = loc;
++    rec.event = nullptr;
++    rec.category = category;
++    rec.level = level;
++    rec.flags = 0;
++    rec.num_fields = 0;
++    rec.size = 0;
++    const std::string &thread{util::ThreadGetInternalName()};
++    const size_t len{std::min(thread.size(), sizeof(rec.thread) - 1)};
++    std::memcpy(rec.thread, thread.data(), len);
++    rec.thread[len] = '\0';
++}
++} // namespace
++
++void BCLog::Logger::BeginEvent(EventBuilder &b) noexcept {
++    if (!Enabled()) {
++        return;
++    }
++    const LogEventSite &site{b.m_site};
++    LogRecord *rec{nullptr};
++    if (m_buffering.load(std::memory_order_acquire)) {
++        // Before logging starts (rare): a heap record, kept until then.
++        try {
++            b.m_buffered.reset(new LogRecord);
++        } catch (const std::bad_alloc &) {
++            return;
++        }
++        rec = b.m_buffered.get();
++    } else {
++        LogRing *ring{ThreadRing()};
++        if (!ring) {
++            return;
++        }
++        rec = ring->Claim();
++        if (!rec) {
++            if (site.level < Level::Warning) {
++                ring->CountDrop();
++                return;
++            }
++            rec = ClaimSlow(*ring);
++            if (!rec) {
++                ring->CountDrop();
++                return;
++            }
++        }
++        b.m_ring = ring;
++        // An event is a complete line.
++        if (ring->m_open_line) {
++            ring->m_open_line = false;
++        }
++    }
++    FillRecordHeader(*rec, site.loc, site.category, site.level);
++    rec->event = &site;
++    b.m_rec = rec;
++}
++
++void BCLog::Logger::EndEvent(EventBuilder &b) noexcept {
++    LogRecord &rec{*b.m_rec};
++    rec.size = uint16_t(b.m_used);
++    LogRateLimiter *limiter{m_limiter_ptr.load(std::memory_order_acquire)};
++    if (b.m_limit && limiter) {
++        // The quota counts the event's encoded size, as messages count
++        // their length.
++        switch (limiter->Consume(*b.m_limit, rec.loc, b.m_used + 1)) {
++            case LogRateLimiter::Status::UNSUPPRESSED:
++                break;
++            case LogRateLimiter::Status::NEWLY_SUPPRESSED:
++                rec.flags |= LogRecord::SUPPRESSION_NOTICE;
++                break;
++            case LogRateLimiter::Status::STILL_SUPPRESSED:
++                rec.flags |= LogRecord::NO_FILE;
++                break;
++        }
++    }
++    if (limiter && limiter->SuppressionsActive()) {
++        rec.flags |= LogRecord::SUPPRESSIONS;
++    }
++    if (b.m_buffered) {
++        StdLockGuard scoped_lock(m_cs);
++        if (m_buffering) {
++            BufferedLog buf{
++                .now = SystemClock::time_point{std::chrono::microseconds{
++                    rec.time_us}},
++                .mocktime = std::chrono::seconds{rec.mocktime_s},
++                .threadname = rec.thread,
++                .source_loc = rec.loc,
++                .category = rec.category,
++                .level = rec.level,
++                .record = OwnedRecord{b.m_buffered.release()},
++            };
++            m_cur_buffer_memusage += sizeof(LogRecord);
++            m_msgs_before_open.push_back(std::move(buf));
++            return;
++        }
++    }
++    if (b.m_buffered) {
++        // Logging started while this event was being built: write it now.
++        OwnedRecord owned{b.m_buffered.release()};
++        StdLockGuard consumer_lock(m_consumer_mutex);
++        StdLockGuard scoped_lock(m_cs);
++        WriteRecord(*owned);
++        return;
++    }
++    if (b.m_ring->Commit() &&
++        !m_wake_requested.load(std::memory_order_relaxed) &&
++        !m_wake_requested.exchange(true)) {
++        {
++            std::lock_guard<std::mutex> lock(m_wake_mutex);
++            m_wake = true;
++        }
++        m_wake_cv.notify_one();
++    }
++    if (rec.level >= Level::Error) {
++        Flush();
++    }
++}
++
++BCLog::EventBuilder::EventBuilder(const LogEventSite &site,
++                                  LogSiteLimit *limit) noexcept
++    : m_site{site}, m_limit{limit} {
++    LogInstance().BeginEvent(*this);
++}
++
++BCLog::EventBuilder::~EventBuilder() {
++    if (m_rec) {
++        LogInstance().EndEvent(*this);
++    }
++}
++
++std::byte *BCLog::EventBuilder::Reserve(FieldId id, FieldKind kind,
++                                        size_t max_size) noexcept {
++    if (!m_rec) {
++        return nullptr;
++    }
++    const size_t start{(m_used + 7) & ~size_t{7}};
++    if (start + sizeof(FieldHeader) + max_size > sizeof(m_rec->payload) ||
++        m_rec->num_fields == 255) {
++        m_rec->flags |= LogRecord::FIELDS_TRUNCATED;
++        return nullptr;
++    }
++    m_pending = reinterpret_cast<FieldHeader *>(m_rec->payload + start);
++    *m_pending = FieldHeader{id, kind, false, 0, 0};
++    m_used = start + sizeof(FieldHeader);
++    return m_rec->payload + m_used;
++}
++
++void BCLog::EventBuilder::Finish(size_t size) noexcept {
++    m_pending->size = uint16_t(size);
++    m_used += size;
++    ++m_rec->num_fields;
++}
++
++BCLog::EventBuilder &BCLog::EventBuilder::Put(FieldId id, FieldKind kind,
++                                              const void *data, size_t size,
++                                              bool truncate) noexcept {
++    if (!m_rec) {
++        return *this;
++    }
++    bool truncated{false};
++    if (truncate) {
++        const size_t start{(m_used + 7) & ~size_t{7}};
++        const size_t room{sizeof(m_rec->payload) > start + sizeof(FieldHeader)
++                              ? sizeof(m_rec->payload) - start -
++                                    sizeof(FieldHeader)
++                              : 0};
++        if (size > room) {
++            size = room;
++            truncated = true;
++        }
++    }
++    if (std::byte * out{Reserve(id, kind, size)}) {
++        std::memcpy(out, data, size);
++        m_pending->truncated = truncated;
++        Finish(size);
++    }
++    return *this;
++}
++
++BCLog::EventBuilder &
++BCLog::EventBuilder::PutRef(FieldId id, std::shared_ptr<const void> object,
++                            RefRenderFn render) noexcept {
++    constexpr size_t SIZE{sizeof(std::shared_ptr<const void>) +
++                          sizeof(RefRenderFn)};
++    if (std::byte * out{Reserve(id, FieldKind::REF, SIZE)}) {
++        // (8-byte aligned: Reserve aligns field headers, 8 bytes long)
++        new (out) std::shared_ptr<const void>{std::move(object)};
++        std::memcpy(out + sizeof(std::shared_ptr<const void>), &render,
++                    sizeof(render));
++        Finish(SIZE);
++    }
++    return *this;
+ }
+ 
+ bool BCLog::Logger::DrainLocked() {
+@@ -905,14 +1187,14 @@ bool BCLog::Logger::DrainLocked() {
+                 "Logging could not keep up: %d debug/info log lines were "
+                 "dropped (%d in total).\n",
+                 dropped - m_dropped_reported, dropped)};
+-            Encode(LogLine{.time = now,
+-                           .mocktime = GetMockTime(),
+-                           .level = Level::Warning,
+-                           .category = LogFlags::ALL,
+-                           .thread = "logger",
+-                           .loc = std::source_location::current(),
+-                           .message = msg});
+-            WriteLine(m_line_buf, /*to_file=*/true);
++            WriteLogLine(LogLine{.time = now,
++                                 .mocktime = GetMockTime(),
++                                 .level = Level::Warning,
++                                 .category = LogFlags::ALL,
++                                 .thread = "logger",
++                                 .loc = std::source_location::current(),
++                                 .message = msg},
++                         /*to_file=*/true);
+             m_dropped_reported = dropped;
+             wrote = true;
+         }
+@@ -925,6 +1207,9 @@ bool BCLog::Logger::DrainLocked() {
+         if (m_fileout) {
+             fflush(m_fileout);
+         }
++        if (m_json_fileout) {
++            fflush(m_json_fileout);
++        }
+         if (m_print_to_console) {
+             fflush(stdout);
+         }
+diff --git a/src/logging.h b/src/logging.h
+index 7ba21a0dd5..4159b95316 100644
+--- a/src/logging.h
++++ b/src/logging.h
+@@ -245,6 +245,11 @@ struct LogRecord {
+         //! Some call site was suppressed when this was logged (the "[*]"
+         //! marker)
+         SUPPRESSIONS = 8,
++        //! This record's call site has just been suppressed: write the
++        //! notice first
++        SUPPRESSION_NOTICE = 16,
++        //! Some fields did not fit
++        FIELDS_TRUNCATED = 32,
+     };
+     //! Producer's time (SystemClock), microseconds since the epoch
+     int64_t time_us;
+@@ -362,6 +367,12 @@ private:
+  */
+ class Logger {
+ public:
++    /** A record on the heap; releases what its fields hold */
++    struct RecordDeleter {
++        void operator()(LogRecord *rec) const;
++    };
++    using OwnedRecord = std::unique_ptr<LogRecord, RecordDeleter>;
++
+     struct BufferedLog {
+         SystemClock::time_point now;
+         std::chrono::seconds mocktime;
+@@ -369,6 +380,8 @@ public:
+         std::source_location source_loc;
+         LogFlags category;
+         Level level;
++        //! A structured event logged before StartLogging
++        OwnedRecord record;
+     };
+ 
+     //! How often the logger thread writes queued lines while busy
+@@ -432,6 +445,26 @@ private:
+ 
+     /** Encode a line into m_line_buf in the current format */
+     void Encode(const LogLine &line) EXCLUSIVE_LOCKS_REQUIRED(m_consumer_mutex);
++    /** Write a line to every sink (encoding it in each one's format) */
++    void WriteLogLine(const LogLine &line, bool to_file)
++        EXCLUSIVE_LOCKS_REQUIRED(m_consumer_mutex, m_cs);
++    //! The secondary JSON log file (-debuglogjsonfile)
++    FILE *m_json_fileout GUARDED_BY(m_consumer_mutex) = nullptr;
++    JsonEncoder m_json_encoder;
++    std::string m_json_buf GUARDED_BY(m_consumer_mutex);
++
++    friend class EventBuilder;
++    /** Claim a record for an event (or leave the builder inert) */
++    void BeginEvent(EventBuilder &builder) noexcept
++        EXCLUSIVE_LOCKS_REQUIRED(!m_consumer_mutex, !m_cs, !m_rings_mutex,
++                                 !m_wake_mutex);
++    /** Publish an event's record */
++    void EndEvent(EventBuilder &builder) noexcept
++        EXCLUSIVE_LOCKS_REQUIRED(!m_consumer_mutex, !m_cs, !m_rings_mutex,
++                                 !m_wake_mutex);
++    /** The "Excessive logging" notice for a call site */
++    std::string SuppressionNotice(const std::source_location &loc) const
++        EXCLUSIVE_LOCKS_REQUIRED(m_cs);
+ 
+     //! Rings of threads (in use or orphaned), and rings ready for reuse
+     mutable StdMutex m_rings_mutex;
+@@ -506,6 +539,8 @@ public:
+     LogFormat m_log_format = LogFormat::TEXT;
+ 
+     fs::path m_file_path;
++    //! Also write generic JSON lines here, if set (-debuglogjsonfile)
++    fs::path m_json_file_path;
+     std::atomic<bool> m_reopen_file{false};
+ 
+     std::string GetLogPrefix(LogFlags category, Level level) const;
+@@ -746,4 +781,7 @@ static inline void LogPrintf_(std::source_location &&source_loc,
+ #define LogPrintToBeContinued LogDebug
+ #define LogPrintLevelToBeContinued LogPrintLevel
+ 
++// Structured events (LogEvent etc.)
++#include <logging/event.h> // IWYU pragma: export
++
+ #endif // BITCOIN_LOGGING_H
+diff --git a/src/logging/encoder.cpp b/src/logging/encoder.cpp
+index 4b055dd79d..a699abaa48 100644
+--- a/src/logging/encoder.cpp
++++ b/src/logging/encoder.cpp
+@@ -254,9 +254,65 @@ void BCLog::AppendLogPrefix(std::string &out, LogFlags category, Level level,
+ 
+ namespace BCLog {
+ 
++namespace {
++    //! Scratch space of the logger thread (encoders run there only)
++    thread_local std::string t_scratch;
++
++    /** A structured event's message and the text of the fields it lacks */
++    std::string_view EventText(const LogLine &line, bool with_fields) {
++        std::string &text{t_scratch};
++        text.clear();
++        uint64_t used{0};
++        AppendEventMessage(text, *line.event, line.fields, &used);
++        if (with_fields) {
++            size_t i{0};
++            std::string value;
++            for (const FieldView f : line.fields) {
++                if (i >= 64 || !(used >> i & 1)) {
++                    text += ' ';
++                    text += f.Info().name;
++                    text += '=';
++                    value.clear();
++                    f.AppendText(value);
++                    AppendQuotedText(text, value);
++                }
++                ++i;
++            }
++            if (line.fields_truncated) {
++                text += " [fields truncated]";
++            }
++        }
++        text += '\n';
++        return text;
++    }
++
++    /** Append a field's value as a JSON value of its type */
++    void AppendJsonValue(std::string &out, const FieldView &f) {
++        switch (f.kind) {
++            case FieldKind::I64:
++            case FieldKind::U64:
++            case FieldKind::F64:
++            case FieldKind::DURATION_NS:
++                f.AppendText(out);
++                return;
++            case FieldKind::BOOL:
++                out += f.Bool() ? "true" : "false";
++                return;
++            default: {
++                std::string text;
++                f.AppendText(text);
++                out += '"';
++                AppendJsonEscaped(out, text);
++                out += '"';
++            }
++        }
++    }
++} // namespace
++
+ void TextEncoder::Encode(const LogLine &line, const LogOptions &opts,
+                          std::string &out) const {
+-    const std::string_view msg{line.message};
++    const std::string_view msg{
++        line.event ? EventText(line, /*with_fields=*/true) : line.message};
+     out.clear();
+     if (line.ratelimited) {
+         // To avoid confusion caused by dropped log messages when debugging
+@@ -311,7 +367,8 @@ void TextEncoder::Encode(const LogLine &line, const LogOptions &opts,
+ 
+ void JsonEncoder::Encode(const LogLine &line, const LogOptions &opts,
+                          std::string &out) const {
+-    std::string_view msg{line.message};
++    std::string_view msg{line.event ? EventText(line, /*with_fields=*/false)
++                                    : line.message};
+     out.clear();
+     out += '{';
+     if (opts.timestamps) {
+@@ -331,6 +388,20 @@ void JsonEncoder::Encode(const LogLine &line, const LogOptions &opts,
+     }
+     AppendJsonEscaped(out, msg);
+     out += '"';
++    if (line.event) {
++        out += ",\"event\":\"";
++        out += line.event->event;
++        out += '"';
++        for (const FieldView f : line.fields) {
++            out += ",\"";
++            out += f.Info().name;
++            out += "\":";
++            AppendJsonValue(out, f);
++        }
++        if (line.fields_truncated) {
++            out += ",\"fields_truncated\":true";
++        }
++    }
+     if (line.mocktime > 0s) {
+         out += ",\"mocktime\":\"";
+         AppendRfc3339(out, SystemClock::time_point{line.mocktime},
+diff --git a/src/logging/encoder.h b/src/logging/encoder.h
+index 7cdabb74a8..842dc9e5be 100644
+--- a/src/logging/encoder.h
++++ b/src/logging/encoder.h
+@@ -5,6 +5,7 @@
+ #ifndef BITCOIN_LOGGING_ENCODER_H
+ #define BITCOIN_LOGGING_ENCODER_H
+ 
++#include <logging/event.h>
+ #include <util/time.h>
+ 
+ #include <chrono>
+@@ -45,6 +46,12 @@ struct LogLine {
+     bool continued{false};
+     //! Some call site was rate limited when this was logged
+     bool ratelimited{false};
++    //! A structured event (then message is empty), or nullptr
++    const LogEventSite *event{nullptr};
++    //! The event's fields
++    FieldList fields;
++    //! Some fields did not fit in the record and were left out
++    bool fields_truncated{false};
+ };
+ 
+ /**
+diff --git a/src/logging/event.cpp b/src/logging/event.cpp
+new file mode 100644
+index 0000000000..f5f1c8d82f
+--- /dev/null
++++ b/src/logging/event.cpp
+@@ -0,0 +1,234 @@
++// Copyright (c) 2026 The Lotus developers
++// Distributed under the MIT software license, see the accompanying
++// file COPYING or http://www.opensource.org/licenses/mit-license.php.
++
++#include <logging/event.h>
++
++#include <cassert>
++#include <charconv>
++#include <cstring>
++
++namespace BCLog {
++
++namespace {
++    template <typename T> T Load(std::span<const std::byte> data) {
++        T v{};
++        assert(data.size() >= sizeof(T));
++        std::memcpy(&v, data.data(), sizeof(T));
++        return v;
++    }
++
++    template <typename T> void AppendNumber(std::string &out, T v) {
++        char buf[32];
++        const auto res{std::to_chars(buf, buf + sizeof(buf), v)};
++        out.append(buf, res.ptr);
++    }
++
++    struct StaticStr {
++        const char *str;
++        uint64_t len;
++    };
++
++    constexpr size_t Align8(size_t n) {
++        return (n + 7) & ~size_t{7};
++    }
++} // namespace
++
++int64_t FieldView::I64() const {
++    return Load<int64_t>(data);
++}
++uint64_t FieldView::U64() const {
++    return Load<uint64_t>(data);
++}
++double FieldView::F64() const {
++    return Load<double>(data);
++}
++bool FieldView::Bool() const {
++    return Load<uint8_t>(data) != 0;
++}
++int64_t FieldView::DurationNs() const {
++    return Load<int64_t>(data);
++}
++
++bool FieldView::IsNumber() const {
++    return kind == FieldKind::I64 || kind == FieldKind::U64 ||
++           kind == FieldKind::F64 || kind == FieldKind::DURATION_NS;
++}
++
++void FieldView::AppendText(std::string &out) const {
++    switch (kind) {
++        case FieldKind::I64:
++            AppendNumber(out, I64());
++            return;
++        case FieldKind::U64:
++            AppendNumber(out, U64());
++            return;
++        case FieldKind::F64:
++            AppendNumber(out, F64());
++            return;
++        case FieldKind::BOOL:
++            out += Bool() ? "true" : "false";
++            return;
++        case FieldKind::STR:
++            out.append(reinterpret_cast<const char *>(data.data()),
++                       data.size());
++            return;
++        case FieldKind::STATIC_STR: {
++            const auto s{Load<StaticStr>(data)};
++            out.append(s.str, s.len);
++            return;
++        }
++        case FieldKind::HASH: {
++            // As uint256::GetHex: most significant byte first
++            static constexpr char HEX[]{"0123456789abcdef"};
++            for (size_t i = data.size(); i-- > 0;) {
++                const uint8_t b{uint8_t(data[i])};
++                out += HEX[b >> 4];
++                out += HEX[b & 0xf];
++            }
++            return;
++        }
++        case FieldKind::DURATION_NS: {
++            // Generic unit: microseconds
++            const int64_t ns{DurationNs()};
++            if (ns % 1000 == 0) {
++                AppendNumber(out, ns / 1000);
++            } else {
++                AppendNumber(out, double(ns) / 1000);
++            }
++            return;
++        }
++        case FieldKind::CUSTOM: {
++            const auto fn{Load<PackedRenderFn>(data)};
++            fn(data.subspan(sizeof(fn)), out);
++            return;
++        }
++        case FieldKind::REF: {
++            const auto &obj{
++                *reinterpret_cast<const std::shared_ptr<const void> *>(
++                    data.data())};
++            const auto fn{Load<RefRenderFn>(
++                data.subspan(sizeof(std::shared_ptr<const void>)))};
++            fn(obj.get(), out);
++            return;
++        }
++    }
++}
++
++FieldView FieldList::Iterator::operator*() const {
++    FieldHeader h;
++    std::memcpy(&h, m_pos, sizeof(h));
++    return FieldView{h.id, h.kind, h.truncated,
++                     std::span<const std::byte>{m_pos + sizeof(h), h.size}};
++}
++
++FieldList::Iterator &FieldList::Iterator::operator++() {
++    FieldHeader h;
++    std::memcpy(&h, m_pos, sizeof(h));
++    m_pos += Align8(sizeof(h) + h.size);
++    --m_left;
++    return *this;
++}
++
++void ReleaseFields(FieldList fields) {
++    for (const FieldView f : fields) {
++        if (f.kind == FieldKind::REF) {
++            auto *obj{const_cast<std::shared_ptr<const void> *>(
++                reinterpret_cast<const std::shared_ptr<const void> *>(
++                    f.data.data()))};
++            std::destroy_at(obj);
++        }
++    }
++}
++
++void AppendQuotedText(std::string &out, std::string_view text) {
++    bool quote{text.empty()};
++    for (const char c : text) {
++        const uint8_t u{uint8_t(c)};
++        if (u <= ' ' || c == '"' || c == '=' || c == '\\' || u == 0x7f) {
++            quote = true;
++            break;
++        }
++    }
++    if (!quote) {
++        out += text;
++        return;
++    }
++    out += '"';
++    for (const char c : text) {
++        const uint8_t u{uint8_t(c)};
++        switch (c) {
++            case '"':
++                out += "\\\"";
++                break;
++            case '\\':
++                out += "\\\\";
++                break;
++            case '\n':
++                out += "\\n";
++                break;
++            case '\r':
++                out += "\\r";
++                break;
++            case '\t':
++                out += "\\t";
++                break;
++            default:
++                if (u < 0x20 || u == 0x7f) {
++                    static constexpr char HEX[]{"0123456789abcdef"};
++                    const char esc[6]{'\\', 'u',         '0',
++                                      '0',  HEX[u >> 4], HEX[u & 0xf]};
++                    out.append(esc, sizeof(esc));
++                } else {
++                    out += c;
++                }
++        }
++    }
++    out += '"';
++}
++
++void AppendEventMessage(std::string &out, const LogEventSite &site,
++                        FieldList fields, uint64_t *used) {
++    if (used) {
++        *used = 0;
++    }
++    if (!site.message) {
++        out += site.event;
++        return;
++    }
++    const std::string_view tmpl{site.message};
++    size_t pos{0};
++    while (pos < tmpl.size()) {
++        const size_t open{tmpl.find('{', pos)};
++        if (open == std::string_view::npos) {
++            break;
++        }
++        const size_t close{tmpl.find('}', open)};
++        if (close == std::string_view::npos) {
++            break;
++        }
++        out.append(tmpl.substr(pos, open - pos));
++        const std::string_view name{tmpl.substr(open + 1, close - open - 1)};
++        bool found{false};
++        size_t i{0};
++        for (const FieldView f : fields) {
++            if (f.Info().name == name) {
++                f.AppendText(out);
++                if (used && i < 64) {
++                    *used |= uint64_t{1} << i;
++                }
++                found = true;
++                break;
++            }
++            ++i;
++        }
++        if (!found) {
++            // A field the call site did not give: keep the placeholder
++            out.append(tmpl.substr(open, close - open + 1));
++        }
++        pos = close + 1;
++    }
++    out.append(tmpl.substr(pos));
++}
++
++} // namespace BCLog
+diff --git a/src/logging/event.h b/src/logging/event.h
+new file mode 100644
+index 0000000000..26710d956f
+--- /dev/null
++++ b/src/logging/event.h
+@@ -0,0 +1,379 @@
++// Copyright (c) 2026 The Lotus developers
++// Distributed under the MIT software license, see the accompanying
++// file COPYING or http://www.opensource.org/licenses/mit-license.php.
++
++#ifndef BITCOIN_LOGGING_EVENT_H
++#define BITCOIN_LOGGING_EVENT_H
++
++#include <logging/fields.h>
++#include <uint256.h>
++
++#include <chrono>
++#include <concepts>
++#include <cstddef>
++#include <cstdint>
++#include <cstring>
++#include <memory>
++#include <source_location>
++#include <span>
++#include <string>
++#include <string_view>
++#include <type_traits>
++#include <vector>
++
++/**
++ * Structured log events: an event name and typed fields instead of a
++ * preformatted string.
++ *
++ *     LogEvent(BCLog::NET, "peer_connected",
++ *              "New outbound peer connected: peer={peer_id}")
++ *         .Field(LogField::PeerId, id)
++ *         .Field(LogField::Addr, addr)
++ *         .Field(LogField::Transport, LogStatic("wss"));
++ *
++ * When the category/level is disabled, nothing after the check is
++ * evaluated (the builder and its arguments are in the else branch of an
++ * if). When enabled, the builder claims a slot in the calling thread's log
++ * ring and each Field() appends the field's id and its value in binary;
++ * the slot is published when the statement ends. No string is built, no
++ * lock is taken and nothing is allocated: rendering (text, JSON, ...)
++ * happens on the logger thread.
++ *
++ * Values are copied into the slot, except string literals passed as
++ * LogStatic (a pointer) and shared immutable objects passed by shared_ptr
++ * (the record keeps a reference, released by the logger thread after
++ * rendering). Strings longer than the slot's remaining space are truncated
++ * and marked. Large blobs cannot be logged: log a hash or a size.
++ */
++
++namespace BCLog {
++
++enum LogFlags : uint32_t;
++enum class Level;
++struct LogRecord;
++class LogRing;
++struct LogSiteLimit;
++
++/** The static description of one structured log call site */
++struct LogEventSite {
++    //! Event name, snake_case
++    const char *event;
++    //! Human message template with {field_name} placeholders, or nullptr
++    const char *message;
++    LogFlags category;
++    Level level;
++    std::source_location loc;
++};
++
++namespace detail {
++    consteval const char *EventMessage() {
++        return nullptr;
++    }
++    consteval const char *EventMessage(const char *message) {
++        return message;
++    }
++} // namespace detail
++
++/**
++ * A string that lives forever (a string literal), stored as a pointer.
++ * The constructor only accepts constant expressions, so a local buffer
++ * does not compile here: pass it as a std::string_view to have it copied.
++ */
++struct LogStatic {
++    const char *str;
++    size_t len;
++    template <size_t N>
++    consteval LogStatic(const char (&s)[N]) : str{s}, len{N - 1} {}
++};
++
++/** How a field's value is stored in a record */
++enum class FieldKind : uint8_t {
++    I64,
++    U64,
++    F64,
++    BOOL,
++    //! Copied bytes
++    STR,
++    //! Pointer and length of a LogStatic
++    STATIC_STR,
++    //! 32 bytes, as in uint256
++    HASH,
++    //! int64 nanoseconds
++    DURATION_NS,
++    //! Bytes packed by LogValue<T>, rendered by its function
++    CUSTOM,
++    //! A shared_ptr<const T> kept in the record, rendered by its function
++    REF,
++};
++
++/** Header of one field in a record's payload; the value follows */
++struct FieldHeader {
++    FieldId id;
++    FieldKind kind;
++    //! The value was cut to fit
++    bool truncated;
++    //! Bytes of value that follow (the next header is 8-byte aligned)
++    uint16_t size;
++    uint16_t reserved;
++};
++static_assert(sizeof(FieldHeader) == 8);
++
++//! Renders a CUSTOM value (packed bytes) as text
++using PackedRenderFn = void (*)(std::span<const std::byte> packed,
++                                std::string &out);
++//! Renders a REF value (the referenced object) as text
++using RefRenderFn = void (*)(const void *object, std::string &out);
++
++/** One field of a record, as encoders see it */
++struct FieldView {
++    FieldId id;
++    FieldKind kind;
++    bool truncated;
++    std::span<const std::byte> data;
++
++    const FieldInfo &Info() const { return GetFieldInfo(id); }
++    int64_t I64() const;
++    uint64_t U64() const;
++    double F64() const;
++    bool Bool() const;
++    int64_t DurationNs() const;
++    /** Append the value as text: numbers in decimal, hashes in hex, ... */
++    void AppendText(std::string &out) const;
++    /** Whether the value is a number (I64, U64, F64, DURATION_NS) */
++    bool IsNumber() const;
++};
++
++/** The fields of a record's payload */
++class FieldList {
++public:
++    FieldList() = default;
++    FieldList(std::span<const std::byte> payload, uint8_t count)
++        : m_payload{payload}, m_count{count} {}
++    uint8_t size() const { return m_count; }
++    bool empty() const { return m_count == 0; }
++
++    class Iterator {
++    public:
++        Iterator(const std::byte *pos, uint8_t left)
++            : m_pos{pos}, m_left{left} {}
++        FieldView operator*() const;
++        Iterator &operator++();
++        bool operator!=(const Iterator &other) const {
++            return m_left != other.m_left;
++        }
++
++    private:
++        const std::byte *m_pos;
++        uint8_t m_left;
++    };
++    Iterator begin() const { return {m_payload.data(), m_count}; }
++    Iterator end() const { return {nullptr, 0}; }
++
++private:
++    std::span<const std::byte> m_payload;
++    uint8_t m_count{0};
++};
++
++/**
++ * Logging of a type other than numbers, strings, hashes and durations:
++ * specialize with
++ *   static constexpr size_t MAX_SIZE;  // bytes packed at most
++ *   static size_t Pack(const T &value, std::span<std::byte> out);
++ *   static void Render(std::span<const std::byte> packed, std::string &out);
++ * Pack copies what Render needs (no pointers to the caller's memory).
++ */
++template <typename T> struct LogValue;
++
++/**
++ * Logging of an immutable shared object by reference: specialize with
++ *   static void Render(const T &object, std::string &out);
++ * and pass a std::shared_ptr<const T>. The record holds one reference
++ * until the logger thread has rendered it (the object is then released,
++ * possibly destroyed, on the logger thread).
++ */
++template <typename T> struct LogRef;
++
++/** Builds one structured log record; see the file comment */
++class EventBuilder {
++public:
++    EventBuilder(const LogEventSite &site, LogSiteLimit *limit) noexcept;
++    ~EventBuilder();
++    EventBuilder(const EventBuilder &) = delete;
++    EventBuilder &operator=(const EventBuilder &) = delete;
++
++    // Integers
++    template <std::integral V>
++        requires(!std::same_as<V, bool>)
++    EventBuilder &Field(FieldKey<FieldType::INT> key, V value) {
++        const int64_t v{int64_t(value)};
++        return Put(key.id, FieldKind::I64, &v, sizeof(v));
++    }
++    template <std::integral V>
++        requires(!std::same_as<V, bool>)
++    EventBuilder &Field(FieldKey<FieldType::UINT> key, V value) {
++        const uint64_t v{uint64_t(value)};
++        return Put(key.id, FieldKind::U64, &v, sizeof(v));
++    }
++    template <typename V>
++        requires std::is_arithmetic_v<V>
++    EventBuilder &Field(FieldKey<FieldType::FLOAT> key, V value) {
++        const double v{double(value)};
++        return Put(key.id, FieldKind::F64, &v, sizeof(v));
++    }
++    template <std::same_as<bool> V>
++    EventBuilder &Field(FieldKey<FieldType::BOOL> key, V value) {
++        const uint8_t v{value};
++        return Put(key.id, FieldKind::BOOL, &v, sizeof(v));
++    }
++    // Hashes (uint256, BlockHash, TxId, ...)
++    EventBuilder &Field(FieldKey<FieldType::HASH> key, const uint256 &hash) {
++        return Put(key.id, FieldKind::HASH, hash.data(), uint256::size());
++    }
++    // Durations
++    template <typename Rep, typename Period>
++    EventBuilder &Field(FieldKey<FieldType::DURATION> key,
++                        std::chrono::duration<Rep, Period> d) {
++        const int64_t ns{
++            std::chrono::duration_cast<std::chrono::nanoseconds>(d).count()};
++        return Put(key.id, FieldKind::DURATION_NS, &ns, sizeof(ns));
++    }
++    // Strings: literals by pointer, anything else copied
++    EventBuilder &Field(FieldKey<FieldType::STRING> key, LogStatic s) {
++        struct {
++            const char *str;
++            uint64_t len;
++        } v{s.str, s.len};
++        return Put(key.id, FieldKind::STATIC_STR, &v, sizeof(v));
++    }
++    EventBuilder &Field(FieldKey<FieldType::STRING> key, std::string_view s) {
++        return Put(key.id, FieldKind::STR, s.data(), s.size(),
++                   /*truncate=*/true);
++    }
++    EventBuilder &Field(FieldKey<FieldType::STRING> key, const std::string &s) {
++        return Field(key, std::string_view{s});
++    }
++    EventBuilder &Field(FieldKey<FieldType::STRING> key, const char *s) {
++        return Field(key, std::string_view{s});
++    }
++    // Other types, packed by their LogValue
++    template <typename T>
++        requires requires { LogValue<T>::MAX_SIZE; }
++    EventBuilder &Field(FieldKey<FieldType::STRING> key, const T &value) {
++        std::byte *out{Reserve(key.id, FieldKind::CUSTOM,
++                               sizeof(PackedRenderFn) + LogValue<T>::MAX_SIZE)};
++        if (out) {
++            const PackedRenderFn fn{&LogValue<T>::Render};
++            std::memcpy(out, &fn, sizeof(fn));
++            const size_t size{LogValue<T>::Pack(
++                value,
++                std::span<std::byte>{out + sizeof(fn), LogValue<T>::MAX_SIZE})};
++            Finish(sizeof(fn) + size);
++        }
++        return *this;
++    }
++    // Shared immutable objects, by reference
++    template <typename T>
++        requires requires(const T &o, std::string &s) {
++            LogRef<T>::Render(o, s);
++        }
++    EventBuilder &Field(FieldKey<FieldType::STRING> key,
++                        const std::shared_ptr<const T> &object) {
++        if (!object) {
++            return Field(key, LogStatic("null"));
++        }
++        return PutRef(key.id, std::shared_ptr<const void>{object},
++                      [](const void *o, std::string &out) {
++                          LogRef<T>::Render(*static_cast<const T *>(o), out);
++                      });
++    }
++    // Blobs are not logged: log their hash or size instead
++    EventBuilder &Field(FieldKey<FieldType::STRING>,
++                        std::span<const uint8_t>) = delete;
++    EventBuilder &Field(FieldKey<FieldType::STRING>,
++                        const std::vector<uint8_t> &) = delete;
++
++    /** Whether this builder records anything (category/level on, room) */
++    bool Active() const { return m_rec != nullptr; }
++
++private:
++    friend class Logger;
++    const LogEventSite &m_site;
++    LogSiteLimit *const m_limit;
++    //! The slot being filled (in the thread's ring, or m_buffered)
++    LogRecord *m_rec{nullptr};
++    LogRing *m_ring{nullptr};
++    //! Before logging starts: a heap record kept until StartLogging
++    std::unique_ptr<LogRecord> m_buffered;
++    //! Payload bytes used
++    size_t m_used{0};
++    FieldHeader *m_pending{nullptr};
++
++    EventBuilder &Put(FieldId id, FieldKind kind, const void *data, size_t size,
++                      bool truncate = false) noexcept;
++    EventBuilder &PutRef(FieldId id, std::shared_ptr<const void> object,
++                         RefRenderFn render) noexcept;
++    /** Space for a field of up to max_size bytes, or nullptr */
++    std::byte *Reserve(FieldId id, FieldKind kind, size_t max_size) noexcept;
++    void Finish(size_t size) noexcept;
++};
++
++/**
++ * Release what a record's fields hold (REF references). The logger calls
++ * this after rendering; records are never copied.
++ */
++void ReleaseFields(FieldList fields);
++
++/** Append text, quoted and escaped as in logfmt if it needs quoting */
++void AppendQuotedText(std::string &out, std::string_view text);
++
++/**
++ * The event's human message: its template with {field} placeholders
++ * replaced by the fields' text values (or the event name if it has none).
++ * Bit i of *used is set if the template used field i.
++ */
++void AppendEventMessage(std::string &out, const LogEventSite &site,
++                        FieldList fields, uint64_t *used = nullptr);
++
++} // namespace BCLog
++
++/**
++ * The site description of the call site this is expanded at, a constant
++ * (category, level, event name, message template and source location).
++ */
++#define LOG_EVENT_SITE_(category, level, event, ...)                           \
++    ([]() -> const BCLog::LogEventSite & {                                     \
++        static constexpr BCLog::LogEventSite site{                             \
++            event, BCLog::detail::EventMessage(__VA_ARGS__), category, level,  \
++            std::source_location::current()};                                  \
++        return site;                                                           \
++    }())
++
++#define LOG_EVENT_(category, level, event, ...)                                \
++    if (!LogAcceptCategory((category), (level))) {                             \
++    } else                                                                     \
++        BCLog::EventBuilder {                                                  \
++            LOG_EVENT_SITE_(category, level,                                   \
++                            event __VA_OPT__(, ) __VA_ARGS__),                 \
++                (level) >= BCLog::Level::Info ? &LOG_SITE_LIMIT_ : nullptr     \
++        }
++
++/**
++ * Structured events. Use as a statement, chaining .Field(...) calls:
++ *   LogEvent(category, "event_name"[, "message template"]).Field(...)...;
++ * LogEvent logs at debug level when the category is enabled (as LogDebug);
++ * LogInfoEvent, LogWarningEvent and LogErrorEvent log unconditionally (with
++ * per call site rate limiting), in a category or none.
++ */
++#define LogEvent(category, event, ...)                                         \
++    LOG_EVENT_(category, BCLog::Level::Debug, event __VA_OPT__(, ) __VA_ARGS__)
++#define LogTraceEvent(category, event, ...)                                    \
++    LOG_EVENT_(category, BCLog::Level::Trace, event __VA_OPT__(, ) __VA_ARGS__)
++#define LogInfoEvent(category, event, ...)                                     \
++    LOG_EVENT_(category, BCLog::Level::Info, event __VA_OPT__(, ) __VA_ARGS__)
++#define LogWarningEvent(category, event, ...)                                  \
++    LOG_EVENT_(category, BCLog::Level::Warning,                                \
++               event __VA_OPT__(, ) __VA_ARGS__)
++#define LogErrorEvent(category, event, ...)                                    \
++    LOG_EVENT_(category, BCLog::Level::Error, event __VA_OPT__(, ) __VA_ARGS__)
++
++#endif // BITCOIN_LOGGING_EVENT_H
+diff --git a/src/logging/fields.h b/src/logging/fields.h
+new file mode 100644
+index 0000000000..d5f2d51bda
+--- /dev/null
++++ b/src/logging/fields.h
+@@ -0,0 +1,134 @@
++// Copyright (c) 2026 The Lotus developers
++// Distributed under the MIT software license, see the accompanying
++// file COPYING or http://www.opensource.org/licenses/mit-license.php.
++
++#ifndef BITCOIN_LOGGING_FIELDS_H
++#define BITCOIN_LOGGING_FIELDS_H
++
++#include <array>
++#include <cstddef>
++#include <cstdint>
++#include <string_view>
++
++/**
++ * The structured log field vocabulary: the only keys a log event can carry.
++ *
++ * Every field is declared once, here, with its value type, its generic
++ * snake_case name (used by text, logfmt, json, json-gcp, and as
++ * LOTUS_<NAME> by journald) and its name in the Elastic Common Schema and
++ * in the OpenTelemetry semantic conventions where those define one. A
++ * field without a standard name is lotus.<name> in ECS and stays an
++ * attribute named <name> elsewhere. Call sites name fields through the
++ * typed keys in BCLog::LogField (e.g. LogField::PeerId), so a free-form
++ * string key does not compile and a new field has to be added here, where
++ * reviewers see it. Keys are small integers: a call site stores the id and
++ * the value; names are looked up on the logger thread.
++ *
++ * Core fields (time, level, category, thread, source location, message)
++ * are captured by the logger itself and are not in this table.
++ *
++ * Standard names (checked against ECS 8.x and OpenTelemetry semantic
++ * conventions 1.x; see doc/logging.md):
++ *  - source.address: ECS "IP address of the source", any peer we talk to
++ *    (ECS has no "peer" fieldset; source/destination describe the network
++ *    endpoints). OTel network.peer.address is the remote address.
++ *  - network.direction: ECS values include "inbound" and "outbound".
++ *  - user_agent.original: ECS and OTel.
++ *  - error.message: ECS; OTel's error.message is in development status.
++ *  - event.reason: ECS ("reason why this event happened").
++ *  - event.duration: ECS, in nanoseconds (encoders convert).
++ *  - file.path: ECS and OTel.
++ *  - rpc.method: OTel only (ECS has no RPC fieldset).
++ */
++#define BCLOG_FIELDS(X)                                                        \
++    /* Id, generic name, type, ECS name, OTel name */                          \
++    X(PeerId, peer_id, INT, "", "")                                            \
++    X(Addr, addr, STRING, "source.address", "network.peer.address")            \
++    X(Network, network, STRING, "", "")                                        \
++    X(Direction, direction, STRING, "network.direction", "")                   \
++    X(Transport, transport, STRING, "", "")                                    \
++    X(ConnType, conn_type, STRING, "", "")                                     \
++    X(UserAgent, user_agent, STRING, "user_agent.original",                    \
++      "user_agent.original")                                                   \
++    X(Version, version, INT, "", "")                                           \
++    X(Services, services, STRING, "", "")                                      \
++    X(MsgType, msg_type, STRING, "", "")                                       \
++    X(BlockHash, block_hash, HASH, "", "")                                     \
++    X(Height, height, INT, "", "")                                             \
++    X(TxId, txid, HASH, "", "")                                                \
++    X(Bytes, bytes, UINT, "", "")                                              \
++    X(Count, count, UINT, "", "")                                              \
++    X(AmountSats, amount_sats, INT, "", "")                                    \
++    X(Method, method, STRING, "", "rpc.method")                                \
++    X(Error, error, STRING, "error.message", "error.message")                  \
++    X(Reason, reason, STRING, "event.reason", "")                              \
++    X(DurationUs, duration_us, DURATION, "event.duration", "")                 \
++    X(Path, path, STRING, "file.path", "file.path")                            \
++    X(Wallet, wallet, STRING, "", "")                                          \
++    X(Name, name, STRING, "", "")                                              \
++    X(Value, value, STRING, "", "")
++
++namespace BCLog {
++
++/** How a field's value is stored and rendered */
++enum class FieldType : uint8_t {
++    //! Signed integer (JSON number)
++    INT,
++    //! Unsigned integer (JSON number)
++    UINT,
++    //! Floating point (JSON number)
++    FLOAT,
++    //! true/false
++    BOOL,
++    //! Text (JSON string); also values rendered as text (addresses...)
++    STRING,
++    //! 256-bit hash, rendered as 64 lowercase hex digits (as in RPC)
++    HASH,
++    //! A duration; the generic unit is microseconds (JSON number)
++    DURATION,
++};
++
++enum class FieldId : uint16_t {
++#define BCLOG_FIELD_ID(id, name, type, ecs, otel) id,
++    BCLOG_FIELDS(BCLOG_FIELD_ID)
++#undef BCLOG_FIELD_ID
++        COUNT
++};
++
++struct FieldInfo {
++    //! Generic snake_case name
++    std::string_view name;
++    FieldType type;
++    //! ECS name, or "" (then lotus.<name>)
++    std::string_view ecs;
++    //! OpenTelemetry semantic convention name, or "" (then <name>)
++    std::string_view otel;
++};
++
++inline constexpr std::array<FieldInfo, size_t(FieldId::COUNT)> FIELDS{{
++#define BCLOG_FIELD_INFO(id, name, type, ecs, otel)                            \
++    FieldInfo{#name, FieldType::type, ecs, otel},
++    BCLOG_FIELDS(BCLOG_FIELD_INFO)
++#undef BCLOG_FIELD_INFO
++}};
++
++inline constexpr const FieldInfo &GetFieldInfo(FieldId id) {
++    return FIELDS[size_t(id)];
++}
++
++/** A typed key: the only way to name a field at a call site */
++template <FieldType T> struct FieldKey {
++    FieldId id;
++};
++
++/** The keys, e.g. LogField::PeerId */
++namespace LogField {
++#define BCLOG_FIELD_KEY(id, name, type, ecs, otel)                             \
++    inline constexpr FieldKey<FieldType::type> id{FieldId::id};
++    BCLOG_FIELDS(BCLOG_FIELD_KEY)
++#undef BCLOG_FIELD_KEY
++} // namespace LogField
++
++} // namespace BCLog
++
++#endif // BITCOIN_LOGGING_FIELDS_H
+diff --git a/src/logging/values.h b/src/logging/values.h
+new file mode 100644
+index 0000000000..2ecbb92eda
+--- /dev/null
++++ b/src/logging/values.h
+@@ -0,0 +1,77 @@
++// Copyright (c) 2026 The Lotus developers
++// Distributed under the MIT software license, see the accompanying
++// file COPYING or http://www.opensource.org/licenses/mit-license.php.
++
++#ifndef BITCOIN_LOGGING_VALUES_H
++#define BITCOIN_LOGGING_VALUES_H
++
++#include <logging/event.h>
++#include <netaddress.h>
++#include <primitives/transaction.h>
++
++#include <algorithm>
++#include <cstring>
++
++/**
++ * How node types are logged as structured field values (see
++ * BCLog::LogValue and BCLog::LogRef in logging/event.h). Include this
++ * where such values are logged.
++ */
++namespace BCLog {
++
++/** Network addresses: copied as raw bytes, rendered in canonical form */
++template <> struct LogValue<CNetAddr> {
++    //! Network, scope id, length, then the address (IPv6, Tor v3, I2P...)
++    static constexpr size_t MAX_SIZE{1 + 4 + 1 + 32};
++    static size_t Pack(const CNetAddr &addr, std::span<std::byte> out) {
++        const auto bytes{addr.RawAddrBytes()};
++        const uint8_t len{uint8_t(std::min<size_t>(bytes.size(), 32))};
++        const uint8_t net{uint8_t(addr.RawNetwork())};
++        const uint32_t scope{addr.RawScopeId()};
++        std::memcpy(out.data(), &net, 1);
++        std::memcpy(out.data() + 1, &scope, 4);
++        std::memcpy(out.data() + 5, &len, 1);
++        std::memcpy(out.data() + 6, bytes.data(), len);
++        return 6 + len;
++    }
++    static CNetAddr Unpack(std::span<const std::byte> in) {
++        uint8_t net, len;
++        uint32_t scope;
++        std::memcpy(&net, in.data(), 1);
++        std::memcpy(&scope, in.data() + 1, 4);
++        std::memcpy(&len, in.data() + 5, 1);
++        return CNetAddr::FromRaw(
++            Network(net),
++            Span{reinterpret_cast<const uint8_t *>(in.data() + 6), len}, scope);
++    }
++    static void Render(std::span<const std::byte> in, std::string &out) {
++        out += Unpack(in).ToStringAddr();
++    }
++};
++
++/** Network address and port */
++template <> struct LogValue<CService> {
++    static constexpr size_t MAX_SIZE{2 + LogValue<CNetAddr>::MAX_SIZE};
++    static size_t Pack(const CService &service, std::span<std::byte> out) {
++        const uint16_t port{service.GetPort()};
++        std::memcpy(out.data(), &port, 2);
++        return 2 + LogValue<CNetAddr>::Pack(service, out.subspan(2));
++    }
++    static void Render(std::span<const std::byte> in, std::string &out) {
++        uint16_t port;
++        std::memcpy(&port, in.data(), 2);
++        out += CService{LogValue<CNetAddr>::Unpack(in.subspan(2)), port}
++                   .ToStringAddrPort();
++    }
++};
++
++/** Transactions, by reference: rendered as their txid */
++template <> struct LogRef<CTransaction> {
++    static void Render(const CTransaction &tx, std::string &out) {
++        out += tx.GetId().GetHex();
++    }
++};
++
++} // namespace BCLog
++
++#endif // BITCOIN_LOGGING_VALUES_H
+diff --git a/src/netaddress.cpp b/src/netaddress.cpp
+index 21b11dd8fe..495fa3a2e4 100644
+--- a/src/netaddress.cpp
++++ b/src/netaddress.cpp
+@@ -676,6 +676,15 @@ std::string CNetAddr::GetWSSPath() const {
+                                  : std::string(slash, m_addr.end());
+ }
+ 
++CNetAddr CNetAddr::FromRaw(Network net, Span<const uint8_t> bytes,
++                           uint32_t scope_id) {
++    CNetAddr addr;
++    addr.m_net = net;
++    addr.m_addr.assign(bytes.begin(), bytes.end());
++    addr.m_scope_id = scope_id;
++    return addr;
++}
++
+ enum Network CNetAddr::GetNetwork() const {
+     if (IsInternal()) {
+         return NET_INTERNAL;
+diff --git a/src/netaddress.h b/src/netaddress.h
+index 8252ce7616..c5d4c0a829 100644
+--- a/src/netaddress.h
++++ b/src/netaddress.h
+@@ -261,6 +261,19 @@ public:
+     bool IsAddrV1Compatible() const;
+ 
+     enum Network GetNetwork() const;
++
++    /**
++     * The raw representation (network, address bytes, scope id), for
++     * copying an address into a log record without allocating; FromRaw()
++     * makes the address again.
++     */
++    Network RawNetwork() const { return m_net; }
++    Span<const uint8_t> RawAddrBytes() const {
++        return Span{m_addr.data(), m_addr.size()};
++    }
++    uint32_t RawScopeId() const { return m_scope_id; }
++    static CNetAddr FromRaw(Network net, Span<const uint8_t> bytes,
++                            uint32_t scope_id);
+     std::string ToStringAddr() const;
+     bool GetInAddr(struct in_addr *pipv4Addr) const;
+     Network GetNetClass() const;
+diff --git a/src/test/CMakeLists.txt b/src/test/CMakeLists.txt
+index a3dad50ff1..f14b402d7a 100644
+--- a/src/test/CMakeLists.txt
++++ b/src/test/CMakeLists.txt
+@@ -189,6 +189,7 @@ add_boost_unit_tests_to_suite(bitcoin test_bitcoin
+ 		key_io_tests.cpp
+ 		key_tests.cpp
+ 		lcg_tests.cpp
++		logging_event_tests.cpp
+ 		logging_tests.cpp
+ 		mempool_tests.cpp
+ 		merkle_tests.cpp
+diff --git a/src/test/logging_event_tests.cpp b/src/test/logging_event_tests.cpp
+new file mode 100644
+index 0000000000..31ff98ec61
+--- /dev/null
++++ b/src/test/logging_event_tests.cpp
+@@ -0,0 +1,250 @@
++// Copyright (c) 2026 The Lotus developers
++// Distributed under the MIT software license, see the accompanying
++// file COPYING or http://www.opensource.org/licenses/mit-license.php.
++
++#include <logging.h>
++#include <logging/values.h>
++#include <netbase.h>
++#include <primitives/transaction.h>
++#include <test/util/setup_common.h>
++#include <univalue.h>
++#include <util/fs.h>
++
++#include <boost/test/unit_test.hpp>
++
++#include <chrono>
++#include <fstream>
++#include <memory>
++#include <string>
++#include <vector>
++
++using BCLog::LogStatic;
++namespace LogField = BCLog::LogField;
++using namespace std::chrono_literals;
++
++namespace {
++/** Log to a temporary file in a given format; read back the lines */
++struct EventLogSetup : public BasicTestingSetup {
++    fs::path prev_path{LogInstance().m_file_path};
++    BCLog::LogFormat prev_format{LogInstance().m_log_format};
++    bool prev_timestamps{LogInstance().m_log_timestamps};
++    bool prev_sourcelocations{LogInstance().m_log_sourcelocations};
++    bool prev_threadnames{LogInstance().m_log_threadnames};
++    uint32_t prev_mask{LogInstance().GetCategoryMask()};
++
++    EventLogSetup() {
++        LogInstance().Flush();
++        LogInstance().m_file_path = m_args.GetDataDirBase() / "events.log";
++        LogInstance().m_reopen_file = true;
++        LogInstance().m_log_timestamps = false;
++        LogInstance().m_log_sourcelocations = false;
++        LogInstance().m_log_threadnames = false;
++        LogInstance().SetRateLimiting(nullptr);
++        LogInstance().DisableCategory(BCLog::ALL);
++        LogInstance().EnableCategory(BCLog::NET);
++    }
++    ~EventLogSetup() {
++        LogInstance().Flush();
++        LogInstance().m_file_path = prev_path;
++        LogInstance().m_reopen_file = true;
++        LogInstance().m_log_format = prev_format;
++        LogInstance().m_log_timestamps = prev_timestamps;
++        LogInstance().m_log_sourcelocations = prev_sourcelocations;
++        LogInstance().m_log_threadnames = prev_threadnames;
++        LogInstance().DisableCategory(BCLog::ALL);
++        LogInstance().EnableCategory(BCLog::LogFlags{prev_mask});
++        LogInstance().Flush();
++    }
++    void Format(BCLog::LogFormat format) {
++        LogInstance().Flush();
++        LogInstance().m_log_format = format;
++    }
++    std::vector<std::string> Lines() {
++        LogInstance().Flush();
++        std::vector<std::string> lines;
++        std::ifstream ifs{LogInstance().m_file_path};
++        for (std::string line; std::getline(ifs, line);) {
++            if (!line.empty()) {
++                lines.push_back(line);
++            }
++        }
++        std::ofstream{LogInstance().m_file_path, std::ios::trunc};
++        LogInstance().m_reopen_file = true;
++        return lines;
++    }
++    UniValue Json() {
++        const auto lines{Lines()};
++        BOOST_REQUIRE_EQUAL(lines.size(), 1U);
++        UniValue v;
++        BOOST_REQUIRE(v.read(lines[0]));
++        return v;
++    }
++};
++
++uint256 SomeHash() {
++    return uint256S(
++        "00000000000000000123456789abcdef0123456789abcdef0123456789abcdef");
++}
++} // namespace
++
++BOOST_FIXTURE_TEST_SUITE(logging_event_tests, EventLogSetup)
++
++BOOST_AUTO_TEST_CASE(event_text_and_json) {
++    const CService addr{LookupNumeric("203.0.113.7", 10605)};
++    for (const auto format : {BCLog::LogFormat::TEXT, BCLog::LogFormat::JSON}) {
++        Format(format);
++        LogEvent(BCLog::NET, "peer_connected",
++                 "New peer connected: peer={peer_id}")
++            .Field(LogField::PeerId, 17)
++            .Field(LogField::Addr, addr)
++            .Field(LogField::Transport, LogStatic("wss"))
++            .Field(LogField::BlockHash, SomeHash())
++            .Field(LogField::Bytes, uint64_t{712345})
++            .Field(LogField::DurationUs, 1500us)
++            .Field(LogField::UserAgent, std::string{"/Lotus:1.0 \"x\"/"});
++        if (format == BCLog::LogFormat::TEXT) {
++            const auto lines{Lines()};
++            BOOST_REQUIRE_EQUAL(lines.size(), 1U);
++            BOOST_CHECK_EQUAL(
++                lines[0],
++                "[net] New peer connected: peer=17 addr=203.0.113.7:10605 "
++                "transport=wss "
++                "block_hash="
++                "00000000000000000123456789abcdef0123456789abcdef0123456789abcd"
++                "ef"
++                " bytes=712345 duration_us=1500 "
++                "user_agent=\"/Lotus:1.0 \\\"x\\\"/\"");
++        } else {
++            const UniValue v{Json()};
++            BOOST_CHECK_EQUAL(v["message"].get_str(),
++                              "New peer connected: peer=17");
++            BOOST_CHECK_EQUAL(v["event"].get_str(), "peer_connected");
++            BOOST_CHECK_EQUAL(v["category"].get_str(), "net");
++            BOOST_CHECK_EQUAL(v["level"].get_str(), "debug");
++            // Numbers stay numbers
++            BOOST_CHECK(v["peer_id"].isNum());
++            BOOST_CHECK_EQUAL(v["peer_id"].getInt<int>(), 17);
++            BOOST_CHECK_EQUAL(v["bytes"].getInt<int64_t>(), 712345);
++            BOOST_CHECK_EQUAL(v["duration_us"].getInt<int>(), 1500);
++            BOOST_CHECK_EQUAL(v["addr"].get_str(), "203.0.113.7:10605");
++            BOOST_CHECK_EQUAL(v["transport"].get_str(), "wss");
++            BOOST_CHECK_EQUAL(v["block_hash"].get_str(), SomeHash().GetHex());
++            BOOST_CHECK_EQUAL(v["user_agent"].get_str(), "/Lotus:1.0 \"x\"/");
++        }
++    }
++}
++
++BOOST_AUTO_TEST_CASE(event_without_template) {
++    LogEvent(BCLog::NET, "ping_timeout").Field(LogField::PeerId, 3);
++    const auto lines{Lines()};
++    BOOST_REQUIRE_EQUAL(lines.size(), 1U);
++    BOOST_CHECK_EQUAL(lines[0], "[net] ping_timeout peer_id=3");
++    LogInfoEvent(BCLog::ALL, "startup_done");
++    BOOST_CHECK_EQUAL(Lines().at(0), "startup_done");
++}
++
++BOOST_AUTO_TEST_CASE(event_escaping) {
++    Format(BCLog::LogFormat::JSON);
++    const std::string nasty{"a\"b\\c\nd\x01\xff"};
++    LogEvent(BCLog::NET, "weird", "say {error}").Field(LogField::Error, nasty);
++    const UniValue v{Json()};
++    BOOST_CHECK_EQUAL(v["error"].get_str(), "a\"b\\c\nd\x01\xef\xbf\xbd");
++    BOOST_CHECK_EQUAL(v["message"].get_str(), "say a\"b\\c\nd\x01\xef\xbf\xbd");
++    Format(BCLog::LogFormat::TEXT);
++    LogEvent(BCLog::NET, "weird", "say {error}").Field(LogField::Error, nasty);
++    // Text: control characters escaped as everywhere in the text format
++    BOOST_CHECK_EQUAL(Lines().at(0), "[net] say a\"b\\c");
++}
++
++BOOST_AUTO_TEST_CASE(event_disabled_evaluates_nothing) {
++    int evaluated{0};
++    const auto value{[&] {
++        ++evaluated;
++        return 1;
++    }};
++    LogInstance().DisableCategory(BCLog::NET);
++    LogEvent(BCLog::NET, "never").Field(LogField::PeerId, value());
++    BOOST_CHECK_EQUAL(evaluated, 0);
++    LogInstance().EnableCategory(BCLog::NET);
++    LogEvent(BCLog::NET, "now").Field(LogField::PeerId, value());
++    BOOST_CHECK_EQUAL(evaluated, 1);
++    BOOST_CHECK_EQUAL(Lines().size(), 1U);
++}
++
++BOOST_AUTO_TEST_CASE(event_dangling_else) {
++    // The macro is an if/else: an outer else still binds to the outer if.
++    bool took_else{false};
++    if (false)
++        LogEvent(BCLog::NET, "no");
++    else
++        took_else = true;
++    BOOST_CHECK(took_else);
++}
++
++BOOST_AUTO_TEST_CASE(event_reference_outlives_caller) {
++    // A transaction logged by reference stays alive until rendered, after
++    // the caller dropped it; then the logger releases it.
++    LogInstance().PauseForTesting(true);
++    LogInstance().Flush();
++    std::weak_ptr<const CTransaction> weak;
++    {
++        CMutableTransaction mtx;
++        mtx.nLockTime = 1234;
++        const CTransactionRef tx{MakeTransactionRef(mtx)};
++        weak = tx;
++        LogEvent(BCLog::NET, "tx_received", "got {txid}")
++            .Field(LogField::Name, tx);
++    }
++    BOOST_CHECK(!weak.expired());
++    const auto lines{Lines()};
++    LogInstance().PauseForTesting(false);
++    BOOST_CHECK(weak.expired());
++    BOOST_REQUIRE_EQUAL(lines.size(), 1U);
++    BOOST_CHECK(lines[0].find("name=") != std::string::npos);
++}
++
++BOOST_AUTO_TEST_CASE(event_copies_strings) {
++    // Non-literal strings are copied: changing the source afterwards does
++    // not change the logged value.
++    std::string s{"before"};
++    LogInstance().PauseForTesting(true);
++    LogEvent(BCLog::NET, "copied").Field(LogField::Name, s);
++    s = "after!";
++    const auto lines{Lines()};
++    LogInstance().PauseForTesting(false);
++    BOOST_CHECK_EQUAL(lines.at(0), "[net] copied name=before");
++}
++
++BOOST_AUTO_TEST_CASE(event_truncation) {
++    Format(BCLog::LogFormat::JSON);
++    const std::string big(1000, 'x');
++    LogEvent(BCLog::NET, "big")
++        .Field(LogField::Name, big)
++        .Field(LogField::PeerId, 1);
++    const UniValue v{Json()};
++    // The string is cut to the record's room; the next field is left out
++    BOOST_CHECK(v["name"].get_str().size() < 500);
++    BOOST_CHECK(v["fields_truncated"].get_bool());
++    BOOST_CHECK(!v.exists("peer_id"));
++}
++
++BOOST_AUTO_TEST_CASE(event_field_registry) {
++    // Every field has a unique snake_case name; standard names are dotted.
++    std::set<std::string_view> names;
++    for (const auto &f : BCLog::FIELDS) {
++        BOOST_CHECK(names.insert(f.name).second);
++        for (const char c : f.name) {
++            BOOST_CHECK((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') ||
++                        c == '_');
++        }
++        BOOST_CHECK(f.ecs.empty() || f.ecs.find('.') != std::string_view::npos);
++        BOOST_CHECK(f.otel.empty() ||
++                    f.otel.find('.') != std::string_view::npos);
++    }
++    BOOST_CHECK_EQUAL(BCLog::GetFieldInfo(BCLog::FieldId::Addr).ecs,
++                      "source.address");
++    BOOST_CHECK_EQUAL(BCLog::GetFieldInfo(BCLog::FieldId::Error).ecs,
++                      "error.message");
++}
++
++BOOST_AUTO_TEST_SUITE_END()
+-- 
+2.50.1 (Apple Git-155)
+

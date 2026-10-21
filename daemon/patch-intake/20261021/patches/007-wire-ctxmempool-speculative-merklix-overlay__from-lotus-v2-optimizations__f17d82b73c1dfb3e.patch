@@ -1,0 +1,1146 @@
+From 1eda43d07617bdc185d2ce2f4c3780ff4f51b16c Mon Sep 17 00:00:00 2001
+From: Shammah Chancellor <shammah.chancellor@notvalid.com>
+Date: Sun, 18 Oct 2026 01:33:29 -0700
+Subject: [PATCH] mempool: wire CTxMemPool speculative Merklix overlay
+
+Hook MerklixOverlayManager into CTxMemPool::addUnchecked, removeUnchecked,
+and block connect reset.
+
+Build-prerequisite maintenance:
+- Introduce the optional no-op CCoinsView prefetch hint API at its first call in 004; concrete overrides remain in 026.
+- Place SHA-tagged-hash and reconciliation prerequisites beside their first overlay callers, and link the overlay foundation library. Original 005 and 006 are one compilation boundary.
+- Supply storage and helper definitions at 007 for overlay queues, snapshot-defer scopes and the UTXO filter already called there; snapshot publication stays disabled until 014. This moves prerequisites out of 020/024; it does not remove forward call sites.
+
+Original-Commit: 2283e3f138ebb4a05ae9c52555f037f031e23bb3
+---
+ src/lotus_v2/CMakeLists.txt       |   2 +-
+ src/lotus_v2/utxo_fast_filter.cpp | 349 ++++++++++++++++++++++++++++++
+ src/lotus_v2/utxo_fast_filter.h   | 158 ++++++++++++++
+ src/txmempool.cpp                 | 198 +++++++++++++++--
+ src/txmempool.h                   | 141 +++++++++++-
+ src/validation.cpp                |  53 ++++-
+ 6 files changed, 877 insertions(+), 24 deletions(-)
+ create mode 100644 src/lotus_v2/utxo_fast_filter.cpp
+ create mode 100644 src/lotus_v2/utxo_fast_filter.h
+
+diff --git a/src/lotus_v2/CMakeLists.txt b/src/lotus_v2/CMakeLists.txt
+index 24526d34ec42f3974379581c12cc13de76d2589e..ee11d4a119379e7c1881c2010f9005ada600367a 100644
+--- a/src/lotus_v2/CMakeLists.txt
++++ b/src/lotus_v2/CMakeLists.txt
+@@ -10,6 +10,6 @@ target_compile_options(lotus_v2_mdbx PRIVATE -O3 -Wno-unused-parameter -Wno-sign
+ if(NOT TARGET Boost::headers)
+   find_package(Boost 1.64 REQUIRED)
+ endif()
+-add_library(lotus_v2_header STATIC tagged_hash.cpp output.cpp commitment.cpp sparse_state.cpp set_reconciliation.cpp mempool_overlay.cpp)
++add_library(lotus_v2_header STATIC tagged_hash.cpp output.cpp commitment.cpp sparse_state.cpp set_reconciliation.cpp mempool_overlay.cpp utxo_fast_filter.cpp)
+ target_include_directories(lotus_v2_header PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}" ..)
+ target_link_libraries(lotus_v2_header PUBLIC crypto Boost::headers)
+diff --git a/src/lotus_v2/utxo_fast_filter.cpp b/src/lotus_v2/utxo_fast_filter.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..69e400f3bc02ca3c0836798d73bf902a04e7283b
+--- /dev/null
++++ b/src/lotus_v2/utxo_fast_filter.cpp
+@@ -0,0 +1,349 @@
++// Copyright (c) 2026 The Lotus developers
++// Distributed under the MIT software license, see the accompanying
++// file COPYING or http://www.opensource.org/licenses/mit-license.php.
++
++#include "utxo_fast_filter.h"
++
++#include <cstring>
++
++namespace lotus::v2 {
++
++namespace {
++
++constexpr size_t kInitialShardTableCap = 256;
++
++inline std::pair<size_t, uint64_t> BloomBit1(uint64_t fp) noexcept {
++    const uint32_t bit = static_cast<uint32_t>(fp & 2047ULL);
++    return {bit >> 6, 1ULL << (bit & 63u)};
++}
++
++inline std::pair<size_t, uint64_t> BloomBit2(uint64_t fp) noexcept {
++    const uint32_t bit = static_cast<uint32_t>((fp >> 11) & 2047ULL);
++    return {bit >> 6, 1ULL << (bit & 63u)};
++}
++
++} // namespace
++
++// ============================================================================
++// UtxoFastFilter::FlatFpSet
++// ============================================================================
++
++UtxoFastFilter::FlatFpSet::FlatFpSet() : slots(kInitialShardTableCap, kEmpty) {}
++
++void UtxoFastFilter::FlatFpSet::Clear() {
++    std::fill(slots.begin(), slots.end(), kEmpty);
++    count = 0;
++    tombstones = 0;
++}
++
++void UtxoFastFilter::FlatFpSet::Reserve(size_t min_entries) {
++    size_t target_cap = kInitialShardTableCap;
++    while (target_cap < min_entries * 2) {
++        target_cap *= 2;
++    }
++    if (target_cap > slots.size()) {
++        Rehash(target_cap);
++    }
++}
++
++void UtxoFastFilter::FlatFpSet::Rehash(size_t new_cap) {
++    std::vector<uint64_t> old = std::move(slots);
++    slots.assign(new_cap, kEmpty);
++    count = 0;
++    tombstones = 0;
++    const size_t mask = new_cap - 1;
++    for (uint64_t val : old) {
++        if (val > kTombstone) {
++            size_t idx = static_cast<size_t>(val) & mask;
++            while (slots[idx] != kEmpty) {
++                idx = (idx + 1) & mask;
++            }
++            slots[idx] = val;
++            ++count;
++        }
++    }
++}
++
++bool UtxoFastFilter::FlatFpSet::Insert(uint64_t fp) {
++    if ((count + tombstones + 1) * 2 >= slots.size()) {
++        const size_t next_cap =
++            (count * 4 >= slots.size()) ? (slots.size() * 2) : slots.size();
++        Rehash(next_cap);
++    }
++    const size_t mask = slots.size() - 1;
++    size_t idx = static_cast<size_t>(fp) & mask;
++    size_t first_tomb = slots.size();
++    while (true) {
++        const uint64_t cur = slots[idx];
++        if (cur == fp) {
++            return false;
++        }
++        if (cur == kEmpty) {
++            if (first_tomb != slots.size()) {
++                slots[first_tomb] = fp;
++                --tombstones;
++            } else {
++                slots[idx] = fp;
++            }
++            ++count;
++            return true;
++        }
++        if (cur == kTombstone && first_tomb == slots.size()) {
++            first_tomb = idx;
++        }
++        idx = (idx + 1) & mask;
++    }
++}
++
++bool UtxoFastFilter::FlatFpSet::Erase(uint64_t fp) {
++    const size_t mask = slots.size() - 1;
++    size_t idx = static_cast<size_t>(fp) & mask;
++    while (true) {
++        const uint64_t cur = slots[idx];
++        if (cur == fp) {
++            slots[idx] = kTombstone;
++            --count;
++            ++tombstones;
++            return true;
++        }
++        if (cur == kEmpty) {
++            return false;
++        }
++        idx = (idx + 1) & mask;
++    }
++}
++
++bool UtxoFastFilter::FlatFpSet::Contains(uint64_t fp) const noexcept {
++    const size_t mask = slots.size() - 1;
++    size_t idx = static_cast<size_t>(fp) & mask;
++    while (true) {
++        const uint64_t cur = slots[idx];
++        if (cur == fp) {
++            return true;
++        }
++        if (cur == kEmpty) {
++            return false;
++        }
++        idx = (idx + 1) & mask;
++    }
++}
++
++// ============================================================================
++// UtxoFastFilter::Shard
++// ============================================================================
++
++UtxoFastFilter::Shard::Shard() {
++    for (auto &w : spent_bloom) {
++        w.store(0ULL, std::memory_order_relaxed);
++    }
++    for (auto &w : unspent_bloom) {
++        w.store(0ULL, std::memory_order_relaxed);
++    }
++}
++
++void UtxoFastFilter::Shard::RebuildSpentBloomLocked() noexcept {
++    std::array<uint64_t, kBloomWords> next_bloom{};
++    for (uint64_t val : spent_set.slots) {
++        if (val > FlatFpSet::kTombstone) {
++            const auto [w1, m1] = BloomBit1(val);
++            const auto [w2, m2] = BloomBit2(val);
++            next_bloom[w1] |= m1;
++            next_bloom[w2] |= m2;
++        }
++    }
++    for (size_t i = 0; i < kBloomWords; ++i) {
++        spent_bloom[i].store(next_bloom[i], std::memory_order_release);
++    }
++}
++
++void UtxoFastFilter::Shard::RebuildUnspentBloomLocked() noexcept {
++    std::array<uint64_t, kBloomWords> next_bloom{};
++    for (uint64_t val : unspent_set.slots) {
++        if (val > FlatFpSet::kTombstone) {
++            const auto [w1, m1] = BloomBit1(val);
++            const auto [w2, m2] = BloomBit2(val);
++            next_bloom[w1] |= m1;
++            next_bloom[w2] |= m2;
++        }
++    }
++    for (size_t i = 0; i < kBloomWords; ++i) {
++        unspent_bloom[i].store(next_bloom[i], std::memory_order_release);
++    }
++}
++
++// ============================================================================
++// UtxoFastFilter
++// ============================================================================
++
++UtxoFastFilter::UtxoFastFilter() = default;
++
++void UtxoFastFilter::ReservePerShard(size_t unspent_cap, size_t spent_cap) {
++    for (Shard &shard : shards_) {
++        std::lock_guard<std::mutex> lock(shard.mutex);
++        shard.unspent_set.Reserve(unspent_cap);
++        shard.spent_set.Reserve(spent_cap);
++    }
++}
++
++uint64_t UtxoFastFilter::ComputeFingerprint(const uint8_t *txid32,
++                                            uint32_t index) noexcept {
++    uint64_t w0 = 0;
++    uint64_t w1 = 0;
++    std::memcpy(&w0, txid32, 8);
++    std::memcpy(&w1, txid32 + 8, 8);
++    uint64_t z = w0 ^ (w1 * 0x9e3779b97f4a7c15ULL) ^
++                 (static_cast<uint64_t>(index) * 0xbf58476d1ce4e5b9ULL);
++    z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9ULL;
++    z = (z ^ (z >> 27)) * 0x94d049bb133111ebULL;
++    const uint64_t fp = z ^ (z >> 31);
++    return fp <= FlatFpSet::kTombstone ? 2ULL : fp;
++}
++
++bool UtxoFastFilter::MarkSpentInMempool(const uint8_t *txid32, uint32_t index) {
++    const size_t sidx = ShardIndex(txid32);
++    const uint64_t fp = ComputeFingerprint(txid32, index);
++    Shard &shard = shards_[sidx];
++    std::lock_guard<std::mutex> lock(shard.mutex);
++    const bool inserted = shard.spent_set.Insert(fp);
++    if (inserted) {
++        shard.spent_count.store(shard.spent_set.count,
++                                std::memory_order_relaxed);
++    }
++    const auto [w1, m1] = BloomBit1(fp);
++    const auto [w2, m2] = BloomBit2(fp);
++    shard.spent_bloom[w1].fetch_or(m1, std::memory_order_release);
++    shard.spent_bloom[w2].fetch_or(m2, std::memory_order_release);
++    return inserted;
++}
++
++bool UtxoFastFilter::UnmarkSpentInMempool(const uint8_t *txid32,
++                                          uint32_t index) {
++    const size_t sidx = ShardIndex(txid32);
++    const uint64_t fp = ComputeFingerprint(txid32, index);
++    Shard &shard = shards_[sidx];
++    std::lock_guard<std::mutex> lock(shard.mutex);
++    const bool erased = shard.spent_set.Erase(fp);
++    if (erased) {
++        shard.spent_count.store(shard.spent_set.count,
++                                std::memory_order_relaxed);
++        shard.RebuildSpentBloomLocked();
++    }
++    return erased;
++}
++
++bool UtxoFastFilter::IsSpentInMempool(const uint8_t *txid32,
++                                      uint32_t index) const noexcept {
++    const size_t sidx = ShardIndex(txid32);
++    const Shard &shard = shards_[sidx];
++    if (shard.spent_count.load(std::memory_order_relaxed) == 0) {
++        return false;
++    }
++    const uint64_t fp = ComputeFingerprint(txid32, index);
++    const auto [w1, m1] = BloomBit1(fp);
++    if ((shard.spent_bloom[w1].load(std::memory_order_acquire) & m1) == 0) {
++        return false;
++    }
++    const auto [w2, m2] = BloomBit2(fp);
++    if ((shard.spent_bloom[w2].load(std::memory_order_acquire) & m2) == 0) {
++        return false;
++    }
++    std::lock_guard<std::mutex> lock(shard.mutex);
++    return shard.spent_set.Contains(fp);
++}
++
++bool UtxoFastFilter::AddUnspent(const uint8_t *txid32, uint32_t index) {
++    const size_t sidx = ShardIndex(txid32);
++    const uint64_t fp = ComputeFingerprint(txid32, index);
++    Shard &shard = shards_[sidx];
++    std::lock_guard<std::mutex> lock(shard.mutex);
++    const bool inserted = shard.unspent_set.Insert(fp);
++    if (inserted) {
++        shard.unspent_count.store(shard.unspent_set.count,
++                                  std::memory_order_relaxed);
++    }
++    const auto [w1, m1] = BloomBit1(fp);
++    const auto [w2, m2] = BloomBit2(fp);
++    shard.unspent_bloom[w1].fetch_or(m1, std::memory_order_release);
++    shard.unspent_bloom[w2].fetch_or(m2, std::memory_order_release);
++    return inserted;
++}
++
++bool UtxoFastFilter::RemoveUnspent(const uint8_t *txid32, uint32_t index) {
++    const size_t sidx = ShardIndex(txid32);
++    const uint64_t fp = ComputeFingerprint(txid32, index);
++    Shard &shard = shards_[sidx];
++    std::lock_guard<std::mutex> lock(shard.mutex);
++    const bool erased = shard.unspent_set.Erase(fp);
++    if (erased) {
++        shard.unspent_count.store(shard.unspent_set.count,
++                                  std::memory_order_relaxed);
++        shard.RebuildUnspentBloomLocked();
++    }
++    return erased;
++}
++
++bool UtxoFastFilter::ContainsUnspent(const uint8_t *txid32,
++                                     uint32_t index) const noexcept {
++    const size_t sidx = ShardIndex(txid32);
++    const Shard &shard = shards_[sidx];
++    if (shard.unspent_count.load(std::memory_order_relaxed) == 0) {
++        return false;
++    }
++    const uint64_t fp = ComputeFingerprint(txid32, index);
++    const auto [w1, m1] = BloomBit1(fp);
++    if ((shard.unspent_bloom[w1].load(std::memory_order_acquire) & m1) == 0) {
++        return false;
++    }
++    const auto [w2, m2] = BloomBit2(fp);
++    if ((shard.unspent_bloom[w2].load(std::memory_order_acquire) & m2) == 0) {
++        return false;
++    }
++    std::lock_guard<std::mutex> lock(shard.mutex);
++    return shard.unspent_set.Contains(fp);
++}
++
++void UtxoFastFilter::ClearMempool() {
++    for (Shard &shard : shards_) {
++        std::lock_guard<std::mutex> lock(shard.mutex);
++        shard.spent_set.Clear();
++        shard.spent_count.store(0, std::memory_order_relaxed);
++        for (auto &w : shard.spent_bloom) {
++            w.store(0ULL, std::memory_order_release);
++        }
++    }
++}
++
++void UtxoFastFilter::ClearAll() {
++    chain_uhs_authoritative_.store(false, std::memory_order_release);
++    for (Shard &shard : shards_) {
++        std::lock_guard<std::mutex> lock(shard.mutex);
++        shard.spent_set.Clear();
++        shard.unspent_set.Clear();
++        shard.spent_count.store(0, std::memory_order_relaxed);
++        shard.unspent_count.store(0, std::memory_order_relaxed);
++        for (auto &w : shard.spent_bloom) {
++            w.store(0ULL, std::memory_order_release);
++        }
++        for (auto &w : shard.unspent_bloom) {
++            w.store(0ULL, std::memory_order_release);
++        }
++    }
++}
++
++size_t UtxoFastFilter::GetMempoolSpentCount() const noexcept {
++    size_t total = 0;
++    for (const Shard &shard : shards_) {
++        total += shard.spent_count.load(std::memory_order_relaxed);
++    }
++    return total;
++}
++
++size_t UtxoFastFilter::GetUnspentCount() const noexcept {
++    size_t total = 0;
++    for (const Shard &shard : shards_) {
++        total += shard.unspent_count.load(std::memory_order_relaxed);
++    }
++    return total;
++}
++
++} // namespace lotus::v2
+diff --git a/src/lotus_v2/utxo_fast_filter.h b/src/lotus_v2/utxo_fast_filter.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..b5e697e9b581269e4132d8d91755f67a1bc62d21
+--- /dev/null
++++ b/src/lotus_v2/utxo_fast_filter.h
+@@ -0,0 +1,158 @@
++// Copyright (c) 2026 The Lotus developers
++// Distributed under the MIT software license, see the accompanying
++// file COPYING or http://www.opensource.org/licenses/mit-license.php.
++
++#ifndef LOTUS_V2_UTXO_FAST_FILTER_H
++#define LOTUS_V2_UTXO_FAST_FILTER_H
++
++#include "sparse_state.h"
++
++#include <array>
++#include <atomic>
++#include <cstddef>
++#include <cstdint>
++#include <mutex>
++#include <vector>
++
++namespace lotus::v2 {
++
++/**
++ * Project Hamilton (opencbdc-tx) style 64-shard compact in-memory Unspent Hash
++ * Set (UHS) and Mempool-Spent Outpoint Fast-Filter.
++ *
++ * Architecture:
++ *   - 64 cacheline-isolated shards selected by the top 6 bits of the outpoint
++ *     TxID (`txid[0] & 0x3F`).
++ *   - Each outpoint is compressed to a non-zero 64-bit SplitMix64 fingerprint
++ *     from the first 16 bytes of the 256-bit TxID mixed with the 32-bit output
++ *     index (~1.5 ns, zero cryptographic hashing overhead since TxID is already
++ *     uniform).
++ *   - Each shard maintains:
++ *       1. Lock-free L1-resident 2048-bit atomic Bloom filters (`spent_bloom`
++ *          and `unspent_bloom`) for ~3 ns lock-free negative checks.
++ *       2. Compact open-addressed power-of-two `uint64_t` hash sets
++ *          (`spent_set` and `unspent_set`) for exact `<25 ns` positive
++ *          double-spend and UHS existence checks.
++ */
++class UtxoFastFilter {
++public:
++    static constexpr size_t kNumShards = 64;
++    static constexpr size_t kBloomWords = 32; // 2048 bits (256 bytes) per filter
++
++    UtxoFastFilter();
++
++    void ReservePerShard(size_t unspent_cap, size_t spent_cap);
++
++    static uint64_t ComputeFingerprint(const uint8_t *txid32,
++                                       uint32_t index) noexcept;
++    static uint64_t ComputeFingerprint(const Outpoint &op) noexcept {
++        return ComputeFingerprint(op.tx_id.data(), op.index);
++    }
++
++    static size_t ShardIndex(const uint8_t *txid32) noexcept {
++        return static_cast<size_t>(txid32[0] & 0x3Fu);
++    }
++    static size_t ShardIndex(const Outpoint &op) noexcept {
++        return ShardIndex(op.tx_id.data());
++    }
++
++    bool MarkSpentInMempool(const uint8_t *txid32, uint32_t index);
++    bool MarkSpentInMempool(const Outpoint &op) {
++        return MarkSpentInMempool(op.tx_id.data(), op.index);
++    }
++
++    bool UnmarkSpentInMempool(const uint8_t *txid32, uint32_t index);
++    bool UnmarkSpentInMempool(const Outpoint &op) {
++        return UnmarkSpentInMempool(op.tx_id.data(), op.index);
++    }
++
++    bool IsSpentInMempool(const uint8_t *txid32,
++                          uint32_t index) const noexcept;
++    bool IsSpentInMempool(const Outpoint &op) const noexcept {
++        return IsSpentInMempool(op.tx_id.data(), op.index);
++    }
++
++    bool AddUnspent(const uint8_t *txid32, uint32_t index);
++    bool AddUnspent(const Outpoint &op) {
++        return AddUnspent(op.tx_id.data(), op.index);
++    }
++
++    bool RemoveUnspent(const uint8_t *txid32, uint32_t index);
++    bool RemoveUnspent(const Outpoint &op) {
++        return RemoveUnspent(op.tx_id.data(), op.index);
++    }
++
++    bool ContainsUnspent(const uint8_t *txid32,
++                         uint32_t index) const noexcept;
++    bool ContainsUnspent(const Outpoint &op) const noexcept {
++        return ContainsUnspent(op.tx_id.data(), op.index);
++    }
++
++    /**
++     * Fast UHS existence check in <50 ns: returns true if the outpoint's
++     * 64-bit fingerprint is present in the sharded unspent hash set (chain or
++     * mempool outputs).
++     */
++    bool MayExistInChainOrMempool(const uint8_t *txid32,
++                                  uint32_t index) const noexcept {
++        return ContainsUnspent(txid32, index);
++    }
++    bool MayExistInChainOrMempool(const Outpoint &op) const noexcept {
++        return ContainsUnspent(op.tx_id.data(), op.index);
++    }
++
++    void SetChainUhsAuthoritative(bool authoritative) noexcept {
++        chain_uhs_authoritative_.store(authoritative,
++                                       std::memory_order_release);
++    }
++    bool IsChainUhsAuthoritative() const noexcept {
++        return chain_uhs_authoritative_.load(std::memory_order_acquire);
++    }
++
++    void ClearMempool();
++    void ClearAll();
++
++    size_t GetMempoolSpentCount() const noexcept;
++    size_t MempoolSpentCount() const noexcept { return GetMempoolSpentCount(); }
++    size_t GetUnspentCount() const noexcept;
++    size_t UnspentCount() const noexcept { return GetUnspentCount(); }
++
++private:
++    struct FlatFpSet {
++        std::vector<uint64_t> slots;
++        size_t count{0};
++        size_t tombstones{0};
++
++        static constexpr uint64_t kEmpty = 0ULL;
++        static constexpr uint64_t kTombstone = 1ULL;
++
++        FlatFpSet();
++        void Clear();
++        void Reserve(size_t min_entries);
++        bool Insert(uint64_t fp);
++        bool Erase(uint64_t fp);
++        bool Contains(uint64_t fp) const noexcept;
++        void Rehash(size_t new_cap);
++    };
++
++    struct alignas(64) Shard {
++        std::array<std::atomic<uint64_t>, kBloomWords> spent_bloom{};
++        std::array<std::atomic<uint64_t>, kBloomWords> unspent_bloom{};
++        std::atomic<size_t> spent_count{0};
++        std::atomic<size_t> unspent_count{0};
++        mutable std::mutex mutex;
++        FlatFpSet spent_set;
++        FlatFpSet unspent_set;
++
++        Shard();
++        void RebuildSpentBloomLocked() noexcept;
++        void RebuildUnspentBloomLocked() noexcept;
++    };
++
++    std::array<Shard, kNumShards> shards_;
++    std::atomic<bool> chain_uhs_authoritative_{false};
++};
++
++} // namespace lotus::v2
++
++#endif // LOTUS_V2_UTXO_FAST_FILTER_H
+diff --git a/src/txmempool.cpp b/src/txmempool.cpp
+index 03c111840ca3e88cae94f2d3751136c9be0203e8..b2ac834bf22d4504db5fb5cb83061f8d4b8f98b9 100644
+--- a/src/txmempool.cpp
++++ b/src/txmempool.cpp
+@@ -14,8 +14,10 @@
+ #include <consensus/tx_verify.h>
+ #include <consensus/validation.h>
+ #include <logging.h>
++#include <primitives/block.h>
+ #include <policy/fees.h>
+ #include <policy/policy.h>
++#include <primitives/block.h>
+ #include <reverse_iterator.h>
+ #include <undo.h>
+ #include <util/check.h>
+@@ -140,6 +142,7 @@ CTxMemPool::CTxMemPool(const Config &config, Options opts)
+       m_opts{std::move(opts)} {
+     // lock free clear
+     _clear();
++    LOCK(cs);
+ }
+ 
+ CTxMemPool::~CTxMemPool() = default;
+@@ -162,7 +165,7 @@ void CTxMemPool::addUnchecked(CTxMemPoolEntryRef entry) {
+     entry->SetEntryId(nextEntryId++);
+ 
+     // Update transaction for any feeDelta created by PrioritiseTransaction
+-    {
++    if (!mapDeltas.empty()) {
+         Amount feeDelta = Amount::zero();
+         ApplyDelta(entry->GetTx().GetId(), feeDelta);
+         // The following call to UpdateModifiedFee assumes no previous fee
+@@ -171,6 +174,8 @@ void CTxMemPool::addUnchecked(CTxMemPoolEntryRef entry) {
+         entry->UpdateModifiedFee(feeDelta);
+     }
+ 
++    const bool had_mempool_txs = !mapTx.empty();
++
+     // Add to memory pool without checking anything.
+     // Used by AcceptToMemoryPool(), which DOES do all the appropriate checks.
+     auto [newit, inserted] = mapTx.insert(entry);
+@@ -187,21 +192,31 @@ void CTxMemPool::addUnchecked(CTxMemPoolEntryRef entry) {
+     cachedInnerUsage += entry->DynamicMemoryUsage();
+ 
+     const CTransactionRef tx = entry->GetSharedTx();
+-    std::set<TxId> setParentTransactions;
++    const TxId *last_parent_txid = nullptr;
+     for (const CTxIn &in : tx->vin) {
+         mapNextTx.insert(std::make_pair(&in.prevout, tx));
+-        setParentTransactions.insert(in.prevout.GetTxId());
++        m_utxo_fast_filter.MarkSpentInMempool(in.prevout.GetTxId().begin(),
++                                              in.prevout.GetN());
++        if (had_mempool_txs &&
++            (last_parent_txid == nullptr ||
++             *last_parent_txid != in.prevout.GetTxId())) {
++            last_parent_txid = &in.prevout.GetTxId();
++            auto pit = mapTx.find(*last_parent_txid);
++            if (pit != mapTx.end() && pit != newit) {
++                UpdateParent(newit, pit, true);
++                UpdateChild(pit, newit, true);
++            }
++        }
+     }
+-    // Don't bother worrying about child transactions of this one. It is
+-    // guaranteed that a new transaction arriving will not have any children,
+-    // because such children would be orphans.
+-
+-    // Update ancestors with information about this tx
+-    for (const auto &pit : GetIterSet(setParentTransactions)) {
+-        UpdateParent(newit, pit, true);
++    const TxId &tx_id = tx->GetId();
++    for (uint32_t i = 0; i < tx->vout.size(); ++i) {
++        if (!tx->vout[i].IsNull() && !tx->vout[i].scriptPubKey.IsUnspendable()) {
++            m_utxo_fast_filter.AddUnspent(tx_id.begin(), i);
++        }
+     }
+ 
+-    UpdateParentsOf(true, newit);
++    m_pending_overlay_adds.emplace_back(tx, entry->GetFee() / SATOSHI,
++                                        entry->GetSigChecks());
+ 
+     nTransactionsUpdated++;
+     totalTxSize += entry->GetTxSize();
+@@ -213,7 +228,15 @@ void CTxMemPool::removeUnchecked(txiter it, MemPoolRemovalReason reason) {
+     // even if not directly reported below.
+     uint64_t mempool_sequence = GetAndIncrementSequence();
+ 
+-    const TxId &txid = (*it)->GetTx().GetId();
++    const CTransaction &tx = (*it)->GetTx();
++    const TxId &txid = tx.GetId();
++
++    if (m_defer_snapshot_depth > 0) {
++        m_pending_overlay_removes.push_back(txid);
++    } else {
++        FlushPendingOverlayAdds();
++        RemoveTransactionFromOverlay(m_merklix_overlay, tx);
++    }
+ 
+     if (reason != MemPoolRemovalReason::BLOCK) {
+         if (m_opts.signals) {
+@@ -230,10 +253,22 @@ void CTxMemPool::removeUnchecked(txiter it, MemPoolRemovalReason reason) {
+                                                    removed_tx->GetSigChecks(),
+                                                    removed_tx->GetFee());
+         }
++        for (uint32_t i = 0; i < tx.vout.size(); ++i) {
++            if (!tx.vout[i].IsNull() &&
++                !tx.vout[i].scriptPubKey.IsUnspendable()) {
++                m_utxo_fast_filter.RemoveUnspent(txid.begin(), i);
++            }
++        }
+     }
+ 
+-    for (const CTxIn &txin : (*it)->GetTx().vin) {
++    for (const CTxIn &txin : tx.vin) {
+         mapNextTx.erase(txin.prevout);
++        m_utxo_fast_filter.UnmarkSpentInMempool(txin.prevout.GetTxId().begin(),
++                                                txin.prevout.GetN());
++        if (reason == MemPoolRemovalReason::BLOCK) {
++            m_utxo_fast_filter.RemoveUnspent(txin.prevout.GetTxId().begin(),
++                                             txin.prevout.GetN());
++        }
+     }
+ 
+     /* add logging because unchecked */
+@@ -246,6 +281,7 @@ void CTxMemPool::removeUnchecked(txiter it, MemPoolRemovalReason reason) {
+         memusage::DynamicUsage((*it)->GetMemPoolParentsConst()) +
+         memusage::DynamicUsage((*it)->GetMemPoolChildrenConst());
+     mapTx.erase(it);
++    ++m_snapshot_reset_seq;
+     nTransactionsUpdated++;
+ }
+ 
+@@ -380,6 +416,10 @@ void CTxMemPool::removeForFinalizedBlock(
+ }
+ 
+ void CTxMemPool::_clear() {
++    m_pending_overlay_adds.clear();
++    m_pending_overlay_removes.clear();
++    m_utxo_fast_filter.ClearMempool();
++    m_merklix_overlay.Clear();
+     mapTx.clear();
+     mapNextTx.clear();
+     totalTxSize = 0;
+@@ -391,6 +431,119 @@ void CTxMemPool::_clear() {
+     ++nTransactionsUpdated;
+ }
+ 
++void CTxMemPool::FlushPendingOverlayAdds() const {
++    AssertLockHeld(cs);
++    if (!m_pending_overlay_adds.empty()) {
++        AddTransactionsToOverlayBatch(m_merklix_overlay, m_pending_overlay_adds);
++        m_pending_overlay_adds.clear();
++    }
++    for (const auto &id : m_pending_overlay_removes) {
++        lotus::v2::Hash hash{};
++        std::memcpy(hash.data(), id.begin(), hash.size());
++        m_merklix_overlay.RemoveTransaction(hash);
++    }
++    m_pending_overlay_removes.clear();
++}
++
++CTxMemPool::ScopedSnapshotDefer::~ScopedSnapshotDefer() {
++    LOCK(m_pool.cs);
++    assert(m_pool.m_defer_snapshot_depth > 0);
++    --m_pool.m_defer_snapshot_depth;
++    if (m_pool.m_defer_snapshot_depth == 0 && m_pool.m_snapshot_dirty) {
++        m_pool.m_snapshot_dirty = false;
++        if (m_flush_on_exit) {
++            // Snapshot publication starts with ecash/014.
++        }
++    }
++}
++
++const lotus::v2::MempoolOverlayLayer &CTxMemPool::FreezeEpochBatch() {
++    AssertLockHeld(cs);
++    return m_merklix_overlay.FreezeEpochBatch();
++}
++
++void CTxMemPool::SyncMerklixOverlayToTip(const BlockHash &tip_hash,
++                                         uint64_t next_height,
++                                         uint64_t next_mtp) const {
++    AssertLockHeld(cs);
++    lotus::v2::Hash tip_id{};
++    std::memcpy(tip_id.data(), tip_hash.begin(), 32);
++    if (m_merklix_overlay.IsAnchoredAt(tip_id, next_height, next_mtp)) {
++        FlushPendingOverlayAdds();
++        return;
++    }
++    std::shared_ptr<const lotus::v2::SmtNode> utxo_root;
++    lotus::v2::MonetaryState mon_state = lotus::v2::GetInitialV2MonetaryState();
++    m_merklix_overlay.ReanchorExistingTxs(tip_id, std::move(utxo_root),
++                                          mon_state, next_height, next_mtp);
++    FlushPendingOverlayAdds();
++}
++
++bool CTxMemPool::TryClearAllForConnectedBlock(
++    const std::vector<CTransactionRef> &vtx) {
++    AssertLockHeld(cs);
++    if (!mapDeltas.empty() || vtx.size() <= 1 ||
++        mapTx.size() != vtx.size() - 1) {
++        return false;
++    }
++    for (size_t i = 1; i < vtx.size(); ++i) {
++        if (mapTx.find(vtx[i]->GetId()) == mapTx.end()) {
++            return false;
++        }
++    }
++    const size_t n_removed = vtx.size() - 1;
++    m_sequence_number += n_removed;
++    for (size_t i = 1; i < vtx.size(); ++i) {
++        const CTransaction &tx = *vtx[i];
++        for (const CTxIn &txin : tx.vin) {
++            m_utxo_fast_filter.RemoveUnspent(txin.prevout.GetTxId().begin(),
++                                             txin.prevout.GetN());
++        }
++    }
++    if (!m_unbroadcast_txids.empty()) {
++        m_unbroadcast_txids.clear();
++    }
++    _clear();
++    m_snapshot_reset_seq += (n_removed - 1);
++    nTransactionsUpdated += (n_removed - 1);
++    updateFeeForBlock();
++
++    return true;
++}
++
++void CTxMemPool::ConnectBlockReset(const BlockHash &new_tip_hash,
++                                   uint64_t next_height,
++                                   uint64_t next_mtp) {
++    AssertLockHeld(cs);
++    lotus::v2::Hash tip_id{};
++    std::memcpy(tip_id.data(), new_tip_hash.begin(), 32);
++    std::shared_ptr<const lotus::v2::SmtNode> utxo_root;
++    lotus::v2::MonetaryState mon_state = lotus::v2::GetInitialV2MonetaryState();
++    if (mapTx.empty()) {
++        m_pending_overlay_adds.clear();
++        m_pending_overlay_removes.clear();
++        m_merklix_overlay.ResetToTip(tip_id, std::move(utxo_root), mon_state,
++                                     next_height, next_mtp);
++    } else if (!m_pending_overlay_removes.empty()) {
++        m_pending_overlay_adds.clear();
++        m_pending_overlay_removes.clear();
++        m_merklix_overlay.ResetToTip(tip_id, std::move(utxo_root), mon_state,
++                                     next_height, next_mtp);
++        std::vector<std::tuple<CTransactionRef, int64_t, int64_t>> remaining;
++        remaining.reserve(mapTx.size());
++        for (const auto &entry : mapTx.get<entry_id>()) {
++            remaining.emplace_back(entry->GetSharedTx(),
++                                   entry->GetFee() / SATOSHI,
++                                   entry->GetSigChecks());
++        }
++        AddTransactionsToOverlayBatch(m_merklix_overlay, remaining);
++    } else {
++        FlushPendingOverlayAdds();
++        m_merklix_overlay.ReanchorExistingTxs(
++            tip_id, std::move(utxo_root), mon_state, next_height, next_mtp);
++    }
++}
++
+ void CTxMemPool::clear(bool include_finalized_txs) {
+     LOCK(cs);
+     _clear();
+@@ -755,6 +908,7 @@ void CTxMemPool::PrioritiseTransaction(const TxId &txid,
+             });
+             ++nTransactionsUpdated;
+         }
++        ++m_snapshot_reset_seq;
+     }
+     LogPrintf("PrioritiseTransaction: %s fee += %s\n", txid.ToString(),
+               FormatMoney(nFeeDelta));
+@@ -772,7 +926,9 @@ void CTxMemPool::ApplyDelta(const TxId &txid, Amount &nFeeDelta) const {
+ 
+ void CTxMemPool::ClearPrioritisation(const TxId &txid) {
+     AssertLockHeld(cs);
+-    mapDeltas.erase(txid);
++    if (mapDeltas.erase(txid) > 0) {
++        ++m_snapshot_reset_seq;
++    }
+ }
+ 
+ CTransactionRef CTxMemPool::GetConflictTx(const COutPoint &prevout) const {
+@@ -861,6 +1017,14 @@ size_t CTxMemPool::DynamicMemoryUsage() const {
+            memusage::DynamicUsage(mapDeltas) + cachedInnerUsage;
+ }
+ 
++void CTxMemPool::AddUnbroadcastTx(const TxId &txid) {
++    LOCK(cs);
++    if (exists(txid)) {
++        if (m_unbroadcast_txids.insert(txid).second) {
++        }
++    }
++}
++
+ void CTxMemPool::RemoveUnbroadcastTx(const TxId &txid, const bool unchecked) {
+     LOCK(cs);
+ 
+@@ -869,6 +1033,8 @@ void CTxMemPool::RemoveUnbroadcastTx(const TxId &txid, const bool unchecked) {
+             BCLog::MEMPOOL, "Removed %i from set of unbroadcast txns%s\n",
+             txid.GetHex(),
+             (unchecked ? " before confirmation that txn was sent out" : ""));
++        if (!unchecked) {
++        }
+     }
+ }
+ 
+@@ -882,6 +1048,8 @@ void CTxMemPool::RemoveStaged(const setEntries &stage,
+     for (txiter it : stageRevTopo) {
+         removeUnchecked(it, reason);
+     }
++    if (!stage.empty()) {
++    }
+ }
+ 
+ int CTxMemPool::Expire(std::chrono::seconds time) {
+@@ -918,6 +1086,7 @@ int CTxMemPool::Expire(std::chrono::seconds time) {
+ void CTxMemPool::LimitSize(CCoinsViewCache &coins_cache) {
+     AssertLockHeld(::cs_main);
+     AssertLockHeld(cs);
++    ScopedSnapshotDefer snap_defer(*this);
+     int expired = Expire(GetTime<std::chrono::seconds>() - m_opts.expiry);
+     if (expired != 0) {
+         LogDebug(BCLog::MEMPOOL,
+@@ -985,6 +1154,7 @@ void CTxMemPool::trackPackageRemoved(const CFeeRate &rate) {
+ void CTxMemPool::TrimToSize(size_t sizelimit,
+                             std::vector<COutPoint> *pvNoSpendsRemaining) {
+     AssertLockHeld(cs);
++    ScopedSnapshotDefer snap_defer(*this);
+ 
+     unsigned nTxnRemoved = 0;
+     size_t finalizedTxsSkipped = 0;
+diff --git a/src/txmempool.h b/src/txmempool.h
+index cb5c1fe728b0a127e5b9199eb84fb230d1e12dc6..5e3df3f12549114e1efc74fd6d28441c5c18e987 100644
+--- a/src/txmempool.h
++++ b/src/txmempool.h
+@@ -13,6 +13,8 @@
+ #include <kernel/cs_main.h>
+ #include <kernel/mempool_entry.h>
+ #include <kernel/mempool_options.h>
++#include <lotus_v2/mempool_overlay.h>
++#include <lotus_v2/utxo_fast_filter.h>
+ #include <node/blockfitter.h>
+ #include <policy/packages.h>
+ #include <primitives/transaction.h>
+@@ -461,6 +463,15 @@ public:
+      */
+     CFeeRate GetMinFee() const { return GetMinFee(m_opts.max_size_bytes); }
+     CFeeRate GetMinFee(size_t sizelimit) const;
++    double GetRollingMinimumFeeRate() const EXCLUSIVE_LOCKS_REQUIRED(cs) {
++        return rollingMinimumFeeRate;
++    }
++    int64_t GetLastRollingFeeUpdate() const EXCLUSIVE_LOCKS_REQUIRED(cs) {
++        return lastRollingFeeUpdate;
++    }
++    bool GetBlockSinceLastRollingFeeBump() const EXCLUSIVE_LOCKS_REQUIRED(cs) {
++        return blockSinceLastRollingFeeBump;
++    }
+ 
+     /**
+      * Remove transactions from the mempool until its dynamic size is <=
+@@ -558,14 +569,7 @@ public:
+     size_t DynamicMemoryUsage() const;
+ 
+     /** Adds a transaction to the unbroadcast set */
+-    void AddUnbroadcastTx(const TxId &txid) {
+-        LOCK(cs);
+-        // Sanity check the transaction is in the mempool & insert into
+-        // unbroadcast set.
+-        if (exists(txid)) {
+-            m_unbroadcast_txids.insert(txid);
+-        }
+-    }
++    void AddUnbroadcastTx(const TxId &txid);
+ 
+     /** Removes a transaction from the unbroadcast set */
+     void RemoveUnbroadcastTx(const TxId &txid, const bool unchecked = false);
+@@ -607,7 +611,128 @@ public:
+         return func(*m_conflicting);
+     }
+ 
++    /**
++     * Flush any pending batch overlay additions queued while ScopedSnapshotDefer
++     * was active, using 16-shard parallel batch insertion.
++     */
++    void FlushPendingOverlayAdds() const EXCLUSIVE_LOCKS_REQUIRED(cs);
++
++    /**
++     * Access the progressive Merklix overlay manager (Subtree A + UTXO SMT
++     * overlay + non-coinbase effective block cost accumulator).
++     */
++    lotus::v2::MerklixOverlayManager &GetMerklixOverlay() const
++        EXCLUSIVE_LOCKS_REQUIRED(cs) {
++        AssertLockHeld(cs);
++        FlushPendingOverlayAdds();
++        return m_merklix_overlay;
++    }
++
++    lotus::v2::MerklixOverlayManager &GetOverlayManager() const
++        EXCLUSIVE_LOCKS_REQUIRED(cs) {
++        AssertLockHeld(cs);
++        FlushPendingOverlayAdds();
++        return m_merklix_overlay;
++    }
++
++    /**
++     * Freeze the current speculative mempool overlay as an immutable epoch
++     * batch snapshot and advance the epoch counter.
++     */
++    const lotus::v2::MempoolOverlayLayer &FreezeEpochBatch()
++        EXCLUSIVE_LOCKS_REQUIRED(cs);
++
++    /**
++     * Ensure the Merklix overlay is anchored at the given tip block snapshot,
++     * next block height, and parent MTP. O(1) no-op if already anchored.
++     */
++    void SyncMerklixOverlayToTip(const BlockHash &tip_hash,
++                                 uint64_t next_height,
++                                 uint64_t next_mtp) const
++        EXCLUSIVE_LOCKS_REQUIRED(cs);
++
++    /**
++     * Reset or re-anchor the Merklix overlay after a block connects or
++     * disconnects so subsequent mempool arrivals build directly on the new tip.
++     */
++    void ConnectBlockReset(const BlockHash &new_tip_hash,
++                           uint64_t next_height,
++                           uint64_t next_mtp)
++        EXCLUSIVE_LOCKS_REQUIRED(cs);
++
++    bool TryClearAllForConnectedBlock(const std::vector<CTransactionRef> &vtx)
++        EXCLUSIVE_LOCKS_REQUIRED(cs);
++
++    /**
++     * [Patch 034 optimization] If a ScopedSnapshotDefer scope is active on this
++     * mempool, mark the snapshot dirty and return true so callers skip
++     * redundant per-tx snapshot rebuilds during batch mutations.
++     */
++    bool DeferSnapshotIfActive() const EXCLUSIVE_LOCKS_REQUIRED(cs) {
++        AssertLockHeld(cs);
++        if (m_defer_snapshot_depth > 0) {
++            m_snapshot_dirty = true;
++            return true;
++        }
++        return false;
++    }
++
++    void ClearSnapshotDirty() const EXCLUSIVE_LOCKS_REQUIRED(cs) {
++        AssertLockHeld(cs);
++        m_snapshot_dirty = false;
++    }
++
++    /**
++     * RAII guard that coalesces multiple mempool snapshot publications within a
++     * batch mutation (submitrawtxbatch, SubmitPackage, removeForBlock,
++     * TrimToSize) into a single RCU publish when the outermost guard exits.
++     */
++    class ScopedSnapshotDefer {
++    private:
++        const CTxMemPool &m_pool;
++        bool m_flush_on_exit{true};
++
++    public:
++        explicit ScopedSnapshotDefer(const CTxMemPool &pool) noexcept
++            : m_pool(pool) {
++            LOCK(m_pool.cs);
++            ++m_pool.m_defer_snapshot_depth;
++        }
++        ScopedSnapshotDefer(const ScopedSnapshotDefer &) = delete;
++        ScopedSnapshotDefer &operator=(const ScopedSnapshotDefer &) = delete;
++
++        void CancelFlush() noexcept { m_flush_on_exit = false; }
++
++        ~ScopedSnapshotDefer();
++    };
++
++    /**
++     * Project Hamilton (opencbdc-tx) style 64-shard compact in-memory UHS
++     * and mempool-spent outpoint fast-filter (<50 ns double-spend rejection).
++     */
++    lotus::v2::UtxoFastFilter &GetUtxoFastFilter() const noexcept {
++        return m_utxo_fast_filter;
++    }
++
++    bool IsSpentFast(const COutPoint &outpoint) const noexcept {
++        return m_utxo_fast_filter.IsSpentInMempool(
++            outpoint.GetTxId().begin(), outpoint.GetN());
++    }
++
++    bool MayExistInChainOrMempoolFast(const COutPoint &outpoint) const noexcept {
++        return m_utxo_fast_filter.MayExistInChainOrMempool(
++            outpoint.GetTxId().begin(), outpoint.GetN());
++    }
++
+ private:
++    mutable lotus::v2::MerklixOverlayManager m_merklix_overlay GUARDED_BY(cs);
++    mutable std::vector<std::tuple<CTransactionRef, int64_t, int64_t>>
++        m_pending_overlay_adds GUARDED_BY(cs);
++    mutable std::vector<TxId> m_pending_overlay_removes GUARDED_BY(cs);
++    mutable lotus::v2::UtxoFastFilter m_utxo_fast_filter;
++    mutable uint32_t m_defer_snapshot_depth GUARDED_BY(cs){0};
++    mutable bool m_snapshot_dirty GUARDED_BY(cs){false};
++    mutable uint64_t m_snapshot_reset_seq GUARDED_BY(cs){1};
+     /** Set ancestor state for an entry */
+     void UpdateEntryForAncestors(txiter it, const setEntries *setAncestors)
+         EXCLUSIVE_LOCKS_REQUIRED(cs);
+diff --git a/src/validation.cpp b/src/validation.cpp
+index 46ae00c11c1ca1ced1316db81188fa112080a357..9b55b6616fe374bb4b602fb440ec86a44c71d3b1 100644
+--- a/src/validation.cpp
++++ b/src/validation.cpp
+@@ -2125,6 +2125,40 @@ bool Chainstate::ConnectBlock(const CBlock &block, BlockValidationState &state,
+     const CChainParams &params{m_chainman.GetParams()};
+     const Consensus::Params &consensusParams = params.GetConsensus();
+ 
++    bool matched_frozen_epoch_overlay = false;
++    if (m_mempool && block.vtx.size() > 1 && pindex->pprev != nullptr &&
++        !block.hashMerkleRoot.IsNull()) {
++        TRY_LOCK(m_mempool->cs, lock_mempool);
++        if (lock_mempool) {
++            lotus::v2::Hash cb_txid{};
++            std::memcpy(cb_txid.data(), block.vtx[0]->GetId().begin(), 32);
++            const auto &mgr = m_mempool->GetMerklixOverlay();
++            auto matches_layer =
++                [&](const lotus::v2::MempoolOverlayLayer &layer) {
++                    if (layer.HasDoubleSpends() ||
++                        layer.GetTxCount() + 1 != block.vtx.size()) {
++                        return false;
++                    }
++                    const lotus::v2::Hash mroot =
++                        layer.ComputePositionalMerkleRoot(cb_txid);
++                    return std::memcmp(mroot.data(),
++                                       block.hashMerkleRoot.begin(), 32) == 0;
++                };
++            const auto &frozen = mgr.GetFrozenEpochs();
++            for (auto it = frozen.rbegin(); it != frozen.rend(); ++it) {
++                if (matches_layer(*it)) {
++                    block.m_checked_merkle_root = true;
++                    matched_frozen_epoch_overlay = true;
++                    break;
++                }
++            }
++            if (!block.m_checked_merkle_root &&
++                matches_layer(mgr.GetSpeculativeOverlay())) {
++                block.m_checked_merkle_root = true;
++            }
++        }
++    }
++
+     // Check it again in case a previous version let a bad block in
+     // NOTE: We don't currently (re-)invoke ContextualCheckBlock() or
+     // ContextualCheckBlockHeader() here. This means that if we add a new
+@@ -2948,6 +2982,13 @@ bool Chainstate::DisconnectTip(BlockValidationState &state,
+         if (disconnectpool) {
+             disconnectpool->addForBlock(block.vtx, *m_mempool);
+         }
++        {
++            LOCK(m_mempool->cs);
++            m_mempool->ConnectBlockReset(
++                pindexDelete->pprev->GetBlockHash(),
++                static_cast<uint64_t>(pindexDelete->pprev->nHeight + 1),
++                static_cast<uint64_t>(pindexDelete->pprev->GetMedianTimePast()));
++        }
+     }
+ 
+     m_chain.SetTip(*pindexDelete->pprev);
+@@ -3145,6 +3186,13 @@ bool Chainstate::ConnectTip(BlockValidationState &state,
+                 "Disconnecting mempool due to acceptance of upgrade block\n");
+             disconnectpool.importMempool(*m_mempool);
+         }
++        {
++            LOCK(m_mempool->cs);
++            m_mempool->ConnectBlockReset(
++                pindexNew->GetBlockHash(),
++                static_cast<uint64_t>(pindexNew->nHeight + 1),
++                static_cast<uint64_t>(pindexNew->GetMedianTimePast()));
++        }
+     }
+ 
+     // Update m_chain & related variables.
+@@ -4446,7 +4494,10 @@ bool CheckBlock(const CBlock &block, BlockValidationState &state,
+                              "bad-blk-length", "size limits failed");
+     }
+ 
+-    auto currentBlockSize = ::GetSerializeSize(block);
++    uint64_t currentBlockSize = 80 + GetSizeOfCompactSize(block.vtx.size());
++    for (const auto &tx : block.vtx) {
++        currentBlockSize += tx->GetTotalSize();
++    }
+     if (currentBlockSize > nMaxBlockSize) {
+         return state.Invalid(BlockValidationResult::BLOCK_CONSENSUS,
+                              "bad-blk-length", "size limits failed");

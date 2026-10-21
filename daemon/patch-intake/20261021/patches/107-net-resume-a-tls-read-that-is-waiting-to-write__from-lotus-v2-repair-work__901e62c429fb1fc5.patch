@@ -1,0 +1,267 @@
+From de936e86a35a487d09778d3c055df17f9f23d34f Mon Sep 17 00:00:00 2001
+From: Shammah Chancellor <shammah.chancellor@notvalid.com>
+Date: Mon, 19 Oct 2026 02:01:43 -0700
+Subject: [PATCH] net: resume a TLS read that is waiting to write
+
+A TLS read can need to write before it can return data, for example
+when the TLS library sends a reply from inside SSL_read and the send
+buffer is full. TlsByteLayer reported that as a plain EAGAIN, and the
+socket loop then waited only for readability. The data the read needs
+may already have been read from the OS socket, so readability might
+never come: the peer then stalled until something else happened on the
+connection.
+
+TlsByteLayer now records which OS event a blocked read is waiting for
+(ReadWaitsFor()). WebSocketSock reports SEND among its PendingEvents()
+while a read waits for writability. FlushPending() retries that read
+once the socket is writable, and CConnman receives in the same pass when
+FlushPending() leaves decoded data behind (HasBufferedRecv()).
+
+OpenSSL 4.0 defers its reply to a TLS 1.3 KeyUpdate to the next write,
+so a KeyUpdate under back-pressure does not reach this path there. A
+unit test drives it with a byte layer whose reads wait for writability;
+without this change, the test's read never resumes. A second test checks
+that a KeyUpdate asking for one back still delivers everything, in both
+directions, while the server's writes are blocked.
+---
+ src/net.cpp                      | 10 ++--
+ src/net_websocket_sock.cpp       | 13 ++++-
+ src/net_websocket_sock.h         |  5 ++
+ src/net_websocket_tls.cpp        | 10 +++-
+ src/net_websocket_tls.h          |  2 +
+ src/test/net_websocket_tests.cpp | 82 ++++++++++++++++++++++++++++++++
+ 6 files changed, 115 insertions(+), 7 deletions(-)
+
+diff --git a/src/net.cpp b/src/net.cpp
+index ee637868438a4a3690ccbb524844f1072b5a8878..15dc6261e5dc2b9b9575fbc951c816d5411f35fb 100644
+--- a/src/net.cpp
++++ b/src/net.cpp
+@@ -1810,9 +1810,13 @@ void CConnman::SocketHandlerConnected(
+                 sendSet = it->second.occurred & Sock::SEND;
+                 errorSet = it->second.occurred & Sock::ERR;
+                 // Flush data the socket implementation buffered itself.
+-                if ((it->second.occurred & pnode->m_sock->PendingEvents()) &&
+-                    !pnode->m_sock->FlushPending()) {
+-                    errorSet = true;
++                if (it->second.occurred & pnode->m_sock->PendingEvents()) {
++                    if (!pnode->m_sock->FlushPending()) {
++                        errorSet = true;
++                    } else if (pnode->m_sock->HasBufferedRecv()) {
++                        // e.g. a TLS read that was waiting to write
++                        recvSet = true;
++                    }
+                 }
+             }
+             // The OS socket being readable was only requested on behalf of
+diff --git a/src/net_websocket_sock.cpp b/src/net_websocket_sock.cpp
+index 436206dd0e33df76ddb9b6809ee3ab18b49d8d57..fb58f331771c2cee3333388f69c44dc682081371 100644
+--- a/src/net_websocket_sock.cpp
++++ b/src/net_websocket_sock.cpp
+@@ -87,7 +87,9 @@ void WebSocketSock::UpdateFlagsLocked() const {
+                      WebSocketCodec::HasCompleteFrame(m_rx_wire) ||
+                      m_eof || m_failed;
+     const bool pending{!m_coalesce.empty() || m_tx_offset < m_tx.size()};
+-    m_pending_events = pending ? m_layer->WriteWaitsFor() : Event{0};
++    // A read blocked on writability resumes from FlushPending().
++    m_pending_events = (pending ? m_layer->WriteWaitsFor() : Event{0}) |
++                       (m_read_waits_send ? Sock::SEND : Event{0});
+ }
+ 
+ bool WebSocketSock::FlushLocked() const {
+@@ -166,6 +168,7 @@ ssize_t WebSocketSock::Send(const void *data, size_t len, int flags) const {
+ bool WebSocketSock::FillLocked() const {
+     // Read what the OS socket (or TLS layer) has, then decode.
+     uint8_t buf[64 * 1024];
++    m_read_waits_send = false;
+     while (!m_eof) {
+         const ssize_t n{m_layer->Read(m_socket, buf, sizeof(buf))};
+         if (n > 0) {
+@@ -180,6 +183,7 @@ bool WebSocketSock::FillLocked() const {
+             break;
+         }
+         if (WouldBlock(errno)) {
++            m_read_waits_send = m_layer->ReadWaitsFor() == Sock::SEND;
+             break;
+         }
+         m_failed = true;
+@@ -255,7 +259,12 @@ Sock::Event WebSocketSock::PendingEvents() const {
+ 
+ bool WebSocketSock::FlushPending() const {
+     LOCK(m_mutex);
+-    const bool ok{!m_failed && FlushLocked()};
++    bool ok{!m_failed && FlushLocked()};
++    // Retry a read that was waiting for the socket to become writable; what
++    // it decodes is then reported by HasBufferedRecv().
++    if (ok && m_read_waits_send) {
++        ok = FillLocked();
++    }
+     UpdateFlagsLocked();
+     return ok;
+ }
+diff --git a/src/net_websocket_sock.h b/src/net_websocket_sock.h
+index 157b00926b6267792fdb47e2723aef42bde9fca6..ea6830f8905398ae0bd7f8dbbe2d971d00dabe25 100644
+--- a/src/net_websocket_sock.h
++++ b/src/net_websocket_sock.h
+@@ -29,6 +29,9 @@ public:
+     virtual bool HasBuffered() const { return false; }
+     //! OS socket events a blocked Write() is waiting for
+     virtual Sock::Event WriteWaitsFor() const { return Sock::SEND; }
++    //! OS socket events the last blocked Read() is waiting for (TLS: a read
++    //! can need to write first, e.g. to answer a KeyUpdate)
++    virtual Sock::Event ReadWaitsFor() const { return Sock::RECV; }
+     //! Best-effort non-blocking shutdown before the socket is closed
+     virtual void Shutdown(SOCKET fd) {}
+     //! Whether the layer is TLS
+@@ -103,6 +106,8 @@ private:
+     //! Decoded P2P bytes not yet returned by Recv()
+     mutable std::vector<uint8_t> m_rx_plain GUARDED_BY(m_mutex);
+     mutable size_t m_rx_offset GUARDED_BY(m_mutex){0};
++    //! The last read blocked until the OS socket is writable
++    mutable bool m_read_waits_send GUARDED_BY(m_mutex){false};
+     mutable bool m_eof GUARDED_BY(m_mutex){false};
+     mutable bool m_failed GUARDED_BY(m_mutex){false};
+     mutable uint64_t m_payload_recv_reported GUARDED_BY(m_mutex){0};
+diff --git a/src/net_websocket_tls.cpp b/src/net_websocket_tls.cpp
+index a55db9b4d23b83ed5f1197acb255196e6d59a579..3d2a08afca9e975ce35856e3ce9f5c45609929c9 100644
+--- a/src/net_websocket_tls.cpp
++++ b/src/net_websocket_tls.cpp
+@@ -49,8 +49,14 @@ ssize_t TlsByteLayer::Translate(int ret, Sock::Event *wait) {
+ 
+ ssize_t TlsByteLayer::Read(SOCKET fd, uint8_t *buf, size_t len) {
+     ERR_clear_error();
+-    const int n{SSL_read(m_ssl.get(), buf, int(std::min<size_t>(len, INT_MAX)))};
+-    return Translate(n, nullptr);
++    const int n{
++        SSL_read(m_ssl.get(), buf, int(std::min<size_t>(len, INT_MAX)))};
++    Sock::Event wait{Sock::RECV};
++    const ssize_t r{Translate(n, &wait)};
++    // A read can need to write first (e.g. the reply to a TLS 1.3
++    // KeyUpdate that asks for one, when the send buffer is full).
++    m_read_waits_for = r < 0 && errno == EAGAIN ? wait : Sock::RECV;
++    return r;
+ }
+ 
+ ssize_t TlsByteLayer::Write(SOCKET fd, const uint8_t *buf, size_t len) {
+diff --git a/src/net_websocket_tls.h b/src/net_websocket_tls.h
+index cfbeaf5e8781139f3c09fe41c8a8b2db02936e6f..e4e1489eea153d7532596a2e42b6301535c7732e 100644
+--- a/src/net_websocket_tls.h
++++ b/src/net_websocket_tls.h
+@@ -28,6 +28,7 @@ public:
+     ssize_t Write(SOCKET fd, const uint8_t *buf, size_t len) override;
+     bool HasBuffered() const override;
+     Sock::Event WriteWaitsFor() const override { return m_write_waits_for; }
++    Sock::Event ReadWaitsFor() const override { return m_read_waits_for; }
+     void Shutdown(SOCKET fd) override;
+     bool IsTLS() const override { return true; }
+ 
+@@ -40,6 +41,7 @@ private:
+ 
+     const tls::SslPtr m_ssl;
+     Sock::Event m_write_waits_for{Sock::SEND};
++    Sock::Event m_read_waits_for{Sock::RECV};
+     //! Length of a write OpenSSL must see again (0: none pending). The
+     //! caller's buffer only grows at the end, so the bytes are unchanged.
+     size_t m_retry_len{0};
+diff --git a/src/test/net_websocket_tests.cpp b/src/test/net_websocket_tests.cpp
+index 202fa4295d405a5f72854be32aa710ef1207ea2f..9d7aeb614fa673d6c2be8cfc2a1211d6d3f95e71 100644
+--- a/src/test/net_websocket_tests.cpp
++++ b/src/test/net_websocket_tests.cpp
+@@ -18,6 +18,7 @@
+ 
+ #include <csignal>
+ 
++#include <algorithm>
+ #include <cerrno>
+ #include <chrono>
+ #include <cstring>
+@@ -424,6 +425,87 @@ BOOST_AUTO_TEST_CASE(tls_key_update_mid_stream) {
+     BOOST_CHECK(ReceiveAll(*p.server, *p.client, a.size()) == a);
+ }
+ 
++namespace {
++/** A byte layer whose reads wait for writability until unblocked */
++class WriteBlockedReadLayer final : public WebSocketByteLayer {
++public:
++    std::vector<uint8_t> wire;
++    bool blocked{true};
++    ssize_t Read(SOCKET, uint8_t *buf, size_t len) override {
++        if (blocked || wire.empty()) {
++            errno = EAGAIN;
++            return -1;
++        }
++        const size_t n{std::min(len, wire.size())};
++        std::memcpy(buf, wire.data(), n);
++        wire.erase(wire.begin(), wire.begin() + n);
++        return n;
++    }
++    ssize_t Write(SOCKET, const uint8_t *, size_t len) override { return len; }
++    Sock::Event ReadWaitsFor() const override {
++        return blocked ? Sock::SEND : Sock::RECV;
++    }
++};
++} // namespace
++
++BOOST_AUTO_TEST_CASE(read_waiting_for_send_resumes_on_flush) {
++    // A read that must write first (TLS) asks to be woken when the socket
++    // is writable, not readable: the data it needs may already have been
++    // read from the OS socket, so readability might never come.
++    int sv[2];
++    BOOST_REQUIRE_EQUAL(socketpair(AF_UNIX, SOCK_STREAM, 0, sv), 0);
++    auto layer{std::make_unique<WriteBlockedReadLayer>()};
++    WriteBlockedReadLayer &l{*layer};
++    WebSocketSock server{SOCKET(sv[0]), Role::SERVER, Info(C::NONE),
++                         std::move(layer)};
++    WebSocketCodec client{Role::CLIENT, C::NONE};
++    const std::vector<uint8_t> payload(100, 4);
++    client.EncodeMessage(payload, l.wire);
++
++    uint8_t buf[256];
++    BOOST_CHECK_EQUAL(server.Recv(buf, sizeof(buf), 0), -1);
++    BOOST_CHECK_EQUAL(errno, EAGAIN);
++    BOOST_CHECK_EQUAL(server.PendingEvents(), Sock::SEND);
++    BOOST_CHECK(!server.HasBufferedRecv());
++
++    // Writable: FlushPending() retries the read, and the data is buffered.
++    l.blocked = false;
++    BOOST_CHECK(server.FlushPending());
++    BOOST_CHECK(server.HasBufferedRecv());
++    BOOST_CHECK_EQUAL(server.PendingEvents(), 0);
++    BOOST_CHECK_EQUAL(server.Recv(buf, sizeof(buf), 0), 100);
++    BOOST_CHECK(std::equal(payload.begin(), payload.end(), buf));
++    close(sv[1]);
++}
++
++BOOST_AUTO_TEST_CASE(tls_key_update_while_send_blocked) {
++    // A KeyUpdate asking for one back arrives while the server cannot write.
++    // (OpenSSL 4.0 defers the reply to the next write; a TLS library that
++    // sends it from SSL_read would block the read on writability instead,
++    // the case read_waiting_for_send_resumes_on_flush covers.)
++    TlsPair p{C::NONE};
++    if (SSL_version(p.client_ssl) != TLS1_3_VERSION) {
++        return;
++    }
++    // Nobody reads the server's data: its writes block.
++    const std::vector<uint8_t> chunk(256 * 1024, 7);
++    size_t sent{0};
++    ssize_t n;
++    while ((n = p.server->Send(chunk.data(), chunk.size(), 0)) > 0) {
++        sent += n;
++        BOOST_REQUIRE(sent < 64 * 1024 * 1024);
++    }
++    BOOST_REQUIRE_EQUAL(SSL_key_update(p.client_ssl, SSL_KEY_UPDATE_REQUESTED),
++                        1);
++    const std::vector<uint8_t> b(100, 9);
++    BOOST_REQUIRE_EQUAL(p.client->Send(b.data(), b.size(), 0), 100);
++    // Everything arrives both ways, and the server's keys rotate too.
++    BOOST_CHECK(ReceiveAll(*p.client, *p.server, b.size()) == b);
++    BOOST_CHECK_EQUAL(ReceiveAll(*p.server, *p.client, sent).size(), sent);
++    BOOST_CHECK_EQUAL(p.server->Send(b.data(), b.size(), 0), 100);
++    BOOST_CHECK(ReceiveAll(*p.server, *p.client, b.size()) == b);
++}
++
+ BOOST_AUTO_TEST_CASE(tls_orderly_close) {
+     TlsPair p{C::ZSTD_DICT};
+     const std::vector<uint8_t> a(500, 3);
+-- 
+2.50.1 (Apple Git-155)
+

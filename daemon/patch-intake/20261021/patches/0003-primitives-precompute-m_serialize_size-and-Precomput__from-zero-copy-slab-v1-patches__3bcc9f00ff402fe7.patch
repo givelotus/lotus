@@ -1,0 +1,376 @@
+From 7cf43f0326f3f7ad8c23f275b26508339b57f52d Mon Sep 17 00:00:00 2001
+From: Shammah Chancellor <shammah.chancellor@notvalid.com>
+Date: Sun, 18 Oct 2026 16:35:37 -0700
+Subject: [PATCH 3/6] primitives: precompute m_serialize_size and
+ PrecomputedTransactionData on CTransaction
+
+A transaction's sighash midstate (hashPrevouts, hashSequence,
+hashOutputs) was recomputed each time a PrecomputedTransactionData was
+built for it: in mempool acceptance and again in ConnectBlock for the
+same CTransactionRef. GetTotalSize() and GetSerializeSize() also
+re-walked the transaction on every call.
+
+Compute both once in CTransaction's constructors and store them in
+const members, so they are immutable and safe to share across threads
+without atomics:
+
+- m_serialize_size: Serialize() with a SizeComputer seeks by it
+  directly, and GetTotalSize() returns it.
+- m_precomputed: exposed as GetPrecomputedData().
+  PrecomputedTransactionData(const CTransaction &) now copies it;
+  CMutableTransaction still hashes, through the new
+  PrecomputedTransactionData::Compute().
+
+ConnectBlock and CheckInputsFromMempoolAndCache bind the cached data by
+const reference, and MemPoolAccept no longer keeps its own copy in the
+workspace.
+
+Trade-off: every constructed CTransaction now pays the three midstate
+hashes up front, including transactions that are never script-checked
+(e.g. blocks deserialized only to be served or indexed), and
+sizeof(CTransaction) grows from 88 to 192 bytes on LP64. Mempool memory
+accounting includes the larger object.
+
+Test: cached size and midstate match fresh computation for null and
+varied transactions, constructed by copy and by move.
+---
+ src/primitives/transaction.cpp | 22 +++++++----
+ src/primitives/transaction.h   | 67 +++++++++++++++++++++++++---------
+ src/script/interpreter.cpp     | 21 ++++++++---
+ src/test/transaction_tests.cpp | 58 +++++++++++++++++++++++++++++
+ src/validation.cpp             | 15 ++------
+ 5 files changed, 141 insertions(+), 42 deletions(-)
+
+diff --git a/src/primitives/transaction.cpp b/src/primitives/transaction.cpp
+index 8da61fc4b9..1d493a80d4 100644
+--- a/src/primitives/transaction.cpp
++++ b/src/primitives/transaction.cpp
+@@ -61,19 +61,31 @@ uint256 CTransaction::ComputeHash() const {
+     return (HashWriter{} << *this).GetHash();
+ }
+ 
++uint32_t CTransaction::ComputeSerializeSize() const {
++    // Bypass Serialize(), whose SizeComputer fast path reads m_serialize_size.
++    SizeComputer s;
++    SerializeTransaction(*this, s);
++    return s.size();
++}
++
+ /**
+  * For backward compatibility, the hash is initialized to 0.
+  * TODO: remove the need for this default constructor entirely.
+  */
+ CTransaction::CTransaction()
+     : vin(), vout(), nVersion(CTransaction::CURRENT_VERSION), nLockTime(0),
+-      hash() {}
++      m_serialize_size(ComputeSerializeSize()), hash(),
++      m_precomputed(PrecomputedTransactionData::Compute(*this)) {}
+ CTransaction::CTransaction(const CMutableTransaction &tx)
+     : vin(tx.vin), vout(tx.vout), nVersion(tx.nVersion),
+-      nLockTime(tx.nLockTime), hash(ComputeHash()) {}
++      nLockTime(tx.nLockTime), m_serialize_size(ComputeSerializeSize()),
++      hash(ComputeHash()),
++      m_precomputed(PrecomputedTransactionData::Compute(*this)) {}
+ CTransaction::CTransaction(CMutableTransaction &&tx)
+     : vin(std::move(tx.vin)), vout(std::move(tx.vout)), nVersion(tx.nVersion),
+-      nLockTime(tx.nLockTime), hash(ComputeHash()) {}
++      nLockTime(tx.nLockTime), m_serialize_size(ComputeSerializeSize()),
++      hash(ComputeHash()),
++      m_precomputed(PrecomputedTransactionData::Compute(*this)) {}
+ 
+ Amount CTransaction::GetValueOut() const {
+     Amount nValueOut = Amount::zero();
+@@ -89,10 +101,6 @@ Amount CTransaction::GetValueOut() const {
+     return nValueOut;
+ }
+ 
+-unsigned int CTransaction::GetTotalSize() const {
+-    return ::GetSerializeSize(*this);
+-}
+-
+ std::string CTransaction::ToString() const {
+     std::string str;
+     str += strprintf("CTransaction(txid=%s, ver=%u, vin.size=%u, vout.size=%u, "
+diff --git a/src/primitives/transaction.h b/src/primitives/transaction.h
+index 8940548da1..7369dc62bd 100644
+--- a/src/primitives/transaction.h
++++ b/src/primitives/transaction.h
+@@ -186,6 +186,32 @@ inline void SerializeTransaction(const TxType &tx, Stream &s) {
+     s << tx.nLockTime;
+ }
+ 
++class CTransaction;
++
++/** Precompute sighash midstate to avoid quadratic hashing */
++struct PrecomputedTransactionData {
++    uint256 hashPrevouts, hashSequence, hashOutputs;
++
++    PrecomputedTransactionData()
++        : hashPrevouts(), hashSequence(), hashOutputs() {}
++
++    PrecomputedTransactionData(const PrecomputedTransactionData &txdata) =
++        default;
++    PrecomputedTransactionData &
++    operator=(const PrecomputedTransactionData &txdata) = default;
++
++    template <class T> explicit PrecomputedTransactionData(const T &tx);
++
++    /**
++     * Copy the midstate cached when the CTransaction was constructed instead
++     * of hashing again.
++     */
++    explicit PrecomputedTransactionData(const CTransaction &tx);
++
++    /** Hash the midstate of tx. */
++    template <class T> static PrecomputedTransactionData Compute(const T &tx);
++};
++
+ /**
+  * The basic transaction that is broadcasted on the network and contained in
+  * blocks. A transaction can contain multiple inputs and outputs.
+@@ -211,9 +237,12 @@ public:
+ 
+ private:
+     /** Memory only. */
++    const uint32_t m_serialize_size;
+     const uint256 hash;
++    const PrecomputedTransactionData m_precomputed;
+ 
+     uint256 ComputeHash() const;
++    uint32_t ComputeSerializeSize() const;
+ 
+ public:
+     /** Construct a CTransaction that qualifies as IsNull() */
+@@ -224,6 +253,11 @@ public:
+     explicit CTransaction(CMutableTransaction &&tx);
+ 
+     template <typename Stream> inline void Serialize(Stream &s) const {
++        if constexpr (std::is_same_v<std::remove_cvref_t<Stream>,
++                                     SizeComputer>) {
++            s.seek(m_serialize_size);
++            return;
++        }
+         SerializeTransaction(*this, s);
+     }
+ 
+@@ -241,6 +275,14 @@ public:
+     TxId GetId() const { return TxId(hash); }
+     TxHash GetHash() const { return TxHash(hash); }
+ 
++    /**
++     * Sighash midstate (hashPrevouts, hashSequence, hashOutputs), computed
++     * once at construction. Immutable, so safe to share across threads.
++     */
++    const PrecomputedTransactionData &GetPrecomputedData() const {
++        return m_precomputed;
++    }
++
+     // Return sum of txouts.
+     Amount GetValueOut() const;
+ 
+@@ -248,7 +290,7 @@ public:
+      * Get the total transaction size in bytes.
+      * @return Total transaction size in bytes
+      */
+-    unsigned int GetTotalSize() const;
++    unsigned int GetTotalSize() const { return m_serialize_size; }
+ 
+     bool IsCoinBase() const {
+         return (vin.size() == 1 && vin[0].prevout.IsNull());
+@@ -265,10 +307,14 @@ public:
+     std::string ToString() const;
+ };
+ #if defined(__x86_64__)
+-static_assert(sizeof(CTransaction) == 88,
+-              "sizeof CTransaction is expected to be 88 bytes");
++static_assert(sizeof(CTransaction) == 192,
++              "sizeof CTransaction is expected to be 192 bytes");
+ #endif
+ 
++inline PrecomputedTransactionData::PrecomputedTransactionData(
++    const CTransaction &tx)
++    : PrecomputedTransactionData(tx.GetPrecomputedData()) {}
++
+ /**
+  * A mutable version of CTransaction.
+  */
+@@ -337,19 +383,4 @@ template <> struct SharedPtrDeserializeAllocator<CTransaction> {
+     using type = TransactionRefAllocator;
+ };
+ 
+-/** Precompute sighash midstate to avoid quadratic hashing */
+-struct PrecomputedTransactionData {
+-    uint256 hashPrevouts, hashSequence, hashOutputs;
+-
+-    PrecomputedTransactionData()
+-        : hashPrevouts(), hashSequence(), hashOutputs() {}
+-
+-    PrecomputedTransactionData(const PrecomputedTransactionData &txdata) =
+-        default;
+-    PrecomputedTransactionData &
+-    operator=(const PrecomputedTransactionData &txdata) = default;
+-
+-    template <class T> explicit PrecomputedTransactionData(const T &tx);
+-};
+-
+ #endif // BITCOIN_PRIMITIVES_TRANSACTION_H
+diff --git a/src/script/interpreter.cpp b/src/script/interpreter.cpp
+index c9c01590f5..5af7fb7fc0 100644
+--- a/src/script/interpreter.cpp
++++ b/src/script/interpreter.cpp
+@@ -1520,15 +1520,24 @@ template <class T> uint256 GetOutputsHash(const T &txTo) {
+ } // namespace
+ 
+ template <class T>
+-PrecomputedTransactionData::PrecomputedTransactionData(const T &txTo) {
+-    hashPrevouts = GetPrevoutHash(txTo);
+-    hashSequence = GetSequenceHash(txTo);
+-    hashOutputs = GetOutputsHash(txTo);
++PrecomputedTransactionData
++PrecomputedTransactionData::Compute(const T &txTo) {
++    PrecomputedTransactionData txdata;
++    txdata.hashPrevouts = GetPrevoutHash(txTo);
++    txdata.hashSequence = GetSequenceHash(txTo);
++    txdata.hashOutputs = GetOutputsHash(txTo);
++    return txdata;
+ }
+ 
++template <class T>
++PrecomputedTransactionData::PrecomputedTransactionData(const T &txTo)
++    : PrecomputedTransactionData(Compute(txTo)) {}
++
+ // explicit instantiation
+-template PrecomputedTransactionData::PrecomputedTransactionData(
+-    const CTransaction &txTo);
++template PrecomputedTransactionData
++PrecomputedTransactionData::Compute(const CTransaction &txTo);
++template PrecomputedTransactionData
++PrecomputedTransactionData::Compute(const CMutableTransaction &txTo);
+ template PrecomputedTransactionData::PrecomputedTransactionData(
+     const CMutableTransaction &txTo);
+ 
+diff --git a/src/test/transaction_tests.cpp b/src/test/transaction_tests.cpp
+index cb57f5aff4..5473089973 100644
+--- a/src/test/transaction_tests.cpp
++++ b/src/test/transaction_tests.cpp
+@@ -956,4 +956,62 @@ BOOST_AUTO_TEST_CASE(tx_getvalueout) {
+     BOOST_CHECK_THROW(overflow_sum_tx.GetValueOut(), std::runtime_error);
+ }
+ 
++BOOST_AUTO_TEST_CASE(cached_size_and_precomputed_data) {
++    // CTransaction caches its serialized size and sighash midstate at
++    // construction; both must match a fresh computation.
++    auto check = [](const CMutableTransaction &mtx) {
++        const CTransaction tx{mtx};
++        DataStream ss{};
++        ss << tx;
++        BOOST_CHECK_EQUAL(tx.GetTotalSize(), ss.size());
++        BOOST_CHECK_EQUAL(::GetSerializeSize(tx), ss.size());
++        BOOST_CHECK_EQUAL(::GetSerializeSize(mtx), ss.size());
++
++        const PrecomputedTransactionData fresh{mtx};
++        const PrecomputedTransactionData &cached = tx.GetPrecomputedData();
++        BOOST_CHECK(cached.hashPrevouts == fresh.hashPrevouts);
++        BOOST_CHECK(cached.hashSequence == fresh.hashSequence);
++        BOOST_CHECK(cached.hashOutputs == fresh.hashOutputs);
++        const PrecomputedTransactionData copied{tx};
++        BOOST_CHECK(copied.hashOutputs == fresh.hashOutputs);
++        BOOST_CHECK(PrecomputedTransactionData::Compute(tx).hashPrevouts ==
++                    fresh.hashPrevouts);
++    };
++
++    // Null transaction.
++    check(CMutableTransaction{});
++    {
++        const CTransaction null_tx;
++        BOOST_CHECK_EQUAL(null_tx.GetTotalSize(), ::GetSerializeSize(
++                                                      CMutableTransaction{}));
++    }
++    // Varying input/output counts and script sizes, including scripts that
++    // spill out of CScript's inline prevector storage.
++    FastRandomContext rng{/*fDeterministic=*/true};
++    for (size_t n_in = 0; n_in < 4; ++n_in) {
++        for (size_t n_out = 0; n_out < 4; ++n_out) {
++            CMutableTransaction mtx;
++            mtx.nVersion = 2;
++            mtx.nLockTime = rng.rand32();
++            for (size_t i = 0; i < n_in; ++i) {
++                mtx.vin.emplace_back(TxId{rng.rand256()}, rng.rand32(),
++                                     CScript() << rng.randbytes(i * 40),
++                                     rng.rand32());
++            }
++            for (size_t i = 0; i < n_out; ++i) {
++                mtx.vout.emplace_back(int64_t(rng.rand32()) * SATOSHI,
++                                      CScript() << rng.randbytes(i * 30));
++            }
++            check(mtx);
++            // Moving the mutable transaction in must give the same caches.
++            CMutableTransaction moved{mtx};
++            const CTransaction tx_moved{std::move(moved)};
++            BOOST_CHECK_EQUAL(tx_moved.GetTotalSize(),
++                              ::GetSerializeSize(mtx));
++            BOOST_CHECK(tx_moved.GetPrecomputedData().hashSequence ==
++                        PrecomputedTransactionData{mtx}.hashSequence);
++        }
++    }
++}
++
+ BOOST_AUTO_TEST_SUITE_END()
+diff --git a/src/validation.cpp b/src/validation.cpp
+index 3094944751..3385d36012 100644
+--- a/src/validation.cpp
++++ b/src/validation.cpp
+@@ -237,7 +237,7 @@ IsReplayProtectionEnabled(const Consensus::Params &params,
+ static bool CheckInputsFromMempoolAndCache(
+     const CTransaction &tx, TxValidationState &state,
+     const CCoinsViewCache &view, const CTxMemPool &pool, const uint32_t flags,
+-    PrecomputedTransactionData &txdata, ValidationCache &validation_cache,
++    const PrecomputedTransactionData &txdata, ValidationCache &validation_cache,
+     int &nSigChecksOut, CCoinsViewCache &coins_tip)
+     EXCLUSIVE_LOCKS_REQUIRED(cs_main, pool.cs) {
+     AssertLockHeld(cs_main);
+@@ -486,12 +486,6 @@ private:
+ 
+         const CTransactionRef &m_ptx;
+         TxValidationState m_state;
+-        /**
+-         * A temporary cache containing serialized transaction data for
+-         * signature verification.
+-         * Reused across PreChecks and ConsensusScriptChecks.
+-         */
+-        PrecomputedTransactionData m_precomputed_txdata;
+ 
+         // ABC specific flags that are used in both PreChecks and
+         // ConsensusScriptChecks
+@@ -729,9 +723,8 @@ bool MemPoolAccept::PreChecks(ATMPArgs &args, Workspace &ws) {
+     // Validate input scripts against standard script flags.
+     const uint32_t scriptVerifyFlags =
+         ws.m_next_block_script_verify_flags | STANDARD_SCRIPT_VERIFY_FLAGS;
+-    ws.m_precomputed_txdata = PrecomputedTransactionData{tx};
+     if (!CheckInputScripts(tx, state, m_view, scriptVerifyFlags, true, false,
+-                           ws.m_precomputed_txdata, GetValidationCache(),
++                           tx.GetPrecomputedData(), GetValidationCache(),
+                            ws.m_sig_checks_standard)) {
+         // State filled in by CheckInputScripts
+         return false;
+@@ -793,7 +786,7 @@ bool MemPoolAccept::ConsensusScriptChecks(const ATMPArgs &args, Workspace &ws) {
+     int nSigChecksConsensus;
+     if (!CheckInputsFromMempoolAndCache(
+             tx, state, m_view, m_pool, ws.m_next_block_script_verify_flags,
+-            ws.m_precomputed_txdata, GetValidationCache(), nSigChecksConsensus,
++            tx.GetPrecomputedData(), GetValidationCache(), nSigChecksConsensus,
+             m_active_chainstate.CoinsTip())) {
+         // This can occur under some circumstances, if the node receives an
+         // unrequested tx which is invalid due to new consensus rules not
+@@ -2453,7 +2446,7 @@ bool Chainstate::ConnectBlock(const CBlock &block, BlockValidationState &state,
+         TxValidationState tx_state;
+         if (fScriptChecks &&
+             !CheckInputScripts(tx, tx_state, view, flags, fCacheResults,
+-                               fCacheResults, PrecomputedTransactionData(tx),
++                               fCacheResults, tx.GetPrecomputedData(),
+                                m_chainman.m_validation_cache, nSigChecksRet,
+                                nSigChecksTxLimiters[txIndex],
+                                &nSigChecksBlockLimiter, &vChecks)) {
+-- 
+2.50.1 (Apple Git-155)
+

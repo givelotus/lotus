@@ -1,0 +1,1868 @@
+From 417c1c91c527f60366af5fa0e27da4094d79ad1e Mon Sep 17 00:00:00 2001
+From: Shammah Chancellor <shammah.chancellor@notvalid.com>
+Date: Sun, 18 Oct 2026 01:33:30 -0700
+Subject: [PATCH] chronik(v2): wire native server and FFI entry points
+
+Extract this concern so its mechanism can be reviewed and measured independently.
+No source semantics are added or removed by this history operation.
+
+Original patch rationale (describes the unsplit source, not every extracted part):
+Extend Chronik with Lotus V2 3-branch script, token/asset ID, and
+134-byte header indexers.
+
+Original-Commit: 5ee9254cba0b0de4d25ba647d11c3af670832a58
+Original-Patch: v2/012
+Split-Concern: runtime
+
+Historical compilation prerequisites are tracked separately in daemon/patch-audit;
+this provenance-preserving split does not imply standalone build validation.
+
+(cherry picked from commit af744223e84bc670c801d83b91ddeac341f54cf5)
+
+Canonical-Source-Commit: af744223e84bc670c801d83b91ddeac341f54cf5
+---
+ chronik/chronik-lib/Cargo.toml               |   8 +-
+ chronik/chronik-lib/build.rs                 |   3 +-
+ chronik/chronik-lib/src/lib.rs               |   3 +
+ chronik/chronik-lib/src/v2.rs                | 572 +++++++++++++++++++
+ chronik/chronik-lib/src/v2_ffi.rs            | 271 +++++++++
+ chronik/chronik-lib/src/v2_server.rs         | 260 +++++++++
+ chronik/chronik-lib/src/v2tests/authority.rs | 117 ++++
+ chronik/chronik-lib/src/v2tests/tests.rs     | 526 +++++++++++++++++
+ 8 files changed, 1758 insertions(+), 2 deletions(-)
+ create mode 100644 chronik/chronik-lib/src/v2.rs
+ create mode 100644 chronik/chronik-lib/src/v2_ffi.rs
+ create mode 100644 chronik/chronik-lib/src/v2_server.rs
+ create mode 100644 chronik/chronik-lib/src/v2tests/authority.rs
+ create mode 100644 chronik/chronik-lib/src/v2tests/tests.rs
+
+diff --git a/chronik/chronik-lib/Cargo.toml b/chronik/chronik-lib/Cargo.toml
+index 456ee6311981b3dbab366bbfcb2e7bbbb2c4ee4f..b76e4e4d28c80fc1893e5ffc9188d9e5a8bb69e4 100644
+--- a/chronik/chronik-lib/Cargo.toml
++++ b/chronik/chronik-lib/Cargo.toml
+@@ -32,6 +32,12 @@ chronik-indexer = { path = "../chronik-indexer" }
+ chronik-plugin = { path = "../chronik-plugin" }
+ chronik-util = { path = "../chronik-util" }
+ 
++# Per-open explorer service epoch from OS entropy
++getrandom = "0.2"
++
++# Explicit V2 HTTP server
++axum = "0.7.9"
++
+ # Bridge to C++
+ cxx = "1.0.138"
+ 
+@@ -39,7 +45,7 @@ cxx = "1.0.138"
+ thiserror = "2.0.3"
+ 
+ # Async runtime
+-tokio = { version = "1.32", features = ["sync", "rt", "rt-multi-thread"] }
++tokio = { version = "1.32", features = ["sync", "rt", "rt-multi-thread", "time", "net", "macros"] }
+ 
+ [build-dependencies]
+ # Build scripts for the cxx crate
+diff --git a/chronik/chronik-lib/build.rs b/chronik/chronik-lib/build.rs
+index e58cf7d7f1d5cca272c9d859a8eea89d4604d792..64bd55f5f09c6a938ce38ec296af131da9d6c54e 100644
+--- a/chronik/chronik-lib/build.rs
++++ b/chronik/chronik-lib/build.rs
+@@ -4,6 +4,7 @@
+ 
+ fn main() {
+     // Build the C++ sources and headers for bridging Rust and C++.
+-    let _build = cxx_build::bridge("src/ffi.rs");
++    let _build = cxx_build::bridges(["src/ffi.rs", "src/v2_ffi.rs"]);
+     println!("cargo:rerun-if-changed=src/ffi.rs");
++    println!("cargo:rerun-if-changed=src/v2_ffi.rs");
+ }
+diff --git a/chronik/chronik-lib/src/lib.rs b/chronik/chronik-lib/src/lib.rs
+index 6cab4accaae25b1117c87abd9d4027e04c815dcf..5dbd0fdb4457f79e30c8d50e5ed0a506c7d8960c 100644
+--- a/chronik/chronik-lib/src/lib.rs
++++ b/chronik/chronik-lib/src/lib.rs
+@@ -18,4 +18,7 @@ abc_rust_lint::lint! {
+     pub mod bridge;
+     pub mod ffi;
+     pub mod in_process;
++    pub mod v2;
++    pub mod v2_ffi;
++    pub mod v2_server;
+ }
+diff --git a/chronik/chronik-lib/src/v2.rs b/chronik/chronik-lib/src/v2.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..05252b9931cf72ba485aa404960271e3b7ef1bf1
+--- /dev/null
++++ b/chronik/chronik-lib/src/v2.rs
+@@ -0,0 +1,572 @@
++//! Bounded native V2 service sharing a serialized DB owner with Rust readers.
++//!
++//! The typed response byte budget uses canonical field order: arrays are raw
++//! bytes, integers are fixed-width little-endian, booleans are one byte, and
++//! vectors carry a u32 count followed by elements. All optional slots are always
++//! present. A page has a 307-byte envelope and each match has 265 fixed bytes,
++//! followed by its output wire and matching-position bytes. This is a transport
++//! payload cap; CXX allocator metadata is not serialized. HTTP adapters must
++//! enforce their own encoding cap if expanding these records to JSON.
++//!
++//! Native callers authenticate consensus, canonical IDs and committed ordering.
++//! This service checks bindings and model shape, and never advances node state.
++//! CXX caller vectors already exist when entering Rust. Caps reject them before
++//! allocating model copies; native callers must also bound their construction.
++//! Readiness is only the equality of separately supplied node/index checkpoints.
++use crate::v2_ffi as f;
++use bitcoinsuite_core::lotus_v2::{
++    Hash32, OutPoint, Output, OutputRecord, TxHash, TxId, TxLocation,
++    MAX_OUTPUT_BYTES,
++};
++use chronik_db::v2_branch::{self as db, ReadSnapshot, V2Db};
++use chronik_db::v2_explorer::{
++    ExplorerBlockFacts, ExplorerTxFacts, InputFact, WireRange, WitnessFact,
++};
++use chronik_indexer::query::v2_branches as q;
++use std::{
++    path::Path,
++    sync::{
++        atomic::{AtomicBool, Ordering},
++        Arc, Mutex, MutexGuard,
++    },
++};
++type Result<T> = std::result::Result<T, String>;
++/// Thread-safe confirmed index owner. Clones share storage and immutable caps.
++#[derive(Clone, Debug)]
++pub struct V2Service {
++    db: Arc<Mutex<V2Db>>,
++    limits: f::ServiceLimits,
++    genesis: [u8; 32],
++    authority: Arc<crate::v2_server::Authority>,
++    service_epoch: [u8; 16],
++    index_error: Arc<AtomicBool>,
++}
++/// Open a dedicated directory; fresh requires absence, existing requires mdbx.dat.
++/// No deletion occurs. Reads stay unavailable until explicit genesis commits.
++pub fn open_service(
++    path: &str,
++    binding: f::Binding,
++    fresh: bool,
++    limits: f::ServiceLimits,
++) -> Result<Box<V2Service>> {
++    if path.is_empty() || path.len() > 4096 {
++        return Err("path bound".into());
++    }
++    if limits.transactions == 0
++        || limits.transactions as usize > db::MAX_TRANSACTIONS
++        || limits.changes == 0
++        || limits.changes as usize > db::MAX_CHANGES
++        || limits.block_bytes == 0
++        || limits.block_bytes as usize > db::MAX_BATCH_BYTES
++        || limits.roots == 0
++        || limits.roots > 256
++        || limits.clauses == 0
++        || limits.clauses > 16
++        || limits.page_size == 0
++        || limits.page_size > 1000
++        || limits.posting_reads == 0
++        || limits.posting_reads > 65536
++        || limits.work == 0
++        || limits.work > 131072
++        || limits.response_bytes < 512
++        || limits.response_bytes > 1024 * 1024
++    {
++        return Err("service limits".into());
++    }
++    let mut service_epoch = [0u8; 16];
++    getrandom::getrandom(&mut service_epoch)
++        .map_err(|_| "explorer entropy unavailable")?;
++    let path = Path::new(path);
++    if fresh {
++        std::fs::create_dir(path).map_err(|e| e.to_string())?;
++    } else if !path.join("mdbx.dat").is_file() {
++        return Err("existing V2 DB required".into());
++    }
++    let database = V2Db::open(
++        path,
++        db::Binding {
++            chain_id: binding.chain_id,
++            genesis: binding.genesis,
++            profile: binding.profile,
++        },
++    )
++    .map_err(|e| e.to_string())?;
++    Ok(Box::new(V2Service {
++        db: Arc::new(Mutex::new(database)),
++        limits,
++        genesis: binding.genesis,
++        authority: Arc::new(crate::v2_server::Authority::default()),
++        service_epoch,
++        index_error: Arc::new(AtomicBool::new(false)),
++    }))
++}
++fn anchor(a: &f::Anchor) -> db::Anchor {
++    db::Anchor {
++        block_id: a.block_id,
++        height: a.height,
++    }
++}
++fn ffi_anchor(a: db::Anchor) -> f::Anchor {
++    f::Anchor {
++        block_id: a.block_id,
++        height: a.height,
++    }
++}
++impl V2Service {
++    /// Invalidate before native chain changes or recovery, before taking node
++    /// locks. Every call advances the durable generation, including ABA.
++    pub fn invalidate_authority(&self) -> Result<u64> {
++        self.authority.publish(None)
++    }
++    /// Publish only after the native chain is stable. The indexed checkpoint
++    /// remains independent; HTTP returns unavailable when these anchors differ.
++    pub fn publish_authority(&self, a: f::Anchor) -> Result<u64> {
++        self.authority.publish(Some(anchor(&a)))
++    }
++    /// Suspend reads for a native work turn without invalidating durable
++    /// continuations. Only exact-context reconciliation can safely resume them.
++    pub fn suspend_authority(&self) -> Result<u64> {
++        self.authority.suspend()
++    }
++    /// Publish a fully reconciled native stamp. Every native mutation/recovery
++    /// must change its context generation or revision, even at an unchanged tip.
++    pub fn publish_authority_context(
++        &self,
++        a: f::Anchor,
++        context_generation: u64,
++        chain_revision: u64,
++    ) -> Result<u64> {
++        self.authority.publish_context(
++            anchor(&a),
++            context_generation,
++            chain_revision,
++        )
++    }
++    /// Clone the shared handle for another Rust service, including future HTTP.
++    pub fn clone_shared(&self) -> Self {
++        self.clone()
++    }
++    /// Share the exact DB owner with a Rust HTTP adapter. Readers must hold the
++    /// mutex through snapshot use; native committed transitions remain the only
++    /// authorized mutation source. Node readiness requires a separate provider.
++    pub fn shared_database(&self) -> Arc<Mutex<V2Db>> {
++        Arc::clone(&self.db)
++    }
++    fn lock(&self) -> Result<MutexGuard<'_, V2Db>> {
++        self.db.lock().map_err(|_| "V2 DB lock poisoned".into())
++    }
++    fn block(&self, block: f::NativeBlock) -> Result<db::CommittedBlock> {
++        if block.transactions.len() > self.limits.transactions as usize {
++            return Err("transaction bound".into());
++        }
++        let mut bytes = 218usize;
++        let mut changes = 0usize;
++        if bytes > self.limits.block_bytes as usize {
++            return Err("block bytes bound".into());
++        }
++        for tx in &block.transactions {
++            let descriptor_bytes = tx
++                .full_inputs
++                .iter()
++                .try_fold(0usize, |n, i| {
++                    i.witnesses
++                        .len()
++                        .checked_mul(80)
++                        .and_then(|w| n.checked_add(w + 128))
++                })
++                .ok_or("descriptor overflow")?;
++            bytes = bytes
++                .checked_add(tx.wire.len())
++                .and_then(|n| n.checked_add(descriptor_bytes))
++                .ok_or("full facts overflow")?;
++            if bytes > self.limits.block_bytes as usize {
++                return Err("full facts bound".into());
++            }
++
++            changes = changes
++                .checked_add(tx.inputs.len())
++                .and_then(|n| n.checked_add(tx.outputs.len()))
++                .ok_or("change overflow")?;
++            bytes = bytes
++                .checked_add(76)
++                .and_then(|n| {
++                    tx.inputs
++                        .len()
++                        .checked_mul(40)
++                        .and_then(|k| n.checked_add(k))
++                })
++                .ok_or("block overflow")?;
++            if changes > self.limits.changes as usize
++                || bytes > self.limits.block_bytes as usize
++            {
++                return Err("block input bound".into());
++            }
++            for output in &tx.outputs {
++                if output.wire.len() > MAX_OUTPUT_BYTES {
++                    return Err("output bound".into());
++                }
++                bytes = bytes
++                    .checked_add(4 + output.wire.len())
++                    .ok_or("block overflow")?;
++                if bytes > self.limits.block_bytes as usize {
++                    return Err("block bytes bound".into());
++                }
++            }
++        }
++        let transactions = block
++            .transactions
++            .into_iter()
++            .map(|tx| {
++                let outputs = tx
++                    .outputs
++                    .into_iter()
++                    .map(|o| Output::decode(&o.wire).map_err(|e| e.to_string()))
++                    .collect::<Result<Vec<_>>>()?;
++                Ok(db::ConfirmedTx {
++                    location: TxLocation {
++                        block_id: Hash32(block.anchor.block_id),
++                        height: block.anchor.height,
++                        tx_index: tx.index,
++                        txid: TxId(Hash32(tx.txid)),
++                        txhash: TxHash(Hash32(tx.txhash)),
++                    },
++                    explorer: ExplorerTxFacts {
++                        wire: tx.wire,
++                        lock: tx.lock,
++                        inputs: tx
++                            .full_inputs
++                            .into_iter()
++                            .map(|i| InputFact {
++                                prev_txid: i.prev_txid,
++                                prev_index: i.prev_index,
++                                sequence: i.sequence,
++                                flags: i.flags,
++                                path_index: i.path_index,
++                                has_coinbase_data: i.has_coinbase_data,
++                                coinbase_data: range(i.coinbase_data),
++                                witnesses: i
++                                    .witnesses
++                                    .into_iter()
++                                    .map(|w| WitnessFact {
++                                        script: range(w.script),
++                                        siblings_table: range(w.siblings_table),
++                                        siblings_count: w.siblings_count,
++                                        arguments_table: range(
++                                            w.arguments_table,
++                                        ),
++                                        arguments_count: w.arguments_count,
++                                    })
++                                    .collect(),
++                                resolved_creation: None,
++                            })
++                            .collect(),
++                    },
++                    outputs,
++                    spends: tx
++                        .inputs
++                        .into_iter()
++                        .map(|i| db::SpentInput {
++                            outpoint: OutPoint {
++                                txid: TxId(Hash32(i.txid)),
++                                out_idx: i.out_idx,
++                            },
++                            input_index: i.input_index,
++                        })
++                        .collect(),
++                })
++            })
++            .collect::<Result<Vec<_>>>()?;
++        Ok(db::CommittedBlock {
++            anchor: anchor(&block.anchor),
++            parent: anchor(&block.parent),
++            transactions,
++            explorer: ExplorerBlockFacts {
++                header_wire: block.header_wire,
++            },
++        })
++    }
++    /// Initialize complete caller-authenticated genesis, checking even empty blocks.
++    pub fn initialize_genesis(&self, block: f::NativeBlock) -> Result<()> {
++        self.transition(|| {
++            if block.anchor.height != 0
++                || block.parent.height != 0
++                || block.anchor.block_id != block.parent.block_id
++                || block.anchor.block_id != self.genesis
++            {
++                return Err("genesis binding/shape".into());
++            }
++            let block = self.block(block)?;
++            self.lock()?
++                .initialize_genesis(block)
++                .map_err(|e| e.to_string())
++        })
++    }
++    /// Index one authoritative committed block without changing node state.
++    pub fn connect_block(&self, block: f::NativeBlock) -> Result<()> {
++        self.transition(|| {
++            let block = self.block(block)?;
++            self.lock()?.connect(&block).map_err(|e| e.to_string())
++        })
++    }
++    /// Undo exactly the expected indexed anchor.
++    pub fn disconnect_block(&self, expected: f::Anchor) -> Result<()> {
++        self.transition(|| {
++            self.lock()?
++                .disconnect(anchor(&expected))
++                .map_err(|e| e.to_string())
++        })
++    }
++    fn transition(&self, action: impl FnOnce() -> Result<()>) -> Result<()> {
++        let result = self.invalidate_authority().and_then(|_| action());
++        self.index_error.store(result.is_err(), Ordering::Release);
++        result
++    }
++    /// Compare separate indexed and authoritative node checkpoints.
++    pub fn status(&self, node: f::Anchor) -> Result<f::Status> {
++        let checkpoint =
++            self.lock()?.checkpoint().map_err(|e| e.to_string())?;
++        Ok(f::Status {
++            initialized: checkpoint.is_some(),
++            ready: checkpoint == Some(anchor(&node)),
++            indexed: ffi_anchor(checkpoint.unwrap_or(db::Anchor {
++                block_id: [0; 32],
++                height: 0,
++            })),
++            node,
++        })
++    }
++    /// Query confirmed branch records or UTXOs on one stable bounded snapshot.
++    pub fn query_branches(
++        &self,
++        request: f::BranchRequest,
++    ) -> Result<f::BranchPage> {
++        if request.positions.len() > self.limits.clauses as usize
++            || request.any_branch.len() > self.limits.roots as usize
++        {
++            return Err("query input bound".into());
++        }
++        let total = request
++            .positions
++            .iter()
++            .try_fold(request.any_branch.len(), |n, p| {
++                n.checked_add(p.roots.len())
++            })
++            .ok_or("root overflow")?;
++        if total > self.limits.roots as usize
++            || request.positions.len() > self.limits.clauses as usize
++        {
++            return Err("query input bound".into());
++        }
++        let filter = q::BranchFilter {
++            any_branch: request
++                .any_branch
++                .into_iter()
++                .map(|r| Hash32(r.bytes))
++                .collect(),
++            positions: request
++                .positions
++                .into_iter()
++                .map(|p| q::PositionClause {
++                    position: p.position,
++                    roots: p
++                        .roots
++                        .into_iter()
++                        .map(|r| Hash32(r.bytes))
++                        .collect(),
++                })
++                .collect(),
++        };
++        let c = request.cursor;
++        let cursor = c.present.then(|| q::Cursor {
++            version: c.version,
++            snapshot: q::Snapshot {
++                chain_id: Hash32(c.chain_id),
++                profile_id: Hash32(c.profile),
++                tip: Hash32(c.anchor.block_id),
++                height: c.anchor.height,
++            },
++            filter_digest: Hash32(c.filter_digest),
++            last_key: c.has_last.then_some(OutPoint {
++                txid: TxId(Hash32(c.last_txid)),
++                out_idx: c.last_out_idx,
++            }),
++        });
++        let database = self.lock()?;
++        let source = Source(database.snapshot().map_err(|e| e.to_string())?);
++        // Fixed-width transport includes absent spend slots. This conservative
++        // budget covers vector framing and all optional cursor/record fields.
++        let envelope = 307usize;
++        let room = self.limits.response_bytes as usize - envelope;
++        let page_cap = (self.limits.page_size as usize).min(room / 300).max(1);
++        let limits = q::Limits {
++            roots: self.limits.roots as usize,
++            clauses: self.limits.clauses as usize,
++            page_size: page_cap,
++            posting_reads: self.limits.posting_reads as usize,
++            work: self.limits.work as usize,
++            result_bytes: room.saturating_sub(page_cap * 119),
++        };
++        let page = q::query(
++            &source,
++            &filter,
++            if request.utxos {
++                q::QueryKind::Utxos
++            } else {
++                q::QueryKind::History {
++                    include_burn: request.include_burn,
++                }
++            },
++            limits,
++            cursor,
++        )
++        .map_err(|e| format!("V2 query: {e:?}"))?;
++        let matches = page
++            .matches
++            .into_iter()
++            .map(|m| {
++                let spend = m.record.spend;
++                Ok(f::OutputMatch {
++                    txid: m.record.outpoint.txid.0 .0,
++                    out_idx: m.record.outpoint.out_idx,
++                    wire: m
++                        .record
++                        .output
++                        .encode()
++                        .map_err(|e| e.to_string())?,
++                    creation: location(m.record.creation),
++                    spent: spend.is_some(),
++                    spend: spend
++                        .map(|s| location(s.transaction))
++                        .unwrap_or_else(empty_location),
++                    input_index: spend.map_or(0, |s| s.input_index),
++                    matching_positions: m.matching_positions,
++                })
++            })
++            .collect::<Result<Vec<_>>>()?;
++        let encoded_bytes = envelope
++            + matches
++                .iter()
++                .map(|m| 265 + m.wire.len() + m.matching_positions.len())
++                .sum::<usize>();
++        if encoded_bytes > self.limits.response_bytes as usize {
++            return Err("response bytes bound".into());
++        }
++        Ok(f::BranchPage {
++            anchor: f::Anchor {
++                block_id: page.snapshot.tip.0,
++                height: page.snapshot.height,
++            },
++            chain_id: page.snapshot.chain_id.0,
++            profile: page.snapshot.profile_id.0,
++            matches,
++            cursor: continuation(page.continuation),
++            posting_reads: page.posting_reads as u64,
++            work: page.work as u64,
++            encoded_bytes: encoded_bytes as u64,
++        })
++    }
++}
++struct Source<'a>(ReadSnapshot<'a>);
++impl q::PostingSource for Source<'_> {
++    fn snapshot(&self) -> q::Snapshot {
++        q::Snapshot {
++            chain_id: Hash32(self.0.binding.chain_id),
++            profile_id: Hash32(self.0.binding.profile),
++            tip: Hash32(self.0.anchor.block_id),
++            height: self.0.anchor.height,
++        }
++    }
++    fn next_posting(
++        &self,
++        root: Hash32,
++        position: Option<u8>,
++        after: Option<OutPoint>,
++    ) -> std::result::Result<Option<OutPoint>, q::QueryError> {
++        self.0
++            .next_posting(root, position, after)
++            .map_err(|_| q::QueryError::Source("DB posting"))
++    }
++    fn output(
++        &self,
++        key: OutPoint,
++    ) -> std::result::Result<Option<OutputRecord>, q::QueryError> {
++        self.0
++            .output(key)
++            .map_err(|_| q::QueryError::Source("DB record"))
++    }
++}
++fn location(l: TxLocation) -> f::Location {
++    f::Location {
++        anchor: f::Anchor {
++            block_id: l.block_id.0,
++            height: l.height,
++        },
++        tx_index: l.tx_index,
++        txid: l.txid.0 .0,
++        txhash: l.txhash.0 .0,
++    }
++}
++fn empty_location() -> f::Location {
++    f::Location {
++        anchor: f::Anchor {
++            block_id: [0; 32],
++            height: 0,
++        },
++        tx_index: 0,
++        txid: [0; 32],
++        txhash: [0; 32],
++    }
++}
++fn continuation(c: Option<q::Cursor>) -> f::Continuation {
++    let present = c.is_some();
++    let c = c.unwrap_or(q::Cursor {
++        version: 1,
++        snapshot: q::Snapshot {
++            chain_id: Hash32([0; 32]),
++            profile_id: Hash32([0; 32]),
++            tip: Hash32([0; 32]),
++            height: 0,
++        },
++        filter_digest: Hash32([0; 32]),
++        last_key: None,
++    });
++    f::Continuation {
++        present,
++        version: c.version,
++        chain_id: c.snapshot.chain_id.0,
++        profile: c.snapshot.profile_id.0,
++        anchor: f::Anchor {
++            block_id: c.snapshot.tip.0,
++            height: c.snapshot.height,
++        },
++        filter_digest: c.filter_digest.0,
++        has_last: c.last_key.is_some(),
++        last_txid: c.last_key.map_or([0; 32], |k| k.txid.0 .0),
++        last_out_idx: c.last_key.map_or(0, |k| k.out_idx),
++    }
++}
++
++#[cfg(test)]
++#[path = "v2tests/tests.rs"]
++mod tests;
++
++/// Start an explicitly bound native V2 HTTP listener sharing this service.
++pub fn start_v2_server(
++    service: &V2Service,
++    bind: &str,
++) -> Result<Box<crate::v2_server::V2Server>> {
++    crate::v2_server::start(
++        service.shared_database(),
++        Arc::clone(&service.authority),
++        service.service_epoch,
++        Arc::clone(&service.index_error),
++        bind,
++    )
++}
++
++fn range(r: f::WireRange) -> WireRange {
++    WireRange {
++        offset: r.offset,
++        length: r.length,
++    }
++}
+diff --git a/chronik/chronik-lib/src/v2_ffi.rs b/chronik/chronik-lib/src/v2_ffi.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..f7085746f0a8ef5b830fd9f2b5597adaec6e97be
+--- /dev/null
++++ b/chronik/chronik-lib/src/v2_ffi.rs
+@@ -0,0 +1,271 @@
++//! Independent bounded native V2 service bridge. Identities use native wire order.
++
++pub use self::ffi_inner::*;
++use crate::v2::{open_service, start_v2_server, V2Service};
++use crate::v2_server::V2Server;
++
++#[allow(unsafe_code)]
++#[cxx::bridge(namespace = "chronik_v2")]
++mod ffi_inner {
++    /// Native V2 Binding transport.
++    #[derive(Clone, Debug)]
++    struct Binding {
++        /// Native chain id.
++        chain_id: [u8; 32],
++        /// Native genesis.
++        genesis: [u8; 32],
++        /// Native profile.
++        profile: [u8; 32],
++    }
++    /// Native V2 Anchor transport.
++    #[derive(Clone, Debug)]
++    struct Anchor {
++        /// Native block id.
++        block_id: [u8; 32],
++        /// Native height.
++        height: u64,
++    }
++    /// Native V2 ServiceLimits transport.
++    #[derive(Clone, Debug)]
++    struct ServiceLimits {
++        /// Native block bytes.
++        block_bytes: u32,
++        /// Native transactions.
++        transactions: u32,
++        /// Native changes.
++        changes: u32,
++        /// Native roots.
++        roots: u32,
++        /// Native clauses.
++        clauses: u32,
++        /// Native page size.
++        page_size: u32,
++        /// Native posting reads.
++        posting_reads: u32,
++        /// Native work.
++        work: u32,
++        /// Native response bytes.
++        response_bytes: u32,
++    }
++    /// Native V2 Input transport.
++    #[derive(Clone, Debug)]
++    struct Input {
++        /// Native txid.
++        txid: [u8; 32],
++        /// Native out idx.
++        out_idx: u32,
++        /// Native input index.
++        input_index: u32,
++    }
++    /// Native V2 NativeOutput transport.
++    #[derive(Clone, Debug)]
++    struct NativeOutput {
++        /// Native wire.
++        wire: Vec<u8>,
++    }
++    /// Byte range in the exact transaction frame.
++    #[derive(Clone, Debug)]
++    struct WireRange {
++        offset: u64,
++        length: u64,
++    }
++    /// Authenticated witness section locations.
++    #[derive(Clone, Debug)]
++    struct NativeWitness {
++        script: WireRange,
++        siblings_table: WireRange,
++        siblings_count: u32,
++        arguments_table: WireRange,
++        arguments_count: u32,
++    }
++    /// Complete input descriptor, including non-spend selectors.
++    #[derive(Clone, Debug)]
++    struct NativeFullInput {
++        prev_txid: [u8; 32],
++        prev_index: u32,
++        sequence: u32,
++        flags: u8,
++        path_index: u8,
++        has_coinbase_data: bool,
++        coinbase_data: WireRange,
++        witnesses: Vec<NativeWitness>,
++    }
++    /// Native V2 NativeTx transport.
++    #[derive(Clone, Debug)]
++    struct NativeTx {
++        /// Native txid.
++        txid: [u8; 32],
++        /// Native txhash.
++        txhash: [u8; 32],
++        /// Native index.
++        index: u32,
++        /// Native inputs.
++        inputs: Vec<Input>,
++        /// Native outputs.
++        outputs: Vec<NativeOutput>,
++        wire: Vec<u8>,
++        lock: u64,
++        full_inputs: Vec<NativeFullInput>,
++    }
++    /// Native V2 NativeBlock transport.
++    #[derive(Clone, Debug)]
++    struct NativeBlock {
++        /// Native anchor.
++        anchor: Anchor,
++        /// Native parent.
++        parent: Anchor,
++        /// Native transactions.
++        transactions: Vec<NativeTx>,
++        header_wire: [u8; 134],
++    }
++    /// Native V2 Status transport.
++    #[derive(Clone, Debug)]
++    struct Status {
++        /// Native initialized.
++        initialized: bool,
++        /// Native indexed.
++        indexed: Anchor,
++        /// Native node.
++        node: Anchor,
++        /// Native ready.
++        ready: bool,
++    }
++    /// Native V2 Root transport.
++    #[derive(Clone, Debug)]
++    struct Root {
++        /// Native bytes.
++        bytes: [u8; 32],
++    }
++    /// Native V2 Position transport.
++    #[derive(Clone, Debug)]
++    struct Position {
++        /// Native position.
++        position: u8,
++        /// Native roots.
++        roots: Vec<Root>,
++    }
++    /// Native V2 Continuation transport.
++    #[derive(Clone, Debug)]
++    struct Continuation {
++        /// Native present.
++        present: bool,
++        /// Native version.
++        version: u8,
++        /// Native chain id.
++        chain_id: [u8; 32],
++        /// Native profile.
++        profile: [u8; 32],
++        /// Native anchor.
++        anchor: Anchor,
++        /// Native filter digest.
++        filter_digest: [u8; 32],
++        /// Native has last.
++        has_last: bool,
++        /// Native last txid.
++        last_txid: [u8; 32],
++        /// Native last out idx.
++        last_out_idx: u32,
++    }
++    /// Native V2 BranchRequest transport.
++    #[derive(Clone, Debug)]
++    struct BranchRequest {
++        /// Native any branch.
++        any_branch: Vec<Root>,
++        /// Native positions.
++        positions: Vec<Position>,
++        /// Native utxos.
++        utxos: bool,
++        /// Native include burn.
++        include_burn: bool,
++        /// Native cursor.
++        cursor: Continuation,
++    }
++    /// Native V2 Location transport.
++    #[derive(Clone, Debug)]
++    struct Location {
++        /// Native anchor.
++        anchor: Anchor,
++        /// Native tx index.
++        tx_index: u32,
++        /// Native txid.
++        txid: [u8; 32],
++        /// Native txhash.
++        txhash: [u8; 32],
++    }
++    /// Native V2 OutputMatch transport.
++    #[derive(Clone, Debug)]
++    struct OutputMatch {
++        /// Native txid.
++        txid: [u8; 32],
++        /// Native out idx.
++        out_idx: u32,
++        /// Native wire.
++        wire: Vec<u8>,
++        /// Native creation.
++        creation: Location,
++        /// Native spent.
++        spent: bool,
++        /// Native spend.
++        spend: Location,
++        /// Native input index.
++        input_index: u32,
++        /// Native matching positions.
++        matching_positions: Vec<u8>,
++    }
++    /// Native V2 BranchPage transport.
++    #[derive(Clone, Debug)]
++    struct BranchPage {
++        /// Native anchor.
++        anchor: Anchor,
++        /// Native chain id.
++        chain_id: [u8; 32],
++        /// Native profile.
++        profile: [u8; 32],
++        /// Native matches.
++        matches: Vec<OutputMatch>,
++        /// Native cursor.
++        cursor: Continuation,
++        /// Native posting reads.
++        posting_reads: u64,
++        /// Native work.
++        work: u64,
++        /// Native encoded bytes.
++        encoded_bytes: u64,
++    }
++    extern "Rust" {
++        type V2Service;
++        type V2Server;
++        fn start_v2_server(
++            service: &V2Service,
++            bind: &str,
++        ) -> Result<Box<V2Server>>;
++        fn actual_address(self: &V2Server) -> String;
++        fn stop(self: &V2Server) -> Result<()>;
++        fn invalidate_authority(self: &V2Service) -> Result<u64>;
++        fn suspend_authority(self: &V2Service) -> Result<u64>;
++        fn publish_authority_context(
++            self: &V2Service,
++            anchor: Anchor,
++            context_generation: u64,
++            chain_revision: u64,
++        ) -> Result<u64>;
++        fn publish_authority(self: &V2Service, anchor: Anchor) -> Result<u64>;
++        fn open_service(
++            path: &str,
++            binding: Binding,
++            fresh: bool,
++            limits: ServiceLimits,
++        ) -> Result<Box<V2Service>>;
++        fn initialize_genesis(
++            self: &V2Service,
++            block: NativeBlock,
++        ) -> Result<()>;
++        fn connect_block(self: &V2Service, block: NativeBlock) -> Result<()>;
++        fn disconnect_block(self: &V2Service, anchor: Anchor) -> Result<()>;
++        fn status(self: &V2Service, node: Anchor) -> Result<Status>;
++        fn query_branches(
++            self: &V2Service,
++            request: BranchRequest,
++        ) -> Result<BranchPage>;
++    }
++}
+diff --git a/chronik/chronik-lib/src/v2_server.rs b/chronik/chronik-lib/src/v2_server.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..620369ad52d23f8cd2116b4585ba7976ff48ff96
+--- /dev/null
++++ b/chronik/chronik-lib/src/v2_server.rs
+@@ -0,0 +1,260 @@
++//! Explicit V2 HTTP listener lifecycle and coherent nonblocking authority reads.
++use chronik_db::v2_branch::{Anchor, V2Db};
++use chronik_http::v2::{self, AuthoritativeState, V2HttpState};
++use std::{
++    net::{SocketAddr, TcpListener},
++    sync::{
++        atomic::{AtomicBool, AtomicU64, Ordering},
++        Arc, Mutex,
++    },
++    thread::JoinHandle,
++};
++use tokio::sync::oneshot;
++
++/// Native reconciliation stamp: service binding is immutable; these values must
++/// cover every native mutation/recovery boundary, including same-anchor ABA.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++struct NativeContext {
++    anchor: Anchor,
++    context_generation: u64,
++    chain_revision: u64,
++}
++#[derive(Debug, Default)]
++struct Publication {
++    context: Option<NativeContext>,
++}
++enum Update {
++    Suspend,
++    Invalidate,
++    Publish(Anchor),
++    Context(NativeContext),
++}
++/// Authority has independent counters: observation fences every busy/publication
++/// boundary; generation versions durable observations and explorer continuations.
++/// A complete idle suspend/resume retains generation only with an exact native
++/// context stamp. Neither counter wraps, and terminal failure stays unknown.
++#[derive(Debug)]
++pub struct Authority {
++    writer: Mutex<Publication>,
++    sequence: AtomicU64,
++    generation: AtomicU64,
++    height: AtomicU64,
++    words: [AtomicU64; 4],
++    known: AtomicU64,
++}
++impl Default for Authority {
++    fn default() -> Self {
++        Self {
++            writer: Mutex::new(Publication::default()),
++            sequence: AtomicU64::new(0),
++            generation: AtomicU64::new(0),
++            height: AtomicU64::new(0),
++            words: std::array::from_fn(|_| AtomicU64::new(0)),
++            known: AtomicU64::new(0),
++        }
++    }
++}
++impl Authority {
++    fn terminal(&self) {
++        self.known.store(0, Ordering::SeqCst);
++        self.generation.store(u64::MAX, Ordering::SeqCst);
++        self.sequence.store(u64::MAX, Ordering::SeqCst);
++    }
++    fn update(&self, update: Update) -> Result<u64, String> {
++        let mut publication = match self.writer.lock() {
++            Ok(writer) => writer,
++            Err(_) => {
++                self.terminal();
++                return Err("authority lock poisoned".into());
++            }
++        };
++        let previous = self.sequence.load(Ordering::SeqCst);
++        let Some(next) = previous.checked_add(2).filter(|n| *n < u64::MAX)
++        else {
++            self.terminal();
++            return Err("authority observation exhausted".into());
++        };
++        let generation = self.generation.load(Ordering::SeqCst);
++        let (anchor, advance) = match &update {
++            Update::Suspend => (None, false),
++            Update::Invalidate => (None, true),
++            Update::Publish(anchor) => (Some(*anchor), true),
++            Update::Context(context) => {
++                (Some(context.anchor), publication.context != Some(*context))
++            }
++        };
++        let generation = if advance {
++            let Some(next) =
++                generation.checked_add(1).filter(|n| *n < u64::MAX)
++            else {
++                self.terminal();
++                return Err("authority generation exhausted".into());
++            };
++            next
++        } else {
++            generation
++        };
++        self.sequence.store(previous + 1, Ordering::SeqCst);
++        match update {
++            Update::Context(context) => publication.context = Some(context),
++            Update::Publish(_) => publication.context = None,
++            Update::Suspend | Update::Invalidate => {}
++        }
++        self.known
++            .store(u64::from(anchor.is_some()), Ordering::SeqCst);
++        if let Some(anchor) = anchor {
++            self.height.store(anchor.height, Ordering::SeqCst);
++            for (word, bytes) in
++                self.words.iter().zip(anchor.block_id.chunks_exact(8))
++            {
++                word.store(
++                    u64::from_le_bytes(bytes.try_into().unwrap()),
++                    Ordering::SeqCst,
++                );
++            }
++        }
++        self.generation.store(generation, Ordering::SeqCst);
++        self.sequence.store(next, Ordering::SeqCst);
++        Ok(generation)
++    }
++    /// Durable invalidation or generic publication; every call consumes a new
++    /// generation. Generic publication cannot certify an unchanged native stamp.
++    pub fn publish(&self, anchor: Option<Anchor>) -> Result<u64, String> {
++        self.update(match anchor {
++            Some(a) => Update::Publish(a),
++            None => Update::Invalidate,
++        })
++    }
++    /// Hide authority while native work runs. Even an idle tick changes the
++    /// observation fence, so an in-flight request cannot span this boundary.
++    pub fn suspend(&self) -> Result<u64, String> {
++        self.update(Update::Suspend)
++    }
++    /// Publish only after native reconciliation validated this complete stamp.
++    /// An exact unchanged stamp resumes the same durable snapshot generation.
++    pub fn publish_context(
++        &self,
++        anchor: Anchor,
++        context_generation: u64,
++        chain_revision: u64,
++    ) -> Result<u64, String> {
++        self.update(Update::Context(NativeContext {
++            anchor,
++            context_generation,
++            chain_revision,
++        }))
++    }
++    /// Observe one coherent stamped authority state without acquiring any lock.
++    /// A racing publication returns unknown rather than waiting on its writer.
++    pub fn observe(&self) -> AuthoritativeState {
++        let first = self.sequence.load(Ordering::SeqCst);
++        if first % 2 != 0 {
++            return AuthoritativeState {
++                observation: first,
++                generation: self.generation.load(Ordering::SeqCst),
++                anchor: None,
++            };
++        }
++        let generation = self.generation.load(Ordering::SeqCst);
++        let known = self.known.load(Ordering::SeqCst) != 0;
++        let height = self.height.load(Ordering::SeqCst);
++        let mut block_id = [0; 32];
++        for (bytes, word) in block_id.chunks_exact_mut(8).zip(&self.words) {
++            bytes.copy_from_slice(&word.load(Ordering::SeqCst).to_le_bytes());
++        }
++        let last = self.sequence.load(Ordering::SeqCst);
++        AuthoritativeState {
++            observation: last,
++            generation,
++            anchor: if first == last && known {
++                Some(Anchor { block_id, height })
++            } else {
++                None
++            },
++        }
++    }
++}
++/// Explicitly started HTTP server. Drop requests shutdown and joins its thread.
++#[derive(Debug)]
++pub struct V2Server {
++    address: String,
++    running:
++        Mutex<Option<(oneshot::Sender<()>, JoinHandle<Result<(), String>>)>>,
++}
++impl V2Server {
++    /// The actual numeric bound socket address, including an assigned ephemeral port.
++    pub fn actual_address(&self) -> String {
++        self.address.clone()
++    }
++    /// Gracefully stop and join the server. Repeated stops are harmless.
++    /// The five-second grace deadline is cooperative: it bounds asynchronous
++    /// connection draining, not arbitrary blocking work. V2 HTTP handlers use
++    /// nonblocking DB acquisition and return 503 while the owner is busy.
++    pub fn stop(&self) -> Result<(), String> {
++        let mut running =
++            self.running.lock().map_err(|_| "server lock poisoned")?;
++        if let Some((shutdown, thread)) = running.take() {
++            let _ = shutdown.send(());
++            thread.join().map_err(|_| "V2 server thread panicked")??;
++        }
++        Ok(())
++    }
++}
++impl Drop for V2Server {
++    fn drop(&mut self) {
++        let _ = self.stop();
++    }
++}
++/// Start only on an explicit numeric socket address. There is no default port.
++/// A dedicated runtime thread owns the listener and shares the service's DB.
++pub fn start(
++    db: Arc<Mutex<V2Db>>,
++    authority: Arc<Authority>,
++    service_epoch: [u8; 16],
++    index_error: Arc<AtomicBool>,
++    bind: &str,
++) -> Result<Box<V2Server>, String> {
++    if bind.len() > 128 {
++        return Err("numeric bind bound".into());
++    }
++    let address: SocketAddr = bind
++        .parse()
++        .map_err(|_| "explicit numeric socket required")?;
++    let listener = TcpListener::bind(address).map_err(|e| e.to_string())?;
++    let address = listener
++        .local_addr()
++        .map_err(|e| e.to_string())?
++        .to_string();
++    listener.set_nonblocking(true).map_err(|e| e.to_string())?;
++    let runtime = tokio::runtime::Builder::new_current_thread()
++        .enable_all()
++        .build()
++        .map_err(|e| e.to_string())?;
++    let (shutdown, receive) = oneshot::channel();
++    let thread=std::thread::Builder::new().name("chronik-v2-http".into()).spawn(move||runtime.block_on(async move {
++        let listener=tokio::net::TcpListener::from_std(listener).map_err(|e|e.to_string())?;
++        let state=V2HttpState {db,service_epoch,index_error,node_anchor:Some(Arc::new(move||authority.observe()))};
++        let (graceful,graceful_receive)=oneshot::channel();
++        let server=axum::serve(listener,v2::router(state)).with_graceful_shutdown(async {let _=graceful_receive.await;});
++        let server=std::future::IntoFuture::into_future(server);
++        tokio::pin!(server);
++        tokio::select! {
++            result=&mut server=>result.map_err(|e|e.to_string()),
++            _=receive=>{
++                let _=graceful.send(());
++                match tokio::time::timeout(std::time::Duration::from_secs(5), &mut server).await {
++                    Ok(result)=>result.map_err(|e|e.to_string()),
++                    Err(_)=>Err("V2 HTTP graceful shutdown deadline".into()),
++                }
++            }
++        }
++    })).map_err(|e|e.to_string())?;
++    Ok(Box::new(V2Server {
++        address,
++        running: Mutex::new(Some((shutdown, thread))),
++    }))
++}
++
++#[cfg(test)]
++#[path = "v2tests/authority.rs"]
++mod tests;
+diff --git a/chronik/chronik-lib/src/v2tests/authority.rs b/chronik/chronik-lib/src/v2tests/authority.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..b68eee16e4bcfc1ed75f011d58e8f464a5699454
+--- /dev/null
++++ b/chronik/chronik-lib/src/v2tests/authority.rs
+@@ -0,0 +1,117 @@
++use super::*;
++fn anchor(height: u64) -> Anchor {
++    Anchor {
++        block_id: [(height % 256) as u8; 32],
++        height,
++    }
++}
++#[test]
++fn idle_turns_preserve_durable_generation_and_fence_observations() {
++    let authority = Authority::default();
++    assert_eq!(
++        authority.observe(),
++        AuthoritativeState {
++            observation: 0,
++            generation: 0,
++            anchor: None
++        }
++    );
++    let generation = authority.publish_context(anchor(1), 7, 11).unwrap();
++    let first = authority.observe();
++    for _ in 0..100 {
++        assert_eq!(authority.suspend().unwrap(), generation);
++        let suspended = authority.observe();
++        assert!(suspended.anchor.is_none());
++        assert!(suspended.observation > first.observation);
++        assert_eq!(
++            authority.publish_context(anchor(1), 7, 11).unwrap(),
++            generation
++        );
++        assert_eq!(authority.observe().anchor, Some(anchor(1)));
++    }
++    assert_ne!(authority.observe().observation, first.observation);
++    assert_eq!(authority.observe().generation, first.generation);
++}
++#[test]
++fn context_aba_and_durable_invalidation_never_resurrect_generations() {
++    let authority = Authority::default();
++    let mut previous = authority.publish_context(anchor(1), 7, 11).unwrap();
++    for (a, c, r) in [
++        (anchor(1), 8, 11),
++        (anchor(1), 7, 11),
++        (anchor(1), 7, 12),
++        (anchor(2), 7, 12),
++        (anchor(1), 7, 11),
++    ] {
++        authority.suspend().unwrap();
++        let next = authority.publish_context(a, c, r).unwrap();
++        assert!(next > previous);
++        previous = next;
++    }
++    let invalidated = authority.publish(None).unwrap();
++    assert!(invalidated > previous);
++    assert_eq!(
++        authority.publish_context(anchor(1), 7, 11).unwrap(),
++        invalidated
++    );
++    let generic = authority.publish(Some(anchor(1))).unwrap();
++    assert!(generic > invalidated);
++    assert!(authority.publish_context(anchor(1), 7, 11).unwrap() > generic);
++}
++#[test]
++fn coherent_nonblocking_stamps_and_terminal_overflow() {
++    let authority = Arc::new(Authority::default());
++    let writer = Arc::clone(&authority);
++    let thread = std::thread::spawn(move || {
++        for n in 1..10000u64 {
++            writer.suspend().unwrap();
++            writer.publish_context(anchor(n), n, n).unwrap();
++        }
++    });
++    for _ in 0..20000 {
++        let state = authority.observe();
++        if let Some(a) = state.anchor {
++            assert_eq!(state.observation % 2, 0);
++            assert_eq!(state.generation, a.height);
++            assert_eq!(a.block_id, [(a.height % 256) as u8; 32]);
++        }
++    }
++    thread.join().unwrap();
++    let guard = authority.writer.lock().unwrap();
++    assert!(authority.observe().anchor.is_some());
++    drop(guard);
++    authority.sequence.store(u64::MAX - 1, Ordering::SeqCst);
++    assert!(authority.publish_context(anchor(1), 7, 11).is_err());
++    assert_eq!(
++        authority.observe(),
++        AuthoritativeState {
++            observation: u64::MAX,
++            generation: u64::MAX,
++            anchor: None
++        }
++    );
++    assert!(authority.publish(None).is_err());
++    assert!(authority.suspend().is_err());
++    assert!(authority.observe().anchor.is_none());
++}
++#[test]
++fn durable_exhaustion_and_poison_are_terminal_unknown() {
++    let authority = Authority::default();
++    authority.publish_context(anchor(1), 7, 11).unwrap();
++    authority.generation.store(u64::MAX - 1, Ordering::SeqCst);
++    assert!(authority.publish(None).is_err());
++    assert!(authority.publish_context(anchor(1), 7, 11).is_err());
++    assert!(authority.suspend().is_err());
++    assert!(authority.observe().anchor.is_none());
++    let authority = Arc::new(Authority::default());
++    let writer = Arc::clone(&authority);
++    assert!(std::thread::spawn(move || {
++        let _guard = writer.writer.lock().unwrap();
++        panic!("poison authority writer");
++    })
++    .join()
++    .is_err());
++    assert!(authority.suspend().is_err());
++    assert!(authority.publish_context(anchor(1), 7, 11).is_err());
++    assert!(authority.observe().anchor.is_none());
++}
+diff --git a/chronik/chronik-lib/src/v2tests/tests.rs b/chronik/chronik-lib/src/v2tests/tests.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..6ec3bc583eb3b1e00ca3fa3f5c06a06871aea947
+--- /dev/null
++++ b/chronik/chronik-lib/src/v2tests/tests.rs
+@@ -0,0 +1,526 @@
++use super::*;
++use std::sync::atomic::{AtomicU64, Ordering};
++static NEXT: AtomicU64 = AtomicU64::new(0);
++fn limits() -> f::ServiceLimits {
++    f::ServiceLimits {
++        block_bytes: 1024 * 1024,
++        transactions: 4096,
++        changes: 65536,
++        roots: 256,
++        clauses: 16,
++        page_size: 1,
++        posting_reads: 4096,
++        work: 8192,
++        response_bytes: 4096,
++    }
++}
++fn binding() -> f::Binding {
++    f::Binding {
++        chain_id: [1; 32],
++        genesis: [2; 32],
++        profile: [3; 32],
++    }
++}
++fn tip(id: u8, height: u64) -> f::Anchor {
++    f::Anchor {
++        block_id: [id; 32],
++        height,
++    }
++}
++fn block(
++    id: u8,
++    height: u64,
++    parent: u8,
++    tx: u8,
++    inputs: Vec<f::Input>,
++) -> f::NativeBlock {
++    let output = Output {
++        flags: 0,
++        value: u64::MAX,
++        token_id: Hash32([0; 32]),
++        branches: vec![Hash32([9; 32])],
++        paths: vec![vec![0]],
++    };
++    f::NativeBlock {
++        anchor: tip(id, height),
++        parent: tip(parent, height.saturating_sub(1)),
++        header_wire: header(height, parent),
++        transactions: vec![f::NativeTx {
++            txid: [tx; 32],
++            txhash: [tx + 1; 32],
++            index: 0,
++            inputs: inputs.clone(),
++            full_inputs: full_inputs(&inputs),
++            wire: vec![0],
++            lock: 0,
++            outputs: vec![f::NativeOutput {
++                wire: output.encode().unwrap(),
++            }],
++        }],
++    }
++}
++fn no_cursor() -> f::Continuation {
++    continuation(None)
++}
++fn request(utxos: bool) -> f::BranchRequest {
++    f::BranchRequest {
++        any_branch: vec![f::Root { bytes: [9; 32] }],
++        positions: vec![],
++        utxos,
++        include_burn: false,
++        cursor: no_cursor(),
++    }
++}
++struct Temp(std::path::PathBuf);
++impl Temp {
++    fn new() -> Self {
++        Self(std::env::temp_dir().join(format!(
++            "lotus-v2-service-{}-{}",
++            std::process::id(),
++            NEXT.fetch_add(1, Ordering::Relaxed)
++        )))
++    }
++    fn path(&self) -> &str {
++        self.0.to_str().unwrap()
++    }
++}
++impl Drop for Temp {
++    fn drop(&mut self) {
++        let _ = std::fs::remove_dir_all(&self.0);
++    }
++}
++#[test]
++fn explicit_genesis_complete_spend_disconnect_reopen() {
++    let path = Temp::new();
++    assert!(open_service(path.path(), binding(), false, limits()).is_err());
++    let service = open_service(path.path(), binding(), true, limits()).unwrap();
++    assert!(!service.status(tip(2, 0)).unwrap().initialized);
++    assert!(service.query_branches(request(true)).is_err());
++    assert!(service
++        .initialize_genesis(block(99, 0, 99, 10, vec![]))
++        .is_err());
++    service
++        .initialize_genesis(block(2, 0, 2, 10, vec![]))
++        .unwrap();
++    let page = service.query_branches(request(true)).unwrap();
++    assert_eq!(page.matches.len(), 1);
++    assert_eq!(
++        Output::decode(&page.matches[0].wire).unwrap().value,
++        u64::MAX
++    );
++    assert!(page.encoded_bytes <= 4096);
++    let cursor = page.cursor;
++    assert!(service.status(tip(2, 0)).unwrap().ready);
++    assert!(!service.status(tip(4, 1)).unwrap().ready);
++    let input = f::Input {
++        txid: [10; 32],
++        out_idx: 0,
++        input_index: 3,
++    };
++    service
++        .connect_block(block(4, 1, 2, 12, vec![input]))
++        .unwrap();
++    let mut stale = request(true);
++    stale.cursor = cursor;
++    assert!(service.query_branches(stale).is_err());
++    let history = service.query_branches(request(false)).unwrap();
++    assert_eq!(history.encoded_bytes as usize, encoded_page(&history).len());
++    assert!(history.matches[0].spent);
++    assert_eq!(history.matches[0].input_index, 3);
++    assert_eq!(
++        service.query_branches(request(true)).unwrap().matches[0].txid,
++        [12; 32]
++    );
++    let shared = service.clone_shared();
++    std::thread::spawn(move || {
++        assert!(shared.status(tip(4, 1)).unwrap().ready)
++    })
++    .join()
++    .unwrap();
++    service.disconnect_block(tip(4, 1)).unwrap();
++    assert_eq!(
++        service.query_branches(request(true)).unwrap().matches[0].txid,
++        [10; 32]
++    );
++    drop(service);
++    let service =
++        open_service(path.path(), binding(), false, limits()).unwrap();
++    assert!(service.status(tip(2, 0)).unwrap().ready);
++    drop(service);
++    let mut foreign = binding();
++    foreign.profile = [42; 32];
++    assert!(open_service(path.path(), foreign, false, limits()).is_err());
++    assert!(open_service(path.path(), binding(), true, limits()).is_err());
++}
++#[test]
++fn input_and_response_caps_preserve_checkpoint() {
++    let path = Temp::new();
++    let mut caps = limits();
++    caps.changes = 1;
++    let service = open_service(path.path(), binding(), true, caps).unwrap();
++    service
++        .initialize_genesis(block(2, 0, 2, 10, vec![]))
++        .unwrap();
++    let mut large = block(4, 1, 2, 12, vec![]);
++    large.transactions[0].outputs.push(f::NativeOutput {
++        wire: vec![0; MAX_OUTPUT_BYTES + 1],
++    });
++    assert!(service.connect_block(large).is_err());
++    let mut oversized = block(4, 1, 2, 12, vec![]);
++    oversized.transactions[0].outputs[0].wire = vec![0; MAX_OUTPUT_BYTES + 1];
++    assert!(service.connect_block(oversized).is_err());
++    let mut malformed = block(4, 1, 2, 12, vec![]);
++    malformed.transactions[0].index = 7;
++    assert!(service.connect_block(malformed).is_err());
++    assert!(service.status(tip(2, 0)).unwrap().ready);
++    let mut invalid = request(true);
++    invalid.positions = vec![f::Position {
++        position: 16,
++        roots: vec![f::Root { bytes: [9; 32] }],
++    }];
++    assert!(service.query_branches(invalid).is_err());
++    let mut many = request(true);
++    many.any_branch = (0..257).map(|_| f::Root { bytes: [9; 32] }).collect();
++    assert!(service.query_branches(many).is_err());
++    drop(service);
++    let mut caps = limits();
++    caps.response_bytes = 512;
++    let service = open_service(path.path(), binding(), false, caps).unwrap();
++    assert!(service.query_branches(request(true)).is_err());
++}
++
++// Independent canonical transport encoder: exercise each actual field, rather
++// than duplicating the service's fixed-overhead accounting constants.
++fn encoded_page(page: &f::BranchPage) -> Vec<u8> {
++    fn a(out: &mut Vec<u8>, a: &f::Anchor) {
++        out.extend(a.block_id);
++        out.extend(a.height.to_le_bytes());
++    }
++    fn loc(out: &mut Vec<u8>, l: &f::Location) {
++        a(out, &l.anchor);
++        out.extend(l.tx_index.to_le_bytes());
++        out.extend(l.txid);
++        out.extend(l.txhash);
++    }
++    fn vec(out: &mut Vec<u8>, b: &[u8]) {
++        out.extend((b.len() as u32).to_le_bytes());
++        out.extend(b);
++    }
++    let mut out = Vec::new();
++    a(&mut out, &page.anchor);
++    out.extend(page.chain_id);
++    out.extend(page.profile);
++    out.extend((page.matches.len() as u32).to_le_bytes());
++    for m in &page.matches {
++        out.extend(m.txid);
++        out.extend(m.out_idx.to_le_bytes());
++        vec(&mut out, &m.wire);
++        loc(&mut out, &m.creation);
++        out.push(u8::from(m.spent));
++        loc(&mut out, &m.spend);
++        out.extend(m.input_index.to_le_bytes());
++        vec(&mut out, &m.matching_positions);
++    }
++    let c = &page.cursor;
++    out.push(u8::from(c.present));
++    out.push(c.version);
++    out.extend(c.chain_id);
++    out.extend(c.profile);
++    a(&mut out, &c.anchor);
++    out.extend(c.filter_digest);
++    out.push(u8::from(c.has_last));
++    out.extend(c.last_txid);
++    out.extend(c.last_out_idx.to_le_bytes());
++    out.extend(page.posting_reads.to_le_bytes());
++    out.extend(page.work.to_le_bytes());
++    out.extend(page.encoded_bytes.to_le_bytes());
++    out
++}
++#[test]
++fn exact_transport_response_and_block_boundaries() {
++    let path = Temp::new();
++    let service = open_service(path.path(), binding(), true, limits()).unwrap();
++    let genesis = block(2, 0, 2, 10, vec![]);
++    assert_eq!(genesis.transactions[0].outputs[0].wire.len(), 45);
++    service.initialize_genesis(genesis).unwrap();
++    let page = service.query_branches(request(true)).unwrap();
++    let encoded = encoded_page(&page);
++    assert_eq!(encoded.len(), 618);
++    assert_eq!(page.encoded_bytes as usize, encoded.len());
++    drop(service);
++    for (cap, ok) in [(600, false), (617, false), (618, true), (619, true)] {
++        let mut caps = limits();
++        caps.response_bytes = cap;
++        let service =
++            open_service(path.path(), binding(), false, caps).unwrap();
++        let result = service.query_branches(request(true));
++        assert_eq!(result.is_ok(), ok, "cap {cap}");
++        if let Ok(page) = result {
++            let bytes = encoded_page(&page);
++            assert_eq!(page.encoded_bytes as usize, bytes.len());
++            assert!(bytes.len() <= cap as usize);
++        }
++    }
++    let mut caps = limits();
++    caps.block_bytes = 217;
++    let other = Temp::new();
++    let service = open_service(other.path(), binding(), true, caps).unwrap();
++    let empty = f::NativeBlock {
++        anchor: tip(2, 0),
++        parent: tip(2, 0),
++        transactions: vec![],
++        header_wire: header(0, 2),
++    };
++    assert!(service.initialize_genesis(empty.clone()).is_err());
++    assert!(!service.status(tip(2, 0)).unwrap().initialized);
++    drop(service);
++    let mut caps = limits();
++    caps.block_bytes = 218;
++    let service = open_service(other.path(), binding(), false, caps).unwrap();
++    service.initialize_genesis(empty).unwrap();
++    assert!(service.status(tip(2, 0)).unwrap().ready);
++}
++
++fn http(address: &str, method: &str, path: &str, body: &str) -> String {
++    use std::io::{Read, Write};
++    let mut socket = std::net::TcpStream::connect(address).unwrap();
++    socket
++        .set_read_timeout(Some(std::time::Duration::from_secs(3)))
++        .unwrap();
++    socket
++        .set_write_timeout(Some(std::time::Duration::from_secs(3)))
++        .unwrap();
++    write!(socket,"{method} {path} HTTP/1.1\r\nHost: {address}\r\nConnection: close\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",body.len()).unwrap();
++    let mut response = String::new();
++    socket.read_to_string(&mut response).unwrap();
++    response
++}
++#[test]
++fn explicit_loopback_server_lifecycle_authority_and_reorg() {
++    let path = Temp::new();
++    let service = open_service(path.path(), binding(), true, limits()).unwrap();
++    assert!(start_v2_server(&service, "localhost:0").is_err());
++    assert!(start_v2_server(&service, "").is_err());
++    let server = start_v2_server(&service, "127.0.0.1:0").unwrap();
++    let address = server.actual_address();
++    assert_ne!(address.parse::<std::net::SocketAddr>().unwrap().port(), 0);
++    let body = format!("{{\"any_branch\":[\"{}\"]}}", "09".repeat(32));
++    assert!(http(&address, "GET", "/v2/status", "").starts_with("HTTP/1.1 503"));
++    service
++        .initialize_genesis(block(2, 0, 2, 10, vec![]))
++        .unwrap();
++    assert!(http(&address, "POST", "/v2/branches/utxos", &body)
++        .starts_with("HTTP/1.1 503"));
++    let first = service.publish_authority(tip(2, 0)).unwrap();
++    assert!(http(&address, "GET", "/v2/status", "").contains("\"ready\":true"));
++    let query = http(&address, "POST", "/v2/branches/utxos", &body);
++    assert!(query.starts_with("HTTP/1.1 200"));
++    assert!(query.contains(&"0a".repeat(32)));
++    let unknown = service.invalidate_authority().unwrap();
++    assert!(unknown > first);
++    assert!(http(&address, "POST", "/v2/branches/utxos", &body)
++        .starts_with("HTTP/1.1 503"));
++    let ahead = service.publish_authority(tip(4, 1)).unwrap();
++    assert!(ahead > unknown);
++    assert!(http(&address, "POST", "/v2/branches/utxos", &body)
++        .starts_with("HTTP/1.1 503"));
++    service.connect_block(block(4, 1, 2, 12, vec![])).unwrap();
++    // DB success does not publish authoritative freshness by itself.
++    assert!(http(&address, "POST", "/v2/branches/utxos", &body)
++        .starts_with("HTTP/1.1 503"));
++    let connected = service.publish_authority(tip(4, 1)).unwrap();
++    assert!(connected > ahead);
++    assert!(http(&address, "POST", "/v2/branches/utxos", &body)
++        .starts_with("HTTP/1.1 200"));
++    service.invalidate_authority().unwrap();
++    service.disconnect_block(tip(4, 1)).unwrap();
++    let aba = service.publish_authority(tip(2, 0)).unwrap();
++    assert!(aba > connected);
++    assert!(http(&address, "POST", "/v2/branches/utxos", &body)
++        .starts_with("HTTP/1.1 200"));
++    service.connect_block(block(5, 1, 2, 14, vec![])).unwrap();
++    service.publish_authority(tip(5, 1)).unwrap();
++    assert!(http(&address, "GET", "/v2/status", "").contains("\"ready\":true"));
++    server.stop().unwrap();
++    server.stop().unwrap();
++    assert!(std::net::TcpStream::connect(&address).is_err());
++    let server = start_v2_server(&service, "127.0.0.1:0").unwrap();
++    let address = server.actual_address();
++    drop(server);
++    assert!(std::net::TcpStream::connect(&address).is_err());
++}
++
++#[test]
++fn real_server_busy_database_returns_503_and_stops_with_owner_held() {
++    let path = Temp::new();
++    let service = open_service(path.path(), binding(), true, limits()).unwrap();
++    service
++        .initialize_genesis(block(2, 0, 2, 10, vec![]))
++        .unwrap();
++    service.publish_authority(tip(2, 0)).unwrap();
++    let server = start_v2_server(&service, "127.0.0.1:0").unwrap();
++    let address = server.actual_address();
++    let body = format!("{{\"any_branch\":[\"{}\"]}}", "09".repeat(32));
++    let shared = service.shared_database();
++    let owner = shared.lock().unwrap();
++    let outpoint_path = format!("/v2/utxos/{}/0", "0a".repeat(32));
++    for (method, path, body) in [
++        ("GET", "/v2/status", ""),
++        ("POST", "/v2/branches/utxos", body.as_str()),
++        ("POST", "/v2/branches/outputs", body.as_str()),
++        ("GET", outpoint_path.as_str(), ""),
++    ] {
++        assert!(http(&address, method, path, body).starts_with("HTTP/1.1 503"));
++    }
++    let start = std::time::Instant::now();
++    server.stop().unwrap();
++    assert!(start.elapsed() < std::time::Duration::from_secs(2));
++    assert!(std::net::TcpStream::connect(&address).is_err());
++    // The owner remains held until stop has completed: shutdown must never
++    // depend on the database owner's release.
++    assert_eq!(owner.checkpoint().unwrap(), Some(anchor(&tip(2, 0))));
++    drop(owner);
++}
++
++fn header(height: u64, parent: u8) -> [u8; 134] {
++    let mut h = [0; 134];
++    if height > 0 {
++        h[..32].fill(parent);
++    }
++    h[62..70].copy_from_slice(&height.to_le_bytes());
++    h[54..62].copy_from_slice(&134u64.to_le_bytes());
++    h
++}
++fn full_inputs(inputs: &[f::Input]) -> Vec<f::NativeFullInput> {
++    let mut full = vec![];
++    for i in inputs {
++        while full.len() < i.input_index as usize {
++            full.push(f::NativeFullInput {
++                prev_txid: [0; 32],
++                prev_index: 0,
++                sequence: u32::MAX,
++                flags: 2,
++                path_index: 0,
++                has_coinbase_data: false,
++                coinbase_data: f::WireRange {
++                    offset: 0,
++                    length: 0,
++                },
++                witnesses: vec![],
++            });
++        }
++        full.push(f::NativeFullInput {
++            prev_txid: i.txid,
++            prev_index: i.out_idx,
++            sequence: 0,
++            flags: 1,
++            path_index: 0,
++            has_coinbase_data: false,
++            coinbase_data: f::WireRange {
++                offset: 0,
++                length: 0,
++            },
++            witnesses: vec![f::NativeWitness {
++                script: f::WireRange {
++                    offset: 0,
++                    length: 0,
++                },
++                siblings_table: f::WireRange {
++                    offset: 0,
++                    length: 1,
++                },
++                siblings_count: 0,
++                arguments_table: f::WireRange {
++                    offset: 0,
++                    length: 1,
++                },
++                arguments_count: 0,
++            }],
++        });
++    }
++    full
++}
++
++#[test]
++fn explorer_idle_context_turns_keep_tokens_and_cursors_but_real_changes_stale()
++{
++    fn field(response: &str, key: &str) -> String {
++        let prefix = format!("\"{key}\":\"");
++        response
++            .split_once(&prefix)
++            .unwrap()
++            .1
++            .split('"')
++            .next()
++            .unwrap()
++            .to_owned()
++    }
++    let path = Temp::new();
++    let service = open_service(path.path(), binding(), true, limits()).unwrap();
++    let mut genesis = block(2, 0, 2, 10, vec![]);
++    let duplicate = genesis.transactions[0].outputs[0].clone();
++    genesis.transactions[0].outputs.push(duplicate);
++    service.initialize_genesis(genesis).unwrap();
++    let generation =
++        service.publish_authority_context(tip(2, 0), 7, 11).unwrap();
++    let server = start_v2_server(&service, "127.0.0.1:0").unwrap();
++    let address = server.actual_address();
++    let body = format!(
++        "{{\"any_branch\":[\"{}\"],\"page_size\":\"1\"}}",
++        "09".repeat(32)
++    );
++    let first =
++        http(&address, "POST", "/v2/explorer/v1/branches/outputs", &body);
++    assert!(first.starts_with("HTTP/1.1 200"));
++    let token = field(&first, "snapshot_token");
++    let cursor = field(&first, "next_cursor");
++    let continuation=format!("{{\"any_branch\":[\"{}\"],\"page_size\":\"1\",\"cursor\":\"{cursor}\"}}","09".repeat(32));
++    for _ in 0..30 {
++        assert_eq!(service.suspend_authority().unwrap(), generation);
++        assert!(http(&address, "GET", "/v2/explorer/v1/blocks", "")
++            .starts_with("HTTP/1.1 503"));
++        assert_eq!(
++            service.publish_authority_context(tip(2, 0), 7, 11).unwrap(),
++            generation
++        );
++    }
++    assert!(http(
++        &address,
++        "POST",
++        "/v2/explorer/v1/branches/outputs",
++        &continuation
++    )
++    .starts_with("HTTP/1.1 200"));
++    let wire=format!("/v2/explorer/v1/transactions/by-id/{}/wire?offset=1&length=1&snapshot_token={token}","0a".repeat(32));
++    assert!(http(&address, "GET", &wire, "").starts_with("HTTP/1.1 200"));
++    assert!(
++        service.publish_authority_context(tip(2, 0), 8, 11).unwrap()
++            > generation
++    );
++    assert!(http(
++        &address,
++        "POST",
++        "/v2/explorer/v1/branches/outputs",
++        &continuation
++    )
++    .starts_with("HTTP/1.1 409"));
++    assert!(http(&address, "GET", &wire, "").starts_with("HTTP/1.1 409"));
++    let current = service.publish_authority_context(tip(2, 0), 8, 11).unwrap();
++    let invalidated = service.invalidate_authority().unwrap();
++    assert!(invalidated > current);
++    assert_eq!(
++        service.publish_authority_context(tip(2, 0), 8, 11).unwrap(),
++        invalidated
++    );
++    service.connect_block(block(4, 1, 2, 12, vec![])).unwrap();
++    service.publish_authority_context(tip(4, 1), 9, 12).unwrap();
++    service.disconnect_block(tip(4, 1)).unwrap();
++    assert!(
++        service
++            .publish_authority_context(tip(2, 0), 10, 13)
++            .unwrap()
++            > invalidated
++    );
++    assert!(http(&address, "GET", &wire, "").starts_with("HTTP/1.1 409"));
++    server.stop().unwrap();
++}
+-- 
+2.50.1 (Apple Git-155)
+

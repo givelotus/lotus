@@ -1,0 +1,1712 @@
+From f8c6f5bbc2a36c20c4da3620a8e104c32c2d46e2 Mon Sep 17 00:00:00 2001
+From: Shammah Chancellor <shammah.chancellor@notvalid.com>
+Date: Mon, 19 Oct 2026 00:53:20 -0700
+Subject: [PATCH 2/2] metrics: Prometheus /metrics with lock-free recording
+ (first metrics)
+
+Operators want to scrape the node with Prometheus. -metrics (default
+off) serves /metrics in the Prometheus text format (0.0.4) on the RPC
+listeners. It is an ordinary HTTP handler, so it gets RPC's access
+rules: only -rpcallowip clients (the address resolved through
+-trustedproxy), never -publicbind listeners. It has no authentication,
+as scrapers expect, which is why it is opt-in: an -rpcallowip opened for
+authenticated RPC does not start publishing node state.
+
+Recording must not slow validation or P2P, so it takes no lock, makes
+no allocation and no system call (src/metrics):
+
+- Counters are split into 16 cache-line aligned shards; a thread adds to
+  its own with a relaxed fetch_add and the shards are summed when
+  scraped. Eight threads on one counter cost 2.3 ns per add, against 45
+  ns for a single shared atomic.
+- Event histograms (durations, sizes) go through a bounded single
+  producer ring per recording thread (6 ns per sample). A full ring drops
+  the sample and counts it (lotus_metrics_dropped_samples_total); a drain
+  thread folds the rings into fixed buckets every 50 ms. Rings of exited
+  threads are drained once more and freed.
+- Gauges are single relaxed atomics, set where a value changes.
+- With -metrics off, a recording site is one load and a branch.
+
+Scrapes drain and render on an HTTP worker under the registry's own
+locks, which recording never takes; a rendering is reused for 1 s.
+
+This first set is lotus_p2p_received_bytes_total{type} (recorded at the
+existing per-message-type accounting) and lotus_block_connect_seconds
+(around ConnectBlock). Further metrics follow the design under review
+(mirrored chain/mempool/peer gauges, RPC and HTTP latencies).
+---
+ src/CMakeLists.txt                        |   2 +
+ src/bench/CMakeLists.txt                  |   1 +
+ src/bench/metrics.cpp                     | 186 ++++++++++
+ src/init.cpp                              |  17 +-
+ src/metrics/metrics.cpp                   | 420 ++++++++++++++++++++++
+ src/metrics/metrics.h                     | 325 +++++++++++++++++
+ src/net.cpp                               |   7 +-
+ src/node/metrics.cpp                      | 103 ++++++
+ src/node/metrics.h                        |  53 +++
+ src/test/CMakeLists.txt                   |   1 +
+ src/test/metrics_tests.cpp                | 196 ++++++++++
+ src/validation.cpp                        |   5 +
+ test/functional/interface_http_metrics.py | 162 +++++++++
+ 13 files changed, 1476 insertions(+), 2 deletions(-)
+ create mode 100644 src/bench/metrics.cpp
+ create mode 100644 src/metrics/metrics.cpp
+ create mode 100644 src/metrics/metrics.h
+ create mode 100644 src/node/metrics.cpp
+ create mode 100644 src/node/metrics.h
+ create mode 100644 src/test/metrics_tests.cpp
+ create mode 100755 test/functional/interface_http_metrics.py
+
+diff --git a/src/CMakeLists.txt b/src/CMakeLists.txt
+index e969b3cc35..0fb15bbd7e 100644
+--- a/src/CMakeLists.txt
++++ b/src/CMakeLists.txt
+@@ -403,6 +403,7 @@ add_library(util
+ 	currencyunit.cpp
+ 	interfaces/handler.cpp
+ 	logging.cpp
++	metrics/metrics.cpp
+ 	random.cpp
+ 	randomenv.cpp
+ 	rcu.cpp
+@@ -676,6 +677,7 @@ add_library(server
+ 	node/interfaces.cpp
+ 	node/kernel_notifications.cpp
+ 	node/mempool_persist_args.cpp
++	node/metrics.cpp
+ 	node/miner.cpp
+ 	node/peerman_args.cpp
+ 	node/psbt.cpp
+diff --git a/src/bench/CMakeLists.txt b/src/bench/CMakeLists.txt
+index 0fc18ab145..d348040109 100644
+--- a/src/bench/CMakeLists.txt
++++ b/src/bench/CMakeLists.txt
+@@ -59,6 +59,7 @@ add_executable(bitcoin-bench
+ 	mempool_eviction.cpp
+ 	mempool_stress.cpp
+ 	merkle_root.cpp
++	metrics.cpp
+ 	nanobench.cpp
+ 	pool.cpp
+ 	peer_eviction.cpp
+diff --git a/src/bench/metrics.cpp b/src/bench/metrics.cpp
+new file mode 100644
+index 0000000000..630971abfd
+--- /dev/null
++++ b/src/bench/metrics.cpp
+@@ -0,0 +1,186 @@
++// Copyright (c) 2026 The Lotus developers
++// Distributed under the MIT software license, see the accompanying
++// file COPYING or http://www.opensource.org/licenses/mit-license.php.
++
++#include <bench/bench.h>
++#include <metrics/metrics.h>
++#include <node/metrics.h>
++
++#include <atomic>
++#include <chrono>
++#include <memory>
++#include <thread>
++#include <vector>
++
++// Cost of recording a metric, per record. "Contended" variants run
++// BACKGROUND_THREADS other threads recording into the same metric while
++// the measured thread records, to show cache-line contention.
++
++static constexpr int BACKGROUND_THREADS{7};
++
++/** Runs f in BACKGROUND_THREADS threads until destroyed */
++class Background {
++public:
++    template <typename F> explicit Background(F f) {
++        for (int i = 0; i < BACKGROUND_THREADS; ++i) {
++            m_threads.emplace_back([this, f] {
++                while (!m_stop.load(std::memory_order_relaxed)) {
++                    for (int j = 0; j < 64; ++j) {
++                        f();
++                    }
++                }
++            });
++        }
++    }
++    ~Background() {
++        m_stop = true;
++        for (auto &t : m_threads) {
++            t.join();
++        }
++    }
++
++private:
++    std::atomic<bool> m_stop{false};
++    std::vector<std::thread> m_threads;
++};
++
++static void MetricsSteadyClockNow(benchmark::Bench &bench) {
++    bench.run([&] {
++        ankerl::nanobench::doNotOptimizeAway(std::chrono::steady_clock::now());
++    });
++}
++
++static metrics::Counter &MakeCounter(metrics::Registry &reg) {
++    return reg.Add(std::make_unique<metrics::Counter>(
++        "c_total", "C.",
++        std::vector<metrics::LabelDim>{{"k", {"a", "b", "c", "d"}}}));
++}
++
++static void MetricsCounterAdd(benchmark::Bench &bench) {
++    metrics::Registry reg;
++    auto &c{MakeCounter(reg)};
++    bench.run([&] { c.Add(1, 100); });
++}
++
++static void MetricsCounterAddContended(benchmark::Bench &bench) {
++    metrics::Registry reg;
++    auto &c{MakeCounter(reg)};
++    Background bg{[&] { c.Add(1, 100); }};
++    bench.run([&] { c.Add(1, 100); });
++}
++
++//! Baseline: one shared atomic, as an unsharded counter would be
++static void MetricsSharedAtomicAddContended(benchmark::Bench &bench) {
++    alignas(metrics::CACHE_LINE) std::atomic<uint64_t> shared{0};
++    Background bg{[&] { shared.fetch_add(100, std::memory_order_relaxed); }};
++    bench.run([&] { shared.fetch_add(100, std::memory_order_relaxed); });
++}
++
++static metrics::EventHistogram &MakeHistogram(metrics::Registry &reg) {
++    return reg.Add(std::make_unique<metrics::EventHistogram>(
++        "h_seconds", "H.", std::vector<double>{0.001, 0.01, 0.1, 1, 10}, 1e9,
++        std::vector<metrics::LabelDim>{{"k", {"a", "b"}}}));
++}
++
++// The drain thread polls continuously here so that the rings keep up with
++// a tight loop; in the node it wakes every 50 ms.
++static void MetricsEventRecord(benchmark::Bench &bench) {
++    metrics::Registry reg;
++    auto &h{MakeHistogram(reg)};
++    reg.Start(std::chrono::milliseconds{0});
++    bench.run([&] { h.Record(12345, 1); });
++    reg.Stop();
++}
++
++static void MetricsEventRecordContended(benchmark::Bench &bench) {
++    metrics::Registry reg;
++    auto &h{MakeHistogram(reg)};
++    reg.Start(std::chrono::milliseconds{0});
++    {
++        Background bg{[&] { h.Record(12345, 0); }};
++        bench.run([&] { h.Record(12345, 1); });
++    }
++    reg.Stop();
++}
++
++//! A full ring: the drop path (nothing drains)
++static void MetricsEventRecordDropping(benchmark::Bench &bench) {
++    metrics::Registry reg;
++    auto &h{MakeHistogram(reg)};
++    for (size_t i = 0; i < metrics::EventRing::CAPACITY; ++i) {
++        h.Record(1);
++    }
++    bench.run([&] { h.Record(12345, 1); });
++}
++
++//! Duration measurement as done at a recording site: two clock reads
++static void MetricsEventRecordDuration(benchmark::Bench &bench) {
++    metrics::Registry reg;
++    auto &h{MakeHistogram(reg)};
++    reg.Start(std::chrono::milliseconds{0});
++    bench.run([&] {
++        const auto start{std::chrono::steady_clock::now()};
++        h.RecordDuration(std::chrono::steady_clock::now() - start, 1);
++    });
++    reg.Stop();
++}
++
++//! As above, but drained in batches of 1024 by the measuring thread itself
++//! (the drain work is included). The busy-polling drain thread above takes
++//! the ring's cache lines after nearly every sample; the node's drain
++//! thread, waking every 50 ms, finds large batches instead.
++static void MetricsEventRecordDurationBatched(benchmark::Bench &bench) {
++    metrics::Registry reg;
++    auto &h{MakeHistogram(reg)};
++    size_t n{0};
++    bench.run([&] {
++        const auto start{std::chrono::steady_clock::now()};
++        h.RecordDuration(std::chrono::steady_clock::now() - start, 1);
++        if (++n % 1024 == 0) {
++            reg.Drain();
++        }
++    });
++}
++
++//! Two clock reads, the cost of measuring a duration
++static void MetricsSteadyClockPair(benchmark::Bench &bench) {
++    bench.run([&] {
++        const auto start{std::chrono::steady_clock::now()};
++        ankerl::nanobench::doNotOptimizeAway(std::chrono::steady_clock::now() -
++                                             start);
++    });
++}
++
++//! Disabled metrics at a recording site: one load and a branch
++static void MetricsDisabledSite(benchmark::Bench &bench) {
++    bench.run([&] {
++        if (auto *m{node::GetNodeMetrics()}) {
++            m->p2p_received_bytes.Add(1, 100);
++        }
++    });
++}
++
++//! Rendering the node's registry (all message types, one histogram)
++static void MetricsRenderNode(benchmark::Bench &bench) {
++    node::NodeMetrics m;
++    for (size_t i = 0; i < 50; ++i) {
++        m.p2p_received_bytes.Add(i % 30, 1000);
++        m.block_connect_seconds.Record(i * 1'000'000);
++    }
++    bench.run([&] {
++        ankerl::nanobench::doNotOptimizeAway(m.registry.Render().size());
++    });
++}
++
++BENCHMARK(MetricsSteadyClockNow);
++BENCHMARK(MetricsCounterAdd);
++BENCHMARK(MetricsCounterAddContended);
++BENCHMARK(MetricsSharedAtomicAddContended);
++BENCHMARK(MetricsEventRecord);
++BENCHMARK(MetricsEventRecordContended);
++BENCHMARK(MetricsEventRecordDropping);
++BENCHMARK(MetricsEventRecordDuration);
++BENCHMARK(MetricsEventRecordDurationBatched);
++BENCHMARK(MetricsSteadyClockPair);
++BENCHMARK(MetricsDisabledSite);
++BENCHMARK(MetricsRenderNode);
+diff --git a/src/init.cpp b/src/init.cpp
+index 9ca8ab5a22..de5fe591d6 100644
+--- a/src/init.cpp
++++ b/src/init.cpp
+@@ -33,7 +33,6 @@
+ #include <hash.h>
+ #include <httprpc.h>
+ #include <httpserver.h>
+-#include <net_websocket_dialer.h>
+ #include <index/blockfilterindex.h>
+ #include <index/coinstatsindex.h>
+ #include <index/txindex.h>
+@@ -46,6 +45,7 @@
+ #include <net.h>
+ #include <net_permissions.h>
+ #include <net_processing.h>
++#include <net_websocket_dialer.h>
+ #include <netbase.h>
+ #include <node/blockmanager_args.h>
+ #include <node/blockstorage.h>
+@@ -55,6 +55,7 @@
+ #include <node/context.h>
+ #include <node/kernel_notifications.h>
+ #include <node/mempool_persist_args.h>
++#include <node/metrics.h>
+ #include <node/miner.h>
+ #include <node/peerman_args.h>
+ #include <node/ui_interface.h>
+@@ -269,6 +270,9 @@ void Shutdown(NodeContext &node) {
+     StopREST();
+     StopRPC();
+     StopHTTPServer();
++    // After the HTTP server: no scrape is in progress. Recording continues
++    // harmlessly into the (still allocated) metrics until exit.
++    node::StopNodeMetrics();
+ 
+ #if ENABLE_CHRONIK
+     // Chronik serves its own HTTP and Electrum interfaces, whose handlers reach
+@@ -1628,6 +1632,14 @@ void SetupServerArgs(NodeContext &node) {
+         "(default: 1, but 0 with -p2pwebsockettoken or -publicfallback, since "
+         "they reveal a node to probes)",
+         ArgsManager::ALLOW_ANY, OptionsCategory::RPC);
++    argsman.AddArg(
++        "-metrics",
++        strprintf(
++            "Serve operator metrics in the Prometheus text format at /metrics "
++            "on the RPC listeners, to -rpcallowip clients only and without "
++            "authentication (default: %u)",
++            DEFAULT_METRICS),
++        ArgsManager::ALLOW_ANY, OptionsCategory::RPC);
+     argsman.AddArg(
+         "-publicfallback=<host>:<port>",
+         "On -publicbind listeners, hand every request the node does not "
+@@ -1883,6 +1895,9 @@ static bool AppInitServers(Config &config,
+     if (args.GetBoolArg("-rest", DEFAULT_REST_ENABLE)) {
+         StartREST(&node);
+     }
++    if (args.GetBoolArg("-metrics", DEFAULT_METRICS)) {
++        node::StartNodeMetrics();
++    }
+ 
+     StartHTTPServer();
+     return true;
+diff --git a/src/metrics/metrics.cpp b/src/metrics/metrics.cpp
+new file mode 100644
+index 0000000000..3b25a97c44
+--- /dev/null
++++ b/src/metrics/metrics.cpp
+@@ -0,0 +1,420 @@
++// Copyright (c) 2026 The Lotus developers
++// Distributed under the MIT software license, see the accompanying
++// file COPYING or http://www.opensource.org/licenses/mit-license.php.
++
++#include <metrics/metrics.h>
++
++#include <util/thread.h>
++
++#include <algorithm>
++#include <cassert>
++#include <charconv>
++#include <cmath>
++#include <functional>
++#include <new>
++
++namespace metrics {
++
++namespace {
++    std::atomic<size_t> g_next_shard{0};
++    std::atomic<uint64_t> g_next_registry_uid{1};
++
++    /** Rings of the current thread, one per registry it has recorded into */
++    struct ThreadRings {
++        struct Entry {
++            uint64_t registry_uid;
++            std::shared_ptr<EventRing> ring;
++        };
++        std::vector<Entry> entries;
++        ~ThreadRings() {
++            for (auto &e : entries) {
++                e.ring->m_orphaned.store(true, std::memory_order_release);
++            }
++        }
++    };
++    thread_local ThreadRings t_rings;
++
++    size_t Product(const std::vector<LabelDim> &labels) {
++        size_t n{1};
++        for (const auto &dim : labels) {
++            assert(!dim.values.empty());
++            n *= dim.values.size();
++        }
++        return n;
++    }
++
++    void AppendUInt(std::string &out, uint64_t v) {
++        char buf[24];
++        const auto res{std::to_chars(buf, buf + sizeof(buf), v)};
++        out.append(buf, res.ptr);
++    }
++
++    const char *TypeName(MetricType t) {
++        switch (t) {
++            case MetricType::COUNTER:
++                return "counter";
++            case MetricType::GAUGE:
++                return "gauge";
++            case MetricType::HISTOGRAM:
++                return "histogram";
++        }
++        assert(false);
++    }
++
++    /**
++     * Append `{a="x",b="y"` (without the closing brace) for a series, or
++     * nothing if the metric has no labels. Returns whether a brace was opened.
++     */
++    bool AppendLabels(std::string &out, const Metric &m, size_t series) {
++        const auto &labels{m.Labels()};
++        if (labels.empty()) {
++            return false;
++        }
++        // Row-major: the last dimension varies fastest.
++        std::array<size_t, 8> idx{};
++        assert(labels.size() <= idx.size());
++        for (size_t d = labels.size(); d-- > 0;) {
++            idx[d] = series % labels[d].values.size();
++            series /= labels[d].values.size();
++        }
++        out += '{';
++        for (size_t d = 0; d < labels.size(); ++d) {
++            if (d) {
++                out += ',';
++            }
++            out += labels[d].name;
++            out += "=\"";
++            AppendLabelValue(out, labels[d].values[idx[d]]);
++            out += '"';
++        }
++        return true;
++    }
++} // namespace
++
++size_t ThisThreadShard() noexcept {
++    thread_local const size_t shard{
++        g_next_shard.fetch_add(1, std::memory_order_relaxed) % NUM_SHARDS};
++    return shard;
++}
++
++void AppendLabelValue(std::string &out, std::string_view value) {
++    for (char c : value) {
++        switch (c) {
++            case '\\':
++                out += "\\\\";
++                break;
++            case '"':
++                out += "\\\"";
++                break;
++            case '\n':
++                out += "\\n";
++                break;
++            default:
++                out += c;
++        }
++    }
++}
++
++void AppendHelp(std::string &out, std::string_view help) {
++    for (char c : help) {
++        switch (c) {
++            case '\\':
++                out += "\\\\";
++                break;
++            case '\n':
++                out += "\\n";
++                break;
++            default:
++                out += c;
++        }
++    }
++}
++
++void AppendValue(std::string &out, double value) {
++    if (std::isnan(value)) {
++        out += "NaN";
++    } else if (std::isinf(value)) {
++        out += value > 0 ? "+Inf" : "-Inf";
++    } else {
++        char buf[32];
++        const auto res{std::to_chars(buf, buf + sizeof(buf), value)};
++        out.append(buf, res.ptr);
++    }
++}
++
++Metric::Metric(std::string name, std::string help, std::vector<LabelDim> labels)
++    : m_name{std::move(name)}, m_help{std::move(help)},
++      m_labels{std::move(labels)}, m_num_series{Product(m_labels)} {}
++
++size_t Metric::SeriesIndex(std::span<const size_t> idx) const {
++    assert(idx.size() == m_labels.size());
++    size_t series{0};
++    for (size_t d = 0; d < idx.size(); ++d) {
++        assert(idx[d] < m_labels[d].values.size());
++        series = series * m_labels[d].values.size() + idx[d];
++    }
++    return series;
++}
++
++Counter::Counter(std::string name, std::string help,
++                 std::vector<LabelDim> labels)
++    : Metric{std::move(name), std::move(help), std::move(labels)},
++      m_stride{[&] {
++          constexpr size_t per_line{CACHE_LINE / sizeof(uint64_t)};
++          return (NumSeries() + per_line - 1) / per_line * per_line;
++      }()} {
++    const size_t lines{NUM_SHARDS * m_stride / (CACHE_LINE / sizeof(uint64_t))};
++    m_lines = std::make_unique<Line[]>(lines);
++    static_assert(sizeof(Line) == CACHE_LINE);
++    m_cells = m_lines[0].v.data();
++}
++
++uint64_t Counter::Value(size_t series) const noexcept {
++    uint64_t sum{0};
++    for (size_t shard = 0; shard < NUM_SHARDS; ++shard) {
++        sum +=
++            m_cells[shard * m_stride + series].load(std::memory_order_relaxed);
++    }
++    return sum;
++}
++
++Gauge::Gauge(std::string name, std::string help, std::vector<LabelDim> labels)
++    : Metric{std::move(name), std::move(help), std::move(labels)},
++      m_values{std::make_unique<std::atomic<double>[]>(NumSeries())} {
++    for (size_t i = 0; i < NumSeries(); ++i) {
++        m_values[i].store(0, std::memory_order_relaxed);
++    }
++}
++
++EventHistogram::EventHistogram(std::string name, std::string help,
++                               std::vector<double> bounds, double divisor,
++                               std::vector<LabelDim> labels)
++    : Metric{std::move(name), std::move(help), std::move(labels)},
++      m_bounds{std::move(bounds)}, m_divisor{divisor} {
++    assert(std::is_sorted(m_bounds.begin(), m_bounds.end()));
++    for (double b : m_bounds) {
++        m_raw_bounds.push_back(uint64_t(std::llround(b * m_divisor)));
++    }
++    m_series.resize(NumSeries());
++    for (auto &s : m_series) {
++        s.buckets.assign(m_bounds.size() + 1, 0);
++    }
++}
++
++void EventHistogram::Record(uint64_t value, size_t series) noexcept {
++    assert(m_registry);
++    m_registry->Record(
++        Sample{.histogram = m_id, .series = uint32_t(series), .value = value});
++}
++
++void EventHistogram::Apply(const Sample &s) {
++    if (s.series >= m_series.size()) {
++        return;
++    }
++    Series &series{m_series[s.series]};
++    // Bucket "le" bounds are inclusive: the first bound >= value.
++    const size_t bucket{size_t(
++        std::lower_bound(m_raw_bounds.begin(), m_raw_bounds.end(), s.value) -
++        m_raw_bounds.begin())};
++    ++series.buckets[bucket];
++    ++series.count;
++    series.sum += s.value;
++}
++
++Registry::Registry()
++    : m_uid{g_next_registry_uid.fetch_add(1, std::memory_order_relaxed)} {}
++
++Registry::~Registry() {
++    Stop();
++}
++
++void Registry::AddMetric(std::unique_ptr<Metric> metric) {
++    if (auto *h{dynamic_cast<EventHistogram *>(metric.get())}) {
++        h->m_registry = this;
++        h->m_id = uint32_t(m_histograms.size());
++        m_histograms.push_back(h);
++    }
++    m_metrics.push_back(std::move(metric));
++}
++
++EventRing *Registry::NewThreadRing() {
++    auto ring{std::make_shared<EventRing>()};
++    t_rings.entries.push_back({m_uid, ring});
++    LOCK(m_rings_mutex);
++    m_rings.push_back(ring);
++    return ring.get();
++}
++
++void Registry::Record(const Sample &s) noexcept {
++    EventRing *ring{nullptr};
++    for (const auto &e : t_rings.entries) {
++        if (e.registry_uid == m_uid) {
++            ring = e.ring.get();
++            break;
++        }
++    }
++    if (!ring) {
++        // First sample from this thread: the only allocation, once.
++        try {
++            ring = NewThreadRing();
++        } catch (const std::bad_alloc &) {
++            return;
++        }
++    }
++    ring->Push(s);
++}
++
++void Registry::Drain() {
++    LOCK2(m_data_mutex, m_rings_mutex);
++    const auto apply{[&](const Sample &s) {
++        if (s.histogram < m_histograms.size()) {
++            m_histograms[s.histogram]->Apply(s);
++        }
++    }};
++    for (auto it = m_rings.begin(); it != m_rings.end();) {
++        EventRing &ring{**it};
++        // A ring is orphaned after its thread's last push, so draining
++        // after seeing the flag collects everything.
++        const bool orphaned{ring.m_orphaned.load(std::memory_order_acquire)};
++        ring.Drain(apply);
++        if (orphaned) {
++            m_dropped_retired += ring.Dropped();
++            it = m_rings.erase(it);
++        } else {
++            ++it;
++        }
++    }
++}
++
++uint64_t Registry::DroppedSamples() const {
++    LOCK(m_rings_mutex);
++    uint64_t dropped{m_dropped_retired};
++    for (const auto &ring : m_rings) {
++        dropped += ring->Dropped();
++    }
++    return dropped;
++}
++
++void Registry::Start(std::chrono::milliseconds drain_interval) {
++    assert(!m_thread.joinable());
++    m_interrupt.reset();
++    m_thread =
++        std::thread{&util::TraceThread, "metrics", [this, drain_interval] {
++                        while (m_interrupt.sleep_for(drain_interval)) {
++                            Drain();
++                        }
++                    }};
++}
++
++void Registry::Stop() {
++    if (m_thread.joinable()) {
++        m_interrupt();
++        m_thread.join();
++        Drain();
++    }
++}
++
++std::string Registry::Render(std::chrono::milliseconds min_interval) {
++    LOCK(m_render_mutex);
++    const auto now{std::chrono::steady_clock::now()};
++    if (min_interval.count() > 0 && !m_rendered.empty() &&
++        now - m_rendered_at < min_interval) {
++        return m_rendered;
++    }
++    Drain();
++    std::string out;
++    out.reserve(std::max<size_t>(m_rendered.size() + 1024, 4096));
++    {
++        LOCK(m_data_mutex);
++        for (const auto &metric : m_metrics) {
++            const std::string &name{metric->Name()};
++            out += "# HELP ";
++            out += name;
++            out += ' ';
++            AppendHelp(out, metric->Help());
++            out += "\n# TYPE ";
++            out += name;
++            out += ' ';
++            out += TypeName(metric->Type());
++            out += '\n';
++            for (size_t i = 0; i < metric->NumSeries(); ++i) {
++                switch (metric->Type()) {
++                    case MetricType::COUNTER: {
++                        out += name;
++                        if (AppendLabels(out, *metric, i)) {
++                            out += '}';
++                        }
++                        out += ' ';
++                        AppendUInt(
++                            out,
++                            static_cast<const Counter &>(*metric).Value(i));
++                        out += '\n';
++                        break;
++                    }
++                    case MetricType::GAUGE: {
++                        out += name;
++                        if (AppendLabels(out, *metric, i)) {
++                            out += '}';
++                        }
++                        out += ' ';
++                        AppendValue(
++                            out, static_cast<const Gauge &>(*metric).Value(i));
++                        out += '\n';
++                        break;
++                    }
++                    case MetricType::HISTOGRAM: {
++                        const auto &h{
++                            static_cast<const EventHistogram &>(*metric)};
++                        const auto &s{h.m_series[i]};
++                        uint64_t cumulative{0};
++                        for (size_t b = 0; b <= h.Bounds().size(); ++b) {
++                            cumulative += s.buckets[b];
++                            out += name;
++                            out += "_bucket";
++                            if (AppendLabels(out, h, i)) {
++                                out += ',';
++                            } else {
++                                out += '{';
++                            }
++                            out += "le=\"";
++                            AppendValue(out, b < h.Bounds().size()
++                                                 ? h.Bounds()[b]
++                                                 : INFINITY);
++                            out += "\"} ";
++                            AppendUInt(out, cumulative);
++                            out += '\n';
++                        }
++                        out += name;
++                        out += "_sum";
++                        if (AppendLabels(out, h, i)) {
++                            out += '}';
++                        }
++                        out += ' ';
++                        AppendValue(out, double(s.sum) / h.Divisor());
++                        out += '\n';
++                        out += name;
++                        out += "_count";
++                        if (AppendLabels(out, h, i)) {
++                            out += '}';
++                        }
++                        out += ' ';
++                        AppendUInt(out, s.count);
++                        out += '\n';
++                        break;
++                    }
++                }
++            }
++        }
++    }
++    out += "# HELP lotus_metrics_dropped_samples_total Event samples dropped "
++           "because a recording thread's buffer was full.\n"
++           "# TYPE lotus_metrics_dropped_samples_total counter\n"
++           "lotus_metrics_dropped_samples_total ";
++    AppendUInt(out, DroppedSamples());
++    out += '\n';
++    m_rendered = out;
++    m_rendered_at = now;
++    return out;
++}
++
++} // namespace metrics
+diff --git a/src/metrics/metrics.h b/src/metrics/metrics.h
+new file mode 100644
+index 0000000000..f13a195743
+--- /dev/null
++++ b/src/metrics/metrics.h
+@@ -0,0 +1,325 @@
++// Copyright (c) 2026 The Lotus developers
++// Distributed under the MIT software license, see the accompanying
++// file COPYING or http://www.opensource.org/licenses/mit-license.php.
++
++#ifndef BITCOIN_METRICS_METRICS_H
++#define BITCOIN_METRICS_METRICS_H
++
++#include <sync.h>
++#include <util/threadinterrupt.h>
++
++#include <array>
++#include <atomic>
++#include <chrono>
++#include <cstddef>
++#include <cstdint>
++#include <memory>
++#include <span>
++#include <string>
++#include <string_view>
++#include <thread>
++#include <vector>
++
++/**
++ * Operator metrics, exposed in the Prometheus text format (version 0.0.4).
++ *
++ * Recording never takes a lock, allocates or makes a system call:
++ *
++ * - Counter: monotonically increasing values, one per label combination.
++ *   Each counter is split in shards (cache-line aligned rows of relaxed
++ *   atomics); a thread adds to the shard picked for it at its first use,
++ *   so threads rarely share a cache line. Shards are summed when scraped.
++ * - Gauge: a single relaxed atomic, set where a value already changes
++ *   (it mirrors state otherwise read under a lock).
++ * - EventHistogram: samples (durations, sizes) are pushed into a bounded
++ *   single-producer ring buffer owned by the recording thread; a full ring
++ *   drops the sample and counts the drop. A background thread drains the
++ *   rings into the histograms' buckets.
++ *
++ * See doc/metrics-design.md (METRICS-DESIGN.md) for the rationale.
++ */
++namespace metrics {
++
++//! Apple arm64 cores have 128 byte cache lines; elsewhere 64 is enough
++//! but 128 also avoids adjacent-line prefetch interference.
++inline constexpr size_t CACHE_LINE{128};
++//! Shards of each counter. Threads beyond this share shards.
++inline constexpr size_t NUM_SHARDS{16};
++
++/** Shard of the calling thread (assigned round robin at first use) */
++size_t ThisThreadShard() noexcept;
++
++/** A label dimension: its name and its fixed set of values */
++struct LabelDim {
++    std::string name;
++    std::vector<std::string> values;
++};
++
++enum class MetricType { COUNTER, GAUGE, HISTOGRAM };
++
++class Registry;
++
++/** Base of every metric: name, help and labels */
++class Metric {
++public:
++    Metric(std::string name, std::string help, std::vector<LabelDim> labels);
++    virtual ~Metric() = default;
++    Metric(const Metric &) = delete;
++    Metric &operator=(const Metric &) = delete;
++
++    const std::string &Name() const { return m_name; }
++    const std::string &Help() const { return m_help; }
++    const std::vector<LabelDim> &Labels() const { return m_labels; }
++    //! Number of series (product of the label dimensions' sizes)
++    size_t NumSeries() const { return m_num_series; }
++    virtual MetricType Type() const = 0;
++    /** Series index for one value index per label dimension */
++    size_t SeriesIndex(std::span<const size_t> label_value_indexes) const;
++
++protected:
++    const std::string m_name;
++    const std::string m_help;
++    const std::vector<LabelDim> m_labels;
++    const size_t m_num_series;
++};
++
++/** Sharded monotonically increasing counters */
++class Counter final : public Metric {
++public:
++    Counter(std::string name, std::string help,
++            std::vector<LabelDim> labels = {});
++    MetricType Type() const override { return MetricType::COUNTER; }
++
++    void Add(size_t series, uint64_t n = 1) noexcept {
++        m_cells[ThisThreadShard() * m_stride + series].fetch_add(
++            n, std::memory_order_relaxed);
++    }
++    void Inc() noexcept { Add(0, 1); }
++    /** Sum over the shards (scrape time) */
++    uint64_t Value(size_t series = 0) const noexcept;
++
++private:
++    //! Cells per shard, rounded up to whole cache lines
++    const size_t m_stride;
++    struct alignas(CACHE_LINE) Line {
++        std::array<std::atomic<uint64_t>, CACHE_LINE / sizeof(uint64_t)> v{};
++    };
++    std::unique_ptr<Line[]> m_lines;
++    std::atomic<uint64_t> *m_cells;
++};
++
++/** Values set where they change; read at scrape time */
++class Gauge final : public Metric {
++public:
++    Gauge(std::string name, std::string help,
++          std::vector<LabelDim> labels = {});
++    MetricType Type() const override { return MetricType::GAUGE; }
++
++    void Set(double v, size_t series = 0) noexcept {
++        m_values[series].store(v, std::memory_order_relaxed);
++    }
++    //! For low-rate up/down counts (e.g. connected peers)
++    void Add(double d, size_t series = 0) noexcept {
++        auto &v{m_values[series]};
++        double old{v.load(std::memory_order_relaxed)};
++        while (
++            !v.compare_exchange_weak(old, old + d, std::memory_order_relaxed)) {
++        }
++    }
++    double Value(size_t series = 0) const noexcept {
++        return m_values[series].load(std::memory_order_relaxed);
++    }
++
++private:
++    std::unique_ptr<std::atomic<double>[]> m_values;
++};
++
++/** One sample travelling through an event ring */
++struct Sample {
++    uint32_t histogram;
++    uint32_t series;
++    uint64_t value;
++};
++
++/**
++ * Bounded single-producer single-consumer ring of samples. The producer
++ * (the thread owning it) pushes; the drain thread pops. Push never blocks:
++ * when the ring is full the sample is dropped and counted.
++ */
++class EventRing {
++public:
++    static constexpr size_t CAPACITY{2048};
++    static_assert((CAPACITY & (CAPACITY - 1)) == 0);
++
++    bool Push(const Sample &s) noexcept {
++        const uint64_t head{m_head.load(std::memory_order_relaxed)};
++        if (head - m_cached_tail >= CAPACITY) {
++            m_cached_tail = m_tail.load(std::memory_order_acquire);
++            if (head - m_cached_tail >= CAPACITY) {
++                m_dropped.store(m_dropped.load(std::memory_order_relaxed) + 1,
++                                std::memory_order_relaxed);
++                return false;
++            }
++        }
++        m_buf[head & (CAPACITY - 1)] = s;
++        m_head.store(head + 1, std::memory_order_release);
++        return true;
++    }
++
++    /** Consumer: hand every available sample to f, then release them */
++    template <typename F> size_t Drain(F &&f) {
++        const uint64_t tail{m_tail.load(std::memory_order_relaxed)};
++        const uint64_t head{m_head.load(std::memory_order_acquire)};
++        for (uint64_t i = tail; i != head; ++i) {
++            f(m_buf[i & (CAPACITY - 1)]);
++        }
++        m_tail.store(head, std::memory_order_release);
++        return size_t(head - tail);
++    }
++    bool Empty() const {
++        return m_head.load(std::memory_order_acquire) ==
++               m_tail.load(std::memory_order_relaxed);
++    }
++    uint64_t Dropped() const {
++        return m_dropped.load(std::memory_order_relaxed);
++    }
++
++    //! Set when the owning thread exits; the drain thread then frees the
++    //! ring once it is empty.
++    std::atomic<bool> m_orphaned{false};
++
++private:
++    // Producer-owned line
++    alignas(CACHE_LINE) std::atomic<uint64_t> m_head{0};
++    uint64_t m_cached_tail{0};
++    std::atomic<uint64_t> m_dropped{0};
++    // Consumer-owned line
++    alignas(CACHE_LINE) std::atomic<uint64_t> m_tail{0};
++    alignas(CACHE_LINE) std::array<Sample, CAPACITY> m_buf;
++};
++
++/**
++ * Histogram of event samples with fixed bucket bounds. Values are recorded
++ * as integers in a base unit (e.g. nanoseconds) and rendered divided by
++ * `divisor` (e.g. 1e9 for seconds), as are the bounds.
++ */
++class EventHistogram final : public Metric {
++public:
++    EventHistogram(std::string name, std::string help,
++                   std::vector<double> bounds, double divisor,
++                   std::vector<LabelDim> labels = {});
++    MetricType Type() const override { return MetricType::HISTOGRAM; }
++
++    /** Record a sample (in base units). Lock-free; may drop if saturated. */
++    void Record(uint64_t value, size_t series = 0) noexcept;
++    void RecordDuration(std::chrono::steady_clock::duration d,
++                        size_t series = 0) noexcept {
++        Record(uint64_t(std::max<int64_t>(
++                   0, std::chrono::duration_cast<std::chrono::nanoseconds>(d)
++                          .count())),
++               series);
++    }
++
++    const std::vector<double> &Bounds() const { return m_bounds; }
++    double Divisor() const { return m_divisor; }
++
++    struct Series {
++        //! Non-cumulative count per bucket; the last one is +Inf
++        std::vector<uint64_t> buckets;
++        uint64_t count{0};
++        //! Sum of values in base units
++        uint64_t sum{0};
++    };
++
++private:
++    friend class Registry;
++    //! Set by the registry when added
++    Registry *m_registry{nullptr};
++    uint32_t m_id{0};
++    const std::vector<double> m_bounds;
++    //! Bounds in base units, for the drain thread's bucket search
++    std::vector<uint64_t> m_raw_bounds;
++    const double m_divisor;
++    //! Aggregated by the drain thread, under Registry::m_data_mutex
++    std::vector<Series> m_series;
++    void Apply(const Sample &s);
++};
++
++/**
++ * The set of metrics served at /metrics, the event rings of recording
++ * threads and the drain thread. Metrics are added before recording starts
++ * and live as long as the registry.
++ */
++class Registry {
++public:
++    Registry();
++    ~Registry();
++
++    /** Take ownership of a metric (before Start; not thread-safe) */
++    template <typename T> T &Add(std::unique_ptr<T> metric) {
++        T &ref{*metric};
++        AddMetric(std::move(metric));
++        return ref;
++    }
++
++    /** Push a sample to the calling thread's ring (creating it once) */
++    void Record(const Sample &s) noexcept;
++
++    /** Start the drain thread */
++    void Start(std::chrono::milliseconds drain_interval =
++                   std::chrono::milliseconds{50});
++    /** Stop and join the drain thread (rings are drained once more) */
++    void Stop();
++
++    /** Drain every ring into the histograms now */
++    void Drain() EXCLUSIVE_LOCKS_REQUIRED(!m_data_mutex, !m_rings_mutex);
++
++    /**
++     * Render all metrics in the Prometheus text format. Drains first. If
++     * called again within min_interval, returns the previous rendering.
++     */
++    std::string Render(
++        std::chrono::milliseconds min_interval = std::chrono::milliseconds{0})
++        EXCLUSIVE_LOCKS_REQUIRED(!m_data_mutex, !m_rings_mutex,
++                                 !m_render_mutex);
++
++    /** Samples dropped because a ring was full (all rings, ever) */
++    uint64_t DroppedSamples() const EXCLUSIVE_LOCKS_REQUIRED(!m_rings_mutex);
++
++private:
++    void AddMetric(std::unique_ptr<Metric> metric);
++    EventRing *NewThreadRing() EXCLUSIVE_LOCKS_REQUIRED(!m_rings_mutex);
++
++    //! Distinguishes registries in the threads' ring caches
++    const uint64_t m_uid;
++
++    std::vector<std::unique_ptr<Metric>> m_metrics;
++    std::vector<EventHistogram *> m_histograms;
++    Counter *m_dropped{nullptr};
++
++    mutable Mutex m_rings_mutex;
++    std::vector<std::shared_ptr<EventRing>> m_rings GUARDED_BY(m_rings_mutex);
++    //! Drops of rings already freed
++    uint64_t m_dropped_retired GUARDED_BY(m_rings_mutex){0};
++
++    Mutex m_data_mutex;
++
++    Mutex m_render_mutex;
++    std::string m_rendered GUARDED_BY(m_render_mutex);
++    std::chrono::steady_clock::time_point
++        m_rendered_at GUARDED_BY(m_render_mutex);
++
++    CThreadInterrupt m_interrupt;
++    std::thread m_thread;
++};
++
++/** Escape a label value (backslash, double quote, newline) */
++void AppendLabelValue(std::string &out, std::string_view value);
++/** Escape HELP text (backslash, newline) */
++void AppendHelp(std::string &out, std::string_view help);
++/** Format a sample value as Prometheus expects (incl. +Inf, NaN) */
++void AppendValue(std::string &out, double value);
++
++} // namespace metrics
++
++#endif // BITCOIN_METRICS_METRICS_H
+diff --git a/src/net.cpp b/src/net.cpp
+index c5827c694b..499ab77554 100644
+--- a/src/net.cpp
++++ b/src/net.cpp
+@@ -26,6 +26,7 @@
+ #include <netaddress.h>
+ #include <netbase.h>
+ #include <node/eviction.h>
++#include <node/metrics.h>
+ #include <node/ui_interface.h>
+ #include <protocol.h>
+ #include <random.h>
+@@ -34,8 +35,8 @@
+ #include <util/sock.h>
+ #include <util/strencodings.h>
+ #include <util/thread.h>
+-#include <util/threadnames.h>
+ #include <util/threadinterrupt.h>
++#include <util/threadnames.h>
+ #include <util/trace.h>
+ #include <util/translation.h>
+ 
+@@ -775,6 +776,10 @@ bool CNode::ReceiveMsgBytes(const Config &config, Span<const uint8_t> msg_bytes,
+ 
+             assert(i != mapRecvBytesPerMsgType.end());
+             i->second += msg.m_raw_message_size;
++            if (auto *metrics{node::GetNodeMetrics()}) {
++                metrics->p2p_received_bytes.Add(
++                    node::MetricMsgTypeIndex(i->first), msg.m_raw_message_size);
++            }
+ 
+             // push the message to the process queue,
+             vRecvMsg.push_back(std::move(msg));
+diff --git a/src/node/metrics.cpp b/src/node/metrics.cpp
+new file mode 100644
+index 0000000000..9df39547e7
+--- /dev/null
++++ b/src/node/metrics.cpp
+@@ -0,0 +1,103 @@
++// Copyright (c) 2026 The Lotus developers
++// Distributed under the MIT software license, see the accompanying
++// file COPYING or http://www.opensource.org/licenses/mit-license.php.
++
++#include <node/metrics.h>
++
++#include <httpserver.h>
++#include <logging.h>
++#include <protocol.h>
++#include <rpc/protocol.h>
++
++#include <algorithm>
++#include <memory>
++#include <string>
++#include <vector>
++
++namespace node {
++
++namespace detail {
++    std::atomic<NodeMetrics *> g_node_metrics{nullptr};
++}
++
++namespace {
++    //! Known P2P message types, sorted, then "other" (the last label value)
++    const std::vector<std::string> &MsgTypeLabels() {
++        static const std::vector<std::string> labels{[] {
++            std::vector<std::string> v{getAllNetMessageTypes()};
++            std::sort(v.begin(), v.end());
++            v.push_back("other");
++            return v;
++        }()};
++        return labels;
++    }
++
++    //! Seconds; from an empty regtest block (~0.2 ms) to a large one (minutes)
++    const std::vector<double> BLOCK_CONNECT_BUCKETS{
++        0.0001, 0.00025, 0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05,
++        0.1,    0.25,    0.5,    1,     2.5,    5,     10,   30,    60};
++
++    bool HTTPReqMetrics(Config &, HTTPRequest *req, const std::string &) {
++        NodeMetrics *m{GetNodeMetrics()};
++        if (req->GetRequestMethod() != HTTPRequest::GET &&
++            req->GetRequestMethod() != HTTPRequest::HEAD) {
++            req->WriteHeader("Allow", "GET, HEAD");
++            req->WriteReply(HTTP_BAD_METHOD);
++            return false;
++        }
++        if (!m) {
++            req->WriteReply(HTTP_SERVICE_UNAVAILABLE);
++            return false;
++        }
++        req->WriteHeader("Content-Type",
++                         "text/plain; version=0.0.4; charset=utf-8");
++        req->WriteHeader("Cache-Control", "no-store");
++        req->WriteReply(HTTP_OK,
++                        m->registry.Render(METRICS_MIN_SCRAPE_INTERVAL));
++        return true;
++    }
++} // namespace
++
++size_t MetricMsgTypeIndex(std::string_view msg_type) noexcept {
++    const auto &labels{MsgTypeLabels()};
++    const auto end{labels.end() - 1};
++    const auto it{std::lower_bound(
++        labels.begin(), end, msg_type,
++        [](const std::string &a, std::string_view b) { return a < b; })};
++    if (it != end && *it == msg_type) {
++        return size_t(it - labels.begin());
++    }
++    return labels.size() - 1;
++}
++
++NodeMetrics::NodeMetrics()
++    : p2p_received_bytes{registry.Add(std::make_unique<metrics::Counter>(
++          "lotus_p2p_received_bytes_total",
++          "P2P bytes received (header and payload), by message type.",
++          std::vector<metrics::LabelDim>{{"type", MsgTypeLabels()}}))},
++      block_connect_seconds{
++          registry.Add(std::make_unique<metrics::EventHistogram>(
++              "lotus_block_connect_seconds",
++              "Time to connect a block to the chain tip (ConnectBlock: "
++              "validating it and updating the UTXO view).",
++              BLOCK_CONNECT_BUCKETS, /*divisor=*/1e9))} {}
++
++void StartNodeMetrics() {
++    if (!GetNodeMetrics()) {
++        // Never freed: recording threads may hold the pointer.
++        detail::g_node_metrics.store(new NodeMetrics(),
++                                     std::memory_order_release);
++    }
++    GetNodeMetrics()->registry.Start();
++    RegisterHTTPHandler("/metrics", true, HTTPReqMetrics);
++    LogPrintf("Serving metrics at /metrics on the RPC listeners\n");
++}
++
++void StopNodeMetrics() {
++    UnregisterHTTPHandler("/metrics", true);
++    if (NodeMetrics * m{GetNodeMetrics()}) {
++        m->registry.Stop();
++    }
++}
++
++} // namespace node
+diff --git a/src/node/metrics.h b/src/node/metrics.h
+new file mode 100644
+index 0000000000..763bc6914a
+--- /dev/null
++++ b/src/node/metrics.h
+@@ -0,0 +1,53 @@
++// Copyright (c) 2026 The Lotus developers
++// Distributed under the MIT software license, see the accompanying
++// file COPYING or http://www.opensource.org/licenses/mit-license.php.
++
++#ifndef BITCOIN_NODE_METRICS_H
++#define BITCOIN_NODE_METRICS_H
++
++#include <metrics/metrics.h>
++
++#include <atomic>
++#include <chrono>
++#include <string_view>
++
++//! Serve /metrics (to -rpcallowip clients, without authentication)
++static constexpr bool DEFAULT_METRICS{false};
++//! Repeated scrapes within this interval get the previous rendering
++static constexpr std::chrono::milliseconds METRICS_MIN_SCRAPE_INTERVAL{1000};
++
++namespace node {
++
++/** The node's metrics. Exists only with -metrics (see GetNodeMetrics). */
++struct NodeMetrics {
++    NodeMetrics();
++    metrics::Registry registry;
++    metrics::Counter &p2p_received_bytes;
++    metrics::EventHistogram &block_connect_seconds;
++};
++
++namespace detail {
++    extern std::atomic<NodeMetrics *> g_node_metrics;
++}
++
++/**
++ * The node's metrics, or nullptr when they are off. Recording sites do
++ * `if (auto *m{node::GetNodeMetrics()}) m->...`, so disabled metrics cost
++ * one load and a branch. Once created, the object is never freed (like
++ * the logger), so a pointer obtained here stays valid.
++ */
++inline NodeMetrics *GetNodeMetrics() noexcept {
++    return detail::g_node_metrics.load(std::memory_order_acquire);
++}
++
++/** Create the metrics, start their drain thread and serve /metrics */
++void StartNodeMetrics();
++/** Stop serving /metrics and the drain thread (recording still works) */
++void StopNodeMetrics();
++
++/** Label index of a P2P message type ("other" for unknown types) */
++size_t MetricMsgTypeIndex(std::string_view msg_type) noexcept;
++
++} // namespace node
++
++#endif // BITCOIN_NODE_METRICS_H
+diff --git a/src/test/CMakeLists.txt b/src/test/CMakeLists.txt
+index 70cd2709a9..a3dad50ff1 100644
+--- a/src/test/CMakeLists.txt
++++ b/src/test/CMakeLists.txt
+@@ -192,6 +192,7 @@ add_boost_unit_tests_to_suite(bitcoin test_bitcoin
+ 		logging_tests.cpp
+ 		mempool_tests.cpp
+ 		merkle_tests.cpp
++		metrics_tests.cpp
+ 		merkleblock_tests.cpp
+ 		miner_tests.cpp
+ 		minerfund_tests.cpp
+diff --git a/src/test/metrics_tests.cpp b/src/test/metrics_tests.cpp
+new file mode 100644
+index 0000000000..0c5ceb9380
+--- /dev/null
++++ b/src/test/metrics_tests.cpp
+@@ -0,0 +1,196 @@
++// Copyright (c) 2026 The Lotus developers
++// Distributed under the MIT software license, see the accompanying
++// file COPYING or http://www.opensource.org/licenses/mit-license.php.
++
++#include <metrics/metrics.h>
++#include <node/metrics.h>
++#include <protocol.h>
++
++#include <test/util/setup_common.h>
++
++#include <boost/test/unit_test.hpp>
++
++#include <cmath>
++#include <memory>
++#include <set>
++#include <string>
++#include <thread>
++#include <vector>
++
++using namespace metrics;
++
++BOOST_FIXTURE_TEST_SUITE(metrics_tests, BasicTestingSetup)
++
++BOOST_AUTO_TEST_CASE(escaping) {
++    std::string out;
++    AppendLabelValue(out, "a\\b\"c\nd");
++    BOOST_CHECK_EQUAL(out, R"(a\\b\"c\nd)");
++    out.clear();
++    AppendHelp(out, "a\\b\"c\nd");
++    BOOST_CHECK_EQUAL(out, R"(a\\b"c\nd)");
++    out.clear();
++    AppendValue(out, 0.005);
++    out += ' ';
++    AppendValue(out, 1e21);
++    out += ' ';
++    AppendValue(out, INFINITY);
++    out += ' ';
++    AppendValue(out, -INFINITY);
++    out += ' ';
++    AppendValue(out, NAN);
++    out += ' ';
++    AppendValue(out, 3);
++    BOOST_CHECK_EQUAL(out, "0.005 1e+21 +Inf -Inf NaN 3");
++}
++
++BOOST_AUTO_TEST_CASE(render_exposition_format) {
++    Registry reg;
++    auto &c{reg.Add(std::make_unique<Counter>(
++        "test_bytes_total", "Bytes \\ by \"type\"\nand dir.",
++        std::vector<LabelDim>{{"dir", {"in", "out"}},
++                              {"type", {"a\"b", "c"}}}))};
++    auto &g{reg.Add(std::make_unique<Gauge>("test_height", "Height."))};
++    auto &h{reg.Add(std::make_unique<EventHistogram>(
++        "test_seconds", "Durations.", std::vector<double>{0.001, 0.01, 1}, 1e9,
++        std::vector<LabelDim>{{"method", {"x", "y"}}}))};
++
++    const std::array<size_t, 2> out_c{1, 1};
++    c.Add(c.SeriesIndex(out_c), 7);
++    c.Add(0, 2);
++    c.Add(0);
++    g.Set(42.5);
++    h.Record(1'000'000, 1);     // 0.001s: le="0.001" (inclusive)
++    h.Record(5'000'000, 1);     // 0.005s
++    h.Record(2'000'000'000, 1); // 2s: +Inf
++    h.Record(0, 0);
++
++    const std::string expected{
++        "# HELP test_bytes_total Bytes \\\\ by \"type\"\\nand dir.\n"
++        "# TYPE test_bytes_total counter\n"
++        "test_bytes_total{dir=\"in\",type=\"a\\\"b\"} 3\n"
++        "test_bytes_total{dir=\"in\",type=\"c\"} 0\n"
++        "test_bytes_total{dir=\"out\",type=\"a\\\"b\"} 0\n"
++        "test_bytes_total{dir=\"out\",type=\"c\"} 7\n"
++        "# HELP test_height Height.\n"
++        "# TYPE test_height gauge\n"
++        "test_height 42.5\n"
++        "# HELP test_seconds Durations.\n"
++        "# TYPE test_seconds histogram\n"
++        "test_seconds_bucket{method=\"x\",le=\"0.001\"} 1\n"
++        "test_seconds_bucket{method=\"x\",le=\"0.01\"} 1\n"
++        "test_seconds_bucket{method=\"x\",le=\"1\"} 1\n"
++        "test_seconds_bucket{method=\"x\",le=\"+Inf\"} 1\n"
++        "test_seconds_sum{method=\"x\"} 0\n"
++        "test_seconds_count{method=\"x\"} 1\n"
++        "test_seconds_bucket{method=\"y\",le=\"0.001\"} 1\n"
++        "test_seconds_bucket{method=\"y\",le=\"0.01\"} 2\n"
++        "test_seconds_bucket{method=\"y\",le=\"1\"} 2\n"
++        "test_seconds_bucket{method=\"y\",le=\"+Inf\"} 3\n"
++        "test_seconds_sum{method=\"y\"} 2.006\n"
++        "test_seconds_count{method=\"y\"} 3\n"
++        "# HELP lotus_metrics_dropped_samples_total Event samples dropped "
++        "because a recording thread's buffer was full.\n"
++        "# TYPE lotus_metrics_dropped_samples_total counter\n"
++        "lotus_metrics_dropped_samples_total 0\n"};
++    BOOST_CHECK_EQUAL(reg.Render(), expected);
++}
++
++BOOST_AUTO_TEST_CASE(unlabelled_histogram) {
++    Registry reg;
++    auto &h{reg.Add(std::make_unique<EventHistogram>(
++        "h_bytes", "Sizes.", std::vector<double>{10, 100}, 1))};
++    h.Record(10);
++    h.Record(11);
++    const std::string r{reg.Render()};
++    BOOST_CHECK(r.find("h_bytes_bucket{le=\"10\"} 1\n"
++                       "h_bytes_bucket{le=\"100\"} 2\n"
++                       "h_bytes_bucket{le=\"+Inf\"} 2\n"
++                       "h_bytes_sum 21\n"
++                       "h_bytes_count 2\n") != std::string::npos);
++}
++
++BOOST_AUTO_TEST_CASE(counter_shards_from_many_threads) {
++    Registry reg;
++    auto &c{reg.Add(std::make_unique<Counter>(
++        "c_total", "C.", std::vector<LabelDim>{{"k", {"a", "b", "c"}}}))};
++    auto &h{reg.Add(std::make_unique<EventHistogram>(
++        "e_seconds", "E.", std::vector<double>{1}, 1))};
++    reg.Start(std::chrono::milliseconds{1});
++    constexpr int THREADS{24}, PER_THREAD{20000};
++    std::vector<std::thread> threads;
++    for (int t = 0; t < THREADS; ++t) {
++        threads.emplace_back([&] {
++            for (int i = 0; i < PER_THREAD; ++i) {
++                c.Add(2);
++                if (i % 20 == 0) {
++                    h.Record(0);
++                }
++            }
++        });
++    }
++    for (auto &t : threads) {
++        t.join();
++    }
++    reg.Stop();
++    BOOST_CHECK_EQUAL(c.Value(2), uint64_t{THREADS} * PER_THREAD);
++    BOOST_CHECK_EQUAL(c.Value(0), 0U);
++    // Every sample is either counted or counted as dropped, and the exited
++    // threads' rings were retired.
++    const std::string r{reg.Render()};
++    const uint64_t dropped{reg.DroppedSamples()};
++    const uint64_t total{uint64_t{THREADS} * PER_THREAD / 20};
++    BOOST_CHECK(r.find("e_seconds_count " + std::to_string(total - dropped) +
++                       "\n") != std::string::npos);
++}
++
++BOOST_AUTO_TEST_CASE(ring_drops_when_full) {
++    EventRing ring;
++    for (size_t i = 0; i < EventRing::CAPACITY; ++i) {
++        BOOST_CHECK(ring.Push({0, 0, i}));
++    }
++    BOOST_CHECK(!ring.Push({0, 0, 1}));
++    BOOST_CHECK(!ring.Push({0, 0, 1}));
++    BOOST_CHECK_EQUAL(ring.Dropped(), 2U);
++    uint64_t expect{0};
++    BOOST_CHECK_EQUAL(ring.Drain([&](const Sample &s) {
++        BOOST_CHECK_EQUAL(s.value, expect++);
++    }),
++                      EventRing::CAPACITY);
++    BOOST_CHECK(ring.Empty());
++    BOOST_CHECK(ring.Push({0, 0, 9}));
++
++    // Without a drain thread, a registry's ring fills and drops too.
++    Registry reg;
++    auto &h{reg.Add(std::make_unique<EventHistogram>(
++        "x", "X.", std::vector<double>{1}, 1))};
++    for (size_t i = 0; i < EventRing::CAPACITY + 5; ++i) {
++        h.Record(1);
++    }
++    BOOST_CHECK_EQUAL(reg.DroppedSamples(), 5U);
++    BOOST_CHECK(reg.Render().find("lotus_metrics_dropped_samples_total 5\n") !=
++                std::string::npos);
++}
++
++BOOST_AUTO_TEST_CASE(render_cache) {
++    Registry reg;
++    auto &g{reg.Add(std::make_unique<Gauge>("g", "G."))};
++    g.Set(1);
++    const std::string first{reg.Render(std::chrono::hours{1})};
++    g.Set(2);
++    BOOST_CHECK_EQUAL(reg.Render(std::chrono::hours{1}), first);
++    BOOST_CHECK(reg.Render().find("\ng 2\n") != std::string::npos);
++}
++
++BOOST_AUTO_TEST_CASE(msg_type_index) {
++    const size_t other{node::MetricMsgTypeIndex("no-such-type")};
++    std::set<size_t> seen;
++    for (const std::string &type : getAllNetMessageTypes()) {
++        const size_t i{node::MetricMsgTypeIndex(type)};
++        BOOST_CHECK(i < other);
++        seen.insert(i);
++    }
++    BOOST_CHECK_EQUAL(seen.size(), getAllNetMessageTypes().size());
++    BOOST_CHECK_EQUAL(node::MetricMsgTypeIndex("*other*"), other);
++}
++
++BOOST_AUTO_TEST_SUITE_END()
+diff --git a/src/validation.cpp b/src/validation.cpp
+index 3094944751..5fbb657e8a 100644
+--- a/src/validation.cpp
++++ b/src/validation.cpp
+@@ -32,6 +32,7 @@
+ #include <logging/timer.h>
+ #include <minerfund.h>
+ #include <node/blockstorage.h>
++#include <node/metrics.h>
+ #include <node/utxo_snapshot.h>
+ #include <policy/block/minerfund.h>
+ #include <policy/block/preconsensus.h>
+@@ -2994,6 +2995,10 @@ bool Chainstate::ConnectTip(BlockValidationState &state,
+         bool rv = ConnectBlock(blockConnecting, state, pindexNew, view,
+                                BlockValidationOptions(m_chainman.GetConfig()),
+                                &blockFees);
++        if (auto *metrics{node::GetNodeMetrics()}; metrics && rv) {
++            metrics->block_connect_seconds.RecordDuration(SteadyClock::now() -
++                                                          time_2);
++        }
+         if (m_chainman.m_options.signals) {
+             m_chainman.m_options.signals->BlockChecked(blockConnecting, state);
+         }
+diff --git a/test/functional/interface_http_metrics.py b/test/functional/interface_http_metrics.py
+new file mode 100755
+index 0000000000..62e8382f77
+--- /dev/null
++++ b/test/functional/interface_http_metrics.py
+@@ -0,0 +1,162 @@
++#!/usr/bin/env python3
++# Copyright (c) 2026 The Lotus developers
++# Distributed under the MIT software license, see the accompanying
++# file COPYING or http://www.opensource.org/licenses/mit-license.php.
++"""Test /metrics (-metrics): the Prometheus text format, values that change,
++and access limited to -rpcallowip clients on the RPC listeners."""
++
++import http.client
++import re
++
++from test_framework.test_framework import BitcoinTestFramework
++from test_framework.util import assert_equal, p2p_port, rpc_port
++
++PUBLIC_PORT_INDEX = 41
++NAME = r"[a-zA-Z_:][a-zA-Z0-9_:]*"
++LABEL = r'[a-zA-Z_][a-zA-Z0-9_]*="(?:[^"\\\n]|\\[\\"n])*"'
++SAMPLE = re.compile(
++    rf"^({NAME})(\{{{LABEL}(?:,{LABEL})*\}})? "
++    r"(NaN|[+-]Inf|[-+]?[0-9]+(?:\.[0-9]+)?(?:[eE][-+]?[0-9]+)?)$"
++)
++LABEL_PAIR = re.compile(r'([a-zA-Z_][a-zA-Z0-9_]*)="((?:[^"\\]|\\.)*)"')
++
++
++def parse(text):
++    """Parse and check an exposition; return {(name, labels): value}."""
++    assert text.endswith("\n")
++    types = {}
++    samples = {}
++    for line in text.splitlines():
++        if line.startswith("# HELP "):
++            assert re.match(rf"^# HELP {NAME} .+$", line), line
++            continue
++        if line.startswith("# TYPE "):
++            _, _, name, kind = line.split(" ")
++            assert kind in ("counter", "gauge", "histogram"), line
++            assert name not in types, f"duplicate TYPE {name}"
++            types[name] = kind
++            continue
++        m = SAMPLE.match(line)
++        assert m, f"bad sample line: {line!r}"
++        name, labels, value = m.group(1), m.group(2) or "", m.group(3)
++        family = name
++        if name not in types:
++            for suffix in ("_bucket", "_sum", "_count"):
++                base = name[: -len(suffix)]
++                if name.endswith(suffix) and types.get(base) == "histogram":
++                    family = base
++        assert family in types, f"sample before/without TYPE: {line}"
++        if types[family] == "counter":
++            assert name.endswith("_total"), name
++        key = (name, tuple(LABEL_PAIR.findall(labels)))
++        assert key not in samples, f"duplicate series {line}"
++        samples[key] = float(value)
++    # Histograms: cumulative buckets ending with +Inf == _count
++    for name, kind in types.items():
++        if kind != "histogram":
++            continue
++        series = {}
++        for (n, labels), v in samples.items():
++            if n == name + "_bucket":
++                rest = tuple(p for p in labels if p[0] != "le")
++                le = dict(labels)["le"]
++                series.setdefault(rest, []).append(
++                    (float("inf") if le == "+Inf" else float(le), v))
++        for rest, buckets in series.items():
++            counts = [v for _, v in sorted(buckets)]
++            assert counts == sorted(counts), f"{name} not cumulative"
++            assert sorted(buckets)[-1][0] == float("inf")
++            assert_equal(counts[-1], samples[(name + "_count", rest)])
++            assert (name + "_sum", rest) in samples
++    return samples
++
++
++class HTTPMetricsTest(BitcoinTestFramework):
++    def set_test_params(self):
++        self.num_nodes = 2
++        self.setup_clean_chain = True
++
++    def setup_network(self):
++        self.public_port = p2p_port(PUBLIC_PORT_INDEX)
++        self.extra_args = [
++            [
++                "-metrics",
++                "-trustedproxy=127.0.0.1",
++                f"-publicbind=127.0.0.1:{self.public_port}",
++            ],
++            [],
++        ]
++        self.add_nodes(self.num_nodes, self.extra_args)
++        self.start_nodes()
++
++    def request(self, port, path="/metrics", method="GET", headers=None):
++        conn = http.client.HTTPConnection("127.0.0.1", port, timeout=30)
++        conn.request(method, path, headers=headers or {})
++        res = conn.getresponse()
++        body = res.read().decode()
++        conn.close()
++        return res, body
++
++    def scrape(self):
++        res, body = self.request(rpc_port(0))
++        assert_equal(res.status, 200)
++        assert_equal(
++            res.getheader("Content-Type"),
++            "text/plain; version=0.0.4; charset=utf-8",
++        )
++        return parse(body)
++
++    def run_test(self):
++        self.log.info("The exposition is well formed")
++        samples = self.scrape()
++        # The genesis block was connected at startup.
++        connected = samples[("lotus_block_connect_seconds_count", ())]
++        assert_equal(connected, 1)
++        assert_equal(samples[("lotus_metrics_dropped_samples_total", ())], 0)
++
++        self.log.info("Values change: a peer connects, a block is mined")
++        self.connect_nodes(0, 1)
++        self.generate(self.nodes[0], 2)
++        # Renderings are cached for up to a second.
++        self.wait_until(
++            lambda: self.scrape()[("lotus_block_connect_seconds_count", ())]
++            == connected + 2
++        )
++        samples = self.scrape()
++        assert samples[("lotus_block_connect_seconds_sum", ())] > 0
++        version_bytes = samples[
++            ("lotus_p2p_received_bytes_total", (("type", "version"),))
++        ]
++        assert version_bytes > 0
++        assert ("lotus_p2p_received_bytes_total", (("type", "other"),)) in samples
++
++        self.log.info("HEAD has the headers but no body; POST is refused")
++        res, body = self.request(rpc_port(0), method="HEAD")
++        assert_equal((res.status, body), (200, ""))
++        res, _ = self.request(rpc_port(0), method="POST")
++        assert_equal(res.status, 405)
++
++        self.log.info("A client outside -rpcallowip is refused (resolved "
++                      "through the trusted proxy's X-Forwarded-For)")
++        res, body = self.request(
++            rpc_port(0), headers={"X-Forwarded-For": "203.0.113.5"}
++        )
++        assert_equal(res.status, 403)
++        assert "lotus_" not in body
++        res, _ = self.request(
++            rpc_port(0), headers={"X-Forwarded-For": "127.0.0.1"}
++        )
++        assert_equal(res.status, 200)
++
++        self.log.info("Public listeners never serve metrics")
++        res, body = self.request(self.public_port)
++        assert_equal(res.status, 404)
++        assert "lotus_" not in body
++
++        self.log.info("Without -metrics there is no /metrics")
++        res, _ = self.request(rpc_port(1))
++        assert_equal(res.status, 404)
++
++
++if __name__ == "__main__":
++    HTTPMetricsTest().main()
+-- 
+2.50.1 (Apple Git-155)
+

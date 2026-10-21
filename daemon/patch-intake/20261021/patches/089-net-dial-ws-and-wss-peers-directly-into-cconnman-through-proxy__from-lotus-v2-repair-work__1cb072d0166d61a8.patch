@@ -1,0 +1,1094 @@
+From bcf487bd25565178e8053aceefec9fc1c41efa34 Mon Sep 17 00:00:00 2001
+From: Shammah Chancellor <shammah.chancellor@notvalid.com>
+Date: Sun, 18 Oct 2026 20:19:20 -0700
+Subject: net: dial ws:// and wss:// peers directly into CConnman, through
+ -proxy
+
+Outbound WebSocket peers no longer go through a socketpair bridge or the
+dialer's own I/O thread, and they honour the proxy configuration:
+
+- CConnman::ConnectWebSocketNode opens the TCP connection exactly as for
+  TCP peers: ConnectThroughProxy() with the host name (the proxy resolves
+  it; no local DNS lookup) when -proxy applies, the -onion proxy for
+  .onion hosts, otherwise every resolved address in turn via
+  ConnectDirectly(). A failed proxy never falls back to a direct
+  connection, and -onlynet must include wss (onion for .onion). This
+  replaces the previous refusal of WebSocket dials under -proxy.
+- The dialer hook (net_websocket.cpp) then performs, synchronously on that
+  socket with a 20 s deadline: TLS for wss:// with OpenSSL on the socket
+  (SNI for names), and the RFC 6455 upgrade written by hand (random
+  Sec-WebSocket-Key, Sec-WebSocket-Accept verified, the selected
+  sub-protocol must be one we offered, extensions refused). The result is
+  a WebSocketSock that CNode uses directly; leftover bytes after the 101
+  response are kept.
+- permessage-deflate is no longer offered outbound (node-to-node uses
+  zstd); it remains accepted from inbound generic clients. The default
+  -p2pwebsocketoffer is now "p2p-zstd-v1,p2p-zstd".
+
+p2p_websocket_proxy.py uses a forwarding SOCKS5 proxy: wss:// and ws://
+peers connect through it with the host name in the CONNECT request, a
+dead proxy leaves no direct connection, -onlynet without wss refuses the
+dial, and without a proxy the dial is direct.
+---
+ src/net.cpp                            | 113 +++++-
+ src/net_websocket.cpp                  | 506 +++++++++++++------------
+ src/net_websocket.h                    |  32 +-
+ src/net_websocket_dialer.h             |  16 +-
+ src/net_websocket_sock.cpp             |  11 +-
+ src/net_websocket_sock.h               |   5 +
+ test/functional/p2p_websocket_proxy.py | 148 ++++++--
+ 7 files changed, 514 insertions(+), 317 deletions(-)
+
+diff --git a/src/net.cpp b/src/net.cpp
+index 4438e8186d10c9881c2b10213fc49dbdbf0e52fb..7518025e70bc6113dc3c7c17f188f42d06094889 100644
+--- a/src/net.cpp
++++ b/src/net.cpp
+@@ -1135,25 +1135,48 @@ std::string WebSocketURLForAddress(const CService &addr) {
+     return strprintf("wss://%s%s", addr.ToStringAddrPort(), addr.GetWSSPath());
+ }
+ 
++std::optional<ParsedWebSocketURL> ParseWebSocketURL(std::string_view url) {
++    ParsedWebSocketURL out;
++    if (url.substr(0, 6) == "wss://") {
++        out.tls = true;
++        url.remove_prefix(6);
++    } else if (url.substr(0, 5) == "ws://") {
++        url.remove_prefix(5);
++    } else {
++        return std::nullopt;
++    }
++    const size_t slash{url.find('/')};
++    const std::string authority{url.substr(0, slash)};
++    out.target = slash == std::string_view::npos
++                     ? std::string{P2P_WEBSOCKET_PATH}
++                     : std::string{url.substr(slash)};
++    uint16_t port{static_cast<uint16_t>(out.tls ? 443 : 80)};
++    std::string host;
++    if (authority.empty() || !SplitHostPort(authority, port, host) ||
++        host.empty()) {
++        return std::nullopt;
++    }
++    out.host = host;
++    out.port = port;
++    const bool ipv6{host.find(':') != std::string::npos};
++    out.authority = strprintf(ipv6 ? "[%s]:%u" : "%s:%u", host, port);
++    return out;
++}
++
+ CNode *CConnman::ConnectWebSocketNode(const std::string &url,
+                                       const CAddress *wss_addr,
+                                       bool fCountFailure,
+                                       ConnectionType conn_type) {
+-    // The WebSocket dialer connects directly. Until it can tunnel through
+-    // the configured proxy, refuse rather than leak our address and DNS
+-    // lookups to a connection the user expects to be proxied.
+-    Proxy proxy;
+-    if (HaveNameProxy() || GetProxy(NET_IPV4, proxy) ||
+-        GetProxy(NET_IPV6, proxy)) {
+-        LogPrintf("Not connecting to %s: WebSocket peers cannot be reached "
+-                  "through -proxy yet\n",
+-                  url);
++    const auto parsed{ParseWebSocketURL(url)};
++    if (!parsed) {
++        LogPrintf("Not connecting to %s: invalid WebSocket peer URL\n", url);
+         return nullptr;
+     }
+-    if (!IsReachable(NET_WSS)) {
+-        LogPrintf("Not connecting to %s: network wss is not reachable "
++    const bool onion{parsed->host.ends_with(".onion")};
++    if (!IsReachable(onion ? NET_ONION : NET_WSS)) {
++        LogPrintf("Not connecting to %s: network %s is not reachable "
+                   "(-onlynet)\n",
+-                  url);
++                  url, onion ? "onion" : "wss");
+         return nullptr;
+     }
+     const WebSocketDialer dialer{GetWebSocketDialer()};
+@@ -1164,24 +1187,74 @@ CNode *CConnman::ConnectWebSocketNode(const std::string &url,
+     }
+     LogPrintLevel(BCLog::NET, BCLog::Level::Debug,
+                   "trying WebSocket connection %s\n", url);
+-    std::optional<WebSocketDialResult> dialed{dialer(url)};
+-    if (wss_addr) {
++
++    // Open the TCP connection exactly as for TCP peers: through the proxy
++    // (which resolves the name: no local DNS lookup) when one applies,
++    // never falling back to a direct connection.
++    std::unique_ptr<Sock> sock;
++    bool proxy_failed{false};
++    std::optional<CService> direct;
++    Proxy proxy;
++    if (onion) {
++        if (!GetProxy(NET_ONION, proxy)) {
++            LogPrintf("Not connecting to %s: no -onion proxy\n", url);
++            return nullptr;
++        }
++        sock = ConnectThroughProxy(proxy, parsed->host, parsed->port,
++                                   proxy_failed);
++    } else if (GetNameProxy(proxy)) {
++        sock = ConnectThroughProxy(proxy, parsed->host, parsed->port,
++                                   proxy_failed);
++    } else {
++        // Try each address the name resolves to (e.g. localhost may give
++        // ::1 first while the peer only listens on 127.0.0.1).
++        const std::vector<CService> resolved{
++            Lookup(parsed->host, parsed->port, fNameLookup, 8)};
++        if (resolved.empty()) {
++            LogDebug(BCLog::NET, "Cannot resolve %s\n", parsed->host);
++            return nullptr;
++        }
++        for (const CService &candidate : resolved) {
++            if (!candidate.IsValid()) {
++                continue;
++            }
++            if (GetProxy(candidate.GetNetwork(), proxy)) {
++                sock = ConnectThroughProxy(proxy, candidate.ToStringAddr(),
++                                           candidate.GetPort(), proxy_failed);
++            } else {
++                sock = ConnectDirectly(candidate,
++                                       conn_type == ConnectionType::MANUAL);
++            }
++            if (sock || proxy_failed) {
++                direct = candidate;
++                break;
++            }
++        }
++    }
++    if (wss_addr && !proxy_failed) {
+         addrman.Attempt(*wss_addr, fCountFailure);
+     }
++    if (!sock) {
++        return nullptr;
++    }
++    const CAddress addr_bind{GetBindAddress(*sock)};
++    std::optional<WebSocketDialResult> dialed{
++        dialer(std::move(sock), *parsed, interruptNet)};
+     if (!dialed) {
+         return nullptr;
+     }
+ 
+-    // The peer is known by its NET_WSS address if it came from addrman, or
+-    // by the IP it resolved to for a -addnode/-connect URL.
++    // The peer is known by its NET_WSS address if it came from addrman, by
++    // the address it resolved to, or (through a proxy) only by its URL.
+     const CAddress addrConnect{wss_addr ? *wss_addr
+-                                        : CAddress{dialed->remote, NODE_NONE}};
++                               : direct ? CAddress{*direct, NODE_NONE}
++                                        : CAddress{}};
+     NetPermissionFlags permission_flags = NetPermissionFlags::None;
+     std::vector<NetWhitelistPermissions> whitelist_permissions =
+         conn_type == ConnectionType::MANUAL
+             ? vWhitelistedRangeOutgoing
+             : std::vector<NetWhitelistPermissions>{};
+-    AddWhitelistPermissionFlags(permission_flags, dialed->remote,
++    AddWhitelistPermissionFlags(permission_flags, addrConnect,
+                                 whitelist_permissions);
+ 
+     NodeId id = GetNewNodeId();
+@@ -1194,8 +1267,8 @@ CNode *CConnman::ConnectWebSocketNode(const std::string &url,
+             .Finalize();
+     CNode *pnode = new CNode(
+         id, std::move(dialed->sock), addrConnect,
+-        CalculateKeyedNetGroup(addrConnect), nonce, extra_entropy,
+-        CAddress{dialed->local, NODE_NONE}, wss_addr ? "" : url, conn_type,
++        CalculateKeyedNetGroup(addrConnect), nonce, extra_entropy, addr_bind,
++        wss_addr ? "" : url, conn_type,
+         /* inbound_onion */ false,
+         CNodeOptions{
+             .permission_flags = permission_flags,
+diff --git a/src/net_websocket.cpp b/src/net_websocket.cpp
+index 51396e8164d7b886247a748be9caf14bb7b933ad..cfae1bdf7f2f332e0b99bfa07e99c6a850537a46 100644
+--- a/src/net_websocket.cpp
++++ b/src/net_websocket.cpp
+@@ -5,301 +5,331 @@
+ #include <net_websocket_dialer.h>
+ 
+ #include <clientversion.h>
++#include <crypto/sha1.h>
+ #include <logging.h>
+ #include <net_websocket.h>
+-#include <net_websocket_bridge.h>
++#include <net_websocket_sock.h>
++#include <net_websocket_tls.h>
+ #include <netbase.h>
+-#include <util/fs.h>
++#include <random.h>
++#include <sync.h>
++#include <tls_util.h>
+ #include <util/strencodings.h>
+ #include <util/string.h>
+-#include <util/threadnames.h>
+-
+-#include <boost/asio/co_spawn.hpp>
+-#include <boost/asio/detached.hpp>
+-#include <boost/asio/io_context.hpp>
+-#include <boost/asio/ip/tcp.hpp>
+-#include <boost/asio/ssl.hpp>
+-#include <boost/asio/strand.hpp>
+-#include <boost/asio/use_future.hpp>
+-#include <boost/beast/http.hpp>
+-#include <boost/beast/ssl.hpp>
+-#include <boost/beast/websocket/ssl.hpp>
++#include <util/threadinterrupt.h>
+ 
++#include <openssl/err.h>
+ #include <openssl/ssl.h>
+ 
++#include <algorithm>
++#include <cerrno>
+ #include <chrono>
+-#include <future>
+-#include <thread>
++#include <map>
+ 
+ namespace {
++using Clock = std::chrono::steady_clock;
+ 
+-namespace asio = boost::asio;
+-namespace beast = boost::beast;
+-namespace http = beast::http;
+-namespace ssl = asio::ssl;
+-namespace websocket = beast::websocket;
+-using tcp = asio::ip::tcp;
++//! Total time allowed for the TLS and WebSocket handshakes
++constexpr std::chrono::seconds HANDSHAKE_TIMEOUT{20};
++//! Largest HTTP response head accepted from the server
++constexpr size_t MAX_RESPONSE_HEAD = 16 * 1024;
++//! RFC 6455 GUID for Sec-WebSocket-Accept
++constexpr const char *WEBSOCKET_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
+ 
+-//! Total time allowed for resolving, connecting and both handshakes
+-constexpr std::chrono::seconds DIAL_TIMEOUT{20};
++struct DialerState {
++    tls::SslCtxPtr client_ctx;
++    //! Sec-WebSocket-Protocol value offered ("" offers none)
++    std::string protocols;
++};
+ 
+-std::unique_ptr<asio::io_context> g_dial_io;
+-std::optional<asio::executor_work_guard<asio::io_context::executor_type>>
+-    g_dial_work;
+-std::thread g_dial_thread;
+-std::unique_ptr<ssl::context> g_client_tls;
+-//! Sec-WebSocket-Protocol offered to peers ("" offers nothing)
+-std::string g_offered_protocols;
+-//! Whether to also offer permessage-deflate
+-bool g_offer_deflate{true};
+-} // namespace
++GlobalMutex g_dialer_mutex;
++std::shared_ptr<const DialerState> g_dialer GUARDED_BY(g_dialer_mutex);
+ 
+-std::optional<ParsedWebSocketURL> ParseWebSocketURL(std::string_view url) {
+-    ParsedWebSocketURL out;
+-    if (url.substr(0, 6) == "wss://") {
+-        out.tls = true;
+-        url.remove_prefix(6);
+-    } else if (url.substr(0, 5) == "ws://") {
+-        url.remove_prefix(5);
+-    } else {
+-        return std::nullopt;
+-    }
+-    const size_t slash{url.find('/')};
+-    const std::string authority{url.substr(0, slash)};
+-    out.target = slash == std::string_view::npos ? std::string{P2P_WEBSOCKET_PATH}
+-                                                 : std::string{url.substr(slash)};
+-    uint16_t port{static_cast<uint16_t>(out.tls ? 443 : 80)};
+-    std::string host;
+-    if (authority.empty() || !SplitHostPort(authority, port, host) ||
+-        host.empty()) {
+-        return std::nullopt;
++/** Exposes the descriptor of a connected Sock during the handshake */
++class HandshakeSock final : public Sock {
++public:
++    explicit HandshakeSock(Sock &&sock) : Sock{std::move(sock)} {}
++    SOCKET Fd() const { return m_socket; }
++};
++
++/** Wait for `events` until `deadline`; false on timeout or interrupt */
++bool WaitFor(const Sock &sock, Sock::Event events, Clock::time_point deadline,
++             CThreadInterrupt &interrupt) {
++    while (!interrupt) {
++        const auto now{Clock::now()};
++        if (now >= deadline) {
++            return false;
++        }
++        const auto step{std::min<std::chrono::milliseconds>(
++            std::chrono::duration_cast<std::chrono::milliseconds>(deadline -
++                                                                  now),
++            std::chrono::milliseconds{100})};
++        Sock::Event occurred{0};
++        if (!sock.Wait(step, events, &occurred)) {
++            return false;
++        }
++        if (occurred != 0) {
++            // ERR included: the next operation reports it.
++            return true;
++        }
+     }
+-    out.host = host;
+-    out.port = port;
+-    const bool ipv6{host.find(':') != std::string::npos};
+-    out.authority = strprintf(ipv6 ? "[%s]:%u" : "%s:%u", host, port);
+-    return out;
++    return false;
+ }
+ 
+-// The dialer bridges through a local socketpair (not available on Windows).
+-#ifdef HAVE_P2P_WEBSOCKET_BRIDGE
+-namespace {
+-CService ToCService(const tcp::endpoint &endpoint) {
+-    return LookupNumeric(endpoint.address().to_string(), endpoint.port());
++bool WouldBlock() {
++    return errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR;
++}
++
++bool WriteAll(WebSocketByteLayer &layer, const HandshakeSock &sock,
++              const std::string &data, Clock::time_point deadline,
++              CThreadInterrupt &interrupt) {
++    size_t off{0};
++    while (off < data.size()) {
++        const ssize_t n{layer.Write(
++            sock.Fd(), reinterpret_cast<const uint8_t *>(data.data()) + off,
++            data.size() - off)};
++        if (n > 0) {
++            off += n;
++        } else if (n < 0 && WouldBlock()) {
++            if (!WaitFor(sock, layer.WriteWaitsFor(), deadline, interrupt)) {
++                return false;
++            }
++        } else {
++            return false;
++        }
++    }
++    return true;
+ }
+ 
+-/** WebSocket handshake on a connected stream, then start the bridge */
+-template <typename WS>
+-asio::awaitable<std::optional<WebSocketDialResult>>
+-FinishDial(std::shared_ptr<WS> ws, const ParsedWebSocketURL &url, bool tls,
+-           CService remote, CService local) {
+-    // Offer permessage-deflate as a last resort for servers without zstd.
+-    p2pws::ConfigureP2PWebSocket(*ws, beast::role_type::client,
+-                                 g_offer_deflate);
+-    ws->set_option(websocket::stream_base::decorator(
+-        [protocols = g_offered_protocols](websocket::request_type &req) {
+-            if (!protocols.empty()) {
+-                req.set(http::field::sec_websocket_protocol, protocols);
++/** Read until the end of the HTTP response head: {head, leftover bytes} */
++std::optional<std::pair<std::string, std::vector<uint8_t>>>
++ReadResponseHead(WebSocketByteLayer &layer, const HandshakeSock &sock,
++                 Clock::time_point deadline, CThreadInterrupt &interrupt) {
++    std::string buf;
++    uint8_t chunk[4096];
++    while (true) {
++        if (const size_t end{buf.find("\r\n\r\n")}; end != std::string::npos) {
++            std::vector<uint8_t> rest(buf.begin() + end + 4, buf.end());
++            buf.resize(end);
++            return std::make_pair(std::move(buf), std::move(rest));
++        }
++        if (buf.size() > MAX_RESPONSE_HEAD) {
++            return std::nullopt;
++        }
++        const ssize_t n{layer.Read(sock.Fd(), chunk, sizeof(chunk))};
++        if (n > 0) {
++            buf.append(reinterpret_cast<const char *>(chunk), n);
++        } else if (n < 0 && WouldBlock()) {
++            if (!layer.HasBuffered() &&
++                !WaitFor(sock, Sock::RECV, deadline, interrupt)) {
++                return std::nullopt;
+             }
+-            req.set(http::field::user_agent, FormatFullVersion());
+-        }));
+-    websocket::response_type res;
+-    auto [hec] = co_await ws->async_handshake(
+-        res, url.authority, url.target, asio::as_tuple(asio::use_awaitable));
+-    if (hec) {
+-        LogDebug(BCLog::NET, "WebSocket handshake with %s failed: %s\n",
+-                 url.authority, hec.message());
+-        co_return std::nullopt;
++        } else {
++            return std::nullopt;
++        }
+     }
+-    const bool deflate{res[http::field::sec_websocket_extensions].find(
+-                           "permessage-deflate") != std::string_view::npos};
++}
+ 
+-    const auto pair{p2pws::CreateBridgeSocketPair()};
+-    if (!pair) {
+-        co_return std::nullopt;
++std::string SecWebSocketAccept(const std::string &key) {
++    const std::string input{key + WEBSOCKET_GUID};
++    unsigned char digest[CSHA1::OUTPUT_SIZE];
++    CSHA1()
++        .Write(reinterpret_cast<const unsigned char *>(input.data()),
++               input.size())
++        .Finalize(digest);
++    return EncodeBase64(Span<const unsigned char>{digest, sizeof(digest)});
++}
++
++P2PWebSocketCompression CompressionForProtocol(std::string_view protocol) {
++    if (protocol == P2P_WS_PROTOCOL_ZSTD_DICT) {
++        return P2PWebSocketCompression::ZSTD_DICT;
+     }
+-    WebSocketDialResult result{
+-        .sock = std::make_unique<Sock>(static_cast<SOCKET>(pair->first)),
+-        .info = std::make_shared<WebSocketTransportInfo>(),
+-        .remote = remote,
+-        .local = local,
+-    };
+-    result.info->tls = tls;
+-    result.info->compression = p2pws::CompressionFromSelectedProtocol(
+-        res[http::field::sec_websocket_protocol], deflate);
+-    p2pws::LocalSocket bridge{ws->get_executor()};
+-    boost::system::error_code ec;
+-    bridge.assign(asio::local::stream_protocol{}, pair->second, ec);
+-    if (ec) {
+-        ::close(pair->second);
+-        co_return std::nullopt;
++    if (protocol == P2P_WS_PROTOCOL_ZSTD) {
++        return P2PWebSocketCompression::ZSTD;
+     }
+-    LogDebug(BCLog::NET, "WebSocket P2P connection to %s (%s, %s)\n",
+-             url.authority, tls ? "wss" : "ws",
+-             P2PWebSocketCompressionName(result.info->compression));
+-    asio::co_spawn(
+-        ws->get_executor(),
+-        [](std::shared_ptr<WS> ws, p2pws::LocalSocket bridge,
+-           std::shared_ptr<WebSocketTransportInfo> info)
+-            -> asio::awaitable<void> {
+-            co_await p2pws::RunP2PWebSocketBridge(*ws, std::move(bridge),
+-                                                  std::move(info),
+-                                                  /*is_client=*/true);
+-        }(ws, std::move(bridge), result.info),
+-        asio::detached);
+-    co_return result;
++    return P2PWebSocketCompression::NONE;
+ }
+ 
+-asio::awaitable<std::optional<WebSocketDialResult>>
+-Dial(ParsedWebSocketURL url) {
+-    try {
+-        auto executor{co_await asio::this_coro::executor};
+-        tcp::resolver resolver{executor};
+-        auto [rec, results] = co_await resolver.async_resolve(
+-            url.host, std::to_string(url.port),
+-            asio::as_tuple(asio::use_awaitable));
+-        if (rec) {
+-            LogDebug(BCLog::NET, "Cannot resolve %s: %s\n", url.host,
+-                     rec.message());
+-            co_return std::nullopt;
+-        }
+-        beast::tcp_stream stream{executor};
+-        stream.expires_after(DIAL_TIMEOUT);
+-        auto [cec, endpoint] = co_await stream.async_connect(
+-            results, asio::as_tuple(asio::use_awaitable));
+-        if (cec) {
+-            LogDebug(BCLog::NET, "WebSocket connect to %s failed: %s\n",
+-                     url.authority, cec.message());
+-            co_return std::nullopt;
++bool OfferedProtocol(const std::string &offered, const std::string &selected) {
++    if (selected.empty()) {
++        return true;
++    }
++    for (const std::string &token : util::SplitString(offered, ',')) {
++        if (util::TrimString(token) == selected) {
++            return true;
+         }
+-        boost::system::error_code ignored;
+-        stream.socket().set_option(tcp::no_delay(true), ignored);
+-        const CService remote{ToCService(endpoint)};
+-        const CService local{ToCService(stream.socket().local_endpoint(ignored))};
++    }
++    return false;
++}
+ 
+-        if (!url.tls) {
+-            stream.expires_never();
+-            auto ws{std::make_shared<websocket::stream<beast::tcp_stream>>(
+-                std::move(stream))};
+-            co_return co_await FinishDial(ws, url, false, remote, local);
+-        }
++std::optional<WebSocketDialResult>
++Handshake(const DialerState &state, std::unique_ptr<Sock> &&tcp,
++          const ParsedWebSocketURL &url, CThreadInterrupt &interrupt) {
++    const auto deadline{Clock::now() + HANDSHAKE_TIMEOUT};
++    auto sock{std::make_unique<HandshakeSock>(std::move(*tcp))};
++    tcp.reset();
++    if (!sock->SetNonBlocking()) {
++        return std::nullopt;
++    }
+ 
+-        auto ws{std::make_shared<
+-            websocket::stream<beast::ssl_stream<beast::tcp_stream>>>(
+-            std::move(stream), *g_client_tls)};
+-        auto &tls_stream{ws->next_layer()};
+-        // SNI lets TLS-terminating proxies route by name; not for literals.
+-        boost::system::error_code addr_ec;
+-        asio::ip::make_address(url.host, addr_ec);
+-        if (addr_ec &&
+-            !SSL_set_tlsext_host_name(tls_stream.native_handle(),
+-                                      url.host.c_str())) {
+-            co_return std::nullopt;
++    std::unique_ptr<WebSocketByteLayer> layer;
++    auto info{std::make_shared<WebSocketTransportInfo>()};
++    if (url.tls) {
++        tls::SslPtr ssl{SSL_new(state.client_ctx.get())};
++        if (!ssl || SSL_set_fd(ssl.get(), int(sock->Fd())) != 1) {
++            return std::nullopt;
+         }
+-        auto [hs_ec] = co_await tls_stream.async_handshake(
+-            ssl::stream_base::client, asio::as_tuple(asio::use_awaitable));
+-        if (hs_ec) {
+-            LogDebug(BCLog::NET, "TLS handshake with %s failed: %s\n",
+-                     url.authority, hs_ec.message());
+-            co_return std::nullopt;
++        if (!LookupHost(url.host, /*fAllowLookup=*/false)) {
++            // A name, not an address literal: SNI lets TLS-terminating
++            // proxies route by name.
++            SSL_set_tlsext_host_name(ssl.get(), url.host.c_str());
++        }
++        SSL_set_connect_state(ssl.get());
++        while (true) {
++            ERR_clear_error();
++            const int r{SSL_do_handshake(ssl.get())};
++            if (r == 1) {
++                break;
++            }
++            const int err{SSL_get_error(ssl.get(), r)};
++            if (err != SSL_ERROR_WANT_READ && err != SSL_ERROR_WANT_WRITE) {
++                LogDebug(BCLog::NET, "TLS handshake with %s failed: %s\n",
++                         url.authority, tls::ErrorString());
++                return std::nullopt;
++            }
++            if (!WaitFor(*sock,
++                         err == SSL_ERROR_WANT_READ ? Sock::RECV : Sock::SEND,
++                         deadline, interrupt)) {
++                LogDebug(BCLog::NET, "TLS handshake with %s timed out\n",
++                         url.authority);
++                return std::nullopt;
++            }
+         }
+-        beast::get_lowest_layer(*ws).expires_never();
+-        co_return co_await FinishDial(ws, url, true, remote, local);
+-    } catch (const std::exception &e) {
+-        LogDebug(BCLog::NET, "WebSocket dial to %s failed: %s\n",
+-                 url.authority, e.what());
+-        co_return std::nullopt;
++        X509 *peer{tls::PeerCertificate(ssl.get())};
++        info->peer_cert_fingerprint_hex = tls::CertSha256Hex(peer);
++        X509_free(peer);
++        info->tls = true;
++        layer = std::make_unique<TlsByteLayer>(std::move(ssl));
++    } else {
++        layer = std::make_unique<PlainByteLayer>();
+     }
+-}
+ 
+-std::optional<WebSocketDialResult> DialBlocking(const std::string &url_str) {
+-    const auto url{ParseWebSocketURL(url_str)};
+-    if (!url) {
+-        LogPrintf("Invalid WebSocket peer URL: %s\n", url_str);
++    // RFC 6455 opening handshake.
++    std::vector<unsigned char> nonce(16);
++    GetRandBytes(nonce);
++    const std::string key{EncodeBase64(nonce)};
++    std::string request{strprintf("GET %s HTTP/1.1\r\n"
++                                  "Host: %s\r\n"
++                                  "Upgrade: websocket\r\n"
++                                  "Connection: Upgrade\r\n"
++                                  "Sec-WebSocket-Key: %s\r\n"
++                                  "Sec-WebSocket-Version: 13\r\n"
++                                  "User-Agent: %s\r\n",
++                                  url.target, url.authority, key,
++                                  FormatFullVersion())};
++    if (!state.protocols.empty()) {
++        request += strprintf("Sec-WebSocket-Protocol: %s\r\n", state.protocols);
++    }
++    request += "\r\n";
++    if (!WriteAll(*layer, *sock, request, deadline, interrupt)) {
++        LogDebug(BCLog::NET, "WebSocket upgrade to %s: write failed\n",
++                 url.authority);
+         return std::nullopt;
+     }
+-    auto future{asio::co_spawn(asio::make_strand(*g_dial_io), Dial(*url),
+-                               asio::use_future)};
+-    if (future.wait_for(DIAL_TIMEOUT + std::chrono::seconds{5}) !=
+-        std::future_status::ready) {
+-        // The late result (if any) is dropped, closing its socketpair.
++    auto response{ReadResponseHead(*layer, *sock, deadline, interrupt)};
++    if (!response) {
++        LogDebug(BCLog::NET, "WebSocket upgrade to %s: no response\n",
++                 url.authority);
+         return std::nullopt;
+     }
+-    try {
+-        return future.get();
+-    } catch (const std::exception &) {
++    const auto lines{util::SplitString(response->first, '\n')};
++    if (lines.empty() || !lines[0].starts_with("HTTP/1.1 101")) {
++        LogDebug(BCLog::NET, "WebSocket upgrade to %s refused: %s\n",
++                 url.authority,
++                 lines.empty() ? std::string{} : util::TrimString(lines[0]));
++        return std::nullopt;
++    }
++    std::map<std::string, std::string> headers;
++    for (size_t i = 1; i < lines.size(); ++i) {
++        const auto colon{lines[i].find(':')};
++        if (colon != std::string::npos) {
++            headers[ToLower(util::TrimString(lines[i].substr(0, colon)))] =
++                util::TrimString(lines[i].substr(colon + 1));
++        }
++    }
++    const auto header = [&](const std::string &name) {
++        const auto it{headers.find(name)};
++        return it == headers.end() ? std::string{} : it->second;
++    };
++    const std::string selected{header("sec-websocket-protocol")};
++    if (ToLower(header("upgrade")) != "websocket" ||
++        ToLower(header("connection")).find("upgrade") == std::string::npos ||
++        header("sec-websocket-accept") != SecWebSocketAccept(key) ||
++        !header("sec-websocket-extensions").empty() ||
++        !OfferedProtocol(state.protocols, selected)) {
++        LogDebug(BCLog::NET, "WebSocket upgrade to %s: invalid response\n",
++                 url.authority);
+         return std::nullopt;
+     }
++    info->compression = CompressionForProtocol(selected);
++    LogDebug(BCLog::NET, "WebSocket P2P connection to %s (%s, %s)\n",
++             url.authority, url.tls ? "wss" : "ws",
++             P2PWebSocketCompressionName(info->compression));
++    return WebSocketDialResult{
++        .sock = std::make_unique<WebSocketSock>(
++            std::move(*sock), WebSocketCodec::Role::CLIENT, info,
++            std::move(layer), std::move(response->second)),
++        .info = info,
++    };
+ }
+ } // namespace
+-#endif // HAVE_P2P_WEBSOCKET_BRIDGE
+ 
+ bool StartP2PWebSocketDialer(const std::optional<fs::path> &client_cert,
+                              const std::optional<fs::path> &client_key,
+                              const std::string &offer) {
+-#ifndef HAVE_P2P_WEBSOCKET_BRIDGE
+-    return false;
+-#else
+-    // "p2p-zstd-v1,p2p-zstd,permessage-deflate" by default; "none" offers
+-    // plain binary messages only.
+-    g_offered_protocols.clear();
+-    g_offer_deflate = false;
++    auto state{std::make_shared<DialerState>()};
++    state->client_ctx = tls::NewContext(/*server=*/false);
++    if (!state->client_ctx) {
++        return false;
++    }
++    // Peers commonly use self-signed certificates: TLS protects against
++    // passive observers and lets proxies route by SNI; peers are not
++    // authenticated (as with plain TCP P2P).
++    SSL_CTX_set_verify(state->client_ctx.get(), SSL_VERIFY_NONE, nullptr);
++    if (client_cert && client_key &&
++        !tls::UseCertificateFiles(state->client_ctx.get(), *client_cert,
++                                  *client_key)) {
++        LogPrintf("Not presenting a TLS client certificate to WebSocket "
++                  "peers: %s\n",
++                  tls::ErrorString());
++    }
++    // "p2p-zstd-v1,p2p-zstd" by default; "none" offers plain messages.
+     for (const std::string &token : util::SplitString(offer, ',')) {
+         const std::string t{util::TrimString(token)};
+-        if (t == "permessage-deflate") {
+-            g_offer_deflate = true;
+-        } else if (t == P2P_WS_PROTOCOL_ZSTD_DICT || t == P2P_WS_PROTOCOL_ZSTD) {
+-            g_offered_protocols += (g_offered_protocols.empty() ? "" : ", ") + t;
++        if (t == P2P_WS_PROTOCOL_ZSTD_DICT || t == P2P_WS_PROTOCOL_ZSTD) {
++            state->protocols += (state->protocols.empty() ? "" : ", ") + t;
++        } else if (t == "permessage-deflate") {
++            LogPrintf("-p2pwebsocketoffer: permessage-deflate is only "
++                      "accepted from inbound clients, not offered\n");
+         } else if (t != "none") {
+             LogPrintf("Ignoring unknown -p2pwebsocketoffer entry %s\n", t);
+         }
+     }
+-    auto ctx{std::make_unique<ssl::context>(ssl::context::tls_client)};
+-    ctx->set_options(ssl::context::default_workarounds |
+-                     ssl::context::no_sslv2 | ssl::context::no_sslv3 |
+-                     ssl::context::no_tlsv1 | ssl::context::no_tlsv1_1);
+-    // Peers commonly use self-signed certificates: TLS here protects against
+-    // passive observers and lets proxies route by SNI; peers are not
+-    // authenticated (as with plain TCP P2P).
+-    ctx->set_verify_mode(ssl::verify_none);
+-    if (client_cert && client_key) {
+-        try {
+-            ctx->use_certificate_chain_file(fs::PathToString(*client_cert));
+-            ctx->use_private_key_file(fs::PathToString(*client_key),
+-                                      ssl::context::pem);
+-        } catch (const boost::system::system_error &e) {
+-            LogPrintf("Not presenting a TLS client certificate to WebSocket "
+-                      "peers: %s\n",
+-                      e.what());
++    WITH_LOCK(g_dialer_mutex, g_dialer = state);
++    SetWebSocketDialer([](std::unique_ptr<Sock> &&tcp,
++                          const ParsedWebSocketURL &url,
++                          CThreadInterrupt &interrupt) {
++        const std::shared_ptr<const DialerState> s{
++            WITH_LOCK(g_dialer_mutex, return g_dialer)};
++        if (!s) {
++            return std::optional<WebSocketDialResult>{};
+         }
+-    }
+-    g_client_tls = std::move(ctx);
+-    if (!g_dial_io) {
+-        g_dial_io = std::make_unique<asio::io_context>();
+-    } else {
+-        g_dial_io->restart();
+-    }
+-    g_dial_work.emplace(asio::make_work_guard(*g_dial_io));
+-    g_dial_thread = std::thread([] {
+-        util::ThreadRename("p2pws");
+-        g_dial_io->run();
++        return Handshake(*s, std::move(tcp), url, interrupt);
+     });
+-    SetWebSocketDialer(DialBlocking);
+     return true;
+-#endif
+ }
+ 
+ void StopP2PWebSocketDialer() {
+     SetWebSocketDialer(nullptr);
+-    if (!g_dial_io) {
+-        return;
+-    }
+-    g_dial_work.reset();
+-    // Bridges end once CConnman has closed its sockets; stop regardless.
+-    g_dial_io->stop();
+-    if (g_dial_thread.joinable()) {
+-        g_dial_thread.join();
+-    }
+-    // g_dial_io is kept: destroying it could run pending handlers'
+-    // destructors after the TLS context is gone.
++    WITH_LOCK(g_dialer_mutex, g_dialer.reset());
+ }
+diff --git a/src/net_websocket.h b/src/net_websocket.h
+index e9c8c979e36be8593e085eb0899ce7c2486f9fed..6f0f073aeee18f0aca828c8cd4ba5fbbb8277d68 100644
+--- a/src/net_websocket.h
++++ b/src/net_websocket.h
+@@ -7,6 +7,7 @@
+ 
+ #include <netaddress.h>
+ #include <util/sock.h>
++#include <util/threadinterrupt.h>
+ 
+ #include <atomic>
+ #include <cstdint>
+@@ -81,22 +82,35 @@ struct WebSocketTransportTotals {
+ };
+ WebSocketTransportTotals &GetWebSocketTransportTotals();
+ 
+-/** An established outbound P2P WebSocket, bridged to a socketpair */
++/** A ws:// or wss:// P2P peer URL */
++struct ParsedWebSocketURL {
++    bool tls{false};
++    std::string host;
++    uint16_t port{0};
++    //! Value of the Host header: host:port, with [] around IPv6 literals
++    std::string authority;
++    //! Request target, "/p2p/ws" if the URL has no path
++    std::string target;
++};
++
++/** Parse ws://host[:port][/path] (default port 80) or wss:// (443) */
++std::optional<ParsedWebSocketURL> ParseWebSocketURL(std::string_view url);
++
++/** An established outbound P2P WebSocket */
+ struct WebSocketDialResult {
+-    //! CConnman's end of the socketpair
++    //! A WebSocketSock on the connection, for CNode
+     std::unique_ptr<Sock> sock;
+     std::shared_ptr<WebSocketTransportInfo> info;
+-    //! TCP endpoints of the WebSocket connection
+-    CService remote;
+-    CService local;
+ };
+ 
+ /**
+- * Opens a ws:// or wss:// P2P connection and starts bridging it. Blocking,
+- * with an internal timeout. Provided by the node (net_websocket.cpp).
++ * Turns a connected TCP socket (direct or through a proxy) into a P2P
++ * WebSocket: TLS for wss:// and the WebSocket upgrade, blocking with an
++ * internal timeout. Provided by the node (net_websocket.cpp).
+  */
+-using WebSocketDialer =
+-    std::function<std::optional<WebSocketDialResult>(const std::string &url)>;
++using WebSocketDialer = std::function<std::optional<WebSocketDialResult>(
++    std::unique_ptr<Sock> &&tcp, const ParsedWebSocketURL &url,
++    CThreadInterrupt &interrupt)>;
+ void SetWebSocketDialer(WebSocketDialer dialer);
+ WebSocketDialer GetWebSocketDialer();
+ 
+diff --git a/src/net_websocket_dialer.h b/src/net_websocket_dialer.h
+index 79df4d7ac1075423ebb72a0c8d5ab3c8c1cd220d..96e90868aa5cd855164cd15b12ec942dc3135a48 100644
+--- a/src/net_websocket_dialer.h
++++ b/src/net_websocket_dialer.h
+@@ -12,23 +12,11 @@
+ #include <string>
+ #include <string_view>
+ 
+-/** A ws:// or wss:// P2P peer URL */
+-struct ParsedWebSocketURL {
+-    bool tls{false};
+-    std::string host;
+-    uint16_t port{0};
+-    //! Value of the Host header: host:port, with [] around IPv6 literals
+-    std::string authority;
+-    //! Request target, "/p2p/ws" if the URL has no path
+-    std::string target;
+-};
+-
+-/** Parse ws://host[:port][/path] (default port 80) or wss:// (443) */
+-std::optional<ParsedWebSocketURL> ParseWebSocketURL(std::string_view url);
++#include <net_websocket.h>
+ 
+ //! What outbound P2P WebSockets offer, in order of preference
+ static const char *const DEFAULT_P2P_WEBSOCKET_OFFER =
+-    "p2p-zstd-v1,p2p-zstd,permessage-deflate";
++    "p2p-zstd-v1,p2p-zstd";
+ 
+ /**
+  * Start the outbound P2P WebSocket dialer (its own I/O thread) and register
+diff --git a/src/net_websocket_sock.cpp b/src/net_websocket_sock.cpp
+index 44a107f0d1dc1cfc2f130fe3b2db5b6deecb9df0..436206dd0e33df76ddb9b6809ee3ab18b49d8d57 100644
+--- a/src/net_websocket_sock.cpp
++++ b/src/net_websocket_sock.cpp
+@@ -48,8 +48,15 @@ WebSocketSock::WebSocketSock(SOCKET fd, WebSocketCodec::Role role,
+                              std::shared_ptr<WebSocketTransportInfo> info,
+                              std::unique_ptr<WebSocketByteLayer> layer,
+                              std::vector<uint8_t> initial_wire_bytes)
+-    : Sock{fd}, m_info{std::move(info)}, m_layer{std::move(layer)},
+-      m_codec{role, m_info->compression},
++    : WebSocketSock(Sock{fd}, role, std::move(info), std::move(layer),
++                    std::move(initial_wire_bytes)) {}
++
++WebSocketSock::WebSocketSock(Sock &&sock, WebSocketCodec::Role role,
++                             std::shared_ptr<WebSocketTransportInfo> info,
++                             std::unique_ptr<WebSocketByteLayer> layer,
++                             std::vector<uint8_t> initial_wire_bytes)
++    : Sock{std::move(sock)}, m_info{std::move(info)},
++      m_layer{std::move(layer)}, m_codec{role, m_info->compression},
+       m_rx_wire{std::move(initial_wire_bytes)} {
+     // Never block a CConnman thread: MSG_DONTWAIT may be unavailable (it is
+     // then defined as 0 by compat.h), so make the socket itself
+diff --git a/src/net_websocket_sock.h b/src/net_websocket_sock.h
+index 6dcb2cea5f8f86264ad57a4c9a67f2f5a144a145..157b00926b6267792fdb47e2723aef42bde9fca6 100644
+--- a/src/net_websocket_sock.h
++++ b/src/net_websocket_sock.h
+@@ -64,6 +64,11 @@ public:
+                   std::shared_ptr<WebSocketTransportInfo> info,
+                   std::unique_ptr<WebSocketByteLayer> layer,
+                   std::vector<uint8_t> initial_wire_bytes = {});
++    /** Take over the descriptor of `sock` */
++    WebSocketSock(Sock &&sock, WebSocketCodec::Role role,
++                  std::shared_ptr<WebSocketTransportInfo> info,
++                  std::unique_ptr<WebSocketByteLayer> layer,
++                  std::vector<uint8_t> initial_wire_bytes = {});
+     ~WebSocketSock() override;
+ 
+     ssize_t Send(const void *data, size_t len, int flags) const override;
+diff --git a/test/functional/p2p_websocket_proxy.py b/test/functional/p2p_websocket_proxy.py
+index a13527dffb9be455e9062f07f51b122543a737cc..df5f06b40ed727fe87c28add751c7950a26879af 100644
+--- a/test/functional/p2p_websocket_proxy.py
++++ b/test/functional/p2p_websocket_proxy.py
+@@ -2,11 +2,17 @@
+ # Copyright (c) 2026 The Bitcoin developers
+ # Distributed under the MIT software license, see the accompanying
+ # file COPYING or http://www.opensource.org/licenses/mit-license.php.
+-"""Test that ws:// and wss:// P2P dials never bypass -proxy or -onlynet."""
++"""Test that ws:// and wss:// P2P dials go through -proxy and never bypass it.
+ 
++A small forwarding SOCKS5 proxy records each CONNECT request: the node must
++hand it the host *name* (so the proxy resolves it, no local DNS lookup) and
++must not fall back to a direct connection when the proxy is gone.
++"""
++
++import socket
++import threading
+ import time
+ 
+-from test_framework.socks5 import Socks5Configuration, Socks5Server
+ from test_framework.test_framework import BitcoinTestFramework
+ from test_framework.util import assert_equal, p2p_port
+ 
+@@ -14,6 +20,77 @@ PUBLIC_PORT_INDEX = 40
+ PROXY_PORT_INDEX = 41
+ 
+ 
++class ForwardingSocks5Proxy:
++    """Minimal SOCKS5 (no auth, CONNECT) that forwards traffic."""
++
++    def __init__(self, port):
++        self.requests = []  # (atyp, addr, port)
++        self.lock = threading.Lock()
++        self.server = socket.create_server(("127.0.0.1", port))
++        self.running = True
++        threading.Thread(target=self.accept_loop, daemon=True).start()
++
++    def accept_loop(self):
++        while self.running:
++            try:
++                conn, _ = self.server.accept()
++            except OSError:
++                return
++            threading.Thread(target=self.handle, args=(conn,), daemon=True).start()
++
++    @staticmethod
++    def recvall(conn, n):
++        data = b""
++        while len(data) < n:
++            chunk = conn.recv(n - len(data))
++            if not chunk:
++                raise ConnectionError("closed")
++            data += chunk
++        return data
++
++    def handle(self, conn):
++        try:
++            ver, nmethods = self.recvall(conn, 2)
++            self.recvall(conn, nmethods)
++            conn.sendall(b"\x05\x00")
++            ver, cmd, _, atyp = self.recvall(conn, 4)
++            if atyp == 3:
++                addr = self.recvall(conn, self.recvall(conn, 1)[0]).decode()
++            elif atyp == 1:
++                addr = socket.inet_ntoa(self.recvall(conn, 4))
++            else:
++                addr = socket.inet_ntop(socket.AF_INET6, self.recvall(conn, 16))
++            port = int.from_bytes(self.recvall(conn, 2), "big")
++            with self.lock:
++                self.requests.append((atyp, addr, port))
++            target = socket.create_connection(
++                ("127.0.0.1" if addr == "localhost" else addr, port)
++            )
++            conn.sendall(b"\x05\x00\x00\x01\x00\x00\x00\x00\x00\x00")
++        except Exception:
++            conn.close()
++            return
++
++        def pump(src, dst):
++            try:
++                while data := src.recv(65536):
++                    dst.sendall(data)
++            except OSError:
++                pass
++            for s in (src, dst):
++                try:
++                    s.shutdown(socket.SHUT_RDWR)
++                except OSError:
++                    pass
++
++        threading.Thread(target=pump, args=(conn, target), daemon=True).start()
++        threading.Thread(target=pump, args=(target, conn), daemon=True).start()
++
++    def stop(self):
++        self.running = False
++        self.server.close()
++
++
+ class P2PWebSocketProxyTest(BitcoinTestFramework):
+     def set_test_params(self):
+         self.num_nodes = 2
+@@ -21,14 +98,11 @@ class P2PWebSocketProxyTest(BitcoinTestFramework):
+ 
+     def setup_network(self):
+         self.public_port = p2p_port(PUBLIC_PORT_INDEX)
+-        conf = Socks5Configuration()
+-        conf.addr = ("127.0.0.1", p2p_port(PROXY_PORT_INDEX))
+-        conf.unauth = True
+-        self.socks = Socks5Server(conf)
+-        self.socks.start()
++        self.proxy_port = p2p_port(PROXY_PORT_INDEX)
++        self.proxy = ForwardingSocks5Proxy(self.proxy_port)
+         self.extra_args = [
+             [f"-publicbind=127.0.0.1:{self.public_port}"],
+-            [f"-proxy=127.0.0.1:{p2p_port(PROXY_PORT_INDEX)}"],
++            [f"-proxy=127.0.0.1:{self.proxy_port}"],
+         ]
+         self.add_nodes(self.num_nodes, self.extra_args)
+         self.start_nodes()
+@@ -36,41 +110,47 @@ class P2PWebSocketProxyTest(BitcoinTestFramework):
+     def ws_peers(self, n):
+         return [p for p in self.nodes[n].getpeerinfo() if p["transport"] != "tcp"]
+ 
+-    def try_dial(self, n, url, expected_log):
+-        with self.nodes[n].assert_debug_log([expected_log]):
+-            self.nodes[n].addnode(node=url, command="onetry")
+-        # Give a (wrong) direct connection time to show up.
+-        time.sleep(1)
+-        assert_equal(self.ws_peers(0), [])
+-        assert_equal(self.ws_peers(n), [])
+-
+     def run_test(self):
++        node0, node1 = self.nodes
++        self.generate(node0, 3, sync_fun=self.no_op)
++
++        for scheme, host in (("wss", "localhost"), ("ws", "localhost")):
++            url = f"{scheme}://{host}:{self.public_port}/p2p/ws"
++            self.log.info(f"{scheme}:// through -proxy, name resolved by the proxy")
++            with self.proxy.lock:
++                self.proxy.requests.clear()
++            node1.addnode(node=url, command="onetry")
++            self.wait_until(lambda: len(self.ws_peers(1)) == 1)
++            peer = self.ws_peers(1)[0]
++            assert_equal(peer["transport"], scheme)
++            assert_equal(peer["websocket"]["compression"], "p2p-zstd-v1")
++            with self.proxy.lock:
++                # SOCKS5 address type 3: a domain name, not an address
++                assert_equal(self.proxy.requests, [(3, host, self.public_port)])
++            self.sync_blocks()
++            node1.disconnectnode(nodeid=peer["id"])
++            self.wait_until(lambda: len(self.ws_peers(1)) == 0)
++            self.wait_until(lambda: len(self.ws_peers(0)) == 0)
++
++        self.log.info("A dead proxy fails closed: no direct connection")
++        self.proxy.stop()
+         url = f"wss://localhost:{self.public_port}/p2p/ws"
+-
+-        self.log.info("With -proxy, a wss:// dial is refused, not made directly")
+-        self.try_dial(
+-            1, url, "WebSocket peers cannot be reached through -proxy yet"
+-        )
+-        assert self.socks.queue.empty()
+-
+-        self.log.info("ws:// too")
+-        self.try_dial(
+-            1,
+-            f"ws://127.0.0.1:{self.public_port}/p2p/ws",
+-            "WebSocket peers cannot be reached through -proxy yet",
+-        )
++        node1.addnode(node=url, command="onetry")
++        time.sleep(2)
++        assert_equal(self.ws_peers(1), [])
++        assert_equal(self.ws_peers(0), [])
+ 
+         self.log.info("-onlynet without wss refuses WebSocket dials")
+         self.restart_node(1, ["-onlynet=ipv4"])
+-        self.try_dial(1, url, "network wss is not reachable")
++        with node1.assert_debug_log(["network wss is not reachable"]):
++            node1.addnode(node=url, command="onetry")
++        assert_equal(self.ws_peers(1), [])
+ 
+-        self.log.info("Without either, the dial works")
++        self.log.info("Without a proxy the dial is direct")
+         self.restart_node(1, [])
+-        self.nodes[1].addnode(node=url, command="onetry")
++        node1.addnode(node=url, command="onetry")
+         self.wait_until(lambda: len(self.ws_peers(1)) == 1)
+ 
+-        self.socks.stop()
+-
+ 
+ if __name__ == "__main__":
+     P2PWebSocketProxyTest().main()
+-- 
+2.50.1 (Apple Git-155)
+

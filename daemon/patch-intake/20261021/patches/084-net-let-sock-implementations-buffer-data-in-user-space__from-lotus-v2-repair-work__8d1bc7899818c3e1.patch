@@ -1,0 +1,228 @@
+From edf7cd1e5c0427cbee7bc9245bb73d226d3038bf Mon Sep 17 00:00:00 2001
+From: Shammah Chancellor <shammah.chancellor@notvalid.com>
+Date: Sun, 18 Oct 2026 19:37:35 -0700
+Subject: [PATCH] net: let Sock implementations buffer data in user space
+
+A socket implementation that decodes or decrypts in user space (TLS,
+WebSocket framing) can hold received bytes that poll() cannot see, and can
+accept data from Send() that it has not written yet. Add three Sock hooks,
+with defaults describing a plain socket:
+
+- HasBufferedRecv(): Recv() can return data now. CConnman then polls with
+  a zero timeout and treats the socket as readable.
+- PendingEvents(): OS socket events needed to flush data accepted by
+  Send() (a TLS write can need RECV). CConnman polls for them even when it
+  has nothing queued itself.
+- FlushPending(): called when one of those events occurs; failure
+  disconnects the peer.
+
+Receiving still honours fPauseRecv when RECV was only polled on behalf of
+a pending flush. Plain sockets behave exactly as before.
+
+diff --git a/src/net.cpp b/src/net.cpp
+index 42350ad75f7b1e9eff131915d608939ed591a94d..d6f4aea5990e785a936bee64903a62a2399c8983 100644
+--- a/src/net.cpp
++++ b/src/net.cpp
+@@ -1521,15 +1521,17 @@ Sock::EventsPerSock CConnman::GenerateWaitSockets(Span<CNode *const> nodes) {
+                             inbound_candidates <= 3);
+         bool select_send =
+             WITH_LOCK(pnode->cs_vSend, return !pnode->vSendMsg.empty());
+-        if (!select_recv && !select_send) {
+-            continue;
+-        }
+ 
+         LOCK(pnode->m_sock_mutex);
+         if (pnode->m_sock) {
+-            Sock::Event event =
+-                (select_send ? Sock::SEND : 0) | (select_recv ? Sock::RECV : 0);
+-            events_per_sock.emplace(pnode->m_sock, Sock::Events{event});
++            // Data the socket implementation buffered itself must make
++            // progress even when CConnman has nothing queued.
++            const Sock::Event pending{pnode->m_sock->PendingEvents()};
++            Sock::Event event = (select_send ? Sock::SEND : 0) |
++                                (select_recv ? Sock::RECV : 0) | pending;
++            if (event != 0) {
++                events_per_sock.emplace(pnode->m_sock, Sock::Events{event});
++            }
+         }
+     }
+ 
+@@ -1550,10 +1552,29 @@ void CConnman::SocketHandler() {
+         // select(2)). If none are ready, wait for a short while and return
+         // empty sets.
+         events_per_sock = GenerateWaitSockets(snap.Nodes());
++
++        // Sockets holding already decoded data are ready to receive whatever
++        // the OS socket says, so don't block in that case.
++        const auto has_buffered = [](const auto &entry) {
++            return (entry.second.requested & Sock::RECV) &&
++                   entry.first->HasBufferedRecv();
++        };
++        const bool buffered{std::any_of(events_per_sock.begin(),
++                                        events_per_sock.end(), has_buffered)};
+         if (events_per_sock.empty() ||
+-            !events_per_sock.begin()->first->WaitMany(timeout,
+-                                                      events_per_sock)) {
+-            interruptNet.sleep_for(timeout);
++            !events_per_sock.begin()->first->WaitMany(
++                buffered ? std::chrono::milliseconds{0} : timeout,
++                events_per_sock)) {
++            if (!buffered) {
++                interruptNet.sleep_for(timeout);
++            }
++        }
++        if (buffered) {
++            for (auto &entry : events_per_sock) {
++                if (has_buffered(entry)) {
++                    entry.second.occurred |= Sock::RECV;
++                }
++            }
+         }
+ 
+         // Service (send/receive) each of the already connected nodes.
+@@ -1593,6 +1614,16 @@ void CConnman::SocketHandlerConnected(
+                 recvSet = it->second.occurred & Sock::RECV;
+                 sendSet = it->second.occurred & Sock::SEND;
+                 errorSet = it->second.occurred & Sock::ERR;
++                // Flush data the socket implementation buffered itself.
++                if ((it->second.occurred & pnode->m_sock->PendingEvents()) &&
++                    !pnode->m_sock->FlushPending()) {
++                    errorSet = true;
++                }
++            }
++            // The OS socket being readable was only requested on behalf of
++            // FlushPending(): don't read past fPauseRecv.
++            if (pnode->fPauseRecv && !errorSet) {
++                recvSet = false;
+             }
+         }
+ 
+diff --git a/src/test/net_tests.cpp b/src/test/net_tests.cpp
+index 645384dd147ff3cedb3886633aa1132c33ee7e25..8a0c9536a299b18f0d67275ebbf12e2832894d70 100644
+--- a/src/test/net_tests.cpp
++++ b/src/test/net_tests.cpp
+@@ -1875,4 +1875,73 @@ BOOST_AUTO_TEST_CASE(p2p_websocket_url_parsing) {
+     BOOST_CHECK(!IsWebSocketURL("1.2.3.4:8333"));
+ }
+ 
++namespace {
++/** A Sock that holds received data and a pending write in user space */
++class BufferedSock final : public Sock {
++public:
++    BufferedSock(SOCKET s, std::string data, Event pending)
++        : Sock{s}, m_data{std::move(data)}, m_pending{pending} {}
++    bool HasBufferedRecv() const override { return !m_data.empty(); }
++    Event PendingEvents() const override { return m_pending; }
++    bool FlushPending() const override {
++        ++m_flushes;
++        m_pending = 0;
++        return true;
++    }
++    ssize_t Recv(void *buf, size_t len, int) const override {
++        const size_t n{std::min(len, m_data.size())};
++        if (n == 0) {
++            errno = EAGAIN;
++            return -1;
++        }
++        std::memcpy(buf, m_data.data(), n);
++        m_data.erase(0, n);
++        return n;
++    }
++    mutable std::string m_data;
++    mutable Event m_pending;
++    mutable int m_flushes{0};
++};
++} // namespace
++
++BOOST_AUTO_TEST_CASE(sock_buffered_data_hooks) {
++    int sv[2];
++    BOOST_REQUIRE_EQUAL(socketpair(AF_UNIX, SOCK_STREAM, 0, sv), 0);
++    const Config &config{m_node.chainman->GetConfig()};
++    ConnmanTestMsg connman{config, 0x1337, 0x1337, *m_node.addrman};
++    const std::string garbage(100, 'x');
++    auto sock{std::make_shared<BufferedSock>(SOCKET(sv[0]), garbage, Sock::SEND)};
++    CNode *node = new CNode{/*id=*/0,
++                            sock,
++                            CAddress{},
++                            /*nKeyedNetGroupIn=*/0,
++                            /*nLocalHostNonceIn=*/0,
++                            /*nLocalExtraEntropyIn=*/0,
++                            CAddress{},
++                            /*addrNameIn=*/"",
++                            ConnectionType::INBOUND,
++                            /*inbound_onion=*/false};
++    connman.AddTestNode(*node);
++
++    // Nothing queued by CConnman and receiving paused: the socket is still
++    // polled for SEND because its implementation has a pending write.
++    node->fPauseRecv = true;
++    std::vector<CNode *> nodes{node};
++    auto events{connman.GenerateWaitSocketsForTest(nodes)};
++    BOOST_REQUIRE_EQUAL(events.size(), 1U);
++    BOOST_CHECK_EQUAL(events.begin()->second.requested, Sock::SEND);
++
++    // Buffered data is received although the OS socket (sv[1] never writes)
++    // is not readable, and the pending write is flushed once writable.
++    node->fPauseRecv = false;
++    const uint64_t before{connman.GetTotalBytesRecv()};
++    connman.SocketHandlerForTest();
++    BOOST_CHECK_EQUAL(connman.GetTotalBytesRecv() - before, garbage.size());
++    BOOST_CHECK_EQUAL(sock->m_flushes, 1);
++    BOOST_CHECK(sock->m_data.empty());
++
++    connman.ClearTestNodes();
++    close(sv[1]);
++}
++
+ BOOST_AUTO_TEST_SUITE_END()
+diff --git a/src/test/util/net.h b/src/test/util/net.h
+index a4870b1a18c4efdff9c57159d80a6d5aa0e50d3b..a41222ac2046d3a455609a1261d8793caba854a3 100644
+--- a/src/test/util/net.h
++++ b/src/test/util/net.h
+@@ -40,6 +40,11 @@ struct ConnmanTestMsg : public CConnman {
+                    int32_t version, bool relay_txs)
+         EXCLUSIVE_LOCKS_REQUIRED(NetEventsInterface::g_msgproc_mutex);
+ 
++    Sock::EventsPerSock GenerateWaitSocketsForTest(Span<CNode *const> nodes) {
++        return GenerateWaitSockets(nodes);
++    }
++    void SocketHandlerForTest() { SocketHandler(); }
++
+     void ProcessMessagesOnce(CNode &node)
+         EXCLUSIVE_LOCKS_REQUIRED(NetEventsInterface::g_msgproc_mutex) {
+         for (auto interface : m_msgproc) {
+diff --git a/src/util/sock.h b/src/util/sock.h
+index b26efc9f2dda486979d8931c92a6b474ec9ec767..59741264c78dc16de6bcfb374d7215a98aa1439d 100644
+--- a/src/util/sock.h
++++ b/src/util/sock.h
+@@ -240,6 +240,30 @@ public:
+     [[nodiscard]] virtual bool WaitMany(std::chrono::milliseconds timeout,
+                                         EventsPerSock &events_per_sock) const;
+ 
++    /* Hooks for implementations that buffer data in user space (e.g. TLS or
++     * WebSocket framing), which readiness of the OS socket cannot reveal.
++     * They must be safe to call from any thread without the lock that
++     * serializes Send()/Recv(). The defaults describe a plain socket. */
++
++    /**
++     * Whether Recv() can return data right now even if the OS socket is not
++     * readable (e.g. bytes already decrypted or decoded).
++     */
++    [[nodiscard]] virtual bool HasBufferedRecv() const { return false; }
++
++    /**
++     * Events on the OS socket needed to make progress with data this object
++     * has accepted from Send() but not yet written (0 if none). A TLS
++     * implementation may need RECV to complete a write.
++     */
++    [[nodiscard]] virtual Event PendingEvents() const { return 0; }
++
++    /**
++     * Try to write data accepted by Send() but not yet written. Called when
++     * one of PendingEvents() occurred. Returns false on a fatal error.
++     */
++    [[nodiscard]] virtual bool FlushPending() const { return true; }
++
+     /**
+      * Wait until the socket is readable or has an exceptional condition,
+      * or the timeout expires,

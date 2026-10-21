@@ -1,0 +1,252 @@
+diff --git a/src/test/native_state_sync_tests.cpp b/src/test/native_state_sync_tests.cpp
+index a840e952cf..d93aa9f46d 100644
+--- a/src/test/native_state_sync_tests.cpp
++++ b/src/test/native_state_sync_tests.cpp
+@@ -46,14 +46,24 @@ BOOST_AUTO_TEST_CASE(snapshot_database_commit_and_failed_replacement_survive_reo
+             {{outpoint, coin}, {COutPoint{TxId(uint256{105}), 0}, Coin{}}}), std::invalid_argument);
+         BOOST_CHECK(db.GetBestBlock() == first);
+         BOOST_REQUIRE(db.GetCoin(outpoint));
++        const auto progress = db.GetFastSyncProgress();
++        BOOST_REQUIRE(progress);
++        BOOST_CHECK(progress->first == first);
++        BOOST_CHECK(progress->second == root);
++        db.SetFastSyncProgress(second, uint256{106});
+     }
+     {
+         CCoinsViewDB db(params, {});
+         BOOST_CHECK(db.GetBestBlock() == first);
++        BOOST_CHECK(!db.NeedsUpgrade());
+         auto marker = db.GetFastSyncSnapshot();
+         BOOST_REQUIRE(marker);
+         BOOST_CHECK(marker->first == first);
+         BOOST_CHECK(marker->second == root);
++        const auto progress = db.GetFastSyncProgress();
++        BOOST_REQUIRE(progress);
++        BOOST_CHECK(progress->first == second);
++        BOOST_CHECK(progress->second == uint256{106});
+         BOOST_REQUIRE(db.GetCoin(outpoint));
+         BOOST_CHECK(db.GetCoin(outpoint)->GetTxOut() == coin.GetTxOut());
+         db.ClearFastSyncSnapshot();
+@@ -61,6 +71,7 @@ BOOST_AUTO_TEST_CASE(snapshot_database_commit_and_failed_replacement_survive_reo
+     {
+         CCoinsViewDB db(params, {});
+         BOOST_CHECK(!db.GetFastSyncSnapshot());
++        BOOST_CHECK(!db.GetFastSyncProgress());
+         BOOST_CHECK(db.GetBestBlock() == first);
+     }
+ }
+diff --git a/src/validation.cpp b/src/validation.cpp
+index 3697a7f0b0..72e05f7e88 100644
+--- a/src/validation.cpp
++++ b/src/validation.cpp
+@@ -3485,28 +3485,43 @@ bool Chainstate::PeelFastSyncBlock(
+         err_out = "Failed to persist authenticated peeled parent state";
+         return false;
+     }
+-    if (!RecordReversePeeledBlock(parent_index->nHeight)) {
+-        err_out = "Failed to update earliest_verified_height";
+-        return false;
+-    }
+-
+     // Update block storage and CBlockIndex accounting for the peeled block
+     // and step m_fast_sync_pivot_base / m_chain_tx_count backwards.
+     if (!pindex->nStatus.hasData()) {
+         FlatFilePos blockPos = m_blockman.WriteBlock(block, pindex->nHeight);
+-        if (!blockPos.IsNull()) {
+-            pindex->nFile = blockPos.nFile;
+-            pindex->nDataPos = blockPos.nPos;
+-            pindex->nSize = ::GetSerializeSize(block);
+-            pindex->nStatus = pindex->nStatus.withData();
++        if (blockPos.IsNull()) {
++            err_out = "Failed to store reverse-verified block";
++            return false;
+         }
++        pindex->nFile = blockPos.nFile;
++        pindex->nDataPos = blockPos.nPos;
++        pindex->nSize = ::GetSerializeSize(block);
++        pindex->nStatus = pindex->nStatus.withData();
+     }
+     if (pindex->nTx == 0) {
+         pindex->nTx = block.vtx.size();
+     }
++    pindex->RaiseValidity(BlockValidity::TRANSACTIONS);
+     // Parent commitments authenticate the reconstruction; complete execution
+     // provenance is established only after peeling reaches genesis.
+     m_blockman.m_dirty_blockindex.insert(pindex);
++    // Publish progress only after the historical body/index and authenticated
++    // predecessor snapshot exist. An interrupted earlier attempt can be replayed.
++    if (!m_blockman.FlushBlockFile(pindex->nFile, false, false)) {
++        err_out = "Failed to flush reverse-verified block";
++        return false;
++    }
++    m_blockman.WriteBlockIndexDB();
++    if (parent_index->nHeight > 0) {
++        uint256 root;
++        const auto parent_root = parent_index->GetBlockHeader().ToV2Header().state_root;
++        std::copy(parent_root.begin(), parent_root.end(), root.begin());
++        CoinsDB().SetFastSyncProgress(parent_index->GetBlockHash(), root);
++    }
++    if (!RecordReversePeeledBlock(parent_index->nHeight)) {
++        err_out = "Failed to update earliest_verified_height";
++        return false;
++    }
+ 
+     if (parent_index->nHeight == 0) {
+         m_fast_sync_pivot_base = nullptr;
+@@ -8283,8 +8298,56 @@ bool Chainstate::LoadChainTip() {
+         for (const auto &coin : coins) if (!verified.Insert(coin)) return false;
+         if (lotus::v2::StateRoot(GetActiveV2ChainId(), pivot->nHeight,
+                                verified.Root(), monetary) != root) return false;
++        CBlockIndex *live_tip =
++            m_blockman.LookupBlockIndex(coins_cache.GetBestBlock());
++        if (!live_tip || live_tip->GetAncestor(pivot->nHeight) != pivot) return false;
++        const auto progress = CoinsDB().GetFastSyncProgress();
++        if (!progress) return false;
++        CBlockIndex *frontier = m_blockman.LookupBlockIndex(progress->first);
++        if (!frontier || frontier->nHeight <= 0 ||
++            frontier->nHeight > pivot->nHeight ||
++            pivot->GetAncestor(frontier->nHeight) != frontier) return false;
++        const auto frontier_root = frontier->GetBlockHeader().ToV2Header().state_root;
++        if (!std::equal(frontier_root.begin(), frontier_root.end(), progress->second.begin()))
++            return false;
++        if (!GetV2BlockStateCoinsAndMonetary(progress->first, frontier->nHeight,
++                                           coins, monetary)) return false;
++        lotus::v2::UtxoSet verified_frontier;
++        for (const auto &coin : coins) if (!verified_frontier.Insert(coin)) return false;
++        if (lotus::v2::StateRoot(GetActiveV2ChainId(), frontier->nHeight,
++                                verified_frontier.Root(), monetary) != frontier_root)
++            return false;
+         m_fast_sync_pivot_base = pivot;
+-        ActivateFastSyncPivot(pivot->nHeight);
++        ActivateFastSyncPivot(frontier->nHeight);
++        // Block-index loading cannot derive transaction counts through missing
++        // pre-pivot bodies. Restore the same provisional estimate installed at
++        // activation, then link downloaded descendants for normal validation.
++        if (!pivot->HaveNumChainTxs()) pivot->m_chain_tx_count = pivot->nHeight + 1;
++        // A process interruption can leave durable block/index descendants
++        // ahead of the last UTXO flush. Rebuild candidates for all downloaded
++        // descendants of the authenticated pivot so ActivateBestChain can
++        // reconnect them using normal validation, rather than losing that work.
++        auto descendants = m_blockman.GetAllBlockIndices();
++        std::sort(descendants.begin(), descendants.end(),
++                  CBlockIndexHeightOnlyComparator());
++        for (CBlockIndex *descendant : descendants) {
++            if (descendant->nHeight < pivot->nHeight ||
++                descendant->GetAncestor(pivot->nHeight) != pivot) continue;
++            if (descendant != pivot) {
++                if (!descendant->nTx || !descendant->IsValid(BlockValidity::TRANSACTIONS) ||
++                    !descendant->pprev->HaveNumChainTxs()) continue;
++                descendant->m_chain_tx_count = descendant->pprev->m_chain_tx_count + descendant->nTx;
++            }
++            auto range = m_blockman.m_blocks_unlinked.equal_range(descendant->pprev);
++            for (auto it = range.first; it != range.second;) {
++                if (it->second == descendant) it = m_blockman.m_blocks_unlinked.erase(it);
++                else ++it;
++            }
++            TryAddBlockIndexCandidate(descendant);
++        }
++        if (!live_tip->HaveNumChainTxs() ||
++            (live_tip != pivot && !live_tip->IsValid(BlockValidity::SCRIPTS))) return false;
++        setBlockIndexCandidates.insert(live_tip);
+     }
+     const CBlockIndex *tip = m_chain.Tip();
+ 
+diff --git a/test/functional/p2p_v2_fast_sync_and_reverse_peel.py b/test/functional/p2p_v2_fast_sync_and_reverse_peel.py
+index 18ae9713a6..5d3b24059c 100755
+--- a/test/functional/p2p_v2_fast_sync_and_reverse_peel.py
++++ b/test/functional/p2p_v2_fast_sync_and_reverse_peel.py
+@@ -438,6 +438,46 @@ class FastSyncAndReversePeelTest(BitcoinTestFramework):
+         assert_equal(peel_104["intra_block_spends"], 0)
+         assert_equal(peel_104["prior_spends_restored"], 0)
+ 
++        self.log.info(
++            "Reverse-verify a missing historical block without rolling back the live tip"
++        )
++        historical_block = node0.getblock(pivot_hash_hex, 0)
++        live_tip = node2.getbestblockhash()
++        live_coin = node2.gettxout(spend_tx.txid_hex, 0)
++        assert live_coin is not None
++        # Node2 joined from headers and shards, so exercise the optional block
++        # body rather than relying on history already downloaded from genesis.
++        assert_raises_rpc_error(
++            -25,
++            "Failed to read block",
++            node2.peelfastsyncblock,
++            pivot_hash_hex,
++            undo_104.raw_payload.hex(),
++        )
++        supplied = node2.peelfastsyncblock(
++            pivot_hash_hex, undo_104.raw_payload.hex(), historical_block
++        )
++        assert_equal(supplied["earliest_verified_height"], 103)
++        assert_equal(node2.getbestblockhash(), live_tip)
++        assert_equal(node2.gettxout(spend_tx.txid_hex, 0), live_coin)
++
++        self.log.info(
++            "Restart with partial backwards verification and preserve both frontiers"
++        )
++        node2.kill_process()
++        self.start_node(2)
++        assert_equal(node2.getbestblockhash(), live_tip)
++        assert_equal(node2.gettxout(spend_tx.txid_hex, 0), live_coin)
++        assert_equal(node2.getblockchaininfo()["earliest_verified_height"], 103)
++        assert_equal(node2.getblockchaininfo()["fast_sync_active"], True)
++        self.generatetodescriptor(
++            node2, 1, V2_OP_TRUE_DESCRIPTOR, sync_fun=self.no_op
++        )
++        assert_equal(node2.getblockcount(), 106)
++        live_tip = node2.getbestblockhash()
++        live_coin = node2.gettxout(spend_tx.txid_hex, 0)
++        assert live_coin is not None
++
+         self.log.info(
+             "Peel block 103 -> 102 with intra-block parent-child spend (Hole 12 test)"
+         )
+@@ -459,6 +499,35 @@ class FastSyncAndReversePeelTest(BitcoinTestFramework):
+             bytes(bad_undo_103).hex(),
+         )
+ 
++        self.log.info("Reject malformed history without changing either frontier")
++        for undo_hex, block_hex, code, message in [
++            (bytes(bad_undo_103).hex(), node0.getblock(hash_103_hex, 0), -25, None),
++            (undo_103.raw_payload.hex(), historical_block, -25, "Provided block hash"),
++            ("00", node0.getblock(hash_103_hex, 0), -22, "Invalid BLOCKUNDO"),
++        ]:
++            assert_raises_rpc_error(
++                code,
++                message,
++                node2.peelfastsyncblock,
++                hash_103_hex,
++                undo_hex,
++                block_hex,
++            )
++            assert_equal(node2.getblockchaininfo()["earliest_verified_height"], 103)
++            assert_equal(node2.getbestblockhash(), live_tip)
++            assert_equal(node2.gettxout(spend_tx.txid_hex, 0), live_coin)
++        supplied_103 = node2.peelfastsyncblock(
++            hash_103_hex, undo_103.raw_payload.hex(), node0.getblock(hash_103_hex, 0)
++        )
++        assert_equal(supplied_103["earliest_verified_height"], 102)
++        assert_equal(supplied_103["intra_block_spends"], 1)
++        assert_equal(node2.getbestblockhash(), live_tip)
++        assert_equal(node2.gettxout(spend_tx.txid_hex, 0), live_coin)
++        self.restart_node(2)
++        assert_equal(node2.getblockchaininfo()["earliest_verified_height"], 102)
++        assert_equal(node2.getbestblockhash(), live_tip)
++        assert_equal(node2.gettxout(spend_tx.txid_hex, 0), live_coin)
++
+         peel_103 = node1.peelfastsyncblock(hash_103_hex, undo_103.raw_payload.hex())
+         assert_equal(peel_103["parent_height"], 102)
+         assert_equal(peel_103["earliest_verified_height"], 102)
+@@ -491,6 +560,11 @@ class FastSyncAndReversePeelTest(BitcoinTestFramework):
+         info1_final = node1.getblockchaininfo()
+         assert_equal(info1_final["earliest_verified_height"], 0)
+         assert_equal(info1_final["fast_sync_active"], False)
++        completed_tip = node1.getbestblockhash()
++        self.restart_node(1)
++        assert_equal(node1.getbestblockhash(), completed_tip)
++        assert_equal(node1.getblockchaininfo()["earliest_verified_height"], 0)
++        assert_equal(node1.getblockchaininfo()["fast_sync_active"], False)
+ 
+ 
+ if __name__ == "__main__":

@@ -1,0 +1,360 @@
+From 3ea4c2710d6f5d5b71e76238cf3308b797746ec8 Mon Sep 17 00:00:00 2001
+From: Shammah Chancellor <shammah.chancellor@notvalid.com>
+Date: Mon, 19 Oct 2026 11:58:05 -0700
+Subject: [PATCH] chronik: index V2 blocks whose children precede their
+ in-block parents
+
+The V2 index service stopped at the first block with chained spends
+("invalid V2 index transition: missing coin", regtest height 103 in the
+parity harness). The ABC host confirms blocks in canonical (txid) order,
+so a transaction can come before the in-block parent whose output it
+spends. Connect resolved and applied transactions strictly in block order
+and required every spent coin to exist already. The txids were correct:
+the missing coin was an output of a later transaction in the same block.
+
+Connect and the undo validation of disconnect now resolve, spend and plan
+asset events in a parents-first order: each in-block parent before its
+children, otherwise block order, so a topologically ordered block is
+processed exactly as before. Positions, receipts and explorer records keep
+block order. Two read and planning checks assumed that an in-block
+creation always has a lower position than its spender (explorer inputs) or
+that an asset's first event has the lowest position (asset summaries); they
+now accept any other position in the same block. A dependency cycle still
+fails as a missing coin.
+
+Tier: V2 (fixup to v2/026)
+---
+ chronik/chronik-db/src/v2_asset.rs    |   5 +-
+ chronik/chronik-db/src/v2_branch.rs   | 228 +++++++++++++++++++++++++-
+ chronik/chronik-db/src/v2_explorer.rs |   7 +-
+ 3 files changed, 228 insertions(+), 12 deletions(-)
+
+diff --git a/chronik/chronik-db/src/v2_asset.rs b/chronik/chronik-db/src/v2_asset.rs
+index 017d779d98..6ba4004750 100644
+--- a/chronik/chronik-db/src/v2_asset.rs
++++ b/chronik/chronik-db/src/v2_asset.rs
+@@ -229,8 +229,9 @@ pub fn plan_asset_tx(
+             Some(s) => {
+                 if s.token_id != event.token_id
+                     || s.event_count == 0
+-                    || (s.first_seen.height, s.first_seen.tx_index)
+-                        > (view.location.height, view.location.tx_index)
++                    // In a block in canonical (txid) order, an in-block
++                    // parent applied first can sit at a later position.
++                    || s.first_seen.height > view.location.height
+                 {
+                     return Err(Error::Corrupt);
+                 }
+diff --git a/chronik/chronik-db/src/v2_branch.rs b/chronik/chronik-db/src/v2_branch.rs
+index 9b047dfac1..6cca9d6ca3 100644
+--- a/chronik/chronik-db/src/v2_branch.rs
++++ b/chronik/chronik-db/src/v2_branch.rs
+@@ -413,10 +413,15 @@ impl V2Db {
+                 Err(Error::Invalid("conflicting replay"))
+             };
+         }
++        // Resolve and apply in-block parents before their children: the host
++        // may confirm blocks in canonical (txid) order, where a child can
++        // precede the parent whose output it spends.
++        let order = processing_order(&block.transactions);
+         let mut resolved = block.clone();
+         let mut creations: BTreeMap<OutPoint, ResolvedCreation> =
+             BTreeMap::new();
+-        for tx in &mut resolved.transactions {
++        for &tx_index in &order {
++            let tx = &mut resolved.transactions[tx_index];
+             for (index, input) in tx.explorer.inputs.iter_mut().enumerate() {
+                 if input.flags == 1 {
+                     let op = OutPoint {
+@@ -514,7 +519,7 @@ impl V2Db {
+         let mut state: BTreeMap<Vec<u8>, Option<Vec<u8>>> = BTreeMap::new();
+         let mut undo = BTreeMap::new();
+         let mut spent = BTreeSet::new();
+-        for tx in &block.transactions {
++        for tx in order.iter().map(|&i| &block.transactions[i]) {
+             let tx_key = key(b't', &tx.location.txid.0 .0);
+             if self.db.get(&tx_key)?.is_some() {
+                 return Err(Error::Invalid("duplicate transaction"));
+@@ -593,9 +598,9 @@ impl V2Db {
+             undo.insert(k.clone(), None);
+             state.insert(k, Some(v));
+         }
+-        for (k, v) in
+-            asset_entries(&resolved, |k| self.db.get(k).map_err(Into::into))?
+-        {
++        for (k, v) in asset_entries(&resolved, &order, |k| {
++            self.db.get(k).map_err(Into::into)
++        })? {
+             let old = self.db.get(&k)?;
+             if !k.starts_with(b"eA") && old.is_some() {
+                 return Err(Error::Invalid("duplicate asset entry"));
+@@ -841,9 +846,10 @@ fn validate_undo(
+         crate::v2_explorer::preflight_explorer_block(&restored_block)?,
+     )
+     .map_err(|_| Error::Corrupt)?;
++    let order = processing_order(&restored_block.transactions);
+     let mut legacy_current = BTreeMap::new();
+     let mut legacy_previous = BTreeMap::new();
+-    for tx in &restored_block.transactions {
++    for tx in order.iter().map(|&i| &restored_block.transactions[i]) {
+         let k = key(b't', &tx.location.txid.0 .0);
+         legacy_current.insert(k.clone(), encode(&Loc::from(tx.location))?);
+         legacy_previous.insert(k, None);
+@@ -920,7 +926,7 @@ fn validate_undo(
+     let explorer_entries: BTreeMap<_, _> =
+         planned_explorer.into_iter().collect();
+     let undo_map: BTreeMap<_, _> = undo.entries.iter().cloned().collect();
+-    let asset_entries = asset_entries(&restored_block, |k| {
++    let asset_entries = asset_entries(&restored_block, &order, |k| {
+         Ok(undo_map.get(k).cloned().flatten())
+     })?;
+     for (k, v) in &asset_entries {
+@@ -1031,13 +1037,62 @@ fn validate_undo(
+     }
+     Ok(())
+ }
++/// Order in which a block's transactions are resolved and applied: every
++/// in-block parent before the children spending its outputs, and otherwise
++/// block order (so a topologically ordered block keeps its own order). A
++/// dependency cycle cannot be confirmed; its members follow in block order
++/// and are rejected as spending a missing coin.
++fn processing_order(transactions: &[ConfirmedTx]) -> Vec<usize> {
++    use std::{cmp::Reverse, collections::BinaryHeap};
++    let index: BTreeMap<TxId, usize> = transactions
++        .iter()
++        .enumerate()
++        .map(|(i, tx)| (tx.location.txid, i))
++        .collect();
++    let mut pending = vec![0usize; transactions.len()];
++    let mut children = vec![Vec::new(); transactions.len()];
++    for (child, tx) in transactions.iter().enumerate() {
++        for spend in &tx.spends {
++            match index.get(&spend.outpoint.txid) {
++                Some(&parent) if parent != child => {
++                    pending[child] += 1;
++                    children[parent].push(child);
++                }
++                _ => {}
++            }
++        }
++    }
++    let mut ready: BinaryHeap<Reverse<usize>> = (0..transactions.len())
++        .filter(|&i| pending[i] == 0)
++        .map(Reverse)
++        .collect();
++    let mut order = Vec::with_capacity(transactions.len());
++    while let Some(Reverse(i)) = ready.pop() {
++        order.push(i);
++        for &child in &children[i] {
++            pending[child] -= 1;
++            if pending[child] == 0 {
++                ready.push(Reverse(child));
++            }
++        }
++    }
++    if order.len() < transactions.len() {
++        let mut placed = vec![false; transactions.len()];
++        for &i in &order {
++            placed[i] = true;
++        }
++        order.extend((0..transactions.len()).filter(|&i| !placed[i]));
++    }
++    order
++}
+ fn asset_entries(
+     block: &CommittedBlock,
++    order: &[usize],
+     mut old_value: impl FnMut(&[u8]) -> Result<Option<Vec<u8>>>,
+ ) -> Result<BTreeMap<Vec<u8>, Vec<u8>>> {
+     use crate::v2_asset::{self as a, AssetTxView};
+     let mut entries: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();
+-    for tx in &block.transactions {
++    for tx in order.iter().map(|&i| &block.transactions[i]) {
+         let resolved_spends: Vec<_> = tx
+             .explorer
+             .inputs
+@@ -1895,6 +1950,163 @@ mod tests {
+         assert!(db.snapshot().unwrap().output(op(20, 0)).unwrap().is_none());
+         assert!(db.snapshot().unwrap().output(op(22, 0)).unwrap().is_none());
+     }
++    /// Hosts may confirm blocks in canonical (txid) order, where a child
++    /// precedes the in-block parent whose output it spends.
++    #[test]
++    fn canonical_order_block_spends_later_parents() {
++        fn tx(
++            anchor: Anchor,
++            index: u32,
++            txid: u8,
++            outputs: Vec<Output>,
++            spends: Vec<OutPoint>,
++        ) -> ConfirmedTx {
++            let spends: Vec<_> = spends
++                .into_iter()
++                .enumerate()
++                .map(|(i, outpoint)| SpentInput {
++                    outpoint,
++                    input_index: i as u32,
++                })
++                .collect();
++            ConfirmedTx {
++                location: TxLocation {
++                    block_id: Hash32(anchor.block_id),
++                    height: anchor.height,
++                    tx_index: index,
++                    txid: TxId(Hash32([txid; 32])),
++                    txhash: TxHash(Hash32([txid ^ 0xff; 32])),
++                },
++                explorer: fixture_facts(&spends, &outputs),
++                outputs,
++                spends,
++            }
++        }
++        let mut token = output(5, false);
++        token.flags = 1;
++        token.token_id = Hash32([77; 32]);
++        // 0x20 -> 0x30 -> 0x40 -> 0x21, carrying a token; 0x31 mints a
++        // second token that 0x22 spends. Canonical order is 0x21, 0x22,
++        // 0x30, 0x31, 0x40; the topological order is 0x30, 0x31, 0x22,
++        // 0x40, 0x21.
++        let connect = |canonical: bool| {
++            let dir = tempdir::TempDir::new("v2-ctor").unwrap();
++            let mut db = V2Db::open(dir.path(), binding()).unwrap();
++            db.initialize_genesis(fixture_genesis(vec![])).unwrap();
++            let genesis = db.checkpoint().unwrap().unwrap();
++            let first = block(genesis, 10, 0x20, vec![token.clone()], vec![]);
++            db.connect(&first).unwrap();
++            let anchor = Anchor {
++                block_id: [11; 32],
++                height: 2,
++            };
++            let mut minted = token.clone();
++            minted.token_id = Hash32([78; 32]);
++            let mut ids = vec![
++                (0x30, token.clone(), Some(op(0x20, 0))),
++                (0x31, minted.clone(), None),
++                (0x22, minted.clone(), Some(op(0x31, 0))),
++                (0x40, token.clone(), Some(op(0x30, 0))),
++                (0x21, token.clone(), Some(op(0x40, 0))),
++            ];
++            if canonical {
++                ids.sort_by_key(|(txid, _, _)| *txid);
++            }
++            let transactions = ids
++                .into_iter()
++                .enumerate()
++                .map(|(i, (txid, out, spend))| {
++                    tx(
++                        anchor,
++                        i as u32,
++                        txid,
++                        vec![out],
++                        spend.into_iter().collect(),
++                    )
++                })
++                .collect();
++            let second = CommittedBlock {
++                anchor,
++                parent: first.anchor,
++                explorer: fixture_header(anchor, first.anchor),
++                transactions,
++            };
++            db.connect(&second).unwrap();
++            db.connect(&second).unwrap(); // exact replay is a no-op
++            (dir, db, second)
++        };
++        let (_topo_dir, topo, _) = connect(false);
++        let (_dir, mut db, second) = connect(true);
++        assert_eq!(
++            second.transactions[0].location.txid,
++            TxId(Hash32([0x21; 32]))
++        );
++        let view = db.snapshot().unwrap();
++        for (parent, child) in
++            [(0x20, 0x30), (0x30, 0x40), (0x40, 0x21), (0x31, 0x22)]
++        {
++            let spend = view.output(op(parent, 0)).unwrap().unwrap().spend;
++            assert_eq!(
++                spend.unwrap().transaction.txid,
++                TxId(Hash32([child; 32]))
++            );
++        }
++        assert!(view.output(op(0x21, 0)).unwrap().unwrap().spend.is_none());
++        let input = view
++            .explorer_input(TxId(Hash32([0x21; 32])), 0)
++            .unwrap()
++            .unwrap();
++        assert_eq!(input.resolved_creation.unwrap().outpoint, op(0x40, 0));
++        let topo_view = topo.snapshot().unwrap();
++        for token_id in [77, 78] {
++            let summary =
++                view.asset_summary(Hash32([token_id; 32])).unwrap().unwrap();
++            let expected = topo_view
++                .asset_summary(Hash32([token_id; 32]))
++                .unwrap()
++                .unwrap();
++            assert_eq!(summary.event_count, expected.event_count);
++            assert_eq!(summary.output_count, expected.output_count);
++        }
++        // The mint stays the first seen location, after its spender.
++        let minted = view.asset_summary(Hash32([78; 32])).unwrap().unwrap();
++        assert_eq!(minted.first_seen.txid, TxId(Hash32([0x31; 32])));
++        assert_eq!(minted.first_seen.tx_index, 3);
++        let input = view
++            .explorer_input(TxId(Hash32([0x22; 32])), 0)
++            .unwrap()
++            .unwrap();
++        assert_eq!(input.resolved_creation.unwrap().outpoint, op(0x31, 0));
++        drop(view);
++        db.disconnect(second.anchor).unwrap();
++        let view = db.snapshot().unwrap();
++        assert!(view.output(op(0x20, 0)).unwrap().unwrap().spend.is_none());
++        for txid in [0x21, 0x22, 0x30, 0x31, 0x40] {
++            assert!(view.output(op(txid, 0)).unwrap().is_none());
++        }
++        drop(view);
++        db.connect(&second).unwrap();
++
++        // A dependency cycle cannot be resolved.
++        let anchor = Anchor {
++            block_id: [12; 32],
++            height: 3,
++        };
++        let cycle = CommittedBlock {
++            anchor,
++            parent: second.anchor,
++            explorer: fixture_header(anchor, second.anchor),
++            transactions: vec![
++                tx(anchor, 0, 0x50, vec![output(6, false)], vec![op(0x51, 0)]),
++                tx(anchor, 1, 0x51, vec![output(6, false)], vec![op(0x50, 0)]),
++            ],
++        };
++        assert_eq!(
++            db.connect(&cycle).unwrap_err().to_string(),
++            "invalid V2 index transition: missing coin"
++        );
++        assert_eq!(db.checkpoint().unwrap(), Some(second.anchor));
++    }
+ }
+ 
+ #[cfg(test)]
+diff --git a/chronik/chronik-db/src/v2_explorer.rs b/chronik/chronik-db/src/v2_explorer.rs
+index 8ea0d79b43..bb43ae3055 100644
+--- a/chronik/chronik-db/src/v2_explorer.rs
++++ b/chronik/chronik-db/src/v2_explorer.rs
+@@ -722,8 +722,11 @@ impl ReadSnapshot<'_> {
+                         creation_tx.location != coin.creation
+                             || coin.outpoint.out_idx >= creation_tx.output_count
+                     })
+-                || (coin.creation.height, coin.creation.tx_index)
+-                    >= (tx.location.height, tx.location.tx_index)
++                // Created earlier, or elsewhere in the same block (which may
++                // be in canonical, not topological, order).
++                || coin.creation.height > tx.location.height
++                || (coin.creation.height == tx.location.height
++                    && coin.creation.tx_index == tx.location.tx_index)
+             {
+                 return Err(Error::Corrupt);
+             }
+-- 
+2.50.1 (Apple Git-155)
+

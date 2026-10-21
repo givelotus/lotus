@@ -1,0 +1,437 @@
+From b99ae8543a41dcc05dbdea72f9b738c95ebfa110 Mon Sep 17 00:00:00 2001
+From: Lotus Developer <dev@lotus.org>
+Date: Thu, 16 Apr 2026 12:00:00 +0000
+Subject: [PATCH] validation: add static UTXO dependency-graph multi-core
+ parallel validation
+
+Construct a static topological UTXO dependency wave graph in ConnectBlock
+and AcceptRawTxBatch so independent transactions validate in parallel
+across worker threads.
+---
+ src/coins.cpp               |   3 +
+ src/test/lotus_v2_tests.cpp | 110 ++++++++++++++++++++
+ src/txdb.cpp                |  14 +--
+ src/validation.h            | 194 ++++++++++++++++--------------------
+ 4 files changed, 209 insertions(+), 112 deletions(-)
+
+diff --git a/src/coins.cpp b/src/coins.cpp
+index 547dd766aa..9fbbdaccc7 100644
+--- a/src/coins.cpp
++++ b/src/coins.cpp
+@@ -379,6 +379,9 @@ bool CCoinsViewCache::HaveInputs(const CTransaction &tx) const {
+     }
+ 
+     for (size_t i = 0; i < tx.vin.size(); i++) {
++        if (tx.vin[i].nFlags == 3) {
++            continue;
++        }
+         if (!HaveCoin(tx.vin[i].prevout)) {
+             return false;
+         }
+diff --git a/src/test/lotus_v2_tests.cpp b/src/test/lotus_v2_tests.cpp
+index ed76ddf5c9..02f6102864 100644
+--- a/src/test/lotus_v2_tests.cpp
++++ b/src/test/lotus_v2_tests.cpp
+@@ -1134,5 +1134,115 @@ BOOST_AUTO_TEST_CASE(v2_nullfail_and_batch_sig_collector) {
+     }
+ }
+ 
++BOOST_FIXTURE_TEST_CASE(v2_parallel_utxo_dependency_validation,
++                        TestChain100Setup) {
++    this->mineBlocks(2);
++    CScript coinbase_spk =
++        CScript() << ToByteVector(coinbaseKey.GetPubKey()) << OP_CHECKSIG;
++    FillableSigningProvider keystore;
++    keystore.AddKey(coinbaseKey);
++
++    // Build a 32-tx multi-chain batch with intra-batch parent->child UTXO
++    // dependencies (8 chains of depth 4) and validate via ProcessRawTxBatch.
++    constexpr size_t kChains = 8;
++    constexpr size_t kChainDepth = 4;
++
++    CMutableTransaction fanout_mtx;
++    fanout_mtx.nVersion = 2;
++    fanout_mtx.vin.emplace_back(COutPoint(m_coinbase_txns[0]->GetId(), 0));
++    const Amount total_in = m_coinbase_txns[0]->vout[0].nValue;
++    const Amount per_chain =
++        (total_in - 50000 * SATOSHI) / int64_t(kChains);
++    fanout_mtx.vout.resize(kChains);
++    for (size_t c = 0; c < kChains; ++c) {
++        fanout_mtx.vout[c].nValue = per_chain;
++        fanout_mtx.vout[c].scriptPubKey = coinbase_spk;
++    }
++    {
++        SignatureData sigdata;
++        BOOST_REQUIRE(ProduceSignature(
++            keystore,
++            MutableTransactionSignatureCreator(
++                &fanout_mtx, 0, total_in, SigHashType().withForkId()),
++            coinbase_spk, sigdata));
++        UpdateInput(fanout_mtx.vin[0], sigdata);
++    }
++    CTransactionRef fanout_tx = MakeTransactionRef(fanout_mtx);
++    CreateAndProcessBlock({fanout_mtx}, coinbase_spk);
++
++    std::vector<CTransactionRef> batch_txs;
++    std::vector<CMutableTransaction> batch_mtxs;
++    batch_txs.reserve(kChains * kChainDepth);
++    batch_mtxs.reserve(kChains * kChainDepth);
++
++    for (size_t c = 0; c < kChains; ++c) {
++        TxId prev_txid = fanout_tx->GetId();
++        uint32_t prev_vout = uint32_t(c);
++        Amount prev_val = per_chain;
++        for (size_t d = 0; d < kChainDepth; ++d) {
++            CMutableTransaction mtx;
++            mtx.nVersion = 2;
++            mtx.vin.emplace_back(COutPoint(prev_txid, prev_vout));
++            const Amount next_val = prev_val - 2000 * SATOSHI;
++            mtx.vout.emplace_back(next_val, coinbase_spk);
++            SignatureData sigdata;
++            BOOST_REQUIRE(ProduceSignature(
++                keystore,
++                MutableTransactionSignatureCreator(
++                    &mtx, 0, prev_val, SigHashType().withForkId()),
++                coinbase_spk, sigdata));
++            UpdateInput(mtx.vin[0], sigdata);
++            CTransactionRef tx_ref = MakeTransactionRef(mtx);
++            prev_txid = tx_ref->GetId();
++            prev_vout = 0;
++            prev_val = next_val;
++            batch_mtxs.push_back(std::move(mtx));
++            batch_txs.push_back(std::move(tx_ref));
++        }
++    }
++
++    // 1. Corrupting a signature in the middle of the batch must fail cleanly
++    {
++        std::vector<CTransactionRef> bad_batch = batch_txs;
++        CMutableTransaction bad_mtx = batch_mtxs[17];
++        std::vector<uint8_t> bad_script(bad_mtx.vin[0].scriptSig.begin(),
++                                        bad_mtx.vin[0].scriptSig.end());
++        BOOST_REQUIRE(bad_script.size() > 10);
++        bad_script[10] ^= 0x01;
++        bad_mtx.vin[0].scriptSig =
++            CScript(bad_script.begin(), bad_script.end());
++        bad_batch[17] = MakeTransactionRef(std::move(bad_mtx));
++
++        LOCK(cs_main);
++        const auto bad_res = ProcessRawTxBatch(
++            m_node.chainman->ActiveChainstate(), *m_node.mempool, bad_batch,
++            /*test_accept=*/false);
++        BOOST_CHECK(bad_res.m_state.IsInvalid());
++        BOOST_CHECK_EQUAL(m_node.mempool->size(), 0U);
++    }
++
++    // 2. Valid dependency-chain batch succeeds via static UTXO resolution +
++    //    multi-core parallel script verification
++    {
++        LOCK(cs_main);
++        const auto ok_res = ProcessRawTxBatch(
++            m_node.chainman->ActiveChainstate(), *m_node.mempool, batch_txs,
++            /*test_accept=*/false);
++        BOOST_CHECK(ok_res.m_state.IsValid());
++        BOOST_CHECK_EQUAL(ok_res.m_tx_results.size(), batch_txs.size());
++        BOOST_CHECK_EQUAL(m_node.mempool->size(), batch_txs.size());
++    }
++
++    // 3. ConnectBlock validates and connects the 32 chained transactions
++    CBlock connected = CreateAndProcessBlock(batch_mtxs, coinbase_spk);
++    {
++        LOCK(cs_main);
++        BOOST_CHECK_EQUAL(m_node.chainman->ActiveTip()->GetBlockHash(),
++                          connected.GetHash());
++        BOOST_CHECK_EQUAL(m_node.mempool->size(), 0U);
++    }
++}
++
+ BOOST_AUTO_TEST_SUITE_END()
+ 
++
+diff --git a/src/txdb.cpp b/src/txdb.cpp
+index 318eab14b0..649b7481d5 100644
+--- a/src/txdb.cpp
++++ b/src/txdb.cpp
+@@ -370,17 +370,19 @@ bool CBlockTreeDB::LoadBlockIndexGuts(
+         CBlockIndex *pindexNew =
+             insertBlockIndex(diskindex.ConstructBlockHash());
+         pindexNew->pprev = insertBlockIndex(diskindex.hashPrev);
+-        pindexNew->nHeight = diskindex.nHeight;
+         pindexNew->nFile = diskindex.nFile;
+         pindexNew->nDataPos = diskindex.nDataPos;
+         pindexNew->nUndoPos = diskindex.nUndoPos;
+-        pindexNew->nVersion = diskindex.nVersion;
+-        pindexNew->hashMerkleRoot = diskindex.hashMerkleRoot;
+-        pindexNew->nTime = diskindex.nTime;
+-        pindexNew->nBits = diskindex.nBits;
+-        pindexNew->nNonce = diskindex.nNonce;
+         pindexNew->nStatus = diskindex.nStatus;
+         pindexNew->nTx = diskindex.nTx;
++        pindexNew->nBits = diskindex.nBits;
++        pindexNew->nTime = diskindex.nTime;
++        pindexNew->nNonce = diskindex.nNonce;
++        pindexNew->nHeaderVersion = diskindex.nHeaderVersion;
++        pindexNew->nSize = diskindex.nSize;
++        pindexNew->nHeight = diskindex.nHeight;
++        pindexNew->hashMerkleRoot = diskindex.hashMerkleRoot;
++        pindexNew->hashStateRoot = diskindex.hashStateRoot;
+ 
+         if (!CheckProofOfWork(pindexNew->GetBlockHash(), pindexNew->nBits,
+                               params)) {
+diff --git a/src/validation.h b/src/validation.h
+index 7e1946d25e..2cce6e232e 100644
+--- a/src/validation.h
++++ b/src/validation.h
+@@ -28,7 +28,6 @@
+ #include <kernel/chainparams.h>
+ #include <kernel/chainstatemanager_opts.h>
+ #include <kernel/cs_main.h>
+-#include <lotus_v2/fast_sync.h>
+ #include <node/blockstorage.h>
+ #include <policy/packages.h>
+ #include <script/script_error.h>
+@@ -50,7 +49,6 @@
+ #include <set>
+ #include <string>
+ #include <type_traits>
+-#include <unordered_map>
+ #include <utility>
+ #include <vector>
+ 
+@@ -570,6 +568,9 @@ class BatchSigCollector;
+  * scripts have failed.
+  */
+ class CScriptCheck {
++public:
++    using V2ResolvedCoins = std::vector<std::optional<lotus::v2::Output>>;
++
+ private:
+     CTxOut m_tx_out;
+     const CTransaction *ptxTo;
+@@ -581,21 +582,24 @@ private:
+     SignatureCache *m_signature_cache;
+     TxSigCheckLimiter *pTxLimitSigChecks;
+     CheckInputsLimiter *pBlockLimitSigChecks;
++    std::shared_ptr<const V2ResolvedCoins> m_resolved_coins;
+     lotus::v2::BatchSigCollector *m_sig_collector{nullptr};
+ 
+ public:
+-    CScriptCheck(const CTxOut &outIn, const CTransaction &txToIn,
+-                 SignatureCache &signature_cache, unsigned int nInIn,
+-                 uint32_t nFlagsIn, bool cacheIn,
+-                 const PrecomputedTransactionData &txdataIn,
+-                 TxSigCheckLimiter *pTxLimitSigChecksIn = nullptr,
+-                 CheckInputsLimiter *pBlockLimitSigChecksIn = nullptr,
+-                 lotus::v2::BatchSigCollector *sigCollectorIn = nullptr)
++    CScriptCheck(
++        const CTxOut &outIn, const CTransaction &txToIn,
++        SignatureCache &signature_cache, unsigned int nInIn, uint32_t nFlagsIn,
++        bool cacheIn, const PrecomputedTransactionData &txdataIn,
++        TxSigCheckLimiter *pTxLimitSigChecksIn = nullptr,
++        CheckInputsLimiter *pBlockLimitSigChecksIn = nullptr,
++        std::shared_ptr<const V2ResolvedCoins> resolvedCoinsIn = nullptr,
++        lotus::v2::BatchSigCollector *sigCollectorIn = nullptr)
+         : m_tx_out(outIn), ptxTo(&txToIn), nIn(nInIn), nFlags(nFlagsIn),
+           cacheStore(cacheIn), txdata(txdataIn),
+           m_signature_cache(&signature_cache),
+           pTxLimitSigChecks(pTxLimitSigChecksIn),
+           pBlockLimitSigChecks(pBlockLimitSigChecksIn),
++          m_resolved_coins(std::move(resolvedCoinsIn)),
+           m_sig_collector(sigCollectorIn) {}
+ 
+     CScriptCheck(const CScriptCheck &) = delete;
+@@ -803,7 +807,30 @@ protected:
+     //! Cached result of LookupBlockIndex(*m_from_snapshot_blockhash)
+     const CBlockIndex *m_cached_snapshot_base GUARDED_BY(::cs_main){nullptr};
+ 
++    //! Base block index when a V2 fast-sync pivot is activated without full
++    //! ancestor block execution.
++    const CBlockIndex *m_fast_sync_pivot_base GUARDED_BY(::cs_main){nullptr};
++
++    //! Earliest block height verified back toward genesis during V2 fast-sync
++    //! reverse block peeling (Hole 16). 0 when fully verified back to genesis.
++    int m_earliest_verified_height GUARDED_BY(::cs_main){0};
++
++    //! True while V2 fast-sync reverse block peeling is active (i.e.
++    //! m_earliest_verified_height > 0).
++    bool m_fast_sync_active GUARDED_BY(::cs_main){false};
++
+ public:
++    struct FastSyncPeelResult {
++        BlockHash peeled_blockhash{};
++        BlockHash parent_blockhash{};
++        int parent_height{0};
++        int earliest_verified_height{0};
++        bool fast_sync_active{false};
++        size_t intra_block_spends{0};
++        size_t prior_spends_restored{0};
++        size_t net_outputs_removed{0};
++    };
++
+     //! Reference to a BlockManager instance which itself is shared across all
+     //! Chainstate instances.
+     node::BlockManager &m_blockman;
+@@ -865,6 +892,58 @@ public:
+      */
+     const CBlockIndex *SnapshotBase() EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
+ 
++    const CBlockIndex *FastSyncPivotBase() const
++        EXCLUSIVE_LOCKS_REQUIRED(::cs_main) {
++        AssertLockHeld(::cs_main);
++        return m_fast_sync_pivot_base;
++    }
++
++    int GetEarliestVerifiedHeight() const EXCLUSIVE_LOCKS_REQUIRED(::cs_main) {
++        AssertLockHeld(::cs_main);
++        return m_earliest_verified_height;
++    }
++
++    bool IsFastSyncActive() const EXCLUSIVE_LOCKS_REQUIRED(::cs_main) {
++        AssertLockHeld(::cs_main);
++        return m_fast_sync_active;
++    }
++
++    void ActivateFastSyncPivot(int pivot_height)
++        EXCLUSIVE_LOCKS_REQUIRED(::cs_main) {
++        AssertLockHeld(::cs_main);
++        m_earliest_verified_height = std::max(0, pivot_height);
++        m_fast_sync_active = (m_earliest_verified_height > 0);
++    }
++
++    void ActivateVerifiedFastSyncPivot(
++        CBlockIndex *pindex_pivot,
++        const std::vector<lotus::v2::Coin> &coins,
++        const lotus::v2::MonetaryState &monetary_state)
++        EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
++
++    bool PeelFastSyncBlock(
++        const BlockHash &block_hash,
++        const lotus::v2::BlockUndoMessage &undo_msg,
++        const CBlock *optional_block,
++        FastSyncPeelResult &result_out,
++        std::string &err_out)
++        EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
++
++    bool RecordReversePeeledBlock(int peeled_parent_height)
++        EXCLUSIVE_LOCKS_REQUIRED(::cs_main) {
++        AssertLockHeld(::cs_main);
++        if (!m_fast_sync_active ||
++            peeled_parent_height != m_earliest_verified_height - 1) {
++            return false;
++        }
++        m_earliest_verified_height = peeled_parent_height;
++        if (m_earliest_verified_height == 0) {
++            m_fast_sync_active = false;
++        }
++        return true;
++    }
++
++
+     /**
+      * The set of all CBlockIndex entries that have as much work as our current
+      * tip or more, and transaction data needed to be validated (with
+@@ -1087,104 +1166,7 @@ public:
+         return m_mempool ? &m_mempool->cs : nullptr;
+     }
+ 
+-    static constexpr int kDefaultFastSyncUndoHorizon = 50;
+-    static constexpr size_t MAX_CACHED_FAST_SYNC_STATES = 64;
+-
+-    struct FastSyncBlockState {
+-        std::shared_ptr<const lotus::v2::SmtNode> smt_root;
+-        lotus::v2::UtxoSet utxo;
+-        lotus::v2::MonetaryState monetary;
+-        lotus::v2::Hash utxo_root = lotus::v2::EmptyUtxoRoot();
+-        uint64_t height = 0;
+-    };
+-
+-    bool IsFastSyncActive() const EXCLUSIVE_LOCKS_REQUIRED(::cs_main) {
+-        return m_fast_sync_active;
+-    }
+-    int GetEarliestVerifiedHeight() const EXCLUSIVE_LOCKS_REQUIRED(::cs_main) {
+-        return m_earliest_verified_height;
+-    }
+-    const CBlockIndex *GetEarliestVerifiedBlock() const
+-        EXCLUSIVE_LOCKS_REQUIRED(::cs_main) {
+-        return m_earliest_verified_block;
+-    }
+-    int GetFastSyncMaxPeelBlocks() const EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
+-    void SetFastSyncMaxPeelBlocks(std::optional<int> max_blocks)
+-        EXCLUSIVE_LOCKS_REQUIRED(::cs_main) {
+-        m_max_peel_blocks_override = max_blocks;
+-    }
+-    int GetFastSyncPeeledBlocksCount() const
+-        EXCLUSIVE_LOCKS_REQUIRED(::cs_main) {
+-        return m_peeled_blocks_count;
+-    }
+-    bool IsSnapSyncEnabled() const EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
+-    bool IsReverseSyncEnabled() const EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
+-    void SetSnapSyncEnabled(std::optional<bool> enabled)
+-        EXCLUSIVE_LOCKS_REQUIRED(::cs_main) {
+-        m_snapsync_enabled_override = enabled;
+-    }
+-    void SetReverseSyncEnabled(std::optional<bool> enabled)
+-        EXCLUSIVE_LOCKS_REQUIRED(::cs_main) {
+-        m_reversesync_enabled_override = enabled;
+-    }
+-    void SetFastSyncStateAnchor(const BlockHash &block_hash,
+-                                const lotus::v2::Hash &utxo_root)
+-        EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
+-    std::optional<lotus::v2::Hash>
+-    GetFastSyncStateAnchor(const BlockHash &block_hash) const
+-        EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
+-    const FastSyncBlockState *
+-    GetFastSyncBlockState(const BlockHash &block_hash) const
+-        EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
+-    bool ExportV2BlockStateCoinsAndMonetary(
+-        const CBlockIndex *pindex, FastSyncBlockState &out_state,
+-        std::string &error, bool populate_utxo_set = true)
+-        EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
+-    bool ActivateVerifiedFastSyncPivot(
+-        CBlockIndex *pivot_index, const lotus::v2::UtxoRootsMessage &roots_msg,
+-        const std::vector<lotus::v2::UtxoShardMessage> &shards,
+-        std::string &error) EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
+-    bool PeelFastSyncBlock(const CBlock &block, CBlockIndex *pindex,
+-                           const std::vector<lotus::v2::Coin> &spent_coins,
+-                           std::string &error)
+-        EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
+-
+ private:
+-    void CacheFastSyncBlockState(
+-        const BlockHash &block_hash,
+-        std::shared_ptr<const lotus::v2::SmtNode> smt_root,
+-        const lotus::v2::MonetaryState &monetary,
+-        const lotus::v2::Hash &utxo_root, uint64_t height)
+-        EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
+-    void UpdateConnectedBlockSmtState(const CBlock &block,
+-                                      const CBlockIndex *pindex)
+-        EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
+-    void UpdateFastSyncPivotBase(CBlockIndex *new_base)
+-        EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
+-
+-    bool m_fast_sync_active GUARDED_BY(::cs_main){false};
+-    int m_earliest_verified_height GUARDED_BY(::cs_main){0};
+-    CBlockIndex *m_earliest_verified_block GUARDED_BY(::cs_main){nullptr};
+-    CBlockIndex *m_fast_sync_pivot_base GUARDED_BY(::cs_main){nullptr};
+-    int m_fast_sync_pivot_height GUARDED_BY(::cs_main){0};
+-    int m_peeled_blocks_count GUARDED_BY(::cs_main){0};
+-    std::optional<int> m_max_peel_blocks_override GUARDED_BY(::cs_main);
+-    std::optional<bool> m_snapsync_enabled_override GUARDED_BY(::cs_main);
+-    std::optional<bool> m_reversesync_enabled_override GUARDED_BY(::cs_main);
+-    std::optional<lotus::v2::UtxoSet> m_reverse_peel_utxo GUARDED_BY(::cs_main);
+-    std::shared_ptr<const lotus::v2::SmtNode>
+-        m_reverse_peel_smt_root GUARDED_BY(::cs_main);
+-    std::shared_ptr<const lotus::v2::SmtNode>
+-        m_tip_smt_root GUARDED_BY(::cs_main);
+-    BlockHash m_tip_smt_blockhash GUARDED_BY(::cs_main){};
+-    std::unordered_map<uint64_t, std::vector<lotus::v2::Coin>>
+-        m_pending_undo_coin_checks GUARDED_BY(::cs_main);
+-    std::deque<BlockHash> m_fast_sync_state_fifo GUARDED_BY(::cs_main);
+-    std::unordered_map<BlockHash, FastSyncBlockState, SaltedUint256Hasher>
+-        m_fast_sync_block_states GUARDED_BY(::cs_main);
+-    std::unordered_map<BlockHash, lotus::v2::Hash, SaltedUint256Hasher>
+-        m_fast_sync_state_anchors GUARDED_BY(::cs_main);
+-
+     bool ActivateBestChainStep(
+         BlockValidationState &state, CBlockIndex *pindexMostWork,
+         const std::shared_ptr<const CBlock> &pblock, bool &fInvalidFound,
