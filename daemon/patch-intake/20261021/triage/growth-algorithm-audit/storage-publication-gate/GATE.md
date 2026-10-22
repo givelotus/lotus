@@ -31,3 +31,7 @@ A source self-review fixed pending numeric deltas being cleared before later sna
 There is no performance, bounded-total-RSS or runtime correctness claim. Root exposure estimates and actual structural-node counts require native measurements. The historical snapshot publisher retains 1024 generations: adding canonical handles there may retain large old roots outside relay reservations during repeated clears/refills; Astra has been asked to review this actual lifetime concern before gate release. No default reservation/time values are frozen here.
 
 The AB|D + learned C/new E => ABC|DE candidate ownership/vote reset behavior remains an independently revised specification task. Generic immutable roots are useful across cut variants; this packet does not implement that lifecycle or claim network convergence.
+
+## Actual source-review correction
+
+Astra's overlay reviewer confirmed the 1024-ring canonical-graph retention blocker. Source `006f5fe7a5` repairs it with a current-only atomically owned tuple containing canonical root, matching numeric tree, sequence and mempool identity. Historical RPC snapshots retain only sequence. A new weak-root regression requires old canonical ownership to expire after clear unless an explicit reader pin survives. Re-review and native execution are still pending; this is not a passing gate.
