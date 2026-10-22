@@ -23,3 +23,7 @@ Final source-review corrections: stable pre-reserved map objects swap only point
 Both independent source reviewers closed their phase1 gates at f6a774e8e8/treec0e38c3946; see sibling astra-reconciliation-overlay-spec/PAIRWISE-SCHEDULER-SOURCE-GATE.md. N1 started the exact source normal-j10 build on its unchanged measured profile. Focused/runtime results remain pending.
 
 Actual first native build exposed a test-only protected callback invocation. Fix c2630fca5a drives the real public ValidationSignals dispatcher with existing ImmediateTaskRunner; callback visibility, production code and assertions are unchanged. The original failed compile receipt is retained by N1; runtime gates remain pending.
+
+Native result: all12 focused tests PASS,411 assertions. The normal remaining30 actions completed in11.43s after the legitimate test-only signal fixture fix; exact c263/treeac707 artifacts and raw receipts are in exports/adaptive-reconciliation-scheduler-validated/BINARY-READY.json. Fresh3node10k/noAVA/reconnect runtime proof is still pending; harness setup retries are not candidate passes or failures.
+
+A narrow accounting policy edge remains under review: if a failed mature captured threshold is superseded by a full newer cohort within the propagation margin, retry count readiness can wait for the newer cohort maturity while the original maxwait remains due/unchanged. No source change was made during the active runtime gate.
