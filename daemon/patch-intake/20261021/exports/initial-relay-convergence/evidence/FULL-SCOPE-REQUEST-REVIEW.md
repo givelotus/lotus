@@ -38,3 +38,12 @@ For FULL_MEMPOOL add focused cases for:
 - Unknown epoch/key floods that schedule no full-root or full-summary work.
 
 These tests complement canonical root, immutable snapshot and bounded-memory proofs. They do not authorize new full-scope code before the specification/review gates finish.
+
+## Follow-up on review draft 2
+
+Draft 2 addresses the initial request ownership, opportunistic collider response, pinned-view reconstruction and exact-identity fallback concerns. Two clarifications were sent to the specification owner:
+
+- Section 3 keeps accepted rounds alive after sketch-domain retirement by using exact canonical zoom, while section 6 cancels contexts on key retirement. Select one explicit lifecycle policy.
+- The canonical internal digest commits child digests and depth, not a numeric count directly. Changing a descriptor count while preserving the same greater-than-one structure need not change that digest. Treat counts as checked traversal/optimization metadata unless a separate proof authenticates them; terminal identity and canonical digest reconstruction remain authoritative. This affects claims about authenticated counts, not the validity of the underlying canonical commitment.
+
+No production implementation or build was added by this review. The narrow request-tracker candidate still awaits its independent native gate.
