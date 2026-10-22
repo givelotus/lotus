@@ -1,5 +1,8 @@
 # Balanced relay-window recovery counterexample and candidate
 
+**Native matched gate passed.** N1 built exact candidate932918233e969ca1cc7b8794f813b070d08a17f3/tree613cf9 (owner266 repair plus independent2995 window-key lifetime repair): normal12 actions PASS5.94s. Balanced guard35/35 assertions PASS; GF64 arithmetic676, all-scopes53 and adversarial49 assertions PASS. Matched old-production control34ce failed exactly the six desired recovery checks while29 other checks passed. Full drain and immutable receipts: exports/reconciliation-owner-repairs-validated/BINARY-READY.json. This establishes the focused repair, not network convergence. Full AVA/scheduler/two-repair union is a separate subsequent gate.
+
+
 N1 actually compiled and ran the original case.cpp at diagnostic a966d7eccf/tree9bad: the two requested-recovery checks failed and the other ten assertions, including the non-relay control, passed. This proves a deterministic balanced-set blind spot in the production diff, independently of time-window expiry, cap4096, network latency or funding. It does not prove all reconnect misses have this cause.
 
 The separate isolated candidate is 866f7ffc9d7869282c714874753a9df98cdeef45/tree cada0c8801d99ad5a1aac97a56e0f3e1360d6086 on canonical2cf83331. Test-only parent202464b76a additionally checks direct depth8 summaries with four remote versus four/five local distinct same-prefix identities, a count-inconsistent decoded difference, and extra-only behavior. Five recovery assertions are predicted to fail before the production repair and pass afterward; this expanded prediction is not yet a native result.
