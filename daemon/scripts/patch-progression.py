@@ -185,10 +185,16 @@ def runtime_workloads(entry, source, available_tests):
     return workloads
 
 
-def native_suite_selection(source, entries, available, av_available):
+def native_suite_selection(source, entries, available, av_available, compiled=None):
     suites = {'bitcoin': ['mempool_tests', 'rpc_tests', 'miner_tests'],
               'avalanche': ['proof_tests', 'delegation_tests']}
     origins = {}
+    # Feature-gated translation units are absent from this build's test binary.
+    # Chronik, HTTP/2, and WebTransport stay off in the benchmark profile, so
+    # their suites are not failures. A suite that is compiled, or that a
+    # contract explicitly requires, still fails closed when it is unregistered.
+    compiled = compiled or {}
+    excluded = []
     for entry in entries:
         for kind, names in entry.get('contract', {}).get('required_native_suites', {}).items():
             for name in names:
@@ -201,15 +207,22 @@ def native_suite_selection(source, entries, available, av_available):
                 continue
             kind = ('bitcoin' if name.startswith('src/test/') else
                     'avalanche' if name.startswith('src/avalanche/test/') else None)
-            if kind:
+            if not kind:
+                continue
+            inputs = compiled.get(kind)
+            if inputs is not None and not any(path.endswith('/' + name) for path in inputs):
                 for suite in re.findall(r'BOOST_(?:FIXTURE|AUTO)_TEST_SUITE\(\s*(\w+)', file.read_text()):
-                    if suite not in suites[kind]:
-                        suites[kind].append(suite)
-                    origins[(kind, suite)] = name
+                    excluded.append({'binary': kind, 'suite': suite, 'origin': name,
+                                     'reason': 'translation unit is not linked into this build'})
+                continue
+            for suite in re.findall(r'BOOST_(?:FIXTURE|AUTO)_TEST_SUITE\(\s*(\w+)', file.read_text()):
+                if suite not in suites[kind]:
+                    suites[kind].append(suite)
+                origins[(kind, suite)] = name
     missing = [{'binary': kind, 'suite': name, 'origin': origins.get((kind, name), 'baseline gate')}
                for kind, listing in [('bitcoin', available), ('avalanche', av_available)]
                for name in suites[kind] if name + '*' not in listing]
-    return suites['bitcoin'], suites['avalanche'], missing
+    return suites['bitcoin'], suites['avalanche'], missing, excluded
 
 
 def run_command(argv, log, timeout=7200, env=None):
@@ -365,7 +378,18 @@ def main():
             daemon = 'lotusd' if 'add_executable(lotusd' in (source / 'src/CMakeLists.txt').read_text() else 'bitcoind'
             targets = subprocess.check_output(['ninja', '-C', str(build), '-t', 'targets', 'all'], text=True)
             extras = [target for target in ('bitcoin-bench', 'bitcoin-cli', 'lotus-cli', 'test_lotus_v2_disk_state') if re.search('^' + target + ':', targets, re.M)]
-            built = run('build', ['ninja', '-C', build, '-j', str(args.jobs), daemon, 'test_bitcoin', 'test-avalanche', *extras])
+            # Separate executables, not Boost suites. A contract may name one
+            # before the CMake target exists; absence is recorded, not a zero.
+            standalone_requested = []
+            for prior in entries[:index + 1]:
+                for name in prior.get('contract', {}).get('required_standalone_binaries', []):
+                    if name not in standalone_requested:
+                        standalone_requested.append(name)
+            standalone_present = [name for name in standalone_requested
+                                  if re.search('^' + re.escape(name) + ':', targets, re.M)]
+            record['standalone_binaries'] = standalone_present
+            record['standalone_unavailable'] = [name for name in standalone_requested if name not in standalone_present]
+            built = run('build', ['ninja', '-C', build, '-j', str(args.jobs), daemon, 'test_bitcoin', 'test-avalanche', *extras, *standalone_present])
             record['incremental_build_seconds'] = built['seconds']
             record['binary_sha256'] = digest((build / 'src' / daemon).read_bytes())
             record['build_passed'] = True
@@ -376,11 +400,16 @@ def main():
             av_listing = subprocess.run([build / 'src/avalanche/test/test-avalanche', '--list_content'], text=True, capture_output=True)
             if av_listing.returncode:
                 raise GateFailure('Avalanche test enumeration failed')
-            suites, av_suites, missing_suites = native_suite_selection(
-                source, entries[:index + 1], available, av_listing.stdout + av_listing.stderr)
+            compiled = {}
+            for kind, target in (('bitcoin', 'src/test/test_bitcoin'), ('avalanche', 'src/avalanche/test/test-avalanche')):
+                compiled[kind] = set(subprocess.check_output(
+                    ['ninja', '-C', str(build), '-t', 'inputs', target], text=True).splitlines())
+            suites, av_suites, missing_suites, excluded_suites = native_suite_selection(
+                source, entries[:index + 1], available, av_listing.stdout + av_listing.stderr, compiled)
             record['unit_suites'] = suites
             record['avalanche_suites'] = av_suites
             record['missing_native_suites'] = missing_suites
+            record['build_excluded_native_suites'] = excluded_suites
             if missing_suites:
                 raise GateFailure('Native test suites exist in source but are not registered: ' + json.dumps(missing_suites))
             run('unit', [build / 'src/test/test_bitcoin', '--run_test=' + ','.join(suites), '--report_level=detailed'], 3600)
@@ -405,6 +434,8 @@ def main():
                     '--tmpdir=' + str(attempt / ('functional-' + Path(test).stem))], 600, env=test_env)
             if 'test_lotus_v2_disk_state' in extras:
                 run('disk_state', [next(build.rglob('test_lotus_v2_disk_state'))], 3600)
+            for name in standalone_present:
+                run('standalone_' + name, [next(build.rglob(name))], 3600)
             # Compile the migrated Chronik backend and its subsequent integration
             # boundaries, independently of the default daemon feature selection.
             if index and (any(name.startswith('chronik/') for name in entry['files'])):
