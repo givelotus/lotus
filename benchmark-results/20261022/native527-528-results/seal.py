@@ -11,7 +11,7 @@ for phase in ['ordinary','reads','batch','reconciliation']:
   except ProcessLookupError:pass
   drains.append({'phase':phase,'point':item['point'],'group':group,'absent':True})
  summary[phase]=result
-logs={}
+logs=json.loads((R/'RAW-RUN-LOGS.json').read_text()) if (R/'RAW-RUN-LOGS.json').exists() else {}
 for f in sorted(R.rglob('*.log')):logs[str(f.relative_to(R))]={'sha256':hashlib.sha256(f.read_bytes()).hexdigest(),'utf8_text':f.read_text(errors='replace')}
 (R/'RAW-RUN-LOGS.json').write_text(json.dumps(logs,indent=2)+'\n')
 recon=[]
