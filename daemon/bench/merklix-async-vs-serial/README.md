@@ -62,3 +62,15 @@ Create NEW_RESULT_DIR first; the smoke and matrix refuse existing raw files.
 The measured host had 18 logical CPUs, AppleClang 21 and the system allocator.
 An unrelated existing one-core explore job was preserved; this was not an idle
 host. The full matrix took about 12.5 minutes and is a component study, not TPS.
+
+## Generic cooperative executor follow-up E
+
+The [E model](COOPERATIVE-MODEL.md) implements a fixed hardware-sized callback
+budget, shared external-helper permits, bounded admission/queue backpressure,
+cooperative joining and quiescent shutdown. Focused and ThreadSanitizer tests
+pass. The separate [E report](../../../benchmark-results/merklix-cooperative-pool-e-20261022/REPORT.md)
+contains 448 fresh ACDE Merklix samples and 96 synthetic mixed-client samples.
+E stayed within18 callback slots with zero timed worker creation, but small-job
+scheduler overhead regressed and performance improvements were workload-specific.
+It remains a reusable prototype, with no daemon adoption. Original D results and
+header are immutable; use `make-cooperative-variants.sh`/`build-e` for this lane.
