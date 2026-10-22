@@ -124,3 +124,23 @@ Append-only. Times are UTC.
 - The runner now records exit 77 only for the closed set of feature-off framework reasons (Chronik, Chronik plugins, Chronik Electrum, wallet, bitcoin-wallet, ZMQ, HTTP/2) as `functional_skipped` with result `N/A` and `coverage` false. Any other non-zero status still fails. `wallet_v2_native_receive.py` at global 517 is the later wallet case. This edits `daemon/scripts/patch-progression.py`, so the harness changes. The previous point 0 record is `point0-ok-before-feature-skip-harness.json`. Point 0 must be remeasured on harness `10bb374b410b4e684b465fab223ffe3a48f1bf3d8c8f285f04e23d0f960bc8c3` before point 374 can be compared. Prefixes are unchanged.
 - `websocket-client` 1.9.2 and `zstandard` 0.25.0 are installed for `/usr/local/bin/python3`, which is the interpreter that runs functional tests. `p2p_websocket_inbound.py` skips the whole test when those modules are missing. That skip is not in the feature-off set, so the modules were installed and the test must actually run. OpenSSL 4.0.3 is on `PATH`.
 - Point 374 is not measured. Point 527 and the sustained 500k workload stay unstarted. The held native527 network run stays unlaunched. Not pushed.
+
+## 2026-10-22T17:10:48Z — point 0 remeasured on the feature-skip harness
+
+- Pid 53019 exited 0. Status ok. Source `1fb7db17c176cdea8a2c60d887891589382ee4e3`, tree `b2e4a0a9f57c593129028352d5dbb0c4ff294cdb`. Prefix `d31812321128763d3b6c9414b600f3dae02218575fd805b06391bb056ce3fe36`, unchanged. Harness `10bb374b410b4e684b465fab223ffe3a48f1bf3d8c8f285f04e23d0f960bc8c3`. Candidate `e2b648177b80890babfeae3a7c195bdc9105556d`.
+- `bitcoind` sha256 `788ca330b50ef094762b59d5c5be406b6f0958514287cac0ae0a777dcf84b074`, byte-identical to `daemon/.local-artifact-archive/grok-progression-binaries/point-000-bitcoind` and to the previous harness. Configure 1.7s, ninja 60.7s, units 0.4s, avalanche 0.5s, three legacy repetitions 11.3/10.7/10.8s. No functional tests are required at point 0, so `functional_skipped` is empty. `gbt_compact` remains unavailable (`Invalid mode`). Kernel benchmark still absent.
+- Same historical short burst: 500 or 801 transactions, n=3. Not a 500k result. This record replaces `patch_000.json` as the comparison baseline. The previous harness record remains `point0-ok-before-feature-skip-harness.json`.
+
+| metric | median | min | max |
+| --- | --- | --- | --- |
+| single_tx tx/s | 14324.0 | 14132.5 | 14396.0 |
+| json_rpc_batch50 tx/s | 21724.9 | 21609.6 | 21949.4 |
+| relay_ingest tx/s | 14668.8 | 13511.4 | 14780.6 |
+| relay500 tx/s | 4099.5 | 3867.3 | 4105.1 |
+| read_unloaded RPC method calls/s | 19009.4 | 18699.9 | 19111.4 |
+| read_loaded RPC method calls/s | 10084.7 | 9628.3 | 10318.8 |
+| gbt_standard p50 ms | 1.549 | 1.548 | 1.561 |
+| block500 three-node ms | 5.275 | 5.164 | 5.470 |
+| block801 three-node ms | 19.275 | 17.840 | 24.604 |
+
+- `block801` still includes one sample above 20ms on the unchanged binary. That is sample spread. Next: `--point 374` on this harness. Point 527 and sustained 500k stay unstarted.
