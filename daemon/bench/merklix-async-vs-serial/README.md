@@ -1,64 +1,64 @@
-# Merklix TransactionSubtreeA: std::async vs serial
+# Merklix TransactionSubtreeA: async versus serial
 
-**STATUS: harness prepared, NOT yet measured.** No compile or benchmark has been run, because no exclusive host window exists (see below). No performance claim is made.
+**Measured:** 448 samples completed on 2026-10-22; all reference and focused
+correctness gates passed. See the [report](../../../benchmark-results/merklix-async-vs-serial-20261022/REPORT.md)
+for all workloads, confidence intervals, resource costs and limitations.
 
-## Verified identity (read-only checks, no CPU-heavy work)
-- Canonical manifest: `benchmark-results/grok-progression-20261022/manifest.json`, candidate commit `c7cf36456179e9a7ccdae3be03a749d3f07c8bda`, manifest sha256 `acc5bc80bde249d4f624da7ea9deb54a332e53507eb2b7e6539fb492b8de537d` (as recorded by Grok's checkpoint; I did not recompute it).
-- `/Users/shammah/repos/lotus-v2-repaired-source` HEAD `657edc0133cac8d54c5570506dad57bf10e300b5`, tree `9a06a5a1c13780ae91390c4407ad90fefd35bbea`, clean. This equals manifest entry 527 (final V2) exactly.
-- `src/lotus_v2/commitment.cpp` sha256 `06e16b3fc6ce2a60832fdf00aa76b7ec639d53e7c93201344a4b3c679e628bba`; it already contains the span-partition change (`7e2b98f01a`).
+A is byte-identical historical production `commitment.cpp` at commit
+`657edc0133cac8d54c5570506dad57bf10e300b5`; B disables only its async condition.
+Both preserve span partitioning, tagged hashing, inputs, compiler and allocator.
+Async launches the left child when depth <4, entries >=64, and both partitions
+are nonempty; the caller processes the right child and joins the future.
+C substitutes a fixed min(15, hardware concurrency) worker pool. D substitutes
+a growing persistent pool capped by `LOTUS_POOL_MAX` (default 4×hardware threads).
+The original A/B question remains distinct from experimental pool evaluation.
+No daemon change was adopted.
 
-## Actual parallelism thresholds (read from source, lines 71-96)
-Async launch iff `depth < 4 && entries.size() >= 64 && !left.empty() && !right.empty()`; `std::launch::async` on the LEFT child, right child runs on the caller, then `future.get()`. So at most 1+2+4+8 = 15 threads created per root, only when both sides are non-empty. Keys concentrated in a few prefixes get one-sided splits and therefore fewer/no spawns at depths 2-3.
+Source inputs and SHA256 provenance are preserved in the canonical report's
+`source/SOURCE.json`. The historical source pin is intentional; current Grok
+progression source is a separate identity. Set `SRC` to this immutable export
+when rebuilding. `make-variants.sh` verifies every exported source hash and pin,
+or accepts a clean Git checkout of that exact historical commit.
 
-## Design
-- A = byte-identical copy of production `commitment.cpp`. B = same file with `false &&` prepended to the single dispatch condition (one-line diff, enforced by `make-variants.sh`). Same harness object, tagged_hash, BLAKE3 lib, flags (`-O3 -DNDEBUG`, system allocator).
-- Timed: whole `BuildTxSubtreeA` call (pointer-array allocation, partition, thread create, join, future destruction). Not timed: fixture, reference check (independent recursive vector implementation, checked before timing, and root printed), warm-up (3 roots), process start.
-- Samples: one process each, >=1.5 s, >=7 repetitions, A/B order alternated; wall, process CPU (getrusage), peak RSS, `pthread_create` count via dyld interposition; concurrency cases use 4 and 16 caller threads.
+The harness times full BuildTxSubtreeA calls, including allocation, partition,
+hash, dispatch, join and future destruction. Fixture/reference creation and three
+warm-up roots are excluded. All timed roots compare against an independent
+recursive vector reference. The matrix covers 64/1,000/5,000/100,000/500,000 random
+and four-prefix fixtures, plus four and sixteen concurrent callers at 5,000 and
+100,000 random entries. Eight rotated orderings, at least 1.5 seconds/sample,
+one process/sample, and a 45-second timeout produce 448 observations.
 
-## Variant C (added after the A/B plan; user question on persistent workers)
-C = A with only the dispatch replaced: process-lifetime pool of min(15, hw) workers behind a mutex/condvar deque (`pool_dispatch.inc`). Same thresholds, partitioning and hash. Join = reclaim-and-run-inline if no worker has started the job, otherwise wait on it, so no deadlock and no help-while-waiting scheduler. Pool construction happens at first use (warm-up, excluded); queue is deliberately not lock-free (<=15 jobs/root). Order rotates through all 6 permutations of A/B/C, 6 reps default. C was written but **never compiled or run** (no window); expect first-compile fixes. `threads_per_root` for C should be 0 in the timed region (workers exist already, counted outside).
-A/B stays the primary question; C is adopted only if it beats both with evidence, and would be a separate follow-up patch.
+Raw JSON includes wall/CPU/root, process peak RSS, successful pthread starts,
+first production-root wall/CPU (lazy pool construction included), worker starts
+before timing and subprocess wall through process exit. RSS includes reference
+and fixture allocations. Subprocess wall also includes fixture/reference/warm-up;
+it does not isolate pool teardown. Concurrent wall/root is throughput-equivalent
+cost; `latency_ms_per_root` is caller-count multiplication, not sampled latency.
+Thread counters are gated against exact expected caller/A/B/C counts.
 
-## Variant D (generic persistent pool with growth)
-`work_pool.h`: header-only `util::WorkPool` with `Async(f)->Future<T>` (move-only callables, reclaim-or-wait `Get()`, exception propagation), `Post(f)`, and on-demand growth (kept, never shrunk) up to `LOTUS_POOL_MAX` (default 4*hw). D = A with only the dispatch replaced by `WorkPool::Shared().Async(...)`. Prototype of the API intended for later reuse by other call sites (consolidating existing pools would be a separate second refactor; `CCheckQueue` and signature pools stay untouched). Never compiled or run yet. Rotation is 8 orderings of A/B/C/D, 8 reps default. Rule: pool jobs may block only via `Future::Get()`.
+D supports move-only captures and movable object results; void work uses Post,
+which intentionally discards exceptions. Get runs an unstarted job inline or
+waits for a running job and rethrows its exception. Destroying or overwriting a
+Future joins its previous job. The pool outlives all Futures. Stop external
+submitters before destruction; draining jobs may still submit descendants.
+Jobs may block only through acyclic Future dependencies, and must not destroy
+the pool. Workers start lazily and never shrink. Shutdown freezes worker growth
+before joining; initial thread-start failure falls back to inline execution.
+This prototype is not validated for arbitrary blocking dependency graphs.
+CCheckQueue, validation caches and signature pools remain outside this study.
 
-## Run (only in an authorized exclusive window)
-    daemon/bench/merklix-async-vs-serial/make-variants.sh
-    daemon/bench/merklix-async-vs-serial/run-matrix.py benchmark-results/merklix-async-vs-serial-<date>
+Reproduce only in a coordinated host window:
 
-## Exclusive-window status
-Grok's progression run (`benchmark-results/grok-progression-20261022`) is active: point 0 finished, points 374 and 527 (builds + timing) are pending. `daemon/WORKTREES.json` lists its checkout. The host also has unrelated load (load avg ~6, an `explore` loop at 100% CPU, a dart language server). I have no channel to Grok, so a window has not been agreed.
+```sh
+# See COMMANDS.txt in the report directory for compiler and sanitizer gates.
+SRC="$PWD/benchmark-results/merklix-async-vs-serial-20261022/source" \
+  daemon/bench/merklix-async-vs-serial/make-variants.sh
+LOTUS_POOL_MAX=72 python3 daemon/bench/merklix-async-vs-serial/correctness-smoke.py NEW_RESULT_DIR
+LOTUS_POOL_MAX=72 python3 daemon/bench/merklix-async-vs-serial/run-matrix.py NEW_RESULT_DIR 8 1.5
+python3 daemon/bench/merklix-async-vs-serial/analyze.py NEW_RESULT_DIR
+```
 
-Raw samples now also record first-root wall/CPU cost (including lazy pool
-creation), worker creations before timing, and subprocess wall time through
-process exit (including teardown, fixture/reference and warm-up). These are
-separate observables: subtracting them does not isolate pool teardown. Thread
-counts and summary column labels cover all four variants.
-## Resume review (2026-10-22)
-The historical source pin `657edc0133cac8d54c5570506dad57bf10e300b5`
-remains the intended A/B input. Grok's newer canonical progression tip is a
-separate source identity; it does not invalidate this historical controlled
-comparison. Before running, preserve the pinned source and build inputs under
-the canonical task home and set `SRC` explicitly. Do not modify Grok inputs.
-
-Source repairs, not yet compiled: corrected C generator argument and hoisted
-its standard includes out of the production namespace. D now freezes worker
-growth before shutdown joins, drains descendants on existing workers, joins
-an overwritten Future, rejects consumed Get, constrains Async to movable
-object results, and falls back to inline execution if initial thread creation
-fails. Workers start lazily; cap zero is normalized to one. The pool must
-outlive Futures; external submissions must stop before destruction; jobs may
-submit descendants while draining but must not destroy the pool. Dependencies
-must be acyclic. Post intentionally discards job exceptions. This is still an
-experimental framework, separate from the A/B result.
-
-`work_pool_test.cpp` prepares focused gates for move-only values/captures,
-exception propagation, consumed Get, nested trees at caps1/2/4, destructor and
-move-assignment joining, thread caps, and descendant draining. It has not been
-compiled or executed. In a negotiated window: compile/run this gate first,
-then build all variants, check every workload against the reference with short
-smokes, and only then run the 8-repetition matrix. The matrix requires at least
-672 seconds of timed execution plus build/reference/warm-up/drain overhead.
-Whole-process RSS includes fixture/reference/warm-up. Warm pool timing excludes
-pool construction and shutdown; full-lifecycle pool costs remain a separate
-measurement requirement. No performance or correctness-pass claim is made.
+Create NEW_RESULT_DIR first; the smoke and matrix refuse existing raw files.
+The measured host had 18 logical CPUs, AppleClang 21 and the system allocator.
+An unrelated existing one-core explore job was preserved; this was not an idle
+host. The full matrix took about 12.5 minutes and is a component study, not TPS.
