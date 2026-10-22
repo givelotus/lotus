@@ -28,10 +28,10 @@ index f6ca056f93..fa65a991e2 100644
          strprintf("Reconcile the transactions admitted in the last this many "
 diff --git a/src/net/full_mempool_reconciliation.cpp b/src/net/full_mempool_reconciliation.cpp
 new file mode 100644
-index 0000000000..665a7e395e
+index 0000000000..2abba573e4
 --- /dev/null
 +++ b/src/net/full_mempool_reconciliation.cpp
-@@ -0,0 +1,716 @@
+@@ -0,0 +1,756 @@
 +// Copyright (c) 2026 The Lotus developers
 +// Distributed under the MIT software license. See COPYING.
 +#include <net/full_mempool_reconciliation.h>
@@ -127,6 +127,13 @@ index 0000000000..665a7e395e
 +    if (transactions.size() > maximum_bytes / per_item ||
 +        transactions.size() > (uint64_t{Node::NONE} - 1) / 2)
 +        throw std::length_error("full-recon snapshot byte budget");
++    const size_t input_bytes{memusage::DynamicUsage(transactions)};
++    const size_t item_bytes{memusage::MallocUsage(transactions.size() * sizeof(Item))};
++    const size_t node_bytes{memusage::MallocUsage(transactions.size() * 2 * sizeof(Node))};
++    if (sizeof(Snapshot) > maximum_bytes || input_bytes > maximum_bytes - sizeof(Snapshot) ||
++        item_bytes > maximum_bytes - sizeof(Snapshot) - input_bytes ||
++        node_bytes > maximum_bytes - sizeof(Snapshot) - input_bytes - item_bytes)
++        throw std::length_error("full-recon snapshot preallocation budget");
 +    m_items.reserve(transactions.size());
 +    m_nodes.reserve(transactions.size() * 2);
 +    // Include the by-value construction inventory and actual vector capacities.
@@ -319,6 +326,7 @@ index 0000000000..665a7e395e
 +        std::optional<Fetch> fetch;
 +        Clock next_offer{0us};
 +        size_t queued_charge{0};
++        std::optional<Offer> pending_control;
 +        uint256 last_remote_context;
 +    };
 +    std::map<int64_t, Peer> peers;
@@ -330,7 +338,7 @@ index 0000000000..665a7e395e
 +    }
 +    size_t Used(size_t *captures = nullptr) const {
 +        std::set<const Snapshot *> unique;
-+        size_t used{peers.size() * sizeof(Peer)};
++        size_t used{memusage::DynamicUsage(peers)};
 +        if (cache.snapshot) unique.insert(cache.snapshot.get());
 +        for (const auto &[_, peer] : peers) {
 +            if (peer.serve) unique.insert(peer.serve->snapshot.get());
@@ -368,8 +376,9 @@ index 0000000000..665a7e395e
 +    }
 +    std::shared_ptr<const Snapshot> CapturePool(Clock now) {
 +        const auto anchor{Anchor()};
++        const auto current_generation{WITH_LOCK(pool.cs, return pool.GetSequence())};
 +        if (cache.snapshot && cache.anchor == anchor &&
-+            cache.generation == pool.GetTransactionsUpdated()) return cache.snapshot;
++            cache.generation == current_generation) return cache.snapshot;
 +        if (now < next_capture) return cache.anchor == anchor ? cache.snapshot : nullptr;
 +        size_t captures{0};
 +        const size_t used{Used(&captures)}, budget{Budget()};
@@ -378,6 +387,8 @@ index 0000000000..665a7e395e
 +            ++stats.busy; return nullptr;
 +        }
 +        const size_t available{budget - used - PARSE_RESERVATION - FETCH_FIXED_CHARGE};
++        // A failed allocation/build must not turn peer ticks into O(N) retries.
++        next_capture = now + CAPTURE_SPACING;
 +        size_t count{0};
 +        {
 +            LOCK(pool.cs);
@@ -394,13 +405,18 @@ index 0000000000..665a7e395e
 +        uint64_t generation{0};
 +        uint256 captured_anchor;
 +        const auto lock_started{Now()};
++        Clock lock_acquired;
 +        {
 +            LOCK2(cs_main, pool.cs);
-+            if (pool.mapTx.size() > transactions.capacity()) return nullptr;
++            lock_acquired = Now();
++            if (pool.mapTx.size() > transactions.capacity() ||
++                pool.mapTx.size() > available / 512 ||
++                pool.DynamicMemoryUsage() > available - pool.mapTx.size() * 512)
++                return nullptr;
 +            const auto *tip{chainman.ActiveTip()};
 +            if (!tip) return nullptr;
 +            captured_anchor = tip->GetBlockHash();
-+            generation = pool.GetTransactionsUpdated();
++            generation = pool.GetSequence();
 +            for (const auto &entry : pool.mapTx) transactions.push_back(entry->GetSharedTx());
 +        }
 +        const auto copied{Now()};
@@ -410,19 +426,25 @@ index 0000000000..665a7e395e
 +        next_capture = now + CAPTURE_SPACING;
 +        ++stats.captures;
 +        stats.captured_members += snapshot->Size();
-+        stats.capture_lock_us += (copied - lock_started).count();
++        stats.capture_lock_wait_us += (lock_acquired - lock_started).count();
++        stats.capture_lock_us += (copied - lock_acquired).count();
 +        stats.capture_build_us += (Now() - copied).count();
 +        LogEvent(BCLog::TXRELAY, "fullrecon_capture", "captured complete mempool count={count} bytes={bytes}")
 +            .Field(BCLog::LogField::Count, snapshot->Size())
 +            .Field(BCLog::LogField::Bytes, snapshot->ChargedBytes())
-+            .Field(BCLog::LogField::DurationUs, (copied - lock_started).count());
++            .Field(BCLog::LogField::DurationUs, (copied - lock_acquired).count());
 +        return snapshot;
 +    }
 +    void ControlFrame(CNode &node, Peer &peer, const Header &header, Control control) {
 +        Offer out;
 +        out.header = header;
 +        out.control = control;
-+        Send(node, peer, NetMsgType::MERKLIXSYNC, out);
++        if (!Send(node, peer, NetMsgType::MERKLIXSYNC, out)) {
++            // Preserve an owned completion under backpressure. Rejected offers'
++            // CANCEL is best-effort; their bounded serving lease is the fallback.
++            if (!peer.pending_control || control == Control::DONE)
++                peer.pending_control = out;
++        }
 +    }
 +    void Push(Fetch &fetch, WorkItem item) {
 +        if (item.remote.digest == fetch.local->At(item.prefix).digest ||
@@ -433,7 +455,18 @@ index 0000000000..665a7e395e
 +    }
 +    void Children(Fetch &fetch, const Prefix &parent,
 +                  const std::array<Descriptor, 16> &children) {
-+        for (unsigned i = 16; i-- > 0;) Push(fetch, {parent.Child(i), children[i]});
++        std::array<WorkItem, 16> next;
++        size_t count{0};
++        for (unsigned i = 16; i-- > 0;) {
++            WorkItem item{parent.Child(i), children[i]};
++            if (item.remote.digest == fetch.local->At(item.prefix).digest ||
++                item.remote.digest == EmptyDigest()) continue;
++            next[count++] = item;
++        }
++        if (count > MAX_DEFERRED_PREFIXES - fetch.deferred.size())
++            throw std::ios_base::failure("full-recon traversal budget");
++        // All checks precede the nonallocating append to the reserved DFS stack.
++        fetch.deferred.insert(fetch.deferred.end(), next.begin(), next.begin() + count);
 +    }
 +    void Topological(Fetch &fetch) {
 +        // One Kahn traversal for the recovered set, never a repeated page scan.
@@ -491,7 +524,7 @@ index 0000000000..665a7e395e
 +            return;
 +        }
 +        if (peer.last_remote_context == offer.header.context) return; // replay cannot restart work
-+        if (offer.anchor != Anchor() || peer.fetch || !Fits(FETCH_FIXED_CHARGE)) {
++        if (offer.anchor != Anchor() || peer.fetch || node.fPauseSend || !Fits(FETCH_FIXED_CHARGE)) {
 +            ControlFrame(node, peer, offer.header, Control::CANCEL);
 +            ++stats.busy;
 +            return;
@@ -585,7 +618,11 @@ index 0000000000..665a7e395e
 +            if (extra > std::numeric_limits<size_t>::max() - PARSE_RESERVATION ||
 +                !Fits(extra + PARSE_RESERVATION))
 +                throw std::length_error("full-recon recovery body budget");
-+            for (const auto &body : reply.bodies) fetch.recovered.emplace(body->GetId(), body);
++            std::map<TxId, CTransactionRef> additions;
++            for (const auto &body : reply.bodies) additions.emplace(body->GetId(), body);
++            // Allocate transactionally, then transfer nodes without allocation.
++            // Failure cannot leave retained bodies outside the exposure charge.
++            fetch.recovered.merge(additions);
 +            fetch.body_charge += extra;
 +            stats.verified_bodies += reply.bodies.size();
 +        }
@@ -597,6 +634,9 @@ index 0000000000..665a7e395e
 +    }
 +    void Tick(CNode &node, Peer &peer, Clock now) {
 +        QueueDrained(node, peer);
++        if (peer.pending_control &&
++            Send(node, peer, NetMsgType::MERKLIXSYNC, *peer.pending_control))
++            peer.pending_control.reset();
 +        const auto anchor{Anchor()};
 +        if (peer.serve && (peer.serve->anchor != anchor || now - peer.serve->progress > IDLE_LEASE ||
 +                           now - peer.serve->born > ABSOLUTE_LEASE)) {
@@ -608,7 +648,7 @@ index 0000000000..665a7e395e
 +            ControlFrame(node, peer, peer.fetch->header, Control::CANCEL);
 +            peer.fetch.reset(); ++stats.expired;
 +        }
-+        if (!peer.serve && now >= peer.next_offer) StartOffer(node, peer, now);
++        if (!peer.serve && now >= peer.next_offer && !node.fPauseSend) StartOffer(node, peer, now);
 +        if (!peer.fetch || node.fPauseSend || node.fDisconnect) return;
 +        auto &fetch{*peer.fetch};
 +        if (fetch.admitting) {
@@ -750,7 +790,7 @@ index 0000000000..665a7e395e
 +} // namespace lotus::v2::net::fullrecon
 diff --git a/src/net/full_mempool_reconciliation.h b/src/net/full_mempool_reconciliation.h
 new file mode 100644
-index 0000000000..1d0067905c
+index 0000000000..625fd3aacd
 --- /dev/null
 +++ b/src/net/full_mempool_reconciliation.h
 @@ -0,0 +1,192 @@
@@ -924,7 +964,7 @@ index 0000000000..1d0067905c
 +    }
 +};
 +struct Stats {
-+    uint64_t captures{0}, captured_members{0}, capture_lock_us{0}, capture_build_us{0};
++    uint64_t captures{0}, captured_members{0}, capture_lock_us{0}, capture_lock_wait_us{0}, capture_build_us{0};
 +    uint64_t offers{0}, requests{0}, replies{0}, verified_bodies{0}, coverage_complete{0};
 +    uint64_t admitted{0}, unresolved{0}, malformed{0}, busy{0}, expired{0};
 +    size_t charged_bytes{0};
