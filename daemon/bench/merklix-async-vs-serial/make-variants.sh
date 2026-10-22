@@ -4,7 +4,7 @@
 set -eu
 SRC=${SRC:-/Users/shammah/repos/lotus-v2-repaired-source}
 HERE=$(cd "$(dirname "$0")" && pwd)
-OUT=$HERE/build
+OUT=${OUT:-$HERE/build}
 mkdir -p "$OUT"
 EXPECT_COMMIT=657edc0133cac8d54c5570506dad57bf10e300b5
 if [ -f "$SRC/SOURCE.json" ]; then

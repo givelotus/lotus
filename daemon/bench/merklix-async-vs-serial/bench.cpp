@@ -7,6 +7,9 @@
 // usage: bench N dist(random|prefix) callers min_seconds [warmup_roots]
 #include <lotus_v2/commitment.h>
 #include <lotus_v2/tagged_hash.h>
+#ifdef BENCH_COOPERATIVE_ENTRY
+#include "cooperative_work_pool.h"
+#endif
 #include <sys/resource.h>
 #include <pthread.h>
 #include <dlfcn.h>
@@ -65,6 +68,14 @@ static std::vector<TxIdentityPair> Fixture(size_t n, bool prefix) {
     return out;
 }
 
+static Hash ComputeRoot(std::span<const TxIdentityPair> fixture) {
+#ifdef BENCH_COOPERATIVE_ENTRY
+    return util::CooperativeWorkPool::Shared().Async([fixture] { return BuildTxSubtreeA(fixture); }).Get();
+#else
+    return BuildTxSubtreeA(fixture);
+#endif
+}
+
 static double cpu_seconds() {
     rusage u; getrusage(RUSAGE_SELF, &u);
     return u.ru_utime.tv_sec + u.ru_stime.tv_sec + (u.ru_utime.tv_usec + u.ru_stime.tv_usec) / 1e6;
@@ -85,10 +96,10 @@ int main(int argc, char **argv) {
     const uint64_t threads_before_warmup = g_threads.load();
     const double cold_cpu0 = cpu_seconds();
     const auto cold_wall0 = std::chrono::steady_clock::now();
-    if (BuildTxSubtreeA(fx) != expected) return 2;
+    if (ComputeRoot(fx) != expected) return 2;
     const double cold_wall = std::chrono::duration<double>(std::chrono::steady_clock::now() - cold_wall0).count();
     const double cold_cpu = cpu_seconds() - cold_cpu0;
-    for (int i = 1; i < warm; ++i) if (BuildTxSubtreeA(fx) != expected) return 2;
+    for (int i = 1; i < warm; ++i) if (ComputeRoot(fx) != expected) return 2;
 
     std::atomic<bool> go{false}, stop{false}, bad{false};
     std::atomic<uint64_t> roots{0};
@@ -96,7 +107,7 @@ int main(int argc, char **argv) {
         while (!go.load()) std::this_thread::yield();
         // each caller runs whole roots until stop; a root in flight at stop is counted
         while (!stop.load(std::memory_order_relaxed)) {
-            if (BuildTxSubtreeA(fx) != expected) bad = true;
+            if (ComputeRoot(fx) != expected) bad = true;
             roots.fetch_add(1, std::memory_order_relaxed);
         }
     };
@@ -128,6 +139,16 @@ int main(int argc, char **argv) {
                 (unsigned long long)caller_threads);
     for (auto b : expected) std::printf("%02x", unsigned(b));
     std::printf("\",\"first_root_wall_s\":%.9f,\"first_root_cpu_s\":%.9f,"
-                "\"threads_created_before_timing\":%llu}\n", cold_wall, cold_cpu,
+                "\"threads_created_before_timing\":%llu", cold_wall, cold_cpu,
                 (unsigned long long)(th0 - threads_before_warmup - caller_threads));
+#ifdef BENCH_COOPERATIVE_ENTRY
+    const auto stats = util::CooperativeWorkPool::Shared().GetStats();
+    std::printf(",\"pool_workers\":%zu,\"pool_budget\":%zu,\"pool_active_peak\":%zu,"
+                "\"pool_queue_peak\":%zu,\"pool_queue_capacity\":%zu,\"pool_outstanding_peak\":%zu,"
+                "\"pool_outstanding_limit\":%zu,\"pool_inline_backpressure\":%zu,\"pool_help_jobs\":%zu,"
+                "\"pool_callback_depth_peak\":%zu,\"pool_own_reclaims\":%zu", stats.workers, stats.budget, stats.active_peak,
+                stats.queued_peak, stats.queue_capacity, stats.outstanding_peak,
+                stats.outstanding_limit, stats.inline_backpressure, stats.help_jobs, stats.callback_depth_peak, stats.own_reclaims);
+#endif
+    std::puts("}");
 }
