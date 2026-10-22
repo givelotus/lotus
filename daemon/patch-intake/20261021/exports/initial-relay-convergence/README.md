@@ -31,3 +31,7 @@ An earlier canonical142 pin lacked the relay-epoch machinery; root subsequently 
 ### Causal owner split for final folding
 
 Source blame identifies two owners. Fold the generic mixed high-bandwidth response selection condition (`10ce2e53e7`) and its generic-scope controls (`c513b39b4d`, `b30cf3c10c`) into `3a7173fde303d5ee47dc251dcdbcadd8a90537e2`, “net: implement shared eCash Merklix peer reconciliation.” Its temporary fixup subject is not the final owner mapping. Fold the authoritative relay-epoch tracker/filter and removal of duplicate registration, plus the actual capability fixture repair, into `56443331da6c8658581fd324a89dfcf4248610e7`, “net: announce transactions by 8-byte short ids to peers that support it” (historical owner265). Final prefix tests must be gated on actual helper availability. Frozen native-gate source bytes and head remain unchanged.
+
+## Final native and owner-prefix outcome
+
+The focused native gates now PASS; original control failures and fixture compile/negotiation failures are preserved in `../relay-authoritative522-validated/`. The pure causal transform is ready under `prefix-adapter/`, with509 successful/idempotent source prefixes and six changed endpoint files byte-identical to native validated61c20/tree35baf. Final folding stays with the two causal owners and preserves the522 purpose count. The obsolete4k backpressure candidate remains excluded. No complete500k convergence result is claimed by this packet.
