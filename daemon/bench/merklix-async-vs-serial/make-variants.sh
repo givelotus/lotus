@@ -13,7 +13,28 @@ cp "$SRC/src/lotus_v2/commitment.cpp" "$OUT/commitment_A.cpp"
 # B: the only change is disabling the recursive async dispatch condition.
 sed 's/if (depth < 4 && entries.size() >= 64 && !left.empty() && !right.empty()) {/if (false \&\& depth < 4 \&\& entries.size() >= 64 \&\& !left.empty() \&\& !right.empty()) {/' \
     "$OUT/commitment_A.cpp" > "$OUT/commitment_B.cpp"
+# C: persistent fixed pool (pool_dispatch.inc) replacing only std::async dispatch.
+python3 - "$OUT/commitment_A.cpp" "$OUT/commitment_C.cpp" "$HERE/pool_dispatch.inc" <<'PY'
+import sys
+a=open(sys.argv[1]).read(); inc=open(sys.argv[3]).read()
+old="""        auto left_future = std::async(std::launch::async, [left, depth]() {
+            return TransactionSubtreeA(left, depth + 1);
+        });
+        const Hash right_hash = TransactionSubtreeA(right, depth + 1);
+        return TxNodeAtDepth(depth, left_future.get(), right_hash);
+"""
+new="""        ForkJoin fj([left, depth]() { return TransactionSubtreeA(left, depth + 1); });
+        const Hash right_hash = TransactionSubtreeA(right, depth + 1);
+        return TxNodeAtDepth(depth, fj.Join(), right_hash);
+"""
+assert a.count(old)==1
+marker="Hash TransactionSubtreeA(std::span<const TxIdentityPair *> entries,"
+assert a.count(marker)==1
+a=a.replace(old,new).replace(marker,inc+"\n"+marker)
+open(sys.argv[2],"w").write(a)
+PY
 diff -u "$OUT/commitment_A.cpp" "$OUT/commitment_B.cpp" > "$OUT/A-vs-B.diff" || true
+diff -u "$OUT/commitment_A.cpp" "$OUT/commitment_C.cpp" > "$OUT/A-vs-C.diff" || true
 [ "$(grep -c '^[-+][^-+]' "$OUT/A-vs-B.diff")" = 2 ] || { echo "B must differ by exactly one line"; exit 1; }
 CXX=${CXX:-/usr/bin/c++}
 CFLAGS="-std=c++20 -O3 -DNDEBUG -pthread -I$SRC/src -I$SRC/src/lotus_v2"
@@ -26,9 +47,9 @@ done
 ar rcs "$OUT/libblake3.a" "$OUT"/blake3*.o
 $CXX $CFLAGS -c "$SRC/src/lotus_v2/tagged_hash.cpp" -o "$OUT/tagged_hash.o"
 $CXX $CFLAGS -c "$HERE/bench.cpp" -o "$OUT/bench.o"
-for v in A B; do
+for v in A B C; do
   $CXX $CFLAGS -c "$OUT/commitment_$v.cpp" -o "$OUT/commitment_$v.o"
   $CXX -O3 -pthread "$OUT/bench.o" "$OUT/commitment_$v.o" "$OUT/tagged_hash.o" "$OUT/libblake3.a" -o "$OUT/bench_$v"
 done
-shasum -a 256 "$SRC/src/lotus_v2/commitment.cpp" "$OUT/commitment_B.cpp" "$HERE/bench.cpp" "$OUT/bench_A" "$OUT/bench_B" "$OUT/libblake3.a" > "$OUT/HASHES.txt"
+shasum -a 256 "$SRC/src/lotus_v2/commitment.cpp" "$OUT/commitment_B.cpp" "$OUT/commitment_C.cpp" "$HERE/pool_dispatch.inc" "$HERE/bench.cpp" "$OUT/bench_A" "$OUT/bench_B" "$OUT/bench_C" "$OUT/libblake3.a" > "$OUT/HASHES.txt"
 cat "$OUT/HASHES.txt"

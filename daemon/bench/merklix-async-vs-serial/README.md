@@ -15,6 +15,10 @@ Async launch iff `depth < 4 && entries.size() >= 64 && !left.empty() && !right.e
 - Timed: whole `BuildTxSubtreeA` call (pointer-array allocation, partition, thread create, join, future destruction). Not timed: fixture, reference check (independent recursive vector implementation, checked before timing, and root printed), warm-up (3 roots), process start.
 - Samples: one process each, >=1.5 s, >=7 repetitions, A/B order alternated; wall, process CPU (getrusage), peak RSS, `pthread_create` count via dyld interposition; concurrency cases use 4 and 16 caller threads.
 
+## Variant C (added after the A/B plan; user question on persistent workers)
+C = A with only the dispatch replaced: process-lifetime pool of min(15, hw) workers behind a mutex/condvar deque (`pool_dispatch.inc`). Same thresholds, partitioning and hash. Join = reclaim-and-run-inline if no worker has started the job, otherwise wait on it, so no deadlock and no help-while-waiting scheduler. Pool construction happens at first use (warm-up, excluded); queue is deliberately not lock-free (<=15 jobs/root). Order rotates through all 6 permutations of A/B/C, 6 reps default. C was written but **never compiled or run** (no window); expect first-compile fixes. `threads_per_root` for C should be 0 in the timed region (workers exist already, counted outside).
+A/B stays the primary question; C is adopted only if it beats both with evidence, and would be a separate follow-up patch.
+
 ## Run (only in an authorized exclusive window)
     daemon/bench/merklix-async-vs-serial/make-variants.sh
     daemon/bench/merklix-async-vs-serial/run-matrix.py benchmark-results/merklix-async-vs-serial-<date>
