@@ -35,3 +35,7 @@ The AB|D + learned C/new E => ABC|DE candidate ownership/vote reset behavior rem
 ## Actual source-review correction
 
 Astra's overlay reviewer confirmed the 1024-ring canonical-graph retention blocker. Source `006f5fe7a5` repairs it with a current-only atomically owned tuple containing canonical root, matching numeric tree, sequence and mempool identity. Historical RPC snapshots retain only sequence. A new weak-root regression requires old canonical ownership to expire after clear unless an explicit reader pin survives. Re-review and native execution are still pending; this is not a passing gate.
+
+## Actual code-review gate released
+
+Independent Astra overlay review approved exact source `ae1d8851fcc9fe280c518ca78666324c31c0f645`, tree `e71a2a874ecbd120232ffb634b93d9bf6d0ee686`. Ring ownership, paired-generation API use and nonwaiting busy-worker fallback are closed by source inspection. The new worker test always releases and joins before assertions. This releases isolated native validation only; no tests/build have executed, no epoch protocol contract is selected, and integrated relay exposure/scratch/allocator high-water guarantees are excluded. N1 was asked to queue this after the already-prioritized cross-peer Avalanche cohort.
