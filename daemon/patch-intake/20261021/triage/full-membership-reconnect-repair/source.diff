@@ -28,10 +28,10 @@ index f6ca056f93..e7f1c26894 100644
          strprintf("Reconcile the transactions admitted in the last this many "
 diff --git a/src/net/full_mempool_reconciliation.cpp b/src/net/full_mempool_reconciliation.cpp
 new file mode 100644
-index 0000000000..915b641e13
+index 0000000000..0b0812165a
 --- /dev/null
 +++ b/src/net/full_mempool_reconciliation.cpp
-@@ -0,0 +1,756 @@
+@@ -0,0 +1,928 @@
 +// Copyright (c) 2026 The Lotus developers
 +// Distributed under the MIT software license. See COPYING.
 +#include <net/full_mempool_reconciliation.h>
@@ -283,6 +283,142 @@ index 0000000000..915b641e13
 +constexpr auto REQUEST_TIMEOUT = 5s;
 +constexpr auto CAPTURE_SPACING = 30s;
 +}
++namespace {
++/** Allocation-free grammar walk before the ordinary transaction decoder. Its
++ * bound includes the native decoder's u16 reserves even on a truncated frame,
++ * and the nested vector headers hidden behind one-byte empty arguments. */
++class ExposureScanner {
++    SpanReader reader;
++    size_t footprint{0};
++    void Add(size_t bytes) {
++        if (bytes > std::numeric_limits<size_t>::max() - footprint)
++            throw std::length_error("full-recon decode size overflow");
++        footprint += bytes;
++    }
++    void Allocation(uint64_t count, size_t element) {
++        if (count > std::numeric_limits<size_t>::max() / element)
++            throw std::length_error("full-recon decode allocation overflow");
++        Add(memusage::MallocUsage(size_t(count) * element));
++    }
++    template <typename T> T Read() { T out; reader >> out; return out; }
++    uint64_t Count(uint64_t maximum) {
++        const auto count{ReadCompactSize(reader)};
++        Require(count <= maximum);
++        return count;
++    }
++    void Bytes(uint64_t maximum) {
++        const auto count{Count(maximum)};
++        Require(count <= reader.size());
++        Allocation(count, 1);
++        reader.ignore(count);
++    }
++    void Witness() {
++        Bytes(DefaultTxProfile.max_script_bytes);
++        const auto siblings{Count(DefaultTxProfile.max_branch_proof_depth)};
++        Require(siblings <= reader.size() / 32);
++        Allocation(siblings, sizeof(Hash));
++        reader.ignore(siblings * 32);
++        const auto arguments{Count(DefaultTxProfile.max_arguments)};
++        Require(arguments <= reader.size()); // each needs a CompactSize byte
++        Allocation(arguments, sizeof(std::vector<uint8_t>));
++        for (uint64_t i = 0; i < arguments; ++i)
++            Bytes(DefaultTxProfile.max_argument_bytes);
++    }
++    void Transaction() {
++        Add(sizeof(CTransaction) + 128); // shared owner and small allocator slack
++        const auto version{Read<uint32_t>()};
++        if (version == 1 || version == 2) {
++            const auto inputs{Count(reader.size() / 41)};
++            Allocation(inputs, sizeof(CTxIn));
++            for (uint64_t i = 0; i < inputs; ++i) {
++                reader.ignore(36);
++                Bytes(MAX_FRAME_BYTES);
++                reader.ignore(4);
++            }
++            const auto outputs{Count(reader.size() / 9)};
++            Allocation(outputs, sizeof(CTxOut));
++            for (uint64_t i = 0; i < outputs; ++i) {
++                reader.ignore(8);
++                Bytes(MAX_FRAME_BYTES);
++            }
++            reader.ignore(4);
++            return;
++        }
++        Require(version == 7);
++        reader.ignore(8);
++        const auto inputs{Read<uint16_t>()}, outputs{Read<uint16_t>()};
++        Require(inputs != 0);
++        Allocation(inputs, sizeof(CTxIn));
++        Allocation(outputs, sizeof(CTxOut));
++        for (uint64_t i = 0; i < inputs; ++i) {
++            reader.ignore(40);
++            const auto flags{Read<uint8_t>()};
++            if (flags == 1) {
++                Count(MAX_OUTPUT_PATHS - 1);
++                const auto witnesses{Count(MAX_OUTPUT_BRANCHES)};
++                Require(witnesses != 0 && witnesses <= reader.size() / 3);
++                Allocation(witnesses, sizeof(BranchWitness));
++                for (uint64_t j = 0; j < witnesses; ++j) Witness();
++            } else if (flags == 2) {
++                if (Count(1)) Bytes(8192);
++            } else {
++                Require(flags == 3);
++                Allocation(1, sizeof(BranchWitness));
++                Witness();
++            }
++        }
++        for (uint64_t i = 0; i < outputs; ++i) {
++            const auto flags{Read<uint8_t>()};
++            Require(!(flags & 0xf8) && !((flags & 4) && (flags & 2)));
++            reader.ignore(8);
++            if (flags & 1) reader.ignore(32);
++            if (flags & 4) reader.ignore(32);
++            const auto branches{Count(MAX_OUTPUT_BRANCHES)};
++            Require(branches != 0 && branches <= reader.size() / 32);
++            Allocation(branches, sizeof(Hash));
++            reader.ignore(branches * 32);
++            const auto paths{Count(MAX_OUTPUT_PATHS)};
++            Require(paths <= reader.size());
++            Allocation(paths, sizeof(std::vector<uint8_t>));
++            for (uint64_t j = 0; j < paths; ++j) {
++                const auto length{Count(MAX_OUTPUT_BRANCHES)};
++                Require(length != 0 && length <= reader.size());
++                Allocation(length, 1);
++                for (uint64_t k = 0; k < length; ++k)
++                    Count(MAX_OUTPUT_BRANCHES - 1);
++            }
++        }
++    }
++public:
++    explicit ExposureScanner(Span<const uint8_t> bytes) : reader{bytes} {}
++    size_t Page() {
++        Reply header;
++        reader >> header.header >> header.request >> header.prefix >> header.work >> header.status;
++        Require(header.work == Work::PAGE && header.status == Status::OK);
++        const auto bodies{Count(MAX_PAGE_BODIES)};
++        Allocation(bodies, sizeof(CTransactionRef));
++        for (uint64_t i = 0; i < bodies; ++i) Transaction();
++        Require(reader.empty());
++        // Phase bound: nested data moves from decoded to immutable storage,
++        // then ToV2Transaction may duplicate it once during identity hashing.
++        // The two vin/vout header arrays can coexist; one current-output
++        // conversion and vector capacity growth fit the remaining graph pair.
++        // Summing all bodies also retains earlier bodies during the last peak.
++        // Eight frame copies cover recorded/serialized wire and capacity
++        // growth, full/core InputWire encoding, output-script conversion and
++        // commitment leaves; the fixed MiB covers the <=64 verification index.
++        constexpr size_t slack{8 * MAX_FRAME_BYTES + 1024 * 1024};
++        if (footprint > (std::numeric_limits<size_t>::max() - slack) / 4)
++            throw std::length_error("full-recon decode peak overflow");
++        return footprint * 4 + slack;
++    }
++};
++}
++size_t PageDecodeExposure(Span<const uint8_t> bytes) {
++    Require(bytes.size() <= MAX_FRAME_BYTES);
++    return ExposureScanner{bytes}.Page();
++}
++
 +struct Manager::Impl {
 +    ChainstateManager &chainman;
 +    CTxMemPool &pool;
@@ -380,6 +516,10 @@ index 0000000000..915b641e13
 +        if (cache.snapshot && cache.anchor == anchor &&
 +            cache.generation == current_generation) return cache.snapshot;
 +        if (now < next_capture) return cache.anchor == anchor ? cache.snapshot : nullptr;
++        // A stale cache must not reserve its own replacement budget forever.
++        // Active serving/fetching owners retain their immutable shared view;
++        // a cache-only view can be freed before constructing the next one.
++        cache.snapshot.reset();
 +        size_t captures{0};
 +        const size_t used{Used(&captures)}, budget{Budget()};
 +        if (used >= budget || captures >= 4 ||
@@ -446,9 +586,19 @@ index 0000000000..915b641e13
 +                peer.pending_control = out;
 +        }
 +    }
++    void Cancel(CNode &node, Peer &peer, const Header &header) noexcept {
++        // Ownership is retired by the caller first. Notification is best-effort
++        // and may never make resource release depend on another allocation.
++        try { ControlFrame(node, peer, header, Control::CANCEL); }
++        catch (...) {}
++    }
 +    void Push(Fetch &fetch, WorkItem item) {
-+        if (item.remote.digest == fetch.local->At(item.prefix).digest ||
-+            item.remote.digest == EmptyDigest()) return;
++        const auto local{fetch.local->At(item.prefix)};
++        if (item.remote.digest == local.digest) {
++            Require(item.remote.count == local.count);
++            return;
++        }
++        if (item.remote.digest == EmptyDigest()) return;
 +        if (fetch.deferred.size() >= MAX_DEFERRED_PREFIXES)
 +            throw std::ios_base::failure("full-recon traversal budget");
 +        fetch.deferred.push_back(std::move(item));
@@ -459,8 +609,12 @@ index 0000000000..915b641e13
 +        size_t count{0};
 +        for (unsigned i = 16; i-- > 0;) {
 +            WorkItem item{parent.Child(i), children[i]};
-+            if (item.remote.digest == fetch.local->At(item.prefix).digest ||
-+                item.remote.digest == EmptyDigest()) continue;
++            const auto local{fetch.local->At(item.prefix)};
++            if (item.remote.digest == local.digest) {
++                Require(item.remote.count == local.count);
++                continue;
++            }
++            if (item.remote.digest == EmptyDigest()) continue;
 +            next[count++] = item;
 +        }
 +        if (count > MAX_DEFERRED_PREFIXES - fetch.deferred.size())
@@ -524,7 +678,7 @@ index 0000000000..915b641e13
 +            return;
 +        }
 +        if (peer.last_remote_context == offer.header.context) return; // replay cannot restart work
-+        if (offer.anchor != Anchor() || peer.fetch || node.fPauseSend || !Fits(FETCH_FIXED_CHARGE)) {
++        if (peer.fetch || node.fPauseSend || !Fits(FETCH_FIXED_CHARGE)) {
 +            ControlFrame(node, peer, offer.header, Control::CANCEL);
 +            ++stats.busy;
 +            return;
@@ -593,8 +747,9 @@ index 0000000000..915b641e13
 +        }
 +        if (reply.status != Status::OK) {
 +            ++stats.unresolved;
-+            ControlFrame(node, peer, fetch.header, Control::CANCEL);
++            const Header header{fetch.header};
 +            peer.fetch.reset();
++            Cancel(node, peer, header);
 +            return;
 +        }
 +        const auto expected{fetch.active->remote};
@@ -637,16 +792,20 @@ index 0000000000..915b641e13
 +        if (peer.pending_control &&
 +            Send(node, peer, NetMsgType::MERKLIXSYNC, *peer.pending_control))
 +            peer.pending_control.reset();
-+        const auto anchor{Anchor()};
-+        if (peer.serve && (peer.serve->anchor != anchor || now - peer.serve->progress > IDLE_LEASE ||
++        // Anchor is diagnostic/domain metadata, not an epoch authority. Chain
++        // changes never mutate or cancel an immutable transport snapshot;
++        // recovered bodies still face current normal admission.
++        if (peer.serve && (now - peer.serve->progress > IDLE_LEASE ||
 +                           now - peer.serve->born > ABSOLUTE_LEASE)) {
-+            ControlFrame(node, peer, peer.serve->header, Control::CANCEL);
++            const Header header{peer.serve->header};
 +            peer.serve.reset(); ++stats.expired;
++            Cancel(node, peer, header);
 +        }
-+        if (peer.fetch && (peer.fetch->anchor != anchor || now - peer.fetch->progress > IDLE_LEASE ||
++        if (peer.fetch && (now - peer.fetch->progress > IDLE_LEASE ||
 +                           now - peer.fetch->born > ABSOLUTE_LEASE)) {
-+            ControlFrame(node, peer, peer.fetch->header, Control::CANCEL);
++            const Header header{peer.fetch->header};
 +            peer.fetch.reset(); ++stats.expired;
++            Cancel(node, peer, header);
 +        }
 +        if (!peer.serve && now >= peer.next_offer && !node.fPauseSend) StartOffer(node, peer, now);
 +        if (!peer.fetch || node.fPauseSend || node.fDisconnect) return;
@@ -676,8 +835,9 @@ index 0000000000..915b641e13
 +            if (now < fetch.deadline) return;
 +            fetch.request.reset();
 +            if (++fetch.retries > 3) {
-+                ControlFrame(node, peer, fetch.header, Control::CANCEL);
++                const Header header{fetch.header};
 +                peer.fetch.reset(); ++stats.unresolved;
++                Cancel(node, peer, header);
 +                return;
 +            }
 +        }
@@ -718,8 +878,17 @@ index 0000000000..915b641e13
 +void Manager::SetPeer(int64_t peer, bool enabled) {
 +    LOCK(m_impl->mutex);
 +    if (enabled) m_impl->peers[peer].enabled = true;
-+    else m_impl->peers.erase(peer);
-+    if (m_impl->peers.empty()) m_impl->cache.snapshot.reset();
++    else if (const auto it = m_impl->peers.find(peer); it != m_impl->peers.end()) {
++        // Renegotiation cannot release bytes already owned by CNode's queue.
++        // Only actual drain or connection teardown retires their exposure.
++        it->second.enabled = false;
++        it->second.serve.reset();
++        it->second.fetch.reset();
++        it->second.pending_control.reset();
++    }
++    if (std::none_of(m_impl->peers.begin(), m_impl->peers.end(),
++                     [](const auto &entry) { return entry.second.enabled; }))
++        m_impl->cache.snapshot.reset();
 +}
 +void Manager::RemovePeer(int64_t peer) {
 +    LOCK(m_impl->mutex);
@@ -729,7 +898,9 @@ index 0000000000..915b641e13
 +void Manager::Tick(CNode &node, Clock now) {
 +    LOCK(m_impl->mutex);
 +    const auto it{m_impl->peers.find(node.GetId())};
-+    if (it == m_impl->peers.end() || !it->second.enabled) return;
++    if (it == m_impl->peers.end()) return;
++    m_impl->QueueDrained(node, it->second);
++    if (!it->second.enabled) return;
 +    try { m_impl->Tick(node, it->second, now); }
 +    catch (const std::exception &) {
 +        ++m_impl->stats.unresolved;
@@ -761,7 +932,7 @@ index 0000000000..915b641e13
 +                header.prefix != fetch->request->prefix || header.work != fetch->request->work)
 +                return true;
 +            if (header.work == Work::PAGE && header.status == Status::OK &&
-+                !m_impl->Fits(PARSE_RESERVATION))
++                !m_impl->Fits(PageDecodeExposure(Span<const uint8_t>{UCharCast(stream.data()), stream.size()})))
 +                throw std::length_error("full-recon decode exposure budget");
 +        }
 +        const auto now{Now()};
@@ -771,8 +942,9 @@ index 0000000000..915b641e13
 +    } catch (const std::length_error &) {
 +        ++m_impl->stats.busy;
 +        if (it->second.fetch) {
-+            m_impl->ControlFrame(node, it->second, it->second.fetch->header, Control::CANCEL);
++            const Header header{it->second.fetch->header};
 +            it->second.fetch.reset();
++            m_impl->Cancel(node, it->second, header);
 +        }
 +    } catch (const std::exception &) {
 +        ++m_impl->stats.malformed;
@@ -790,10 +962,10 @@ index 0000000000..915b641e13
 +} // namespace lotus::v2::net::fullrecon
 diff --git a/src/net/full_mempool_reconciliation.h b/src/net/full_mempool_reconciliation.h
 new file mode 100644
-index 0000000000..625fd3aacd
+index 0000000000..e6a12c9295
 --- /dev/null
 +++ b/src/net/full_mempool_reconciliation.h
-@@ -0,0 +1,192 @@
+@@ -0,0 +1,195 @@
 +// Copyright (c) 2026 The Lotus developers
 +// Distributed under the MIT software license. See COPYING.
 +#ifndef BITCOIN_NET_FULL_MEMPOOL_RECONCILIATION_H
@@ -963,6 +1135,9 @@ index 0000000000..625fd3aacd
 +        }
 +    }
 +};
++/** Allocation-free structural preflight; conservative decoder peak bytes. */
++size_t PageDecodeExposure(Span<const uint8_t> bytes);
++
 +struct Stats {
 +    uint64_t captures{0}, captured_members{0}, capture_lock_us{0}, capture_lock_wait_us{0}, capture_build_us{0};
 +    uint64_t offers{0}, requests{0}, replies{0}, verified_bodies{0}, coverage_complete{0};
@@ -1102,10 +1277,10 @@ index 6163b3cca5..a6e6486756 100644
  		# RPC Tests
 diff --git a/src/test/full_mempool_reconciliation_tests.cpp b/src/test/full_mempool_reconciliation_tests.cpp
 new file mode 100644
-index 0000000000..23672a529f
+index 0000000000..9ce6ce3fe4
 --- /dev/null
 +++ b/src/test/full_mempool_reconciliation_tests.cpp
-@@ -0,0 +1,168 @@
+@@ -0,0 +1,224 @@
 +// Copyright (c) 2026 The Lotus developers
 +// Distributed under the MIT software license. See COPYING.
 +#include <net/full_mempool_reconciliation.h>
@@ -1249,6 +1424,62 @@ index 0000000000..23672a529f
 +    BOOST_CHECK_EQUAL(deepest.At(last.Child(0)).count, 1U);
 +    BOOST_CHECK_EQUAL(deepest.At(last.Child(8)).count, 1U);
 +}
++BOOST_AUTO_TEST_CASE(page_decode_exposure_counts_empty_arguments_before_allocation) {
++    using namespace fullrecon;
++    DataStream frame;
++    Header header; header.context = uint256::ONE;
++    frame << header << uint64_t{1} << Prefix{} << Work::PAGE << Status::OK;
++    WriteCompactSize(frame, 1);
++    frame << uint32_t{7} << uint64_t{0} << uint16_t{2} << uint16_t{0};
++    const std::vector<uint8_t> empty_arguments(65535, 0);
++    for (int input = 0; input < 2; ++input) {
++        frame << TxId{uint256{uint64_t(input + 1)}} << uint32_t{0}
++              << uint32_t{UINT32_MAX} << uint8_t{1};
++        WriteCompactSize(frame, 0); // path
++        const unsigned witnesses{input ? 15U : 16U};
++        WriteCompactSize(frame, witnesses);
++        for (unsigned witness = 0; witness < witnesses; ++witness) {
++            WriteCompactSize(frame, 0); // script
++            WriteCompactSize(frame, 0); // sibling count
++            WriteCompactSize(frame, 65535);
++            frame.write(AsBytes(Span{empty_arguments}));
++        }
++    }
++    BOOST_REQUIRE_LT(frame.size(), MAX_FRAME_BYTES);
++    const auto bytes{Span<const uint8_t>{UCharCast(frame.data()), frame.size()}};
++    // One small wire frame can transiently duplicate almost100MB of vector
++    // headers. The preflight walks bytes without constructing those vectors.
++    BOOST_CHECK_GT(PageDecodeExposure(bytes), 128U * 1024 * 1024);
++    DataStream truncated;
++    truncated << header << uint64_t{1} << Prefix{} << Work::PAGE << Status::OK;
++    WriteCompactSize(truncated, 1);
++    truncated << uint32_t{7} << uint64_t{0} << uint16_t{65535} << uint16_t{65535};
++    BOOST_CHECK_THROW(PageDecodeExposure(Span<const uint8_t>{UCharCast(truncated.data()), truncated.size()}), std::ios_base::failure);
++    DataStream legacy;
++    legacy << header << uint64_t{1} << Prefix{} << Work::PAGE << Status::OK;
++    WriteCompactSize(legacy, 1);
++    legacy << uint32_t{2};
++    WriteCompactSize(legacy, 0x02000000); // No bytes for even one input.
++    BOOST_CHECK_THROW(PageDecodeExposure(Span<const uint8_t>{UCharCast(legacy.data()), legacy.size()}), std::ios_base::failure);
++    auto tiny_arguments = [&](bool nonempty) {
++        DataStream page;
++        page << header << uint64_t{1} << Prefix{} << Work::PAGE << Status::OK;
++        WriteCompactSize(page, 1);
++        page << uint32_t{7} << uint64_t{0} << uint16_t{1} << uint16_t{0}
++             << TxId{uint256::ONE} << uint32_t{0} << uint32_t{UINT32_MAX} << uint8_t{1};
++        WriteCompactSize(page, 0); WriteCompactSize(page, 1);
++        WriteCompactSize(page, 0); WriteCompactSize(page, 0);
++        WriteCompactSize(page, 512);
++        for (int i = 0; i < 512; ++i) {
++            WriteCompactSize(page, nonempty ? 1 : 0);
++            if (nonempty) page << uint8_t{1};
++        }
++        return PageDecodeExposure(Span<const uint8_t>{UCharCast(page.data()), page.size()});
++    };
++    // Heap rounding is charged separately for every one-byte allocation;
++    // counting only total payload bytes would badly undercharge this case.
++    BOOST_CHECK_GE(tiny_arguments(true) - tiny_arguments(false), 512U * 4U * 8U);
++}
 +BOOST_AUTO_TEST_CASE(native_witness_variants_preserve_exact_hash_identity) {
 +    CMutableTransaction tx;
 +    tx.nVersion = 7;
@@ -1275,7 +1506,7 @@ index 0000000000..23672a529f
 +}
 +BOOST_AUTO_TEST_SUITE_END()
 diff --git a/src/test/txrelay_tests.cpp b/src/test/txrelay_tests.cpp
-index d220106136..6f3354faa8 100644
+index d220106136..e1924afdd0 100644
 --- a/src/test/txrelay_tests.cpp
 +++ b/src/test/txrelay_tests.cpp
 @@ -11,6 +11,7 @@
@@ -1323,7 +1554,7 @@ index d220106136..6f3354faa8 100644
                  if (msg.m_type == NetMsgType::INV) {
                      std::vector<CInv> invs;
                      msg.m_recv >> invs;
-@@ -1201,4 +1225,269 @@ BOOST_AUTO_TEST_CASE(no_body_push_by_default) {
+@@ -1201,4 +1225,339 @@ BOOST_AUTO_TEST_CASE(no_body_push_by_default) {
      }
  }
  
@@ -1473,6 +1704,58 @@ index d220106136..6f3354faa8 100644
 +    BOOST_CHECK_EQUAL(manager.GetStats().captures, 0U);
 +    BOOST_CHECK_EQUAL(manager.GetStats().verified_bodies, 0U);
 +}
++BOOST_AUTO_TEST_CASE(full_reconciliation_renegotiation_retains_queued_exposure) {
++    using namespace lotus::v2::net::fullrecon;
++    LOCK(NetEventsInterface::g_msgproc_mutex);
++    MockTick clock{20'000'000ms};
++    RelayHarness h{m_node, PeerManager::Options{}};
++    auto &node{h.AddPeer()}; h.SendAll();
++    Manager manager{*m_node.chainman, *m_node.mempool, *h.connman, *h.peerman};
++    manager.SetPeer(node.GetId(), true);
++    Request request; request.header.context = uint256::ONE; request.request = 1;
++    DataStream stream; stream << request;
++    manager.Handle(node, NetMsgType::GETMERKLIXBUCK, stream, 80s);
++    const auto queued{manager.GetStats().charged_bytes};
++    BOOST_REQUIRE_GT(queued, 0U);
++    manager.SetPeer(node.GetId(), false);
++    BOOST_CHECK_EQUAL(manager.GetStats().charged_bytes, queued);
++    manager.SetPeer(node.GetId(), true);
++    BOOST_CHECK_EQUAL(manager.GetStats().charged_bytes, queued);
++    manager.SetPeer(node.GetId(), false);
++    const auto replies{h.Drain(node)};
++    BOOST_REQUIRE_EQUAL(replies.full_replies.size(), 1U);
++    // Harness Drain intentionally clears real transport ownership below too.
++    { LOCK(node.cs_vSend); node.nSendSize = 0; }
++    manager.Tick(node, 20'000'250ms);
++    BOOST_CHECK_LT(manager.GetStats().charged_bytes, queued);
++    manager.RemovePeer(node.GetId());
++    BOOST_CHECK_EQUAL(manager.GetStats().charged_bytes, 0U);
++}
++BOOST_AUTO_TEST_CASE(full_reconciliation_equal_digest_false_count_rejected) {
++    using namespace lotus::v2::net::fullrecon;
++    LOCK(NetEventsInterface::g_msgproc_mutex);
++    MockTick clock{19'000'000ms};
++    RelayHarness h{m_node, PeerManager::Options{}};
++    auto &node{h.AddPeer()}; h.SendAll();
++    FastRandomContext rng{uint256{0x9e}};
++    const auto body{MakeTx(rng)};
++    AddToMempool(m_node, body);
++    Snapshot snapshot{{body}, 1024 * 1024};
++    Manager manager{*m_node.chainman, *m_node.mempool, *h.connman, *h.peerman};
++    manager.SetPeer(node.GetId(), true);
++    Offer offer; offer.header.context = rng.rand256();
++    { LOCK(cs_main); offer.anchor = m_node.chainman->ActiveTip()->GetBlockHash(); }
++    offer.children = snapshot.Children(Prefix{});
++    for (auto &child : offer.children) if (child.count) child.count = 2;
++    // Children/root remain self-consistent but the leaf digest proves the
++    // pinned local singleton, so a false count may not silently skip its work.
++    offer.root = Fold(offer.children, 0);
++    DataStream stream; stream << offer;
++    manager.Handle(node, NetMsgType::MERKLIXSYNC, stream, 70s);
++    BOOST_CHECK_EQUAL(manager.GetStats().malformed, 1U);
++    BOOST_CHECK_EQUAL(manager.GetStats().coverage_complete, 0U);
++    BOOST_CHECK_EQUAL(manager.GetStats().verified_bodies, 0U);
++}
 +BOOST_AUTO_TEST_CASE(full_reconciliation_timeout_retries_owned_work_and_releases) {
 +    using namespace lotus::v2::net::fullrecon;
 +    LOCK(NetEventsInterface::g_msgproc_mutex);
@@ -1562,6 +1845,24 @@ index d220106136..6f3354faa8 100644
 +        LOCK2(cs_main, m_node.mempool->cs);
 +        m_node.mempool->removeRecursive(*txs[0], MemPoolRemovalReason::EXPIRY);
 +    }
++    // An ordinary compatible tip extension cannot expire transport ownership.
++    // This unit changes only the active index view; normal validation remains
++    // outside this serving-only check and the fixture tip is restored by RAII.
++    CBlockIndex extension;
++    const BlockHash extension_hash{uint256{0x9d}};
++    CBlockIndex *original_tip;
++    { LOCK(cs_main); original_tip = chainman.ActiveTip(); }
++    extension.pprev = original_tip;
++    extension.nHeight = original_tip->nHeight + 1;
++    extension.phashBlock = &extension_hash;
++    struct RestoreTip {
++        ChainstateManager &chainman; CBlockIndex &tip;
++        ~RestoreTip() { LOCK(cs_main); chainman.ActiveChain().SetTip(tip); }
++    } restore_tip{chainman, *original_tip};
++    { LOCK(cs_main); chainman.ActiveChain().SetTip(extension); }
++    clock.Set(17'032'000ms);
++    manager.Tick(third, 17'032'000ms);
++    BOOST_CHECK(h.Drain(third).full_offers.empty());
 +    Request request;
 +    request.header = captured.full_offers[0].header;
 +    request.request = 1;
