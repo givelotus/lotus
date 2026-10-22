@@ -14,7 +14,7 @@ cp "$SRC/src/lotus_v2/commitment.cpp" "$OUT/commitment_A.cpp"
 sed 's/if (depth < 4 && entries.size() >= 64 && !left.empty() && !right.empty()) {/if (false \&\& depth < 4 \&\& entries.size() >= 64 \&\& !left.empty() \&\& !right.empty()) {/' \
     "$OUT/commitment_A.cpp" > "$OUT/commitment_B.cpp"
 # C: persistent fixed pool (pool_dispatch.inc) replacing only std::async dispatch.
-python3 - "$OUT/commitment_A.cpp" "$OUT/commitment_C.cpp" "$HERE/pool_dispatch.inc" <<'PY'
+python3 - "$OUT/commitment_A.cpp" "$OUT/commitment_C.cpp" "$OUT/commitment_D.cpp" "$HERE/pool_dispatch.inc" "$HERE/work_pool.h" <<'PY'
 import sys
 a=open(sys.argv[1]).read(); inc=open(sys.argv[3]).read()
 old="""        auto left_future = std::async(std::launch::async, [left, depth]() {
@@ -33,11 +33,34 @@ assert a.count(marker)==1
 a=a.replace(old,new).replace(marker,inc+"\n"+marker)
 open(sys.argv[2],"w").write(a)
 PY
+# D: generic persistent pool with growth (work_pool.h); same thresholds/partitioning.
+python3 - "$OUT/commitment_A.cpp" "$OUT/commitment_D.cpp" <<'PY'
+import sys
+a=open(sys.argv[1]).read()
+old="""        auto left_future = std::async(std::launch::async, [left, depth]() {
+            return TransactionSubtreeA(left, depth + 1);
+        });
+        const Hash right_hash = TransactionSubtreeA(right, depth + 1);
+        return TxNodeAtDepth(depth, left_future.get(), right_hash);
+"""
+new="""        auto left_future = util::WorkPool::Shared().Async([left, depth]() {
+            return TransactionSubtreeA(left, depth + 1);
+        });
+        const Hash right_hash = TransactionSubtreeA(right, depth + 1);
+        return TxNodeAtDepth(depth, left_future.Get(), right_hash);
+"""
+assert a.count(old)==1
+inc='#include "work_pool.h"\n'
+marker='#include "tagged_hash.h"\n'
+assert a.count(marker)==1
+open(sys.argv[2],"w").write(a.replace(old,new).replace(marker,marker+inc))
+PY
+diff -u "$OUT/commitment_A.cpp" "$OUT/commitment_D.cpp" > "$OUT/A-vs-D.diff" || true
 diff -u "$OUT/commitment_A.cpp" "$OUT/commitment_B.cpp" > "$OUT/A-vs-B.diff" || true
 diff -u "$OUT/commitment_A.cpp" "$OUT/commitment_C.cpp" > "$OUT/A-vs-C.diff" || true
 [ "$(grep -c '^[-+][^-+]' "$OUT/A-vs-B.diff")" = 2 ] || { echo "B must differ by exactly one line"; exit 1; }
 CXX=${CXX:-/usr/bin/c++}
-CFLAGS="-std=c++20 -O3 -DNDEBUG -pthread -I$SRC/src -I$SRC/src/lotus_v2"
+CFLAGS="-std=c++20 -O3 -DNDEBUG -pthread -I$SRC/src -I$SRC/src/lotus_v2 -I$HERE"
 BL=$SRC/src/lotus_v2/vendor/blake3
 # BLAKE3 compiled once from vendored sources (NEON path), shared by both.
 for f in blake3 blake3_dispatch blake3_portable; do
@@ -47,9 +70,9 @@ done
 ar rcs "$OUT/libblake3.a" "$OUT"/blake3*.o
 $CXX $CFLAGS -c "$SRC/src/lotus_v2/tagged_hash.cpp" -o "$OUT/tagged_hash.o"
 $CXX $CFLAGS -c "$HERE/bench.cpp" -o "$OUT/bench.o"
-for v in A B C; do
+for v in A B C D; do
   $CXX $CFLAGS -c "$OUT/commitment_$v.cpp" -o "$OUT/commitment_$v.o"
   $CXX -O3 -pthread "$OUT/bench.o" "$OUT/commitment_$v.o" "$OUT/tagged_hash.o" "$OUT/libblake3.a" -o "$OUT/bench_$v"
 done
-shasum -a 256 "$SRC/src/lotus_v2/commitment.cpp" "$OUT/commitment_B.cpp" "$OUT/commitment_C.cpp" "$HERE/pool_dispatch.inc" "$HERE/bench.cpp" "$OUT/bench_A" "$OUT/bench_B" "$OUT/bench_C" "$OUT/libblake3.a" > "$OUT/HASHES.txt"
+shasum -a 256 "$SRC/src/lotus_v2/commitment.cpp" "$OUT/commitment_B.cpp" "$OUT/commitment_C.cpp" "$OUT/commitment_D.cpp" "$HERE/pool_dispatch.inc" "$HERE/work_pool.h" "$HERE/bench.cpp" "$OUT/bench_A" "$OUT/bench_B" "$OUT/bench_C" "$OUT/bench_D" "$OUT/libblake3.a" > "$OUT/HASHES.txt"
 cat "$OUT/HASHES.txt"
