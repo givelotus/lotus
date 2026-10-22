@@ -1,0 +1,354 @@
+From f0b6293e85f44786b3d96557bf4962507653cf55 Mon Sep 17 00:00:00 2001
+From: Shammah Chancellor <shammah.chancellor@notvalid.com>
+Date: Wed, 21 Oct 2026 23:45:05 -0700
+Subject: [PATCH] validation(v2): warm native signature cache before commit
+
+Copy advisory native coins under the chain/pool locks, then warm successful primitive signature entries outside cs_main using the configured owned chain domain. Export no staged transaction verdict. Authoritative admission resolves current coins, rules, maturity, limits and deferred effects again. Invalid signatures are not cached.
+
+Native tests cover wrong ambient domain, signature/witness mutation, changed coin value and metadata, deferred failure, tip change and unchanged staged batch authority. Existing signature-cache and double-spend guards pass. The matched performance pair uses the same independently validated TLS chain-domain fix on both endpoints; evidence and single-observation limits are retained separately.
+---
+ src/test/lotus_v2_tests.cpp          | 122 +++++++++++++++++++++++++++
+ src/test/txvalidationcache_tests.cpp |  23 ++---
+ src/validation.cpp                   |  94 ++++++++++++++++++++-
+ src/validation.h                     |   5 ++
+ 4 files changed, 222 insertions(+), 22 deletions(-)
+
+diff --git a/src/test/lotus_v2_tests.cpp b/src/test/lotus_v2_tests.cpp
+index bc15256ae766db39ccb03488906190c3abe1b432..2b4e34bd959c100afea192e8353fc8ff31e5e773 100644
+--- a/src/test/lotus_v2_tests.cpp
++++ b/src/test/lotus_v2_tests.cpp
+@@ -26,6 +26,7 @@
+ #include <primitives/block.h>
+ #include <primitives/transaction.h>
+ #include <script/interpreter.h>
++#include <script/sigcache.h>
+ #include <script/script.h>
+ #include <script/sign.h>
+ #include <script/signingprovider.h>
+@@ -568,6 +569,127 @@ NativeBenchmarkSpend(const CTransaction &previous, uint32_t index,
+     return tx;
+ }
+ 
++BOOST_FIXTURE_TEST_CASE(v2_native_crypto_warmup_keeps_authoritative_context,
++                        TestChain100Setup) {
++    using namespace lotus::v2;
++    const auto program = NativeBenchmarkProgram();
++    Output output;
++    output.value = 1000000;
++    output.branches = {BranchLeaf(program)};
++    output.paths = {{0}};
++    const auto funding = MineV2Coinbase({CTxOut::FromV2Output(output)});
++    auto mutable_tx = NativeBenchmarkSpend(
++        *funding, 0, {funding->vout[0].nValue - 10000 * SATOSHI});
++    const auto tx = MakeTransactionRef(mutable_tx);
++    const auto chain = m_node.chainman->GetParams().V2ChainId();
++    auto &cache = m_node.chainman->m_validation_cache.m_signature_cache;
++    auto message_for = [&](const CTransaction &spend, const CTxOut &coin) {
++        lotus::v2::Hash message{};
++        std::string error;
++        BOOST_REQUIRE_MESSAGE(SigningMessage(
++            spend.ToV2Transaction(), DefaultTxProfile, chain,
++            {coin.ToV2Output()}, 0, 0, 0, std::nullopt, message, error), error);
++        return message;
++    };
++    auto entry_for = [&](const CTransaction &spend, const CTxOut &coin) {
++        uint256 entry;
++        cache.ComputeBip340Entry(
++            entry, message_for(spend, coin),
++            spend.vin[0].vWitnesses[0].arguments[0],
++            std::span<const uint8_t>(program.data() + 1, 32), false);
++        return entry;
++    };
++    auto authoritative = [&](const CTransactionRef &spend) {
++        LOCK(cs_main);
++        return m_node.chainman->ProcessTransaction(spend, /*test_accept=*/true);
++    };
++    const auto entry = entry_for(*tx, funding->vout[0]);
++    BOOST_CHECK(!cache.Get(entry, false));
++    // A runtime chain-parameter constructor can temporarily change this
++    // inherited global. Warmup must use the selected chainman's owned ID.
++    const auto previous_chain = GetActiveV2ChainId();
++    auto other_chain = previous_chain;
++    other_chain[0] ^= 1;
++    struct RestoreChain {
++        ChainId previous;
++        ~RestoreChain() { SetActiveV2ChainId(previous); }
++    } restore_chain{previous_chain};
++    SetActiveV2ChainId(other_chain);
++    const auto preparation = PrecomputeMempoolAdmission(*m_node.chainman, tx, {});
++    SetActiveV2ChainId(previous_chain);
++    BOOST_CHECK(!preparation.standard.ran && !preparation.consensus.ran);
++    BOOST_CHECK(preparation.spent_outputs.empty());
++    bool shared_hit{false};
++    std::thread reader([&] { shared_hit = cache.Get(entry, false); });
++    reader.join();
++    BOOST_CHECK(shared_hit);
++    BOOST_CHECK_EQUAL(m_node.mempool->size(), 0U);
++
++    // TxId excludes witnesses: a different signature must not inherit success.
++    auto bad = mutable_tx;
++    bad.vin[0].vWitnesses[0].arguments[0][10] ^= 1;
++    const auto bad_tx = MakeTransactionRef(std::move(bad));
++    BOOST_REQUIRE(bad_tx->GetId() == tx->GetId());
++    BOOST_REQUIRE(bad_tx->GetHash() != tx->GetHash());
++    const auto bad_entry = entry_for(*bad_tx, funding->vout[0]);
++    PrecomputeMempoolAdmission(*m_node.chainman, bad_tx, {});
++    BOOST_CHECK(!cache.Get(bad_entry, false));
++    BOOST_CHECK(authoritative(bad_tx).m_result_type != MempoolAcceptResult::ResultType::VALID);
++
++    const COutPoint prevout(funding->GetId(), 0);
++    const auto original = WITH_LOCK(cs_main,
++        return m_node.chainman->ActiveChainstate().CoinsTip().GetCoin(prevout));
++    BOOST_REQUIRE(original.has_value());
++    auto replace_coin = [&](const ::Coin &coin) {
++        LOCK(cs_main);
++        auto &coins = m_node.chainman->ActiveChainstate().CoinsTip();
++        BOOST_REQUIRE(coins.SpendCoin(prevout));
++        coins.AddCoin(prevout, ::Coin(coin), false);
++    };
++    // A changed value creates a different signing message. Commit resolves it
++    // again; the old valid primitive entry is not a transaction verdict.
++    auto changed_output = original->GetTxOut().ToV2Output();
++    --changed_output.value;
++    replace_coin(::Coin(CTxOut::FromV2Output(changed_output),
++                      original->GetHeight(), original->IsCoinBase()));
++    BOOST_CHECK(!cache.Get(entry_for(*tx, CTxOut::FromV2Output(changed_output)), false));
++    BOOST_CHECK(authoritative(tx).m_result_type != MempoolAcceptResult::ResultType::VALID);
++    replace_coin(*original);
++    // Metadata does not change the signature message, but maturity still does.
++    const auto height = WITH_LOCK(cs_main, return m_node.chainman->ActiveChain().Height());
++    replace_coin(::Coin(original->GetTxOut(), height, true));
++    BOOST_CHECK(authoritative(tx).m_result_type != MempoolAcceptResult::ResultType::VALID);
++    replace_coin(*original);
++
++    // A mathematically valid signature may precede a failed deferred rule.
++    // Warming that primitive must not authorize the forbidden state output.
++    auto forbidden = mutable_tx;
++    auto state_output = forbidden.vout[0].ToV2Output();
++    state_output.flags |= OUTPUT_FLAG_HAS_STATE;
++    state_output.state_root[0] = 1;
++    forbidden.vout[0] = CTxOut::FromV2Output(state_output);
++    std::array<uint8_t, 32> secret{};
++    secret[31] = 3;
++    std::string sign_error;
++    BOOST_REQUIRE_MESSAGE(SignBip340Message(
++        secret, message_for(CTransaction(forbidden), funding->vout[0]), 0, {},
++        forbidden.vin[0].vWitnesses[0].arguments[0], sign_error), sign_error);
++    const auto forbidden_tx = MakeTransactionRef(std::move(forbidden));
++    PrecomputeMempoolAdmission(*m_node.chainman, forbidden_tx, {});
++    BOOST_CHECK(cache.Get(entry_for(*forbidden_tx, funding->vout[0]), false));
++    BOOST_CHECK(authoritative(forbidden_tx).m_result_type != MempoolAcceptResult::ResultType::VALID);
++
++    // Disconnect the latest block after warming. Current contextual checks
++    // still run at the new tip; this mature unchanged coin remains spendable.
++    CBlockIndex *tip = WITH_LOCK(cs_main, return m_node.chainman->ActiveTip());
++    BlockValidationState state;
++    BOOST_REQUIRE(m_node.chainman->ActiveChainstate().InvalidateBlock(state, tip));
++    const auto final = authoritative(tx);
++    BOOST_REQUIRE_MESSAGE(final.m_result_type == MempoolAcceptResult::ResultType::VALID,
++                          final.m_state.ToString());
++    BOOST_CHECK_EQUAL(m_node.mempool->size(), 0U);
++}
++
+ BOOST_FIXTURE_TEST_CASE(v2_kernel_throughput_benchmark, TestChain100Setup) {
+     const unsigned int hw_threads =
+         std::max(1U, std::thread::hardware_concurrency());
+diff --git a/src/test/txvalidationcache_tests.cpp b/src/test/txvalidationcache_tests.cpp
+index c7555b5bbf02421950ee640016614750d4d9bf68..eaf9b9348a31b34581bae0ce83b6d571c13ce276 100644
+--- a/src/test/txvalidationcache_tests.cpp
++++ b/src/test/txvalidationcache_tests.cpp
+@@ -94,7 +94,7 @@ struct NativeValidationCacheSetup : TestChain100Setup {
+ 
+ BOOST_AUTO_TEST_SUITE(txvalidationcache_tests)
+ 
+-BOOST_FIXTURE_TEST_CASE(native_advisory_precompute_avoids_locks, TestingSetup) {
++BOOST_FIXTURE_TEST_CASE(native_advisory_warmup_exports_no_verdict, TestingSetup) {
+     // An invalid native transaction is sufficient: advisory staging must leave
+     // its verdict to the unchanged authoritative admission path.
+     CMutableTransaction native_mtx;
+@@ -120,23 +120,10 @@ BOOST_FIXTURE_TEST_CASE(native_advisory_precompute_avoids_locks, TestingSetup) {
+         BOOST_CHECK(!checks.standard.ran);
+         BOOST_CHECK(!checks.consensus.ran);
+     };
+-    const auto check_without_lock = [&](auto &mutex) {
+-        std::promise<void> started;
+-        std::future<PrecomputedAdmissionChecks> result;
+-        {
+-            LOCK(mutex);
+-            result = std::async(std::launch::async, [&] {
+-                started.set_value();
+-                return PrecomputeMempoolAdmission(*m_node.chainman, tx, {});
+-            });
+-            started.get_future().wait();
+-            BOOST_CHECK(result.wait_for(std::chrono::seconds{1}) ==
+-                        std::future_status::ready);
+-        }
+-        check_default(result.get());
+-    };
+-    check_without_lock(cs_main);
+-    check_without_lock(m_node.mempool->cs);
++    // Single-RPC warmup now takes a short coin-snapshot lock and performs
++    // useful native crypto outside it. It still exports no acceptance verdict.
++    // Missing inputs must remain an ordinary authoritative rejection.
++    check_default(PrecomputeMempoolAdmission(*m_node.chainman, tx, {}));
+ 
+     // A native-only batch must reach the unlocked phase without first waiting
+     // for cs_main. Phase C must still take the lock and reject both transactions.
+diff --git a/src/validation.cpp b/src/validation.cpp
+index 5c36009acaf5940094325e4724bc57c24a396089..9a5300aa71d7b5074a675e0254a4399c3c13f428 100644
+--- a/src/validation.cpp
++++ b/src/validation.cpp
+@@ -1248,6 +1248,12 @@ private:
+     }
+ 
+ public:
++    /** Copy only advisory native input context; never export a verdict. */
++    std::optional<std::vector<Coin>> PrepareNativeCrypto(
++        const CTransactionRef &tx, std::vector<COutPoint> &fetched,
++        uint32_t script_flags, const MempoolAdmissionLimits &limits)
++        EXCLUSIVE_LOCKS_REQUIRED(cs_main);
++
+     std::vector<bool>
+     PrepareStaged(const std::vector<CTransactionRef> &txs,
+                   std::vector<PrecomputedAdmissionChecks> &checks,
+@@ -3201,14 +3207,93 @@ MemPoolAccept::PrepareStaged(const std::vector<CTransactionRef> &txs,
+     return verify;
+ }
+ 
++std::optional<std::vector<Coin>> MemPoolAccept::PrepareNativeCrypto(
++    const CTransactionRef &tx, std::vector<COutPoint> &fetched,
++    uint32_t script_flags, const MempoolAdmissionLimits &limits) {
++    AssertLockHeld(cs_main);
++    LOCK(m_pool.cs);
++    assert(tx->nVersion == 7);
++    auto args = ATMPArgs::SingleAccept(
++        m_active_chainstate.m_chainman.GetConfig(), GetTime(), false,
++        fetched, false, 0);
++    Workspace ws(tx, script_flags);
++    if (!PreChecks(args, ws, /*defer_script_checks=*/true) ||
++        ws.m_modified_fees <
++            m_pool.m_opts.min_relay_feerate.GetFee(tx->GetTotalSize()) ||
++        (limits.max_fee > Amount::zero() && ws.m_base_fees > limits.max_fee)) {
++        return std::nullopt;
++    }
++    return std::move(ws.m_resolved_inputs);
++}
++
++namespace {
++/**
++ * Run the ordinary native script engine on owned, copied coins. Only its
++ * independently synchronized signature cache is shared with admission. Never
++ * cache a script verdict or pass a staged success/failure to the commit owner.
++ * It re-resolves coins and derives every signing message again under cs_main;
++ * changed coins/rules/context therefore hit only their own signature keys.
++ */
++void WarmNativeAdmissionSignatures(const CTransaction &tx,
++                                  const std::vector<Coin> &coins,
++                                  uint32_t flags,
++                                  const lotus::v2::ChainId &chain_id,
++                                  SignatureCache &signature_cache) {
++    AssertLockNotHeld(cs_main);
++    auto resolved = std::make_shared<CScriptCheck::V2ResolvedCoins>(tx.vin.size());
++    for (size_t i = 0; i < tx.vin.size(); ++i) {
++        if (tx.vin[i].nFlags != 3) {
++            (*resolved)[i] = coins[i].GetTxOut().ToV2Output();
++        }
++    }
++    auto deferred = std::make_shared<V2DeferredTxChecks>(tx);
++    TxSigCheckLimiter limiter;
++    for (size_t i = 0; i < tx.vin.size(); ++i) {
++        const CTxOut empty;
++        const auto &out = tx.vin[i].nFlags == 0 ? coins[i].GetTxOut() : empty;
++        CScriptCheck check(out, tx, signature_cache, i, flags,
++                           /*cacheIn=*/true, tx.GetPrecomputedData(), &limiter,
++                           /*blockLimit=*/nullptr, resolved);
++        check.SetV2Deferred(deferred);
++        check.SetV2ChainId(chain_id);
++        if (check().has_value()) return;
++    }
++}
++} // namespace
++
+ PrecomputedAdmissionChecks
+ PrecomputeMempoolAdmission(ChainstateManager &chainman,
+                            const CTransactionRef &tx,
+                            const MempoolAdmissionLimits &limits) {
+     AssertLockNotHeld(cs_main);
+-    // Native scripts deliberately use authoritative admission only. Do not
+-    // acquire staging locks or allocate spent-output tables for a skipped tx.
+     if (tx->nVersion == 7) {
++        std::optional<std::vector<Coin>> coins;
++        uint32_t flags{0};
++        lotus::v2::ChainId chain_id{};
++        {
++            const auto waiting = SteadyClock::now();
++            LOCK(cs_main);
++            node::AdmissionLockTimer timer(waiting);
++            auto &chainstate = chainman.ActiveChainstate();
++            chain_id = chainman.GetParams().V2ChainId();
++            if (auto *pool = chainstate.GetMempool()) {
++                std::vector<COutPoint> fetched;
++                flags = GetMempoolScriptFlags(chainstate) |
++                        STANDARD_SCRIPT_VERIFY_FLAGS;
++                coins = MemPoolAccept(*pool, chainstate)
++                            .PrepareNativeCrypto(tx, fetched, flags, limits);
++                for (const auto &outpoint : fetched) {
++                    chainstate.CoinsTip().Uncache(outpoint);
++                }
++            }
++        }
++        if (coins) {
++            WarmNativeAdmissionSignatures(
++                *tx, *coins, flags, chain_id,
++                chainman.m_validation_cache.m_signature_cache);
++        }
++        // Native execution verdicts are intentionally never reused. Ordinary
++        // authoritative checks still resolve all current coins and rules.
+         PrecomputedAdmissionChecks checks;
+         return checks;
+     }
+@@ -4415,7 +4500,7 @@ CScriptCheck::CheckInput(lotus::v2::DeferredRecords &records) {
+         };
+ 
+         if (m_resolved_coins) {
+-            const auto &chain = GetActiveV2ChainId();
++            const auto &chain = m_v2_chain_id ? *m_v2_chain_id : GetActiveV2ChainId();
+             if (tl_cache.tx_ptr != ptxTo ||
+                 tl_cache.tx_hash != ptxTo->GetHash() ||
+                 tl_cache.chain != chain ||
+@@ -4460,7 +4545,8 @@ CScriptCheck::CheckInput(lotus::v2::DeferredRecords &records) {
+             std::string prep_err;
+             if (local_prepared_vm.PrepareChecked(
+                     ptxTo->ToV2Transaction(), lotus::v2::DefaultTxProfile,
+-                    GetActiveV2ChainId(), fallback_resolved, kDefaultVmCost,
++                    (m_v2_chain_id ? *m_v2_chain_id : GetActiveV2ChainId()),
++                    fallback_resolved, kDefaultVmCost,
+                     prep_err, &precomputed_ids) !=
+                 lotus::v2::SigningPreparationStatus::Ready) {
+                 return std::make_pair(ScriptError::EVAL_FALSE,
+diff --git a/src/validation.h b/src/validation.h
+index a24a0b5bcf751999ae3703d52ecad7987a9386dc..581433810bcec08627ce362ed282a3d6100d04dd 100644
+--- a/src/validation.h
++++ b/src/validation.h
+@@ -788,6 +788,9 @@ private:
+     TxSigCheckLimiter *pTxLimitSigChecks;
+     CheckInputsLimiter *pBlockLimitSigChecks;
+     std::shared_ptr<const V2ResolvedCoins> m_resolved_coins;
++    // Advisory verification captures the selected immutable chain identity;
++    // it must not read a runtime chain-parameter constructor's global override.
++    std::optional<lotus::v2::ChainId> m_v2_chain_id;
+     lotus::v2::BatchSigCollector *m_sig_collector{nullptr};
+     // Deferred V2 checks of the whole transaction, shared by the checks of
+     // all its inputs (null: this input is checked on its own and its
+@@ -828,6 +831,8 @@ public:
+ 
+     std::optional<std::pair<ScriptError, std::string>> operator()();
+ 
++    void SetV2ChainId(const lotus::v2::ChainId &chain) { m_v2_chain_id = chain; }
++
+     void SetV2Deferred(std::shared_ptr<V2DeferredTxChecks> deferred) {
+         m_v2_deferred = std::move(deferred);
+     }
+-- 
+2.50.1 (Apple Git-155)
+
