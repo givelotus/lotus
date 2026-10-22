@@ -84,3 +84,24 @@ Append-only. Times are UTC.
 - Chronik, HTTP/2, and WebTransport are off in this build. Their translation units are not linked, so those file-scan suites are recorded as build exclusions. A compiled suite, or a suite a contract requires, still fails closed if it is unregistered. The point-374 binaries contain `mempool_overlay_tests`, `validationinterface_tests`, and `preconsensus_batch_tests`, and the simulated selection has no missing suite.
 - Prefixes from global 11 through 527 were recomputed. Global 0–10, including the point 0 prefix, are unchanged. Manifest sha256 `6e0add0d0da2c10a6aa7ec33e31d56d7ca0cd25658b6fd6a3f79463d7f4b0be6`. Contracts sha256 `239f1426bec0af0d428abaa9bae54b709fb7677c3f1e71d7c04e00ac2d4a9890`.
 - The runner file is part of the harness fingerprint. The previous point 0 record is preserved as `point0-ok-before-schema-harness.json`. Point 0 will be remeasured on this harness before point 374, then point 374. Point 527 and the sustained 500k workload stay unstarted. The held native527 network run stays unlaunched. Not pushed. Backup is the local branch after this commit.
+- Schema repair committed as `31b635c10a0f1601f3b88a332f09d30d7621af0c`. Point 0 remeasure started as pid 94898 after the clean-tree check. Notes were restored. This is not a completed measurement yet.
+
+## 2026-10-22T16:37:37Z — point 0 remeasured on the new harness
+
+- Pid 94898 exited 0. Status ok. Source `1fb7db17c176cdea8a2c60d887891589382ee4e3`, tree `b2e4a0a9f57c593129028352d5dbb0c4ff294cdb`. Prefix `d31812321128763d3b6c9414b600f3dae02218575fd805b06391bb056ce3fe36`, same as the previous point 0 record. Harness `ef608f917cd0d321b5c4f4989b6b77ceb157554560d4c28ce2926cd5b898c7f3`.
+- `bitcoind` sha256 `788ca330b50ef094762b59d5c5be406b6f0958514287cac0ae0a777dcf84b074`, byte-identical to the preserved copy. Configure 1.9s, ninja 67.2s. Units 0.4s, avalanche 0.5s, three legacy repetitions 11.1/10.8/10.7s. Correctness passed. No Chronik/HTTP2/WebTransport suites were linked. `gbt_compact` remains unavailable (`Invalid mode`). Kernel benchmark still absent.
+- Same historical short burst: 500 or 801 transactions, n=3. Not a 500k result.
+
+| metric | median | min | max |
+| --- | --- | --- | --- |
+| single_tx tx/s | 13446.2 | 12530.4 | 13649.8 |
+| json_rpc_batch50 tx/s | 21176.6 | 13232.2 | 21195.0 |
+| relay_ingest tx/s | 14740.5 | 13700.6 | 14760.7 |
+| relay500 tx/s | 3986.4 | 3890.6 | 4242.7 |
+| read_unloaded RPC method calls/s | 19025.2 | 19012.0 | 19032.3 |
+| read_loaded RPC method calls/s | 9785.7 | 9116.2 | 10101.2 |
+| block500 three-node ms | 5.554 | 5.379 | 8.042 |
+| block801 three-node ms | 17.225 | 8.357 | 20.788 |
+
+- `block801` three-node median is higher than the previous harness median of 8.995ms because one of three sub-25ms samples was 20.8ms. The daemon binary is unchanged. This is sample spread, not a source change.
+- Next: `--point 374` on this harness. Point 527 and sustained 500k stay unstarted. Not pushed.
