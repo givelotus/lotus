@@ -16,7 +16,7 @@ sed 's/if (depth < 4 && entries.size() >= 64 && !left.empty() && !right.empty())
 # C: persistent fixed pool (pool_dispatch.inc) replacing only std::async dispatch.
 python3 - "$OUT/commitment_A.cpp" "$OUT/commitment_C.cpp" "$OUT/commitment_D.cpp" "$HERE/pool_dispatch.inc" "$HERE/work_pool.h" <<'PY'
 import sys
-a=open(sys.argv[1]).read(); inc=open(sys.argv[3]).read()
+a=open(sys.argv[1]).read(); inc=open(sys.argv[4]).read()
 old="""        auto left_future = std::async(std::launch::async, [left, depth]() {
             return TransactionSubtreeA(left, depth + 1);
         });
@@ -30,7 +30,9 @@ new="""        ForkJoin fj([left, depth]() { return TransactionSubtreeA(left, de
 assert a.count(old)==1
 marker="Hash TransactionSubtreeA(std::span<const TxIdentityPair *> entries,"
 assert a.count(marker)==1
-a=a.replace(old,new).replace(marker,inc+"\n"+marker)
+headers="\n".join(line for line in inc.splitlines() if line.startswith("#include"))
+inc="\n".join(line for line in inc.splitlines() if not line.startswith("#include"))
+a=headers+"\n"+a.replace(old,new).replace(marker,inc+"\n"+marker)
 open(sys.argv[2],"w").write(a)
 PY
 # D: generic persistent pool with growth (work_pool.h); same thresholds/partitioning.

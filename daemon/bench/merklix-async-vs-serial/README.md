@@ -34,3 +34,31 @@ creation), worker creations before timing, and subprocess wall time through
 process exit (including teardown, fixture/reference and warm-up). These are
 separate observables: subtracting them does not isolate pool teardown. Thread
 counts and summary column labels cover all four variants.
+## Resume review (2026-10-22)
+The historical source pin `657edc0133cac8d54c5570506dad57bf10e300b5`
+remains the intended A/B input. Grok's newer canonical progression tip is a
+separate source identity; it does not invalidate this historical controlled
+comparison. Before running, preserve the pinned source and build inputs under
+the canonical task home and set `SRC` explicitly. Do not modify Grok inputs.
+
+Source repairs, not yet compiled: corrected C generator argument and hoisted
+its standard includes out of the production namespace. D now freezes worker
+growth before shutdown joins, drains descendants on existing workers, joins
+an overwritten Future, rejects consumed Get, constrains Async to movable
+object results, and falls back to inline execution if initial thread creation
+fails. Workers start lazily; cap zero is normalized to one. The pool must
+outlive Futures; external submissions must stop before destruction; jobs may
+submit descendants while draining but must not destroy the pool. Dependencies
+must be acyclic. Post intentionally discards job exceptions. This is still an
+experimental framework, separate from the A/B result.
+
+`work_pool_test.cpp` prepares focused gates for move-only values/captures,
+exception propagation, consumed Get, nested trees at caps1/2/4, destructor and
+move-assignment joining, thread caps, and descendant draining. It has not been
+compiled or executed. In a negotiated window: compile/run this gate first,
+then build all variants, check every workload against the reference with short
+smokes, and only then run the 8-repetition matrix. The matrix requires at least
+672 seconds of timed execution plus build/reference/warm-up/drain overhead.
+Whole-process RSS includes fixture/reference/warm-up. Warm pool timing excludes
+pool construction and shutdown; full-lifecycle pool costs remain a separate
+measurement requirement. No performance or correctness-pass claim is made.

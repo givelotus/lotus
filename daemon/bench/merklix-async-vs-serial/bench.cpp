@@ -81,8 +81,14 @@ int main(int argc, char **argv) {
     auto fx = Fixture(n, prefix);
     std::vector<const TxIdentityPair *> ptrs;
     for (auto &t : fx) ptrs.push_back(&t);
-    const Hash expected = n <= 100000 || true ? Reference(ptrs) : Hash{};
-    for (int i = 0; i < warm; ++i) if (BuildTxSubtreeA(fx) != expected) return 2;
+    const Hash expected = Reference(ptrs);
+    const uint64_t threads_before_warmup = g_threads.load();
+    const double cold_cpu0 = cpu_seconds();
+    const auto cold_wall0 = std::chrono::steady_clock::now();
+    if (BuildTxSubtreeA(fx) != expected) return 2;
+    const double cold_wall = std::chrono::duration<double>(std::chrono::steady_clock::now() - cold_wall0).count();
+    const double cold_cpu = cpu_seconds() - cold_cpu0;
+    for (int i = 1; i < warm; ++i) if (BuildTxSubtreeA(fx) != expected) return 2;
 
     std::atomic<bool> go{false}, stop{false}, bad{false};
     std::atomic<uint64_t> roots{0};
@@ -121,5 +127,7 @@ int main(int argc, char **argv) {
                 (unsigned long long)(g_threads.load() - th0), double(g_threads.load() - th0) / r,
                 (unsigned long long)caller_threads);
     for (auto b : expected) std::printf("%02x", unsigned(b));
-    std::printf("\"}\n");
+    std::printf("\",\"first_root_wall_s\":%.9f,\"first_root_cpu_s\":%.9f,"
+                "\"threads_created_before_timing\":%llu}\n", cold_wall, cold_cpu,
+                (unsigned long long)(th0 - threads_before_warmup - caller_threads));
 }
