@@ -1,0 +1,21 @@
+# Chain-domain construction scope correctness fix
+
+Code: `3a995e4cc2a3e7f8abdeafe174b6c4c0edfa87ff`, on canonical 524 `23ff06e9fa8bd43ab77efc8a039d19c0a25142d2` / tree `14e035afc396308ec0809e6007cdb1f331d9301f`. Causal owner `bf728caced8ad802fcf549f9db03a775bb266a37` is the current replay of historical `363922665a4ddfc3de2d0153635a5987a4f4edff` (“chain: give Lotus V2 its own data directory, ports and network identity”). The commit is authored as a fixup for that owner.
+
+Before: an anonymous kernel ScopedV2ChainId saved, overwrote and restored the plain process-global active ChainId during Main/Test/Reg parameter factories. Concurrent RPC decode/CTransaction::InitHashes reads could observe another network's domain or race with those writes; overlapping factories could restore an incorrect global value.
+
+After: public ScopedV2ChainId in primitives/block.h owns a const ChainId and the preceding thread-local override pointer. Constructor copies its input then installs only a pointer to its own value; destructor asserts LIFO identity and restores the previous pointer. Copy and move are deleted. GetActiveV2ChainId returns the current thread's scoped override, otherwise the unchanged process-wide startup-selected domain. It does not replace the process selection with TLS. The three factory scope call sites are unchanged. SetActiveV2ChainId is explicitly startup-only.
+
+The setter audit leaves src/chainparams.cpp SelectParams as the sole non-test caller. Existing standalone/unit test setters remain separate serialized test setup concerns. Getter references are consumed synchronously or copied into owned state at inspected production sites; the header explicitly forbids keeping a scoped reference past scope teardown. Native InitHashes computes fast-path TxId/TxHash synchronously under the same thread's scope; fallback identity computation receives the domain explicitly. Public transaction commitment async jobs operate on already computed TxId/TxHash pairs and never consult the active domain, so their existing workers need no TLS propagation. Future domain-dependent factory work moved to a worker would need an explicit owned context rather than inheriting this thread's scope.
+
+This does not make arbitrary runtime SetActiveV2ChainId writes safe. Production startup must select once before reader threads begin, as documented. It also does not change genesis constants, hash algorithms, network identifiers, warmup behavior or admission performance code.
+
+Evidence: source-change.diff, setter-calls.txt, getter-calls.txt, causal-owner.txt and delivery.json. Source whitespace checks passed. **No compiler, tests or runtime were launched by this lane.** Coordinator owns deterministic scope/concurrent factory/transaction identity tests and subsequent native validation.
+
+## Coordinator prepared regression/source gate
+
+Latest subject `306f4dfe2b9e25890bd361fc337f8f8344f43d55`, tree `3a9227011fce3a8e853ab9f8e7e7cb30108c9425`, adds two meaningful genesis-suite regressions described in COMPLETE-PRODUCTION-CALLGRAPH.md. Independent Astra actual source review closed with no semantic/lifetime blocker; source-only review is preserved in INDEPENDENT-OVERLAY-REVIEW.md. No native test result is implied by that approval.
+
+The same-API old-global control is `f3282600341262b1ece71a12757a0b6969515570`. Run only the deterministic reader test as a control: it should produce one failed reader verdict while a different-domain scope remains held. The reader joins before nested domain changes, so the regression does not rely on intentionally raced writes. The parallel old-global factory stress is deliberately excluded from the control because the genuine old race can trigger genesis assertions/abort.
+
+The pure source adapter passes all524 original prefixes: first437 untouched,87 adapted/idempotent; production repair begins at causal owner438 and test additions begin only when the existing genesis suite arrives at439. Final transformed source tree exactly matches the subject. This is not an all-prefix compile claim and adds no new purpose. Original authorship/purpose metadata remain the composer's responsibility. N1 owns upcoming native control/subject and warmup-union gates; the same correctness fix must be present on both sides of any subsequent performance comparison.
