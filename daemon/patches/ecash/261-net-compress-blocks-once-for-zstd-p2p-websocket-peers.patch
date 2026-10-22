@@ -1,0 +1,2512 @@
+From ccedfd22f0e03dc50e8770976baa1ca2e8ed0a0c Mon Sep 17 00:00:00 2001
+From: Shammah Chancellor <shammah.chancellor@notvalid.com>
+Date: Mon, 19 Oct 2026 18:43:54 -0700
+Subject: [PATCH] net: compress blocks once for zstd P2P WebSocket peers
+
+A p2p-zstd-v1 WebSocket connection compresses one zstd stream per
+direction. Its output depends on the connection's history, so a block
+sent to N WebSocket peers is compressed N times. Compression is most of
+what a node spends per WebSocket peer when it serves a block (2.2-2.7
+ns/byte against 0.2 for serialization and 0.4 for the checksum), so a new
+tip served to many peers costs N times that.
+
+Port the V2 tier's independent block frames (V2 patch 095, "[v2 only]
+net: cache dictionary-versioned independent compressed block frames") to
+the eCash tier as part of its existing compressed WebSocket protocol.
+Both p2p-zstd-v1 and p2p-zstd support independent frames without another
+subprotocol or feature negotiation.
+
+- Format (as V2): an unfragmented binary message with RSV2 only, payload
+  [format 1][dictionary version LE32][one zstd frame with its content
+  size], compressed with only the dictionary. Version 1 is the existing
+  p2p-zstd-v1 dictionary. It decompresses to whole P2P messages and
+  neither uses nor changes the stream state.
+- Decoder: V2's strict validation: unknown format or dictionary
+  version, skippable, concatenated, trailing or truncated data, missing
+  or over-limit content size, and a declared window above 1 MiB (checked
+  before allocating) are fatal, and nothing is appended on error.
+- Sender: WebSocketSock follows the outgoing P2P message framing (CConnman
+  sends a header with MSG_MORE, then the payload) and sends `block`
+  messages of at least -p2pcompressoncethreshold bytes (default 65536,
+  header included; 0 never sends frames but still accepts them) as one
+  independent frame, after framing whatever precedes them. A header split
+  by a flush, or any other unusual send pattern, falls back to the stream;
+  the P2P bytes delivered are the same either way.
+- Cache: one LRU shared by all peers (net_zstd_independent.*), bounded by
+  the allocated bytes of its frames (-p2pcompressoncecache, MiB, default
+  128) and 64 blocks. Keys include the block hash, full double-SHA256
+  payload digest, exact P2P header and dictionary version. Encode accepts
+  arbitrary payloads, so the header's 32-bit checksum cannot substitute for
+  a payload digest. A mismatch regression holds the entire header fixed
+  while changing body bytes and verifies distinct decoded frames.
+  Peers asking for a block while
+  it is being compressed wait for that compression (a shared future, not
+  V2's cache-wide lock), so unrelated blocks and hits are not blocked.
+- Metrics (lotus_, this tier's prefix): frames sent/received, cache hits,
+  misses, evictions, bytes, entries and compress-once encodes.
+  getpeerinfo shows frames sent/received per WebSocket peer.
+- doc/p2p-websocket.md documents the eCash rule in place of V2's "not
+  suitable for the eCash tier" note.
+
+Evidence:
+
+- Focused unit coverage: stream history across frames, fresh-peer decoding,
+  invalid RSV combinations, strict validation, message limits, cache
+  bounds, identity, eviction and concurrent requests; mixed zstd/plain
+  peers; split headers, multi-call payloads, thresholds and client frames.
+- p2p_websocket_compress_once.py: three zstd peers, one uncompressed
+  WebSocket peer and raw TCP receive identical block bytes; one encode,
+  one miss, two hits and three independent frames; repeat requests hit;
+  both dictionary and dictionary-free zstd peers can send independent frames.
+- Original session reported focused unit and related functional tests pass
+  after removing negotiation. Final resumed validation is in the delivery
+  packet; no broad sweep is performed during recovery.
+
+A/B (contrib/bench/ws-block-frames, previous commit): A = base, B = this
+commit. These historical measurements used the earlier handshake token
+on B and the existing token on A; removing the extra token leaves the
+compression algorithm unchanged. The corrected full-payload cache key
+adds per-request hashing; these historical A/B numbers do not measure
+that correction. ws://, regtest blocks of ~225-byte
+P2PKH-shaped transactions with random keys/signatures/hashes. Medians of
+5 interleaved rounds (order alternating), Apple M5 Max, 18 CPUs, shared
+with other agents' builds (1-minute load average 45-65 throughout):
+
+    block peers | node CPU ms A -> B (B/A) | wall ms A -> B (B/A) | wire MB A / B
+     1 MB    8 |    22.4 ->     8.5 (0.38) |    25.6 ->     9.4 (0.37) | 5.1 / 5.1
+     1 MB   32 |    98.1 ->    27.4 (0.28) |    98.2 ->    28.3 (0.29) | 20.3 / 20.3
+     1 MB   64 |   191.1 ->    59.0 (0.31) |   220.8 ->    57.1 (0.26) | 40.6 / 40.6
+     8 MB    8 |   170.8 ->    62.4 (0.37) |   198.9 ->    66.8 (0.34) | 40.8 / 40.8
+     8 MB   32 |   722.4 ->   204.7 (0.28) |  1429.2 ->   213.6 (0.15) | 163.4 / 163.3
+     8 MB   64 |  1471.2 ->   395.4 (0.27) |  2751.1 ->   521.7 (0.19) | 326.8 / 326.7
+    32 MB    8 |   703.1 ->   256.0 (0.36) |  1176.5 ->   269.0 (0.23) | 164.3 / 164.3
+    32 MB   32 |  2980.0 ->   827.5 (0.28) |  5463.2 ->  1139.1 (0.21) | 657.2 / 657.0
+    32 MB   64 |  6072.0 ->  1693.9 (0.28) | 11669.6 ->  2175.4 (0.19) | 1314.3 / 1314.0
+
+Min-max ranges (in the bench output) do not overlap for node CPU in any
+cell; wall-time ranges are wide under this load (e.g. 32 MB/64 peers: A
+7.5-16.6 s, B 1.3-4.7 s). Wire bytes are the same: one block compressed
+alone with the dictionary is as small as in a fresh stream. Metrics show
+exactly one encode and N-1 hits per serve. Per-peer encoding
+(bitcoin-bench WsServe*PerPeer): 2.5-3.3 ns/byte for the stream against
+0.02 ns/byte to copy the cached frame. What remains per frames peer is
+mostly the block's disk read and checksum (next commit).
+
+How to reproduce: build the previous commit and this one (Release), then
+from this tree
+
+    python3 contrib/bench/ws-block-frames/serve_ab.py \
+        --base <previous-build> --patched <this-build> --output <dir> \
+        --sizes 1,8,32 --peers 8,32,64 --rounds 5
+    <this-build>/src/bench/bitcoin-bench -filter='WsServe.*'
+
+Output: per-serve lines, then SUMMARY.md with "| Block | Peers | Metric |
+A median (min-max) | B median (min-max) | B/A | n |".
+
+Not tested: TLS (wss://) serving under load, Linux and other platforms,
+sanitizers, the full functional suite, real WAN peers or mainnet blocks. Frames
+are not yet used for other large messages (blocktxn, headers), which
+stay in the stream. Server-role peers still copy the cached frame into
+their send buffer.
+
+The V2 tier can later rebase its patch 095 onto this shared code
+(net_zstd_independent.*), keeping its own dictionary version and its
+dictionary choices.
+
+Tier: eCash
+
+Coordinator integration provenance (network403):
+Use direct fullnode metric namespace, with no lotus_ aliases. Shared independent cache is later extended by the existing native cache owner, not duplicated.
+Original scripted commands/hashes above are original-author provenance; modified parent/tool/catalog hashes are not claimed to reproduce this composition. Exact coordinator adaptation scripts and ordered tree proof are in composed403-network-metrics-delivery. Build/runtime/benchmarks NOT_RUN for this composition under user compile-first policy.
+
+Coordinator integration provenance (reference405):
+Preserve earlier purposeful source repairs through downstream consumer/context adaptations; exact conflict ledger retained.
+All60 authored input payloads retained, with prerequisite-aware same-purpose splits; distinct legacy-index and inherited CXX compatibility remain independent. Pre-format source equals exact403+all60 control tree95718fceff83364b74294a751bd752b2f1a4e384. Only pinnedRuff import/format cleanup follows. Original author commands/hashes are historical reference evidence, not combined405 approval. Reference OFF/native/Rust full gates are preserved separately; combined compile/runtime NOT_RUN.
+---
+ contrib/bench/ws-block-frames/README.md       |  17 +-
+ contrib/bench/ws-block-frames/peers.py        |  39 +-
+ doc/p2p-websocket.md                          |  58 +-
+ doc/release-notes.md                          |   5 +
+ src/CMakeLists.txt                            |   1 +
+ src/bench/ws_block_serve.cpp                  |  67 ++-
+ src/init.cpp                                  |  37 ++
+ src/net_websocket.h                           |   4 +
+ src/net_websocket_codec.cpp                   |  36 +-
+ src/net_websocket_codec.h                     |  24 +-
+ src/net_websocket_sock.cpp                    | 128 ++++-
+ src/net_websocket_sock.h                      |  31 ++
+ src/net_zstd_independent.cpp                  | 315 +++++++++++
+ src/net_zstd_independent.h                    | 144 +++++
+ src/node/metrics.cpp                          |  24 +
+ src/node/metrics.h                            |  10 +
+ src/rpc/net.cpp                               |   8 +
+ src/test/net_websocket_tests.cpp              | 510 +++++++++++++++++-
+ .../functional/p2p_websocket_compress_once.py | 174 ++++++
+ .../test_framework/p2p_websocket.py           | 211 +++++++-
+ test/functional/test_runner.py                |   1 +
+ 21 files changed, 1794 insertions(+), 50 deletions(-)
+ create mode 100644 src/net_zstd_independent.cpp
+ create mode 100644 src/net_zstd_independent.h
+ create mode 100644 test/functional/p2p_websocket_compress_once.py
+
+diff --git a/contrib/bench/ws-block-frames/README.md b/contrib/bench/ws-block-frames/README.md
+index 72387e510522d02041a6cb5fe136b1c5ec5298a2..cdecb2e1bb9422031debcd8251ab57f17bf071a0 100644
+--- a/contrib/bench/ws-block-frames/README.md
++++ b/contrib/bench/ws-block-frames/README.md
+@@ -3,7 +3,8 @@
+ Tools to measure what a node spends to serve the same block to many peers
+ at once, comparing two builds (A and B) on the same fixture, over P2P
+ WebSocket (see [doc/p2p-websocket.md](../../../doc/p2p-websocket.md)) or raw
+-TCP. They work for any two builds of the node.
++TCP. They work for any two builds of the node; they were written for
++compress-once block frames.
+ 
+ ## What is measured
+ 
+@@ -20,8 +21,8 @@ serve it records:
+   SHA256);
+ - **bytes on the wire**: WebSocket frame bytes the node sent
+   (`getnettotals`), or TCP bytes with `--transport=tcp`;
+-- with `-metrics` (the default `--node-arg`), the change of the node's
+-  WebSocket serving metrics, where a build has them.
++- with `-metrics`, the change of the `fullnode_p2p_compress_once_*` and
++  `fullnode_p2p_websocket_independent_*` metrics where they exist.
+ 
+ The peers (`peers.py`) are asyncio connections in several client processes
+ (`--workers`, default 8). They decode what they receive as real peers would
+@@ -39,7 +40,8 @@ beforehand so they come from the page cache, as a fresh tip would.
+ 
+ `src/bench/ws_block_serve.cpp` (`bitcoin-bench -filter='WsServe.*'`)
+ measures the per-peer pieces in isolation: block serialization, the P2P
+-checksum, and stream compression and decompression.
++checksum, stream compression and decompression, and (with compress-once)
++independent compression, cache hits and decompression.
+ 
+ ## How to reproduce
+ 
+@@ -52,7 +54,8 @@ cmake -GNinja -S <patched-tree> -B <patched-build> -DCMAKE_BUILD_TYPE=Release -D
+ ninja -C <patched-build> bitcoind bitcoin-bench
+ ```
+ 
+-Run the driver from the newer tree, with Python 3.10+ and `zstandard`:
++Run the driver from the newer tree (its client decodes independent
++frames), with Python 3.10+ and `zstandard`:
+ 
+ ```
+ python3 contrib/bench/ws-block-frames/serve_ab.py \
+@@ -60,9 +63,7 @@ python3 contrib/bench/ws-block-frames/serve_ab.py \
+     --output /path/to/results --sizes 1,8,32 --peers 8,32,64 --rounds 5
+ ```
+ 
+-`--base`/`--patched` take a build directory or a `bitcoind` binary. The
+-offer is what every peer offers: a node that does not know a token ignores
+-it. `--transport=tcp` measures raw TCP peers instead. `--rpcport`/`--port`
++`--base`/`--patched` take a build directory or a `bitcoind` binary. `--offer` selects the compression subprotocol offered by every peer. `--transport=tcp` measures raw TCP peers instead. `--rpcport`/`--port`
+ (default 41604/41605) choose the node's ports. Building the fixture takes a
+ few minutes; it is kept in `<output>/fixture` and reused. A full run of the
+ default matrix (9 cells, 5 rounds, two builds) takes 20-40 minutes.
+diff --git a/contrib/bench/ws-block-frames/peers.py b/contrib/bench/ws-block-frames/peers.py
+index 9c3201e1106d47082c76cbabbb1ffa1cd0dfcf7e..0c01854e5ab0dda3e196067e2a6608bf6b47145e 100644
+--- a/contrib/bench/ws-block-frames/peers.py
++++ b/contrib/bench/ws-block-frames/peers.py
+@@ -8,7 +8,8 @@ Sec-WebSocket-Protocol offer) or raw TCP, complete the version handshake,
+ wait for a common start signal, send `getdata` for one block and stop when
+ the whole `block` message has arrived and matches the expected SHA256.
+ WebSocket peers decode what they receive exactly as a real peer would
+-(zstd stream with the P2P dictionary), so every side does the same work.
++(zstd stream with the P2P dictionary, and independent RSV2 frames on zstd
++connections), so every side does the same work.
+ 
+ Peers run in asyncio event loops inside several worker processes (see
+ serve_ab.py); this module has no dependency on the node's source tree
+@@ -84,6 +85,23 @@ def getdata_payload(block_hash_hex):
+     )
+ 
+ 
++def decode_independent(body, dictionary, max_size=64 << 20):
++    """An independent frame: [1][dictionary version LE32 = 1][zstd frame]"""
++    import zstandard
++
++    if len(body) < 11 or body[0] != 1 or struct.unpack_from("<I", body, 1)[0] != 1:
++        raise ValueError("unsupported independent frame")
++    frame = body[5:]
++    params = zstandard.get_frame_parameters(frame)
++    if params.content_size > max_size or params.window_size > 1 << 20:
++        raise ValueError("independent frame resource bound exceeded")
++    out = zstandard.ZstdDecompressor(dict_data=dictionary).decompressobj()
++    data = out.decompress(frame)
++    if not out.eof or out.unused_data or len(data) != params.content_size:
++        raise ValueError("malformed independent frame")
++    return data
++
++
+ class Codec:
+     """The P2P byte stream over one transport (raw TCP or WebSocket)."""
+ 
+@@ -91,21 +109,24 @@ class Codec:
+         self.subprotocol = subprotocol
+         self.encoder = self.decoder = None
+         self.dictionary = None
+-        if subprotocol in ("p2p-zstd", "p2p-zstd-v1"):
++        self.frames = subprotocol in ("p2p-zstd", "p2p-zstd-v1")
++        if self.frames:
+             import zstandard
+ 
+-            if subprotocol != "p2p-zstd":
+-                self.dictionary = zstandard.ZstdCompressionDict(
+-                    dictionary, dict_type=zstandard.DICT_TYPE_RAWCONTENT
+-                )
++            # Independent frames always use the dictionary, the stream only
++            # with p2p-zstd-v1.
++            self.dictionary = zstandard.ZstdCompressionDict(
++                dictionary, dict_type=zstandard.DICT_TYPE_RAWCONTENT
++            )
++            stream_dict = self.dictionary if subprotocol == "p2p-zstd-v1" else None
+             self.encoder = zstandard.ZstdCompressor(
+                 level=1,
+-                dict_data=self.dictionary,
++                dict_data=stream_dict,
+                 write_checksum=False,
+                 write_content_size=False,
+             ).compressobj()
+             self.decoder = zstandard.ZstdDecompressor(
+-                dict_data=self.dictionary
++                dict_data=stream_dict
+             ).decompressobj()
+             self.flush = zstandard.COMPRESSOBJ_FLUSH_BLOCK
+ 
+@@ -115,6 +136,8 @@ class Codec:
+         return self.encoder.compress(raw) + self.encoder.flush(self.flush)
+ 
+     def decode(self, payload, rsv):
++        if rsv == 0x20 and self.frames:
++            return decode_independent(payload, self.dictionary)
+         if rsv:
+             raise ValueError(f"unexpected RSV bits {rsv:#x}")
+         return self.decoder.decompress(payload) if self.decoder else payload
+diff --git a/doc/p2p-websocket.md b/doc/p2p-websocket.md
+index 9ae2f59386da9018243f15bdd20c77e9ffce61c7..cda40fc387cc0dea27c906c60ab249911c8a887a 100644
+--- a/doc/p2p-websocket.md
++++ b/doc/p2p-websocket.md
+@@ -183,7 +183,63 @@ and whether the key was pinned or listed.
+ Peers negotiate a subprotocol. `p2p-zstd-v1` (the default) compresses the
+ message stream with zstd and a built-in dictionary of common P2P messages,
+ so even small messages shrink; `p2p-zstd` does the same without the
+-dictionary; `none` sends plain messages.
++dictionary; `none` sends plain messages. Both zstd subprotocols also carry
++independent block frames, below.
++
++### Independent block frames (compress once, serve many)
++
++A zstd stream's compressed bytes depend on everything sent before on that
++connection, so a block sent to many WebSocket peers would be compressed
++again for each of them. An independent frame is compressed with the
++built-in dictionary only, so the node compresses a block once and sends the
++same bytes to every zstd peer.
++
++**Format.** An independent frame is one unfragmented binary WebSocket
++message (FIN=1, opcode 2) with RSV2 (`0x20`) set and no other RSV bit. Its
++payload is `[format byte = 1][dictionary version, LE32 = 1][one zstd
++frame]`. Dictionary version 1 is the `p2p-zstd-v1` dictionary
++(`P2P_ZSTD_DICT_V1`), also on `p2p-zstd` connections. The zstd frame
++records its content size and is compressed with that dictionary and no
++other history. It decompresses to whole P2P messages (24-byte header
++included), which continue the connection's P2P byte stream at that point.
++Independent frames neither use nor change either direction's zstd stream:
++the next stream message continues from the previous one.
++
++Either end of a `p2p-zstd-v1` or `p2p-zstd` connection may send independent
++frames, and must accept them. Plain (`none`) and permessage-deflate
++connections use no RSV bits; a frame with any RSV bit ends them. The HTTP
++server's debug bridge (`-p2pwebsocketbridge`) does not support independent
++frames: a peer sending one through it is disconnected.
++
++A receiver rejects, and disconnects for: RSV2 on a fragmented, continuation,
++text or control frame; RSV1 or RSV3; an unknown format byte or dictionary
++version; a payload that is not exactly one zstd frame (skippable frames,
++concatenated frames, trailing or truncated data); a missing content size or
++one above the message size limit (the configured or adaptive block size
++limit plus the P2P header, as for stream and plain messages); and a declared
++zstd window above 1 MiB, checked before any output is allocated.
++
++**Sending.** Nodes send `block` messages of at least
++`-p2pcompressoncethreshold` bytes (default 65536, P2P header included) as
++independent frames; `0` keeps every message in the stream (incoming frames
++are still accepted), which is the control for comparisons. Smaller blocks
++and other messages stay in the stream, where the connection's history
++compresses them better and nothing is shared between peers. Encoded blocks
++are kept in an LRU cache shared by all peers, bounded by the allocated
++bytes of the frames (`-p2pcompressoncecache`, MiB, default 128) and by 64
++blocks. Its key includes the block hash, a full double-SHA256 digest of the
++payload, the exact 24-byte P2P header and the dictionary version. The
++short P2P checksum alone is insufficient to identify supplied payloads. Peers asking for a
++block while it is being compressed wait for that compression rather than
++repeating it.
++
++`getpeerinfo` counts independent frames sent and received per peer
++(`websocket.independent_frames_sent`, `_recv`). With `-metrics`:
++`fullnode_p2p_websocket_independent_frames_total{direction}` and
++`fullnode_p2p_compress_once_{cache_hits,cache_misses,cache_evictions,encodes}_total`,
++`fullnode_p2p_compress_once_cache_{bytes,entries}`.
++
++The frame format comes from the V2 tier (its patch 095).
+ 
+ ## Over HTTP/2
+ 
+diff --git a/doc/release-notes.md b/doc/release-notes.md
+index fe0ec1cc25d933fbbb77aa6ab17a56d5a4ba5e52..8c75167b591f7d5b3062b67007f2ffc9b1364900 100644
+--- a/doc/release-notes.md
++++ b/doc/release-notes.md
+@@ -5,6 +5,11 @@ Bitcoin ABC version 0.34.1 is now available from:
+   <https://download.bitcoinabc.org/0.34.1/>
+ 
+ This release includes the following features and fixes:
++- On zstd P2P WebSocket connections (`p2p-zstd-v1`, `p2p-zstd`), large
++  blocks are sent as independent zstd frames, compressed once and shared by
++  every such peer instead of once per peer. See
++  `-p2pcompressoncethreshold`, `-p2pcompressoncecache` and
++  doc/p2p-websocket.md.
+ - Wallets receive chain notifications (blocks, mempool transactions and chain
+   state flushes) on a per-wallet worker thread instead of the validation
+   scheduler thread, in the same order as before. A wallet that is busy, for
+diff --git a/src/CMakeLists.txt b/src/CMakeLists.txt
+index 8ab6bc62d6b938689165aad0589a8e76c078eba7..1cb32a550f3e37ec2ecfe30fa800a9359f7b944a 100644
+--- a/src/CMakeLists.txt
++++ b/src/CMakeLists.txt
+@@ -674,6 +674,7 @@ add_library(server
+ 	net_websocket_codec.cpp
+ 	net_websocket_sock.cpp
+ 	net_websocket_tls.cpp
++	net_zstd_independent.cpp
+ 	node/abort.cpp
+ 	node/blockfitter.cpp
+ 	node/blockmanager_args.cpp
+diff --git a/src/bench/ws_block_serve.cpp b/src/bench/ws_block_serve.cpp
+index fdfa32c3a5fdaa137fd70ba065ab69adc3166995..08dd0c739b5bbba867255910fcb32bcb471b401d 100644
+--- a/src/bench/ws_block_serve.cpp
++++ b/src/bench/ws_block_serve.cpp
+@@ -3,13 +3,16 @@
+ // file COPYING or http://www.opensource.org/licenses/mit-license.php.
+ 
+ // Per-peer costs of serving one block message: serializing it, its P2P
+-// checksum, and the WebSocket p2p-zstd-v1 stream compression. Run with
++// checksum, and the WebSocket p2p-zstd-v1 stream compression, against
++// compress-once independent frames. Run with
+ // -filter='WsServe.*'. See contrib/bench/ws-block-frames/README.md.
+ 
+ #include <bench/bench.h>
+ 
+ #include <hash.h>
++#include <net_websocket_codec.h>
+ #include <net_zstd_dict.h>
++#include <net_zstd_independent.h>
+ #include <primitives/block.h>
+ #include <primitives/transaction.h>
+ #include <protocol.h>
+@@ -140,6 +143,64 @@ void BenchStreamDecompress(benchmark::Bench &bench, size_t bytes) {
+         assert(out.size() == f.message.size());
+     });
+ }
++
++/** independent frames: the one compression of a block for all peers */
++void BenchIndependentCompress(benchmark::Bench &bench, size_t bytes) {
++    const auto &f{GetFixture(bytes)};
++    Setup(bench, f);
++    bench.run([&] {
++        const auto frame{CompressP2PIndependent(f.header, f.payload)};
++        ankerl::nanobench::doNotOptimizeAway(frame.data());
++    });
++}
++
++/**
++ * independent frames: each further peer, served from the cache and copied
++ * into that peer's WebSocket frame (server role: unmasked)
++ */
++void BenchIndependentPerPeer(benchmark::Bench &bench, size_t bytes) {
++    const auto &f{GetFixture(bytes)};
++    P2PIndependentFrameCache cache;
++    cache.Encode(f.header, f.payload);
++    WebSocketCodec codec{WebSocketCodec::Role::SERVER,
++                         P2PWebSocketCompression::ZSTD_DICT};
++    Setup(bench, f);
++    std::vector<uint8_t> wire;
++    bench.run([&] {
++        const auto frame{cache.Encode(f.header, f.payload)};
++        wire.clear();
++        codec.EncodeIndependent(*frame, wire);
++        ankerl::nanobench::doNotOptimizeAway(wire.data());
++    });
++    assert(cache.GetStats().encodes == 1);
++}
++
++/** p2p-zstd-v1: each peer, compressed and framed for it */
++void BenchStreamPerPeer(benchmark::Bench &bench, size_t bytes) {
++    const auto &f{GetFixture(bytes)};
++    Setup(bench, f);
++    std::vector<uint8_t> wire;
++    bench.run([&] {
++        WebSocketCodec codec{WebSocketCodec::Role::SERVER,
++                             P2PWebSocketCompression::ZSTD_DICT};
++        wire.clear();
++        codec.EncodeMessage(f.message, wire);
++        ankerl::nanobench::doNotOptimizeAway(wire.data());
++    });
++}
++
++/** independent frames: what each receiving peer spends decompressing it */
++void BenchIndependentDecompress(benchmark::Bench &bench, size_t bytes) {
++    const auto &f{GetFixture(bytes)};
++    const auto frame{CompressP2PIndependent(f.header, f.payload)};
++    Setup(bench, f);
++    std::vector<uint8_t> out;
++    bench.run([&] {
++        out.clear();
++        DecompressP2PIndependent(frame, out, f.message.size());
++        assert(out.size() == f.message.size());
++    });
++}
+ } // namespace
+ 
+ #define WS_SERVE_BENCH(name, fn)                                               \
+@@ -160,3 +221,7 @@ WS_SERVE_BENCH(BlockSerialize, BenchSerialize)
+ WS_SERVE_BENCH(BlockChecksum, BenchChecksum)
+ WS_SERVE_BENCH(StreamCompress, BenchStreamCompress)
+ WS_SERVE_BENCH(StreamDecompress, BenchStreamDecompress)
++WS_SERVE_BENCH(IndependentCompress, BenchIndependentCompress)
++WS_SERVE_BENCH(IndependentPerPeer, BenchIndependentPerPeer)
++WS_SERVE_BENCH(StreamPerPeer, BenchStreamPerPeer)
++WS_SERVE_BENCH(IndependentDecompress, BenchIndependentDecompress)
+diff --git a/src/init.cpp b/src/init.cpp
+index 2ee3e75a4b9869f6ac4da41fc4a350affacd8d3a..f3aac30786ed13015746dc88f00d731c9aeab88d 100644
+--- a/src/init.cpp
++++ b/src/init.cpp
+@@ -47,6 +47,7 @@
+ #include <net_permissions.h>
+ #include <net_processing.h>
+ #include <net_websocket_dialer.h>
++#include <net_zstd_independent.h>
+ #include <netbase.h>
+ #include <node/blockmanager_args.h>
+ #include <node/blockstorage.h>
+@@ -1152,6 +1153,23 @@ void SetupServerArgs(NodeContext &node) {
+                   DEFAULT_P2P_WEBSOCKET_OFFER),
+         ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY,
+         OptionsCategory::CONNECTION);
++    argsman.AddArg(
++        "-p2pcompressoncethreshold=<bytes>",
++        strprintf("Send block messages of at least this size (P2P header "
++                  "included) to zstd WebSocket peers as independent zstd "
++                  "frames, compressed once and shared by all of them. 0 "
++                  "keeps every message in the connection's zstd stream; "
++                  "independent frames from peers are still accepted (0 or at "
++                  "least 64, default: %d)",
++                  DEFAULT_P2P_COMPRESS_ONCE_THRESHOLD),
++        ArgsManager::ALLOW_ANY, OptionsCategory::CONNECTION);
++    argsman.AddArg(
++        "-p2pcompressoncecache=<n>",
++        strprintf("Keep up to <n> MiB of compressed block frames for "
++                  "-p2pcompressoncethreshold, at most %u blocks (default: %d)",
++                  P2P_COMPRESS_ONCE_CACHE_ENTRIES,
++                  DEFAULT_P2P_COMPRESS_ONCE_CACHE_MB),
++        ArgsManager::ALLOW_ANY, OptionsCategory::CONNECTION);
+     argsman.AddArg(
+         "-p2pwebsocketpin=<host>=<pin>",
+         "Only connect to wss:// peers at <host> (dialed URLs and advertised "
+@@ -3812,6 +3830,25 @@ bool AppInitMain(Config &config, RPCServer &rpcServer,
+     connOptions.m_i2p_accept_incoming =
+         args.GetBoolArg("-i2pacceptincoming", true);
+ 
++    {
++        // Compress-once block frames for zstd WebSocket peers.
++        const int64_t threshold{args.GetIntArg(
++            "-p2pcompressoncethreshold", DEFAULT_P2P_COMPRESS_ONCE_THRESHOLD)};
++        if (threshold != 0 && (threshold < 64 || threshold > UINT32_MAX)) {
++            return InitError(Untranslated(
++                "Invalid -p2pcompressoncethreshold (0, or 64 to 4294967295 "
++                "bytes)"));
++        }
++        g_p2p_compress_once_threshold = size_t(threshold);
++        const int64_t cache_mb{args.GetIntArg(
++            "-p2pcompressoncecache", DEFAULT_P2P_COMPRESS_ONCE_CACHE_MB)};
++        if (cache_mb < 0 || cache_mb > 65536) {
++            return InitError(
++                Untranslated("Invalid -p2pcompressoncecache (0 to 65536 MiB)"));
++        }
++        GetP2PIndependentFrameCache().SetMaxBytes(size_t(cache_mb) << 20);
++    }
++
+     {
+         // Outbound ws:// and wss:// peers. Present our TLS certificate, if
+         // any, to peers requesting client certificates.
+diff --git a/src/net_websocket.h b/src/net_websocket.h
+index e7d6716f4d648df75133a1e185b89c6552558e17..eeb6914ba2e596bccfe6831ae2312cb4dce80e5f 100644
+--- a/src/net_websocket.h
++++ b/src/net_websocket.h
+@@ -75,6 +75,10 @@ uint64_t GetP2PWebSocketMessageSizeLimit();
+ struct WebSocketTransportInfo {
+     bool tls{false};
+     P2PWebSocketCompression compression{P2PWebSocketCompression::NONE};
++    //! Independent (compress-once, RSV2) frames carried in each direction,
++    //! zstd modes only
++    std::atomic<uint64_t> independent_frames_sent{0};
++    std::atomic<uint64_t> independent_frames_recv{0};
+     //! Bytes of P2P data (uncompressed) carried in each direction
+     std::atomic<uint64_t> payload_bytes_sent{0};
+     std::atomic<uint64_t> payload_bytes_recv{0};
+diff --git a/src/net_websocket_codec.cpp b/src/net_websocket_codec.cpp
+index b20a25a688427f3729dc6315be3c11203ecf558d..902a4fb5b4de3ed9441dba06c231b97c6c720253 100644
+--- a/src/net_websocket_codec.cpp
++++ b/src/net_websocket_codec.cpp
+@@ -4,9 +4,12 @@
+ 
+ #include <net_websocket_codec.h>
+ 
++#include <net_zstd_independent.h>
++
+ #include <tinyformat.h>
+ 
+ #include <algorithm>
++#include <cassert>
+ #include <cstring>
+ 
+ namespace {
+@@ -16,6 +19,8 @@ constexpr uint8_t OP_BINARY = 0x2;
+ constexpr uint8_t OP_CLOSE = 0x8;
+ constexpr uint8_t OP_PING = 0x9;
+ constexpr uint8_t OP_PONG = 0xA;
++//! Marks an independent frame (zstd modes only)
++constexpr uint8_t RSV2 = 0x20;
+ 
+ /** Parsed frame header */
+ struct FrameHeader {
+@@ -73,7 +78,9 @@ std::optional<FrameHeader> ParseHeader(Span<const uint8_t> in) {
+ } // namespace
+ 
+ WebSocketCodec::WebSocketCodec(Role role, P2PWebSocketCompression compression)
+-    : m_role{role}, m_compression{compression} {
++    : m_role{role}, m_compression{compression},
++      m_independent{compression == P2PWebSocketCompression::ZSTD ||
++                    compression == P2PWebSocketCompression::ZSTD_DICT} {
+     if (compression == P2PWebSocketCompression::ZSTD ||
+         compression == P2PWebSocketCompression::ZSTD_DICT) {
+         m_zstd = std::make_unique<P2PZstdSession>(
+@@ -87,10 +94,10 @@ uint64_t WebSocketCodec::MaxWireMessageSize() const {
+ }
+ 
+ void WebSocketCodec::AppendFrame(uint8_t opcode, Span<const uint8_t> payload,
+-                                 std::vector<uint8_t> &out) {
++                                 std::vector<uint8_t> &out, uint8_t rsv) {
+     const size_t start{out.size()};
+     const bool mask{m_role == Role::CLIENT};
+-    out.push_back(0x80 | opcode);
++    out.push_back(0x80 | rsv | opcode);
+     const uint8_t mask_bit = mask ? 0x80 : 0;
+     const uint64_t len{payload.size()};
+     if (len <= 125) {
+@@ -132,6 +139,12 @@ void WebSocketCodec::EncodeMessage(Span<const uint8_t> payload,
+     }
+ }
+ 
++void WebSocketCodec::EncodeIndependent(Span<const uint8_t> frame,
++                                       std::vector<uint8_t> &out) {
++    assert(m_independent);
++    AppendFrame(OP_BINARY, frame, out, RSV2);
++}
++
+ void WebSocketCodec::EncodeClose(uint16_t code, std::vector<uint8_t> &out) {
+     if (m_close_sent) {
+         return;
+@@ -160,6 +173,15 @@ WebSocketCodec::FinishMessage(std::vector<uint8_t> &plain) {
+         }
+         return std::nullopt;
+     }
++    if (m_message_independent) {
++        try {
++            DecompressP2PIndependent(m_message, plain, plain_limit);
++        } catch (const std::exception &e) {
++            return strprintf("independent zstd: %s", e.what());
++        }
++        ++m_independent_recv;
++        return std::nullopt;
++    }
+     size_t produced{0};
+     try {
+         m_zstd->DecompressFrame(m_message, [&](Span<const uint8_t> chunk) {
+@@ -186,7 +208,10 @@ WebSocketCodec::Decode(Span<const uint8_t> in, std::vector<uint8_t> &plain,
+             break;
+         }
+         // Validate as soon as the header is known, before buffering.
+-        if (h->rsv != 0) {
++        // RSV2 marks an unfragmented independent binary message (zstd
++        // modes only).
++        if (h->rsv != 0 && !(m_independent && h->rsv == RSV2 &&
++                             h->opcode == OP_BINARY && h->fin)) {
+             result.error = "reserved bits set (extensions not supported)";
+             return result;
+         }
+@@ -237,6 +262,9 @@ WebSocketCodec::Decode(Span<const uint8_t> in, std::vector<uint8_t> &plain,
+                     result.error = "unexpected continuation state";
+                     return result;
+                 }
++                if (h->opcode == OP_BINARY) {
++                    m_message_independent = h->rsv == RSV2;
++                }
+                 m_in_message = !h->fin;
+                 unmask_into(m_message);
+                 if (h->fin) {
+diff --git a/src/net_websocket_codec.h b/src/net_websocket_codec.h
+index a6086b3220e810c5c1867aa411a85d95f97e786d..359692776a49e300b5a567ffa1a38a8f0b7bc08f 100644
+--- a/src/net_websocket_codec.h
++++ b/src/net_websocket_codec.h
+@@ -22,8 +22,10 @@
+  * One P2P chunk handed to EncodeMessage() becomes one binary message (one
+  * frame), optionally zstd-compressed as negotiated (see P2PZstdSession).
+  * Decode() turns received wire bytes back into P2P bytes, answering pings
+- * and closes. Extensions (RSV bits, permessage-deflate) are not supported:
+- * connections that negotiated them use the HTTP server's bridge instead.
++ * and closes. Extensions (permessage-deflate) are not supported: connections
++ * that negotiated them use the HTTP server's bridge instead. The only RSV
++ * bit used is RSV2, for independent frames, part of the zstd modes (see
++ * net_zstd_independent.h).
+  */
+ class WebSocketCodec {
+ public:
+@@ -34,6 +36,16 @@ public:
+ 
+     WebSocketCodec(Role role, P2PWebSocketCompression compression);
+ 
++    bool IndependentFrames() const { return m_independent; }
++
++    /**
++     * Append an independent frame (see CompressP2PIndependent) as one RSV2
++     * binary message. It neither uses nor changes the zstd stream's state.
++     * Only with IndependentFrames() (the zstd modes).
++     */
++    void EncodeIndependent(Span<const uint8_t> frame,
++                           std::vector<uint8_t> &out);
++
+     /** Append `payload` (P2P bytes) to `out` as one binary message */
+     void EncodeMessage(Span<const uint8_t> payload, std::vector<uint8_t> &out);
+ 
+@@ -63,24 +75,30 @@ public:
+     //! Bytes of wire frames produced / consumed (headers included)
+     uint64_t WireBytesSent() const { return m_wire_sent; }
+     uint64_t WireBytesRecv() const { return m_wire_recv; }
++    //! Independent frames decoded
++    uint64_t IndependentFramesRecv() const { return m_independent_recv; }
+ 
+ private:
+     void AppendFrame(uint8_t opcode, Span<const uint8_t> payload,
+-                     std::vector<uint8_t> &out);
++                     std::vector<uint8_t> &out, uint8_t rsv = 0);
+     std::optional<std::string> FinishMessage(std::vector<uint8_t> &plain);
+ 
+     const Role m_role;
+     const P2PWebSocketCompression m_compression;
++    const bool m_independent;
+     std::unique_ptr<P2PZstdSession> m_zstd;
+     FastRandomContext m_rng;
+ 
+     //! Fragments of the message being received
+     std::vector<uint8_t> m_message;
+     bool m_in_message{false};
++    //! The message being received is an independent (RSV2) frame
++    bool m_message_independent{false};
+     bool m_peer_closed{false};
+     bool m_close_sent{false};
+     uint64_t m_wire_sent{0};
+     uint64_t m_wire_recv{0};
++    uint64_t m_independent_recv{0};
+     std::vector<uint8_t> m_scratch;
+ };
+ 
+diff --git a/src/net_websocket_sock.cpp b/src/net_websocket_sock.cpp
+index ca660d6ff77d61975047b17a2a493b18256d1872..071bd19f61d1f649fb4b5c157abde40130e5ef83 100644
+--- a/src/net_websocket_sock.cpp
++++ b/src/net_websocket_sock.cpp
+@@ -5,11 +5,16 @@
+ #include <net_websocket_sock.h>
+ 
+ #include <compat/compat.h>
++#include <crypto/common.h>
+ #include <logging.h>
++#include <net_zstd_independent.h>
++#include <node/metrics.h>
++#include <protocol.h>
+ 
+ #include <algorithm>
+ #include <cerrno>
+ #include <cstring>
++#include <utility>
+ 
+ #ifndef MSG_NOSIGNAL
+ #define MSG_NOSIGNAL 0
+@@ -55,8 +60,8 @@ WebSocketSock::WebSocketSock(Sock &&sock, WebSocketCodec::Role role,
+                              std::shared_ptr<WebSocketTransportInfo> info,
+                              std::unique_ptr<WebSocketByteLayer> layer,
+                              std::vector<uint8_t> initial_wire_bytes)
+-    : Sock{std::move(sock)}, m_info{std::move(info)},
+-      m_layer{std::move(layer)}, m_codec{role, m_info->compression},
++    : Sock{std::move(sock)}, m_info{std::move(info)}, m_layer{std::move(layer)},
++      m_codec{role, m_info->compression},
+       m_rx_wire{std::move(initial_wire_bytes)} {
+     // Never block a CConnman thread: MSG_DONTWAIT may be unavailable (it is
+     // then defined as 0 by compat.h), so make the socket itself
+@@ -93,12 +98,99 @@ void WebSocketSock::UpdateFlagsLocked() const {
+                        (m_read_waits_send ? Sock::SEND : Event{0});
+ }
+ 
+-bool WebSocketSock::FlushLocked() const {
+-    if (!m_coalesce.empty()) {
+-        m_codec.EncodeMessage(m_coalesce, m_tx);
+-        AddCounters(*m_info, m_coalesce.size(), 0, 0, 0);
+-        m_coalesce.clear();
++void WebSocketSock::EncodeCoalescedLocked() const {
++    if (m_coalesce.empty()) {
++        return;
++    }
++    m_codec.EncodeMessage(m_coalesce, m_tx);
++    AddCounters(*m_info, m_coalesce.size(), 0, 0, 0);
++    m_coalesce.clear();
++    if (m_out_header_have > 0) {
++        // The start of the current header went into the zstd stream.
++        m_out_header_split = true;
++    }
++}
++
++void WebSocketSock::EncodeIndependentLocked(Span<const uint8_t> payload) const {
++    const auto frame{
++        GetP2PIndependentFrameCache().Encode(m_out_header, payload)};
++    m_codec.EncodeIndependent(*frame, m_tx);
++    m_out_independent = false;
++    AddCounters(*m_info, m_out_header.size() + payload.size(), 0, 0, 0);
++    ++m_info->independent_frames_sent;
++    if (auto *metrics{node::GetNodeMetrics()}) {
++        metrics->websocket_independent_frames.Add(0);
++    }
++}
++
++void WebSocketSock::QueueLocked(Span<const uint8_t> bytes) const {
++    if (!m_codec.IndependentFrames()) {
++        m_coalesce.insert(m_coalesce.end(), bytes.begin(), bytes.end());
++        return;
++    }
++    // CConnman sends whole P2P messages (header, then payload) in order, so
++    // the stream can be followed message by message. Following it wrongly
++    // would only change how bytes are framed, never the bytes themselves.
++    static constexpr size_t HEADER{CMessageHeader::HEADER_SIZE};
++    static_assert(std::tuple_size_v<decltype(m_out_header)> == HEADER);
++    static constexpr char BLOCK_COMMAND[CMessageHeader::MESSAGE_TYPE_SIZE]{
++        "block"};
++    while (!bytes.empty()) {
++        if (m_out_body_left == 0 && !m_out_independent) {
++            const size_t take{
++                std::min(HEADER - m_out_header_have, bytes.size())};
++            std::copy(bytes.begin(), bytes.begin() + take,
++                      m_out_header.begin() + m_out_header_have);
++            m_coalesce.insert(m_coalesce.end(), bytes.begin(),
++                              bytes.begin() + take);
++            m_out_header_have += take;
++            bytes = bytes.subspan(take);
++            if (m_out_header_have < HEADER) {
++                break;
++            }
++            m_out_header_have = 0;
++            const bool split{std::exchange(m_out_header_split, false)};
++            m_out_body_left = ReadLE32(m_out_header.data() +
++                                       CMessageHeader::MESSAGE_SIZE_OFFSET);
++            const uint64_t total{HEADER + m_out_body_left};
++            const size_t threshold{g_p2p_compress_once_threshold.load()};
++            if (!split && threshold != 0 && total >= threshold &&
++                total <= GetP2PWebSocketMessageSizeLimit() &&
++                std::memcmp(m_out_header.data() +
++                                CMessageHeader::MESSAGE_START_SIZE,
++                            BLOCK_COMMAND, sizeof(BLOCK_COMMAND)) == 0) {
++                // Frame what precedes the block, then the block on its own.
++                m_coalesce.resize(m_coalesce.size() - HEADER);
++                EncodeCoalescedLocked();
++                m_out_independent = true;
++            }
++            continue;
++        }
++        const size_t take{
++            size_t(std::min<uint64_t>(m_out_body_left, bytes.size()))};
++        if (!m_out_independent) {
++            m_coalesce.insert(m_coalesce.end(), bytes.begin(),
++                              bytes.begin() + take);
++            m_out_body_left -= take;
++        } else if (m_out_block.empty() && take == m_out_body_left) {
++            // The whole payload in one call (as CConnman sends it): no copy.
++            m_out_body_left = 0;
++            EncodeIndependentLocked(bytes.first(take));
++        } else {
++            m_out_block.insert(m_out_block.end(), bytes.begin(),
++                               bytes.begin() + take);
++            m_out_body_left -= take;
++            if (m_out_body_left == 0) {
++                EncodeIndependentLocked(m_out_block);
++                std::vector<uint8_t>().swap(m_out_block);
++            }
++        }
++        bytes = bytes.subspan(take);
+     }
++}
++
++bool WebSocketSock::FlushLocked() const {
++    EncodeCoalescedLocked();
+     while (m_tx_offset < m_tx.size()) {
+         const ssize_t n{m_layer->Write(m_socket, m_tx.data() + m_tx_offset,
+                                        m_tx.size() - m_tx_offset)};
+@@ -143,7 +235,8 @@ ssize_t WebSocketSock::Send(const void *data, size_t len, int flags) const {
+         errno = EPIPE;
+         return -1;
+     }
+-    if (m_tx.size() - m_tx_offset + m_coalesce.size() > MAX_PENDING_SEND) {
++    if (m_tx.size() - m_tx_offset + m_coalesce.size() + m_out_block.size() >
++        MAX_PENDING_SEND) {
+         // Back-pressure: try to drain first.
+         if (!FlushLocked()) {
+             errno = ECONNRESET;
+@@ -157,7 +250,16 @@ ssize_t WebSocketSock::Send(const void *data, size_t len, int flags) const {
+         }
+     }
+     const auto *bytes{static_cast<const uint8_t *>(data)};
+-    m_coalesce.insert(m_coalesce.end(), bytes, bytes + len);
++    try {
++        QueueLocked(Span<const uint8_t>{bytes, len});
++    } catch (const std::exception &e) {
++        LogPrintf("WebSocket: cannot encode an independent frame: %s\n",
++                  e.what());
++        m_failed = true;
++        UpdateFlagsLocked();
++        errno = ECONNRESET;
++        return -1;
++    }
+     bool more{false};
+ #ifdef MSG_MORE
+     more = flags & MSG_MORE;
+@@ -205,6 +307,14 @@ bool WebSocketSock::FillLocked() const {
+     AddCounters(*m_info, 0, m_rx_plain.size() - plain_before, 0,
+                 m_codec.WireBytesRecv() - m_wire_recv_reported);
+     m_wire_recv_reported = m_codec.WireBytesRecv();
++    if (const uint64_t independent{m_codec.IndependentFramesRecv() -
++                                   m_independent_recv_reported}) {
++        m_independent_recv_reported = m_codec.IndependentFramesRecv();
++        m_info->independent_frames_recv += independent;
++        if (auto *metrics{node::GetNodeMetrics()}) {
++            metrics->websocket_independent_frames.Add(1, independent);
++        }
++    }
+     if (result.error) {
+         LogDebug(BCLog::NET, "WebSocket peer error: %s\n", *result.error);
+         m_failed = true;
+diff --git a/src/net_websocket_sock.h b/src/net_websocket_sock.h
+index 9c3bd4c314285fd06860fe6e0f7752ccc3fbf31d..bd89c0be53385ca9ced7e7e89146fbae6f1afcf9 100644
+--- a/src/net_websocket_sock.h
++++ b/src/net_websocket_sock.h
+@@ -10,6 +10,7 @@
+ #include <sync.h>
+ #include <util/sock.h>
+ 
++#include <array>
+ #include <atomic>
+ #include <memory>
+ #include <vector>
+@@ -55,6 +56,13 @@ public:
+  * frames and (if negotiated) compresses on the calling thread; Recv()
+  * deframes and decompresses. No extra thread or socketpair is involved.
+  *
++ * With zstd compression, Send() follows the P2P
++ * message framing of the outgoing stream. A block message of at least
++ * g_p2p_compress_once_threshold bytes is sent as one independent frame from
++ * the shared cache (GetP2PIndependentFrameCache()) instead of through the
++ * connection's zstd stream; bytes before it are framed first, so the P2P
++ * byte stream is unchanged.
++ *
+  * Send() coalesces chunks passed with MSG_MORE into one message. It accepts
+  * everything it is given (returning `len`) unless more than
+  * MAX_PENDING_SEND bytes are already waiting to be written, in which case
+@@ -90,6 +98,14 @@ public:
+     }
+ 
+ private:
++    /** Queue P2P bytes, routing large block messages to independent frames */
++    void QueueLocked(Span<const uint8_t> bytes) const
++        EXCLUSIVE_LOCKS_REQUIRED(m_mutex);
++    /** Frame m_coalesce (if any) as a stream message into m_tx */
++    void EncodeCoalescedLocked() const EXCLUSIVE_LOCKS_REQUIRED(m_mutex);
++    /** Queue the current block message as an independent frame */
++    void EncodeIndependentLocked(Span<const uint8_t> payload) const
++        EXCLUSIVE_LOCKS_REQUIRED(m_mutex);
+     //! Frame coalesced data; write as much as possible. False on error.
+     bool FlushLocked() const EXCLUSIVE_LOCKS_REQUIRED(m_mutex);
+     //! Read and decode what is available. False on fatal error.
+@@ -118,6 +134,21 @@ private:
+     mutable uint64_t m_payload_recv_reported GUARDED_BY(m_mutex){0};
+     mutable uint64_t m_wire_recv_reported GUARDED_BY(m_mutex){0};
+     mutable uint64_t m_wire_sent_reported GUARDED_BY(m_mutex){0};
++    mutable uint64_t m_independent_recv_reported GUARDED_BY(m_mutex){0};
++
++    //! Outgoing P2P message framing, tracked with independent frames only.
++    //! Header of the current message, bytes of it seen so far.
++    mutable std::array<uint8_t, 24> m_out_header GUARDED_BY(m_mutex){};
++    mutable size_t m_out_header_have GUARDED_BY(m_mutex){0};
++    //! Part of the current header was already framed, so the message
++    //! cannot be moved to an independent frame
++    mutable bool m_out_header_split GUARDED_BY(m_mutex){false};
++    //! Payload bytes of the current message not yet passed to Send()
++    mutable uint64_t m_out_body_left GUARDED_BY(m_mutex){0};
++    //! The current message is sent as an independent frame
++    mutable bool m_out_independent GUARDED_BY(m_mutex){false};
++    //! Its payload so far, when it arrives over several Send() calls
++    mutable std::vector<uint8_t> m_out_block GUARDED_BY(m_mutex);
+ 
+     //! Lock-free views for the Sock hooks (see util/sock.h). A failed or
+     //! closed socket reports buffered data so CConnman calls Recv() and
+diff --git a/src/net_zstd_independent.cpp b/src/net_zstd_independent.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..d096e0cee0ca0f2975c37e8c61e84bcccd0d4c78
+--- /dev/null
++++ b/src/net_zstd_independent.cpp
+@@ -0,0 +1,315 @@
++// Copyright (c) 2026 The Bitcoin developers
++// Distributed under the MIT software license, see the accompanying
++// file COPYING or http://www.opensource.org/licenses/mit-license.php.
++
++#include <net_zstd_independent.h>
++
++#include <crypto/common.h>
++#include <hash.h>
++#include <net_zstd_dict.h>
++#include <node/metrics.h>
++#include <primitives/block.h>
++#include <protocol.h>
++#include <streams.h>
++
++#include <zstd.h>
++
++#include <algorithm>
++#include <cstring>
++#include <stdexcept>
++#include <tuple>
++
++namespace {
++size_t Check(size_t result) {
++    if (ZSTD_isError(result)) {
++        throw std::runtime_error(ZSTD_getErrorName(result));
++    }
++    return result;
++}
++
++using CCtxPtr = std::unique_ptr<ZSTD_CCtx, size_t (*)(ZSTD_CCtx *)>;
++using DCtxPtr = std::unique_ptr<ZSTD_DCtx, size_t (*)(ZSTD_DCtx *)>;
++
++//! The P2P header's command field, if this is a block message
++bool IsBlockMessage(Span<const uint8_t> header) {
++    if (header.size() != CMessageHeader::HEADER_SIZE) {
++        return false;
++    }
++    char command[CMessageHeader::MESSAGE_TYPE_SIZE];
++    std::memcpy(command, header.data() + CMessageHeader::MESSAGE_START_SIZE,
++                sizeof(command));
++    return std::string_view{command, strnlen(command, sizeof(command))} ==
++           NetMsgType::BLOCK;
++}
++} // namespace
++
++std::vector<uint8_t> CompressP2PIndependent(Span<const uint8_t> header,
++                                            Span<const uint8_t> payload) {
++    CCtxPtr ctx{ZSTD_createCCtx(), &ZSTD_freeCCtx};
++    if (!ctx) {
++        throw std::bad_alloc();
++    }
++    // The CDict carries the compression level. Same window as the streams.
++    Check(ZSTD_CCtx_refCDict(ctx.get(), GetP2PZstdCDict()));
++    Check(ZSTD_CCtx_setParameter(ctx.get(), ZSTD_c_windowLog,
++                                 P2P_ZSTD_WINDOW_LOG));
++    Check(ZSTD_CCtx_setParameter(ctx.get(), ZSTD_c_contentSizeFlag, 1));
++    Check(ZSTD_CCtx_setParameter(ctx.get(), ZSTD_c_checksumFlag, 0));
++    const size_t total{header.size() + payload.size()};
++    Check(ZSTD_CCtx_setPledgedSrcSize(ctx.get(), total));
++    std::vector<uint8_t> frame(P2P_INDEPENDENT_ENVELOPE +
++                               ZSTD_compressBound(total));
++    frame[0] = P2P_INDEPENDENT_FORMAT;
++    WriteLE32(frame.data() + 1, P2P_INDEPENDENT_DICT_VERSION);
++    ZSTD_outBuffer output{frame.data(), frame.size(), P2P_INDEPENDENT_ENVELOPE};
++    ZSTD_inBuffer input{header.data(), header.size(), 0};
++    while (input.pos < input.size) {
++        Check(
++            ZSTD_compressStream2(ctx.get(), &output, &input, ZSTD_e_continue));
++    }
++    input = ZSTD_inBuffer{payload.data(), payload.size(), 0};
++    // Output room is compressBound, so this ends in one call; loop anyway.
++    while (Check(ZSTD_compressStream2(ctx.get(), &output, &input,
++                                      ZSTD_e_end)) != 0) {
++        if (output.pos == output.size) {
++            throw std::runtime_error("independent frame exceeds bound");
++        }
++    }
++    frame.resize(output.pos);
++    // Do not keep compressBound-sized storage for a well compressed frame.
++    // Cache accounting uses capacity, as shrink_to_fit is nonbinding.
++    frame.shrink_to_fit();
++    return frame;
++}
++
++void DecompressP2PIndependent(Span<const uint8_t> frame,
++                              std::vector<uint8_t> &out, size_t maximum) {
++    if (frame.size() < P2P_INDEPENDENT_ENVELOPE ||
++        frame[0] != P2P_INDEPENDENT_FORMAT ||
++        ReadLE32(frame.data() + 1) != P2P_INDEPENDENT_DICT_VERSION) {
++        throw std::runtime_error(
++            "unsupported independent frame format/dictionary version");
++    }
++    frame = frame.subspan(P2P_INDEPENDENT_ENVELOPE);
++    // Magic plus frame header descriptor; skippable frames have another magic.
++    if (frame.size() < 6 || ReadLE32(frame.data()) != ZSTD_MAGICNUMBER) {
++        throw std::runtime_error("independent payload is not a zstd frame");
++    }
++    const size_t frame_size{
++        Check(ZSTD_findFrameCompressedSize(frame.data(), frame.size()))};
++    if (frame_size != frame.size()) {
++        throw std::runtime_error("independent frame has trailing data");
++    }
++    const unsigned long long size{
++        ZSTD_getFrameContentSize(frame.data(), frame.size())};
++    if (size == ZSTD_CONTENTSIZE_ERROR || size == ZSTD_CONTENTSIZE_UNKNOWN ||
++        size > maximum) {
++        throw std::runtime_error("invalid independent frame content size");
++    }
++    // libzstd may skip its window allocation for a complete single-segment
++    // frame, so check the declared window before allocating any output, as
++    // well as limiting the decoder. Frame header descriptor bit 5 is
++    // single-segment (window = content size); otherwise the next byte is the
++    // window descriptor: 2^(10 + exponent) plus mantissa eighths.
++    const uint64_t window_limit{uint64_t{1} << P2P_ZSTD_MAX_WINDOW_LOG};
++    const bool single_segment{(frame[4] & 0x20) != 0};
++    uint64_t window_size{size};
++    if (!single_segment) {
++        const uint64_t base{uint64_t{1} << (10 + (frame[5] >> 3))};
++        window_size = base + (base / 8) * (frame[5] & 7);
++    }
++    if (window_size > window_limit) {
++        throw std::runtime_error("independent frame window exceeds limit");
++    }
++    DCtxPtr ctx{ZSTD_createDCtx(), &ZSTD_freeDCtx};
++    if (!ctx) {
++        throw std::bad_alloc();
++    }
++    Check(ZSTD_DCtx_refDDict(ctx.get(), GetP2PZstdDDict()));
++    Check(ZSTD_DCtx_setParameter(ctx.get(), ZSTD_d_windowLogMax,
++                                 P2P_ZSTD_MAX_WINDOW_LOG));
++    const size_t start{out.size()};
++    // One spare byte detects content beyond the declared size.
++    out.resize(start + size + 1);
++    try {
++        ZSTD_inBuffer input{frame.data(), frame.size(), 0};
++        ZSTD_outBuffer output{out.data() + start, size_t(size) + 1, 0};
++        size_t remaining{1};
++        while (remaining) {
++            const size_t in_before{input.pos};
++            const size_t out_before{output.pos};
++            remaining =
++                Check(ZSTD_decompressStream(ctx.get(), &output, &input));
++            if (remaining &&
++                (input.pos == input.size || output.pos == output.size ||
++                 (input.pos == in_before && output.pos == out_before))) {
++                throw std::runtime_error("incomplete independent frame");
++            }
++        }
++        if (input.pos != input.size || output.pos != size) {
++            throw std::runtime_error("independent frame length mismatch");
++        }
++    } catch (...) {
++        out.resize(start);
++        throw;
++    }
++    out.resize(start + size);
++}
++
++bool P2PIndependentFrameCache::Key::operator<(const Key &o) const {
++    return std::tie(block_hash, payload_hash, header, dict_version) <
++           std::tie(o.block_hash, o.payload_hash, o.header, o.dict_version);
++}
++
++P2PIndependentFrameCache::P2PIndependentFrameCache(size_t max_bytes,
++                                                   size_t max_entries)
++    : m_max_bytes{max_bytes}, m_max_entries{max_entries} {}
++
++P2PIndependentFrameCache::Frame
++P2PIndependentFrameCache::Fresh(Span<const uint8_t> header,
++                                Span<const uint8_t> payload) {
++    auto frame{std::make_shared<const std::vector<uint8_t>>(
++        CompressP2PIndependent(header, payload))};
++    if (m_report_metrics) {
++        if (auto *m{node::GetNodeMetrics()}) {
++            m->p2p_compress_once_encodes.Inc();
++        }
++    }
++    return frame;
++}
++
++void P2PIndependentFrameCache::PublishLocked() {
++    if (!m_report_metrics) {
++        return;
++    }
++    if (auto *m{node::GetNodeMetrics()}) {
++        m->p2p_compress_once_cache_bytes.Set(double(m_stats.bytes));
++        m->p2p_compress_once_cache_entries.Set(double(m_cache.size()));
++    }
++}
++
++void P2PIndependentFrameCache::EvictLocked(size_t incoming) {
++    uint64_t evicted{0};
++    while (!m_lru.empty() &&
++           (m_stats.bytes + incoming > m_max_bytes ||
++            m_cache.size() + (incoming ? 1 : 0) > m_max_entries)) {
++        const auto old{m_cache.find(m_lru.back())};
++        m_stats.bytes -= old->second.frame->capacity();
++        m_cache.erase(old);
++        m_lru.pop_back();
++        ++evicted;
++    }
++    m_stats.evictions += evicted;
++    if (evicted && m_report_metrics) {
++        if (auto *m{node::GetNodeMetrics()}) {
++            m->p2p_compress_once_cache_evictions.Add(0, evicted);
++        }
++    }
++}
++
++P2PIndependentFrameCache::Frame
++P2PIndependentFrameCache::Encode(Span<const uint8_t> header,
++                                 Span<const uint8_t> payload) {
++    if (!IsBlockMessage(header)) {
++        const auto frame{Fresh(header, payload)};
++        WITH_LOCK(m_mutex, ++m_stats.encodes);
++        return frame;
++    }
++    Key key;
++    try {
++        SpanReader reader{payload};
++        CBlockHeader block_header;
++        reader >> block_header;
++        key.block_hash = block_header.GetHash();
++    } catch (const std::exception &) {
++        // Not a block body: nothing to share.
++        const auto frame{Fresh(header, payload)};
++        WITH_LOCK(m_mutex, ++m_stats.encodes);
++        return frame;
++    }
++    std::copy(header.begin(), header.end(), key.header.begin());
++    key.dict_version = P2P_INDEPENDENT_DICT_VERSION;
++    // Encode accepts arbitrary bytes, not only validated canonical blocks.
++    key.payload_hash = Hash(payload);
++
++    std::promise<Frame> promise;
++    {
++        WAIT_LOCK(m_mutex, lock);
++        if (const auto found{m_cache.find(key)}; found != m_cache.end()) {
++            ++m_stats.hits;
++            m_lru.splice(m_lru.begin(), m_lru, found->second.position);
++            if (m_report_metrics) {
++                if (auto *m{node::GetNodeMetrics()}) {
++                    m->p2p_compress_once_cache_hits.Inc();
++                }
++            }
++            return found->second.frame;
++        }
++        if (const auto pending{m_pending.find(key)};
++            pending != m_pending.end()) {
++            // Another peer is compressing this block: share its result.
++            auto future{pending->second};
++            ++m_stats.hits;
++            if (m_report_metrics) {
++                if (auto *m{node::GetNodeMetrics()}) {
++                    m->p2p_compress_once_cache_hits.Inc();
++                }
++            }
++            REVERSE_LOCK(lock);
++            return future.get();
++        }
++        ++m_stats.misses;
++        if (m_report_metrics) {
++            if (auto *m{node::GetNodeMetrics()}) {
++                m->p2p_compress_once_cache_misses.Inc();
++            }
++        }
++        m_pending.emplace(key, promise.get_future().share());
++    }
++
++    Frame frame;
++    try {
++        frame = Fresh(header, payload);
++    } catch (...) {
++        promise.set_exception(std::current_exception());
++        WITH_LOCK(m_mutex, m_pending.erase(key));
++        throw;
++    }
++    {
++        LOCK(m_mutex);
++        m_pending.erase(key);
++        ++m_stats.encodes;
++        const size_t allocated{frame->capacity()};
++        if (allocated <= m_max_bytes && m_max_entries) {
++            EvictLocked(allocated);
++            m_lru.push_front(key);
++            m_cache.emplace(key, Entry{frame, m_lru.begin()});
++            m_stats.bytes += allocated;
++        }
++        PublishLocked();
++    }
++    promise.set_value(frame);
++    return frame;
++}
++
++void P2PIndependentFrameCache::SetMaxBytes(size_t max_bytes) {
++    LOCK(m_mutex);
++    m_max_bytes = max_bytes;
++    EvictLocked(0);
++    PublishLocked();
++}
++
++P2PIndependentFrameCache::Stats P2PIndependentFrameCache::GetStats() const {
++    LOCK(m_mutex);
++    Stats stats{m_stats};
++    stats.entries = m_cache.size();
++    return stats;
++}
++
++P2PIndependentFrameCache &GetP2PIndependentFrameCache() {
++    static P2PIndependentFrameCache cache;
++    // Set once, during the thread-safe initialization of this static.
++    static const bool reports{cache.m_report_metrics = true};
++    (void)reports;
++    return cache;
++}
+diff --git a/src/net_zstd_independent.h b/src/net_zstd_independent.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..6937a8428f069469a8ed7adaba930b895ba5e027
+--- /dev/null
++++ b/src/net_zstd_independent.h
+@@ -0,0 +1,144 @@
++// Copyright (c) 2026 The Bitcoin developers
++// Distributed under the MIT software license, see the accompanying
++// file COPYING or http://www.opensource.org/licenses/mit-license.php.
++
++#ifndef BITCOIN_NET_ZSTD_INDEPENDENT_H
++#define BITCOIN_NET_ZSTD_INDEPENDENT_H
++
++#include <span.h>
++#include <sync.h>
++#include <uint256.h>
++
++#include <array>
++#include <atomic>
++#include <cstddef>
++#include <cstdint>
++#include <future>
++#include <list>
++#include <map>
++#include <memory>
++#include <vector>
++
++/**
++ * Independent ("compress once, serve many") P2P frames of the zstd
++ * WebSocket subprotocols, p2p-zstd-v1 and p2p-zstd (see
++ * doc/p2p-websocket.md).
++ *
++ * An independent frame is `[format byte = 1][dictionary version LE32]
++ * [one zstd frame]`. The zstd frame records its content size and uses only
++ * the immutable prebaked P2P dictionary (P2P_ZSTD_DICT_V1), never a
++ * connection's streaming history, so the same bytes can be sent to every
++ * zstd peer. Ported from the V2 tier (patch 095).
++ */
++
++//! Format byte of an independent frame
++static constexpr uint8_t P2P_INDEPENDENT_FORMAT{1};
++//! Version of P2P_ZSTD_DICT_V1 as carried in independent frames
++static constexpr uint32_t P2P_INDEPENDENT_DICT_VERSION{1};
++//! Format byte + dictionary version
++static constexpr size_t P2P_INDEPENDENT_ENVELOPE{5};
++
++//! Default -p2pcompressoncethreshold: smallest block message (P2P header
++//! included) sent as an independent frame; 0 never sends them
++static constexpr int64_t DEFAULT_P2P_COMPRESS_ONCE_THRESHOLD{64 * 1024};
++//! Default -p2pcompressoncecache, MiB of retained encoded block frames
++static constexpr int64_t DEFAULT_P2P_COMPRESS_ONCE_CACHE_MB{128};
++//! Cached block frames, whatever their size
++static constexpr size_t P2P_COMPRESS_ONCE_CACHE_ENTRIES{64};
++
++//! Outgoing policy only: independent frames from peers are accepted
++//! whatever its value.
++inline std::atomic<size_t> g_p2p_compress_once_threshold{
++    size_t(DEFAULT_P2P_COMPRESS_ONCE_THRESHOLD)};
++
++/**
++ * Compress one complete P2P message (24-byte header, then payload) as an
++ * independent frame. Throws std::runtime_error or std::bad_alloc.
++ */
++std::vector<uint8_t> CompressP2PIndependent(Span<const uint8_t> header,
++                                            Span<const uint8_t> payload);
++
++/**
++ * Decode an independent frame, appending the P2P bytes to `out`. Rejects
++ * (std::runtime_error) unknown format/dictionary versions, frames without a
++ * content size or whose content size exceeds `maximum`, windows above
++ * 2^P2P_ZSTD_MAX_WINDOW_LOG, skippable, truncated, concatenated and
++ * trailing data. Nothing is appended on error beyond a bounded scratch
++ * region that is removed again.
++ */
++void DecompressP2PIndependent(Span<const uint8_t> frame,
++                              std::vector<uint8_t> &out, size_t maximum);
++
++/**
++ * Shared LRU cache of independent frames of block messages, bounded by the
++ * allocated bytes of its frames and by an entry count. Keys are the block
++ * hash plus a full double-SHA256 payload digest, the exact 24-byte P2P
++ * header and the dictionary version. The short P2P checksum alone is not
++ * sufficient to identify arbitrary supplied payloads. Peers
++ * asking for a block that is being compressed wait for that compression
++ * instead of repeating it. Handed-out frames stay valid after eviction.
++ */
++class P2PIndependentFrameCache {
++public:
++    using Frame = std::shared_ptr<const std::vector<uint8_t>>;
++
++    struct Stats {
++        uint64_t hits{0};
++        uint64_t misses{0};
++        uint64_t evictions{0};
++        //! Compressions done (cache misses plus uncacheable messages)
++        uint64_t encodes{0};
++        size_t bytes{0};
++        size_t entries{0};
++    };
++
++    explicit P2PIndependentFrameCache(
++        size_t max_bytes = size_t(DEFAULT_P2P_COMPRESS_ONCE_CACHE_MB) << 20,
++        size_t max_entries = P2P_COMPRESS_ONCE_CACHE_ENTRIES);
++
++    /**
++     * The independent frame of a P2P message: from the cache for a block
++     * message, else freshly compressed. `header` is the 24-byte P2P header.
++     */
++    Frame Encode(Span<const uint8_t> header, Span<const uint8_t> payload)
++        EXCLUSIVE_LOCKS_REQUIRED(!m_mutex);
++
++    /** Change the byte budget, evicting as needed */
++    void SetMaxBytes(size_t max_bytes) EXCLUSIVE_LOCKS_REQUIRED(!m_mutex);
++
++    Stats GetStats() const EXCLUSIVE_LOCKS_REQUIRED(!m_mutex);
++
++private:
++    struct Key {
++        uint256 block_hash;
++        uint256 payload_hash;
++        std::array<uint8_t, 24> header;
++        uint32_t dict_version;
++        bool operator<(const Key &o) const;
++    };
++    struct Entry {
++        Frame frame;
++        std::list<Key>::iterator position;
++    };
++
++    Frame Fresh(Span<const uint8_t> header, Span<const uint8_t> payload);
++    void EvictLocked(size_t incoming) EXCLUSIVE_LOCKS_REQUIRED(m_mutex);
++    void PublishLocked() EXCLUSIVE_LOCKS_REQUIRED(m_mutex);
++
++    mutable Mutex m_mutex;
++    size_t m_max_bytes GUARDED_BY(m_mutex);
++    const size_t m_max_entries;
++    std::map<Key, Entry> m_cache GUARDED_BY(m_mutex);
++    std::list<Key> m_lru GUARDED_BY(m_mutex);
++    //! Compressions in progress; other requesters wait on them
++    std::map<Key, std::shared_future<Frame>> m_pending GUARDED_BY(m_mutex);
++    Stats m_stats GUARDED_BY(m_mutex);
++    //! Whether this is the node's shared cache (reports to node metrics)
++    bool m_report_metrics{false};
++    friend P2PIndependentFrameCache &GetP2PIndependentFrameCache();
++};
++
++/** The node's cache, shared by all WebSocket peers */
++P2PIndependentFrameCache &GetP2PIndependentFrameCache();
++
++#endif // BITCOIN_NET_ZSTD_INDEPENDENT_H
+diff --git a/src/node/metrics.cpp b/src/node/metrics.cpp
+index 3446638e59ec1b6170e4647fee73346d8bd86d36..e1e6417f58d477d6020db371405984d9195de659 100644
+--- a/src/node/metrics.cpp
++++ b/src/node/metrics.cpp
+@@ -497,6 +497,30 @@ NodeMetrics::NodeMetrics(std::vector<std::string> rpc_methods)
+           "Connected P2P WebSocket peers, by compression and TLS.",
+           std::vector<LabelDim>{{"compression", L::WebSocketCompressions()},
+                                 {"tls", {"false", "true"}}})},
++      websocket_independent_frames{Add<Counter>(
++          registry, MetricName("p2p_websocket_independent_frames_total"),
++          "Independent (compress-once) WebSocket frames, by direction.",
++          std::vector<LabelDim>{{"direction", {"sent", "received"}}})},
++      p2p_compress_once_cache_hits{Add<Counter>(
++          registry, MetricName("p2p_compress_once_cache_hits_total"),
++          "Block messages served from the compress-once frame cache "
++          "(including waits for a compression in progress).")},
++      p2p_compress_once_cache_misses{Add<Counter>(
++          registry, MetricName("p2p_compress_once_cache_misses_total"),
++          "Block messages that had to be compressed for the compress-once "
++          "frame cache.")},
++      p2p_compress_once_cache_evictions{Add<Counter>(
++          registry, MetricName("p2p_compress_once_cache_evictions_total"),
++          "Frames evicted from the compress-once frame cache.")},
++      p2p_compress_once_cache_bytes{Add<Gauge>(
++          registry, MetricName("p2p_compress_once_cache_bytes"),
++          "Allocated bytes of the frames in the compress-once frame cache.")},
++      p2p_compress_once_cache_entries{
++          Add<Gauge>(registry, MetricName("p2p_compress_once_cache_entries"),
++                     "Frames in the compress-once frame cache.")},
++      p2p_compress_once_encodes{Add<Counter>(
++          registry, MetricName("p2p_compress_once_encodes_total"),
++          "Independent frames compressed (each cached block once).")},
+       tip_height{Add<Gauge>(registry, MetricName("chain_tip_height"),
+                             "Height of the active chain tip.")},
+       tip_timestamp{
+diff --git a/src/node/metrics.h b/src/node/metrics.h
+index 31993f2f29b838e148d2538e0c3c5e1cee73650d..7e6ab25975ec575278d76c5c4d787c2a9587f0dd 100644
+--- a/src/node/metrics.h
++++ b/src/node/metrics.h
+@@ -145,6 +145,16 @@ struct NodeMetrics {
+     metrics::Counter &p2p_connections;
+     //! WebSocket peers, by compression x tls (0 = plain, 1 = TLS)
+     metrics::Gauge &websocket_peers;
++    //! Independent frames, by direction (0 = sent, 1 = received)
++    metrics::Counter &websocket_independent_frames;
++
++    // Compress-once block frames (net_zstd_independent.h)
++    metrics::Counter &p2p_compress_once_cache_hits;
++    metrics::Counter &p2p_compress_once_cache_misses;
++    metrics::Counter &p2p_compress_once_cache_evictions;
++    metrics::Gauge &p2p_compress_once_cache_bytes;
++    metrics::Gauge &p2p_compress_once_cache_entries;
++    metrics::Counter &p2p_compress_once_encodes;
+ 
+     // Chain
+     metrics::Gauge &tip_height;
+diff --git a/src/rpc/net.cpp b/src/rpc/net.cpp
+index e45e101e8f67715f29795d992cf23de3c9fd5b1f..112f4d5a7c9f6e3f5ee76296434cb73493f7b1b1 100644
+--- a/src/rpc/net.cpp
++++ b/src/rpc/net.cpp
+@@ -184,6 +184,10 @@ static RPCHelpMan getpeerinfo() {
+                          {RPCResult::Type::STR, "compression",
+                           "none, permessage-deflate, p2p-zstd or p2p-zstd-v1 "
+                           "(zstd with the prebaked P2P dictionary)"},
++                         {RPCResult::Type::NUM, "independent_frames_sent",
++                          "Independent (compress-once) frames sent"},
++                         {RPCResult::Type::NUM, "independent_frames_recv",
++                          "Independent frames received"},
+                          {RPCResult::Type::NUM, "payload_bytes_sent",
+                           "P2P bytes sent (before compression)"},
+                          {RPCResult::Type::NUM, "payload_bytes_recv",
+@@ -377,6 +381,10 @@ static RPCHelpMan getpeerinfo() {
+                     wsobj.pushKV("tls", ws->tls);
+                     wsobj.pushKV("compression",
+                                  P2PWebSocketCompressionName(ws->compression));
++                    wsobj.pushKV("independent_frames_sent",
++                                 ws->independent_frames_sent.load());
++                    wsobj.pushKV("independent_frames_recv",
++                                 ws->independent_frames_recv.load());
+                     wsobj.pushKV("payload_bytes_sent",
+                                  ws->payload_bytes_sent.load());
+                     wsobj.pushKV("payload_bytes_recv",
+diff --git a/src/test/net_websocket_tests.cpp b/src/test/net_websocket_tests.cpp
+index 1534e74b333bbd436a3c61a92dade4551994141f..75d19c6fe88345e99aca6271bfa697298ea87173 100644
+--- a/src/test/net_websocket_tests.cpp
++++ b/src/test/net_websocket_tests.cpp
+@@ -3,10 +3,15 @@
+ // file COPYING or http://www.opensource.org/licenses/mit-license.php.
+ 
+ #include <config.h>
+-#include <protocol.h>
++#include <hash.h>
+ #include <net_websocket_codec.h>
+ #include <net_websocket_sock.h>
+ #include <net_websocket_tls.h>
++#include <net_zstd_dict.h>
++#include <net_zstd_independent.h>
++#include <primitives/block.h>
++#include <protocol.h>
++#include <streams.h>
+ #include <tls_util.h>
+ 
+ #include <random.h>
+@@ -23,6 +28,7 @@
+ #include <cerrno>
+ #include <chrono>
+ #include <cstring>
++#include <future>
+ #include <memory>
+ #include <thread>
+ #include <vector>
+@@ -706,4 +712,506 @@ BOOST_AUTO_TEST_CASE(incompressible_stream_wire_overhead_is_allowed) {
+     BOOST_CHECK(plain == payload);
+ }
+ 
++// Independent (compress-once) frames of the zstd modes.
++namespace {
++/** Restore g_p2p_compress_once_threshold when a test changes it */
++struct RestoreThreshold {
++    const size_t old{g_p2p_compress_once_threshold.load()};
++    ~RestoreThreshold() { g_p2p_compress_once_threshold = old; }
++};
++
++/** A complete P2P message: 24-byte header, then the payload */
++struct P2PMessage {
++    std::vector<uint8_t> header, payload;
++    std::vector<uint8_t> Bytes() const {
++        std::vector<uint8_t> all{header};
++        all.insert(all.end(), payload.begin(), payload.end());
++        return all;
++    }
++};
++
++P2PMessage MakeMessage(const char *type, std::vector<uint8_t> payload) {
++    P2PMessage msg;
++    msg.payload = std::move(payload);
++    CMessageHeader hdr{CMessageHeader::MessageMagic{0xe3, 0xe1, 0xf3, 0xe8},
++                       type, uint32_t(msg.payload.size())};
++    const uint256 hash{Hash(msg.payload)};
++    std::memcpy(hdr.pchChecksum, hash.begin(), CMessageHeader::CHECKSUM_SIZE);
++    VectorWriter{msg.header, 0, hdr};
++    BOOST_REQUIRE_EQUAL(msg.header.size(), CMessageHeader::HEADER_SIZE);
++    return msg;
++}
++
++/** A block message: a block header, then `size` partly compressible bytes */
++P2PMessage MakeBlockMessage(FastRandomContext &rng, size_t size) {
++    std::vector<uint8_t> payload;
++    CBlockHeader header;
++    header.nNonce = rng.rand32();
++    header.nTime = rng.rand32();
++    VectorWriter{payload, 0, header};
++    auto body{rng.randbytes<uint8_t>(size)};
++    // Like transactions: random hashes and keys between repeated structure.
++    for (size_t i = 0; i < body.size(); i += 64) {
++        std::fill(body.begin() + i,
++                  body.begin() + std::min(body.size(), i + 24), 0x76);
++    }
++    payload.insert(payload.end(), body.begin(), body.end());
++    return MakeMessage(NetMsgType::BLOCK, std::move(payload));
++}
++
++/** A server and client WebSocketSock with the given compression */
++struct ModePair {
++    std::unique_ptr<WebSocketSock> client, server;
++    explicit ModePair(C mode) {
++        int sv[2];
++        BOOST_REQUIRE_EQUAL(socketpair(AF_UNIX, SOCK_STREAM, 0, sv), 0);
++        BigBuffers(sv);
++        client = std::make_unique<WebSocketSock>(
++            SOCKET(sv[0]), Role::CLIENT, Info(mode),
++            std::make_unique<PlainByteLayer>());
++        server = std::make_unique<WebSocketSock>(
++            SOCKET(sv[1]), Role::SERVER, Info(mode),
++            std::make_unique<PlainByteLayer>());
++    }
++};
++
++/** Send a P2P message as CConnman does: header with MSG_MORE, payload */
++void SendLikeConnman(const Sock &sock, const P2PMessage &msg, bool more) {
++    int flags{0};
++#ifdef MSG_MORE
++    flags = MSG_MORE;
++#endif
++    BOOST_REQUIRE_EQUAL(sock.Send(msg.header.data(), msg.header.size(), flags),
++                        ssize_t(msg.header.size()));
++    BOOST_REQUIRE_EQUAL(
++        sock.Send(msg.payload.data(), msg.payload.size(), more ? flags : 0),
++        ssize_t(msg.payload.size()));
++}
++
++std::vector<uint8_t> Concat(std::initializer_list<const P2PMessage *> msgs) {
++    std::vector<uint8_t> all;
++    for (const auto *m : msgs) {
++        const auto bytes{m->Bytes()};
++        all.insert(all.end(), bytes.begin(), bytes.end());
++    }
++    return all;
++}
++} // namespace
++
++BOOST_AUTO_TEST_CASE(independent_frames_are_part_of_zstd_modes) {
++    BOOST_CHECK(WebSocketCodec(Role::SERVER, C::ZSTD_DICT).IndependentFrames());
++    BOOST_CHECK(WebSocketCodec(Role::SERVER, C::ZSTD).IndependentFrames());
++    BOOST_CHECK(!WebSocketCodec(Role::SERVER, C::NONE).IndependentFrames());
++    BOOST_CHECK(!WebSocketCodec(Role::SERVER, C::PERMESSAGE_DEFLATE)
++                     .IndependentFrames());
++}
++
++BOOST_AUTO_TEST_CASE(independent_frames_keep_stream_history) {
++    FastRandomContext rng{true};
++    const auto block{MakeBlockMessage(rng, 200000)};
++    const auto block_bytes{block.Bytes()};
++    const std::vector<uint8_t> small(4096, 0x71);
++    WebSocketCodec encoder{Role::SERVER, C::ZSTD_DICT};
++    WebSocketCodec decoder{Role::CLIENT, C::ZSTD_DICT};
++    std::vector<uint8_t> wire, plain, reply;
++    encoder.EncodeMessage(small, wire);
++    const size_t first{wire.size()};
++    const auto frame{CompressP2PIndependent(block.header, block.payload)};
++    encoder.EncodeIndependent(frame, wire);
++    BOOST_CHECK_EQUAL(wire[first] & 0x70, 0x20);
++    encoder.EncodeMessage(small, wire);
++    BOOST_REQUIRE(!decoder.Decode(wire, plain, reply).error);
++    std::vector<uint8_t> expected{small};
++    expected.insert(expected.end(), block_bytes.begin(), block_bytes.end());
++    expected.insert(expected.end(), small.begin(), small.end());
++    BOOST_CHECK(plain == expected);
++    BOOST_CHECK_EQUAL(decoder.IndependentFramesRecv(), 1U);
++    // The frame alone decodes for a brand-new peer: no stream history.
++    WebSocketCodec fresh_encoder{Role::SERVER, C::ZSTD_DICT};
++    WebSocketCodec fresh{Role::CLIENT, C::ZSTD_DICT};
++    wire.clear();
++    plain.clear();
++    fresh_encoder.EncodeIndependent(frame, wire);
++    BOOST_REQUIRE(!fresh.Decode(wire, plain, reply).error);
++    BOOST_CHECK(plain == block_bytes);
++    // A client (masked) can send them too.
++    WebSocketCodec client{Role::CLIENT, C::ZSTD_DICT};
++    WebSocketCodec server{Role::SERVER, C::ZSTD_DICT};
++    wire.clear();
++    plain.clear();
++    client.EncodeIndependent(frame, wire);
++    BOOST_REQUIRE(!server.Decode(wire, plain, reply).error);
++    BOOST_CHECK(plain == block_bytes);
++}
++
++BOOST_AUTO_TEST_CASE(independent_frames_rejected_without_zstd) {
++    FastRandomContext rng{true};
++    const auto block{MakeBlockMessage(rng, 70000)};
++    const auto frame{CompressP2PIndependent(block.header, block.payload)};
++    WebSocketCodec sender{Role::SERVER, C::ZSTD_DICT};
++    std::vector<uint8_t> wire;
++    sender.EncodeIndependent(frame, wire);
++    // Uncompressed connections have no RSV bits at all.
++    {
++        WebSocketCodec decoder{Role::CLIENT, C::NONE};
++        std::vector<uint8_t> plain, reply;
++        const auto result{decoder.Decode(wire, plain, reply)};
++        BOOST_REQUIRE(result.error);
++        BOOST_CHECK(result.error->find("reserved bits") != std::string::npos);
++        BOOST_CHECK(plain.empty());
++    }
++    // p2p-zstd (no stream dictionary) decodes them too.
++    {
++        WebSocketCodec decoder{Role::CLIENT, C::ZSTD};
++        std::vector<uint8_t> plain, reply;
++        BOOST_REQUIRE(!decoder.Decode(wire, plain, reply).error);
++        BOOST_CHECK(plain == block.Bytes());
++    }
++    // RSV1, RSV3, RSV1|RSV2, RSV2 on a fragment,
++    // continuation, text or control frame are invalid.
++    for (const uint8_t first :
++         {uint8_t(0xc2), uint8_t(0x92), uint8_t(0xe2), uint8_t(0x22),
++          uint8_t(0xa1), uint8_t(0xa9), uint8_t(0xa8)}) {
++        WebSocketCodec decoder{Role::CLIENT, C::ZSTD_DICT};
++        std::vector<uint8_t> plain, reply;
++        BOOST_CHECK(
++            decoder.Decode(std::vector<uint8_t>{first, 1, 0}, plain, reply)
++                .error);
++    }
++    {
++        // A fragmented message cannot continue with an RSV2 frame.
++        WebSocketCodec decoder{Role::CLIENT, C::ZSTD_DICT};
++        std::vector<uint8_t> plain, reply;
++        BOOST_CHECK(decoder
++                        .Decode(std::vector<uint8_t>{0x02, 1, 0, 0xa0, 1, 0},
++                                plain, reply)
++                        .error);
++    }
++}
++
++BOOST_AUTO_TEST_CASE(independent_frame_strict_validation) {
++    FastRandomContext rng{true};
++    const auto block{MakeBlockMessage(rng, 70000)};
++    const auto bytes{block.Bytes()};
++    const auto original{CompressP2PIndependent(block.header, block.payload)};
++    std::vector<uint8_t> out;
++    DecompressP2PIndependent(original, out, bytes.size());
++    BOOST_CHECK(out == bytes);
++    out.clear();
++    auto expect_reject = [&](const std::vector<uint8_t> &frame,
++                             size_t maximum) {
++        out.assign(3, 0x55);
++        BOOST_CHECK_THROW(DecompressP2PIndependent(frame, out, maximum),
++                          std::runtime_error);
++        // Nothing was appended.
++        BOOST_CHECK(out == std::vector<uint8_t>(3, 0x55));
++    };
++    auto bad{original};
++    bad[0] = 2; // Unknown format
++    expect_reject(bad, 100000);
++    bad = original;
++    bad[1] ^= 1; // Unknown dictionary version
++    expect_reject(bad, 100000);
++    bad = original;
++    bad.push_back(0); // Trailing data
++    expect_reject(bad, 100000);
++    bad = original;
++    bad.pop_back(); // Truncated
++    expect_reject(bad, 100000);
++    bad = original;
++    bad.insert(bad.end(), original.begin() + P2P_INDEPENDENT_ENVELOPE,
++               original.end()); // Two concatenated frames
++    expect_reject(bad, 1000000);
++    expect_reject(original, bytes.size() - 1); // Above the message limit
++    expect_reject({}, 100000);
++    expect_reject({1, 1, 0, 0, 0}, 100000); // Envelope only
++    // A skippable frame is not a compressed P2P message.
++    bad.assign(13, 0);
++    bad[0] = P2P_INDEPENDENT_FORMAT;
++    WriteLE32(bad.data() + 1, P2P_INDEPENDENT_DICT_VERSION);
++    WriteLE32(bad.data() + 5, 0x184d2a50);
++    expect_reject(bad, 100000);
++    // Without a content size.
++    {
++        std::vector<uint8_t> frame(P2P_INDEPENDENT_ENVELOPE +
++                                   ZSTD_compressBound(bytes.size()));
++        frame[0] = P2P_INDEPENDENT_FORMAT;
++        WriteLE32(frame.data() + 1, P2P_INDEPENDENT_DICT_VERSION);
++        std::unique_ptr<ZSTD_CCtx, size_t (*)(ZSTD_CCtx *)> ctx{
++            ZSTD_createCCtx(), &ZSTD_freeCCtx};
++        BOOST_REQUIRE(!ZSTD_isError(
++            ZSTD_CCtx_setParameter(ctx.get(), ZSTD_c_contentSizeFlag, 0)));
++        ZSTD_outBuffer output{frame.data(), frame.size(),
++                              P2P_INDEPENDENT_ENVELOPE};
++        ZSTD_inBuffer input{bytes.data(), bytes.size(), 0};
++        BOOST_REQUIRE(!ZSTD_isError(
++            ZSTD_compressStream2(ctx.get(), &output, &input, ZSTD_e_end)));
++        frame.resize(output.pos);
++        BOOST_REQUIRE_EQUAL(
++            ZSTD_getFrameContentSize(frame.data() + P2P_INDEPENDENT_ENVELOPE,
++                                     frame.size() - P2P_INDEPENDENT_ENVELOPE),
++            ZSTD_CONTENTSIZE_UNKNOWN);
++        expect_reject(frame, 1000000);
++    }
++    // A declared window above the decoder limit, even though the content
++    // fits the message limit.
++    {
++        const std::vector<uint8_t> big(2 * 1024 * 1024, 0x24);
++        std::vector<uint8_t> frame(P2P_INDEPENDENT_ENVELOPE +
++                                   ZSTD_compressBound(big.size()));
++        frame[0] = P2P_INDEPENDENT_FORMAT;
++        WriteLE32(frame.data() + 1, P2P_INDEPENDENT_DICT_VERSION);
++        const size_t n{ZSTD_compress(frame.data() + P2P_INDEPENDENT_ENVELOPE,
++                                     frame.size() - P2P_INDEPENDENT_ENVELOPE,
++                                     big.data(), big.size(), 3)};
++        BOOST_REQUIRE(!ZSTD_isError(n));
++        frame.resize(P2P_INDEPENDENT_ENVELOPE + n);
++        expect_reject(frame, 4 * 1024 * 1024);
++    }
++    // Over the wire, a bad frame is a fatal decode error.
++    WebSocketCodec sender{Role::SERVER, C::ZSTD_DICT};
++    WebSocketCodec decoder{Role::CLIENT, C::ZSTD_DICT};
++    std::vector<uint8_t> wire, plain, reply;
++    bad = original;
++    bad.push_back(0);
++    sender.EncodeIndependent(bad, wire);
++    const auto result{decoder.Decode(wire, plain, reply)};
++    BOOST_REQUIRE(result.error);
++    BOOST_CHECK(result.error->find("independent zstd") != std::string::npos);
++}
++
++BOOST_AUTO_TEST_CASE(independent_frame_message_limit) {
++    RestoreBlockLimit restore;
++    BOOST_REQUIRE(restore.config.SetMaxBlockSize(32 * 1000000));
++    const uint64_t limit{GetP2PWebSocketMessageSizeLimit()};
++    WebSocketCodec sender{Role::SERVER, C::ZSTD_DICT};
++    WebSocketCodec decoder{Role::CLIENT, C::ZSTD_DICT};
++    // Incompressible: the frame is larger than its content, and accepted.
++    FastRandomContext rng{true};
++    const auto random{rng.randbytes<uint8_t>(limit - 24)};
++    const std::vector<uint8_t> header(24, 0);
++    std::vector<uint8_t> wire, plain, reply;
++    sender.EncodeIndependent(CompressP2PIndependent(header, random), wire);
++    BOOST_CHECK_GT(wire.size(), limit);
++    BOOST_REQUIRE(!decoder.Decode(wire, plain, reply).error);
++    BOOST_CHECK_EQUAL(plain.size(), limit);
++    // One byte over the configured message limit is refused before output.
++    wire.clear();
++    plain.clear();
++    sender.EncodeIndependent(
++        CompressP2PIndependent(header, std::vector<uint8_t>(limit - 23, 0)),
++        wire);
++    const auto result{decoder.Decode(wire, plain, reply)};
++    BOOST_REQUIRE(result.error);
++    BOOST_CHECK(result.error->find("content size") != std::string::npos);
++    BOOST_CHECK(plain.empty());
++}
++
++BOOST_AUTO_TEST_CASE(block_frame_cache_bounds_and_identity) {
++    FastRandomContext rng{true};
++    const auto block{MakeBlockMessage(rng, 20000)};
++    P2PIndependentFrameCache cache{1 << 20, 2};
++    const auto held{cache.Encode(block.header, block.payload)};
++    BOOST_CHECK(cache.Encode(block.header, block.payload) == held);
++    // Same block header, different body (so a different P2P checksum).
++    auto changed{block.payload};
++    changed.back() ^= 1;
++    const auto changed_msg{MakeMessage(NetMsgType::BLOCK, changed)};
++    const auto second{cache.Encode(changed_msg.header, changed_msg.payload)};
++    BOOST_CHECK(second != held);
++    std::vector<uint8_t> decoded;
++    DecompressP2PIndependent(*second, decoded, 100000);
++    BOOST_CHECK(decoded == changed_msg.Bytes());
++    // A third block evicts the least recently used (the first).
++    const auto third{MakeBlockMessage(rng, 20000)};
++    cache.Encode(third.header, third.payload);
++    auto stats{cache.GetStats()};
++    BOOST_CHECK_EQUAL(stats.hits, 1U);
++    BOOST_CHECK_EQUAL(stats.misses, 3U);
++    BOOST_CHECK_EQUAL(stats.encodes, 3U);
++    BOOST_CHECK_EQUAL(stats.entries, 2U);
++    BOOST_CHECK_EQUAL(stats.evictions, 1U);
++    BOOST_CHECK_LE(stats.bytes, 1U << 20);
++    // The evicted frame stays valid for whoever holds it.
++    decoded.clear();
++    DecompressP2PIndependent(*held, decoded, 100000);
++    BOOST_CHECK(decoded == block.Bytes());
++    // Non-block messages and unparsable bodies are not cached.
++    const auto tx{MakeMessage(NetMsgType::TX, std::vector<uint8_t>(5000, 1))};
++    cache.Encode(tx.header, tx.payload);
++    const auto stub{
++        MakeMessage(NetMsgType::BLOCK, std::vector<uint8_t>(10, 1))};
++    cache.Encode(stub.header, stub.payload);
++    stats = cache.GetStats();
++    BOOST_CHECK_EQUAL(stats.encodes, 5U);
++    BOOST_CHECK_EQUAL(stats.misses, 3U);
++    BOOST_CHECK_EQUAL(stats.entries, 2U);
++    // The byte budget is of allocated capacity; shrinking it evicts.
++    cache.SetMaxBytes(held->capacity());
++    stats = cache.GetStats();
++    BOOST_CHECK_LE(stats.bytes, held->capacity());
++    BOOST_CHECK_LE(stats.entries, 1U);
++    // A frame larger than the whole budget is served but not kept.
++    P2PIndependentFrameCache tiny{16, 2};
++    BOOST_CHECK(tiny.Encode(block.header, block.payload));
++    BOOST_CHECK_EQUAL(tiny.GetStats().entries, 0U);
++    BOOST_CHECK_EQUAL(tiny.GetStats().bytes, 0U);
++    P2PIndependentFrameCache off{0, 2};
++    off.Encode(block.header, block.payload);
++    off.Encode(block.header, block.payload);
++    BOOST_CHECK_EQUAL(off.GetStats().encodes, 2U);
++}
++
++BOOST_AUTO_TEST_CASE(block_frame_cache_same_header_different_payload) {
++    FastRandomContext rng{true};
++    const auto block{MakeBlockMessage(rng, 20000)};
++    auto changed{block.payload};
++    changed.back() ^= 1;
++    P2PIndependentFrameCache cache;
++    const auto first{cache.Encode(block.header, block.payload)};
++    // The API does not validate the checksum. Reuse the entire P2P header,
++    // including its 32-bit checksum, with different supplied body bytes.
++    const auto second{cache.Encode(block.header, changed)};
++    BOOST_CHECK(first != second);
++    BOOST_CHECK(cache.Encode(block.header, changed) == second);
++    std::vector<uint8_t> expected{block.header};
++    expected.insert(expected.end(), changed.begin(), changed.end());
++    std::vector<uint8_t> decoded;
++    DecompressP2PIndependent(*second, decoded, expected.size());
++    BOOST_CHECK(decoded == expected);
++    const auto stats{cache.GetStats()};
++    BOOST_CHECK_EQUAL(stats.encodes, 2U);
++    BOOST_CHECK_EQUAL(stats.misses, 2U);
++    BOOST_CHECK_EQUAL(stats.hits, 1U);
++}
++
++BOOST_AUTO_TEST_CASE(block_frame_cache_concurrent_single_compression) {
++    FastRandomContext rng{true};
++    const auto block{MakeBlockMessage(rng, 2000000)};
++    P2PIndependentFrameCache cache;
++    std::array<P2PIndependentFrameCache::Frame, 8> results;
++    std::promise<void> start;
++    const std::shared_future<void> go{start.get_future().share()};
++    std::vector<std::thread> workers;
++    for (size_t i = 0; i < results.size(); ++i) {
++        workers.emplace_back([&, i] {
++            go.wait();
++            results[i] = cache.Encode(block.header, block.payload);
++        });
++    }
++    start.set_value();
++    for (auto &thread : workers) {
++        thread.join();
++    }
++    const auto stats{cache.GetStats()};
++    BOOST_CHECK_EQUAL(stats.encodes, 1U);
++    BOOST_CHECK_EQUAL(stats.misses, 1U);
++    BOOST_CHECK_EQUAL(stats.hits, 7U);
++    for (const auto &result : results) {
++        BOOST_CHECK(result == results[0]);
++    }
++}
++
++BOOST_AUTO_TEST_CASE(mixed_peers_receive_identical_streams) {
++    RestoreThreshold restore;
++    g_p2p_compress_once_threshold = DEFAULT_P2P_COMPRESS_ONCE_THRESHOLD;
++    FastRandomContext rng{true};
++    const auto ping{MakeMessage("ping", rng.randbytes<uint8_t>(8))};
++    const auto block{MakeBlockMessage(rng, 3000000)};
++    const auto small_block{MakeBlockMessage(rng, 1000)};
++    const auto inv{MakeMessage("inv", std::vector<uint8_t>(37, 2))};
++    const auto expected{Concat({&ping, &block, &small_block, &inv})};
++    // Three zstd peers (two modes) and two uncompressed peers.
++    std::vector<std::unique_ptr<ModePair>> peers;
++    for (const C mode :
++         {C::ZSTD_DICT, C::NONE, C::ZSTD, C::NONE, C::ZSTD_DICT}) {
++        peers.push_back(std::make_unique<ModePair>(mode));
++    }
++    const auto before{GetP2PIndependentFrameCache().GetStats()};
++    for (const auto &p : peers) {
++        SendLikeConnman(*p->server, ping, true);
++        SendLikeConnman(*p->server, block, true);
++        SendLikeConnman(*p->server, small_block, true);
++        SendLikeConnman(*p->server, inv, false);
++    }
++    for (const auto &p : peers) {
++        BOOST_CHECK(ReceiveAll(*p->server, *p->client, expected.size()) ==
++                    expected);
++        const auto &info{*p->server->Info()};
++        // Only the large block goes alone, and only to zstd peers.
++        const bool zstd{info.compression != C::NONE};
++        BOOST_CHECK_EQUAL(info.independent_frames_sent.load(), zstd ? 1U : 0U);
++        BOOST_CHECK_EQUAL(p->client->Info()->independent_frames_recv.load(),
++                          zstd ? 1U : 0U);
++        BOOST_CHECK_EQUAL(info.payload_bytes_sent.load(), expected.size());
++    }
++    // Compressed once for the three zstd peers.
++    const auto after{GetP2PIndependentFrameCache().GetStats()};
++    BOOST_CHECK_EQUAL(after.encodes - before.encodes, 1U);
++    BOOST_CHECK_EQUAL(after.misses - before.misses, 1U);
++    BOOST_CHECK_EQUAL(after.hits - before.hits, 2U);
++}
++
++BOOST_AUTO_TEST_CASE(independent_frames_follow_unusual_send_patterns) {
++    RestoreThreshold restore;
++    g_p2p_compress_once_threshold = DEFAULT_P2P_COMPRESS_ONCE_THRESHOLD;
++    FastRandomContext rng{true};
++    const auto block{MakeBlockMessage(rng, 300000)};
++    const auto block2{MakeBlockMessage(rng, 300000)};
++    const auto tx{MakeMessage(NetMsgType::TX, rng.randbytes<uint8_t>(200000))};
++    {
++        // Payload in pieces, and a header split by a flush: both still
++        // deliver the same bytes; the split block goes in the stream.
++        ModePair p{C::ZSTD_DICT};
++        const auto bytes{block.Bytes()};
++        size_t off{0};
++        for (const size_t piece :
++             {size_t(24), size_t(100000), bytes.size() - 100024}) {
++            BOOST_REQUIRE_EQUAL(p.server->Send(bytes.data() + off, piece, 0),
++                                ssize_t(piece));
++            off += piece;
++        }
++        const auto bytes2{block2.Bytes()};
++        // Header split by a flush (no MSG_MORE), then the rest at once.
++        BOOST_REQUIRE_EQUAL(p.server->Send(bytes2.data(), 7, 0), 7);
++        BOOST_REQUIRE_EQUAL(
++            p.server->Send(bytes2.data() + 7, bytes2.size() - 7, 0),
++            ssize_t(bytes2.size() - 7));
++        // A large non-block message stays in the stream.
++        SendLikeConnman(*p.server, tx, false);
++        const auto expected{Concat({&block, &block2, &tx})};
++        BOOST_CHECK(ReceiveAll(*p.server, *p.client, expected.size()) ==
++                    expected);
++        BOOST_CHECK_EQUAL(p.server->Info()->independent_frames_sent.load(), 1U);
++    }
++    {
++        // Threshold 0: the streaming control, frames never sent.
++        g_p2p_compress_once_threshold = 0;
++        ModePair p{C::ZSTD_DICT};
++        SendLikeConnman(*p.server, block, false);
++        BOOST_CHECK(ReceiveAll(*p.server, *p.client, block.Bytes().size()) ==
++                    block.Bytes());
++        BOOST_CHECK_EQUAL(p.server->Info()->independent_frames_sent.load(), 0U);
++        // Above the threshold only.
++        g_p2p_compress_once_threshold = block.Bytes().size() + 1;
++        SendLikeConnman(*p.server, block2, false);
++        ReceiveAll(*p.server, *p.client, block2.Bytes().size());
++        BOOST_CHECK_EQUAL(p.server->Info()->independent_frames_sent.load(), 0U);
++        g_p2p_compress_once_threshold = block2.Bytes().size();
++        SendLikeConnman(*p.server, block2, false);
++        BOOST_CHECK(ReceiveAll(*p.server, *p.client, block2.Bytes().size()) ==
++                    block2.Bytes());
++        BOOST_CHECK_EQUAL(p.server->Info()->independent_frames_sent.load(), 1U);
++    }
++    {
++        // Clients send them too.
++        g_p2p_compress_once_threshold = DEFAULT_P2P_COMPRESS_ONCE_THRESHOLD;
++        ModePair p{C::ZSTD_DICT};
++        SendLikeConnman(*p.client, block, false);
++        BOOST_CHECK(ReceiveAll(*p.client, *p.server, block.Bytes().size()) ==
++                    block.Bytes());
++        BOOST_CHECK_EQUAL(p.server->Info()->independent_frames_recv.load(), 1U);
++    }
++}
++
+ BOOST_AUTO_TEST_SUITE_END()
+diff --git a/test/functional/p2p_websocket_compress_once.py b/test/functional/p2p_websocket_compress_once.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..7d7c51f9e972ad379207729476ea8c5046e33b77
+--- /dev/null
++++ b/test/functional/p2p_websocket_compress_once.py
+@@ -0,0 +1,174 @@
++#!/usr/bin/env python3
++# Copyright (c) 2026 The Bitcoin developers
++# Distributed under the MIT software license, see the accompanying
++# file COPYING or http://www.opensource.org/licenses/mit-license.php.
++"""Test compress-once block frames with mixed peers.
++
++One node serves the same block to zstd WebSocket peers (p2p-zstd-v1 and
++p2p-zstd), an uncompressed WebSocket peer and a raw TCP peer. Every peer
++receives the identical block, zstd peers get it as an independent frame
++compressed once for all of them (metrics), and a zstd peer may send
++independent frames too.
++"""
++
++import http.client
++import time
++
++from test_framework.messages import MSG_BLOCK, CInv, msg_getdata, msg_ping
++from test_framework.p2p import P2PInterface
++from test_framework.test_framework import BitcoinTestFramework, SkipTest
++from test_framework.util import assert_equal, rpc_port
++from test_framework.wallet import MiniWallet
++
++
++class BlockCollector(P2PInterface):
++    def __init__(self):
++        super().__init__()
++        self.blocks = {}
++
++    def on_block(self, message):
++        self.blocks[message.block.hash_hex] = message.block.serialize().hex()
++
++
++class P2PWebSocketCompressOnceTest(BitcoinTestFramework):
++    num_nodes = 1
++    extra_args = [["-metrics"]]
++
++    def skip_test_if_missing_module(self):
++        try:
++            import websocket  # noqa: F401
++            import zstandard  # noqa: F401
++        except ImportError:
++            raise SkipTest("websocket-client and zstandard are required")
++
++    def scrape(self):
++        # Repeated scrapes within a second return the previous rendering.
++        time.sleep(1.1)
++        conn = http.client.HTTPConnection("127.0.0.1", rpc_port(0), timeout=30)
++        conn.request("GET", "/metrics")
++        res = conn.getresponse()
++        assert_equal(res.status, 200)
++        values = {}
++        for line in res.read().decode().splitlines():
++            if line.startswith("fullnode_p2p_compress_once") or line.startswith(
++                "fullnode_p2p_websocket_independent"
++            ):
++                name, value = line.rsplit(" ", 1)
++                values[name] = float(value)
++        conn.close()
++        return values
++
++    def ws_peers(self, n):
++        return [p for p in self.nodes[n].getpeerinfo() if p["transport"] != "tcp"]
++
++    def connect(self, subprotocols):
++        from test_framework.p2p_websocket import P2PWebSocketClient
++
++        peer = P2PWebSocketClient(
++            f"ws://127.0.0.1:{rpc_port(0)}/p2p/ws",
++            subprotocols=subprotocols,
++            srcdir=self.config["environment"]["SRCDIR"],
++        )
++        peer.handshake()
++        return peer
++
++    def run_test(self):
++        node = self.nodes[0]
++
++        self.log.info("Mine a block larger than -p2pcompressoncethreshold")
++        wallet = MiniWallet(node)
++        for _ in range(40):
++            wallet.send_self_transfer_multi(from_node=node, num_outputs=100)
++        blockhash = self.generate(node, 1, sync_fun=self.no_op)[0]
++        raw_block = bytes.fromhex(node.getblock(blockhash, 0))
++        assert len(raw_block) > 100000, len(raw_block)
++
++        self.log.info("Peers: p2p-zstd-v1 (two), p2p-zstd, none and raw TCP")
++        dict_a = self.connect(["p2p-zstd-v1", "p2p-zstd"])
++        dict_b = self.connect(["p2p-zstd-v1"])
++        zstd = self.connect(["p2p-zstd"])
++        uncompressed = self.connect(None)
++        assert_equal(dict_a.subprotocol, "p2p-zstd-v1")
++        assert_equal(dict_b.subprotocol, "p2p-zstd-v1")
++        assert_equal(zstd.subprotocol, "p2p-zstd")
++        assert_equal(uncompressed.subprotocol, None)
++        tcp = node.add_p2p_connection(BlockCollector())
++        self.wait_until(lambda: len(self.ws_peers(0)) == 4)
++        before = self.scrape()
++
++        ws_peers = [dict_a, dict_b, zstd, uncompressed]
++        getdata = msg_getdata([CInv(MSG_BLOCK, int(blockhash, 16))])
++        for peer in ws_peers:
++            peer.send_message(getdata)
++        tcp.send_without_ping(getdata)
++
++        received = []
++        for peer in ws_peers:
++            while True:
++                msgtype, raw = peer.recv_raw_message()
++                if msgtype == b"block":
++                    received.append(raw)
++                    break
++        self.log.info("Every peer received the identical block")
++        for raw in received:
++            assert_equal(raw[24:], raw_block)
++            assert_equal(raw, received[0])
++        tcp.wait_until(lambda: blockhash in tcp.blocks)
++        assert_equal(tcp.blocks[blockhash], raw_block.hex())
++
++        self.log.info("zstd peers got it as an independent frame")
++        assert_equal(dict_a.independent_frames_recv, 1)
++        assert_equal(dict_b.independent_frames_recv, 1)
++        assert_equal(zstd.independent_frames_recv, 1)
++        assert_equal(uncompressed.independent_frames_recv, 0)
++        sent = sorted(
++            p["websocket"]["independent_frames_sent"] for p in self.ws_peers(0)
++        )
++        assert_equal(sent, [0, 1, 1, 1])
++
++        self.log.info("The block was compressed once for the three zstd peers")
++        after = self.scrape()
++
++        def delta(name):
++            return after.get(name, 0) - before.get(name, 0)
++
++        assert_equal(delta("fullnode_p2p_compress_once_encodes_total"), 1)
++        assert_equal(delta("fullnode_p2p_compress_once_cache_misses_total"), 1)
++        assert_equal(delta("fullnode_p2p_compress_once_cache_hits_total"), 2)
++        assert_equal(
++            delta('fullnode_p2p_websocket_independent_frames_total{direction="sent"}'),
++            3,
++        )
++        assert_equal(after["fullnode_p2p_compress_once_cache_entries"], 1)
++        assert after["fullnode_p2p_compress_once_cache_bytes"] > 0
++
++        self.log.info("Serving it again is a cache hit")
++        dict_a.send_message(getdata)
++        while dict_a.recv_raw_message()[0] != b"block":
++            pass
++        again = self.scrape()
++        assert_equal(
++            again["fullnode_p2p_compress_once_encodes_total"],
++            after["fullnode_p2p_compress_once_encodes_total"],
++        )
++        assert_equal(
++            again["fullnode_p2p_compress_once_cache_hits_total"],
++            after["fullnode_p2p_compress_once_cache_hits_total"] + 1,
++        )
++
++        self.log.info("A zstd peer may send independent frames")
++        for peer, nonce in [(dict_a, 42), (zstd, 43)]:
++            peer.send_independent(peer.build_message(msg_ping(nonce=nonce)))
++            assert_equal(peer.wait_for(b"pong").nonce, nonce)
++        self.wait_until(
++            lambda: (
++                sum(p["websocket"]["independent_frames_recv"] for p in self.ws_peers(0))
++                == 2
++            )
++        )
++        for peer in ws_peers:
++            peer.close()
++
++
++if __name__ == "__main__":
++    P2PWebSocketCompressOnceTest().main()
+diff --git a/test/functional/test_framework/p2p_websocket.py b/test/functional/test_framework/p2p_websocket.py
+index 6802567d3083fa07d8df347f5190bc7630600115..bd060fe693edfa509f1bf924cca9ad6ebd418111 100644
+--- a/test/functional/test_framework/p2p_websocket.py
++++ b/test/functional/test_framework/p2p_websocket.py
+@@ -7,11 +7,18 @@
+ It implements the p2p-zstd-v1 / p2p-zstd sub-protocols independently of the
+ node (with python-zstandard), so tests exercise interoperability rather than
+ the node talking to itself.
++
++Both zstd sub-protocols also carry independent (compress-once) frames:
++binary messages with RSV2 set whose payload is
++[format 1][dictionary version LE32][one zstd frame with its content size],
++compressed with the P2P dictionary only (see doc/p2p-websocket.md).
+ """
+ 
+ import os
+ import re
+ import ssl
++import struct
++import unittest
+ from io import BytesIO
+ 
+ from .messages import msg_sendaddrv2, msg_verack, msg_version, sha256
+@@ -28,6 +35,99 @@ def load_p2p_zstd_dict(srcdir):
+     return bytes(int(b, 16) for b in re.findall(r"0x([0-9a-f]{2})", body))
+ 
+ 
++ZSTD_SUBPROTOCOLS = ("p2p-zstd-v1", "p2p-zstd")
++INDEPENDENT_FORMAT = 1
++INDEPENDENT_DICT_VERSION = 1
++MAX_WINDOW = 1 << 20
++
++
++def decode_independent(body, zdict, max_size):
++    """Decode an independent frame as strictly as the node does."""
++    import zstandard
++
++    if (
++        len(body) < 5
++        or body[0] != INDEPENDENT_FORMAT
++        or struct.unpack("<I", body[1:5])[0] != INDEPENDENT_DICT_VERSION
++    ):
++        raise ValueError("unsupported independent frame format/dictionary")
++    frame = body[5:]
++    if len(frame) < 6 or frame[:4] != b"\x28\xb5\x2f\xfd":
++        raise ValueError("independent payload is not a zstd frame")
++    params = zstandard.get_frame_parameters(frame)
++    if params.content_size in (zstandard.CONTENTSIZE_UNKNOWN, None):
++        raise ValueError("independent frame without content size")
++    if params.content_size > max_size or params.window_size > MAX_WINDOW:
++        raise ValueError("independent frame resource bound exceeded")
++    if zstandard.frame_content_size(frame) != params.content_size:
++        raise ValueError("inconsistent content size")
++    out = zstandard.ZstdDecompressor(dict_data=zdict).decompressobj()
++    data = out.decompress(frame)
++    if not out.eof or out.unused_data or len(data) != params.content_size:
++        raise ValueError("truncated, trailing or mismatched independent frame")
++    return data
++
++
++def encode_independent(raw, zdict):
++    """An independent frame of P2P bytes (as the node makes them)."""
++    import zstandard
++
++    frame = zstandard.ZstdCompressor(
++        level=1, dict_data=zdict, write_content_size=True, write_checksum=False
++    ).compress(raw)
++    return (
++        bytes([INDEPENDENT_FORMAT])
++        + struct.pack("<I", INDEPENDENT_DICT_VERSION)
++        + frame
++    )
++
++
++def _frames_frame_buffer(ws, allow_rsv2):
++    """websocket-client refuses every RSV bit: accept RSV2 on complete binary
++    frames of a zstd connection, and nothing else."""
++    from websocket import _abnf
++
++    class Frame(_abnf.ABNF):
++        def validate(self, skip_utf8_validation=False):
++            if (
++                allow_rsv2
++                and self.rsv2
++                and not self.rsv1
++                and not self.rsv3
++                and self.fin
++                and self.opcode == _abnf.ABNF.OPCODE_BINARY
++            ):
++                self.rsv2 = 0
++                try:
++                    super().validate(skip_utf8_validation)
++                finally:
++                    self.rsv2 = 1
++                return
++            super().validate(skip_utf8_validation)
++
++    class Buffer(_abnf.frame_buffer):
++        def recv_frame(self):
++            with self.lock:
++                if self.needs_header():
++                    self.recv_header()
++                fin, rsv1, rsv2, rsv3, opcode, has_mask, _ = self.header
++                if self.needs_length():
++                    self.recv_length()
++                length = self.length
++                if self.needs_mask():
++                    self.recv_mask()
++                mask_value = self.mask_value
++                payload = self.recv_strict(length)
++                if has_mask:
++                    payload = _abnf.ABNF.mask(mask_value, payload)
++                self.clear()
++                frame = Frame(fin, rsv1, rsv2, rsv3, opcode, has_mask, payload)
++                frame.validate(self.skip_utf8_validation)
++            return frame
++
++    return Buffer(ws.frame_buffer.recv, ws.frame_buffer.skip_utf8_validation)
++
++
+ class P2PWebSocketClient:
+     def __init__(
+         self,
+@@ -54,18 +154,23 @@ class P2PWebSocketClient:
+                 url, subprotocols=subprotocols, sslopt=sslopt, timeout=timeout, header=header
+             )
+         self.subprotocol = self.ws.getsubprotocol()
++        self.frames = self.subprotocol in ZSTD_SUBPROTOCOLS
++        self.ws.frame_buffer = _frames_frame_buffer(self.ws, self.frames)
+         self.magic = NET_MAGIC_BYTES[net]
+         self.recvbuf = b""
+         self.wire_bytes_sent = 0
+         self.payload_bytes_sent = 0
+-        self.compressor = self.decompressor = None
+-        if self.subprotocol in ("p2p-zstd-v1", "p2p-zstd"):
+-            dict_data = None
+-            if self.subprotocol == "p2p-zstd-v1":
+-                dict_data = zstandard.ZstdCompressionDict(
+-                    load_p2p_zstd_dict(srcdir),
+-                    dict_type=zstandard.DICT_TYPE_RAWCONTENT,
+-                )
++        self.independent_frames_recv = 0
++        self.max_message_size = 64 * 1024 * 1024
++        self.compressor = self.decompressor = self.zdict = None
++        if self.frames:
++            # Independent frames always use the dictionary; the stream only
++            # with p2p-zstd-v1.
++            self.zdict = zstandard.ZstdCompressionDict(
++                load_p2p_zstd_dict(srcdir),
++                dict_type=zstandard.DICT_TYPE_RAWCONTENT,
++            )
++            dict_data = self.zdict if self.subprotocol == "p2p-zstd-v1" else None
+             self.compressor = zstandard.ZstdCompressor(
+                 level=1,
+                 dict_data=dict_data,
+@@ -102,6 +207,44 @@ class P2PWebSocketClient:
+     def send_message(self, message):
+         self.send_raw(self.build_message(message))
+ 
++    def send_independent(self, raw):
++        """Send P2P bytes as one independent (RSV2) frame (zstd modes)."""
++        from websocket import ABNF
++
++        payload = encode_independent(raw, self.zdict)
++        self.ws.send_frame(ABNF(1, 0, 1, 0, ABNF.OPCODE_BINARY, 1, payload))
++        self.payload_bytes_sent += len(raw)
++        self.wire_bytes_sent += len(payload)
++
++    def recv_wire(self):
++        """The next data message's P2P bytes (decompressed)."""
++        from websocket import ABNF
++
++        opcode, frame = self.ws.recv_data_frame(True)
++        if opcode == ABNF.OPCODE_CLOSE or opcode not in (
++            ABNF.OPCODE_BINARY,
++            ABNF.OPCODE_CONT,
++        ):
++            raise ConnectionError("WebSocket closed by the node")
++        data = frame.data
++        if frame.rsv2:
++            self.independent_frames_recv += 1
++            return decode_independent(data, self.zdict, self.max_message_size)
++        if self.decompressor:
++            data = self.decompressor.decompress(data)
++        return data
++
++    def recv_raw_message(self):
++        """The next complete P2P message: (msgtype, its exact bytes)."""
++        while True:
++            if len(self.recvbuf) >= 24:
++                length = int.from_bytes(self.recvbuf[16:20], "little")
++                if len(self.recvbuf) >= 24 + length:
++                    raw = self.recvbuf[: 24 + length]
++                    self.recvbuf = self.recvbuf[24 + length :]
++                    return raw[4:16].rstrip(b"\x00"), raw
++            self.recvbuf += self.recv_wire()
++
+     def recv_message(self):
+         """Return the next complete P2P message (deserialized)."""
+         while True:
+@@ -119,13 +262,7 @@ class P2PWebSocketClient:
+                     obj = cls()
+                     obj.deserialize(BytesIO(payload))
+                     return msgtype, obj
+-            data = self.ws.recv()
+-            if isinstance(data, str) or not data:
+-                # websocket-client returns a Close frame as an empty string.
+-                raise ConnectionError("WebSocket closed by the node")
+-            if self.decompressor:
+-                data = self.decompressor.decompress(data)
+-            self.recvbuf += data
++            self.recvbuf += self.recv_wire()
+ 
+     def wait_for(self, msgtype):
+         while True:
+@@ -154,3 +291,47 @@ class P2PWebSocketClient:
+ 
+     def close(self):
+         self.ws.close()
++
++
++# Codec-only tests; they start no node.
++class TestIndependentFrames(unittest.TestCase):
++    def setUp(self):
++        try:
++            import zstandard
++        except ImportError:
++            self.skipTest("zstandard needed for independent-frame tests")
++        self.zstd = zstandard
++        srcdir = os.path.join(os.path.dirname(__file__), "..", "..", "..")
++        self.zdict = zstandard.ZstdCompressionDict(
++            load_p2p_zstd_dict(srcdir), dict_type=zstandard.DICT_TYPE_RAWCONTENT
++        )
++        self.raw = b"\xfa\xbf\xb5\xdablock" + bytes(range(256)) * 400
++
++    def test_roundtrip(self):
++        frame = encode_independent(self.raw, self.zdict)
++        self.assertEqual(decode_independent(frame, self.zdict, 1 << 20), self.raw)
++
++    def test_rejects(self):
++        good = encode_independent(self.raw, self.zdict)
++        no_size = good[:5] + self.zstd.ZstdCompressor(
++            dict_data=self.zdict, write_content_size=False
++        ).compress(self.raw)
++        window = good[:5] + self.zstd.ZstdCompressor(level=3).compress(
++            b"x" * (2 * 1024 * 1024)
++        )
++        for bad in [
++            b"",
++            good[:4],
++            bytes([2]) + good[1:],
++            good[:1] + struct.pack("<I", 2) + good[5:],
++            good[:-1],
++            good + b"x",
++            good + good[5:],
++            no_size,
++            window,
++        ]:
++            with self.subTest(size=len(bad)):
++                with self.assertRaises(Exception):
++                    decode_independent(bad, self.zdict, 4 * 1024 * 1024)
++        with self.assertRaises(ValueError):
++            decode_independent(good, self.zdict, len(self.raw) - 1)
+diff --git a/test/functional/test_runner.py b/test/functional/test_runner.py
+index b2afed2ed575ad9f6525d5d187ecfccc85238c54..73465d5da28518d9143b86589343478ab484c6e9 100755
+--- a/test/functional/test_runner.py
++++ b/test/functional/test_runner.py
+@@ -91,6 +91,7 @@ TEST_FRAMEWORK_MODULES = [
+     "reporting",
+     "messages",
+     "muhash",
++    "p2p_websocket",
+     "results",
+     "script",
+     "test_framework",
+-- 
+2.50.1 (Apple Git-155)
+

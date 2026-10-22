@@ -1,0 +1,248 @@
+From 473cd9fece256e2d20bbc8824e2ee5083b8cd5b1 Mon Sep 17 00:00:00 2001
+From: Shammah Chancellor <shammah.chancellor@gmail.com>
+Date: Mon, 19 Oct 2026 19:11:17 -0700
+Subject: [PATCH] net: let a user-space transport say it cannot send now
+
+Why: the WebTransport peer socket (later in this series) is one end of a
+local socketpair; the QUIC engine thread does the real I/O. When its
+send queue is full, Send() fails with EAGAIN, but CConnman then polls the
+descriptor for SEND, which a socketpair always satisfies: the socket
+handler spins calling Send(). The transport needs a way to say "do not
+poll me for SEND; I will make my descriptor readable when I can take
+more".
+
+What:
+- Sock::SendBlockedByTransport() (default false), documented with the
+  other user-space transport hooks.
+- CConnman::GenerateWaitSockets(): while it is true and data is queued,
+  wait for RECV instead of SEND (and remember that on the node,
+  CNode::m_send_wait_on_recv, socket handler thread only).
+- SocketHandlerConnected(): when such a wait sees RECV and the transport
+  no longer blocks, send before receiving (lock order cs_vSend after
+  m_sock_mutex is released, as before); fPauseRecv still limits reading.
+Plain sockets never return true, so TCP and WebSocket peers wait and send
+exactly as before.
+
+Measured / run:
+- New net_tests/sock_send_blocked_by_transport: a Sock whose Send() is
+  refused while blocked and which signals through a socketpair. With
+  this change: the wait asks for RECV only, Send() is retried at most
+  once over 200 ms of handler passes, and one pass after the signal
+  drains the queue with receiving paused. Without the net.cpp change
+  the same test sees SEND|RECV requested and 244,473 Send() calls in
+  200 ms (a busy loop).
+- net_tests, net_websocket_tests, sock_tests, sockwakeup_tests pass.
+
+Not run: functional tests (no transport uses the hook yet); Linux and
+Windows; sanitizers.
+---
+ src/net.cpp            | 25 +++++++++--
+ src/net.h              |  4 ++
+ src/test/net_tests.cpp | 98 ++++++++++++++++++++++++++++++++++++++++++
+ src/util/sock.h        |  9 ++++
+ 4 files changed, 133 insertions(+), 3 deletions(-)
+
+diff --git a/src/net.cpp b/src/net.cpp
+index f5b784fcb8a68a3e37e5c943607ed1d09f8134d0..e8865bbb4c7077751e9d2d2b2148cf549b875279 100644
+--- a/src/net.cpp
++++ b/src/net.cpp
+@@ -2071,12 +2071,21 @@ Sock::EventsPerSock CConnman::GenerateWaitSockets(Span<CNode *const> nodes) {
+             WITH_LOCK(pnode->cs_vSend, return !pnode->vSendMsg.empty());
+ 
+         LOCK(pnode->m_sock_mutex);
++        pnode->m_send_wait_on_recv = false;
+         if (pnode->m_sock) {
+             // Data the socket implementation buffered itself must make
+             // progress even when CConnman has nothing queued.
+             const Sock::Event pending{pnode->m_sock->PendingEvents()};
+-            Sock::Event event = (select_send ? Sock::SEND : 0) |
+-                                (select_recv ? Sock::RECV : 0) | pending;
++            // A user-space transport that blocked sending signals RECV once
++            // it can take more: waiting for SEND could spin.
++            if (select_send && pnode->m_sock->SendBlockedByTransport()) {
++                select_send = false;
++                pnode->m_send_wait_on_recv = true;
++            }
++            Sock::Event event =
++                (select_send ? Sock::SEND : 0) |
++                (select_recv || pnode->m_send_wait_on_recv ? Sock::RECV : 0) |
++                pending;
+             if (event != 0) {
+                 events_per_sock.emplace(pnode->m_sock, Sock::Events{event});
+             }
+@@ -2169,6 +2178,7 @@ void CConnman::SocketHandlerConnected(
+         bool recvSet = false;
+         bool sendSet = false;
+         bool errorSet = false;
++        bool send_unblocked = false;
+         {
+             LOCK(pnode->m_sock_mutex);
+             if (!pnode->m_sock) {
+@@ -2189,12 +2199,21 @@ void CConnman::SocketHandlerConnected(
+                     }
+                 }
+             }
++            // The transport that blocked sending can take more: send first
++            // (below), receiving only what fPauseRecv allows.
++            send_unblocked = pnode->m_send_wait_on_recv &&
++                             it != events_per_sock.end() &&
++                             (it->second.occurred & Sock::RECV) &&
++                             !pnode->m_sock->SendBlockedByTransport();
+             // The OS socket being readable was only requested on behalf of
+-            // FlushPending(): don't read past fPauseRecv.
++            // FlushPending() or a blocked send: don't read past fPauseRecv.
+             if (pnode->fPauseRecv && !errorSet) {
+                 recvSet = false;
+             }
+         }
++        if (send_unblocked && !sendSet) {
++            sendSet = WITH_LOCK(pnode->cs_vSend, return !pnode->vSendMsg.empty());
++        }
+ 
+         if (sendSet) {
+             // Send data
+diff --git a/src/net.h b/src/net.h
+index 374b50ed41b56ef511ded0ce22b73c3c020f93f6..29368fca6e74c512730411e602e89b101ef84308 100644
+--- a/src/net.h
++++ b/src/net.h
+@@ -464,6 +464,10 @@ public:
+     // Used only by SocketHandler thread
+     const std::unique_ptr<TransportDeserializer> m_deserializer;
+     const std::unique_ptr<const TransportSerializer> m_serializer;
++    //! The last wait asked for RECV in place of SEND because the socket's
++    //! transport blocked sending (Sock::SendBlockedByTransport()).
++    //! Used only by SocketHandler thread.
++    bool m_send_wait_on_recv{false};
+ 
+     const NetPermissionFlags m_permission_flags{NetPermissionFlags::None};
+ 
+diff --git a/src/test/net_tests.cpp b/src/test/net_tests.cpp
+index 6554b4489a0200e891b517c23e08d7327fa61eb0..49ba75b7bd8559f3fe0188ebc247ef527d68e0bb 100644
+--- a/src/test/net_tests.cpp
++++ b/src/test/net_tests.cpp
+@@ -2240,4 +2240,102 @@ BOOST_AUTO_TEST_CASE(precomputed_checksum_is_used) {
+     BOOST_CHECK(msg.Copy().m_checksum == msg.m_checksum);
+ }
+ 
++namespace {
++/**
++ * A user-space transport whose Send() fails with EAGAIN while blocked and
++ * that signals "can send again" by making its descriptor readable, like
++ * the WebTransport peer socket.
++ */
++class TransportBlockedSock final : public Sock {
++public:
++    explicit TransportBlockedSock(SOCKET s) : Sock{s} {}
++    ssize_t Send(const void *, size_t len, int) const override {
++        ++m_send_calls;
++        if (m_blocked) {
++            errno = EAGAIN;
++            return -1;
++        }
++        m_sent += len;
++        return len;
++    }
++    ssize_t Recv(void *buf, size_t len, int) const override {
++        Drain();
++        errno = EAGAIN;
++        return -1;
++    }
++    bool SendBlockedByTransport() const override { return m_blocked; }
++    Event PendingEvents() const override { return m_blocked ? RECV : 0; }
++    bool FlushPending() const override {
++        Drain();
++        return true;
++    }
++    void Drain() const {
++        uint8_t b[64];
++        while (::recv(m_socket, b, sizeof(b), MSG_DONTWAIT) > 0) {
++        }
++    }
++    mutable std::atomic<bool> m_blocked{true};
++    mutable std::atomic<int> m_send_calls{0};
++    mutable std::atomic<size_t> m_sent{0};
++};
++} // namespace
++
++BOOST_AUTO_TEST_CASE(sock_send_blocked_by_transport) {
++    int sv[2];
++    BOOST_REQUIRE_EQUAL(socketpair(AF_UNIX, SOCK_STREAM, 0, sv), 0);
++    const Config &config{m_node.chainman->GetConfig()};
++    ConnmanTestMsg connman{config, 0x1337, 0x1337, *m_node.addrman};
++    auto sock{std::make_shared<TransportBlockedSock>(SOCKET(sv[0]))};
++    CNode *node = new CNode{/*id=*/0,
++                            sock,
++                            CAddress{},
++                            /*nKeyedNetGroupIn=*/0,
++                            /*nLocalHostNonceIn=*/0,
++                            /*nLocalExtraEntropyIn=*/0,
++                            CAddress{},
++                            /*addrNameIn=*/"",
++                            ConnectionType::INBOUND,
++                            /*inbound_onion=*/false};
++    connman.AddTestNode(*node);
++    std::vector<CNode *> nodes{node};
++
++    // The optimistic send in PushMessage() is refused: the message stays
++    // queued.
++    connman.PushMessage(node, NetMsg::Make(NetMsgType::PING, uint64_t{42}));
++    BOOST_CHECK(WITH_LOCK(node->cs_vSend, return !node->vSendMsg.empty()));
++    const int after_push{sock->m_send_calls};
++    BOOST_CHECK_LE(after_push, 1);
++
++    // While blocked the socket is waited on for RECV, not SEND (whose
++    // descriptor is writable, so polling it would spin).
++    auto events{connman.GenerateWaitSocketsForTest(nodes)};
++    BOOST_REQUIRE_EQUAL(events.size(), 1U);
++    BOOST_CHECK_EQUAL(events.begin()->second.requested, Sock::RECV);
++
++    // Nothing readable for 200 ms: the handler waits out its timeouts and
++    // does not retry Send() in a loop.
++    const auto start{SteadyClock::now()};
++    int loops{0};
++    while (SteadyClock::now() - start < 200ms) {
++        connman.SocketHandlerForTest();
++        ++loops;
++    }
++    BOOST_CHECK_GE(loops, 2);
++    BOOST_CHECK_LE(sock->m_send_calls - after_push, 1);
++    BOOST_CHECK(WITH_LOCK(node->cs_vSend, return !node->vSendMsg.empty()));
++
++    // The transport takes data again and says so through its descriptor:
++    // the queue drains on the next pass, even with receiving paused.
++    node->fPauseRecv = true;
++    sock->m_blocked = false;
++    const uint8_t token{1};
++    BOOST_REQUIRE_EQUAL(::send(sv[1], &token, 1, 0), 1);
++    connman.SocketHandlerForTest();
++    BOOST_CHECK(WITH_LOCK(node->cs_vSend, return node->vSendMsg.empty()));
++    BOOST_CHECK_GT(sock->m_sent.load(), 0U);
++
++    connman.ClearTestNodes();
++    close(sv[1]);
++}
++
+ BOOST_AUTO_TEST_SUITE_END()
+diff --git a/src/util/sock.h b/src/util/sock.h
+index 425c326299f40effabe385d81ea0aa3c68f44624..0ccfb29813b0973937dab0a7a4150305abe14d14 100644
+--- a/src/util/sock.h
++++ b/src/util/sock.h
+@@ -270,6 +270,15 @@ public:
+      */
+     [[nodiscard]] virtual bool FlushPending() const { return true; }
+ 
++    /**
++     * Whether a user-space transport cannot accept more data from Send()
++     * now (its Send() would fail with EAGAIN) and will report RECV readiness
++     * on its descriptor when it can. CConnman then waits for RECV instead
++     * of SEND for it: its descriptor (e.g. one end of a socketpair) may be
++     * always writable, and polling SEND would spin.
++     */
++    [[nodiscard]] virtual bool SendBlockedByTransport() const { return false; }
++
+     /**
+      * Wait until the socket is readable or has an exceptional condition,
+      * or the timeout expires,
+-- 
+2.50.1 (Apple Git-155)
+

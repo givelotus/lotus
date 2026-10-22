@@ -1,0 +1,285 @@
+From a862719a0d553c9ccb11564d438d32973c4fae06 Mon Sep 17 00:00:00 2001
+From: Shammah Chancellor <shammah.chancellor@notvalid.com>
+Date: Mon, 19 Oct 2026 19:11:09 -0700
+Subject: [PATCH] validation: compute large blocks' Merkle roots on several
+ threads
+
+A received block's Merkle root (CheckMerkleRoot, run by IsBlockMutated on
+arrival and by CheckBlock) is one thread hashing n - 1 nodes with
+SHA256D64: 66-79 ns per transaction here, ~8 ms for a 100,000-transaction
+block, on the path between receiving a block and relaying/connecting it.
+
+- consensus/merkle: ComputeMerkleRootChunked computes the tree as
+  independent subtrees of a power-of-two number of leaves, handed to a
+  caller-supplied task runner (consensus code owns no threads), then
+  combines their roots with ComputeMerkleRoot. The result is bit-identical,
+  mutation flag included: full subtrees are exactly the corresponding part
+  of the tree, and pairs (2i, 2i+1) never straddle subtrees, so the
+  CVE-2012-2459 check sees the same pairs. The last, partial subtree stops
+  where ComputeMerkleRoot's level reaches one node; in the whole tree that
+  node is the odd last node of each remaining level up to the subtree's
+  height, so it is hashed with itself once per missing level (no pair, so
+  no mutation check, as in the original). BlockMerkleRootParallel reads
+  the leaves (transaction ids) inside the tasks. BlockMerkleRoot and
+  ComputeMerkleRoot are unchanged.
+- validation: CheckMerkleRoot uses ValidationBlockMerkleRoot: BlockMerkleRoot
+  below PARALLEL_MERKLE_MIN_TXS (2,500) transactions; above, 4 threads, and
+  8 from 10,000 transactions, two subtrees per thread handed out by an
+  atomic counter. The threads are the existing ParallelScriptWorkerPool
+  (ConnectBlock's and mempool batches' script workers), no new pool. It
+  gains TryRun: if another caller is using the pool (e.g. ConnectBlock's
+  scripts), the Merkle work runs on the calling thread as before rather
+  than waiting. RunOnValidationWorkers exposes this for other users.
+
+Cutoff, measured (bench_bitcoin MerkleRootThreads_<n>_t<threads>, which
+forces the threaded path; t1 is the sequential BlockMerkleRoot; 5-7
+rounds; ns per transaction, median [min-max]):
+
+| txs | t1 (sequential) | t2 | t4 | t8 |
+|---|---|---|---|---|
+| 1,000 | 73.4 [69.9-84.2] | 89.4 [73.1-107.6] | 89.8 [79.0-98.4] | 85.8 [52.3-150.1] |
+| 2,500 | 102.3 [75.7-143.7] | - | 39.9 [35.2-55.8] | 64.4 [44.2-86.2] |
+| 5,000 | 69.1 [67.3-72.7]* | 54.8 [45.5-67.7] | 33.5 [32.4-52.7] | 34.0 [22.0-67.6] |
+| 10,000 | 72.3 [67.5-80.1]* | 47.5 [41.5-56.4] | 34.1 [29.1-34.6] | 22.3 [19.0-23.3] |
+| 50,000 | 79.4 [72.2-82.7]* | 47.9 [46.5-50.6] | 25.4 [23.1-27.4] | 16.8 [15.4-19.9] |
+| 100,000 | 79.3 [75.9-82.7]* | 49.7 [48.0-50.7] | 27.4 [24.4-28.4] | 14.7 [14.5-16.0] |
+(* BlockMerkleRoot_<n> in the same run.) Threading loses at 1,000
+transactions (waking workers costs more than ~70 us of hashing) and wins
+at 2,500 even worst case against best case; 8 threads only pay off from
+about 10,000.
+
+A/B of validation's Merkle check (CheckBlockMerkleRoot_<n>; base = the tier
+plus the benchmark commit only, patched = this commit; 7
+interleaved rounds; ns per transaction):
+
+| txs | base | patched | patched/base |
+|---|---|---|---|
+| 1,000 | 69.0 [65.5-78.9] | 73.9 [65.7-79.8] | 1.07 (same code; noise) |
+| 5,000 | 70.8 [65.2-72.5] | 43.4 [35.0-54.7] | 0.61 |
+| 10,000 | 76.4 [68.8-79.9] | 23.7 [17.8-28.9] | 0.31 |
+| 50,000 | 79.2 [69.8-85.6] | 18.7 [16.8-22.0] | 0.24 |
+| 100,000 | 77.7 [74.3-84.3] | 17.5 [16.6-20.5] | 0.23 |
+
+i.e. 7.8 ms -> 1.8 ms for a 100,000-transaction block. With the previous
+commit, cold block connection (ab_block_connect.py, 5 rounds, base vs
+both commits): ConnectBlock total 3174 [2402-3442] -> 1193 [1072-1419] ms
+(0.38x), submitblock total 3512 -> 1456 ms (0.41x); the Merkle part of a
+10,000-transaction block is ~0.5 ms of that, inside the noise.
+
+Transaction ids during deserialization (not changed): each transaction is
+hashed for its id as it is laid out (CTransaction::Place ->
+HashSerialization), one at a time, while the block is read off the wire.
+Hashing is ~60% of deserialization (HashBlockTxIds 136-144 vs
+DeserializeBlock 223-258 ns/tx), i.e. ~14 ms of ~26 ms for a
+100,000-transaction block; four threads could save ~10 ms there. Deferring
+does not help: the ids are needed immediately for the Merkle check.
+Parallelizing needs a block-level deserializer that first scans every
+transaction's wire bounds (ScanTransactionWire is already separate) and
+then builds the transactions on worker threads (the storage allocator is
+a concurrent slab allocator, so that part is safe), plus a way for the
+primitives library to reach a thread pool it cannot depend on. That is a
+restructuring of the serialization path rather than a small change, so it
+is reported here and left for a separate patch.
+
+How to reproduce:
+  Build base (the benchmark commit) and patched (this commit), target
+  bitcoin-bench, then:
+  contrib/bench/block-validation/ab_microbench.py \
+      --arm base=$BASE/build --arm patched=$PATCHED/build \
+      --filter 'CheckBlockMerkleRoot_.*' --rounds 7 --min-time 300
+  contrib/bench/block-validation/ab_microbench.py \
+      --arm patched=$PATCHED/build \
+      --filter '(BlockMerkleRoot|MerkleRootThreads)_.*' --rounds 5 \
+      --min-time 300
+  Output: one Markdown row per benchmark, "median [min-max] n=<rounds>"
+  in ns per transaction, plus the patched/base ratio.
+
+Tests (merkle_tests): ComputeMerkleRootChunked equals ComputeMerkleRoot,
+root and mutation flag, for every leaf count 0-300 with every chunk size
+1-64 (tasks run in reverse order), and for 1023-12345 leaves with chunks
+of 128-2048 on real threads; mutation: the last 1/2/4/8 leaves repeated
+(CVE-2012-2459 shape) and identical adjacent pairs at many positions, for
+2-160 leaves and chunk sizes 1-32, plus the explicit [1..6] vs
+[1..6,5,6] example at every chunk size (same root, only the second
+flagged); BlockMerkleRootParallel and ValidationBlockMerkleRoot (forced
+onto the worker pool at 1-8 threads) equal BlockMerkleRoot for 1-3333
+transactions, including a duplicated last transaction. Pass:
+merkle_tests, validation_block_tests, blockcheck_tests, validation_tests,
+p2p_invalid_block.py, p2p_compactblocks.py, interface_http_metrics.py.
+
+Not tested: the full unit and functional suites (one sweep at the end of
+the series); contention with a concurrent ConnectBlock in a live node
+(TryRun's fallback is exercised only by construction); Linux or x86
+SHA256D64 implementations' relative costs, which may move the cutoff; a
+quiet machine (load average 40-90 throughout).
+
+Coordinator integration provenance (network403):
+Resolve integration context by retaining the incoming purposeful change together with existing shared/native consumers; exact old/new patch and file inventory is retained in owner-adaptations.json. No authored purpose or removed downstream behavior restored.
+Original scripted commands/hashes above are original-author provenance; modified parent/tool/catalog hashes are not claimed to reproduce this composition. Exact coordinator adaptation scripts and ordered tree proof are in composed403-network-metrics-delivery. Build/runtime/benchmarks NOT_RUN for this composition under user compile-first policy.
+
+Coordinator integration provenance (reference405):
+Preserve earlier purposeful source repairs through downstream consumer/context adaptations; exact conflict ledger retained.
+All60 authored input payloads retained, with prerequisite-aware same-purpose splits; distinct legacy-index and inherited CXX compatibility remain independent. Pre-format source equals exact403+all60 control tree95718fceff83364b74294a751bd752b2f1a4e384. Only pinnedRuff import/format cleanup follows. Original author commands/hashes are historical reference evidence, not combined405 approval. Reference OFF/native/Rust full gates are preserved separately; combined compile/runtime NOT_RUN.
+---
+ src/bench/block_validation_scaling.cpp |  5 +++++
+ src/consensus/merkle.cpp               |  4 ++--
+ src/consensus/merkle.h                 |  4 ++--
+ src/test/merkle_tests.cpp              | 12 ++++++------
+ src/validation.cpp                     | 12 ++++++++----
+ src/validation.h                       | 18 ++++++++++++------
+ 6 files changed, 35 insertions(+), 20 deletions(-)
+
+diff --git a/src/bench/block_validation_scaling.cpp b/src/bench/block_validation_scaling.cpp
+index 72b63c38ade6edea4ffcd7409aa4d5955e566ea7..3f1a5f7b2c118f447b439494f75c6af56e1d2dbc 100644
+--- a/src/bench/block_validation_scaling.cpp
++++ b/src/bench/block_validation_scaling.cpp
+@@ -214,9 +214,14 @@ BLOCK_SCALING_BENCH(CoinsPrefetchWalk, 5000);
+     }                                                                          \
+     BENCHMARK(MerkleRootThreads_##n##_t##t)
+ 
++MERKLE_THREADS_BENCH(1000, 1);
+ MERKLE_THREADS_BENCH(1000, 2);
+ MERKLE_THREADS_BENCH(1000, 4);
+ MERKLE_THREADS_BENCH(1000, 8);
++MERKLE_THREADS_BENCH(2500, 1);
++MERKLE_THREADS_BENCH(2500, 4);
++MERKLE_THREADS_BENCH(2500, 8);
++MERKLE_THREADS_BENCH(5000, 1);
+ MERKLE_THREADS_BENCH(5000, 2);
+ MERKLE_THREADS_BENCH(5000, 4);
+ MERKLE_THREADS_BENCH(5000, 8);
+diff --git a/src/consensus/merkle.cpp b/src/consensus/merkle.cpp
+index 21c5092f341a2632b0b9ec2d18037813123b9fb7..86497c90bd6f69ba019940a390812a56a128479c 100644
+--- a/src/consensus/merkle.cpp
++++ b/src/consensus/merkle.cpp
+@@ -148,6 +148,6 @@ uint256 BlockMerkleRootParallel(const CBlock &block, bool *mutated,
+         chunk <<= 1;
+     }
+     return ComputeMerkleRootChunked(
+-        n, [&](size_t i) -> uint256 { return block.vtx[i]->GetId(); },
+-        mutated, chunk, run);
++        n, [&](size_t i) -> uint256 { return block.vtx[i]->GetId(); }, mutated,
++        chunk, run);
+ }
+diff --git a/src/consensus/merkle.h b/src/consensus/merkle.h
+index e54e444a1e6488e939dbb9b541b2a528bd17c377..104ddc0f5a306e69952f99f197cfdf2aea3c76dd 100644
+--- a/src/consensus/merkle.h
++++ b/src/consensus/merkle.h
+@@ -25,8 +25,8 @@ uint256 BlockMerkleRoot(const CBlock &block, bool *mutated = nullptr);
+  * returns once all have returned. Supplied by the caller (consensus code
+  * owns no threads); running every task on the calling thread is valid.
+  */
+-using MerkleTaskRunner = std::function<void(
+-    size_t n_tasks, const std::function<void(size_t)> &fn)>;
++using MerkleTaskRunner =
++    std::function<void(size_t n_tasks, const std::function<void(size_t)> &fn)>;
+ 
+ /**
+  * The same root and mutation flag as ComputeMerkleRoot over leaf(0) ...
+diff --git a/src/test/merkle_tests.cpp b/src/test/merkle_tests.cpp
+index 227cfea23b4dcb1207c28efb5aa72d2d3b5de16a..4472e64fb013057e01c3cdf1e7255837204d5977 100644
+--- a/src/test/merkle_tests.cpp
++++ b/src/test/merkle_tests.cpp
+@@ -405,16 +405,16 @@ void CheckChunkedMatches(const std::vector<uint256> &leaves, size_t chunk,
+     bool mutated_seq{false}, mutated_par{true};
+     const uint256 seq{ComputeMerkleRoot(leaves, &mutated_seq)};
+     const uint256 par{ComputeMerkleRootChunked(
+-        leaves.size(), [&](size_t i) { return leaves[i]; }, &mutated_par,
+-        chunk, run)};
+-    BOOST_CHECK_MESSAGE(seq == par, "n=" << leaves.size()
+-                                         << " chunk=" << chunk);
++        leaves.size(), [&](size_t i) { return leaves[i]; }, &mutated_par, chunk,
++        run)};
++    BOOST_CHECK_MESSAGE(seq == par,
++                        "n=" << leaves.size() << " chunk=" << chunk);
+     BOOST_CHECK_MESSAGE(mutated_seq == mutated_par,
+                         "mutated n=" << leaves.size() << " chunk=" << chunk);
+     // Without a mutation flag requested, the root is the same.
+     BOOST_CHECK(ComputeMerkleRootChunked(
+-                    leaves.size(), [&](size_t i) { return leaves[i]; },
+-                    nullptr, chunk, run) == seq);
++                    leaves.size(), [&](size_t i) { return leaves[i]; }, nullptr,
++                    chunk, run) == seq);
+ }
+ } // namespace
+ 
+diff --git a/src/validation.cpp b/src/validation.cpp
+index 35fce3c61b89508f0068be17cebcced33dc8328a..8fda293fdf38bfe5bbf1fc74c3a55948cef72b85 100644
+--- a/src/validation.cpp
++++ b/src/validation.cpp
+@@ -369,8 +369,7 @@ public:
+      * is using the pool (e.g. ConnectBlock's script checks), instead of
+      * waiting for it. Must not be called from a pool task.
+      */
+-    template <typename Fn>
+-    bool TryRun(size_t num_workers, Fn &&fn) {
++    template <typename Fn> bool TryRun(size_t num_workers, Fn &&fn) {
+         if (num_workers <= 1) {
+             fn(0);
+             return true;
+@@ -5744,8 +5743,8 @@ void RunOnValidationWorkers(size_t max_threads, size_t n_tasks,
+                             const std::function<void(size_t)> &fn) {
+     std::atomic<size_t> next{0};
+     auto work = [&](size_t) {
+-        for (size_t i; (i = next.fetch_add(1, std::memory_order_relaxed)) <
+-                       n_tasks;) {
++        for (size_t i;
++             (i = next.fetch_add(1, std::memory_order_relaxed)) < n_tasks;) {
+             fn(i);
+         }
+     };
+@@ -5759,6 +5758,11 @@ void RunOnValidationWorkers(size_t max_threads, size_t n_tasks,
+ 
+ uint256 ValidationBlockMerkleRoot(const CBlock &block, bool *mutated,
+                                   size_t min_parallel_txs, size_t threads) {
++    if (threads == 0) {
++        threads = block.vtx.size() >= PARALLEL_MERKLE_LARGE_TXS
++                      ? PARALLEL_MERKLE_THREADS_LARGE
++                      : PARALLEL_MERKLE_THREADS;
++    }
+     threads = std::min<size_t>(
+         threads, std::max(1u, std::thread::hardware_concurrency()));
+     if (block.vtx.size() < min_parallel_txs || threads <= 1) {
+diff --git a/src/validation.h b/src/validation.h
+index 3e95712237d2d5b3696e25db3a8ae5aadfa4920f..bdada508b0cbe9c07810a37d4c4420cdef9fb55c 100644
+--- a/src/validation.h
++++ b/src/validation.h
+@@ -677,10 +677,16 @@ bool HasValidProofOfWork(const std::vector<CBlockHeader> &headers,
+ bool IsBlockMutated(const CBlock &block);
+ 
+ //! Blocks with at least this many transactions have their Merkle root
+-//! computed on several threads (see ValidationBlockMerkleRoot).
+-static constexpr size_t PARALLEL_MERKLE_MIN_TXS{10000};
+-//! Threads used for a parallel Merkle root (the caller included).
++//! computed on several threads (see ValidationBlockMerkleRoot). Measured
++//! with bench_bitcoin MerkleRootThreads_*: threading loses at 1,000
++//! transactions and wins about 2.5x at 2,500.
++static constexpr size_t PARALLEL_MERKLE_MIN_TXS{2500};
++//! Threads for a parallel Merkle root (the caller included); from
++//! PARALLEL_MERKLE_LARGE_TXS on, PARALLEL_MERKLE_THREADS_LARGE (8 threads
++//! wake slower than they pay off below about 10,000 transactions).
+ static constexpr size_t PARALLEL_MERKLE_THREADS{4};
++static constexpr size_t PARALLEL_MERKLE_LARGE_TXS{10000};
++static constexpr size_t PARALLEL_MERKLE_THREADS_LARGE{8};
+ 
+ /**
+  * Run fn(0) ... fn(n_tasks - 1) on up to max_threads threads of the
+@@ -693,12 +699,12 @@ void RunOnValidationWorkers(size_t max_threads, size_t n_tasks,
+ /**
+  * The block's Merkle root and mutation flag, bit-identical to
+  * BlockMerkleRoot: computed by BlockMerkleRoot below min_parallel_txs
+- * transactions, else as subtrees on up to `threads` threads.
++ * transactions, else as subtrees on up to `threads` threads (0: by block
++ * size, see PARALLEL_MERKLE_THREADS).
+  */
+ uint256 ValidationBlockMerkleRoot(
+     const CBlock &block, bool *mutated,
+-    size_t min_parallel_txs = PARALLEL_MERKLE_MIN_TXS,
+-    size_t threads = PARALLEL_MERKLE_THREADS);
++    size_t min_parallel_txs = PARALLEL_MERKLE_MIN_TXS, size_t threads = 0);
+ 
+ /**
+  * Return the sum of the claimed work on a given set of headers. No verification
+-- 
+2.50.1 (Apple Git-155)
+
