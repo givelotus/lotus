@@ -23,6 +23,8 @@ No new message, service bit, alias, version fallback, migration, or compatibilit
 2. `758dcecb67`: production repair, mixed-peer negotiation tests, adapted body-push test, actual sealed-header path regression using real negotiation rather than manually inserting handler state.
 3. `09efb790d0`: tests for local opt-out and independent operation with INVSHORT disabled; ensures the no-body default is checked even with successfully negotiated private support.
 
+4. `e724205aec`: preserve disabled short-ID epoch maintenance when only private relay is enabled; the new capability bit must not accidentally enable an unrelated transaction index.
+
 N1 owns the single incremental build and focused checks. Requested cases:
 
 - `txrelay_tests/stock_peer_does_not_support_private_relay`
