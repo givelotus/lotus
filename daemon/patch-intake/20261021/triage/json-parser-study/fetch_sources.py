@@ -20,3 +20,11 @@ with ThreadPoolExecutor(max_workers=4) as pool:
  manifest=dict(pool.map(fetch,SOURCES.items()))
 (ROOT/'sources.json').write_text(json.dumps(manifest,indent=2))
 print(json.dumps(manifest,indent=2))
+
+# Reconstruct the frozen in-repository baseline without using a moving checkout.
+record=json.loads((ROOT/'univalue-source.json').read_text())
+uvdir=ROOT/'cache'/'univalue';uvdir.mkdir(exist_ok=True)
+for rel,expected in record['files_sha256'].items():
+    data=subprocess.check_output(['git','-C',record['repository'],'show',record['commit']+':src/univalue/'+rel])
+    if hashlib.sha256(data).hexdigest()!=expected:raise RuntimeError('UniValue hash mismatch: '+rel)
+    (uvdir/pathlib.Path(rel).name).write_bytes(data)

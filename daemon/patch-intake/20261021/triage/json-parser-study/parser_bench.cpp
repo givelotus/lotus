@@ -40,9 +40,8 @@ static UniValue FromSimd(simdjson::ondemand::value x, size_t depth=0) {
     case json_type::object: {
         UniValue out(UniValue::VOBJ);
         for(auto item:x.get_object()) {
-            auto field=item.value();
-            std::string key(field.unescaped_key().value());
-            out.pushKVEnd(std::move(key),FromSimd(field.value(),depth+1));
+            std::string key(item.unescaped_key().value());
+            out.pushKVEnd(std::move(key),FromSimd(item.value().value(),depth+1));
         }
         return out;
     }
@@ -54,6 +53,7 @@ static UniValue FromSimd(simdjson::ondemand::value x, size_t depth=0) {
     }
     case json_type::boolean:return UniValue(x.get_bool().value());
     case json_type::null:if(!x.is_null().value())throw std::runtime_error("null");return UniValue();
+    case json_type::unknown:throw std::runtime_error("unknown type");
     }
     throw std::runtime_error("type");
 }

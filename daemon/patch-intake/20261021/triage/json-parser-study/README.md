@@ -1,6 +1,6 @@
 # RPC parser feasibility study
 
-Source-only preparation. No production dependency or RPC code changed. No compile/timing result yet.
+Isolated compile and valid-fixture timings are complete; see REPORT.md. No production dependency or RPC code changed. Production compatibility remains held by one invalid-UTF8 acceptance difference.
 
 The study compares current UniValue with benchmark-only adapters using official exact-revision simdjson and yyjson sources. Both adapters fully materialize the same owned UniValue tree before returning. The existing writer is used for every round trip, so parse+conversion cost and parse+conversion+serialization cost include the representation actually required by unchanged RPC handlers. There is no binary-floating-point conversion of numbers.
 
@@ -14,4 +14,4 @@ Inputs include 207/414-byte raw transaction-sized hex strings, arrays of 50 indi
 
 `TYPED-RPC-DESIGN.md` describes the distinct useful next boundary: directly parsing owned typed requests and centrally serializing typed results, with one shared field descriptor for schema/help/codecs and unchanged UniValue fallback. Latest Glaze requires C++23, while this node uses C++20; this study does not upgrade the standard.
 
-Build and timing require a coordinated empty compiler/runtime window. They must not run during daemon measurements. Commands, compiler version, all input/source/binary hashes, host load and results will be recorded if that gate is reached.
+Build and timing ran in an empty compiler/runtime window with no daemon benchmark overlap. Commands, compiler version, input/source/binary hashes, host load and results are recorded. The initial compile error and corrected compile log are retained; the 48-case differential mismatch is not relabeled as a full compatibility pass.
