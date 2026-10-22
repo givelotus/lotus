@@ -5,6 +5,10 @@ Source worktree: `/Users/shammah/repos/lotus-v2-private-relay-capability`.
 Branch: `repair/private-relay-capability-20261021`.
 Current delivery identities and validation state: `delivery.json`.
 
+## Current integration limit
+
+The current `daemon/v2-version` now pins original142 `09f95c297a67de61836c495904ce9f20551bf415`. That source has no `sendinvshort` feature exchange. This validated521-lineage candidate must not be blindly imported into142: parent mapping must carry the appropriate negotiation dependency or select a separate capability design. This lane has not changed canonical refs.
+
 ## Problem and resulting behavior
 
 Local `-highbandwidthtx=1` previously marked every transaction-relay peer private-capable during initialization/VERACK. Ordinary BIP152 high-bandwidth negotiation or NoBan also sufficed to push private `shorttx` bodies. Neither establishes that a remote peer understands those formats. A stock ABC peer could therefore receive a private block announcement instead of its ordinary block announcement, or an unsolicited body instead of INV.
@@ -33,7 +37,7 @@ N1 owns the single incremental build and focused checks. Requested cases:
 - `txrelay_tests/no_body_push_by_default`
 - `v2_protocol_handler_tests/high_bandwidth_sealedheader_push_and_peer_cleanup`
 
-Until N1 supplies results, these are prepared tests, not passing claims. No standalone daemon-to-stock-ABC pair or broad functional suite has been run in this lane.
+N1 compiled the combined candidate `2b61dded451755e175681f41a57281a5c0554e32`, tree `2b4fef46071b44cc8789a49553b3d112b4fd084e`. All six affected MR06/announcement cases pass, with318 assertions. The real stock control fails three policy/wire assertions before the production repair. Exact identities and raw receipt hashes are in `evidence/native-validation.json`. No standalone daemon-to-stock-ABC pair or broad functional suite has been run in this lane.
 
 ## Causal ownership / integration constraint
 
