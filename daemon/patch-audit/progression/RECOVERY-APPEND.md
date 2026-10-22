@@ -410,3 +410,215 @@ Combined a07 jemallocON exact500k PASS/FULLDRAIN. Actual ON daemon3e14/cache3c24
 ## 2026-10-22T00:00:16+00:00 — overnight_n1_prep
 
 ORDERED521 IMPORT READY sourcea60bba6f/treecaf6 exactactuala07.371shared150native; fournewindependentpurposes, earliercausal111decode/112fullhashguard, prerequisiteexistingbridge/nativecryptofixturetests. ALL521indexmailboxtrees+rawmetadataPASS; bundleverified; READY exports/native521-prepared/.READY manifestf6a8d8b83a2b24e6d0855b375642aaff8991f25fb972d602ef88cc4de504940f seal3eb0475d567files. Importer-compatiblederivedstatusokproof adjacentexports/native521-import-replay-proof.json (sealedoriginalproofremainsimmutable). Allnormal/focused/allocatoractivityPASS. OFF500kbefore158.867after42.814; samea07ON40.726; exact500000+800warmup/end500800 singleobservations3profiles notmaxTPS. Allresourcesdrained; rootownsimportcommand/preflight/canonicalpins. No redundantbuildneeded endpointtreeexactcaf6.
+
+## 2026-10-22T00:01:56+00:00 — root
+
+Canonical native521-profiled-prepared promotion COMPLETE. Importer --check-only preflight passed, then actual import exit0: head a60bba6facc924cdf43c34dc881805bb114fe373, tree caf6bd4ce012b2383e733b45df46753b49b2a894, 521 owners (371 shared,150 native). Packet native521-prepared preserves all intermediate replay/metadata and endpoint exactly matching measured a07 source. Isolated OFF 500k recon before158.867377s after42.814038s; exact same-source allocatorON40.725577s, exact500800 inventory each. Focused builds/tests and actual allocator startup/101blocks/verifychain/shutdown pass. No full Guix/non-host certification, no maximumTPS claim. All agent compiler/runtime jobs drained. Next remaining work is profile-guided follow-up and separate pending delivery intake, not a still-running benchmark. Do not repeat completed measurements without new changes or unresolved evidence.
+
+## 2026-10-22T00:04:34+00:00 — canonical_records_sync
+
+Parent promoted canonical521 a60bba/treecaf6 equivalent measureda07. Benchmark coordinator resumed NEXTchanges, no baseline rerun. Three source lanes: commitment transientstdasync→persistentexecutor, snapshot repeatedpublication/RCU, callback-safe independent admissionmicrobatch. CurrentONbaseline immutable3e14/cache3c24 +500k40.725577s/3depthprofiles retained. Supplied exact reports/source pins to lanes. Waiting actualsource/correctnessREADY before candidateAB; no compiler/runtimeours. Attribution workloads: commitment exactrootkernel plus common500k endpoint; snapshots samecommondefaultrelay (admission+unbroadcast); microbatch ordinaryRPCarrays50/8writers, expliciteligibility/fallback/perrequestcallbacks. No canonical source edit; exclusive resourcecoord timing windows remain.
+
+## 2026-10-22T00:06:03+00:00 — review_mining_relay_architecture
+
+Resumed profile-guided implementation after root521 a60bba6f/treecaf6. Isolated source ~/repos/lotus-v2-persistent-commitment branchreview/persistent-commitment-workers-20261021 replaces per-root recursive async with depth4frontier+bounded persistent ParallelRangeExecutor; no nested submissions, exact fold semantics. Kernel before/after builds3.3s and both pass18spec-oraclecohorts,576concurrentrootcalls, duplicate rejection/posterrorreuse. Focused permanent TxOverlayArena-equivalence/concurrent test added but fullnative unit target not built yet. Canonical delivery/proofs daemon/patch-intake/20261021/exports/persistent-commitment-workers521/. Kernel3scohorts now running session25940 after runtimebenchmarkagent confirmed all endpoint timing drained. No baseline cache writes.
+
+## 2026-10-22T00:08:11+00:00 — cow_snapshot_slab_allocator
+
+Residual snapshot candidate 9e5e64d655c6570d1f2d6037055c1201ade65544, tree3906d2ae, source /Users/shammah/repos/lotus-v2-shorttx-unbroadcast. Export /Users/shammah/repos/lotus-v2-optimizations/daemon/patch-intake/20261021/exports/residual-snapshot-coalescing. GETSHORTTX batch marking currently publishes once per actual unbroadcast removal, confirmed in latest450k stack. Existing ScopedSnapshotDefer coalesces to one publication before resolver returns, preserving immutable flags/counts and response/callback ordering. Added real three-body GETSHORTTX test plus retained-generation and repeat-noop checks. git diff --check PASS; native build/runtime/causal control/performance NOT RUN. N1 and runtime owner notified for coordinated validation; existing ON500k baseline retained. No canonical series changed.
+
+## 2026-10-22T00:08:36+00:00 — review_mining_relay_architecture
+
+Persistent-root R2 fulloracle/concurrent proof passes. Kernel3sec cohorts1000:0.236→0.158ms;10k1.423→1.150ms;100k13.88→13.70ms;500k78.13→82.81ms onepair. Candidate remains unpromoted due large-input regression. R3 source-only refinement parallelizes large-input bucket classification via sameexecutor before rootdispatch; NOTcompiled/tested. canonical_records_sync informed allkernelsdrained and startingABC500kbaseline; no compile/runtime permitted until explicitclear. All prior results retained in requestedrepo exports/persistent-commitment-workers521.
+
+## 2026-10-22T00:09:18+00:00 — review_mining_relay_architecture
+
+Source-only R3 preserves existing ParallelRangeExecutor recursion/concurrency fallback; large>=65536 bucket classification split into8disjoint ranges thenmerged before independent rootdispatch, addressing serialprefixcost observedR2. Kernel/permanent equivalence test now includes65536uniformkeys tocoverlargebranch (longcommonprefixcoveredthrough4096). AwaitABC500kdrain beforecompile/runtime; latest source uncommitted/unvalidatedR3, do notimport yet. R2 binary and reconstructed source retained alongside negative500kresult.
+
+## 2026-10-22T00:10:24+00:00 — canonical_records_sync
+
+Root requested actual depthmatchedABC500k, notold5sec62.6k baseline. Prepared baseline1fb7/treeb2e4/bitcoind38ae, actualoriginalO3assertions/walletON/ChronikOFFprofile copied. Legacy200B vsnative207B/allocator+consensus+transport differences explicit. Untimedtooling added earlyconfirmed256x256hierarchicallegacyfunding; initialsmallsmoke caught<100Bfundingpadding afteroutputsreplace, correctedexistingpad_tx,18testsPASS. Correctedsmoke32signed+32OPTRUE PASS/FULLDRAIN. New500k driver/plan requestedrepo benchmark-results/20261021/abc-native-depth500k-v1/abc, toolc975, identicaltimedcore/progress/sampling/8writers/arrays50/800warmup/10kfee/productionpolicyON/wholePG12GiB/free6/critical4/swap4/20min. Launching now, no candidatecompiler overlap. Native521ON500k reference remains unchanged40.725577s.
+
+## 2026-10-22T00:11:46+00:00 — review_admission_storage_pipeline
+
+Concrete RPC commit-queue candidate frozen 25a3a19f1312e52ece026588f96ccf6f5260c66e, tree22a409b50ff3fffe3685afa175bf2f3a3d9a4711, exact521basea60bba/treecaf6. Canonical packet /Users/shammah/repos/lotus-v2-optimizations/daemon/patch-intake/20261021/exports/queued-admission-prototype/candidate-25a3a19f13. Source+tests prepared, NOT COMPILED/MEASURED; root-priority ABC500k active so all runtime parked. Internal sendrawtransaction-only optin; queue256/32MiB drains32 immediately; producer retains callback/secondary waits+relay. Preserves PER-TX snapshot publication, no unsafe cross-request defer/native cache. P2P existing fair queue remains separate; follow-up shared engine design documents sender/scoring/orphans. N1 owns later build slot.
+
+## 2026-10-22T00:12:07+00:00 — overnight_n1_prep
+
+Rootauthorizedresidualshorttxcoalescingvalidation ACTIVE afterABC500kexplicitdrain. Owncontrolbd6a3c4d/treec9c37b07 (exactnewGETSHORTTXtest+unchanged521production) core10-j10 started run.pycontrol under repair-work/residual-shorttx-snapshot. Candidate9e5e64d6/tree3906d2ae follows<=20actions, sameONcache3c24/O3assertionsprofile. ExpectedcontrolONLYpubcounterdelta3vs1fail; candidatethennewcase+existinginvshortPASS. Causalownerrecovered-relay-20261020-0004/global265, snapshotdeferAPIsalreadyowner15. Prefix testneedsdirectnode/snapshot.h includeat265 (later371originalheadernothoisted); preservefinalbytesdedup. All521sealedpackets/measurementbins untouched. No benchmarkoverlap.
+
+## 2026-10-22T00:13:31+00:00 — canonical_records_sync
+
+DepthmatchedABC500k PASS/FULLDRAIN. Actualbitcoind38ae/source1fb7,legacy200B/systemallocator:500000timed+800warmup/final500800 in37.842467042s,13,212.67observedmean/s,peakowned1.685GiB. Existingcurrent521nativeON3e14/a07/treecaf6 remains40.725577083s,12,277.30/s,peak5.33GiB. Nativeobservedrate7.08%lower,one sampledobs each withconsensus/format/transport/allocator differences—NOTsinglecauseorcleanmaxTPS. ABCfirst/last50k3.617/3.990s vsnative3.811/4.305s; nodepthcollapse. All3ABCprofilesactiveingestion/exit0,PG58679empty; compilerwindowreleasedtoN1. Requestedrepo benchmark-results/20261021/abc-native-depth500k-v1 sealedREPORT.md SHA677d9d2b+summary/chunkCSV/top20/actualstackcontexts/raw6profiles+manifest. ABC450kCompare77/SHA25660/secpadd55/double52; native snapshotradix24/RCU23/asynccommitment21/mmap27 remain. ABCsendto38 isP2PnotHTTP (36ProcessGetData→SocketSendData). HOTSPOTS.md sourceinterpretations; exclusiveleafthreadticksNOTCPU%. Toolinglegacyhierarchy/padding commits24b685c9+c975d4f8,18testsPASS,corrected64txsmokePASS; untimedinitialpaddingfailure preserved. No repeatednative/extendedtests. Actualexecutedplaninheritedinformationalnativefee/memoryprojectionfields clarified separately EXECUTED-PLAN-NOTES.json, neverrewritten.
+
+## 2026-10-22T00:14:41+00:00 — review_mining_relay_architecture
+
+Final persistent-root candidate committed e8c1efb70d on521a60; source tree and exported mailbox/delivery.json in canonical exports/persistent-commitment-workers521. R3compile1.5s passes-O3WallWextra;21independentspecoraclecohorts,672concurrentcalls, duplicate rejection/posterrorreuse PASS. Final3s kernel64root37.8→19.7us,500k74.3→76.4ms (~2.9%sloweronepair). Candidate explicitly NOTPROMOTED; mediumrootgainsmeasuredR2only, noTPSclaim. PermanentTxOverlayArena differential/concurrencytest added butnotcompiledrun. Allownedruntime/compilerFULLdrain notifiedcanonical_records_sync/N1; noexistingcache/canonicalsourceedits. Next onlyifcoordinatorchooses: focusednativebuild+endpointA/Bagainstpreserved521.
+
+## 2026-10-22T00:15:22+00:00 — canonical_records_sync
+
+Measurementcoordination resumed allbuglanes. Durableledger benchmark-results/20261021/next-performance-coordination/ACTIVE-LEDGER.json distinguishes9e5shorttxcausalPASSawaitingfold/binaryREADY; admission25a3SOURCEreadyawaitingbuild/correctness; commitmentexecutorrefiningkernel/daemonpending. Poolreadiness/privatecapability/HS04HS05 arebehavior-first, no unexercisedTPSruns. Existingnative521ON3e14/cache3c24/500k40.725577s andnewABC38ae/500k37.842467s preserved; no baselinerepeatsplanned. No runtimeours. Source-freeze+meaningfulnormal/focusedREADY triggersagreedactualAPIAB underexclusivecompilerdrain, no newusergrant. Resourcecoordinatorresumed;N1askedforactual9e5binary/source/cache.
+
+## 2026-10-22T00:15:42+00:00 — pool_template_readiness_repair
+
+MR08 pool gap sourceconfirmed on521a60/treecaf6. Isolated ~/repos/lotus-v2-pool-template-readiness commits87dbdfc3b0(production3lines fixup originalpool1ad901ac56) +c3eac61fc2(testfixup8a185d4cad where nativepayoutfileintroduced). Exportcanonical daemon/patch-intake/20261021/exports/pool-template-readiness. BeforeGBT firstjob after65independent native mempool children must include650kfees and exact65txids whenmined, tests actualcommitments. py_compile/diffcheckPASS; runtime/buildNOTYET. N1requested beforecontrol preserved521 and buildslot, noindependentbuild started.
+
+## 2026-10-22T00:16:32+00:00 — private_relay_capability_repair
+
+MR06 repair active. Isolatedsource /Users/shammah/repos/lotus-v2-private-relay-capability, branch repair/private-relay-capability-20261021, base521 a60bba6facc924cdf43c34dc881805bb114fe373. Frozen negativecontroltest commit0f38c6237e adds txrelay_tests/stock_peer_does_not_support_private_relay: localhighbandwidthtx+push enabled, ordinary BIP152 stockpeer without privateoffer mustretain INV20 andnotSHORTTX orsealedeligibility. N1ownsfocusedbuild; noindependentbuild. Existing sendinvshort hasINVSHORT/RECON only; nosealedcapability. Rootdesignquestion requested addingexplicit HIGH_BANDWIDTH featurebit insameenvelope (noalias/migration/version). Alsofound outbound SHORTTX policy bypassesprivateflag via BIP152 orNoBan, needsremote-capabilityguard separately. No productionedit yet.
+
+## 2026-10-22T00:16:35+00:00 — review_historical_state_architecture/window_expiry_fix
+
+HS05 window reverse expiry source ready: badd5ad8c7, base a60bba6fac; expiry-owner fixup eec5449b79, separate worktree architecture-state-window-expiry. Three-line net delta repair and focused 3-block serial/window parity/expiry/cancellation test. Mailbox/evidence in historical-state/repairs/window. Compile and before/after NOT_RUN pending parent/N1 resource slot; no production wiring or consensus changes.
+
+## 2026-10-22T00:16:45+00:00 — pool_template_readiness_repair
+
+MR08 beforecontrol REPRODUCED exact521ON preservedlotusd3e14. FrozenupdatednativepayouttestSHAf79b after65independentpendingnativechildren firstpooljob(beforeGBT)reward5,000,000,000 vsrequired5,000,650,000; expectedsoleassertfailure. Onefunctional~1s, no compiler. testhelperclearednodeonfailure; ownpathpgrepemptyFULLDRAIN, portseed208released. Canonicalexports/pool-template-readiness/control.log+delivery.json sealbeforefailure. Candidate87dbdfc3b0+c3eac61fc2 awaitsN1admissioncohortbuild, then exactsamefunctionalpass inclsolvefirstjob+exact65txidrootacceptance; notyetvalidated.
+
+## 2026-10-22T00:16:54+00:00 — review_historical_state_architecture
+
+HS04 real P2P export repair source ready in ~/repos/lotus-v2-repair-work/architecture-state-undo-export branch review/state-expiry-undo-export-20261021: test-only fd52323a1a then causal fixup following. Handler now reads authoritative local CBlockUndo, exports exact vexpired identities with canonical parent snapshot metadata (creationParentMtp absent ABC Coin), no new protocol or root bypass. Focused getblockundo_exports_authoritative_expiry_undo test exercises real TryHandleMessage and binary response. Fixture installs persisted authoritative sweep event directly instead of mining131400blocks; does not claim valid whole expiry chain. HS05 subagent source-ready badd5ad8c7 test reverse_disk_window_restores_expiry_and_cancels_spends. Both base521a60bba. N1 notified build-slot request, no own compilers.
+
+## 2026-10-22T00:17:50+00:00 — canonical_records_sync
+
+Shorttx9e5/tree3906 validatedbinaryfreezeconfirmedbyN1 (daemon9764330f/cache3c24same521ON), actualcausal56assert+existinginvshortPASS. Rootapprovedbenchmarkbeforeordering; kernel/N1compiler/runtimeFULLDRAIN andpsnoheavyjobs. Resourcecoordinatortransferredexclusivewindow. Actual500k candidateRUNNING PG70894/session84708, plan1188e7c2 requestedrepo benchmark-results/20261021/native-shorttx-snapshot-500k-v1/candidate. Same207B/500800/800warmup/500k/10kfee/8writers/arrays50/defaultrealrelay,3depthprofiles/12GiB/free6/critical4/swap4/20min. Existing521ON40.725577s reused, no baselinerepeat. N1sourceprivateindexcompositionmaycontinue,no compileruntilFULLdrain. Activeledgerupdated.
+
+## 2026-10-22T00:18:10+00:00 — intake_delivery_triage
+
+Canonical521 completeness checkpoint durable: triage/deliveries/completeness521/{README.md,ALL-FINDINGS.csv,METADATA.json,FOCUSED-SOURCE-SEARCH.json,reconcile.py}. All60purpose+27independentreview+4snapshot+2memory+1reachability=94 overlapping records preserve disposition/owner/nextgate. C66 doubledecode now resolved in521. MR08 control reproduced missing650000fees after65pendingtx; candidate unbuilt. HS04/HS05/MR06/coalesce/RPCqueue/commitment mapped liveowners/gates. Exact521: parallel StageFinalizedOverlay only through test-only CommitFinalizedOverlay; no DiskStateStore in active validation/block source. Live persistence V2BlockStateSnapshot files+forwarddeltas. Retention/reclamation, reverse fullsnapshot amplification and O(height) activechaincopy need separately scoped design/implementation; no owner assigned. No destructive pruning, unsafe auth/finality restoration, production edits/builds/runtime. Original09final authority maintained. Wider historical coverage remains open.
+
+## 2026-10-22T00:19:29+00:00 — review_historical_state_architecture
+
+HS04 FINAL source freeze replaces local-undo WIP: test-only196b0cc3ae then node3192103295, branch review/state-expiry-undo-export-delivery-20261021, 13-line canonical parent-CoW-SMT sweep selector (GetV2BlockUtxoRoot + erase prior spends + SmtCollectExpired), no new rev dependency. Existing snapshot remains intact. Source mailboxes/evidence/owner mapping/report physically canonical historical-state/repairs/undo-export/. Selector v2_protocol_handler_tests/getblockundo_exports_expired_parent_coins. N1 requested before/after exact gate; no local compilers. HS05 badd5ad source under repairs/window same causal C17aowner. Runtime/build pending explicitly.
+
+## 2026-10-22T00:19:30+00:00 — canonical_records_sync
+
+Shorttx9e5/tree3906 endpoint500k PASS/FULLDRAIN40.624656583s versus preserved521ON40.725577083s(~0.25%difference,NOmaterialendpointgainclaim). Each500000timed+800warmup/final500800/207B/10kfee/defaultrelay,all3activeprofilesPASS. WholePGpeak5.299vs5.330GiB; loadcandidate15.50→13.42vsbaseline10.43→11.54,sampling/freshbytes confounds. Causal56assert+existinginvshortPASS/3→1publicationfixvalid independently; ownerfoldN1pending. Requestedrepo benchmark-results/20261021/native-shorttx-snapshot-500k-v1/{REPORT.md,summary.json,manifest.json,CSVs,rawprofiles,validationreceipts,DRAIN.json};PG70894empty/session84708exit0. ReleasedcompilerboundarydirectN1/resourcecoord. Activeledgerupdated; no baselinerepeat/extendedtests/canonicalsourceedits. NextperfREADYsourcegatespending.
+
+## 2026-10-22T00:19:49+00:00 — private_relay_capability_repair
+
+MR06 root explicitly approved existing sendinvshort high-bandwidth feature-bit extension. Candidate758dcecb67 +testrefinement09efb790d0 atopnegativecontrol0f38c6237e/base521a60bba. TXRELAY_HIGH_BANDWIDTH bit2 advertisesacceptanceofsealedheader+unsolicitedshorttx; localhighbw/pushcontrolsretained, remoteofferrequiredforallprivateoutbound; BIP152/NoBan no longer substitute. Source/tests frozen, N1informedtointegrateincrementalbuild andbefore/fixedfocusedchecks. Packet README/delivery.json/evidence/source-diff.txt at daemon/patch-intake/20261021/exports/private-relay-capability. Nativebuildandbehaviorpending, no benchmarkclaim. Fixupcurrentlynegotiationowner56443331da; earliersealedowner42aa88 andbodyownerbed33 predatecapabilityheader, stagedcausalprefixintegrationrequirescare.
+
+## 2026-10-22T00:21:32+00:00 — beast_json_array_regression
+
+Beastarray investigation source audit frozen: original09fast libevent+same sequentialcoroutinebatch; current521Beast+coroutine; baselineABC libevent+sync. Generic handlers have no per-elementpost. Existingdepthdependentarrayregression cannot be purefixedHTTPoverhead. Preparedcanonical triage/beast-json-array/{README.md,transport_probe.py},8independentpersistentHTTPclients echo singles/arrays50 5seach, clientCPU+responsechecks+binaryhash, nofixture. AwaitexclusiveboundaryafterN1compile; no productionedit/build yet.
+
+## 2026-10-22T00:21:47+00:00 — review_admission_storage_pipeline
+
+RPCqueue refinement a422bbd911 (parent25a3/treeac1097429) gates creation on existing args.GetBoolArg(-server,false), matching AppInitServers. Exported candidate25a/fixups; N1 owns later build union. Confirmed exact native wallet subscriber functional wallet_v2_native_receive.py sendrawtransaction145->immediate gettransaction148. Existing wallet_async_broadcast_visible unit is direct-path only unless separately opting queue. No compilation/runtime by this agent.
+
+## 2026-10-22T00:22:26+00:00 — private_relay_capability_repair
+
+MR06 finalsourcehead e724205aec, tree recovered in exportdelivery.json. Additional2-lineguard keeps short-IDepochindex disabled when txrelayshortids=0 despiteprivate-onlyfeatureoffers. Canonicalpacketreceipt commits23094254 +f103190a. N1confirmed coherentadmission/MR08/HS04/HS05/MR06 incrementalbuildgate; beforecontrol0f38only, fixedadds758d+09ef+e724; assertions/results pending. Noindependentcompileorbenchmark. Parentnotified sourcefrozenandvalidationqueued.
+
+## 2026-10-22T00:22:58+00:00 — beast_json_array_regression
+
+Beastarray cheapRPC control PASS/FULLDRAIN. ABCecho singles41862calls/s arrays50 611509/s;521Beast48099/s arrays615222/s. 5sec/case,8independentpersistentprocessclients,fullyvalidatedidenticalresponsebytes. Noarrayregression (~0.6%diffnoise), singles+14.9%observed. 1secsampleeachdisclosed;onepair/uncontrolledhostload,allocator/dispatcherdifferencessoendpointnotpureBeastAB. No productionfixjustified; largepayload/sendraw/dedicatednetworklane remains. Canonical triage/beast-json-array/{REPORT.md,README.md,comparison.json,script,rawsamples}. Sessions69154/5266exit0 bothdaemonsexit0 allworkersjoined/noownpgrep;compilerboundaryreleasedN1/resourcecoordinator.
+
+## 2026-10-22T00:24:38+00:00 — canonical_records_sync
+
+Usernewnetworkceiling/dedicated500k task: auditconfirmedallprior500kclockstoppednode0RPCreplies andONLYnode0final500800persisted. Peer1/2successcountsNOTretained, cannotrecovercleaneddatadirs; previousresultsnotallnetworkceiling. Newoptintooling commits3d84cc42+3f3d594f,21testsPASS; separatesingressfinish/allpeerpoolconvergence, warmupall3beforeclock, perwriterinjectionnode/count, finalall3counts+matchingSHA256sortedtxidsets(NOTconsensusroot), actualCLI/networkconfig/provenance. Distributed8writers3/3/2takesdisjointsharedmmapchunks, no3xcountinflation. Nextbounded6400batch200preflight single+distributed plans2979c94c/ca4cdc73 prepared requestedrepo benchmark-results/20261021/native-network-batch500k-v1; NO runtimesuntilN1compiler/fullcorrectnessdrain/resourcecoordslot. Actual500kplan503200prepared/3200warmup/500000timed/207B/fee10k (sourceboundrequired<=7633),defaultnativecapabilities,wholePG12GiB/free6/critical4/swap4/20min; peerprofilesplanned. BeastJSONarraycheapRPCisolate sourceauditparallel, no compilers/probes overlap. 3nodeonehostloopback NOTglobalWANceiling.
+
+## 2026-10-22T00:25:55+00:00 — overnight_n1_prep
+
+Nextcoherentadmission/auditbuggate ACTIVE control9873c162/tree50a4e50e, candidateac947cec/treede7d3c03. Source repair-work/rpc-lazy-overlay-source; cache rpc-lazy-overlay-build ON3c24 sameO3assertionswalletONChronikOFF. Normal318-j10 node/core/AVA session28411 build.pycontrol in repair-work/admission-audit-bug-cohort. Controlretainscandidateheaders/tests/newadmission+MR08fix; only3productionTUsrestoreprerepair forMR06/HS04/HS05. Expectedcontrolprivate3assertfails/emptyexpiry1/windowauthroot1 thencandidate<=25incremental+allfailedcasesPASS+newadmissionunit/nativefunctionals+MR08firstjob65txpayoutfunctional. MR08before521solefeeassertalreadyFAILfreshdata/drained. Inputs source.json includes46df/25a/a422,87db/c3ea,0f38/758d/09ef/e724,196b/319210,badd. No benchmark/profileoverlap; shorttx500k andBeastprobeFULLdrained. Rootowns canonicalimports. Shorttx521ownerfold6b017c21/tree3906 all521exportreplayrunning65767.
+
+## 2026-10-22T00:29:56+00:00 — canonical_records_sync
+
+Networkpreflighttoolingnow361b7988/23testsPASS, prepared-onlybothcasesPASS. Addednative/fixed/explicitdistributedguardtests andstrictdedicatedpertransactionreplyaccounting; no actualnetworkruntimeyet. N1coherentcontrolnormal stopped204/318(58.68s)onfixture-onlyHS05ambiguousHash, qualifiedlotus::v2::Hashfixinprogress; no production/runtimefail/testsrun. Remaining~120actions thencontrol/candidatecorrectnessgates; networkcasesparkeduntilactualFULLdrain, no approvalwait. Activeledgerupdated. Rootinformedpriornode1/2successcountsneverpersisted; newobserverallpeerproofmandatory, no fabricatednetworkceiling.
+
+## 2026-10-22T00:30:29+00:00 — review_historical_state_architecture
+
+N1 coherent control build surfaced HS05 test compile ambiguity `Hash target` at fast_sync_shard_tests.cpp897; corrected exactly to `lotus::v2::Hash target` in test-only fixup0d60dbc4d8, sent immediately for identical control/candidate application. No production/assertion changes, no own build. Source-only HS01/02/06 completion plan saved historical-state/STORAGE-COMPLETION-PLAN.md: architecture-state lane owner; explicit finalized retention/recovery/index lease decisions before deletion; live native backend is V2BlockStateSnapshot files, not standaloneDiskStateStore; reverse inverse-delta DAG/checkpoint design must avoid forward-parent/reverse-child cycles, preserve verification and durable frontier. No destructive implementation/default changes.
+
+## 2026-10-22T00:34:12+00:00 — review_historical_state_architecture
+
+Actual N1 HS04 control now reproduces intended missing export: expired_swept_coins0vs1 (12/13assertionspass,exit201,0.1804sec). HS05 first runtime stopped beforetarget: directDiskStateStore::Open lacked explicit header_index (not causal expiry failure). Test-only e28c1981d8 adds header_index plus PutCheckedHeader required byImportFastSyncPivot and preservesOpen error diagnostics; N1receivedforbothcontrol/candidate. Rawlogs admission-audit-bug-cohort/control-HS04.log andcontrol-HS05.log. Both failures retained in reports; don'tcountHS05asvalidatedcausaluntilrerun.
+
+## 2026-10-22T00:34:22+00:00 — canonical_records_sync
+
+Network coordinator checkpoint: NO owned runtime. Tooling361b7988/23testsPASS; bounded6400 single/distributed plans prepared native-network-batch500k-v1. N1 coherent control compile/link now PASS after fixture Hash qualification; MR06 expected3 wirepolicy failures and HS04 expiredvector failure reproduced. HS05 before fixture failed opening without header_index BEFORE target, explicitly INVALID causal proof; identical fixture correction/rerun HS05 only pending, then candidate gates. Do NOT start network until N1 actual FULL compiler/runtime DRAIN. Prior500k nativeON/shorttx/ABC results unchanged. Next authorized slot: bounded signedbatch2006400 cases with all-peer proof, then actual503200 prepared/500000timed single/distributed with peer profiles under root12GiB/free6/critical4/swap4/20min. Source/binary currently validated9e5/9764330f/cache3c24; pin any new combined source/binary before using it.
+
+## 2026-10-22T00:36:30+00:00 — canonical_records_sync
+
+Relay configuration correction before network500k: actual frozen native adapted scripts explicitlywhitelist127.0.0.1 AND highbandwidthtx1(defaultfalse),16RPCthreads/par8/checkmempool0. Prior shorthand defaultrelay inaccurate; these are realP2P but whitelistedhighbandwidthloopback benchmarks, notstock/WAN/globalceiling. ABCadapterremovesunavailablehighbandwidthoption whilewhitelistremains. Rawactualadaptedscripts/hashesproveflags. Addedappend-only RELAY-CONFIG-CORRECTION.json beside completednativeON/shorttx/ABC reports; originalsealedresults/manifestsunchanged. Newnetworkplans preserveandexplicitlylabeltheseactualflags, notsilentlychangeprofile. Rootnotified; no runtimesours.
+
+## 2026-10-22T00:38:08+00:00 — review_historical_state_architecture
+
+IMPORTANT HS05 HOLD: corrected runtime fixture reaches deeper originalgenericC17agap, notwindowtarget. BuildBlockUndoMessage predicts1expiredcoin; generic assembler_fixture::Connect leavescoin, so assertionabsenceFAIL thenserialPeelBlockReverse rejects 'expired swept coin already exists'. Generic StageCompleteBlock called by PeelBlockReverse also lacksexpiry; handcraftedexpiry-awareendingstates wouldfailforwardroot. Do notweakenserialchecks/fakefixture orclaimwindowcausality. HS05nodefix/integrationHELD, source-onlygenericpipelineparityscopeassignedexistingwindowagent. Realdaemonprimitives/block.cpp DOESsweep. HS04causalcontrolvalid, candidatepending. Root/N1notifiedimmediately; logsreportsupdated.
+
+## 2026-10-22T00:39:12+00:00 — review_historical_state_architecture/window_expiry_fix
+
+HS05 held after real fixture run found deeper ORIGINAL generic forward expiry omission: generic Preview/Stage/Connect does not sweep although undo builder/reverse expects it. SOURCE-ONLY GENERIC-EXPIRY-GAP.md + exact original/current hashes evidence now in canonical historical-state/repairs/window. Minimal coherent repair requires state expiry selection API, evaluator sweep+monetary args and preview/disk/undo parity. No additional production edit/build/runtime launched.
+
+## 2026-10-22T00:42:09+00:00 — overnight_n1_prep
+
+Candidate r5 clean2b61dded451755e175681f41a57281a5c0554e32/tree2b4fef46071b44cc8789a49553b3d112b4fd084e: normal15-j10 node/core/AVA PASS11.99s, unchangedON3c24. All10focused relay/private/sealed/HS04/admission cases PASS. Logs/results repair-work/admission-audit-bug-cohort/candidate-{build,focused-results}.json. Compiler/unitdrained; pool agent now runs ONLYMR08afterfunctional then admission2nativefunctionals serial. HS05production/test REMOVED: genericC17aforwardStageCompleteBlock lacks expiry, proposedreversefixtureinvalid; originalfailedlogs preserved, stateownerstaffed. Do not claimHS05passed. Currentcache/sourcefrozen; no benchmark/networkuntilfunctionalFULLdrain. Rootshorttximportwrapper remains READY.
+
+## 2026-10-22T00:42:14+00:00 — pool_template_readiness_repair
+
+MR08 AFTERcontrol PASS unchangednativepayoutscriptSHAf79b, combinedsource2b61dded451755e175681f41a57281a5c0554e32/tree2b4fef46071b44cc8789a49553b3d112b4fd084e clean; daemon339e58967f6deba62e029da04528f7d423926f16455c64d49c3ffb72cb0b7275 actualONsamecache. Singlefunctional~3s: firstjob650kfees +solvedacceptedblockexact65txids/mempoolempty +inheritedmaturity/spendability/invalidpayoutguards. Canonicalexports/pool-template-readiness/candidate.log+delivery.json nowBEFORE_FAIL_AFTER_PASS. N1compiler/focused10unitPASSreportedseparately; thisreceiptclaimsfunctionalonly. OwnnodesSTOPPED/pgremptyFULLDRAIN portseed208released, N1notifiedadmissionruntimefree. Ownerprefixfixup1cc82dee40 parent1ad901ac56 plainapplyPASS, tipprod87db/testc3ea readyrootfold.
+
+## 2026-10-22T00:42:31+00:00 — canonical_records_sync
+
+N1r5gateupdate: normal15actionsPASS11.99s,tenrelay/HS04/admissionfocusedcasesactive,then3nativefunctionals. HS05window-onlycandidatecannotclaimpassbecauseforwardStageCompleteBlockalsoomits expiry; HS05production/testexcludedpendingbroaderauthorizedrepair. NetworkruntimeparkeduntilFULLdrain. NewnetworkdedicatedbatchAPIbypassordinaryRPCmicrobatchfeature; doNOTattributeitsrategaintoqueue. Aftergateactualsource/binfreeze: bounded6400observer/distributedsanity,latestuser500ksingle/distributednetworkcasespriority; separateONEcommonJSONarray50candidateobservationcanexercisequeuevs521ONbaseline. Toolsource122c6aea/23PASS andcanonicalrecoverytooling-snapshot retained. No ownedruntime/sourcechanges.
+
+## 2026-10-22T00:44:04+00:00 — review_admission_storage_pipeline
+
+Combined2b61 compiled and N1reports3RPCqueue focusedcasesPASS. Firstnewfunctional attempt fails BEFORE node startup: __file__ string passed to argv harness; exit2/.38s, no processes left, exactsource/bin/config stable. Wallet notrun. Test-only causalfix4880e9b098 changes entrypoint to IndependentAdmissionTest().main(), --helpPASS. Exportcandidate25a/fixups0002. AwaitN1source re-pin before retry samebinary. No combinedsource edits byme.
+
+## 2026-10-22T00:44:29+00:00 — review_historical_state_architecture
+
+HS04 actualafterPASS now: N1candidate2b61dded451755e175681f41a57281a5c0554e32/tree2b4fef46071b44cc8789a49553b3d112b4fd084e, binary9d0e696ba3c18976931132cd64f9d43c0ac12ea8dbd2b06f5ea8674cea3add61, selectorgetblockundo_exports_expired_parent_coins18/18assertPASS exit0 .1363s. Validbefore0vs1FAIL preserved. Rawlogs copied canonicalrepairs/undo-export. PureHS04prefixtransform ready there/prefix-transform:93independent C17aowner-to521prefixes transform/idempotencePASS, immediatepreownerNOOP, finalexact196b+319bytes. No93prefixbuildclaim. N1requestedownertransform delivered; HS05/genericexpiry stillHELD, excludedcandidate.
+
+## 2026-10-22T00:46:11+00:00 — overnight_n1_prep
+
+FULLCOHORTPASS/FULLDRAIN: normal2b61/tree2b4fef46 15actions11.99s; tenunitcases482assertions; poolfirst65txjobafterPASS; independentRPC+walletcallbackfunctionalsPASS1.168/2.142s. Runtimefixture0858ed52/tree143e6 (ONLYPymainargvfix4880, compiledC++exact2b61). Preserveddaemon339e58967f6deba62e029da04528f7d423926f16455c64d49c3ffb72cb0b7275, ON3c24cache. Sealed exports/admission-audit-bug-cohort-validated/.READY withsourcebundle+rawreceipts; statusexplicitVALIDATED_DIAGNOSTIC_ENDPOINT_NOT_CANONICAL_IMPORT_READY. HS05production/testexcludedgenericC17aforwardexpirygap. Rootnotifiedcanonicalnow142(80/62), source09f95/tree72bff versusold521cohortbase; NEVERimport521overcurrent142withoutmapping. Ownerprefixtransforms MR06/HS04/admissionunderpreparation. Runner/coordinatorexplicitFULLdrainnotified; networkpreflightqueuednext. No furtherbuild/runtimeours.
+
+## 2026-10-22T00:46:44+00:00 — private_relay_capability_repair
+
+MR06 N1reported allsixaffectedrelaycasesPASSoncombined2b61/tree2b4,15normalcasesPASS,actualcontrol3expectedfailingassertionsretained. Sourcefrozen e724205aec nowbehavior-gated. Pureprefixtransform(files)->dict at exports/private-relay-capability/prefix-adapter/transform.py +payload.json; all257prefixesfromrecovered-relay-0004/global265(56443331da) through521a60 transformandsecondapplicationidempotent; endpoint6blobs exactlymatchcandidate. Earlierhelpersdon'timportfuturetxrecon/pushoptions; existingsealedtestatowner265, newbodytestsenterwithpushoptionowner6e26776089; nativeordinarysealedguardonlywhenvariableexists. N1integrationprepnext, noGit/cache/sourceeditstotheirlane.
+
+## 2026-10-22T00:47:48+00:00 — canonical_records_sync
+
+ActualnetworkpreflightRUNNING singleingress signedbatch200 PG97681/session43535,latestvalidatedcohortcompiled2b61/tree2b4 daemon339e/cache3c24. N1FULLgatesPASS15normal/10focused482assert/MR08+2admissionwalletfunctionals; runtimefixture0858diffONLYtestfunctionalPython independentlychecked. HS05explicitlyexcluded. Singleplan50f7b5a/distributed20c97cb1,toolb699/24testsPASS,6400prepared/3200warm/3200timed/noTPS/nosampler,allpeerwarmup andexactfinalsetproof. Whitelist127/highbandwidth1/16RPC/par8/checkmempool0explicitnotdefaults. Root/resourcecoordnotifiedexclusivequeuedruntimewindow,nocompiler/probesuntilbothsanitiesdrain. Sourceorderingnotrequiredforactualfrozenpins. OnPASSnextrootrequested503200prepared/500000timedsingle+distributed networkcaseswithpeerprofiles under12GiB/free6/critical4/swap4/20min.
+
+## 2026-10-22T00:47:49+00:00 — private_relay_capability_repair
+
+MR06rawproofreadandhashed: canonical exports/admission-audit-bug-cohort-validated/candidate-focused-results.json first6casesPASS318assertions, source2b61dded451755e175681f41a57281a5c0554e32 tree2b4fef46071b44cc8789a49553b3d112b4fd084e. Actualcontrolstockcase3of32assertionsfailbeforefix. Importantintegrationhold: daemon/v2-versionnow09f95original142withoutsendinvshortfeatureexchange; old521transformcannotblindimport. RootandN1notifiedparentmapping/dependencydesignneeded. DeliveryjsonandREADMEupdatedhonestly, native-validation.jsonstoresproof+rawhashes. Canonicalrefsuntouched.
+
+## 2026-10-22T00:48:27+00:00 — review_admission_storage_pipeline
+
+RPC functionalsbothPASS onruntimefixturesource0858/tree143e productionbinary339e58 (2b61compiled): independent1.168s, nativewallet2.142s; FULLDRAIN PG92848/92887,no kills. Callbackaudit exported candidate25a/CALLBACK-AUDIT.md. Prepared UNVALIDATED hardening29736e1a3e: shared-owned validation barrier survives schedulerthrow-after-enqueue, actualBroadcast causaltest. CurrentRPCthreads remain blocked; no coroutine/nonblocking claim. Source-onlyprefixtransform in progress againstOLD521prereqs only, explicitlynot142-stack validated.
+
+## 2026-10-22T00:51:00+00:00 — review_admission_storage_pipeline
+
+Historical521 admission pureprefixtransform delivered exports/queued-admission-prototype/prefix-transform-old521/{transform.py,payload.json,PREFIX-RECEIPT.json,README.md}. 151originalprefixes transform+idempotencePASS; all10endpointfiles exactcandidate29736 bytes. Nativefunctional firsteligible573ebd nativewalletreceiveowner, notshared. Sharedinit/destructor transforms avoidfuturepool APIs. ExplicitNO142-stack replay/build/validation orpinreplacement. Hardening29736 stillunbuilt; earlierqueuefunctionalsPASS cannotrelabel.
+
+## 2026-10-22T00:51:36+00:00 — canonical_records_sync
+
+Bothboundednativebatch200networkpreflightsPASS/FULLDRAIN:3200timed+3200warmup,all3final6400/identicalsortedtxidsetdigests;single8/0/0vsdistributed3/3/2confirmed;peak864/892MiB. Pollfirstfull~0.255/0.261s is250mspollupperbound, NOTprecisenetworklatency/noTPSclaim. Actual500kSINGLEINGRESS nowRUNNING PG99516/session71990,plan4c250a60 latestvalidated2b61/tree2b4 daemon339e/cache3c24/toolb699.503200prepared/3200warmup/500000timed,8writersnativebatch200/fullsignedvalidation/fee10k,explicitwhitelist/highbandwidthloopback. Observerall3/finalmatchingtxidsets,peerprofilesownnode0/1/2atlocal50k; progress/fsynccheckpoints. ConservativewholePGbudget10GiB<root12GiB/free6/critical4/swap4/20min hardguards. No activecompiler/probes inactualps; coordinator/rootnotifiedstandingnextscope. Distributedplan df32599b followsseriallyonPASS, no moreapprovalwait. N1sourceorderingmetadataonlymaycontinue. HS05excludedfromlatestcohort,nohiddenbugfixclaim.
+
+## 2026-10-22T01:02:59+00:00 — beast_json_array_regression
+
+Beastarray resumed userclarification preserve sequentialarrays. Foundactualoriginal c1latencyregression in /private/tmp/beast-http-p2p-bench/http_ab.pass1/2/3:50getblockhashbatchp50111/116/111uslibeventvs146/150/151Beast;concurrent16/64throughputroughlysame. Historicalowner155writefastpath+oneidletimerfixalreadyretained,remaininghistoricaltwohandoffgapnotfreshproof. Sourceexactbeforee6f5b77/after8796bdbbothcoroutineRPC isolatesBeastreplacementifbuilt(no buildsstarted). CanonicalSOURCE-HISTORY.md+historicalraw/hashes copied;size_probe.py prepared207/414binarybyteshexargs,c1/c8,singles/arrays50,5sec,p50p95p99. No runtime untilcanonicalrecordsnetwork500kFULLDRAIN+grant. No sourcepatch.
+
+## 2026-10-22T01:03:40+00:00 — canonical_records_sync
+
+NETWORK500K FAIL/DRAIN 2026-10-22T01:03Z: single-ingress dedicated submitrawtxbatch200 accepted500000 timed +3200warmup in44.938443708s; after600s post-injection convergence deadline inventories503200/499882/502279. Processgroup99516/session71990 exited1, no remaining descendants (ps verified); peak5295603712B/no resource abort. Missing snapshot3318/921, only1 absentboth, none withinlowest4096originIDs; unbroadcast0. Investigative lead not causal proof. Exact source2b61dded/tree2b4fef460/bin339e58967/cache3c24, toolingb6993133. Report benchmark-results/20261021/native-network-batch500k-v1/REPORT.md; NETWORK-FAILURE-SUMMARY.json +failure-artifact-hashes.json preserve profiles/missing sets/raw receipts. Distributed500k UNRUN after genuine network failure. Root/N1/resourcecoordinator explicitly notified FULL drain; no new measurements or compilers owned. Next task relay/request-state coverage repair then meaningful corrected network test; no successful all-peerTPS claim.
+
+## 2026-10-22T01:06:30+00:00 — growth_dependent_algorithm_audit
+
+StartingURGENTreconeventualcoverage repair exacttested521derived2b61dded/tree2b4fef46. Ownsource recon-eventual-coverage-source. Investigate4096fixedminIDs+agedout30swindow; deterministiccounterexample first, boundedexplicitmatchingrange/page sem ifneeded; coordinateprivate_relay_capability_repair, noheavybuild/runtime untilN1.
+
+## 2026-10-22T01:06:34+00:00 — review_admission_storage_pipeline
+
+Typed owned RPCqueue outcome SOURCEONLY d559b131a8/tree17432940 onsharedbarrier29736. Worker now promise<RpcAdmissionOutcome> enum+ownederrstring+sharednotification, set_value(move(outcome)); producer future.get thenseparatevalidation/secondarywait+relay. Queuedclosure owns tx/limits/movedprecompute/barrier, no result/error RPCframe refs. Node borrowed underownedshutdownlifetime. Testsnowtypedperrequestpayload; newrefactorNOTcompiled/coveredby2b61passes. Canonicalcandidate25a/fixups0004+TYPED-OUTCOME.md; N1gatedafteractive networkcase.
+
+## 2026-10-22T01:07:34+00:00 — review_admission_storage_pipeline
+
+Typed-owned candidate d559 minimaldelta exported + N1handoff. New historical521prefix-transform-old521-typed:151prefixes/idempotencePASS, exact10endpointfiles tod559; older29736artifactpreserved. No142-stack validation/pinwrites. Requiresnextownedbuild fourfocusedcases + independentRPC/nativewalletfunctionals; earlier2b61/0858proofs staypriorversion. No HTTPsession captures, queuedinputsown tx/limits/precompute/barrier; node lifetimecontextowned. ExplicitRP Cpoolblocking remains synchronous, notasyncresumption. No additional runtime/compiler ran.
+
+## 2026-10-22T01:08:43+00:00 — beast_json_array_regression
+
+Size-matchedJSONprobe16casesPASS/FULLDRAINsession78147exit0:8owneddaemonsexit0 allworkersjoined,anchoredowneddaemonpgrepempty. Five-seconds each,no sampler.207Braw→414hex array50 c1ABC122669vs521121554calls/s,c8520941vs509311;414Braw→828hexc8ABC357074vs521372662. No consistentarrayregression;singlec1p50gap66.5→85.5us207Bwhilearray50p50394.6→397.7us. EndpointnotpureBeastAB;largeechoresponseoverestimatesTxIdresponse. ActualstageinstrumentationNOT_RUN. CanonicalSIZE-REPORT.md,size-results.json,percasecommands/hashes/clientCPU/p50p95p99,size-DRAIN. DirectcompilerboundaryreleasedN1/root/coordinator.
