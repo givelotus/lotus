@@ -4,7 +4,7 @@ Status: **implemented in production call paths on review source
 `c4d489d4826509013c982fa100e5e5de4a64ba5c`, based on corrected 527
 `385b64d7e7e0666e2bfff9865ee831a3186795fd`. All 1,199 native cases and
 400-round ThreadSanitizer stress and two-node scope-5 recovery/mining pass. Three microbenchmark repetitions at
-5k/100k/500k are recorded; integration into the active main manifest is pending.** This document is the
+5k/100k/500k are recorded; canonical patch 528 is integrated by commit `90e98bf0`; matched 527/528 node benchmarks are pending.** This document is the
 specification for the follow-up recorded in
 [`lazy-merklix-snapshot-followup.md`](lazy-merklix-snapshot-followup.md). It
 does not change consensus hashing, block validity, transaction validation or
