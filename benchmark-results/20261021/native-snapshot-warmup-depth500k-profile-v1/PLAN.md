@@ -1,0 +1,7 @@
+# Final snapshot-warmup depth profile — prepared, not executed
+
+Exactly one existing500k ordinary JSONarray50 run: eight writers,500800 distinct207B transactions including800 untimed warmup, fee10000. Candidatee1ff/tree9a06/daemon46df, cache3c24, original256KiB, jemallocON and fullscope source. Sample only ownednode0 for1s/1ms at actual accepted depths50k/250k/450k; retain overlap markers and mark elapsed diagnostic. No baseline rerun or matrix.
+
+After ingestion read node counts and per-process/client RSS at0/5/15/30s. Counts do not prove TxId-set equality. Whole-owned-group12GiB/free-indicator6GiB/critical-pressure4/new-swap4GiB/20min guards remain. Stream/mmap fixtures; no all-JSON in RAM. Source/binary/tool hashes and unchanged timed core are pinned inexecution-plan.json.
+
+Execution is held until root confirms actual527 import and exclusive compiler/heavyGit drain. Driver refuses the PREPARED status. On release change only status toREADY_AFTER_ACTUAL527_IMPORT_AND_EXCLUSIVE_DRAIN, preserve this prepared plan hash, then run `python3 run.py` here. Reuse existing depth analyzer; distinguish active leaf candidates from nonadditive ancestor counts and waits. Do not convert thread sample ticks to CPU utilization. Report final serialized hotpaths, particularly whether snapshot preparation removed lockedPreChecks/capture; no further runtime after this unless a concrete failure requires it.
