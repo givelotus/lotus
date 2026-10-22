@@ -181,3 +181,16 @@ Append-only. Times are UTC.
 - Legacy `gbt_compact` is unavailable at point 374 (`standard template returned`). At point 0 it was unavailable (`Invalid mode`). Neither value is zero.
 - `historical-l1` ran only at point 374, because batch RPC is registered there. Point 0 has no matching samples. Its largest admission is 6000 transactions in about 0.04–0.54s, so its tx/s figures are short bursts. One-call batches: 6000 requests, median 11170 tx/s. Batches of 200: 30 HTTP requests, median 136300 tx/s. A 4000-transaction batch of 1000 lasted median 0.027s (145800 tx/s). Three-node relay of a 6001-transaction block took median 68.4 ms. These are not a 500k sustained result and are not a comparison with point 0.
 - Point 527 and the sustained 500k workload stay unstarted. Not pushed.
+
+## 2026-10-22T17:44:30Z — point 527 measurement started
+
+- Merklix ninja 61030 finished. No other ninja or clang had a Merklix build directory as its working directory. Notes stash `bf1c8fa8` was popped after the dataset manifest rewrite. The stash list is empty.
+- Runner pid 64312. Candidate `e3c62b33`. Harness `10bb374b410b4e684b465fab223ffe3a48f1bf3d8c8f285f04e23d0f960bc8c3`. Repetitions 3, jobs 10. Expected tip `ec6f79f7b6c497e70c57a3442bd7d714d7602ef3`, tree `41e7c702526a0687cdbc3148286b72fea8c7605a`.
+- Host memory pressure level 2. Swap about 30.6/31.7 GiB used. Replay was in progress at `ced306c14c` when this note was written. No timing yet. V2 patch 041 still names `mining_template`; its compile has not been tested.
+
+## 2026-10-22T17:48:00Z — point 527 build failed in the txrelay template test
+
+- Pid 64312 exited 1 after 167s. Replay reached the V2 tip and ninja failed while compiling `src/test/txrelay_tests.cpp`. No timing samples.
+- The test still called `PublicationCount`, `mining`, and `GetMiningTemplate`. V2 patch 041 removes those and stores `mining_template` by value. Packet `failure-point-527-txrelay-template-api.json` (`9c7331e9dbd436034ab225fdba991816628ed9570257e905fc96241cb7abe5ff`).
+- The test in that mailbox now calls `EnsureMiningTemplate()` and requires the new template id to be the previous id plus one. Snapshot identity, `transactions_updated`, mempool size, and the unbroadcast flags stay checked. Prefixes 0–414 are unchanged, so the point 0 and point 374 records stay valid.
+- Replayed tip `aa4f90e58240072c0f2cb7bf54fa502d36ca05b6`, tree `4bff83f7c062f483ec7958db7695b674b75b7404`. Global 415 commit `901e2815b831d144f77e2774966883f9a3aeff99`, tree `b5c554fa52ca19f0eb89b5ed76756dc0826b465b`. These gates have not passed. The sustained 500k workload stays unstarted.
