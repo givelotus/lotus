@@ -1,0 +1,1265 @@
+From b67ce2d260e94b22facf22744b68f7cdbf0aa6a1 Mon Sep 17 00:00:00 2001
+From: Shammah Chancellor <shammah.chancellor@notvalid.com>
+Date: Wed, 21 Oct 2026 17:10:34 -0700
+Subject: [PATCH] rpc: drain independent submissions through a bounded commit
+ owner
+
+Keep ordinary per-request fee bounds, authoritative admission, snapshot publication and validation barriers. Only sendrawtransaction opts in; producer threads perform their existing callback waits and relay after commit acknowledgment. Drain immediately with no collection timer, share cs_main across bounded slices, and retain direct fallback under overload. Wallet, Chronik and existing fair P2P admission remain direct/separate.
+
+Add callback/snapshot causal control, independent exception and shutdown/byte-pressure cases, plus native concurrent-error/conflict and sequential-array functional coverage. Candidate compile/runtime validation pending coordinated build; no performance claim.
+
+Coordinator validated purpose integration (2026-10-21): includes original design46df, server-enabled lifetime fixupa422 and argv-only functional fixup4880. Retain full per-transaction authoritative admission/publication/callbacks; bounded immediate RPC-only commit owner, direct overload fallback, no P2P result flattening. Native-only functional enters with its real NativeMiniWallet/wallet-receive prerequisites. Typed outcome/barrier successor29736+d559 remains separate UNVALIDATED work and is excluded here.
+---
+ doc/design/queued-rpc-admission.md     | 275 +++++++++++++++++++++++++
+ src/init.cpp                           |   6 +
+ src/net/txrelay_index.h                |   3 -
+ src/net_processing.cpp                 |  51 +++--
+ src/net_processing.h                   |   4 +-
+ src/node/context.cpp                   |   5 +-
+ src/node/context.h                     |   2 +
+ src/node/transaction.cpp               | 239 +++++++++++++++++----
+ src/node/transaction.h                 |  27 ++-
+ src/protocol.h                         |   7 +-
+ src/rpc/mempool.cpp                    |   3 +-
+ src/test/txrelay_tests.cpp             | 124 +----------
+ src/test/v2_protocol_handler_tests.cpp |  52 ++---
+ src/test/validationinterface_tests.cpp | 117 +++++++++++
+ 14 files changed, 678 insertions(+), 237 deletions(-)
+ create mode 100644 doc/design/queued-rpc-admission.md
+
+diff --git a/doc/design/queued-rpc-admission.md b/doc/design/queued-rpc-admission.md
+new file mode 100644
+index 0000000000000000000000000000000000000000..cec663ce7b322854d6b16b68191ec239f77d1fe9
+--- /dev/null
++++ b/doc/design/queued-rpc-admission.md
+@@ -0,0 +1,275 @@
++# RPC admission microbatch design
++
++Status: source-reviewed design, not implemented or enabled. Base is maintained
++517 `aed364af278a26e71d34ecfa3569ea870e82ccfb`, tree
++`5caf8ba1cb66ca15e50c0c761bae744a779d5798`. No build, test, profile or benchmark
++was run for this document.
++
++## What the queue can improve
++
++A node-owned admission thread can collect already-arriving independent RPC
++submissions and amortize chain/mempool lock transitions and snapshot publication.
++Producers enqueue bounded requests and wait outside daemon locks. The worker
++drains immediately; there is no mandatory batching delay. A quiet node processes
++one request immediately, while a busy node naturally accumulates batches.
++
++This does not make native VM execution cheap by itself. It does not turn one
++atomic package verifier into independent transactions. It does not eliminate the
++consistency requirements currently enforced by `cs_main`.
++
++## Current call graph and ownership
++
++```
++sendrawtransaction / PWA RPC
++  -> BroadcastTransaction(wait_callback=true)
++     -> PrecomputeMempoolAdmission
++        legacy: resolve copied inputs under locks, verify outside locks
++        v7: return immediately (not a legacy advisory-verification target)
++     -> LOCK(cs_main)
++        -> check already-confirmed outputs
++        -> ProcessTransaction(limits, optional advisory outcome)
++           -> authoritative admission, fee/lock/conflict/deferred checks
++           -> mempool insertion and validation notification
++        -> AddUnbroadcastTx when relay requested
++        -> register main validation-queue barrier for newly accepted tx
++     -> unlock
++     -> wait for main barrier, then SyncSecondaryQueues (wallet/Chronik)
++     -> RelayTransaction
++     -> RPC result
++```
++
++Wallet callers using `wait_callback=false` may hold wallet/chain locks. They must
++continue through the direct path; sending them to a worker and waiting can
++deadlock. `transaction.h` already documents this restriction for synchronous
++callers. Chronik and internal callers must be inspected individually rather than
++assuming every call is an unlocked public RPC.
++
++`ProcessRawTxBatch` is a different API: it provides atomic package semantics,
++one shared fee-rate limit, coordinated dependency checks and collective failure.
++Independent `sendrawtransaction` requests can have different fee bounds and
++must return different outcomes. Calling the atomic API once for a queue batch
++would change semantics.
++
++## Why immutable views do not remove the commit lock
++
++Published chain/mempool snapshots let readers observe immutable data without
++owning mutable daemon state. They do not atomically reserve input coins or
++prevent a concurrent block, wallet send, P2P transaction, expiry sweep or reorg
++from changing the state used by an admission decision. An immutable spent coin
++can remain alive after another transaction has spent its outpoint.
++
++The RPC queue has one commit owner **for queued RPCs**. Block validation, direct
++wallet admission and P2P admission still exist, so it is not a global transaction
++sequencer. The final commit still takes the existing authoritative locks.
++
++Slabs also do not eliminate this distinction: they reduce allocation overhead,
++while mutation ordering and object lifetime remain independent requirements.
++
++## Phase 1: independent commits and publication coalescing
++
++1. Add a `NodeContext`-owned `RpcAdmissionDispatcher`. Initialize it after
++   chainman/mempool/peerman/validation signals exist and before RPC warmup ends.
++   Use the existing process lifecycle; do not create a global singleton.
++2. Route only unlocked synchronous callers (`wait_callback=true`) to it. Keep
++   current legacy advisory preparation on producer threads before enqueueing.
++   This retains useful parallel legacy verification. Native preparation remains
++   unchanged initially.
++3. Each request owns immutable `CTransactionRef`, its exact `MempoolAdmissionLimits`,
++   relay intent, optional advisory result, main-callback barrier and completion
++   promise. Do not retain an HTTP/session pointer or a caller's stack string.
++4. Use an existing fixed-capacity Boost lock-free pointer queue for many
++   producers/one consumer. Slots, pending transaction count, bytes and in-flight
++   request count must all be bounded. Promise/request allocations occur before
++   admission locks. A request object remains owned until the worker acknowledges
++   completion, even if the HTTP connection disappears.
++5. Wake the consumer on publication; drain immediately up to a bounded work
++   budget. Do not sleep 10 ms to collect a batch. Determine a useful drain bound
++   from measurements before selecting a production default. No new operator
++   configuration is needed for an unmeasured timer.
++6. Split `BroadcastTransaction` into an unchanged authoritative locked phase and
++   post-lock notification/relay completion. The direct path calls both in the
++   same order as today. This extraction must land with parity tests before the
++   dispatcher is enabled.
++7. The dispatcher takes `cs_main` and mempool ownership once for its drained
++   slice, constructs one `ScopedSnapshotDefer`, and invokes the ordinary
++   authoritative locked phase separately for each request in queue order.
++   Never pass the slice to atomic package admission. One bad member does not
++   reject earlier or later independent members. A child only sees an earlier
++   parent if that parent actually committed.
++8. Destroy the snapshot-defer guard and release **all** chain/mempool locks before
++   any main-queue or secondary-queue wait. Relay and resolve each promise only
++   after that request's existing completion requirements are met.
++
++The batching layer must not wait for a wallet callback while it owns either
++admission lock. A worker that simply calls the existing synchronous
++`BroadcastTransaction` serially, including its callback waits, would remove
++current RPC concurrency and is explicitly not the proposed implementation.
++
++### Publication/callback invariant that needs a test before enabling
++
++Today each transaction publishes its snapshot before its validation callback is
++registered. A batch defer can allow queued notification processing to begin
++while the batch snapshot is still old. Before enabling coalescing, establish
++whether subscribers consume snapshot state during an event. If they do, stage
++notifications until after publication while retaining their original sequence,
++or keep per-transaction publication. Do not assume that a completion barrier
++alone proves event-time state is equivalent.
++
++The barrier must remain per request. A later request with unusually slow work
++must not be silently included in an earlier request's declared completion
++contract. Coalescing creates a possible additional wait inside the bounded
++slice, which needs latency measurement and an explicit upper bound.
++
++## Phase 2: native parallel preparation needs a validated read set
++
++Do not introduce a cache of whole VM outcomes keyed only by txid. Validity also
++depends on script flags, native coin data/creation height, transaction lock
++context, deferred and structural records, and policy context.
++
++A safe reusable outcome needs to own:
++
++- Immutable transaction/witness data and the exact resolved coin bytes used.
++- The tip/context identity and native script flags used for preparation.
++- Every relevant outpoint and deferred/structural dependency read.
++- Successful cryptographic outcomes bound to their exact signature message,
++  public key and signature; full VM execution outcomes need a broader key.
++- Produced native records, resource counts and error attribution.
++
++Resolve/capture under the appropriate lifetime and consistency guards, run pure
++preparation/verification through existing persistent workers outside
++`cs_main`, then repeat cheap authoritative checks under the commit locks. Compare
++the actual read set: unchanged tip alone is insufficient because other mempool
++transactions can spend the same inputs at the same tip. A context mismatch must
++fall back to ordinary authoritative verification, never trust the stale result.
++
++Existing legacy `PrepareStaged`/`ComputeAdmissionChecks` is an example of the
++capture/verify/revalidate pattern, not proof that its outcome type is sufficient
++for native deferred semantics. Native atomic package collectors can eventually
++share pure cryptography, but their collective failure protocol cannot become
++the independent-RPC admission policy.
++
++## Ordering, overload and lifecycle
++
++- FIFO means linearized successful enqueue order. Concurrent callers have no
++  extra cross-connection ordering guarantee today. Sequential JSON-RPC array
++  execution stays sequential: its next mutating call is not enqueued until the
++  previous call returns. Do not split arrays into parallel calls.
++- Duplicate accepted/mempool transactions retain today's success behavior;
++  already-confirmed and invalid transactions retain their error mapping.
++- Per-request maximum fee and fee-hysteresis intent cannot be combined into one
++  slice-wide value.
++- Per-transaction mempool sequence, native produced records, unbroadcast marking
++  and validation notification order remain the ordinary commit order.
++- Queue overload must not drop requests or bypass policy. Prefer bounded producer
++  backpressure outside daemon locks. For a request larger than the byte budget,
++  retain an ordinary direct path or return an existing explicit resource error;
++  choose and test the behavior before changing public responses.
++- RPC disconnection does not undo a transaction already admitted. Cancellation
++  may skip only requests not committed; once committed, complete normal internal
++  notification/relay work even if nobody waits for the response.
++- Keep the worker alive while RPC/HTTP shutdown drains handlers waiting on it.
++  After producers stop, stop accepting, drain/fail queued requests deterministically,
++  join the worker, then tear down peers/wallet subscribers/validation scheduler.
++  A destructor must not depend on already-destroyed `NodeContext` dependencies.
++- Any exception path resolves every outstanding promise or sets an exception;
++  a dangling barrier capture or broken future cannot leave an RPC permanently
++  waiting. Do not hold queue resources while waiting for admission locks.
++
++## Verification gates
++
++Phase-extraction parity and queue behavior must be tested against the direct
++path, with the same signed fixtures and errors:
++
++1. Valid parent/child ordering, invalid middle/end, missing parent, repeated
++   txid, already-in-mempool and already-confirmed cases.
++2. Different maximum fees and relay settings in one drained slice.
++3. Two requests spending the same input: exactly the authoritative first commit
++   wins, and queue insertion order has a reproducible test hook.
++4. A block/reorg or another admission between preparation and commit; stale
++   outcomes cannot authorize admission.
++5. Native deferred/structural dependencies and expiry/context mutation, not
++   only ordinary keyhash inputs.
++6. Wallet sees the transaction and balances immediately after synchronous RPC
++   return; native/Rust Chronik barriers retain their guarantees.
++7. A subscriber reading published snapshot state during notifications, plus
++   slow callbacks to catch waits performed under the mempool/chain locks.
++8. Queue count/byte saturation, no lost/duplicate promises, stopped/rejected
++   producers, consumer exceptions, RPC disconnect and clean shutdown with queued
++   and committed-but-not-yet-notified requests.
++9. Sequential mutating JSON-RPC arrays retain order; concurrent connections can
++   coalesce without sharing one atomic package result.
++
++Then perform one controlled run per case: current direct path versus dispatcher,
++same binary configuration/fixtures, both quiet single-client latency and sustained
++multi-client throughput, with/without loaded readers. Report enqueue delay,
++drain-size distribution, `cs_main` wait/hold time, snapshot publish count/time,
++worker CPU, callback time and end-to-end accepted TPS. A queue that only moves
++time from one thread to another is not a demonstrated improvement.
++
++## Delivery decision
++
++The first useful patch is **not** an unwired queue. It is the phase extraction
++plus executable parity coverage, followed by the bounded dispatcher and callback
++publication coverage as one reviewable optimization. No new consensus rule is
++required, but the callback/snapshot observation invariant and native read-set
++design are not established by source inspection alone. This design should be
++reviewed before an enabled runtime prototype; the existing 500k measurement
++must continue against its pinned source without interference.
++
++
++## Source prototype checkpoint (current 521)
++
++The implementation candidate now rebases this design onto
++`a60bba6facc924cdf43c34dc881805bb114fe373`, tree
++`caf6bd4ce012b2383e733b45df46753b49b2a894`.
++
++Its deliberately narrower first step batches only the `cs_main` commit ownership.
++It **retains per-transaction snapshot publication**, callback registration, native
++verification and per-request limits/errors. The queue consumer acknowledges commits
++without waiting for validation callbacks; the original RPC producer threads retain
++main/secondary callback waits and relay. It does not use `ScopedSnapshotDefer`
++across independent requests. The causal callback test uses immediate delivery to
++show that naive coalescing can expose an older snapshot during an event, and then
++checks that dispatcher requests retain ordinary publication.
++
++The fixed pointer queue has 256 slots, the serialized-byte admission reservation
++is 32 MiB, and a drain slice has at most 32 requests. These are prototype safety
++bounds, not measured tuning recommendations. No timer delay is added. A full,
++stopped or oversized submission follows existing direct admission without dropping
++or changing its policy result. Concurrent requests were not globally FIFO across
++connections previously; successful queued requests preserve queue order, while
++fallback direct work can interleave through the existing authoritative lock.
++
++Producer/request allocations happen outside `cs_main`. A request is strongly owned
++through promise completion, including exceptions. The Boost pointer queue itself is
++lock-free; the sleep/wake handoff uses a short mutex to close the condition-variable
++lost-wakeup race. The whole Dispatch call is not claimed lock-free. Stop closes
++producer registration, completes already-registered requests and joins the worker.
++HTTP/RPC handlers drain before destruction; wallet and Chronik callers never opt in.
++
++The only public RPC opting in is `sendrawtransaction`. Ordinary RPC arrays still
++execute their handlers in order. No configurable new runtime flag was added. A
++profiled comparison must disclose this eligibility and distinguish queue transfer
++cost from actual lock contention; an unlock sample count is not a wait-time measure.
++
++### P2P integration boundary
++
++P2P already owns `TxAdmissionQueue`, its fair per-peer FIFOs, `TxAdmissionSender`
++strong node/peer ownership, `m_tx_admission_inflight`, pending-message deferral,
++`ThreadTxAdmission` and `ProcessTxAdmissionDone` (`net_processing.cpp:3294–3460`).
++Its worker sends results back to the message handler, which preserves
++`PrepareTxAdmission`/`FinishTxAdmission`, peer scoring, orphan/replay handling and
++network wakeups. It also has a serial `ProcessTxBatch` fallback.
++
++This prototype does **not** send P2P work through the new RPC queue, does not wait
++on RPC futures in the message handler, and does not create a second batching layer
++for P2P. A unified follow-up should share an admission commit/preparation engine,
++with distinct request completion adapters: RPC futures and limits versus existing
++P2P sender/result records. It should retain per-peer fairness and pending-message
++ordering, and arbitrate RPC work without starving peers. Returning a generic
++`TransactionError` instead of the existing `MempoolAcceptResult` would lose policy,
++DoS and orphan information. That integration needs its own behavior tests and is
++not part of this candidate.
++
++Build, focused execution and A/B remain pending. The source prototype is not a
++validated optimization or a replacement for native off-lock verification.
+diff --git a/src/init.cpp b/src/init.cpp
+index fb16a2a52e6b610a3df26fb4b615f462b80f6c38..cc9277653f537b11ae5dd3946cdebf7e2d354b07 100644
+--- a/src/init.cpp
++++ b/src/init.cpp
+@@ -68,6 +68,7 @@
+ #include <node/miner.h>
+ #include <node/peerman_args.h>
+ #include <node/txadmission.h>
++#include <node/transaction.h>
+ #include <node/ui_interface.h>
+ #include <policy/block/rtt.h>
+ #include <policy/policy.h>
+@@ -286,6 +287,8 @@ void Shutdown(NodeContext &node) {
+     StopREST();
+     StopRPC();
+     StopHTTPServer();
++    // HTTP/RPC handlers have drained; no producer still waits on this owner.
++    node.rpc_admission.reset();
+     // After the HTTP server: no scrape is in progress. Recording continues
+     // harmlessly into the (still allocated) metrics until exit.
+     StopHTTPMetrics();
+@@ -3691,6 +3694,9 @@ bool AppInitMain(Config &config, RPCServer &rpcServer,
+                                      node.banman.get(), chainman, *node.mempool,
+                                      node.avalanche.get(), peerman_opts);
+     validation_signals.RegisterValidationInterface(node.peerman.get());
++    if (args.GetBoolArg("-server", false)) {
++        node.rpc_admission = std::make_unique<node::RpcAdmissionDispatcher>();
++    }
+ 
+     // Encoded addresses using cashaddr instead of base58.
+     // We do this by default to avoid confusion with BTC addresses.
+diff --git a/src/net/txrelay_index.h b/src/net/txrelay_index.h
+index f114def3be07dd3ba563c1f4632ba40b3a8429fb..062930cccba04e66751b5f115a17693b1e827e71 100644
+--- a/src/net/txrelay_index.h
++++ b/src/net/txrelay_index.h
+@@ -42,9 +42,6 @@ namespace txrelay {
+ enum Feature : uint64_t {
+     TXRELAY_INVSHORT = 1 << 0,
+     TXRELAY_RECON = 1 << 1,
+-    // Accept sealedheader block announcements and unsolicited shorttx bodies.
+-    // This is separate from ordinary compact blocks and short-id requests.
+-    TXRELAY_HIGH_BANDWIDTH = 1 << 2,
+ };
+ /** Version of the sendinvshort message we send */
+ static constexpr uint32_t SENDINVSHORT_VERSION{1};
+diff --git a/src/net_processing.cpp b/src/net_processing.cpp
+index d5e0e6c98eaf3de8709d9127dba589e82b60fd22..c650affadf106e8d0c3b2b556cf1a49b4955a5f8 100644
+--- a/src/net_processing.cpp
++++ b/src/net_processing.cpp
+@@ -1538,20 +1538,12 @@ private:
+     txrelay::TxRelayIndex m_txrelay_index;
+     /** Features we offer in sendinvshort (txrelay::Feature) */
+     uint64_t OurTxRelayFeatures() const {
+-        uint64_t features{0};
+-        if (m_opts.txrelay_shortids) {
+-            features |= txrelay::TXRELAY_INVSHORT;
+-            if (m_opts.txrecon_interval > 0ms) {
+-                features |= txrelay::TXRELAY_RECON;
+-            }
++        if (!m_opts.txrelay_shortids) {
++            return 0;
+         }
+-        const bool disabled_for_test =
+-            Params().GetChainType() == ChainType::REGTEST &&
+-            gArgs.GetBoolArg("-testdisablehighbandwidthshorttx", false);
+-        if (!disabled_for_test &&
+-            (gArgs.GetBoolArg("-highbandwidthtx", false) ||
+-             m_opts.txrelay_push_hb)) {
+-            features |= txrelay::TXRELAY_HIGH_BANDWIDTH;
++        uint64_t features{txrelay::TXRELAY_INVSHORT};
++        if (m_opts.txrecon_interval > 0ms) {
++            features |= txrelay::TXRELAY_RECON;
+         }
+         return features;
+     }
+@@ -2741,6 +2733,10 @@ void PeerManagerImpl::InitializeNode(const Config &config, CNode &node,
+         m_peer_map.emplace_hint(m_peer_map.end(), nodeid, peer);
+     }
+     m_v2_protocol_handler.RegisterPeerNode(node);
++    if (gArgs.GetBoolArg("-highbandwidthtx", false) &&
++        !node.IsBlockOnlyConn()) {
++        m_v2_protocol_handler.SetHighBandwidthShortTxPeer(nodeid, true);
++    }
+     if (!node.IsInboundConn()) {
+         PushNodeVersion(config, node, *peer);
+     }
+@@ -3635,7 +3631,6 @@ void PeerManagerImpl::NewPoWValidBlock(
+                 ProcessBlockAvailability(pnode->GetId());
+                 CNodeState &state = *State(pnode->GetId());
+                 if (is_v2_sealed_candidate &&
+-                    gArgs.GetBoolArg("-highbandwidthtx", false) &&
+                     m_v2_protocol_handler.IsHighBandwidthShortTxPeer(
+                         pnode->GetId()) &&
+                     !PeerHasHeader(&state, pindex) &&
+@@ -3685,7 +3680,7 @@ void PeerManagerImpl::UpdatedBlockTip(const CBlockIndex *pindexNew,
+     }
+ 
+     // A new tip is a new short-id epoch (new key).
+-    if (m_opts.txrelay_shortids) {
++    if (OurTxRelayFeatures() != 0) {
+         UpdateRelayEpochTo(pindexNew->GetBlockHash(), pindexNew->nHeight);
+     }
+ 
+@@ -4142,7 +4137,7 @@ void PeerManagerImpl::DrainRelayQueue() {
+     if (batch.empty()) {
+         return;
+     }
+-    if (m_opts.txrelay_shortids && !m_txrelay_index.Current()) {
++    if (OurTxRelayFeatures() != 0 && !m_txrelay_index.Current()) {
+         UpdateRelayEpoch();
+     }
+ 
+@@ -6806,6 +6801,14 @@ void PeerManagerImpl::ProcessMessage(
+                                     !tx_relay->m_relay_ready));
+         }
+ 
++        const bool disable_shorttx_for_test =
++            Params().GetChainType() == ChainType::REGTEST &&
++            gArgs.GetBoolArg("-testdisablehighbandwidthshorttx", false);
++        m_v2_protocol_handler.SetHighBandwidthShortTxPeer(
++            pfrom.GetId(), !disable_shorttx_for_test &&
++                               gArgs.GetBoolArg("-highbandwidthtx", false) &&
++                               !pfrom.IsBlockOnlyConn());
++
+         if (auto *metrics{node::GetNodeMetrics()};
+             metrics && pfrom.m_metrics_connected_at !=
+                            std::chrono::steady_clock::time_point{}) {
+@@ -6978,15 +6981,7 @@ void PeerManagerImpl::ProcessMessage(
+         uint64_t flags{0};
+         vRecv >> version >> flags;
+         // Any version: flags are only ever added, each with its meaning.
+-        peer->m_txrelay_features =
+-            peer->GetTxRelay() && !pfrom.IsBlockOnlyConn()
+-                ? flags & OurTxRelayFeatures()
+-                : 0;
+-        // Local opt-in, compact-block negotiation and permissions cannot prove
+-        // that the remote peer understands our private block/transaction wire.
+-        m_v2_protocol_handler.SetHighBandwidthShortTxPeer(
+-            pfrom.GetId(), peer->m_txrelay_features &
+-                               txrelay::TXRELAY_HIGH_BANDWIDTH);
++        peer->m_txrelay_features = flags & OurTxRelayFeatures();
+         LogDebug(BCLog::NET, "sendinvshort version=%u flags=%u peer=%d\n",
+                  version, flags, pfrom.GetId());
+         return;
+@@ -11036,7 +11031,11 @@ bool PeerManagerImpl::SendMessages(const Config &config, CNode *pto) {
+             const bool high_bandwidth_peer =
+                 m_opts.txrelay_push_hb && !disable_shorttx_for_test &&
+                 !pto->IsBlockOnlyConn() &&
+-                (peer->m_txrelay_features & txrelay::TXRELAY_HIGH_BANDWIDTH);
++                (pto->m_bip152_highbandwidth_from.load() ||
++                 pto->m_bip152_highbandwidth_to.load() ||
++                 pto->HasPermission(NetPermissionFlags::NoBan) ||
++                 m_v2_protocol_handler.IsHighBandwidthShortTxPeer(
++                     pto->GetId()));
+             // Every peer announces transactions on the same fixed relay
+             // tick (-txrelaytick) of the monotonic clock; there is no
+             // random per-peer delay.
+diff --git a/src/net_processing.h b/src/net_processing.h
+index 2a2d13f5c0cda50f9cbbe3811e1af1b5377cecfa..b552fbd47e2be86c2c2b49a929ee15c39491ce22 100644
+--- a/src/net_processing.h
++++ b/src/net_processing.h
+@@ -118,8 +118,8 @@ static constexpr uint64_t DEFAULT_TXRELAY_RATE_MAX{250'000};
+ static constexpr bool DEFAULT_TXRELAY_SHORTIDS{true};
+ /**
+  * Default for -txrelaypushhb: whether bursts of 16 or more transactions are
+- * pushed as unsolicited shorttx bodies to peers that explicitly negotiate
+- * TXRELAY_HIGH_BANDWIDTH instead of being announced. Off:
++ * pushed as unsolicited shorttx bodies to high-bandwidth peers (BIP152
++ * high-bandwidth, noban, -highbandwidthtx) instead of being announced. Off:
+  * the relay simulation puts the latency gain at ~0.1 s against a duplicate
+  * body in most cases. Receiving pushed bodies is unchanged.
+  */
+diff --git a/src/node/context.cpp b/src/node/context.cpp
+index 133b585c18feb9533f14ca1c236e11a673f35270..13170a7caac7ab0cf3bf3d8ced966f364362a9ff 100644
+--- a/src/node/context.cpp
++++ b/src/node/context.cpp
+@@ -13,11 +13,14 @@
+ #include <net_processing.h>
+ #include <node/kernel_notifications.h>
+ #include <node/snapshot.h>
++#include <node/transaction.h>
+ #include <scheduler.h>
+ #include <txmempool.h>
+ #include <validation.h>
+ 
+ namespace node {
+ NodeContext::NodeContext() : snapshot_publisher(GetGlobalSnapshotPublisherPtr()) {}
+-NodeContext::~NodeContext() = default;
++NodeContext::~NodeContext() {
++    rpc_admission.reset();
++}
+ } // namespace node
+diff --git a/src/node/context.h b/src/node/context.h
+index 58712c19d14dd5f7c505d5cf137c764b524d4285..599699992dfe793212d36e4dcbf9bd057df47e73 100644
+--- a/src/node/context.h
++++ b/src/node/context.h
+@@ -36,6 +36,7 @@ class Processor;
+ 
+ namespace node {
+ class SnapshotPublisher;
++class RpcAdmissionDispatcher;
+ class KernelNotifications;
+ 
+ //! NodeContext struct containing references to chain state and connection
+@@ -54,6 +55,7 @@ struct NodeContext {
+     std::unique_ptr<kernel::Context> kernel;
+     std::unique_ptr<AddrMan> addrman;
+     std::unique_ptr<CConnman> connman;
++    std::unique_ptr<RpcAdmissionDispatcher> rpc_admission;
+     std::unique_ptr<CTxMemPool> mempool;
+     std::unique_ptr<PeerManager> peerman;
+     std::unique_ptr<ChainstateManager> chainman;
+diff --git a/src/node/transaction.cpp b/src/node/transaction.cpp
+index 9ceb4e1c560ef7fd2a6cf7ede1886805634eb3be..432edb92abd9d9d4c6a4c98d3e56ddd858a43d04 100644
+--- a/src/node/transaction.cpp
++++ b/src/node/transaction.cpp
+@@ -21,8 +21,16 @@
+ #include <txmempool.h>
+ #include <validation.h>
+ #include <validationinterface.h>
++#include <util/threadnames.h>
+ 
++#include <array>
++#include <atomic>
++#include <boost/lockfree/queue.hpp>
++#include <condition_variable>
++#include <exception>
+ #include <future>
++#include <mutex>
++#include <thread>
+ 
+ namespace node {
+ static TransactionError HandleATMPError(const TxValidationState &state,
+@@ -38,38 +46,17 @@ static TransactionError HandleATMPError(const TxValidationState &state,
+     }
+ }
+ 
+-TransactionError BroadcastTransaction(const NodeContext &node,
+-                                      const CTransactionRef tx,
+-                                      std::string &err_string,
+-                                      const Amount max_tx_fee, bool relay,
+-                                      bool wait_callback, bool rpc_fee_hysteresis) {
+-    // BroadcastTransaction can be called by either sendrawtransaction RPC or
+-    // the wallet. chainman, mempool and peerman are initialized before the RPC
+-    // server and wallet are started and reset after the RPC server and wallet
+-    // are stopped.
+-    assert(node.chainman);
+-    assert(node.mempool);
+-    assert(node.peerman);
+-
+-    std::promise<void> promise;
+-    TxId txid = tx->GetId();
+-    bool callback_set = false;
+-    const MempoolAdmissionLimits limits{max_tx_fee, rpc_fee_hysteresis};
+-    std::optional<PrecomputedAdmissionChecks> precomputed;
+-    if (wait_callback && node.args &&
+-        node.args->GetBoolArg("-parallelmempool", DEFAULT_PARALLEL_MEMPOOL)) {
+-        // Synchronous callers guarantee they hold no chain/mempool/wallet
+-        // locks. RPC clients can therefore verify concurrently. The existing
+-        // critical section below decides every verdict,
+-        // fee bound, broadcast marker and notification in the same order.
+-        precomputed = PrecomputeMempoolAdmission(*node.chainman, tx, limits);
+-    }
+-
+-    {
+-        const auto waiting = std::chrono::steady_clock::now();
+-        LOCK(cs_main);
+-        AdmissionLockTimer timer(waiting);
+-
++namespace {
++    TransactionError
++    AdmitBroadcastLocked(const NodeContext &node, const CTransactionRef &tx,
++                         std::string &err_string,
++                         const MempoolAdmissionLimits &limits, bool relay,
++                         bool wait_callback,
++                         const PrecomputedAdmissionChecks *precomputed,
++                         std::promise<void> &promise, bool &callback_set)
++        EXCLUSIVE_LOCKS_REQUIRED(cs_main) {
++        AssertLockHeld(cs_main);
++        const TxId &txid = tx->GetId();
+         // If the transaction is already confirmed in the chain, don't do
+         // anything and return early.
+         CCoinsViewCache &view = node.chainman->ActiveChainstate().CoinsTip();
+@@ -85,11 +72,11 @@ TransactionError BroadcastTransaction(const NodeContext &node,
+ 
+         if (!node.mempool->exists(txid)) {
+             // Transaction is not already in the mempool.
+-            // Validate caller fee bounds before insertion in this one ATMP pass.
++            // Validate caller fee bounds before insertion in this one ATMP
++            // pass.
+             const MempoolAcceptResult result =
+-                node.chainman->ProcessTransaction(
+-                    tx, /*test_accept=*/false, limits,
+-                    precomputed ? &*precomputed : nullptr);
++                node.chainman->ProcessTransaction(tx, /*test_accept=*/false,
++                                                  limits, precomputed);
+             if (result.m_result_type !=
+                 MempoolAcceptResult::ResultType::VALID) {
+                 if (result.m_state.GetRejectReason() == "max-fee-exceeded") {
+@@ -120,7 +107,185 @@ TransactionError BroadcastTransaction(const NodeContext &node,
+                 callback_set = true;
+             }
+         }
+-    } // cs_main
++        return TransactionError::OK;
++    }
++} // namespace
++
++struct RpcAdmissionDispatcher::Impl {
++    // Bounds include queued and executing requests. Larger/full requests keep
++    // the existing direct path: overload never drops an RPC or changes policy.
++    static constexpr size_t MAX_BYTES = 32 << 20;
++    static constexpr size_t MAX_SLICE = 32;
++    static constexpr uint64_t STOPPED = uint64_t{1} << 63;
++    struct Request : std::enable_shared_from_this<Request> {
++        Request(size_t size, std::function<void()> fn)
++            : bytes(size), commit(std::move(fn)) {}
++        size_t bytes;
++        std::function<void()> commit;
++        std::promise<void> completed;
++        std::exception_ptr error;
++    };
++    boost::lockfree::queue<Request *, boost::lockfree::capacity<256>> queue;
++    std::atomic<size_t> bytes{0};
++    // High bit closes registration; low bits count producer calls through
++    // completion. A registered producer can publish after Stop() begins.
++    std::atomic<uint64_t> producers{0};
++    std::mutex wake_mutex;
++    std::condition_variable wake;
++    std::thread worker;
++
++    Impl() : worker([this] { Run(); }) {}
++    ~Impl() { Stop(); }
++
++    void Notify() {
++        // Publication is lock-free. This short mutex only closes the condition
++        // variable's check/sleep race; no chain/mempool operation owns it.
++        {
++            std::lock_guard<std::mutex> lock(wake_mutex);
++        }
++        wake.notify_one();
++    }
++    void Stop() {
++        producers.fetch_or(STOPPED, std::memory_order_acq_rel);
++        Notify();
++        if (worker.joinable()) worker.join();
++    }
++    bool Dispatch(size_t nbytes, std::function<void()> commit) {
++        AssertLockNotHeld(cs_main);
++        uint64_t observed = producers.load(std::memory_order_acquire);
++        do {
++            if (observed & STOPPED) return false;
++        } while (!producers.compare_exchange_weak(observed, observed + 1,
++                                                  std::memory_order_acq_rel));
++        struct Producer {
++            Impl &owner;
++            ~Producer() {
++                owner.producers.fetch_sub(1, std::memory_order_acq_rel);
++                owner.Notify();
++            }
++        } producer{*this};
++        if (nbytes > MAX_BYTES) return false;
++        auto request = std::make_shared<Request>(nbytes, std::move(commit));
++        auto completed = request->completed.get_future();
++        size_t used = bytes.load(std::memory_order_relaxed);
++        do {
++            if (used > MAX_BYTES - nbytes) return false;
++        } while (!bytes.compare_exchange_weak(used, used + nbytes,
++                                              std::memory_order_relaxed));
++        if (!queue.push(request.get())) {
++            bytes.fetch_sub(nbytes, std::memory_order_relaxed);
++            return false;
++        }
++        Notify();
++        // The calling RPC owns every captured reference until its
++        // acknowledgment. Disconnecting HTTP does not cancel a committed tx.
++        completed.get();
++        return true;
++    }
++    void Run() {
++        util::ThreadRename("rpcadmit");
++        for (;;) {
++            {
++                std::unique_lock<std::mutex> lock(wake_mutex);
++                wake.wait(lock, [&] {
++                    return !queue.empty() ||
++                           producers.load(std::memory_order_acquire) == STOPPED;
++                });
++            }
++            std::array<std::shared_ptr<Request>, MAX_SLICE> slice{};
++            size_t count = 0;
++            Request *pending = nullptr;
++            while (count < slice.size() && queue.pop(pending)) {
++                slice[count++] = pending->shared_from_this();
++            }
++            if (count == 0) {
++                if (producers.load(std::memory_order_acquire) == STOPPED)
++                    return;
++                continue;
++            }
++            {
++                const auto waiting = SteadyClock::now();
++                LOCK(cs_main);
++                AdmissionLockTimer timer(waiting);
++                for (size_t i = 0; i < count; ++i) {
++                    try {
++                        slice[i]->commit();
++                    } catch (...) {
++                        slice[i]->error = std::current_exception();
++                    }
++                }
++            }
++            for (size_t i = 0; i < count; ++i) {
++                const auto &request = slice[i];
++                bytes.fetch_sub(request->bytes, std::memory_order_relaxed);
++                // Retain ownership through set_value/set_exception: the
++                // waiting producer may immediately release its own reference.
++                if (request->error)
++                    request->completed.set_exception(request->error);
++                else
++                    request->completed.set_value();
++            }
++        }
++    }
++};
++
++RpcAdmissionDispatcher::RpcAdmissionDispatcher()
++    : m_impl(std::make_unique<Impl>()) {}
++RpcAdmissionDispatcher::~RpcAdmissionDispatcher() = default;
++void RpcAdmissionDispatcher::Stop() {
++    m_impl->Stop();
++}
++bool RpcAdmissionDispatcher::Dispatch(size_t bytes,
++                                      std::function<void()> commit) {
++    return m_impl->Dispatch(bytes, std::move(commit));
++}
++
++TransactionError
++BroadcastTransaction(const NodeContext &node, const CTransactionRef tx,
++                     std::string &err_string, const Amount max_tx_fee,
++                     bool relay, bool wait_callback, bool rpc_fee_hysteresis,
++                     bool use_rpc_admission_queue) {
++    // BroadcastTransaction can be called by either sendrawtransaction RPC or
++    // the wallet. chainman, mempool and peerman are initialized before the RPC
++    // server and wallet are started and reset after the RPC server and wallet
++    // are stopped.
++    assert(node.chainman);
++    assert(node.mempool);
++    assert(node.peerman);
++
++    std::promise<void> promise;
++    TxId txid = tx->GetId();
++    bool callback_set = false;
++    const MempoolAdmissionLimits limits{max_tx_fee, rpc_fee_hysteresis};
++    std::optional<PrecomputedAdmissionChecks> precomputed;
++    if (wait_callback && node.args &&
++        node.args->GetBoolArg("-parallelmempool", DEFAULT_PARALLEL_MEMPOOL)) {
++        // Synchronous callers guarantee they hold no chain/mempool/wallet
++        // locks. RPC clients can therefore verify concurrently. The existing
++        // critical section below decides every verdict,
++        // fee bound, broadcast marker and notification in the same order.
++        precomputed = PrecomputeMempoolAdmission(*node.chainman, tx, limits);
++    }
++
++    TransactionError result = TransactionError::OK;
++    auto commit = [&]() EXCLUSIVE_LOCKS_REQUIRED(cs_main) {
++        result = AdmitBroadcastLocked(
++            node, tx, err_string, limits, relay, wait_callback,
++            precomputed ? &*precomputed : nullptr, promise, callback_set);
++    };
++    // Only the explicit unlocked sendrawtransaction RPC path opts in. Wallet,
++    // Chronik, package broadcast and internal producers retain direct
++    // admission.
++    const bool queued =
++        use_rpc_admission_queue && wait_callback && node.rpc_admission &&
++        node.rpc_admission->Dispatch(tx->GetTotalSize(), commit);
++    if (!queued) {
++        const auto waiting = SteadyClock::now();
++        LOCK(cs_main);
++        AdmissionLockTimer timer(waiting);
++        commit();
++    }
++    if (result != TransactionError::OK) return result;
+ 
+     if (callback_set) {
+         // Wait until Validation Interface clients have been notified of the
+diff --git a/src/node/transaction.h b/src/node/transaction.h
+index 24d1bfd8616ebc938fe58186560f92fdf31ed095..7234f7a2e7f2b9c0f9f7a92373206b17aec4699f 100644
+--- a/src/node/transaction.h
++++ b/src/node/transaction.h
+@@ -6,6 +6,9 @@
+ #define BITCOIN_NODE_TRANSACTION_H
+ 
+ #include <feerate.h>
++#include <cstddef>
++#include <functional>
++#include <memory>
+ #include <node/types.h>
+ #include <primitives/transaction.h>
+ 
+@@ -23,6 +26,25 @@ namespace node {
+ class BlockManager;
+ struct NodeContext;
+ 
++/** Bounded immediate-drain independent RPC commit dispatcher.
++ * Dispatch callbacks run under cs_main. Callers wait without daemon locks and
++ * retain ownership of callback captures until Dispatch returns. False means
++ * stopped/full/oversized: use ordinary direct admission. This does not batch
++ * atomic packages, native verification, callbacks, or snapshot publication.
++ */
++class RpcAdmissionDispatcher {
++    struct Impl;
++    std::unique_ptr<Impl> m_impl;
++
++public:
++    RpcAdmissionDispatcher();
++    ~RpcAdmissionDispatcher();
++    RpcAdmissionDispatcher(const RpcAdmissionDispatcher &) = delete;
++    RpcAdmissionDispatcher &operator=(const RpcAdmissionDispatcher &) = delete;
++    bool Dispatch(size_t bytes, std::function<void()> commit);
++    void Stop();
++};
++
+ /**
+  * Maximum fee rate for sendrawtransaction and testmempoolaccept RPC calls.
+  * Also used by the GUI when broadcasting a completed PSBT.
+@@ -52,12 +74,15 @@ static const CFeeRate DEFAULT_MAX_RAW_TX_FEE_RATE{COIN / 10};
+  * @param[in]  relay flag if both mempool insertion and p2p relay are requested
+  * @param[in]  wait_callback wait until callbacks, and their secondary worker
+  * queues, have been processed to avoid stale result due to a sequentially RPC.
++ * @param[in] use_rpc_admission_queue opt in only for an unlocked public RPC;
++ * wallet/Chronik/internal callers keep the direct path
+  * @return error
+  */
+ [[nodiscard]] TransactionError
+ BroadcastTransaction(const NodeContext &node, CTransactionRef tx,
+                      std::string &err_string, Amount max_tx_fee, bool relay,
+-                     bool wait_callback, bool rpc_fee_hysteresis = false);
++                     bool wait_callback, bool rpc_fee_hysteresis = false,
++                     bool use_rpc_admission_queue = false);
+ 
+ /**
+  * Return transaction with a given txid.
+diff --git a/src/protocol.h b/src/protocol.h
+index 1c49502865449cc2adb0944ad4c9580d33867812..1219b39c27e6c589d04e86a66688068a61096251 100644
+--- a/src/protocol.h
++++ b/src/protocol.h
+@@ -364,11 +364,8 @@ extern const char *SHORTTX;
+  * Nucleation relay capability (sent after verack): {uint32 version, uint64
+  * flags}. A peer that receives it with a flag it also supports may use that
+  * feature towards the sender: TXRELAY_INVSHORT (short-id announcements) and
+- * TXRELAY_RECON (continuous LIVE_MEMPOOL reconciliation), and
+- * TXRELAY_HIGH_BANDWIDTH (sealedheader announcements and unsolicited shorttx
+- * bodies). High-bandwidth formats require explicit remote advertisement;
+- * ordinary BIP152 negotiation does not opt into them. Stock peers ignore the
+- * unknown message and keep receiving ordinary INVs/compact blocks.
++ * TXRELAY_RECON (continuous LIVE_MEMPOOL reconciliation). Stock peers ignore
++ * the unknown message and keep receiving ordinary INVs.
+  */
+ extern const char *SENDINVSHORT;
+ /**
+diff --git a/src/rpc/mempool.cpp b/src/rpc/mempool.cpp
+index cf299722884a735a3246b38ea69584f7776c6aa3..19183064047ba3d35392d492991912826b19f335 100644
+--- a/src/rpc/mempool.cpp
++++ b/src/rpc/mempool.cpp
+@@ -110,7 +110,8 @@ static RPCHelpMan sendrawtransaction() {
+                 fee_ctrl.GetFeeRateInfo(now_ms);
+             const TransactionError err = BroadcastTransaction(
+                 node, tx, err_string, max_raw_tx_fee, /*relay*/ true,
+-                /*wait_callback*/ true, /*rpc_fee_hysteresis=*/true);
++                /*wait_callback*/ true, /*rpc_fee_hysteresis=*/true,
++                /*use_rpc_admission_queue=*/true);
+             if (err != TransactionError::OK) {
+                 if (err == TransactionError::MEMPOOL_REJECTED &&
+                     (err_string.find("min relay fee not met") !=
+diff --git a/src/test/txrelay_tests.cpp b/src/test/txrelay_tests.cpp
+index d220106136d9ebb2bbbcda408148b3b1246d62c1..507d1c866600cda188535392c6dbd7425c86d256 100644
+--- a/src/test/txrelay_tests.cpp
++++ b/src/test/txrelay_tests.cpp
+@@ -7,7 +7,6 @@
+ #include <net_processing.h>
+ 
+ #include <config.h>
+-#include <common/args.h>
+ #include <lotus_v2/commitment.h>
+ #include <net.h>
+ #include <net/txrelay_index.h>
+@@ -1056,123 +1055,8 @@ BOOST_AUTO_TEST_CASE(reconciliation_round_robin) {
+     chainman.ResetIbd();
+ }
+ 
+-BOOST_AUTO_TEST_CASE(stock_peer_does_not_support_private_relay) {
+-    LOCK(NetEventsInterface::g_msgproc_mutex);
+-    MockTick clock{8'000'000ms};
+-    struct ResetArgs {
+-        ~ResetArgs() { gArgs.ClearForcedArg("-highbandwidthtx"); }
+-    } reset_args;
+-    gArgs.ForceSetArg("-highbandwidthtx", "1");
+-    PeerManager::Options opts;
+-    opts.txrelay_push_hb = true;
+-    RelayHarness h{m_node, opts};
+-    CNode &stock{h.AddPeer()};
+-    // Ordinary Bitcoin compact-block negotiation does not negotiate Lotus
+-    // sealed headers or unsolicited shorttx messages.
+-    stock.m_bip152_highbandwidth_to = true;
+-    stock.m_bip152_highbandwidth_from = true;
+-    BOOST_CHECK(!h.peerman->GetV2ProtocolHandler()
+-                     ->IsHighBandwidthShortTxPeer(stock.GetId()));
+-    h.SendAll();
+-    FastRandomContext rng{true};
+-    std::vector<CTransactionRef> txs;
+-    for (int i = 0; i < 20; ++i) {
+-        txs.push_back(MakeTx(rng));
+-        AddToMempool(m_node, txs.back());
+-    }
+-    h.peerman->RelayTransactionBatch(txs);
+-    clock.Set(8'000'010ms);
+-    const Sent sent{h.SendAll()[stock.GetId()]};
+-    BOOST_CHECK(sent.shorttx_txids.empty());
+-    BOOST_CHECK_EQUAL(sent.inv_txids.size(), 20U);
+-}
+-
+-BOOST_AUTO_TEST_CASE(private_relay_requires_explicit_remote_offer) {
+-    LOCK(NetEventsInterface::g_msgproc_mutex);
+-    struct ResetArgs {
+-        ~ResetArgs() { gArgs.ClearForcedArg("-highbandwidthtx"); }
+-    } reset_args;
+-    gArgs.ForceSetArg("-highbandwidthtx", "1");
+-    MockTick clock{9'000'000ms};
+-    PeerManager::Options opts;
+-    opts.txrelay_push_hb = true;
+-    RelayHarness h{m_node, opts};
+-    CNode &stock{h.AddPeer()};
+-    CNode &short_only{h.AddPeer()};
+-    CNode &capable{h.AddPeer()};
+-    CNode &block_only{h.AddPeer(ConnectionType::BLOCK_RELAY)};
+-    auto offer = [&](CNode &node, uint64_t flags) {
+-        DataStream message{};
+-        message << txrelay::SENDINVSHORT_VERSION << flags;
+-        std::atomic<bool> interrupt{false};
+-        h.peerman->ProcessMessage(h.config, node, NetMsgType::SENDINVSHORT,
+-                                  message, 0us, interrupt);
+-    };
+-    offer(short_only, txrelay::TXRELAY_INVSHORT | (1ULL << 40));
+-    offer(capable, txrelay::TXRELAY_HIGH_BANDWIDTH | (1ULL << 40));
+-    offer(block_only, txrelay::TXRELAY_HIGH_BANDWIDTH);
+-    auto *handler{h.peerman->GetV2ProtocolHandler()};
+-    BOOST_CHECK(!handler->IsHighBandwidthShortTxPeer(stock.GetId()));
+-    BOOST_CHECK(!handler->IsHighBandwidthShortTxPeer(short_only.GetId()));
+-    BOOST_CHECK(handler->IsHighBandwidthShortTxPeer(capable.GetId()));
+-    BOOST_CHECK(!handler->IsHighBandwidthShortTxPeer(block_only.GetId()));
+-    h.SendAll();
+-    FastRandomContext rng{true};
+-    std::vector<CTransactionRef> txs;
+-    for (int i = 0; i < 20; ++i) {
+-        txs.push_back(MakeTx(rng));
+-        AddToMempool(m_node, txs.back());
+-    }
+-    h.peerman->RelayTransactionBatch(txs);
+-    clock.Set(9'000'010ms);
+-    auto sent{h.SendAll()};
+-    BOOST_CHECK_EQUAL(sent[stock.GetId()].inv_txids.size(), 20U);
+-    BOOST_CHECK(sent[stock.GetId()].shorttx_txids.empty());
+-    BOOST_CHECK_EQUAL(sent[short_only.GetId()].short_ids.size(), 20U);
+-    BOOST_CHECK(sent[short_only.GetId()].shorttx_txids.empty());
+-    BOOST_CHECK_EQUAL(sent[capable.GetId()].shorttx_txids.size(), 20U);
+-    BOOST_CHECK_EQUAL(sent[block_only.GetId()].Total(), 0U);
+-    // Unknown flags neither enable the private path nor preserve an earlier
+-    // offer when its explicit high-bandwidth bit is removed.
+-    offer(capable, uint64_t{1} << 40);
+-    BOOST_CHECK(!handler->IsHighBandwidthShortTxPeer(capable.GetId()));
+-    offer(capable, txrelay::TXRELAY_HIGH_BANDWIDTH);
+-    BOOST_CHECK(handler->IsHighBandwidthShortTxPeer(capable.GetId()));
+-    // FinalizeNode cleanup is checked by the sealed-header integration test;
+-    // another connection to the same implementation still needs its own offer.
+-    CNode &reconnected{h.AddPeer()};
+-    BOOST_CHECK(!handler->IsHighBandwidthShortTxPeer(reconnected.GetId()));
+-}
+-
+-BOOST_AUTO_TEST_CASE(private_relay_local_willingness_and_disabled_shortids) {
+-    LOCK(NetEventsInterface::g_msgproc_mutex);
+-    struct ResetArgs {
+-        ~ResetArgs() { gArgs.ClearForcedArg("-highbandwidthtx"); }
+-    } reset_args;
+-    for (const bool willing : {false, true}) {
+-        gArgs.ForceSetArg("-highbandwidthtx", willing ? "1" : "0");
+-        PeerManager::Options opts;
+-        opts.txrelay_shortids = false;
+-        RelayHarness h{m_node, opts};
+-        CNode &peer{h.AddPeer()};
+-        DataStream offer{};
+-        offer << txrelay::SENDINVSHORT_VERSION
+-              << uint64_t{txrelay::TXRELAY_HIGH_BANDWIDTH};
+-        std::atomic<bool> interrupt{false};
+-        h.peerman->ProcessMessage(h.config, peer, NetMsgType::SENDINVSHORT,
+-                                  offer, 0us, interrupt);
+-        BOOST_CHECK_EQUAL(h.peerman->GetV2ProtocolHandler()
+-                              ->IsHighBandwidthShortTxPeer(peer.GetId()),
+-                          willing);
+-    }
+-}
+-
+ BOOST_AUTO_TEST_CASE(no_body_push_by_default) {
+     LOCK(NetEventsInterface::g_msgproc_mutex);
+-    struct ResetArgs {
+-        ~ResetArgs() { gArgs.ClearForcedArg("-highbandwidthtx"); }
+-    } reset_args;
+-    gArgs.ForceSetArg("-highbandwidthtx", "1");
+     FastRandomContext rng{true};
+     for (const bool push : {false, true}) {
+         MockTick clock{7'000'000ms};
+@@ -1180,12 +1064,8 @@ BOOST_AUTO_TEST_CASE(no_body_push_by_default) {
+         opts.txrelay_push_hb = push;
+         RelayHarness h{m_node, opts};
+         CNode &peer{h.AddPeer()};
+-        DataStream offer{};
+-        offer << txrelay::SENDINVSHORT_VERSION
+-              << uint64_t{txrelay::TXRELAY_HIGH_BANDWIDTH};
+-        std::atomic<bool> interrupt{false};
+-        h.peerman->ProcessMessage(h.config, peer, NetMsgType::SENDINVSHORT,
+-                                  offer, 0us, interrupt);
++        h.peerman->GetV2ProtocolHandler()->SetHighBandwidthShortTxPeer(
++            peer.GetId(), true);
+         h.SendAll();
+         std::vector<CTransactionRef> txs;
+         for (int i = 0; i < 20; ++i) {
+diff --git a/src/test/v2_protocol_handler_tests.cpp b/src/test/v2_protocol_handler_tests.cpp
+index e2b5701d705065ea75477bdb87d38025edf5aa89..eca7b4f8418c9c6df45141ccb42ae01d44e61eab 100644
+--- a/src/test/v2_protocol_handler_tests.cpp
++++ b/src/test/v2_protocol_handler_tests.cpp
+@@ -13,8 +13,6 @@
+ #include <blockencodings.h>
+ #include <chain.h>
+ #include <chainparams.h>
+-#include <common/args.h>
+-#include <net/txrelay_index.h>
+ #include <config.h>
+ #include <consensus/merkle.h>
+ #include <logging.h>
+@@ -2851,10 +2849,6 @@ BOOST_AUTO_TEST_CASE(shorttx_batch_admission_fallback_and_proactive_push) {
+ 
+ BOOST_AUTO_TEST_CASE(high_bandwidth_sealedheader_push_and_peer_cleanup) {
+     LOCK(NetEventsInterface::g_msgproc_mutex);
+-    struct ResetArgs {
+-        ~ResetArgs() { gArgs.ClearForcedArg("-highbandwidthtx"); }
+-    } reset_args;
+-    gArgs.ForceSetArg("-highbandwidthtx", "1");
+     SetMockTime(
+         WITH_LOCK(cs_main, return m_node.chainman->ActiveTip()->GetBlockTime()));
+ 
+@@ -2917,22 +2911,19 @@ BOOST_AUTO_TEST_CASE(high_bandwidth_sealedheader_push_and_peer_cleanup) {
+         connman->AddTestNode(*p);
+     }
+ 
+-    // Only an explicit remote private-format offer enables sealed relay.
+-    // Stock peers can request BIP152 high bandwidth without supporting it.
+-    auto offer = [&](CNode &node, uint64_t flags) {
+-        DataStream message{};
+-        message << txrelay::SENDINVSHORT_VERSION << flags;
+-        std::atomic<bool> interrupt{false};
+-        peerman->ProcessMessage(config, node, NetMsgType::SENDINVSHORT,
+-                                message, 0us, interrupt);
+-    };
+-    BOOST_CHECK(!v2_handler->IsHighBandwidthShortTxPeer(peer_hb->GetId()));
+-    offer(*peer_sender, txrelay::TXRELAY_HIGH_BANDWIDTH);
+-    offer(*peer_hb, txrelay::TXRELAY_HIGH_BANDWIDTH | (1ULL << 40));
+-    BOOST_CHECK(v2_handler->IsHighBandwidthShortTxPeer(peer_hb->GetId()));
+-    peer_normal->m_bip152_highbandwidth_to = true;
+-    peer_normal->m_bip152_highbandwidth_from = true;
+-    BOOST_CHECK(!v2_handler->IsHighBandwidthShortTxPeer(peer_normal->GetId()));
++    // Opt in peer_sender and peer_hb as high-bandwidth V2 peers; keep peer_normal
++    // as a standard low-bandwidth peer.
++    peer_sender->m_bip152_highbandwidth_to = true;
++    peer_sender->m_bip152_highbandwidth_from = true;
++    v2_handler->SetHighBandwidthShortTxPeer(peer_sender->GetId(), true);
++
++    peer_hb->m_bip152_highbandwidth_to = true;
++    peer_hb->m_bip152_highbandwidth_from = true;
++    v2_handler->SetHighBandwidthShortTxPeer(peer_hb->GetId(), true);
++
++    peer_normal->m_bip152_highbandwidth_to = false;
++    peer_normal->m_bip152_highbandwidth_from = false;
++    v2_handler->SetHighBandwidthShortTxPeer(peer_normal->GetId(), false);
+ 
+     // 1. Build a valid V2 block containing tx1 on top of the current tip, and
+     //    add tx1 to the mempool WITHOUT manually calling SyncMerklixOverlayToTip
+@@ -3042,23 +3033,6 @@ BOOST_AUTO_TEST_CASE(high_bandwidth_sealedheader_push_and_peer_cleanup) {
+     }
+     BOOST_CHECK_EQUAL(hb_sealedheader_count, 1U);
+ 
+-    {
+-        V1TransportDeserializer deserializer(config, peer_normal->GetId());
+-        LOCK(peer_normal->cs_vSend);
+-        for (const auto &chunk : peer_normal->vSendMsg) {
+-            Span<const uint8_t> bytes{chunk};
+-            while (!bytes.empty()) {
+-                BOOST_REQUIRE_GE(deserializer.Read(config, bytes), 0);
+-                if (deserializer.Complete()) {
+-                    bool rejected{false};
+-                    const auto message = deserializer.GetMessage(0us, rejected);
+-                    BOOST_CHECK(!rejected);
+-                    BOOST_CHECK_NE(message.m_type, NetMsgType::SEALEDHEADER);
+-                }
+-            }
+-        }
+-    }
+-
+     // 3. Verify duplicate SEALEDHEADER from peer_hb for an already-connected
+     //    block is a no-op (no fallback GETDATA(MSG_CMPCT_BLOCK) emitted).
+     {
+diff --git a/src/test/validationinterface_tests.cpp b/src/test/validationinterface_tests.cpp
+index ef9498ddffe87e59c34e293e70b6019d2c9ce60f..ddaec04589b32ea4ff83b64f6a0ca3c5fe613952 100644
+--- a/src/test/validationinterface_tests.cpp
++++ b/src/test/validationinterface_tests.cpp
+@@ -7,6 +7,7 @@
+ #include <interfaces/chain.h>
+ #include <interfaces/handler.h>
+ #include <node/transaction.h>
++#include <node/snapshot.h>
+ #include <primitives/block.h>
+ #include <scheduler.h>
+ #include <script/standard.h>
+@@ -28,6 +29,7 @@
+ #include <condition_variable>
+ #include <deque>
+ #include <future>
++#include <stdexcept>
+ #include <util/task_runner.h>
+ 
+ BOOST_FIXTURE_TEST_SUITE(validationinterface_tests, ChainTestingSetup)
+@@ -36,6 +38,121 @@ struct TestSubscriberNoop final : public CValidationInterface {
+     void BlockChecked(const CBlock &, const BlockValidationState &) override {}
+ };
+ 
++// Immediate delivery is a deterministic control for a scheduler callback that
++// wins the race with the snapshot-defer destructor. It demonstrates why a
++// dispatcher must not silently coalesce independent transaction publications.
++BOOST_AUTO_TEST_CASE(
++    admission_notification_observes_per_transaction_publication) {
++    struct Observer final : CValidationInterface {
++        std::vector<size_t> observed;
++        void TransactionAddedToMempool(const CTransactionRef &,
++                                       std::shared_ptr<const std::vector<Coin>>,
++                                       uint64_t, int64_t) override {
++            observed.push_back(
++                node::GetGlobalSnapshotPublisher().Load()->mempool_size);
++        }
++    };
++    ValidationSignals signals(std::make_unique<util::ImmediateTaskRunner>());
++    auto observer = std::make_shared<Observer>();
++    signals.RegisterSharedValidationInterface(observer);
++    auto &pool = *Assert(m_node.mempool);
++    TestMemPoolEntryHelper entry;
++    auto add = [&](uint32_t n) EXCLUSIVE_LOCKS_REQUIRED(cs_main) {
++        LOCK(pool.cs);
++        CMutableTransaction tx;
++        tx.vin.emplace_back(TxId{}, n);
++        tx.vout.emplace_back(1000 * SATOSHI, CScript() << OP_TRUE);
++        auto ref = MakeTransactionRef(std::move(tx));
++        pool.addUnchecked(entry.FromTx(ref));
++        signals.TransactionAddedToMempool(ref, {}, n);
++    };
++    {
++        LOCK2(cs_main, pool.cs);
++        add(1);
++        BOOST_CHECK_EQUAL(observer->observed.back(), 1U);
++        {
++            CTxMemPool::ScopedSnapshotDefer deferred(pool);
++            add(2);
++            BOOST_CHECK_EQUAL(pool.size(), 2U);
++            BOOST_CHECK_EQUAL(observer->observed.back(), 1U);
++        }
++        BOOST_CHECK_EQUAL(
++            node::GetGlobalSnapshotPublisher().Load()->mempool_size, 2U);
++    }
++    // Production dispatcher callbacks keep each ordinary publication, even
++    // when multiple requests share a chain-lock slice.
++    node::RpcAdmissionDispatcher dispatcher;
++    BOOST_REQUIRE(
++        dispatcher.Dispatch(100, [&]() EXCLUSIVE_LOCKS_REQUIRED(cs_main) {
++            add(3);
++            BOOST_CHECK_EQUAL(observer->observed.back(), 3U);
++        }));
++    BOOST_REQUIRE(
++        dispatcher.Dispatch(100, [&]() EXCLUSIVE_LOCKS_REQUIRED(cs_main) {
++            add(4);
++            BOOST_CHECK_EQUAL(observer->observed.back(), 4U);
++        }));
++    dispatcher.Stop();
++    signals.UnregisterAllValidationInterfaces();
++}
++
++BOOST_AUTO_TEST_CASE(rpc_admission_dispatcher_independent_errors_and_shutdown) {
++    node::RpcAdmissionDispatcher dispatcher;
++    std::atomic<unsigned> committed{0};
++    std::vector<std::future<void>> producers;
++    for (unsigned i = 0; i < 64; ++i) {
++        producers.push_back(std::async(std::launch::async, [&, i] {
++            bool failed = false;
++            try {
++                BOOST_REQUIRE(dispatcher.Dispatch(100, [&] {
++                    AssertLockHeld(cs_main);
++                    if (i == 17)
++                        throw std::runtime_error("independent request");
++                    committed.fetch_add(1);
++                }));
++            } catch (const std::runtime_error &e) {
++                failed = true;
++                BOOST_CHECK_EQUAL(e.what(), "independent request");
++            }
++            BOOST_CHECK_EQUAL(failed, i == 17);
++        }));
++    }
++    for (auto &producer : producers)
++        producer.get();
++    BOOST_CHECK_EQUAL(committed.load(), 63U);
++    bool oversized_ran = false;
++    BOOST_CHECK(!dispatcher.Dispatch(33 << 20, [&] { oversized_ran = true; }));
++    BOOST_CHECK(!oversized_ran);
++    dispatcher.Stop();
++    BOOST_CHECK(!dispatcher.Dispatch(100, [&] { committed.fetch_add(1); }));
++    BOOST_CHECK_EQUAL(committed.load(), 63U);
++}
++
++BOOST_AUTO_TEST_CASE(rpc_admission_stop_drains_owned_request_and_byte_pressure) {
++    node::RpcAdmissionDispatcher dispatcher;
++    std::promise<void> entered;
++    std::promise<void> release;
++    auto released = release.get_future();
++    auto producer = std::async(std::launch::async, [&] {
++        return dispatcher.Dispatch(32 << 20, [&] {
++            AssertLockHeld(cs_main);
++            entered.set_value();
++            released.wait();
++        });
++    });
++    entered.get_future().wait();
++    bool overflow_ran = false;
++    BOOST_CHECK(!dispatcher.Dispatch(100, [&] { overflow_ran = true; }));
++    BOOST_CHECK(!overflow_ran);
++    auto stopped = std::async(std::launch::async, [&] { dispatcher.Stop(); });
++    BOOST_CHECK(stopped.wait_for(std::chrono::milliseconds(20)) ==
++                std::future_status::timeout);
++    release.set_value();
++    BOOST_CHECK(producer.get());
++    stopped.get();
++    BOOST_CHECK(!dispatcher.Dispatch(100, [] {}));
++}
++
+ BOOST_AUTO_TEST_CASE(unregister_validation_interface_race) {
+     std::atomic<bool> generate{true};
+ 
+-- 
+2.50.1 (Apple Git-155)
+
