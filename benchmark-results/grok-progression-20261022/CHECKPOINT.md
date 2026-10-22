@@ -64,4 +64,12 @@ Append-only. Times are UTC.
 
 - Global 266's stored canonical commit remains `8894dcfabf4c1a3178bc468c2fd568785758c1d3`. This checkout's equivalent commit is `6fb15ce1` with the same tree. Prior composed-tree native/500k claims do not apply from global 267 onward.
 - V2 patch 041 still names `mining_template` as a member. It applied with whitespace warnings only. It was not edited. Compile at point 527 is unknown.
-- Repair ledger entry appended. Next: commit this identity on `benchmark/grok-progression-20261022`, then rerun `--point 374` with 3 repetitions and 10 jobs. Point 527 and the sustained 500k workload stay unstarted. The held native527 network run stays unlaunched.
+- Repair ledger entry appended. Committed on `benchmark/grok-progression-20261022` as `1b3078c32f1b354041b154c0ebbc909d5ee34158`. Not pushed. Backup of this commit is the local branch only.
+- Point 374 rerun started at pid 65859 after the clean-tree check. Notes were stashed only across that check and restored. The corrected replay tip remains on source branch `grok-corrected-replay-20261022`. Point 527 and the sustained 500k workload stay unstarted. The held native527 network run stays unlaunched.
+
+## 2026-10-22T16:19:00Z — point 374 build failed on a missing txrelay include
+
+- Pid 65859 exited. Ninja returned 1 after 79.1s. The only failed target was `v2_protocol_handler_tests.cpp.o`. `txrelay::` was undeclared because global 374 deleted `#include <net/txrelay_index.h>` while tests from global 267 and 268 still call `MakeEpochKey`, `ComputeShortId`, and `EpochKey`. Packet: `failure-point-374-missing-txrelay-include.json`. The earlier `mining_template` error did not return. Tree check had passed at `642e8c944f5bf41d6aee594f78e11c52a387c783` / `3ec37f7ca55f9383ef155d8ab81873e5905d984a`.
+- The include is restored in global 374. `TXRELAY_HIGH_BANDWIDTH` and the `#include <common/args.h>` removal stay. The corrected object compiled with existing warnings and no errors.
+- V2 patch 001 had added that include back. Its hunk now adds only `common/args.h` and keeps the existing txrelay header as context. All 153 V2 mailboxes then applied. Tip `e6e0fe3557503fe8d5df0a0425d2f9bcaaa8a5f6`. Its tree `ae49789b3d5571669121dbd596567fe74c0fcadb` matches the previous corrected V2 tip tree. Point 374's new tree is `0400e2c12189c9f38a450adf9ad0cbc97c1e310a`. Prefixes before 374 are unchanged. Manifest sha256 `a3bdec4dbc1a2994ca14e839af238d9958300486647506ebe93ee73f354c0a91`.
+- Next: commit this identity and rerun `--point 374`. Point 527 and sustained 500k stay unstarted.
