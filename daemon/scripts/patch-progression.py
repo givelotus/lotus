@@ -25,6 +25,19 @@ FLAGS = ['-DCMAKE_BUILD_TYPE=Release', '-DBUILD_WALLET=OFF', '-DBUILD_QT=OFF',
          '-DBUILD_ZMQ=OFF', '-DBUILD_CLI=ON', '-DBUILD_TX=OFF',
          '-DBUILD_CHRONIK=OFF', '-DBUILD_SEEDER=OFF', '-DENABLE_UPNP=OFF',
          '-DENABLE_NATPMP=OFF']
+# Exact framework skip reasons for features this measurement build leaves off.
+# HTTP/2 is not a FLAGS entry; the existing cache leaves it off and enabling it
+# would be a different benchmark. Any other exit 77 still fails the gate.
+# A match is N/A, not a passed test and not coverage.
+PROFILE_FEATURE_SKIPS = frozenset({
+    'Chronik indexer has not been compiled.',
+    'Chronik indexer plugins have not been compiled.',
+    'Chronik Electrum interface has not been compiled.',
+    'wallet has not been compiled.',
+    'bitcoin-wallet has not been compiled',
+    'bitcoind has not been built with zmq enabled.',
+    'bitcoind has not been built with HTTP/2 enabled.',
+})
 
 
 def now():
@@ -246,6 +259,22 @@ def run_command(argv, log, timeout=7200, env=None):
             'seconds': time.monotonic() - start, 'log': str(log)}
 
 
+def profile_feature_skip(log_path, returncode):
+    """Return the skip reason when exit 77 is a feature this profile leaves off.
+
+    The Bitcoin functional framework uses 77 for every skip. Only the closed
+    set in PROFILE_FEATURE_SKIPS is N/A. A missing interpreter module, an
+    unknown reason, or any other non-zero status stays a gate failure.
+    """
+    if returncode != 77:
+        return None
+    content = re.sub(r'\x1b\[[0-9;]*m', '', Path(log_path).read_text(errors='replace'))
+    reasons = [line.strip() for line in re.findall(r'Test Skipped: ([^\r\n]+)', content)]
+    if len(reasons) != 1 or reasons[0] not in PROFILE_FEATURE_SKIPS:
+        return None
+    return reasons[0]
+
+
 def ensure_source(source, base, upstream, log):
     if (source / '.git').exists():
         return
@@ -423,15 +452,37 @@ def main():
             functional_tests = sorted({test for prior in entries[:index + 1]
                                        for test in prior.get('contract', {}).get('required_functional_tests', [])})
             record['functional_tests'] = functional_tests
+            record['functional_passed'] = []
+            record['functional_skipped'] = []
             for test in functional_tests:
                 test_path = source / 'test/functional' / test
                 if not test_path.is_file():
                     raise GateFailure('Required functional test missing: ' + test)
                 test_env = dict(os.environ, TEST_RUNNER_PORT_MIN='32000')
-                run('functional_' + Path(test).stem, [sys.executable, test_path,
+                name = 'functional_' + Path(test).stem
+                command = run_command([sys.executable, test_path,
                     '--configfile=' + str(build / 'test/config.ini'), '--portseed=0',
                     '--cachedir=' + str(attempt / 'functional-cache'),
-                    '--tmpdir=' + str(attempt / ('functional-' + Path(test).stem))], 600, env=test_env)
+                    '--tmpdir=' + str(attempt / ('functional-' + Path(test).stem))],
+                    attempt / (name + '.log'), 600, env=test_env)
+                record['commands'].append(command)
+                reason = profile_feature_skip(command['log'], command['returncode'])
+                if reason:
+                    # N/A: the measurement daemon does not include this feature.
+                    # Do not count the test as passed or as correctness coverage.
+                    record['functional_skipped'].append({
+                        'test': test, 'returncode': command['returncode'],
+                        'reason': reason, 'result': 'N/A', 'coverage': False})
+                    persist()
+                    continue
+                persist()
+                if command['returncode']:
+                    raise GateFailure(name + ' failed')
+                record['functional_passed'].append(test)
+            if record['functional_skipped']:
+                record['functional_skip_note'] = (
+                    'functional_skipped tests are N/A for this wallet-off, Chronik-off, '
+                    'ZMQ-off profile. They were not executed and are not correctness coverage.')
             if 'test_lotus_v2_disk_state' in extras:
                 run('disk_state', [next(build.rglob('test_lotus_v2_disk_state'))], 3600)
             for name in standalone_present:
