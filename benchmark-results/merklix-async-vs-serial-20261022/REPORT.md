@@ -138,3 +138,12 @@ symbols are preserved in the local canonical archive
 archive and binary hashes are recorded, not claimed remotely backed up. Source,
 raw results and small evidence are committed. No daemon source, validation
 cache, CCheckQueue, Grok source/build/mailbox, production node or release changed.
+
+Source/results delivery commit: `49ffe8d4`; no remote push was performed.
+A verified incremental recovery bundle preserves that commit and its ancestry
+back to prerequisite `6c85f365` at
+`daemon/.local-artifact-archive/merklix-async-vs-serial-20261022/source-through-49ffe8d4.bundle`.
+Its SHA256 is recorded with the local artifact hashes. The source snapshot and
+generated diff artifacts intentionally preserve upstream bytes, including
+inherited whitespace. All variants use the same successful-pthread-start counter;
+its per-start bookkeeping is included in measured CPU and wall costs.
