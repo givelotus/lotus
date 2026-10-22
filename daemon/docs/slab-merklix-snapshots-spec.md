@@ -1,8 +1,8 @@
 # Slab-backed persistent Merklix snapshots with lazy commitments and incremental MinHash
 
 Status: **implemented in production call paths on review source
-`c4d489d4826509013c982fa100e5e5de4a64ba5c`, based on corrected 527
-`385b64d7e7e0666e2bfff9865ee831a3186795fd`. All 1,199 native cases and
+`922eb4a7f9d8ec8af7a5e64d521454c572ece937`, based on repaired 527
+`0f42fcfde6d36fd4326b8de18df17ce740b22446`. All 1,200 native cases pass with the matched allocator-OFF profile; the unchanged tree code retains its prior
 400-round ThreadSanitizer stress and two-node scope-5 recovery/mining pass. Three microbenchmark repetitions at
 5k/100k/500k are recorded; canonical patch 528 is integrated by commit `90e98bf0`; matched 527/528 node benchmarks are pending.** This document is the
 specification for the follow-up recorded in
@@ -386,3 +386,14 @@ for exact source/binary hashes, test outcomes and measurements.
 * A depleted working sketch stays depleted until `CurrentSketch` refills it;
   distinct pins can independently refill their immutable sketches. Threshold
   hash ties may grow the candidate buffer beyond its 256-value target.
+
+## 18. Shared lifetime repair before matched endpoints
+
+The matched allocator-OFF comparison uses repaired 527 `0f42fcfd` and 528
+`922eb4a7`. Both inherit the same signature-cache lifetime fix in ecash/025
+(global 26) and exact-transaction admission fixture repair in ecash/348 (global
+349). Their complete native gates pass (1,187 / 1,200 cases); all 528 mailbox
+intermediate trees replay exactly. No assertion is weakened or skipped, and no
+generic/cooperative executor is included. Existing 385/c4 artifacts remain
+historical. Exact endpoint hashes and causal before/after evidence are under
+`daemon/patch-intake/20261022/tls-cache-lifetime-repair/`.
