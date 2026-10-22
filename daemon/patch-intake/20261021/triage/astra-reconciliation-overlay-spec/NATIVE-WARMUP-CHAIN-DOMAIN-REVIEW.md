@@ -1,0 +1,20 @@
+# Native cache warmup: chain-domain safety review
+
+Reviewed source: `/Users/shammah/repos/lotus-v2-native-staged-crypto`, candidate `677bc7fa88459095b07f770b5d64109668653640`, tree `cb56a26199ac3d774fec7f0a66602005a912733f`, on base `9f04419037a5527b498188c3a81f1cac259cc9c5`. Astra's final source review is clear; native execution and performance gates remain pending. This is independent of full-mempool reconciliation and does not authorize a broad validation rewrite.
+
+The initial warmup called ordinary `CScriptCheck` outside `cs_main`, which reads `GetActiveV2ChainId()` during native signing preparation. The assumption that this global is startup-only is false:
+
+- `src/primitives/block.cpp:862` returns the plain global by reference; `SetActiveV2ChainId` assigns it without synchronization.
+- `src/kernel/chainparams.cpp:166` temporarily replaces it through `ScopedV2ChainId`; all three network parameter constructors use that helper for genesis construction.
+- `src/kernel/chainparams.cpp:555` constructs those parameters in `GetNetworkForMagic`, called by `src/node/utxo_snapshot.h:86` during snapshot metadata decoding.
+- `src/minerfund.cpp:29` constructs mainnet parameters in the lazily initialized destination path; treasury address parsing also has parameter-construction fallbacks.
+
+These writers are not synchronized by merely copying the global under `cs_main`. No runtime race reproduction or exploited acceptance is claimed here; the source lacks a synchronization or immutability guarantee.
+
+The owner repaired the new path narrowly: copy `chainman.GetParams().V2ChainId()` from the immutable selected configuration, then supply an owned optional chain ID to each warmup checker. Both native preparation branches use that value. The prepared VM cache already compares chain ID, TxHash, and the entire resolved-coin context; its prepared transaction owns the data borrowed by each synchronous invocation. Its weak pointer is only an identity/reuse check, not lifetime ownership of borrowed coins.
+
+This does **not** repair the preexisting general issue. Ordinary parallel checks and the native fast path also read the global; transaction-identity calculation does too. Their existing callers remain unchanged in this performance candidate. A separate corrective change should pass the configured domain through all authoritative validation/identity contexts, or remove process-global mutation from temporary parameter/genesis construction. It must preserve the selected network domain and native identity vectors, rather than silently redefining signatures under a performance patch.
+
+For the new warmup, successful primitive cache entries are framed by message, public key, full signature encoding, and mint domain. Reorgs or changed coins can make these entries unused; they do not establish a transaction verdict. Invalid witness encoding is checked before lookup. Legacy bridge verification still runs the interpreter and its signature checker; no whole-script cache entry is produced by warmup. `PrecomputeMempoolAdmission` returns empty native staged checks, and the existing version-7 exclusion in `CheckInputScriptsReusing` still forces authoritative validation.
+
+The frozen source includes `lotus_v2_tests/v2_native_crypto_warmup_keeps_authoritative_context`: configured-domain warmup despite a temporarily different global, a cache hit from another thread, empty exported staged checks, uncached invalid signature with the same TxId and different TxHash, changed-coin-message rejection, coinbase maturity rejection, valid primitive followed by failed deferred state authorization, and current-context validation after tip disconnection. The funding fixture mines the maturity interval before the last check, so disconnecting one latest block leaves that coin spendable. These are source-inspected assertions, not execution results. No further source safety blocker was found. Native RPC measurements must establish a benefit separately; the batch fast path and P2P path are not automatically accelerated by this change. No builds were run by this review lane.
