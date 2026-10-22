@@ -28,3 +28,9 @@ A/B stays the primary question; C is adopted only if it beats both with evidence
 
 ## Exclusive-window status
 Grok's progression run (`benchmark-results/grok-progression-20261022`) is active: point 0 finished, points 374 and 527 (builds + timing) are pending. `daemon/WORKTREES.json` lists its checkout. The host also has unrelated load (load avg ~6, an `explore` loop at 100% CPU, a dart language server). I have no channel to Grok, so a window has not been agreed.
+
+Raw samples now also record first-root wall/CPU cost (including lazy pool
+creation), worker creations before timing, and subprocess wall time through
+process exit (including teardown, fixture/reference and warm-up). These are
+separate observables: subtracting them does not isolate pool teardown. Thread
+counts and summary column labels cover all four variants.
