@@ -4,7 +4,7 @@ Status: **implemented in production call paths on review source
 `922eb4a7f9d8ec8af7a5e64d521454c572ece937`, based on repaired 527
 `0f42fcfde6d36fd4326b8de18df17ce740b22446`. All 1,200 native cases pass with the matched allocator-OFF profile; the unchanged tree code retains its prior
 400-round ThreadSanitizer stress and two-node scope-5 recovery/mining pass. Three microbenchmark repetitions at
-5k/100k/500k are recorded; canonical patch 528 is integrated by commit `90e98bf0`; matched 527/528 node benchmarks are pending.** This document is the
+5k/100k/500k are recorded; canonical patch 528 is integrated by commit `90e98bf0`; matched 527/528 node benchmarks are running separately; results are not yet available.** This document is the
 specification for the follow-up recorded in
 [`lazy-merklix-snapshot-followup.md`](lazy-merklix-snapshot-followup.md). It
 does not change consensus hashing, block validity, transaction validation or
@@ -12,7 +12,7 @@ epoch finality.
 
 | Item | Value |
 | --- | --- |
-| Base source | corrected 527-patch stack tip `385b64d7e7e0666e2bfff9865ee831a3186795fd`, tree `1a554ffc949842a1243fb9f54ad2d16514f2fa24`; original halted parent `657edc0133` is preserved as historical recovery only |
+| Base source | repaired 527 tip `0f42fcfde6d36fd4326b8de18df17ce740b22446`, tree `a2c855dc0f6d16fa260549c40958ba37aecb03b9`; earlier `385b64d7` and halted `657edc0133` remain historical recovery |
 | Source lane | `daemon/worktrees/merklix-slab-source` (linked worktree of `~/repos/lotus-v2-repaired-source`), branch `review/merklix-slab-snapshot-20261022` |
 | Code | `src/lotus_v2/tx_merklix.{h,cpp}`, `src/lotus_v2/minhash.{h,cpp}`, integration in `mempool_overlay`, `primitives/block.cpp`, `txmempool`, `net/full_mempool_reconciliation`, `node/snapshot.cpp`, `node/metrics_collectors.cpp` |
 | Tests | `src/test/tx_merklix_tests.cpp` (+ updated `full_mempool_reconciliation_tests.cpp`) |
