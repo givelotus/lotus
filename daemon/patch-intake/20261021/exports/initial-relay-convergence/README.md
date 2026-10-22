@@ -1,6 +1,6 @@
 # Initial relay convergence: authoritative request state
 
-**Current candidate: dc1c12adaf**, branch `repair/authoritative-relay-requests-20261021`, source `/Users/shammah/repos/lotus-v2-authoritative-relay-requests`. Base is actual tested521-derived `2b61dded451755e175681f41a57281a5c0554e32`. Exact identities are in delivery.json. Native before/after gates are pending with N1; no500k rerun or performance claim.
+**Current candidate:8200846333**, branch `repair/authoritative-relay-requests-20261021`, source `/Users/shammah/repos/lotus-v2-authoritative-relay-requests`. Base is actual tested521-derived `2b61dded451755e175681f41a57281a5c0554e32`. Exact identities are in delivery.json. Native before/after gates are pending with N1; no500k rerun or performance claim.
 
 ## Defects and replacement
 
@@ -14,7 +14,7 @@ A separate existing bug affected mixed generic responses: if even one body match
 
 ## Focused gates
 
-1. **relay_epoch_responses_use_authoritative_requests:** actual wire handshake,5000 absent short IDs and two emitted requests. The last body's request is beyond the old4096 duplicate cap. Its funded valid transaction must enter the mempool. The wrong peer, wrong epoch, unrequested transaction and expired request must still fail admission.
+1. **relay_epoch_responses_use_authoritative_requests:** actual wire handshake,5000 absent short IDs and two emitted requests. The last body's request is beyond the old4096 duplicate cap. Two funded valid transactions are forced to share that short ID; both must enter the mempool from one response, proving selection precedes consuming the request. The wrong peer, wrong epoch, unrequested transaction and expired request must still fail admission.
 2. **shorttx_batch_admission_fallback_and_proactive_push:** leave one pending delayed match beside20 opted-in valid bodies; retain all20, including child/parent. The non-opted-in stage includes an unrequested third body and requires it to remain rejected.
 3. **bursts_wait_for_the_relay_tick:** preserve fixed-tick and known-inventory behavior with an actual private capability offer. The former manually inserted handler flag was insufficient after MR06; this is a fixture correction, not a new node behavior.
 
