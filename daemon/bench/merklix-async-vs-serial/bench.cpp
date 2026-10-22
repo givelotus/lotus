@@ -9,6 +9,7 @@
 #include <lotus_v2/tagged_hash.h>
 #include <sys/resource.h>
 #include <pthread.h>
+#include <dlfcn.h>
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -20,19 +21,18 @@
 #include <vector>
 using namespace lotus::v2;
 
-// Thread-creation counter: interpose pthread_create (macOS dyld interposing;
-// applies to libc++'s std::async/std::thread calls into libpthread).
+// Count successful thread starts through the actual executable symbol. dyld
+// interpose sections do not rewrite calls originating in this same image.
 static std::atomic<uint64_t> g_threads{0};
-extern "C" int counting_pthread_create(pthread_t *t, const pthread_attr_t *a,
-                                       void *(*f)(void *), void *arg) {
-    g_threads.fetch_add(1, std::memory_order_relaxed);
-    return pthread_create(t, a, f, arg);
+extern "C" int pthread_create(pthread_t *t, const pthread_attr_t *a,
+                              void *(*f)(void *), void *arg) {
+    using Create = int (*)(pthread_t *, const pthread_attr_t *, void *(*)(void *), void *);
+    static const Create real_create = reinterpret_cast<Create>(dlsym(RTLD_NEXT, "pthread_create"));
+    if (!real_create) std::abort();
+    const int rc = real_create(t, a, f, arg);
+    if (rc == 0) g_threads.fetch_add(1, std::memory_order_relaxed);
+    return rc;
 }
-#define INTERPOSE(rep, orig) \
-    __attribute__((used)) static struct { const void *r; const void *o; } \
-        _interpose_##orig __attribute__((section("__DATA,__interpose"))) = { \
-            (const void *)(unsigned long)&rep, (const void *)(unsigned long)&orig }
-INTERPOSE(counting_pthread_create, pthread_create);
 
 static Hash Reference(std::vector<const TxIdentityPair *> txs, unsigned depth = 0) {
     if (txs.empty()) return TaggedHash(HashDomain::TxRoot, std::array<uint8_t, 1>{2});

@@ -10,7 +10,7 @@ os.makedirs(out, exist_ok=True)
 sizes = [64, 1000, 5000, 100000, 500000]
 cases = [(n, d, 1) for n in sizes for d in ("random", "prefix")]
 cases += [(n, "random", c) for n in (5000, 100000) for c in (4, 16)]
-raw = open(os.path.join(out, "raw.jsonl"), "a")
+raw = open(os.path.join(out, "raw.jsonl"), "x")
 samples = {}
 for (n, d, c) in cases:
     for rep in range(reps):
@@ -18,12 +18,13 @@ for (n, d, c) in cases:
         for v in order:
             exe = os.path.join(here, "build", f"bench_{v}")
             process_start = time.monotonic()
-            r = subprocess.run([exe, str(n), d, str(c), min_s], capture_output=True, text=True)
+            r = subprocess.run([exe, str(n), d, str(c), min_s], capture_output=True, text=True, timeout=45)
             process_wall_s = time.monotonic() - process_start
-            if r.returncode: sys.exit(f"{exe} {n} {d} {c} failed rc={r.returncode}")
+            if r.returncode: sys.exit(f"{exe} {n} {d} {c} failed rc={r.returncode}: {r.stderr}")
             j = json.loads(r.stdout); j.update(process_wall_s=process_wall_s, variant=v, rep=rep, order=order, load=os.getloadavg(), ts=time.time())
             raw.write(json.dumps(j) + "\n"); raw.flush()
             samples.setdefault((n, d, c), {}).setdefault(v, []).append(j)
+        print(f"completed {n} {d} callers={c} repetition={rep+1}/{reps}", flush=True)
 def cv(x): return 100 * st.pstdev(x) / st.mean(x)
 rows = ["| workload | A async ms | B serial ms | C pool ms | A/B | C/B | C/A | D/B | D/C | D pool ms | CV% A/B/C/D | cpu ms A/B/C/D | process peak rss MB A/B/C/D | threads/root A/B/C/D |", "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|"]
 for (n, d, c), v in samples.items():

@@ -7,8 +7,18 @@ HERE=$(cd "$(dirname "$0")" && pwd)
 OUT=$HERE/build
 mkdir -p "$OUT"
 EXPECT_COMMIT=657edc0133cac8d54c5570506dad57bf10e300b5
-[ "$(git -C "$SRC" rev-parse HEAD)" = "$EXPECT_COMMIT" ] || { echo "source commit mismatch"; exit 1; }
-[ -z "$(git -C "$SRC" status --porcelain)" ] || { echo "source dirty"; exit 1; }
+if [ -f "$SRC/SOURCE.json" ]; then
+    python3 - "$SRC" "$EXPECT_COMMIT" <<'VERIFY'
+import hashlib,json,pathlib,sys
+root=pathlib.Path(sys.argv[1]); manifest=json.loads((root/'SOURCE.json').read_text())
+assert manifest['commit']==sys.argv[2], 'source commit mismatch'
+for name,digest in manifest['files'].items():
+    assert hashlib.sha256((root/name).read_bytes()).hexdigest()==digest, name
+VERIFY
+else
+    [ "$(git -C "$SRC" rev-parse HEAD)" = "$EXPECT_COMMIT" ] || { echo "source commit mismatch"; exit 1; }
+    [ -z "$(git -C "$SRC" status --porcelain)" ] || { echo "source dirty"; exit 1; }
+fi
 cp "$SRC/src/lotus_v2/commitment.cpp" "$OUT/commitment_A.cpp"
 # B: the only change is disabling the recursive async dispatch condition.
 sed 's/if (depth < 4 && entries.size() >= 64 && !left.empty() && !right.empty()) {/if (false \&\& depth < 4 \&\& entries.size() >= 64 \&\& !left.empty() \&\& !right.empty()) {/' \
