@@ -18,6 +18,10 @@ The source keeps the existing100k short-ID announcement bound and peer permissio
 - `short_id_request_window_backpressure_and_timeout`: announce5000 distinct absent IDs; request4096, retain904 as eligible, deliberately omit the first reply, advance beyond the2-second timeout, request the remaining904, and prove slots are released after their timeout too.
 - `short_id_body_satisfies_other_peer_pending_slots`: actual announcement/request bookkeeping plus delayed response state on another peer; receiving the body through the validated-batch callback must release both peers' pending slots.
 
+- `bursts_wait_for_the_relay_tick`: preserve the existing fixed-tick/known-inventory behavior using an actual capability offer. Its former manual private-handler flag does not establish the peer feature required by MR06. This is a fixture correction, not another node behavior change.
+
+The mixed-response test also includes an unrequested third body in its non-high-bandwidth stage and requires it to remain rejected.
+
 For a matched old-production control, keep the candidate's two test files but restore its three production files to exact2b61. The tests use no newly added public helper API. N1 was given the frozen source and selectors; actual results remain pending.
 
 ## Scope and integration
