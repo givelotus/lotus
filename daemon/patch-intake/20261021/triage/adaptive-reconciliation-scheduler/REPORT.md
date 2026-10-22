@@ -19,3 +19,5 @@ Review repair: complete new D/E/F thresholds now survive a captured A/B/C genera
 A sustained-arrival test guards against starvation of the count trigger: once a retained threshold is full, dropped extra hints do not push its maturity deadline forward. Actual dispatch remains subject to per-connection pacing and transport availability; max-wait is an initiation-readiness deadline, not a promise that a paused or paced peer receives bytes by that instant.
 
 Final source-review corrections: stable pre-reserved map objects swap only pointers because salted hashers are nonassignable; no global hasher was changed. The fairness cursor/deadline advances only after the reserved fair connection actually enqueues, with an explicit pause/disconnect-race test. Constructor arming ensures the periodic tick can observe quiet deadlines before the first message-loop poll.
+
+Both independent source reviewers closed their phase1 gates at f6a774e8e8/treec0e38c3946; see sibling astra-reconciliation-overlay-spec/PAIRWISE-SCHEDULER-SOURCE-GATE.md. N1 started the exact source normal-j10 build on its unchanged measured profile. Focused/runtime results remain pending.
