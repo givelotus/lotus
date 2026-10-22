@@ -117,15 +117,27 @@ BOOST_AUTO_TEST_CASE(relay_epoch_balanced_difference_requires_recovery) {
     BOOST_CHECK_MESSAGE(!mismatch.unresolved_sub_buckets.empty(),
                         "relay count inconsistency must request drilldown");
     // Budget control: root inequality also exists for a true remote subset.
-    // Restoring root fallback deliberately schedules root-bucket checks here,
-    // although no remote transaction is missing. Keep this cost visible.
+    // An authenticated subset needs no body: avoid amplified drilldown only
+    // after the full subset root proves that the inferred extras explain it.
     local.SetScopedTransactions(ReconScope::LIVE_MEMPOOL, key.epoch_id, {a, b});
     remote.SetScopedTransactions(ReconScope::LIVE_MEMPOOL, key.epoch_id, {a});
     const auto extra_only{local.DiffSyncSummary(remote.BuildSyncSummary(
         ReconScope::LIVE_MEMPOOL, key.epoch_id, key.k0, key.k1))};
     BOOST_CHECK(!extra_only.root_matched);
     BOOST_CHECK(extra_only.single_missing_short_ids.empty());
+    BOOST_CHECK_EQUAL(extra_only.mismatched_bucket_mask, 0U);
+    // Bucket hints can conceal another balanced difference. Even a plausible
+    // local-extra hint cannot suppress recovery when the subset root differs.
+    auto hidden_difference{remote.BuildSyncSummary(
+        ReconScope::LIVE_MEMPOOL, key.epoch_id, key.k0, key.k1)};
+    hidden_difference.candidate_root = control;
+    BOOST_REQUIRE(hidden_difference.candidate_root !=
+                  ComputeScopedMerklixRoot({a}));
+    const auto hidden{local.DiffSyncSummary(hidden_difference)};
+    BOOST_CHECK(!hidden.root_matched);
+    BOOST_CHECK_EQUAL(hidden.mismatched_bucket_mask, 0xFFFFU);
     BOOST_TEST_MESSAGE("extra-only relay root bucket mask=" <<
                         extra_only.mismatched_bucket_mask);
 
 }
+
