@@ -1,0 +1,3373 @@
+From 56457652875b8ba54f70e0fe2183d61916d07a01 Mon Sep 17 00:00:00 2001
+From: Shammah Chancellor <shammah.chancellor@notvalid.com>
+Date: Thu, 22 Oct 2026 10:38:55 -0700
+Subject: [PATCH] lotus_v2: slab-backed persistent Merklix snapshots with lazy
+ hashing and MinHash
+
+Replace the append-only TxOverlayArena inside every MempoolOverlayLayer with
+txmerklix::Tree: a path-compressed, reference-counted persistent tree whose
+branch and leaf nodes live in per-family slabs addressed by 32-bit handles.
+Exclusively owned (path-unique) nodes are mutated in place; shared nodes are
+path-copied. Freed slots are reclaimed in batches and reused with generation
+counters; a solely owned empty store returns its chunks. Digests are lazy
+derived caches published with a Dirty/Busy/Clean compare-and-swap, so
+ordinary readers never hash and any number of threads can complete the
+commitment of an immutable pinned version. Consensus Subtree A is unchanged
+and equality with TransactionSubtreeA and the legacy arena is tested.
+
+Epoch freezes now share the tree in O(1) and block-connect re-anchoring
+adopts the existing trees and cached digests instead of re-inserting every
+transaction. The RPC template snapshot pins Subtree A under the mempool lock
+and hashes after releasing it.
+
+Full-mempool reconciliation captures pin the mempool's working tree in O(1)
+under cs_main and mempool.cs instead of copying every transaction reference
+and rebuilding/eagerly hashing a private trie; the legacy rebuild remains as
+an explicit fallback and as the bounded page verifier. Each pinned version
+carries an incrementally maintained bottom-k (k=64) MinHash of the same
+(TxId, TxHash) membership with exact deletion support (candidate buffer of
+256 with lazy bounded rebuild). Scope-5 frames are version 2: offers carry
+the sketch, receivers record Jaccard/remote-only estimates and their error
+against the authenticated traversal. The sketch is a hint only and never
+decides fetching, validity or finality. Prometheus exposes txmerklix and
+fullrecon series.
+
+The RPC entry radix index, UTXO SMT/overlay and short-id relay index are
+unchanged. Specification: daemon/docs/slab-merklix-snapshots-spec.md in the
+monorepo.
+---
+ doc/metrics.md                                |  39 +
+ src/lotus_v2/CMakeLists.txt                   |   3 +-
+ .../block_assembler_test/CMakeLists.txt       |   2 +-
+ src/lotus_v2/mempool_overlay.cpp              |  53 +-
+ src/lotus_v2/mempool_overlay.h                |  42 +-
+ src/lotus_v2/minhash.cpp                      | 115 +++
+ src/lotus_v2/minhash.h                        |  80 ++
+ src/lotus_v2/tx_merklix.cpp                   | 838 ++++++++++++++++++
+ src/lotus_v2/tx_merklix.h                     | 319 +++++++
+ src/net/full_mempool_reconciliation.cpp       | 206 +++--
+ src/net/full_mempool_reconciliation.h         |  84 +-
+ src/node/metrics_collectors.cpp               |  92 ++
+ src/node/snapshot.cpp                         |  12 +-
+ src/primitives/block.cpp                      |  17 +-
+ src/test/CMakeLists.txt                       |   1 +
+ .../full_mempool_reconciliation_tests.cpp     |  20 +-
+ src/test/tx_merklix_tests.cpp                 | 637 +++++++++++++
+ src/test/txrelay_tests.cpp                    |   4 +
+ src/txmempool.cpp                             |  12 +
+ src/txmempool.h                               |  10 +
+ .../p2p_full_mempool_reconciliation.py        | 119 +++
+ 21 files changed, 2539 insertions(+), 166 deletions(-)
+ create mode 100644 src/lotus_v2/minhash.cpp
+ create mode 100644 src/lotus_v2/minhash.h
+ create mode 100644 src/lotus_v2/tx_merklix.cpp
+ create mode 100644 src/lotus_v2/tx_merklix.h
+ create mode 100644 src/test/tx_merklix_tests.cpp
+ create mode 100755 test/functional/p2p_full_mempool_reconciliation.py
+
+diff --git a/doc/metrics.md b/doc/metrics.md
+index a9ddb89ff39950db8a2bf933f903c68cafc47dda..50482ebe77d88664d8e9c8ac5232a5ccb5d4a420 100644
+--- a/doc/metrics.md
++++ b/doc/metrics.md
+@@ -212,6 +212,45 @@ work, under this naming scheme; they are not listed here.
+ | `fullnode_adaptive_block_size_bytes` | gauge | `limit` (`max`, `target`, `max_generated`, `ema`) | 4 | Adaptive block capacity: the consensus limit it allows, its target, the mining limit with `-adaptiveblocksize`, and the moving average of block sizes. |
+ | `fullnode_adaptive_block_size_history_complete` | gauge | | 1 | 1 once the adaptive capacity has a complete history. |
+ 
++### Slab Merklix tree and full-mempool reconciliation
++
++Process-wide counters of the slab-backed transaction Merklix tree
++(`lotus_v2/tx_merklix.h`) and of complete-mempool reconciliation (scope 5).
++The MinHash series describe an unauthenticated similarity hint only.
++
++| Name | Type | Labels | Max series | Meaning |
++|---|---|---|---|---|
++| `fullnode_txmerklix_leaf_allocations_total` | counter | | 1 | Leaf nodes allocated. |
++| `fullnode_txmerklix_branch_allocations_total` | counter | | 1 | Branch nodes allocated (new branch points and path copies). |
++| `fullnode_txmerklix_slot_reuses_total` | counter | | 1 | Allocations served from reclaimed slab slots. |
++| `fullnode_txmerklix_path_copies_total` | counter | | 1 | Shared branches copied because a snapshot or tree copy still referenced them. |
++| `fullnode_txmerklix_inplace_updates_total` | counter | | 1 | Exclusively owned branches mutated in place. |
++| `fullnode_txmerklix_nodes_freed_total` | counter | | 1 | Nodes reclaimed after their last owner was released. |
++| `fullnode_txmerklix_node_hashes_total` | counter | | 1 | Lazy digest computations (leaves, branches and unary folds). |
++| `fullnode_txmerklix_hash_races_total` | counter | | 1 | Concurrent digest computations that lost the cache publication race. |
++| `fullnode_txmerklix_pins_total` | counter | | 1 | Immutable snapshots pinned. |
++| `fullnode_txmerklix_parallel_completions_total` | counter | | 1 | Large dirty commitments completed with parallel subtree hashing. |
++| `fullnode_txmerklix_sketch_rebuilds_total` | counter | | 1 | MinHash candidate rebuilds after deletions exhausted the candidate buffer. |
++| `fullnode_txmerklix_sketch_rebuild_members_total` | counter | | 1 | Members scanned by MinHash candidate rebuilds. |
++| `fullnode_txmerklix_live_leaves` | gauge | | 1 | Live leaf nodes in all stores. |
++| `fullnode_txmerklix_live_branches` | gauge | | 1 | Live branch nodes in all stores. |
++| `fullnode_txmerklix_retained_slot_bytes` | gauge | | 1 | Bytes of constructed slab slots (live or reusable) in all stores. |
++| `fullnode_txmerklix_stores` | gauge | | 1 | Live node stores. |
++| `fullnode_fullrecon_captures_total` | counter | | 1 | Reconciliation snapshots captured. |
++| `fullnode_fullrecon_capture_pins_total` | counter | | 1 | Captures served by an O(1) pinned mempool tree. |
++| `fullnode_fullrecon_capture_fallbacks_total` | counter | | 1 | Captures rebuilt from copied mempool transactions. |
++| `fullnode_fullrecon_capture_lock_microseconds_total` | counter | | 1 | Time holding `cs_main` and the mempool lock to capture. |
++| `fullnode_fullrecon_capture_build_microseconds_total` | counter | | 1 | Time constructing captured snapshots after the locks. |
++| `fullnode_fullrecon_commitment_microseconds_total` | counter | | 1 | Lazy commitment completion for offered roots, outside mempool locks. |
++| `fullnode_fullrecon_offers_total` | counter | | 1 | Offers sent. |
++| `fullnode_fullrecon_coverage_complete_total` | counter | | 1 | Remote snapshots whose authenticated traversal completed. |
++| `fullnode_fullrecon_sketch_offers_total` | counter | | 1 | Received offers whose MinHash hint was evaluated. |
++| `fullnode_fullrecon_sketch_jaccard_ppm_total` | counter | | 1 | Summed estimated Jaccard similarity (parts per million). |
++| `fullnode_fullrecon_sketch_estimated_remote_only_total` | counter | | 1 | Summed estimates of remote-only members at offer time. |
++| `fullnode_fullrecon_sketch_completed_total` | counter | | 1 | Completed traversals that had an estimate. |
++| `fullnode_fullrecon_sketch_actual_recovered_total` | counter | | 1 | Members actually recovered by those traversals. |
++| `fullnode_fullrecon_sketch_abs_error_total` | counter | | 1 | Summed absolute error between estimates and recovered members. |
++
+ ### Chronik
+ 
+ | Name | Type | Labels | Max series | Meaning |
+diff --git a/src/lotus_v2/CMakeLists.txt b/src/lotus_v2/CMakeLists.txt
+index 215aff79cd832ff1c8febd2954f69e21c1663033..ff9f0ad7ea21fa007b80d13249baac65ae889ff1 100644
+--- a/src/lotus_v2/CMakeLists.txt
++++ b/src/lotus_v2/CMakeLists.txt
+@@ -19,7 +19,8 @@ if(NOT TARGET Boost::headers)
+     find_package(Boost 1.64 REQUIRED)
+ endif()
+ target_sources(lotus_v2_header PRIVATE
+-    output.cpp commitment.cpp sparse_state.cpp mempool_overlay.cpp)
++    output.cpp commitment.cpp sparse_state.cpp mempool_overlay.cpp
++    tx_merklix.cpp minhash.cpp)
+ target_sources(lotus_v2_header PRIVATE address.cpp)
+ target_link_libraries(lotus_v2_header PUBLIC lotus_v2_blake3)
+ target_link_libraries(lotus_v2_header PUBLIC Boost::headers)
+diff --git a/src/lotus_v2/block_assembler_test/CMakeLists.txt b/src/lotus_v2/block_assembler_test/CMakeLists.txt
+index d78d3f12cbade64e9b0a03fcd705dc310b074539..aeea2f5a7191608b0a52480adc11b830fd899eb9 100644
+--- a/src/lotus_v2/block_assembler_test/CMakeLists.txt
++++ b/src/lotus_v2/block_assembler_test/CMakeLists.txt
+@@ -10,7 +10,7 @@ endif()
+ get_filename_component(LOTUS_SRC "${CMAKE_CURRENT_SOURCE_DIR}/../.." ABSOLUTE)
+ add_executable(block_assembler_test
+     ../../support/cleanse.cpp
+-    ../mempool_overlay.cpp ../header_admission.cpp ../disk_body.cpp ../development_chain.cpp ../disk_block.cpp ../block_transition.cpp ../test_block_assembler.cpp ../block_assembler.cpp ../block_template.cpp ../development_runtime.cpp ../candidate_selection.cpp ../candidate_body_pool.cpp ../reorg_recovery.cpp ../chain_index.cpp
++    ../mempool_overlay.cpp ../tx_merklix.cpp ../minhash.cpp ../header_admission.cpp ../disk_body.cpp ../development_chain.cpp ../disk_block.cpp ../block_transition.cpp ../test_block_assembler.cpp ../block_assembler.cpp ../block_template.cpp ../development_runtime.cpp ../candidate_selection.cpp ../candidate_body_pool.cpp ../reorg_recovery.cpp ../chain_index.cpp
+     ../output.cpp ../transaction.cpp ../commitment.cpp ../tagged_hash.cpp
+     ../signing.cpp ../vm.cpp ../field_size.cpp ../sparse_state.cpp
+     ../incremental_utxo.cpp ../ordinary_validation.cpp ../monetary.cpp
+diff --git a/src/lotus_v2/mempool_overlay.cpp b/src/lotus_v2/mempool_overlay.cpp
+index be78bf3a9d407ff3a0b2ece5be15c84bdf94fe48..a3bcf64addbd7a983bd3847f2d42599f5a69adc3 100644
+--- a/src/lotus_v2/mempool_overlay.cpp
++++ b/src/lotus_v2/mempool_overlay.cpp
+@@ -2256,8 +2256,8 @@ void MempoolOverlayLayer::Reset(const Hash &parent_block_id,
+     parent_mtp_ = parent_mtp;
+     base_mon_state_ = base_mon_state;
+ 
+-    tx_arena_.Reset();
+-    tx_root_idx_ = TxOverlayArena::kNullIdx;
++    // Keeps the store: freed slots are reused by the next membership.
++    tx_tree_.Clear();
+     utxo_arena_.Reset(std::move(base_utxo_root));
+     utxo_arena_dirty_ = false;
+     sum_non_cb_effective_cost_ = 0;
+@@ -2312,7 +2312,8 @@ bool MempoolOverlayLayer::AddTransaction(
+     const std::vector<Coin> &created_coins,
+     int64_t fee_sats,
+     int64_t sigchecks,
+-    std::shared_ptr<const void> tx_ref) {
++    std::shared_ptr<const void> tx_ref,
++    uint32_t payload_bytes) {
+     if (active_txs_.find(tx_id) != active_txs_.end()) {
+         return false;
+     }
+@@ -2320,7 +2321,7 @@ bool MempoolOverlayLayer::AddTransaction(
+     const uint64_t eff_cost =
+         TransactionEffectiveCost(linear_cost, kDefaultMonetaryProfile);
+ 
+-    tx_root_idx_ = tx_arena_.InsertTxLeaf(tx_root_idx_, tx_id, tx_hash);
++    tx_tree_.Insert(tx_id, tx_hash, tx_ref, payload_bytes);
+     sum_non_cb_effective_cost_ += eff_cost;
+ 
+     for (const auto &op : spent_outpoints) {
+@@ -2339,6 +2340,7 @@ bool MempoolOverlayLayer::AddTransaction(
+     entry.effective_cost = eff_cost;
+     entry.fee_sats = fee_sats;
+     entry.sigchecks = sigchecks;
++    entry.payload_bytes = payload_bytes;
+     entry.spent_outpoints = spent_outpoints;
+     entry.created_coins = created_coins;
+     entry.tx_ref = std::move(tx_ref);
+@@ -2349,14 +2351,20 @@ bool MempoolOverlayLayer::AddTransaction(
+ 
+ size_t MempoolOverlayLayer::AddTransactionBatch(
+     std::span<OverlayTxEntry> entries) {
++    return AddTransactionBatch(entries, false);
++}
++
++size_t MempoolOverlayLayer::AddTransactionBatch(
++    std::span<OverlayTxEntry> entries, bool tree_already_contains) {
+     if (entries.empty()) {
+         return 0;
+     }
+-    if (entries.size() == 1) {
++    if (entries.size() == 1 && !tree_already_contains) {
+         auto &e = entries[0];
+         return AddTransaction(e.tx_id, e.tx_hash, e.linear_cost,
+                               e.spent_outpoints, e.created_coins, e.fee_sats,
+-                              e.sigchecks, std::move(e.tx_ref))
++                              e.sigchecks, std::move(e.tx_ref),
++                              e.payload_bytes)
+                    ? 1
+                    : 0;
+     }
+@@ -2364,18 +2372,20 @@ size_t MempoolOverlayLayer::AddTransactionBatch(
+     ReserveBucketsAmortized(created_coins_, entries.size() * 2);
+     ReserveBucketsAmortized(spent_outpoints_, entries.size() * 2);
+ 
+-    std::vector<std::pair<Hash, Hash>> tx_leaves;
+-    tx_leaves.reserve(entries.size());
+-
+     size_t added_count = 0;
+     for (auto &entry : entries) {
+         if (active_txs_.find(entry.tx_id) != active_txs_.end()) {
+             continue;
+         }
++        // Tree first: an allocation failure leaves the layer unchanged for
++        // this entry.
++        if (!tree_already_contains) {
++            tx_tree_.Insert(entry.tx_id, entry.tx_hash, entry.tx_ref,
++                            entry.payload_bytes);
++        }
+         entry.effective_cost =
+             TransactionEffectiveCost(entry.linear_cost, kDefaultMonetaryProfile);
+         sum_non_cb_effective_cost_ += entry.effective_cost;
+-        tx_leaves.emplace_back(entry.tx_id, entry.tx_hash);
+ 
+         for (const auto &op : entry.spent_outpoints) {
+             ++spent_outpoints_[op];
+@@ -2394,11 +2404,13 @@ size_t MempoolOverlayLayer::AddTransactionBatch(
+         return 0;
+     }
+ 
+-    if (tx_leaves.size() >= 16) {
+-        tx_root_idx_ = tx_arena_.InsertBatchParallel(tx_root_idx_, tx_leaves);
+-    } else {
+-        for (const auto &[tx_id, tx_hash] : tx_leaves) {
+-            tx_root_idx_ = tx_arena_.InsertTxLeaf(tx_root_idx_, tx_id, tx_hash);
++    if (tree_already_contains && tx_tree_.Count() != active_txs_.size()) {
++        // The adopted tree did not describe exactly these entries; rebuild it
++        // from the authoritative entry map rather than publish a wrong root.
++        tx_tree_.Clear();
++        for (const auto &[tx_id, entry] : active_txs_) {
++            tx_tree_.Insert(tx_id, entry.tx_hash, entry.tx_ref,
++                            entry.payload_bytes);
+         }
+     }
+ 
+@@ -2413,7 +2425,7 @@ bool MempoolOverlayLayer::RemoveTransaction(const Hash &tx_id) {
+     }
+ 
+     const OverlayTxEntry &entry = it->second;
+-    tx_root_idx_ = tx_arena_.EraseTxLeaf(tx_root_idx_, tx_id);
++    tx_tree_.Erase(tx_id);
+     assert(sum_non_cb_effective_cost_ >= entry.effective_cost);
+     sum_non_cb_effective_cost_ -= entry.effective_cost;
+ 
+@@ -2523,6 +2535,9 @@ void MerklixOverlayManager::ReanchorExistingTxs(
+             MempoolOverlayLayer reanchored(tip_block_id, base_utxo_root,
+                                            base_mon_state, next_height,
+                                            parent_mtp, old_layer.GetLayerId());
++            // Membership (TxId, TxHash) is unchanged by re-anchoring; share
++            // the frozen tree and its completed digests instead of rebuilding.
++            reanchored.AdoptTxTree(old_layer.GetTxTree());
+             std::vector<OverlayTxEntry> batch;
+             batch.reserve(old_layer.GetOrderedTxs().size());
+             for (auto [tx_id, entry] : old_layer.GetOrderedTxs()) {
+@@ -2534,15 +2549,17 @@ void MerklixOverlayManager::ReanchorExistingTxs(
+                 }
+                 batch.push_back(std::move(entry));
+             }
+-            reanchored.AddTransactionBatch(batch);
++            reanchored.AddTransactionBatch(batch, true);
+             frozen_epochs_.push_back(std::move(reanchored));
+         }
+     }
+ 
+     auto existing_txs = speculative_layer_.GetOrderedTxs();
++    txmerklix::Tree existing_tree = speculative_layer_.GetTxTree();
+     speculative_layer_.Reset(tip_block_id, std::move(base_utxo_root),
+                              base_mon_state, next_height, parent_mtp,
+                              next_epoch_id_);
++    speculative_layer_.AdoptTxTree(std::move(existing_tree));
+ 
+     std::vector<OverlayTxEntry> batch;
+     batch.reserve(existing_txs.size());
+@@ -2555,7 +2572,7 @@ void MerklixOverlayManager::ReanchorExistingTxs(
+         }
+         batch.push_back(std::move(entry));
+     }
+-    speculative_layer_.AddTransactionBatch(batch);
++    speculative_layer_.AddTransactionBatch(batch, true);
+ }
+ 
+ bool MerklixOverlayManager::AddTransaction(
+diff --git a/src/lotus_v2/mempool_overlay.h b/src/lotus_v2/mempool_overlay.h
+index 51263287aba4610dd6b5de0a5a523913ed42e908..d4fe90cc838dbadc2a984804ff7d55d683ad30b2 100644
+--- a/src/lotus_v2/mempool_overlay.h
++++ b/src/lotus_v2/mempool_overlay.h
+@@ -10,6 +10,7 @@
+ #include "monetary.h"
+ #include "output.h"
+ #include "sparse_state.h"
++#include "tx_merklix.h"
+ 
+ #include <array>
+ #include <cstddef>
+@@ -86,6 +87,11 @@ struct TxOverlayNode {
+ /**
+  * Persistent path-copying arena for Subtree A (non-coinbase transactions).
+  * Produces digests bit-for-bit identical to consensus TransactionRoot Subtree A.
++ *
++ * Legacy reference only: production overlay layers use txmerklix::Tree
++ * (slab-backed, path-compressed, reference-counted, reclaiming). This
++ * append-only arena never reclaims superseded path copies until Reset and is
++ * retained for equivalence tests and A/B microbenchmarks.
+  */
+ class TxOverlayArena {
+ public:
+@@ -252,6 +258,8 @@ struct OverlayTxEntry {
+     uint64_t effective_cost{0};
+     int64_t fee_sats{0};
+     int64_t sigchecks{0};
++    //! Conservative retained-body charge used by pinned reconciliation views.
++    uint32_t payload_bytes{0};
+     std::vector<Outpoint> spent_outpoints;
+     std::vector<Coin> created_coins;
+     std::shared_ptr<const void> tx_ref;
+@@ -262,7 +270,9 @@ struct OverlayTxEntry {
+  *   Layer 0 (Confirmed Chain Tip) -> Layer 1..k (Frozen Epoch Batches) -> Speculative Tip.
+  *
+  * Maintains:
+- *   - Subtree A (non-coinbase TxRoot SMT) via TxOverlayArena
++ *   - Subtree A (non-coinbase TxRoot Merklix) via txmerklix::Tree: lazy
++ *     digests, O(1) structural pins for advertised/hashed snapshots, and an
++ *     incrementally maintained bottom-k MinHash of the same membership
+  *   - UTXO State Root SMT via UtxoOverlayArena (with intra-overlay spend elision)
+  *   - Additive non-coinbase effective block cost for O(1) MonetaryState transition
+  *   - CTOR-sorted active transaction map for O(1) block template emission
+@@ -291,20 +301,35 @@ public:
+                         const std::vector<Coin> &created_coins,
+                         int64_t fee_sats = 0,
+                         int64_t sigchecks = 0,
+-                        std::shared_ptr<const void> tx_ref = nullptr);
++                        std::shared_ptr<const void> tx_ref = nullptr,
++                        uint32_t payload_bytes = 0);
+ 
+     /**
+-     * Coalesced 16-shard parallel batch transaction insertion into the overlay.
+-     * Elides intra-batch spent outputs before touching the UTXO SMT arena and
+-     * performs a single 16-shard InsertBatchParallel + BatchUpdateParallel.
++     * Coalesced batch transaction insertion into the overlay. Transaction
++     * tree inserts are sequential path-copy/in-place updates without hashing;
++     * the UTXO arena is rebuilt lazily as before.
+      */
+     size_t AddTransactionBatch(std::span<OverlayTxEntry> entries);
+ 
++    /**
++     * Re-anchoring support: adopt an existing transaction tree whose
++     * membership exactly equals the entries subsequently re-added with
++     * AddTransactionBatch(entries, tree_already_contains = true).
++     */
++    void AdoptTxTree(txmerklix::Tree tree) { tx_tree_ = std::move(tree); }
++    size_t AddTransactionBatch(std::span<OverlayTxEntry> entries,
++                               bool tree_already_contains);
++
+     bool RemoveTransaction(const Hash &tx_id);
+ 
+     bool Contains(const Hash &tx_id) const;
+ 
+-    Hash GetSubtreeARoot() const { return tx_arena_.SubtreeARoot(tx_root_idx_); }
++    /** Lazily completes only dirty digests; caller holds the writer lock. */
++    Hash GetSubtreeARoot() const { return tx_tree_.RootDigest(); }
++    /** O(1) immutable view of the current Subtree A membership + MinHash. */
++    std::shared_ptr<const txmerklix::Snapshot> PinTxTree() const {
++        return tx_tree_.Pin();
++    }
+     Hash GetUtxoRootDigest() const {
+         EnsureUtxoArenaUpdated();
+         return utxo_arena_.RootDigest();
+@@ -343,7 +368,7 @@ public:
+     std::vector<Outpoint> GetNetErasedOutpoints() const;
+     std::vector<Coin> GetNetInsertedCoins() const;
+ 
+-    const TxOverlayArena &GetTxArena() const noexcept { return tx_arena_; }
++    const txmerklix::Tree &GetTxTree() const noexcept { return tx_tree_; }
+     const UtxoOverlayArena &GetUtxoArena() const {
+         EnsureUtxoArenaUpdated();
+         return utxo_arena_;
+@@ -358,8 +383,7 @@ private:
+     uint64_t parent_mtp_{0};
+     MonetaryState base_mon_state_{};
+ 
+-    TxOverlayArena tx_arena_;
+-    uint32_t tx_root_idx_{TxOverlayArena::kNullIdx};
++    txmerklix::Tree tx_tree_;
+     mutable UtxoOverlayArena utxo_arena_;
+     mutable bool utxo_arena_dirty_{false};
+     uint64_t sum_non_cb_effective_cost_{0};
+diff --git a/src/lotus_v2/minhash.cpp b/src/lotus_v2/minhash.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..11ebf3fec2584878fac55909efa20446352d82f9
+--- /dev/null
++++ b/src/lotus_v2/minhash.cpp
+@@ -0,0 +1,115 @@
++// Copyright (c) 2026 The Lotus developers
++// Distributed under the MIT software license, see the accompanying
++// file COPYING or http://www.opensource.org/licenses/mit-license.php.
++
++#include "minhash.h"
++
++#include <crypto/siphash.h>
++
++#include <algorithm>
++#include <cmath>
++
++namespace lotus::v2::minhash {
++
++uint64_t Value(const Hash &tx_id, const Hash &tx_hash) noexcept {
++    return CSipHasher(KEY0, KEY1)
++        .Write(Span<const uint8_t>{tx_id.data(), tx_id.size()})
++        .Write(Span<const uint8_t>{tx_hash.data(), tx_hash.size()})
++        .Finalize();
++}
++
++std::vector<uint64_t> Reference(std::vector<uint64_t> all) {
++    std::sort(all.begin(), all.end());
++    if (all.size() > K) all.resize(K);
++    return all;
++}
++
++double EstimateJaccard(std::span<const uint64_t> a, std::span<const uint64_t> b) {
++    if (a.empty() && b.empty()) return 1.0;
++    if (a.empty() || b.empty()) return 0.0;
++    // Merge the two ascending sketches; the K smallest union values are the
++    // union sketch. A value counts as shared when both sketches contain it.
++    size_t i{0}, j{0}, taken{0}, shared{0};
++    while (taken < K && (i < a.size() || j < b.size())) {
++        if (j == b.size() || (i < a.size() && a[i] < b[j])) {
++            ++i;
++        } else if (i == a.size() || b[j] < a[i]) {
++            ++j;
++        } else {
++            ++shared;
++            ++i;
++            ++j;
++        }
++        ++taken;
++    }
++    return taken ? double(shared) / double(taken) : 1.0;
++}
++
++double EstimateOnlyInB(double jaccard, uint64_t size_a, uint64_t size_b) {
++    // |A n B| = J (|A| + |B|) / (1 + J).
++    const double inter = jaccard * (double(size_a) + double(size_b)) / (1.0 + jaccard);
++    return std::max(0.0, double(size_b) - inter);
++}
++
++void Maintainer::Insert(uint64_t value) {
++    if (m_capped && value > m_threshold) return;
++    m_buffer.insert(std::upper_bound(m_buffer.begin(), m_buffer.end(), value), value);
++    if (m_buffer.size() > CANDIDATES) Shrink();
++}
++
++void Maintainer::Shrink() {
++    // Drop every copy of the maximum so that "all members <= threshold" holds
++    // exactly. Refuse when that would leave fewer than K (pathological ties).
++    const uint64_t top = m_buffer.back();
++    const auto first_top = std::lower_bound(m_buffer.begin(), m_buffer.end(), top);
++    if (size_t(first_top - m_buffer.begin()) < K) return;
++    m_buffer.erase(first_top, m_buffer.end());
++    m_threshold = m_buffer.back();
++    m_capped = true;
++}
++
++void Maintainer::Erase(uint64_t value) {
++    if (m_capped && value > m_threshold) return;
++    const auto it = std::lower_bound(m_buffer.begin(), m_buffer.end(), value);
++    if (it == m_buffer.end() || *it != value) {
++        // Caller contract violation (erasing a non-member); recover exactly.
++        m_needs_rebuild = true;
++        return;
++    }
++    m_buffer.erase(it);
++    if (m_capped && m_buffer.size() < K) m_needs_rebuild = true;
++}
++
++void Maintainer::Clear() {
++    m_buffer.clear();
++    m_threshold = 0;
++    m_capped = false;
++    m_needs_rebuild = false;
++}
++
++void Maintainer::Rebuild(std::vector<uint64_t> all) {
++    m_needs_rebuild = false;
++    if (all.size() <= CANDIDATES) {
++        std::sort(all.begin(), all.end());
++        m_buffer = std::move(all);
++        m_capped = false;
++        m_threshold = 0;
++        return;
++    }
++    std::nth_element(all.begin(), all.begin() + (CANDIDATES - 1), all.end());
++    m_threshold = all[CANDIDATES - 1];
++    const auto end = std::partition(all.begin(), all.end(),
++                                    [t = m_threshold](uint64_t v) { return v <= t; });
++    all.erase(end, all.end());
++    std::sort(all.begin(), all.end());
++    m_buffer = std::move(all);
++    m_buffer.shrink_to_fit();
++    m_capped = true;
++}
++
++std::vector<uint64_t> Maintainer::Export() const {
++    const size_t n = std::min(K, m_buffer.size());
++    return {m_buffer.begin(), m_buffer.begin() + n};
++}
++
++} // namespace lotus::v2::minhash
+diff --git a/src/lotus_v2/minhash.h b/src/lotus_v2/minhash.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..a4e7e66ef0282c9a2f8760485b4bba09b7dc38be
+--- /dev/null
++++ b/src/lotus_v2/minhash.h
+@@ -0,0 +1,80 @@
++// Copyright (c) 2026 The Lotus developers
++// Distributed under the MIT software license, see the accompanying
++// file COPYING or http://www.opensource.org/licenses/mit-license.php.
++
++#ifndef LOTUS_V2_MINHASH_H
++#define LOTUS_V2_MINHASH_H
++
++#include "header.h"
++
++#include <cstddef>
++#include <cstdint>
++#include <span>
++#include <vector>
++
++namespace lotus::v2::minhash {
++
++/**
++ * Bottom-k MinHash over transaction identity pairs (TxId, TxHash).
++ *
++ * Set semantics: one element per Merklix leaf. Re-inserting an identical
++ * pair is not a membership change; replacing a TxId's TxHash removes the old
++ * element and inserts the new one. Element value: SipHash-2-4 with the fixed
++ * protocol key below over TxId || TxHash. Values are deterministic and
++ * comparable across nodes; they are NOT secret, so transaction creators can
++ * grind low values. The sketch is a fetching/similarity hint only and never
++ * authenticates membership or decides validity.
++ */
++inline constexpr size_t K = 64;
++//! Candidate buffer capacity: all members with value <= threshold are kept.
++inline constexpr size_t CANDIDATES = 4 * K;
++inline constexpr uint64_t KEY0 = 0x6c6f7475732d6d68ULL; // "lotus-mh"
++inline constexpr uint64_t KEY1 = 0x2d74786964763031ULL; // "-txidv01"
++
++uint64_t Value(const Hash &tx_id, const Hash &tx_hash) noexcept;
++
++/** Reference: K smallest values of a multiset, ascending. */
++std::vector<uint64_t> Reference(std::vector<uint64_t> all);
++
++/**
++ * Jaccard estimate from two bottom-k sketches (ascending, <= K values each).
++ * Uses the K smallest values of the union; returns 1 for two empty sets.
++ */
++double EstimateJaccard(std::span<const uint64_t> a, std::span<const uint64_t> b);
++/** Estimated |B \ A| from J and the exact set sizes. Never negative. */
++double EstimateOnlyInB(double jaccard, uint64_t size_a, uint64_t size_b);
++
++/**
++ * Incrementally maintained bottom-k sketch with deletion support.
++ *
++ * Invariant: when capped, buffer == every member value <= threshold (with
++ * multiplicity), and |buffer| >= K unless a rebuild is pending. When not
++ * capped, buffer == every member value. Insertion is O(CANDIDATES) worst case
++ * (sorted small vector). Deletion of a sampled value is O(CANDIDATES); if the
++ * capped buffer falls below K, the next minima cannot be recovered locally and
++ * NeedsRebuild() becomes true. The owner then supplies all member values
++ * (O(n)); at least CANDIDATES-K+1 sampled deletions separate two rebuilds.
++ */
++class Maintainer {
++public:
++    void Insert(uint64_t value);
++    void Erase(uint64_t value);
++    void Clear();
++    bool NeedsRebuild() const noexcept { return m_needs_rebuild; }
++    void Rebuild(std::vector<uint64_t> all_values);
++    /** The current bottom-k (ascending). Requires !NeedsRebuild(). */
++    std::vector<uint64_t> Export() const;
++    size_t BufferSize() const noexcept { return m_buffer.size(); }
++    bool Capped() const noexcept { return m_capped; }
++
++private:
++    void Shrink();
++    std::vector<uint64_t> m_buffer; // ascending, with multiplicity
++    uint64_t m_threshold{0};
++    bool m_capped{false};
++    bool m_needs_rebuild{false};
++};
++
++} // namespace lotus::v2::minhash
++
++#endif // LOTUS_V2_MINHASH_H
+diff --git a/src/lotus_v2/tx_merklix.cpp b/src/lotus_v2/tx_merklix.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..884ba43113c2f1870e3858553f50f85f22c6b75b
+--- /dev/null
++++ b/src/lotus_v2/tx_merklix.cpp
+@@ -0,0 +1,838 @@
++// Copyright (c) 2026 The Lotus developers
++// Distributed under the MIT software license, see the accompanying
++// file COPYING or http://www.opensource.org/licenses/mit-license.php.
++
++#include "tx_merklix.h"
++
++#include "tagged_hash.h"
++
++#include <algorithm>
++#include <cassert>
++#include <future>
++#include <limits>
++#include <new>
++#include <stdexcept>
++#include <system_error>
++#include <thread>
++
++namespace lotus::v2::txmerklix {
++
++namespace {
++constexpr uint32_t kGeomChunks = 11;
++constexpr uint32_t kGeomSlots = 64u * ((1u << kGeomChunks) - 1u); // 131008
++constexpr uint32_t kLinearChunk = 1u << 16;
++//! Explicit DFS bound for releases: <= 257 branch levels, one pending sibling each.
++constexpr size_t kReleaseStack = 2 * 260;
++constexpr size_t kFreeBatch = 1024;
++//! Parallel completion only pays for itself on large dirty trees.
++constexpr uint32_t kParallelCompleteMin = 4096;
++
++unsigned FirstDiff(const Hash &a, const Hash &b, unsigned from, unsigned to) noexcept {
++    unsigned bit = from;
++    while (bit < to) {
++        if ((bit & 7) == 0 && bit + 8 <= to) {
++            const uint8_t x = a[bit >> 3] ^ b[bit >> 3];
++            if (x == 0) {
++                bit += 8;
++                continue;
++            }
++            return bit + unsigned(__builtin_ctz(x));
++        }
++        if (KeyBit(a, bit) != KeyBit(b, bit)) return bit;
++        ++bit;
++    }
++    return to;
++}
++
++template <typename Node>
++bool Publish(const Node &node, const Hash &digest) noexcept {
++    uint8_t expected = kDirty;
++    if (node.hash_state.compare_exchange_strong(expected, kBusy,
++                                                std::memory_order_acquire,
++                                                std::memory_order_relaxed)) {
++        node.digest = digest;
++        node.hash_state.store(kClean, std::memory_order_release);
++        return true;
++    }
++    Stats().hash_cas_losses.fetch_add(1, std::memory_order_relaxed);
++    return false;
++}
++} // namespace
++
++GlobalStats &Stats() noexcept {
++    static GlobalStats stats;
++    return stats;
++}
++
++Hash EmptyDigest() {
++    static const Hash digest =
++        TaggedHash(HashDomain::TxRoot, std::array<uint8_t, 1>{0x02});
++    return digest;
++}
++
++Hash LeafDigest(const Hash &tx_id, const Hash &tx_hash) {
++    std::array<uint8_t, 65> buf{};
++    buf[0] = 0x00;
++    std::copy(tx_id.begin(), tx_id.end(), buf.begin() + 1);
++    std::copy(tx_hash.begin(), tx_hash.end(), buf.begin() + 33);
++    return TaggedHash(HashDomain::TxRoot, buf);
++}
++
++Hash BranchDigest(unsigned depth, const Hash &left, const Hash &right) {
++    std::array<uint8_t, 67> buf{};
++    buf[0] = 0x01;
++    buf[1] = static_cast<uint8_t>(depth & 0xff);
++    buf[2] = static_cast<uint8_t>((depth >> 8) & 0xff);
++    std::copy(left.begin(), left.end(), buf.begin() + 3);
++    std::copy(right.begin(), right.end(), buf.begin() + 35);
++    return TaggedHash(HashDomain::TxRoot, buf);
++}
++
++// ===========================================================================
++// Slab
++// ===========================================================================
++
++template <typename T> Slab<T>::Slab() : m_chunks(new std::atomic<T *>[kChunks]) {
++    for (uint32_t i = 0; i < kChunks; ++i) {
++        m_chunks[i].store(nullptr, std::memory_order_relaxed);
++    }
++}
++
++template <typename T> Slab<T>::~Slab() {
++    for (uint32_t slot = 0; slot < m_constructed; ++slot) At(slot).~T();
++    for (uint32_t i = 0; i < kChunks; ++i) {
++        if (T *chunk = m_chunks[i].load(std::memory_order_relaxed)) {
++            ::operator delete(chunk, std::align_val_t{alignof(T)});
++        }
++    }
++}
++
++template <typename T>
++typename Slab<T>::Location Slab<T>::Locate(uint32_t slot) noexcept {
++    if (slot < kGeomSlots) {
++        const uint32_t t = slot / 64 + 1;
++        const uint32_t k = 31u - uint32_t(__builtin_clz(t));
++        return {k, slot - 64u * ((1u << k) - 1u)};
++    }
++    const uint32_t r = slot - kGeomSlots;
++    return {kGeomChunks + r / kLinearChunk, r % kLinearChunk};
++}
++
++template <typename T> uint32_t Slab<T>::ChunkSize(uint32_t chunk) noexcept {
++    return chunk < kGeomChunks ? (64u << chunk) : kLinearChunk;
++}
++
++template <typename T> T &Slab<T>::At(uint32_t slot) const noexcept {
++    const Location loc = Locate(slot);
++    T *chunk = m_chunks[loc.chunk].load(std::memory_order_acquire);
++    return chunk[loc.offset];
++}
++
++template <typename T> uint32_t Slab<T>::Allocate(bool &reused) {
++    if (!m_free.empty()) {
++        const uint32_t slot = m_free.back();
++        m_free.pop_back();
++        reused = true;
++        return slot;
++    }
++    reused = false;
++    if (m_constructed >= kMaxSlots) throw std::length_error("txmerklix slab full");
++    const Location loc = Locate(m_constructed);
++    T *chunk = m_chunks[loc.chunk].load(std::memory_order_relaxed);
++    if (!chunk) {
++        chunk = static_cast<T *>(::operator new(sizeof(T) * ChunkSize(loc.chunk),
++                                                std::align_val_t{alignof(T)}));
++        m_chunks[loc.chunk].store(chunk, std::memory_order_release);
++    }
++    // The free list's capacity always covers every constructed slot, so the
++    // non-throwing Free() path never allocates. Grow geometrically.
++    if (m_free.capacity() < size_t(m_constructed) + 1) {
++        m_free.reserve(std::max<size_t>(64, m_free.capacity() * 2));
++    }
++    new (&chunk[loc.offset]) T();
++    return m_constructed++;
++}
++
++template <typename T> void Slab<T>::Free(uint32_t slot) {
++    m_free.push_back(slot);
++}
++
++template <typename T> void Slab<T>::ReleaseChunksIfUnused() {
++    for (uint32_t slot = 0; slot < m_constructed; ++slot) At(slot).~T();
++    for (uint32_t i = 0; i < kChunks; ++i) {
++        if (T *chunk = m_chunks[i].load(std::memory_order_relaxed)) {
++            ::operator delete(chunk, std::align_val_t{alignof(T)});
++            m_chunks[i].store(nullptr, std::memory_order_relaxed);
++        }
++    }
++    m_constructed = 0;
++    m_free.clear();
++    m_free.shrink_to_fit();
++}
++
++template class Slab<Branch>;
++template class Slab<Leaf>;
++
++// ===========================================================================
++// Store
++// ===========================================================================
++
++std::shared_ptr<Store> Store::Create() {
++    return std::shared_ptr<Store>(new Store());
++}
++
++Store::Store() {
++    // Branch slot 0 is the null handle and is never handed out.
++    bool reused{false};
++    (void)m_branches.Allocate(reused);
++    Stats().stores.fetch_add(1, std::memory_order_relaxed);
++    Stats().retained_branch_slots.fetch_add(1, std::memory_order_relaxed);
++}
++
++Store::~Store() {
++    auto &s = Stats();
++    s.stores.fetch_sub(1, std::memory_order_relaxed);
++    s.retained_branch_slots.fetch_sub(int64_t(m_branches.Constructed()),
++                                      std::memory_order_relaxed);
++    s.retained_leaf_slots.fetch_sub(int64_t(m_leaves.Constructed()),
++                                    std::memory_order_relaxed);
++}
++
++NodeId Store::NewLeaf(const Hash &id, const Hash &hash, uint64_t minhash,
++                      std::shared_ptr<const void> payload, uint32_t payload_bytes) {
++    bool reused{false};
++    uint32_t slot;
++    {
++        std::lock_guard<std::mutex> lock(m_alloc_mutex);
++        if (m_next_generation == std::numeric_limits<uint64_t>::max())
++            throw std::length_error("txmerklix generation exhausted");
++        slot = m_leaves.Allocate(reused);
++        m_leaves.At(slot).generation.store(m_next_generation++, std::memory_order_release);
++    }
++    auto &s = Stats();
++    s.leaf_allocs.fetch_add(1, std::memory_order_relaxed);
++    s.live_leaves.fetch_add(1, std::memory_order_relaxed);
++    if (reused) s.slot_reuses.fetch_add(1, std::memory_order_relaxed);
++    else s.retained_leaf_slots.fetch_add(1, std::memory_order_relaxed);
++    Leaf &leaf = m_leaves.At(slot);
++    leaf.key = id;
++    leaf.tx_hash = hash;
++    leaf.minhash = minhash;
++    leaf.payload = std::move(payload);
++    leaf.payload_bytes = payload_bytes;
++    leaf.hash_state.store(kDirty, std::memory_order_relaxed);
++    leaf.refs.store(1, std::memory_order_release);
++    return kLeafBit | slot;
++}
++
++NodeId Store::NewBranch(const Branch &shape) {
++    bool reused{false};
++    uint32_t slot;
++    {
++        std::lock_guard<std::mutex> lock(m_alloc_mutex);
++        if (m_next_generation == std::numeric_limits<uint64_t>::max())
++            throw std::length_error("txmerklix generation exhausted");
++        slot = m_branches.Allocate(reused);
++        m_branches.At(slot).generation.store(m_next_generation++, std::memory_order_release);
++    }
++    auto &s = Stats();
++    s.branch_allocs.fetch_add(1, std::memory_order_relaxed);
++    s.live_branches.fetch_add(1, std::memory_order_relaxed);
++    if (reused) s.slot_reuses.fetch_add(1, std::memory_order_relaxed);
++    else s.retained_branch_slots.fetch_add(1, std::memory_order_relaxed);
++    Branch &b = m_branches.At(slot);
++    b.child = shape.child;
++    b.count = shape.count;
++    b.split = shape.split;
++    b.key = shape.key;
++    b.hash_state.store(kDirty, std::memory_order_relaxed);
++    b.refs.store(1, std::memory_order_release);
++    return slot;
++}
++
++uint32_t Store::Refs(NodeId n) const noexcept {
++    if (n == kNull) return 0;
++    return IsLeaf(n) ? L(n).refs.load(std::memory_order_acquire)
++                     : B(n).refs.load(std::memory_order_acquire);
++}
++
++void Store::Retain(NodeId n) const noexcept {
++    if (n == kNull) return;
++    if (IsLeaf(n)) m_leaves.At(n & ~kLeafBit).refs.fetch_add(1, std::memory_order_relaxed);
++    else m_branches.At(n).refs.fetch_add(1, std::memory_order_relaxed);
++}
++
++void Store::FreeBatch(const NodeId *dead, size_t count) const noexcept {
++    if (count == 0) return;
++    size_t leaves{0};
++    {
++        std::lock_guard<std::mutex> lock(m_alloc_mutex);
++        for (size_t i = 0; i < count; ++i) {
++            const NodeId n = dead[i];
++            if (IsLeaf(n)) {
++                m_leaves.Free(n & ~kLeafBit);
++                ++leaves;
++            } else {
++                m_branches.Free(n);
++            }
++        }
++    }
++    auto &s = Stats();
++    s.frees.fetch_add(count, std::memory_order_relaxed);
++    s.live_leaves.fetch_sub(int64_t(leaves), std::memory_order_relaxed);
++    s.live_branches.fetch_sub(int64_t(count - leaves), std::memory_order_relaxed);
++}
++
++void Store::Release(NodeId n) const noexcept {
++    if (n == kNull) return;
++    // Fast path: most releases only drop a shared reference.
++    if (IsLeaf(n) ? m_leaves.At(n & ~kLeafBit).refs.fetch_sub(1, std::memory_order_acq_rel) != 1
++                  : m_branches.At(n).refs.fetch_sub(1, std::memory_order_acq_rel) != 1) {
++        return;
++    }
++    // n is dead and exclusively ours. Walk its exclusively owned descendants
++    // with a bounded explicit stack; freed handles are returned in batches to
++    // bound allocation-mutex hold times. No heap allocation on this path.
++    std::array<NodeId, kReleaseStack> stack;
++    std::array<NodeId, kFreeBatch> dead;
++    size_t top{0}, ndead{0};
++    auto bury = [&](NodeId x) {
++        if (IsLeaf(x)) {
++            m_leaves.At(x & ~kLeafBit).payload.reset();
++        } else {
++            Branch &b = m_branches.At(x);
++            assert(top + 2 <= kReleaseStack);
++            if (b.child[1] != kNull) stack[top++] = b.child[1];
++            if (b.child[0] != kNull) stack[top++] = b.child[0];
++            b.child = {kNull, kNull};
++        }
++        if (ndead == dead.size()) {
++            FreeBatch(dead.data(), ndead);
++            ndead = 0;
++        }
++        dead[ndead++] = x;
++    };
++    bury(n);
++    while (top) {
++        const NodeId x = stack[--top];
++        const bool last = IsLeaf(x)
++            ? m_leaves.At(x & ~kLeafBit).refs.fetch_sub(1, std::memory_order_acq_rel) == 1
++            : m_branches.At(x).refs.fetch_sub(1, std::memory_order_acq_rel) == 1;
++        if (last) bury(x);
++    }
++    FreeBatch(dead.data(), ndead);
++}
++
++Store::WeakRef Store::Weak(NodeId n) const noexcept {
++    if (n == kNull) return {};
++    const uint64_t gen = IsLeaf(n) ? L(n).generation.load(std::memory_order_acquire)
++                                   : B(n).generation.load(std::memory_order_acquire);
++    return {n, gen};
++}
++
++NodeId Store::TryRetain(const WeakRef &weak) const noexcept {
++    if (weak.node == kNull) return kNull;
++    // The family writer lock excludes mutation while a weak owner is added;
++    // allocation lock also excludes slot reuse and slab trimming during lookup.
++    std::lock_guard<std::mutex> lock(m_alloc_mutex);
++    const uint32_t slot = weak.node & ~kLeafBit;
++    if (IsLeaf(weak.node) ? slot >= m_leaves.Constructed()
++                          : (slot == 0 || slot >= m_branches.Constructed())) {
++        return kNull;
++    }
++    auto attempt = [&](auto &node) -> NodeId {
++        if (node.generation.load(std::memory_order_acquire) != weak.generation) return kNull;
++        uint32_t refs = node.refs.load(std::memory_order_relaxed);
++        do {
++            if (refs == 0) return kNull;
++        } while (!node.refs.compare_exchange_weak(refs, refs + 1,
++                                                  std::memory_order_acquire,
++                                                  std::memory_order_relaxed));
++        return weak.node;
++    };
++    if (IsLeaf(weak.node)) return attempt(m_leaves.At(slot));
++    return attempt(m_branches.At(slot));
++}
++
++size_t Store::LiveLeaves() const noexcept {
++    std::lock_guard<std::mutex> lock(m_alloc_mutex);
++    return m_leaves.Constructed() - m_leaves.FreeSlots();
++}
++
++size_t Store::LiveBranches() const noexcept {
++    std::lock_guard<std::mutex> lock(m_alloc_mutex);
++    return m_branches.Constructed() - 1 - m_branches.FreeSlots();
++}
++
++size_t Store::RetainedBytes() const noexcept {
++    std::lock_guard<std::mutex> lock(m_alloc_mutex);
++    return m_leaves.Constructed() * sizeof(Leaf) +
++           m_branches.Constructed() * sizeof(Branch);
++}
++
++bool Store::TrimIfUnused() noexcept {
++    std::lock_guard<std::mutex> lock(m_alloc_mutex);
++    if (m_leaves.Constructed() != m_leaves.FreeSlots() ||
++        m_branches.Constructed() != m_branches.FreeSlots() + 1) {
++        return false;
++    }
++    auto &s = Stats();
++    s.retained_leaf_slots.fetch_sub(int64_t(m_leaves.Constructed()), std::memory_order_relaxed);
++    s.retained_branch_slots.fetch_sub(int64_t(m_branches.Constructed()) - 1,
++                                      std::memory_order_relaxed);
++    m_leaves.ReleaseChunksIfUnused();
++    m_branches.ReleaseChunksIfUnused();
++    bool reused{false};
++    try {
++        (void)m_branches.Allocate(reused); // re-reserve the null handle
++    } catch (...) {
++        // Unreachable: the first chunk is 64 slots of a fresh slab.
++        std::terminate();
++    }
++    return true;
++}
++
++Hash Store::NodeDigestCounted(NodeId n, uint64_t &hashes) const {
++    if (IsLeaf(n)) {
++        const Leaf &leaf = L(n);
++        if (leaf.hash_state.load(std::memory_order_acquire) == kClean) return leaf.digest;
++        const Hash h = LeafDigest(leaf.key, leaf.tx_hash);
++        ++hashes;
++        Publish(leaf, h);
++        return h;
++    }
++    const Branch &b = B(n);
++    if (b.hash_state.load(std::memory_order_acquire) == kClean) return b.digest;
++    const unsigned below = unsigned(b.split) + 1;
++    const Hash left = DigestAtCounted(b.child[0], below, hashes);
++    const Hash right = DigestAtCounted(b.child[1], below, hashes);
++    const Hash h = BranchDigest(b.split, left, right);
++    ++hashes;
++    Publish(b, h);
++    return h;
++}
++
++Hash Store::DigestAtCounted(NodeId n, unsigned depth, uint64_t &hashes) const {
++    if (n == kNull) return EmptyDigest();
++    Hash x = NodeDigestCounted(n, hashes);
++    if (IsLeaf(n)) return x;
++    const Branch &b = B(n);
++    for (unsigned d = b.split; d-- > depth;) {
++        x = KeyBit(b.key, d) ? BranchDigest(d, EmptyDigest(), x)
++                             : BranchDigest(d, x, EmptyDigest());
++        ++hashes;
++    }
++    return x;
++}
++
++Hash Store::NodeDigest(NodeId n) const {
++    uint64_t hashes{0};
++    const Hash h = NodeDigestCounted(n, hashes);
++    if (hashes) Stats().node_hashes.fetch_add(hashes, std::memory_order_relaxed);
++    return h;
++}
++
++Hash Store::DigestAt(NodeId n, unsigned depth) const {
++    uint64_t hashes{0};
++    const Hash h = DigestAtCounted(n, depth, hashes);
++    if (hashes) Stats().node_hashes.fetch_add(hashes, std::memory_order_relaxed);
++    return h;
++}
++
++void Store::Complete(NodeId n) const {
++    if (n == kNull || IsLeaf(n)) return;
++    const Branch &root = B(n);
++    if (root.hash_state.load(std::memory_order_acquire) == kClean ||
++        root.count < kParallelCompleteMin) {
++        return;
++    }
++    // Frontier: dirty subtrees whose split is at least 4 bits deep (<= 16).
++    std::vector<NodeId> frontier;
++    std::vector<NodeId> pending{n};
++    while (!pending.empty()) {
++        const NodeId x = pending.back();
++        pending.pop_back();
++        if (x == kNull || IsLeaf(x)) continue;
++        const Branch &b = B(x);
++        if (b.hash_state.load(std::memory_order_acquire) == kClean) continue;
++        if (b.split >= 4) {
++            frontier.push_back(x);
++        } else {
++            pending.push_back(b.child[0]);
++            pending.push_back(b.child[1]);
++        }
++    }
++    if (frontier.size() < 2) return;
++    Stats().parallel_completions.fetch_add(1, std::memory_order_relaxed);
++    std::vector<std::future<void>> tasks;
++    tasks.reserve(frontier.size() - 1);
++    try {
++        for (size_t i = 1; i < frontier.size(); ++i) {
++            tasks.push_back(std::async(std::launch::async, [this, x = frontier[i]] {
++                (void)NodeDigest(x);
++            }));
++        }
++    } catch (const std::system_error &) {
++        // Thread exhaustion: whatever was not started is hashed serially by
++        // the caller's ordinary traversal.
++    }
++    (void)NodeDigest(frontier[0]);
++    for (auto &task : tasks) task.get();
++}
++
++// ===========================================================================
++// Tree
++// ===========================================================================
++
++Tree::Tree(std::shared_ptr<Store> store)
++    : m_store(store ? std::move(store) : Store::Create()) {}
++
++Tree::Tree(const Tree &other)
++    : m_store(other.m_store), m_root(other.m_root), m_version(other.m_version),
++      m_payload_bytes(other.m_payload_bytes), m_sketch(other.m_sketch) {
++    m_store->Retain(m_root);
++}
++
++Tree &Tree::operator=(const Tree &other) {
++    if (this == &other) return *this;
++    other.m_store->Retain(other.m_root);
++    const auto old_store = m_store;
++    const NodeId old_root = m_root;
++    m_store = other.m_store;
++    m_root = other.m_root;
++    m_version = other.m_version;
++    m_payload_bytes = other.m_payload_bytes;
++    m_sketch = other.m_sketch;
++    old_store->Release(old_root);
++    return *this;
++}
++
++Tree::Tree(Tree &&other) noexcept
++    : m_store(other.m_store), m_root(other.m_root), m_version(other.m_version),
++      m_payload_bytes(other.m_payload_bytes), m_sketch(std::move(other.m_sketch)) {
++    other.m_root = kNull;
++    other.m_payload_bytes = 0;
++    other.m_sketch.Clear();
++}
++
++Tree &Tree::operator=(Tree &&other) noexcept {
++    if (this == &other) return *this;
++    const auto old_store = m_store;
++    const NodeId old_root = m_root;
++    m_store = other.m_store;
++    m_root = other.m_root;
++    m_version = other.m_version;
++    m_payload_bytes = other.m_payload_bytes;
++    m_sketch = std::move(other.m_sketch);
++    other.m_root = kNull;
++    other.m_payload_bytes = 0;
++    other.m_sketch.Clear();
++    old_store->Release(old_root);
++    return *this;
++}
++
++Tree::~Tree() { m_store->Release(m_root); }
++
++NodeId Tree::Touch(NodeId b) {
++    // A descendant changed in place, which implies this whole path is
++    // unique: refresh the derived count and invalidate the cached digest.
++    Branch &m = m_store->MutB(b);
++    assert(m.refs.load(std::memory_order_relaxed) == 1);
++    m.count = m_store->Count(m.child[0]) + m_store->Count(m.child[1]);
++    m.hash_state.store(kDirty, std::memory_order_relaxed);
++    Stats().inplace_updates.fetch_add(1, std::memory_order_relaxed);
++    return b;
++}
++
++NodeId Tree::ReplaceChild(NodeId b, bool unique, unsigned bit, NodeId new_child) {
++    if (unique) {
++        Branch &m = m_store->MutB(b);
++        const NodeId old = m.child[bit];
++        m.child[bit] = new_child;
++        m.count = m_store->Count(m.child[0]) + m_store->Count(m.child[1]);
++        m.hash_state.store(kDirty, std::memory_order_relaxed);
++        m_store->Release(old);
++        Stats().inplace_updates.fetch_add(1, std::memory_order_relaxed);
++        return b;
++    }
++    const Branch &src = m_store->B(b);
++    Branch shape;
++    shape.child = src.child;
++    shape.split = src.split;
++    shape.key = src.key;
++    shape.child[bit] = new_child;
++    shape.count = m_store->Count(shape.child[0]) + m_store->Count(shape.child[1]);
++    m_store->Retain(shape.child[bit ^ 1]);
++    Stats().path_copies.fetch_add(1, std::memory_order_relaxed);
++    try {
++        return m_store->NewBranch(shape);
++    } catch (...) {
++        m_store->Release(shape.child[bit ^ 1]);
++        m_store->Release(new_child); // recursive result ownership was transferred here
++        throw;
++    }
++}
++
++NodeId Tree::InsertAt(NodeId n, unsigned depth, bool unique, const Hash &id,
++                      const Hash &hash, uint64_t minhash,
++                      std::shared_ptr<const void> &payload,
++                      uint32_t payload_bytes, Change &change, Outgoing &old) {
++    if (n == kNull) {
++        change = Change::Inserted;
++        return m_store->NewLeaf(id, hash, minhash, std::move(payload), payload_bytes);
++    }
++    Branch shape;
++    if (Store::IsLeaf(n)) {
++        const Leaf &leaf = m_store->L(n);
++        if (leaf.key == id) {
++            if (leaf.tx_hash == hash) return n;
++            change = Change::Replaced;
++            old = {true, leaf.minhash, leaf.payload_bytes};
++            return m_store->NewLeaf(id, hash, minhash, std::move(payload), payload_bytes);
++        }
++        shape.split = uint16_t(FirstDiff(leaf.key, id, depth, 256));
++        shape.count = 2;
++    } else {
++        const Branch &b = m_store->B(n);
++        const unsigned split = FirstDiff(b.key, id, depth, b.split);
++        if (split == b.split) {
++            const unsigned bit = KeyBit(id, b.split);
++            const NodeId c = b.child[bit];
++            const NodeId r = InsertAt(c, unsigned(b.split) + 1, ChildUnique(unique, c),
++                                      id, hash, minhash, payload, payload_bytes,
++                                      change, old);
++            if (change == Change::Unchanged) return n;
++            if (r == c) return Touch(n);
++            return ReplaceChild(n, unique, bit, r);
++        }
++        shape.split = uint16_t(split);
++        shape.count = b.count + 1;
++    }
++    // The new key diverges from everything under n at shape.split: n keeps
++    // its contents and becomes one child of a new branch point.
++    shape.key = id;
++    const NodeId added =
++        m_store->NewLeaf(id, hash, minhash, std::move(payload), payload_bytes);
++    const bool added_right = KeyBit(id, shape.split);
++    shape.child = added_right ? std::array<NodeId, 2>{n, added}
++                              : std::array<NodeId, 2>{added, n};
++    m_store->Retain(n);
++    change = Change::Inserted;
++    try {
++        return m_store->NewBranch(shape);
++    } catch (...) {
++        m_store->Release(n);
++        m_store->Release(added);
++        throw;
++    }
++}
++
++Tree::Change Tree::Insert(const Hash &tx_id, const Hash &tx_hash,
++                          std::shared_ptr<const void> payload,
++                          uint32_t payload_bytes) {
++    const uint64_t value = minhash::Value(tx_id, tx_hash);
++    Change change{Change::Unchanged};
++    Outgoing old;
++    const NodeId r = InsertAt(m_root, 0, ChildUnique(true, m_root), tx_id, tx_hash,
++                              value, payload, payload_bytes, change, old);
++    if (r != m_root) {
++        const NodeId prev = m_root;
++        m_root = r;
++        m_store->Release(prev);
++    }
++    if (change == Change::Unchanged) return change;
++    ++m_version;
++    if (change == Change::Replaced) {
++        m_sketch.Erase(old.minhash);
++        m_payload_bytes -= old.payload_bytes;
++    }
++    m_sketch.Insert(value);
++    m_payload_bytes += payload_bytes;
++    return change;
++}
++
++NodeId Tree::EraseAt(NodeId n, unsigned depth, bool unique, const Hash &id,
++                     Outgoing &old) {
++    if (n == kNull) return n;
++    if (Store::IsLeaf(n)) {
++        const Leaf &leaf = m_store->L(n);
++        if (leaf.key != id) return n;
++        old = {true, leaf.minhash, leaf.payload_bytes};
++        return kNull;
++    }
++    const Branch &b = m_store->B(n);
++    if (FirstDiff(b.key, id, depth, b.split) != b.split) return n;
++    const unsigned bit = KeyBit(id, b.split);
++    const NodeId c = b.child[bit];
++    const NodeId r = EraseAt(c, unsigned(b.split) + 1, ChildUnique(unique, c), id, old);
++    if (!old.found) return n;
++    if (r == c) return Touch(n);
++    if (r == kNull) {
++        // The branch point disappears; the sibling moves up unchanged. Its
++        // digest at its own split stays valid (unary runs are recomputed).
++        const NodeId other = b.child[bit ^ 1];
++        m_store->Retain(other);
++        return other;
++    }
++    return ReplaceChild(n, unique, bit, r);
++}
++
++bool Tree::Erase(const Hash &tx_id) {
++    Outgoing old;
++    const NodeId r = EraseAt(m_root, 0, ChildUnique(true, m_root), tx_id, old);
++    if (!old.found) return false;
++    if (r != m_root) {
++        const NodeId prev = m_root;
++        m_root = r;
++        m_store->Release(prev);
++    }
++    ++m_version;
++    m_sketch.Erase(old.minhash);
++    m_payload_bytes -= old.payload_bytes;
++    return true;
++}
++
++void Tree::Clear() {
++    const NodeId prev = m_root;
++    m_root = kNull;
++    if (prev != kNull) ++m_version;
++    m_payload_bytes = 0;
++    m_sketch.Clear();
++    m_store->Release(prev);
++    // Sole owner of the store: no other tree or snapshot can hold a node, so
++    // a fully free store returns its slab chunks (bounded retained memory
++    // after a mempool spike). use_count()==1 cannot grow concurrently because
++    // copying requires access to this owner.
++    if (m_store.use_count() == 1) m_store->TrimIfUnused();
++}
++
++std::optional<Hash> Tree::FindHash(const Hash &tx_id) const {
++    NodeId n = m_root;
++    while (n != kNull && !Store::IsLeaf(n)) {
++        const Branch &b = m_store->B(n);
++        n = b.child[KeyBit(tx_id, b.split)];
++    }
++    if (n == kNull) return std::nullopt;
++    const Leaf &leaf = m_store->L(n);
++    if (leaf.key != tx_id) return std::nullopt;
++    return leaf.tx_hash;
++}
++
++Hash Tree::RootDigest() const {
++    m_store->Complete(m_root);
++    return m_store->DigestAt(m_root, 0);
++}
++
++void Tree::EnsureSketch() const {
++    if (!m_sketch.NeedsRebuild()) return;
++    std::vector<uint64_t> values;
++    values.reserve(Count());
++    ForEachLeaf([&](const Leaf &leaf) { values.push_back(leaf.minhash); });
++    auto &s = Stats();
++    s.sketch_rebuilds.fetch_add(1, std::memory_order_relaxed);
++    s.sketch_rebuild_members.fetch_add(values.size(), std::memory_order_relaxed);
++    m_sketch.Rebuild(std::move(values));
++}
++
++Sketch Tree::CurrentSketch() const {
++    EnsureSketch();
++    return Sketch{m_sketch.Export()};
++}
++
++std::shared_ptr<const Snapshot> Tree::Pin() const {
++    const bool rebuild_sketch = m_sketch.NeedsRebuild();
++    Sketch sketch = rebuild_sketch ? Sketch{} : Sketch{m_sketch.Export()};
++    m_store->Retain(m_root);
++    try {
++        auto out = std::make_shared<const Snapshot>(m_store, m_root, m_version,
++                                                    m_payload_bytes, std::move(sketch), rebuild_sketch);
++        Stats().pins.fetch_add(1, std::memory_order_relaxed);
++        return out;
++    } catch (...) {
++        m_store->Release(m_root);
++        throw;
++    }
++}
++
++// ===========================================================================
++// Snapshot
++// ===========================================================================
++
++Snapshot::Snapshot(std::shared_ptr<Store> store, NodeId root, uint64_t version,
++                   uint64_t payload_bytes, Sketch sketch, bool rebuild_sketch)
++    : m_store(std::move(store)), m_root(root), m_version(version),
++      m_payload_bytes(payload_bytes), m_sketch(std::move(sketch)),
++      m_rebuild_sketch(rebuild_sketch) {}
++
++Snapshot::~Snapshot() { m_store->Release(m_root); }
++
++const Sketch &Snapshot::GetSketch() const {
++    std::call_once(m_sketch_once, [this] {
++        if (!m_rebuild_sketch) return;
++        std::vector<uint64_t> values;
++        values.reserve(Count());
++        ForEachLeaf([&](const Leaf &leaf) { values.push_back(leaf.minhash); });
++        const size_t members = values.size();
++        minhash::Maintainer rebuilt;
++        rebuilt.Rebuild(std::move(values));
++        m_sketch.values = rebuilt.Export();
++        Stats().sketch_rebuilds.fetch_add(1, std::memory_order_relaxed);
++        Stats().sketch_rebuild_members.fetch_add(members, std::memory_order_relaxed);
++    });
++    return m_sketch;
++}
++
++Hash Snapshot::RootDigest() const {
++    m_store->Complete(m_root);
++    return m_store->DigestAt(m_root, 0);
++}
++
++NodeId Snapshot::Find(const Hash &prefix, unsigned depth) const {
++    NodeId n = m_root;
++    unsigned checked = 0;
++    while (n != kNull) {
++        if (Store::IsLeaf(n)) {
++            return FirstDiff(m_store->L(n).key, prefix, checked, depth) == depth ? n : kNull;
++        }
++        const Branch &b = m_store->B(n);
++        const unsigned limit = std::min<unsigned>(depth, b.split);
++        if (FirstDiff(b.key, prefix, checked, limit) != limit) return kNull;
++        if (depth <= b.split) return n;
++        n = b.child[KeyBit(prefix, b.split)];
++        checked = unsigned(b.split) + 1;
++    }
++    return kNull;
++}
++
++Snapshot::Descriptor Snapshot::At(const Hash &prefix, unsigned depth) const {
++    const NodeId n = Find(prefix, depth);
++    if (n == kNull) return {0, EmptyDigest()};
++    return {m_store->Count(n), m_store->DigestAt(n, depth)};
++}
++
++std::optional<std::vector<const Leaf *>> Snapshot::Leaves(const Hash &prefix,
++                                                          unsigned depth,
++                                                          size_t max_leaves) const {
++    std::vector<const Leaf *> out;
++    const NodeId n = Find(prefix, depth);
++    if (n == kNull) return out;
++    if (m_store->Count(n) > max_leaves) return std::nullopt;
++    out.reserve(m_store->Count(n));
++    auto collect = [&](const Leaf &leaf) { out.push_back(&leaf); };
++    detail::ForEachLeaf(*m_store, n, collect);
++    return out;
++}
++
++std::optional<Hash> Snapshot::FindHash(const Hash &tx_id) const {
++    NodeId n = m_root;
++    while (n != kNull && !Store::IsLeaf(n)) {
++        const Branch &b = m_store->B(n);
++        n = b.child[KeyBit(tx_id, b.split)];
++    }
++    if (n == kNull) return std::nullopt;
++    const Leaf &leaf = m_store->L(n);
++    if (leaf.key != tx_id) return std::nullopt;
++    return leaf.tx_hash;
++}
++
++} // namespace lotus::v2::txmerklix
+diff --git a/src/lotus_v2/tx_merklix.h b/src/lotus_v2/tx_merklix.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..c8d4ff5afdad623ec392542f67cf49e36140ee64
+--- /dev/null
++++ b/src/lotus_v2/tx_merklix.h
+@@ -0,0 +1,319 @@
++// Copyright (c) 2026 The Lotus developers
++// Distributed under the MIT software license, see the accompanying
++// file COPYING or http://www.opensource.org/licenses/mit-license.php.
++
++#ifndef LOTUS_V2_TX_MERKLIX_H
++#define LOTUS_V2_TX_MERKLIX_H
++
++#include "header.h"
++#include "minhash.h"
++
++#include <array>
++#include <atomic>
++#include <cstddef>
++#include <cstdint>
++#include <memory>
++#include <mutex>
++#include <optional>
++#include <vector>
++
++/**
++ * Slab-backed, path-compressed, persistent transaction Merklix tree.
++ *
++ * Specification: daemon/docs/slab-merklix-snapshots-spec.md (monorepo).
++ *
++ * The tree commits exactly to consensus Transaction Subtree A: keys are
++ * 256-bit TxIds routed LSB-first (bit d = (id[d/8] >> (d%8)) & 1), leaves are
++ * TaggedHash(TxRoot, 0x00 || TxId || TxHash), a branch at depth d is
++ * TaggedHash(TxRoot, 0x01 || u16le(d) || left || right), empty is
++ * TaggedHash(TxRoot, 0x02) and a single-member subtree collapses to its leaf.
++ * Only real branch points are stored; a unary run between a parent's split and
++ * a child's split is hashed on demand with empty siblings.
++ *
++ * Ownership model:
++ *  - Nodes live in per-family Store slabs addressed by 32-bit handles and are
++ *    reference counted. A parent owns one reference per child; a Tree or a
++ *    Snapshot owns one reference to its root.
++ *  - Trees are single-writer views. All Trees sharing one Store must be
++ *    mutated under one external writer lock (the mempool lock in production).
++ *    A node is mutated in place only when every node on the path from the
++ *    writer's root to it has refcount 1 ("path-unique"). Otherwise the path is
++ *    copied. No other thread can raise a refcount without that lock.
++ *  - Snapshots are immutable, thread-safe, and may be read, hashed and released
++ *    on any thread. Pinning a Tree is O(1) (one reference on the root) plus a
++ *    K-value MinHash copy and must happen under the writer lock. A pending
++ *    sketch refill is computed lazily from the immutable snapshot.
++ *  - Digests are derived caches with an atomic Dirty/Busy/Clean state. Readers
++ *    never need digests; hashing fills caches without changing logical contents.
++ *    Concurrent hashers race through compare-and-swap; a loser uses its own
++ *    computed value and never writes. Nothing here is claimed lock-free:
++ *    slab allocation and batched slot return take a short mutex.
++ */
++namespace lotus::v2::txmerklix {
++
++using NodeId = uint32_t;
++inline constexpr NodeId kNull = 0;
++inline constexpr NodeId kLeafBit = 0x80000000u;
++inline constexpr uint32_t kMaxSlots = uint32_t{1} << 26;
++
++inline bool KeyBit(const Hash &key, unsigned bit) noexcept {
++    return (key[bit >> 3] >> (bit & 7)) & 1;
++}
++Hash EmptyDigest();
++Hash LeafDigest(const Hash &tx_id, const Hash &tx_hash);
++Hash BranchDigest(unsigned depth, const Hash &left, const Hash &right);
++
++enum HashState : uint8_t { kDirty = 0, kBusy = 1, kClean = 2 };
++
++struct Branch {
++    std::atomic<uint32_t> refs{0};
++    std::atomic<uint64_t> generation{0};
++    std::array<NodeId, 2> child{kNull, kNull};
++    uint32_t count{0};
++    uint16_t split{0};
++    mutable std::atomic<uint8_t> hash_state{kDirty};
++    Hash key{};            // any member key; bits below split are the prefix
++    mutable Hash digest{}; // digest at split; valid only when Clean
++};
++
++struct Leaf {
++    std::atomic<uint32_t> refs{0};
++    std::atomic<uint64_t> generation{0};
++    mutable std::atomic<uint8_t> hash_state{kDirty};
++    uint32_t payload_bytes{0};
++    uint64_t minhash{0};
++    Hash key{};
++    Hash tx_hash{};
++    mutable Hash digest{};
++    std::shared_ptr<const void> payload;
++};
++
++/** Process-wide counters (relaxed). Exported to Prometheus by the node. */
++struct GlobalStats {
++    std::atomic<uint64_t> leaf_allocs{0}, branch_allocs{0}, slot_reuses{0};
++    std::atomic<uint64_t> path_copies{0}, inplace_updates{0}, frees{0};
++    std::atomic<uint64_t> node_hashes{0}, hash_cas_losses{0};
++    std::atomic<uint64_t> pins{0}, sketch_rebuilds{0}, sketch_rebuild_members{0};
++    std::atomic<uint64_t> parallel_completions{0};
++    std::atomic<int64_t> live_leaves{0}, live_branches{0};
++    std::atomic<int64_t> retained_leaf_slots{0}, retained_branch_slots{0};
++    std::atomic<int64_t> stores{0};
++};
++GlobalStats &Stats() noexcept;
++
++/** Fixed-size slot storage with stable addresses and generation counters. */
++template <typename T> class Slab {
++public:
++    Slab();
++    ~Slab();
++    Slab(const Slab &) = delete;
++    Slab &operator=(const Slab &) = delete;
++    T &At(uint32_t slot) const noexcept;
++    //! Caller holds the store allocation mutex.
++    uint32_t Allocate(bool &reused);
++    void Free(uint32_t slot);
++    size_t Constructed() const noexcept { return m_constructed; }
++    size_t FreeSlots() const noexcept { return m_free.size(); }
++    void ReleaseChunksIfUnused();
++
++private:
++    struct Location { uint32_t chunk, offset; };
++    static Location Locate(uint32_t slot) noexcept;
++    static uint32_t ChunkSize(uint32_t chunk) noexcept;
++    static constexpr uint32_t kChunks = 11 + ((kMaxSlots - 131008) >> 16) + 1;
++    std::unique_ptr<std::atomic<T *>[]> m_chunks;
++    uint32_t m_constructed{0};
++    std::vector<uint32_t> m_free;
++};
++
++class Snapshot;
++
++/** Node storage for a family of trees and their snapshots. */
++class Store : public std::enable_shared_from_this<Store> {
++public:
++    static std::shared_ptr<Store> Create();
++    ~Store();
++    Store(const Store &) = delete;
++    Store &operator=(const Store &) = delete;
++
++    static bool IsLeaf(NodeId n) noexcept { return n & kLeafBit; }
++    const Branch &B(NodeId n) const noexcept { return m_branches.At(n); }
++    const Leaf &L(NodeId n) const noexcept { return m_leaves.At(n & ~kLeafBit); }
++    Branch &MutB(NodeId n) noexcept { return m_branches.At(n); }
++
++    NodeId NewLeaf(const Hash &id, const Hash &hash, uint64_t minhash,
++                   std::shared_ptr<const void> payload, uint32_t payload_bytes);
++    NodeId NewBranch(const Branch &shape); // copies shape, refs = 1, Dirty
++    void Retain(NodeId n) const noexcept;
++    void Release(NodeId n) const noexcept;
++    uint32_t Refs(NodeId n) const noexcept;
++    uint32_t Count(NodeId n) const noexcept {
++        return n == kNull ? 0 : IsLeaf(n) ? 1 : B(n).count;
++    }
++    const Hash &AnyKey(NodeId n) const noexcept {
++        return IsLeaf(n) ? L(n).key : B(n).key;
++    }
++
++    /** Digest of n as the subtree rooted at depth (folds unary runs). */
++    Hash DigestAt(NodeId n, unsigned depth) const;
++    /** Digest at n's own split (leaf digest for leaves), cached. */
++    Hash NodeDigest(NodeId n) const;
++    /** Complete caches below n, in parallel for large dirty trees. */
++    void Complete(NodeId n) const;
++
++    /** Weak reference with ABA protection through slot generations. */
++    struct WeakRef { NodeId node{kNull}; uint64_t generation{0}; };
++    WeakRef Weak(NodeId n) const noexcept;
++    //! Caller holds the family writer lock, including against mutation/trim.
++    //! Returns a retained node (caller releases) or kNull if stale.
++    NodeId TryRetain(const WeakRef &weak) const noexcept;
++
++    size_t LiveLeaves() const noexcept;
++    size_t LiveBranches() const noexcept;
++    size_t RetainedBytes() const noexcept;
++    /** Return all slab chunks when no node is live (no tree/snapshot holds one). */
++    bool TrimIfUnused() noexcept;
++
++private:
++    Store();
++    void FreeBatch(const NodeId *dead, size_t count) const noexcept;
++    Hash NodeDigestCounted(NodeId n, uint64_t &hashes) const;
++    Hash DigestAtCounted(NodeId n, unsigned depth, uint64_t &hashes) const;
++    uint64_t m_next_generation{1}; // never reset when empty slabs are trimmed
++    mutable std::mutex m_alloc_mutex;
++    mutable Slab<Branch> m_branches;
++    mutable Slab<Leaf> m_leaves;
++};
++
++/** Copyable pinned summary of a membership version. */
++struct Sketch {
++    std::vector<uint64_t> values; // bottom-k, ascending
++};
++
++/**
++ * Writable working view. Not thread-safe; see the writer-lock contract above.
++ * Copying a Tree shares all nodes (O(1)); both copies then copy-on-write.
++ */
++class Tree {
++public:
++    enum class Change { Unchanged, Inserted, Replaced };
++
++    explicit Tree(std::shared_ptr<Store> store = Store::Create());
++    Tree(const Tree &other);
++    Tree &operator=(const Tree &other);
++    Tree(Tree &&other) noexcept;
++    Tree &operator=(Tree &&other) noexcept;
++    ~Tree();
++
++    Change Insert(const Hash &tx_id, const Hash &tx_hash,
++                  std::shared_ptr<const void> payload = {},
++                  uint32_t payload_bytes = 0);
++    bool Erase(const Hash &tx_id);
++    void Clear();
++
++    std::optional<Hash> FindHash(const Hash &tx_id) const;
++    bool Contains(const Hash &tx_id) const { return FindHash(tx_id).has_value(); }
++    size_t Count() const noexcept { return m_store->Count(m_root); }
++    uint64_t Version() const noexcept { return m_version; }
++    uint64_t PayloadBytes() const noexcept { return m_payload_bytes; }
++    const std::shared_ptr<Store> &GetStore() const noexcept { return m_store; }
++    NodeId Root() const noexcept { return m_root; }
++
++    /** Lazily completes dirty digests in place; caller holds the writer lock. */
++    Hash RootDigest() const;
++    /** Current bottom-k sketch (rebuilds if a deletion exhausted candidates). */
++    Sketch CurrentSketch() const;
++    /** O(1) structural pin + sketch; caller holds the writer lock. */
++    std::shared_ptr<const Snapshot> Pin() const;
++
++    /** Visit leaves in canonical (LSB-first trie) order. */
++    template <typename F> void ForEachLeaf(F &&f) const;
++
++private:
++    struct Outgoing {
++        bool found{false};
++        uint64_t minhash{0};
++        uint32_t payload_bytes{0};
++    };
++    NodeId InsertAt(NodeId n, unsigned depth, bool unique, const Hash &id,
++                    const Hash &hash, uint64_t minhash,
++                    std::shared_ptr<const void> &payload,
++                    uint32_t payload_bytes, Change &change, Outgoing &old);
++    NodeId EraseAt(NodeId n, unsigned depth, bool unique, const Hash &id,
++                   Outgoing &old);
++    NodeId ReplaceChild(NodeId b, bool unique, unsigned bit, NodeId new_child);
++    NodeId Touch(NodeId b);
++    bool ChildUnique(bool unique, NodeId c) const noexcept {
++        return unique && c != kNull && m_store->Refs(c) == 1;
++    }
++    void EnsureSketch() const;
++
++    std::shared_ptr<Store> m_store;
++    NodeId m_root{kNull};
++    uint64_t m_version{0};
++    uint64_t m_payload_bytes{0};
++    mutable minhash::Maintainer m_sketch;
++};
++
++/** Immutable pinned version. Safe for concurrent readers and hashers. */
++class Snapshot {
++public:
++    struct Descriptor { uint64_t count{0}; Hash digest{}; };
++    Snapshot(std::shared_ptr<Store> store, NodeId root, uint64_t version,
++             uint64_t payload_bytes, Sketch sketch, bool rebuild_sketch = false);
++    ~Snapshot();
++    Snapshot(const Snapshot &) = delete;
++    Snapshot &operator=(const Snapshot &) = delete;
++
++    size_t Count() const noexcept { return m_store->Count(m_root); }
++    uint64_t Version() const noexcept { return m_version; }
++    uint64_t PayloadBytes() const noexcept { return m_payload_bytes; }
++    const Sketch &GetSketch() const;
++    const Store &GetStore() const noexcept { return *m_store; }
++    NodeId Root() const noexcept { return m_root; }
++
++    Hash RootDigest() const;
++    /** Count and digest of the members whose first `depth` bits equal prefix. */
++    Descriptor At(const Hash &prefix, unsigned depth) const;
++    /** Leaves under the prefix in canonical order; nullopt if > max_leaves. */
++    std::optional<std::vector<const Leaf *>> Leaves(const Hash &prefix,
++                                                     unsigned depth,
++                                                     size_t max_leaves) const;
++    std::optional<Hash> FindHash(const Hash &tx_id) const;
++    template <typename F> void ForEachLeaf(F &&f) const;
++
++private:
++    NodeId Find(const Hash &prefix, unsigned depth) const;
++    std::shared_ptr<Store> m_store;
++    NodeId m_root;
++    uint64_t m_version;
++    uint64_t m_payload_bytes;
++    mutable Sketch m_sketch;
++    bool m_rebuild_sketch;
++    mutable std::once_flag m_sketch_once;
++};
++
++namespace detail {
++template <typename F>
++void ForEachLeaf(const Store &store, NodeId n, F &f) {
++    if (n == kNull) return;
++    if (Store::IsLeaf(n)) {
++        f(store.L(n));
++        return;
++    }
++    const Branch &b = store.B(n);
++    ForEachLeaf(store, b.child[0], f);
++    ForEachLeaf(store, b.child[1], f);
++}
++} // namespace detail
++
++template <typename F> void Tree::ForEachLeaf(F &&f) const {
++    detail::ForEachLeaf(*m_store, m_root, f);
++}
++template <typename F> void Snapshot::ForEachLeaf(F &&f) const {
++    detail::ForEachLeaf(*m_store, m_root, f);
++}
++
++} // namespace lotus::v2::txmerklix
++
++#endif // LOTUS_V2_TX_MERKLIX_H
+diff --git a/src/net/full_mempool_reconciliation.cpp b/src/net/full_mempool_reconciliation.cpp
+index 88509c9c94cd00dd15e625898b54d7521902d13c..fe3758f3b465a0592fd4b63590722af950ea2482 100644
+--- a/src/net/full_mempool_reconciliation.cpp
++++ b/src/net/full_mempool_reconciliation.cpp
+@@ -27,12 +27,6 @@ Hash Branch(uint16_t depth, const Hash &left, const Hash &right) {
+     std::copy(right.begin(), right.end(), bytes.begin() + 35);
+     return TaggedHash(HashDomain::TxRoot, bytes);
+ }
+-bool Less(const Hash &a, const Hash &b) {
+-    for (unsigned i = 0; i < 256; ++i) {
+-        if (Bit(a, i) != Bit(b, i)) return !Bit(a, i);
+-    }
+-    return false;
+-}
+ Descriptor FoldAt(const std::array<Descriptor, 16> &children,
+                   uint16_t depth, unsigned bit, unsigned index) {
+     if (bit == 4) return children[index];
+@@ -86,29 +80,21 @@ Descriptor Fold(const std::array<Descriptor, 16> &children, uint16_t depth) {
+     return FoldAt(children, depth, 0, 0);
+ }
+ 
++namespace {
++constexpr size_t NODE_BYTES{Snapshot::NODE_BYTES_PER_MEMBER};
++} // namespace
++
+ Snapshot::Snapshot(std::vector<CTransactionRef> transactions, size_t maximum_bytes) {
+-    // Check before reserving. At most two compressed nodes per identity; the
+-    // charge also accounts for pinned transaction serialization, not just refs.
+-    constexpr size_t per_item{sizeof(Item) + 2 * sizeof(Node) + sizeof(CTransactionRef)};
+-    if (transactions.size() > maximum_bytes / per_item ||
+-        transactions.size() > (uint64_t{Node::NONE} - 1) / 2)
++    // Check before allocating nodes. Two slab nodes (leaf + branch) bound the
++    // structural cost per identity; the charge also covers pinned bodies.
++    if (transactions.size() > maximum_bytes / (NODE_BYTES + sizeof(CTransactionRef)) ||
++        transactions.size() >= txmerklix::kMaxSlots)
+         throw std::length_error("full-recon snapshot byte budget");
+-    const size_t input_bytes{memusage::DynamicUsage(transactions)};
+-    const size_t item_bytes{memusage::MallocUsage(transactions.size() * sizeof(Item))};
+-    const size_t node_bytes{memusage::MallocUsage(transactions.size() * 2 * sizeof(Node))};
+-    if (sizeof(Snapshot) > maximum_bytes || input_bytes > maximum_bytes - sizeof(Snapshot) ||
+-        item_bytes > maximum_bytes - sizeof(Snapshot) - input_bytes ||
+-        node_bytes > maximum_bytes - sizeof(Snapshot) - input_bytes - item_bytes)
+-        throw std::length_error("full-recon snapshot preallocation budget");
+-    m_items.reserve(transactions.size());
+-    m_nodes.reserve(transactions.size() * 2);
+-    // Include the by-value construction inventory and actual vector capacities.
+-    // Conservatively retain that temporary charge after construction as well.
+-    m_charged_bytes = sizeof(Snapshot) + memusage::DynamicUsage(m_items) +
+-                      memusage::DynamicUsage(m_nodes) +
+-                      memusage::DynamicUsage(transactions);
++    m_charged_bytes = sizeof(Snapshot) + memusage::DynamicUsage(transactions) +
++                      transactions.size() * NODE_BYTES;
+     if (m_charged_bytes > maximum_bytes)
+         throw std::length_error("full-recon snapshot construction budget");
++    txmerklix::Tree tree;
+     for (const auto &tx : transactions) {
+         if (!tx || tx->IsNull() || tx->IsCoinBase())
+             throw std::invalid_argument("invalid full-recon member");
+@@ -117,66 +103,29 @@ Snapshot::Snapshot(std::vector<CTransactionRef> transactions, size_t maximum_byt
+         if (bytes > maximum_bytes - m_charged_bytes)
+             throw std::length_error("full-recon pinned body byte budget");
+         m_charged_bytes += bytes;
+-        m_items.push_back({Identity(tx->GetId()), Identity(tx->GetHash()), tx});
+-    }
+-    std::sort(m_items.begin(), m_items.end(), [](const Item &a, const Item &b) {
+-        return Less(a.id, b.id);
+-    });
+-    for (size_t i = 1; i < m_items.size(); ++i)
+-        if (m_items[i - 1].id == m_items[i].id)
++        const auto change{tree.Insert(Identity(tx->GetId()), Identity(tx->GetHash()), tx,
++                                      static_cast<uint32_t>(std::min<size_t>(
++                                          bytes, std::numeric_limits<uint32_t>::max())))};
++        if (change != txmerklix::Tree::Change::Inserted)
+             throw std::invalid_argument("duplicate full-recon identity");
+-    if (!m_items.empty()) Build(0, m_items.size());
+-}
+-uint32_t Snapshot::Build(size_t begin, size_t end) {
+-    const uint32_t index{static_cast<uint32_t>(m_nodes.size())};
+-    m_nodes.push_back(Node{begin, end});
+-    if (end - begin == 1) {
+-        m_nodes[index].digest = LeafDigest(m_items[begin].id, m_items[begin].hash);
+-        return index;
+     }
+-    unsigned split{0};
+-    while (Bit(m_items[begin].id, split) == Bit(m_items[end - 1].id, split)) ++split;
+-    const auto middle{std::partition_point(m_items.begin() + begin,
+-        m_items.begin() + end, [&](const Item &item) { return !Bit(item.id, split); })};
+-    const size_t offset{static_cast<size_t>(middle - m_items.begin())};
+-    const uint32_t left{Build(begin, offset)}, right{Build(offset, end)};
+-    m_nodes[index].left = left;
+-    m_nodes[index].right = right;
+-    m_nodes[index].split = split;
+-    m_nodes[index].digest = Branch(split, NodeAt(left, split + 1).digest,
+-                                         NodeAt(right, split + 1).digest);
+-    return index;
++    m_tree = tree.Pin();
+ }
+-Descriptor Snapshot::NodeAt(uint32_t index, uint16_t depth) const {
+-    const auto &node{m_nodes[index]};
+-    Descriptor out{node.end - node.begin, node.digest};
+-    if (out.count == 1) return out;
+-    for (unsigned d = node.split; d > depth; --d) {
+-        if (Bit(m_items[node.begin].id, d - 1)) out.digest = Branch(d - 1, EmptyDigest(), out.digest);
+-        else out.digest = Branch(d - 1, out.digest, EmptyDigest());
+-    }
+-    return out;
+-}
+-const Snapshot::Node *Snapshot::Find(const Prefix &prefix, uint32_t *out) const {
+-    if (!prefix.Valid()) throw std::invalid_argument("invalid full-recon prefix");
+-    if (m_nodes.empty()) return nullptr;
+-    uint32_t index{0};
+-    while (true) {
+-        const auto &node{m_nodes[index]};
+-        const auto &id{m_items[node.begin].id};
+-        for (unsigned bit = 0; bit < std::min<unsigned>(prefix.depth, node.split); ++bit)
+-            if (Bit(prefix.bytes, bit) != Bit(id, bit)) return nullptr;
+-        if (node.end - node.begin == 1 || prefix.depth <= node.split) {
+-            if (out) *out = index;
+-            return &node;
+-        }
+-        index = Bit(prefix.bytes, node.split) ? node.right : node.left;
+-    }
++Snapshot::Snapshot(std::shared_ptr<const txmerklix::Snapshot> pinned, size_t maximum_bytes)
++    : m_tree{std::move(pinned)} {
++    if (!m_tree) throw std::invalid_argument("missing pinned full-recon tree");
++    const size_t count{m_tree->Count()};
++    if (count > (maximum_bytes - std::min(maximum_bytes, sizeof(Snapshot))) / NODE_BYTES)
++        throw std::length_error("full-recon pinned snapshot budget");
++    m_charged_bytes = sizeof(Snapshot) + count * NODE_BYTES;
++    if (m_tree->PayloadBytes() > maximum_bytes - m_charged_bytes)
++        throw std::length_error("full-recon pinned body byte budget");
++    m_charged_bytes += m_tree->PayloadBytes();
+ }
+ Descriptor Snapshot::At(const Prefix &prefix) const {
+-    uint32_t index{0};
+-    if (!Find(prefix, &index)) return {0, EmptyDigest()};
+-    return NodeAt(index, prefix.depth);
++    if (!prefix.Valid()) throw std::invalid_argument("invalid full-recon prefix");
++    const auto out{m_tree->At(prefix.bytes, prefix.depth)};
++    return {out.count, out.digest};
+ }
+ std::array<Descriptor, 16> Snapshot::Children(const Prefix &prefix) const {
+     std::array<Descriptor, 16> out;
+@@ -185,16 +134,21 @@ std::array<Descriptor, 16> Snapshot::Children(const Prefix &prefix) const {
+ }
+ std::optional<std::vector<CTransactionRef>> Snapshot::Page(
+     const Prefix &prefix, size_t max_bytes) const {
+-    const auto *node{Find(prefix)};
++    if (!prefix.Valid()) throw std::invalid_argument("invalid full-recon prefix");
++    const auto leaves{m_tree->Leaves(prefix.bytes, prefix.depth, MAX_PAGE_BODIES)};
++    if (!leaves) return std::nullopt;
+     std::vector<CTransactionRef> out;
+-    if (!node) return out;
+-    if (node->end - node->begin > MAX_PAGE_BODIES) return std::nullopt;
++    out.reserve(leaves->size());
+     size_t bytes{0};
+-    for (size_t i = node->begin; i < node->end; ++i) {
+-        const size_t next{GetSerializeSize(*m_items[i].tx)};
++    for (const auto *leaf : *leaves) {
++        // Production leaves carry the admitted body; a body-less identity
++        // (fixtures only) can be described but never served as a page.
++        if (!leaf->payload) return std::nullopt;
++        auto tx{std::static_pointer_cast<const CTransaction>(leaf->payload)};
++        const size_t next{GetSerializeSize(*tx)};
+         if (next > max_bytes - bytes) return std::nullopt;
+         bytes += next;
+-        out.push_back(m_items[i].tx);
++        out.push_back(std::move(tx));
+     }
+     return out;
+ }
+@@ -206,7 +160,7 @@ Hash Snapshot::PageDigest(const Prefix &prefix,
+     if (bodies.size() > MAX_PAGE_BODIES)
+         throw std::length_error("full-recon page count budget");
+     // The transport owns/reserves the already-decoded bodies; this temporary
+-    // builds only a <=64-member index and cannot reserve from claimed counts.
++    // builds only a <=64-member tree and cannot reserve from claimed counts.
+     Snapshot page{bodies, std::numeric_limits<size_t>::max()};
+     return page.At(prefix).digest;
+ }
+@@ -426,6 +380,8 @@ struct Manager::Impl {
+         size_t admission_cursor{0};
+         bool admitting{false};
+         uint64_t rejected{0};
++        //! MinHash estimate of remote-only members at offer time (hint).
++        double sketch_estimate{-1.0};
+     };
+     struct Peer {
+         bool enabled{false};
+@@ -512,27 +468,49 @@ struct Manager::Impl {
+                 return nullptr;
+             }
+         }
+-        std::vector<CTransactionRef> transactions;
+-        transactions.reserve(count); // never allocate inventory while locked
+         std::pair<uint64_t, size_t> generation{};
+         uint256 captured_anchor;
+         const auto lock_started{Now()};
+-        Clock lock_acquired;
++        Clock lock_acquired, copied;
++        std::shared_ptr<const Snapshot> snapshot;
++        std::shared_ptr<const txmerklix::Snapshot> pinned;
++        std::vector<CTransactionRef> transactions;
+         {
+             LOCK2(cs_main, pool.cs);
+             lock_acquired = Now();
+-            if (pool.mapTx.size() > transactions.capacity() ||
+-                pool.mapTx.size() > available / 512 ||
++            if (pool.mapTx.size() > available / 512 ||
+                 pool.DynamicMemoryUsage() > available - pool.mapTx.size() * 512)
+                 return nullptr;
+             const auto *tip{chainman.ActiveTip()};
+             if (!tip) return nullptr;
+             captured_anchor = tip->GetBlockHash();
+             generation = {pool.GetSnapshotResetSequence(), pool.mapTx.size()};
+-            for (const auto &entry : pool.mapTx) transactions.push_back(entry->GetSharedTx());
++            // O(1): one reference on the mempool's working Subtree A tree plus
++            // its MinHash. No body copies and no hashing under the locks. A
++            // null result (overlay membership not equal to mapTx) selects the
++            // legacy complete copy below, rebuilt outside these locks.
++            pinned = pool.PinTxMerklixSnapshot();
++            copied = Now();
++        }
++        if (pinned) {
++            snapshot = std::make_shared<const Snapshot>(std::move(pinned), available);
++            ++stats.capture_pins;
++            GlobalCounters().capture_pins.fetch_add(1, std::memory_order_relaxed);
++        } else {
++            transactions.reserve(count);
++            {
++                LOCK2(cs_main, pool.cs);
++                const auto *tip{chainman.ActiveTip()};
++                if (!tip || tip->GetBlockHash() != captured_anchor ||
++                    pool.mapTx.size() > transactions.capacity())
++                    return nullptr;
++                generation = {pool.GetSnapshotResetSequence(), pool.mapTx.size()};
++                for (const auto &entry : pool.mapTx) transactions.push_back(entry->GetSharedTx());
++            }
++            snapshot = std::make_shared<const Snapshot>(std::move(transactions), available);
++            ++stats.capture_fallbacks;
++            GlobalCounters().capture_fallbacks.fetch_add(1, std::memory_order_relaxed);
+         }
+-        const auto copied{Now()};
+-        auto snapshot{std::make_shared<const Snapshot>(std::move(transactions), available)};
+         if (Anchor() != captured_anchor) return nullptr;
+         cache = {snapshot, generation, captured_anchor};
+         next_capture = now + CAPTURE_SPACING;
+@@ -541,6 +519,10 @@ struct Manager::Impl {
+         stats.capture_lock_wait_us += (lock_acquired - lock_started).count();
+         stats.capture_lock_us += (copied - lock_acquired).count();
+         stats.capture_build_us += (Now() - copied).count();
++        auto &counters{GlobalCounters()};
++        counters.captures.fetch_add(1, std::memory_order_relaxed);
++        counters.capture_lock_us.fetch_add((copied - lock_acquired).count(), std::memory_order_relaxed);
++        counters.capture_build_us.fetch_add((Now() - copied).count(), std::memory_order_relaxed);
+         LogEvent(BCLog::TXRELAY, "fullrecon_capture", "captured complete mempool count={count} bytes={bytes}")
+             .Field(BCLog::LogField::Count, snapshot->Size())
+             .Field(BCLog::LogField::Bytes, snapshot->ChargedBytes())
+@@ -634,13 +616,21 @@ struct Manager::Impl {
+         Offer offer;
+         offer.header.context = GetRandHash();
+         offer.anchor = cache.anchor;
++        // First commitment request for this pinned version: completes only
++        // the digests dirtied since the mempool tree was last hashed.
++        const auto hash_started{Now()};
+         offer.root = snapshot->Root();
+         offer.children = snapshot->Children(Prefix{});
++        offer.sketch = snapshot->Sketch();
++        const uint64_t hash_us(std::max<int64_t>(0, (Now() - hash_started).count()));
++        stats.commitment_us += hash_us;
++        GlobalCounters().commitment_us.fetch_add(hash_us, std::memory_order_relaxed);
+         // Register ownership only after successful serialization/enqueue.
+         if (!Send(node, peer, NetMsgType::MERKLIXSYNC, offer)) return;
+         peer.serve.emplace(Serve{offer.header, snapshot, offer.anchor, 0, now, now});
+         peer.next_offer = now + CAPTURE_SPACING;
+         ++stats.offers;
++        GlobalCounters().offers.fetch_add(1, std::memory_order_relaxed);
+     }
+     void OnOffer(CNode &node, Peer &peer, Offer offer, Clock now) {
+         if (offer.control != Control::OFFER) {
+@@ -664,6 +654,18 @@ struct Manager::Impl {
+         Fetch fetch;
+         fetch.header = offer.header;
+         fetch.anchor = offer.anchor;
++        // Similarity hint only: both sketches are unauthenticated summaries.
++        // The authenticated traversal below decides what is fetched.
++        const double jaccard{minhash::EstimateJaccard(local->Sketch(), offer.sketch)};
++        fetch.sketch_estimate = minhash::EstimateOnlyInB(jaccard, local->Size(), offer.root.count);
++        ++stats.sketch_offers;
++        stats.sketch_jaccard_ppm += uint64_t(jaccard * 1e6);
++        stats.sketch_estimated_remote_only += uint64_t(fetch.sketch_estimate + 0.5);
++        auto &counters{GlobalCounters()};
++        counters.sketch_offers.fetch_add(1, std::memory_order_relaxed);
++        counters.sketch_jaccard_ppm.fetch_add(uint64_t(jaccard * 1e6), std::memory_order_relaxed);
++        counters.sketch_estimated_remote_only.fetch_add(uint64_t(fetch.sketch_estimate + 0.5),
++                                                        std::memory_order_relaxed);
+         fetch.local = std::move(local);
+         fetch.born = fetch.progress = now;
+         fetch.deferred.reserve(MAX_DEFERRED_PREFIXES);
+@@ -821,6 +823,20 @@ struct Manager::Impl {
+         if (!fetch.active) {
+             Topological(fetch);
+             ++stats.coverage_complete;
++            GlobalCounters().coverage_complete.fetch_add(1, std::memory_order_relaxed);
++            if (fetch.sketch_estimate >= 0) {
++                // Hint quality versus the authenticated recovery result.
++                const uint64_t actual{fetch.recovered.size()};
++                const uint64_t estimate{uint64_t(fetch.sketch_estimate + 0.5)};
++                const uint64_t error{actual > estimate ? actual - estimate : estimate - actual};
++                ++stats.sketch_completed;
++                stats.sketch_actual_recovered += actual;
++                stats.sketch_abs_error += error;
++                auto &counters{GlobalCounters()};
++                counters.sketch_completed.fetch_add(1, std::memory_order_relaxed);
++                counters.sketch_actual_recovered.fetch_add(actual, std::memory_order_relaxed);
++                counters.sketch_abs_error.fetch_add(error, std::memory_order_relaxed);
++            }
+             ControlFrame(node, peer, fetch.header, Control::DONE);
+             LogEvent(BCLog::TXRELAY, "fullrecon_coverage_complete", "verified remote snapshot peer={peer_id} bodies={count}")
+                 .Field(BCLog::LogField::PeerId, node.GetId())
+diff --git a/src/net/full_mempool_reconciliation.h b/src/net/full_mempool_reconciliation.h
+index 6b48883d54ee46ba9fe8a43a81979112c4d386d5..526a3a72b1765ee8cf919643bdfb426cfbaed47b 100644
+--- a/src/net/full_mempool_reconciliation.h
++++ b/src/net/full_mempool_reconciliation.h
+@@ -4,6 +4,8 @@
+ #define BITCOIN_NET_FULL_MEMPOOL_RECONCILIATION_H
+ 
+ #include <lotus_v2/commitment.h>
++#include <lotus_v2/minhash.h>
++#include <lotus_v2/tx_merklix.h>
+ #include <primitives/transaction.h>
+ #include <blockencodings.h>
+ #include <streams.h>
+@@ -11,7 +13,9 @@
+ #include <string>
+ #include <serialize.h>
+ 
++#include <algorithm>
+ #include <array>
++#include <atomic>
+ #include <cstdint>
+ #include <limits>
+ #include <memory>
+@@ -54,15 +58,21 @@ Hash EmptyDigest();
+ Hash LeafDigest(const Hash &id, const Hash &hash);
+ Descriptor Fold(const std::array<Descriptor, 16> &children, uint16_t depth);
+ 
+-/** Immutable complete membership captured once; no admission-time cutoff.
+- * A compressed binary trie stores only real branch points and leaves. Unary
+- * depth tags are folded without allocating nodes, including adversarial long
+- * common prefixes. All bodies are shared immutable transaction references.
++/** Immutable complete membership; no admission-time cutoff.
++ * Backed by a pinned slab Merklix version (lotus_v2/tx_merklix.h): only real
++ * branch points and leaves are stored, unary depth tags are folded on demand,
++ * digests are completed lazily and shared with the mempool's own Subtree A
++ * caches. Production captures pin the mempool's working tree in O(1); the
++ * transaction-vector constructor builds a private tree (page verification,
++ * tests and the fallback path). All bodies are shared immutable references.
+  */
+ class Snapshot {
+ public:
+     explicit Snapshot(std::vector<CTransactionRef> transactions,
+                       size_t maximum_bytes);
++    /** Adopt an O(1) pinned mempool view; throws length_error over budget. */
++    Snapshot(std::shared_ptr<const txmerklix::Snapshot> pinned,
++             size_t maximum_bytes);
+     Descriptor Root() const { return At(Prefix{}); }
+     Descriptor At(const Prefix &prefix) const;
+     std::array<Descriptor, 16> Children(const Prefix &prefix) const;
+@@ -72,28 +82,20 @@ public:
+     std::optional<std::vector<CTransactionRef>> Page(
+         const Prefix &prefix, size_t max_bytes) const;
+     size_t ChargedBytes() const { return m_charged_bytes; }
+-    size_t Size() const { return m_items.size(); }
++    size_t Size() const { return m_tree->Count(); }
++    /** Bottom-k MinHash of exactly this membership version (hint only). */
++    const std::vector<uint64_t> &Sketch() const { return m_tree->GetSketch().values; }
++    uint64_t Version() const { return m_tree->Version(); }
++    const txmerklix::Snapshot &Tree() const { return *m_tree; }
++    /** Conservative bytes charged per member by structural storage. */
++    static constexpr size_t NODE_BYTES_PER_MEMBER =
++        sizeof(txmerklix::Leaf) + sizeof(txmerklix::Branch);
+     /** Authenticate a whole body page at its original canonical prefix depth. */
+     static Hash PageDigest(const Prefix &prefix,
+                            const std::vector<CTransactionRef> &bodies);
+ private:
+-    // Narrow test fixture exercises adversarial canonical identities without
+-    // grinding transaction hashes; production captures always derive both IDs.
+-    friend struct SnapshotIdentityFixture;
+-    struct Item { Hash id, hash; CTransactionRef tx; };
+-    struct Node {
+-        size_t begin, end;
+-        uint32_t left{NONE}, right{NONE};
+-        uint16_t split{256};
+-        Hash digest{}; // Digest at split, before any compressed unary path.
+-        static constexpr uint32_t NONE = std::numeric_limits<uint32_t>::max();
+-    };
+-    std::vector<Item> m_items;
+-    std::vector<Node> m_nodes;
++    std::shared_ptr<const txmerklix::Snapshot> m_tree;
+     size_t m_charged_bytes{0};
+-    uint32_t Build(size_t begin, size_t end);
+-    Descriptor NodeAt(uint32_t node, uint16_t depth) const;
+-    const Node *Find(const Prefix &prefix, uint32_t *index = nullptr) const;
+ };
+ 
+ inline void Require(bool ok) {
+@@ -110,12 +112,14 @@ struct EnumByteFormatter {
+ enum class Control : uint8_t { OFFER = 0, DONE = 1, CANCEL = 2 };
+ enum class Work : uint8_t { EXPAND = 0, PAGE = 1 };
+ enum class Status : uint8_t { OK = 0, LIMIT = 1, GONE = 2, BUSY = 3, UNAVAILABLE = 4 };
++//! Version 2 adds the bottom-k MinHash to offers (no released v1 peers).
++inline constexpr uint8_t FRAME_VERSION = 2;
+ struct Header {
+-    uint8_t scope{SCOPE}, version{1};
++    uint8_t scope{SCOPE}, version{FRAME_VERSION};
+     uint256 context{};
+     SERIALIZE_METHODS(Header, obj) {
+         READWRITE(obj.scope, obj.version);
+-        Require(obj.scope == SCOPE && obj.version == 1);
++        Require(obj.scope == SCOPE && obj.version == FRAME_VERSION);
+         READWRITE(obj.context);
+         Require(!obj.context.IsNull());
+     }
+@@ -126,6 +130,9 @@ struct Offer {
+     uint256 anchor{};
+     Descriptor root;
+     std::array<Descriptor, 16> children;
++    //! Bottom-k MinHash of the offered membership: a similarity/fetching
++    //! hint. It is NOT authenticated by the root; never trust it for validity.
++    std::vector<uint64_t> sketch;
+     SERIALIZE_METHODS(Offer, obj) {
+         READWRITE(obj.header, Using<EnumByteFormatter>(obj.control));
+         Require(uint8_t(obj.control) <= uint8_t(Control::CANCEL));
+@@ -134,6 +141,14 @@ struct Offer {
+             for (auto &child : obj.children) READWRITE(child);
+             const auto actual{Fold(obj.children, 0)};
+             Require(actual.digest == obj.root.digest && actual.count == obj.root.count);
++            uint64_t count{obj.sketch.size()};
++            if constexpr (ser_action.ForRead()) count = ReadCompactSize(s);
++            else WriteCompactSize(s, count);
++            // Shape is checked; values are an unauthenticated hint.
++            Require(count == std::min<uint64_t>(minhash::K, obj.root.count));
++            if constexpr (ser_action.ForRead()) obj.sketch.resize(count);
++            for (auto &value : obj.sketch) READWRITE(value);
++            Require(std::is_sorted(obj.sketch.begin(), obj.sketch.end()));
+         }
+     }
+ };
+@@ -181,10 +196,33 @@ size_t PageDecodeExposure(Span<const uint8_t> bytes);
+ 
+ struct Stats {
+     uint64_t captures{0}, captured_members{0}, capture_lock_us{0}, capture_lock_wait_us{0}, capture_build_us{0};
++    //! Captures served by an O(1) pinned mempool tree vs the rebuild fallback.
++    uint64_t capture_pins{0}, capture_fallbacks{0};
++    //! Lazy commitment completion for offered roots (outside mempool locks).
++    uint64_t commitment_us{0};
+     uint64_t offers{0}, requests{0}, replies{0}, verified_bodies{0}, coverage_complete{0};
+     uint64_t admitted{0}, unresolved{0}, malformed{0}, busy{0}, expired{0};
++    //! MinHash hint quality: offers evaluated, summed Jaccard (ppm), summed
++    //! estimated remote-only members, and for completed fetches the summed
++    //! actually recovered members and absolute estimate error.
++    uint64_t sketch_offers{0}, sketch_jaccard_ppm{0}, sketch_estimated_remote_only{0};
++    uint64_t sketch_completed{0}, sketch_actual_recovered{0}, sketch_abs_error{0};
+     size_t charged_bytes{0};
+ };
++
++/** Process-wide monotonic mirrors of Stats for Prometheus scraping. */
++struct Counters {
++    std::atomic<uint64_t> captures{0}, capture_pins{0}, capture_fallbacks{0};
++    std::atomic<uint64_t> capture_lock_us{0}, capture_build_us{0}, commitment_us{0};
++    std::atomic<uint64_t> offers{0}, coverage_complete{0};
++    std::atomic<uint64_t> sketch_offers{0}, sketch_jaccard_ppm{0};
++    std::atomic<uint64_t> sketch_estimated_remote_only{0};
++    std::atomic<uint64_t> sketch_completed{0}, sketch_actual_recovered{0}, sketch_abs_error{0};
++};
++inline Counters &GlobalCounters() noexcept {
++    static Counters counters;
++    return counters;
++}
+ /** Connection-owned derived snapshots only; never primary mempool state. */
+ class Manager {
+ public:
+diff --git a/src/node/metrics_collectors.cpp b/src/node/metrics_collectors.cpp
+index e731910e4b21a5ef2a5384ba8759fa975cfd94fe..42f1f625ee2561d5c8b53b82ff16b97033018685 100644
+--- a/src/node/metrics_collectors.cpp
++++ b/src/node/metrics_collectors.cpp
+@@ -10,6 +10,8 @@
+ #include <banman.h>
+ #include <feerate.h>
+ #include <lotus_v2/fee_hysteresis.h>
++#include <lotus_v2/tx_merklix.h>
++#include <net/full_mempool_reconciliation.h>
+ #include <net/v2_protocol_handler.h>
+ #include <net_processing.h>
+ #include <node/context.h>
+@@ -20,6 +22,8 @@
+ #include <txorphanage.h>
+ 
+ #include <cstdint>
++#include <memory>
++#include <mutex>
+ #include <vector>
+ 
+ namespace node {
+@@ -129,6 +133,93 @@ namespace {
+             }
+         }));
+     }
++    /**
++     * Slab Merklix tree and full-mempool reconciliation series. The process
++     * counters live in the subsystems (relaxed atomics); these metrics read
++     * them at scrape time. Registered once per process.
++     */
++    void AddMerklixMetrics(NodeMetrics &m) {
++        static std::once_flag registered;
++        std::call_once(registered, [&m] {
++            auto counter = [&m](const char *name, const char *help, auto fn) {
++                m.registry.Add(std::make_unique<metrics::FunctionCounter>(
++                    MetricName(name), help, fn));
++            };
++            using lotus::v2::txmerklix::Stats;
++            auto u = [](const std::atomic<uint64_t> &a) { return a.load(std::memory_order_relaxed); };
++            counter("txmerklix_leaf_allocations_total", "Slab Merklix leaf nodes allocated.",
++                    [u] { return u(Stats().leaf_allocs); });
++            counter("txmerklix_branch_allocations_total", "Slab Merklix branch nodes allocated (new branch points and path copies).",
++                    [u] { return u(Stats().branch_allocs); });
++            counter("txmerklix_slot_reuses_total", "Slab Merklix allocations served from reclaimed slots.",
++                    [u] { return u(Stats().slot_reuses); });
++            counter("txmerklix_path_copies_total", "Shared Merklix branches copied because a snapshot or tree copy still referenced them.",
++                    [u] { return u(Stats().path_copies); });
++            counter("txmerklix_inplace_updates_total", "Exclusively owned Merklix branches mutated in place.",
++                    [u] { return u(Stats().inplace_updates); });
++            counter("txmerklix_nodes_freed_total", "Merklix nodes reclaimed after their last owner was released.",
++                    [u] { return u(Stats().frees); });
++            counter("txmerklix_node_hashes_total", "Lazy Merklix digest computations (leaves, branches and unary folds).",
++                    [u] { return u(Stats().node_hashes); });
++            counter("txmerklix_hash_races_total", "Concurrent digest computations that lost the cache publication race.",
++                    [u] { return u(Stats().hash_cas_losses); });
++            counter("txmerklix_pins_total", "Immutable Merklix snapshots pinned.",
++                    [u] { return u(Stats().pins); });
++            counter("txmerklix_parallel_completions_total", "Large dirty commitments completed with parallel subtree hashing.",
++                    [u] { return u(Stats().parallel_completions); });
++            counter("txmerklix_sketch_rebuilds_total", "MinHash candidate rebuilds after deletions exhausted the candidate buffer.",
++                    [u] { return u(Stats().sketch_rebuilds); });
++            counter("txmerklix_sketch_rebuild_members_total", "Members scanned by MinHash candidate rebuilds.",
++                    [u] { return u(Stats().sketch_rebuild_members); });
++            using lotus::v2::net::fullrecon::GlobalCounters;
++            counter("fullrecon_captures_total", "Full-mempool reconciliation snapshots captured.",
++                    [u] { return u(GlobalCounters().captures); });
++            counter("fullrecon_capture_pins_total", "Captures served by an O(1) pinned mempool Merklix tree.",
++                    [u] { return u(GlobalCounters().capture_pins); });
++            counter("fullrecon_capture_fallbacks_total", "Captures that rebuilt a tree from copied mempool transactions.",
++                    [u] { return u(GlobalCounters().capture_fallbacks); });
++            counter("fullrecon_capture_lock_microseconds_total", "Time holding cs_main and the mempool lock to capture snapshots.",
++                    [u] { return u(GlobalCounters().capture_lock_us); });
++            counter("fullrecon_capture_build_microseconds_total", "Time constructing captured snapshots after the locks.",
++                    [u] { return u(GlobalCounters().capture_build_us); });
++            counter("fullrecon_commitment_microseconds_total", "Lazy commitment completion for offered roots, outside mempool locks.",
++                    [u] { return u(GlobalCounters().commitment_us); });
++            counter("fullrecon_offers_total", "Full-mempool reconciliation offers sent.",
++                    [u] { return u(GlobalCounters().offers); });
++            counter("fullrecon_coverage_complete_total", "Remote snapshots whose authenticated traversal completed.",
++                    [u] { return u(GlobalCounters().coverage_complete); });
++            counter("fullrecon_sketch_offers_total", "Received offers whose MinHash hint was evaluated.",
++                    [u] { return u(GlobalCounters().sketch_offers); });
++            counter("fullrecon_sketch_jaccard_ppm_total", "Summed estimated Jaccard similarity (parts per million) of evaluated offers.",
++                    [u] { return u(GlobalCounters().sketch_jaccard_ppm); });
++            counter("fullrecon_sketch_estimated_remote_only_total", "Summed MinHash estimates of remote-only members at offer time.",
++                    [u] { return u(GlobalCounters().sketch_estimated_remote_only); });
++            counter("fullrecon_sketch_completed_total", "Completed traversals with a MinHash estimate to compare.",
++                    [u] { return u(GlobalCounters().sketch_completed); });
++            counter("fullrecon_sketch_actual_recovered_total", "Members actually recovered by completed traversals with estimates.",
++                    [u] { return u(GlobalCounters().sketch_actual_recovered); });
++            counter("fullrecon_sketch_abs_error_total", "Summed absolute error between MinHash estimates and recovered members.",
++                    [u] { return u(GlobalCounters().sketch_abs_error); });
++            auto &live_leaves = m.registry.Add(std::make_unique<metrics::Gauge>(
++                MetricName("txmerklix_live_leaves"), "Live slab Merklix leaf nodes (all stores)."));
++            auto &live_branches = m.registry.Add(std::make_unique<metrics::Gauge>(
++                MetricName("txmerklix_live_branches"), "Live slab Merklix branch nodes (all stores)."));
++            auto &retained = m.registry.Add(std::make_unique<metrics::Gauge>(
++                MetricName("txmerklix_retained_slot_bytes"), "Bytes of constructed slab slots retained for reuse or live (all stores)."));
++            auto &stores = m.registry.Add(std::make_unique<metrics::Gauge>(
++                MetricName("txmerklix_stores"), "Live slab Merklix stores."));
++            m.registry.AddCollector([&live_leaves, &live_branches, &retained, &stores] {
++                auto &s = Stats();
++                live_leaves.Set(double(s.live_leaves.load(std::memory_order_relaxed)));
++                live_branches.Set(double(s.live_branches.load(std::memory_order_relaxed)));
++                retained.Set(double(s.retained_leaf_slots.load(std::memory_order_relaxed)) *
++                                 sizeof(lotus::v2::txmerklix::Leaf) +
++                             double(s.retained_branch_slots.load(std::memory_order_relaxed)) *
++                                 sizeof(lotus::v2::txmerklix::Branch));
++                stores.Set(double(s.stores.load(std::memory_order_relaxed)));
++            });
++        });
++    }
+ } // namespace
+ 
+ void StartNodeMetricsCollectors(NodeContext &node) {
+@@ -150,6 +241,7 @@ void StartNodeMetricsCollectors(NodeContext &node) {
+     }
+     AddAdaptiveCapacityCollector(*m);
+     AddPeersCollector(*m, node.addrman.get(), node.banman.get());
++    AddMerklixMetrics(*m);
+ }
+ 
+ void StopNodeMetricsCollectors() {
+diff --git a/src/node/snapshot.cpp b/src/node/snapshot.cpp
+index c864afcd6faa2923ee7068ba86e6d1d5434d3b6e..48d31b66abc33875bc8075d56d1ae5cf5f77df21 100644
+--- a/src/node/snapshot.cpp
++++ b/src/node/snapshot.cpp
+@@ -934,6 +934,9 @@ void MiningTemplateSnapshot::EnsureRoots() const {
+ 
+     if (has_tip_utxo_snapshot &&
+         (tip_utxo_root != nullptr || next_height <= 1)) {
++        // Subtree A is pinned under the mempool lock in O(1) and its lazy
++        // commitment is completed after the lock is released.
++        std::shared_ptr<const lotus::v2::txmerklix::Snapshot> pinned_tx_tree;
+         if (mempool_ptr != nullptr) {
+             TRY_LOCK(mempool_ptr->cs, lock_mp);
+             if (lock_mp && mempool_ptr->GetTransactionsUpdated() == transactions_updated &&
+@@ -944,7 +947,7 @@ void MiningTemplateSnapshot::EnsureRoots() const {
+                 const auto &overlay =
+                     mempool_ptr->GetMerklixOverlay().GetSpeculativeOverlay();
+                 if (overlay.GetTxCount() == non_coinbase_txs.size()) {
+-                    subtree_a_root = overlay.GetSubtreeARoot();
++                    pinned_tx_tree = overlay.PinTxTree();
+                     (void)overlay.GetUtxoRootDigest();
+                     v2_base_state = V2TemplateBaseState{};
+                     v2_base_state.utxo_arena =
+@@ -956,11 +959,14 @@ void MiningTemplateSnapshot::EnsureRoots() const {
+                         overlay.GetSumNonCbEffectiveCost();
+                     v2_base_state.height = uint64_t(next_height);
+                     v2_base_state.parent_mtp = uint64_t(parent_mtp);
+-                    roots_ready = true;
+-                    return;
+                 }
+             }
+         }
++        if (pinned_tx_tree) {
++            subtree_a_root = pinned_tx_tree->RootDigest();
++            roots_ready = true;
++            return;
++        }
+         lotus::v2::Hash parent_id{};
+         std::memcpy(parent_id.data(), prev_block_hash.begin(), 32);
+         lotus::v2::MempoolOverlayLayer overlay(
+diff --git a/src/primitives/block.cpp b/src/primitives/block.cpp
+index da27f725a9117e477cd5c91aa2e6d716a28365e0..b74d79d0f08cd3c764de3699581c6bcd21317aee 100644
+--- a/src/primitives/block.cpp
++++ b/src/primitives/block.cpp
+@@ -11,6 +11,7 @@
+ #include <cstring>
+ #include <filesystem>
+ #include <fstream>
++#include <core_memusage.h>
+ #include <hash.h>
+ #include <lotus_v2/candidate_state_key.h>
+ #include <stdexcept>
+@@ -19,6 +20,7 @@
+ #include <lotus_v2/monetary.h>
+ #include <lotus_v2/sparse_state.h>
+ #include <lotus_v2/tagged_hash.h>
++#include <limits>
+ #include <list>
+ #include <map>
+ #include <memory>
+@@ -1139,6 +1141,17 @@ uint256 ComputeV2StateRootFromOverlay(
+     return out;
+ }
+ 
++namespace {
++//! Retained-body charge for pinned reconciliation views; matches the former
++//! full-mempool snapshot capture charge max(serialized, recursive usage).
++uint32_t OverlayPayloadBytes(const CTransactionRef &ptx) {
++    const size_t bytes = std::max<size_t>(GetSerializeSize(*ptx),
++                                          RecursiveDynamicUsage(ptx));
++    return static_cast<uint32_t>(
++        std::min<size_t>(bytes, std::numeric_limits<uint32_t>::max()));
++}
++} // namespace
++
+ bool AddTransactionToOverlay(lotus::v2::MempoolOverlayLayer &overlay,
+                              const CTransactionRef &ptx,
+                              int64_t fee_sats,
+@@ -1154,7 +1167,8 @@ bool AddTransactionToOverlay(lotus::v2::MempoolOverlayLayer &overlay,
+     ExtractOverlayTxData(*ptx, overlay.GetHeight(), overlay.GetParentMtp(),
+                          fee_sats, tx_id, tx_hash, linear_cost, spent, created);
+     return overlay.AddTransaction(tx_id, tx_hash, linear_cost, spent, created,
+-                                  fee_sats, sigchecks, ptx);
++                                  fee_sats, sigchecks, ptx,
++                                  OverlayPayloadBytes(ptx));
+ }
+ 
+ bool AddTransactionToOverlay(lotus::v2::MerklixOverlayManager &manager,
+@@ -1192,6 +1206,7 @@ size_t AddTransactionsToOverlayBatch(
+                                  e.created_coins);
+             e.fee_sats = fee_sats;
+             e.sigchecks = sigchecks;
++            e.payload_bytes = OverlayPayloadBytes(ptx);
+             e.tx_ref = ptx;
+         }
+     };
+diff --git a/src/test/CMakeLists.txt b/src/test/CMakeLists.txt
+index a6e6486756fa86af562b4c70e907fca733759361..f8be8e0a25dcfa52ab0288e80a8d7bcec79fd252 100644
+--- a/src/test/CMakeLists.txt
++++ b/src/test/CMakeLists.txt
+@@ -335,6 +335,7 @@ add_boost_unit_tests_to_suite(bitcoin test_bitcoin
+ 		v2_deferred_block_tests.cpp
+ 		v2_protocol_handler_tests.cpp
+ 		full_mempool_reconciliation_tests.cpp
++		tx_merklix_tests.cpp
+ 		blockindex_comparator_tests.cpp
+ 
+ 		# RPC Tests
+diff --git a/src/test/full_mempool_reconciliation_tests.cpp b/src/test/full_mempool_reconciliation_tests.cpp
+index 40bc1c986f17952b48a34a351c6bcdb9d2e603f0..0a439cfe551e55f27e468abf3a476946dd4c8487 100644
+--- a/src/test/full_mempool_reconciliation_tests.cpp
++++ b/src/test/full_mempool_reconciliation_tests.cpp
+@@ -28,24 +28,14 @@ V2Hash Identity(const uint256 &id) {
+ }
+ }
+ namespace lotus::v2::net::fullrecon {
++// Adversarial canonical identities without grinding transaction hashes: a
++// body-less slab tree is pinned and described by the production Snapshot.
+ struct SnapshotIdentityFixture {
+     static Snapshot Index(const std::vector<TxIdentityPair> &identities) {
+-        Snapshot out{{}, 64 * 1024 * 1024};
+-        out.m_items.reserve(identities.size());
+-        out.m_nodes.reserve(identities.size() * 2);
++        txmerklix::Tree tree;
+         for (const auto &identity : identities)
+-            out.m_items.push_back({identity.tx_id, identity.tx_hash, {}});
+-        auto less = [](const Snapshot::Item &a, const Snapshot::Item &b) {
+-            for (unsigned bit = 0; bit < 256; ++bit) {
+-                const auto left{(a.id[bit / 8] >> (bit % 8)) & 1};
+-                const auto right{(b.id[bit / 8] >> (bit % 8)) & 1};
+-                if (left != right) return left < right;
+-            }
+-            return false;
+-        };
+-        std::sort(out.m_items.begin(), out.m_items.end(), less);
+-        if (!out.m_items.empty()) out.Build(0, out.m_items.size());
+-        return out;
++            tree.Insert(identity.tx_id, identity.tx_hash);
++        return Snapshot{tree.Pin(), 256 * 1024 * 1024};
+     }
+ };
+ }
+diff --git a/src/test/tx_merklix_tests.cpp b/src/test/tx_merklix_tests.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..76e430ecba38ad5a59a6bde67ac82005b80deee5
+--- /dev/null
++++ b/src/test/tx_merklix_tests.cpp
+@@ -0,0 +1,637 @@
++// Copyright (c) 2026 The Lotus developers
++// Distributed under the MIT software license, see the accompanying
++// file COPYING or http://www.opensource.org/licenses/mit-license.php.
++
++#include <lotus_v2/commitment.h>
++#include <lotus_v2/mempool_overlay.h>
++#include <lotus_v2/minhash.h>
++#include <lotus_v2/tx_merklix.h>
++#include <net/full_mempool_reconciliation.h>
++#include <script/script.h>
++#include <streams.h>
++#include <txmempool.h>
++#include <validation.h>
++
++#include <test/util/random.h>
++#include <test/util/setup_common.h>
++#include <test/util/txmempool.h>
++
++#include <boost/test/unit_test.hpp>
++
++#include <algorithm>
++#include <atomic>
++#include <map>
++#include <set>
++#include <thread>
++#include <vector>
++
++using V2Hash = lotus::v2::Hash;
++using lotus::v2::TxIdentityPair;
++namespace txm = lotus::v2::txmerklix;
++namespace mh = lotus::v2::minhash;
++
++namespace {
++V2Hash RandomHash(FastRandomContext &rng) {
++    const uint256 v = rng.rand256();
++    V2Hash out;
++    std::copy(v.begin(), v.end(), out.begin());
++    return out;
++}
++
++V2Hash Reference(const std::map<V2Hash, V2Hash> &members) {
++    std::vector<TxIdentityPair> pairs;
++    pairs.reserve(members.size());
++    for (const auto &[id, hash] : members) pairs.push_back({hash, id});
++    return lotus::v2::BuildTxSubtreeA(pairs);
++}
++
++std::vector<uint64_t> ReferenceSketch(const std::map<V2Hash, V2Hash> &members) {
++    std::vector<uint64_t> values;
++    for (const auto &[id, hash] : members) values.push_back(mh::Value(id, hash));
++    return mh::Reference(std::move(values));
++}
++
++std::map<V2Hash, V2Hash> Members(const txm::Snapshot &snapshot) {
++    std::map<V2Hash, V2Hash> out;
++    snapshot.ForEachLeaf([&](const txm::Leaf &leaf) { out.emplace(leaf.key, leaf.tx_hash); });
++    return out;
++}
++
++CTransactionRef Member(FastRandomContext &rng) {
++    CMutableTransaction tx;
++    tx.nVersion = 2;
++    tx.vin.emplace_back(COutPoint(TxId{rng.rand256()}, 0));
++    tx.vin.front().scriptSig = CScript() << OP_TRUE;
++    tx.vout.emplace_back(10000 * SATOSHI, CScript() << OP_TRUE);
++    return MakeTransactionRef(std::move(tx));
++}
++
++V2Hash Identity(const uint256 &id) {
++    V2Hash out;
++    std::copy(id.begin(), id.end(), out.begin());
++    return out;
++}
++
++uint64_t Counter(const std::atomic<uint64_t> &c) { return c.load(); }
++} // namespace
++
++BOOST_FIXTURE_TEST_SUITE(tx_merklix_tests, BasicTestingSetup)
++
++BOOST_AUTO_TEST_CASE(canonical_root_equivalence_with_consensus_and_legacy_arena) {
++    FastRandomContext rng{uint256{0x51}};
++    for (size_t n : {size_t{0}, size_t{1}, size_t{2}, size_t{3}, size_t{17},
++                     size_t{1000}, size_t{5000}}) {
++        txm::Tree tree;
++        lotus::v2::TxOverlayArena legacy;
++        uint32_t legacy_root{lotus::v2::TxOverlayArena::kNullIdx};
++        std::map<V2Hash, V2Hash> members;
++        while (members.size() < n) {
++            const V2Hash id = RandomHash(rng), hash = RandomHash(rng);
++            members.emplace(id, hash);
++            BOOST_CHECK(tree.Insert(id, hash) == txm::Tree::Change::Inserted);
++            legacy_root = legacy.InsertTxLeaf(legacy_root, id, hash);
++        }
++        BOOST_CHECK_EQUAL(tree.Count(), n);
++        const V2Hash expected = Reference(members);
++        BOOST_CHECK(tree.RootDigest() == expected);
++        BOOST_CHECK(legacy.SubtreeARoot(legacy_root) == expected);
++        // Remove a random half, then re-add it: every intermediate root matches.
++        std::vector<V2Hash> removed;
++        for (auto it = members.begin(); it != members.end();) {
++            if (rng.randbool()) {
++                BOOST_CHECK(tree.Erase(it->first));
++                legacy_root = legacy.EraseTxLeaf(legacy_root, it->first);
++                removed.push_back(it->first);
++                it = members.erase(it);
++            } else {
++                ++it;
++            }
++        }
++        BOOST_CHECK(tree.RootDigest() == Reference(members));
++        BOOST_CHECK(legacy.SubtreeARoot(legacy_root) == Reference(members));
++        BOOST_CHECK(!tree.Erase(RandomHash(rng))); // non-member
++        for (const V2Hash &id : removed) {
++            const V2Hash hash = RandomHash(rng);
++            members.emplace(id, hash);
++            tree.Insert(id, hash);
++        }
++        BOOST_CHECK(tree.RootDigest() == Reference(members));
++        for (const auto &[id, hash] : members) {
++            BOOST_CHECK(tree.FindHash(id) == hash);
++        }
++    }
++}
++
++BOOST_AUTO_TEST_CASE(adversarial_prefixes_and_deepest_split) {
++    std::map<V2Hash, V2Hash> members;
++    txm::Tree tree;
++    for (uint64_t i = 0; i < 4097; ++i) {
++        V2Hash id{}, hash{};
++        for (unsigned byte = 0; byte < 8; ++byte) {
++            id[2 + byte] = hash[byte] = (i >> (8 * byte)) & 255;
++        }
++        members.emplace(id, hash);
++        tree.Insert(id, hash);
++    }
++    BOOST_CHECK(tree.RootDigest() == Reference(members));
++    // Two keys differing only at canonical bit 255.
++    txm::Tree deep;
++    std::map<V2Hash, V2Hash> pair;
++    V2Hash a{}, b{};
++    b[31] = 128;
++    pair.emplace(a, a);
++    pair.emplace(b, a);
++    deep.Insert(a, a);
++    deep.Insert(b, a);
++    BOOST_CHECK(deep.RootDigest() == Reference(pair));
++    BOOST_CHECK(deep.Erase(b));
++    pair.erase(b);
++    BOOST_CHECK(deep.RootDigest() == Reference(pair));
++}
++
++BOOST_AUTO_TEST_CASE(duplicate_replacement_and_readd_semantics) {
++    FastRandomContext rng{uint256{0x52}};
++    txm::Tree tree;
++    const V2Hash id = RandomHash(rng), h1 = RandomHash(rng), h2 = RandomHash(rng);
++    BOOST_CHECK(tree.Insert(id, h1) == txm::Tree::Change::Inserted);
++    const uint64_t v1 = tree.Version();
++    const auto sketch1 = tree.CurrentSketch().values;
++    const V2Hash root1 = tree.RootDigest();
++    // Identical membership: no version, sketch or structure change.
++    BOOST_CHECK(tree.Insert(id, h1) == txm::Tree::Change::Unchanged);
++    BOOST_CHECK_EQUAL(tree.Version(), v1);
++    BOOST_CHECK(tree.CurrentSketch().values == sketch1);
++    // Same TxId, different TxHash: one element replaced, never counted twice.
++    BOOST_CHECK(tree.Insert(id, h2) == txm::Tree::Change::Replaced);
++    BOOST_CHECK_EQUAL(tree.Count(), 1U);
++    BOOST_CHECK_GT(tree.Version(), v1);
++    BOOST_CHECK(tree.CurrentSketch().values == std::vector<uint64_t>{mh::Value(id, h2)});
++    BOOST_CHECK(tree.RootDigest() != root1);
++    // Remove and re-add the original: identical root and sketch again.
++    BOOST_CHECK(tree.Erase(id));
++    BOOST_CHECK(tree.RootDigest() == txm::EmptyDigest());
++    BOOST_CHECK(tree.CurrentSketch().values.empty());
++    tree.Insert(id, h1);
++    BOOST_CHECK(tree.RootDigest() == root1);
++    BOOST_CHECK(tree.CurrentSketch().values == sketch1);
++}
++
++BOOST_AUTO_TEST_CASE(ordinary_readers_do_not_hash) {
++    FastRandomContext rng{uint256{0x53}};
++    txm::Tree tree;
++    std::vector<V2Hash> ids;
++    const uint64_t hashes_before = Counter(txm::Stats().node_hashes);
++    for (int i = 0; i < 2000; ++i) {
++        ids.push_back(RandomHash(rng));
++        tree.Insert(ids.back(), RandomHash(rng));
++    }
++    for (int i = 0; i < 500; ++i) tree.Erase(ids[i]);
++    const auto pinned = tree.Pin();
++    for (const V2Hash &id : ids) {
++        (void)tree.Contains(id);
++        (void)pinned->FindHash(id);
++    }
++    V2Hash prefix{};
++    (void)pinned->Leaves(prefix, 8, 64);
++    (void)Members(*pinned);
++    // Structure maintenance, lookups, pins and leaf enumeration hash nothing.
++    BOOST_CHECK_EQUAL(Counter(txm::Stats().node_hashes), hashes_before);
++    (void)pinned->RootDigest();
++    BOOST_CHECK_GT(Counter(txm::Stats().node_hashes), hashes_before);
++}
++
++BOOST_AUTO_TEST_CASE(pinned_snapshot_is_stable_under_later_writes) {
++    FastRandomContext rng{uint256{0x54}};
++    txm::Tree tree;
++    std::map<V2Hash, V2Hash> members;
++    for (int i = 0; i < 3000; ++i) {
++        const V2Hash id = RandomHash(rng), hash = RandomHash(rng);
++        members.emplace(id, hash);
++        tree.Insert(id, hash);
++    }
++    // Pin before any hashing: the lazy commitment must still describe the
++    // pinned membership after the working view diverges.
++    const auto pinned = tree.Pin();
++    const auto pinned_members = members;
++    const uint64_t pinned_version = pinned->Version();
++    const auto pinned_sketch = pinned->GetSketch().values;
++    for (int i = 0; i < 2000; ++i) {
++        const int op = rng.randrange(3);
++        if (op == 0 || members.empty()) {
++            const V2Hash id = RandomHash(rng), hash = RandomHash(rng);
++            members.emplace(id, hash);
++            tree.Insert(id, hash);
++        } else {
++            auto it = members.begin();
++            std::advance(it, rng.randrange(members.size()));
++            if (op == 1) {
++                tree.Erase(it->first);
++                members.erase(it);
++            } else {
++                it->second = RandomHash(rng);
++                tree.Insert(it->first, it->second);
++            }
++        }
++        if (i % 500 == 0) (void)tree.RootDigest(); // hash shared nodes too
++    }
++    BOOST_CHECK(Members(*pinned) == pinned_members);
++    BOOST_CHECK_EQUAL(pinned->Count(), pinned_members.size());
++    BOOST_CHECK_EQUAL(pinned->Version(), pinned_version);
++    BOOST_CHECK(pinned->GetSketch().values == pinned_sketch);
++    BOOST_CHECK(pinned_sketch == ReferenceSketch(pinned_members));
++    BOOST_CHECK(pinned->RootDigest() == Reference(pinned_members));
++    BOOST_CHECK(tree.RootDigest() == Reference(members));
++    BOOST_CHECK(tree.CurrentSketch().values == ReferenceSketch(members));
++}
++
++BOOST_AUTO_TEST_CASE(concurrent_hashers_and_releases_during_writes) {
++    // One writer mutates and pins under its own (single-thread) ownership;
++    // reader threads hash and enumerate pinned snapshots concurrently, then
++    // release them on their own threads while the writer keeps allocating.
++    FastRandomContext rng{uint256{0x55}};
++    txm::Tree tree;
++    std::map<V2Hash, V2Hash> members;
++    for (int i = 0; i < 1500; ++i) {
++        const V2Hash id = RandomHash(rng), hash = RandomHash(rng);
++        members.emplace(id, hash);
++        tree.Insert(id, hash);
++    }
++    struct Work {
++        std::shared_ptr<const txm::Snapshot> snapshot;
++        V2Hash expected;
++        size_t count;
++    };
++    std::mutex queue_mutex;
++    std::vector<Work> queue;
++    std::atomic<bool> done{false};
++    std::atomic<int> failures{0}, checked{0};
++    auto reader = [&] {
++        while (true) {
++            Work work;
++            {
++                std::lock_guard<std::mutex> lock(queue_mutex);
++                if (queue.empty()) {
++                    if (done) return;
++                } else {
++                    work = std::move(queue.back());
++                    queue.pop_back();
++                }
++            }
++            if (!work.snapshot) {
++                std::this_thread::yield();
++                continue;
++            }
++            // Two hashers on the same pinned version race through the cache.
++            V2Hash a, b;
++            std::thread twin([&] { b = work.snapshot->RootDigest(); });
++            a = work.snapshot->RootDigest();
++            twin.join();
++            if (a != work.expected || b != work.expected ||
++                work.snapshot->Count() != work.count) {
++                ++failures;
++            }
++            ++checked;
++            work.snapshot.reset(); // release off the writer thread
++        }
++    };
++    std::vector<std::thread> readers;
++    for (int i = 0; i < 3; ++i) readers.emplace_back(reader);
++    for (int round = 0; round < 60; ++round) {
++        for (int i = 0; i < 50; ++i) {
++            if (rng.randbool() || members.empty()) {
++                const V2Hash id = RandomHash(rng), hash = RandomHash(rng);
++                members.emplace(id, hash);
++                tree.Insert(id, hash);
++            } else {
++                auto it = members.begin();
++                std::advance(it, rng.randrange(members.size()));
++                tree.Erase(it->first);
++                members.erase(it);
++            }
++        }
++        if (round % 7 == 0) (void)tree.RootDigest(); // writer hashes shared nodes too
++        Work work{tree.Pin(), Reference(members), members.size()};
++        std::lock_guard<std::mutex> lock(queue_mutex);
++        queue.push_back(std::move(work));
++    }
++    done = true;
++    for (auto &t : readers) t.join();
++    BOOST_CHECK_EQUAL(failures.load(), 0);
++    BOOST_CHECK_EQUAL(checked.load(), 60);
++    BOOST_CHECK(tree.RootDigest() == Reference(members));
++}
++
++BOOST_AUTO_TEST_CASE(pin_defers_exhausted_sketch_refill_to_immutable_snapshot) {
++    FastRandomContext rng{uint256{0x72}};
++    txm::Tree tree;
++    std::map<V2Hash, V2Hash> members;
++    std::vector<std::pair<uint64_t, V2Hash>> ranked;
++    for (int i = 0; i < 1000; ++i) {
++        const V2Hash id = RandomHash(rng), hash = RandomHash(rng);
++        members.emplace(id, hash);
++        tree.Insert(id, hash);
++        ranked.emplace_back(mh::Value(id, hash), id);
++    }
++    std::sort(ranked.begin(), ranked.end());
++    for (int i = 0; i < 193; ++i) {
++        tree.Erase(ranked[i].second);
++        members.erase(ranked[i].second);
++    }
++    const auto expected = ReferenceSketch(members);
++    const auto before = Counter(txm::Stats().sketch_rebuild_members);
++    const auto pinned = tree.Pin();
++    BOOST_CHECK_EQUAL(Counter(txm::Stats().sketch_rebuild_members), before);
++    tree.Clear(); // refill must use the pinned version, never the live tree
++    std::atomic<int> failures{0};
++    std::vector<std::thread> readers;
++    for (int i = 0; i < 4; ++i) {
++        readers.emplace_back([&] {
++            if (pinned->GetSketch().values != expected) ++failures;
++        });
++    }
++    for (auto &reader : readers) reader.join();
++    BOOST_CHECK_EQUAL(failures.load(), 0);
++    BOOST_CHECK_EQUAL(Counter(txm::Stats().sketch_rebuild_members), before + members.size());
++    BOOST_CHECK(pinned->RootDigest() == Reference(members));
++}
++
++BOOST_AUTO_TEST_CASE(incremental_minhash_matches_reference_through_deletions) {
++    FastRandomContext rng{uint256{0x56}};
++    txm::Tree tree;
++    std::map<V2Hash, V2Hash> members;
++    const uint64_t rebuilds_before = Counter(txm::Stats().sketch_rebuilds);
++    for (int step = 0; step < 6000; ++step) {
++        const int op = rng.randrange(10);
++        if (op < 6 || members.size() < 10) {
++            const V2Hash id = RandomHash(rng), hash = RandomHash(rng);
++            members.emplace(id, hash);
++            tree.Insert(id, hash);
++        } else if (op < 9) {
++            auto it = members.begin();
++            std::advance(it, rng.randrange(members.size()));
++            tree.Erase(it->first);
++            members.erase(it);
++        } else {
++            auto it = members.begin();
++            std::advance(it, rng.randrange(members.size()));
++            it->second = RandomHash(rng);
++            tree.Insert(it->first, it->second);
++        }
++        if (step % 97 == 0) {
++            BOOST_CHECK(tree.CurrentSketch().values == ReferenceSketch(members));
++        }
++    }
++    BOOST_CHECK(tree.CurrentSketch().values == ReferenceSketch(members));
++    // Adversarial deletions: repeatedly remove the current minimum members,
++    // forcing the candidate buffer to drain and rebuild from the tree.
++    std::map<uint64_t, V2Hash> by_value;
++    for (const auto &[id, hash] : members) by_value.emplace(mh::Value(id, hash), id);
++    for (int i = 0; i < int(mh::CANDIDATES) + 50 && !by_value.empty(); ++i) {
++        const V2Hash id = by_value.begin()->second;
++        by_value.erase(by_value.begin());
++        tree.Erase(id);
++        members.erase(id);
++        if (i % 16 == 0) {
++            BOOST_CHECK(tree.CurrentSketch().values == ReferenceSketch(members));
++        }
++    }
++    BOOST_CHECK(tree.CurrentSketch().values == ReferenceSketch(members));
++    BOOST_CHECK_GT(Counter(txm::Stats().sketch_rebuilds), rebuilds_before);
++    // Jaccard estimates: identical sets are 1; disjoint sets are 0.
++    const auto s = tree.CurrentSketch().values;
++    BOOST_CHECK_EQUAL(mh::EstimateJaccard(s, s), 1.0);
++    txm::Tree other;
++    for (int i = 0; i < 500; ++i) other.Insert(RandomHash(rng), RandomHash(rng));
++    BOOST_CHECK_EQUAL(mh::EstimateJaccard(s, other.CurrentSketch().values), 0.0);
++}
++
++BOOST_AUTO_TEST_CASE(shared_subtrees_copy_only_touched_paths) {
++    FastRandomContext rng{uint256{0x57}};
++    txm::Tree tree;
++    std::map<V2Hash, V2Hash> members;
++    for (int i = 0; i < 4096; ++i) {
++        const V2Hash id = RandomHash(rng), hash = RandomHash(rng);
++        members.emplace(id, hash);
++        tree.Insert(id, hash);
++    }
++    // Unshared working view mutates in place: no path copies.
++    const uint64_t copies0 = Counter(txm::Stats().path_copies);
++    const uint64_t inplace0 = Counter(txm::Stats().inplace_updates);
++    for (int i = 0; i < 100; ++i) tree.Insert(RandomHash(rng), RandomHash(rng));
++    BOOST_CHECK_EQUAL(Counter(txm::Stats().path_copies), copies0);
++    BOOST_CHECK_GT(Counter(txm::Stats().inplace_updates), inplace0);
++    // Copy shares everything (O(1)); one write copies at most one path.
++    const V2Hash root_before = tree.RootDigest();
++    txm::Tree copy = tree;
++    const size_t live_before = tree.GetStore()->LiveBranches();
++    copy.Insert(RandomHash(rng), RandomHash(rng));
++    const uint64_t copied = Counter(txm::Stats().path_copies) - copies0;
++    BOOST_CHECK_GT(copied, 0U);
++    BOOST_CHECK_LE(copied, 40U); // ~log2(4196) path, never O(n)
++    BOOST_CHECK_LE(tree.GetStore()->LiveBranches() - live_before, copied + 1);
++    // The second write on the same path finds it unique: in place.
++    const uint64_t copies1 = Counter(txm::Stats().path_copies);
++    copy.Insert(RandomHash(rng), RandomHash(rng));
++    BOOST_CHECK_LE(Counter(txm::Stats().path_copies) - copies1, 40U);
++    BOOST_CHECK(tree.RootDigest() == root_before);
++    BOOST_CHECK_EQUAL(copy.Count(), tree.Count() + 2);
++}
++
++BOOST_AUTO_TEST_CASE(reclamation_slot_reuse_and_weak_generations) {
++    FastRandomContext rng{uint256{0x58}};
++    auto store = txm::Store::Create();
++    txm::Tree tree{store};
++    std::vector<V2Hash> ids;
++    for (int i = 0; i < 1000; ++i) {
++        ids.push_back(RandomHash(rng));
++        tree.Insert(ids.back(), RandomHash(rng));
++    }
++    BOOST_CHECK_EQUAL(store->LiveLeaves(), 1000U);
++    BOOST_CHECK_EQUAL(store->LiveBranches(), 999U);
++    auto pinned = tree.Pin();
++    const txm::NodeId root = tree.Root();
++    const auto weak_root = store->Weak(root);
++    // A long-lived snapshot keeps its whole version alive after the working
++    // view is cleared; nothing is freed or reused underneath it.
++    tree.Clear();
++    BOOST_CHECK_EQUAL(store->LiveLeaves(), 1000U);
++    const txm::NodeId retained = store->TryRetain(weak_root);
++    BOOST_CHECK_EQUAL(retained, root);
++    store->Release(retained);
++    const V2Hash pinned_root = pinned->RootDigest();
++    // Releasing the last owner reclaims every node.
++    pinned.reset();
++    BOOST_CHECK_EQUAL(store->LiveLeaves(), 0U);
++    BOOST_CHECK_EQUAL(store->LiveBranches(), 0U);
++    BOOST_CHECK_EQUAL(store->TryRetain(weak_root), txm::kNull);
++    // New members reuse freed slots; a stale weak handle never resolves to the
++    // new occupant (generation mismatch), even if the slot index matches.
++    const uint64_t reuses0 = Counter(txm::Stats().slot_reuses);
++    for (int i = 0; i < 1000; ++i) tree.Insert(RandomHash(rng), RandomHash(rng));
++    BOOST_CHECK_GE(Counter(txm::Stats().slot_reuses) - reuses0, 1999U);
++    BOOST_CHECK_EQUAL(store->TryRetain(weak_root), txm::kNull);
++    BOOST_CHECK(tree.RootDigest() != pinned_root);
++    // Sole owner clearing an otherwise unused store returns its chunks.
++    store.reset();
++    tree.Clear();
++    BOOST_CHECK_EQUAL(tree.GetStore()->RetainedBytes(), sizeof(txm::Branch));
++}
++
++BOOST_AUTO_TEST_CASE(weak_handle_stays_stale_after_trim_and_reallocation) {
++    FastRandomContext rng{uint256{0x92}};
++    txm::Tree tree;
++    tree.Insert(RandomHash(rng), RandomHash(rng));
++    const auto weak = tree.GetStore()->Weak(tree.Root());
++    tree.Clear(); // sole owner: deallocates the leaf slab
++    tree.Insert(RandomHash(rng), RandomHash(rng));
++    BOOST_CHECK_EQUAL(tree.Root(), weak.node); // same slot, new allocation epoch
++    const auto retained = tree.GetStore()->TryRetain(weak);
++    BOOST_CHECK_EQUAL(retained, txm::kNull);
++    if (retained != txm::kNull) tree.GetStore()->Release(retained);
++}
++
++BOOST_AUTO_TEST_CASE(overlay_layer_freeze_and_reanchor_share_trees) {
++    FastRandomContext rng{uint256{0x59}};
++    lotus::v2::MerklixOverlayManager manager;
++    std::map<V2Hash, V2Hash> members;
++    for (int i = 0; i < 300; ++i) {
++        const V2Hash id = RandomHash(rng), hash = RandomHash(rng);
++        members.emplace(id, hash);
++        manager.AddTransaction(id, hash, 100, {}, {});
++    }
++    BOOST_CHECK(manager.GetSpeculativeOverlay().GetSubtreeARoot() == Reference(members));
++    const uint64_t copies0 = Counter(txm::Stats().path_copies);
++    const auto &frozen = manager.FreezeEpochBatch();
++    const V2Hash frozen_root = frozen.GetSubtreeARoot();
++    // Freezing is a structural share: no node copies until the next write.
++    BOOST_CHECK_EQUAL(Counter(txm::Stats().path_copies), copies0);
++    const V2Hash extra = RandomHash(rng);
++    manager.AddTransaction(extra, extra, 100, {}, {});
++    members.emplace(extra, extra);
++    BOOST_CHECK(manager.GetFrozenEpochs().back().GetSubtreeARoot() == frozen_root);
++    BOOST_CHECK(manager.GetSpeculativeOverlay().GetSubtreeARoot() == Reference(members));
++    // Re-anchoring keeps membership and reuses the existing trees.
++    V2Hash tip{};
++    tip[0] = 1;
++    const uint64_t leaves0 = Counter(txm::Stats().leaf_allocs);
++    manager.ReanchorExistingTxs(tip, nullptr, lotus::v2::GetInitialV2MonetaryState(), 2, 0);
++    BOOST_CHECK_EQUAL(Counter(txm::Stats().leaf_allocs), leaves0);
++    BOOST_CHECK(manager.GetSpeculativeOverlay().GetSubtreeARoot() == Reference(members));
++    BOOST_CHECK_EQUAL(manager.GetSpeculativeOverlay().GetTxCount(), members.size());
++}
++
++BOOST_AUTO_TEST_SUITE_END()
++
++BOOST_FIXTURE_TEST_SUITE(tx_merklix_mempool_tests, TestingSetup)
++
++BOOST_AUTO_TEST_CASE(mempool_pin_drives_full_reconciliation_snapshots) {
++    FastRandomContext rng{uint256{0x5a}};
++    CTxMemPool &pool = *m_node.mempool;
++    TestMemPoolEntryHelper entry;
++    std::vector<CTransactionRef> txs;
++    std::shared_ptr<const txm::Snapshot> first;
++    std::map<V2Hash, V2Hash> first_members;
++    {
++        LOCK2(cs_main, pool.cs);
++        pool.clear();
++        for (int i = 0; i < 700; ++i) {
++            txs.push_back(Member(rng));
++            pool.addUnchecked(entry.Fee(1000 * SATOSHI).FromTx(txs.back()));
++        }
++        first = pool.PinTxMerklixSnapshot();
++        BOOST_REQUIRE(first);
++        for (const auto &tx : txs) first_members.emplace(Identity(tx->GetId()), Identity(tx->GetHash()));
++        // Remove some members and add others through the ordinary paths.
++        for (int i = 0; i < 100; ++i) {
++            pool.removeRecursive(*txs[i], MemPoolRemovalReason::CONFLICT);
++        }
++        for (int i = 0; i < 50; ++i) {
++            txs.push_back(Member(rng));
++            pool.addUnchecked(entry.Fee(1000 * SATOSHI).FromTx(txs.back()));
++        }
++    }
++    std::map<V2Hash, V2Hash> current;
++    std::shared_ptr<const txm::Snapshot> second;
++    {
++        LOCK2(cs_main, pool.cs);
++        second = pool.PinTxMerklixSnapshot();
++        BOOST_REQUIRE(second);
++        for (const auto &e : pool.mapTx) {
++            current.emplace(Identity(e->GetTx().GetId()), Identity(e->GetTx().GetHash()));
++        }
++        // The mempool's own block-template root shares the same caches.
++        BOOST_CHECK(pool.GetMerklixOverlay().GetSpeculativeOverlay().GetSubtreeARoot() ==
++                    Reference(current));
++    }
++    // Hashing happens outside the mempool lock, on the pinned versions.
++    BOOST_CHECK(first->RootDigest() == Reference(first_members));
++    BOOST_CHECK(second->RootDigest() == Reference(current));
++    BOOST_CHECK(first->GetSketch().values == ReferenceSketch(first_members));
++    BOOST_CHECK(second->GetSketch().values == ReferenceSketch(current));
++    BOOST_CHECK_GT(second->Version(), first->Version());
++
++    // Reconciliation snapshot over the pinned tree: same descriptors, pages
++    // carry the admitted bodies and verify against their prefix digests.
++    using namespace lotus::v2::net;
++    const fullrecon::Snapshot served{first, 256 * 1024 * 1024};
++    std::vector<CTransactionRef> first_txs(txs.begin(), txs.begin() + 700);
++    const fullrecon::Snapshot rebuilt{first_txs, 256 * 1024 * 1024};
++    BOOST_CHECK(served.Root().digest == rebuilt.Root().digest);
++    BOOST_CHECK_EQUAL(served.Root().count, 700U);
++    BOOST_CHECK(served.Sketch() == rebuilt.Sketch());
++    std::vector<fullrecon::Prefix> pending{fullrecon::Prefix{}};
++    std::set<TxId> found;
++    while (!pending.empty()) {
++        const auto prefix = pending.back();
++        pending.pop_back();
++        const auto page = served.Page(prefix, fullrecon::MAX_FRAME_BYTES);
++        if (page) {
++            BOOST_CHECK(fullrecon::Snapshot::PageDigest(prefix, *page) == served.At(prefix).digest);
++            for (const auto &tx : *page) BOOST_CHECK(found.insert(tx->GetId()).second);
++        } else {
++            for (unsigned i = 0; i < 16; ++i) {
++                if (served.At(prefix.Child(i)).count) pending.push_back(prefix.Child(i));
++            }
++        }
++    }
++    BOOST_CHECK_EQUAL(found.size(), 700U);
++
++    // Offer frames carry the sketch and reject malformed sketch shapes.
++    fullrecon::Offer offer;
++    offer.header.context = uint256::ONE;
++    offer.root = served.Root();
++    offer.children = served.Children(fullrecon::Prefix{});
++    offer.sketch = served.Sketch();
++    DataStream stream;
++    stream << offer;
++    fullrecon::Offer decoded;
++    stream >> decoded;
++    BOOST_CHECK(decoded.sketch == offer.sketch);
++    // The encoder refuses a malformed sketch shape outright.
++    auto short_offer = offer;
++    short_offer.sketch.pop_back();
++    DataStream refused;
++    BOOST_CHECK_THROW(refused << short_offer, std::ios_base::failure);
++    // The decoder rejects a wrong count and unsorted values from the wire.
++    DataStream valid;
++    valid << offer;
++    const std::vector<uint8_t> wire(UCharCast(valid.data()), UCharCast(valid.data()) + valid.size());
++    const size_t count_at = wire.size() - 8 * 64 - 1;
++    BOOST_REQUIRE_EQUAL(wire[count_at], 64);
++    auto truncated = wire;
++    truncated[count_at] = 63;
++    truncated.resize(truncated.size() - 8);
++    DataStream bad_count{truncated};
++    BOOST_CHECK_THROW(bad_count >> decoded, std::ios_base::failure);
++    auto unsorted = wire;
++    std::swap_ranges(unsorted.begin() + count_at + 1, unsorted.begin() + count_at + 9,
++                     unsorted.begin() + count_at + 9);
++    DataStream bad_order{unsorted};
++    BOOST_CHECK_THROW(bad_order >> decoded, std::ios_base::failure);
++    // Estimated remote-only members from the hint (first vs current view).
++    const double j = mh::EstimateJaccard(second->GetSketch().values, first->GetSketch().values);
++    BOOST_CHECK(j > 0.5 && j <= 1.0);
++}
++
++BOOST_AUTO_TEST_SUITE_END()
++
+diff --git a/src/test/txrelay_tests.cpp b/src/test/txrelay_tests.cpp
+index e1924afdd00a9f5eabc2c7b450830129a58959f9..c5a4c5c69a449faa478ecfc99247bcd0dc9ab0eb 100644
+--- a/src/test/txrelay_tests.cpp
++++ b/src/test/txrelay_tests.cpp
+@@ -1275,6 +1275,7 @@ BOOST_AUTO_TEST_CASE(full_reconciliation_owned_page_and_admission_outcome) {
+     }
+     offer.root = remote.Root();
+     offer.children = remote.Children(Prefix{});
++    offer.sketch = remote.Sketch();
+     DataStream offered;
+     offered << offer;
+     BOOST_CHECK(manager.Handle(owner, NetMsgType::MERKLIXSYNC, offered, 10s));
+@@ -1417,6 +1418,8 @@ BOOST_AUTO_TEST_CASE(full_reconciliation_equal_digest_false_count_rejected) {
+     // Children/root remain self-consistent but the leaf digest proves the
+     // pinned local singleton, so a false count may not silently skip its work.
+     offer.root = Fold(offer.children, 0);
++    // A well-formed hint for the claimed count; the hint is never authority.
++    offer.sketch.assign(offer.root.count, snapshot.Sketch().front());
+     DataStream stream; stream << offer;
+     manager.Handle(node, NetMsgType::MERKLIXSYNC, stream, 70s);
+     BOOST_CHECK_EQUAL(manager.GetStats().malformed, 1U);
+@@ -1438,6 +1441,7 @@ BOOST_AUTO_TEST_CASE(full_reconciliation_timeout_retries_owned_work_and_releases
+     offer.header.context = rng.rand256();
+     { LOCK(cs_main); offer.anchor = m_node.chainman->ActiveTip()->GetBlockHash(); }
+     offer.root = remote.Root(); offer.children = remote.Children(Prefix{});
++    offer.sketch = remote.Sketch();
+     DataStream stream; stream << offer;
+     manager.Handle(node, NetMsgType::MERKLIXSYNC, stream, 60s);
+     uint64_t previous_request{0};
+diff --git a/src/txmempool.cpp b/src/txmempool.cpp
+index 49e380c76ff1a8d9163a357a56caf181611148c2..a4918004723e1acaf46b9773b6dbe30d2a3edf11 100644
+--- a/src/txmempool.cpp
++++ b/src/txmempool.cpp
+@@ -556,6 +556,18 @@ const lotus::v2::MempoolOverlayLayer &CTxMemPool::FreezeEpochBatch() {
+     return frozen;
+ }
+ 
++std::shared_ptr<const lotus::v2::txmerklix::Snapshot>
++CTxMemPool::PinTxMerklixSnapshot() const {
++    AssertLockHeld(cs);
++    FlushPendingOverlayAdds();
++    const auto &spec = m_merklix_overlay.GetSpeculativeOverlay();
++    if (spec.GetTxCount() != mapTx.size() ||
++        spec.GetTxTree().Count() != mapTx.size()) {
++        return nullptr;
++    }
++    return spec.PinTxTree();
++}
++
+ void CTxMemPool::SyncMerklixOverlayToTip(const BlockHash &tip_hash,
+                                          uint64_t next_height,
+                                          uint64_t next_mtp) const {
+diff --git a/src/txmempool.h b/src/txmempool.h
+index a1adc3d5f37f7da8f4745251c47b646f1a92dbfc..9f515902353d73e37eed0b01bfe86ee86b52f9ab 100644
+--- a/src/txmempool.h
++++ b/src/txmempool.h
+@@ -669,6 +669,16 @@ public:
+ 
+     const lotus::v2::MempoolOverlayLayer &FreezeEpochBatch()
+         EXCLUSIVE_LOCKS_REQUIRED(cs);
++
++    /**
++     * O(1) immutable Subtree A view of the complete current mempool: the
++     * speculative overlay's slab Merklix tree after deferred overlay updates
++     * are applied, pinned together with its membership version and bottom-k
++     * MinHash. Digests are completed lazily by the holder, outside cs. Returns
++     * nullptr (caller falls back) if overlay membership does not equal mapTx.
++     */
++    std::shared_ptr<const lotus::v2::txmerklix::Snapshot>
++    PinTxMerklixSnapshot() const EXCLUSIVE_LOCKS_REQUIRED(cs);
+     void SyncMerklixOverlayToTip(const BlockHash &tip_hash,
+                                 uint64_t next_height, uint64_t parent_mtp) const
+         EXCLUSIVE_LOCKS_REQUIRED(cs);
+diff --git a/test/functional/p2p_full_mempool_reconciliation.py b/test/functional/p2p_full_mempool_reconciliation.py
+new file mode 100755
+index 0000000000000000000000000000000000000000..40c3f5a7b0e78bf53464002c6066f118ccc82b73
+--- /dev/null
++++ b/test/functional/p2p_full_mempool_reconciliation.py
+@@ -0,0 +1,119 @@
++#!/usr/bin/env python3
++# Copyright (c) 2026 The Lotus developers
++# Distributed under the MIT software license, see the accompanying
++# file COPYING or http://www.opensource.org/licenses/mit-license.php.
++"""Complete-mempool reconciliation over pinned slab Merklix snapshots.
++
++Two nodes share a chain, then diverge while disconnected: each admits
++transactions the other has never seen. The live reconciliation window is
++made tiny and allowed to expire, so on reconnection only complete-mempool
++reconciliation (scope 5) can repair the difference. It must:
++
++ - capture by pinning the mempool's slab Merklix tree (no rebuild fallback),
++ - advertise and evaluate a MinHash hint with every offer,
++ - recover every missing transaction through authenticated pages,
++ - leave both mempools equal and mineable (template Subtree A roots valid).
++"""
++import http.client
++import re
++import time
++
++from test_framework.test_framework import BitcoinTestFramework
++from test_framework.util import assert_equal, rpc_port
++from test_framework.wallet import MiniWallet
++
++ONLY_0 = 40
++ONLY_1 = 15
++
++
++class FullMempoolReconciliationTest(BitcoinTestFramework):
++    def set_test_params(self):
++        self.num_nodes = 2
++        self.setup_clean_chain = True
++        self.extra_args = [
++            ["-txreconwindow=1", "-txreconinterval=250", "-metrics", "-debug=txrelay"]
++        ] * 2
++
++    def setup_network(self):
++        self.setup_nodes()
++        self.connect_nodes(0, 1)
++
++    def metrics(self, i):
++        conn = http.client.HTTPConnection("127.0.0.1", rpc_port(i), timeout=30)
++        conn.request("GET", "/metrics")
++        body = conn.getresponse().read().decode()
++        conn.close()
++        out = {}
++        for line in body.splitlines():
++            m = re.match(r"^(fullnode_(?:fullrecon|txmerklix)_\w+)(\{[^}]*\})? (\S+)$", line)
++            if m:
++                out[m.group(1)] = float(m.group(3))
++        return out
++
++    def run_test(self):
++        wallet = MiniWallet(self.nodes[0])
++        self.generate(wallet, 101)
++        wallet.send_self_transfer_multi(from_node=self.nodes[0], num_outputs=ONLY_0 + ONLY_1)
++        self.generate(self.nodes[0], 1)
++        wallet.rescan_utxos()
++        self.sync_blocks()
++
++        self.log.info("Diverge both mempools while disconnected")
++        self.disconnect_nodes(0, 1)
++        utxos = wallet.get_utxos(mark_as_spent=True, confirmed_only=True)
++        only0, only1 = [], []
++        for i, utxo in enumerate(utxos[: ONLY_0 + ONLY_1]):
++            node = 0 if i < ONLY_0 else 1
++            tx = wallet.create_self_transfer(utxo_to_spend=utxo)["tx"]
++            self.nodes[node].sendrawtransaction(tx.serialize().hex())
++            (only0 if node == 0 else only1).append(tx.txid_hex)
++        assert_equal(len(self.nodes[0].getrawmempool()), ONLY_0)
++        assert_equal(len(self.nodes[1].getrawmempool()), ONLY_1)
++        # Let the one-second live window expire so it cannot carry them.
++        time.sleep(2.5)
++
++        self.log.info("Reconnect: complete-mempool reconciliation repairs both sides")
++        before = [self.metrics(i) for i in range(2)]
++        self.connect_nodes(0, 1)
++        everything = set(only0 + only1)
++        self.wait_until(
++            lambda: all(set(n.getrawmempool()) == everything for n in self.nodes),
++            timeout=90,
++        )
++        time.sleep(1.1)  # /metrics caches a scrape for one second
++        after = [self.metrics(i) for i in range(2)]
++
++        def delta(i, name):
++            return after[i].get(name, 0) - before[i].get(name, 0)
++
++        recovered = sum(delta(i, "fullnode_fullrecon_sketch_actual_recovered_total") for i in range(2))
++        self.log.info(f"recovered through scope 5: {recovered:.0f} of {len(everything)} one-sided txs")
++        assert recovered > 0
++        assert sum(delta(i, "fullnode_fullrecon_coverage_complete_total") for i in range(2)) >= 1
++        assert sum(delta(i, "fullnode_fullrecon_sketch_offers_total") for i in range(2)) >= 1
++        for i in range(2):
++            assert after[i]["fullnode_fullrecon_capture_pins_total"] >= 1
++            assert_equal(after[i].get("fullnode_fullrecon_capture_fallbacks_total", 0), 0)
++            assert after[i]["fullnode_txmerklix_pins_total"] >= 1
++        bucks = sum(
++            p["bytesrecv_per_msg"].get("merklixbuck", 0)
++            for n in self.nodes
++            for p in n.getpeerinfo()
++        )
++        assert bucks > 0
++
++        self.log.info("Both views are mineable: template roots from the slab tree")
++        tmpl = self.nodes[1].getblocktemplate()
++        assert_equal(len(tmpl["transactions"]), len(everything))
++        # Admissions reach the tree through deferred overlay batches; the
++        # template flushed them, so the live leaves now cover every member.
++        time.sleep(1.1)
++        assert self.metrics(1)["fullnode_txmerklix_live_leaves"] >= len(everything)
++        self.generate(self.nodes[1], 1)
++        self.sync_blocks()
++        for n in self.nodes:
++            assert_equal(n.getrawmempool(), [])
++
++
++if __name__ == "__main__":
++    FullMempoolReconciliationTest().main()
+-- 
+2.50.1 (Apple Git-155)
+
