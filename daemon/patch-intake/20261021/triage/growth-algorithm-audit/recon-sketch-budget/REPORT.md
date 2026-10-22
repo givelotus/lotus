@@ -36,3 +36,9 @@ Commits, in order:
 Nine Boost cases cover worker ownership surviving bulk clear/cancel request, shared root accounting, fifth-root deferral without eviction, uint64 overflow, charged destruction outside the budget mutex, delayed jobs blocking rekey/late publication, two fixed slots over repeated rekeys, stale-token registry recreation, and concurrent publication of complete immutable values.
 
 `git diff --check` passed. CMake includes the two implementations in `server` and the new test source in the existing test suite. Native compile/runtime and independent Astra review are required before promotion. No R/default lifetime or performance claim has been validated.
+
+## Portable shared-pointer atomic API correction
+
+Source fixup `3af7e19d6c05e138b3bdc73055192236840510be` (tree `c53a05ec1c1c733b7694d425fb8a6e0f1534acce`) replaces the prepared `atomic<shared_ptr<const Value>>` with a shared-pointer member accessed exclusively through `atomic_load_explicit` and `atomic_compare_exchange_strong_explicit`. The parent integration build exposed missing `atomic<shared_ptr<T>>` support in its Apple libc++; this helper remains unintegrated and was corrected from that established portability finding.
+
+Loads remain acquire; completed publication remains release CAS with relaxed failure ordering. The retirement/publication mutex and token checks are unchanged. Explicitly deleted copy/move operations preserve the former atomic member's noncopyability, avoiding accidental non-atomic pointer copies during publication. No compiler, node, cache workload or runtime was invoked; only source inspection and `git diff --check` were performed. Existing nine tests remain unrun. Independent review and native compilation are still required.
