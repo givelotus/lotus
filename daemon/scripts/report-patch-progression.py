@@ -7,6 +7,7 @@ import hashlib
 import importlib.util
 import json
 from pathlib import Path
+import math
 import statistics
 
 
@@ -17,6 +18,211 @@ def flatten(value, prefix=''):
     elif isinstance(value, (int, float)) and not isinstance(value, bool):
         if prefix.endswith(('tps', 'rpc_per_second', '_ms', '_us', '_TPS', '_MBPS', '_HPS', '_US', '_MS', '_PS')):
             yield prefix, value
+
+
+WORKLOAD_NOTES = {
+    'single_tx': '500 signed transactions, 8 workers. One HTTP request carries one sendrawtransaction call, so transaction rate and RPC method rate match.',
+    'json_rpc_batch50': '500 signed transactions, 8 workers. One HTTP request carries a JSON-RPC array of 50 sendrawtransaction calls. tps counts transactions. HTTP requests are transactions/50. Each array element is one RPC method call.',
+    'relay_ingest': '500 signed transactions admitted on one node. This timer stops at local acceptance, before the other peers converge.',
+    'relay500': '500 signed transactions. The timer runs from the start of admission until all three peers report mempool size 500. It mixes admission and convergence.',
+    'read_unloaded': '12 concurrent readers, empty mempool. Each sample is two sequential method calls, getmempoolinfo then getblockchaininfo, on one connection. rpc_per_second counts method calls, not transactions.',
+    'read_loaded': 'Same 12 readers while an 801-transaction admission runs. rpc_per_second counts method calls, not transactions.',
+    'block500': 'Time to mine and connect one block that contains the 500-transaction pool, then for all three peers to share that tip. This is not mempool admission.',
+    'block801': 'Time to mine and connect one block that contains the 801-transaction pool, then for all three peers to share that tip. This is not mempool admission.',
+    'gbt_standard': '31 getblocktemplate samples with rules segwit. Latency only. Unavailable results stay absent.',
+    'gbt_compact': '31 compact-template samples. A standard template returned for this request is recorded as unavailable, not as a zero.',
+}
+
+
+def metric_family(column):
+    name = column.rsplit(' / ', 1)[-1]
+    leaf = name.rsplit('.', 1)[-1]
+    if leaf == 'rpc_per_second':
+        return 'rpc-throughput', True, 'RPC method calls per second', 'Higher is better.'
+    if leaf == 'tps' or leaf.endswith('_TPS'):
+        return 'transaction-throughput', True, 'transactions per second', 'Higher is better.'
+    if leaf.endswith(('_HPS', '_MBPS', '_PS')):
+        return 'component-operations', True, leaf, 'Higher is better. This is component operation throughput, not transaction throughput.'
+    if leaf.endswith(('_ms', '_MS')):
+        return 'elapsed-time', False, 'milliseconds', 'Lower is better.'
+    if leaf.endswith(('_us', '_US')):
+        return 'elapsed-time', False, 'microseconds', 'Lower is better.'
+    return None
+
+
+def workload_note(column):
+    phase = column.split(' / ', 1)[-1].split('.', 1)[0]
+    return WORKLOAD_NOTES.get(phase, 'Historical progression workload. Operation units are the metric name; they are not a 500k sustained run.')
+
+
+def svg_figure(column, family, unit, direction, points, boundary):
+    width, height = 1000, 440
+    values = [point['median'] for point in points]
+    lows = [point['min'] for point in points]
+    highs = [point['max'] for point in points]
+    top = max(highs) if highs else 1
+    top = top or 1
+    last_index = max((point['global_number'] for point in points), default=1)
+
+    def x(index):
+        return 70 + 880 * index / max(last_index, 1)
+
+    def y(value):
+        return 300 - 250 * value / top
+
+    parts = [
+        '<?xml version="1.0" encoding="UTF-8"?>',
+        f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" viewBox="0 0 {width} {height}">',
+        '<rect width="100%" height="100%" fill="#ffffff"/>',
+        '<style>text{font-family:ui-sans-serif,sans-serif;fill:#18212b}</style>',
+        f'<text x="70" y="28" font-size="16">{html.escape(column)}</text>',
+        f'<text x="70" y="50" font-size="13">{html.escape(unit + ". " + direction + " " + workload_note(column))}</text>',
+        '<line x1="70" y1="300" x2="950" y2="300" stroke="#667"/>',
+        '<text x="510" y="390" text-anchor="middle" font-size="13">Global canonical patch number</text>',
+    ]
+    for step in range(5):
+        value = top * step / 4
+        parts.append(f'<text x="64" y="{y(value)+4:.1f}" text-anchor="end" font-size="11">{value:.3g}</text>')
+        parts.append(f'<line x1="70" y1="{y(value):.1f}" x2="950" y2="{y(value):.1f}" stroke="#eee"/>')
+    tick = max(1, last_index // 12)
+    for index in range(0, last_index + 1, tick):
+        parts.append(f'<text x="{x(index):.1f}" y="322" text-anchor="middle" font-size="11">{index}</text>')
+    if boundary is not None and boundary <= last_index:
+        parts.append(f'<line x1="{x(boundary):.1f}" y1="70" x2="{x(boundary):.1f}" y2="300" stroke="#b65" stroke-dasharray="5 4"/>')
+        parts.append(f'<text x="{x(boundary)+6:.1f}" y="84" font-size="12">V2 boundary {boundary}</text>')
+    color = '#176fa6' if family != 'elapsed-time' else '#0d6b4d'
+    previous = None
+    for point in points:
+        px, py = x(point['global_number']), y(point['median'])
+        if previous and previous['global_number'] + 1 == point['global_number'] and previous['layer'] == point['layer']:
+            parts.append(
+                f'<line x1="{x(previous["global_number"]):.1f}" y1="{y(previous["median"]):.1f}" '
+                f'x2="{px:.1f}" y2="{py:.1f}" stroke="{color}"/>'
+            )
+        parts.append(
+            f'<line x1="{px:.1f}" y1="{y(point["min"]):.1f}" x2="{px:.1f}" y2="{y(point["max"]):.1f}" stroke="{color}" stroke-width="2"/>'
+        )
+        evidence = html.escape(point['record_path'], quote=True)
+        label = html.escape(
+            f"patch {point['global_number']}: median {point['median']:.6g}, min {point['min']:.6g}, max {point['max']:.6g}, n {point['n']}"
+        )
+        parts.append(f'<a href="{evidence}"><circle cx="{px:.1f}" cy="{py:.1f}" r="4.5" fill="{color}"><title>{label}</title></circle></a>')
+        previous = point
+    parts.append(f'<text x="70" y="424" font-size="12">Vertical bars are the min-max range across repetitions. Unmeasured patch numbers are gaps. {html.escape(family)}</text>')
+    parts.append('</svg>')
+    return '\n'.join(parts) + '\n'
+
+
+def purpose_text(row):
+    contract = row.get('contract') or {}
+    for key in ('canonical_purpose', 'author_recorded_rationale', 'concrete_problem'):
+        value = contract.get(key)
+        if isinstance(value, str) and value.strip():
+            return ' '.join(value.split())
+    return row.get('subject') or 'No contract purpose recorded.'
+
+
+def write_presentation(output, rows):
+    boundary = next((row['global_number'] for row in rows if row.get('layer') == 'v2'), None)
+    figures = []
+    comparisons = []
+    by_column = {}
+    for row in rows:
+        if row.get('status') != 'ok':
+            continue
+        for column, value in row.get('metrics', {}).items():
+            classified = metric_family(column)
+            if not classified or value.get('median') is None:
+                continue
+            family, higher, unit, direction = classified
+            by_column.setdefault(column, []).append({
+                'global_number': row['global_number'], 'layer': row['layer'], 'subject': row.get('subject'),
+                'median': value['median'], 'min': value['min'], 'max': value['max'], 'n': value['n'],
+                'record_path': row.get('record_path'), 'purpose': purpose_text(row),
+                'family': family, 'higher': higher, 'unit': unit, 'direction': direction,
+            })
+    figure_root = output / 'figures'
+    for column, points in sorted(by_column.items()):
+        points.sort(key=lambda item: item['global_number'])
+        family = points[0]['family']
+        slug = ''.join(ch.lower() if ch.isalnum() else '-' for ch in column).strip('-')
+        path = figure_root / family / f'{slug}.svg'
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(svg_figure(column, family, points[0]['unit'], points[0]['direction'], points, boundary))
+        figures.append((family, column, path.relative_to(output).as_posix(), points[0]['direction']))
+        previous = None
+        for point in points:
+            if previous and previous['layer'] == point['layer']:
+                before, after = previous['median'], point['median']
+                ratio = (after / before) if point['higher'] and before else ((before / after) if after else None)
+                span = point['global_number'] - previous['global_number']
+                comparisons.append({
+                    'family': family, 'metric': column, 'layer': point['layer'],
+                    'before_patch': previous['global_number'], 'after_patch': point['global_number'],
+                    'interval': span == 1, 'before': before, 'after': after,
+                    'before_n': previous['n'], 'after_n': point['n'],
+                    'before_min': previous['min'], 'before_max': previous['max'],
+                    'after_min': point['min'], 'after_max': point['max'],
+                    'ratio': ratio, 'direction': point['direction'], 'unit': point['unit'],
+                    'purpose': point['purpose'] if span == 1 else 'Interval only. Adjacent measurements have not isolated one patch.',
+                    'evidence': point['record_path'],
+                })
+            previous = point
+    rule = (
+        'Highlighted when both sides have at least three repetitions and the median ratio is at least 1.25 '
+        '(25% higher throughput, or 25% less time). The ratio is after/before for throughput and before/after for time. '
+        'Only the nearest earlier measured point in the same layer, workload, and metric is compared. '
+        'A comparison whose patch numbers differ by more than one is an unmeasured interval and is not attributed to one patch. '
+        'jumps-all.csv keeps every such comparison.'
+    )
+    with (output / 'jumps-all.csv').open('w', newline='') as stream:
+        fields = ['family', 'layer', 'before_patch', 'after_patch', 'isolated', 'metric', 'before', 'after',
+                  'ratio', 'before_n', 'after_n', 'before_min', 'before_max', 'after_min', 'after_max', 'purpose', 'evidence']
+        writer = csv.DictWriter(stream, fieldnames=fields)
+        writer.writeheader()
+        for item in comparisons:
+            writer.writerow({
+                'family': item['family'], 'layer': item['layer'], 'before_patch': item['before_patch'],
+                'after_patch': item['after_patch'], 'isolated': item['interval'], 'metric': item['metric'],
+                'before': item['before'], 'after': item['after'], 'ratio': item['ratio'],
+                'before_n': item['before_n'], 'after_n': item['after_n'],
+                'before_min': item['before_min'], 'before_max': item['before_max'],
+                'after_min': item['after_min'], 'after_max': item['after_max'],
+                'purpose': item['purpose'], 'evidence': item['evidence'],
+            })
+    highlights = [item for item in comparisons if item['ratio'] is not None and item['before_n'] >= 3 and item['after_n'] >= 3 and (item['ratio'] >= 1.25 or item['ratio'] <= 0.8)]
+    highlights.sort(key=lambda item: abs(math.log(item['ratio'])), reverse=True)
+    lines = ['# Measured jumps and regressions', '', rule, '',
+             '| patch number/range | patch purpose | metric/workload | before | after | ratio | explanation/evidence |',
+             '| --- | --- | --- | --- | --- | --- | --- |']
+    if not highlights:
+        lines.append('| | | | | | | No comparison meets the 1.25 selection rule yet. |')
+    for item in highlights:
+        span = f"{item['before_patch']}→{item['after_patch']}" if item['interval'] else f"{item['before_patch']}–{item['after_patch']}"
+        lines.append('| ' + ' | '.join([
+            span, item['purpose'].replace('|', '/'), item['metric'].replace('|', '/'),
+            f"{item['before']:.6g}", f"{item['after']:.6g}", f"{item['ratio']:.3f}",
+            item['evidence'],
+        ]) + ' |')
+    (output / 'JUMPS.md').write_text('\n'.join(lines) + '\n')
+    page = ['<!doctype html><meta charset="utf-8"><title>Progression figures</title>',
+            '<style>body{font:15px system-ui;margin:24px;color:#18212b}img{max-width:100%;height:auto;border:1px solid #ddd}section{margin:28px 0}</style>',
+            '<h1>Patch progression figures</h1>',
+            '<p>Each figure uses the global canonical patch number on the x axis. Transaction throughput, RPC method throughput, elapsed time, and component operation throughput are separate figures. Unmeasured points are gaps. Vertical bars show the repetition min and max.</p>',
+            f'<p>{html.escape(rule)}</p>',
+            '<p><a href="JUMPS.md">Highlighted jumps</a> · <a href="jumps-all.csv">Every adjacent comparison</a> · <a href="progression.csv">Full metric CSV</a></p>']
+    current = None
+    for family, column, relative, direction in figures:
+        if family != current:
+            page.append(f'<h2>{html.escape(family)}</h2>')
+            current = family
+        page.append('<section>')
+        page.append(f'<h3>{html.escape(column)}</h3><p>{html.escape(direction)} {html.escape(workload_note(column))}</p>')
+        page.append(f'<img src="{html.escape(relative)}" alt="{html.escape(column)}">')
+        page.append('</section>')
+    if not figures:
+        page.append('<p>No completed measurements to plot.</p>')
+    (output / 'presentation.html').write_text('\n'.join(page) + '\n')
 
 
 def measurements(record):
@@ -134,6 +340,7 @@ def main():
 function draw(){const svg=document.getElementById('graph');svg.replaceChildren();const relative=document.getElementById('relative').checked;const field=relative?'baseline_percent':'median';const points=data.patches.filter(r=>r.metrics[select.value]?.[field]!=null);const max=Math.max(1,...points.map(r=>r.metrics[select.value][field]));const n=data.patches.length-1;const x=i=>55+900*i/Math.max(n,1),y=v=>305-270*v/max;const add=(tag,attrs,text)=>{const e=document.createElementNS('http://www.w3.org/2000/svg',tag);for(const[k,v]of Object.entries(attrs))e.setAttribute(k,v);if(text)e.textContent=text;svg.append(e);return e};add('line',{x1:55,y1:305,x2:955,y2:305,stroke:'#888'});for(let i=0;i<5;i++){const v=max*i/4;add('text',{x:50,y:y(v)+4,'text-anchor':'end','font-size':11},v.toFixed(1));add('line',{x1:55,y1:y(v),x2:955,y2:y(v),stroke:'#eee'})}for(let i=0;i<=n;i+=Math.max(1,Math.ceil(n/12)))add('text',{x:x(i),y:325,'text-anchor':'middle','font-size':12},String(i));add('text',{x:500,y:348,'text-anchor':'middle'},'Global canonical patch number');const boundary=data.patches.find(r=>r.layer==='v2');if(boundary){add('line',{x1:x(boundary.global_number),y1:20,x2:x(boundary.global_number),y2:305,stroke:'#b65','stroke-dasharray':'5 4'});add('text',{x:x(boundary.global_number)+5,y:18,'font-size':12},'V2 consensus boundary')}
 for(const layer of ['ecash','v2']){const rows=points.filter(r=>r.layer===layer);const color=layer==='ecash'?'#176fa6':'#ba6025';let last=null;for(const r of rows){const v=r.metrics[select.value][field];if(last&&last.global_number+1===r.global_number)add('line',{x1:x(last.global_number),y1:y(last.metrics[select.value][field]),x2:x(r.global_number),y2:y(v),stroke:color});const c=add('circle',{cx:x(r.global_number),cy:y(v),r:4,fill:color,style:'cursor:pointer'});const title=document.createElementNS(svg.namespaceURI,'title');title.textContent=`${r.global_number}: ${r.subject}\n${v}\n${r.prefix_sha256}`;c.append(title);c.onclick=()=>{const d=document.getElementById('patch-'+r.global_number);d.open=true;d.scrollIntoView()};last=r}}}select.onchange=draw;document.getElementById('relative').onchange=draw;draw();</script>'''
     (output / 'index.html').write_text(page.replace('TABLE', ''.join(table)).replace('DETAILS', ''.join(details)).replace('PAYLOAD', payload))
+    write_presentation(output, rows)
     print(json.dumps({'output': str(output), 'passed': sum(r['status'] == 'ok' for r in rows), 'total': len(rows), 'metrics': len(columns)}))
 
 
