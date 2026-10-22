@@ -1,4 +1,6 @@
-# Typed request and result boundary (proposal, no wire change)
+# Typed request and result boundary — deferred TODO
+
+Status: deferred by the user. This is a design record, not an active migration or implementation commitment. No RPC migration is in flight under this study.
 
 Current JSON-RPC is dynamic at both ends: `JSONRPCRequest` owns UniValue `id` and `params`; handlers manually assemble UniValue results. `RPCArg`/`RPCResult` describe help and runtime checks, not C++ request/result types. Switching parsers alone does not remove those tree allocations or handler-level copies.
 
@@ -14,7 +16,7 @@ Conceptual types:
 - `SubmitBatchResult`: `accepted`, optional `package-error`, ordered `txids`, ordered per-transaction results.
 - Per-transaction results can use a tagged C++ variant for accepted/rejected/prevalidation states, but the serializer emits the existing heterogeneous JSON objects, optional fields and names, without adding a wire tag.
 
-The same field definition should feed the named/positional decoder, generated `RPCArg`/`RPCResult` documentation where expressible, legacy-UniValue adapter, and central JSON serializer. Do not replace each handwritten handler with a different handwritten JSON writer or repeat the field names in three places. Existing runtime metadata cannot itself magically generate C++ struct types; migrated methods need a compile-time descriptor source, with legacy metadata derived from it.
+The same authoritative method/field definition should feed the named/positional decoder, generated `RPCArg`/`RPCResult` documentation where expressible, legacy-UniValue adapter, central JSON serializer, and registration/table entry. Current `CRPCCommand` already derives its method name and argument-name list from `RPCHelpMan` in the simplified function-pointer constructor; preserve that existing linkage rather than creating a parallel manual name registry. Do not replace each handwritten handler with a different handwritten JSON writer or repeat the field names in three places. Existing runtime metadata cannot itself magically generate C++ struct types; migrated methods need a compile-time descriptor source, with legacy metadata derived from it.
 
 ## Envelope and compatibility
 
