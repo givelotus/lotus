@@ -1,0 +1,680 @@
+diff --git a/src/init.cpp b/src/init.cpp
+index f6ca056f93..ba24028cd9 100644
+--- a/src/init.cpp
++++ b/src/init.cpp
+@@ -668,11 +668,19 @@ void SetupServerArgs(NodeContext &node) {
+         ArgsManager::ALLOW_ANY, OptionsCategory::CONNECTION);
+     argsman.AddArg(
+         "-txreconinterval=<ms>",
+-        strprintf("Every this many milliseconds, reconcile recently admitted "
+-                  "transactions with the next peer that supports it, round "
+-                  "robin; 0 to disable (default: %d)",
++        strprintf("Maximum wait in milliseconds before initiating permissionless "
++                  "reconciliation with a fresh relay fanout subset; 0 to "
++                  "disable (default: %d)",
+                   count_milliseconds(DEFAULT_TXRECON_INTERVAL)),
+         ArgsManager::ALLOW_ANY, OptionsCategory::CONNECTION);
++    argsman.AddArg("-txrecontarget=<n>",
++                   "Distinct mature change hints triggering reconciliation "
++                   "before max-wait (1..8192, default: 1000)",
++                   ArgsManager::ALLOW_ANY, OptionsCategory::CONNECTION);
++    argsman.AddArg("-txreconmargin=<ms>",
++                   "Propagation margin before newly admitted transactions "
++                   "enter reconciliation (0..60000ms, default: 50)",
++                   ArgsManager::ALLOW_ANY, OptionsCategory::CONNECTION);
+     argsman.AddArg(
+         "-txreconwindow=<s>",
+         strprintf("Reconcile the transactions admitted in the last this many "
+diff --git a/src/net/reconciliation_scheduler.h b/src/net/reconciliation_scheduler.h
+new file mode 100644
+index 0000000000..3a248c4b18
+--- /dev/null
++++ b/src/net/reconciliation_scheduler.h
+@@ -0,0 +1,138 @@
++// Copyright (c) 2026 The Lotus developers
++// Distributed under the MIT software license, see the accompanying
++// file COPYING or http://www.opensource.org/licenses/mit-license.php.
++#ifndef BITCOIN_NET_RECONCILIATION_SCHEDULER_H
++#define BITCOIN_NET_RECONCILIATION_SCHEDULER_H
++#include <net.h>
++#include <primitives/txid.h>
++#include <random.h>
++#include <util/hasher.h>
++#include <algorithm>
++#include <chrono>
++#include <mutex>
++#include <optional>
++#include <unordered_map>
++#include <vector>
++namespace txrelay {
++/** Bounded readiness hints, never delivery acknowledgments or a claim that a
++ * truncated live window covers the whole pool. Caller supplies monotonic time.
++ * Notification threads record changes; the message thread initiates passes. */
++class ReconciliationScheduler {
++public:
++    using Clock = std::chrono::microseconds;
++    struct Ticket { uint64_t generation; Clock cutoff; bool fairness; };
++private:
++    struct Change { uint64_t generation; Clock time; };
++    const size_t m_target;
++    const Clock m_max_wait, m_cooldown, m_margin;
++    std::mutex m_mutex;
++    std::unordered_map<TxId, Change, SaltedTxIdHasher> m_changes;
++    std::optional<std::pair<TxId, Change>> m_overflow;
++    uint64_t m_generation{0};
++    bool m_started{false}, m_active{false}, m_incoming{false};
++    std::optional<uint64_t> m_incoming_generation;
++    Clock m_last_pass{0}, m_last_fair{0}, m_next_attempt{0};
++    NodeId m_last_fair_peer{-1};
++    uint256 m_observed_root, m_observed_base;
++    size_t m_observed_repeats{0};
++public:
++    ReconciliationScheduler(size_t target, Clock max_wait, Clock cooldown,
++                            Clock margin)
++        : m_target(std::clamp<size_t>(target, 1, 8192)), m_max_wait(max_wait),
++          m_cooldown(cooldown), m_margin(margin) {}
++    void Changed(const TxId &id, Clock now) {
++        std::lock_guard lock(m_mutex);
++        ++m_generation;
++        m_observed_repeats = 0;
++        auto it = m_changes.find(id);
++        if (it != m_changes.end()) it->second = {m_generation, now};
++        else if (m_changes.size() < m_target)
++            m_changes.emplace(id, Change{m_generation, now});
++        else m_overflow = std::make_pair(id, Change{m_generation, now});
++    }
++    bool Incoming(bool mismatch = false) {
++        std::lock_guard lock(m_mutex);
++        if (mismatch) m_observed_repeats = 0;
++        // At most one scheduling hint per local membership generation. A
++        // stable node cannot ping-pong fresh passes from identical requests.
++        if (m_incoming_generation == m_generation) return false;
++        m_incoming_generation = m_generation;
++        m_incoming = true;
++        m_observed_repeats = 0; // unsealed observation, never a checkpoint
++        return true;
++    }
++    std::optional<Ticket> Begin(Clock now) {
++        std::lock_guard lock(m_mutex);
++        if (m_max_wait <= Clock{0} || m_active || now < m_next_attempt)
++            return std::nullopt;
++        if (!m_started) {
++            m_started = true;
++            m_last_pass = m_last_fair = now;
++        }
++        const auto cutoff = now - m_margin;
++        size_t eligible{0};
++        for (const auto &[id, change] : m_changes)
++            eligible += change.time <= cutoff;
++        if (eligible < m_target && now - m_last_pass < m_max_wait)
++            return std::nullopt;
++        m_active = true;
++        if (m_incoming) m_observed_repeats = 0;
++        return Ticket{m_generation, cutoff, now - m_last_fair >= m_max_wait};
++    }
++    void Complete(const Ticket &ticket, Clock now, bool sent) {
++        std::lock_guard lock(m_mutex);
++        m_active = false;
++        m_next_attempt = now + m_cooldown;
++        if (!sent) return; // retain readiness when no peer/slot was available
++        for (auto it = m_changes.begin(); it != m_changes.end();) {
++            if (it->second.generation <= ticket.generation &&
++                it->second.time <= ticket.cutoff) it = m_changes.erase(it);
++            else ++it;
++        }
++        if (m_overflow && m_overflow->second.generation > ticket.generation &&
++            m_changes.size() < m_target) {
++            m_changes.insert_or_assign(m_overflow->first, m_overflow->second);
++        }
++        if (m_overflow && m_overflow->second.generation <= ticket.generation)
++            m_overflow.reset();
++        m_last_pass = now;
++        if (ticket.fairness) m_last_fair = now;
++        m_incoming = false;
++    }
++    /** Fresh randomness; separately paced rotation prevents starvation even
++     * when continuous count-triggered passes keep resetting the idle timer. */
++    std::vector<NodeId> Select(std::vector<NodeId> peers, size_t count,
++                               bool fairness, FastRandomContext &rng) {
++        if (peers.empty() || count == 0) return {};
++        count = std::min(count, peers.size());
++        std::lock_guard lock(m_mutex);
++        std::optional<NodeId> reserved;
++        if (fairness) {
++            std::sort(peers.begin(), peers.end());
++            auto it = std::upper_bound(peers.begin(), peers.end(), m_last_fair_peer);
++            if (it == peers.end()) it = peers.begin();
++            reserved = *it;
++            m_last_fair_peer = *it;
++            peers.erase(it);
++        }
++        Shuffle(peers.begin(), peers.end(), rng);
++        peers.resize(count - (reserved ? 1 : 0));
++        if (reserved) peers.push_back(*reserved);
++        return peers;
++    }
++    /** Observation of our captures only: existing wire has no fresh-pass ACK.
++     * Never seals a layer, stops discovery, or establishes peer consensus. */
++    size_t ObserveLocalRoot(const uint256 &root, const uint256 &base,
++                            const Ticket &ticket) {
++        std::lock_guard lock(m_mutex);
++        if (ticket.generation != m_generation) return m_observed_repeats = 0;
++        if (m_observed_repeats && root == m_observed_root && base == m_observed_base)
++            ++m_observed_repeats;
++        else m_observed_repeats = 1;
++        m_observed_root = root;
++        m_observed_base = base;
++        return m_observed_repeats;
++    }
++};
++} // namespace txrelay
++#endif
+diff --git a/src/net/v2_protocol_handler.cpp b/src/net/v2_protocol_handler.cpp
+index 400d4c49a6..07b9c27e1f 100644
+--- a/src/net/v2_protocol_handler.cpp
++++ b/src/net/v2_protocol_handler.cpp
+@@ -1332,6 +1332,10 @@ void V2PeerProtocolHandler::HandleMerklixSync(
+     }
+ 
+     MerklixSyncDiffResult diff = DiffSyncSummary(summary);
++    if (scope == ReconScope::LIVE_MEMPOOL &&
++        IsRelayEpoch(scope, summary.context_id, summary.salt_k0, summary.salt_k1)) {
++        m_peerman.ReconciliationSummaryReceived(pfrom.GetId(), diff.root_matched);
++    }
+     if (auto *metrics{node::GetNodeMetrics()}) {
+         metrics->merklix_rounds.Add(diff.root_matched ? 0 : 1);
+         if (!diff.single_missing_short_ids.empty()) {
+diff --git a/src/net_processing.cpp b/src/net_processing.cpp
+index dc169d7341..c994bf9c3d 100644
+--- a/src/net_processing.cpp
++++ b/src/net_processing.cpp
+@@ -4,6 +4,7 @@
+ // file COPYING or http://www.opensource.org/licenses/mit-license.php.
+ 
+ #include <net/txrelay_index.h>
++#include <net/reconciliation_scheduler.h>
+ #include <net/v2_protocol_handler.h>
+ #include <net_processing.h>
+ #include <node/snapshot.h>
+@@ -874,11 +875,13 @@ public:
+                                    std::shared_ptr<const std::vector<Coin>>,
+                                    uint64_t) override {
+         m_txrelay_index.Add(tx->GetId(), GetTime<std::chrono::microseconds>());
++        m_recon_scheduler.Changed(tx->GetId(), RelayTickNow());
+     }
+     void TransactionRemovedFromMempool(const CTransactionRef &tx,
+                                        MemPoolRemovalReason,
+                                        uint64_t) override {
+         m_txrelay_index.Remove(tx->GetId());
++        m_recon_scheduler.Changed(tx->GetId(), RelayTickNow());
+     }
+ 
+     /** Implement TxRelayEpochProvider (for the Merklix handler) */
+@@ -1568,11 +1571,19 @@ private:
+         }
+         return features;
+     }
+-    /** Continuous reconciliation: when the next round is due, the last
+-     * peer reconciled with (round robin by id) */
+-    std::chrono::microseconds m_next_recon GUARDED_BY(g_msgproc_mutex){0};
+-    NodeId m_last_recon_peer GUARDED_BY(g_msgproc_mutex){-1};
+-    /** Send a reconciliation summary to the next peer when one is due */
++    /** Node-local bounded readiness and initiation pacing, independent of
++     * Avalanche proofs, votes, stake and consensus finalization. */
++    txrelay::ReconciliationScheduler m_recon_scheduler;
++    std::unordered_map<NodeId, std::chrono::microseconds> m_recon_last_sent
++        GUARDED_BY(g_msgproc_mutex);
++    void ReconciliationSummaryReceived(NodeId peer_id, bool root_matched) override {
++        const auto peer{GetPeerRef(peer_id)};
++        if (peer && (peer->m_txrelay_features & txrelay::TXRELAY_RECON)) {
++            if (m_recon_scheduler.Incoming(!root_matched))
++                m_txrelay_wake.store(true, std::memory_order_relaxed);
++        }
++    }
++    /** Initiate a bounded random subset when count or max-wait is ready. */
+     void MaybeReconcile()
+         EXCLUSIVE_LOCKS_REQUIRED(g_msgproc_mutex, !m_peer_mutex);
+     /** Re-key the relay index if the chain tip changed (or on first use) */
+@@ -3294,6 +3305,8 @@ PeerManagerImpl::PeerManagerImpl(CConnman &connman, AddrMan &addrman,
+       m_addrman(addrman), m_banman(banman), m_chainman(chainman),
+       m_mempool(pool), m_avalanche(avalanche), m_opts{opts},
+       m_txrelay_index{opts.txrelay_shortid_bits},
++      m_recon_scheduler{opts.txrecon_target, opts.txrecon_interval,
++                        opts.txrelay_tick, opts.txrecon_margin},
+       m_v2_protocol_handler{m_chainman, m_mempool, m_connman, *this},
+       m_block_messages{opts.block_message_cache_bytes} {
+     m_v2_protocol_handler.SetTxRelayEpochProvider(this);
+@@ -3981,13 +3994,12 @@ PeerManagerImpl::RelayReconSet(const uint256 &context_id) const {
+     if (!m_txrelay_index.FindEpoch(context_id)) {
+         return std::nullopt;
+     }
+-    // Leave out the newest transactions (two intervals): they are usually
+-    // still on their way to the peer by announcement, and would only be
+-    // differences that cost bucket drill-down.
++    // Leave a configurable propagation margin. Scheduler readiness uses the
++    // same duration against monotonic notification times.
+     const auto now{GetTime<std::chrono::microseconds>()};
+     const auto since = now - std::chrono::microseconds{m_opts.txrecon_window};
+     const auto until =
+-        now - 2 * std::chrono::microseconds{m_opts.txrecon_interval};
++        now - std::chrono::microseconds{m_opts.txrecon_margin};
+     const auto candidates = m_txrelay_index.PinAdmittedSince(since, until);
+     const auto snapshot = node::GetGlobalSnapshotPublisher().Load();
+     std::vector<CTransactionRef> txs;
+@@ -4034,75 +4046,65 @@ PeerManagerImpl::RelayReconSet(const uint256 &context_id) const {
+ }
+ 
+ void PeerManagerImpl::MaybeReconcile() {
+-    if (m_opts.txrecon_interval <= 0ms || !m_opts.txrelay_shortids) {
+-        return;
+-    }
+-    const auto tick_now{RelayTickNow()};
+-    if (tick_now < m_next_recon) {
+-        return;
+-    }
+-    m_next_recon = tick_now + m_opts.txrecon_interval;
+-    if (m_chainman.IsInitialBlockDownload()) {
+-        return;
+-    }
++    if (m_opts.txrecon_interval <= 0ms || !m_opts.txrelay_shortids ||
++        m_chainman.IsInitialBlockDownload()) return;
++    const auto now{RelayTickNow()};
+     const auto epoch{m_txrelay_index.Current()};
+-    if (!epoch) {
+-        return;
+-    }
+-    // Next negotiating peer after the last one, by id (round robin).
+-    NodeId next{-1};
++    if (!epoch) return;
++    const auto ticket{m_recon_scheduler.Begin(now)};
++    if (!ticket) return;
++    std::vector<NodeId> eligible;
+     {
+         LOCK(m_peer_mutex);
+-        NodeId first{-1};
+         for (const auto &[id, peer] : m_peer_map) {
+-            if (!(peer->m_txrelay_features & txrelay::TXRELAY_RECON)) {
+-                continue;
+-            }
+-            if (first < 0) {
+-                first = id;
+-            }
+-            if (id > m_last_recon_peer) {
+-                next = id;
+-                break;
+-            }
+-        }
+-        if (next < 0) {
+-            next = first;
+-        }
+-    }
+-    if (next < 0) {
+-        return;
+-    }
+-    m_last_recon_peer = next;
+-    const auto summary{m_v2_protocol_handler.BuildSyncSummary(
+-        lotus::v2::net::ReconScope::LIVE_MEMPOOL, epoch->epoch_id, epoch->k0,
+-        epoch->k1)};
+-    uint64_t window{0};
+-    for (const auto &bucket : summary.buckets) {
+-        window += bucket.count;
+-    }
+-    // Nothing admitted in the window: the peer cannot be missing anything
+-    // from us.
+-    if (window > 0) {
+-        m_connman.ForNode(next, [&](CNode *node) {
+-            if (!node->fSuccessfullyConnected || node->fDisconnect) {
+-                return false;
+-            }
+-            MakeAndPushMessage(*node, NetMsgType::MERKLIXSYNC, summary);
+-            return true;
+-        });
+-        if (auto *m{node::GetNodeMetrics()}) {
+-            m->txrelay_recon_rounds.Inc();
++            if (peer->m_txrelay_features & txrelay::TXRELAY_RECON)
++                eligible.push_back(id);
+         }
+-        LogEvent(BCLog::TXRELAY, "peer_recon_summary_sent",
+-                 "reconciliation summary of {count} transactions to "
+-                 "peer={peer_id}")
+-            .Field(BCLog::LogField::PeerId, next)
+-            .Field(BCLog::LogField::Count, window);
+     }
+-    // Window entries older than the window are no longer needed.
+-    m_txrelay_index.PruneWindow(
+-        GetTime<std::chrono::microseconds>() -
++    // Current wire has no round ACK. Avoid piling new summaries onto an
++    // active body exchange; a bounded lease permits discovery after a timeout.
++    std::erase_if(eligible, [&](NodeId id) {
++        const auto it = m_recon_last_sent.find(id);
++        return m_v2_protocol_handler.HasPendingShortTxRequests(id) &&
++               it != m_recon_last_sent.end() && now - it->second < 2s;
++    });
++    const auto count{TxRelayFanout(eligible.size(), m_opts.txrelay_fanout_min,
++                                  m_opts.txrelay_fanout_pct,
++                                  m_opts.txrelay_fanout_max)};
++    const auto selected{m_recon_scheduler.Select(
++        eligible, count, ticket->fairness, m_rng)};
++    bool sent{false};
++    if (!selected.empty()) {
++        const auto summary{m_v2_protocol_handler.BuildSyncSummary(
++            lotus::v2::net::ReconScope::LIVE_MEMPOOL, epoch->epoch_id,
++            epoch->k0, epoch->k1)};
++        for (NodeId id : selected) {
++            const bool delivered{m_connman.ForNode(id, [&](CNode *node) {
++                if (!node->fSuccessfullyConnected || node->fDisconnect ||
++                    node->fPauseSend) return false;
++                MakeAndPushMessage(*node, NetMsgType::MERKLIXSYNC, summary);
++                return true;
++            })};
++            if (!delivered) continue;
++            sent = true;
++            m_recon_last_sent[id] = now;
++            if (auto *metrics{node::GetNodeMetrics()})
++                metrics->txrelay_recon_rounds.Inc();
++        }
++        if (sent) {
++            const auto repeats{m_recon_scheduler.ObserveLocalRoot(
++                summary.candidate_root, epoch->epoch_id, *ticket)};
++            LogEvent(BCLog::TXRELAY, "recon_local_root_observed",
++                     "local reconciliation capture repeated {count} times")
++                .Field(BCLog::LogField::Count, uint64_t(repeats));
++        }
++    }
++    m_recon_scheduler.Complete(*ticket, now, sent);
++    // Retain only connection-local pacing state for connected relay peers.
++    std::erase_if(m_recon_last_sent, [&](const auto &entry) {
++        return !GetPeerRef(entry.first);
++    });
++    m_txrelay_index.PruneWindow(GetTime<std::chrono::microseconds>() -
+         2 * std::chrono::microseconds{m_opts.txrecon_window});
+ }
+ 
+diff --git a/src/net_processing.h b/src/net_processing.h
+index cc504ab558..b8a93bfb1f 100644
+--- a/src/net_processing.h
++++ b/src/net_processing.h
+@@ -125,13 +125,15 @@ static constexpr bool DEFAULT_TXRELAY_SHORTIDS{true};
+  */
+ static constexpr bool DEFAULT_TXRELAY_PUSH_HB{false};
+ /**
+- * Continuous reconciliation (-txreconinterval, -txreconwindow): every
+- * interval, send a LIVE_MEMPOOL Merklix summary of the transactions admitted
+- * in the last window to the next negotiating peer, round robin, so it can
+- * fetch what relay did not bring it. The safety net under fan-out.
++ * Permissionless pairwise reconciliation: initiate at the distinct-change
++ * target or monotonic maximum wait, choosing a fresh configured relay subset.
++ * A separately paced rotating slot preserves quiet-peer discovery. Existing
++ * live-window and scope limits remain; scheduling is not a coverage ACK.
+  */
+ static constexpr std::chrono::milliseconds DEFAULT_TXRECON_INTERVAL{250};
+ static constexpr std::chrono::seconds DEFAULT_TXRECON_WINDOW{30};
++static constexpr size_t DEFAULT_TXRECON_TARGET{1000};
++static constexpr std::chrono::milliseconds DEFAULT_TXRECON_MARGIN{50};
+ 
+ /** Number of peers to announce a relayed transaction to (see above) */
+ size_t TxRelayFanout(size_t relay_peers, size_t fanout_min, double fanout_pct,
+@@ -216,8 +218,12 @@ public:
+         unsigned txrelay_shortid_bits{64};
+         //! Push bodies to high-bandwidth peers (-txrelaypushhb)
+         bool txrelay_push_hb{DEFAULT_TXRELAY_PUSH_HB};
+-        //! Reconcile with the next peer every interval; 0 = off
++        //! Maximum wait between reconciliation initiations; 0 = off
+         std::chrono::milliseconds txrecon_interval{DEFAULT_TXRECON_INTERVAL};
++        //! Distinct-change scheduling target (bounded hint, not delivery ACK)
++        size_t txrecon_target{DEFAULT_TXRECON_TARGET};
++        //! Leave this much propagation time before including new admissions
++        std::chrono::milliseconds txrecon_margin{DEFAULT_TXRECON_MARGIN};
+         //! Reconciliation set: transactions admitted within this window
+         std::chrono::seconds txrecon_window{DEFAULT_TXRECON_WINDOW};
+ 
+@@ -303,6 +309,8 @@ public:
+     virtual void
+     AddRelayShortIdAnnouncements(const CNode &node, const uint256 &epoch_id,
+                                  const std::vector<uint64_t> &short_ids) {}
++    /** Valid negotiated relay summary: coalesce an outbound scheduling hint. */
++    virtual void ReconciliationSummaryReceived(NodeId peer_id, bool root_matched) {}
+     virtual void MarkPeerKnownTxBatch(NodeId peer_id,
+                                       std::span<const CTransactionRef> txs) {
+         for (const auto &tx : txs) {
+diff --git a/src/node/peerman_args.cpp b/src/node/peerman_args.cpp
+index 1d35d88d3b..f3d19b5bc0 100644
+--- a/src/node/peerman_args.cpp
++++ b/src/node/peerman_args.cpp
+@@ -84,11 +84,22 @@ void ApplyArgsManOptions(const ArgsManager &argsman,
+         options.txrecon_interval = std::chrono::milliseconds{
+             std::clamp<int64_t>(*value, 0, 3'600'000)};
+     }
++    if (auto value{argsman.GetIntArg("-txrecontarget")}) {
++        options.txrecon_target = size_t(std::clamp<int64_t>(*value, 1, 8192));
++    }
++    if (auto value{argsman.GetIntArg("-txreconmargin")}) {
++        options.txrecon_margin = std::chrono::milliseconds{
++            std::clamp<int64_t>(*value, 0, 60'000)};
++    }
+     if (auto value{argsman.GetIntArg("-txreconwindow")}) {
+         options.txrecon_window =
+             std::chrono::seconds{std::clamp<int64_t>(*value, 1, 86'400)};
+     }
+ 
++    options.txrecon_margin = std::min(options.txrecon_margin,
++        std::chrono::duration_cast<std::chrono::milliseconds>(
++            options.txrecon_window) - std::chrono::milliseconds{1});
++
+     options.parallel_admission =
+         argsman.GetBoolArg("-parallelmempool", node::DEFAULT_PARALLEL_MEMPOOL);
+     options.parallel_admission_threads = int(std::clamp<int64_t>(
+diff --git a/src/test/txrelay_tests.cpp b/src/test/txrelay_tests.cpp
+index d220106136..575228e21a 100644
+--- a/src/test/txrelay_tests.cpp
++++ b/src/test/txrelay_tests.cpp
+@@ -11,6 +11,7 @@
+ #include <lotus_v2/commitment.h>
+ #include <net.h>
+ #include <net/txrelay_index.h>
++#include <net/reconciliation_scheduler.h>
+ #include <node/snapshot.h>
+ 
+ #include <net/v2_protocol_handler.h>
+@@ -996,6 +997,9 @@ BOOST_AUTO_TEST_CASE(reconciliation_round_robin) {
+     MockTick clock{6'000'000ms};
+     PeerManager::Options opts;
+     opts.txrecon_interval = 250ms;
++    opts.txrelay_fanout_min = 1;
++    opts.txrelay_fanout_pct = 0;
++    opts.txrelay_fanout_max = 1;
+     RelayHarness h{m_node, opts};
+     // Three peers: two negotiate reconciliation, one only short ids.
+     std::vector<CNode *> peers;
+@@ -1020,6 +1024,7 @@ BOOST_AUTO_TEST_CASE(reconciliation_round_robin) {
+     // The newest two intervals are left out of the summary: be past them.
+     SetMockTime(t0 + 1s);
+ 
++    h.SendAll(); // establish the monotonic max-wait origin
+     // One round per interval, alternating between the two that negotiated.
+     std::vector<NodeId> order;
+     auto ms{6'000'000ms};
+@@ -1201,4 +1206,183 @@ BOOST_AUTO_TEST_CASE(no_body_push_by_default) {
+     }
+ }
+ 
++
++BOOST_AUTO_TEST_CASE(reconciliation_count_time_and_generation) {
++    txrelay::ReconciliationScheduler scheduler{3, 100ms, 10ms, 5ms};
++    FastRandomContext rng{true};
++    const TxId a{rng.rand256()}, b{rng.rand256()}, c{rng.rand256()}, d{rng.rand256()};
++    BOOST_CHECK(!scheduler.Begin(0ms));
++    scheduler.Changed(a, 1ms);
++    scheduler.Changed(a, 1ms); // distinct identity, not notification count
++    scheduler.Changed(b, 1ms);
++    BOOST_CHECK(!scheduler.Begin(6ms));
++    scheduler.Changed(c, 6ms);
++    BOOST_CHECK(!scheduler.Begin(10ms)); // propagation margin
++    auto pass = scheduler.Begin(11ms);
++    BOOST_REQUIRE(pass);
++    BOOST_CHECK(!scheduler.Begin(12ms)); // one initiation in flight
++    scheduler.Changed(d, 12ms); // arrives while the bounded set is saturated
++    scheduler.Complete(*pass, 12ms, true);
++    BOOST_CHECK(!scheduler.Begin(21ms)); // node cooldown
++    BOOST_CHECK(!scheduler.Begin(22ms)); // only a later change remains
++    auto timeout = scheduler.Begin(112ms);
++    BOOST_REQUIRE(timeout);
++    scheduler.Complete(*timeout, 112ms, false); // no slot: obligation retained
++    BOOST_CHECK(!scheduler.Begin(121ms));
++    auto retry = scheduler.Begin(122ms);
++    BOOST_REQUIRE(retry);
++    scheduler.Complete(*retry, 122ms, true);
++}
++
++BOOST_AUTO_TEST_CASE(reconciliation_fresh_subsets_and_fair_discovery) {
++    txrelay::ReconciliationScheduler scheduler{1, 100ms, 1ms, 0ms};
++    FastRandomContext rng{uint256{77}};
++    std::vector<NodeId> peers;
++    for (int i = 0; i < 40; ++i) peers.push_back(i);
++    std::set<std::vector<NodeId>> draws;
++    for (int i = 0; i < 12; ++i) {
++        auto chosen = scheduler.Select(peers, 10, false, rng);
++        BOOST_CHECK_EQUAL(chosen.size(), 10U);
++        std::set<NodeId> unique(chosen.begin(), chosen.end());
++        BOOST_CHECK_EQUAL(unique.size(), chosen.size());
++        std::sort(chosen.begin(), chosen.end());
++        draws.insert(chosen);
++    }
++    BOOST_CHECK_GT(draws.size(), 1U);
++    std::set<NodeId> discovered;
++    for (int i = 0; i < 40; ++i) {
++        auto chosen = scheduler.Select(peers, 1, true, rng);
++        BOOST_REQUIRE_EQUAL(chosen.size(), 1U);
++        discovered.insert(chosen[0]);
++    }
++    BOOST_CHECK_EQUAL(discovered.size(), peers.size());
++}
++
++BOOST_AUTO_TEST_CASE(reconciliation_coalesced_hints_and_local_observation) {
++    txrelay::ReconciliationScheduler scheduler{1, 100ms, 10ms, 0ms};
++    FastRandomContext rng{true};
++    const uint256 root{rng.rand256()}, base{rng.rand256()};
++    BOOST_CHECK(!scheduler.Begin(0ms));
++    for (int i = 0; i < 10000; ++i) scheduler.Incoming();
++    BOOST_CHECK(!scheduler.Begin(99ms)); // incoming traffic cannot force fanout
++    for (int i = 1; i <= 3; ++i) {
++        auto pass = scheduler.Begin(i * 100ms);
++        BOOST_REQUIRE(pass);
++        BOOST_CHECK_EQUAL(scheduler.ObserveLocalRoot(root, base, *pass), size_t(i));
++        scheduler.Complete(*pass, i * 100ms, true);
++    }
++    scheduler.Changed(TxId{rng.rand256()}, 301ms);
++    auto changed = scheduler.Begin(310ms);
++    BOOST_REQUIRE(changed);
++    BOOST_CHECK_EQUAL(scheduler.ObserveLocalRoot(root, base, *changed), 1U);
++    scheduler.Complete(*changed, 310ms, true);
++    scheduler.Incoming();
++    auto later = scheduler.Begin(410ms);
++    BOOST_REQUIRE(later);
++    BOOST_CHECK_EQUAL(scheduler.ObserveLocalRoot(root, rng.rand256(), *later), 1U);
++    scheduler.Complete(*later, 410ms, true);
++}
++
++BOOST_AUTO_TEST_CASE(reconciliation_disabled_and_default_bounds) {
++    txrelay::ReconciliationScheduler disabled{0, 0ms, 10ms, 0ms};
++    FastRandomContext rng{true};
++    disabled.Changed(TxId{rng.rand256()}, 0ms);
++    disabled.Incoming();
++    BOOST_CHECK(!disabled.Begin(1h));
++    txrelay::ReconciliationScheduler defaults{
++        DEFAULT_TXRECON_TARGET, DEFAULT_TXRECON_INTERVAL,
++        DEFAULT_TXRELAY_TICK, DEFAULT_TXRECON_MARGIN};
++    BOOST_CHECK(!defaults.Begin(0ms));
++    BOOST_CHECK(!defaults.Begin(DEFAULT_TXRECON_INTERVAL - 1ms));
++    auto low_traffic = defaults.Begin(DEFAULT_TXRECON_INTERVAL);
++    BOOST_REQUIRE(low_traffic);
++    defaults.Complete(*low_traffic, DEFAULT_TXRECON_INTERVAL, true);
++}
++
++BOOST_AUTO_TEST_CASE(reconciliation_permissionless_count_and_incoming_coalescing) {
++    LOCK(NetEventsInterface::g_msgproc_mutex);
++    auto &chainman{static_cast<TestChainstateManager &>(*m_node.chainman)};
++    chainman.JumpOutOfIbd();
++    MockTick clock{8'000'000ms};
++    PeerManager::Options opts;
++    opts.txrecon_target = 3;
++    opts.txrecon_interval = 1s;
++    opts.txrecon_margin = 0ms;
++    // RelayHarness constructs PeerManager with avalanche=nullptr and no proofs.
++    RelayHarness h{m_node, opts};
++    std::atomic<bool> interrupt{false};
++    std::vector<CNode *> peers;
++    for (int i = 0; i < 3; ++i) {
++        auto &peer{h.AddPeer()};
++        DataStream offer{};
++        offer << txrelay::SENDINVSHORT_VERSION
++              << uint64_t(txrelay::TXRELAY_INVSHORT |
++                          (i < 2 ? txrelay::TXRELAY_RECON : 0));
++        h.peerman->ProcessMessage(h.config, peer, NetMsgType::SENDINVSHORT,
++                                  offer, 0us, interrupt);
++        peers.push_back(&peer);
++    }
++    h.SendAll(); // arm monotonic max-wait; no initial summary
++    FastRandomContext rng{true};
++    for (int i = 0; i < 3; ++i) {
++        auto tx{MakeTx(rng)};
++        AddToMempool(m_node, tx);
++        // This isolated harness does not register validation callbacks.
++        h.peerman->TransactionAddedToMempool(tx, nullptr, uint64_t(i));
++        h.peerman->RelayTransaction(tx->GetId());
++    }
++    SetMockTime(GetTime<std::chrono::seconds>() + 1s);
++    clock.Set(8'000'010ms); // threshold beats the one-second maximum wait
++    auto sent{h.SendAll()};
++    BOOST_REQUIRE_EQUAL(sent[peers[0]->GetId()].summaries.size(), 1U);
++    BOOST_REQUIRE_EQUAL(sent[peers[1]->GetId()].summaries.size(), 1U);
++    BOOST_CHECK(sent[peers[2]->GetId()].summaries.empty());
++    const auto summary{sent[peers[0]->GetId()].summaries.front()};
++    uint64_t represented{0};
++    for (const auto &bucket : summary.buckets) represented += bucket.count;
++    BOOST_CHECK_EQUAL(represented, 3U);
++    // Repeated valid incoming summaries are serviced, but cannot recursively
++    // turn one inbound frame into a new outbound subset on every call.
++    for (int i = 0; i < 16; ++i) {
++        DataStream message{};
++        message << summary;
++        h.peerman->ProcessMessage(h.config, *peers[0], NetMsgType::MERKLIXSYNC,
++                                  message, std::chrono::microseconds{i}, interrupt);
++    }
++    for (const auto &[id, messages] : h.SendAll())
++        BOOST_CHECK(messages.summaries.empty());
++    // Losing a peer cannot prevent the other capable peer's timeout discovery.
++    peers[0]->fDisconnect = true;
++    clock.Set(8'001'010ms);
++    auto timeout{h.SendAll()};
++    BOOST_CHECK(timeout[peers[0]->GetId()].summaries.empty());
++    BOOST_REQUIRE_EQUAL(timeout[peers[1]->GetId()].summaries.size(), 1U);
++    BOOST_CHECK(timeout[peers[2]->GetId()].summaries.empty());
++    SetMockTime(0);
++    chainman.ResetIbd();
++}
++
++
++BOOST_AUTO_TEST_CASE(reconciliation_same_identity_changes_survive_capture) {
++    txrelay::ReconciliationScheduler scheduler{2, 1s, 1ms, 0ms};
++    FastRandomContext rng{true};
++    const TxId a{rng.rand256()}, b{rng.rand256()};
++    scheduler.Changed(a, 0ms);
++    scheduler.Changed(b, 0ms);
++    auto first = scheduler.Begin(0ms);
++    BOOST_REQUIRE(first);
++    // Insert/remove/reinsert of the same IDs after capture belongs to the next
++    // scheduling generation, rather than being erased with the old ticket.
++    scheduler.Changed(a, 1ms);
++    scheduler.Changed(b, 1ms);
++    scheduler.Complete(*first, 1ms, true);
++    auto next = scheduler.Begin(2ms);
++    BOOST_REQUIRE(next);
++    BOOST_CHECK(next->generation > first->generation);
++    scheduler.Complete(*next, 2ms, true);
++    // Same-generation inbound requests coalesce across initiated passes too.
++    BOOST_CHECK(scheduler.Incoming());
++    BOOST_CHECK(!scheduler.Incoming());
++}
++
+ BOOST_AUTO_TEST_SUITE_END()
