@@ -1,41 +1,21 @@
-# Generic owned canonical arena / publication gate
+# Generic owned canonical arena: native validation passed
 
-Source is prepared on latest `2cf83331`, independently of the unresolved epoch-cut design. Exact source/tree and targets are in SOURCE.json. No protocol lifecycle glue, new capability advertisement or old full-mempool wire experiment is included. No native build/test has run.
+Exact source `a429917c018437d38f684c2a6bb5b839a0437157`, tree `4aca247a67d57f55f785b72d43b3ff4515619dce`, on canonical base `2cf83331`. No canonical pin or maintained series has been promoted by this gate.
 
-## Queue order and actual commands
+Fresh isolated arm64 Ninja build uses native Chronik ON, MDBX ON, plugins OFF, wallet ON, jemalloc ON and Release `-O3` with assertions. All four normal targets linked: `lotusd`, `test_bitcoin`, `test_lotus_v2_block_assembler`, `test-avalanche`. Version check passed. Build concurrency was `-j10`. The existing measured Chronik-OFF cache and source were untouched.
 
-N1 exclusively owns compilers and runtime scheduling. Its cross-peer Avalanche cohort has the next actual slot. This packet is held for Astra's actual CODE review; architectural approval alone does not release it. Use the existing native Chronik-ON configuration. Do not configure Rust Chronik or silently disable Chronik to avoid a build dependency. Compilation target names were read from source CMake, not inferred from historical V1 naming.
+| Executed check | Cases | Assertions | Result |
+|---|---:|---:|---|
+| mempool_overlay_tests | 19 | 40,040 | PASS |
+| rpc_snapshot_read_tests | 5 | 1,090 | PASS |
+| lotus_v2_tests | 8 | 137,117 | PASS |
+| preconsensus_batch_tests | 12 | 2,960 | PASS |
+| standalone block assembler integration | standalone | — | PASS |
 
-Once source review is released, the minimal normal link gate is:
+Total: 44 Boost cases, 181,207 assertions, plus standalone block assembler. Its logged injected builder exceptions are expected test scenarios. The existing `lotus_v2_tests` selector includes small kernel microbenchmark cases; their printed throughput is not an endpoint benchmark or a causal speedup claim.
 
-```sh
-cmake --build <BUILD> --target lotusd test_bitcoin test_lotus_v2_block_assembler -j10
-<BUILD>/src/test/test_bitcoin --run_test=mempool_overlay_tests --report_level=detailed
-<BUILD>/src/test/test_bitcoin --run_test=rpc_snapshot_read_tests --report_level=detailed
-<BUILD>/src/test/test_bitcoin --run_test=lotus_v2_tests --report_level=detailed
-<BUILD>/src/lotus_v2/test_lotus_v2_block_assembler
-```
+The first fresh build exposed a real Apple libc++ portability issue: `atomic<shared_ptr<T>>` is unsupported here. Production now uses the standard free atomic shared_ptr operations, acquire/release, matching existing daemon practice. Subsequent compile failures were two new test name qualifications. One runtime fixture incorrectly compared distinct CTransactionRef pointer identities; it now checks that the pinned leaf owns readable transaction bytes equal to the fixture after clear. Failed attempts and their original logs are preserved in numbered attempt directories. The final build is incremental after those repairs; its short duration must not be represented as the fresh build duration.
 
-The exact binary paths must be confirmed against N1's existing build directory. Existing standalone header/commitment tests do not exercise the replacement arena, so they are not substitutes for linking test_bitcoin and the development-runtime block assembler.
+`RESULT.json` preserves executed commands, times and exit codes; `VALIDATION-RECEIPT.json` seals log hashes and counts. The compiler/runtime lease was explicitly drained and released after success. No additional benchmark, profile or node runtime was started.
 
-After this gate, `test-avalanche --run_test=preconsensus_batch_tests` verifies that cumulative frozen overlay/finality behavior remains unchanged. Relevant existing sealed-header overlay tests may be run from v2_protocol_handler_tests; no new epoch-cut semantics are asserted.
-
-## Prepared evidence
-
-The arena suite independently compares roots against canonical BuildTxSubtreeA, retained old generations, a 255-bit common prefix, replacement/deletion/re-add, zero-allocation identity no-op, cold batch mutation without old-root hashing, changed-path hash-work counts, six concurrent cold readers, lifetime after reset, and worker exception/drain/reentrancy. Publication tests cover owned root/body lifetime across bulk clear, matched numeric-root generation and metadata-only sequence stability. Existing deferred overlay/mining tests ensure a relay pin does not flush UTXO/CTOR bookkeeping.
-
-A source self-review fixed pending numeric deltas being cleared before later snapshot/template allocation could fail. Another source review found only unnecessary temporary vector allocation, now removed. These are source assessments, not executed test results.
-
-## Claims still held
-
-There is no performance, bounded-total-RSS or runtime correctness claim. Root exposure estimates and actual structural-node counts require native measurements. The historical snapshot publisher retains 1024 generations: adding canonical handles there may retain large old roots outside relay reservations during repeated clears/refills; Astra has been asked to review this actual lifetime concern before gate release. No default reservation/time values are frozen here.
-
-The AB|D + learned C/new E => ABC|DE candidate ownership/vote reset behavior remains an independently revised specification task. Generic immutable roots are useful across cut variants; this packet does not implement that lifecycle or claim network convergence.
-
-## Actual source-review correction
-
-Astra's overlay reviewer confirmed the 1024-ring canonical-graph retention blocker. Source `006f5fe7a5` repairs it with a current-only atomically owned tuple containing canonical root, matching numeric tree, sequence and mempool identity. Historical RPC snapshots retain only sequence. A new weak-root regression requires old canonical ownership to expire after clear unless an explicit reader pin survives. Re-review and native execution are still pending; this is not a passing gate.
-
-## Actual code-review gate released
-
-Independent Astra overlay review approved exact source `ae1d8851fcc9fe280c518ca78666324c31c0f645`, tree `e71a2a874ecbd120232ffb634b93d9bf6d0ee686`. Ring ownership, paired-generation API use and nonwaiting busy-worker fallback are closed by source inspection. The new worker test always releases and joins before assertions. This releases isolated native validation only; no tests/build have executed, no epoch protocol contract is selected, and integrated relay exposure/scratch/allocator high-water guarantees are excluded. N1 was asked to queue this after the already-prioritized cross-peer Avalanche cohort.
+This validates generic owned topology/hash-cache/body lifetimes and publication plumbing. It does not implement epoch reconciliation lifecycle, prove network convergence, establish an integrated retained-memory budget, or replace the mutable primary mempool with a CoW primary. See the adjacent primary-CoW source audit for the remaining architecture gap. Independent Astra source review approved ring ownership, paired generation and nonwaiting worker dispatch; the portable atomic spelling is a narrow follow-up source review before promotion.
