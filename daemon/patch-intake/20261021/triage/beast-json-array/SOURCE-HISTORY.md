@@ -26,7 +26,7 @@ The exact introducing boundary in the current 521 lineage is:
 - before: `e6f5b77e75a3e4003a286e411f7c38ca56ad6478` (libevent HTTP, coroutine RPC already present);
 - after: `8796bdb44618cd0e15125aa1534e9b3aba066a4e` (Beast HTTP, same coroutine command dispatcher).
 
-A build of those two sources would isolate the initial HTTP replacement more directly than ABC versus current. It would not represent the later write/timer repairs or today's full native endpoint. Fresh before/after source builds have **not** been performed in this investigation.
+A build of those two sources would isolate the initial HTTP replacement more directly than ABC versus current. It would not represent the later write/timer repairs or today's full native endpoint. Fresh before/after source builds have **not** been performed in this investigation. `introducing-boundary.json` records SHA256 equality of `rpc/server.{cpp,h}`, `rpc/util.cpp`, `httprpc.cpp`, and UniValue read/write sources across that exact boundary; it is a suitable future transport-only source A/B.
 
 `size_probe.py` prepares the next control: 207- and 414-byte deterministic binary values encoded as 414- and 828-character hexadecimal JSON arguments; each echoed response is validated. Cases use singles and arrays of 50, client concurrency 1 and 8, five seconds each, full per-request p50/p95/p99 and exact request/response byte counts. Echo deliberately includes an equally large response, so it bounds combined parse/serialize cost rather than exactly reproducing sendrawtransaction's short TxId response. No arrays are parallelized and no daemon asyncio path is introduced.
 
