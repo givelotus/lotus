@@ -1,5 +1,6 @@
 import pathlib,json,subprocess,hashlib,time,os,signal,datetime,re,shlex
 root=pathlib.Path('/Users/shammah/repos/lotus-v2-repair-work/benchmark-readiness-20261020');plan=json.load(open(pathlib.Path('/Users/shammah/repos/lotus-v2-optimizations/benchmark-results/20261021/native-warmup-depth500k-profile-v1/execution-plan.json')));tooling=pathlib.Path('/Users/shammah/repos/lotus-benchmark-readiness');scripts=tooling/'daemon/patch-audit/progression/scripts'
+assert plan['status'] == 'READY_AFTER_FULLSCOPE_GATE_DRAIN_RUNTIME_LEASE'
 assert subprocess.check_output(['git','-C',str(tooling),'rev-parse','HEAD'],text=True).strip()==plan['tooling_head']
 assert not subprocess.check_output(['git','-C',str(tooling),'status','--porcelain','--untracked-files=no'],text=True).strip()
 for name,digest in plan['module_hashes'].items():assert hashlib.sha256((scripts/name).read_bytes()).hexdigest()==digest
