@@ -144,3 +144,11 @@ Append-only. Times are UTC.
 | block801 three-node ms | 19.275 | 17.840 | 24.604 |
 
 - `block801` still includes one sample above 20ms on the unchanged binary. That is sample spread. Next: `--point 374` on this harness. Point 527 and sustained 500k stay unstarted.
+
+## 2026-10-22T17:15:57Z — point 374 functional gate failed in prefetch metrics
+
+- Pid 57307 is dead. Units and avalanche passed. `chronik_rpc_port_proxy.py` was recorded N/A (`Chronik indexer has not been compiled.`, coverage false). Ten functional tests passed. `interface_http_metrics.py` returned 1 after 5.1s. Source was still `6dab13b0dd5a195e575ebb1f6d39117d02ed66b6`, tree `f460f6f809ac742a2c55bf83e4602a177edfd4ca`. No timing samples.
+- The log is `TypeError: 'Scrape' object is not subscriptable` at `samples[("fullnode_block_prefetch_started_total", ())]`. Global 277 added those empty-label subscripts after `scrape()` already returned `Scrape`. The rest of the test uses `value(m(name))`, which ignores the constant client and network labels. The expected counts are unchanged. The empty tuple was not a series key.
+- Packet: `failure-point-374-http-metrics.json` (`b922f1ff88dc162fa2e7384e0f7eb60043fd9108b4fa31a9c44605263ef95262`). Record copy: `patch-374-http-metrics-failed.json` (`01d8fb4324120cef1dffc1997e651db43fd5a70b20964d6925506bac7f7560c8`).
+- Clean `git am` from global 276 parent `96998e2e9065` applied 251 mailboxes. Only global 277's mailbox hash changed, to `075ecb5b6d60d81da83562f48399654f948fa5a2c6da82ded57b956378eb80dc`. Prefixes 0–276 are unchanged, including point 0. Point 374 is now `f14e7838966a651ee808e619e0c628fb5d9c90dd`, tree `6f3d52f6198117d0dfba12ae2e0bb2d10b519f2d`. V2 tip `ec6f79f7b6c497e70c57a3442bd7d714d7602ef3`, tree `41e7c702526a0687cdbc3148286b72fea8c7605a`. Manifest sha256 `d2ff0bf40293b1d2bd36268d3669b34a42675ddbef9700083620a985ea632e02`. Historical `sha`/`tree`/`parent` fields were left as provenance.
+- These gates have not passed on the repaired tree. Point 527 and the sustained 500k workload stay unstarted. The held native527 network run stays unlaunched. Not pushed.
