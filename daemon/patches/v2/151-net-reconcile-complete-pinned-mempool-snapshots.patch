@@ -1,0 +1,1939 @@
+From d330ce6657fb0c213f534fb0c856930fee12d72e Mon Sep 17 00:00:00 2001
+From: Shammah Chancellor <shammah.chancellor@notvalid.com>
+Date: Wed, 21 Oct 2026 23:32:28 -0700
+Subject: [PATCH] net: reconcile complete pinned mempool snapshots with
+ authenticated prefix pages
+
+Negotiate full-membership scope independently of legacy recent-window reconciliation. Capture and share complete immutable TxId/TxHash/body-reference snapshots, authenticate bounded canonical-prefix expansion and complete body pages, and retain connection/request ownership through paced retries and current-chain admission. Admission age and the old 4096 limit do not truncate this mode. Bound derived storage, queued bytes and decoder exposure; preserve legacy peer wire and normal validation.
+---
+ src/CMakeLists.txt                            |   2 +-
+ src/init.cpp                                  |   4 +
+ src/net/full_mempool_reconciliation.cpp       | 936 ++++++++++++++++++
+ src/net/full_mempool_reconciliation.h         | 204 ++++
+ src/net/txrelay_index.h                       |   2 +
+ src/net_processing.cpp                        |  15 +-
+ src/test/CMakeLists.txt                       |   1 +
+ .../full_mempool_reconciliation_tests.cpp     | 225 +++++
+ src/test/txrelay_tests.cpp                    | 359 +++++++
+ 9 files changed, 1746 insertions(+), 2 deletions(-)
+ create mode 100644 src/net/full_mempool_reconciliation.cpp
+ create mode 100644 src/net/full_mempool_reconciliation.h
+ create mode 100644 src/test/full_mempool_reconciliation_tests.cpp
+
+diff --git a/src/CMakeLists.txt b/src/CMakeLists.txt
+index 13e6000776d6020f6483157408a429a03abd3a62..f5d3561fffa89ac8e24aba3771bbeb98d270f5c0 100644
+--- a/src/CMakeLists.txt
++++ b/src/CMakeLists.txt
+@@ -1103,7 +1103,7 @@ endif()
+ 
+ target_link_libraries(common lotus_v2_header)
+ 
+-target_sources(server PRIVATE net/v2_protocol_handler.cpp)
++target_sources(server PRIVATE net/v2_protocol_handler.cpp net/full_mempool_reconciliation.cpp)
+ target_sources(server PRIVATE net/txrelay_index.cpp)
+ 
+ target_sources(server PRIVATE avalanche/preconsensus.cpp)
+diff --git a/src/init.cpp b/src/init.cpp
+index f6ca056f9322740f3f6c09be49cf0950020336e1..e7f1c2689466a327057ad707336bd4a496a99f74 100644
+--- a/src/init.cpp
++++ b/src/init.cpp
+@@ -673,6 +673,10 @@ void SetupServerArgs(NodeContext &node) {
+                   "robin; 0 to disable (default: %d)",
+                   count_milliseconds(DEFAULT_TXRECON_INTERVAL)),
+         ArgsManager::ALLOW_ANY, OptionsCategory::CONNECTION);
++    argsman.AddArg("-txreconfull", "Negotiate bounded complete-mempool reconciliation (default: 1)",
++                   ArgsManager::ALLOW_ANY, OptionsCategory::CONNECTION);
++    argsman.AddArg("-txreconmaxmemory=<MiB>", "Maximum full-reconciliation snapshot, recovery and queue exposure (128..4096 MiB, default: 256)",
++                   ArgsManager::ALLOW_ANY, OptionsCategory::CONNECTION);
+     argsman.AddArg(
+         "-txreconwindow=<s>",
+         strprintf("Reconcile the transactions admitted in the last this many "
+diff --git a/src/net/full_mempool_reconciliation.cpp b/src/net/full_mempool_reconciliation.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..88509c9c94cd00dd15e625898b54d7521902d13c
+--- /dev/null
++++ b/src/net/full_mempool_reconciliation.cpp
+@@ -0,0 +1,936 @@
++// Copyright (c) 2026 The Lotus developers
++// Distributed under the MIT software license. See COPYING.
++#include <net/full_mempool_reconciliation.h>
++#include <lotus_v2/tagged_hash.h>
++#include <consensus/consensus.h>
++#include <core_memusage.h>
++
++#include <algorithm>
++#include <stdexcept>
++
++namespace lotus::v2::net::fullrecon {
++namespace {
++bool Bit(const Hash &id, unsigned bit) {
++    return (id[bit / 8] >> (bit % 8)) & 1;
++}
++Hash Identity(const uint256 &id) {
++    Hash out;
++    std::copy(id.begin(), id.end(), out.begin());
++    return out;
++}
++Hash Branch(uint16_t depth, const Hash &left, const Hash &right) {
++    std::array<uint8_t, 67> bytes{};
++    bytes[0] = 1;
++    bytes[1] = depth & 255;
++    bytes[2] = depth >> 8;
++    std::copy(left.begin(), left.end(), bytes.begin() + 3);
++    std::copy(right.begin(), right.end(), bytes.begin() + 35);
++    return TaggedHash(HashDomain::TxRoot, bytes);
++}
++bool Less(const Hash &a, const Hash &b) {
++    for (unsigned i = 0; i < 256; ++i) {
++        if (Bit(a, i) != Bit(b, i)) return !Bit(a, i);
++    }
++    return false;
++}
++Descriptor FoldAt(const std::array<Descriptor, 16> &children,
++                  uint16_t depth, unsigned bit, unsigned index) {
++    if (bit == 4) return children[index];
++    const auto left{FoldAt(children, depth, bit + 1, index)};
++    const auto right{FoldAt(children, depth, bit + 1, index | (1U << bit))};
++    if (right.count > std::numeric_limits<uint64_t>::max() - left.count)
++        throw std::ios_base::failure("full-recon count overflow");
++    Descriptor out{left.count + right.count, EmptyDigest()};
++    if (out.count == 1) out.digest = left.count ? left.digest : right.digest;
++    else if (out.count > 1) out.digest = Branch(depth + bit, left.digest, right.digest);
++    return out;
++}
++}
++
++bool Prefix::Valid() const {
++    if (depth > 256 || depth % 4) return false;
++    for (unsigned i = depth; i < 256; ++i) if (Bit(bytes, i)) return false;
++    return true;
++}
++bool Prefix::Contains(const Hash &id) const {
++    if (!Valid()) return false;
++    for (unsigned i = 0; i < depth; ++i) if (Bit(bytes, i) != Bit(id, i)) return false;
++    return true;
++}
++Prefix Prefix::Child(unsigned index) const {
++    if (!Valid() || depth > 252 || index >= 16)
++        throw std::ios_base::failure("invalid full-recon child");
++    Prefix out{*this};
++    for (unsigned j = 0; j < 4; ++j)
++        out.bytes[(depth + j) / 8] |= ((index >> j) & 1) << ((depth + j) % 8);
++    out.depth += 4;
++    return out;
++}
++Hash EmptyDigest() {
++    static const Hash digest{TaggedHash(HashDomain::TxRoot, std::array<uint8_t, 1>{2})};
++    return digest;
++}
++Hash LeafDigest(const Hash &id, const Hash &hash) {
++    std::array<uint8_t, 65> bytes{};
++    std::copy(id.begin(), id.end(), bytes.begin() + 1);
++    std::copy(hash.begin(), hash.end(), bytes.begin() + 33);
++    return TaggedHash(HashDomain::TxRoot, bytes);
++}
++Descriptor Fold(const std::array<Descriptor, 16> &children, uint16_t depth) {
++    if (depth > 252 || depth % 4) throw std::ios_base::failure("invalid fold depth");
++    for (const auto &child : children) {
++        if (((child.count == 0) != (child.digest == EmptyDigest())) ||
++            (depth == 252 && child.count > 1))
++            throw std::ios_base::failure("invalid full-recon child descriptor");
++    }
++    return FoldAt(children, depth, 0, 0);
++}
++
++Snapshot::Snapshot(std::vector<CTransactionRef> transactions, size_t maximum_bytes) {
++    // Check before reserving. At most two compressed nodes per identity; the
++    // charge also accounts for pinned transaction serialization, not just refs.
++    constexpr size_t per_item{sizeof(Item) + 2 * sizeof(Node) + sizeof(CTransactionRef)};
++    if (transactions.size() > maximum_bytes / per_item ||
++        transactions.size() > (uint64_t{Node::NONE} - 1) / 2)
++        throw std::length_error("full-recon snapshot byte budget");
++    const size_t input_bytes{memusage::DynamicUsage(transactions)};
++    const size_t item_bytes{memusage::MallocUsage(transactions.size() * sizeof(Item))};
++    const size_t node_bytes{memusage::MallocUsage(transactions.size() * 2 * sizeof(Node))};
++    if (sizeof(Snapshot) > maximum_bytes || input_bytes > maximum_bytes - sizeof(Snapshot) ||
++        item_bytes > maximum_bytes - sizeof(Snapshot) - input_bytes ||
++        node_bytes > maximum_bytes - sizeof(Snapshot) - input_bytes - item_bytes)
++        throw std::length_error("full-recon snapshot preallocation budget");
++    m_items.reserve(transactions.size());
++    m_nodes.reserve(transactions.size() * 2);
++    // Include the by-value construction inventory and actual vector capacities.
++    // Conservatively retain that temporary charge after construction as well.
++    m_charged_bytes = sizeof(Snapshot) + memusage::DynamicUsage(m_items) +
++                      memusage::DynamicUsage(m_nodes) +
++                      memusage::DynamicUsage(transactions);
++    if (m_charged_bytes > maximum_bytes)
++        throw std::length_error("full-recon snapshot construction budget");
++    for (const auto &tx : transactions) {
++        if (!tx || tx->IsNull() || tx->IsCoinBase())
++            throw std::invalid_argument("invalid full-recon member");
++        const size_t bytes{std::max<size_t>(GetSerializeSize(*tx),
++                                          RecursiveDynamicUsage(tx))};
++        if (bytes > maximum_bytes - m_charged_bytes)
++            throw std::length_error("full-recon pinned body byte budget");
++        m_charged_bytes += bytes;
++        m_items.push_back({Identity(tx->GetId()), Identity(tx->GetHash()), tx});
++    }
++    std::sort(m_items.begin(), m_items.end(), [](const Item &a, const Item &b) {
++        return Less(a.id, b.id);
++    });
++    for (size_t i = 1; i < m_items.size(); ++i)
++        if (m_items[i - 1].id == m_items[i].id)
++            throw std::invalid_argument("duplicate full-recon identity");
++    if (!m_items.empty()) Build(0, m_items.size());
++}
++uint32_t Snapshot::Build(size_t begin, size_t end) {
++    const uint32_t index{static_cast<uint32_t>(m_nodes.size())};
++    m_nodes.push_back(Node{begin, end});
++    if (end - begin == 1) {
++        m_nodes[index].digest = LeafDigest(m_items[begin].id, m_items[begin].hash);
++        return index;
++    }
++    unsigned split{0};
++    while (Bit(m_items[begin].id, split) == Bit(m_items[end - 1].id, split)) ++split;
++    const auto middle{std::partition_point(m_items.begin() + begin,
++        m_items.begin() + end, [&](const Item &item) { return !Bit(item.id, split); })};
++    const size_t offset{static_cast<size_t>(middle - m_items.begin())};
++    const uint32_t left{Build(begin, offset)}, right{Build(offset, end)};
++    m_nodes[index].left = left;
++    m_nodes[index].right = right;
++    m_nodes[index].split = split;
++    m_nodes[index].digest = Branch(split, NodeAt(left, split + 1).digest,
++                                         NodeAt(right, split + 1).digest);
++    return index;
++}
++Descriptor Snapshot::NodeAt(uint32_t index, uint16_t depth) const {
++    const auto &node{m_nodes[index]};
++    Descriptor out{node.end - node.begin, node.digest};
++    if (out.count == 1) return out;
++    for (unsigned d = node.split; d > depth; --d) {
++        if (Bit(m_items[node.begin].id, d - 1)) out.digest = Branch(d - 1, EmptyDigest(), out.digest);
++        else out.digest = Branch(d - 1, out.digest, EmptyDigest());
++    }
++    return out;
++}
++const Snapshot::Node *Snapshot::Find(const Prefix &prefix, uint32_t *out) const {
++    if (!prefix.Valid()) throw std::invalid_argument("invalid full-recon prefix");
++    if (m_nodes.empty()) return nullptr;
++    uint32_t index{0};
++    while (true) {
++        const auto &node{m_nodes[index]};
++        const auto &id{m_items[node.begin].id};
++        for (unsigned bit = 0; bit < std::min<unsigned>(prefix.depth, node.split); ++bit)
++            if (Bit(prefix.bytes, bit) != Bit(id, bit)) return nullptr;
++        if (node.end - node.begin == 1 || prefix.depth <= node.split) {
++            if (out) *out = index;
++            return &node;
++        }
++        index = Bit(prefix.bytes, node.split) ? node.right : node.left;
++    }
++}
++Descriptor Snapshot::At(const Prefix &prefix) const {
++    uint32_t index{0};
++    if (!Find(prefix, &index)) return {0, EmptyDigest()};
++    return NodeAt(index, prefix.depth);
++}
++std::array<Descriptor, 16> Snapshot::Children(const Prefix &prefix) const {
++    std::array<Descriptor, 16> out;
++    for (unsigned i = 0; i < 16; ++i) out[i] = At(prefix.Child(i));
++    return out;
++}
++std::optional<std::vector<CTransactionRef>> Snapshot::Page(
++    const Prefix &prefix, size_t max_bytes) const {
++    const auto *node{Find(prefix)};
++    std::vector<CTransactionRef> out;
++    if (!node) return out;
++    if (node->end - node->begin > MAX_PAGE_BODIES) return std::nullopt;
++    size_t bytes{0};
++    for (size_t i = node->begin; i < node->end; ++i) {
++        const size_t next{GetSerializeSize(*m_items[i].tx)};
++        if (next > max_bytes - bytes) return std::nullopt;
++        bytes += next;
++        out.push_back(m_items[i].tx);
++    }
++    return out;
++}
++Hash Snapshot::PageDigest(const Prefix &prefix,
++                         const std::vector<CTransactionRef> &bodies) {
++    for (const auto &tx : bodies)
++        if (!tx || !prefix.Contains(Identity(tx->GetId())))
++            throw std::invalid_argument("full-recon body outside prefix");
++    if (bodies.size() > MAX_PAGE_BODIES)
++        throw std::length_error("full-recon page count budget");
++    // The transport owns/reserves the already-decoded bodies; this temporary
++    // builds only a <=64-member index and cannot reserve from claimed counts.
++    Snapshot page{bodies, std::numeric_limits<size_t>::max()};
++    return page.At(prefix).digest;
++}
++} // namespace lotus::v2::net::fullrecon
++
++#include <net.h>
++#include <net_processing.h>
++#include <net/v2_protocol_handler.h>
++#include <netmessagemaker.h>
++#include <common/args.h>
++#include <logging.h>
++#include <random.h>
++#include <txmempool.h>
++#include <validation.h>
++#include <util/time.h>
++#include <map>
++#include <set>
++#include <deque>
++
++namespace lotus::v2::net::fullrecon {
++using namespace std::chrono_literals;
++namespace {
++using Clock = std::chrono::microseconds;
++Clock Now() {
++    return std::chrono::duration_cast<Clock>(MockableSteadyClock::now().time_since_epoch());
++}
++template <typename T> T Decode(DataStream &stream) {
++    Require(stream.size() <= MAX_FRAME_BYTES);
++    T out;
++    stream >> out;
++    Require(stream.empty());
++    return out;
++}
++struct WorkItem { Prefix prefix; Descriptor remote; bool force_expand{false}; };
++constexpr size_t FETCH_FIXED_CHARGE = 512 * 1024;
++constexpr size_t PARSE_RESERVATION = 64 * 1024 * 1024;
++constexpr auto EXCHANGE_SPACING = 125ms;
++constexpr auto IDLE_LEASE = 60s;
++constexpr auto ABSOLUTE_LEASE = 30min;
++constexpr auto REQUEST_TIMEOUT = 5s;
++constexpr auto CAPTURE_SPACING = 30s;
++}
++namespace {
++/** Allocation-free grammar walk before the ordinary transaction decoder. Its
++ * bound includes the native decoder's u16 reserves even on a truncated frame,
++ * and the nested vector headers hidden behind one-byte empty arguments. */
++class ExposureScanner {
++    SpanReader reader;
++    size_t footprint{0};
++    void Add(size_t bytes) {
++        if (bytes > std::numeric_limits<size_t>::max() - footprint)
++            throw std::length_error("full-recon decode size overflow");
++        footprint += bytes;
++    }
++    void Allocation(uint64_t count, size_t element) {
++        if (count > std::numeric_limits<size_t>::max() / element)
++            throw std::length_error("full-recon decode allocation overflow");
++        Add(memusage::MallocUsage(size_t(count) * element));
++    }
++    template <typename T> T Read() { T out; reader >> out; return out; }
++    uint64_t Count(uint64_t maximum) {
++        const auto count{ReadCompactSize(reader)};
++        Require(count <= maximum);
++        return count;
++    }
++    void Bytes(uint64_t maximum) {
++        const auto count{Count(maximum)};
++        Require(count <= reader.size());
++        Allocation(count, 1);
++        reader.ignore(count);
++    }
++    void Witness() {
++        Bytes(DefaultTxProfile.max_script_bytes);
++        const auto siblings{Count(DefaultTxProfile.max_branch_proof_depth)};
++        Require(siblings <= reader.size() / 32);
++        Allocation(siblings, sizeof(Hash));
++        reader.ignore(siblings * 32);
++        const auto arguments{Count(DefaultTxProfile.max_arguments)};
++        Require(arguments <= reader.size()); // each needs a CompactSize byte
++        Allocation(arguments, sizeof(std::vector<uint8_t>));
++        for (uint64_t i = 0; i < arguments; ++i)
++            Bytes(DefaultTxProfile.max_argument_bytes);
++    }
++    void Transaction() {
++        Add(sizeof(CTransaction) + 128); // shared owner and small allocator slack
++        const auto version{Read<uint32_t>()};
++        if (version == 1 || version == 2) {
++            const auto inputs{Count(reader.size() / 41)};
++            Allocation(inputs, sizeof(CTxIn));
++            for (uint64_t i = 0; i < inputs; ++i) {
++                reader.ignore(36);
++                Bytes(MAX_FRAME_BYTES);
++                reader.ignore(4);
++            }
++            const auto outputs{Count(reader.size() / 9)};
++            Allocation(outputs, sizeof(CTxOut));
++            for (uint64_t i = 0; i < outputs; ++i) {
++                reader.ignore(8);
++                Bytes(MAX_FRAME_BYTES);
++            }
++            reader.ignore(4);
++            return;
++        }
++        Require(version == 7);
++        reader.ignore(8);
++        const auto inputs{Read<uint16_t>()}, outputs{Read<uint16_t>()};
++        Require(inputs != 0);
++        Allocation(inputs, sizeof(CTxIn));
++        Allocation(outputs, sizeof(CTxOut));
++        for (uint64_t i = 0; i < inputs; ++i) {
++            reader.ignore(40);
++            const auto flags{Read<uint8_t>()};
++            if (flags == 1) {
++                Count(MAX_OUTPUT_PATHS - 1);
++                const auto witnesses{Count(MAX_OUTPUT_BRANCHES)};
++                Require(witnesses != 0 && witnesses <= reader.size() / 3);
++                Allocation(witnesses, sizeof(BranchWitness));
++                for (uint64_t j = 0; j < witnesses; ++j) Witness();
++            } else if (flags == 2) {
++                if (Count(1)) Bytes(8192);
++            } else {
++                Require(flags == 3);
++                Allocation(1, sizeof(BranchWitness));
++                Witness();
++            }
++        }
++        for (uint64_t i = 0; i < outputs; ++i) {
++            const auto flags{Read<uint8_t>()};
++            Require(!(flags & 0xf8) && !((flags & 4) && (flags & 2)));
++            reader.ignore(8);
++            if (flags & 1) reader.ignore(32);
++            if (flags & 4) reader.ignore(32);
++            const auto branches{Count(MAX_OUTPUT_BRANCHES)};
++            Require(branches != 0 && branches <= reader.size() / 32);
++            Allocation(branches, sizeof(Hash));
++            reader.ignore(branches * 32);
++            const auto paths{Count(MAX_OUTPUT_PATHS)};
++            Require(paths <= reader.size());
++            Allocation(paths, sizeof(std::vector<uint8_t>));
++            for (uint64_t j = 0; j < paths; ++j) {
++                const auto length{Count(MAX_OUTPUT_BRANCHES)};
++                Require(length != 0 && length <= reader.size());
++                Allocation(length, 1);
++                for (uint64_t k = 0; k < length; ++k)
++                    Count(MAX_OUTPUT_BRANCHES - 1);
++            }
++        }
++    }
++public:
++    explicit ExposureScanner(Span<const uint8_t> bytes) : reader{bytes} {}
++    size_t Page() {
++        Reply header;
++        uint8_t work, status;
++        reader >> header.header >> header.request >> header.prefix >> work >> status;
++        header.work = static_cast<Work>(work); header.status = static_cast<Status>(status);
++        Require(header.work == Work::PAGE && header.status == Status::OK);
++        const auto bodies{Count(MAX_PAGE_BODIES)};
++        Allocation(bodies, sizeof(CTransactionRef));
++        for (uint64_t i = 0; i < bodies; ++i) Transaction();
++        Require(reader.empty());
++        // Phase bound: nested data moves from decoded to immutable storage,
++        // then ToV2Transaction may duplicate it once during identity hashing.
++        // The two vin/vout header arrays can coexist; one current-output
++        // conversion and vector capacity growth fit the remaining graph pair.
++        // Summing all bodies also retains earlier bodies during the last peak.
++        // Eight frame copies cover recorded/serialized wire and capacity
++        // growth, full/core InputWire encoding, output-script conversion and
++        // commitment leaves; the fixed MiB covers the <=64 verification index.
++        constexpr size_t slack{8 * MAX_FRAME_BYTES + 1024 * 1024};
++        if (footprint > (std::numeric_limits<size_t>::max() - slack) / 4)
++            throw std::length_error("full-recon decode peak overflow");
++        return footprint * 4 + slack;
++    }
++};
++}
++size_t PageDecodeExposure(Span<const uint8_t> bytes) {
++    Require(bytes.size() <= MAX_FRAME_BYTES);
++    return ExposureScanner{bytes}.Page();
++}
++
++struct Manager::Impl {
++    ChainstateManager &chainman;
++    CTxMemPool &pool;
++    CConnman &connman;
++    PeerManager &peerman;
++    mutable Mutex mutex;
++    Stats stats;
++    struct Capture {
++        std::shared_ptr<const Snapshot> snapshot;
++        // Reset sequence advances on every erase/clear; between resets only
++        // inserts can change immutable membership, so exact size completes
++        // the version. External notification sequence skips addUnchecked.
++        std::pair<uint64_t, size_t> generation{};
++        uint256 anchor;
++    } cache;
++    Clock next_capture{0us};
++    struct Serve {
++        Header header;
++        std::shared_ptr<const Snapshot> snapshot;
++        uint256 anchor;
++        uint64_t highest_request{0};
++        Clock born, progress, next_reply{0us};
++    };
++    struct Fetch {
++        Header header;
++        uint256 anchor;
++        std::shared_ptr<const Snapshot> local;
++        std::vector<WorkItem> deferred;
++        std::optional<WorkItem> active;
++        std::optional<Request> request;
++        uint64_t next_request{1};
++        Clock born, progress, deadline{0us}, next_send{0us};
++        size_t retries{0};
++        std::map<TxId, CTransactionRef> recovered;
++        size_t body_charge{0};
++        std::vector<CTransactionRef> ordered;
++        size_t admission_cursor{0};
++        bool admitting{false};
++        uint64_t rejected{0};
++    };
++    struct Peer {
++        bool enabled{false};
++        std::optional<Serve> serve;
++        std::optional<Fetch> fetch;
++        Clock next_offer{0us};
++        size_t queued_charge{0};
++        std::optional<Offer> pending_control;
++        uint256 last_remote_context;
++    };
++    std::map<int64_t, Peer> peers;
++    explicit Impl(ChainstateManager &c, CTxMemPool &p, CConnman &n, PeerManager &pm)
++        : chainman(c), pool(p), connman(n), peerman(pm) {}
++    size_t Budget() const {
++        return static_cast<size_t>(std::clamp<int64_t>(
++            gArgs.GetIntArg("-txreconmaxmemory", 256), 128, 4096)) * 1024 * 1024;
++    }
++    size_t Used(size_t *captures = nullptr) const {
++        std::set<const Snapshot *> unique;
++        size_t used{memusage::DynamicUsage(peers)};
++        if (cache.snapshot) unique.insert(cache.snapshot.get());
++        for (const auto &[_, peer] : peers) {
++            if (peer.serve) unique.insert(peer.serve->snapshot.get());
++            if (peer.fetch) {
++                unique.insert(peer.fetch->local.get());
++                used += FETCH_FIXED_CHARGE + peer.fetch->body_charge;
++            }
++            used += peer.queued_charge;
++        }
++        for (const auto *snapshot : unique) used += snapshot->ChargedBytes();
++        if (captures) *captures = unique.size();
++        return used;
++    }
++    bool Fits(size_t bytes) const {
++        const auto used{Used()}, budget{Budget()};
++        return used <= budget && bytes <= budget - used;
++    }
++    void QueueDrained(CNode &node, Peer &peer) {
++        if (WITH_LOCK(node.cs_vSend, return node.nSendSize == 0)) peer.queued_charge = 0;
++    }
++    template <typename T> bool Send(CNode &node, Peer &peer,
++                                    const std::string &command, const T &message) {
++        if (node.fDisconnect || node.fPauseSend) return false;
++        QueueDrained(node, peer);
++        const auto bytes{GetSerializeSize(message)};
++        if (bytes > MAX_FRAME_BYTES || !Fits(bytes + 64)) { ++stats.busy; return false; }
++        connman.PushMessage(&node, NetMsg::Make(command, message));
++        peer.queued_charge += bytes + 64;
++        return true;
++    }
++    uint256 Anchor() const {
++        LOCK(cs_main);
++        const auto *tip{chainman.ActiveTip()};
++        return tip ? uint256{tip->GetBlockHash()} : uint256{};
++    }
++    std::shared_ptr<const Snapshot> CapturePool(Clock now) {
++        const auto anchor{Anchor()};
++        const auto current_generation{WITH_LOCK(pool.cs, return (std::pair{
++            pool.GetSnapshotResetSequence(), pool.mapTx.size()}))};
++        if (cache.snapshot && cache.anchor == anchor &&
++            cache.generation == current_generation) return cache.snapshot;
++        if (now < next_capture) return cache.anchor == anchor ? cache.snapshot : nullptr;
++        // A stale cache must not reserve its own replacement budget forever.
++        // Active serving/fetching owners retain their immutable shared view;
++        // a cache-only view can be freed before constructing the next one.
++        cache.snapshot.reset();
++        size_t captures{0};
++        const size_t used{Used(&captures)}, budget{Budget()};
++        if (used >= budget || captures >= 4 ||
++            PARSE_RESERVATION + FETCH_FIXED_CHARGE > budget - used) {
++            ++stats.busy; return nullptr;
++        }
++        const size_t available{budget - used - PARSE_RESERVATION - FETCH_FIXED_CHARGE};
++        // A failed allocation/build must not turn peer ticks into O(N) retries.
++        next_capture = now + CAPTURE_SPACING;
++        size_t count{0};
++        {
++            LOCK(pool.cs);
++            count = pool.mapTx.size();
++            // Conservative reservation before copying any references. The
++            // mempool's usage includes bodies and its own (unretained) indexes.
++            if (count > available / 512 || pool.DynamicMemoryUsage() > available - count * 512) {
++                ++stats.busy;
++                return nullptr;
++            }
++        }
++        std::vector<CTransactionRef> transactions;
++        transactions.reserve(count); // never allocate inventory while locked
++        std::pair<uint64_t, size_t> generation{};
++        uint256 captured_anchor;
++        const auto lock_started{Now()};
++        Clock lock_acquired;
++        {
++            LOCK2(cs_main, pool.cs);
++            lock_acquired = Now();
++            if (pool.mapTx.size() > transactions.capacity() ||
++                pool.mapTx.size() > available / 512 ||
++                pool.DynamicMemoryUsage() > available - pool.mapTx.size() * 512)
++                return nullptr;
++            const auto *tip{chainman.ActiveTip()};
++            if (!tip) return nullptr;
++            captured_anchor = tip->GetBlockHash();
++            generation = {pool.GetSnapshotResetSequence(), pool.mapTx.size()};
++            for (const auto &entry : pool.mapTx) transactions.push_back(entry->GetSharedTx());
++        }
++        const auto copied{Now()};
++        auto snapshot{std::make_shared<const Snapshot>(std::move(transactions), available)};
++        if (Anchor() != captured_anchor) return nullptr;
++        cache = {snapshot, generation, captured_anchor};
++        next_capture = now + CAPTURE_SPACING;
++        ++stats.captures;
++        stats.captured_members += snapshot->Size();
++        stats.capture_lock_wait_us += (lock_acquired - lock_started).count();
++        stats.capture_lock_us += (copied - lock_acquired).count();
++        stats.capture_build_us += (Now() - copied).count();
++        LogEvent(BCLog::TXRELAY, "fullrecon_capture", "captured complete mempool count={count} bytes={bytes}")
++            .Field(BCLog::LogField::Count, snapshot->Size())
++            .Field(BCLog::LogField::Bytes, snapshot->ChargedBytes())
++            .Field(BCLog::LogField::DurationUs, copied - lock_acquired);
++        return snapshot;
++    }
++    void ControlFrame(CNode &node, Peer &peer, const Header &header, Control control) {
++        Offer out;
++        out.header = header;
++        out.control = control;
++        if (!Send(node, peer, NetMsgType::MERKLIXSYNC, out)) {
++            // Preserve an owned completion under backpressure. Rejected offers'
++            // CANCEL is best-effort; their bounded serving lease is the fallback.
++            if (!peer.pending_control || control == Control::DONE)
++                peer.pending_control = out;
++        }
++    }
++    void Cancel(CNode &node, Peer &peer, const Header &header) noexcept {
++        // Ownership is retired by the caller first. Notification is best-effort
++        // and may never make resource release depend on another allocation.
++        try { ControlFrame(node, peer, header, Control::CANCEL); }
++        catch (...) {}
++    }
++    void Push(Fetch &fetch, WorkItem item) {
++        const auto local{fetch.local->At(item.prefix)};
++        if (item.remote.digest == local.digest) {
++            Require(item.remote.count == local.count);
++            return;
++        }
++        if (item.remote.digest == EmptyDigest()) return;
++        if (fetch.deferred.size() >= MAX_DEFERRED_PREFIXES)
++            throw std::ios_base::failure("full-recon traversal budget");
++        fetch.deferred.push_back(std::move(item));
++    }
++    void Children(Fetch &fetch, const Prefix &parent,
++                  const std::array<Descriptor, 16> &children) {
++        std::array<WorkItem, 16> next;
++        size_t count{0};
++        for (unsigned i = 16; i-- > 0;) {
++            WorkItem item{parent.Child(i), children[i]};
++            const auto local{fetch.local->At(item.prefix)};
++            if (item.remote.digest == local.digest) {
++                Require(item.remote.count == local.count);
++                continue;
++            }
++            if (item.remote.digest == EmptyDigest()) continue;
++            next[count++] = item;
++        }
++        if (count > MAX_DEFERRED_PREFIXES - fetch.deferred.size())
++            throw std::ios_base::failure("full-recon traversal budget");
++        // All checks precede the nonallocating append to the reserved DFS stack.
++        fetch.deferred.insert(fetch.deferred.end(), next.begin(), next.begin() + count);
++    }
++    void Topological(Fetch &fetch) {
++        // One Kahn traversal for the recovered set, never a repeated page scan.
++        std::map<TxId, size_t> index;
++        std::vector<CTransactionRef> bodies;
++        bodies.reserve(fetch.recovered.size());
++        for (const auto &[id, body] : fetch.recovered) {
++            index.emplace(id, bodies.size());
++            bodies.push_back(body);
++        }
++        std::vector<size_t> degree(bodies.size(), 0);
++        std::vector<std::pair<size_t, size_t>> edges;
++        for (size_t child = 0; child < bodies.size(); ++child)
++            for (const auto &input : bodies[child]->vin)
++                if (const auto it = index.find(input.prevout.GetTxId()); it != index.end()) {
++                    ++degree[child];
++                    edges.emplace_back(it->second, child);
++                }
++        std::sort(edges.begin(), edges.end());
++        std::deque<size_t> ready;
++        for (size_t i = 0; i < degree.size(); ++i) if (!degree[i]) ready.push_back(i);
++        fetch.ordered.reserve(bodies.size());
++        while (!ready.empty()) {
++            const auto parent{ready.front()}; ready.pop_front();
++            fetch.ordered.push_back(bodies[parent]);
++            auto it{std::lower_bound(edges.begin(), edges.end(), std::pair{parent, size_t{0}})};
++            while (it != edges.end() && it->first == parent) {
++                if (--degree[it->second] == 0) ready.push_back(it->second);
++                ++it;
++            }
++        }
++        if (fetch.ordered.size() != bodies.size())
++            throw std::ios_base::failure("cyclic full-recon recovered dependencies");
++        fetch.admitting = true;
++    }
++    void StartOffer(CNode &node, Peer &peer, Clock now) {
++        auto snapshot{CapturePool(now)};
++        if (!snapshot) return;
++        Offer offer;
++        offer.header.context = GetRandHash();
++        offer.anchor = cache.anchor;
++        offer.root = snapshot->Root();
++        offer.children = snapshot->Children(Prefix{});
++        // Register ownership only after successful serialization/enqueue.
++        if (!Send(node, peer, NetMsgType::MERKLIXSYNC, offer)) return;
++        peer.serve.emplace(Serve{offer.header, snapshot, offer.anchor, 0, now, now});
++        peer.next_offer = now + CAPTURE_SPACING;
++        ++stats.offers;
++    }
++    void OnOffer(CNode &node, Peer &peer, Offer offer, Clock now) {
++        if (offer.control != Control::OFFER) {
++            if (peer.serve && peer.serve->header.context == offer.header.context) peer.serve.reset();
++            if (offer.control == Control::CANCEL && peer.fetch &&
++                peer.fetch->header.context == offer.header.context) peer.fetch.reset();
++            return;
++        }
++        if (peer.last_remote_context == offer.header.context) return; // replay cannot restart work
++        if (peer.fetch || node.fPauseSend || !Fits(FETCH_FIXED_CHARGE)) {
++            ControlFrame(node, peer, offer.header, Control::CANCEL);
++            ++stats.busy;
++            return;
++        }
++        auto local{CapturePool(now)};
++        if (!local || !Fits(FETCH_FIXED_CHARGE)) {
++            ControlFrame(node, peer, offer.header, Control::CANCEL);
++            ++stats.busy;
++            return;
++        }
++        Fetch fetch;
++        fetch.header = offer.header;
++        fetch.anchor = offer.anchor;
++        fetch.local = std::move(local);
++        fetch.born = fetch.progress = now;
++        fetch.deferred.reserve(MAX_DEFERRED_PREFIXES);
++        Children(fetch, Prefix{}, offer.children);
++        peer.last_remote_context = offer.header.context;
++        peer.fetch.emplace(std::move(fetch));
++    }
++    void OnRequest(CNode &node, Peer &peer, const Request &request, Clock now) {
++        Reply reply;
++        reply.header = request.header;
++        reply.request = request.request;
++        reply.prefix = request.prefix;
++        reply.work = request.work;
++        if (!peer.serve || peer.serve->header.context != request.header.context) reply.status = Status::GONE;
++        else if (request.request <= peer.serve->highest_request) return;
++        else if (now < peer.serve->next_reply) reply.status = Status::BUSY;
++        else {
++            auto &serve{*peer.serve};
++            serve.highest_request = request.request;
++            serve.next_reply = now + EXCHANGE_SPACING;
++            if (request.work == Work::EXPAND) {
++                if (request.prefix.depth >= 256) reply.status = Status::UNAVAILABLE;
++                else reply.children = serve.snapshot->Children(request.prefix);
++            } else {
++                auto page{serve.snapshot->Page(request.prefix, MAX_FRAME_BYTES - 256)};
++                if (!page) reply.status = request.prefix.depth == 256 ? Status::UNAVAILABLE : Status::LIMIT;
++                else reply.bodies = std::move(*page);
++                if (reply.status == Status::OK && GetSerializeSize(reply) > MAX_FRAME_BYTES) {
++                    reply.bodies.clear();
++                    reply.status = request.prefix.depth == 256 ? Status::UNAVAILABLE : Status::LIMIT;
++                }
++            }
++            serve.progress = now;
++        }
++        if (Send(node, peer, NetMsgType::MERKLIXBUCK, reply)) ++stats.replies;
++    }
++    void OnReply(CNode &node, Peer &peer, const Reply &reply, Clock now) {
++        if (!peer.fetch || !peer.fetch->request || !peer.fetch->active) return;
++        auto &fetch{*peer.fetch};
++        const auto &request{*fetch.request};
++        Require(reply.header.context == fetch.header.context && reply.request == request.request &&
++                reply.prefix == request.prefix && reply.work == request.work);
++        if (reply.status == Status::BUSY) {
++            fetch.request.reset();
++            fetch.next_send = now + EXCHANGE_SPACING;
++            return;
++        }
++        if (reply.status == Status::LIMIT && reply.work == Work::PAGE && reply.prefix.depth < 256) {
++            fetch.active->force_expand = true;
++            fetch.request.reset();
++            fetch.next_send = now + EXCHANGE_SPACING;
++            return;
++        }
++        if (reply.status != Status::OK) {
++            ++stats.unresolved;
++            const Header header{fetch.header};
++            peer.fetch.reset();
++            Cancel(node, peer, header);
++            return;
++        }
++        const auto expected{fetch.active->remote};
++        if (reply.work == Work::EXPAND) {
++            const auto actual{Fold(reply.children, reply.prefix.depth)};
++            Require(actual.digest == expected.digest && actual.count == expected.count);
++            Children(fetch, reply.prefix, reply.children);
++        } else {
++            Require(reply.bodies.size() == expected.count &&
++                    Snapshot::PageDigest(reply.prefix, reply.bodies) == expected.digest);
++            size_t extra{0};
++            for (const auto &body : reply.bodies) {
++                if (fetch.recovered.contains(body->GetId()))
++                    throw std::ios_base::failure("duplicate full-recon recovered member");
++                const size_t charge{RecursiveDynamicUsage(body)};
++                if (charge > (std::numeric_limits<size_t>::max() - 256) / 2 ||
++                    extra > std::numeric_limits<size_t>::max() - (charge * 2 + 256))
++                    throw std::length_error("full-recon body charge overflow");
++                extra += charge * 2 + 256; // bodies plus topo/capacity scratch
++            }
++            if (extra > std::numeric_limits<size_t>::max() - PARSE_RESERVATION ||
++                !Fits(extra + PARSE_RESERVATION))
++                throw std::length_error("full-recon recovery body budget");
++            std::map<TxId, CTransactionRef> additions;
++            for (const auto &body : reply.bodies) additions.emplace(body->GetId(), body);
++            // Allocate transactionally, then transfer nodes without allocation.
++            // Failure cannot leave retained bodies outside the exposure charge.
++            fetch.recovered.merge(additions);
++            fetch.body_charge += extra;
++            stats.verified_bodies += reply.bodies.size();
++        }
++        fetch.progress = now;
++        fetch.request.reset();
++        fetch.active.reset();
++        fetch.retries = 0;
++        fetch.next_send = now + EXCHANGE_SPACING;
++    }
++    void Tick(CNode &node, Peer &peer, Clock now) {
++        QueueDrained(node, peer);
++        if (peer.pending_control &&
++            Send(node, peer, NetMsgType::MERKLIXSYNC, *peer.pending_control))
++            peer.pending_control.reset();
++        // Anchor is diagnostic/domain metadata, not an epoch authority. Chain
++        // changes never mutate or cancel an immutable transport snapshot;
++        // recovered bodies still face current normal admission.
++        if (peer.serve && (now - peer.serve->progress > IDLE_LEASE ||
++                           now - peer.serve->born > ABSOLUTE_LEASE)) {
++            const Header header{peer.serve->header};
++            peer.serve.reset(); ++stats.expired;
++            Cancel(node, peer, header);
++        }
++        if (peer.fetch && (now - peer.fetch->progress > IDLE_LEASE ||
++                           now - peer.fetch->born > ABSOLUTE_LEASE)) {
++            const Header header{peer.fetch->header};
++            peer.fetch.reset(); ++stats.expired;
++            Cancel(node, peer, header);
++        }
++        if (!peer.serve && now >= peer.next_offer && !node.fPauseSend) StartOffer(node, peer, now);
++        if (!peer.fetch || node.fPauseSend || node.fDisconnect) return;
++        auto &fetch{*peer.fetch};
++        if (fetch.admitting) {
++            if (fetch.ordered.empty()) { peer.fetch.reset(); return; }
++            const size_t end{std::min(fetch.admission_cursor + MAX_PAGE_BODIES, fetch.ordered.size())};
++            const std::span<const CTransactionRef> batch{
++                fetch.ordered.data() + fetch.admission_cursor, end - fetch.admission_cursor};
++            peerman.ProcessShortTxResponse(node, batch);
++            for (const auto &body : batch) {
++                const auto actual{pool.get(body->GetId())};
++                if (actual && actual->GetHash() == body->GetHash()) ++stats.admitted;
++                else { ++fetch.rejected; ++stats.unresolved; }
++            }
++            fetch.admission_cursor = end;
++            fetch.progress = now;
++            if (end == fetch.ordered.size()) {
++                LogEvent(BCLog::TXRELAY, "fullrecon_admission_finished", "full reconciliation admission peer={peer_id} unresolved={count}")
++                    .Field(BCLog::LogField::PeerId, node.GetId())
++                    .Field(BCLog::LogField::Count, fetch.rejected);
++                peer.fetch.reset();
++            }
++            return;
++        }
++        if (fetch.request) {
++            if (now < fetch.deadline) return;
++            fetch.request.reset();
++            if (++fetch.retries > 3) {
++                const Header header{fetch.header};
++                peer.fetch.reset(); ++stats.unresolved;
++                Cancel(node, peer, header);
++                return;
++            }
++        }
++        if (now < fetch.next_send) return;
++        if (!fetch.active && !fetch.deferred.empty()) {
++            fetch.active = fetch.deferred.back();
++            fetch.deferred.pop_back();
++        }
++        if (!fetch.active) {
++            Topological(fetch);
++            ++stats.coverage_complete;
++            ControlFrame(node, peer, fetch.header, Control::DONE);
++            LogEvent(BCLog::TXRELAY, "fullrecon_coverage_complete", "verified remote snapshot peer={peer_id} bodies={count}")
++                .Field(BCLog::LogField::PeerId, node.GetId())
++                .Field(BCLog::LogField::Count, fetch.recovered.size());
++            return;
++        }
++        Request request;
++        request.header = fetch.header;
++        if (fetch.next_request == std::numeric_limits<uint64_t>::max())
++            throw std::ios_base::failure("full-recon request sequence exhausted");
++        request.request = fetch.next_request++;
++        request.prefix = fetch.active->prefix;
++        request.work = (!fetch.active->force_expand && fetch.active->remote.count <= MAX_PAGE_BODIES)
++            ? Work::PAGE : Work::EXPAND;
++        if (Send(node, peer, NetMsgType::GETMERKLIXBUCK, request)) {
++            fetch.request = request;
++            fetch.deadline = now + REQUEST_TIMEOUT;
++            fetch.next_send = now + EXCHANGE_SPACING;
++            ++stats.requests;
++        }
++    }
++};
++
++Manager::Manager(ChainstateManager &chainman, CTxMemPool &pool, CConnman &connman, PeerManager &peerman)
++    : m_impl{std::make_unique<Impl>(chainman, pool, connman, peerman)} {}
++Manager::~Manager() = default;
++void Manager::SetPeer(int64_t peer, bool enabled) {
++    LOCK(m_impl->mutex);
++    if (enabled) m_impl->peers[peer].enabled = true;
++    else if (const auto it = m_impl->peers.find(peer); it != m_impl->peers.end()) {
++        // Renegotiation cannot release bytes already owned by CNode's queue.
++        // Only actual drain or connection teardown retires their exposure.
++        it->second.enabled = false;
++        it->second.serve.reset();
++        it->second.fetch.reset();
++        it->second.pending_control.reset();
++    }
++    if (std::none_of(m_impl->peers.begin(), m_impl->peers.end(),
++                     [](const auto &entry) { return entry.second.enabled; }))
++        m_impl->cache.snapshot.reset();
++}
++void Manager::RemovePeer(int64_t peer) {
++    LOCK(m_impl->mutex);
++    m_impl->peers.erase(peer);
++    if (m_impl->peers.empty()) m_impl->cache.snapshot.reset();
++}
++void Manager::Tick(CNode &node, Clock now) {
++    LOCK(m_impl->mutex);
++    const auto it{m_impl->peers.find(node.GetId())};
++    if (it == m_impl->peers.end()) return;
++    m_impl->QueueDrained(node, it->second);
++    if (!it->second.enabled) return;
++    try { m_impl->Tick(node, it->second, now); }
++    catch (const std::exception &) {
++        ++m_impl->stats.unresolved;
++        it->second.fetch.reset();
++        it->second.serve.reset();
++        it->second.next_offer = now + 1s;
++    }
++}
++bool Manager::Handle(CNode &node, const std::string &command, DataStream &stream, Clock time_received) {
++    if (command != NetMsgType::MERKLIXSYNC && command != NetMsgType::GETMERKLIXBUCK &&
++        command != NetMsgType::MERKLIXBUCK) return false;
++    if (stream.empty() || uint8_t(*stream.begin()) != SCOPE) return false;
++    LOCK(m_impl->mutex);
++    const auto it{m_impl->peers.find(node.GetId())};
++    if (it == m_impl->peers.end() || !it->second.enabled) return true;
++    if (!m_impl->peerman.GetV2ProtocolHandler()->CheckPeerRateLimit(node.GetId(), time_received)) return true;
++    if (stream.size() > MAX_FRAME_BYTES) { ++m_impl->stats.malformed; return true; }
++    try {
++        // Parse only fixed ownership metadata before permitting body allocation.
++        // SpanReader borrows the incoming bytes without another frame copy.
++        if (command == NetMsgType::MERKLIXBUCK) {
++            SpanReader preview{Span<const uint8_t>{UCharCast(stream.data()), stream.size()}};
++            Reply header;
++            uint8_t work, status;
++            preview >> header.header >> header.request >> header.prefix >> work >> status;
++            header.work = static_cast<Work>(work); header.status = static_cast<Status>(status);
++            const auto &fetch{it->second.fetch};
++            if (!fetch || !fetch->request || !fetch->active ||
++                header.header.context != fetch->header.context ||
++                header.request != fetch->request->request ||
++                header.prefix != fetch->request->prefix || header.work != fetch->request->work)
++                return true;
++            if (header.work == Work::PAGE && header.status == Status::OK &&
++                !m_impl->Fits(PageDecodeExposure(Span<const uint8_t>{UCharCast(stream.data()), stream.size()})))
++                throw std::length_error("full-recon decode exposure budget");
++        }
++        const auto now{Now()};
++        if (command == NetMsgType::MERKLIXSYNC) m_impl->OnOffer(node, it->second, Decode<Offer>(stream), now);
++        else if (command == NetMsgType::GETMERKLIXBUCK) m_impl->OnRequest(node, it->second, Decode<Request>(stream), now);
++        else m_impl->OnReply(node, it->second, Decode<Reply>(stream), now);
++    } catch (const std::length_error &) {
++        ++m_impl->stats.busy;
++        if (it->second.fetch) {
++            const Header header{it->second.fetch->header};
++            it->second.fetch.reset();
++            m_impl->Cancel(node, it->second, header);
++        }
++    } catch (const std::exception &) {
++        ++m_impl->stats.malformed;
++        // Parsing/verification never consumes a valid pending request. A real
++        // timeout retries it with a fresh ID; invalid frames do not renew leases.
++    }
++    return true;
++}
++Stats Manager::GetStats() const {
++    LOCK(m_impl->mutex);
++    auto stats{m_impl->stats};
++    stats.charged_bytes = m_impl->Used();
++    return stats;
++}
++} // namespace lotus::v2::net::fullrecon
+diff --git a/src/net/full_mempool_reconciliation.h b/src/net/full_mempool_reconciliation.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..6b48883d54ee46ba9fe8a43a81979112c4d386d5
+--- /dev/null
++++ b/src/net/full_mempool_reconciliation.h
+@@ -0,0 +1,204 @@
++// Copyright (c) 2026 The Lotus developers
++// Distributed under the MIT software license. See COPYING.
++#ifndef BITCOIN_NET_FULL_MEMPOOL_RECONCILIATION_H
++#define BITCOIN_NET_FULL_MEMPOOL_RECONCILIATION_H
++
++#include <lotus_v2/commitment.h>
++#include <primitives/transaction.h>
++#include <blockencodings.h>
++#include <streams.h>
++#include <chrono>
++#include <string>
++#include <serialize.h>
++
++#include <array>
++#include <cstdint>
++#include <limits>
++#include <memory>
++#include <optional>
++#include <ios>
++#include <span>
++#include <vector>
++
++class CNode;
++class CConnman;
++class CTxMemPool;
++class PeerManager;
++class ChainstateManager;
++
++namespace lotus::v2::net::fullrecon {
++inline constexpr uint8_t SCOPE = 5;
++inline constexpr uint64_t CAPABILITY = uint64_t{1} << 3;
++inline constexpr size_t MAX_PAGE_BODIES = 64;
++inline constexpr size_t MAX_FRAME_BYTES = 2 * 1024 * 1024;
++inline constexpr size_t MAX_DEFERRED_PREFIXES = 64 * 15 + 1;
++
++struct Prefix {
++    uint16_t depth{0};
++    Hash bytes{};
++    bool Valid() const;
++    bool Contains(const Hash &id) const;
++    Prefix Child(unsigned index) const;
++    friend bool operator==(const Prefix &, const Prefix &) = default;
++    SERIALIZE_METHODS(Prefix, obj) {
++        READWRITE(obj.depth, obj.bytes);
++        if (!obj.Valid()) throw std::ios_base::failure("invalid full-recon prefix");
++    }
++};
++struct Descriptor {
++    uint64_t count{0}; // Scheduling hint; only digest equality authenticates data.
++    Hash digest{};
++    SERIALIZE_METHODS(Descriptor, obj) { READWRITE(obj.count, obj.digest); }
++};
++Hash EmptyDigest();
++Hash LeafDigest(const Hash &id, const Hash &hash);
++Descriptor Fold(const std::array<Descriptor, 16> &children, uint16_t depth);
++
++/** Immutable complete membership captured once; no admission-time cutoff.
++ * A compressed binary trie stores only real branch points and leaves. Unary
++ * depth tags are folded without allocating nodes, including adversarial long
++ * common prefixes. All bodies are shared immutable transaction references.
++ */
++class Snapshot {
++public:
++    explicit Snapshot(std::vector<CTransactionRef> transactions,
++                      size_t maximum_bytes);
++    Descriptor Root() const { return At(Prefix{}); }
++    Descriptor At(const Prefix &prefix) const;
++    std::array<Descriptor, 16> Children(const Prefix &prefix) const;
++    /** Empty optional means the complete prefix exceeds count/byte bounds.
++     * An empty vector is a complete empty prefix. Never returns a partial page.
++     */
++    std::optional<std::vector<CTransactionRef>> Page(
++        const Prefix &prefix, size_t max_bytes) const;
++    size_t ChargedBytes() const { return m_charged_bytes; }
++    size_t Size() const { return m_items.size(); }
++    /** Authenticate a whole body page at its original canonical prefix depth. */
++    static Hash PageDigest(const Prefix &prefix,
++                           const std::vector<CTransactionRef> &bodies);
++private:
++    // Narrow test fixture exercises adversarial canonical identities without
++    // grinding transaction hashes; production captures always derive both IDs.
++    friend struct SnapshotIdentityFixture;
++    struct Item { Hash id, hash; CTransactionRef tx; };
++    struct Node {
++        size_t begin, end;
++        uint32_t left{NONE}, right{NONE};
++        uint16_t split{256};
++        Hash digest{}; // Digest at split, before any compressed unary path.
++        static constexpr uint32_t NONE = std::numeric_limits<uint32_t>::max();
++    };
++    std::vector<Item> m_items;
++    std::vector<Node> m_nodes;
++    size_t m_charged_bytes{0};
++    uint32_t Build(size_t begin, size_t end);
++    Descriptor NodeAt(uint32_t node, uint16_t depth) const;
++    const Node *Find(const Prefix &prefix, uint32_t *index = nullptr) const;
++};
++
++inline void Require(bool ok) {
++    if (!ok) throw std::ios_base::failure("invalid full-mempool reconciliation frame");
++}
++struct EnumByteFormatter {
++    template <typename Stream, typename E> void Ser(Stream &stream, const E &value) const {
++        ::Serialize(stream, static_cast<uint8_t>(value));
++    }
++    template <typename Stream, typename E> void Unser(Stream &stream, E &value) const {
++        uint8_t byte; ::Unserialize(stream, byte); value = static_cast<E>(byte);
++    }
++};
++enum class Control : uint8_t { OFFER = 0, DONE = 1, CANCEL = 2 };
++enum class Work : uint8_t { EXPAND = 0, PAGE = 1 };
++enum class Status : uint8_t { OK = 0, LIMIT = 1, GONE = 2, BUSY = 3, UNAVAILABLE = 4 };
++struct Header {
++    uint8_t scope{SCOPE}, version{1};
++    uint256 context{};
++    SERIALIZE_METHODS(Header, obj) {
++        READWRITE(obj.scope, obj.version);
++        Require(obj.scope == SCOPE && obj.version == 1);
++        READWRITE(obj.context);
++        Require(!obj.context.IsNull());
++    }
++};
++struct Offer {
++    Header header;
++    Control control{Control::OFFER};
++    uint256 anchor{};
++    Descriptor root;
++    std::array<Descriptor, 16> children;
++    SERIALIZE_METHODS(Offer, obj) {
++        READWRITE(obj.header, Using<EnumByteFormatter>(obj.control));
++        Require(uint8_t(obj.control) <= uint8_t(Control::CANCEL));
++        if (obj.control == Control::OFFER) {
++            READWRITE(obj.anchor, obj.root);
++            for (auto &child : obj.children) READWRITE(child);
++            const auto actual{Fold(obj.children, 0)};
++            Require(actual.digest == obj.root.digest && actual.count == obj.root.count);
++        }
++    }
++};
++struct Request {
++    Header header;
++    uint64_t request{0};
++    Prefix prefix;
++    Work work{Work::EXPAND};
++    SERIALIZE_METHODS(Request, obj) {
++        READWRITE(obj.header, obj.request, obj.prefix, Using<EnumByteFormatter>(obj.work));
++        Require(obj.request != 0 && uint8_t(obj.work) <= uint8_t(Work::PAGE));
++    }
++};
++struct Reply {
++    Header header;
++    uint64_t request{0};
++    Prefix prefix;
++    Work work{Work::EXPAND};
++    Status status{Status::OK};
++    std::array<Descriptor, 16> children;
++    std::vector<CTransactionRef> bodies;
++    SERIALIZE_METHODS(Reply, obj) {
++        READWRITE(obj.header, obj.request, obj.prefix, Using<EnumByteFormatter>(obj.work), Using<EnumByteFormatter>(obj.status));
++        Require(obj.request != 0 && uint8_t(obj.work) <= uint8_t(Work::PAGE) &&
++                uint8_t(obj.status) <= uint8_t(Status::UNAVAILABLE));
++        if (obj.status != Status::OK) return;
++        if (obj.work == Work::EXPAND) {
++            Require(obj.prefix.depth <= 252);
++            for (auto &child : obj.children) READWRITE(child);
++        } else {
++            uint64_t count{obj.bodies.size()};
++            if constexpr (ser_action.ForRead()) count = ReadCompactSize(s);
++            Require(count <= MAX_PAGE_BODIES);
++            if constexpr (ser_action.ForRead()) obj.bodies.resize(count);
++            else WriteCompactSize(s, count);
++            for (auto &tx : obj.bodies) {
++                READWRITE(Using<TransactionCompression>(tx));
++                Require(bool(tx));
++            }
++        }
++    }
++};
++/** Allocation-free structural preflight; conservative decoder peak bytes. */
++size_t PageDecodeExposure(Span<const uint8_t> bytes);
++
++struct Stats {
++    uint64_t captures{0}, captured_members{0}, capture_lock_us{0}, capture_lock_wait_us{0}, capture_build_us{0};
++    uint64_t offers{0}, requests{0}, replies{0}, verified_bodies{0}, coverage_complete{0};
++    uint64_t admitted{0}, unresolved{0}, malformed{0}, busy{0}, expired{0};
++    size_t charged_bytes{0};
++};
++/** Connection-owned derived snapshots only; never primary mempool state. */
++class Manager {
++public:
++    Manager(ChainstateManager &, CTxMemPool &, CConnman &, PeerManager &);
++    ~Manager();
++    void SetPeer(int64_t peer, bool enabled);
++    void RemovePeer(int64_t peer);
++    void Tick(CNode &, std::chrono::microseconds now);
++    bool Handle(CNode &, const std::string &, DataStream &,
++                std::chrono::microseconds now);
++    Stats GetStats() const;
++private:
++    struct Impl;
++    std::unique_ptr<Impl> m_impl;
++};
++} // namespace lotus::v2::net::fullrecon
++#endif
+diff --git a/src/net/txrelay_index.h b/src/net/txrelay_index.h
+index 7748bb33de7302d78facd8ae80eb212924998768..426999ae0e72339ef0b2164decf52f9a26da8286 100644
+--- a/src/net/txrelay_index.h
++++ b/src/net/txrelay_index.h
+@@ -42,6 +42,8 @@ namespace txrelay {
+ enum Feature : uint64_t {
+     TXRELAY_INVSHORT = 1 << 0,
+     TXRELAY_RECON = 1 << 1,
++    //! Complete immutable full-mempool scope5 framing (not legacy windows).
++    TXRELAY_FULL_MEMPOOL = 1 << 3,
+     // Accept sealedheader block announcements and unsolicited shorttx bodies.
+     // This is separate from ordinary compact blocks and short-id requests.
+     TXRELAY_HIGH_BANDWIDTH = 1 << 2,
+diff --git a/src/net_processing.cpp b/src/net_processing.cpp
+index a338b20cfe385221d6684c53b4cb6d8f271d9f2c..3c6706f62e0a13f2e517f1f53ec1d10d498ab8cc 100644
+--- a/src/net_processing.cpp
++++ b/src/net_processing.cpp
+@@ -4,6 +4,7 @@
+ // file COPYING or http://www.opensource.org/licenses/mit-license.php.
+ 
+ #include <net/txrelay_index.h>
++#include <net/full_mempool_reconciliation.h>
+ #include <net/v2_protocol_handler.h>
+ #include <net_processing.h>
+ #include <node/snapshot.h>
+@@ -1566,6 +1567,8 @@ private:
+             features |= txrelay::TXRELAY_INVSHORT;
+             if (m_opts.txrecon_interval > 0ms) {
+                 features |= txrelay::TXRELAY_RECON;
++                if (gArgs.GetBoolArg("-txreconfull", true))
++                    features |= txrelay::TXRELAY_FULL_MEMPOOL;
+             }
+         }
+         const bool disabled_for_test =
+@@ -1760,6 +1763,7 @@ private:
+         EXCLUSIVE_LOCKS_REQUIRED(g_msgproc_mutex);
+ 
+     lotus::v2::net::V2PeerProtocolHandler m_v2_protocol_handler;
++    lotus::v2::net::fullrecon::Manager m_full_recon;
+ 
+     //! Serialized block messages served recently (-blockmessagecache)
+     BlockMessageCache m_block_messages;
+@@ -2743,6 +2747,7 @@ void PeerManagerImpl::UpdateLastBlockAnnounceTime(NodeId node,
+ void PeerManagerImpl::InitializeNode(const Config &config, CNode &node,
+                                      ServiceFlags our_services) {
+     NodeId nodeid = node.GetId();
++    m_full_recon.RemovePeer(nodeid);
+     m_v2_protocol_handler.RemovePeer(nodeid);
+     {
+         LOCK(cs_main);
+@@ -2930,6 +2935,7 @@ scheduleLater:
+ 
+ void PeerManagerImpl::FinalizeNode(const Config &config, const CNode &node) {
+     NodeId nodeid = node.GetId();
++    m_full_recon.RemovePeer(nodeid);
+     m_v2_protocol_handler.RemovePeer(nodeid);
+     {
+         LOCK(cs_main);
+@@ -3305,6 +3311,7 @@ PeerManagerImpl::PeerManagerImpl(CConnman &connman, AddrMan &addrman,
+       m_mempool(pool), m_avalanche(avalanche), m_opts{opts},
+       m_txrelay_index{opts.txrelay_shortid_bits},
+       m_v2_protocol_handler{m_chainman, m_mempool, m_connman, *this},
++      m_full_recon{m_chainman, m_mempool, m_connman, *this},
+       m_block_messages{opts.block_message_cache_bytes} {
+     m_v2_protocol_handler.SetTxRelayEpochProvider(this);
+     m_v2_protocol_handler.SetServeUtxoShards(
+@@ -4065,7 +4072,8 @@ void PeerManagerImpl::MaybeReconcile() {
+         LOCK(m_peer_mutex);
+         NodeId first{-1};
+         for (const auto &[id, peer] : m_peer_map) {
+-            if (!(peer->m_txrelay_features & txrelay::TXRELAY_RECON)) {
++            if (!(peer->m_txrelay_features & txrelay::TXRELAY_RECON) ||
++                (peer->m_txrelay_features & txrelay::TXRELAY_FULL_MEMPOOL)) {
+                 continue;
+             }
+             if (first < 0) {
+@@ -6951,6 +6959,8 @@ void PeerManagerImpl::ProcessMessage(
+         return;
+     }
+ 
++    if (m_full_recon.Handle(pfrom, msg_type, vRecv, time_received)) return;
++
+     if (m_v2_protocol_handler.TryHandleMessage(pfrom, msg_type, vRecv,
+                                                time_received)) {
+         if (msg_type == NetMsgType::MINEDHEADER ||
+@@ -7109,6 +7119,8 @@ void PeerManagerImpl::ProcessMessage(
+             peer->GetTxRelay() && !pfrom.IsBlockOnlyConn()
+                 ? flags & OurTxRelayFeatures()
+                 : 0;
++        m_full_recon.SetPeer(pfrom.GetId(),
++            peer->m_txrelay_features & txrelay::TXRELAY_FULL_MEMPOOL);
+         // Local opt-in, compact-block negotiation and permissions cannot prove
+         // that the remote peer understands our private block/transaction wire.
+         m_v2_protocol_handler.SetHighBandwidthShortTxPeer(
+@@ -10853,6 +10865,7 @@ bool PeerManagerImpl::SendMessages(const Config &config, CNode *pto) {
+     // At each relay tick, the first peer to get here moves the relay queue
+     // into the chosen peers' inventory, so all peers send at this tick.
+     MaybeDrainRelayQueue();
++    if (!m_chainman.IsInitialBlockDownload()) m_full_recon.Tick(*pto, RelayTickNow());
+     MaybeReconcile();
+ 
+     const auto current_time{GetTime<std::chrono::microseconds>()};
+diff --git a/src/test/CMakeLists.txt b/src/test/CMakeLists.txt
+index 6163b3cca5cd4e6b40078a84d65cdbe8f2480fd9..a6e6486756fa86af562b4c70e907fca733759361 100644
+--- a/src/test/CMakeLists.txt
++++ b/src/test/CMakeLists.txt
+@@ -334,6 +334,7 @@ add_boost_unit_tests_to_suite(bitcoin test_bitcoin
+ 		validationinterface_tests.cpp
+ 		v2_deferred_block_tests.cpp
+ 		v2_protocol_handler_tests.cpp
++		full_mempool_reconciliation_tests.cpp
+ 		blockindex_comparator_tests.cpp
+ 
+ 		# RPC Tests
+diff --git a/src/test/full_mempool_reconciliation_tests.cpp b/src/test/full_mempool_reconciliation_tests.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..40bc1c986f17952b48a34a351c6bcdb9d2e603f0
+--- /dev/null
++++ b/src/test/full_mempool_reconciliation_tests.cpp
+@@ -0,0 +1,225 @@
++// Copyright (c) 2026 The Lotus developers
++// Distributed under the MIT software license. See COPYING.
++#include <net/full_mempool_reconciliation.h>
++#include <arith_uint256.h>
++#include <net/v2_protocol_handler.h>
++#include <test/util/setup_common.h>
++#include <test/util/random.h>
++#include <script/script.h>
++#include <boost/test/unit_test.hpp>
++#include <algorithm>
++#include <set>
++
++using namespace lotus::v2::net;
++using V2Hash = lotus::v2::Hash;
++namespace {
++CTransactionRef Member(FastRandomContext &rng) {
++    CMutableTransaction tx;
++    tx.nVersion = 2;
++    tx.vin.emplace_back(COutPoint(TxId{rng.rand256()}, 0));
++    tx.vin.front().scriptSig = CScript() << OP_TRUE;
++    tx.vout.emplace_back(10000 * SATOSHI, CScript() << OP_TRUE);
++    return MakeTransactionRef(std::move(tx));
++}
++V2Hash Identity(const uint256 &id) {
++    V2Hash out;
++    std::copy(id.begin(), id.end(), out.begin());
++    return out;
++}
++}
++namespace lotus::v2::net::fullrecon {
++struct SnapshotIdentityFixture {
++    static Snapshot Index(const std::vector<TxIdentityPair> &identities) {
++        Snapshot out{{}, 64 * 1024 * 1024};
++        out.m_items.reserve(identities.size());
++        out.m_nodes.reserve(identities.size() * 2);
++        for (const auto &identity : identities)
++            out.m_items.push_back({identity.tx_id, identity.tx_hash, {}});
++        auto less = [](const Snapshot::Item &a, const Snapshot::Item &b) {
++            for (unsigned bit = 0; bit < 256; ++bit) {
++                const auto left{(a.id[bit / 8] >> (bit % 8)) & 1};
++                const auto right{(b.id[bit / 8] >> (bit % 8)) & 1};
++                if (left != right) return left < right;
++            }
++            return false;
++        };
++        std::sort(out.m_items.begin(), out.m_items.end(), less);
++        if (!out.m_items.empty()) out.Build(0, out.m_items.size());
++        return out;
++    }
++};
++}
++BOOST_FIXTURE_TEST_SUITE(full_mempool_reconciliation_tests, BasicTestingSetup)
++BOOST_AUTO_TEST_CASE(complete_snapshot_native_root_and_generation_lifetime) {
++    FastRandomContext rng{uint256{0x98}};
++    std::vector<CTransactionRef> txs;
++    for (size_t count : {size_t{0}, size_t{1}, size_t{2}, size_t{17}, size_t{4097}}) {
++        while (txs.size() < count) txs.push_back(Member(rng));
++        const fullrecon::Snapshot snapshot{txs, 32 * 1024 * 1024};
++        BOOST_CHECK_EQUAL(snapshot.Root().count, count);
++        std::vector<lotus::v2::TxIdentityPair> identities;
++        for (const auto &tx : txs)
++            identities.push_back({Identity(tx->GetHash()), Identity(tx->GetId())});
++        BOOST_CHECK(snapshot.Root().digest == lotus::v2::BuildTxSubtreeA(identities));
++        BOOST_CHECK(snapshot.At(fullrecon::Prefix{}).digest == snapshot.Root().digest);
++        const auto root_before{snapshot.Root().digest};
++        if (count > 1) {
++            auto next{txs};
++            next.erase(next.begin());
++            next.push_back(Member(rng));
++            const fullrecon::Snapshot changed{next, 32 * 1024 * 1024};
++            BOOST_CHECK(changed.Root().digest != root_before);
++            BOOST_CHECK(snapshot.Root().digest == root_before);
++        }
++    }
++}
++BOOST_AUTO_TEST_CASE(prefix_pages_are_complete_authenticated_and_bounded) {
++    FastRandomContext rng{uint256{0x99}};
++    std::vector<CTransactionRef> txs;
++    for (size_t i = 0; i < 4097; ++i) txs.push_back(Member(rng));
++    const fullrecon::Snapshot snapshot{txs, 32 * 1024 * 1024};
++    BOOST_CHECK(!snapshot.Page(fullrecon::Prefix{}, fullrecon::MAX_FRAME_BYTES));
++    std::vector<fullrecon::Prefix> pending{fullrecon::Prefix{}};
++    std::set<TxId> found;
++    while (!pending.empty()) {
++        const auto prefix{pending.back()};
++        pending.pop_back();
++        const auto page{snapshot.Page(prefix, fullrecon::MAX_FRAME_BYTES)};
++        if (page) {
++            BOOST_CHECK_LE(page->size(), fullrecon::MAX_PAGE_BODIES);
++            BOOST_CHECK(fullrecon::Snapshot::PageDigest(prefix, *page) ==
++                        snapshot.At(prefix).digest);
++            for (const auto &tx : *page) BOOST_CHECK(found.insert(tx->GetId()).second);
++        } else {
++            BOOST_REQUIRE_LT(prefix.depth, 256U);
++            const auto children{snapshot.Children(prefix)};
++            BOOST_CHECK(fullrecon::Fold(children, prefix.depth).digest ==
++                        snapshot.At(prefix).digest);
++            for (unsigned i = 0; i < 16; ++i)
++                if (children[i].count) pending.push_back(prefix.Child(i));
++        }
++    }
++    BOOST_CHECK_EQUAL(found.size(), txs.size());
++    const fullrecon::Snapshot single{{txs[0]}, 32 * 1024 * 1024};
++    BOOST_CHECK(!single.Page(fullrecon::Prefix{}, 1));
++    BOOST_CHECK_THROW(fullrecon::Snapshot(txs, 1), std::length_error);
++    auto duplicate{txs};
++    duplicate.push_back(txs[0]);
++    BOOST_CHECK_THROW(fullrecon::Snapshot(duplicate, 32 * 1024 * 1024), std::invalid_argument);
++    auto corrupt{txs};
++    corrupt[0] = Member(rng);
++    BOOST_CHECK(fullrecon::Snapshot(corrupt, 32 * 1024 * 1024).Root().digest != snapshot.Root().digest);
++}
++BOOST_AUTO_TEST_CASE(adversarial_full_identity_prefixes_and_u64_counts) {
++    std::vector<lotus::v2::TxIdentityPair> identities;
++    for (uint64_t i = 0; i < 65537; ++i) {
++        lotus::v2::TxIdentityPair pair{};
++        for (unsigned byte = 0; byte < 8; ++byte)
++            pair.tx_id[2 + byte] = pair.tx_hash[byte] = (i >> (8 * byte)) & 255;
++        identities.push_back(pair);
++    }
++    const auto index{fullrecon::SnapshotIdentityFixture::Index(identities)};
++    BOOST_CHECK_EQUAL(index.Root().count, 65537U);
++    BOOST_CHECK(index.Root().digest == lotus::v2::BuildTxSubtreeA(identities));
++    fullrecon::Prefix old_terminal;
++    old_terminal.depth = 16;
++    BOOST_CHECK_EQUAL(index.At(old_terminal).count, 65537U);
++    const auto children{index.Children(old_terminal)};
++    BOOST_CHECK(fullrecon::Fold(children, 16).digest == index.At(old_terminal).digest);
++    uint64_t total{0};
++    for (const auto &child : children) total += child.count;
++    BOOST_CHECK_EQUAL(total, 65537U);
++    identities.resize(2);
++    identities[0].tx_id = {};
++    identities[1].tx_id = {};
++    identities[1].tx_id[31] = 128; // First differing canonical bit255.
++    const auto deepest{fullrecon::SnapshotIdentityFixture::Index(identities)};
++    BOOST_CHECK(deepest.Root().digest == lotus::v2::BuildTxSubtreeA(identities));
++    fullrecon::Prefix last;
++    last.depth = 252;
++    BOOST_CHECK_EQUAL(deepest.At(last).count, 2U);
++    BOOST_CHECK(fullrecon::Fold(deepest.Children(last), 252).digest == deepest.At(last).digest);
++    BOOST_CHECK_EQUAL(deepest.At(last.Child(0)).count, 1U);
++    BOOST_CHECK_EQUAL(deepest.At(last.Child(8)).count, 1U);
++}
++BOOST_AUTO_TEST_CASE(page_decode_exposure_counts_empty_arguments_before_allocation) {
++    using namespace fullrecon;
++    DataStream frame;
++    Header header; header.context = uint256::ONE;
++    frame << header << uint64_t{1} << Prefix{} << uint8_t(Work::PAGE) << uint8_t(Status::OK);
++    WriteCompactSize(frame, 1);
++    frame << uint32_t{7} << uint64_t{0} << uint16_t{2} << uint16_t{0};
++    const std::vector<uint8_t> empty_arguments(65535, 0);
++    for (int input = 0; input < 2; ++input) {
++        frame << TxId{ArithToUint256(arith_uint256(input + 1))} << uint32_t{0}
++              << uint32_t{UINT32_MAX} << uint8_t{1};
++        WriteCompactSize(frame, 0); // path
++        const unsigned witnesses{input ? 15U : 16U};
++        WriteCompactSize(frame, witnesses);
++        for (unsigned witness = 0; witness < witnesses; ++witness) {
++            WriteCompactSize(frame, 0); // script
++            WriteCompactSize(frame, 0); // sibling count
++            WriteCompactSize(frame, 65535);
++            frame.write(AsBytes(Span{empty_arguments}));
++        }
++    }
++    BOOST_REQUIRE_LT(frame.size(), MAX_FRAME_BYTES);
++    const auto bytes{Span<const uint8_t>{UCharCast(frame.data()), frame.size()}};
++    // One small wire frame can transiently duplicate almost100MB of vector
++    // headers. The preflight walks bytes without constructing those vectors.
++    BOOST_CHECK_GT(PageDecodeExposure(bytes), 128U * 1024 * 1024);
++    DataStream truncated;
++    truncated << header << uint64_t{1} << Prefix{} << uint8_t(Work::PAGE) << uint8_t(Status::OK);
++    WriteCompactSize(truncated, 1);
++    truncated << uint32_t{7} << uint64_t{0} << uint16_t{65535} << uint16_t{65535};
++    BOOST_CHECK_THROW(PageDecodeExposure(Span<const uint8_t>{UCharCast(truncated.data()), truncated.size()}), std::ios_base::failure);
++    DataStream legacy;
++    legacy << header << uint64_t{1} << Prefix{} << uint8_t(Work::PAGE) << uint8_t(Status::OK);
++    WriteCompactSize(legacy, 1);
++    legacy << uint32_t{2};
++    WriteCompactSize(legacy, 0x02000000); // No bytes for even one input.
++    BOOST_CHECK_THROW(PageDecodeExposure(Span<const uint8_t>{UCharCast(legacy.data()), legacy.size()}), std::ios_base::failure);
++    auto tiny_arguments = [&](bool nonempty) {
++        DataStream page;
++        page << header << uint64_t{1} << Prefix{} << uint8_t(Work::PAGE) << uint8_t(Status::OK);
++        WriteCompactSize(page, 1);
++        page << uint32_t{7} << uint64_t{0} << uint16_t{1} << uint16_t{0}
++             << TxId{uint256::ONE} << uint32_t{0} << uint32_t{UINT32_MAX} << uint8_t{1};
++        WriteCompactSize(page, 0); WriteCompactSize(page, 1);
++        WriteCompactSize(page, 0); WriteCompactSize(page, 0);
++        WriteCompactSize(page, 512);
++        for (int i = 0; i < 512; ++i) {
++            WriteCompactSize(page, nonempty ? 1 : 0);
++            if (nonempty) page << uint8_t{1};
++        }
++        return PageDecodeExposure(Span<const uint8_t>{UCharCast(page.data()), page.size()});
++    };
++    // Heap rounding is charged separately for every one-byte allocation;
++    // counting only total payload bytes would badly undercharge this case.
++    BOOST_CHECK_GE(tiny_arguments(true) - tiny_arguments(false), 512U * 4U * 8U);
++}
++BOOST_AUTO_TEST_CASE(native_witness_variants_preserve_exact_hash_identity) {
++    CMutableTransaction tx;
++    tx.nVersion = 7;
++    tx.vin.emplace_back(COutPoint(TxId{uint256::ONE}, 0));
++    tx.vin.front().nFlags = 1;
++    lotus::v2::BranchWitness witness;
++    witness.script = {0x4e};
++    witness.arguments = {{1}};
++    tx.vin.front().vWitnesses = {witness};
++    lotus::v2::Output output;
++    output.value = 1000;
++    output.branches = {lotus::v2::BranchLeaf(witness.script)};
++    output.paths = {{0}};
++    tx.vout = {CTxOut::FromV2Output(output)};
++    const auto first{MakeTransactionRef(tx)};
++    tx.vin.front().vWitnesses.front().arguments = {{2}};
++    const auto second{MakeTransactionRef(tx)};
++    BOOST_REQUIRE(first->GetId() == second->GetId());
++    BOOST_REQUIRE(first->GetHash() != second->GetHash());
++    const fullrecon::Snapshot a{{first}, 1024 * 1024}, b{{second}, 1024 * 1024};
++    BOOST_CHECK(a.Root().digest != b.Root().digest);
++    BOOST_CHECK(fullrecon::Snapshot::PageDigest(fullrecon::Prefix{}, {second}) != a.Root().digest);
++    BOOST_CHECK_THROW(fullrecon::Snapshot({first, second}, 1024 * 1024), std::invalid_argument);
++}
++BOOST_AUTO_TEST_SUITE_END()
+diff --git a/src/test/txrelay_tests.cpp b/src/test/txrelay_tests.cpp
+index d220106136d9ebb2bbbcda408148b3b1246d62c1..e1924afdd00a9f5eabc2c7b450830129a58959f9 100644
+--- a/src/test/txrelay_tests.cpp
++++ b/src/test/txrelay_tests.cpp
+@@ -11,6 +11,7 @@
+ #include <lotus_v2/commitment.h>
+ #include <net.h>
+ #include <net/txrelay_index.h>
++#include <net/full_mempool_reconciliation.h>
+ #include <node/snapshot.h>
+ 
+ #include <net/v2_protocol_handler.h>
+@@ -82,6 +83,9 @@ struct Sent {
+     std::vector<lotus::v2::net::ShortTxRequest> short_requests;
+     //! merklixsync summaries
+     std::vector<lotus::v2::net::MerklixSyncSummary> summaries;
++    std::vector<lotus::v2::net::fullrecon::Offer> full_offers;
++    std::vector<lotus::v2::net::fullrecon::Request> full_requests;
++    std::vector<lotus::v2::net::fullrecon::Reply> full_replies;
+     size_t Total() const {
+         return inv_txids.size() + shorttx_txids.size() + short_ids.size();
+     }
+@@ -155,6 +159,26 @@ struct RelayHarness {
+                 bool rejected = false;
+                 auto msg = deserializer.GetMessage(0us, rejected);
+                 BOOST_CHECK(!rejected);
++                if ((msg.m_type == NetMsgType::MERKLIXSYNC ||
++                     msg.m_type == NetMsgType::GETMERKLIXBUCK ||
++                     msg.m_type == NetMsgType::MERKLIXBUCK) &&
++                    !msg.m_recv.empty() &&
++                    uint8_t(msg.m_recv[0]) == lotus::v2::net::fullrecon::SCOPE) {
++                    if (msg.m_type == NetMsgType::MERKLIXSYNC) {
++                        lotus::v2::net::fullrecon::Offer offer;
++                        msg.m_recv >> offer;
++                        sent.full_offers.push_back(std::move(offer));
++                    } else if (msg.m_type == NetMsgType::GETMERKLIXBUCK) {
++                        lotus::v2::net::fullrecon::Request request;
++                        msg.m_recv >> request;
++                        sent.full_requests.push_back(std::move(request));
++                    } else {
++                        lotus::v2::net::fullrecon::Reply reply;
++                        msg.m_recv >> reply;
++                        sent.full_replies.push_back(std::move(reply));
++                    }
++                    continue;
++                }
+                 if (msg.m_type == NetMsgType::INV) {
+                     std::vector<CInv> invs;
+                     msg.m_recv >> invs;
+@@ -1201,4 +1225,339 @@ BOOST_AUTO_TEST_CASE(no_body_push_by_default) {
+     }
+ }
+ 
++BOOST_AUTO_TEST_CASE(full_reconciliation_negotiation_preserves_old_peer) {
++    LOCK(NetEventsInterface::g_msgproc_mutex);
++    auto &chainman{static_cast<TestChainstateManager &>(*m_node.chainman)};
++    chainman.JumpOutOfIbd();
++    struct Reset { TestChainstateManager &chainman; ~Reset() { chainman.ResetIbd(); } } reset{chainman};
++    MockTick clock{15'000'000ms};
++    RelayHarness h{m_node, PeerManager::Options{}};
++    auto &old_peer{h.AddPeer()}, &new_peer{h.AddPeer()};
++    auto negotiate = [&](CNode &node, uint64_t flags) {
++        DataStream stream;
++        stream << txrelay::SENDINVSHORT_VERSION << flags;
++        std::atomic<bool> interrupt{false};
++        h.peerman->ProcessMessage(h.config, node, NetMsgType::SENDINVSHORT,
++                                  stream, 0us, interrupt);
++    };
++    negotiate(old_peer, txrelay::TXRELAY_INVSHORT | txrelay::TXRELAY_RECON | (uint64_t{1} << 40));
++    negotiate(new_peer, txrelay::TXRELAY_INVSHORT | txrelay::TXRELAY_RECON | txrelay::TXRELAY_FULL_MEMPOOL);
++    const auto sent{h.SendAll()};
++    BOOST_CHECK(sent.at(old_peer.GetId()).full_offers.empty());
++    BOOST_REQUIRE_EQUAL(sent.at(new_peer.GetId()).full_offers.size(), 1U);
++    BOOST_CHECK(sent.at(new_peer.GetId()).summaries.empty());
++    // Unknown high flags are ignored by the old-style parser. No full-mode
++    // wire is sent merely because another peer negotiated the new capability.
++    clock.Set(15'000'250ms);
++    BOOST_CHECK(h.SendAll().at(old_peer.GetId()).full_offers.empty());
++}
++BOOST_AUTO_TEST_CASE(full_reconciliation_owned_page_and_admission_outcome) {
++    using namespace lotus::v2::net::fullrecon;
++    LOCK(NetEventsInterface::g_msgproc_mutex);
++    auto &chainman{static_cast<TestChainstateManager &>(*m_node.chainman)};
++    chainman.JumpOutOfIbd();
++    struct Reset { TestChainstateManager &chainman; ~Reset() { chainman.ResetIbd(); } } reset{chainman};
++    MockTick clock{16'000'000ms};
++    RelayHarness h{m_node, PeerManager::Options{}};
++    auto &owner{h.AddPeer()}, &other{h.AddPeer()};
++    h.SendAll();
++    Manager manager{chainman, *m_node.mempool, *h.connman, *h.peerman};
++    manager.SetPeer(owner.GetId(), true);
++    manager.SetPeer(other.GetId(), true);
++    FastRandomContext rng{uint256{0x9a}};
++    const auto body{MakeTx(rng)};
++    Snapshot remote{{body}, 1024 * 1024};
++    Offer offer;
++    offer.header.context = rng.rand256();
++    {
++        LOCK(cs_main);
++        offer.anchor = chainman.ActiveTip()->GetBlockHash();
++    }
++    offer.root = remote.Root();
++    offer.children = remote.Children(Prefix{});
++    DataStream offered;
++    offered << offer;
++    BOOST_CHECK(manager.Handle(owner, NetMsgType::MERKLIXSYNC, offered, 10s));
++    manager.Tick(owner, 16'000'000ms);
++    const auto outgoing{h.Drain(owner)};
++    BOOST_REQUIRE_EQUAL(outgoing.full_requests.size(), 1U);
++    const auto request{outgoing.full_requests.front()};
++    BOOST_CHECK(request.work == Work::PAGE);
++    Reply reply;
++    reply.header = request.header;
++    reply.request = request.request;
++    reply.prefix = request.prefix;
++    reply.work = request.work;
++    reply.bodies = {body};
++    // A genuine page on the wrong connection cannot acquire request ownership.
++    DataStream wrong_peer;
++    wrong_peer << reply;
++    manager.Handle(other, NetMsgType::MERKLIXBUCK, wrong_peer, 11s);
++    BOOST_CHECK_EQUAL(manager.GetStats().verified_bodies, 0U);
++    DataStream wrong_request;
++    ++reply.request;
++    wrong_request << reply;
++    manager.Handle(owner, NetMsgType::MERKLIXBUCK, wrong_request, 12s);
++    BOOST_CHECK_EQUAL(manager.GetStats().verified_bodies, 0U);
++    --reply.request;
++    const auto owned_context{reply.header.context};
++    reply.header.context = rng.rand256();
++    DataStream wrong_context; wrong_context << reply;
++    manager.Handle(owner, NetMsgType::MERKLIXBUCK, wrong_context, 12s);
++    BOOST_CHECK_EQUAL(manager.GetStats().verified_bodies, 0U);
++    reply.header.context = owned_context;
++    const auto owned_prefix{reply.prefix};
++    reply.prefix = Prefix{};
++    // The owned request is a depth-four child; a root page may not retag it.
++    BOOST_REQUIRE(owned_prefix.depth > 0);
++    DataStream wrong_prefix; wrong_prefix << reply;
++    manager.Handle(owner, NetMsgType::MERKLIXBUCK, wrong_prefix, 12s);
++    BOOST_CHECK_EQUAL(manager.GetStats().verified_bodies, 0U);
++    reply.prefix = owned_prefix;
++    reply.bodies = {body, body};
++    DataStream duplicate_identity; duplicate_identity << reply;
++    manager.Handle(owner, NetMsgType::MERKLIXBUCK, duplicate_identity, 12s);
++    BOOST_CHECK_EQUAL(manager.GetStats().verified_bodies, 0U);
++    // Corrupt payload cannot satisfy the owned prefix's complete digest.
++    const auto different{MakeTx(rng)};
++    reply.bodies = {different};
++    DataStream corrupt;
++    corrupt << reply;
++    manager.Handle(owner, NetMsgType::MERKLIXBUCK, corrupt, 13s);
++    BOOST_CHECK_EQUAL(manager.GetStats().verified_bodies, 0U);
++    reply.bodies = {body};
++    DataStream correct;
++    correct << reply;
++    manager.Handle(owner, NetMsgType::MERKLIXBUCK, correct, 14s);
++    BOOST_CHECK_EQUAL(manager.GetStats().verified_bodies, 1U);
++    DataStream duplicate;
++    duplicate << reply;
++    manager.Handle(owner, NetMsgType::MERKLIXBUCK, duplicate, 15s);
++    BOOST_CHECK_EQUAL(manager.GetStats().verified_bodies, 1U);
++    clock.Set(16'000'250ms);
++    manager.Tick(owner, 16'000'250ms);
++    BOOST_CHECK_EQUAL(manager.GetStats().coverage_complete, 1U);
++    const auto completion{h.Drain(owner)};
++    BOOST_CHECK(std::any_of(completion.full_offers.begin(), completion.full_offers.end(),
++        [&](const Offer &out) { return out.control == Control::DONE && out.header.context == offer.header.context; }));
++    clock.Set(16'000'500ms);
++    manager.Tick(owner, 16'000'500ms);
++    // Unfunded synthetic body is NOT accepted simply because its membership
++    // proof passed. Coverage and normal admission are separate outcomes.
++    BOOST_CHECK_EQUAL(manager.GetStats().admitted, 0U);
++    BOOST_CHECK(manager.GetStats().unresolved > 0);
++    manager.RemovePeer(owner.GetId());
++    manager.RemovePeer(other.GetId());
++    BOOST_CHECK_EQUAL(manager.GetStats().charged_bytes, 0U);
++}
++BOOST_AUTO_TEST_CASE(full_reconciliation_unknown_context_does_not_capture_pool) {
++    using namespace lotus::v2::net::fullrecon;
++    LOCK(NetEventsInterface::g_msgproc_mutex);
++    RelayHarness h{m_node, PeerManager::Options{}};
++    auto &node{h.AddPeer()};
++    h.SendAll();
++    Manager manager{*m_node.chainman, *m_node.mempool, *h.connman, *h.peerman};
++    manager.SetPeer(node.GetId(), true);
++    Request request;
++    request.header.context = uint256::ONE;
++    request.request = 1;
++    request.work = Work::PAGE;
++    DataStream stream;
++    stream << request;
++    BOOST_CHECK(manager.Handle(node, NetMsgType::GETMERKLIXBUCK, stream, 20s));
++    const auto sent{h.Drain(node)};
++    BOOST_REQUIRE_EQUAL(sent.full_replies.size(), 1U);
++    BOOST_CHECK(sent.full_replies.front().status == Status::GONE);
++    BOOST_CHECK_EQUAL(manager.GetStats().captures, 0U);
++    BOOST_CHECK_EQUAL(manager.GetStats().verified_bodies, 0U);
++}
++BOOST_AUTO_TEST_CASE(full_reconciliation_renegotiation_retains_queued_exposure) {
++    using namespace lotus::v2::net::fullrecon;
++    LOCK(NetEventsInterface::g_msgproc_mutex);
++    MockTick clock{20'000'000ms};
++    RelayHarness h{m_node, PeerManager::Options{}};
++    auto &node{h.AddPeer()}; h.SendAll();
++    Manager manager{*m_node.chainman, *m_node.mempool, *h.connman, *h.peerman};
++    manager.SetPeer(node.GetId(), true);
++    Request request; request.header.context = uint256::ONE; request.request = 1;
++    DataStream stream; stream << request;
++    manager.Handle(node, NetMsgType::GETMERKLIXBUCK, stream, 80s);
++    const auto queued{manager.GetStats().charged_bytes};
++    BOOST_REQUIRE_GT(queued, 0U);
++    manager.SetPeer(node.GetId(), false);
++    BOOST_CHECK_EQUAL(manager.GetStats().charged_bytes, queued);
++    manager.SetPeer(node.GetId(), true);
++    BOOST_CHECK_EQUAL(manager.GetStats().charged_bytes, queued);
++    manager.SetPeer(node.GetId(), false);
++    const auto replies{h.Drain(node)};
++    BOOST_REQUIRE_EQUAL(replies.full_replies.size(), 1U);
++    // Harness Drain intentionally clears real transport ownership below too.
++    { LOCK(node.cs_vSend); node.nSendSize = 0; }
++    manager.Tick(node, 20'000'250ms);
++    BOOST_CHECK_LT(manager.GetStats().charged_bytes, queued);
++    manager.RemovePeer(node.GetId());
++    BOOST_CHECK_EQUAL(manager.GetStats().charged_bytes, 0U);
++}
++BOOST_AUTO_TEST_CASE(full_reconciliation_equal_digest_false_count_rejected) {
++    using namespace lotus::v2::net::fullrecon;
++    LOCK(NetEventsInterface::g_msgproc_mutex);
++    MockTick clock{19'000'000ms};
++    RelayHarness h{m_node, PeerManager::Options{}};
++    auto &node{h.AddPeer()}; h.SendAll();
++    FastRandomContext rng{uint256{0x9e}};
++    const auto body{MakeTx(rng)};
++    AddToMempool(m_node, body);
++    Snapshot snapshot{{body}, 1024 * 1024};
++    Manager manager{*m_node.chainman, *m_node.mempool, *h.connman, *h.peerman};
++    manager.SetPeer(node.GetId(), true);
++    Offer offer; offer.header.context = rng.rand256();
++    { LOCK(cs_main); offer.anchor = m_node.chainman->ActiveTip()->GetBlockHash(); }
++    offer.children = snapshot.Children(Prefix{});
++    for (auto &child : offer.children) if (child.count) child.count = 2;
++    // Children/root remain self-consistent but the leaf digest proves the
++    // pinned local singleton, so a false count may not silently skip its work.
++    offer.root = Fold(offer.children, 0);
++    DataStream stream; stream << offer;
++    manager.Handle(node, NetMsgType::MERKLIXSYNC, stream, 70s);
++    BOOST_CHECK_EQUAL(manager.GetStats().malformed, 1U);
++    BOOST_CHECK_EQUAL(manager.GetStats().coverage_complete, 0U);
++    BOOST_CHECK_EQUAL(manager.GetStats().verified_bodies, 0U);
++}
++BOOST_AUTO_TEST_CASE(full_reconciliation_timeout_retries_owned_work_and_releases) {
++    using namespace lotus::v2::net::fullrecon;
++    LOCK(NetEventsInterface::g_msgproc_mutex);
++    MockTick clock{18'000'000ms};
++    RelayHarness h{m_node, PeerManager::Options{}};
++    auto &node{h.AddPeer()};
++    h.SendAll();
++    Manager manager{*m_node.chainman, *m_node.mempool, *h.connman, *h.peerman};
++    manager.SetPeer(node.GetId(), true);
++    FastRandomContext rng{uint256{0x9c}};
++    Snapshot remote{{MakeTx(rng)}, 1024 * 1024};
++    Offer offer;
++    offer.header.context = rng.rand256();
++    { LOCK(cs_main); offer.anchor = m_node.chainman->ActiveTip()->GetBlockHash(); }
++    offer.root = remote.Root(); offer.children = remote.Children(Prefix{});
++    DataStream stream; stream << offer;
++    manager.Handle(node, NetMsgType::MERKLIXSYNC, stream, 60s);
++    uint64_t previous_request{0};
++    for (int attempt = 0; attempt < 4; ++attempt) {
++        const auto now{18'000'000ms + attempt * 5s};
++        clock.Set(now);
++        manager.Tick(node, now);
++        const auto outgoing{h.Drain(node)};
++        BOOST_REQUIRE_EQUAL(outgoing.full_requests.size(), 1U);
++        const auto &request{outgoing.full_requests.front()};
++        BOOST_CHECK(request.header.context == offer.header.context);
++        BOOST_CHECK(request.request > previous_request);
++        previous_request = request.request;
++        // No response is provided: only the real monotonic deadline retries.
++        BOOST_CHECK_EQUAL(manager.GetStats().coverage_complete, 0U);
++    }
++    clock.Set(18'020'000ms);
++    manager.Tick(node, 18'020'000ms);
++    const auto retired{h.Drain(node)};
++    BOOST_CHECK(retired.full_requests.empty());
++    BOOST_CHECK(std::any_of(retired.full_offers.begin(), retired.full_offers.end(),
++        [&](const Offer &out) { return out.control == Control::CANCEL && out.header.context == offer.header.context; }));
++    BOOST_CHECK_EQUAL(manager.GetStats().coverage_complete, 0U);
++    BOOST_CHECK_EQUAL(manager.GetStats().unresolved, 1U);
++    manager.RemovePeer(node.GetId());
++    BOOST_CHECK_EQUAL(manager.GetStats().charged_bytes, 0U);
++}
++BOOST_AUTO_TEST_CASE(full_reconciliation_capture_reuse_old_membership_and_lease) {
++    using namespace lotus::v2::net::fullrecon;
++    LOCK(NetEventsInterface::g_msgproc_mutex);
++    auto &chainman{static_cast<TestChainstateManager &>(*m_node.chainman)};
++    chainman.JumpOutOfIbd();
++    struct Reset { TestChainstateManager &chainman; ~Reset() { chainman.ResetIbd(); } } reset{chainman};
++    MockTick clock{17'000'000ms};
++    RelayHarness h{m_node, PeerManager::Options{}};
++    auto &first{h.AddPeer()}, &second{h.AddPeer()}, &third{h.AddPeer()}, &fourth{h.AddPeer()};
++    h.SendAll();
++    Manager manager{chainman, *m_node.mempool, *h.connman, *h.peerman};
++    for (auto *node : {&first, &second, &third, &fourth}) manager.SetPeer(node->GetId(), true);
++    manager.Tick(first, 17'000'000ms);
++    auto initial{h.Drain(first)};
++    BOOST_REQUIRE_EQUAL(initial.full_offers.size(), 1U);
++    BOOST_CHECK_EQUAL(manager.GetStats().captures, 1U);
++    auto done = [&](CNode &node, const Header &header, std::chrono::microseconds time) {
++        Offer ack; ack.header = header; ack.control = Control::DONE;
++        DataStream stream; stream << ack;
++        manager.Handle(node, NetMsgType::MERKLIXSYNC, stream, time);
++    };
++    done(first, initial.full_offers[0].header, 30s);
++    FastRandomContext rng{uint256{0x9b}};
++    std::vector<CTransactionRef> txs;
++    for (int i = 0; i < 10; ++i) {
++        txs.push_back(MakeTx(rng));
++        AddToMempool(m_node, txs.back());
++    }
++    // A changed generation/new connection cannot force another full scan before
++    // the node-wide capture interval. The offered cached generation is explicit.
++    clock.Set(17'001'000ms);
++    manager.Tick(second, 17'001'000ms);
++    auto cached{h.Drain(second)};
++    BOOST_REQUIRE_EQUAL(cached.full_offers.size(), 1U);
++    BOOST_CHECK_EQUAL(cached.full_offers[0].root.count, 0U);
++    BOOST_CHECK_EQUAL(manager.GetStats().captures, 1U);
++    done(second, cached.full_offers[0].header, 31s);
++    clock.Set(17'031'000ms);
++    manager.Tick(third, 17'031'000ms);
++    auto captured{h.Drain(third)};
++    BOOST_REQUIRE_EQUAL(captured.full_offers.size(), 1U);
++    BOOST_CHECK_EQUAL(captured.full_offers[0].root.count, 10U);
++    BOOST_CHECK_EQUAL(manager.GetStats().captures, 2U);
++    {
++        LOCK2(cs_main, m_node.mempool->cs);
++        m_node.mempool->removeRecursive(*txs[0], MemPoolRemovalReason::EXPIRY);
++    }
++    // An ordinary compatible tip extension cannot expire transport ownership.
++    // This unit changes only the active index view; normal validation remains
++    // outside this serving-only check and the fixture tip is restored by RAII.
++    CBlockIndex extension;
++    const BlockHash extension_hash{uint256{0x9d}};
++    CBlockIndex *original_tip;
++    { LOCK(cs_main); original_tip = chainman.ActiveTip(); }
++    extension.pprev = original_tip;
++    extension.nHeight = original_tip->nHeight + 1;
++    extension.phashBlock = &extension_hash;
++    struct RestoreTip {
++        ChainstateManager &chainman; CBlockIndex &tip;
++        ~RestoreTip() { LOCK(cs_main); chainman.ActiveChain().SetTip(tip); }
++    } restore_tip{chainman, *original_tip};
++    { LOCK(cs_main); chainman.ActiveChain().SetTip(extension); }
++    clock.Set(17'032'000ms);
++    manager.Tick(third, 17'032'000ms);
++    BOOST_CHECK(h.Drain(third).full_offers.empty());
++    Request request;
++    request.header = captured.full_offers[0].header;
++    request.request = 1;
++    request.work = Work::PAGE;
++    DataStream stream; stream << request;
++    manager.Handle(third, NetMsgType::GETMERKLIXBUCK, stream, 40s);
++    const auto pinned{h.Drain(third)};
++    BOOST_REQUIRE_EQUAL(pinned.full_replies.size(), 1U);
++    BOOST_CHECK(pinned.full_replies[0].status == Status::OK);
++    BOOST_CHECK_EQUAL(pinned.full_replies[0].bodies.size(), 10U);
++    BOOST_CHECK(Snapshot::PageDigest(Prefix{}, pinned.full_replies[0].bodies) ==
++                captured.full_offers[0].root.digest);
++    clock.Set(17'062'000ms);
++    manager.Tick(fourth, 17'062'000ms);
++    const auto changed{h.Drain(fourth)};
++    BOOST_REQUIRE_EQUAL(changed.full_offers.size(), 1U);
++    BOOST_CHECK_EQUAL(changed.full_offers[0].root.count, 9U);
++    BOOST_CHECK(changed.full_offers[0].root.digest != captured.full_offers[0].root.digest);
++    BOOST_CHECK_EQUAL(manager.GetStats().captures, 3U);
++    clock.Set(17'093'000ms);
++    manager.Tick(third, 17'093'000ms);
++    h.Drain(third);
++    ++request.request;
++    DataStream expired; expired << request;
++    manager.Handle(third, NetMsgType::GETMERKLIXBUCK, expired, 50s);
++    const auto gone{h.Drain(third)};
++    BOOST_REQUIRE_EQUAL(gone.full_replies.size(), 1U);
++    BOOST_CHECK(gone.full_replies[0].status == Status::GONE);
++    BOOST_CHECK_EQUAL(manager.GetStats().captures, 3U);
++}
+ BOOST_AUTO_TEST_SUITE_END()
+-- 
+2.50.1 (Apple Git-155)
+
