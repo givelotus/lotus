@@ -152,3 +152,32 @@ Append-only. Times are UTC.
 - Packet: `failure-point-374-http-metrics.json` (`b922f1ff88dc162fa2e7384e0f7eb60043fd9108b4fa31a9c44605263ef95262`). Record copy: `patch-374-http-metrics-failed.json` (`01d8fb4324120cef1dffc1997e651db43fd5a70b20964d6925506bac7f7560c8`).
 - Clean `git am` from global 276 parent `96998e2e9065` applied 251 mailboxes. Only global 277's mailbox hash changed, to `075ecb5b6d60d81da83562f48399654f948fa5a2c6da82ded57b956378eb80dc`. Prefixes 0–276 are unchanged, including point 0. Point 374 is now `f14e7838966a651ee808e619e0c628fb5d9c90dd`, tree `6f3d52f6198117d0dfba12ae2e0bb2d10b519f2d`. V2 tip `ec6f79f7b6c497e70c57a3442bd7d714d7602ef3`, tree `41e7c702526a0687cdbc3148286b72fea8c7605a`. Manifest sha256 `d2ff0bf40293b1d2bd36268d3669b34a42675ddbef9700083620a985ea632e02`. Historical `sha`/`tree`/`parent` fields were left as provenance.
 - These gates have not passed on the repaired tree. Point 527 and the sustained 500k workload stay unstarted. The held native527 network run stays unlaunched. Not pushed.
+
+## 2026-10-22T17:29:00Z — repaired point 374 measurement started
+
+- Merklix ninja 9690 and shell 9687 finished. No other ninja or cmake was running. Notes stash `9cd0588c` was popped after the dataset manifest rewrite and the stash list is empty.
+- Runner pid 14080. Candidate `c4938895e56304abc177764542fc57c0252cd4f1`. Harness `10bb374b410b4e684b465fab223ffe3a48f1bf3d8c8f285f04e23d0f960bc8c3`, unchanged by the unmeasured Merklix dispatch commit. Repetitions 3, jobs 10. Expected point 374 source `f14e7838966a651ee808e619e0c628fb5d9c90dd`, tree `6f3d52f6198117d0dfba12ae2e0bb2d10b519f2d`.
+- Host memory pressure level 2. Swap about 34.5/35.8 GiB used. Unrelated `explore` pid 82695 remains. Replay had reached global 276 parent `96998e2e90` while this note was written. No timing yet.
+
+## 2026-10-22T17:37:22Z — point 374 passed
+
+- Pid 14080 exited 0. Status ok. Source `f14e7838966a651ee808e619e0c628fb5d9c90dd`, tree `6f3d52f6198117d0dfba12ae2e0bb2d10b519f2d`. Prefix `3b214d5fdd071e4eb02784754d344263e97a1fd19938b5cb0bbc80374764e767`. Harness `10bb374b410b4e684b465fab223ffe3a48f1bf3d8c8f285f04e23d0f960bc8c3`. Candidate at start `c4938895e56304abc177764542fc57c0252cd4f1`.
+- Configure 2.0s, ninja 96.1s, units 25.5s, avalanche 6.0s. Correctness passed. 35 functional tests passed. `chronik_rpc_port_proxy.py` is N/A (`Chronik indexer has not been compiled.`, coverage false). `test_lotus_v2_commitment` is unavailable at this boundary. Chronik, HTTP/2, and QUIC suites are unlinked and are not coverage.
+- `bitcoind` sha256 `7946be7840ec3a70f6294599ee517b91a9b4708cda3c67f99609abd909461c75`, copied to `daemon/.local-artifact-archive/grok-progression-binaries/point-374-bitcoind`. The point 0 archive `788ca330` was left in place.
+- Comparable workload is `legacy-v2-p2pkh-schnorr64`, 500 or 801 transactions, n=3. This is a short burst. The change from point 0 to point 374 spans patches 1–374 and is not isolated to one patch.
+
+| metric | point 0 median (min–max) | point 374 median (min–max) |
+| --- | --- | --- |
+| single_tx tx/s | 14324 (14133–14396) | 9277 (7528–9477) |
+| json_rpc_batch50 tx/s | 21725 (21610–21949) | 20910 (19030–22780) |
+| relay_ingest tx/s | 14669 (13511–14781) | 9637 (7543–9839) |
+| relay500 tx/s, admission through 3-peer size 500 | 4100 (3867–4105) | 8538 (6863–8718) |
+| read_unloaded RPC method calls/s | 19009 (18700–19111) | 12230 (9230–12240) |
+| read_loaded RPC method calls/s | 10085 (9628–10319) | 7003 (5348–7055) |
+| gbt_standard p50 ms | 1.549 (1.548–1.561) | 1.762 (1.732–1.805) |
+| block500 three-node ms | 5.275 (5.164–5.470) | 9.439 (7.287–9.633) |
+| block801 three-node ms | 19.275 (17.840–24.604) | 14.66 (14.53–14.84) |
+
+- Legacy `gbt_compact` is unavailable at point 374 (`standard template returned`). At point 0 it was unavailable (`Invalid mode`). Neither value is zero.
+- `historical-l1` ran only at point 374, because batch RPC is registered there. Point 0 has no matching samples. Its largest admission is 6000 transactions in about 0.04–0.54s, so its tx/s figures are short bursts. One-call batches: 6000 requests, median 11170 tx/s. Batches of 200: 30 HTTP requests, median 136300 tx/s. A 4000-transaction batch of 1000 lasted median 0.027s (145800 tx/s). Three-node relay of a 6001-transaction block took median 68.4 ms. These are not a 500k sustained result and are not a comparison with point 0.
+- Point 527 and the sustained 500k workload stay unstarted. Not pushed.
