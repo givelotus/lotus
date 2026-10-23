@@ -838,6 +838,11 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main() -> int:
+    # The submodule source model replaces workspace replay for this migration.
+    # Keep historical helper functions available for old evidence/tests.
+    if (DAEMON_DIR / "sources.json").is_file():
+        from daemon_sources import main as source_main
+        return source_main(sys.argv[1:])
     parser = build_parser()
     args = parser.parse_args()
     try:

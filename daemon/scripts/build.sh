@@ -14,18 +14,17 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DAEMON_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 SERIES="${SERIES:-v1}"
 
+# Resolve only the registered source submodule; never fall back to workspace-*.
+SERIES="$(python3 "$SCRIPT_DIR/daemon_sources.py" canonical "$SERIES")"
+python3 "$SCRIPT_DIR/daemon_sources.py" require-ready "$SERIES"
+WORKSPACE="$(python3 "$SCRIPT_DIR/daemon_sources.py" path "$SERIES")"
 case "$SERIES" in
-    v1) WORKSPACE="$DAEMON_DIR/workspace-v1"; LABEL="V1 (mainnet)"; TARGETS=(lotusd lotus-cli) ;;
-    v2) WORKSPACE="$DAEMON_DIR/workspace-v2"; LABEL="V2 (Lotus new chain)"; TARGETS=(lotusd lotus-cli) ;;
-    ecash) WORKSPACE="$DAEMON_DIR/workspace-ecash"; LABEL="eCash candidates"; TARGETS=(bitcoind bitcoin-cli) ;;
-    doged) WORKSPACE="$DAEMON_DIR/workspace-doged-abc"; LABEL="Dogecoin on Bitcoin ABC"; TARGETS=(doged doge-cli) ;;
-    doged-reference) WORKSPACE="$DAEMON_DIR/workspace-doged-reference"; LABEL="historical doged reference"; TARGETS=(doged doge-cli) ;;
-    bitcoin) WORKSPACE="$DAEMON_DIR/workspace-bitcoin"; LABEL="Bitcoin Core BTC"; TARGETS=(bitcoind bitcoin-cli) ;;
-    bchn) WORKSPACE="$DAEMON_DIR/workspace-bchn"; LABEL="BCHN candidates"; TARGETS=(bitcoind bitcoin-cli) ;;
-    *) echo "Unsupported series: $SERIES (choose v1, v2, ecash, doged, doged-reference, bchn, or bitcoin)" >&2; exit 1 ;;
+    v1|v2) LABEL="Lotus $SERIES"; TARGETS=(lotusd lotus-cli) ;;
+    ecash|bchn|bitcoin) LABEL="$SERIES"; TARGETS=(bitcoind bitcoin-cli) ;;
+    doged) LABEL="Dogecoin on ABC"; TARGETS=(doged doge-cli) ;;
 esac
 
-BUILD_DIR="$WORKSPACE/build"
+BUILD_DIR="$DAEMON_DIR/.build/$SERIES"
 
 if [[ ! -d "$WORKSPACE" ]]; then
     echo "Workspace not found. Run: make setup SERIES=$SERIES"
@@ -48,6 +47,9 @@ fi
 
 if [[ "$SERIES" == "v1" || "$SERIES" == "v2" || "$SERIES" == "doged" || "$SERIES" == "doged-reference" ]]; then
     CMAKE_ARGS+=(-DBUILD_CHRONIK=ON)
+    if [[ "$SERIES" == v2 || "$SERIES" == doged ]]; then
+        CMAKE_ARGS+=(-DCHRONIK_IMPLEMENTATION=native)
+    fi
 fi
 
 if [[ -n "${FEATURES:-}" ]]; then
@@ -61,7 +63,7 @@ fi
 CMAKE_ARGS+=("$@")
 
 echo "Configuring $LABEL with cmake..."
-cmake .. "${CMAKE_ARGS[@]}"
+cmake -S "$WORKSPACE" -B "$BUILD_DIR" "${CMAKE_ARGS[@]}"
 
 echo "Building..."
 ninja -j"$(nproc 2>/dev/null || sysctl -n hw.logicalcpu)" "${TARGETS[@]}"

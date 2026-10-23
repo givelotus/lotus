@@ -1,3 +1,46 @@
+# Submodule migration: base-only scaffold
+
+The active migration uses `daemon/sources.json` and exact gitlinks in `.gitmodules`.
+`make -C daemon setup SERIES=all` initializes sources only. It never applies a
+mailbox, rebases a stack, changes a published source branch, or resets local work.
+Use `make -C daemon status` and `make -C daemon source-verify` to check repository
+URLs, gitlinks, HEADs and exact trees.
+
+Review the proposed order with `make -C daemon source-plan SERIES=v2`;
+`PLAN_ARGS=--commits` lists the individual inputs and `PLAN_ARGS=--json` exports
+the full plan. Shared eCash changes target `daemon/ecashd` in
+`givelotus/bitcoin-abc`. After review, that exact shared tip is fetched into
+`daemon/lotusd` as the parent of the Lotus-only commits. The native stage must
+not replay the shared list again. Cross-repository branch updates require
+explicit coordination; `rebase.updateRefs` cannot update another repository.
+
+The six source paths are `daemon/ecashd`, `daemon/lotusd`, `daemon/lotusv1`,
+`daemon/doged`, `daemon/bitcoincashd` and `daemon/bitcoind`. Builds resolve these
+paths and use `daemon/.build/<series>` instead of writing inside the submodules.
+Build/run and historical replay/release entrypoints are gated until the relevant
+stack is reviewed and promoted. No new stack application command is enabled in
+this phase.
+
+Dogecoin has three distinct identities: the original Doged export source,
+the historical ABC replay base, and the pinned current ABC master used as the
+new replay target. Its 174 exported changes plus retained fixes are pending
+review and replay on that new target; the original Doged history stays preserved.
+
+The reviewed source reference has 378 shared eCash commits; the historical
+mailbox manifest has 377. This difference is visible in the plan and must be
+resolved before application. V1's generated local release-metadata variant is
+also explicitly distinguished from the published source reference. All old
+source histories, patch inputs and benchmark identities remain preserved.
+
+Private source clones require credentials with read access to the private
+`givelotus` repositories. The optional authenticated source-layout CI job uses
+`DAEMON_REPOS_TOKEN`; the ordinary layout tests do not fetch private sources.
+
+## Historical workspace workflow (retained for provenance)
+
+The workflow below describes the pre-submodule manager. Its mutation commands
+are disabled by the scaffold guard; it is not the current setup procedure.
+
 # Adding and updating daemon patches
 
 Run commands below from the monorepo root. A patch is one ordinary Git commit,
