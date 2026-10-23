@@ -4,10 +4,11 @@ import json
 import os
 from pathlib import Path
 import runpy
+import struct
 import sys
 import time
 
-from generator import ROOT, FROZEN, run_processes
+from generator import ROOT, FROZEN, run_processes, core
 sys.path.insert(0, str(FROZEN))
 import steady_suite as suite
 
@@ -23,12 +24,42 @@ def measured(fixture, client_factory, mode, batch_size, **kwargs):
     settings = {**config, 'mode': mode, 'batch_size': batch_size,
                 'readers': config['readers'] if kwargs.get('reader_workers') else 0,
                 'warmup_batches': 16 // config['writers']}
-    if settings['writers'] not in (8, 16):
+    calibration = []
+    if config.get('transport_calibration'):
+        payload = []
+        for offset in fixture.offsets[:batch_size]:
+            length = struct.unpack_from('<I', fixture.mapping, offset)[0]
+            payload.append(fixture.mapping[offset + 4:offset + 4 + length].decode('ascii'))
+        for number in range(3):
+            echo = {**settings, 'processes': 4, 'writers': 0, 'readers': 8,
+                    'read_method': 'echo', 'echo_payload': [payload]}
+            record = run_processes(echo, context['pids'],
+                     Path(config['directory']) / f'transport-{number+1}')
+            record.update(measurement='echo-transport-only-not-admission',
+                          transaction_sized_items_per_request=len(payload),
+                          transaction_equivalents_per_second=record['rpc_per_second'] * len(payload))
+            calibration.append(record)
+            print('TRANSPORT', number + 1, record['transaction_equivalents_per_second'], flush=True)
+    if config.get('global_warmup'):
+        # Keep a fixed16 transactions at every concurrency, including >16
+        # submitters. Each child still warms its own HTTP connection/threads.
+        client = client_factory()
+        for _ in range(16):
+            core.submit(client, mode, fixture.take(batch_size))
+        client.connection.close()
+        fixture.offsets = fixture.offsets[fixture.index:]
+        settings['warmup_batches'] = 0
+    elif settings['writers'] not in (8, 16):
         raise ValueError('Keep total warmup at16transactions/batches')
-    result = run_processes(settings, context['pids'], Path(config['directory']) / 'ingestion', fixture)
+    result = run_processes(settings, context['pids'], Path(config['directory']) / 'ingestion', fixture,
+                           on_started=kwargs.get('on_started'))
     result['request_count'] = sum(row['request_count'] for row in result['children'])
     result['fixture_count'] = len(fixture.offsets)
     result['fixture_sha256'] = fixture.digest.hexdigest()
+    if calibration:
+        result['transport_calibration'] = calibration
+    if config.get('global_warmup'):
+        result['global_warmup_transactions'] = 16 * batch_size
     return result
 
 
@@ -57,7 +88,8 @@ def run(context_arg, *args, **kwargs):
     context_arg['results']['capacity_configuration'] = {
         **{k: v for k, v in config.items() if k != 'auth'},
         'node_pids': context['pids'], 'original_client_core': str(FROZEN / 'steady_ingestion.py'),
-        'warmup_rule': '16total batches, matching the frozen8writers×2warmup'}
+        'warmup_rule': '16total batches; child HTTP connections/threads warmed before common GO',
+        'global_warmup': config.get('global_warmup', False)}
     suite.measure = measured
     if config.get('read_matrix'):
         suite.measure_reads = read_matrix

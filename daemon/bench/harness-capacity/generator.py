@@ -51,8 +51,13 @@ class Client:
         return reply
 
     def call(self, method, params=None):
-        return self.request({'jsonrpc': '2.0', 'id': 1, 'method': method,
-                             'params': params or []})['result']
+        if method == 'echo' and 'echo_payload' in self.config:
+            params = self.config['echo_payload']
+        result = self.request({'jsonrpc': '2.0', 'id': 1, 'method': method,
+                               'params': params or []})['result']
+        if method == 'echo' and 'echo_payload' in self.config and result != params:
+            raise RuntimeError('Echo did not return the full transaction-sized payload')
+        return result
 
 
 def synchronize():
@@ -133,7 +138,7 @@ def child(path):
     print(json.dumps({'result': result, 'pid': os.getpid()}), flush=True)
 
 
-def run_processes(config, pids, directory, fixture=None):
+def run_processes(config, pids, directory, fixture=None, on_started=None):
     """Warm all workers before a common start; return only proven responses."""
     directory.mkdir(parents=True, exist_ok=False)
     count = config['processes']
@@ -169,6 +174,12 @@ def run_processes(config, pids, directory, fixture=None):
         for proc in children:
             proc.stdin.write(json.dumps({'start': start}) + '\n')
             proc.stdin.flush()
+        if on_started is not None:
+            while (remaining := start - time.perf_counter()) > 0:
+                time.sleep(min(.005, remaining))
+            warmup = (16 if config.get('global_warmup') else
+                      config['writers'] * config['warmup_batches']) * config['batch_size']
+            on_started(start, time.time_ns(), warmup)
         results = []
         for proc in children:
             message = json.loads(proc.stdout.readline())

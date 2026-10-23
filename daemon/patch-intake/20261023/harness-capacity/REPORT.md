@@ -1,24 +1,35 @@
-# Load-generator capacity and RPC-worker attribution
+# Harness capacity, RPC concurrency and native snapshot wiring
 
-The user requested proof that the harness limited throughput, followed by an isolated blocking-versus-co_await worker-count comparison. Node source is unchanged. The worker sweep compares blocking94453bdd with async-only6e70bcae; the atomic-reader candidate is excluded. No active source pins changed.
+Exact source, binary and workload identities are in SCOPE.json. The worker-count A/B tests and lock profiles used shared ABC/eCash with legacy transactions. The native batch and native coroutine checks used Lotus V2. Their results must not be mixed.
 
-## Completed read proof
+## What was established
 
-| RPC | One process, RPC/s | Four processes, RPC/s | Ratio |
-|---|---:|---:|---:|
-| getmempoolinfo | 14,202 | 44,405 | 3.13× |
-| getblockchaininfo | 14,046 | 43,164 | 3.07× |
+- **Generator limitation:** with the same node and 12 connections, four generator processes increased isolated `getmempoolinfo` throughput from 14,202 to 44,405 RPC/s, and `getblockchaininfo` from 14,046 to 43,164 RPC/s. These are medians of three alternating pairs. Exploratory admission comparisons also improved; JSON arrays did not. There is no universal correction factor for older benchmarks.
+- **Coroutine tradeoff:** the shared-tier sweeps completed 36 RPC-worker samples and 24 client-concurrency samples, with three pairs per setting. At 64 clients and 16 RPC workers, `co_await` increased mixed read throughput by 42.3% and decreased individual admission throughput by 21.8%. At 128 clients the changes were +73.1% and −26.5%. TABLE.md contains every setting.
+- **Wait attribution:** in one matched 64-client diagnostic pair, 57% of blocking RPC-worker samples were in future condition waits and 27% in admission-preparation locks. With `co_await`, future waits disappeared, workers were 46% idle and preparation-lock waits remained at 33%. Mempool-info ownership-lock waits accounted for 0.02%/0.06%. These are wall-stack sample shares, not CPU percentages or an exact attribution of the throughput difference. They do not describe native V2's different preparation path.
 
-Three alternating pairs, unchanged combined binaryd2e4db3226, exactly12total warmed persistent connections and5seconds per sample. Same node/datadir while reading an empty mempool. Increased client process parallelism alone yields3.1× read throughput, establishing a generator-side limitation under these conditions. This does not prove node maximum capacity or explain every historical benchmark discrepancy.
+All measured windows lasted at least five seconds. RPC errors, exhausted fixtures, excessive start skew and incorrect exact source mempool inventory fail the run. Threads, connections, transaction construction and signing are warmed or completed outside the timer. Three nodes and the load generators share one host.
 
-## Initial admission screening
+## Native V2 injection headroom
 
-One complete8-cell round and one extra array sample are preserved at benchmark-results/20261023/harness-capacity-matrix. At equal8submitters/12readers, splitting the generator into4processes raised loaded admissions4904→10199tx/s; individual sends10966→17192tx/s. Arrays22628→22164tx/s did not improve. These admission comparisons have only one pair; they are exploratory, unlike the repeated read result. The broader run was interrupted on user steering; the interrupted attempt is excluded. All completed samples remain preserved.
+The existing native binary at `3cfb7031` has tree `a576cd04`, identical to review `a3679647`. Three signed batch-of-200 runs admitted **35,782 / 36,788 / 38,769 tx/s**, using 800,000 distinct presigned transactions per trial. These measure acceptance, not all-peer propagation, block confirmation or finality.
 
-## RPC-worker sweep
+Three separate `echo` probes using the same transaction-sized payloads achieved **1,627,624 / 1,639,442 / 1,588,624 items/s**. Echo does no transaction validation. This is transport headroom, never accepted TPS. The client used about 0.52 CPU seconds per five-second admission run.
 
-Running three alternating pairs each at1,2,4,8,16,32RPC workers. Constant four generator processes,8submitters and12readers alternating getmempoolinfo/getblockchaininfo. Same150000distinct presigned fixture cardinality,16total untimed warmup transactions,≥5s measured windows. Warm all subprocess threads/connections before common GO; reject>25ms start skew, fixture exhaustion, RPC errors, or incorrect exact mempool inventory. The smaller fixture reduces untimed setup for36samples and is identical across both sides; this is a distinct workload from the initial500K-corpus screening. One-worker smoke is seeded as the first valid pair, without remeasurement.
+An initial slow fixture-preparation attempt was stopped before timing. A subsequent echo probe hit its ten-argument limit; wrapping the payloads in one array fixed the request. Neither failed attempt supplied a published TPS sample. Final native fixtures use pinned `blake3==1.0.8` for preparation, checked against 13 frozen-byte compatibility vectors and retaining the existing large-input fallback. Node validation is unchanged. Backend hashes are recorded. Interrupted generated runtime data remains in the canonical local artifact archive.
 
-CPU evidence uses per-process ps CPU counters for all3nodes and the sum of measured child CPU. Node counters bracket0.1s common-start lead plus final drain; they are not exact critical-path attribution. Three nodes and generators share one host. No builds/profilers run during timings. Source/binary/config/tool hashes are in each input packet. Independent process partitions use disjoint read-only corpus offsets; no signing, funding, connection creation or thread startup is timed.
+## Native coroutine candidate
 
-Tools: daemon/bench/harness-capacity/. All source/report paths are canonical; no extra source worktree or clone created.
+The shared coroutine/owned-completion change was ported onto native review `a3679647`, retaining native transaction-ID results. Its new `SubmitRpcAdmission` entry passes the expected mempool pointer to the existing native snapshot-preparation API. The regression test holds `cs_main` on another thread: eligible native preparation finishes while authoritative commit correctly waits.
+
+**All 1,209 native C++ tests pass.** A real 64-client HTTP integration run accepted 57,219 transactions in 5.0025 seconds, checked exact inventory and exited cleanly. That is one integration sample, not a comparative native speedup. Wallet, Rust Chronik, HTTP/2, WebTransport and jemalloc builds remain outside this profile.
+
+Source review branch: `perf/native-async-rpc-20261023` in `givelotus/lotusd`. NATIVE-OWNERSHIP.json records exact compiled/final identities, every source owner, verified recovery bundles and endpoint tree equality. Development fixups were consolidated into two logical owner fixups, with the RPC result assertion kept in the feature that introduces the test. The existing 531-commit history and active source pins were not changed. Shared-tier replay and promotion remain separate work; this candidate is not claimed integrated into the active stack.
+
+## eCash and snapblock follow-up
+
+SHARED-COIN-VIEW-PORT.md records the inspected port: a pinned MDBX generation plus a persistent CoW dirty-coin overlay, coherent with the chain anchor and mempool view. It covers flush/reorg behavior, reader lifetime, reclamation and real consumer tests. **That shared UTXO view is not implemented by this coroutine candidate.** Native commitment and signature rules stay in the V2 adapter.
+
+## Reproduction and preservation
+
+Readable tools are in `daemon/bench/harness-capacity/`. The verified compressed evidence archive preserves raw inputs/results, source/binary/config/tool hashes, generated scripts, process CPU counters, diagnostic stacks and historical tool versions. TOOL-VERSIONS.json verifies the executed tool versions for successful comparisons. Source exports and recovery bundles are canonical. No extra source worktree or clone was created; all owned processes stopped.

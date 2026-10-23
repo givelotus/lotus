@@ -22,6 +22,8 @@ def main():
     parser.add_argument('--rounds', type=int, default=3)
     parser.add_argument('--fixture-transactions', type=int, default=150000)
     parser.add_argument('--seed-results', type=Path)
+    parser.add_argument('--client-counts', help='Balanced submitter/reader totals; hold RPC workers at16')
+    parser.add_argument('--profile', action='store_true', help='Diagnostic samples; exclude throughput')
     args = parser.parse_args()
     data = args.data.resolve()
     data.mkdir(parents=True, exist_ok=False)
@@ -37,11 +39,18 @@ def main():
         assert audit.sha(sources[side]['binary']) == sources[side]['binary_sha256']
     audit.write(data / 'INPUTS.json', {'sources': sources, 'argv': sys.argv,
                 'tools': {str(p.relative_to(ROOT)): audit.sha(p) for p in Path(__file__).parent.glob('*.py')},
-                'constant': {'generator_processes': 4, 'submitters': 8, 'readers': 12,
+                'constant': {'generator_processes': 8 if args.client_counts else 4,
+                             'submitters': 'half of client count' if args.client_counts else 8,
+                             'readers': 'half of client count' if args.client_counts else 12,
+                             'rpc_workers': 16 if args.client_counts else 'varied',
                              'methods': ['getmempoolinfo', 'getblockchaininfo'],
                              'seconds': 5, 'fixture_transactions': args.fixture_transactions},
-                'isolation': 'Async-only vs blocking; no atomic-reader changes; same negotiated P2P behavior; fixed16total warmup transactions; no builds or profiles'})
-    counts = list(map(int, args.counts.split(',')))
+                'diagnostic_profiles': args.profile,
+                'isolation': 'Async-only vs blocking; no atomic-reader changes; same negotiated P2P behavior; fixed16total warmup transactions; no builds'})
+    counts = list(map(int, (args.client_counts or args.counts).split(',')))
+    if args.client_counts:
+        assert all(n >= 16 and n % 16 == 0 for n in counts)
+        assert args.seed_results is None
     rows = []
     if args.seed_results:
         seed = json.loads(args.seed_results.read_text())
@@ -56,16 +65,21 @@ def main():
     completed = {(r['round'], r['rpc_workers'], r['side']) for r in rows}
     for number in range(1, args.rounds + 1):
         order = counts if number % 2 else list(reversed(counts))
-        for index, workers in enumerate(order):
+        for index, axis_count in enumerate(order):
+            workers = 16 if args.client_counts else axis_count
             sides = ['blocking', 'co_await'] if (number + index) % 2 else ['co_await', 'blocking']
             for side in sides:
                 if (number, workers, side) in completed:
                     continue
                 receipt = sources[side]
                 audit.checkout(receipt['commit'])
-                directory = data / f'round-{number}' / f'rpc-{workers}-{side}'
+                label = f'clients-{axis_count}' if args.client_counts else f'rpc-{workers}'
+                directory = data / f'round-{number}' / f'{label}-{side}'
                 directory.mkdir(parents=True)
-                config = dict(processes=4, writers=8, readers=12, rpc_workers=workers,
+                config = dict(processes=8 if args.client_counts else 4,
+                              writers=axis_count // 2 if args.client_counts else 8,
+                              readers=axis_count // 2 if args.client_counts else 12,
+                              global_warmup=bool(args.client_counts), rpc_workers=workers,
                               directory=str(directory))
                 path = directory / 'CONFIG.json'
                 audit.write(path, config)
@@ -76,7 +90,9 @@ def main():
                            '--max-fixture-transactions', '800000', '--fixture-fee-sats', '10000',
                            '--hierarchical-funding', '--maxmempool-mb', '4096', '--port-base', '39110',
                            '--exact-fixture-transactions', str(args.fixture_transactions)]
-                print('RUN', number, workers, side, flush=True)
+                if args.profile:
+                    command += ['--sample-node0-output', directory / 'node0.sample.txt']
+                print('RUN', number, label, side, flush=True)
                 env = dict(os.environ, CAPACITY_CONFIG=str(path),
                            TMPDIR=str(ROOT / 'daemon/.local-artifact-archive/commit-regressions/runtime'))
                 resources = audit.guarded(command, directory / 'stdout.log', env)
@@ -84,22 +100,34 @@ def main():
                 payload = json.loads(output.read_text())
                 assert payload['status'] == 'ok'
                 result = payload['metrics']['single_tx_loaded_steady']
+                if args.profile:
+                    result['throughput_publishable'] = False
                 assert result['seconds'] >= 5 and result['tx_count'] > 0
                 rows.append(dict(round=number, rpc_workers=workers, side=side,
+                                 axis_count=axis_count, client_workers=config['writers'] + config['readers'],
                                  result=result, source=receipt, evidence=str(output)))
                 audit.write(data / 'RESULTS.json', dict(status='partial', runs=rows))
-                print('RESULT', number, workers, side, result['tps'],
-                      result['loaded_read']['rpc_per_second'], flush=True)
+                if args.profile:
+                    print('PROFILE DONE', number, label, side, flush=True)
+                else:
+                    print('RESULT', number, label, side, result['tps'],
+                          result['loaded_read']['rpc_per_second'], flush=True)
+    if args.profile:
+        audit.write(data / 'RESULTS.json', dict(status='complete', runs=rows,
+                    kind='diagnostic profiles; instrumented throughput excluded'))
+        return
     summary = []
-    for workers in counts:
+    for axis_count in counts:
+        workers = 16 if args.client_counts else axis_count
         groups = {}
         for side in sources:
-            selected = [r['result'] for r in rows if r['rpc_workers'] == workers and r['side'] == side]
+            selected = [r['result'] for r in rows if r.get('axis_count', r['rpc_workers']) == axis_count and r['side'] == side]
             groups[side] = {}
             for metric in ('tps', 'reads'):
                 values = [r['tps'] if metric == 'tps' else r['loaded_read']['rpc_per_second'] for r in selected]
                 groups[side][metric] = dict(median=statistics.median(values), min=min(values), max=max(values), n=len(values))
         summary.append(dict(rpc_workers=workers, groups=groups,
+                       axis_count=axis_count, axis='client_workers' if args.client_counts else 'rpc_workers',
                        tps_change=100 * (groups['co_await']['tps']['median'] / groups['blocking']['tps']['median'] - 1),
                        read_change=100 * (groups['co_await']['reads']['median'] / groups['blocking']['reads']['median'] - 1)))
     audit.write(data / 'RESULTS.json', dict(status='complete', runs=rows, summary=summary))

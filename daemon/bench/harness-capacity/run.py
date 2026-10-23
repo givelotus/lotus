@@ -24,6 +24,12 @@ def main():
     parser.add_argument('--cells', default='single_tx_steady:1:8:0,single_tx_steady:4:8:0,single_tx_loaded_steady:1:8:12,single_tx_loaded_steady:4:8:12')
     parser.add_argument('--reads', action='store_true')
     parser.add_argument('--smoke', action='store_true')
+    parser.add_argument('--series', choices=['l1', 'v2'], default='l1')
+    parser.add_argument('--build-receipt', type=Path)
+    parser.add_argument('--fixture-transactions', type=int, default=500000)
+    parser.add_argument('--transport-calibration', action='store_true')
+    parser.add_argument('--fixture-hash-site', type=Path)
+    parser.add_argument('--global-warmup', action='store_true')
     args = parser.parse_args()
     data = args.data.resolve()
     data.mkdir(parents=True, exist_ok=False)
@@ -31,7 +37,8 @@ def main():
     fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
     source_lock = (audit.SOURCE / '.git/progression.lock').open('a')
     fcntl.flock(source_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    receipt = json.loads((ROOT / 'daemon/.local-artifact-archive/commit-regressions/async-admission-and-info/point-377/BUILD.json').read_text())
+    receipt_path = args.build_receipt or ROOT / 'daemon/.local-artifact-archive/commit-regressions/async-admission-and-info/point-377/BUILD.json'
+    receipt = json.loads(receipt_path.read_text())
     assert audit.sha(receipt['binary']) == receipt['binary_sha256']
     audit.checkout(receipt['commit'])
     tools = {str(p.relative_to(ROOT)): audit.sha(p) for p in Path(__file__).parent.glob('*.py')}
@@ -47,17 +54,22 @@ def main():
             directory = data / f'round-{round_number}' / label
             directory.mkdir(parents=True)
             config = dict(processes=processes, writers=writers, readers=readers,
-                          directory=str(directory), read_matrix=args.reads and not rows)
+                          directory=str(directory), read_matrix=args.reads and not rows,
+                          transport_calibration=args.transport_calibration and not rows,
+                          global_warmup=args.global_warmup)
             path = directory / 'CONFIG.json'
             audit.write(path, config)
             output = directory / 'result.json'
-            command = [sys.executable, Path(__file__).with_name('adapter.py'), '--series', 'l1',
+            command = [sys.executable, Path(__file__).with_name('adapter.py'), '--series', args.series,
                        '--daemon', receipt['binary'], '--source', audit.SOURCE, '--output', output,
-                       '--steady', '--case', case, '--max-fixture-transactions', '800000',
+                       '--steady', '--case', case, '--max-fixture-transactions', '1200000',
                        '--fixture-fee-sats', '10000', '--hierarchical-funding',
                        '--maxmempool-mb', '4096', '--port-base', '39110']
             if not args.smoke:
-                command += ['--exact-fixture-transactions', '500000']
+                command += ['--exact-fixture-transactions', str(args.fixture_transactions)]
+            if args.fixture_hash_site:
+                assert args.series == 'v2'
+                command += ['--fixture-hash-site', args.fixture_hash_site.resolve()]
             print('RUN', round_number, label, flush=True)
             env = dict(os.environ, CAPACITY_CONFIG=str(path),
                        TMPDIR=str(ROOT / 'daemon/.local-artifact-archive/commit-regressions/runtime'))
