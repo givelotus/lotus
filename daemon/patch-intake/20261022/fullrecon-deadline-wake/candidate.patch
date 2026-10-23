@@ -1,0 +1,168 @@
+From 2a36522dc27ba4832ccfa48264291820e960d12c Mon Sep 17 00:00:00 2001
+From: Shammah Chancellor <shammah.chancellor@notvalid.com>
+Date: Thu, 22 Oct 2026 17:20:45 -0700
+Subject: [PATCH] fixup! net: reconcile complete pinned mempool snapshots with
+ authenticated prefix pages
+
+---
+ src/net/full_mempool_reconciliation.cpp | 29 ++++++++++++++++++++-----
+ src/net/full_mempool_reconciliation.h   |  3 ++-
+ src/net_processing.cpp                  | 23 ++++++++++++++++----
+ src/test/txrelay_tests.cpp              | 10 ++++++---
+ 4 files changed, 51 insertions(+), 14 deletions(-)
+
+diff --git a/src/net/full_mempool_reconciliation.cpp b/src/net/full_mempool_reconciliation.cpp
+index fe3758f3b4..e5f3c787b6 100644
+--- a/src/net/full_mempool_reconciliation.cpp
++++ b/src/net/full_mempool_reconciliation.cpp
+@@ -787,9 +787,19 @@ struct Manager::Impl {
+         if (fetch.admitting) {
+             if (fetch.ordered.empty()) { peer.fetch.reset(); return; }
+             const size_t end{std::min(fetch.admission_cursor + MAX_PAGE_BODIES, fetch.ordered.size())};
+-            const std::span<const CTransactionRef> batch{
+-                fetch.ordered.data() + fetch.admission_cursor, end - fetch.admission_cursor};
+-            peerman.ProcessShortTxResponse(node, batch);
++            std::array<CTransactionRef, MAX_PAGE_BODIES> pending;
++            size_t pending_count{0};
++            for (size_t i{fetch.admission_cursor}; i < end; ++i) {
++                const auto &body{fetch.ordered[i]};
++                const auto actual{pool.get(body->GetId())};
++                // Membership coverage still authenticates every remote body.
++                // Only exact bodies already admitted need no repeat validation;
++                // a matching TxId with different bytes must use the normal path.
++                if (actual && actual->GetHash() == body->GetHash()) ++stats.admitted;
++                else pending[pending_count++] = body;
++            }
++            const std::span<const CTransactionRef> batch{pending.data(), pending_count};
++            if (!batch.empty()) peerman.ProcessShortTxResponse(node, batch);
+             for (const auto &body : batch) {
+                 const auto actual{pool.get(body->GetId())};
+                 if (actual && actual->GetHash() == body->GetHash()) ++stats.admitted;
+@@ -883,12 +893,12 @@ void Manager::RemovePeer(int64_t peer) {
+     m_impl->peers.erase(peer);
+     if (m_impl->peers.empty()) m_impl->cache.snapshot.reset();
+ }
+-void Manager::Tick(CNode &node, Clock now) {
++std::optional<Clock> Manager::Tick(CNode &node, Clock now) {
+     LOCK(m_impl->mutex);
+     const auto it{m_impl->peers.find(node.GetId())};
+-    if (it == m_impl->peers.end()) return;
++    if (it == m_impl->peers.end()) return std::nullopt;
+     m_impl->QueueDrained(node, it->second);
+-    if (!it->second.enabled) return;
++    if (!it->second.enabled) return std::nullopt;
+     try { m_impl->Tick(node, it->second, now); }
+     catch (const std::exception &) {
+         ++m_impl->stats.unresolved;
+@@ -896,6 +906,13 @@ void Manager::Tick(CNode &node, Clock now) {
+         it->second.serve.reset();
+         it->second.next_offer = now + 1s;
+     }
++    const auto &fetch{it->second.fetch};
++    if (!fetch || node.fPauseSend || node.fDisconnect) return std::nullopt;
++    // A bounded admission slice must yield to other peers, but need not wait
++    // for the message handler's otherwise idle 100ms receive heartbeat.
++    if (fetch->admitting) return now;
++    if (fetch->request) return fetch->deadline;
++    return std::max(now, fetch->next_send);
+ }
+ bool Manager::Handle(CNode &node, const std::string &command, DataStream &stream, Clock time_received) {
+     if (command != NetMsgType::MERKLIXSYNC && command != NetMsgType::GETMERKLIXBUCK &&
+diff --git a/src/net/full_mempool_reconciliation.h b/src/net/full_mempool_reconciliation.h
+index 526a3a72b1..a856bc7e14 100644
+--- a/src/net/full_mempool_reconciliation.h
++++ b/src/net/full_mempool_reconciliation.h
+@@ -230,7 +230,8 @@ public:
+     ~Manager();
+     void SetPeer(int64_t peer, bool enabled);
+     void RemovePeer(int64_t peer);
+-    void Tick(CNode &, std::chrono::microseconds now);
++    /** Earliest useful continuation, without changing wire pacing or work bounds. */
++    std::optional<std::chrono::microseconds> Tick(CNode &, std::chrono::microseconds now);
+     bool Handle(CNode &, const std::string &, DataStream &,
+                 std::chrono::microseconds now);
+     Stats GetStats() const;
+diff --git a/src/net_processing.cpp b/src/net_processing.cpp
+index 3c6706f62e..6e7297e3ac 100644
+--- a/src/net_processing.cpp
++++ b/src/net_processing.cpp
+@@ -1764,6 +1764,9 @@ private:
+ 
+     lotus::v2::net::V2PeerProtocolHandler m_v2_protocol_handler;
+     lotus::v2::net::fullrecon::Manager m_full_recon;
++    // Earliest useful continuation across peers; consumed by the existing
++    // relay scheduler, rather than adding an unbounded queue of peer timers.
++    std::atomic<int64_t> m_full_recon_wake{std::numeric_limits<int64_t>::max()};
+ 
+     //! Serialized block messages served recently (-blockmessagecache)
+     BlockMessageCache m_block_messages;
+@@ -3531,9 +3534,14 @@ void PeerManagerImpl::ScheduleRelayTick(CScheduler &scheduler) {
+     const auto delay{NextRelayTick(now, m_opts.txrelay_tick) - now + 100us};
+     scheduler.scheduleFromNow(
+         [this, &scheduler] {
+-            if (m_txrelay_wake.exchange(false, std::memory_order_relaxed)) {
+-                m_connman.WakeMessageHandler();
+-            }
++            bool wake{m_txrelay_wake.exchange(false, std::memory_order_relaxed)};
++            auto deadline{m_full_recon_wake.load(std::memory_order_relaxed)};
++            if (deadline <= RelayTickNow().count() &&
++                m_full_recon_wake.compare_exchange_strong(
++                    deadline, std::numeric_limits<int64_t>::max(), std::memory_order_relaxed)) {
++                wake = true;
++            }
++            if (wake) m_connman.WakeMessageHandler();
+             ScheduleRelayTick(scheduler);
+         },
+         std::chrono::ceil<std::chrono::milliseconds>(delay));
+@@ -10865,7 +10873,14 @@ bool PeerManagerImpl::SendMessages(const Config &config, CNode *pto) {
+     // At each relay tick, the first peer to get here moves the relay queue
+     // into the chosen peers' inventory, so all peers send at this tick.
+     MaybeDrainRelayQueue();
+-    if (!m_chainman.IsInitialBlockDownload()) m_full_recon.Tick(*pto, RelayTickNow());
++    if (!m_chainman.IsInitialBlockDownload()) {
++        if (const auto next{m_full_recon.Tick(*pto, RelayTickNow())}) {
++            auto deadline{m_full_recon_wake.load(std::memory_order_relaxed)};
++            while (next->count() < deadline &&
++                   !m_full_recon_wake.compare_exchange_weak(
++                       deadline, next->count(), std::memory_order_relaxed)) {}
++        }
++    }
+     MaybeReconcile();
+ 
+     const auto current_time{GetTime<std::chrono::microseconds>()};
+diff --git a/src/test/txrelay_tests.cpp b/src/test/txrelay_tests.cpp
+index a039a71aca..1b95beb6e0 100644
+--- a/src/test/txrelay_tests.cpp
++++ b/src/test/txrelay_tests.cpp
+@@ -1287,7 +1287,9 @@ BOOST_AUTO_TEST_CASE(full_reconciliation_owned_page_and_admission_outcome) {
+     DataStream offered;
+     offered << offer;
+     BOOST_CHECK(manager.Handle(owner, NetMsgType::MERKLIXSYNC, offered, 10s));
+-    manager.Tick(owner, 16'000'000ms);
++    const auto waiting{manager.Tick(owner, 16'000'000ms)};
++    BOOST_REQUIRE(waiting);
++    BOOST_CHECK(*waiting == 16'005'000ms);
+     const auto outgoing{h.Drain(owner)};
+     BOOST_REQUIRE_EQUAL(outgoing.full_requests.size(), 1U);
+     const auto request{outgoing.full_requests.front()};
+@@ -1344,13 +1346,15 @@ BOOST_AUTO_TEST_CASE(full_reconciliation_owned_page_and_admission_outcome) {
+     manager.Handle(owner, NetMsgType::MERKLIXBUCK, duplicate, 15s);
+     BOOST_CHECK_EQUAL(manager.GetStats().verified_bodies, 1U);
+     clock.Set(16'000'250ms);
+-    manager.Tick(owner, 16'000'250ms);
++    const auto continuation{manager.Tick(owner, 16'000'250ms)};
++    BOOST_REQUIRE(continuation);
++    BOOST_CHECK(*continuation == 16'000'250ms);
+     BOOST_CHECK_EQUAL(manager.GetStats().coverage_complete, 1U);
+     const auto completion{h.Drain(owner)};
+     BOOST_CHECK(std::any_of(completion.full_offers.begin(), completion.full_offers.end(),
+         [&](const Offer &out) { return out.control == Control::DONE && out.header.context == offer.header.context; }));
+     clock.Set(16'000'500ms);
+-    manager.Tick(owner, 16'000'500ms);
++    BOOST_CHECK(!manager.Tick(owner, 16'000'500ms));
+     // Unfunded synthetic body is NOT accepted simply because its membership
+     // proof passed. Coverage and normal admission are separate outcomes.
+     BOOST_CHECK_EQUAL(manager.GetStats().admitted, 0U);
+-- 
+2.50.1 (Apple Git-155)
+
