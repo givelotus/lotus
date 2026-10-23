@@ -1,24 +1,10 @@
-From d330ce6657fb0c213f534fb0c856930fee12d72e Mon Sep 17 00:00:00 2001
+From 07cab06bc810f305bfa0242387b4f7609496e5f2 Mon Sep 17 00:00:00 2001
 From: Shammah Chancellor <shammah.chancellor@notvalid.com>
 Date: Wed, 21 Oct 2026 23:32:28 -0700
 Subject: [PATCH] net: reconcile complete pinned mempool snapshots with
  authenticated prefix pages
 
 Negotiate full-membership scope independently of legacy recent-window reconciliation. Capture and share complete immutable TxId/TxHash/body-reference snapshots, authenticate bounded canonical-prefix expansion and complete body pages, and retain connection/request ownership through paced retries and current-chain admission. Admission age and the old 4096 limit do not truncate this mode. Bound derived storage, queued bytes and decoder exposure; preserve legacy peer wire and normal validation.
----
- src/CMakeLists.txt                            |   2 +-
- src/init.cpp                                  |   4 +
- src/net/full_mempool_reconciliation.cpp       | 936 ++++++++++++++++++
- src/net/full_mempool_reconciliation.h         | 204 ++++
- src/net/txrelay_index.h                       |   2 +
- src/net_processing.cpp                        |  15 +-
- src/test/CMakeLists.txt                       |   1 +
- .../full_mempool_reconciliation_tests.cpp     | 225 +++++
- src/test/txrelay_tests.cpp                    | 359 +++++++
- 9 files changed, 1746 insertions(+), 2 deletions(-)
- create mode 100644 src/net/full_mempool_reconciliation.cpp
- create mode 100644 src/net/full_mempool_reconciliation.h
- create mode 100644 src/test/full_mempool_reconciliation_tests.cpp
 
 diff --git a/src/CMakeLists.txt b/src/CMakeLists.txt
 index 13e6000776d6020f6483157408a429a03abd3a62..f5d3561fffa89ac8e24aba3771bbeb98d270f5c0 100644
@@ -50,10 +36,10 @@ index f6ca056f9322740f3f6c09be49cf0950020336e1..e7f1c2689466a327057ad707336bd4a4
          strprintf("Reconcile the transactions admitted in the last this many "
 diff --git a/src/net/full_mempool_reconciliation.cpp b/src/net/full_mempool_reconciliation.cpp
 new file mode 100644
-index 0000000000000000000000000000000000000000..88509c9c94cd00dd15e625898b54d7521902d13c
+index 0000000000000000000000000000000000000000..68d45cadd1febf3a471f2c028603f5cc2b9b07be
 --- /dev/null
 +++ b/src/net/full_mempool_reconciliation.cpp
-@@ -0,0 +1,936 @@
+@@ -0,0 +1,953 @@
 +// Copyright (c) 2026 The Lotus developers
 +// Distributed under the MIT software license. See COPYING.
 +#include <net/full_mempool_reconciliation.h>
@@ -841,9 +827,19 @@ index 0000000000000000000000000000000000000000..88509c9c94cd00dd15e625898b54d752
 +        if (fetch.admitting) {
 +            if (fetch.ordered.empty()) { peer.fetch.reset(); return; }
 +            const size_t end{std::min(fetch.admission_cursor + MAX_PAGE_BODIES, fetch.ordered.size())};
-+            const std::span<const CTransactionRef> batch{
-+                fetch.ordered.data() + fetch.admission_cursor, end - fetch.admission_cursor};
-+            peerman.ProcessShortTxResponse(node, batch);
++            std::array<CTransactionRef, MAX_PAGE_BODIES> pending;
++            size_t pending_count{0};
++            for (size_t i{fetch.admission_cursor}; i < end; ++i) {
++                const auto &body{fetch.ordered[i]};
++                const auto actual{pool.get(body->GetId())};
++                // Membership coverage still authenticates every remote body.
++                // Only exact bodies already admitted need no repeat validation;
++                // a matching TxId with different bytes must use the normal path.
++                if (actual && actual->GetHash() == body->GetHash()) ++stats.admitted;
++                else pending[pending_count++] = body;
++            }
++            const std::span<const CTransactionRef> batch{pending.data(), pending_count};
++            if (!batch.empty()) peerman.ProcessShortTxResponse(node, batch);
 +            for (const auto &body : batch) {
 +                const auto actual{pool.get(body->GetId())};
 +                if (actual && actual->GetHash() == body->GetHash()) ++stats.admitted;
@@ -923,12 +919,12 @@ index 0000000000000000000000000000000000000000..88509c9c94cd00dd15e625898b54d752
 +    m_impl->peers.erase(peer);
 +    if (m_impl->peers.empty()) m_impl->cache.snapshot.reset();
 +}
-+void Manager::Tick(CNode &node, Clock now) {
++std::optional<Clock> Manager::Tick(CNode &node, Clock now) {
 +    LOCK(m_impl->mutex);
 +    const auto it{m_impl->peers.find(node.GetId())};
-+    if (it == m_impl->peers.end()) return;
++    if (it == m_impl->peers.end()) return std::nullopt;
 +    m_impl->QueueDrained(node, it->second);
-+    if (!it->second.enabled) return;
++    if (!it->second.enabled) return std::nullopt;
 +    try { m_impl->Tick(node, it->second, now); }
 +    catch (const std::exception &) {
 +        ++m_impl->stats.unresolved;
@@ -936,6 +932,13 @@ index 0000000000000000000000000000000000000000..88509c9c94cd00dd15e625898b54d752
 +        it->second.serve.reset();
 +        it->second.next_offer = now + 1s;
 +    }
++    const auto &fetch{it->second.fetch};
++    if (!fetch || node.fPauseSend || node.fDisconnect) return std::nullopt;
++    // A bounded admission slice must yield to other peers, but need not wait
++    // for the message handler's otherwise idle 100ms receive heartbeat.
++    if (fetch->admitting) return now;
++    if (fetch->request) return fetch->deadline;
++    return std::max(now, fetch->next_send);
 +}
 +bool Manager::Handle(CNode &node, const std::string &command, DataStream &stream, Clock time_received) {
 +    if (command != NetMsgType::MERKLIXSYNC && command != NetMsgType::GETMERKLIXBUCK &&
@@ -992,10 +995,10 @@ index 0000000000000000000000000000000000000000..88509c9c94cd00dd15e625898b54d752
 +} // namespace lotus::v2::net::fullrecon
 diff --git a/src/net/full_mempool_reconciliation.h b/src/net/full_mempool_reconciliation.h
 new file mode 100644
-index 0000000000000000000000000000000000000000..6b48883d54ee46ba9fe8a43a81979112c4d386d5
+index 0000000000000000000000000000000000000000..e54bd92ca36b7a9550d6585a1c0bd7b4e6d70f37
 --- /dev/null
 +++ b/src/net/full_mempool_reconciliation.h
-@@ -0,0 +1,204 @@
+@@ -0,0 +1,205 @@
 +// Copyright (c) 2026 The Lotus developers
 +// Distributed under the MIT software license. See COPYING.
 +#ifndef BITCOIN_NET_FULL_MEMPOOL_RECONCILIATION_H
@@ -1190,7 +1193,8 @@ index 0000000000000000000000000000000000000000..6b48883d54ee46ba9fe8a43a81979112
 +    ~Manager();
 +    void SetPeer(int64_t peer, bool enabled);
 +    void RemovePeer(int64_t peer);
-+    void Tick(CNode &, std::chrono::microseconds now);
++    /** Earliest useful continuation, without changing wire pacing or work bounds. */
++    std::optional<std::chrono::microseconds> Tick(CNode &, std::chrono::microseconds now);
 +    bool Handle(CNode &, const std::string &, DataStream &,
 +                std::chrono::microseconds now);
 +    Stats GetStats() const;
@@ -1214,7 +1218,7 @@ index 7748bb33de7302d78facd8ae80eb212924998768..426999ae0e72339ef0b2164decf52f9a
      // This is separate from ordinary compact blocks and short-id requests.
      TXRELAY_HIGH_BANDWIDTH = 1 << 2,
 diff --git a/src/net_processing.cpp b/src/net_processing.cpp
-index a338b20cfe385221d6684c53b4cb6d8f271d9f2c..3c6706f62e0a13f2e517f1f53ec1d10d498ab8cc 100644
+index a338b20cfe385221d6684c53b4cb6d8f271d9f2c..6e7297e3ac29a34d75971b8ad6244902af2afaa1 100644
 --- a/src/net_processing.cpp
 +++ b/src/net_processing.cpp
 @@ -4,6 +4,7 @@
@@ -1234,15 +1238,18 @@ index a338b20cfe385221d6684c53b4cb6d8f271d9f2c..3c6706f62e0a13f2e517f1f53ec1d10d
              }
          }
          const bool disabled_for_test =
-@@ -1760,6 +1763,7 @@ private:
+@@ -1760,6 +1763,10 @@ private:
          EXCLUSIVE_LOCKS_REQUIRED(g_msgproc_mutex);
  
      lotus::v2::net::V2PeerProtocolHandler m_v2_protocol_handler;
 +    lotus::v2::net::fullrecon::Manager m_full_recon;
++    // Earliest useful continuation across peers; consumed by the existing
++    // relay scheduler, rather than adding an unbounded queue of peer timers.
++    std::atomic<int64_t> m_full_recon_wake{std::numeric_limits<int64_t>::max()};
  
      //! Serialized block messages served recently (-blockmessagecache)
      BlockMessageCache m_block_messages;
-@@ -2743,6 +2747,7 @@ void PeerManagerImpl::UpdateLastBlockAnnounceTime(NodeId node,
+@@ -2743,6 +2750,7 @@ void PeerManagerImpl::UpdateLastBlockAnnounceTime(NodeId node,
  void PeerManagerImpl::InitializeNode(const Config &config, CNode &node,
                                       ServiceFlags our_services) {
      NodeId nodeid = node.GetId();
@@ -1250,7 +1257,7 @@ index a338b20cfe385221d6684c53b4cb6d8f271d9f2c..3c6706f62e0a13f2e517f1f53ec1d10d
      m_v2_protocol_handler.RemovePeer(nodeid);
      {
          LOCK(cs_main);
-@@ -2930,6 +2935,7 @@ scheduleLater:
+@@ -2930,6 +2938,7 @@ scheduleLater:
  
  void PeerManagerImpl::FinalizeNode(const Config &config, const CNode &node) {
      NodeId nodeid = node.GetId();
@@ -1258,7 +1265,7 @@ index a338b20cfe385221d6684c53b4cb6d8f271d9f2c..3c6706f62e0a13f2e517f1f53ec1d10d
      m_v2_protocol_handler.RemovePeer(nodeid);
      {
          LOCK(cs_main);
-@@ -3305,6 +3311,7 @@ PeerManagerImpl::PeerManagerImpl(CConnman &connman, AddrMan &addrman,
+@@ -3305,6 +3314,7 @@ PeerManagerImpl::PeerManagerImpl(CConnman &connman, AddrMan &addrman,
        m_mempool(pool), m_avalanche(avalanche), m_opts{opts},
        m_txrelay_index{opts.txrelay_shortid_bits},
        m_v2_protocol_handler{m_chainman, m_mempool, m_connman, *this},
@@ -1266,7 +1273,25 @@ index a338b20cfe385221d6684c53b4cb6d8f271d9f2c..3c6706f62e0a13f2e517f1f53ec1d10d
        m_block_messages{opts.block_message_cache_bytes} {
      m_v2_protocol_handler.SetTxRelayEpochProvider(this);
      m_v2_protocol_handler.SetServeUtxoShards(
-@@ -4065,7 +4072,8 @@ void PeerManagerImpl::MaybeReconcile() {
+@@ -3524,9 +3534,14 @@ void PeerManagerImpl::ScheduleRelayTick(CScheduler &scheduler) {
+     const auto delay{NextRelayTick(now, m_opts.txrelay_tick) - now + 100us};
+     scheduler.scheduleFromNow(
+         [this, &scheduler] {
+-            if (m_txrelay_wake.exchange(false, std::memory_order_relaxed)) {
+-                m_connman.WakeMessageHandler();
+-            }
++            bool wake{m_txrelay_wake.exchange(false, std::memory_order_relaxed)};
++            auto deadline{m_full_recon_wake.load(std::memory_order_relaxed)};
++            if (deadline <= RelayTickNow().count() &&
++                m_full_recon_wake.compare_exchange_strong(
++                    deadline, std::numeric_limits<int64_t>::max(), std::memory_order_relaxed)) {
++                wake = true;
++            }
++            if (wake) m_connman.WakeMessageHandler();
+             ScheduleRelayTick(scheduler);
+         },
+         std::chrono::ceil<std::chrono::milliseconds>(delay));
+@@ -4065,7 +4080,8 @@ void PeerManagerImpl::MaybeReconcile() {
          LOCK(m_peer_mutex);
          NodeId first{-1};
          for (const auto &[id, peer] : m_peer_map) {
@@ -1276,7 +1301,7 @@ index a338b20cfe385221d6684c53b4cb6d8f271d9f2c..3c6706f62e0a13f2e517f1f53ec1d10d
                  continue;
              }
              if (first < 0) {
-@@ -6951,6 +6959,8 @@ void PeerManagerImpl::ProcessMessage(
+@@ -6951,6 +6967,8 @@ void PeerManagerImpl::ProcessMessage(
          return;
      }
  
@@ -1285,7 +1310,7 @@ index a338b20cfe385221d6684c53b4cb6d8f271d9f2c..3c6706f62e0a13f2e517f1f53ec1d10d
      if (m_v2_protocol_handler.TryHandleMessage(pfrom, msg_type, vRecv,
                                                 time_received)) {
          if (msg_type == NetMsgType::MINEDHEADER ||
-@@ -7109,6 +7119,8 @@ void PeerManagerImpl::ProcessMessage(
+@@ -7109,6 +7127,8 @@ void PeerManagerImpl::ProcessMessage(
              peer->GetTxRelay() && !pfrom.IsBlockOnlyConn()
                  ? flags & OurTxRelayFeatures()
                  : 0;
@@ -1294,19 +1319,26 @@ index a338b20cfe385221d6684c53b4cb6d8f271d9f2c..3c6706f62e0a13f2e517f1f53ec1d10d
          // Local opt-in, compact-block negotiation and permissions cannot prove
          // that the remote peer understands our private block/transaction wire.
          m_v2_protocol_handler.SetHighBandwidthShortTxPeer(
-@@ -10853,6 +10865,7 @@ bool PeerManagerImpl::SendMessages(const Config &config, CNode *pto) {
+@@ -10853,6 +10873,14 @@ bool PeerManagerImpl::SendMessages(const Config &config, CNode *pto) {
      // At each relay tick, the first peer to get here moves the relay queue
      // into the chosen peers' inventory, so all peers send at this tick.
      MaybeDrainRelayQueue();
-+    if (!m_chainman.IsInitialBlockDownload()) m_full_recon.Tick(*pto, RelayTickNow());
++    if (!m_chainman.IsInitialBlockDownload()) {
++        if (const auto next{m_full_recon.Tick(*pto, RelayTickNow())}) {
++            auto deadline{m_full_recon_wake.load(std::memory_order_relaxed)};
++            while (next->count() < deadline &&
++                   !m_full_recon_wake.compare_exchange_weak(
++                       deadline, next->count(), std::memory_order_relaxed)) {}
++        }
++    }
      MaybeReconcile();
  
      const auto current_time{GetTime<std::chrono::microseconds>()};
 diff --git a/src/test/CMakeLists.txt b/src/test/CMakeLists.txt
-index 6163b3cca5cd4e6b40078a84d65cdbe8f2480fd9..a6e6486756fa86af562b4c70e907fca733759361 100644
+index 47845dbc8d413bd1d6f31120476f9e867e3b9eb9..0002568c48ff11450461fea91462682fda729870 100644
 --- a/src/test/CMakeLists.txt
 +++ b/src/test/CMakeLists.txt
-@@ -334,6 +334,7 @@ add_boost_unit_tests_to_suite(bitcoin test_bitcoin
+@@ -335,6 +335,7 @@ add_boost_unit_tests_to_suite(bitcoin test_bitcoin
  		validationinterface_tests.cpp
  		v2_deferred_block_tests.cpp
  		v2_protocol_handler_tests.cpp
@@ -1546,7 +1578,7 @@ index 0000000000000000000000000000000000000000..40bc1c986f17952b48a34a351c6bcdb9
 +}
 +BOOST_AUTO_TEST_SUITE_END()
 diff --git a/src/test/txrelay_tests.cpp b/src/test/txrelay_tests.cpp
-index d220106136d9ebb2bbbcda408148b3b1246d62c1..e1924afdd00a9f5eabc2c7b450830129a58959f9 100644
+index a179fd2b586b5a0d37584ad665a88da07a2a8808..5c1661eaf505f3d555b305a51c2a4d9eb4ba3b50 100644
 --- a/src/test/txrelay_tests.cpp
 +++ b/src/test/txrelay_tests.cpp
 @@ -11,6 +11,7 @@
@@ -1594,7 +1626,7 @@ index d220106136d9ebb2bbbcda408148b3b1246d62c1..e1924afdd00a9f5eabc2c7b450830129
                  if (msg.m_type == NetMsgType::INV) {
                      std::vector<CInv> invs;
                      msg.m_recv >> invs;
-@@ -1201,4 +1225,339 @@ BOOST_AUTO_TEST_CASE(no_body_push_by_default) {
+@@ -1209,4 +1233,343 @@ BOOST_AUTO_TEST_CASE(no_body_push_by_default) {
      }
  }
  
@@ -1651,7 +1683,9 @@ index d220106136d9ebb2bbbcda408148b3b1246d62c1..e1924afdd00a9f5eabc2c7b450830129
 +    DataStream offered;
 +    offered << offer;
 +    BOOST_CHECK(manager.Handle(owner, NetMsgType::MERKLIXSYNC, offered, 10s));
-+    manager.Tick(owner, 16'000'000ms);
++    const auto waiting{manager.Tick(owner, 16'000'000ms)};
++    BOOST_REQUIRE(waiting);
++    BOOST_CHECK(*waiting == 16'005'000ms);
 +    const auto outgoing{h.Drain(owner)};
 +    BOOST_REQUIRE_EQUAL(outgoing.full_requests.size(), 1U);
 +    const auto request{outgoing.full_requests.front()};
@@ -1708,13 +1742,15 @@ index d220106136d9ebb2bbbcda408148b3b1246d62c1..e1924afdd00a9f5eabc2c7b450830129
 +    manager.Handle(owner, NetMsgType::MERKLIXBUCK, duplicate, 15s);
 +    BOOST_CHECK_EQUAL(manager.GetStats().verified_bodies, 1U);
 +    clock.Set(16'000'250ms);
-+    manager.Tick(owner, 16'000'250ms);
++    const auto continuation{manager.Tick(owner, 16'000'250ms)};
++    BOOST_REQUIRE(continuation);
++    BOOST_CHECK(*continuation == 16'000'250ms);
 +    BOOST_CHECK_EQUAL(manager.GetStats().coverage_complete, 1U);
 +    const auto completion{h.Drain(owner)};
 +    BOOST_CHECK(std::any_of(completion.full_offers.begin(), completion.full_offers.end(),
 +        [&](const Offer &out) { return out.control == Control::DONE && out.header.context == offer.header.context; }));
 +    clock.Set(16'000'500ms);
-+    manager.Tick(owner, 16'000'500ms);
++    BOOST_CHECK(!manager.Tick(owner, 16'000'500ms));
 +    // Unfunded synthetic body is NOT accepted simply because its membership
 +    // proof passed. Coverage and normal admission are separate outcomes.
 +    BOOST_CHECK_EQUAL(manager.GetStats().admitted, 0U);
@@ -1934,6 +1970,3 @@ index d220106136d9ebb2bbbcda408148b3b1246d62c1..e1924afdd00a9f5eabc2c7b450830129
 +    BOOST_CHECK_EQUAL(manager.GetStats().captures, 3U);
 +}
  BOOST_AUTO_TEST_SUITE_END()
--- 
-2.50.1 (Apple Git-155)
-
