@@ -1,5 +1,13 @@
 # Commit performance audit
 
+The **[ABC-anchored progression table](shared-range-progression/TABLE.md)** is the primary benchmark view: untouched ABC0 versus numbered Git prefixes, with footnotes describing the intervening changes. Its status and sample counts distinguish provisional observations from completed repeats. Failed setup checks are shown as FAIL, never credited a rate. [Machine-readable observations](shared-range-progression/RESULTS.json), [ranges and deltas](shared-range-progression/SUMMARY.csv), [exact source/parameter plan](shared-range-progression/PLAN.json).
+
+That table covers shared ABC/eCash commits0–378; it is not the complete native V2 endpoint. The isolated controls below answer repair-specific questions and must not be substituted for the progression.
+
+The three-round progression is complete. Shared endpoint 378 versus ABC 0: 13,176→12,164 individual tx/s (−7.7%); 15,005→24,129 array tx/s (+60.8%); 5,267→5,281 loaded tx/s and 8,241→8,266 concurrent read RPC/s (both about parity). It contains 76 valid samples and 5 untimed synchronization failures across points 78/94; affected cells are FAIL. The individual-submit regression remains unresolved.
+
+Individual-owner follow-up is active. [Source audit of mixed owner 377](../../../daemon/patch-intake/20261023/queue-owner-audit/REPORT.md): the queue commit also reverses peer-capability checks, so its performance change cannot be attributed solely to the queue. The expanded gate also found a stale pre-377 fixture. Its test-only repair advertises actual capability, retains the 16-push assertion and passes 127 gate cases. Actual companion source SHAs are recorded; no production source or review branch is silently changed. The next matched study isolates 1/2/3 and 375/376/377/378, then separates queue and peer behavior. [Current continuation state](CONTINUATION-FIXTURE.json); [earlier stopped gate](CONTINUATION.json).
+
 The first confirmed transport regression has a repair folded into its owning Git commit. The broader 531-commit audit remains open. Source review inputs now reference the repaired branches; all six permanent submodules remain base-only.
 
 | Review history | Published commit | Tracked tree |
@@ -9,7 +17,7 @@ The first confirmed transport regression has a repair folded into its owning Git
 
 The source contains 378 shared + 153 native owners, no extra fixup commits. Owner 86 now grows HTTP body read-ahead lazily, bounded at 16 KiB. The complete shared/native trees differ from the frozen input by exactly those six production lines. Separately, template-specific test expressions move 44 → 88, where their prerequisite API appears; final test content is unchanged. Original histories and all candidate phases remain preserved with verified bundles and complete ownership ledgers.
 
-## Measured comparisons
+## Isolated repair controls and earlier reference comparisons
 
 Each row is an independent comparison; do not add percentages or combine unrelated medians. Ranges and all individual observations are in the linked raw results.
 

@@ -67,6 +67,7 @@ def main():
     ap.add_argument('--plan',type=Path,default=ROOT/'daemon/stack-review.json')
     ap.add_argument('--variant',default='reference')
     ap.add_argument('--override-ref',action='append',default=[],metavar='POINT=REF')
+    ap.add_argument('--diagnostic-net',action='store_true',help='Enable network logs; results are diagnostics, not progression timing samples')
     ap.add_argument('--fixed-transactions',type=int,help='Fixed-count latency diagnostic, not a sustained TPS claim');args=ap.parse_args()
     assert 1<=args.jobs<=10 and args.rounds>=1
     if not re.fullmatch(r'[a-zA-Z0-9_-]+',args.variant):raise RuntimeError('Invalid variant label')
@@ -91,7 +92,7 @@ def main():
     shared_lock=(ROOT/'daemon/.local-artifact-archive/benchmark-host.lock').open('a');fcntl.flock(shared_lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
     fingerprint={'parent_commit':subprocess.check_output(['git','-C',str(ROOT),'rev-parse','HEAD'],text=True).strip(),'flags':FLAGS,'compiler':subprocess.check_output(['c++','--version'],text=True),'platform':platform.platform(),'runner_sha256':sha(__file__),'startup_adapter_sha256':sha(Path(__file__).with_name('steady_loopback.py')),
                  'history_plan':str(args.plan.resolve()),'history_plan_sha256':sha(args.plan),'variant':args.variant,
-                 'fixed_transactions':args.fixed_transactions,
+                 'fixed_transactions':args.fixed_transactions,'diagnostic_net':args.diagnostic_net,
                  'frozen_tools':{str(p.relative_to(TOOLS)):sha(p) for p in TOOLS.rglob('*.py')},'points':{str(n):ordered[n] for n in points},
                  'semantics':'RPC admission and unloaded reads; not confirmed blocks, Avalanche finality or all-peer convergence',
                  'policy':'At least 5 seconds per measured throughput window; 3 rotated A/B rounds by default. Flag >=5% median losses for paired confirmation and profiling; never assume monotonic prefix performance.'}
@@ -107,7 +108,7 @@ def main():
             target='lotusd' if n>len(plan['ecash']['commits']) else 'bitcoind'
             elapsed=run(['ninja','-C',BUILD,'-j',args.jobs,'-k','0',target,'test_bitcoin'],data/f'point-{n:03}-build.log')
             test=BUILD/'src/test/test_bitcoin';listing=subprocess.run([str(test),'--list_content'],capture_output=True,text=True,check=True);suites=['mempool_tests','rpc_tests','miner_tests']
-            for optional in ['mempool_admission_tests','txrelay_tests','mempool_overlay_tests','snapshot_rcu_tests']:
+            for optional in ['mempool_admission_tests','txrelay_tests','mempool_overlay_tests','snapshot_rcu_tests','v2_protocol_handler_tests','validationinterface_tests']:
                 if re.search(r'^'+optional+r'\*?$',listing.stdout+listing.stderr,re.M):suites.append(optional)
             unit_dir=archive/f'point-{n:03}-unit-work';unit_dir.mkdir(exist_ok=True)
             run([test,'--run_test='+','.join(suites),'--log_level=test_suite'],data/f'point-{n:03}-units.log',cwd=unit_dir)
@@ -127,6 +128,7 @@ def main():
                       '--daemon',binaries[n]['binary'],'--source',SOURCE,'--output',output,'--steady','--case',case,
                       '--max-fixture-transactions','800000','--fixture-fee-sats','10000','--hierarchical-funding','--maxmempool-mb','4096','--port-base','39110']
                 if args.fixture_smoke:argv+=['--fixture-smoke']
+                if args.diagnostic_net:argv+=['--audit-debug-net']
                 if args.fixed_transactions:argv+=['--exact-fixture-transactions',str(args.fixed_transactions),'--diagnostic-fixed-work','--progress-chunk-transactions','10000']
                 write(directory/'INPUTS.json',{'point':n,'round':round_number+1,'source':binaries[n],'argv':[str(x) for x in argv],'host_before':host(),'fixture_smoke':args.fixture_smoke})
                 print('RUN',n,'round',round_number+1,case,flush=True)
@@ -134,7 +136,7 @@ def main():
                 payload=json.loads(output.read_text());metrics=payload.get('metrics',payload)
                 value=metrics[case] if not args.fixture_smoke else metrics
                 if not args.fixture_smoke:assert value['seconds']>=5 and value['tx_count']>0
-                results.append({'point':n,'round':round_number+1,'case':case,'source_commit':binaries[n]['commit'],'result':value,'unloaded_reads':metrics.get('read_unloaded_steady'),'evidence':str(output)})
+                results.append({'point':n,'round':round_number+1,'case':case,'source_commit':binaries[n]['commit'],'diagnostic_net':args.diagnostic_net,'result':value,'unloaded_reads':metrics.get('read_unloaded_steady'),'evidence':str(output)})
                 write(data/'RESULTS.json',{'status':'partial','runs':results})
                 if not args.fixture_smoke:print('RESULT',n,case,value['tx_count'],value['seconds'],flush=True)
     write(data/'RESULTS.json',{'status':'fixture-smoke-pass' if args.fixture_smoke else 'complete','runs':results})
