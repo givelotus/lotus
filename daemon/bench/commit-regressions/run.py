@@ -63,19 +63,35 @@ def main():
     ap.add_argument('--cases',default='single_tx_steady,json_rpc_batch50_steady')
     ap.add_argument('--data',type=Path,default=ROOT/'benchmark-results/20261023/commit-regressions')
     ap.add_argument('--jobs',type=int,default=10);ap.add_argument('--build-only',action='store_true');ap.add_argument('--skip-build',action='store_true')
-    ap.add_argument('--fixture-smoke',action='store_true');args=ap.parse_args()
+    ap.add_argument('--fixture-smoke',action='store_true')
+    ap.add_argument('--plan',type=Path,default=ROOT/'daemon/stack-review.json')
+    ap.add_argument('--variant',default='reference')
+    ap.add_argument('--override-ref',action='append',default=[],metavar='POINT=REF')
+    ap.add_argument('--fixed-transactions',type=int,help='Fixed-count latency diagnostic, not a sustained TPS claim');args=ap.parse_args()
     assert 1<=args.jobs<=10 and args.rounds>=1
+    if not re.fullmatch(r'[a-zA-Z0-9_-]+',args.variant):raise RuntimeError('Invalid variant label')
+    if args.plan.resolve()!=(ROOT/'daemon/stack-review.json').resolve() and args.variant=='reference':raise RuntimeError('Candidate history requires a separate --variant cache')
     points=[int(x) for x in args.points.split(',')];cases=args.cases.split(',')
+    if args.fixed_transactions and (not 100000<=args.fixed_transactions<=500000 or cases!=['json_rpc_batch50_steady']):raise RuntimeError('Fixed diagnostic requires array50 and100k..500k transactions')
     if any(c not in ['single_tx_steady','json_rpc_batch50_steady','single_tx_loaded_steady'] for c in cases):raise RuntimeError('Unsupported common workload')
-    plan=json.loads((ROOT/'daemon/stack-review.json').read_text())['stages']
+    plan=json.loads(args.plan.read_text())['stages']
     ordered=[{'commit':plan['ecash']['input_commit'],'subject':'Unmodified ABC baseline'}]+plan['ecash']['commits']+plan['v2']['commits']
+    if args.override_ref and args.variant=='reference':raise RuntimeError('Candidate refs require a separate --variant cache')
+    for override in args.override_ref:
+        position,ref=override.split('=',1);position=int(position)
+        original=ordered[position]
+        ordered[position]={**original,'reference_commit':original['commit'],'commit':git('rev-parse',ref+'^{commit}'),'subject':'Candidate variant of: '+original['subject']}
     if any(n<0 or n>=len(ordered) for n in points):raise RuntimeError('Invalid ordered Git prefix')
     data=args.data.resolve();data.mkdir(parents=True,exist_ok=True)
     if not args.build_only and any(data.glob('round-*')):raise RuntimeError('Existing attempts are preserved; select a fresh --data directory')
-    archive=ROOT/'daemon/.local-artifact-archive/commit-regressions';archive.mkdir(exist_ok=True)
+    archive=ROOT/'daemon/.local-artifact-archive/commit-regressions'
+    if args.variant!='reference':archive=archive/args.variant
+    archive.mkdir(parents=True,exist_ok=True)
     lock=(SOURCE/'.git/progression.lock').open('a');fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
     shared_lock=(ROOT/'daemon/.local-artifact-archive/benchmark-host.lock').open('a');fcntl.flock(shared_lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
     fingerprint={'parent_commit':subprocess.check_output(['git','-C',str(ROOT),'rev-parse','HEAD'],text=True).strip(),'flags':FLAGS,'compiler':subprocess.check_output(['c++','--version'],text=True),'platform':platform.platform(),'runner_sha256':sha(__file__),'startup_adapter_sha256':sha(Path(__file__).with_name('steady_loopback.py')),
+                 'history_plan':str(args.plan.resolve()),'history_plan_sha256':sha(args.plan),'variant':args.variant,
+                 'fixed_transactions':args.fixed_transactions,
                  'frozen_tools':{str(p.relative_to(TOOLS)):sha(p) for p in TOOLS.rglob('*.py')},'points':{str(n):ordered[n] for n in points},
                  'semantics':'RPC admission and unloaded reads; not confirmed blocks, Avalanche finality or all-peer convergence',
                  'policy':'At least 5 seconds per measured throughput window; 3 rotated A/B rounds by default. Flag >=5% median losses for paired confirmation and profiling; never assume monotonic prefix performance.'}
@@ -84,6 +100,7 @@ def main():
     for n in points:
         commit=ordered[n]['commit'];checkout(commit);tree=git('rev-parse','HEAD^{tree}')
         dest=archive/f'point-{n:03}';dest.mkdir(exist_ok=True);receipt=dest/'BUILD.json'
+        if receipt.exists() and not args.skip_build:raise RuntimeError(f'Frozen binary cache already exists: {dest}; use --skip-build or a fresh --variant')
         if not args.skip_build:
             print('BUILD',n,commit,flush=True)
             configure=run(['cmake','-GNinja','-S',SOURCE,'-B',BUILD,*FLAGS],data/f'point-{n:03}-configure.log')
@@ -110,6 +127,7 @@ def main():
                       '--daemon',binaries[n]['binary'],'--source',SOURCE,'--output',output,'--steady','--case',case,
                       '--max-fixture-transactions','800000','--fixture-fee-sats','10000','--hierarchical-funding','--maxmempool-mb','4096','--port-base','39110']
                 if args.fixture_smoke:argv+=['--fixture-smoke']
+                if args.fixed_transactions:argv+=['--exact-fixture-transactions',str(args.fixed_transactions),'--diagnostic-fixed-work','--progress-chunk-transactions','10000']
                 write(directory/'INPUTS.json',{'point':n,'round':round_number+1,'source':binaries[n],'argv':[str(x) for x in argv],'host_before':host(),'fixture_smoke':args.fixture_smoke})
                 print('RUN',n,'round',round_number+1,case,flush=True)
                 resources=guarded(argv,directory/'stdout.log',env);write(directory/'RESOURCES.json',resources)

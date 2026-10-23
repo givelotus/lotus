@@ -1,19 +1,51 @@
-# Commit performance regression audit
+# Commit performance audit — first repair
 
-Source reference: `ef42f1ea59399923a57a9b813e3103c98cbcbc8d`, 378 shared + 153 native commits. Positions below refer to this Git history, not old mailbox numbers. Permanent submodules remain base-only; no repairs have been integrated.
+The first confirmed transport regression has a repair folded into its owning Git commit. The broader 531-commit audit remains open. Source review inputs now reference the repaired branches; all six permanent submodules remain base-only.
 
-Each throughput sample runs at least five seconds. Three paired rounds alternate before/after order. Both builds use Release, wallet/Chronik/jemalloc/HTTP2/WebTransport off. Timings exclude fixture funding and signing. These measure RPC acceptance, not block confirmation or network finality.
+| Review history | Published commit | Tracked tree |
+|---|---|---|
+| [Shared eCash](https://github.com/givelotus/bitcoin-abc/tree/perf/commit-regression-repairs-20261023) |21ac6de622c5d459f78c608ed45dbc6399f04591|2c6b9bc763382dd3236952d5c8c66efe77f10241|
+| [Lotus V2](https://github.com/givelotus/lotusd/tree/perf/commit-regression-repairs-20261023) |3cfb703183eb4134d3fbebfe862127450cd4c199|a576cd04fc505e68069809d0bc00ec8ed96b4955|
 
-| Change | Workload | Before median (range) | After median (range) | Change | Adoption status |
-|---|---|---:|---:|---:|---|
-| 376 → 377, bounded RPC admission owner | Individual RPC tx/s | 11,083 (10,351–11,352) | 10,540 (9,927–10,918) | −4.9% | Already in reference; individual-path effect unresolved |
-| Same | JSON arrays of 50 tx/s | 18,788 (18,573–19,251) | 23,223 (22,393–23,776) | +23.6% | Clear gain in this workload |
-| Same | Unloaded read RPC/s | 12,458 (11,804–14,549) | 12,958 (11,885–13,248) | +4.0% | Overlapping ranges |
+The source contains 378 shared + 153 native owners, no extra fixup commits. Owner 86 now grows HTTP body read-ahead lazily, bounded at 16 KiB. The complete shared/native trees differ from the frozen input by exactly those six production lines. Separately, template-specific test expressions move 44 → 88, where their prerequisite API appears; final test content is unchanged. Original histories and all candidate phases remain preserved with verified bundles and complete ownership ledgers.
 
-Source: [paired raw summary](paired-376-377/SUMMARY.json), [all samples](paired-376-377/RESULTS.json), per-case INPUTS and RESOURCES receipts. Before `43caf1aa50fa0fd17087205a960ec1b5fa582bb5`; after `acf7f61425e613581ddd0f0b71e8ccacd4ef2656`.
+## Measured comparisons
 
-The individual-path loss did not repeat in every pair (one pair improved). Do not label this a confirmed regression from the medians alone.
+Each row is an independent comparison; do not add percentages or combine unrelated medians. Ranges and all individual observations are in the linked raw results.
 
-Next comparison is upstream point 0 plus adjacent shared positions 85 → 86, isolating the libevent-to-Beast HTTP server transition. Builds and common correctness gates precede timing. Historical endpoint regressions are triage inputs, not attribution to a particular commit.
+| Change / workload | Before | After | Change | Adoption / evidence |
+|---|---:|---:|---:|---|
+| Upstream0→shared376: individual RPC admissions |11,140 tx/s|10,928 tx/s|−1.9%, overlapping|[Reference comparison](paired-000-376/SUMMARY.json) |
+| Same: JSON arrays50 admissions |13,422 tx/s|20,469 tx/s|+52.5%|[Reference comparison](paired-000-376/SUMMARY.json) |
+| Same: unloaded reads |13,207 RPC/s|13,148 RPC/s|−0.4%, overlapping|[Reference comparison](paired-000-376/SUMMARY.json) |
+|85→initial Beast86: larger echo arrays50 |507,696 RPC/s|357,629 RPC/s|−29.6%|[Introducing-boundary regression](http-085-086-echo-8clients/RESULTS.json) |
+|85→shared376: same echo workload |418,881 RPC/s|364,121 RPC/s|−13.1%|[Gap before repair](http-085-376-echo-8clients/RESULTS.json) |
+| Shared376→buffer candidate: same echo workload |426,572 RPC/s|460,339 RPC/s|+7.9%|[Source-matched repair control](http-body16k-paired/RESULTS.json) |
+| Pre-Beast85→repaired shared377: larger echo arrays50 |513,958 RPC/s|516,748 RPC/s|+0.5%, parity|[Gap recovery](http-prebeast-body16k-final-paired/RESULTS.json) |
+| Same: individual echo requests |43,956 RPC/s|46,665 RPC/s|+6.2%|[Final transport comparison](http-prebeast-body16k-final-paired/RESULTS.json) |
+| Shared377→buffer repair: individual admissions |12,067 tx/s|12,224 tx/s|+1.3%, overlapping|[Three rotated pairs](http-body16k-queued-admission-paired/RESULTS.json) |
+| Same: JSON arrays50 admissions |24,150 tx/s|25,142 tx/s|+4.1%, all three pairs improve|[Three rotated pairs](http-body16k-queued-admission-paired/RESULTS.json) |
+| Same: fixed 499,200 timed admissions |22.70s|22.62s|−0.3%, no meaningful gain|[Two reversed pairs](HTTP-BODY-500K-SUMMARY.json) |
 
-Investigate a repeated loss with a separate sampling profile, make a small owning-commit repair, and measure the repair under the same workload before folding it into source history. Repeat endpoint checks because improvements can hide earlier regressions. Record justified feature costs explicitly rather than assuming every commit is monotonic.
+The unqueued376 admission control was unfavorable:21,366→20,065 tx/s (−6.1%, overlapping ranges), despite its echo gain. That result is retained in [the raw comparison](http-body16k-admission-paired/RESULTS.json). The subsequent377 controls include the bounded admission owner. These observations do not establish a universal admission speedup or a formal interaction between the two optimizations.
+
+Throughput windows are at least five seconds, with three alternating pairs. Admission uses eight persistent writers, distinct signed 200-byte legacy eCash transactions and 10,000-satoshi fees, with three loopback nodes sharing the host. The fixed 500,000-transaction corpus excludes 800 warmups, leaving 499,200 timed admissions; each side ran twice in reversed order. Those are latency diagnostics. Unrelated CPU-heavy jobs were observed during the study; small differences remain uncertain.
+
+Echo tests use eight independent warmed clients and 414-character hexadecimal arguments. Transaction validation, P2P and profiling are outside those echo clocks. All responses are checked. Separate samples include profiler overhead and are diagnostics only. RPC acceptance, block confirmation, all-peer reconciliation and native V2 transaction throughput are distinct measurements; this pass does not establish the latter three.
+
+## Cause and correctness
+
+Beast's read-size helper uses max(512,capacity−size). Its initially small buffer can stay at 512 bytes as the parser consumes each chunk, producing many receive operations for a larger body. Profiles showed more receive-system-call activity than libevent. The repair reserves at most 16 KiB only for a body requiring more reading, respecting smaller Content-Length values. Existing body/header limits, authentication, sequential arrays and validation remain in place.
+
+Complete shared/native builds and focused correctness gates pass. The full native suite passes **1,203/1,203 cases and 31,488,118 assertions**. Existing HTTP units and interface_http.py pass. The final native daemon also passes large Unicode bodies over plain/TLS, Content-Length/chunked framing and keep-alive follow-ups. Wallet, Chronik, jemalloc, HTTP2 and WebTransport are OFF in this Release/arm64 profile.
+
+[Exact validation and binary identities](../../../daemon/patch-intake/20261023/perf-regression-repaired-stack/VALIDATION.json), [all 531 owner mappings](../../../daemon/patch-intake/20261023/perf-regression-repaired-stack/LEDGER.json), [reviewed production diff](../../../daemon/patch-intake/20261023/perf-regression-repaired-stack/v2-reviewed-production-delta.diff), [native unit log](repaired-stack-build/native-full-unit.log), [live native HTTP checks](native-http-roundtrip/RESULTS.json).
+
+## Remaining work
+
+- Snapshot timing at 29 → 30 → 31 first hit an include-ownership compile error: owner15 introduces gArgs use, but owner34 supplies its header. [Failure evidence](SNAPSHOT-BOUNDARY-FAILURE.json). Move the include to15 with endpoint trees preserved, then rerun. Broader fee-policy, RPC, relay, block/template and large-pool progression remains open.
+- Checkpoint89 failed before timing while peers did not synchronize its9.6MB funding block. [Failure logs and post-failure samples](paired-000-089/FAILURE.json) remain an unresolved intermediate correctness investigation.
+- No obvious growing full-pool scan appeared in the large reference run: successive 100k segments took 4.11,4.40,4.17 and4.35 seconds. This does not establish an asymptotic bound.
+- Frozen binary caches refuse overwrites. Use a new --variant for a new source history. Preserve historical source/binary identities when comparing revisions.
+
+[Earlier investigation notes](HISTORY.md) are historical; this report is the current entry point. All work stays under ~/repos/lotus-v2-optimizations; the audit reused the existing registered benchmark checkout and created no additional worktree or clone.
