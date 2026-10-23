@@ -26,9 +26,9 @@ the historical ABC replay base, and the pinned current ABC master used as the
 new replay target. Its 174 exported changes plus retained fixes are pending
 review and replay on that new target; the original Doged history stays preserved.
 
-The reviewed source reference has 378 shared eCash commits; the historical
-mailbox manifest has 377. This difference is visible in the plan and must be
-resolved before application. V1's generated local release-metadata variant is
+The reviewed source reference has all 378 shared eCash commits; the historical
+mailbox export has 377. This is informational archival lag. Normal source
+initialization and builds do not read or require patch-series files. V1's generated local release-metadata variant is
 also explicitly distinguished from the published source reference. All old
 source histories, patch inputs and benchmark identities remain preserved.
 

@@ -12,9 +12,10 @@ these references are preserved evidence, not already-applied module contents.
   `daemon/lotusd`; the Lotus stage must not replay the shared inputs again.
 - Dogecoin's export source, historical replay base, and pinned current ABC-master
   target are distinct. Its exported changes plus retained fixes remain unapplied.
-- Preserve existing stack branches, source trees and mailbox inputs. Resolve the
-  377 historical shared-mailbox versus 378 reference-commit difference before
-  applying anything. Build/run, stack mutations and legacy releases are gated.
+- Preserve existing stack branches, source trees and archived mailbox inputs.
+  Git commit histories are authoritative. The old 377-entry shared mailbox export
+  lags the complete 378-commit Git history; regenerating it is not required.
+  Normal setup/build must not read patch-series files. Stack review gates remain.
 - The workspace-based mutation instructions below are historical during this
   scaffold phase. Do not use them to bypass the source model or its review gates.
   See `daemon/docs/adding-patches.md` for the active procedure.

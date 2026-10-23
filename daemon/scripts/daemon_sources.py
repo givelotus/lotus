@@ -46,17 +46,6 @@ class Project:
                 raise RuntimeError(f'Stack destination does not match source repository: {name}')
             if stage['depends_on'] != source['parent_series']:
                 raise RuntimeError(f'Stack dependency differs from source dependency: {name}')
-            manifest = self.root / stage['historical_manifest']
-            if hashlib.sha256(manifest.read_bytes()).hexdigest() != stage['historical_manifest_sha256']:
-                raise RuntimeError(f'Historical series changed since review capture: {name}')
-            for mailbox in stage.get('historical_mailboxes', []):
-                payload = manifest.parent / mailbox['file']
-                if hashlib.sha256(payload.read_bytes()).hexdigest() != mailbox['sha256']:
-                    raise RuntimeError(f'Historical patch changed since review capture: {payload}')
-            if name == 'v2':
-                includes = [line.strip() for line in manifest.read_text().splitlines() if line.strip().startswith('@include ')]
-                if includes != ['@include ../ecash/series']:
-                    raise RuntimeError('Historical V2 manifest must include shared eCash exactly once')
             parent = stage.get('input_commit')
             for row in stage.get('commits', []):
                 if row['parents'] != [parent] or row['subject'].startswith(('fixup!', 'squash!')):
@@ -203,13 +192,13 @@ def main(argv=None):
                 print(json.dumps({'application': 'deferred', 'stages': stages}, indent=2))
             else:
                 for name, stage in stages.items():
-                    count = len(stage.get('commits', stage.get('mailboxes', [])))
+                    count = len(stage.get('commits', stage.get('migration_mailboxes', [])))
                     print(f'{name}: {count} ordered inputs -> {stage["destination"]} ({stage["repository"]})')
                     print(f'  starts at {stage.get("input_commit", stage["upstream_base"])}; depends on {stage["depends_on"] or "upstream"}; NOT APPLIED')
                     if stage.get('review_note'):
                         print('  REVIEW: '+stage['review_note'])
                     if args.commits:
-                        for i, row in enumerate(stage.get('commits', stage.get('mailboxes', [])), 1):
+                        for i, row in enumerate(stage.get('commits', stage.get('migration_mailboxes', [])), 1):
                             print(f'  {i:03} {row.get("commit", row.get("file"))} {row.get("subject", "")}')
         return 0
     except (RuntimeError, KeyError, ValueError) as error:

@@ -3,6 +3,7 @@ import hashlib
 import json
 from pathlib import Path
 import subprocess
+import shutil
 import sys
 import tempfile
 import unittest
@@ -121,9 +122,17 @@ class SourceRoutingTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, 'exact reviewed ecash tip'):
             Project(self.root)
 
-    def test_changed_patch_input_is_rejected(self):
-        (self.root / 'daemon/patches/ecash/one.patch').write_text('unreviewed replacement')
-        with self.assertRaisesRegex(RuntimeError, 'patch changed'):
+    def test_archival_patch_series_are_not_required_for_setup(self):
+        before = Project(self.root).plan('v2')
+        shutil.rmtree(self.root / 'daemon/patches')
+        project = Project(self.root)
+        project.setup('all')
+        self.assertEqual(project.plan('v2'), before)
+
+    def test_unreviewed_commit_order_digest_is_rejected(self):
+        p = self.root / self.model['stack_review']
+        p.write_text(p.read_text()+' ')
+        with self.assertRaisesRegex(RuntimeError, 'Stack review changed'):
             Project(self.root)
 
     def test_source_path_cannot_escape_daemon(self):
