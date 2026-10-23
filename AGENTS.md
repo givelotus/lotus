@@ -1,3 +1,24 @@
+## Active source migration — base-only submodules (2026-10-23)
+
+The user requested submodules/tooling BEFORE stack application. On this migration
+branch, `daemon/sources.json` and the parent gitlinks select the active base-only
+source checkouts. `daemon/stack-review.json` records ordered reference inputs;
+these references are preserved evidence, not already-applied module contents.
+
+- Use `make -C daemon setup SERIES=all`, `status`, `source-verify`, and
+  `source-plan SERIES=v2 PLAN_ARGS=--commits`. Setup must never replay patches.
+- Shared changes belong in `daemon/ecashd` (`givelotus/bitcoin-abc`). Only after
+  review/application there does its exact resulting tip become the parent in
+  `daemon/lotusd`; the Lotus stage must not replay the shared inputs again.
+- Dogecoin's export source, historical replay base, and pinned current ABC-master
+  target are distinct. Its exported changes plus retained fixes remain unapplied.
+- Preserve existing stack branches, source trees and mailbox inputs. Resolve the
+  377 historical shared-mailbox versus 378 reference-commit difference before
+  applying anything. Build/run, stack mutations and legacy releases are gated.
+- The workspace-based mutation instructions below are historical during this
+  scaffold phase. Do not use them to bypass the source model or its review gates.
+  See `daemon/docs/adding-patches.md` for the active procedure.
+
 # Lotus Monorepo — Agent & Developer Guide (`AGENTS.md`)
 
 > `CLAUDE.md` is a symlink to `AGENTS.md` so Claude Code, Cursor, Codex, Antigravity, and other agent harnesses share a single source of truth.
