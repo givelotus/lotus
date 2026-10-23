@@ -1,11 +1,11 @@
-# Commit performance audit — first repair
+# Commit performance audit
 
 The first confirmed transport regression has a repair folded into its owning Git commit. The broader 531-commit audit remains open. Source review inputs now reference the repaired branches; all six permanent submodules remain base-only.
 
 | Review history | Published commit | Tracked tree |
 |---|---|---|
-| [Shared eCash](https://github.com/givelotus/bitcoin-abc/tree/perf/commit-regression-repairs-20261023) |21ac6de622c5d459f78c608ed45dbc6399f04591|2c6b9bc763382dd3236952d5c8c66efe77f10241|
-| [Lotus V2](https://github.com/givelotus/lotusd/tree/perf/commit-regression-repairs-20261023) |3cfb703183eb4134d3fbebfe862127450cd4c199|a576cd04fc505e68069809d0bc00ec8ed96b4955|
+| [Shared eCash](https://github.com/givelotus/bitcoin-abc/tree/perf/commit-regression-repairs-20261023) |d38c382061d54d76e04b3c7316ca31a8820e6b93|2c6b9bc763382dd3236952d5c8c66efe77f10241|
+| [Lotus V2](https://github.com/givelotus/lotusd/tree/perf/commit-regression-repairs-20261023) |a367964741e22fbe20c7f62f2d0b68ed652adc61|a576cd04fc505e68069809d0bc00ec8ed96b4955|
 
 The source contains 378 shared + 153 native owners, no extra fixup commits. Owner 86 now grows HTTP body read-ahead lazily, bounded at 16 KiB. The complete shared/native trees differ from the frozen input by exactly those six production lines. Separately, template-specific test expressions move 44 → 88, where their prerequisite API appears; final test content is unchanged. Original histories and all candidate phases remain preserved with verified bundles and complete ownership ledgers.
 
@@ -26,8 +26,21 @@ Each row is an independent comparison; do not add percentages or combine unrelat
 | Shared377→buffer repair: individual admissions |12,067 tx/s|12,224 tx/s|+1.3%, overlapping|[Three rotated pairs](http-body16k-queued-admission-paired/RESULTS.json) |
 | Same: JSON arrays50 admissions |24,150 tx/s|25,142 tx/s|+4.1%, all three pairs improve|[Three rotated pairs](http-body16k-queued-admission-paired/RESULTS.json) |
 | Same: fixed 499,200 timed admissions |22.70s|22.62s|−0.3%, no meaningful gain|[Two reversed pairs](HTTP-BODY-500K-SUMMARY.json) |
+| Count-only RPC fix: admissions with 12 concurrent readers |2,715 tx/s|5,349 tx/s|+97.1%|[Isolated control; ownership candidate](unbroadcast-count-only-paired/RESULTS.json) |
+| Same: concurrent reads |6,271 RPC/s|8,353 RPC/s|+33.2%|[Isolated control](unbroadcast-count-only-paired/RESULTS.json) |
+| Count-fixed reference → complete snapshot feature: loaded admissions |5,390 tx/s|5,288 tx/s|−1.9%|[Source-matched architecture control](snapshot-versus-count-only-paired/RESULTS.json) |
+| Same: concurrent reads |8,405 RPC/s|8,629 RPC/s|+2.7%|[Source-matched architecture control](snapshot-versus-count-only-paired/RESULTS.json) |
+| Same: writer-only JSON arrays50 |16,537 tx/s|16,021 tx/s|−3.1%, overlapping|[Source-matched architecture control](snapshot-versus-count-only-paired/RESULTS.json) |
 
 The unqueued376 admission control was unfavorable:21,366→20,065 tx/s (−6.1%, overlapping ranges), despite its echo gain. That result is retained in [the raw comparison](http-body16k-admission-paired/RESULTS.json). The subsequent377 controls include the bounded admission owner. These observations do not establish a universal admission speedup or a formal interaction between the two optimizations.
+
+## Snapshot attribution and count-copy fix
+
+The original ABC `getmempoolinfo` calls `GetUnbroadcastTxs().size()`, copying a growing `std::set` under the mempool lock merely to count it. The snapshot producer already supplies a caller-locked count accessor, but the legacy RPC does not use it until snapshot readers replace the implementation. A control adds only that existing accessor and its ordinary RPC use: no CoW publication or readers. It almost doubles loaded writer throughput. Consequently the earlier roughly twofold snapshot-boundary result cannot be attributed entirely to CoW or moving reads outside `cs_main`.
+
+The paired count-fixed versus snapshot comparison above measures the remaining architectural change. The loaded writer ranges are 5,364–5,402 versus 5,261–5,313 tx/s; concurrent reads are 8,381–8,497 versus 8,575–8,742 RPC/s. These small differences occurred under external host load and are not precise hardware-independent costs. Writer-only arrays have overlapping ranges. The feature retains a modest writer-cost observation requiring further profiling; grouping commits does not erase that cost.
+
+The [planned ownership candidate](../../../daemon/patch-intake/20261023/snapshot-count-order/PLAN.md) puts the cheap count fix at new3 and combines original30 publication with original31 read consumers. It accounts for every original owner and preserves both complete tracked trees exactly. Both new boundaries pass their build/correctness gates and the review branches are published and remotely verified. The previous21ac/3cf review tips remain under archive/perf-review-first-repair-20261023. Full native correctness evidence is reused by exact tracked-tree identity; it is not described as a rebuild of the new history. [Isolated source control](../../../daemon/patch-intake/20261023/unbroadcast-count-control/CONTROL.json) and [complete ownership ledger](../../../daemon/patch-intake/20261023/snapshot-count-order/LEDGER.json).
 
 Throughput windows are at least five seconds, with three alternating pairs. Admission uses eight persistent writers, distinct signed 200-byte legacy eCash transactions and 10,000-satoshi fees, with three loopback nodes sharing the host. The fixed 500,000-transaction corpus excludes 800 warmups, leaving 499,200 timed admissions; each side ran twice in reversed order. Those are latency diagnostics. Unrelated CPU-heavy jobs were observed during the study; small differences remain uncertain.
 
@@ -43,7 +56,7 @@ Complete shared/native builds and focused correctness gates pass. The full nativ
 
 ## Remaining work
 
-- Snapshot timing at 29 → 30 → 31 first hit an include-ownership compile error: owner15 introduces gArgs use, but owner34 supplies its header. [Failure evidence](SNAPSHOT-BOUNDARY-FAILURE.json). Move the include to15 with endpoint trees preserved, then rerun. Broader fee-policy, RPC, relay, block/template and large-pool progression remains open.
+- Snapshot prefixes29,30,31 and34 now build and pass their common/overlay/snapshot gates. Two prerequisite repairs move an explicit args include34→15 and an intact legacy-SMT test19→34; complete tracked trees are unchanged. Superseded failed attempts remain preserved. [Prerequisite ledger](../../../daemon/patch-intake/20261023/validation-args-ownership/LEDGER.json), [prefix benchmark](snapshot-029-030-031-paired/RESULTS.json). The count/snapshot ownership repair is also gated and published. Broader fee-policy, RPC, relay, block/template and large-pool progression remains open.
 - Checkpoint89 failed before timing while peers did not synchronize its9.6MB funding block. [Failure logs and post-failure samples](paired-000-089/FAILURE.json) remain an unresolved intermediate correctness investigation.
 - No obvious growing full-pool scan appeared in the large reference run: successive 100k segments took 4.11,4.40,4.17 and4.35 seconds. This does not establish an asymptotic bound.
 - Frozen binary caches refuse overwrites. Use a new --variant for a new source history. Preserve historical source/binary identities when comparing revisions.

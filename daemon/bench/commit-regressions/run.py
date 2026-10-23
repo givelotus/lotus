@@ -105,9 +105,9 @@ def main():
             print('BUILD',n,commit,flush=True)
             configure=run(['cmake','-GNinja','-S',SOURCE,'-B',BUILD,*FLAGS],data/f'point-{n:03}-configure.log')
             target='lotusd' if n>len(plan['ecash']['commits']) else 'bitcoind'
-            elapsed=run(['ninja','-C',BUILD,'-j',args.jobs,target,'test_bitcoin'],data/f'point-{n:03}-build.log')
+            elapsed=run(['ninja','-C',BUILD,'-j',args.jobs,'-k','0',target,'test_bitcoin'],data/f'point-{n:03}-build.log')
             test=BUILD/'src/test/test_bitcoin';listing=subprocess.run([str(test),'--list_content'],capture_output=True,text=True,check=True);suites=['mempool_tests','rpc_tests','miner_tests']
-            for optional in ['mempool_admission_tests','txrelay_tests']:
+            for optional in ['mempool_admission_tests','txrelay_tests','mempool_overlay_tests','snapshot_rcu_tests']:
                 if re.search(r'^'+optional+r'\*?$',listing.stdout+listing.stderr,re.M):suites.append(optional)
             unit_dir=archive/f'point-{n:03}-unit-work';unit_dir.mkdir(exist_ok=True)
             run([test,'--run_test='+','.join(suites),'--log_level=test_suite'],data/f'point-{n:03}-units.log',cwd=unit_dir)
