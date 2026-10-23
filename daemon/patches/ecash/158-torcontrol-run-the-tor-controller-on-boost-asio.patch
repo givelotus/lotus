@@ -1,0 +1,938 @@
+From 13e5a13371fc9b37ca58d32ad8519ffe80b7d905 Mon Sep 17 00:00:00 2001
+From: Shammah Chancellor <shammah.chancellor@notvalid.com>
+Date: Mon, 19 Oct 2026 05:36:41 -0700
+Subject: [PATCH] torcontrol: run the Tor controller on Boost.Asio
+
+The Tor control client was built on libevent bufferevents, an event
+base of its own and libevent's thread support. Run it on a Boost.Asio
+io_context on the same torcontrol thread instead.
+
+- TorControlConnection reads with async_read_some and splits lines on
+  LF, removing one CR before it, as EVBUFFER_EOL_CRLF did. The reply
+  parsing, async/sync dispatch and MAX_LINE_LENGTH check are the same
+  code; an overlong line still disconnects without the disconnected
+  callback, so the controller does not reconnect. Commands queued
+  before the connection completes are sent once it does, as with a
+  bufferevent.
+- A generation counter, incremented by Disconnect(), makes the
+  completion of any operation on an older socket a no-op, and stops
+  processing buffered lines once a reply handler has disconnected
+  (libevent kept reading from the freed buffer).
+- The control address is parsed by ParseTorControlAddress, which
+  accepts the same numeric forms as evutil_parse_sockaddr_port.
+- The reconnect timer is a steady_timer with the same exponential
+  backoff; the "out of memory" message for a failed event_new goes.
+- InterruptTorControl() stops the io_context, which, like the
+  event_base_once loopbreak it replaces, also works before the loop
+  has started. evthread_use_* is no longer needed.
+
+TorControlReply, TorControlConnection and the reply parsers are now
+declared in torcontrol.h, so torcontrol_tests can drive a connection
+against an in-test acceptor: replies split across reads, CRLF and LF
+endings, async events, commands queued before connect, a handler that
+disconnects, the line-length limit, a refused connection and a host
+name. All log messages are unchanged, and feature_torcontrol.py passes
+unmodified.
+
+Tier: eCash
+
+diff --git a/src/test/torcontrol_tests.cpp b/src/test/torcontrol_tests.cpp
+index 3a9455587b22799c52a17a5fce43a92388f1ff8b..289348bf89052f1a3efecae3a5b3a15e1fc7fd06 100644
+--- a/src/test/torcontrol_tests.cpp
++++ b/src/test/torcontrol_tests.cpp
+@@ -9,15 +9,17 @@
+ 
+ #include <event2/util.h>
+ 
++#include <boost/asio/read.hpp>
++#include <boost/asio/write.hpp>
+ #include <boost/test/unit_test.hpp>
+ 
++#include <chrono>
++#include <functional>
+ #include <map>
+ #include <optional>
+ #include <string>
+ #include <utility>
+-
+-std::pair<std::string, std::string> SplitTorReplyLine(const std::string &s);
+-std::map<std::string, std::string> ParseTorReplyMapping(const std::string &s);
++#include <vector>
+ 
+ BOOST_FIXTURE_TEST_SUITE(torcontrol_tests, BasicTestingSetup)
+ 
+@@ -260,4 +262,191 @@ BOOST_AUTO_TEST_CASE(util_ParseTorControlAddress) {
+     }
+ }
+ 
++namespace {
++using boost::asio::ip::tcp;
++
++/**
++ * A loopback listener and a TorControlConnection on the same io_context,
++ * driven by the test thread.
++ */
++struct TorConnFixture {
++    boost::asio::io_context io;
++    tcp::acceptor acceptor{
++        io, tcp::endpoint(boost::asio::ip::address_v4::loopback(), 0)};
++    tcp::socket server{io};
++    TorControlConnection conn{io};
++    int n_connected{0};
++    int n_disconnected{0};
++    std::vector<TorControlReply> replies;
++
++    std::string Address() const {
++        return "127.0.0.1:" + std::to_string(acceptor.local_endpoint().port());
++    }
++
++    /** Run the io_context until pred() holds; false on timeout. */
++    bool
++    RunUntil(const std::function<bool()> &pred,
++             std::chrono::milliseconds timeout = std::chrono::seconds(10)) {
++        const auto deadline = std::chrono::steady_clock::now() + timeout;
++        while (!pred()) {
++            if (std::chrono::steady_clock::now() > deadline) {
++                return false;
++            }
++            io.restart();
++            io.run_one_for(std::chrono::milliseconds(10));
++        }
++        return true;
++    }
++
++    /** Connect the client and accept it on the server side. */
++    void Open() {
++        bool accepted = false;
++        acceptor.async_accept(server, [&](const boost::system::error_code &ec) {
++            BOOST_REQUIRE(!ec);
++            accepted = true;
++        });
++        BOOST_REQUIRE(conn.Connect(
++            Address(), [this](TorControlConnection &) { ++n_connected; },
++            [this](TorControlConnection &) { ++n_disconnected; }));
++        BOOST_REQUIRE(RunUntil([&] { return accepted && n_connected == 1; }));
++    }
++
++    void Send(const std::string &data) {
++        boost::asio::write(server, boost::asio::buffer(data));
++    }
++
++    TorControlConnection::ReplyHandlerCB Record() {
++        return [this](TorControlConnection &, const TorControlReply &reply) {
++            replies.push_back(reply);
++        };
++    }
++
++    /** Read exactly n bytes the client sent. */
++    std::string Receive(size_t n) {
++        std::string data(n, '\0');
++        boost::asio::read(server, boost::asio::buffer(data));
++        return data;
++    }
++
++    /** Whether the server sees the client close the connection. */
++    bool ServerSeesClose() {
++        bool closed = false;
++        std::vector<char> buf(1024);
++        std::function<void()> read_more;
++        read_more = [&] {
++            server.async_read_some(
++                boost::asio::buffer(buf),
++                [&](const boost::system::error_code &ec, size_t) {
++                    if (ec) {
++                        closed = true;
++                    } else {
++                        read_more();
++                    }
++                });
++        };
++        read_more();
++        const bool ok = RunUntil([&] { return closed; });
++        if (!ok) {
++            server.cancel();
++            RunUntil([&] { return closed; });
++        }
++        return ok;
++    }
++};
++} // namespace
++
++BOOST_AUTO_TEST_CASE(conn_commands_and_replies) {
++    TorConnFixture f;
++    // A command queued before the connection completes is sent afterwards.
++    bool accepted = false;
++    f.acceptor.async_accept(f.server, [&](const boost::system::error_code &ec) {
++        BOOST_REQUIRE(!ec);
++        accepted = true;
++    });
++    BOOST_REQUIRE(f.conn.Connect(
++        f.Address(),
++        [&](TorControlConnection &c) {
++            ++f.n_connected;
++            BOOST_CHECK(c.Command("PROTOCOLINFO 1", f.Record()));
++        },
++        [&](TorControlConnection &) { ++f.n_disconnected; }));
++    BOOST_CHECK(f.conn.Command("GETINFO version", f.Record()));
++    BOOST_REQUIRE(f.RunUntil([&] { return accepted && f.n_connected == 1; }));
++    BOOST_CHECK_EQUAL(f.Receive(33), "GETINFO version\r\nPROTOCOLINFO 1\r\n");
++
++    std::vector<TorControlReply> async_replies;
++    f.conn.async_handler.connect(
++        [&](TorControlConnection &, const TorControlReply &reply) {
++            async_replies.push_back(reply);
++        });
++
++    // A multi-line reply with CRLF, split across writes; a short line is
++    // skipped; an asynchronous event goes to the async handler; LF-only
++    // line endings are accepted.
++    f.Send("250-version=0.4");
++    BOOST_CHECK(!f.RunUntil([&] { return !f.replies.empty(); },
++                            std::chrono::milliseconds(200)));
++    f.Send(".8\r\nab\r\n250 OK\r\n650 CIRC 1 BUILT\n");
++    f.Send("250-PROTOCOLINFO 1\n250 OK\n");
++    BOOST_REQUIRE(f.RunUntil([&] { return f.replies.size() == 2; }));
++    BOOST_CHECK_EQUAL(f.replies[0].code, 250);
++    BOOST_CHECK(f.replies[0].lines ==
++                std::vector<std::string>({"version=0.4.8", "OK"}));
++    BOOST_CHECK(f.replies[1].lines ==
++                std::vector<std::string>({"PROTOCOLINFO 1", "OK"}));
++    BOOST_REQUIRE_EQUAL(async_replies.size(), 1U);
++    BOOST_CHECK_EQUAL(async_replies[0].code, 650);
++    BOOST_CHECK(async_replies[0].lines ==
++                std::vector<std::string>({"CIRC 1 BUILT"}));
++
++    // The server closing the connection reports a disconnection.
++    f.server.close();
++    BOOST_REQUIRE(f.RunUntil([&] { return f.n_disconnected == 1; }));
++    BOOST_CHECK(!f.conn.Command("GETINFO version", f.Record()));
++}
++
++BOOST_AUTO_TEST_CASE(conn_handler_disconnect_drops_rest) {
++    TorConnFixture f;
++    f.Open();
++    int calls = 0;
++    BOOST_CHECK(f.conn.Command(
++        "A", [&](TorControlConnection &c, const TorControlReply &) {
++            ++calls;
++            c.Disconnect();
++        }));
++    BOOST_CHECK(f.conn.Command("B", f.Record()));
++    f.Send("250 first\r\n250 second\r\n");
++    BOOST_REQUIRE(f.RunUntil([&] { return calls == 1; }));
++    BOOST_CHECK(f.ServerSeesClose());
++    BOOST_CHECK(f.replies.empty());
++    // Disconnect() itself does not call the disconnected callback.
++    BOOST_CHECK_EQUAL(f.n_disconnected, 0);
++}
++
++BOOST_AUTO_TEST_CASE(conn_max_line_length) {
++    TorConnFixture f;
++    f.Open();
++    // An overlong line disconnects without the disconnected callback, so
++    // the controller does not reconnect.
++    f.Send(std::string(100001, 'x'));
++    BOOST_CHECK(f.ServerSeesClose());
++    BOOST_CHECK_EQUAL(f.n_disconnected, 0);
++}
++
++BOOST_AUTO_TEST_CASE(conn_refused_and_bad_address) {
++    TorConnFixture f;
++    const std::string address = f.Address();
++    f.acceptor.close();
++    int n_disconnected = 0;
++    BOOST_REQUIRE(f.conn.Connect(
++        address, [](TorControlConnection &) { BOOST_ERROR("connected"); },
++        [&](TorControlConnection &) { ++n_disconnected; }));
++    BOOST_REQUIRE(f.RunUntil([&] { return n_disconnected == 1; }));
++
++    BOOST_CHECK(!f.conn.Connect(
++        "localhost:9051", [](TorControlConnection &) {},
++        [](TorControlConnection &) {}));
++    BOOST_CHECK(!f.conn.Command("GETINFO version", f.Record()));
++}
++
+ BOOST_AUTO_TEST_SUITE_END()
+diff --git a/src/torcontrol.cpp b/src/torcontrol.cpp
+index 0294d8bb320212db9db25a3464dab41928750e6d..36c49505f9f7222bba000d853f3ac4bd0d8835e1 100644
+--- a/src/torcontrol.cpp
++++ b/src/torcontrol.cpp
+@@ -20,18 +20,20 @@
+ #include <util/thread.h>
+ #include <util/time.h>
+ 
++#include <boost/asio/buffer.hpp>
++#include <boost/asio/error.hpp>
++#include <boost/asio/executor_work_guard.hpp>
++#include <boost/asio/steady_timer.hpp>
++#include <boost/asio/write.hpp>
+ #include <boost/signals2/signal.hpp>
+ 
+-#include <event2/buffer.h>
+-#include <event2/bufferevent.h>
+-#include <event2/event.h>
+-#include <event2/thread.h>
+-#include <event2/util.h>
+-
++#include <chrono>
+ #include <cstdlib>
++#include <cstring>
+ #include <deque>
+ #include <functional>
+ #include <limits>
++#include <memory>
+ #include <set>
+ #include <vector>
+ 
+@@ -64,215 +66,224 @@ static const int MAX_LINE_LENGTH = 100000;
+ 
+ /****** Low-level TorControlConnection ********/
+ 
+-/** Reply from Tor, can be single or multi-line */
+-class TorControlReply {
+-public:
+-    TorControlReply() { Clear(); }
+-
+-    int code;
+-    std::vector<std::string> lines;
+-
+-    void Clear() {
+-        code = 0;
+-        lines.clear();
+-    }
+-};
++namespace {
++/** Size of each socket read. */
++constexpr size_t TOR_READ_CHUNK_SIZE = 64 * 1024;
++} // namespace
+ 
+-/**
+- * Low-level handling for Tor control connection.
+- * Speaks the SMTP-like protocol as defined in torspec/control-spec.txt
+- */
+-class TorControlConnection {
+-public:
+-    typedef std::function<void(TorControlConnection &)> ConnectionCB;
+-    typedef std::function<void(TorControlConnection &, const TorControlReply &)>
+-        ReplyHandlerCB;
++TorControlConnection::TorControlConnection(boost::asio::io_context &io)
++    : m_io(io), m_read_chunk(TOR_READ_CHUNK_SIZE) {}
+ 
+-    /** Create a new TorControlConnection.
+-     */
+-    explicit TorControlConnection(struct event_base *base);
+-    ~TorControlConnection();
+-
+-    /**
+-     * Connect to a Tor control port.
+-     * tor_control_center is address of the form host:port.
+-     * connected is the handler that is called when connection is successfully
+-     * established.
+-     * disconnected is a handler that is called when the connection is broken.
+-     * Return true on success.
+-     */
+-    bool Connect(const std::string &tor_control_center,
+-                 const ConnectionCB &connected,
+-                 const ConnectionCB &disconnected);
+-
+-    /**
+-     * Disconnect from Tor control port.
+-     */
+-    void Disconnect();
+-
+-    /**
+-     * Send a command, register a handler for the reply.
+-     * A trailing CRLF is automatically added.
+-     * Return true on success.
+-     */
+-    bool Command(const std::string &cmd, const ReplyHandlerCB &reply_handler);
+-
+-    /** Response handlers for async replies */
+-    boost::signals2::signal<void(TorControlConnection &,
+-                                 const TorControlReply &)>
+-        async_handler;
+-
+-private:
+-    /** Callback when ready for use */
+-    std::function<void(TorControlConnection &)> connected;
+-    /** Callback when connection lost */
+-    std::function<void(TorControlConnection &)> disconnected;
+-    /** Libevent event base */
+-    struct event_base *base;
+-    /** Connection to control socket */
+-    struct bufferevent *b_conn{nullptr};
+-    /** Message being received */
+-    TorControlReply message;
+-    /** Response handlers */
+-    std::deque<ReplyHandlerCB> reply_handlers;
+-
+-    /** Libevent handlers: internal */
+-    static void readcb(struct bufferevent *bev, void *ctx);
+-    static void eventcb(struct bufferevent *bev, short what, void *ctx);
+-};
++TorControlConnection::~TorControlConnection() {
++    Disconnect();
++}
+ 
+-TorControlConnection::TorControlConnection(struct event_base *_base)
+-    : base(_base) {}
++void TorControlConnection::Lost(const boost::system::error_code &ec) {
++    if (ec == boost::asio::error::eof) {
++        LogDebug(BCLog::TOR, "tor: End of stream\n");
++    } else {
++        LogDebug(BCLog::TOR, "tor: Error connecting to Tor control socket\n");
++    }
++    Disconnect();
++    disconnected(*this);
++}
+ 
+-TorControlConnection::~TorControlConnection() {
+-    if (b_conn) {
+-        bufferevent_free(b_conn);
++void TorControlConnection::OnConnect(uint64_t gen,
++                                     const boost::system::error_code &ec) {
++    if (gen != m_gen || ec == boost::asio::error::operation_aborted) {
++        return;
++    }
++    if (ec) {
++        LogDebug(BCLog::TOR, "tor: Error connecting to Tor control socket\n");
++        Disconnect();
++        disconnected(*this);
++        return;
++    }
++    m_connected = true;
++    LogDebug(BCLog::TOR, "tor: Successfully connected!\n");
++    connected(*this);
++    if (gen != m_gen) {
++        // The callback disconnected.
++        return;
+     }
++    StartWrite();
++    StartRead();
+ }
+ 
+-void TorControlConnection::readcb(struct bufferevent *bev, void *ctx) {
+-    TorControlConnection *self = static_cast<TorControlConnection *>(ctx);
+-    struct evbuffer *input = bufferevent_get_input(bev);
+-    size_t n_read_out = 0;
+-    char *line;
+-    assert(input);
+-    // If there is not a whole line to read, evbuffer_readln returns nullptr
+-    while ((line = evbuffer_readln(input, &n_read_out, EVBUFFER_EOL_CRLF)) !=
+-           nullptr) {
+-        std::string s(line, n_read_out);
+-        free(line);
++void TorControlConnection::StartRead() {
++    const uint64_t gen = m_gen;
++    m_socket->async_read_some(
++        boost::asio::buffer(m_read_chunk),
++        [this, gen](const boost::system::error_code &ec, size_t bytes) {
++            OnRead(gen, ec, bytes);
++        });
++}
++
++void TorControlConnection::OnRead(uint64_t gen,
++                                  const boost::system::error_code &ec,
++                                  size_t bytes) {
++    if (gen != m_gen || ec == boost::asio::error::operation_aborted) {
++        return;
++    }
++    if (ec) {
++        Lost(ec);
++        return;
++    }
++    m_rbuf.append(m_read_chunk.data(), bytes);
++
++    // Take every complete line. A line ends with LF, optionally preceded by
++    // CR, which is removed.
++    size_t begin = 0;
++    size_t end;
++    while ((end = m_rbuf.find('\n', begin)) != std::string::npos) {
++        std::string s = m_rbuf.substr(begin, end - begin);
++        begin = end + 1;
++        if (!s.empty() && s.back() == '\r') {
++            s.pop_back();
++        }
+         // Short line
+         if (s.size() < 4) {
+             continue;
+         }
+         // <status>(-|+| )<data><CRLF>
+-        self->message.code = LocaleIndependentAtoi<int>(s.substr(0, 3));
+-        self->message.lines.push_back(s.substr(4));
++        message.code = LocaleIndependentAtoi<int>(s.substr(0, 3));
++        message.lines.push_back(s.substr(4));
+         // '-','+' or ' '
+         char ch = s[3];
+         if (ch == ' ') {
+             // Final line, dispatch reply and clean up
+-            if (self->message.code >= 600) {
++            if (message.code >= 600) {
+                 // Dispatch async notifications to async handler.
+                 // Synchronous and asynchronous messages are never interleaved
+-                self->async_handler(*self, self->message);
++                async_handler(*this, message);
+             } else {
+-                if (!self->reply_handlers.empty()) {
++                if (!reply_handlers.empty()) {
+                     // Invoke reply handler with message
+-                    self->reply_handlers.front()(*self, self->message);
+-                    self->reply_handlers.pop_front();
++                    reply_handlers.front()(*this, message);
++                    reply_handlers.pop_front();
+                 } else {
+                     LogDebug(BCLog::TOR,
+                              "tor: Received unexpected sync reply %i\n",
+-                             self->message.code);
++                             message.code);
+                 }
+             }
+-            self->message.Clear();
++            message.Clear();
++            if (gen != m_gen) {
++                // A handler disconnected; the rest of the input is dropped.
++                return;
++            }
+         }
+     }
++    m_rbuf.erase(0, begin);
+ 
+     // Check for size of buffer - protect against memory exhaustion with very
+-    // long lines. Do this after evbuffer_readln to make sure all full lines
++    // long lines. Do this after reading the lines to make sure all full lines
+     // have been removed from the buffer. Everything left is an incomplete line.
+-    if (evbuffer_get_length(input) > MAX_LINE_LENGTH) {
++    if (m_rbuf.size() > size_t(MAX_LINE_LENGTH)) {
+         LogPrintf("tor: Disconnecting because MAX_LINE_LENGTH exceeded\n");
+-        self->Disconnect();
++        Disconnect();
++        return;
+     }
++    StartRead();
+ }
+ 
+-void TorControlConnection::eventcb(struct bufferevent *bev, short what,
+-                                   void *ctx) {
+-    TorControlConnection *self = static_cast<TorControlConnection *>(ctx);
+-    if (what & BEV_EVENT_CONNECTED) {
+-        LogDebug(BCLog::TOR, "tor: Successfully connected!\n");
+-        self->connected(*self);
+-    } else if (what & (BEV_EVENT_EOF | BEV_EVENT_ERROR)) {
+-        if (what & BEV_EVENT_ERROR) {
+-            LogDebug(BCLog::TOR,
+-                     "tor: Error connecting to Tor control socket\n");
+-        } else {
+-            LogDebug(BCLog::TOR, "tor: End of stream\n");
+-        }
+-        self->Disconnect();
+-        self->disconnected(*self);
++void TorControlConnection::StartWrite() {
++    if (!m_socket || !m_connected || m_writing || m_wqueue.empty()) {
++        return;
+     }
++    // Write everything queued so far in one operation. The data is owned by
++    // the completion handler, so it outlives a Disconnect() in between.
++    auto data = std::make_shared<std::string>();
++    for (const std::string &cmd : m_wqueue) {
++        data->append(cmd);
++    }
++    m_wqueue.clear();
++    m_writing = true;
++    const uint64_t gen = m_gen;
++    boost::asio::async_write(
++        *m_socket, boost::asio::buffer(*data),
++        [this, gen, data](const boost::system::error_code &ec, size_t) {
++            OnWrite(gen, ec);
++        });
++}
++
++void TorControlConnection::OnWrite(uint64_t gen,
++                                   const boost::system::error_code &ec) {
++    if (gen != m_gen || ec == boost::asio::error::operation_aborted) {
++        return;
++    }
++    m_writing = false;
++    if (ec) {
++        Lost(ec);
++        return;
++    }
++    StartWrite();
+ }
+ 
+ bool TorControlConnection::Connect(const std::string &tor_control_center,
+                                    const ConnectionCB &_connected,
+                                    const ConnectionCB &_disconnected) {
+-    if (b_conn) {
++    if (m_socket) {
+         Disconnect();
+     }
+     // Parse tor_control_center address:port
++    const std::optional<CService> addr =
++        ParseTorControlAddress(tor_control_center);
+     struct sockaddr_storage connect_to_addr;
+-    int connect_to_addrlen = sizeof(connect_to_addr);
+-    if (evutil_parse_sockaddr_port(tor_control_center.c_str(),
+-                                   (struct sockaddr *)&connect_to_addr,
+-                                   &connect_to_addrlen) < 0) {
++    socklen_t connect_to_addrlen = sizeof(connect_to_addr);
++    if (!addr || !addr->GetSockAddr(
++                     reinterpret_cast<struct sockaddr *>(&connect_to_addr),
++                     &connect_to_addrlen)) {
+         LogPrintf("tor: Error parsing socket address %s\n", tor_control_center);
+         return false;
+     }
++    boost::asio::ip::tcp::endpoint endpoint;
++    std::memcpy(endpoint.data(), &connect_to_addr, connect_to_addrlen);
++    endpoint.resize(connect_to_addrlen);
+ 
+-    // Create a new socket, set up callbacks and enable notification bits
+-    b_conn = bufferevent_socket_new(base, -1, BEV_OPT_CLOSE_ON_FREE);
+-    if (!b_conn) {
++    // Create a new socket
++    boost::system::error_code ec;
++    m_socket.emplace(m_io);
++    m_socket->open(endpoint.protocol(), ec);
++    if (ec) {
++        m_socket.reset();
++        LogPrintf("tor: Error connecting to address %s\n", tor_control_center);
+         return false;
+     }
+-    bufferevent_setcb(b_conn, TorControlConnection::readcb, nullptr,
+-                      TorControlConnection::eventcb, this);
+-    bufferevent_enable(b_conn, EV_READ | EV_WRITE);
+     this->connected = _connected;
+     this->disconnected = _disconnected;
+ 
+     // Finally, connect to tor_control_center
+-    if (bufferevent_socket_connect(b_conn, (struct sockaddr *)&connect_to_addr,
+-                                   connect_to_addrlen) < 0) {
+-        LogPrintf("tor: Error connecting to address %s\n", tor_control_center);
+-        return false;
+-    }
++    const uint64_t gen = m_gen;
++    m_socket->async_connect(
++        endpoint,
++        [this, gen](const boost::system::error_code &e) { OnConnect(gen, e); });
+     return true;
+ }
+ 
+ void TorControlConnection::Disconnect() {
+-    if (b_conn) {
+-        bufferevent_free(b_conn);
+-    }
+-    b_conn = nullptr;
++    ++m_gen;
++    if (m_socket) {
++        boost::system::error_code ignored;
++        m_socket->shutdown(boost::asio::ip::tcp::socket::shutdown_both,
++                           ignored);
++        m_socket->close(ignored);
++        m_socket.reset();
++    }
++    m_connected = false;
++    m_writing = false;
++    m_rbuf.clear();
++    m_wqueue.clear();
+ }
+ 
+ bool TorControlConnection::Command(const std::string &cmd,
+                                    const ReplyHandlerCB &reply_handler) {
+-    if (!b_conn) {
++    if (!m_socket) {
+         return false;
+     }
+-    struct evbuffer *buf = bufferevent_get_output(b_conn);
+-    if (!buf) {
+-        return false;
+-    }
+-    evbuffer_add(buf, cmd.data(), cmd.size());
+-    evbuffer_add(buf, "\r\n", 2);
++    m_wqueue.push_back(cmd + "\r\n");
+     reply_handlers.push_back(reply_handler);
++    StartWrite();
+     return true;
+ }
+ 
+@@ -503,7 +514,7 @@ std::map<std::string, std::string> ParseTorReplyMapping(const std::string &s) {
+  */
+ class TorController {
+ public:
+-    TorController(struct event_base *base,
++    TorController(boost::asio::io_context &io,
+                   const std::string &tor_control_center,
+                   const CService &target);
+     ~TorController();
+@@ -515,13 +526,12 @@ public:
+     void Reconnect();
+ 
+ private:
+-    struct event_base *base;
+     const std::string m_tor_control_center;
+     TorControlConnection conn;
+     std::string private_key;
+     std::string service_id;
+     bool reconnect{true};
+-    struct event *reconnect_ev;
++    boost::asio::steady_timer m_reconnect_timer;
+     float reconnect_timeout{RECONNECT_TIMEOUT_START};
+     CService service;
+     const CService m_target;
+@@ -544,21 +554,13 @@ private:
+     void connected_cb(TorControlConnection &conn);
+     /** Callback after connection lost or failed connection attempt */
+     void disconnected_cb(TorControlConnection &conn);
+-
+-    /** Callback for reconnect timer */
+-    static void reconnect_cb(evutil_socket_t fd, short what, void *arg);
+ };
+ 
+-TorController::TorController(struct event_base *_base,
++TorController::TorController(boost::asio::io_context &io,
+                              const std::string &tor_control_center,
+                              const CService &target)
+-    : base(_base), m_tor_control_center(tor_control_center), conn(base),
++    : m_tor_control_center(tor_control_center), conn(io), m_reconnect_timer(io),
+       m_target(target) {
+-    reconnect_ev = event_new(base, -1, 0, reconnect_cb, this);
+-    if (!reconnect_ev) {
+-        LogPrintf(
+-            "tor: Failed to create event for reconnection: out of memory?\n");
+-    }
+     // Start connection attempts immediately
+     if (!conn.Connect(m_tor_control_center,
+                       std::bind(&TorController::connected_cb, this,
+@@ -578,10 +580,6 @@ TorController::TorController(struct event_base *_base,
+ }
+ 
+ TorController::~TorController() {
+-    if (reconnect_ev) {
+-        event_free(reconnect_ev);
+-        reconnect_ev = nullptr;
+-    }
+     if (service.IsValid()) {
+         RemoveLocal(service);
+     }
+@@ -893,10 +891,13 @@ void TorController::disconnected_cb(TorControlConnection &_conn) {
+              m_tor_control_center);
+ 
+     // Single-shot timer for reconnect. Use exponential backoff.
+-    struct timeval time = MillisToTimeval(int64_t(reconnect_timeout * 1000.0));
+-    if (reconnect_ev) {
+-        event_add(reconnect_ev, &time);
+-    }
++    m_reconnect_timer.expires_after(
++        std::chrono::milliseconds(int64_t(reconnect_timeout * 1000.0)));
++    m_reconnect_timer.async_wait([this](const boost::system::error_code &ec) {
++        if (!ec) {
++            Reconnect();
++        }
++    });
+     reconnect_timeout *= RECONNECT_TIMEOUT_EXP;
+ }
+ 
+@@ -919,34 +920,22 @@ fs::path TorController::GetPrivateKeyFile() {
+     return gArgs.GetDataDirNet() / "onion_v3_private_key";
+ }
+ 
+-void TorController::reconnect_cb(evutil_socket_t fd, short what, void *arg) {
+-    TorController *self = static_cast<TorController *>(arg);
+-    self->Reconnect();
+-}
+-
+ /****** Thread ********/
+-static struct event_base *gBase;
++static std::unique_ptr<boost::asio::io_context> g_tor_io;
+ static std::thread torControlThread;
+ 
+ static void TorControlThread(CService onion_service_target) {
+-    TorController ctrl(gBase, gArgs.GetArg("-torcontrol", DEFAULT_TOR_CONTROL),
++    auto work = boost::asio::make_work_guard(*g_tor_io);
++    TorController ctrl(*g_tor_io,
++                       gArgs.GetArg("-torcontrol", DEFAULT_TOR_CONTROL),
+                        onion_service_target);
+ 
+-    event_base_dispatch(gBase);
++    g_tor_io->run();
+ }
+ 
+ void StartTorControl(CService onion_service_target) {
+-    assert(!gBase);
+-#ifdef WIN32
+-    evthread_use_windows_threads();
+-#else
+-    evthread_use_pthreads();
+-#endif
+-    gBase = event_base_new();
+-    if (!gBase) {
+-        LogPrintf("tor: Unable to create event_base\n");
+-        return;
+-    }
++    assert(!g_tor_io);
++    g_tor_io = std::make_unique<boost::asio::io_context>(1);
+ 
+     torControlThread =
+         std::thread(&util::TraceThread, "torcontrol", [onion_service_target] {
+@@ -955,20 +944,17 @@ void StartTorControl(CService onion_service_target) {
+ }
+ 
+ void InterruptTorControl() {
+-    if (gBase) {
++    if (g_tor_io) {
+         LogPrintf("tor: Thread interrupt\n");
+-        event_base_once(
+-            gBase, -1, EV_TIMEOUT,
+-            [](evutil_socket_t, short, void *) { event_base_loopbreak(gBase); },
+-            nullptr, nullptr);
++        // Thread-safe; if the loop has not started yet, run() returns at once.
++        g_tor_io->stop();
+     }
+ }
+ 
+ void StopTorControl() {
+-    if (gBase) {
++    if (g_tor_io) {
+         torControlThread.join();
+-        event_base_free(gBase);
+-        gBase = nullptr;
++        g_tor_io.reset();
+     }
+ }
+ 
+diff --git a/src/torcontrol.h b/src/torcontrol.h
+index f17c6f1edb915e8055727fd970c663268abdd802..12d015a6f8672e68196038fc074cc14609b5aea3 100644
+--- a/src/torcontrol.h
++++ b/src/torcontrol.h
+@@ -10,8 +10,18 @@
+ 
+ #include <netaddress.h>
+ 
++#include <boost/asio/io_context.hpp>
++#include <boost/asio/ip/tcp.hpp>
++#include <boost/signals2/signal.hpp>
++
++#include <cstdint>
++#include <deque>
++#include <functional>
++#include <map>
+ #include <optional>
+ #include <string>
++#include <utility>
++#include <vector>
+ 
+ extern const std::string DEFAULT_TOR_CONTROL;
+ static const bool DEFAULT_LISTEN_ONION = true;
+@@ -31,4 +41,114 @@ CService DefaultOnionServiceTarget();
+  */
+ std::optional<CService> ParseTorControlAddress(const std::string &address);
+ 
++/**
++ * Split reply line in the form 'AUTH METHODS=...' into a type 'AUTH' and
++ * arguments 'METHODS=...'.
++ */
++std::pair<std::string, std::string> SplitTorReplyLine(const std::string &s);
++
++/**
++ * Parse reply arguments in the form 'METHODS=COOKIE,SAFECOOKIE
++ * COOKIEFILE=".../control_auth_cookie"'. Returns a map of keys to values, or
++ * an empty map if there was an error.
++ */
++std::map<std::string, std::string> ParseTorReplyMapping(const std::string &s);
++
++/** Reply from Tor, can be single or multi-line */
++class TorControlReply {
++public:
++    TorControlReply() { Clear(); }
++
++    int code;
++    std::vector<std::string> lines;
++
++    void Clear() {
++        code = 0;
++        lines.clear();
++    }
++};
++
++/**
++ * Low-level handling for Tor control connection.
++ * Speaks the SMTP-like protocol as defined in torspec/control-spec.txt
++ *
++ * All methods and callbacks run on the thread that runs the io_context.
++ */
++class TorControlConnection {
++public:
++    typedef std::function<void(TorControlConnection &)> ConnectionCB;
++    typedef std::function<void(TorControlConnection &, const TorControlReply &)>
++        ReplyHandlerCB;
++
++    /** Create a new TorControlConnection. */
++    explicit TorControlConnection(boost::asio::io_context &io);
++    ~TorControlConnection();
++
++    /**
++     * Connect to a Tor control port.
++     * tor_control_center is address of the form host:port.
++     * connected is the handler that is called when connection is successfully
++     * established.
++     * disconnected is a handler that is called when the connection is broken.
++     * Return true on success.
++     */
++    bool Connect(const std::string &tor_control_center,
++                 const ConnectionCB &connected,
++                 const ConnectionCB &disconnected);
++
++    /**
++     * Disconnect from Tor control port.
++     */
++    void Disconnect();
++
++    /**
++     * Send a command, register a handler for the reply.
++     * A trailing CRLF is automatically added.
++     * Return true on success.
++     */
++    bool Command(const std::string &cmd, const ReplyHandlerCB &reply_handler);
++
++    /** Response handlers for async replies */
++    boost::signals2::signal<void(TorControlConnection &,
++                                 const TorControlReply &)>
++        async_handler;
++
++private:
++    void OnConnect(uint64_t gen, const boost::system::error_code &ec);
++    void StartRead();
++    void OnRead(uint64_t gen, const boost::system::error_code &ec,
++                size_t bytes);
++    void StartWrite();
++    void OnWrite(uint64_t gen, const boost::system::error_code &ec);
++    /** Handle a broken connection: log, disconnect, notify. */
++    void Lost(const boost::system::error_code &ec);
++
++    boost::asio::io_context &m_io;
++    /** Callback when ready for use */
++    std::function<void(TorControlConnection &)> connected;
++    /** Callback when connection lost */
++    std::function<void(TorControlConnection &)> disconnected;
++    /** Connection to control socket */
++    std::optional<boost::asio::ip::tcp::socket> m_socket;
++    /** Whether the connection attempt has completed */
++    bool m_connected{false};
++    /** Received bytes not yet forming a complete line */
++    std::string m_rbuf;
++    /** Socket read buffer */
++    std::vector<char> m_read_chunk;
++    /** Commands waiting to be written */
++    std::deque<std::string> m_wqueue;
++    /** Whether a write is in progress */
++    bool m_writing{false};
++    /**
++     * Incremented by Disconnect(), so completions of operations on an older
++     * socket are ignored.
++     */
++    uint64_t m_gen{0};
++    /** Message being received */
++    TorControlReply message;
++    /** Response handlers */
++    std::deque<ReplyHandlerCB> reply_handlers;
++};
++
+ #endif // BITCOIN_TORCONTROL_H
