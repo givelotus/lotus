@@ -1,0 +1,11 @@
+# Upstream-first source order
+
+First reorder exactly six independent optimizations onto the ABC base: Currency cache, single-context salted hasher, numeric hash comparator, stake-hash hoist, coins bucket reservation, single-input/disabled-sequence fastpaths. Preserve each logical commit and its tests; no squashing to lower the count. All six actual diffs apply textually on ABC; this does not replace the upcoming prefix build and tests.
+
+Next, checker/default policy can follow existing ancestor API owner003. Its production and C++ tests are independent of snapshots; its new functional test requires late framework class-attribute support. Map that file to the framework prerequisite rather than hoisting broad framework changes. All assertions and exact endpoint bytes remain.
+
+Remaining order follows dependency closure: small independent correctness first, generic primitives before their consumers; larger allocator/CoW/storage/admission work afterward, broad logging conversions and P2P/protocol work later. Minimal logger prerequisites may precede consumers. Native proof/rule/hash adapters stay native. Pool lifecycle alone cannot move before its native manager exists. Relay and persistent tree interfaces need an explicit adapter split rather than a blind reorder.
+
+This bounded execution first moves six exact source commits with a deterministic Git rebase sequence. A backup ref and source bundle precede mutation. Every old commit maps to its rewritten owner; final529 full tracked tree must remain f58 exactly. No manifests advance until prefix gates and all-intermediate source replay pass.
+
+Executed adjustment: an inherited CMake linked-worktree bug prevented building the early prefix. Extracted its existing generic src/CMakeLists.txt hunk from adaptive-policy into a new first standalone build owner (530 total logical owners). Checker is global11 after original shared003; its exact functional file belongs to class-attribute framework companion. All remaining original owner line operations are accounted, including repeated-context Git hunk alignment differences; complete shared and Lotus trees unchanged. Early7 and early11 normal builds passed, followed by relevant suites.

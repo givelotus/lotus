@@ -1,0 +1,414 @@
+From bd78885a22a060c6891a50ae7fef7fb89915e3e1 Mon Sep 17 00:00:00 2001
+From: Shammah Chancellor <shammah.chancellor@notvalid.com>
+Date: Wed, 21 Oct 2026 19:55:05 -0700
+Subject: [PATCH] avalanche: preverify ready responses across peers without
+ reordering dispatch
+
+Batch already-ready isolated responses across peer keys, retaining ordinary
+ordered message consumption, poll binding, fault attribution and key checks.
+Bound copied heads, per-message bytes and total copied bytes; do not wait for
+new traffic. Preserve existing contiguous per-peer burst handling.
+
+Includes ownership/key-rotation/disconnect/malformed-message cases and matched
+component benchmarks. No daemon throughput improvement is claimed.
+
+Source provenance: 8cb2b44b17 + 71403f0564 + iterator include 2371b224.
+Shared insertion follows AVARESPONSE owner da60f85abd; legacy Schnorr collector
+prerequisite 8a3f993145 is already present. Endpoint build/focused/component
+results do not independently validate this earlier prefix build.
+
+diff --git a/src/avalanche/test/preconsensus_batch_tests.cpp b/src/avalanche/test/preconsensus_batch_tests.cpp
+index a0c3cd6bc285788200e3b9c29da10957aaae9e6e..6f2a991c2b8f7cb137b12d271811903c62e757dd 100644
+--- a/src/avalanche/test/preconsensus_batch_tests.cpp
++++ b/src/avalanche/test/preconsensus_batch_tests.cpp
+@@ -126,6 +126,66 @@ BOOST_FIXTURE_TEST_CASE(avaresponse_burst_preserves_individual_messages,
+     }
+ }
+ 
++BOOST_FIXTURE_TEST_CASE(avaresponse_cross_peer_ready_turn,
++                        AvalancheTestingSetup) {
++    std::vector<CNode *> nodes;
++    std::vector<CKey> keys;
++    for (int i = 0; i < 7; ++i) {
++        keys.push_back(CKey::MakeCompressedKey());
++        auto *node = new CNode(950 + i, nullptr, CAddress(), 0, 0, 0,
++                              CAddress(), "", ConnectionType::OUTBOUND_FULL_RELAY,
++                              false);
++        node->SetCommonVersion(PROTOCOL_VERSION);
++        node->m_has_all_wanted_services = true;
++        m_node.peerman->InitializeNode(config, *node, NODE_NETWORK);
++        node->nVersion = PROTOCOL_VERSION;
++        node->fSuccessfullyConnected = true;
++        node->m_avalanche_enabled = true;
++        WITH_LOCK(node->cs_avalanche_pubkey,
++                  node->m_avalanche_pubkey = keys.back().GetPubKey());
++        m_connman->AddTestNode(*node);
++        Response response(i, 0, {});
++        HashWriter hash;
++        hash << response;
++        SchnorrSig signature;
++        BOOST_REQUIRE(keys.back().SignSchnorr(hash.GetHash(), signature));
++        if (i == 1) signature[32] ^= 1;
++        auto message = NetMsg::Make(NetMsgType::AVARESPONSE, response, signature);
++        if (i == 5) message.data.resize(1);
++        BOOST_REQUIRE(m_connman->ReceiveMsgFrom(*node, message));
++        node->fPauseSend = false;
++        nodes.push_back(node);
++    }
++    // Wrong-type and over-budget peeks must leave the head untouched.
++    BOOST_CHECK(!nodes[0]->CopyIsolatedMessage(NetMsgType::PING, 65536));
++    BOOST_CHECK(!nodes[0]->CopyIsolatedMessage(NetMsgType::AVARESPONSE, 1));
++    std::atomic<bool> interrupt{false};
++    LOCK(NetEventsInterface::g_msgproc_mutex);
++    m_node.peerman->PrepareMessageTurn(nodes, interrupt);
++    // A pre-pass must not consume votes or dequeue responses.
++    for (auto *node : nodes) {
++        BOOST_CHECK_EQUAL(node->m_avalanche_message_fault_counter, 0);
++    }
++    // Key changes between preverification and ordered consumption invalidate
++    // the token; an earlier valid signature must never authorize a new key.
++    WITH_LOCK(nodes[2]->cs_avalanche_pubkey,
++              nodes[2]->m_avalanche_pubkey = keys[0].GetPubKey());
++    nodes[3]->fDisconnect = true;
++    for (auto *node : nodes) {
++        m_node.peerman->ProcessMessages(config, node, interrupt);
++    }
++    // Valid responses reach registerVotes (unsolicited in this fixture);
++    // invalid signatures, including rotated keys, must not reach it. One bad
++    // peer must not suppress a valid peer before or after it in the batch.
++    BOOST_CHECK_EQUAL(nodes[0]->m_avalanche_message_fault_counter, 1);
++    BOOST_CHECK_EQUAL(nodes[1]->m_avalanche_message_fault_counter, 0);
++    BOOST_CHECK_EQUAL(nodes[2]->m_avalanche_message_fault_counter, 0);
++    BOOST_CHECK_EQUAL(nodes[3]->m_avalanche_message_fault_counter, 0);
++    BOOST_CHECK_EQUAL(nodes[4]->m_avalanche_message_fault_counter, 1);
++    BOOST_CHECK_EQUAL(nodes[5]->m_avalanche_message_fault_counter, 0);
++    BOOST_CHECK_EQUAL(nodes[6]->m_avalanche_message_fault_counter, 1);
++}
++
+ BOOST_FIXTURE_TEST_CASE(avalanche_defaults_keep_upstream_unparking,
+                         BasicTestingSetup) {
+     kernel::Notifications notifications;
+diff --git a/src/bench/CMakeLists.txt b/src/bench/CMakeLists.txt
+index 0fc18ab145c533583cffd84ce43fcd6603887782..82965aba1714c01ffd7b6465cab4a55b6027eeae 100644
+--- a/src/bench/CMakeLists.txt
++++ b/src/bench/CMakeLists.txt
+@@ -35,6 +35,7 @@ endforeach()
+ 
+ add_executable(bitcoin-bench
+ 	addrman.cpp
++	avalanche_signatures.cpp
+ 	base58.cpp
+ 	bench.cpp
+ 	bench_bitcoin.cpp
+diff --git a/src/bench/avalanche_signatures.cpp b/src/bench/avalanche_signatures.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..c8a3c70dcf1325107ac71068a534fd8fde47ad58
+--- /dev/null
++++ b/src/bench/avalanche_signatures.cpp
+@@ -0,0 +1,111 @@
++// Copyright (c) 2026 The Lotus developers
++// Distributed under the MIT software license, see the accompanying
++// file COPYING or http://www.opensource.org/licenses/mit-license.php.
++
++#include <avalanche/protocol.h>
++#include <bench/bench.h>
++#include <hash.h>
++#include <key.h>
++#include <lotus_v2/signing.h>
++#include <streams.h>
++
++#include <array>
++#include <stdexcept>
++
++namespace {
++struct SignedResponse {
++    CPubKey key;
++    uint256 hash;
++    SchnorrSig signature;
++    DataStream bytes;
++};
++
++void AvalancheSignatures(benchmark::Bench &bench, bool multiple_keys,
++                         bool batch, bool include_prepass,
++                         size_t batch_size = 32, size_t key_reuse = 1) {
++    ECC_Start();
++    constexpr size_t COUNT = 32;
++    std::array<SignedResponse, COUNT> responses;
++    CKey key = CKey::MakeCompressedKey();
++    for (size_t i = 0; i < COUNT; ++i) {
++        if (multiple_keys && i % key_reuse == 0) {
++            key = CKey::MakeCompressedKey();
++        }
++        auto &item = responses[i];
++        item.key = key.GetPubKey();
++        avalanche::Response response(i, 0, std::vector<avalanche::Vote>(16));
++        HashWriter hash;
++        hash << response;
++        item.hash = hash.GetHash();
++        if (!key.SignSchnorr(item.hash, item.signature)) {
++            throw std::runtime_error("Schnorr benchmark signing failed");
++        }
++        item.bytes << response << item.signature;
++    }
++    bench.batch(COUNT).unit("signature").run([&] {
++        lotus::v2::BatchSigCollector collector;
++        collector.Reserve(COUNT);
++        for (const auto &item : responses) {
++            uint256 hash = item.hash;
++            SchnorrSig signature = item.signature;
++            if (include_prepass) {
++                // Includes the bounded queue-head copy and duplicate parse;
++                // the normal consumer subsequently parses once in all cases.
++                DataStream copied{Span{item.bytes.data(), item.bytes.size()}};
++                avalanche::Response response;
++                HashVerifier verifier(copied);
++                verifier >> response;
++                hash = verifier.GetHash();
++                copied >> signature;
++            }
++            const bool valid = batch
++                ? collector.AddLegacySchnorr(
++                    std::span<const uint8_t>{item.key.data(), item.key.size()},
++                    std::span<const uint8_t>{signature.data(), signature.size()},
++                    hash.begin())
++                : item.key.VerifySchnorr(hash, signature);
++            if (!valid) throw std::runtime_error("Schnorr benchmark invalid item");
++            if (batch && collector.Size() == batch_size) {
++                // Use the same automatic worker threshold as production.
++                if (!collector.VerifyAll()) {
++                    throw std::runtime_error("Schnorr benchmark invalid batch");
++                }
++                collector.Clear();
++            }
++        }
++    });
++    ECC_Stop();
++}
++} // namespace
++
++static void AvaSameKeyIndividual(benchmark::Bench &b) {
++    AvalancheSignatures(b, false, false, false);
++}
++static void AvaSameKeyBatch(benchmark::Bench &b) {
++    AvalancheSignatures(b, false, true, false);
++}
++static void AvaCrossPeerIndividual(benchmark::Bench &b) {
++    AvalancheSignatures(b, true, false, false);
++}
++static void AvaCrossPeerBatch(benchmark::Bench &b) {
++    AvalancheSignatures(b, true, true, false);
++}
++static void AvaCrossPeerBatchPrepass(benchmark::Bench &b) {
++    AvalancheSignatures(b, true, true, true);
++}
++// Matched workload: eight peers, four responses/key, identical payload shape.
++// This control measures crypto grouping only: production intentionally retains
++// contiguous per-peer burst handling rather than copying/reordering it.
++static void AvaEightPeerBatches(benchmark::Bench &b) {
++    AvalancheSignatures(b, true, true, false, 4, 4);
++}
++static void AvaEightPeerCombined(benchmark::Bench &b) {
++    AvalancheSignatures(b, true, true, false, 32, 4);
++}
++BENCHMARK(AvaEightPeerBatches);
++BENCHMARK(AvaEightPeerCombined);
++BENCHMARK(AvaSameKeyIndividual);
++BENCHMARK(AvaSameKeyBatch);
++BENCHMARK(AvaCrossPeerIndividual);
++BENCHMARK(AvaCrossPeerBatch);
++BENCHMARK(AvaCrossPeerBatchPrepass);
+diff --git a/src/net.cpp b/src/net.cpp
+index abd8c657787354d107461212907ebda161130497..16df2ce4ad2f8118eee53e5de55aa720eb0a5a58 100644
+--- a/src/net.cpp
++++ b/src/net.cpp
+@@ -53,6 +53,7 @@
+ #include <cmath>
+ #include <cstdint>
+ #include <functional>
++#include <iterator>
+ #include <limits>
+ #include <optional>
+ #include <unordered_map>
+@@ -2281,6 +2282,10 @@ void CConnman::ThreadMessageHandler() {
+             // multiple consecutive connections in the vNodes list.
+             const NodesSnapshot snap{*this, /*shuffle=*/true};
+ 
++            for (auto interface : m_msgproc) {
++                interface->PrepareMessageTurn(snap.Nodes(), flagInterruptMsgProc);
++            }
++
+             for (CNode *pnode : snap.Nodes()) {
+                 if (pnode->fDisconnect) {
+                     continue;
+@@ -3135,6 +3140,21 @@ void CNode::MarkReceivedMsgsForProcessing() {
+     pauseRecv(m_msg_process_queue_size > m_recv_flood_size);
+ }
+ 
++std::optional<DataStream> CNode::CopyIsolatedMessage(const std::string &type,
++                                                    size_t max_bytes) {
++    LOCK(m_msg_process_queue_mutex);
++    if (m_msg_process_queue.empty()) return std::nullopt;
++    const auto &first = m_msg_process_queue.front();
++    if (first.m_type != type || first.m_recv.size() > max_bytes) {
++        return std::nullopt;
++    }
++    const auto second = std::next(m_msg_process_queue.begin());
++    if (second != m_msg_process_queue.end() && second->m_type == type) {
++        return std::nullopt;
++    }
++    return DataStream{Span{first.m_recv.data(), first.m_recv.size()}};
++}
++
+ std::optional<std::pair<CNetMessage, bool>> CNode::PollMessage() {
+     LOCK(m_msg_process_queue_mutex);
+     if (m_msg_process_queue.empty()) {
+diff --git a/src/net.h b/src/net.h
+index 4fa4f0587dfd6a682c7c00623c0bfe32a173b658..877426df7017effa9bc006e2b01b9da44390a834 100644
+--- a/src/net.h
++++ b/src/net.h
+@@ -479,6 +479,14 @@ public:
+      * consisting of the message and a bool that indicates if the processing
+      * queue has more entries.
+      */
++    /** Copy a bounded, isolated queue head for signature preverification.
++     * Leaves ordering/accounting unchanged. Contiguous bursts use the existing
++     * per-peer batch path instead. No caller retains a reference to queue data.
++     */
++    std::optional<DataStream> CopyIsolatedMessage(const std::string &type,
++                                                 size_t max_bytes)
++        EXCLUSIVE_LOCKS_REQUIRED(!m_msg_process_queue_mutex);
++
+     std::optional<std::pair<CNetMessage, bool>> PollMessage()
+         EXCLUSIVE_LOCKS_REQUIRED(!m_msg_process_queue_mutex);
+ 
+@@ -811,6 +819,13 @@ public:
+                                  std::atomic<bool> &interrupt)
+         EXCLUSIVE_LOCKS_REQUIRED(g_msgproc_mutex) = 0;
+ 
++    /** Preverify ready queue heads without dispatching or reordering messages.
++     * Called with a connection snapshot that pins all nodes for this turn.
++     */
++    virtual void PrepareMessageTurn(Span<CNode *const>,
++                                    const std::atomic<bool> &)
++        EXCLUSIVE_LOCKS_REQUIRED(g_msgproc_mutex) {}
++
+     /**
+      * Send queued protocol messages to a given node.
+      *
+diff --git a/src/net_processing.cpp b/src/net_processing.cpp
+index fcae9735f0f5fe582697ffd42a1863100dd02347..41a208e9a895d5b847da539c0580958956760733 100644
+--- a/src/net_processing.cpp
++++ b/src/net_processing.cpp
+@@ -827,6 +827,9 @@ public:
+     void FinalizeNode(const Config &config, const CNode &node) override
+         EXCLUSIVE_LOCKS_REQUIRED(!m_peer_mutex, !cs_proofrequest,
+                                  !m_headers_presync_mutex);
++    void PrepareMessageTurn(Span<CNode *const> nodes,
++                            const std::atomic<bool> &interrupt) override
++        EXCLUSIVE_LOCKS_REQUIRED(g_msgproc_mutex);
+     bool ProcessMessages(const Config &config, CNode *pfrom,
+                          std::atomic<bool> &interrupt) override
+         EXCLUSIVE_LOCKS_REQUIRED(!m_peer_mutex,
+@@ -1040,6 +1043,13 @@ private:
+         EXCLUSIVE_LOCKS_REQUIRED(!m_peer_mutex,
+                                  !m_recent_confirmed_transactions_mutex,
+                                  g_msgproc_mutex);
++    struct PreverifiedAvaSignature {
++        CPubKey pubkey;
++        uint256 hash;
++        SchnorrSig signature;
++    };
++    std::map<NodeId, PreverifiedAvaSignature> m_preverified_ava_signatures
++        GUARDED_BY(g_msgproc_mutex);
+     std::optional<avalanche::Response>
+         m_preverified_ava_response GUARDED_BY(g_msgproc_mutex);
+     void ProcessAvaResponseBatch(const Config &config, CNode &pfrom, Peer &peer,
+@@ -5283,6 +5293,70 @@ void PeerManagerImpl::ProcessBlock(const Config &config, CNode &node,
+     }
+ }
+ 
++void PeerManagerImpl::PrepareMessageTurn(
++    Span<CNode *const> nodes, const std::atomic<bool> &interrupt) {
++    AssertLockHeld(g_msgproc_mutex);
++    m_preverified_ava_signatures.clear();
++    if (!m_avalanche || interrupt) return;
++
++    // No timer, queue removal, vote registration, or CNode lifetime extends
++    // beyond this turn. Duplicate parsing is bounded; normal dispatch remains
++    // authoritative for syntax errors, peer attribution and poll validation.
++    constexpr size_t MAX_SIGNATURES = 64;
++    constexpr size_t MAX_MESSAGE_BYTES = 64 * 1024;
++    constexpr size_t MAX_TOTAL_BYTES = 1024 * 1024;
++    std::vector<std::pair<NodeId, PreverifiedAvaSignature>> candidates;
++    candidates.reserve(MAX_SIGNATURES);
++    lotus::v2::BatchSigCollector collector;
++    collector.Reserve(MAX_SIGNATURES);
++    size_t total_bytes = 0;
++    size_t copied_heads = 0;
++    for (CNode *node : nodes) {
++        if (interrupt || copied_heads == MAX_SIGNATURES ||
++            total_bytes == MAX_TOTAL_BYTES) break;
++        if (node->fDisconnect || node->fPauseSend ||
++            !node->fSuccessfullyConnected) continue;
++        std::optional<CPubKey> key;
++        {
++            LOCK(node->cs_avalanche_pubkey);
++            key = node->m_avalanche_pubkey;
++        }
++        if (!key) continue;
++        auto data = node->CopyIsolatedMessage(
++            NetMsgType::AVARESPONSE,
++            std::min(MAX_MESSAGE_BYTES, MAX_TOTAL_BYTES - total_bytes));
++        if (!data) continue;
++        ++copied_heads;
++        total_bytes += data->size();
++        PreverifiedAvaSignature item{*key, {}, {}};
++        try {
++            avalanche::Response response;
++            HashVerifier verifier(*data);
++            verifier >> response;
++            item.hash = verifier.GetHash();
++            *data >> item.signature;
++        } catch (const std::ios_base::failure &) {
++            continue;
++        }
++        if (!collector.AddLegacySchnorr(
++                std::span<const uint8_t>{item.pubkey.data(), item.pubkey.size()},
++                std::span<const uint8_t>{item.signature.data(), item.signature.size()},
++                item.hash.begin())) continue;
++        candidates.emplace_back(node->GetId(), std::move(item));
++    }
++    if (candidates.size() < 2 || interrupt) return;
++    const bool valid = collector.VerifyAll();
++    const auto first_bad = valid ? std::optional<size_t>{}
++                                 : collector.FirstFailingIndex();
++    for (size_t i = 0; i < candidates.size() && !interrupt; ++i) {
++        auto &[id, item] = candidates[i];
++        const bool verified = valid || (first_bad && i < *first_bad) ||
++            ((!first_bad || i > *first_bad) &&
++             item.pubkey.VerifySchnorr(item.hash, item.signature));
++        if (verified) m_preverified_ava_signatures.emplace(id, std::move(item));
++    }
++}
++
+ void PeerManagerImpl::ProcessAvaResponseBatch(
+     const Config &config, CNode &pfrom, Peer &peer,
+     std::vector<CNetMessage> &ava_batch,
+@@ -7128,9 +7202,15 @@ void PeerManagerImpl::ProcessMessage(
+ 
+             {
+                 LOCK(pfrom.cs_avalanche_pubkey);
++                auto preverified = m_preverified_ava_signatures.extract(pfrom.GetId());
++                const bool preverified_match = !preverified.empty() &&
++                    pfrom.m_avalanche_pubkey &&
++                    preverified.mapped().pubkey == *pfrom.m_avalanche_pubkey &&
++                    preverified.mapped().hash == verifier.GetHash() &&
++                    preverified.mapped().signature == sig;
+                 if (!pfrom.m_avalanche_pubkey.has_value() ||
+-                    !(*pfrom.m_avalanche_pubkey)
+-                         .VerifySchnorr(verifier.GetHash(), sig)) {
++                    (!preverified_match && !(*pfrom.m_avalanche_pubkey)
++                         .VerifySchnorr(verifier.GetHash(), sig))) {
+                     Misbehaving(*peer, "invalid-ava-response-signature");
+                     return;
+                 }

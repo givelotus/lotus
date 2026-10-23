@@ -1,0 +1,1628 @@
+From a3a020d451bc767952a26ec55cab9dfc6c639824 Mon Sep 17 00:00:00 2001
+From: Shammah Chancellor <shammah.chancellor@gmail.com>
+Date: Mon, 19 Oct 2026 23:11:57 -0700
+Subject: [PATCH] net: publish WebTransport discovery and rotating browser
+ certificates
+
+Add opt-in overlapping ten-day browser leaves using the unchanged EC P-256
+node TLS key. Recover current/next hashes across restart, promote the
+previous successor before replacing it, and reload by generation before a
+new inbound TLS session. Keep existing contexts alive across rollover and
+preserve published-leaf metadata after a successor-write failure.
+
+Extend getwebtransportinfo and serve GET/HEAD /p2p/wt/info on the bounded
+HTTP worker queue. Public discovery omits tokens and private connection,
+fallback and cache counters. Keep generic HTTP resources free of blanket
+H3 Alt-Svc because the QUIC listener supports WT P2P only. Document actual
+Origin, identity, proxy and browser trust constraints; retain p2p-v1.
+
+Replace the obsolete echo-CLI browser harness with bounded actual-node
+checks using fresh owned data/profiles, strict protocol/close results and
+no global trust or certificate-error bypass. Native daemon 43/unit 171
+builds, 37 cases/13630 assertions, rotation/live-leaf, existing fallback
+and HTTP metrics checks pass. Actual Chrome 155 hash mode passes. Stock
+local-CA mode rejects; explicit development-CA controls reject untrusted
+and accept profile-trusted roots while preserving chain/hostname checks.
+This is not stock public-CA or reverse-proxy acceptance. Preserve failed
+stock runs and partial raw NetLogs; no broad sweep or benchmark ran.
+W10-W12 and the external interoperability gates remain outstanding.
+
+Coordinator ordered integration (2026-10-20):
+Existing causal fixes and mechanical namespace/format adaptations are folded at their first responsible owner. Exact inputs and prefix adaptations are recorded in integration-next final delivery; original author provenance is retained.
+
+diff --git a/contrib/devtools/webtransport-browser-test/run.py b/contrib/devtools/webtransport-browser-test/run.py
+new file mode 100755
+index 0000000000000000000000000000000000000000..65f2ffd56bd292b1d3b53ef93e148a559e188acb
+--- /dev/null
++++ b/contrib/devtools/webtransport-browser-test/run.py
+@@ -0,0 +1,353 @@
++#!/usr/bin/env python3
++# Copyright (c) 2026 The Bitcoin developers
++# Distributed under the MIT software license, see the accompanying
++# file COPYING or http://www.opensource.org/licenses/mit-license.php.
++"""Bounded actual-node WebTransport browser gate, with isolated owned profiles."""
++
++import argparse
++import base64
++import hashlib
++import json
++import os
++import signal
++import sqlite3
++import ssl
++import subprocess
++import sys
++import time
++import urllib.error
++import urllib.parse
++import urllib.request
++from pathlib import Path
++
++
++def sha256(path):
++    with path.open("rb") as source:
++        return hashlib.file_digest(source, "sha256").hexdigest()
++
++
++def main():
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument("--node", type=Path, required=True)
++    parser.add_argument("--browser", type=Path, required=True)
++    parser.add_argument("--kind", choices=("chrome", "firefox"), required=True)
++    parser.add_argument("--out", type=Path, required=True)
++    parser.add_argument("--portbase", type=int, default=41000)
++    parser.add_argument(
++        "--ca-cert", type=Path, help="CA-signed leaf covering localhost"
++    )
++    parser.add_argument("--ca-key", type=Path)
++    parser.add_argument(
++        "--ca-root",
++        type=Path,
++        help="Trust a test root only in this run's fresh browser profile",
++    )
++    parser.add_argument(
++        "--certutil",
++        type=Path,
++        help="NSS certutil binary, required for Firefox --ca-root",
++    )
++    parser.add_argument(
++        "--expect-reject",
++        action="store_true",
++        help="Negative CA control: require opening-handshake rejection without root import",
++    )
++    parser.add_argument(
++        "--local-ca-development",
++        action="store_true",
++        help="Chrome only: relax known-root policy for an isolated CA test; still verify certificate chain/hostname",
++    )
++    args = parser.parse_args()
++    if bool(args.ca_cert) != bool(args.ca_key):
++        parser.error("--ca-cert and --ca-key must be supplied together")
++    if args.ca_root and (
++        not args.ca_cert or (args.kind == "firefox" and not args.certutil)
++    ):
++        parser.error(
++            "--ca-root requires a CA-signed leaf/key and, for Firefox, NSS --certutil"
++        )
++    if args.expect_reject and (not args.ca_cert or args.ca_root):
++        parser.error(
++            "--expect-reject requires a CA leaf/key without importing its root"
++        )
++    if args.local_ca_development and (args.kind != "chrome" or not args.ca_cert):
++        parser.error("--local-ca-development requires Chrome and a CA leaf/key")
++    if not 35000 <= args.portbase <= 49995:
++        parser.error("port block must be within the coordinated 35000..49999 range")
++    args.out = args.out.resolve()
++    if args.out.exists():
++        parser.error("--out must not exist; preserve earlier runs")
++    args.out.mkdir(parents=True)
++    data, profile = args.out / "node", args.out / "profile"
++    data.mkdir()
++    profile.mkdir()
++    processes, logs, commands = [], [], []
++    peak_rss, results, failure = 0, {}, None
++    load_start = os.getloadavg()
++    started = time.time_ns()
++
++    def launch(command, name):
++        log = (args.out / (name + ".log")).open("xb")
++        logs.append(log)
++        process = subprocess.Popen(
++            [str(x) for x in command], stdout=log, stderr=log, start_new_session=True
++        )
++        processes.append(process)
++        commands.append(
++            {"name": name, "pid": process.pid, "argv": [str(x) for x in command]}
++        )
++        return process
++
++    def memory():
++        nonlocal peak_rss
++        groups = {p.pid for p in processes if p.poll() is None}
++        output = subprocess.check_output(
++            ["ps", "-axo", "pgid=,rss="], text=True, timeout=2
++        )
++        peak_rss = max(
++            peak_rss,
++            sum(
++                int(parts[1])
++                for line in output.splitlines()
++                if len(parts := line.split()) == 2 and int(parts[0]) in groups
++            ),
++        )
++
++    def rpc(method):
++        cookie = (data / "regtest/.cookie").read_text().strip()
++        request = urllib.request.Request(
++            f"http://127.0.0.1:{args.portbase + 1}/",
++            json.dumps(
++                {"jsonrpc": "2.0", "id": 1, "method": method, "params": []}
++            ).encode(),
++            {"Authorization": "Basic " + base64.b64encode(cookie.encode()).decode()},
++        )
++        with urllib.request.urlopen(request, timeout=2) as response:
++            value = json.load(response)
++        if value.get("error"):
++            raise RuntimeError(str(value["error"]))
++        return value["result"]
++
++    try:
++        command = [
++            args.node.resolve(),
++            "-regtest",
++            f"-datadir={data}",
++            "-server=1",
++            "-dnsseed=0",
++            "-fixedseeds=0",
++            "-connect=0",
++            "-discover=0",
++            "-listenonion=0",
++            "-chronik=0",
++            "-p2pwebsocket=0",
++            "-p2pwebtransport=1",
++            f"-bind=127.0.0.1:{args.portbase}",
++            f"-port={args.portbase}",
++            f"-rpcport={args.portbase + 1}",
++            f"-rpcbind=127.0.0.1:{args.portbase + 1}",
++            "-rpcallowip=127.0.0.1",
++        ]
++        if args.ca_cert:
++            command += [
++                f"-tlscert={args.ca_cert.resolve()}",
++                f"-tlskey={args.ca_key.resolve()}",
++            ]
++        else:
++            command.append("-p2pwebtransportbrowsercert=1")
++        node = launch(command, "node")
++        deadline = time.monotonic() + 10
++        while True:
++            memory()
++            try:
++                results["node_info"] = rpc("getwebtransportinfo")
++                break
++            except (OSError, ValueError, RuntimeError):
++                if node.poll() is not None or time.monotonic() >= deadline:
++                    raise RuntimeError("owned test node failed to become ready")
++                time.sleep(0.1)
++        if args.ca_root and args.kind == "firefox":
++            for command in (
++                [args.certutil, "-N", "--empty-password", "-d", f"sql:{profile}"],
++                [
++                    args.certutil,
++                    "-A",
++                    "-n",
++                    "WT isolated local root",
++                    "-t",
++                    "C,,",
++                    "-i",
++                    args.ca_root.resolve(),
++                    "-d",
++                    f"sql:{profile}",
++                ],
++            ):
++                subprocess.run(
++                    [str(x) for x in command],
++                    check=True,
++                    capture_output=True,
++                    timeout=5,
++                )
++            results["isolated_trust"] = {
++                "store": "fresh-profile NSS",
++                "root_sha256": sha256(args.ca_root),
++            }
++        elif args.ca_root:
++            # Chromium's per-profile ServerCertificate store, schema 1, as
++            # observed read-only in our isolated Chrome 155 baseline. No
++            # migration, existing profile or system/user keychain is touched.
++            # CertificateMetadata: trust=TRUSTED, DNS constraint=localhost.
++            # https://chromium.googlesource.com/chromium/src/+/refs/tags/143.0.7491.0/components/server_certificate_database/server_certificate_database.cc
++            # https://chromium.googlesource.com/chromium/src/+/refs/tags/135.0.7044.0/components/server_certificate_database/server_certificate_database.proto
++            store = profile / "Default/ServerCertificate"
++            store.parent.mkdir()
++            der = ssl.PEM_cert_to_DER_cert(args.ca_root.read_text())
++            with sqlite3.connect(store) as database:
++                database.execute(
++                    "CREATE TABLE meta(key LONGVARCHAR NOT NULL UNIQUE PRIMARY KEY, value LONGVARCHAR)"
++                )
++                database.executemany(
++                    "INSERT INTO meta VALUES(?,?)",
++                    [
++                        ("mmap_status", "-1"),
++                        ("version", "1"),
++                        ("last_compatible_version", "1"),
++                    ],
++                )
++                database.execute(
++                    "CREATE TABLE certificates(sha256hash_hex TEXT PRIMARY KEY,der_cert BLOB NOT NULL,trust_settings BLOB NOT NULL)"
++                )
++                database.execute(
++                    "INSERT INTO certificates VALUES(?,?,?)",
++                    (
++                        hashlib.sha256(der).hexdigest().upper(),
++                        der,
++                        b"\x0a\x02\x08\x03\x12\x0b\x0a\x09localhost",
++                    ),
++                )
++            results["isolated_trust"] = {
++                "store": "fresh-profile Chromium ServerCertificate",
++                "schema": 1,
++                "dns_constraint": "localhost",
++                "root_der_sha256": hashlib.sha256(der).hexdigest(),
++                "database_sha256_before_browser": sha256(store),
++            }
++        response = args.out / "result.json"
++        page = launch(
++            [
++                sys.executable,
++                Path(__file__).with_name("serve.py"),
++                "--port",
++                args.portbase + 3,
++                "--result",
++                response,
++            ],
++            "page",
++        )
++        time.sleep(0.2)
++        query = {"url": f"https://localhost:{args.portbase}/p2p/wt"}
++        if not args.ca_cert:
++            query["hash"] = results["node_info"]["cert_sha256"][0]
++        url = (
++            f"http://127.0.0.1:{args.portbase + 3}/handshake.html?"
++            + urllib.parse.urlencode(query)
++        )
++        if args.kind == "chrome":
++            command = [
++                args.browser.resolve(),
++                "--headless=new",
++                "--no-first-run",
++                "--no-default-browser-check",
++                "--host-resolver-rules=MAP localhost 127.0.0.1",
++                f"--user-data-dir={profile}",
++                f"--log-net-log={args.out / 'netlog.json'}",
++            ]
++            if args.local_ca_development:
++                command.append("--webtransport-developer-mode")
++            command.append(url)
++        else:
++            (profile / "user.js").write_text(
++                'user_pref("network.dns.disableIPv6", true);\n'
++            )
++            command = [
++                args.browser.resolve(),
++                "--headless",
++                "--no-remote",
++                "--profile",
++                profile,
++                url,
++            ]
++        browser = launch(command, "browser")
++        deadline = time.monotonic() + 25
++        while not response.exists():
++            memory()
++            if (
++                browser.poll() is not None
++                or page.poll() is not None
++                or time.monotonic() >= deadline
++            ):
++                raise RuntimeError("browser did not report a bounded handshake result")
++            time.sleep(0.1)
++        results["browser"] = json.loads(response.read_text())
++        if args.expect_reject:
++            if results["browser"].get("ok") or not results["browser"].get("error"):
++                raise RuntimeError(
++                    "negative control did not reject the opening handshake"
++                )
++            results["expected_rejection_observed"] = True
++        elif not (
++            results["browser"].get("ok")
++            and results["browser"].get("closed_cleanly")
++            and results["browser"].get("protocol") == "p2p-v1"
++        ):
++            raise RuntimeError("browser handshake/protocol/close failed")
++    except Exception as error:
++        failure = str(error)
++    finally:
++        # Stop only process groups created by this run. Never touch a user's
++        # default browser, node, global keychain or trust configuration.
++        for process in reversed(processes):
++            try:
++                os.killpg(process.pid, signal.SIGTERM)
++                process.wait(timeout=5)
++            except ProcessLookupError:
++                pass
++            except subprocess.TimeoutExpired:
++                os.killpg(process.pid, signal.SIGKILL)
++                process.wait(timeout=5)
++        for log in logs:
++            log.close()
++        try:
++            version = subprocess.run(
++                [str(args.browser), "--version"],
++                capture_output=True,
++                text=True,
++                timeout=5,
++            ).stdout.strip()
++        except Exception as error:
++            version = "unavailable: " + str(error)
++        manifest = {
++            "ok": failure is None,
++            "failure": failure,
++            "results": results,
++            "mode": "ca" if args.ca_cert else "certificate-hash",
++            "expected_rejection": args.expect_reject,
++            "local_ca_development": args.local_ca_development,
++            "browser_sha256": sha256(args.browser),
++            "node_sha256": sha256(args.node),
++            "browser_version": version,
++            "commands": commands,
++            "start_ns": started,
++            "end_ns": time.time_ns(),
++            "load_start": load_start,
++            "load_end": os.getloadavg(),
++            "peak_owned_process_group_rss_kib": peak_rss,
++            "rss_is_sum_not_pss": True,
++        }
++        (args.out / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
++    print(json.dumps({"ok": failure is None, "failure": failure, "out": str(args.out)}))
++    return int(failure is not None)
++
++
++if __name__ == "__main__":
++    sys.exit(main())
+diff --git a/contrib/devtools/webtransport-browser-test/run.sh b/contrib/devtools/webtransport-browser-test/run.sh
+index e15e093f39d77ae1af4b8ed5b2abc8e0ee1aa4e4..f65a47527bb2615c78791d62e05849a61888d09d 100755
+--- a/contrib/devtools/webtransport-browser-test/run.sh
++++ b/contrib/devtools/webtransport-browser-test/run.sh
+@@ -1,89 +1,8 @@
+-#!/usr/bin/env bash
++#!/usr/bin/env sh
+ # Copyright (c) 2026 The Bitcoin developers
+ # Distributed under the MIT software license, see the accompanying
+ # file COPYING or http://www.opensource.org/licenses/mit-license.php.
+-#
+-# Browser interop check for P2P over WebTransport. Starts a regtest node
+-# with -p2pwebtransport=1 -p2pwebtransportecho=1 and a 10-day ECDSA P-256
+-# certificate, serves wt_test.html, opens it in headless Chrome (and
+-# Firefox with --firefox) using serverCertificateHashes, and prints one
+-# JSON result per browser. Exits 0 only if every browser run passes.
+-#
+-# Usage: run.sh <bitcoind> [--firefox] [--portbase N] [--keep]
+-#   <bitcoind>   path to the node binary (built with -DENABLE_WEBTRANSPORT=ON)
+-#   --portbase   first of the 3 ports used (default 46400; avoid 20000-34999)
+-set -euo pipefail
+-here=$(cd "$(dirname "$0")" && pwd)
+-node=${1:?usage: run.sh <bitcoind> [--firefox] [--portbase N] [--keep]}
+-shift
+-firefox=0 portbase=46400 keep=0
+-while [ $# -gt 0 ]; do
+-  case "$1" in
+-    --firefox) firefox=1 ;;
+-    --portbase) portbase=$2; shift ;;
+-    --keep) keep=1 ;;
+-    *) echo "unknown option $1" >&2; exit 2 ;;
+-  esac
+-  shift
+-done
+-chrome=${CHROME:-"/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"}
+-firefox_bin=${FIREFOX:-"/Applications/Firefox.app/Contents/MacOS/firefox"}
+-command -v "$chrome" >/dev/null 2>&1 || [ -x "$chrome" ] || chrome=$(command -v google-chrome || command -v chromium || true)
+-p2p=$portbase rpc=$((portbase + 1)) web=$((portbase + 2))
+-
+-work=$(mktemp -d "${TMPDIR:-/tmp}/wt-browser.XXXXXX")
+-pids=()
+-cleanup() {
+-  for p in "${pids[@]}"; do kill "$p" 2>/dev/null || true; done
+-  wait 2>/dev/null || true
+-  [ "$keep" = 1 ] && echo "kept $work" >&2 || rm -rf "$work"
+-}
+-trap cleanup EXIT
+-
+-# A certificate browsers accept by hash: ECDSA P-256, valid < 14 days.
+-openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes \
+-  -days 10 -subj /CN=localhost -addext subjectAltName=IP:127.0.0.1,DNS:localhost \
+-  -keyout "$work/key.pem" -out "$work/cert.pem" 2>/dev/null
+-hash=$(openssl x509 -in "$work/cert.pem" -outform der | openssl dgst -sha256 -hex | awk '{print $NF}')
+-
+-mkdir -p "$work/node"
+-"$node" -regtest -datadir="$work/node" -listen=1 -port=$p2p -bind=127.0.0.1 \
+-  -rpcport=$rpc -rpcbind=127.0.0.1 -rpcallowip=127.0.0.1 -server=1 -dnsseed=0 -fixedseeds=0 \
+-  -tlscert="$work/cert.pem" -tlskey="$work/key.pem" \
+-  -p2pwebtransport=1 -p2pwebtransportbind=127.0.0.1:$p2p -p2pwebtransportecho=1 \
+-  -debug=webtransport -printtoconsole=0 > "$work/node.out" 2>&1 &
+-pids+=($!)
+-for _ in $(seq 100); do
+-  grep -q "WebTransport listening" "$work/node/regtest/debug.log" 2>/dev/null && break
+-  sleep 0.1
+-done
+-
+-python3 "$here/serve.py" --port $web --result "$work/result.json" &
+-pids+=($!)
+-sleep 0.5
+-url="http://127.0.0.1:$web/wt_test.html?port=$p2p&hash=$hash"
+-
+-status=0
+-run_browser() { # name cmd...
+-  local name=$1; shift
+-  rm -f "$work/result.json"
+-  "$@" > "$work/$name.out" 2>&1 &
+-  local bp=$!
+-  for _ in $(seq 300); do [ -s "$work/result.json" ] && break; sleep 0.1; done
+-  kill $bp 2>/dev/null || true; wait $bp 2>/dev/null || true
+-  if [ -s "$work/result.json" ]; then
+-    python3 -c 'import json,sys; r=json.load(open(sys.argv[1])); r["browser"]=sys.argv[2]; print(json.dumps(r)); sys.exit(0 if r.get("ok") else 1)' "$work/result.json" "$name" || status=1
+-  else
+-    echo "{\"browser\": \"$name\", \"ok\": false, \"error\": \"no result within 30 s\"}"
+-    status=1
+-  fi
+-}
+-
+-run_browser chrome "$chrome" --headless=new --no-first-run --no-default-browser-check \
+-  --user-data-dir="$work/chrome-profile" "$url"
+-if [ "$firefox" = 1 ]; then
+-  mkdir -p "$work/ff-profile"
+-  run_browser firefox "$firefox_bin" --headless --no-remote --profile "$work/ff-profile" "$url"
+-fi
+-grep -E "WebTransport session from" "$work/node/regtest/debug.log" | sed 's/^/# node: /' >&2 || true
+-exit $status
++# Run only with a coordinated runtime slot. All node data and browser profiles
++# live under the required fresh --out directory; user profiles are never used.
++set -eu
++exec python3 "$(dirname "$0")/run.py" "$@"
+diff --git a/contrib/devtools/webtransport-browser-test/serve.py b/contrib/devtools/webtransport-browser-test/serve.py
+index e6b46ba0a75d7e23a670c9e5295e5765d2b8460c..a044b623eff02cf099ba6c320a85350f718f92c0 100755
+--- a/contrib/devtools/webtransport-browser-test/serve.py
++++ b/contrib/devtools/webtransport-browser-test/serve.py
+@@ -24,7 +24,9 @@ def main():
+ 
+         def do_GET(self):
+             if self.path.startswith("/result?"):
+-                result.write_text(urllib.parse.unquote(self.path[len("/result?"):]))
++                temporary = result.with_suffix(result.suffix + ".tmp")
++                temporary.write_text(urllib.parse.unquote(self.path[len("/result?") :]))
++                temporary.replace(result)
+                 self.send_response(204)
+                 self.end_headers()
+                 return
+diff --git a/doc/p2p-webtransport.md b/doc/p2p-webtransport.md
+index 91a9aeb1104f6aa8514564a1d67c41bb26c16a3e..c446280d4287bcce3e2a766a4aad81543b40ef95 100644
+--- a/doc/p2p-webtransport.md
++++ b/doc/p2p-webtransport.md
+@@ -212,3 +212,112 @@ test, and the existing HTTP metrics functional test. The opt-in capture-server
+ case remained inactive; no new browser cohort or broad benchmark ran. Linux,
+ Guix, cross-lane admission integration and the remaining W9–W12 gates are
+ separate from these focused results.
++
++## Browser certificates and discovery (W9)
++
++For normal Web PKI, provide `-tlscert` and `-tlskey` with a certificate
++trusted by the browser for the node's hostname. The H3 listener uses the same
++certificate as HTTP/WebSocket unless browser hash mode is enabled. H3 serves
++WebTransport P2P sessions only; it does not serve generic RPC or wallet HTTP
++resources. No blanket `Alt-Svc: h3` is emitted for those resources.
++
++`-p2pwebtransportbrowsercert=1` creates `node_wt_cert.pem` and
++`node_wt_cert_next.pem` in the network datadir. Each leaf is valid for ten
++days. The next begins four days before current expiry; at that point it is
++promoted and another successor is prepared. Both hashes survive restart.
++Refresh happens on discovery requests or new TLS handshakes, using the node's
++clock, and changed generations reload before the new handshake. Existing TLS
++sessions keep their original context. Each certificate uses the existing
++`node_tls_key.pem` (or explicit `-tlskey`), preserving its SPKI. HTTP/WSS
++certificates and the shared private key are not rewritten. Browser hash mode
++fails clearly for a key other than EC P-256; it does not silently rotate keys.
++On storage failure, discovery retains the hash of the actual published leaf
++and logs the failure; publishing its successor is retried on a later refresh.
++
++Browser hash authentication requires a full leaf DER SHA-256, not an SPKI
++hash. The [WebTransport specification](https://www.w3.org/TR/webtransport/)
++requires a currently valid X.509v3 leaf lasting at most two weeks, includes
++P-256 as an interoperable key type, and excludes RSA in this mode. Normal CA
++authentication has its normal certificate rules. Certificate hashes must
++arrive over a trusted channel, such as the application's authenticated
++configuration. Fetching a hash from an unauthenticated endpoint cannot
++authenticate that same endpoint, and knowing a hash does not grant client
++permissions.
++
++`getwebtransportinfo` reports binds, path, `p2p-v1`, current/next certificate
++hashes, SPKI, allowed Origins, public WT standards SETTINGS identifiers and
++private connection/fallback/cache counts. `GET` or `HEAD /p2p/wt/info` exposes
++only discovery metadata on public listeners and on allowed RPC listeners.
++It contains no URL token or connection/cache/fallback counters, permits
++noncredentialed cross-origin reads, and uses `Cache-Control: no-store`.
++Other methods return 405. WT Origin enforcement remains independent of this
++public metadata endpoint.
++
++```js
++// Supplied by the application's authenticated configuration, not TOFU fetch.
++const info = trustedApplicationConfig.webtransport;
++const transport = new WebTransport(`https://node.example${info.path}`, {
++  protocols: ["p2p-v1"],
++  serverCertificateHashes: info.cert_sha256.map(hex => ({
++    algorithm: "sha-256",
++    value: Uint8Array.from(hex.match(/../g), pair => parseInt(pair, 16)),
++  })),
++});
++await transport.ready;
++// P2P class streams and framing follow the protocol above.
++```
++
++Allow the advertised UDP port through the firewall. The QUIC listener does
++not accept PROXY protocol or infer UDP peer identity from `-trustedproxy`.
++UDP passthrough preserves the node's TLS identity; a terminating proxy must
++itself support WebTransport extended CONNECT, WT/H3 SETTINGS, stream and
++connection flow control, sufficient handshake/idle timeouts and orderly
++session shutdown. Ordinary HTTP/2 support or RFC 8441 WebSocket support alone
++does not establish HTTP/3 WebTransport support. Native H2/TCP fallback and
++cross-lane proxy integration require their own interoperability checks.
++
++The bounded actual-node browser gate creates its own regtest datadir and
++fresh profile, then checks authentication, `p2p-v1`, readiness and clean close:
++
++```sh
++contrib/devtools/webtransport-browser-test/run.sh \
++  --node build/src/bitcoind --kind chrome \
++  --browser '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome' \
++  --out /tmp/wt-browser-gate-fresh
++```
++
++It prints PASS/FAIL JSON and records commands, binary hashes, browser version,
++timing and summed process-group RSS. It does not use a default profile or
++modify global trust. Supply `--ca-cert` and `--ca-key` for the CA path, omitting
++hash overrides; the browser must genuinely trust that leaf. Firefox can
++import a local root using `--ca-root` and an NSS `--certutil` into only the
++fresh profile. For current Chrome, the test root can instead be stored in the
++fresh profile's `ServerCertificate` database, constrained to `localhost`,
++using the schema observed in the isolated Chrome 155 baseline and documented
++by Chromium's certificate database sources. This is test tooling, not a
++system/user keychain change or a certificate-error bypass. Run the same leaf
++without `--ca-root`, with `--expect-reject`, as the paired untrusted-root
++control. A negative result alone does not distinguish authentication failure
++from a reachability failure; the paired trusted run checks that distinction.
++No browser/CA result is claimed until those actual gates pass.
++
++Chrome's stock WebTransport CA path additionally requires a *known* root,
++not merely a locally trusted one. Chromium documents this in its
++[WebTransport switch](https://chromium.googlesource.com/chromium/src/+/refs/tags/140.0.7339.19/components/network_session_configurator/common/network_switch_list.h)
++and [proof-verifier selection](https://chromium.googlesource.com/chromium/src/+/d50147ff3e3622ef1a527c07d1442504a21a7c91/net/quic/dedicated_web_transport_http3_client.cc).
++For an explicit isolated local-CA development test only,
++`--local-ca-development` adds the documented browser developer switch.
++Certificate-chain and hostname verification still run; use the paired
++untrusted-root negative control in that mode too. Such a result is a
++development-CA result, not stock public-CA or browser-fingerprint equivalence.
++The node's TLS policy and browser defaults are unchanged.
++
++Focused W9 validation passes daemon/unit builds, 37 selected cases (13,630
++assertions), browser-certificate rotation/public-info/live-leaf checks, and
++unchanged fallback/HTTP metrics tests. Chrome 155 on an actual isolated node
++passes hash authentication, p2p-v1 and clean close. Stock local-CA attempts
++reject with and without the profile root. With explicit local-CA development
++mode, the untrusted control rejects and the profile-trusted control passes.
++This does not establish stock publicly trusted CA or reverse-proxy acceptance.
++Raw development NetLogs have unfinished JSON envelopes after browser SIGTERM;
++complete event records and the browser's final result are preserved separately.
+diff --git a/src/CMakeLists.txt b/src/CMakeLists.txt
+index 571e8a673d428b8086151ee66cee859a340392a0..a8d4e34c6762526d3a1a154ef4e30ec51982e1a9 100644
+--- a/src/CMakeLists.txt
++++ b/src/CMakeLists.txt
+@@ -811,6 +811,7 @@ if(ENABLE_WEBTRANSPORT)
+ 	find_package(Ngtcp2 1.25.0 REQUIRED COMPONENTS ngtcp2 crypto_ossl)
+ 	target_sources(server PRIVATE
+ 		net_quic/node_webtransport.cpp
++		net_quic/quic_certificate.cpp
+ 		net_quic/quic_connection.cpp
+ 		net_quic/quic_engine.cpp
+ 		net_quic/quic_peer_sock.cpp
+diff --git a/src/httpserver.cpp b/src/httpserver.cpp
+index bcddbaeaf876960923359d23b362fd58cadceecb..0c38d58fac1f4e9d0b95319aab2508b8e7889234 100644
+--- a/src/httpserver.cpp
++++ b/src/httpserver.cpp
+@@ -23,6 +23,7 @@
+ #include <net_websocket_bridge.h>
+ #include <net_websocket_sock.h>
+ #include <net_websocket_tls.h>
++#include <net_webtransport.h>
+ #include <netbase.h>
+ #include <node/metrics.h>
+ #include <node/ui_interface.h>
+@@ -405,6 +406,9 @@ static std::vector<std::string> g_public_prefixes;
+ 
+ //! Whether /chronik is served (-chronik and -chronikpubliconrpcport)
+ static bool g_chronik_enabled{false};
++//! Fixed public discovery endpoint; configured before HTTP threads start.
++static bool g_webtransport_info_enabled{false};
++static constexpr std::string_view WT_INFO_PATH{"/p2p/wt/info"};
+ 
+ /** A web server requests are relayed to */
+ struct ForwardTarget {
+@@ -534,6 +538,11 @@ static bool IsPublicPath(std::string_view uri) {
+                        });
+ }
+ 
++static bool IsWebTransportInfoPath(std::string_view target) {
++    return g_webtransport_info_enabled &&
++           target.substr(0, target.find('?')) == WT_INFO_PATH;
++}
++
+ /** Check if a network address is allowed to access the HTTP server */
+ static bool ClientAllowed(const CNetAddr &netaddr) {
+     if (!netaddr.IsValid()) {
+@@ -741,15 +750,16 @@ DispatchRequest(BeastRequest &&beast_req, const HTTPConnectionInfo &conn) {
+     };
+     auto hreq{std::make_unique<HTTPRequest>(std::move(impl))};
+ 
+-    if (conn.public_only) {
+-        // Public listeners only serve the WebSocket and Chronik endpoints,
+-        // which are handled before dispatch: never RPC, wallet or REST.
++    if (conn.public_only && !IsWebTransportInfoPath(hreq->GetURI())) {
++        // Public listeners serve only explicit public endpoints. WebSocket
++        // and Chronik are handled before dispatch; WT discovery uses a fixed
++        // handler on the bounded worker queue: never RPC, wallet or REST.
+         LogDebug(BCLog::HTTP,
+                  "Request for %s on a public listener from %s rejected\n",
+                  SanitizeString(hreq->GetURI(), SAFE_CHARS_URI).substr(0, 100),
+                  hreq->GetPeer().ToStringAddrPort());
+         hreq->WriteReply(HTTP_NOT_FOUND);
+-    } else if (!ClientAllowed(hreq->GetPeer())) {
++    } else if (!conn.public_only && !ClientAllowed(hreq->GetPeer())) {
+         // Early address-based allow check
+         LogDebug(BCLog::HTTP,
+                  "HTTP request from %s rejected: Client network is not allowed "
+@@ -1481,6 +1491,32 @@ static std::string_view TargetPath(std::string_view target) {
+     return target.substr(0, target.find('?'));
+ }
+ 
++/** This advertises a WT-P2P endpoint, not generic HTTP/3 RPC support.
++ * Deliberately omit blanket Alt-Svc: the QUIC listener cannot serve the
++ * other resources of this HTTP origin. Discovery responses are not cached,
++ * so certificate rollover never depends on a stale cached hash list. */
++static bool WebTransportInfoResponse(Config &, HTTPRequest *req,
++                                     const std::string &) {
++    if (!IsWebTransportInfoPath(req->GetURI())) {
++        req->WriteReply(HTTP_NOT_FOUND);
++        return false;
++    }
++    if (req->GetRequestMethod() != HTTPRequest::GET &&
++        req->GetRequestMethod() != HTTPRequest::HEAD) {
++        req->WriteHeader("Allow", "GET, HEAD");
++        req->WriteReply(HTTP_BAD_METHOD);
++        return false;
++    }
++    auto info{GetWebTransportInfo(/*public_only=*/true)};
++    req->WriteHeader("Content-Type", "application/json");
++    req->WriteHeader("Cache-Control", "no-store");
++    req->WriteHeader("Access-Control-Allow-Origin", "*");
++    req->WriteReply(info["enabled"].get_bool() ? HTTP_OK
++                                               : HTTP_SERVICE_UNAVAILABLE,
++                    info.write() + "\n");
++    return true;
++}
++
+ /** Whether a request (header) is a health check this server answers */
+ static bool IsHealthRequest(const BeastRequest &header, bool body_done) {
+     if (!g_health_enabled || !body_done ||
+@@ -3372,6 +3408,16 @@ bool InitHTTPServer(Config &config) {
+     }
+ 
+     g_public_prefixes.clear();
++    UnregisterHTTPHandler(std::string{WT_INFO_PATH}, false);
++    g_webtransport_info_enabled = false;
++#ifdef ENABLE_WEBTRANSPORT
++    g_webtransport_info_enabled = gArgs.GetBoolArg("-p2pwebtransport", false);
++    if (g_webtransport_info_enabled) {
++        RegisterPublicHTTPPrefix(std::string{WT_INFO_PATH});
++        RegisterHTTPHandler(std::string{WT_INFO_PATH}, false,
++                            WebTransportInfoResponse);
++    }
++#endif
+     g_chronik_enabled =
+         gArgs.GetBoolArg("-chronik", false) &&
+         gArgs.GetBoolArg("-chronikpubliconrpcport",
+diff --git a/src/init.cpp b/src/init.cpp
+index 441f360774e6e6ffe33fcb405fb3fe4dc26fd3bb..801d3c15cf0bdcaa371b26101c013692de2f7f72 100644
+--- a/src/init.cpp
++++ b/src/init.cpp
+@@ -1359,6 +1359,12 @@ void SetupServerArgs(NodeContext &node) {
+         strprintf("Request path of WebTransport sessions (default: %s)",
+                   P2P_WEBTRANSPORT_PATH),
+         ArgsManager::ALLOW_ANY, OptionsCategory::CONNECTION);
++    argsman.AddArg(
++        "-p2pwebtransportbrowsercert",
++        "Use overlapping ten-day EC P-256 certificates for browser "
++        "serverCertificateHashes on the H3 WebTransport listener only; "
++        "reuse the existing TLS key (default: 0)",
++        ArgsManager::ALLOW_ANY, OptionsCategory::CONNECTION);
+     argsman.AddArg(
+         "-p2pwebtransporttoken=<token>",
+         "Only accept WebTransport sessions whose URL carries ?t=<token> "
+diff --git a/src/net_quic/node_webtransport.cpp b/src/net_quic/node_webtransport.cpp
+index 19a9ff4281a28f1c6223a2437697976a42f58f70..6beecbcc676b52e430d1757911d5dae846eeb3e7 100644
+--- a/src/net_quic/node_webtransport.cpp
++++ b/src/net_quic/node_webtransport.cpp
+@@ -9,7 +9,9 @@
+ #include <httpserver.h>
+ #include <logging.h>
+ #include <net.h>
++#include <net_quic/quic_certificate.h>
+ #include <net_quic/quic_engine.h>
++#include <net_quic/webtransport_wire.h>
+ #include <net_webtransport.h>
+ #include <netbase.h>
+ #include <random.h>
+@@ -22,7 +24,7 @@
+ #include <memory>
+ 
+ namespace {
+-std::unique_ptr<QuicEngine> g_engine;
++std::shared_ptr<QuicEngine> g_engine;
+ 
+ /** The certificate for QUIC: -tlscert/-tlskey, else the node's datadir
+  * certificate (as the HTTP server uses), created if missing */
+@@ -93,6 +95,20 @@ bool StartNodeWebTransport(const ArgsManager &args, CConnman &connman,
+     if (!CertificateFiles(args, cert, key, error)) {
+         return false;
+     }
++    const bool browser{args.GetBoolArg("-p2pwebtransportbrowsercert", false)};
++    if (browser) cert = args.GetDataDirNet() / "node_wt_cert.pem";
++    auto certificate{std::make_shared<QuicCertificate>(cert, key, browser)};
++    std::string certificate_error;
++    if (!certificate->Refresh(certificate_error)) {
++        error = Untranslated(certificate_error);
++        return false;
++    }
++    opts.certificate_generation = [certificate] {
++        std::string why;
++        if (!certificate->Refresh(why))
++            LogPrintf("WebTransport certificate refresh failed: %s\n", why);
++        return certificate->Snapshot().generation;
++    };
+     opts.cert_file = cert;
+     opts.key_file = key;
+     opts.application = QuicApplication::WEBTRANSPORT;
+@@ -243,10 +259,59 @@ bool StartNodeWebTransport(const ArgsManager &args, CConnman &connman,
+             }
+             return engine->Dial(target, u, timeout, interrupt, error);
+         });
++    // A copied provider keeps the engine/certificate state alive through an
++    // in-flight RPC or HTTP request during shutdown. Bind addresses and policy
++    // are immutable snapshots; only atomic statistics are read from the engine.
++    SetWebTransportInfoProvider([engine = g_engine, certificate,
++                                 binds = g_engine->BoundAddresses(),
++                                 path = opts.wt_path, origins = opts.wt_origins,
++                                 browser](bool public_only) {
++        std::string why;
++        if (!certificate->Refresh(why))
++            LogPrintf("WebTransport discovery certificate refresh failed: %s\n",
++                      why);
++        const auto cert_info{certificate->Snapshot()};
++        UniValue result{UniValue::VOBJ};
++        result.pushKV("enabled", true);
++        result.pushKV("browsercert", browser);
++        result.pushKV("h3_service", "webtransport-p2p");
++        UniValue addresses{UniValue::VARR}, protocols{UniValue::VARR},
++            hashes{UniValue::VARR}, origin_list{UniValue::VARR},
++            drafts{UniValue::VARR};
++        for (const auto &address : binds)
++            addresses.push_back(address.ToStringAddrPort());
++        protocols.push_back(P2P_WT_PROTOCOL_V1);
++        for (const auto &hash : cert_info.hashes)
++            hashes.push_back(hash);
++        for (const auto &origin : origins)
++            origin_list.push_back(origin);
++        for (const auto codepoint :
++             {wt::SETTINGS_ENABLE_WEBTRANSPORT_D02,
++              wt::SETTINGS_WT_MAX_SESSIONS_D07,
++              wt::SETTINGS_WT_MAX_SESSIONS_D13, wt::SETTINGS_WT_ENABLED})
++            drafts.push_back(codepoint);
++        result.pushKV("binds", addresses);
++        result.pushKV("path", path);
++        result.pushKV("protocols", protocols);
++        result.pushKV("cert_sha256", hashes);
++        result.pushKV("spki", cert_info.spki);
++        result.pushKV("origins", origin_list);
++        result.pushKV("draft_codepoints", drafts);
++        if (!public_only) {
++            const auto stats{engine->Stats()};
++            UniValue connections{UniValue::VOBJ};
++            connections.pushKV("inbound", stats.inbound);
++            connections.pushKV("outbound", stats.outbound);
++            connections.pushKV("handshaking", stats.handshaking);
++            result.pushKV("connections", connections);
++        }
++        return result;
++    });
+     return true;
+ }
+ 
+ void InterruptNodeWebTransport() {
++    SetWebTransportInfoProvider(nullptr);
+     SetP2PWebTransportAcceptor(nullptr);
+     SetWebTransportDialer(nullptr);
+ }
+diff --git a/src/net_quic/quic_certificate.cpp b/src/net_quic/quic_certificate.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..c09099123b2c6a0a9f2316ee212ebaf2e6e887d7
+--- /dev/null
++++ b/src/net_quic/quic_certificate.cpp
+@@ -0,0 +1,177 @@
++// Copyright (c) 2026 The Bitcoin developers
++// Distributed under the MIT software license, see the accompanying
++// file COPYING or http://www.opensource.org/licenses/mit-license.php.
++
++#include <net_quic/quic_certificate.h>
++
++#include <net_websocket.h>
++#include <tls_util.h>
++#include <util/time.h>
++
++#include <openssl/pem.h>
++#include <openssl/x509.h>
++
++#include <ctime>
++#include <memory>
++#include <string_view>
++#include <utility>
++
++namespace {
++constexpr int64_t DAY{86400};
++using CertificatePtr = std::unique_ptr<X509, decltype(&X509_free)>;
++using KeyPtr = std::unique_ptr<EVP_PKEY, decltype(&EVP_PKEY_free)>;
++using BioPtr = std::unique_ptr<BIO, decltype(&BIO_free)>;
++
++KeyPtr ReadKey(const std::string &pem) {
++    BioPtr bio{BIO_new_mem_buf(pem.data(), int(pem.size())), BIO_free};
++    return {bio ? PEM_read_bio_PrivateKey(bio.get(), nullptr, nullptr, nullptr)
++                : nullptr,
++            EVP_PKEY_free};
++}
++bool IsP256(EVP_PKEY *key) {
++    if (!key || !EVP_PKEY_is_a(key, "EC")) return false;
++    char group[80];
++    size_t size{0};
++    return EVP_PKEY_get_group_name(key, group, sizeof(group), &size) == 1 &&
++           std::string_view{group, size} == "prime256v1";
++}
++std::optional<int64_t> Seconds(const ASN1_TIME *value) {
++    std::tm tm{};
++    if (ASN1_TIME_to_tm(value, &tm) != 1) return std::nullopt;
++    return timegm(&tm);
++}
++} // namespace
++
++QuicCertificate::QuicCertificate(fs::path certificate, fs::path key,
++                                 bool browser, std::function<int64_t()> clock)
++    : m_certificate{std::move(certificate)}, m_key{std::move(key)},
++      m_next_path{m_certificate.parent_path() / "node_wt_cert_next.pem"},
++      m_browser{browser}, m_clock{std::move(clock)} {}
++
++std::optional<QuicCertificate::Certificate>
++QuicCertificate::Read(const std::string &pem, const std::string &key_pem) {
++    BioPtr bio{BIO_new_mem_buf(pem.data(), int(pem.size())), BIO_free};
++    CertificatePtr cert{
++        bio ? PEM_read_bio_X509(bio.get(), nullptr, nullptr, nullptr) : nullptr,
++        X509_free};
++    auto key{ReadKey(key_pem)};
++    if (!cert || !key || X509_check_private_key(cert.get(), key.get()) != 1)
++        return std::nullopt;
++    const auto begin{Seconds(X509_get0_notBefore(cert.get()))};
++    const auto end{Seconds(X509_get0_notAfter(cert.get()))};
++    if (!begin || !end) return std::nullopt;
++    Certificate result{pem,
++                       tls::CertSha256Hex(cert.get()),
++                       EncodeSpkiPin(tls::SpkiSha256(cert.get())),
++                       *begin,
++                       *end,
++                       X509_get_version(cert.get()) == 2};
++    if (result.hash.size() != 64 || result.spki.empty()) return std::nullopt;
++    return result;
++}
++
++std::optional<QuicCertificate::Certificate>
++QuicCertificate::Generate(const std::string &key, int64_t begin) {
++    const auto pem{tls::GenerateSelfSigned(
++        "localhost", {"localhost"}, {"127.0.0.1", "::1"},
++        std::chrono::seconds{10 * DAY}, key, begin)};
++    return pem ? Read(pem->cert_pem, key) : std::nullopt;
++}
++
++bool QuicCertificate::Refresh(std::string &error) {
++    std::lock_guard lock{m_mutex};
++    const int64_t now{m_clock ? m_clock()
++                              : GetTime<std::chrono::seconds>().count()};
++    // Public discovery requests share this state. Parse key/certificate files
++    // at most once per wall-clock second, while mocktime changes remain
++    // visible.
++    if (m_last_refresh && *m_last_refresh == now) return true;
++    const auto key_pem{tls::ReadFile(m_key)};
++    if (!key_pem) {
++        error = "unable to read WebTransport TLS key";
++        return false;
++    }
++    if (!m_browser) {
++        const auto pem{tls::ReadFile(m_certificate)};
++        auto certificate{pem ? Read(*pem, *key_pem) : std::nullopt};
++        if (!certificate) {
++            error = "unable to read matching WebTransport certificate and key";
++            return false;
++        }
++        if (!m_current || certificate->hash != m_current->hash) ++m_generation;
++        m_current = std::move(certificate);
++        m_last_refresh = now;
++        return true;
++    }
++    const auto key{ReadKey(*key_pem)};
++    if (!IsP256(key.get())) {
++        error = "-p2pwebtransportbrowsercert requires the existing TLS key to "
++                "be EC P-256; the key is not replaced automatically";
++        return false;
++    }
++    auto current{m_current}, next{m_next};
++    if (!current || m_key_pem != *key_pem) {
++        const auto pem{tls::ReadFile(m_certificate)};
++        const auto next_pem{tls::ReadFile(m_next_path)};
++        current = pem ? Read(*pem, *key_pem) : std::nullopt;
++        next = next_pem ? Read(*next_pem, *key_pem) : std::nullopt;
++    }
++    const auto usable = [now](const std::optional<Certificate> &c) {
++        return c && c->x509v3 && c->end > c->begin &&
++               c->end - c->begin <= 14 * DAY && c->begin <= now && now < c->end;
++    };
++    if (!usable(current)) {
++        current = usable(next) ? next : Generate(*key_pem, now - 3600);
++        next.reset();
++    } else if (current->end - now <= 4 * DAY) {
++        current = usable(next) ? next : Generate(*key_pem, now - 3600);
++        next.reset();
++    }
++    if (!current) {
++        error = "unable to generate browser WebTransport certificate";
++        return false;
++    }
++    if (!next || !next->x509v3 || next->begin != current->end - 4 * DAY ||
++        next->end - next->begin != 10 * DAY || next->spki != current->spki) {
++        next = Generate(*key_pem, current->end - 4 * DAY);
++    }
++    if (!next || next->hash == current->hash) {
++        error = "unable to generate next browser WebTransport certificate";
++        return false;
++    }
++    // Publish the previous next certificate as current before replacing next.
++    // A crash between the two atomic replacements then retains a current hash
++    // already advertised to clients. Never rewrite the shared TLS private key.
++    if ((!m_current || m_current->hash != current->hash) &&
++        !tls::ReplaceFile(m_certificate, current->pem)) {
++        error = "unable to write browser WebTransport certificate";
++        return false;
++    }
++    if (!m_current || m_current->hash != current->hash) ++m_generation;
++    m_current = std::move(current);
++    m_key_pem = *key_pem;
++    if (m_next && m_next->hash == m_current->hash) m_next.reset();
++    if ((!m_next || m_next->hash != next->hash) &&
++        !tls::ReplaceFile(m_next_path, next->pem)) {
++        // Current was published: snapshots must describe the actual leaf even
++        // if writing its successor fails. A later refresh retries the
++        // successor.
++        error = "unable to write next browser WebTransport certificate";
++        return false;
++    }
++    m_next = std::move(next);
++    m_last_refresh = now;
++    return true;
++}
++
++QuicCertificate::Info QuicCertificate::Snapshot() const {
++    std::lock_guard lock{m_mutex};
++    Info info;
++    if (m_current) {
++        info.hashes.push_back(m_current->hash);
++        info.spki = m_current->spki;
++    }
++    if (m_next) info.hashes.push_back(m_next->hash);
++    info.generation = m_generation;
++    return info;
++}
+diff --git a/src/net_quic/quic_certificate.h b/src/net_quic/quic_certificate.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..2efd40aceda86b1436d7e48663e23bfd1d489f53
+--- /dev/null
++++ b/src/net_quic/quic_certificate.h
+@@ -0,0 +1,55 @@
++// Copyright (c) 2026 The Bitcoin developers
++// Distributed under the MIT software license, see the accompanying
++// file COPYING or http://www.opensource.org/licenses/mit-license.php.
++
++#ifndef BITCOIN_NET_QUIC_QUIC_CERTIFICATE_H
++#define BITCOIN_NET_QUIC_QUIC_CERTIFICATE_H
++
++#include <util/fs.h>
++
++#include <cstdint>
++#include <functional>
++#include <mutex>
++#include <optional>
++#include <string>
++#include <vector>
++
++/** Owned certificate state shared by the engine and public-info provider.
++ * Browser hash mode uses the existing node TLS key, never replaces it, and
++ * keeps two overlapping ten-day certificates. Normal CA mode is read-only.
++ * Refresh is lazy on discovery or new TLS handshakes; existing TLS sessions
++ * retain their OpenSSL context. No system clock or global trust is modified. */
++class QuicCertificate {
++public:
++    struct Info {
++        std::vector<std::string> hashes;
++        std::string spki;
++        uint64_t generation{0};
++    };
++    QuicCertificate(fs::path certificate, fs::path key, bool browser,
++                    std::function<int64_t()> clock = {});
++    bool Refresh(std::string &error);
++    Info Snapshot() const;
++    const fs::path &CertificatePath() const { return m_certificate; }
++
++private:
++    struct Certificate {
++        std::string pem, hash, spki;
++        int64_t begin{0}, end{0};
++        bool x509v3{false};
++    };
++    static std::optional<Certificate> Read(const std::string &pem,
++                                           const std::string &key);
++    static std::optional<Certificate> Generate(const std::string &key,
++                                               int64_t begin);
++    const fs::path m_certificate, m_key, m_next_path;
++    const bool m_browser;
++    const std::function<int64_t()> m_clock;
++    mutable std::mutex m_mutex;
++    std::optional<Certificate> m_current, m_next;
++    std::string m_key_pem;
++    uint64_t m_generation{0};
++    std::optional<int64_t> m_last_refresh;
++};
++
++#endif // BITCOIN_NET_QUIC_QUIC_CERTIFICATE_H
+diff --git a/src/net_quic/quic_engine.cpp b/src/net_quic/quic_engine.cpp
+index e9b536e20906880f0bd173770edfc8e940e9a3f1..f274cec943ed35622f36b617b724427e484dd6be 100644
+--- a/src/net_quic/quic_engine.cpp
++++ b/src/net_quic/quic_engine.cpp
+@@ -953,6 +953,13 @@ private:
+     }
+ 
+     void MaybeReloadServerContext() {
++        if (m_opts.certificate_generation) {
++            const auto generation{m_opts.certificate_generation()};
++            if (generation != m_certificate_generation) {
++                m_certificate_generation = generation;
++                m_next_cert_check = {};
++            }
++        }
+         const auto now{std::chrono::steady_clock::now()};
+         if (!m_server_ctx || now < m_next_cert_check) {
+             return;
+@@ -1525,6 +1532,7 @@ private:
+     uint32_t m_reset_tokens{0};
+     std::chrono::steady_clock::time_point m_reset_refill{};
+     tls::SslCtxPtr m_server_ctx;
++    uint64_t m_certificate_generation{0};
+     tls::SslCtxPtr m_client_ctx;
+     fs::file_time_type m_cert_mtime{}, m_key_mtime{};
+     std::chrono::steady_clock::time_point m_next_cert_check{};
+diff --git a/src/net_quic/quic_engine.h b/src/net_quic/quic_engine.h
+index 277a22ab4804d7759e245f95d2f20ee2933f7cf5..ea2b6d3e9f0641cf0b1f9fce7604a780938818ea 100644
+--- a/src/net_quic/quic_engine.h
++++ b/src/net_quic/quic_engine.h
+@@ -58,6 +58,9 @@ struct QuicEngineOptions {
+     //! minute.
+     std::optional<fs::path> cert_file;
+     std::optional<fs::path> key_file;
++    //! Refresh owned certificate state before new inbound TLS sessions.
++    //! A changed generation bypasses the normal file-reload interval.
++    std::function<uint64_t()> certificate_generation;
+     QuicApplication application{QuicApplication::WEBTRANSPORT};
+     QuicRetryMode retry{QuicRetryMode::AUTO};
+     //! BBR instead of CUBIC
+diff --git a/src/net_webtransport.cpp b/src/net_webtransport.cpp
+index 1dc726ae4a1d3ff6e0f47500a4988edda4da8255..e346c1a1192d8618b02f991b1bc7bb610840b321 100644
+--- a/src/net_webtransport.cpp
++++ b/src/net_webtransport.cpp
+@@ -338,6 +338,24 @@ static GlobalMutex g_wt_registry_mutex;
+ static P2PWebTransportAcceptor
+     g_wt_acceptor GUARDED_BY(g_wt_registry_mutex);
+ static WebTransportDialer g_wt_dialer GUARDED_BY(g_wt_registry_mutex);
++static WebTransportInfoProvider g_wt_info GUARDED_BY(g_wt_registry_mutex);
++
++void SetWebTransportInfoProvider(WebTransportInfoProvider provider) {
++    LOCK(g_wt_registry_mutex);
++    g_wt_info = std::move(provider);
++}
++
++UniValue GetWebTransportInfo(bool public_only) {
++    WebTransportInfoProvider provider;
++    {
++        LOCK(g_wt_registry_mutex);
++        provider = g_wt_info;
++    }
++    if (provider) return provider(public_only);
++    UniValue result{UniValue::VOBJ};
++    result.pushKV("enabled", false);
++    return result;
++}
+ 
+ void SetP2PWebTransportAcceptor(P2PWebTransportAcceptor acceptor) {
+     LOCK(g_wt_registry_mutex);
+diff --git a/src/net_webtransport.h b/src/net_webtransport.h
+index 6aa23babbbd6a1a13175183585ffebe3432e7b9b..60541a9f6253691a9e33af2025d521bbf3ecd04a 100644
+--- a/src/net_webtransport.h
++++ b/src/net_webtransport.h
+@@ -10,6 +10,7 @@
+ #include <protocol.h>
+ #include <span.h>
+ #include <sync.h>
++#include <univalue.h>
+ #include <util/sock.h>
+ #include <util/threadinterrupt.h>
+ 
+@@ -238,4 +239,12 @@ using WebTransportDialer = std::function<std::optional<WebTransportDialResult>(
+ void SetWebTransportDialer(WebTransportDialer dialer);
+ WebTransportDialer GetWebTransportDialer();
+ 
++/** Discovery metadata. The copied provider owns everything it
++ * accesses across shutdown; never include access tokens. Public snapshots
++ * omit connection counters and other private node state.
++ * An unset provider returns {enabled:false}. */
++using WebTransportInfoProvider = std::function<UniValue(bool public_only)>;
++void SetWebTransportInfoProvider(WebTransportInfoProvider provider);
++UniValue GetWebTransportInfo(bool public_only);
++
+ #endif // BITCOIN_NET_WEBTRANSPORT_H
+diff --git a/src/rpc/net.cpp b/src/rpc/net.cpp
+index 4d16fd3dd08617e6f9ced9755ae735b6deb696e4..099bd11cafab029431e8df986898ab676747ebdd 100644
+--- a/src/rpc/net.cpp
++++ b/src/rpc/net.cpp
+@@ -13,6 +13,7 @@
+ #include <net_permissions.h>
+ #include <net_processing.h>
+ #include <net_types.h> // For banmap_t
++#include <net_webtransport.h>
+ #include <netbase.h>
+ #include <node/context.h>
+ #include <node/protocol_version.h>
+@@ -60,8 +61,9 @@ static RPCHelpMan getconnectioncount() {
+ static RPCHelpMan getwebtransportinfo() {
+     return RPCHelpMan{
+         "getwebtransportinfo",
+-        "Returns WebTransport dialing availability and automatic fallback "
+-        "counters.\n",
++        "Returns WebTransport endpoint, certificate and protocol information, "
++        "connection counts and automatic fallback counters. H3 serves "
++        "WebTransport P2P only.\n",
+         {},
+         RPCResult{
+             RPCResult::Type::OBJ,
+@@ -70,6 +72,46 @@ static RPCHelpMan getwebtransportinfo() {
+             {
+                 {RPCResult::Type::BOOL, "enabled",
+                  "The WebTransport dialer is running"},
++                {RPCResult::Type::BOOL, "browsercert", /*optional=*/true,
++                 "Browser hash certificate mode"},
++                {RPCResult::Type::STR, "h3_service", /*optional=*/true,
++                 "webtransport-p2p; no generic H3 RPC service"},
++                {RPCResult::Type::ARR,
++                 "binds",
++                 /*optional=*/true,
++                 "Bound UDP listener addresses",
++                 {{RPCResult::Type::STR, "", "Address and port"}}},
++                {RPCResult::Type::STR, "path", /*optional=*/true,
++                 "Extended CONNECT request path"},
++                {RPCResult::Type::ARR,
++                 "protocols",
++                 /*optional=*/true,
++                 "Current application protocols",
++                 {{RPCResult::Type::STR, "", "Protocol token"}}},
++                {RPCResult::Type::ARR,
++                 "cert_sha256",
++                 /*optional=*/true,
++                 "Current and next full leaf DER SHA-256 hashes (hex)",
++                 {{RPCResult::Type::STR, "", "Certificate hash"}}},
++                {RPCResult::Type::STR, "spki", /*optional=*/true,
++                 "Current certificate SPKI pin"},
++                {RPCResult::Type::ARR,
++                 "origins",
++                 /*optional=*/true,
++                 "Allowed Origins (empty accepts any)",
++                 {{RPCResult::Type::STR, "", "Origin"}}},
++                {RPCResult::Type::ARR,
++                 "draft_codepoints",
++                 /*optional=*/true,
++                 "Public WebTransport standards SETTINGS identifiers",
++                 {{RPCResult::Type::NUM, "", "SETTINGS identifier"}}},
++                {RPCResult::Type::OBJ,
++                 "connections",
++                 /*optional=*/true,
++                 "Private current QUIC counts (not published over HTTP)",
++                 {{RPCResult::Type::NUM, "inbound", "Inbound connections"},
++                  {RPCResult::Type::NUM, "outbound", "Outbound connections"},
++                  {RPCResult::Type::NUM, "handshaking", "Pending handshakes"}}},
+                 {RPCResult::Type::NUM, "negative_cache",
+                  "Unexpired automatic UDP failure entries"},
+                 {RPCResult::Type::OBJ,
+@@ -87,8 +129,8 @@ static RPCHelpMan getwebtransportinfo() {
+         [&](const RPCHelpMan &, const Config &,
+             const JSONRPCRequest &request) -> UniValue {
+             auto &connman{EnsureConnman(EnsureAnyNodeContext(request.context))};
+-            UniValue result{UniValue::VOBJ}, fallback{UniValue::VOBJ};
+-            result.pushKV("enabled", bool(GetWebTransportDialer()));
++            UniValue result{GetWebTransportInfo(/*public_only=*/false)},
++                fallback{UniValue::VOBJ};
+             result.pushKV("negative_cache",
+                           uint64_t(connman.WebTransportNegativeCacheSize()));
+             const auto counts{connman.WebTransportFallbackCounts()};
+diff --git a/src/test/net_quic_tests.cpp b/src/test/net_quic_tests.cpp
+index ed4b4147e266ce6e0e5f65cce45ab49b5a4e461a..9b72203fd13c259a937454e679fe2bc7965fb904 100644
+--- a/src/test/net_quic_tests.cpp
++++ b/src/test/net_quic_tests.cpp
+@@ -4,8 +4,9 @@
+ 
+ // Built only with -DENABLE_WEBTRANSPORT=ON.
+ 
+-#include <net_quic/quic_engine.h>
+ #include <crypto/common.h>
++#include <net_quic/quic_certificate.h>
++#include <net_quic/quic_engine.h>
+ #include <net_quic/webtransport_wire.h>
+ 
+ #include <netaddress.h>
+@@ -15,6 +16,7 @@
+ #include <tls_util.h>
+ #include <util/fs.h>
+ #include <util/strencodings.h>
++#include <util/time.h>
+ 
+ #include <test/util/setup_common.h>
+ 
+@@ -221,6 +223,88 @@ std::vector<uint8_t> RandomPayload(size_t n) {
+ 
+ BOOST_FIXTURE_TEST_SUITE(net_quic_tests, QuicTestSetup)
+ 
++BOOST_AUTO_TEST_CASE(browser_certificate_overlap_and_key_stability) {
++    int64_t now{GetTime<std::chrono::seconds>().count()};
++    const auto original_key{tls::ReadFile(key)};
++    const auto original_cert{tls::ReadFile(cert)};
++    const auto browser_cert{m_path_root / "node_wt_cert.pem"};
++    std::string error;
++    QuicCertificate ca{cert, key, false};
++    BOOST_REQUIRE_MESSAGE(ca.Refresh(error), error);
++    auto browser{std::make_unique<QuicCertificate>(browser_cert, key, true,
++                                                   [&now] { return now; })};
++    BOOST_REQUIRE_MESSAGE(browser->Refresh(error), error);
++    const auto first{browser->Snapshot()};
++    BOOST_REQUIRE_EQUAL(first.hashes.size(), 2U);
++    BOOST_CHECK(first.hashes[0] != first.hashes[1]);
++    BOOST_CHECK_EQUAL(first.spki, ca.Snapshot().spki);
++    // Restart recovers both advertised hashes without regenerating either.
++    browser = std::make_unique<QuicCertificate>(browser_cert, key, true,
++                                                [&now] { return now; });
++    BOOST_REQUIRE_MESSAGE(browser->Refresh(error), error);
++    BOOST_CHECK(browser->Snapshot().hashes == first.hashes);
++    now += 6 * 86400;
++    BOOST_REQUIRE_MESSAGE(browser->Refresh(error), error);
++    const auto rotated{browser->Snapshot()};
++    BOOST_REQUIRE_EQUAL(rotated.hashes.size(), 2U);
++    BOOST_CHECK_EQUAL(rotated.hashes[0], first.hashes[1]);
++    BOOST_CHECK(rotated.hashes[1] != first.hashes[0]);
++    BOOST_CHECK_EQUAL(rotated.spki, first.spki);
++    now += 100 * 86400; // Recovery after a long offline period.
++    BOOST_REQUIRE_MESSAGE(browser->Refresh(error), error);
++    BOOST_CHECK(browser->Snapshot().hashes[0] != rotated.hashes[0]);
++    BOOST_CHECK_EQUAL(browser->Snapshot().spki, first.spki);
++    BOOST_CHECK(tls::ReadFile(key) == original_key);
++    BOOST_CHECK(tls::ReadFile(cert) == original_cert);
++}
++
++BOOST_AUTO_TEST_CASE(browser_certificate_failure_keeps_published_hash) {
++    const auto directory{m_path_root / "browser-failure"};
++    fs::create_directories(directory / "node_wt_cert_next.pem");
++    QuicCertificate browser{directory / "node_wt_cert.pem", key, true};
++    std::string error;
++    BOOST_CHECK(!browser.Refresh(error));
++    const auto published{browser.Snapshot()};
++    BOOST_REQUIRE_EQUAL(published.hashes.size(), 1U);
++    const auto pem{tls::ReadFile(directory / "node_wt_cert.pem")};
++    BOOST_REQUIRE(pem);
++    BIO *bio{BIO_new_mem_buf(pem->data(), int(pem->size()))};
++    X509 *x{PEM_read_bio_X509(bio, nullptr, nullptr, nullptr)};
++    BIO_free(bio);
++    BOOST_REQUIRE(x);
++    BOOST_CHECK_EQUAL(published.hashes[0], tls::CertSha256Hex(x));
++    X509_free(x);
++    BOOST_REQUIRE(fs::remove(directory / "node_wt_cert_next.pem"));
++    BOOST_REQUIRE_MESSAGE(browser.Refresh(error), error);
++    BOOST_CHECK_EQUAL(browser.Snapshot().hashes.size(), 2U);
++    BOOST_CHECK_EQUAL(browser.Snapshot().hashes[0], published.hashes[0]);
++}
++
++BOOST_AUTO_TEST_CASE(
++    browser_certificate_rejects_other_curve_without_replacing_key) {
++    EVP_PKEY *other{EVP_PKEY_Q_keygen(nullptr, nullptr, "EC", "secp384r1")};
++    BOOST_REQUIRE(other);
++    BIO *bio{BIO_new(BIO_s_mem())};
++    BOOST_REQUIRE(bio);
++    BOOST_REQUIRE_EQUAL(PEM_write_bio_PrivateKey(bio, other, nullptr, nullptr,
++                                                 0, nullptr, nullptr),
++                        1);
++    char *data{nullptr};
++    const long size{BIO_get_mem_data(bio, &data)};
++    const std::string pem{data, size_t(size)};
++    BIO_free(bio);
++    EVP_PKEY_free(other);
++    const auto unsupported{m_path_root / "unsupported_key.pem"};
++    BOOST_REQUIRE(tls::ReplaceFile(unsupported, pem));
++    QuicCertificate browser{m_path_root / "node_wt_cert.pem", unsupported,
++                            true};
++    std::string error;
++    BOOST_CHECK(!browser.Refresh(error));
++    BOOST_CHECK(error.find("EC P-256") != std::string::npos);
++    BOOST_CHECK_EQUAL(*tls::ReadFile(unsupported), pem);
++    BOOST_CHECK(browser.Snapshot().hashes.empty());
++}
++
+ BOOST_AUTO_TEST_CASE(admission_ip_groups_and_handshake_slots) {
+     using D = QuicAdmission::Decision;
+     const auto now{QuicAdmission::Clock::time_point{}};
+diff --git a/src/tls_util.cpp b/src/tls_util.cpp
+index baab5fafe09977c549fb229843f9e12dd92484b6..a87a88bbb055d157d813d6435cf35bb4a55ae0f2 100644
+--- a/src/tls_util.cpp
++++ b/src/tls_util.cpp
+@@ -276,12 +276,10 @@ EVP_PKEY *ReadPrivateKey(const std::string &pem) {
+ }
+ } // namespace
+ 
+-std::optional<SelfSigned>
+-GenerateSelfSigned(const std::string &common_name,
+-                   const std::vector<std::string> &dns_names,
+-                   const std::vector<std::string> &ip_addresses,
+-                   std::chrono::seconds validity,
+-                   const std::string &key_pem) {
++std::optional<SelfSigned> GenerateSelfSigned(
++    const std::string &common_name, const std::vector<std::string> &dns_names,
++    const std::vector<std::string> &ip_addresses, std::chrono::seconds validity,
++    const std::string &key_pem, std::optional<int64_t> valid_from) {
+     std::unique_ptr<EVP_PKEY, EVPPKeyDeleter> key{
+         key_pem.empty() ? NewP256Key() : ReadPrivateKey(key_pem)};
+     if (!key) {
+@@ -292,11 +290,14 @@ GenerateSelfSigned(const std::string &common_name,
+     std::unique_ptr<BIGNUM, BNDeleter> serial{BN_new()};
+     if (!cert || !serial || X509_set_version(cert.get(), 2) != 1 ||
+         BN_rand(serial.get(), 127, BN_RAND_TOP_ANY, BN_RAND_BOTTOM_ANY) != 1 ||
+-        !BN_to_ASN1_INTEGER(serial.get(),
+-                            X509_get_serialNumber(cert.get())) ||
+-        !X509_gmtime_adj(X509_getm_notBefore(cert.get()), -3600) ||
+-        !X509_gmtime_adj(X509_getm_notAfter(cert.get()),
+-                         static_cast<long>(validity.count())) ||
++        !BN_to_ASN1_INTEGER(serial.get(), X509_get_serialNumber(cert.get())) ||
++        !(valid_from
++              ? ASN1_TIME_set(X509_getm_notBefore(cert.get()), *valid_from)
++              : X509_gmtime_adj(X509_getm_notBefore(cert.get()), -3600)) ||
++        !(valid_from ? ASN1_TIME_set(X509_getm_notAfter(cert.get()),
++                                     *valid_from + validity.count())
++                     : X509_gmtime_adj(X509_getm_notAfter(cert.get()),
++                                       static_cast<long>(validity.count()))) ||
+         X509_set_pubkey(cert.get(), key.get()) != 1) {
+         return std::nullopt;
+     }
+diff --git a/src/tls_util.h b/src/tls_util.h
+index c9f69c323d7034e40fd6e2f3b01e4749a460e95f..91bbee9c73ad88db7ada01fdb37b36aed1f8befb 100644
+--- a/src/tls_util.h
++++ b/src/tls_util.h
+@@ -10,6 +10,7 @@
+ #include <openssl/ssl.h>
+ 
+ #include <chrono>
++#include <cstdint>
+ #include <memory>
+ #include <mutex>
+ #include <optional>
+@@ -85,14 +86,15 @@ struct SelfSigned {
+  * Generate a self-signed certificate (CA:FALSE) with the given subject CN,
+  * DNS and IP subject alternative names and validity, for a new EC P-256 key
+  * or, if `key_pem` is set, for that existing key (renewals keep the public
+- * key, and with it any SPKI pins).
++ * key, and with it any SPKI pins). An explicit valid_from (Unix seconds)
++ * creates a certificate valid for exactly validity seconds from that time;
++ * otherwise retain the normal one-hour backdate and system-time expiry.
+  */
+-std::optional<SelfSigned>
+-GenerateSelfSigned(const std::string &common_name,
+-                   const std::vector<std::string> &dns_names,
+-                   const std::vector<std::string> &ip_addresses,
+-                   std::chrono::seconds validity,
+-                   const std::string &key_pem = {});
++std::optional<SelfSigned> GenerateSelfSigned(
++    const std::string &common_name, const std::vector<std::string> &dns_names,
++    const std::vector<std::string> &ip_addresses, std::chrono::seconds validity,
++    const std::string &key_pem = {},
++    std::optional<int64_t> valid_from = std::nullopt);
+ 
+ /** Write a key (mode 0600) and certificate as PEM files */
+ bool WritePemFiles(const SelfSigned &pem, const fs::path &cert_path,
+diff --git a/test/functional/p2p_webtransport_browser_cert.py b/test/functional/p2p_webtransport_browser_cert.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..736ac792a2f575e1989cdb84e97a76e7fec92175
+--- /dev/null
++++ b/test/functional/p2p_webtransport_browser_cert.py
+@@ -0,0 +1,154 @@
++#!/usr/bin/env python3
++# Copyright (c) 2026 The Bitcoin developers
++# Distributed under the MIT software license, see the accompanying
++# file COPYING or http://www.opensource.org/licenses/mit-license.php.
++"""Browser certificate overlap, stable key, public discovery and live reload."""
++
++import hashlib
++import http.client
++import json
++import ssl
++import time
++from pathlib import Path
++
++from test_framework.test_framework import BitcoinTestFramework, SkipTest
++from test_framework.util import assert_equal, p2p_port, rpc_port
++
++
++class WebTransportBrowserCertificateTest(BitcoinTestFramework):
++    def set_test_params(self):
++        self.num_nodes = 2
++        self.setup_clean_chain = True
++
++    def skip_test_if_missing_module(self):
++        if not self.config["components"].getboolean(
++            "ENABLE_WEBTRANSPORT", fallback=False
++        ):
++            raise SkipTest("WebTransport was not compiled")
++
++    def setup_network(self):
++        self.public_port = p2p_port(40)
++        self.extra_args = [
++            [
++                "-p2pwebtransport=1",
++                "-p2pwebtransportbrowsercert=1",
++                f"-publicbind=127.0.0.1:{self.public_port}",
++            ],
++            ["-p2pwebtransport=1", "-listen=0"],
++        ]
++        self.add_nodes(self.num_nodes, self.extra_args)
++        config = Path(self.nodes[1].datadir) / "bitcoin.conf"
++        config.write_text(
++            "\n".join(
++                line
++                for line in config.read_text().splitlines()
++                if line != "bind=127.0.0.1"
++            )
++            + "\n"
++        )
++        self.start_nodes()
++
++    def request(self, port, path="/p2p/wt/info", method="GET"):
++        connection = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
++        connection.request(method, path)
++        response = connection.getresponse()
++        body = response.read()
++        headers = dict(response.getheaders())
++        connection.close()
++        return response.status, headers, body
++
++    def peers(self, index):
++        return [
++            p
++            for p in self.nodes[index].getpeerinfo()
++            if p["transport"] == "webtransport"
++        ]
++
++    def connect(self, certificate_hash):
++        self.nodes[1].addnode(
++            f"wt://127.0.0.1:{p2p_port(0)}/p2p/wt#cert={certificate_hash}", "onetry"
++        )
++        self.wait_until(
++            lambda: len(self.peers(1)) == 1 and self.peers(1)[0]["version"] != 0
++        )
++        assert_equal(
++            self.peers(1)[0]["webtransport"]["peer_cert_fingerprint"], certificate_hash
++        )
++
++    def run_test(self):
++        server = self.nodes[0]
++        directory = Path(server.datadir) / self.chain
++        key = directory / "node_tls_key.pem"
++        normal_cert = directory / "node_tls_cert.pem"
++        browser_cert = directory / "node_wt_cert.pem"
++        original_key, original_normal = key.read_bytes(), normal_cert.read_bytes()
++        self.log.info(
++            "Public discovery publishes current and next hashes without private counters"
++        )
++        first = server.getwebtransportinfo()
++        assert_equal(first["enabled"], True)
++        assert_equal(first["browsercert"], True)
++        assert_equal(first["protocols"], ["p2p-v1"])
++        assert_equal(first["h3_service"], "webtransport-p2p")
++        assert_equal(len(first["cert_sha256"]), 2)
++        assert first["cert_sha256"][0] != first["cert_sha256"][1]
++
++        def digest():
++            return hashlib.sha256(
++                ssl.PEM_cert_to_DER_cert(browser_cert.read_text())
++            ).hexdigest()
++
++        assert_equal(first["cert_sha256"][0], digest())
++        decoded = ssl._ssl._test_decode_cert(str(browser_cert))
++        assert_equal(
++            ssl.cert_time_to_seconds(decoded["notAfter"])
++            - ssl.cert_time_to_seconds(decoded["notBefore"]),
++            10 * 86400,
++        )
++        status, headers, body = self.request(self.public_port)
++        assert_equal(status, 200)
++        assert_equal(headers["Cache-Control"], "no-store")
++        assert_equal(headers["Access-Control-Allow-Origin"], "*")
++        assert "Alt-Svc" not in headers
++        public = json.loads(body)
++        assert_equal(public["cert_sha256"], first["cert_sha256"])
++        for private in ("negative_cache", "fallback", "connections"):
++            assert private not in public
++        assert_equal(self.request(self.public_port, method="HEAD")[2], b"")
++        assert_equal(self.request(self.public_port, method="POST")[0], 405)
++        assert_equal(self.request(self.public_port, "/p2p/wt/info?test=1")[0], 200)
++        assert_equal(
++            self.request(self.public_port, "/p2p/wt/info?test=1", "POST")[0], 405
++        )
++        for path in ("/", "/metrics", "/p2p/wt/info/extra", "/p2p/wt/infoevil"):
++            assert_equal(self.request(self.public_port, path)[0], 404)
++        assert "Alt-Svc" not in self.request(rpc_port(0))[1]
++        self.connect(first["cert_sha256"][0])
++
++        self.log.info(
++            "Restart recovers both hashes; mocktime rollover promotes the published successor"
++        )
++        self.stop_node(0)
++        self.start_node(0)
++        self.wait_until(lambda: not self.peers(1))
++        assert_equal(server.getwebtransportinfo()["cert_sha256"], first["cert_sha256"])
++        server.setmocktime(int(time.time()) + 6 * 86400)
++        rotated = server.getwebtransportinfo()
++        assert_equal(rotated["cert_sha256"][0], first["cert_sha256"][1])
++        assert rotated["cert_sha256"][1] not in first["cert_sha256"]
++        assert_equal(rotated["cert_sha256"][0], digest())
++        assert_equal(rotated["spki"], first["spki"])
++        assert_equal(key.read_bytes(), original_key)
++        assert_equal(normal_cert.read_bytes(), original_normal)
++        # Native pinned TLS confirms that the engine refreshes its actual leaf
++        # immediately. Browser validity against real time is a separate manual
++        # gate; this fixture advances only the node's mock clock.
++        self.connect(rotated["cert_sha256"][0])
++        assert_equal(
++            json.loads(self.request(self.public_port)[2])["cert_sha256"],
++            rotated["cert_sha256"],
++        )
++
++
++if __name__ == "__main__":
++    WebTransportBrowserCertificateTest().main()

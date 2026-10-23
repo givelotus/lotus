@@ -1,0 +1,301 @@
+From ea01609e9fcc40bd6593bf4da46386fa01068bcb Mon Sep 17 00:00:00 2001
+From: Shammah Chancellor <shammah.chancellor@gmail.com>
+Date: Mon, 19 Oct 2026 18:44:12 -0700
+Subject: [PATCH] mempool: grow Merklix overlay arenas geometrically, not per
+ batch
+
+Why: the admission profile in the previous commit put 75% of the message
+handler thread in MempoolOverlayLayer::AddTransactionBatch once the mempool
+held 150k transactions, and script verification at 9%. Admission
+publishes the overlay after every coalesced burst of peer transactions, so
+this, not signature checking, was the throughput ceiling for large
+mempools: the accepted rate fell from about 4k tx/s to about 1k tx/s as
+the pool grew.
+
+The cause is two reserve calls that ask for exactly the next batch:
+- TxOverlayArena::InsertBatchParallel and UtxoOverlayArena::
+  BatchUpdateParallel splice with
+  nodes_.reserve(nodes_.size() + new_nodes). An exact reserve beyond
+  capacity reallocates to exactly that size, so every batch copies the
+  whole persistent arena (memmove was 26% of the thread).
+- AddTransactionBatch calls created_coins_.reserve(size + 2k) and
+  spent_outpoints_.reserve(size + 2k), which rehashes both maps (bucket
+  arrays zeroed and refilled) on every batch.
+Each is O(overlay size) per batch, so a stream of small batches is
+quadratic.
+
+What: reserve only when the container would actually grow, and then to at
+least double its capacity (vectors) or size (unordered maps). Contents,
+ordering of every exported list (they are sorted) and all roots are
+unchanged; only allocation timing differs.
+
+Evidence:
+- New unit test batched_inserts_match_serial_inserts_while_growing: 3000
+  transactions (half spending outputs of earlier ones, inside and across
+  batches) added one by one and in random batches of 17-80 give equal
+  Subtree A roots, UTXO roots, counts, fees, sigchecks, costs and net
+  erased/inserted sets, with and without the state root in the header.
+  mempool_overlay_tests pass.
+- bitcoin-bench (shared host, load average about 70):
+    MempoolOverlayAddBatch64To100k  4,175,146 ns/tx before, 5,275 after
+    MempoolOverlayAddBatch64To10k     162,015 ns/tx before, 5,358 after
+- 200k signed-transaction flood, 8 peers: node CPU for the whole flood
+  64.5 s before, 26.9 s after; overlay share of the message handler at
+  150k mempool entries 75% before, 4.9% after; script verification is
+  now the largest item (33%). Interleaved A/B rounds are in the README of
+  the admission series.
+
+How to reproduce:
+    ninja -C build bitcoind bitcoin-bench test_bitcoin
+    build/src/bench/bitcoin-bench -filter='MempoolOverlayAddBatch.*'
+    build/src/test/test_bitcoin --run_test=mempool_overlay_tests
+    contrib/bench/mempool-admission/flood.py --bitcoind build/src/bitcoind \
+        --fixture FX --workdir RUN --peers 8 \
+        --sample-seconds 8 --sample-at-size 150000
+bitcoin-bench prints nanobench rows in ns/tx; flood.py prints JSON with
+node_cpu_s and tps_10_90.
+
+Not addressed: the persistent arena still never compacts, so its memory
+grows with every path copy until the next reset; that is unchanged.
+
+diff --git a/src/bench/CMakeLists.txt b/src/bench/CMakeLists.txt
+index 0d1ef4c9e20a5093c6e9b05deb26ea1361bd73a9..2cae65d7060873d5fbed4172c7898dba75a6ffe4 100644
+--- a/src/bench/CMakeLists.txt
++++ b/src/bench/CMakeLists.txt
+@@ -60,6 +60,7 @@ add_executable(bitcoin-bench
+ 	logging.cpp
+ 	mempool_admission.cpp
+ 	mempool_eviction.cpp
++	mempool_overlay_batch.cpp
+ 	mempool_stress.cpp
+ 	merkle_root.cpp
+ 	metrics.cpp
+diff --git a/src/bench/mempool_overlay_batch.cpp b/src/bench/mempool_overlay_batch.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..9ca56cc012eaaa4feaa8656fe0e6b0fcce9dbc7b
+--- /dev/null
++++ b/src/bench/mempool_overlay_batch.cpp
+@@ -0,0 +1,69 @@
++// Copyright (c) 2026 The Lotus developers
++// Distributed under the MIT software license, see the accompanying
++// file COPYING or http://www.opensource.org/licenses/mit-license.php.
++
++#include <bench/bench.h>
++#include <lotus_v2/mempool_overlay.h>
++#include <random.h>
++
++#include <vector>
++
++/**
++ * Cost of adding one small batch of transactions to a speculative Merklix
++ * overlay that already holds a large mempool. Mempool admission publishes a
++ * batch like this after every coalesced burst of peer transactions, so the
++ * per-batch cost must not grow with the size of the overlay.
++ */
++namespace {
++
++lotus::v2::Hash RandomHash(FastRandomContext &rng) {
++    lotus::v2::Hash h;
++    const uint256 r = rng.rand256();
++    std::copy(r.begin(), r.end(), h.begin());
++    return h;
++}
++
++std::vector<lotus::v2::OverlayTxEntry> MakeBatch(FastRandomContext &rng,
++                                                 size_t n) {
++    std::vector<lotus::v2::OverlayTxEntry> batch(n);
++    for (auto &e : batch) {
++        e.tx_id = RandomHash(rng);
++        e.tx_hash = RandomHash(rng);
++        e.linear_cost = 220;
++        e.fee_sats = 500;
++        e.sigchecks = 1;
++        e.spent_outpoints.push_back({RandomHash(rng), 0});
++        for (uint32_t i = 0; i < 2; ++i) {
++            lotus::v2::Coin coin;
++            coin.outpoint = {e.tx_id, i};
++            coin.output.value = 1000;
++            e.created_coins.push_back(std::move(coin));
++        }
++    }
++    return batch;
++}
++
++void AddBatches(benchmark::Bench &bench, size_t pool_size, size_t batch_size) {
++    FastRandomContext rng(/*fDeterministic=*/true);
++    lotus::v2::MempoolOverlayLayer layer;
++    for (size_t added = 0; added < pool_size; added += batch_size) {
++        auto batch = MakeBatch(rng, batch_size);
++        layer.AddTransactionBatch(batch);
++    }
++    bench.batch(batch_size).unit("tx").run([&] {
++        auto batch = MakeBatch(rng, batch_size);
++        layer.AddTransactionBatch(batch);
++    });
++}
++
++} // namespace
++
++static void MempoolOverlayAddBatch64To10k(benchmark::Bench &bench) {
++    AddBatches(bench, 10'000, 64);
++}
++static void MempoolOverlayAddBatch64To100k(benchmark::Bench &bench) {
++    AddBatches(bench, 100'000, 64);
++}
++
++BENCHMARK(MempoolOverlayAddBatch64To10k);
++BENCHMARK(MempoolOverlayAddBatch64To100k);
+diff --git a/src/lotus_v2/mempool_overlay.cpp b/src/lotus_v2/mempool_overlay.cpp
+index 4f50fef36556bf8211b28d15164c208762ce9387..ba1f805ae364fe3069ee0438a499f637cd43e963 100644
+--- a/src/lotus_v2/mempool_overlay.cpp
++++ b/src/lotus_v2/mempool_overlay.cpp
+@@ -20,6 +20,28 @@ namespace lotus::v2 {
+ 
+ namespace {
+ 
++/**
++ * Reserve room for `extra` more elements while keeping amortized growth.
++ * reserve(size() + extra) on every batch defeats the container's geometric
++ * growth: each call reallocates (vector) or rehashes (unordered_map) the
++ * whole container, so a stream of small batches costs O(n) per batch.
++ */
++template <typename Vec>
++void ReserveAmortized(Vec &v, size_t extra) {
++    const size_t needed = v.size() + extra;
++    if (needed > v.capacity()) {
++        v.reserve(std::max(needed, v.capacity() * 2));
++    }
++}
++
++template <typename Map>
++void ReserveBucketsAmortized(Map &m, size_t extra) {
++    const size_t needed = m.size() + extra;
++    if (needed > static_cast<size_t>(m.bucket_count() * m.max_load_factor())) {
++        m.reserve(std::max(needed, m.size() * 2));
++    }
++}
++
+ constexpr uint64_t OverlayEffectiveCost(uint64_t linear_cost) noexcept {
+     const auto sq = static_cast<unsigned __int128>(linear_cost) * linear_cost;
+     return linear_cost + static_cast<uint64_t>(sq >> 16);
+@@ -1039,7 +1061,7 @@ uint32_t TxOverlayArena::InsertBatchParallel(
+     for (unsigned s = 0; s < 16; ++s) {
+         total_new_nodes += local_nodes[s].size();
+     }
+-    nodes_.reserve(nodes_.size() + total_new_nodes);
++    ReserveAmortized(nodes_, total_new_nodes);
+ 
+     for (unsigned s = 0; s < 16; ++s) {
+         if (local_nodes[s].empty()) {
+@@ -1696,7 +1718,7 @@ void UtxoOverlayArena::BatchUpdateParallel(
+     for (unsigned s = 0; s < 16; ++s) {
+         total_new_nodes += local_nodes[s].size();
+     }
+-    nodes_.reserve(nodes_.size() + total_new_nodes);
++    ReserveAmortized(nodes_, total_new_nodes);
+ 
+     for (unsigned s = 0; s < 16; ++s) {
+         if (local_nodes[s].empty()) {
+@@ -1977,8 +1999,8 @@ size_t MempoolOverlayLayer::AddTransactionBatch(
+                    : 0;
+     }
+ 
+-    created_coins_.reserve(created_coins_.size() + entries.size() * 2);
+-    spent_outpoints_.reserve(spent_outpoints_.size() + entries.size() * 2);
++    ReserveBucketsAmortized(created_coins_, entries.size() * 2);
++    ReserveBucketsAmortized(spent_outpoints_, entries.size() * 2);
+ 
+     std::vector<std::pair<Hash, Hash>> tx_leaves;
+     tx_leaves.reserve(entries.size());
+diff --git a/src/test/mempool_overlay_tests.cpp b/src/test/mempool_overlay_tests.cpp
+index 0ef4b2ee677948ab94184f0f059e67ba4e252025..e70b9fea0e27bc01d142853dd15da03ab479c416 100644
+--- a/src/test/mempool_overlay_tests.cpp
++++ b/src/test/mempool_overlay_tests.cpp
+@@ -335,6 +335,87 @@ BOOST_AUTO_TEST_CASE(mempool_overlay_tracks_admission_removal_and_tip) {
+     BOOST_CHECK_EQUAL(manager.GetSpeculativeOverlay().GetTxCount(), 0U);
+ }
+ 
++BOOST_AUTO_TEST_CASE(batched_inserts_match_serial_inserts_while_growing) {
++    // Many small batches into a growing overlay must give exactly the state
++    // of inserting the same transactions one at a time, in both UTXO-root
++    // modes. This covers the arena and map growth between batches.
++    for (const bool commit_state_root : {false, true}) {
++        FastRandomContext rng(/*fDeterministic=*/true);
++        auto random_hash = [&] {
++            lotus::v2::Hash h;
++            const uint256 r = rng.rand256();
++            std::copy(r.begin(), r.end(), h.begin());
++            return h;
++        };
++        std::vector<lotus::v2::OverlayTxEntry> all;
++        std::vector<lotus::v2::Outpoint> unspent_created;
++        for (size_t i = 0; i < 3000; ++i) {
++            lotus::v2::OverlayTxEntry e;
++            e.tx_id = random_hash();
++            e.tx_hash = random_hash();
++            e.linear_cost = 200 + i % 50;
++            e.fee_sats = 300 + int64_t(i % 7);
++            e.sigchecks = 1 + int64_t(i % 3);
++            if (!unspent_created.empty() && i % 2 == 0) {
++                // Spend an output created by an earlier transaction, which
++                // may sit in the same batch or in an earlier one.
++                const size_t pick = rng.randrange(unspent_created.size());
++                e.spent_outpoints.push_back(unspent_created[pick]);
++                unspent_created.erase(unspent_created.begin() + pick);
++            } else {
++                e.spent_outpoints.push_back({random_hash(), 0});
++            }
++            for (uint32_t n = 0; n < 2; ++n) {
++                lotus::v2::Coin coin;
++                coin.outpoint = {e.tx_id, n};
++                coin.output.value = 1000 + n;
++                coin.creation_height = 200;
++                e.created_coins.push_back(coin);
++                unspent_created.push_back(coin.outpoint);
++            }
++            all.push_back(std::move(e));
++        }
++
++        const lotus::v2::Hash parent{};
++        lotus::v2::MempoolOverlayLayer serial(
++            parent, nullptr, lotus::v2::GetInitialV2MonetaryState(), 200,
++            1700000100);
++        lotus::v2::MempoolOverlayLayer batched(
++            parent, nullptr, lotus::v2::GetInitialV2MonetaryState(), 200,
++            1700000100);
++        serial.SetCommitStateRootInHeader(commit_state_root);
++        batched.SetCommitStateRootInHeader(commit_state_root);
++        for (const auto &e : all) {
++            BOOST_CHECK(serial.AddTransaction(
++                e.tx_id, e.tx_hash, e.linear_cost, e.spent_outpoints,
++                e.created_coins, e.fee_sats, e.sigchecks));
++        }
++        size_t pos = 0;
++        while (pos < all.size()) {
++            const size_t n = std::min<size_t>(all.size() - pos,
++                                              17 + rng.randrange(64));
++            std::vector<lotus::v2::OverlayTxEntry> batch(
++                all.begin() + pos, all.begin() + pos + n);
++            BOOST_CHECK_EQUAL(batched.AddTransactionBatch(batch), n);
++            pos += n;
++        }
++        BOOST_CHECK_EQUAL(serial.GetTxCount(), batched.GetTxCount());
++        BOOST_CHECK(serial.GetSubtreeARoot() == batched.GetSubtreeARoot());
++        BOOST_CHECK(serial.GetUtxoRootDigest() ==
++                    batched.GetUtxoRootDigest());
++        BOOST_CHECK_EQUAL(serial.GetTotalFeesSats(),
++                          batched.GetTotalFeesSats());
++        BOOST_CHECK_EQUAL(serial.GetTotalSigChecks(),
++                          batched.GetTotalSigChecks());
++        BOOST_CHECK_EQUAL(serial.GetSumNonCbEffectiveCost(),
++                          batched.GetSumNonCbEffectiveCost());
++        BOOST_CHECK(serial.GetNetErasedOutpoints() ==
++                    batched.GetNetErasedOutpoints());
++        BOOST_CHECK_EQUAL(serial.GetNetInsertedCoins().size(),
++                          batched.GetNetInsertedCoins().size());
++    }
++}
++
+ 
+ BOOST_AUTO_TEST_CASE(transaction_subtree_span_partition_matches_arena) {
+     using namespace lotus::v2;

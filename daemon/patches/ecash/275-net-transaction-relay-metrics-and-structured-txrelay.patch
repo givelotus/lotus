@@ -1,0 +1,599 @@
+From d79d49b621677b8027af2d5fd92d54442342043f Mon Sep 17 00:00:00 2001
+From: Shammah Chancellor <shammah.chancellor@notvalid.com>
+Date: Mon, 19 Oct 2026 17:47:20 -0700
+Subject: [PATCH] net: transaction relay metrics and structured txrelay logs
+
+Tuning the fan-out, tick and reconciliation, and seeing whether short-id
+collisions ever happen (the trigger for per-link salts), needs numbers
+from running nodes. The node already has a lock-free Prometheus registry
+(-metrics) and typed structured log events; this uses both.
+
+Metrics, all named from one prefix (TXRELAY_METRIC_PREFIX,
+"fullnode_txrelay_"; the node's metrics are moving to a neutral fullnode_
+namespace, so the plan's lotus_txrelay_ names are superseded and the
+prefix is the one line to rebase), labels from fixed small sets only:
+
+- announce_sent_total, announce_recv_total, announce_dup_total, by
+  kind="short|full" (invshort ids, inv entries); dup = received for a
+  transaction we already had;
+- body_recv_total, body_dup_total: bodies through the tx-message path
+  (tx messages and short-id responses);
+- fanout_peers (histogram): peers each relayed transaction was queued for;
+- queue_depth (gauge): transactions drained at the last non-empty tick;
+- tick_overrun_total: a tick drained more than a tick late with
+  transactions waiting (they still go; nothing is dropped);
+- recon_rounds_total, recon_diff (histogram of missing ids per received
+  summary or bucket summary), recon_overflow_total (undecodable
+  sub-buckets), recon_fetched_total (ids requested because of
+  reconciliation);
+- shortid_collision_total;
+- first_seen_to_announce_seconds (histogram): from queueing a transaction
+  for relay to the tick that queues its announcements.
+
+Bytes per message type, and so per kind (announcements, requests, bodies,
+reconciliation), were already exported as lotus_p2p_{sent,received}_bytes
+by type; invshort and sendinvshort are now message types there.
+
+Logs: a new txrelay debug category with typed events, at most one per tick
+or message: txrelay_tick (transactions drained, announcements queued; only
+for ticks that had any), peer_invshort_received (peer, ids, new ids),
+peer_recon_summary_sent (peer, window size) and
+mempool_tx_shortid_collision (txid, short id, transactions already under
+it). New log fields: short_id, peers, missing.
+
+Also: a reconciliation round whose window is empty no longer sends a
+summary (a peer cannot be missing anything from us then); found while
+adding the summary log, which logged "0 transactions" four times a second.
+
+Tests: p2p_tx_reconciliation.py now reads the metrics: recon rounds,
+recon-fetched ids, short announcements and bodies are non-zero (one run:
+101 rounds, 63 ids fetched by reconciliation, 60 short announcements, 106
+bodies of which 6 duplicates, the duplicates coming from a body requested
+both by reconciliation and by announcement), and checks the summary log
+line. The structured event and field-key lints pass (110 production call
+sites). interface_http_metrics, feature_logging, rpc_misc,
+p2p_tx_relay_invshort and the metrics, logging, txrelay and
+v2_protocol_handler unit suites pass.
+
+Not tested here: the full functional suite (run once on the finished
+series); the metrics on clusters under load (R10).
+
+Coordinator integration provenance (network403):
+Use MetricName/fullnode namespace directly; union prior metric families and new transaction relay collectors. No transitional prefix macro or dual-name alias.
+Original scripted commands/hashes above are original-author provenance; modified parent/tool/catalog hashes are not claimed to reproduce this composition. Exact coordinator adaptation scripts and ordered tree proof are in composed403-network-metrics-delivery. Build/runtime/benchmarks NOT_RUN for this composition under user compile-first policy.
+
+diff --git a/src/logging.cpp b/src/logging.cpp
+index 51dcaf285543ac3e6767fc92b066093ad46d791f..14cb4beb0830f7f4d57e9c119741161c3cbab282 100644
+--- a/src/logging.cpp
++++ b/src/logging.cpp
+@@ -417,9 +417,10 @@ static const std::map<std::string, BCLog::LogFlags, std::less<>>
+         {"blockstorage", BCLog::BLOCKSTORE},
+         {"netdebug", BCLog::NETDEBUG},
+         {"txpackages", BCLog::TXPACKAGES},
++        {"txrelay", BCLog::TXRELAY},
+         {"1", BCLog::ALL},
+         {"all", BCLog::ALL},
+-    };
++};
+ 
+ static const std::unordered_map<BCLog::LogFlags, std::string>
+     LOG_CATEGORIES_BY_FLAG{
+diff --git a/src/logging.h b/src/logging.h
+index ec7562412aee50bc81258909cd4df409982ede0b..8f459b6e949785784b7a0b95f398950bbd7c706a 100644
+--- a/src/logging.h
++++ b/src/logging.h
+@@ -90,6 +90,7 @@ enum LogFlags : uint32_t {
+     BLOCKSTORE = (1 << 26),
+     NETDEBUG = (1 << 27),
+     TXPACKAGES = (1 << 28),
++    TXRELAY = (1 << 29),
+     ALL = ~uint32_t(0),
+ };
+ 
+diff --git a/src/logging/fields.h b/src/logging/fields.h
+index 3ef8dbd3072a378d65f5f96fe99adc373b7818cc..d7d08531b1c162b1335d579d391143ecf460dd4b 100644
+--- a/src/logging/fields.h
++++ b/src/logging/fields.h
+@@ -64,6 +64,9 @@
+     X(Bytes, bytes, UINT, "", "")                                              \
+     X(DroppedLines, dropped_lines, UINT, "", "")                               \
+     X(Count, count, UINT, "", "")                                              \
++    X(ShortId, short_id, UINT, "", "")                                         \
++    X(Peers, peers, UINT, "", "")                                              \
++    X(Missing, missing, UINT, "", "")                                          \
+     X(AmountSats, amount_sats, INT, "", "")                                    \
+     X(Method, method, STRING, "", "rpc.method")                                \
+     X(OriginalMethod, original_method, STRING, "", "rpc.method_original")      \
+diff --git a/src/net/txrelay_index.cpp b/src/net/txrelay_index.cpp
+index 68fa5bffeb9cf3ac8c455c2b87caf294e302a124..818f0471d55d96cf18c53882a41028bb9dd8ca0e 100644
+--- a/src/net/txrelay_index.cpp
++++ b/src/net/txrelay_index.cpp
+@@ -5,7 +5,10 @@
+ #include <net/txrelay_index.h>
+ 
+ #include <crypto/siphash.h>
++#include <logging.h>
++#include <logging/values.h>
+ #include <lotus_v2/set_reconciliation.h>
++#include <node/metrics.h>
+ 
+ #include <algorithm>
+ #include <cstring>
+@@ -63,6 +66,15 @@ void TxRelayIndex::Insert(Epoch &epoch, const TxId &txid) {
+     if (!txids.empty()) {
+         // Keep both: either may be requested under this short id.
+         ++m_collisions;
++        if (auto *m{node::GetNodeMetrics()}) {
++            m->txrelay_shortid_collision.Inc();
++        }
++        LogEvent(BCLog::TXRELAY, "mempool_tx_shortid_collision",
++                 "short id {short_id} of {txid} already holds {count} "
++                 "transaction(s) in this epoch")
++            .Field(BCLog::LogField::TxId, txid)
++            .Field(BCLog::LogField::ShortId, short_id)
++            .Field(BCLog::LogField::Count, uint64_t(txids.size()));
+     }
+     txids.push_back(txid);
+ }
+diff --git a/src/net/v2_protocol_handler.cpp b/src/net/v2_protocol_handler.cpp
+index c030afaa030f9be07a929f9cde674a3ebed64ff7..927314a362bae81783161671ff27933a8676591a 100644
+--- a/src/net/v2_protocol_handler.cpp
++++ b/src/net/v2_protocol_handler.cpp
+@@ -4,6 +4,8 @@
+ 
+ #include <net/v2_protocol_handler.h>
+ 
++#include <node/metrics.h>
++
+ #include <avalanche/processor.h>
+ #include <common/args.h>
+ #include <consensus/merkle.h>
+@@ -452,12 +454,19 @@ void V2PeerProtocolHandler::FilterRelayHave(
+     if (short_ids.empty() || !IsRelayEpoch(scope, context_id, k0, k1)) {
+         return;
+     }
++    auto *metrics{node::GetNodeMetrics()};
++    if (metrics) {
++        metrics->txrelay_recon_diff.Record(short_ids.size());
++    }
+     // "Missing" from our window may still be in our mempool (admitted
+     // before the window, or the peer's window edge differs from ours).
+     std::erase_if(short_ids, [&](uint64_t short_id) {
+         return m_relay_epochs->HaveRelayShortId(context_id, short_id);
+     });
+     if (!short_ids.empty()) {
++        if (metrics) {
++            metrics->txrelay_recon_fetched.Add(0, short_ids.size());
++        }
+         {
+             LOCK(m_mutex);
+             m_stats.recon_relay_missing += short_ids.size();
+@@ -465,7 +474,8 @@ void V2PeerProtocolHandler::FilterRelayHave(
+         // Fetch them like announced short ids: one request per transaction
+         // across peers, whether reconciliation or an announcement found it.
+         m_peerman.AddRelayShortIdAnnouncements(pfrom, context_id, short_ids);
+-        short_ids.clear();    }
++        short_ids.clear();
++    }
+ }
+ 
+ uint64_t V2PeerProtocolHandler::ScopedShortId(ReconScope scope,
+@@ -1613,6 +1623,14 @@ void V2PeerProtocolHandler::HandleMerklixBuck(
+                               NetMsg::Make(NetMsgType::GETSHORTTX, req));
+     }
+ 
++    if (!diff.unresolved_sub_buckets.empty() &&
++        IsRelayEpoch(scope, sub.context_id, sub.salt_k0, sub.salt_k1)) {
++        if (auto *metrics{node::GetNodeMetrics()}) {
++            metrics->txrelay_recon_overflow.Add(
++                0, diff.unresolved_sub_buckets.size());
++        }
++    }
++
+     // Multi-depth prefix bisection for d >= 3 sub-bucket overflows:
+     // depth 8 -> request depth 12; depth 12 -> request depth 16.
+     if (!diff.unresolved_sub_buckets.empty() && depth_bits < 16) {
+diff --git a/src/net_processing.cpp b/src/net_processing.cpp
+index 45e67c98cb67654cd5a9b2e75a6e7ead3c499ad3..7d349fd83ca3b72d82d4abed54a217224b91a41c 100644
+--- a/src/net_processing.cpp
++++ b/src/net_processing.cpp
+@@ -1468,6 +1468,8 @@ private:
+         TxId txid;
+         //! Originated by this node: announce to every relay peer
+         bool local;
++        //! When it was queued (relay tick clock)
++        std::chrono::microseconds queued;
+     };
+     // GlobalMutex: taken from many call paths without lock annotations.
+     GlobalMutex m_relay_queue_mutex;
+@@ -3552,7 +3554,8 @@ void PeerManagerImpl::RelayTransaction(const TxId &txid) {
+     // Index the short id now, so that an announcement of this transaction
+     // arriving before the next tick is recognised as known.
+     m_txrelay_index.Add(txid, GetTime<std::chrono::microseconds>());
+-    WITH_LOCK(m_relay_queue_mutex, m_relay_queue.push_back({txid, local}));
++    WITH_LOCK(m_relay_queue_mutex,
++              m_relay_queue.push_back({txid, local, RelayTickNow()}));
+     m_txrelay_wake.store(true, std::memory_order_relaxed);
+ }
+ 
+@@ -3578,12 +3581,13 @@ void PeerManagerImpl::RelayTransactionBatch(
+             m_txrelay_index.Add(tx->GetId(), now);
+         }
+     }
++    const auto queued{RelayTickNow()};
+     {
+         LOCK(m_relay_queue_mutex);
+         m_relay_queue.reserve(m_relay_queue.size() + txs.size());
+         for (size_t i = 0; i < txs.size(); ++i) {
+             if (txs[i]) {
+-                m_relay_queue.push_back({txs[i]->GetId(), local[i]});
++                m_relay_queue.push_back({txs[i]->GetId(), local[i], queued});
+             }
+         }
+     }
+@@ -3745,13 +3749,29 @@ void PeerManagerImpl::MaybeReconcile() {
+     const auto summary{m_v2_protocol_handler.BuildSyncSummary(
+         lotus::v2::net::ReconScope::LIVE_MEMPOOL, epoch->epoch_id, epoch->k0,
+         epoch->k1)};
+-    m_connman.ForNode(next, [&](CNode *node) {
+-        if (!node->fSuccessfullyConnected || node->fDisconnect) {
+-            return false;
++    uint64_t window{0};
++    for (const auto &bucket : summary.buckets) {
++        window += bucket.count;
++    }
++    // Nothing admitted in the window: the peer cannot be missing anything
++    // from us.
++    if (window > 0) {
++        m_connman.ForNode(next, [&](CNode *node) {
++            if (!node->fSuccessfullyConnected || node->fDisconnect) {
++                return false;
++            }
++            MakeAndPushMessage(*node, NetMsgType::MERKLIXSYNC, summary);
++            return true;
++        });
++        if (auto *m{node::GetNodeMetrics()}) {
++            m->txrelay_recon_rounds.Inc();
+         }
+-        MakeAndPushMessage(*node, NetMsgType::MERKLIXSYNC, summary);
+-        return true;
+-    });
++        LogEvent(BCLog::TXRELAY, "peer_recon_summary_sent",
++                 "reconciliation summary of {count} transactions to "
++                 "peer={peer_id}")
++            .Field(BCLog::LogField::PeerId, next)
++            .Field(BCLog::LogField::Count, window);
++    }
+     // Window entries older than the window are no longer needed.
+     m_txrelay_index.PruneWindow(
+         GetTime<std::chrono::microseconds>() -
+@@ -3817,7 +3837,16 @@ void PeerManagerImpl::MaybeDrainRelayQueue() {
+     if (tick_now < m_next_relay_drain) {
+         return;
+     }
++    const bool late{m_next_relay_drain > 0us &&
++                    tick_now >= m_next_relay_drain + m_opts.txrelay_tick};
+     m_next_relay_drain = NextRelayTick(tick_now, m_opts.txrelay_tick);
++    if (late && WITH_LOCK(m_relay_queue_mutex, return !m_relay_queue.empty())) {
++        // A tick went by with transactions waiting (the message handler
++        // was busy): they go out now, nothing is dropped.
++        if (auto *m{node::GetNodeMetrics()}) {
++            m->txrelay_tick_overrun.Inc();
++        }
++    }
+     DrainRelayQueue();
+ }
+ 
+@@ -3947,6 +3976,24 @@ void PeerManagerImpl::DrainRelayQueue() {
+         new_routes.emplace_back(batch[i].txid, std::move(route));
+     }
+ 
++    size_t announcements{0};
++    for (const auto &route : new_routes) {
++        announcements += route.second.size();
++    }
++    if (auto *m{node::GetNodeMetrics()}) {
++        m->txrelay_queue_depth.Set(double(batch.size()));
++        const auto now{RelayTickNow()};
++        for (size_t i = 0; i < batch.size(); ++i) {
++            m->txrelay_fanout_peers.Record(new_routes[i].second.size());
++            m->txrelay_first_seen_to_announce_seconds.RecordDuration(
++                now - batch[i].queued);
++        }
++    }
++    LogEvent(BCLog::TXRELAY, "txrelay_tick",
++             "relay tick: {count} transactions, {peers} announcements queued")
++        .Field(BCLog::LogField::Count, uint64_t(batch.size()))
++        .Field(BCLog::LogField::Peers, uint64_t(announcements));
++
+     for (auto &target : targets) {
+         if (target.picks.empty()) {
+             continue;
+@@ -5225,6 +5272,12 @@ void PeerManagerImpl::ProcessSingleTx(CNode &pfrom, Peer &peer,
+     m_txrequest.ReceivedResponse(pfrom.GetId(), txid);
+     // Whichever way it came, it answers announcements of its short id.
+     ForgetShortIdRequests(txid);
++    if (auto *m{node::GetNodeMetrics()}) {
++        m->txrelay_body_recv.Inc();
++        if (AlreadyHaveTx(txid, /*include_reconsiderable=*/true)) {
++            m->txrelay_body_dup.Inc();
++        }
++    }
+ 
+     if (AlreadyHaveTx(txid, /*include_reconsiderable=*/true)) {
+         if (pfrom.HasPermission(NetPermissionFlags::ForceRelay)) {
+@@ -6674,6 +6727,7 @@ void PeerManagerImpl::ProcessMessage(
+         const auto current_time{GetTime<std::chrono::microseconds>()};
+         LOCK(cs_main);
+         std::vector<TxId> have;
++        uint64_t missing{0};
+         for (const uint64_t short_id : short_ids) {
+             if (interruptMsgProc) {
+                 return;
+@@ -6687,10 +6741,23 @@ void PeerManagerImpl::ProcessMessage(
+                 }
+                 continue;
+             }
++            ++missing;
+             AddTxAnnouncement(
+                 pfrom, TxId{txrelay::ShortIdRequestKey(epoch_id, short_id)},
+                 current_time, SHORTID_REQUEST_PARAMS);
+         }
++        if (auto *m{node::GetNodeMetrics()}) {
++            m->txrelay_announce_recv.Add(size_t(node::TxRelayKind::SHORT),
++                                         short_ids.size());
++            m->txrelay_announce_dup.Add(size_t(node::TxRelayKind::SHORT),
++                                        short_ids.size() - missing);
++        }
++        LogEvent(BCLog::TXRELAY, "peer_invshort_received",
++                 "invshort from peer={peer_id}: {count} short ids, "
++                 "{missing} new")
++            .Field(BCLog::LogField::PeerId, pfrom.GetId())
++            .Field(BCLog::LogField::Count, uint64_t(short_ids.size()))
++            .Field(BCLog::LogField::Missing, missing);
+         return;
+     }
+ 
+@@ -6790,6 +6857,14 @@ void PeerManagerImpl::ProcessMessage(
+                 const bool fAlreadyHave =
+                     AlreadyHaveTx(txid, /*include_reconsiderable=*/true);
+                 logInv(inv, fAlreadyHave);
++                if (auto *m{node::GetNodeMetrics()}) {
++                    m->txrelay_announce_recv.Add(
++                        size_t(node::TxRelayKind::FULL));
++                    if (fAlreadyHave) {
++                        m->txrelay_announce_dup.Add(
++                            size_t(node::TxRelayKind::FULL));
++                    }
++                }
+ 
+                 AddKnownTx(*peer, txid);
+                 if (reject_tx_invs) {
+@@ -10639,10 +10714,18 @@ bool PeerManagerImpl::SendMessages(const Config &config, CNode *pto) {
+                         MakeAndPushMessage(*pto, NetMsgType::INVSHORT,
+                                            epoch->epoch_id, short_ids);
+                     }
++                    if (auto *m{node::GetNodeMetrics()}) {
++                        m->txrelay_announce_sent.Add(
++                            size_t(node::TxRelayKind::SHORT), vRelayTxs.size());
++                    }
+                 } else {
+                     for (const auto &entry : vRelayTxs) {
+                         addInvAndMaybeFlush(MSG_TX, entry.first);
+                     }
++                    if (auto *m{node::GetNodeMetrics()}) {
++                        m->txrelay_announce_sent.Add(
++                            size_t(node::TxRelayKind::FULL), vRelayTxs.size());
++                    }
+                 }
+             }
+             if (!tx_relay->m_tx_inventory_to_send.empty()) {
+diff --git a/src/node/metrics.cpp b/src/node/metrics.cpp
+index ac2e14ca1f1aa1e0f73bf0648fbfbbcc2b86db71..b34809867ebf52a7379128208fb790a3ed525db6 100644
+--- a/src/node/metrics.cpp
++++ b/src/node/metrics.cpp
+@@ -269,6 +269,17 @@ namespace {
+         0.0001, 0.00025, 0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1,
+         0.25,   0.5,     1,      2.5,   5,      10,    30,   60,    300};
+ 
++    //! Peers per relayed transaction
++    const std::vector<double> FANOUT_BUCKETS{1,  2,  4,  6,  8,  10, 12,
++                                             16, 24, 32, 48, 64, 128};
++    //! Missing short ids per reconciliation message
++    const std::vector<double> DIFF_BUCKETS{0,  1,   2,   4,    8,   16,
++                                           32, 128, 512, 2048, 8192};
++    //! Seconds; queue to tick (one tick is 10 ms by default)
++    const std::vector<double> ANNOUNCE_BUCKETS{
++        0.0005, 0.001, 0.0025, 0.005, 0.01, 0.015, 0.02,
++        0.05,   0.1,   0.25,   0.5,   1,    5};
++
+     std::vector<std::string> SortedWithOther(std::vector<std::string> v) {
+         std::sort(v.begin(), v.end());
+         v.erase(std::unique(v.begin(), v.end()), v.end());
+@@ -903,6 +914,65 @@ NodeMetrics::NodeMetrics(std::vector<std::string> rpc_methods)
+       process_max_fds{
+           Add<Gauge>(registry, "process_max_fds",
+                      "Maximum number of open file descriptors (soft limit).")},
++      txrelay_announce_sent{Add<Counter>(
++          registry, MetricName("txrelay_announce_sent_total"),
++          "Transaction announcements sent, by kind (short: 8-byte invshort "
++          "ids, full: 36-byte inv entries).",
++          std::vector<LabelDim>{{"kind", {"short", "full"}}})},
++      txrelay_announce_recv{
++          Add<Counter>(registry, MetricName("txrelay_announce_recv_total"),
++                       "Transaction announcements received, by kind.",
++                       std::vector<LabelDim>{{"kind", {"short", "full"}}})},
++      txrelay_announce_dup{Add<Counter>(
++          registry, MetricName("txrelay_announce_dup_total"),
++          "Transaction announcements received for a transaction we already "
++          "had, by kind.",
++          std::vector<LabelDim>{{"kind", {"short", "full"}}})},
++      txrelay_body_recv{
++          Add<Counter>(registry, MetricName("txrelay_body_recv_total"),
++                       "Transaction bodies received (tx messages and "
++                       "short-id responses).")},
++      txrelay_body_dup{
++          Add<Counter>(registry, MetricName("txrelay_body_dup_total"),
++                       "Transaction bodies received for a transaction we "
++                       "already had.")},
++      txrelay_fanout_peers{Add<EventHistogram>(
++          registry, MetricName("txrelay_fanout_peers"),
++          "Peers each relayed transaction was queued for at a relay tick.",
++          FANOUT_BUCKETS, /*divisor=*/1)},
++      txrelay_queue_depth{
++          Add<Gauge>(registry, MetricName("txrelay_queue_depth"),
++                     "Transactions drained from the relay queue at the last "
++                     "tick that had any.")},
++      txrelay_tick_overrun{
++          Add<Counter>(registry, MetricName("txrelay_tick_overrun_total"),
++                       "Relay ticks drained more than one tick late.")},
++      txrelay_recon_rounds{
++          Add<Counter>(registry, MetricName("txrelay_recon_rounds_total"),
++                       "Reconciliation summaries sent.")},
++      txrelay_recon_diff{Add<EventHistogram>(
++          registry, MetricName("txrelay_recon_diff"),
++          "Short ids found missing per received reconciliation summary or "
++          "bucket summary (before dropping those we have outside the "
++          "window).",
++          DIFF_BUCKETS, /*divisor=*/1)},
++      txrelay_recon_overflow{Add<Counter>(
++          registry, MetricName("txrelay_recon_overflow_total"),
++          "Reconciliation sub-buckets with more differences than decode "
++          "(bisected deeper, or resolved from overflow ids).")},
++      txrelay_recon_fetched{
++          Add<Counter>(registry, MetricName("txrelay_recon_fetched_total"),
++                       "Short ids requested because reconciliation found "
++                       "them missing.")},
++      txrelay_shortid_collision{Add<Counter>(
++          registry, MetricName("txrelay_shortid_collision_total"),
++          "Short ids that already held another transaction in their epoch "
++          "when one was indexed.")},
++      txrelay_first_seen_to_announce_seconds{Add<EventHistogram>(
++          registry, MetricName("txrelay_first_seen_to_announce_seconds"),
++          "Time from queueing a transaction for relay to the tick that "
++          "queues its announcements.",
++          ANNOUNCE_BUCKETS, /*divisor=*/1e9)},
+       m_rpc_methods{SortedWithOther(std::move(rpc_methods))} {
+     build_info.Set(1);
+     registry.Add(std::make_unique<metrics::FunctionCounter>(
+diff --git a/src/node/metrics.h b/src/node/metrics.h
+index 2cd084df28b5df58985cf3ae0928fc1966e5896d..7d7ae0eac01b6be331ab00eeb47d776099330bf1 100644
+--- a/src/node/metrics.h
++++ b/src/node/metrics.h
+@@ -311,6 +311,35 @@ struct NodeMetrics {
+     metrics::Gauge &process_open_fds;
+     metrics::Gauge &process_max_fds;
+ 
++    // Transaction relay (Nucleation relay). Names use MetricName("txrelay_...").
++    //! Announcements sent / received, by kind (TxRelayKind)
++    metrics::Counter &txrelay_announce_sent;
++    metrics::Counter &txrelay_announce_recv;
++    //! Announcements received for a transaction we already had
++    metrics::Counter &txrelay_announce_dup;
++    //! Transaction bodies received (tx messages and short-id responses),
++    //! and those for a transaction we already had
++    metrics::Counter &txrelay_body_recv;
++    metrics::Counter &txrelay_body_dup;
++    //! Peers each relayed transaction was announced to
++    metrics::EventHistogram &txrelay_fanout_peers;
++    //! Transactions drained from the relay queue at the last tick
++    metrics::Gauge &txrelay_queue_depth;
++    //! Ticks drained more than a tick late
++    metrics::Counter &txrelay_tick_overrun;
++    //! Reconciliation summaries sent
++    metrics::Counter &txrelay_recon_rounds;
++    //! Short ids found missing per received summary or bucket summary
++    metrics::EventHistogram &txrelay_recon_diff;
++    //! Sub-buckets whose difference could not be decoded (bisected deeper)
++    metrics::Counter &txrelay_recon_overflow;
++    //! Short ids requested because of reconciliation
++    metrics::Counter &txrelay_recon_fetched;
++    //! Short ids that already held another transaction in their epoch
++    metrics::Counter &txrelay_shortid_collision;
++    //! From queueing a transaction for relay to the tick that announces it
++    metrics::EventHistogram &txrelay_first_seen_to_announce_seconds;
++
+     /** Label index of an RPC method ("other" if not in the set) */
+     size_t RPCMethodIndex(std::string_view method) const noexcept;
+ 
+@@ -509,6 +538,8 @@ inline void SetChronikIndexedHeight(int height) noexcept {
+ /** Count a transaction pool's (orphans, conflicting) removals */
+ void RecordTxPoolRemovals(std::string_view pool_kind, unsigned expired,
+                           unsigned evicted) noexcept;
++/** Label index of txrelay_announce_* kind */
++enum class TxRelayKind : size_t { SHORT = 0, FULL = 1 };
+ 
+ /** Label index of a P2P message type ("other" for unknown types) */
+ size_t MetricMsgTypeIndex(std::string_view msg_type) noexcept;
+diff --git a/test/functional/p2p_tx_reconciliation.py b/test/functional/p2p_tx_reconciliation.py
+index ee93753ee585f6bd628c51bf6f742aa623714386..7d647ac31c4c0f7a43d2f4dbec650d97ccd8d622 100755
+--- a/test/functional/p2p_tx_reconciliation.py
++++ b/test/functional/p2p_tx_reconciliation.py
+@@ -12,10 +12,13 @@ what it lacks. Every node must get every transaction, and reconciliation
+ messages must have been used.
+ """
+ 
++import http.client
++import re
+ import time
+ 
+ from test_framework.p2p import P2PInterface
+ from test_framework.test_framework import BitcoinTestFramework
++from test_framework.util import rpc_port
+ from test_framework.wallet import MiniWallet
+ 
+ NODES = 6
+@@ -40,9 +43,27 @@ class TxReconciliationTest(BitcoinTestFramework):
+             "-txrelayfanoutmax=1",
+             "-txreconinterval=250",
+             "-txreconwindow=30",
++            "-metrics",
++            "-debug=txrelay",
+         ]
+     ] * NODES
+ 
++    def relay_metrics(self, i):
++        """{(name, labels): value} of node i's fullnode_txrelay_ metrics"""
++        conn = http.client.HTTPConnection("127.0.0.1", rpc_port(i), timeout=30)
++        conn.request("GET", "/metrics")
++        body = conn.getresponse().read().decode()
++        conn.close()
++        out = {}
++        for line in body.splitlines():
++            m = re.match(r"^(fullnode_txrelay_\w+)(\{[^}]*\})? (\S+)$", line)
++            if m:
++                out[(m.group(1), m.group(2) or "")] = float(m.group(3))
++        return out
++
++    def metric(self, name, labels=""):
++        return sum(self.relay_metrics(i).get((name, labels), 0) for i in range(NODES))
++
+     def run_test(self):
+         for node in self.nodes:
+             for _ in range(SILENT):
+@@ -86,6 +107,25 @@ class TxReconciliationTest(BitcoinTestFramework):
+         )
+         assert syncs > 0
+         assert fetched > 0
++        # The relay metrics agree.
++        time.sleep(1.1)  # the metrics endpoint caches a scrape for 1 s
++        rounds = self.metric("fullnode_txrelay_recon_rounds_total")
++        recon_fetched = self.metric("fullnode_txrelay_recon_fetched_total")
++        short_sent = self.metric(
++            "fullnode_txrelay_announce_sent_total", '{kind="short"}'
++        )
++        bodies = self.metric("fullnode_txrelay_body_recv_total")
++        dup = self.metric("fullnode_txrelay_body_dup_total")
++        self.log.info(
++            f"recon rounds {rounds}, recon-fetched ids {recon_fetched}, short "
++            f"announcements {short_sent}, bodies {bodies} ({dup} duplicate)"
++        )
++        assert rounds > 0
++        assert recon_fetched > 0
++        assert short_sent > 0
++        assert bodies >= (NODES - 1) * TXS
++        with self.nodes[1].assert_debug_log(["[txrelay] reconciliation summary of"]):
++            time.sleep(0.6)
+         # Summaries go only to peers that negotiated reconciliation.
+         for n in self.nodes:
+             for p in n.getpeerinfo():

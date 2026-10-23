@@ -1,0 +1,946 @@
+From f56ee926dcac2943e3aca2a2a2947d32ef0377f3 Mon Sep 17 00:00:00 2001
+From: Shammah Chancellor <shammah.chancellor@notvalid.com>
+Date: Mon, 19 Oct 2026 07:02:06 -0700
+Subject: [PATCH] chronik: native ABC subscriber, entry points and in-process
+ /chronik
+
+Wire the native Chronik into the node:
+
+- hosts/abc/abc_entry.cpp: the chronik::Start/Interrupt/Stop entry
+  points of chronik-cpp/chronik.h (init.cpp is unchanged), a port of
+  ParseChronikParams and try_setup_chronik minus Electrum and plugins:
+  the same argument checks and error texts; any -chronikelectrum*
+  argument is an init error ("Electrum is not supported by the native
+  Chronik implementation"). Only the selected storage backends are
+  linked and registered.
+- hosts/abc/abc_subscriber.cpp: port of chronik_validationinterface.cpp
+  (the bounded, fail-closed worker queue; assumed-valid events
+  skipped), feeding the Service; failures abort like ok_or_abort.
+- hosts/abc/abc_http.cpp and src/httpserver: SetChronikInProcessHandlers.
+  When set (native), /chronik requests and /chronik/ws upgrades are
+  served in process on the query pool instead of being proxied to the
+  Chronik listener; the proxy remains for the Rust implementation.
+  Public-prefix and -rpcallowip rules, TLS, zstd and the response cap
+  stay the HTTP server's. WebSocket sessions get the real client
+  address, so -chronikmaxsubsperip keys on it rather than on loopback.
+- init.cpp: hidden -chronikqueryworkers (native only).
+
+Tier: eCash
+
+Coordinator integration provenance (metrics369):
+Bind native ABC node-metrics callbacks at startup; portable core remains host-neutral. Document actual native timing boundaries and shutdown: metrics allocated through exit; workers/sessions drain; callbacks atomic-only/no registry or host/indexer locks.
+All build/runtime/observer controls deferred by user compile-first policy; ordered source replay is not runtime approval.
+
+Coordinator integration provenance (reference405):
+Preserve earlier purposeful source repairs through downstream consumer/context adaptations; exact conflict ledger retained.
+All60 authored input payloads retained, with prerequisite-aware same-purpose splits; distinct legacy-index and inherited CXX compatibility remain independent. Pre-format source equals exact403+all60 control tree95718fceff83364b74294a751bd752b2f1a4e384. Only pinnedRuff import/format cleanup follows. Original author commands/hashes are historical reference evidence, not combined405 approval. Reference OFF/native/Rust full gates are preserved separately; combined compile/runtime NOT_RUN.
+
+diff --git a/chronik/native/CMakeLists.txt b/chronik/native/CMakeLists.txt
+index b2b9f7811cb2f7abcb96626b7e871f9815dd24e3..5eae2e81ef60df00f959d8b97bba8147936d47b7 100644
+--- a/chronik/native/CMakeLists.txt
++++ b/chronik/native/CMakeLists.txt
+@@ -111,6 +111,10 @@ if(NOT CHRONIK_NATIVE_STANDALONE)
+         hosts/abc/abc_entry.cpp
+         # chronik::native::Host for the node (ChronikBridge port).
+         hosts/abc/abc_host.cpp
++        # Validation-interface worker feeding the Service.
++        hosts/abc/abc_subscriber.cpp
++        # In-process /chronik on the node's HTTP server.
++        hosts/abc/abc_http.cpp
+     )
+     target_include_directories(chronik_native_host_abc
+         PUBLIC
+@@ -121,7 +125,14 @@ if(NOT CHRONIK_NATIVE_STANDALONE)
+     )
+     target_link_libraries(chronik_native_host_abc
+         chronik_native_core
++        chronik_native_service
+         util
+     )
++    # Storage backends: only the selected ones are linked.
++    if(CHRONIK_NATIVE_MDBX)
++        target_link_libraries(chronik_native_host_abc chronik_native_store_mdbx)
++        target_compile_definitions(chronik_native_host_abc
++            PRIVATE CHRONIK_NATIVE_HAVE_MDBX=1)
++    endif()
+     target_link_libraries(server chronik_native_host_abc)
+ endif()
+diff --git a/chronik/native/hosts/abc/abc_entry.cpp b/chronik/native/hosts/abc/abc_entry.cpp
+index 964788bd8457e99ead7ec1c477b33ab4cbbdcdac..e58fb0c0c54330450fdd33c4d6d05ab2b6b40ece 100644
+--- a/chronik/native/hosts/abc/abc_entry.cpp
++++ b/chronik/native/hosts/abc/abc_entry.cpp
+@@ -4,30 +4,256 @@
+ 
+ // Entry points of the native Chronik for the ABC/eCash node, with the
+ // signatures of chronik/chronik-cpp/chronik.h so init.cpp is unchanged.
+-//
+-// Skeleton: the native indexer is not wired yet, so -chronik fails cleanly at
+-// startup instead of silently running without an index.
++// Port of chronik/chronik-cpp/chronik.cpp (ParseChronikParams) and
++// chronik-lib/src/bridge.rs (try_setup_chronik), without Electrum and plugins.
+ 
++#include <chainparams.h>
++#include <chainparamsbase.h>
++#include <clientversion.h>
+ #include <common/args.h>
+ #include <config.h>
++#include <logging.h>
++#include <pubkey.h>
+ #include <node/context.h>
++#include <node/metrics.h>
+ #include <node/ui_interface.h>
++#include <script/script.h>
++#include <util/chaintype.h>
++#include <util/result.h>
++#include <util/time.h>
+ #include <util/translation.h>
+ 
+ #include <chronik-cpp/chronik.h>
+ 
++#include <chronik/native/error.h>
++#ifdef CHRONIK_NATIVE_HAVE_MDBX
++#include <chronik/native/mdbx_store.h>
++#endif
++#include <chronik/native/service.h>
++#include <chronik/native/token_io/token_index.h>
++#include <hosts/abc/abc_host.h>
++#include <hosts/abc/abc_http.h>
++#include <hosts/abc/abc_subscriber.h>
++
++#include <tinyformat.h>
++
++#include <limits>
++
+ namespace chronik {
+ 
++namespace {
++
++// Duration between WebSocket pings initiated by Chronik.
++// 45s has been empirically established as a reliable duration for both browser
++// and NodeJS WebSockets.
++constexpr std::chrono::seconds WS_PING_INTERVAL_DEFAULT{45s};
++
++// Ping duration is just 5s on regtest to speed up ping tests and make
++// functional tests more reliable.
++constexpr std::chrono::seconds WS_PING_INTERVAL_REGTEST{5s};
++
++const std::vector<std::string> ELECTRUM_ARGS = {
++    "-chronikelectrumbind",
++    "-chronikelectrumcert",
++    "-chronikelectrumprivkey",
++    "-chronikelectrumurl",
++    "-chronikelectrummaxhistory",
++    "-chronikelectrumdonationaddress",
++    "-chronikelectrumpeersvalidationinterval",
++    "-chronikelectrumidletimeout",
++};
++
++std::unique_ptr<native::abc::AbcHost> g_host;
++std::shared_ptr<native::Service> g_service;
++
++std::string NetworkName(ChainType chain_type) {
++    switch (chain_type) {
++        case ChainType::MAIN:
++            return "main";
++        case ChainType::TESTNET:
++            return "test";
++        case ChainType::REGTEST:
++            return "regtest";
++    }
++    throw std::runtime_error("Unknown chain type");
++}
++
++util::Result<native::ServiceParams>
++ParseChronikParams(const ArgsManager &args, const Config &config, bool fWipe) {
++    for (const std::string &arg : ELECTRUM_ARGS) {
++        if (args.IsArgSet(arg)) {
++            return {{_("Electrum is not supported by the native Chronik "
++                       "implementation")}};
++        }
++    }
++
++    const bool is_pause_allowed = args.GetBoolArg("-chronikallowpause", false);
++    const CChainParams &params = config.GetChainParams();
++    if (is_pause_allowed && !params.IsTestChain()) {
++        return {{_("Using -chronikallowpause on a mainnet chain is not allowed "
++                   "for security reasons.")}};
++    }
++
++    const int64_t max_subs =
++        args.GetIntArg("-chronikmaxsubs", chronik::DEFAULT_MAX_SUBS);
++    if (max_subs < 1 ||
++        static_cast<uint64_t>(max_subs) > std::numeric_limits<size_t>::max()) {
++        return {{_(strprintf("The -chronikmaxsubs value should be within the "
++                             "range [1, %llu].",
++                             static_cast<unsigned long long>(
++                                 std::numeric_limits<size_t>::max()))
++                       .c_str())}};
++    }
++
++    const int64_t max_subs_per_ip = args.GetIntArg(
++        "-chronikmaxsubsperip", chronik::DEFAULT_MAX_SUBS_PER_IP);
++    if (max_subs_per_ip < 1 || static_cast<uint64_t>(max_subs_per_ip) >
++                                   std::numeric_limits<size_t>::max()) {
++        return {
++            {_(strprintf("The -chronikmaxsubsperip value should be within the "
++                         "range [1, %llu].",
++                         static_cast<unsigned long long>(
++                             std::numeric_limits<size_t>::max()))
++                   .c_str())}};
++    }
++
++    const int64_t subscription_max_script_size =
++        args.GetIntArg("-chroniksubsmaxscriptsize",
++                       chronik::DEFAULT_SUBSCRIPTION_MAX_SCRIPT_SIZE);
++    if (subscription_max_script_size < 1 ||
++        subscription_max_script_size > MAX_SCRIPT_SIZE) {
++        return {{_(strprintf("The -chroniksubsmaxscriptsize value should "
++                             "be within the range [1, %d].",
++                             MAX_SCRIPT_SIZE)
++                       .c_str())}};
++    }
++
++    const int64_t subscription_max_plugin_size =
++        args.GetIntArg("-chroniksubsmaxpluginsize",
++                       chronik::DEFAULT_SUBSCRIPTION_MAX_PLUGIN_SIZE);
++    if (subscription_max_plugin_size < 1 ||
++        subscription_max_plugin_size > 2 * MAX_SCRIPT_SIZE) {
++        return {{_(strprintf("The -chroniksubsmaxpluginsize value should "
++                             "be within the range [1, %d].",
++                             2 * MAX_SCRIPT_SIZE)
++                       .c_str())}};
++    }
++
++    native::ServiceParams out;
++    out.indexer.datadir_net = args.GetDataDirNet();
++    out.indexer.wipe = fWipe;
++    out.indexer.token_index = args.GetBoolArg("-chroniktokenindex", true);
++    out.indexer.lokad_id_index = args.GetBoolArg("-chroniklokadidindex", true);
++    // Without Electrum, the scripthash index defaults to off (as in Rust).
++    out.indexer.scripthash_index =
++        args.GetBoolArg("-chronikscripthashindex", false);
++    out.indexer.perf_stats = args.GetBoolArg("-chronikperfstats", false);
++    out.indexer.tx_num_cache_buckets = (size_t)args.GetIntArg(
++        "-chroniktxnumcachebuckets", DEFAULT_TX_NUM_CACHE_BUCKETS);
++    out.indexer.tx_num_cache_bucket_size = (size_t)args.GetIntArg(
++        "-chroniktxnumcachebucketsize", DEFAULT_TX_NUM_CACHE_BUCKET_SIZE);
++    out.indexer.backend = native::StoreBackend::Mdbx;
++    out.indexer.token_index_factory = native::token_io::MakeEcashTokenIndex;
++    out.indexer.decompress_pubkey =
++        [](native::ByteView form) -> std::optional<native::Bytes> {
++        // Compressed-script P2PK forms 0x04/0x05 hold the x coordinate.
++        if (form.size() != 33 || (form[0] != 4 && form[0] != 5)) {
++            return std::nullopt;
++        }
++        std::vector<uint8_t> vch(form.begin(), form.end());
++        vch[0] = form[0] - 2;
++        CPubKey pubkey(vch);
++        if (!pubkey.Decompress()) {
++            return std::nullopt;
++        }
++        return native::Bytes(pubkey.begin(), pubkey.end());
++    };
++    out.hosts = args.IsArgSet("-chronikbind") ? args.GetArgs("-chronikbind")
++                                              : DEFAULT_BINDS;
++    out.default_port = BaseParams().ChronikPort();
++    out.is_pause_allowed = is_pause_allowed;
++    out.ws_ping_interval = params.GetChainType() == ChainType::REGTEST
++                               ? WS_PING_INTERVAL_REGTEST
++                               : WS_PING_INTERVAL_DEFAULT;
++    out.enable_cors = args.GetBoolArg("-chronikcors", false);
++    out.max_subs = static_cast<size_t>(max_subs);
++    out.max_subs_per_ip = static_cast<size_t>(max_subs_per_ip);
++    out.subscription_max_script_size =
++        static_cast<size_t>(subscription_max_script_size);
++    out.subscription_max_plugin_size =
++        static_cast<size_t>(subscription_max_plugin_size);
++    out.query_workers = (size_t)std::max<int64_t>(
++        0, args.GetIntArg("-chronikqueryworkers", 0));
++    return out;
++}
++
++} // namespace
++
+ bool Start(const ArgsManager &args, const Config &config,
+            const node::NodeContext &node, bool fWipe) {
+-    return InitError(
+-        Untranslated("The native Chronik implementation is not available yet "
+-                     "in this build; rebuild with "
+-                     "-DCHRONIK_IMPLEMENTATION=rust"));
++    util::Result<native::ServiceParams> params =
++        ParseChronikParams(args, config, fWipe);
++    if (!params) {
++        return InitError(ErrorString(params));
++    }
++    const CChainParams &chain_params = config.GetChainParams();
++
++    // No registry work or host locks from callbacks. Chronik workers/listeners
++    // drain before node metrics teardown; GetNodeMetrics also permits -metrics=0.
++    params->observe_request = [](std::string_view route, uint16_t status,
++                                 uint64_t nanos) noexcept {
++        node::RecordChronikRequest(route, status, nanos);
++    };
++    params->observe_ws_connections = [](int32_t delta) noexcept {
++        if (auto *m = node::GetNodeMetrics()) m->chronik_ws_connections.Add(delta);
++    };
++    params->observe_ws_subscriptions = [](int32_t delta) noexcept {
++        if (auto *m = node::GetNodeMetrics()) m->chronik_ws_subscriptions.Add(delta);
++    };
++    params->observe_indexed_height = [](int32_t height) noexcept {
++        node::SetChronikIndexedHeight(height);
++    };
++
++    native::HostCapabilities caps;
++    caps.avalanche = true;
++    caps.slp_alp_tokens = true;
++    caps.allow_pause_on_this_chain = chain_params.IsTestChain();
++    caps.witness = false;
++    caps.network = NetworkName(chain_params.GetChainType());
++    caps.default_http_port = BaseParams().ChronikPort();
++    caps.client_name = CLIENT_NAME;
++
++#ifdef CHRONIK_NATIVE_HAVE_MDBX
++    native::RegisterMdbxStore();
++#endif
++    g_host = std::make_unique<native::abc::AbcHost>(node, std::move(caps));
++    try {
++        std::unique_ptr<native::Service> service =
++            native::Service::Start(*g_host, std::move(*params));
++        if (!service) {
++            // Shutdown was requested during resync
++            return true;
++        }
++        g_service = std::move(service);
++    } catch (const std::exception &e) {
++        g_host->Log(native::LogLevel::Debug, std::string(e.what()) + "\n");
++        return InitError(Untranslated(e.what()));
++    }
++    native::abc::RegisterInProcessHttp(g_service);
++    native::abc::StartSubscriber(node, *g_host, g_service);
++    return true;
+ }
+ 
+-void Interrupt() {}
++void Interrupt() {
++    native::abc::UnregisterInProcessHttp();
++    native::abc::InterruptSubscriber();
++}
+ 
+-void Stop() {}
++void Stop() {
++    LogPrintf("Stopping Chronik...\n");
++    native::abc::StopSubscriber();
++    g_service.reset();
++    g_host.reset();
++}
+ 
+ } // namespace chronik
+diff --git a/chronik/native/hosts/abc/abc_http.cpp b/chronik/native/hosts/abc/abc_http.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..6c5af864abf37a90e56f8604a9d89755d8b8acb9
+--- /dev/null
++++ b/chronik/native/hosts/abc/abc_http.cpp
+@@ -0,0 +1,196 @@
++// Copyright (c) 2026 The Lotus developers
++// Distributed under the MIT software license, see the accompanying
++// file COPYING or http://www.opensource.org/licenses/mit-license.php.
++
++// In-process /chronik transport on the node's HTTP server (design §6.4
++// host_beast_bridge): converts between the HTTP server's in-process types and
++// the native Router/WsSession interfaces, and moves all Chronik work onto the
++// query pool so the server's io threads never block.
++
++#include <hosts/abc/abc_http.h>
++
++#include <chronik/native/http.h>
++#include <chronik/native/service.h>
++#include <chronik/native/ws.h>
++
++#include <httpserver.h>
++
++#include <cstring>
++#include <mutex>
++
++namespace chronik::native::abc {
++
++namespace {
++
++HttpRequest ToNativeRequest(InProcessHTTPRequest in) {
++    HttpRequest out;
++    out.method = std::move(in.method);
++    const size_t q = in.target.find('?');
++    if (q == std::string::npos) {
++        out.path = std::move(in.target);
++    } else {
++        out.path = in.target.substr(0, q);
++        out.query_string = in.target.substr(q + 1);
++        out.has_query = true;
++    }
++    out.headers = std::move(in.headers);
++    out.body.assign(in.body.begin(), in.body.end());
++    out.peer_ip = std::move(in.peer_ip);
++    return out;
++}
++
++InProcessHTTPResponse ToInProcessResponse(HttpResponse in) {
++    InProcessHTTPResponse out;
++    out.status = in.status;
++    out.headers = std::move(in.headers);
++    out.body.assign(in.body.begin(), in.body.end());
++    return out;
++}
++
++/**
++ * Calls the HTTP server's completion exactly once: with the response, or
++ * with 503 if the query pool drops the request (shutdown), so no server
++ * coroutine waits forever.
++ */
++class DoneOnce {
++public:
++    explicit DoneOnce(std::function<void(InProcessHTTPResponse)> done)
++        : m_done(std::move(done)) {}
++    ~DoneOnce() {
++        if (m_done) {
++            InProcessHTTPResponse resp;
++            resp.status = 503;
++            resp.headers.emplace_back("content-type",
++                                      std::string(CONTENT_TYPE_TEXT));
++            resp.body = "Chronik is shutting down";
++            m_done(std::move(resp));
++        }
++    }
++    void Call(InProcessHTTPResponse resp) {
++        auto done = std::move(m_done);
++        m_done = nullptr;
++        done(std::move(resp));
++    }
++
++private:
++    std::function<void(InProcessHTTPResponse)> m_done;
++};
++
++/** Native WsSession over the HTTP server's in-process WebSocket. */
++class NodeWsSession final : public WsSession {
++public:
++    NodeWsSession(std::shared_ptr<InProcessWebSocket> ws, std::string peer_ip)
++        : m_ws(std::move(ws)), m_peer_ip(std::move(peer_ip)) {}
++    void SendBinary(Bytes msg) override {
++        m_ws->SendBinary(std::string(msg.begin(), msg.end()));
++    }
++    void Close() override { m_ws->Close(); }
++    const std::string &PeerIp() const override { return m_peer_ip; }
++    void NotifyActivity() override { m_ws->NotifyActivity(); }
++
++private:
++    std::shared_ptr<InProcessWebSocket> m_ws;
++    std::string m_peer_ip;
++};
++
++/**
++ * Receives the server's session callbacks (io thread) and replays them, in
++ * order, on a query-pool strand where the native WsHandler lives.
++ */
++class StrandWsHandler final : public InProcessWebSocketHandler {
++public:
++    StrandWsHandler(std::shared_ptr<Service> service,
++                    std::shared_ptr<WsSession> session)
++        : m_state(std::make_shared<State>()) {
++        m_state->post = service->MakeSerialExecutor();
++        m_state->post([state = m_state, service = std::move(service),
++                       session = std::move(session)]() mutable {
++            if (!state->closed) {
++                state->handler = service->AcceptWs(std::move(session));
++            }
++        });
++    }
++    void OnBinary(std::string msg) override {
++        m_state->post([state = m_state, msg = std::move(msg)] {
++            if (state->handler) {
++                state->handler->OnBinary(std::span<const uint8_t>(
++                    reinterpret_cast<const uint8_t *>(msg.data()),
++                    msg.size()));
++            }
++        });
++    }
++    void OnText() override {
++        m_state->post([state = m_state] {
++            if (state->handler) {
++                state->handler->OnText();
++            }
++        });
++    }
++    void OnClosed() override {
++        m_state->post([state = m_state] {
++            state->closed = true;
++            if (state->handler) {
++                state->handler->OnClosed();
++                state->handler.reset();
++            }
++        });
++    }
++
++private:
++    struct State {
++        std::function<void(std::function<void()>)> post;
++        // Only touched on the strand
++        std::unique_ptr<WsHandler> handler;
++        bool closed = false;
++    };
++    std::shared_ptr<State> m_state;
++};
++
++std::mutex g_mutex;
++bool g_registered = false;
++
++} // namespace
++
++void RegisterInProcessHttp(std::shared_ptr<Service> service) {
++    auto handlers = std::make_shared<ChronikInProcessHandlers>();
++    handlers->http = [service](InProcessHTTPRequest req,
++                               std::function<void(InProcessHTTPResponse)>
++                                   done) {
++        auto once = std::make_shared<DoneOnce>(std::move(done));
++        service->HandleHttpAsync(ToNativeRequest(std::move(req)),
++                                 [once](HttpResponse resp) {
++                                     once->Call(
++                                         ToInProcessResponse(std::move(resp)));
++                                 });
++    };
++    handlers->ws_check = [service](const InProcessHTTPRequest &req) {
++        return service->CheckWsUpgrade(ToNativeRequest(req));
++    };
++    handlers->ws_open = [service](std::shared_ptr<InProcessWebSocket> ws,
++                                  const std::string &peer_ip)
++        -> std::unique_ptr<InProcessWebSocketHandler> {
++        auto session = std::make_shared<NodeWsSession>(std::move(ws), peer_ip);
++        return std::make_unique<StrandWsHandler>(service, std::move(session));
++    };
++    handlers->ws_ping_interval = service->WsPingInterval();
++    handlers->ws_ping_payload = WS_PING_PAYLOAD;
++    handlers->ws_max_message_size = 20'000;
++    {
++        std::lock_guard lock(g_mutex);
++        g_registered = true;
++    }
++    SetChronikInProcessHandlers(std::move(handlers));
++}
++
++void UnregisterInProcessHttp() {
++    {
++        std::lock_guard lock(g_mutex);
++        if (!g_registered) {
++            return;
++        }
++        g_registered = false;
++    }
++    SetChronikInProcessHandlers(nullptr);
++}
++
++} // namespace chronik::native::abc
+diff --git a/chronik/native/hosts/abc/abc_http.h b/chronik/native/hosts/abc/abc_http.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..d89907c0eedb456cfc8d651e20f1d005419132b8
+--- /dev/null
++++ b/chronik/native/hosts/abc/abc_http.h
+@@ -0,0 +1,28 @@
++// Copyright (c) 2026 The Lotus developers
++// Distributed under the MIT software license, see the accompanying
++// file COPYING or http://www.opensource.org/licenses/mit-license.php.
++
++#ifndef CHRONIK_NATIVE_HOSTS_ABC_ABC_HTTP_H
++#define CHRONIK_NATIVE_HOSTS_ABC_ABC_HTTP_H
++
++#include <memory>
++
++namespace chronik::native {
++class Service;
++} // namespace chronik::native
++
++namespace chronik::native::abc {
++
++/**
++ * Serve /chronik and /chronik/ws on the node's Beast HTTP server in process
++ * (SetChronikInProcessHandlers), replacing the loopback proxy to the Chronik
++ * listener. Requests run on the Chronik query pool with the real client
++ * address.
++ */
++void RegisterInProcessHttp(std::shared_ptr<Service> service);
++/** Back to the proxy; closes open in-process WebSocket sessions. */
++void UnregisterInProcessHttp();
++
++} // namespace chronik::native::abc
++
++#endif // CHRONIK_NATIVE_HOSTS_ABC_ABC_HTTP_H
+diff --git a/chronik/native/hosts/abc/abc_subscriber.cpp b/chronik/native/hosts/abc/abc_subscriber.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..2ed5ba71035674baa0f1fbf88cbc22864aae3849
+--- /dev/null
++++ b/chronik/native/hosts/abc/abc_subscriber.cpp
+@@ -0,0 +1,279 @@
++// Copyright (c) 2026 The Lotus developers
++// Distributed under the MIT software license, see the accompanying
++// file COPYING or http://www.opensource.org/licenses/mit-license.php.
++
++// Port of chronik/chronik-cpp/chronik_validationinterface.cpp and of the
++// event handlers of chronik-lib/src/bridge.rs (`Chronik::handle_*`), feeding
++// the native Service instead of the Rust indexer.
++
++#include <hosts/abc/abc_subscriber.h>
++
++#include <chronik/native/service.h>
++#include <hosts/abc/abc_host.h>
++
++#include <blockindex.h>
++#include <kernel/chain.h>
++#include <logging.h>
++#include <node/context.h>
++#include <primitives/block.h>
++#include <shutdown.h>
++#include <txmempool.h>
++#include <undo.h>
++#include <util/bounded_task_queue.h>
++#include <util/validation_queue_memory.h>
++#include <validationinterface.h>
++
++#include <functional>
++
++namespace chronik::native::abc {
++
++namespace {
++
++class NativeChronikValidationInterface final : public CValidationInterface {
++public:
++    NativeChronikValidationInterface(const node::NodeContext &node,
++                                     const AbcHost &host,
++                                     std::shared_ptr<Service> service)
++        : m_node(node), m_host(host), m_service(std::move(service)),
++          m_queue(MAX_QUEUE_BYTES, MAX_QUEUE_SIZE, [] {
++              LogPrintf("FATAL: Chronik worker queue overflow or worker "
++                        "failure; stopping node. "
++                        "Restart to resync Chronik from block files.\n");
++              StartShutdown();
++          }) {}
++
++    ~NativeChronikValidationInterface() { StopWorker(); }
++
++    void Register() {
++        m_node.validation_signals->RegisterValidationInterface(this);
++    }
++
++    void Unregister() {
++        m_node.validation_signals->UnregisterValidationInterface(this);
++    }
++
++    void InterruptChronik() { m_service->Interrupt(); }
++
++    // Normal-operation fence for work already forwarded by ValidationSignals.
++    // Once shutdown starts, StopWorker/join owns draining the remaining FIFO.
++    void SyncTransactionQueue() override { m_queue.Sync(); }
++
++    void StopWorker() { m_queue.Stop(); }
++
++    bool StopChronik() {
++        StopWorker();
++        try {
++            m_service->Stop();
++        } catch (const std::exception &e) {
++            LogPrintf("Error stopping Chronik: %s\n", e.what());
++            return false;
++        }
++        return true;
++    }
++
++private:
++    static constexpr size_t MAX_QUEUE_SIZE = 65536;
++    static constexpr size_t MAX_QUEUE_BYTES = 256 * 1024 * 1024;
++    static constexpr size_t TASK_OVERHEAD = 256;
++
++    const node::NodeContext &m_node;
++    const AbcHost &m_host;
++    std::shared_ptr<Service> m_service;
++    BoundedTaskQueue m_queue;
++
++    void Enqueue(std::function<void()> task, size_t bytes = 0) {
++        // Overflow is fatal: never block the shared ValidationSignals
++        // scheduler.
++        m_queue.Enqueue(TASK_OVERHEAD + bytes, std::move(task));
++    }
++
++    using CValidationInterface::TransactionAddedToMempool;
++
++    void TransactionAddedToMempool(
++        const CTransactionRef &ptx,
++        std::shared_ptr<const std::vector<::Coin>> spent_coins,
++        uint64_t /* mempool_sequence */, int64_t entry_time) override {
++        if (!spent_coins) {
++            LogPrintf("Chronik: transaction %s added to mempool but spent "
++                      "coins are not available\n",
++                      ptx->GetId().ToString());
++            return;
++        }
++        const int64_t tx_time =
++            entry_time != 0
++                ? entry_time
++                : m_node.mempool->info(ptx->GetId()).m_time.count();
++        const size_t bytes = validation_queue::TxBytes(ptx) +
++                             validation_queue::CoinBytes(spent_coins);
++        Enqueue(
++            [this, ptx, spent_coins = std::move(spent_coins), tx_time]() {
++                OkOrAbort(m_host, "handle_tx_added_to_mempool", [&] {
++                    auto tx = std::make_shared<const Tx>(
++                        ConvertTx(false, *ptx, *spent_coins));
++                    m_service->HandleTxAddedToMempool(tx, tx_time);
++                    m_host.Log(LogLevel::Debug,
++                               "Chronik: transaction " +
++                                   ptx->GetId().ToString() +
++                                   " added to mempool\n");
++                });
++            },
++            bytes);
++    }
++
++    void
++    TransactionRemovedFromMempool(const CTransactionRef &ptx,
++                                  MemPoolRemovalReason /* reason */,
++                                  uint64_t /* mempool_sequence */) override {
++        Enqueue([this, ptx]() {
++            OkOrAbort(m_host, "handle_tx_removed_from_mempool", [&] {
++                TxId txid;
++                std::memcpy(txid.b.data(), ptx->GetId().begin(), 32);
++                m_service->HandleTxRemovedFromMempool(txid);
++            });
++            m_host.Log(LogLevel::Debug, "Chronik: transaction " +
++                                            ptx->GetId().ToString() +
++                                            " removed from mempool\n");
++        });
++    }
++
++    void BlockConnected(ChainstateRole role,
++                        const std::shared_ptr<const CBlock> &block,
++                        const CBlockIndex *pindex) override {
++        // Ignore events from the assumed-valid chain; we will process its
++        // blocks (sequentially) after it is fully verified by the background
++        // chainstate.
++        if (role == ChainstateRole::ASSUMEDVALID) {
++            return;
++        }
++        Enqueue(
++            [this, block, pindex]() {
++                OkOrAbort(m_host, "handle_block_connected", [&] {
++                    std::unique_ptr<CBlockUndo> undo =
++                        m_host.LoadBlockUndo(*pindex);
++                    if (!undo) {
++                        throw std::runtime_error(
++                            "Reading block undo data failed");
++                    }
++                    Block nblock = ConvertBlock(*block, *undo, *pindex);
++                    const size_t num_txs = nblock.txs.size();
++                    m_service->HandleBlockConnected(std::move(nblock));
++                    m_host.Log(LogLevel::Debug,
++                               "Chronik: block " +
++                                   block->GetHash().ToString() +
++                                   " connected with " +
++                                   std::to_string(num_txs) + " txs\n");
++                });
++            },
++            validation_queue::BlockBytes(block));
++    }
++
++    void BlockDisconnected(const std::shared_ptr<const CBlock> &block,
++                           const CBlockIndex *pindex) override {
++        Enqueue(
++            [this, block, pindex]() {
++                OkOrAbort(m_host, "handle_block_disconnected", [&] {
++                    std::unique_ptr<CBlockUndo> undo =
++                        m_host.LoadBlockUndo(*pindex);
++                    if (!undo) {
++                        throw std::runtime_error(
++                            "Reading block undo data failed");
++                    }
++                    Block nblock = ConvertBlock(*block, *undo, *pindex);
++                    const size_t num_txs = nblock.txs.size();
++                    m_service->HandleBlockDisconnected(std::move(nblock));
++                    m_host.Log(LogLevel::Debug,
++                               "Chronik: block " +
++                                   block->GetHash().ToString() +
++                                   " disconnected with " +
++                                   std::to_string(num_txs) + " txs\n");
++                });
++            },
++            validation_queue::BlockBytes(block));
++    }
++
++    void BlockFinalized(const CBlockIndex *pindex) override {
++        Enqueue([this, pindex]() {
++            OkOrAbort(m_host, "handle_block_finalized", [&] {
++                BlockInfo info = WITH_LOCK(::cs_main,
++                                           return ConvertBlockInfo(*pindex));
++                m_service->HandleBlockFinalized(info);
++            });
++        });
++    }
++
++    void BlockInvalidated(const CBlockIndex *pindex,
++                          const std::shared_ptr<const CBlock> &block) override {
++        Enqueue(
++            [this, block, pindex]() {
++                OkOrAbort(m_host, "handle_block_invalidated", [&] {
++                    // Like Rust: silently skip if the undo data is missing.
++                    std::unique_ptr<CBlockUndo> undo =
++                        m_host.LoadBlockUndo(*pindex);
++                    if (!undo) {
++                        return;
++                    }
++                    Block nblock = ConvertBlock(*block, *undo, *pindex);
++                    m_service->HandleBlockInvalidated(std::move(nblock));
++                });
++            },
++            validation_queue::BlockBytes(block));
++    }
++
++    void TransactionFinalized(const CTransactionRef &tx) override {
++        Enqueue([this, tx]() {
++            OkOrAbort(m_host, "handle_tx_finalized", [&] {
++                TxId txid;
++                std::memcpy(txid.b.data(), tx->GetId().begin(), 32);
++                m_service->HandleTxFinalized(txid);
++            });
++        });
++    }
++
++    void TransactionInvalidated(
++        const CTransactionRef &tx,
++        std::shared_ptr<const std::vector<::Coin>> spent_coins) override {
++        if (!spent_coins) {
++            LogPrintf("Chronik: transaction %s invalidated but spent coins are "
++                      "not available\n",
++                      tx->GetId().ToString());
++            return;
++        }
++        const size_t bytes = validation_queue::TxBytes(tx) +
++                             validation_queue::CoinBytes(spent_coins);
++        Enqueue(
++            [this, tx, spent_coins = std::move(spent_coins)]() {
++                OkOrAbort(m_host, "handle_tx_invalidated", [&] {
++                    m_service->HandleTxInvalidated(std::make_shared<const Tx>(
++                        ConvertTx(false, *tx, *spent_coins)));
++                });
++            },
++            bytes);
++    }
++};
++
++std::unique_ptr<NativeChronikValidationInterface> g_subscriber;
++
++} // namespace
++
++void StartSubscriber(const node::NodeContext &node, const AbcHost &host,
++                     std::shared_ptr<Service> service) {
++    g_subscriber = std::make_unique<NativeChronikValidationInterface>(
++        node, host, std::move(service));
++    g_subscriber->Register();
++}
++
++void InterruptSubscriber() {
++    if (g_subscriber) {
++        g_subscriber->InterruptChronik();
++    }
++}
++
++void StopSubscriber() {
++    if (g_subscriber) {
++        g_subscriber->Unregister();
++        g_subscriber->StopChronik();
++        g_subscriber.reset();
++    }
++}
++
++} // namespace chronik::native::abc
+diff --git a/chronik/native/hosts/abc/abc_subscriber.h b/chronik/native/hosts/abc/abc_subscriber.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..89689b0ad49ccad37b1605152b96b15af2eb27d7
+--- /dev/null
++++ b/chronik/native/hosts/abc/abc_subscriber.h
+@@ -0,0 +1,36 @@
++// Copyright (c) 2026 The Lotus developers
++// Distributed under the MIT software license, see the accompanying
++// file COPYING or http://www.opensource.org/licenses/mit-license.php.
++
++#ifndef CHRONIK_NATIVE_HOSTS_ABC_ABC_SUBSCRIBER_H
++#define CHRONIK_NATIVE_HOSTS_ABC_ABC_SUBSCRIBER_H
++
++#include <memory>
++
++namespace node {
++struct NodeContext;
++} // namespace node
++
++namespace chronik::native {
++class Service;
++} // namespace chronik::native
++
++namespace chronik::native::abc {
++
++class AbcHost;
++
++/**
++ * Register the validation-interface subscriber feeding `service`. Port of
++ * chronik_validationinterface.cpp: events run on the dedicated worker thread
++ * (BoundedTaskQueue, fail-closed on overflow).
++ */
++void StartSubscriber(const node::NodeContext &node, const AbcHost &host,
++                     std::shared_ptr<Service> service);
++/** Stop HTTP/WS request handlers (keeps indexing). */
++void InterruptSubscriber();
++/** Unregister, drain the worker, stop the service. */
++void StopSubscriber();
++
++} // namespace chronik::native::abc
++
++#endif // CHRONIK_NATIVE_HOSTS_ABC_ABC_SUBSCRIBER_H
+diff --git a/doc/metrics.md b/doc/metrics.md
+index 8a9144a8b29352b36aa47954f85ca97b57cf9327..a9ddb89ff39950db8a2bf933f903c68cafc47dda 100644
+--- a/doc/metrics.md
++++ b/doc/metrics.md
+@@ -224,6 +224,23 @@ work, under this naming scheme; they are not listed here.
+ | `fullnode_chronik_lag_blocks` | gauge | | 1 | Blocks the index is behind the chain tip, at scrape time. |
+ 
+ 
++### Native Chronik observation boundaries
++
++Both backend choices report the same bounded request families, status classes,
++connection/subscription gauges and indexed-height/lag gauges. Native callbacks
++are installed by the ABC host; the portable core has no node-metrics dependency.
++Native request duration measures router dispatch; a successful WebSocket upgrade
++measures response-header preparation, excluding socket and query-pool waiting.
++Rust duration retains its middleware boundary. Compare timing workloads within
++a backend rather than treating these boundaries as identical. Connections count
++accepted handlers, and subscriptions count successfully reserved slots until
++release. Metrics callbacks cannot change a response or subscription outcome.
++
++The callbacks are fixed before publication and perform atomic recording only;
++they must not acquire registry, host or indexer locks. Native limiter callbacks
++run under its existing mutex. Shutdown drains the Chronik workers/sessions;
++node metrics remain allocated through process exit even after scraping stops.
++
+ ## Tests
+ 
+ `test/functional/test_framework/metrics.py` scrapes and checks an
+diff --git a/src/init.cpp b/src/init.cpp
+index 4e560a917032ef6cbf5354f80e6b22a552ffd272..6342b780dc7a58c0069fdfa8c86bb101572ca394 100644
+--- a/src/init.cpp
++++ b/src/init.cpp
+@@ -845,6 +845,13 @@ void SetupServerArgs(NodeContext &node) {
+                    "Output some performance statistics (e.g. num cache hits, "
+                    "seconds spent) into a <datadir>/perf folder. (default: 0)",
+                    ArgsManager::ALLOW_ANY, OptionsCategory::CHRONIK);
++#if ENABLE_CHRONIK_NATIVE
++    argsman.AddArg("-chronikqueryworkers=<n>",
++                   "Threads answering Chronik HTTP/WebSocket queries, 0 for "
++                   "min(8, cores / 2) (native Chronik only; default: 0)",
++                   ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY,
++                   OptionsCategory::CHRONIK);
++#endif
+     argsman.AddArg("-chronikscripthashindex",
+                    "Enable the scripthash index for the Chronik indexer "
+                    "(default: 1 if chronikelectrumbind is set, 0 otherwise) ",
