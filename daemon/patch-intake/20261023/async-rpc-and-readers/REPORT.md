@@ -1,0 +1,13 @@
+# Asynchronous admission and atomic mempool diagnostics candidates
+
+Input: queue-only control `94453bdd7d8a681d6a872df85366f370bfa78089`, preserving negotiated peer capabilities. Source identities and canonical mailbox exports: CANDIDATES.json. These are review candidates, not active source-stack integration.
+
+The reader variant removes the steady-state getmempoolinfo full-snapshot shared_ptr load and fee-diagnostics publication mutex. A versioned group of atomic scalar fields provides a coherent response without allocation or reader mutex. Writers serialize their bounded publication; readers may retry. Startup fallback still initializes under existing locks. Other RPCs retain their current snapshots.
+
+The async variant makes sendrawtransaction suspend its Asio coroutine for admission and validation/indexing completion. Owned outcomes cross the callback boundary, completion resumes on the originating executor/strand, and private queue fences preserve notification ordering. Synchronous callers retain blocking waits. JSON-RPC arrays remain serial. Preparation and overload fallback can still acquire admission locks; this does not make the entire admission path lock-free.
+
+Correctness: combined clean build/common gate passed; fee_hysteresis_tests passed separately. interface_http.py and mempool_parallel_admission.py passed, including in-flight shutdown. Large Unicode JSON arrays passed plain/TLS, content-length/chunked and keep-alive checks. Added unit cases verify progress with one RPC worker while a send is blocked, queue cutoff fences under capacity pressure, executor/strand affinity and exactly-once exception delivery. Async-only clean build/common gate passed. Builds use wallet, Rust Chronik, HTTP2 and WebTransport OFF; those optional builds are not claimed validated here.
+
+Performance: pending three alternating pairs for each of reader-only, async-only and combined, against the same input. Shared ABC/eCash workload, not the complete native V2 endpoint. No throughput claim yet.
+
+Preservation: committed source refs plus canonical mailbox exports and verified incremental bundle daemon/.local-artifact-archive/commit-regressions/async-rpc-and-readers.bundle. No historical mailbox edited. No source-history rewrite or permanent submodule pin changed.

@@ -1,0 +1,926 @@
+From 9fa971b340b117313e2c8af1bb03ba4c47d3c06c Mon Sep 17 00:00:00 2001
+From: Canonical patch progression <213740+schancel@users.noreply.github.com>
+Date: Fri, 23 Oct 2026 13:24:25 -0700
+Subject: [PATCH 1/2] fixup! rpc: isolate bounded commit owner without
+ unrelated relay capability reversals
+
+Use callback-based admission completion and Asio awaitables, retain synchronous callers and direct overload fallback, fence primary and built-in secondary notification queues without blocking RPC workers. Completion posts to the originating executor/strand, owns payloads through delivery, and safely ignores late retained callbacks after initiation exceptions. Preserve sequential JSON arrays and callback/relay ordering. Shared combined gate146cases PASS; benchmark pending.
+---
+ .../chronik_validationinterface.cpp           |   3 +
+ src/node/interfaces.cpp                       |   4 +
+ src/node/transaction.cpp                      | 108 ++++++++++--
+ src/node/transaction.h                        |  21 ++-
+ src/rpc/mempool.cpp                           |  80 +++++++--
+ src/test/validationinterface_tests.cpp        | 165 ++++++++++++++++++
+ src/util/async_completion.h                   |  69 ++++++++
+ src/util/bounded_task_queue.h                 |  22 +++
+ src/util/completion_signal.h                  |  57 ++++++
+ src/validationinterface.cpp                   |  20 +++
+ src/validationinterface.h                     |  17 ++
+ 11 files changed, 543 insertions(+), 23 deletions(-)
+ create mode 100644 src/util/async_completion.h
+ create mode 100644 src/util/completion_signal.h
+
+diff --git a/chronik/chronik-cpp/chronik_validationinterface.cpp b/chronik/chronik-cpp/chronik_validationinterface.cpp
+index 3b79045e50..4b83fb922e 100644
+--- a/chronik/chronik-cpp/chronik_validationinterface.cpp
++++ b/chronik/chronik-cpp/chronik_validationinterface.cpp
+@@ -51,6 +51,9 @@ public:
+     // Normal-operation fence for work already forwarded by ValidationSignals.
+     // Once shutdown starts, StopWorker/join owns draining the remaining FIFO.
+     void SyncTransactionQueue() override { m_queue.Sync(); }
++    void CallAfterTransactionQueue(std::function<void()> callback) override {
++        m_queue.CallAfter(std::move(callback));
++    }
+ 
+     void StopWorker() { m_queue.Stop(); }
+ 
+diff --git a/src/node/interfaces.cpp b/src/node/interfaces.cpp
+index 2587a415d6..8d45756039 100644
+--- a/src/node/interfaces.cpp
++++ b/src/node/interfaces.cpp
+@@ -508,6 +508,10 @@ namespace {
+                 m_queue->Sync();
+             }
+         }
++        void CallAfterTransactionQueue(std::function<void()> callback) override {
++            if (m_queue) m_queue->CallAfter(std::move(callback));
++            else callback();
++        }
+         //! Run every accepted callback, then join the worker. Later events are
+         //! dropped. The caller must not hold a lock the callbacks take.
+         void StopWorker() {
+diff --git a/src/node/transaction.cpp b/src/node/transaction.cpp
+index 65596be3d4..1ed76a9a38 100644
+--- a/src/node/transaction.cpp
++++ b/src/node/transaction.cpp
+@@ -52,7 +52,7 @@ namespace {
+                          const MempoolAdmissionLimits &limits, bool relay,
+                          bool wait_callback,
+                          const PrecomputedAdmissionChecks *precomputed,
+-                         const std::shared_ptr<std::promise<void>> &promise)
++                         const std::shared_ptr<util::CompletionSignal> &promise)
+         EXCLUSIVE_LOCKS_REQUIRED(cs_main) {
+         AssertLockHeld(cs_main);
+         RpcAdmissionOutcome outcome;
+@@ -104,7 +104,7 @@ namespace {
+                 // immediately call some wallet RPC, and get a stale result
+                 // because callbacks have not yet been processed.
+                 node.validation_signals->CallFunctionInValidationInterfaceQueue(
+-                    [promise] { promise->set_value(); });
++                    [promise] { promise->Complete(); });
+                 outcome.notification = promise;
+             }
+         }
+@@ -123,7 +123,9 @@ struct RpcAdmissionDispatcher::Impl {
+             : bytes(size), commit(std::move(fn)) {}
+         size_t bytes;
+         std::function<RpcAdmissionOutcome()> commit;
+-        std::promise<RpcAdmissionOutcome> completed;
++        std::optional<std::promise<RpcAdmissionOutcome>> completed;
++        Completion async_completed;
++        std::shared_ptr<Request> retained;
+         std::optional<RpcAdmissionOutcome> outcome;
+         std::exception_ptr error;
+     };
+@@ -169,7 +171,7 @@ struct RpcAdmissionDispatcher::Impl {
+         } producer{*this};
+         if (nbytes > MAX_BYTES) return std::nullopt;
+         auto request = std::make_shared<Request>(nbytes, std::move(commit));
+-        auto completed = request->completed.get_future();
++        auto completed = request->completed.emplace().get_future();
+         size_t used = bytes.load(std::memory_order_relaxed);
+         do {
+             if (used > MAX_BYTES - nbytes) return std::nullopt;
+@@ -184,6 +186,41 @@ struct RpcAdmissionDispatcher::Impl {
+         // and independent notification barrier to the waiting RPC producer.
+         return completed.get();
+     }
++    bool DispatchAsync(size_t nbytes, std::function<RpcAdmissionOutcome()> commit,
++                       Completion completion) {
++        AssertLockNotHeld(cs_main);
++        assert(completion);
++        uint64_t observed = producers.load(std::memory_order_acquire);
++        do {
++            if (observed & STOPPED) return false;
++        } while (!producers.compare_exchange_weak(observed, observed + 1,
++                                                   std::memory_order_acq_rel));
++        struct Producer {
++            Impl &owner;
++            ~Producer() {
++                owner.producers.fetch_sub(1, std::memory_order_acq_rel);
++                owner.Notify();
++            }
++        } producer{*this};
++        if (nbytes > MAX_BYTES) return false;
++        auto request = std::make_shared<Request>(nbytes, std::move(commit));
++        request->async_completed = std::move(completion);
++        size_t used = bytes.load(std::memory_order_relaxed);
++        do {
++            if (used > MAX_BYTES - nbytes) return false;
++        } while (!bytes.compare_exchange_weak(used, used + nbytes,
++                                               std::memory_order_relaxed));
++        // Unlike a synchronous producer, the coroutine returns to its executor
++        // immediately. Keep the raw queue entry owned until the worker pops it.
++        request->retained = request;
++        if (!queue.push(request.get())) {
++            request->retained.reset();
++            bytes.fetch_sub(nbytes, std::memory_order_relaxed);
++            return false;
++        }
++        Notify();
++        return true;
++    }
+     void Run() {
+         util::ThreadRename("rpcadmit");
+         for (;;) {
+@@ -198,7 +235,9 @@ struct RpcAdmissionDispatcher::Impl {
+             size_t count = 0;
+             Request *pending = nullptr;
+             while (count < slice.size() && queue.pop(pending)) {
+-                slice[count++] = pending->shared_from_this();
++                slice[count] = pending->shared_from_this();
++                slice[count]->retained.reset();
++                ++count;
+             }
+             if (count == 0) {
+                 if (producers.load(std::memory_order_acquire) == STOPPED)
+@@ -222,10 +261,15 @@ struct RpcAdmissionDispatcher::Impl {
+                 bytes.fetch_sub(request->bytes, std::memory_order_relaxed);
+                 // Retain ownership through set_value/set_exception: the
+                 // waiting producer may immediately release its own reference.
+-                if (request->error)
+-                    request->completed.set_exception(request->error);
+-                else
+-                    request->completed.set_value(std::move(*request->outcome));
++                if (request->async_completed) {
++                    request->async_completed(request->error,
++                        request->outcome ? std::move(*request->outcome)
++                                         : RpcAdmissionOutcome{});
++                } else if (request->error) {
++                    request->completed->set_exception(request->error);
++                } else {
++                    request->completed->set_value(std::move(*request->outcome));
++                }
+             }
+         }
+     }
+@@ -243,6 +287,48 @@ RpcAdmissionDispatcher::Dispatch(size_t bytes,
+     return m_impl->Dispatch(bytes, std::move(commit));
+ }
+ 
++bool RpcAdmissionDispatcher::DispatchAsync(
++    size_t bytes, std::function<RpcAdmissionOutcome()> commit,
++    Completion completion) {
++    return m_impl->DispatchAsync(bytes, std::move(commit), std::move(completion));
++}
++
++void SubmitRpcAdmission(const NodeContext &node, CTransactionRef tx,
++                        Amount max_tx_fee,
++                        RpcAdmissionDispatcher::Completion completion) {
++    AssertLockNotHeld(cs_main);
++    assert(node.chainman && node.mempool && node.peerman);
++    const auto notification = std::make_shared<util::CompletionSignal>();
++    const MempoolAdmissionLimits limits{max_tx_fee, true};
++    std::optional<PrecomputedAdmissionChecks> prepared;
++    if (node.args && node.args->GetBoolArg("-parallelmempool", DEFAULT_PARALLEL_MEMPOOL)) {
++        prepared = PrecomputeMempoolAdmission(*node.chainman, tx, limits);
++    }
++    if (node.rpc_admission && node.rpc_admission->DispatchAsync(
++        tx->GetTotalSize(),
++        [&node, tx, limits, notification, prepared = std::move(prepared)]()
++            EXCLUSIVE_LOCKS_REQUIRED(cs_main) {
++            return AdmitBroadcastLocked(node, tx, limits, true, true,
++                prepared ? &*prepared : nullptr, notification);
++        }, completion)) {
++        return;
++    }
++    // Preserve the existing overload/stopped fallback and all authoritative
++    // checks. It can take cs_main; notification waits remain asynchronous.
++    RpcAdmissionOutcome outcome;
++    std::exception_ptr error;
++    try {
++        const auto waiting = SteadyClock::now();
++        LOCK(cs_main);
++        AdmissionLockTimer timer(waiting);
++        outcome = AdmitBroadcastLocked(node, tx, limits, true, true, nullptr,
++                                       notification);
++    } catch (...) {
++        error = std::current_exception();
++    }
++    completion(error, std::move(outcome));
++}
++
+ TransactionError
+ BroadcastTransaction(const NodeContext &node, const CTransactionRef tx,
+                      std::string &err_string, const Amount max_tx_fee,
+@@ -259,7 +345,7 @@ BroadcastTransaction(const NodeContext &node, const CTransactionRef tx,
+     // The queue can retain a barrier even if scheduling it throws. Give the
+     // callback ownership independent of an RPC frame or disconnected client.
+     const auto promise =
+-        wait_callback ? std::make_shared<std::promise<void>>() : nullptr;
++        wait_callback ? std::make_shared<util::CompletionSignal>() : nullptr;
+     TxId txid = tx->GetId();
+     const MempoolAdmissionLimits limits{max_tx_fee, rpc_fee_hysteresis};
+     std::optional<PrecomputedAdmissionChecks> precomputed;
+@@ -309,7 +395,7 @@ BroadcastTransaction(const NodeContext &node, const CTransactionRef tx,
+     if (outcome.notification) {
+         // Wait until Validation Interface clients have been notified of the
+         // transaction entering the mempool.
+-        outcome.notification->get_future().wait();
++        outcome.notification->Wait();
+         // Subscribers that deliver on their own worker (the wallet, Chronik)
+         // received the event from the main queue; wait for them too.
+         node.validation_signals->SyncSecondaryQueues();
+diff --git a/src/node/transaction.h b/src/node/transaction.h
+index 44b2b5ce80..e2313c1ddf 100644
+--- a/src/node/transaction.h
++++ b/src/node/transaction.h
+@@ -6,6 +6,8 @@
+ #define BITCOIN_NODE_TRANSACTION_H
+ 
+ #include <cstddef>
++#include <exception>
++#include <util/completion_signal.h>
+ #include <feerate.h>
+ #include <functional>
+ #include <future>
+@@ -35,12 +37,12 @@ struct NodeContext;
+ struct RpcAdmissionOutcome {
+     TransactionError result{TransactionError::OK};
+     std::string error;
+-    std::shared_ptr<std::promise<void>> notification;
++    std::shared_ptr<util::CompletionSignal> notification;
+ };
+ 
+ /** Bounded immediate-drain independent RPC commit dispatcher.
+  * Dispatch callbacks run under cs_main. Callers wait without daemon locks and
+- * receive an owned outcome through a future. nullopt means
++ * receive an owned outcome through a future or callback. nullopt/false means
+  * stopped/full/oversized: use ordinary direct admission. This does not batch
+  * atomic packages, native verification, callbacks, or snapshot publication.
+  */
+@@ -49,12 +51,19 @@ class RpcAdmissionDispatcher {
+     std::unique_ptr<Impl> m_impl;
+ 
+ public:
++    using Completion = std::function<void(std::exception_ptr, RpcAdmissionOutcome)>;
+     RpcAdmissionDispatcher();
+     ~RpcAdmissionDispatcher();
+     RpcAdmissionDispatcher(const RpcAdmissionDispatcher &) = delete;
+     RpcAdmissionDispatcher &operator=(const RpcAdmissionDispatcher &) = delete;
+     std::optional<RpcAdmissionOutcome>
+     Dispatch(size_t bytes, std::function<RpcAdmissionOutcome()> commit);
++    /** Returns false for the same stopped/full/oversized direct fallback.
++     * The queue owns an accepted request through its completion callback.
++     * Completion occurs after releasing cs_main, never in the commit slice.
++     */
++    bool DispatchAsync(size_t bytes, std::function<RpcAdmissionOutcome()> commit,
++                       Completion completion);
+     void Stop();
+ };
+ 
+@@ -97,6 +106,14 @@ BroadcastTransaction(const NodeContext &node, CTransactionRef tx,
+                      bool wait_callback, bool rpc_fee_hysteresis = false,
+                      bool use_rpc_admission_queue = false);
+ 
++/** RPC-only submission. Returns the owned authoritative commit result through
++ * completion; the RPC coroutine then fences notifications and relays. Existing
++ * synchronous wallet/Chronik callers retain BroadcastTransaction.
++ */
++void SubmitRpcAdmission(const NodeContext &node, CTransactionRef tx,
++                        Amount max_tx_fee,
++                        RpcAdmissionDispatcher::Completion completion);
++
+ /**
+  * Return transaction with a given txid.
+  * If mempool is provided and block_index is not provided, check it first for
+diff --git a/src/rpc/mempool.cpp b/src/rpc/mempool.cpp
+index 2ca1ca3cc6..cdb25986e5 100644
+--- a/src/rpc/mempool.cpp
++++ b/src/rpc/mempool.cpp
+@@ -9,6 +9,7 @@
+ #include <chainparams.h>
+ #include <common/args.h>
+ #include <core_io.h>
++#include <httpserver.h>
+ #include <lotus_v2/fee_hysteresis.h>
+ #include <lotus_v2/mempool_overlay.h>
+ #include <net.h>
+@@ -36,6 +37,7 @@
+ #include <validationinterface.h>
+ 
+ #include <atomic>
++#include <util/async_completion.h>
+ 
+ using kernel::DumpMempool;
+ 
+@@ -45,6 +47,50 @@ using node::NodeContext;
+ using node::TransactionError;
+ using util::ToString;
+ 
++namespace {
++boost::asio::awaitable<void> WaitForRpcNotification(
++    std::shared_ptr<util::CompletionSignal> signal,
++    boost::asio::any_io_executor executor) {
++    if (!signal->IsComplete()) {
++        HTTPScopedWaitSuspension suspended;
++        co_await util::AwaitCompletion(executor, [signal](auto complete) {
++            signal->Then([complete] { complete(nullptr, {}); });
++        });
++    }
++}
++
++boost::asio::awaitable<void> WaitForRpcSecondaryQueues(
++    ValidationSignals &signals, boost::asio::any_io_executor executor) {
++    // Keep subscriber ownership on this frame/executor, never on the private
++    // worker that calls its fence (which might otherwise destroy/join itself).
++    auto subscribers = signals.GetTransactionQueueSubscribers();
++    if (subscribers.empty()) co_return;
++    struct Group {
++        std::atomic<size_t> remaining;
++        std::shared_ptr<util::CompletionSignal> ready{
++            std::make_shared<util::CompletionSignal>()};
++        explicit Group(size_t n) : remaining(n) {}
++    };
++    auto group = std::make_shared<Group>(subscribers.size() + 1);
++    auto arrive = [group] {
++        if (group->remaining.fetch_sub(1) == 1) group->ready->Complete();
++    };
++    for (const auto &subscriber : subscribers) {
++        signals.CallAfterTransactionQueue(*subscriber, arrive);
++    }
++    arrive();
++    co_await WaitForRpcNotification(group->ready, executor);
++}
++
++boost::asio::awaitable<void> WaitForRpcValidationQueues(
++    ValidationSignals &signals, boost::asio::any_io_executor executor) {
++    auto signal = std::make_shared<util::CompletionSignal>();
++    signals.CallFunctionInValidationInterfaceQueue([signal] { signal->Complete(); });
++    co_await WaitForRpcNotification(signal, executor);
++    co_await WaitForRpcSecondaryQueues(signals, executor);
++}
++} // namespace
++
+ static RPCHelpMan sendrawtransaction() {
+     return RPCHelpMan{
+         "sendrawtransaction",
+@@ -81,7 +127,9 @@ static RPCHelpMan sendrawtransaction() {
+             "\nAs a JSON-RPC call\n" +
+             HelpExampleRpc("sendrawtransaction", "\"signedhex\"")},
+         [&](const RPCHelpMan &self, const Config &config,
+-            const JSONRPCRequest &request) -> UniValue {
++            const JSONRPCRequest &request,
++            boost::asio::any_io_executor executor)
++            -> boost::asio::awaitable<UniValue> {
+             // parse hex string from parameter
+             CMutableTransaction mtx;
+             if (!DecodeHexTx(mtx, request.params[0].get_str())) {
+@@ -106,10 +154,17 @@ static RPCHelpMan sendrawtransaction() {
+                 TicksSinceEpoch<std::chrono::milliseconds>(NodeClock::now());
+             const auto &fee_ctrl =
+                 lotus::v2::GetGlobalFeeHysteresisController();
+-            const TransactionError err = BroadcastTransaction(
+-                node, tx, err_string, max_raw_tx_fee, /*relay*/ true,
+-                /*wait_callback*/ true, /*rpc_fee_hysteresis=*/true,
+-                /*use_rpc_admission_queue=*/true);
++            node::RpcAdmissionOutcome outcome;
++            {
++                HTTPScopedWaitSuspension suspended;
++                outcome = co_await util::AwaitCompletion<node::RpcAdmissionOutcome>(
++                    executor, [&node, tx, max_raw_tx_fee](auto complete) {
++                        node::SubmitRpcAdmission(node, tx, max_raw_tx_fee,
++                                                  std::move(complete));
++                    });
++            }
++            const TransactionError err = outcome.result;
++            err_string = std::move(outcome.error);
+             if (err != TransactionError::OK) {
+                 if (err == TransactionError::MEMPOOL_REJECTED &&
+                     (err_string.find("min relay fee not met") !=
+@@ -135,11 +190,16 @@ static RPCHelpMan sendrawtransaction() {
+                 throw JSONRPCTransactionError(err, err_string);
+             }
+ 
+-            // Block to make sure wallet/indexers sync before returning
+-            CHECK_NONFATAL(node.validation_signals)
+-                ->SyncWithValidationInterfaceQueue();
+-
+-            return tx->GetHash().GetHex();
++            if (outcome.notification) {
++                co_await WaitForRpcNotification(outcome.notification, executor);
++                co_await WaitForRpcSecondaryQueues(
++                    *CHECK_NONFATAL(node.validation_signals), executor);
++            }
++            node.peerman->RelayTransaction(tx->GetId());
++            // Preserve the existing final wallet/indexer fence after relay.
++            co_await WaitForRpcValidationQueues(
++                *CHECK_NONFATAL(node.validation_signals), executor);
++            co_return tx->GetHash().GetHex();
+         },
+     };
+ }
+diff --git a/src/test/validationinterface_tests.cpp b/src/test/validationinterface_tests.cpp
+index a1c7de8ecb..f0f4314144 100644
+--- a/src/test/validationinterface_tests.cpp
++++ b/src/test/validationinterface_tests.cpp
+@@ -7,6 +7,13 @@
+ #include <interfaces/chain.h>
+ #include <interfaces/handler.h>
+ #include <node/transaction.h>
++#include <core_io.h>
++#include <rpc/server.h>
++#include <util/async_completion.h>
++#include <boost/asio/co_spawn.hpp>
++#include <boost/asio/thread_pool.hpp>
++#include <boost/asio/strand.hpp>
++#include <boost/asio/use_future.hpp>
+ #include <node/snapshot.h>
+ #include <primitives/block.h>
+ #include <scheduler.h>
+@@ -884,6 +891,9 @@ public:
+         });
+     }
+ 
++    void CallAfterTransactionQueue(std::function<void()> callback) override {
++        Enqueue(std::move(callback));
++    }
+     void SyncTransactionQueue() override {
+         auto promise = std::make_shared<std::promise<void>>();
+         auto completed = promise->get_future();
+@@ -1135,6 +1145,11 @@ struct MempoolSecondaryQueueSubscriber final : public CValidationInterface {
+         });
+     }
+     void SyncTransactionQueue() override { queue.Sync(); }
++    std::atomic<bool> async_fence_entered{false};
++    void CallAfterTransactionQueue(std::function<void()> callback) override {
++        queue.CallAfter(std::move(callback));
++        async_fence_entered = true;
++    }
+ };
+ 
+ BOOST_FIXTURE_TEST_CASE(broadcast_wait_fences_secondary_queue,
+@@ -1165,6 +1180,156 @@ BOOST_FIXTURE_TEST_CASE(broadcast_wait_fences_secondary_queue,
+     m_node.validation_signals->UnregisterSharedValidationInterface(subscriber);
+ }
+ 
++BOOST_FIXTURE_TEST_CASE(rpc_one_worker_serves_reads_while_notification_pending,
++                        TestChain100Setup) {
++    using namespace std::chrono_literals;
++    auto subscriber = std::make_shared<MempoolSecondaryQueueSubscriber>();
++    m_node.validation_signals->RegisterSharedValidationInterface(subscriber);
++    m_node.rpc_admission = std::make_unique<node::RpcAdmissionDispatcher>();
++    const auto spend = MakeTransactionRef(CreateValidMempoolTransaction(
++        m_coinbase_txns[0], 0, 1, coinbaseKey,
++        GetScriptForRawPubKey(coinbaseKey.GetPubKey()),
++        m_coinbase_txns[0]->vout[0].nValue - 2000 * SATOSHI, false));
++    if (RPCIsInWarmup(nullptr)) SetRPCWarmupFinished();
++    JSONRPCRequest write;
++    write.context = &m_node;
++    write.strMethod = "sendrawtransaction";
++    write.params = UniValue(UniValue::VARR);
++    write.params.push_back(EncodeHexTx(*spend));
++    write.params.push_back(0);
++    JSONRPCRequest read;
++    read.context = &m_node;
++    read.strMethod = "getmempoolinfo";
++    read.params = UniValue(UniValue::VARR);
++    const Config &config = m_node.chainman->GetConfig();
++    boost::asio::thread_pool pool(1);
++    auto result = boost::asio::co_spawn(pool,
++        tableRPC.executeAsync(config, write, pool.get_executor()),
++        boost::asio::use_future);
++    const auto deadline = std::chrono::steady_clock::now() + 3s;
++    while (!subscriber->async_fence_entered &&
++           std::chrono::steady_clock::now() < deadline &&
++           result.wait_for(0ms) != std::future_status::ready) {
++        std::this_thread::sleep_for(1ms);
++    }
++    const bool entered = subscriber->async_fence_entered;
++    const bool pending = result.wait_for(0ms) == std::future_status::timeout;
++    auto reading = boost::asio::co_spawn(pool,
++        tableRPC.executeAsync(config, read, pool.get_executor()),
++        boost::asio::use_future);
++    const bool read_ready = reading.wait_for(3s) == std::future_status::ready;
++    // Always release the private worker before asserting, including failures.
++    subscriber->release_indexing.set_value();
++    const bool write_ready = result.wait_for(10s) == std::future_status::ready;
++    pool.join();
++    m_node.rpc_admission.reset();
++    m_node.validation_signals->UnregisterSharedValidationInterface(subscriber);
++    BOOST_CHECK(entered);
++    BOOST_CHECK(pending);
++    BOOST_CHECK(read_ready);
++    BOOST_REQUIRE(write_ready);
++    BOOST_CHECK_EQUAL(result.get().get_str(), spend->GetHash().GetHex());
++    BOOST_CHECK_EQUAL(reading.get()["size"].getInt<int>(), 1);
++    BOOST_CHECK(subscriber->indexed);
++}
++
++BOOST_AUTO_TEST_CASE(async_completion_retained_then_throw_is_delivered_once) {
++    using namespace std::chrono_literals;
++    boost::asio::thread_pool pool(1);
++    std::function<void(std::exception_ptr, std::monostate)> late;
++    auto result = boost::asio::co_spawn(pool,
++        util::AwaitCompletion(pool.get_executor(), [&late](auto complete) {
++            late = complete;
++            throw std::runtime_error("retained completion");
++        }), boost::asio::use_future);
++    BOOST_REQUIRE(result.wait_for(3s) == std::future_status::ready);
++    BOOST_CHECK_EXCEPTION(result.get(), std::runtime_error,
++        [](const auto &error) { return std::string(error.what()) == "retained completion"; });
++    pool.join();
++    BOOST_REQUIRE(bool(late));
++    // The coroutine frame is gone; a retained late callback must be harmless.
++    late(nullptr, {});
++}
++
++BOOST_AUTO_TEST_CASE(admission_wait_releases_single_rpc_executor) {
++    using namespace std::chrono_literals;
++    if (RPCIsInWarmup(nullptr)) SetRPCWarmupFinished();
++    JSONRPCRequest read;
++    read.context = &m_node;
++    read.strMethod = "getmempoolinfo";
++    read.params = UniValue(UniValue::VARR);
++    const Config &config = m_node.chainman->GetConfig();
++    // Initialize the scalar publication before the controlled cs_main hold.
++    tableRPC.execute(config, read);
++    node::RpcAdmissionDispatcher dispatcher;
++    std::promise<void> entered, release, queued;
++    auto released = release.get_future().share();
++    BOOST_REQUIRE(dispatcher.DispatchAsync(1, [&] {
++        entered.set_value();
++        released.wait();
++        return node::RpcAdmissionOutcome{};
++    }, [](auto, auto) {}));
++    entered.get_future().wait();
++    boost::asio::thread_pool pool(1);
++    auto lifetime = std::make_shared<int>(1);
++    std::weak_ptr<int> weak = lifetime;
++    auto waiting = boost::asio::co_spawn(pool,
++        util::AwaitCompletion<node::RpcAdmissionOutcome>(
++            pool.get_executor(), [&, lifetime](auto complete) {
++                const bool accepted = dispatcher.DispatchAsync(1,
++                    [lifetime] { return node::RpcAdmissionOutcome{}; }, complete);
++                if (!accepted) throw std::runtime_error("unexpected queue pressure");
++                queued.set_value();
++            }), boost::asio::use_future);
++    lifetime.reset();
++    queued.get_future().wait();
++    auto reading = boost::asio::co_spawn(pool,
++        tableRPC.executeAsync(config, read, pool.get_executor()),
++        boost::asio::use_future);
++    const bool pending = waiting.wait_for(0ms) == std::future_status::timeout;
++    const bool readable = reading.wait_for(3s) == std::future_status::ready;
++    release.set_value();
++    BOOST_REQUIRE(waiting.wait_for(3s) == std::future_status::ready);
++    dispatcher.Stop();
++    pool.join();
++    BOOST_CHECK(pending);
++    BOOST_CHECK(readable);
++    BOOST_CHECK(waiting.get().result == node::TransactionError::OK);
++    BOOST_CHECK(reading.get().isObject());
++    BOOST_CHECK(weak.expired());
++}
++
++BOOST_AUTO_TEST_CASE(async_completion_resumes_on_originating_strand) {
++    boost::asio::thread_pool pool(2);
++    auto strand = boost::asio::make_strand(pool);
++    BoundedTaskQueue queue(1024, 16, [] {});
++    auto operation = [&]() -> boost::asio::awaitable<bool> {
++        co_await util::AwaitCompletion(pool.get_executor(), [&queue](auto done) {
++            queue.Enqueue(1, [done] { done(nullptr, {}); });
++        });
++        co_return strand.running_in_this_thread();
++    };
++    auto result = boost::asio::co_spawn(strand, operation(), boost::asio::use_future);
++    BOOST_CHECK(result.get());
++    pool.join();
++    queue.Stop();
++}
++
++BOOST_AUTO_TEST_CASE(full_secondary_queue_accepts_nonblocking_cutoff_fence) {
++    using namespace std::chrono_literals;
++    BoundedTaskQueue queue(1, 1, [] {}, BoundedTaskQueue::Overflow::BLOCK);
++    std::promise<void> entered, release, completed;
++    auto released = release.get_future().share();
++    BOOST_REQUIRE(queue.Enqueue(1, [&] { entered.set_value(); released.wait(); }));
++    entered.get_future().wait();
++    auto done = completed.get_future();
++    queue.CallAfter([&] { completed.set_value(); });
++    BOOST_CHECK(done.wait_for(0ms) == std::future_status::timeout);
++    release.set_value();
++    BOOST_REQUIRE(done.wait_for(3s) == std::future_status::ready);
++    queue.Stop();
++}
++
+ namespace {
+ /** Records Chain::Notifications in the order they arrive. */
+ struct RecordingNotifications final : public interfaces::Chain::Notifications {
+diff --git a/src/util/async_completion.h b/src/util/async_completion.h
+new file mode 100644
+index 0000000000..036ed2954c
+--- /dev/null
++++ b/src/util/async_completion.h
+@@ -0,0 +1,69 @@
++// Copyright (c) 2026 The Lotus developers
++// Distributed under the MIT software license, see the accompanying
++// file COPYING or http://www.opensource.org/licenses/mit-license.php.
++#ifndef BITCOIN_UTIL_ASYNC_COMPLETION_H
++#define BITCOIN_UTIL_ASYNC_COMPLETION_H
++#include <boost/asio/any_io_executor.hpp>
++#include <boost/asio/associated_executor.hpp>
++#include <boost/asio/async_result.hpp>
++#include <boost/asio/awaitable.hpp>
++#include <boost/asio/executor_work_guard.hpp>
++#include <boost/asio/post.hpp>
++#include <boost/asio/use_awaitable.hpp>
++#include <atomic>
++#include <exception>
++#include <functional>
++#include <memory>
++#include <optional>
++#include <type_traits>
++#include <utility>
++#include <variant>
++
++namespace util {
++/** Bridge an owned callback to Asio. Completion is posted, never resumed on a
++ * commit/subscriber thread. Exactly-once claiming also handles initiation which
++ * retains a callback and then throws: late delivery cannot resume a dead frame.
++ * The executor stays alive through delivery. Cancellation does not undo work
++ * already accepted by the node; its owned completion is still drained.
++ */
++template <typename T = void, typename Start>
++boost::asio::awaitable<T> AwaitCompletion(
++    boost::asio::any_io_executor executor, Start start) {
++    using Value = std::conditional_t<std::is_void_v<T>, std::monostate, T>;
++    auto token = boost::asio::use_awaitable;
++    auto value = co_await boost::asio::async_initiate<
++        decltype(token), void(std::exception_ptr, Value)>(
++        [executor, start = std::move(start)](auto handler) mutable {
++            using Handler = decltype(handler);
++            struct State {
++                std::atomic<bool> claimed{false};
++                std::optional<Handler> handler;
++                boost::asio::executor_work_guard<boost::asio::any_io_executor> work;
++                State(Handler h, boost::asio::any_io_executor ex)
++                    : handler(std::move(h)), work(ex) {}
++            };
++            // Preserve the caller's strand, not merely its underlying pool.
++            boost::asio::any_io_executor resume_executor =
++                boost::asio::get_associated_executor(handler, executor);
++            auto state = std::make_shared<State>(std::move(handler), resume_executor);
++            auto complete = [state, resume_executor](std::exception_ptr error,
++                                               Value result) {
++                if (state->claimed.exchange(true)) return;
++                boost::asio::post(resume_executor,
++                    [state, error, result = std::move(result)]() mutable {
++                        auto handler = std::move(*state->handler);
++                        state->handler.reset();
++                        state->work.reset();
++                        std::move(handler)(error, std::move(result));
++                    });
++            };
++            try {
++                start(complete);
++            } catch (...) {
++                complete(std::current_exception(), Value{});
++            }
++        }, token);
++    if constexpr (!std::is_void_v<T>) co_return std::move(value);
++}
++} // namespace util
++#endif // BITCOIN_UTIL_ASYNC_COMPLETION_H
+diff --git a/src/util/bounded_task_queue.h b/src/util/bounded_task_queue.h
+index ea8ef95b00..53e622a6d6 100644
+--- a/src/util/bounded_task_queue.h
++++ b/src/util/bounded_task_queue.h
+@@ -11,6 +11,7 @@
+ #include <cstdint>
+ #include <deque>
+ #include <functional>
++#include <list>
+ #include <mutex>
+ #include <string>
+ #include <thread>
+@@ -41,6 +42,8 @@ private:
+     std::deque<Task> m_tasks;
+     size_t m_bytes{0}, m_count{0};
+     uint64_t m_submitted{0}, m_completed{0};
++    using Fence = std::pair<uint64_t, std::function<void()>>;
++    std::list<Fence> m_fences;
+     bool m_stopping{false}, m_failed{false};
+     const Overflow m_overflow;
+     const std::string m_thread_name;
+@@ -80,11 +83,17 @@ private:
+             }
+             // A completed fence must also observe the fatal notification.
+             if (notify_failure) m_fail();
++            std::list<Fence> ready;
+             {
+                 std::lock_guard<std::mutex> lock(m_mutex);
+                 ++m_completed;
++                while (!m_fences.empty() &&
++                       m_fences.front().first <= m_completed) {
++                    ready.splice(ready.end(), m_fences, m_fences.begin());
++                }
+             }
+             m_drained.notify_all();
++            for (auto &fence : ready) fence.second();
+         }
+     }
+ 
+@@ -140,6 +149,19 @@ public:
+         if (notify_failure) m_fail();
+         return !notify_failure;
+     }
++    /** Capture the current submitted cutoff without consuming a FIFO task
++     * reservation or waiting for queue capacity. Completion is outside locks.
++     */
++    void CallAfter(std::function<void()> callback) {
++        {
++            std::lock_guard<std::mutex> lock(m_mutex);
++            if (m_completed < m_submitted) {
++                m_fences.emplace_back(m_submitted, std::move(callback));
++                return;
++            }
++        }
++        callback();
++    }
+     void Sync() {
+         if (std::this_thread::get_id() == m_worker_id) return;
+         std::unique_lock<std::mutex> lock(m_mutex);
+diff --git a/src/util/completion_signal.h b/src/util/completion_signal.h
+new file mode 100644
+index 0000000000..852d7072b1
+--- /dev/null
++++ b/src/util/completion_signal.h
+@@ -0,0 +1,57 @@
++// Copyright (c) 2026 The Lotus developers
++// Distributed under the MIT software license, see the accompanying
++// file COPYING or http://www.opensource.org/licenses/mit-license.php.
++#ifndef BITCOIN_UTIL_COMPLETION_SIGNAL_H
++#define BITCOIN_UTIL_COMPLETION_SIGNAL_H
++#include <cassert>
++#include <atomic>
++#include <condition_variable>
++#include <functional>
++#include <mutex>
++#include <utility>
++
++namespace util {
++/** Owned one-shot notification, with synchronous and callback-based waits.
++ * The callback is always invoked outside the state mutex. Its ownership is
++ * independent of the submitting RPC, including retained-then-throwing queues.
++ */
++class CompletionSignal {
++    std::mutex m_mutex;
++    std::condition_variable m_ready;
++    std::atomic<bool> m_complete{false};
++    bool m_attached{false};
++    std::function<void()> m_callback;
++public:
++    void Complete() {
++        std::function<void()> callback;
++        {
++            std::lock_guard lock(m_mutex);
++            assert(!m_complete);
++            m_complete.store(true, std::memory_order_release);
++            callback = std::move(m_callback);
++        }
++        m_ready.notify_all();
++        if (callback) callback();
++    }
++    void Then(std::function<void()> callback) {
++        {
++            std::lock_guard lock(m_mutex);
++            assert(!m_attached);
++            m_attached = true;
++            if (!m_complete) {
++                m_callback = std::move(callback);
++                return;
++            }
++        }
++        callback();
++    }
++    bool IsComplete() const noexcept {
++        return m_complete.load(std::memory_order_acquire);
++    }
++    void Wait() {
++        std::unique_lock lock(m_mutex);
++        m_ready.wait(lock, [this] { return m_complete.load(std::memory_order_acquire); });
++    }
++};
++} // namespace util
++#endif // BITCOIN_UTIL_COMPLETION_SIGNAL_H
+diff --git a/src/validationinterface.cpp b/src/validationinterface.cpp
+index 5f8097b7d2..2ffe2f91c8 100644
+--- a/src/validationinterface.cpp
++++ b/src/validationinterface.cpp
+@@ -89,6 +89,14 @@ public:
+         m_map.clear();
+     }
+ 
++    auto SnapshotCallbacks() {
++        std::vector<std::shared_ptr<CValidationInterface>> callbacks;
++        LOCK(m_mutex);
++        callbacks.reserve(m_list.size());
++        for (const auto &entry : m_list) callbacks.push_back(entry.callbacks);
++        return callbacks;
++    }
++
+     template <typename F>
+     void Iterate(F &&f) EXCLUSIVE_LOCKS_REQUIRED(!m_mutex) {
+         WAIT_LOCK(m_mutex, lock);
+@@ -122,6 +130,18 @@ void ValidationSignals::SyncSecondaryQueues() {
+     });
+ }
+ 
++std::vector<std::shared_ptr<CValidationInterface>>
++ValidationSignals::GetTransactionQueueSubscribers() {
++    AssertLockNotHeld(cs_main);
++    return m_internals->SnapshotCallbacks();
++}
++
++void ValidationSignals::CallAfterTransactionQueue(
++    CValidationInterface &subscriber, std::function<void()> callback) {
++    AssertLockNotHeld(cs_main);
++    subscriber.CallAfterTransactionQueue(std::move(callback));
++}
++
+ size_t ValidationSignals::CallbacksPending() {
+     return m_internals->m_task_runner->size();
+ }
+diff --git a/src/validationinterface.h b/src/validationinterface.h
+index 7e8a3ace92..a42a52071d 100644
+--- a/src/validationinterface.h
++++ b/src/validationinterface.h
+@@ -53,6 +53,14 @@ protected:
+     ~CValidationInterface() = default;
+     /** Wait for prior callbacks offloaded to a subscriber's secondary queue. */
+     virtual void SyncTransactionQueue() {}
++    /** Callback counterpart to SyncTransactionQueue. Built-in subscribers
++     * with private queues override this with a nonblocking cutoff fence.
++     * The fallback retains correctness for legacy synchronous subscribers.
++     */
++    virtual void CallAfterTransactionQueue(std::function<void()> callback) {
++        SyncTransactionQueue();
++        callback();
++    }
+     /**
+      * Notifies listeners when the block chain tip advances.
+      *
+@@ -251,6 +259,15 @@ public:
+      * that do not run on the scheduler thread.
+      */
+     void SyncSecondaryQueues() LOCKS_EXCLUDED(cs_main);
++    /** The async waiter retains these references in its coroutine frame until
++     * all fences complete. This prevents final subscriber destruction/join on
++     * its own private worker when unregistration races with an RPC.
++     */
++    std::vector<std::shared_ptr<CValidationInterface>>
++    GetTransactionQueueSubscribers() LOCKS_EXCLUDED(cs_main);
++    void CallAfterTransactionQueue(CValidationInterface &subscriber,
++                                   std::function<void()> callback)
++        LOCKS_EXCLUDED(cs_main);
+ 
+     void UpdatedBlockTip(const CBlockIndex *, const CBlockIndex *,
+                          bool fInitialDownload);
+-- 
+2.50.1 (Apple Git-155)
+
+
+From 6e70bcae21589835017400093b010d30521536b9 Mon Sep 17 00:00:00 2001
+From: Canonical patch progression <213740+schancel@users.noreply.github.com>
+Date: Fri, 23 Oct 2026 13:28:41 -0700
+Subject: [PATCH 2/2] fixup! rpc: isolate bounded commit owner without
+ unrelated relay capability reversals
+
+Keep the initiation callable owned on the initiating thread stack when an unstranded executor completes concurrently.
+---
+ src/util/async_completion.h | 6 +++++-
+ 1 file changed, 5 insertions(+), 1 deletion(-)
+
+diff --git a/src/util/async_completion.h b/src/util/async_completion.h
+index 036ed2954c..2a9ffd4f80 100644
+--- a/src/util/async_completion.h
++++ b/src/util/async_completion.h
+@@ -57,8 +57,12 @@ boost::asio::awaitable<T> AwaitCompletion(
+                         std::move(handler)(error, std::move(result));
+                     });
+             };
++            // An unstranded executor may resume on another thread before
++            // initiation returns. Move the starter off its coroutine frame
++            // before exposing completion, so its callable stays alive locally.
++            auto begin = std::move(start);
+             try {
+-                start(complete);
++                begin(complete);
+             } catch (...) {
+                 complete(std::current_exception(), Value{});
+             }
+-- 
+2.50.1 (Apple Git-155)
+
