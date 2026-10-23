@@ -1,0 +1,1750 @@
+diff --git a/src/lotus_v2/CMakeLists.txt b/src/lotus_v2/CMakeLists.txt
+index 215aff79cd832ff1c8febd2954f69e21c1663033..ff9f0ad7ea21fa007b80d13249baac65ae889ff1 100644
+--- a/src/lotus_v2/CMakeLists.txt
++++ b/src/lotus_v2/CMakeLists.txt
+@@ -19,7 +19,8 @@ if(NOT TARGET Boost::headers)
+     find_package(Boost 1.64 REQUIRED)
+ endif()
+ target_sources(lotus_v2_header PRIVATE
+-    output.cpp commitment.cpp sparse_state.cpp mempool_overlay.cpp)
++    output.cpp commitment.cpp sparse_state.cpp mempool_overlay.cpp
++    tx_merklix.cpp minhash.cpp)
+ target_sources(lotus_v2_header PRIVATE address.cpp)
+ target_link_libraries(lotus_v2_header PUBLIC lotus_v2_blake3)
+ target_link_libraries(lotus_v2_header PUBLIC Boost::headers)
+diff --git a/src/lotus_v2/mempool_overlay.cpp b/src/lotus_v2/mempool_overlay.cpp
+index be78bf3a9d407ff3a0b2ece5be15c84bdf94fe48..a3bcf64addbd7a983bd3847f2d42599f5a69adc3 100644
+--- a/src/lotus_v2/mempool_overlay.cpp
++++ b/src/lotus_v2/mempool_overlay.cpp
+@@ -2256,8 +2256,8 @@ void MempoolOverlayLayer::Reset(const Hash &parent_block_id,
+     parent_mtp_ = parent_mtp;
+     base_mon_state_ = base_mon_state;
+ 
+-    tx_arena_.Reset();
+-    tx_root_idx_ = TxOverlayArena::kNullIdx;
++    // Keeps the store: freed slots are reused by the next membership.
++    tx_tree_.Clear();
+     utxo_arena_.Reset(std::move(base_utxo_root));
+     utxo_arena_dirty_ = false;
+     sum_non_cb_effective_cost_ = 0;
+@@ -2312,7 +2312,8 @@ bool MempoolOverlayLayer::AddTransaction(
+     const std::vector<Coin> &created_coins,
+     int64_t fee_sats,
+     int64_t sigchecks,
+-    std::shared_ptr<const void> tx_ref) {
++    std::shared_ptr<const void> tx_ref,
++    uint32_t payload_bytes) {
+     if (active_txs_.find(tx_id) != active_txs_.end()) {
+         return false;
+     }
+@@ -2320,7 +2321,7 @@ bool MempoolOverlayLayer::AddTransaction(
+     const uint64_t eff_cost =
+         TransactionEffectiveCost(linear_cost, kDefaultMonetaryProfile);
+ 
+-    tx_root_idx_ = tx_arena_.InsertTxLeaf(tx_root_idx_, tx_id, tx_hash);
++    tx_tree_.Insert(tx_id, tx_hash, tx_ref, payload_bytes);
+     sum_non_cb_effective_cost_ += eff_cost;
+ 
+     for (const auto &op : spent_outpoints) {
+@@ -2339,6 +2340,7 @@ bool MempoolOverlayLayer::AddTransaction(
+     entry.effective_cost = eff_cost;
+     entry.fee_sats = fee_sats;
+     entry.sigchecks = sigchecks;
++    entry.payload_bytes = payload_bytes;
+     entry.spent_outpoints = spent_outpoints;
+     entry.created_coins = created_coins;
+     entry.tx_ref = std::move(tx_ref);
+@@ -2349,14 +2351,20 @@ bool MempoolOverlayLayer::AddTransaction(
+ 
+ size_t MempoolOverlayLayer::AddTransactionBatch(
+     std::span<OverlayTxEntry> entries) {
++    return AddTransactionBatch(entries, false);
++}
++
++size_t MempoolOverlayLayer::AddTransactionBatch(
++    std::span<OverlayTxEntry> entries, bool tree_already_contains) {
+     if (entries.empty()) {
+         return 0;
+     }
+-    if (entries.size() == 1) {
++    if (entries.size() == 1 && !tree_already_contains) {
+         auto &e = entries[0];
+         return AddTransaction(e.tx_id, e.tx_hash, e.linear_cost,
+                               e.spent_outpoints, e.created_coins, e.fee_sats,
+-                              e.sigchecks, std::move(e.tx_ref))
++                              e.sigchecks, std::move(e.tx_ref),
++                              e.payload_bytes)
+                    ? 1
+                    : 0;
+     }
+@@ -2364,18 +2372,20 @@ size_t MempoolOverlayLayer::AddTransactionBatch(
+     ReserveBucketsAmortized(created_coins_, entries.size() * 2);
+     ReserveBucketsAmortized(spent_outpoints_, entries.size() * 2);
+ 
+-    std::vector<std::pair<Hash, Hash>> tx_leaves;
+-    tx_leaves.reserve(entries.size());
+-
+     size_t added_count = 0;
+     for (auto &entry : entries) {
+         if (active_txs_.find(entry.tx_id) != active_txs_.end()) {
+             continue;
+         }
++        // Tree first: an allocation failure leaves the layer unchanged for
++        // this entry.
++        if (!tree_already_contains) {
++            tx_tree_.Insert(entry.tx_id, entry.tx_hash, entry.tx_ref,
++                            entry.payload_bytes);
++        }
+         entry.effective_cost =
+             TransactionEffectiveCost(entry.linear_cost, kDefaultMonetaryProfile);
+         sum_non_cb_effective_cost_ += entry.effective_cost;
+-        tx_leaves.emplace_back(entry.tx_id, entry.tx_hash);
+ 
+         for (const auto &op : entry.spent_outpoints) {
+             ++spent_outpoints_[op];
+@@ -2394,11 +2404,13 @@ size_t MempoolOverlayLayer::AddTransactionBatch(
+         return 0;
+     }
+ 
+-    if (tx_leaves.size() >= 16) {
+-        tx_root_idx_ = tx_arena_.InsertBatchParallel(tx_root_idx_, tx_leaves);
+-    } else {
+-        for (const auto &[tx_id, tx_hash] : tx_leaves) {
+-            tx_root_idx_ = tx_arena_.InsertTxLeaf(tx_root_idx_, tx_id, tx_hash);
++    if (tree_already_contains && tx_tree_.Count() != active_txs_.size()) {
++        // The adopted tree did not describe exactly these entries; rebuild it
++        // from the authoritative entry map rather than publish a wrong root.
++        tx_tree_.Clear();
++        for (const auto &[tx_id, entry] : active_txs_) {
++            tx_tree_.Insert(tx_id, entry.tx_hash, entry.tx_ref,
++                            entry.payload_bytes);
+         }
+     }
+ 
+@@ -2413,7 +2425,7 @@ bool MempoolOverlayLayer::RemoveTransaction(const Hash &tx_id) {
+     }
+ 
+     const OverlayTxEntry &entry = it->second;
+-    tx_root_idx_ = tx_arena_.EraseTxLeaf(tx_root_idx_, tx_id);
++    tx_tree_.Erase(tx_id);
+     assert(sum_non_cb_effective_cost_ >= entry.effective_cost);
+     sum_non_cb_effective_cost_ -= entry.effective_cost;
+ 
+@@ -2523,6 +2535,9 @@ void MerklixOverlayManager::ReanchorExistingTxs(
+             MempoolOverlayLayer reanchored(tip_block_id, base_utxo_root,
+                                            base_mon_state, next_height,
+                                            parent_mtp, old_layer.GetLayerId());
++            // Membership (TxId, TxHash) is unchanged by re-anchoring; share
++            // the frozen tree and its completed digests instead of rebuilding.
++            reanchored.AdoptTxTree(old_layer.GetTxTree());
+             std::vector<OverlayTxEntry> batch;
+             batch.reserve(old_layer.GetOrderedTxs().size());
+             for (auto [tx_id, entry] : old_layer.GetOrderedTxs()) {
+@@ -2534,15 +2549,17 @@ void MerklixOverlayManager::ReanchorExistingTxs(
+                 }
+                 batch.push_back(std::move(entry));
+             }
+-            reanchored.AddTransactionBatch(batch);
++            reanchored.AddTransactionBatch(batch, true);
+             frozen_epochs_.push_back(std::move(reanchored));
+         }
+     }
+ 
+     auto existing_txs = speculative_layer_.GetOrderedTxs();
++    txmerklix::Tree existing_tree = speculative_layer_.GetTxTree();
+     speculative_layer_.Reset(tip_block_id, std::move(base_utxo_root),
+                              base_mon_state, next_height, parent_mtp,
+                              next_epoch_id_);
++    speculative_layer_.AdoptTxTree(std::move(existing_tree));
+ 
+     std::vector<OverlayTxEntry> batch;
+     batch.reserve(existing_txs.size());
+@@ -2555,7 +2572,7 @@ void MerklixOverlayManager::ReanchorExistingTxs(
+         }
+         batch.push_back(std::move(entry));
+     }
+-    speculative_layer_.AddTransactionBatch(batch);
++    speculative_layer_.AddTransactionBatch(batch, true);
+ }
+ 
+ bool MerklixOverlayManager::AddTransaction(
+diff --git a/src/lotus_v2/mempool_overlay.h b/src/lotus_v2/mempool_overlay.h
+index 51263287aba4610dd6b5de0a5a523913ed42e908..d4fe90cc838dbadc2a984804ff7d55d683ad30b2 100644
+--- a/src/lotus_v2/mempool_overlay.h
++++ b/src/lotus_v2/mempool_overlay.h
+@@ -10,6 +10,7 @@
+ #include "monetary.h"
+ #include "output.h"
+ #include "sparse_state.h"
++#include "tx_merklix.h"
+ 
+ #include <array>
+ #include <cstddef>
+@@ -86,6 +87,11 @@ struct TxOverlayNode {
+ /**
+  * Persistent path-copying arena for Subtree A (non-coinbase transactions).
+  * Produces digests bit-for-bit identical to consensus TransactionRoot Subtree A.
++ *
++ * Legacy reference only: production overlay layers use txmerklix::Tree
++ * (slab-backed, path-compressed, reference-counted, reclaiming). This
++ * append-only arena never reclaims superseded path copies until Reset and is
++ * retained for equivalence tests and A/B microbenchmarks.
+  */
+ class TxOverlayArena {
+ public:
+@@ -252,6 +258,8 @@ struct OverlayTxEntry {
+     uint64_t effective_cost{0};
+     int64_t fee_sats{0};
+     int64_t sigchecks{0};
++    //! Conservative retained-body charge used by pinned reconciliation views.
++    uint32_t payload_bytes{0};
+     std::vector<Outpoint> spent_outpoints;
+     std::vector<Coin> created_coins;
+     std::shared_ptr<const void> tx_ref;
+@@ -262,7 +270,9 @@ struct OverlayTxEntry {
+  *   Layer 0 (Confirmed Chain Tip) -> Layer 1..k (Frozen Epoch Batches) -> Speculative Tip.
+  *
+  * Maintains:
+- *   - Subtree A (non-coinbase TxRoot SMT) via TxOverlayArena
++ *   - Subtree A (non-coinbase TxRoot Merklix) via txmerklix::Tree: lazy
++ *     digests, O(1) structural pins for advertised/hashed snapshots, and an
++ *     incrementally maintained bottom-k MinHash of the same membership
+  *   - UTXO State Root SMT via UtxoOverlayArena (with intra-overlay spend elision)
+  *   - Additive non-coinbase effective block cost for O(1) MonetaryState transition
+  *   - CTOR-sorted active transaction map for O(1) block template emission
+@@ -291,20 +301,35 @@ public:
+                         const std::vector<Coin> &created_coins,
+                         int64_t fee_sats = 0,
+                         int64_t sigchecks = 0,
+-                        std::shared_ptr<const void> tx_ref = nullptr);
++                        std::shared_ptr<const void> tx_ref = nullptr,
++                        uint32_t payload_bytes = 0);
+ 
+     /**
+-     * Coalesced 16-shard parallel batch transaction insertion into the overlay.
+-     * Elides intra-batch spent outputs before touching the UTXO SMT arena and
+-     * performs a single 16-shard InsertBatchParallel + BatchUpdateParallel.
++     * Coalesced batch transaction insertion into the overlay. Transaction
++     * tree inserts are sequential path-copy/in-place updates without hashing;
++     * the UTXO arena is rebuilt lazily as before.
+      */
+     size_t AddTransactionBatch(std::span<OverlayTxEntry> entries);
+ 
++    /**
++     * Re-anchoring support: adopt an existing transaction tree whose
++     * membership exactly equals the entries subsequently re-added with
++     * AddTransactionBatch(entries, tree_already_contains = true).
++     */
++    void AdoptTxTree(txmerklix::Tree tree) { tx_tree_ = std::move(tree); }
++    size_t AddTransactionBatch(std::span<OverlayTxEntry> entries,
++                               bool tree_already_contains);
++
+     bool RemoveTransaction(const Hash &tx_id);
+ 
+     bool Contains(const Hash &tx_id) const;
+ 
+-    Hash GetSubtreeARoot() const { return tx_arena_.SubtreeARoot(tx_root_idx_); }
++    /** Lazily completes only dirty digests; caller holds the writer lock. */
++    Hash GetSubtreeARoot() const { return tx_tree_.RootDigest(); }
++    /** O(1) immutable view of the current Subtree A membership + MinHash. */
++    std::shared_ptr<const txmerklix::Snapshot> PinTxTree() const {
++        return tx_tree_.Pin();
++    }
+     Hash GetUtxoRootDigest() const {
+         EnsureUtxoArenaUpdated();
+         return utxo_arena_.RootDigest();
+@@ -343,7 +368,7 @@ public:
+     std::vector<Outpoint> GetNetErasedOutpoints() const;
+     std::vector<Coin> GetNetInsertedCoins() const;
+ 
+-    const TxOverlayArena &GetTxArena() const noexcept { return tx_arena_; }
++    const txmerklix::Tree &GetTxTree() const noexcept { return tx_tree_; }
+     const UtxoOverlayArena &GetUtxoArena() const {
+         EnsureUtxoArenaUpdated();
+         return utxo_arena_;
+@@ -358,8 +383,7 @@ private:
+     uint64_t parent_mtp_{0};
+     MonetaryState base_mon_state_{};
+ 
+-    TxOverlayArena tx_arena_;
+-    uint32_t tx_root_idx_{TxOverlayArena::kNullIdx};
++    txmerklix::Tree tx_tree_;
+     mutable UtxoOverlayArena utxo_arena_;
+     mutable bool utxo_arena_dirty_{false};
+     uint64_t sum_non_cb_effective_cost_{0};
+diff --git a/src/lotus_v2/minhash.cpp b/src/lotus_v2/minhash.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..11ebf3fec2584878fac55909efa20446352d82f9
+--- /dev/null
++++ b/src/lotus_v2/minhash.cpp
+@@ -0,0 +1,115 @@
++// Copyright (c) 2026 The Lotus developers
++// Distributed under the MIT software license, see the accompanying
++// file COPYING or http://www.opensource.org/licenses/mit-license.php.
++
++#include "minhash.h"
++
++#include <crypto/siphash.h>
++
++#include <algorithm>
++#include <cmath>
++
++namespace lotus::v2::minhash {
++
++uint64_t Value(const Hash &tx_id, const Hash &tx_hash) noexcept {
++    return CSipHasher(KEY0, KEY1)
++        .Write(Span<const uint8_t>{tx_id.data(), tx_id.size()})
++        .Write(Span<const uint8_t>{tx_hash.data(), tx_hash.size()})
++        .Finalize();
++}
++
++std::vector<uint64_t> Reference(std::vector<uint64_t> all) {
++    std::sort(all.begin(), all.end());
++    if (all.size() > K) all.resize(K);
++    return all;
++}
++
++double EstimateJaccard(std::span<const uint64_t> a, std::span<const uint64_t> b) {
++    if (a.empty() && b.empty()) return 1.0;
++    if (a.empty() || b.empty()) return 0.0;
++    // Merge the two ascending sketches; the K smallest union values are the
++    // union sketch. A value counts as shared when both sketches contain it.
++    size_t i{0}, j{0}, taken{0}, shared{0};
++    while (taken < K && (i < a.size() || j < b.size())) {
++        if (j == b.size() || (i < a.size() && a[i] < b[j])) {
++            ++i;
++        } else if (i == a.size() || b[j] < a[i]) {
++            ++j;
++        } else {
++            ++shared;
++            ++i;
++            ++j;
++        }
++        ++taken;
++    }
++    return taken ? double(shared) / double(taken) : 1.0;
++}
++
++double EstimateOnlyInB(double jaccard, uint64_t size_a, uint64_t size_b) {
++    // |A n B| = J (|A| + |B|) / (1 + J).
++    const double inter = jaccard * (double(size_a) + double(size_b)) / (1.0 + jaccard);
++    return std::max(0.0, double(size_b) - inter);
++}
++
++void Maintainer::Insert(uint64_t value) {
++    if (m_capped && value > m_threshold) return;
++    m_buffer.insert(std::upper_bound(m_buffer.begin(), m_buffer.end(), value), value);
++    if (m_buffer.size() > CANDIDATES) Shrink();
++}
++
++void Maintainer::Shrink() {
++    // Drop every copy of the maximum so that "all members <= threshold" holds
++    // exactly. Refuse when that would leave fewer than K (pathological ties).
++    const uint64_t top = m_buffer.back();
++    const auto first_top = std::lower_bound(m_buffer.begin(), m_buffer.end(), top);
++    if (size_t(first_top - m_buffer.begin()) < K) return;
++    m_buffer.erase(first_top, m_buffer.end());
++    m_threshold = m_buffer.back();
++    m_capped = true;
++}
++
++void Maintainer::Erase(uint64_t value) {
++    if (m_capped && value > m_threshold) return;
++    const auto it = std::lower_bound(m_buffer.begin(), m_buffer.end(), value);
++    if (it == m_buffer.end() || *it != value) {
++        // Caller contract violation (erasing a non-member); recover exactly.
++        m_needs_rebuild = true;
++        return;
++    }
++    m_buffer.erase(it);
++    if (m_capped && m_buffer.size() < K) m_needs_rebuild = true;
++}
++
++void Maintainer::Clear() {
++    m_buffer.clear();
++    m_threshold = 0;
++    m_capped = false;
++    m_needs_rebuild = false;
++}
++
++void Maintainer::Rebuild(std::vector<uint64_t> all) {
++    m_needs_rebuild = false;
++    if (all.size() <= CANDIDATES) {
++        std::sort(all.begin(), all.end());
++        m_buffer = std::move(all);
++        m_capped = false;
++        m_threshold = 0;
++        return;
++    }
++    std::nth_element(all.begin(), all.begin() + (CANDIDATES - 1), all.end());
++    m_threshold = all[CANDIDATES - 1];
++    const auto end = std::partition(all.begin(), all.end(),
++                                    [t = m_threshold](uint64_t v) { return v <= t; });
++    all.erase(end, all.end());
++    std::sort(all.begin(), all.end());
++    m_buffer = std::move(all);
++    m_buffer.shrink_to_fit();
++    m_capped = true;
++}
++
++std::vector<uint64_t> Maintainer::Export() const {
++    const size_t n = std::min(K, m_buffer.size());
++    return {m_buffer.begin(), m_buffer.begin() + n};
++}
++
++} // namespace lotus::v2::minhash
+diff --git a/src/lotus_v2/minhash.h b/src/lotus_v2/minhash.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..34fe0660c68f89fd056e9179c582106dc54c168f
+--- /dev/null
++++ b/src/lotus_v2/minhash.h
+@@ -0,0 +1,80 @@
++// Copyright (c) 2026 The Lotus developers
++// Distributed under the MIT software license, see the accompanying
++// file COPYING or http://www.opensource.org/licenses/mit-license.php.
++
++#ifndef LOTUS_V2_MINHASH_H
++#define LOTUS_V2_MINHASH_H
++
++#include "commitment.h"
++
++#include <cstddef>
++#include <cstdint>
++#include <span>
++#include <vector>
++
++namespace lotus::v2::minhash {
++
++/**
++ * Bottom-k MinHash over transaction identity pairs (TxId, TxHash).
++ *
++ * Set semantics: one element per Merklix leaf. Re-inserting an identical
++ * pair is not a membership change; replacing a TxId's TxHash removes the old
++ * element and inserts the new one. Element value: SipHash-2-4 with the fixed
++ * protocol key below over TxId || TxHash. Values are deterministic and
++ * comparable across nodes; they are NOT secret, so transaction creators can
++ * grind low values. The sketch is a fetching/similarity hint only and never
++ * authenticates membership or decides validity.
++ */
++inline constexpr size_t K = 64;
++//! Candidate buffer capacity: all members with value <= threshold are kept.
++inline constexpr size_t CANDIDATES = 4 * K;
++inline constexpr uint64_t KEY0 = 0x6c6f7475732d6d68ULL; // "lotus-mh"
++inline constexpr uint64_t KEY1 = 0x2d74786964763031ULL; // "-txidv01"
++
++uint64_t Value(const Hash &tx_id, const Hash &tx_hash) noexcept;
++
++/** Reference: K smallest values of a multiset, ascending. */
++std::vector<uint64_t> Reference(std::vector<uint64_t> all);
++
++/**
++ * Jaccard estimate from two bottom-k sketches (ascending, <= K values each).
++ * Uses the K smallest values of the union; returns 1 for two empty sets.
++ */
++double EstimateJaccard(std::span<const uint64_t> a, std::span<const uint64_t> b);
++/** Estimated |B \ A| from J and the exact set sizes. Never negative. */
++double EstimateOnlyInB(double jaccard, uint64_t size_a, uint64_t size_b);
++
++/**
++ * Incrementally maintained bottom-k sketch with deletion support.
++ *
++ * Invariant: when capped, buffer == every member value <= threshold (with
++ * multiplicity), and |buffer| >= K unless a rebuild is pending. When not
++ * capped, buffer == every member value. Insertion is O(CANDIDATES) worst case
++ * (sorted small vector). Deletion of a sampled value is O(CANDIDATES); if the
++ * capped buffer falls below K, the next minima cannot be recovered locally and
++ * NeedsRebuild() becomes true. The owner then supplies all member values
++ * (O(n)); at least CANDIDATES-K+1 sampled deletions separate two rebuilds.
++ */
++class Maintainer {
++public:
++    void Insert(uint64_t value);
++    void Erase(uint64_t value);
++    void Clear();
++    bool NeedsRebuild() const noexcept { return m_needs_rebuild; }
++    void Rebuild(std::vector<uint64_t> all_values);
++    /** The current bottom-k (ascending). Requires !NeedsRebuild(). */
++    std::vector<uint64_t> Export() const;
++    size_t BufferSize() const noexcept { return m_buffer.size(); }
++    bool Capped() const noexcept { return m_capped; }
++
++private:
++    void Shrink();
++    std::vector<uint64_t> m_buffer; // ascending, with multiplicity
++    uint64_t m_threshold{0};
++    bool m_capped{false};
++    bool m_needs_rebuild{false};
++};
++
++} // namespace lotus::v2::minhash
++
++#endif // LOTUS_V2_MINHASH_H
+diff --git a/src/lotus_v2/tx_merklix.cpp b/src/lotus_v2/tx_merklix.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..884ba43113c2f1870e3858553f50f85f22c6b75b
+--- /dev/null
++++ b/src/lotus_v2/tx_merklix.cpp
+@@ -0,0 +1,838 @@
++// Copyright (c) 2026 The Lotus developers
++// Distributed under the MIT software license, see the accompanying
++// file COPYING or http://www.opensource.org/licenses/mit-license.php.
++
++#include "tx_merklix.h"
++
++#include "tagged_hash.h"
++
++#include <algorithm>
++#include <cassert>
++#include <future>
++#include <limits>
++#include <new>
++#include <stdexcept>
++#include <system_error>
++#include <thread>
++
++namespace lotus::v2::txmerklix {
++
++namespace {
++constexpr uint32_t kGeomChunks = 11;
++constexpr uint32_t kGeomSlots = 64u * ((1u << kGeomChunks) - 1u); // 131008
++constexpr uint32_t kLinearChunk = 1u << 16;
++//! Explicit DFS bound for releases: <= 257 branch levels, one pending sibling each.
++constexpr size_t kReleaseStack = 2 * 260;
++constexpr size_t kFreeBatch = 1024;
++//! Parallel completion only pays for itself on large dirty trees.
++constexpr uint32_t kParallelCompleteMin = 4096;
++
++unsigned FirstDiff(const Hash &a, const Hash &b, unsigned from, unsigned to) noexcept {
++    unsigned bit = from;
++    while (bit < to) {
++        if ((bit & 7) == 0 && bit + 8 <= to) {
++            const uint8_t x = a[bit >> 3] ^ b[bit >> 3];
++            if (x == 0) {
++                bit += 8;
++                continue;
++            }
++            return bit + unsigned(__builtin_ctz(x));
++        }
++        if (KeyBit(a, bit) != KeyBit(b, bit)) return bit;
++        ++bit;
++    }
++    return to;
++}
++
++template <typename Node>
++bool Publish(const Node &node, const Hash &digest) noexcept {
++    uint8_t expected = kDirty;
++    if (node.hash_state.compare_exchange_strong(expected, kBusy,
++                                                std::memory_order_acquire,
++                                                std::memory_order_relaxed)) {
++        node.digest = digest;
++        node.hash_state.store(kClean, std::memory_order_release);
++        return true;
++    }
++    Stats().hash_cas_losses.fetch_add(1, std::memory_order_relaxed);
++    return false;
++}
++} // namespace
++
++GlobalStats &Stats() noexcept {
++    static GlobalStats stats;
++    return stats;
++}
++
++Hash EmptyDigest() {
++    static const Hash digest =
++        TaggedHash(HashDomain::TxRoot, std::array<uint8_t, 1>{0x02});
++    return digest;
++}
++
++Hash LeafDigest(const Hash &tx_id, const Hash &tx_hash) {
++    std::array<uint8_t, 65> buf{};
++    buf[0] = 0x00;
++    std::copy(tx_id.begin(), tx_id.end(), buf.begin() + 1);
++    std::copy(tx_hash.begin(), tx_hash.end(), buf.begin() + 33);
++    return TaggedHash(HashDomain::TxRoot, buf);
++}
++
++Hash BranchDigest(unsigned depth, const Hash &left, const Hash &right) {
++    std::array<uint8_t, 67> buf{};
++    buf[0] = 0x01;
++    buf[1] = static_cast<uint8_t>(depth & 0xff);
++    buf[2] = static_cast<uint8_t>((depth >> 8) & 0xff);
++    std::copy(left.begin(), left.end(), buf.begin() + 3);
++    std::copy(right.begin(), right.end(), buf.begin() + 35);
++    return TaggedHash(HashDomain::TxRoot, buf);
++}
++
++// ===========================================================================
++// Slab
++// ===========================================================================
++
++template <typename T> Slab<T>::Slab() : m_chunks(new std::atomic<T *>[kChunks]) {
++    for (uint32_t i = 0; i < kChunks; ++i) {
++        m_chunks[i].store(nullptr, std::memory_order_relaxed);
++    }
++}
++
++template <typename T> Slab<T>::~Slab() {
++    for (uint32_t slot = 0; slot < m_constructed; ++slot) At(slot).~T();
++    for (uint32_t i = 0; i < kChunks; ++i) {
++        if (T *chunk = m_chunks[i].load(std::memory_order_relaxed)) {
++            ::operator delete(chunk, std::align_val_t{alignof(T)});
++        }
++    }
++}
++
++template <typename T>
++typename Slab<T>::Location Slab<T>::Locate(uint32_t slot) noexcept {
++    if (slot < kGeomSlots) {
++        const uint32_t t = slot / 64 + 1;
++        const uint32_t k = 31u - uint32_t(__builtin_clz(t));
++        return {k, slot - 64u * ((1u << k) - 1u)};
++    }
++    const uint32_t r = slot - kGeomSlots;
++    return {kGeomChunks + r / kLinearChunk, r % kLinearChunk};
++}
++
++template <typename T> uint32_t Slab<T>::ChunkSize(uint32_t chunk) noexcept {
++    return chunk < kGeomChunks ? (64u << chunk) : kLinearChunk;
++}
++
++template <typename T> T &Slab<T>::At(uint32_t slot) const noexcept {
++    const Location loc = Locate(slot);
++    T *chunk = m_chunks[loc.chunk].load(std::memory_order_acquire);
++    return chunk[loc.offset];
++}
++
++template <typename T> uint32_t Slab<T>::Allocate(bool &reused) {
++    if (!m_free.empty()) {
++        const uint32_t slot = m_free.back();
++        m_free.pop_back();
++        reused = true;
++        return slot;
++    }
++    reused = false;
++    if (m_constructed >= kMaxSlots) throw std::length_error("txmerklix slab full");
++    const Location loc = Locate(m_constructed);
++    T *chunk = m_chunks[loc.chunk].load(std::memory_order_relaxed);
++    if (!chunk) {
++        chunk = static_cast<T *>(::operator new(sizeof(T) * ChunkSize(loc.chunk),
++                                                std::align_val_t{alignof(T)}));
++        m_chunks[loc.chunk].store(chunk, std::memory_order_release);
++    }
++    // The free list's capacity always covers every constructed slot, so the
++    // non-throwing Free() path never allocates. Grow geometrically.
++    if (m_free.capacity() < size_t(m_constructed) + 1) {
++        m_free.reserve(std::max<size_t>(64, m_free.capacity() * 2));
++    }
++    new (&chunk[loc.offset]) T();
++    return m_constructed++;
++}
++
++template <typename T> void Slab<T>::Free(uint32_t slot) {
++    m_free.push_back(slot);
++}
++
++template <typename T> void Slab<T>::ReleaseChunksIfUnused() {
++    for (uint32_t slot = 0; slot < m_constructed; ++slot) At(slot).~T();
++    for (uint32_t i = 0; i < kChunks; ++i) {
++        if (T *chunk = m_chunks[i].load(std::memory_order_relaxed)) {
++            ::operator delete(chunk, std::align_val_t{alignof(T)});
++            m_chunks[i].store(nullptr, std::memory_order_relaxed);
++        }
++    }
++    m_constructed = 0;
++    m_free.clear();
++    m_free.shrink_to_fit();
++}
++
++template class Slab<Branch>;
++template class Slab<Leaf>;
++
++// ===========================================================================
++// Store
++// ===========================================================================
++
++std::shared_ptr<Store> Store::Create() {
++    return std::shared_ptr<Store>(new Store());
++}
++
++Store::Store() {
++    // Branch slot 0 is the null handle and is never handed out.
++    bool reused{false};
++    (void)m_branches.Allocate(reused);
++    Stats().stores.fetch_add(1, std::memory_order_relaxed);
++    Stats().retained_branch_slots.fetch_add(1, std::memory_order_relaxed);
++}
++
++Store::~Store() {
++    auto &s = Stats();
++    s.stores.fetch_sub(1, std::memory_order_relaxed);
++    s.retained_branch_slots.fetch_sub(int64_t(m_branches.Constructed()),
++                                      std::memory_order_relaxed);
++    s.retained_leaf_slots.fetch_sub(int64_t(m_leaves.Constructed()),
++                                    std::memory_order_relaxed);
++}
++
++NodeId Store::NewLeaf(const Hash &id, const Hash &hash, uint64_t minhash,
++                      std::shared_ptr<const void> payload, uint32_t payload_bytes) {
++    bool reused{false};
++    uint32_t slot;
++    {
++        std::lock_guard<std::mutex> lock(m_alloc_mutex);
++        if (m_next_generation == std::numeric_limits<uint64_t>::max())
++            throw std::length_error("txmerklix generation exhausted");
++        slot = m_leaves.Allocate(reused);
++        m_leaves.At(slot).generation.store(m_next_generation++, std::memory_order_release);
++    }
++    auto &s = Stats();
++    s.leaf_allocs.fetch_add(1, std::memory_order_relaxed);
++    s.live_leaves.fetch_add(1, std::memory_order_relaxed);
++    if (reused) s.slot_reuses.fetch_add(1, std::memory_order_relaxed);
++    else s.retained_leaf_slots.fetch_add(1, std::memory_order_relaxed);
++    Leaf &leaf = m_leaves.At(slot);
++    leaf.key = id;
++    leaf.tx_hash = hash;
++    leaf.minhash = minhash;
++    leaf.payload = std::move(payload);
++    leaf.payload_bytes = payload_bytes;
++    leaf.hash_state.store(kDirty, std::memory_order_relaxed);
++    leaf.refs.store(1, std::memory_order_release);
++    return kLeafBit | slot;
++}
++
++NodeId Store::NewBranch(const Branch &shape) {
++    bool reused{false};
++    uint32_t slot;
++    {
++        std::lock_guard<std::mutex> lock(m_alloc_mutex);
++        if (m_next_generation == std::numeric_limits<uint64_t>::max())
++            throw std::length_error("txmerklix generation exhausted");
++        slot = m_branches.Allocate(reused);
++        m_branches.At(slot).generation.store(m_next_generation++, std::memory_order_release);
++    }
++    auto &s = Stats();
++    s.branch_allocs.fetch_add(1, std::memory_order_relaxed);
++    s.live_branches.fetch_add(1, std::memory_order_relaxed);
++    if (reused) s.slot_reuses.fetch_add(1, std::memory_order_relaxed);
++    else s.retained_branch_slots.fetch_add(1, std::memory_order_relaxed);
++    Branch &b = m_branches.At(slot);
++    b.child = shape.child;
++    b.count = shape.count;
++    b.split = shape.split;
++    b.key = shape.key;
++    b.hash_state.store(kDirty, std::memory_order_relaxed);
++    b.refs.store(1, std::memory_order_release);
++    return slot;
++}
++
++uint32_t Store::Refs(NodeId n) const noexcept {
++    if (n == kNull) return 0;
++    return IsLeaf(n) ? L(n).refs.load(std::memory_order_acquire)
++                     : B(n).refs.load(std::memory_order_acquire);
++}
++
++void Store::Retain(NodeId n) const noexcept {
++    if (n == kNull) return;
++    if (IsLeaf(n)) m_leaves.At(n & ~kLeafBit).refs.fetch_add(1, std::memory_order_relaxed);
++    else m_branches.At(n).refs.fetch_add(1, std::memory_order_relaxed);
++}
++
++void Store::FreeBatch(const NodeId *dead, size_t count) const noexcept {
++    if (count == 0) return;
++    size_t leaves{0};
++    {
++        std::lock_guard<std::mutex> lock(m_alloc_mutex);
++        for (size_t i = 0; i < count; ++i) {
++            const NodeId n = dead[i];
++            if (IsLeaf(n)) {
++                m_leaves.Free(n & ~kLeafBit);
++                ++leaves;
++            } else {
++                m_branches.Free(n);
++            }
++        }
++    }
++    auto &s = Stats();
++    s.frees.fetch_add(count, std::memory_order_relaxed);
++    s.live_leaves.fetch_sub(int64_t(leaves), std::memory_order_relaxed);
++    s.live_branches.fetch_sub(int64_t(count - leaves), std::memory_order_relaxed);
++}
++
++void Store::Release(NodeId n) const noexcept {
++    if (n == kNull) return;
++    // Fast path: most releases only drop a shared reference.
++    if (IsLeaf(n) ? m_leaves.At(n & ~kLeafBit).refs.fetch_sub(1, std::memory_order_acq_rel) != 1
++                  : m_branches.At(n).refs.fetch_sub(1, std::memory_order_acq_rel) != 1) {
++        return;
++    }
++    // n is dead and exclusively ours. Walk its exclusively owned descendants
++    // with a bounded explicit stack; freed handles are returned in batches to
++    // bound allocation-mutex hold times. No heap allocation on this path.
++    std::array<NodeId, kReleaseStack> stack;
++    std::array<NodeId, kFreeBatch> dead;
++    size_t top{0}, ndead{0};
++    auto bury = [&](NodeId x) {
++        if (IsLeaf(x)) {
++            m_leaves.At(x & ~kLeafBit).payload.reset();
++        } else {
++            Branch &b = m_branches.At(x);
++            assert(top + 2 <= kReleaseStack);
++            if (b.child[1] != kNull) stack[top++] = b.child[1];
++            if (b.child[0] != kNull) stack[top++] = b.child[0];
++            b.child = {kNull, kNull};
++        }
++        if (ndead == dead.size()) {
++            FreeBatch(dead.data(), ndead);
++            ndead = 0;
++        }
++        dead[ndead++] = x;
++    };
++    bury(n);
++    while (top) {
++        const NodeId x = stack[--top];
++        const bool last = IsLeaf(x)
++            ? m_leaves.At(x & ~kLeafBit).refs.fetch_sub(1, std::memory_order_acq_rel) == 1
++            : m_branches.At(x).refs.fetch_sub(1, std::memory_order_acq_rel) == 1;
++        if (last) bury(x);
++    }
++    FreeBatch(dead.data(), ndead);
++}
++
++Store::WeakRef Store::Weak(NodeId n) const noexcept {
++    if (n == kNull) return {};
++    const uint64_t gen = IsLeaf(n) ? L(n).generation.load(std::memory_order_acquire)
++                                   : B(n).generation.load(std::memory_order_acquire);
++    return {n, gen};
++}
++
++NodeId Store::TryRetain(const WeakRef &weak) const noexcept {
++    if (weak.node == kNull) return kNull;
++    // The family writer lock excludes mutation while a weak owner is added;
++    // allocation lock also excludes slot reuse and slab trimming during lookup.
++    std::lock_guard<std::mutex> lock(m_alloc_mutex);
++    const uint32_t slot = weak.node & ~kLeafBit;
++    if (IsLeaf(weak.node) ? slot >= m_leaves.Constructed()
++                          : (slot == 0 || slot >= m_branches.Constructed())) {
++        return kNull;
++    }
++    auto attempt = [&](auto &node) -> NodeId {
++        if (node.generation.load(std::memory_order_acquire) != weak.generation) return kNull;
++        uint32_t refs = node.refs.load(std::memory_order_relaxed);
++        do {
++            if (refs == 0) return kNull;
++        } while (!node.refs.compare_exchange_weak(refs, refs + 1,
++                                                  std::memory_order_acquire,
++                                                  std::memory_order_relaxed));
++        return weak.node;
++    };
++    if (IsLeaf(weak.node)) return attempt(m_leaves.At(slot));
++    return attempt(m_branches.At(slot));
++}
++
++size_t Store::LiveLeaves() const noexcept {
++    std::lock_guard<std::mutex> lock(m_alloc_mutex);
++    return m_leaves.Constructed() - m_leaves.FreeSlots();
++}
++
++size_t Store::LiveBranches() const noexcept {
++    std::lock_guard<std::mutex> lock(m_alloc_mutex);
++    return m_branches.Constructed() - 1 - m_branches.FreeSlots();
++}
++
++size_t Store::RetainedBytes() const noexcept {
++    std::lock_guard<std::mutex> lock(m_alloc_mutex);
++    return m_leaves.Constructed() * sizeof(Leaf) +
++           m_branches.Constructed() * sizeof(Branch);
++}
++
++bool Store::TrimIfUnused() noexcept {
++    std::lock_guard<std::mutex> lock(m_alloc_mutex);
++    if (m_leaves.Constructed() != m_leaves.FreeSlots() ||
++        m_branches.Constructed() != m_branches.FreeSlots() + 1) {
++        return false;
++    }
++    auto &s = Stats();
++    s.retained_leaf_slots.fetch_sub(int64_t(m_leaves.Constructed()), std::memory_order_relaxed);
++    s.retained_branch_slots.fetch_sub(int64_t(m_branches.Constructed()) - 1,
++                                      std::memory_order_relaxed);
++    m_leaves.ReleaseChunksIfUnused();
++    m_branches.ReleaseChunksIfUnused();
++    bool reused{false};
++    try {
++        (void)m_branches.Allocate(reused); // re-reserve the null handle
++    } catch (...) {
++        // Unreachable: the first chunk is 64 slots of a fresh slab.
++        std::terminate();
++    }
++    return true;
++}
++
++Hash Store::NodeDigestCounted(NodeId n, uint64_t &hashes) const {
++    if (IsLeaf(n)) {
++        const Leaf &leaf = L(n);
++        if (leaf.hash_state.load(std::memory_order_acquire) == kClean) return leaf.digest;
++        const Hash h = LeafDigest(leaf.key, leaf.tx_hash);
++        ++hashes;
++        Publish(leaf, h);
++        return h;
++    }
++    const Branch &b = B(n);
++    if (b.hash_state.load(std::memory_order_acquire) == kClean) return b.digest;
++    const unsigned below = unsigned(b.split) + 1;
++    const Hash left = DigestAtCounted(b.child[0], below, hashes);
++    const Hash right = DigestAtCounted(b.child[1], below, hashes);
++    const Hash h = BranchDigest(b.split, left, right);
++    ++hashes;
++    Publish(b, h);
++    return h;
++}
++
++Hash Store::DigestAtCounted(NodeId n, unsigned depth, uint64_t &hashes) const {
++    if (n == kNull) return EmptyDigest();
++    Hash x = NodeDigestCounted(n, hashes);
++    if (IsLeaf(n)) return x;
++    const Branch &b = B(n);
++    for (unsigned d = b.split; d-- > depth;) {
++        x = KeyBit(b.key, d) ? BranchDigest(d, EmptyDigest(), x)
++                             : BranchDigest(d, x, EmptyDigest());
++        ++hashes;
++    }
++    return x;
++}
++
++Hash Store::NodeDigest(NodeId n) const {
++    uint64_t hashes{0};
++    const Hash h = NodeDigestCounted(n, hashes);
++    if (hashes) Stats().node_hashes.fetch_add(hashes, std::memory_order_relaxed);
++    return h;
++}
++
++Hash Store::DigestAt(NodeId n, unsigned depth) const {
++    uint64_t hashes{0};
++    const Hash h = DigestAtCounted(n, depth, hashes);
++    if (hashes) Stats().node_hashes.fetch_add(hashes, std::memory_order_relaxed);
++    return h;
++}
++
++void Store::Complete(NodeId n) const {
++    if (n == kNull || IsLeaf(n)) return;
++    const Branch &root = B(n);
++    if (root.hash_state.load(std::memory_order_acquire) == kClean ||
++        root.count < kParallelCompleteMin) {
++        return;
++    }
++    // Frontier: dirty subtrees whose split is at least 4 bits deep (<= 16).
++    std::vector<NodeId> frontier;
++    std::vector<NodeId> pending{n};
++    while (!pending.empty()) {
++        const NodeId x = pending.back();
++        pending.pop_back();
++        if (x == kNull || IsLeaf(x)) continue;
++        const Branch &b = B(x);
++        if (b.hash_state.load(std::memory_order_acquire) == kClean) continue;
++        if (b.split >= 4) {
++            frontier.push_back(x);
++        } else {
++            pending.push_back(b.child[0]);
++            pending.push_back(b.child[1]);
++        }
++    }
++    if (frontier.size() < 2) return;
++    Stats().parallel_completions.fetch_add(1, std::memory_order_relaxed);
++    std::vector<std::future<void>> tasks;
++    tasks.reserve(frontier.size() - 1);
++    try {
++        for (size_t i = 1; i < frontier.size(); ++i) {
++            tasks.push_back(std::async(std::launch::async, [this, x = frontier[i]] {
++                (void)NodeDigest(x);
++            }));
++        }
++    } catch (const std::system_error &) {
++        // Thread exhaustion: whatever was not started is hashed serially by
++        // the caller's ordinary traversal.
++    }
++    (void)NodeDigest(frontier[0]);
++    for (auto &task : tasks) task.get();
++}
++
++// ===========================================================================
++// Tree
++// ===========================================================================
++
++Tree::Tree(std::shared_ptr<Store> store)
++    : m_store(store ? std::move(store) : Store::Create()) {}
++
++Tree::Tree(const Tree &other)
++    : m_store(other.m_store), m_root(other.m_root), m_version(other.m_version),
++      m_payload_bytes(other.m_payload_bytes), m_sketch(other.m_sketch) {
++    m_store->Retain(m_root);
++}
++
++Tree &Tree::operator=(const Tree &other) {
++    if (this == &other) return *this;
++    other.m_store->Retain(other.m_root);
++    const auto old_store = m_store;
++    const NodeId old_root = m_root;
++    m_store = other.m_store;
++    m_root = other.m_root;
++    m_version = other.m_version;
++    m_payload_bytes = other.m_payload_bytes;
++    m_sketch = other.m_sketch;
++    old_store->Release(old_root);
++    return *this;
++}
++
++Tree::Tree(Tree &&other) noexcept
++    : m_store(other.m_store), m_root(other.m_root), m_version(other.m_version),
++      m_payload_bytes(other.m_payload_bytes), m_sketch(std::move(other.m_sketch)) {
++    other.m_root = kNull;
++    other.m_payload_bytes = 0;
++    other.m_sketch.Clear();
++}
++
++Tree &Tree::operator=(Tree &&other) noexcept {
++    if (this == &other) return *this;
++    const auto old_store = m_store;
++    const NodeId old_root = m_root;
++    m_store = other.m_store;
++    m_root = other.m_root;
++    m_version = other.m_version;
++    m_payload_bytes = other.m_payload_bytes;
++    m_sketch = std::move(other.m_sketch);
++    other.m_root = kNull;
++    other.m_payload_bytes = 0;
++    other.m_sketch.Clear();
++    old_store->Release(old_root);
++    return *this;
++}
++
++Tree::~Tree() { m_store->Release(m_root); }
++
++NodeId Tree::Touch(NodeId b) {
++    // A descendant changed in place, which implies this whole path is
++    // unique: refresh the derived count and invalidate the cached digest.
++    Branch &m = m_store->MutB(b);
++    assert(m.refs.load(std::memory_order_relaxed) == 1);
++    m.count = m_store->Count(m.child[0]) + m_store->Count(m.child[1]);
++    m.hash_state.store(kDirty, std::memory_order_relaxed);
++    Stats().inplace_updates.fetch_add(1, std::memory_order_relaxed);
++    return b;
++}
++
++NodeId Tree::ReplaceChild(NodeId b, bool unique, unsigned bit, NodeId new_child) {
++    if (unique) {
++        Branch &m = m_store->MutB(b);
++        const NodeId old = m.child[bit];
++        m.child[bit] = new_child;
++        m.count = m_store->Count(m.child[0]) + m_store->Count(m.child[1]);
++        m.hash_state.store(kDirty, std::memory_order_relaxed);
++        m_store->Release(old);
++        Stats().inplace_updates.fetch_add(1, std::memory_order_relaxed);
++        return b;
++    }
++    const Branch &src = m_store->B(b);
++    Branch shape;
++    shape.child = src.child;
++    shape.split = src.split;
++    shape.key = src.key;
++    shape.child[bit] = new_child;
++    shape.count = m_store->Count(shape.child[0]) + m_store->Count(shape.child[1]);
++    m_store->Retain(shape.child[bit ^ 1]);
++    Stats().path_copies.fetch_add(1, std::memory_order_relaxed);
++    try {
++        return m_store->NewBranch(shape);
++    } catch (...) {
++        m_store->Release(shape.child[bit ^ 1]);
++        m_store->Release(new_child); // recursive result ownership was transferred here
++        throw;
++    }
++}
++
++NodeId Tree::InsertAt(NodeId n, unsigned depth, bool unique, const Hash &id,
++                      const Hash &hash, uint64_t minhash,
++                      std::shared_ptr<const void> &payload,
++                      uint32_t payload_bytes, Change &change, Outgoing &old) {
++    if (n == kNull) {
++        change = Change::Inserted;
++        return m_store->NewLeaf(id, hash, minhash, std::move(payload), payload_bytes);
++    }
++    Branch shape;
++    if (Store::IsLeaf(n)) {
++        const Leaf &leaf = m_store->L(n);
++        if (leaf.key == id) {
++            if (leaf.tx_hash == hash) return n;
++            change = Change::Replaced;
++            old = {true, leaf.minhash, leaf.payload_bytes};
++            return m_store->NewLeaf(id, hash, minhash, std::move(payload), payload_bytes);
++        }
++        shape.split = uint16_t(FirstDiff(leaf.key, id, depth, 256));
++        shape.count = 2;
++    } else {
++        const Branch &b = m_store->B(n);
++        const unsigned split = FirstDiff(b.key, id, depth, b.split);
++        if (split == b.split) {
++            const unsigned bit = KeyBit(id, b.split);
++            const NodeId c = b.child[bit];
++            const NodeId r = InsertAt(c, unsigned(b.split) + 1, ChildUnique(unique, c),
++                                      id, hash, minhash, payload, payload_bytes,
++                                      change, old);
++            if (change == Change::Unchanged) return n;
++            if (r == c) return Touch(n);
++            return ReplaceChild(n, unique, bit, r);
++        }
++        shape.split = uint16_t(split);
++        shape.count = b.count + 1;
++    }
++    // The new key diverges from everything under n at shape.split: n keeps
++    // its contents and becomes one child of a new branch point.
++    shape.key = id;
++    const NodeId added =
++        m_store->NewLeaf(id, hash, minhash, std::move(payload), payload_bytes);
++    const bool added_right = KeyBit(id, shape.split);
++    shape.child = added_right ? std::array<NodeId, 2>{n, added}
++                              : std::array<NodeId, 2>{added, n};
++    m_store->Retain(n);
++    change = Change::Inserted;
++    try {
++        return m_store->NewBranch(shape);
++    } catch (...) {
++        m_store->Release(n);
++        m_store->Release(added);
++        throw;
++    }
++}
++
++Tree::Change Tree::Insert(const Hash &tx_id, const Hash &tx_hash,
++                          std::shared_ptr<const void> payload,
++                          uint32_t payload_bytes) {
++    const uint64_t value = minhash::Value(tx_id, tx_hash);
++    Change change{Change::Unchanged};
++    Outgoing old;
++    const NodeId r = InsertAt(m_root, 0, ChildUnique(true, m_root), tx_id, tx_hash,
++                              value, payload, payload_bytes, change, old);
++    if (r != m_root) {
++        const NodeId prev = m_root;
++        m_root = r;
++        m_store->Release(prev);
++    }
++    if (change == Change::Unchanged) return change;
++    ++m_version;
++    if (change == Change::Replaced) {
++        m_sketch.Erase(old.minhash);
++        m_payload_bytes -= old.payload_bytes;
++    }
++    m_sketch.Insert(value);
++    m_payload_bytes += payload_bytes;
++    return change;
++}
++
++NodeId Tree::EraseAt(NodeId n, unsigned depth, bool unique, const Hash &id,
++                     Outgoing &old) {
++    if (n == kNull) return n;
++    if (Store::IsLeaf(n)) {
++        const Leaf &leaf = m_store->L(n);
++        if (leaf.key != id) return n;
++        old = {true, leaf.minhash, leaf.payload_bytes};
++        return kNull;
++    }
++    const Branch &b = m_store->B(n);
++    if (FirstDiff(b.key, id, depth, b.split) != b.split) return n;
++    const unsigned bit = KeyBit(id, b.split);
++    const NodeId c = b.child[bit];
++    const NodeId r = EraseAt(c, unsigned(b.split) + 1, ChildUnique(unique, c), id, old);
++    if (!old.found) return n;
++    if (r == c) return Touch(n);
++    if (r == kNull) {
++        // The branch point disappears; the sibling moves up unchanged. Its
++        // digest at its own split stays valid (unary runs are recomputed).
++        const NodeId other = b.child[bit ^ 1];
++        m_store->Retain(other);
++        return other;
++    }
++    return ReplaceChild(n, unique, bit, r);
++}
++
++bool Tree::Erase(const Hash &tx_id) {
++    Outgoing old;
++    const NodeId r = EraseAt(m_root, 0, ChildUnique(true, m_root), tx_id, old);
++    if (!old.found) return false;
++    if (r != m_root) {
++        const NodeId prev = m_root;
++        m_root = r;
++        m_store->Release(prev);
++    }
++    ++m_version;
++    m_sketch.Erase(old.minhash);
++    m_payload_bytes -= old.payload_bytes;
++    return true;
++}
++
++void Tree::Clear() {
++    const NodeId prev = m_root;
++    m_root = kNull;
++    if (prev != kNull) ++m_version;
++    m_payload_bytes = 0;
++    m_sketch.Clear();
++    m_store->Release(prev);
++    // Sole owner of the store: no other tree or snapshot can hold a node, so
++    // a fully free store returns its slab chunks (bounded retained memory
++    // after a mempool spike). use_count()==1 cannot grow concurrently because
++    // copying requires access to this owner.
++    if (m_store.use_count() == 1) m_store->TrimIfUnused();
++}
++
++std::optional<Hash> Tree::FindHash(const Hash &tx_id) const {
++    NodeId n = m_root;
++    while (n != kNull && !Store::IsLeaf(n)) {
++        const Branch &b = m_store->B(n);
++        n = b.child[KeyBit(tx_id, b.split)];
++    }
++    if (n == kNull) return std::nullopt;
++    const Leaf &leaf = m_store->L(n);
++    if (leaf.key != tx_id) return std::nullopt;
++    return leaf.tx_hash;
++}
++
++Hash Tree::RootDigest() const {
++    m_store->Complete(m_root);
++    return m_store->DigestAt(m_root, 0);
++}
++
++void Tree::EnsureSketch() const {
++    if (!m_sketch.NeedsRebuild()) return;
++    std::vector<uint64_t> values;
++    values.reserve(Count());
++    ForEachLeaf([&](const Leaf &leaf) { values.push_back(leaf.minhash); });
++    auto &s = Stats();
++    s.sketch_rebuilds.fetch_add(1, std::memory_order_relaxed);
++    s.sketch_rebuild_members.fetch_add(values.size(), std::memory_order_relaxed);
++    m_sketch.Rebuild(std::move(values));
++}
++
++Sketch Tree::CurrentSketch() const {
++    EnsureSketch();
++    return Sketch{m_sketch.Export()};
++}
++
++std::shared_ptr<const Snapshot> Tree::Pin() const {
++    const bool rebuild_sketch = m_sketch.NeedsRebuild();
++    Sketch sketch = rebuild_sketch ? Sketch{} : Sketch{m_sketch.Export()};
++    m_store->Retain(m_root);
++    try {
++        auto out = std::make_shared<const Snapshot>(m_store, m_root, m_version,
++                                                    m_payload_bytes, std::move(sketch), rebuild_sketch);
++        Stats().pins.fetch_add(1, std::memory_order_relaxed);
++        return out;
++    } catch (...) {
++        m_store->Release(m_root);
++        throw;
++    }
++}
++
++// ===========================================================================
++// Snapshot
++// ===========================================================================
++
++Snapshot::Snapshot(std::shared_ptr<Store> store, NodeId root, uint64_t version,
++                   uint64_t payload_bytes, Sketch sketch, bool rebuild_sketch)
++    : m_store(std::move(store)), m_root(root), m_version(version),
++      m_payload_bytes(payload_bytes), m_sketch(std::move(sketch)),
++      m_rebuild_sketch(rebuild_sketch) {}
++
++Snapshot::~Snapshot() { m_store->Release(m_root); }
++
++const Sketch &Snapshot::GetSketch() const {
++    std::call_once(m_sketch_once, [this] {
++        if (!m_rebuild_sketch) return;
++        std::vector<uint64_t> values;
++        values.reserve(Count());
++        ForEachLeaf([&](const Leaf &leaf) { values.push_back(leaf.minhash); });
++        const size_t members = values.size();
++        minhash::Maintainer rebuilt;
++        rebuilt.Rebuild(std::move(values));
++        m_sketch.values = rebuilt.Export();
++        Stats().sketch_rebuilds.fetch_add(1, std::memory_order_relaxed);
++        Stats().sketch_rebuild_members.fetch_add(members, std::memory_order_relaxed);
++    });
++    return m_sketch;
++}
++
++Hash Snapshot::RootDigest() const {
++    m_store->Complete(m_root);
++    return m_store->DigestAt(m_root, 0);
++}
++
++NodeId Snapshot::Find(const Hash &prefix, unsigned depth) const {
++    NodeId n = m_root;
++    unsigned checked = 0;
++    while (n != kNull) {
++        if (Store::IsLeaf(n)) {
++            return FirstDiff(m_store->L(n).key, prefix, checked, depth) == depth ? n : kNull;
++        }
++        const Branch &b = m_store->B(n);
++        const unsigned limit = std::min<unsigned>(depth, b.split);
++        if (FirstDiff(b.key, prefix, checked, limit) != limit) return kNull;
++        if (depth <= b.split) return n;
++        n = b.child[KeyBit(prefix, b.split)];
++        checked = unsigned(b.split) + 1;
++    }
++    return kNull;
++}
++
++Snapshot::Descriptor Snapshot::At(const Hash &prefix, unsigned depth) const {
++    const NodeId n = Find(prefix, depth);
++    if (n == kNull) return {0, EmptyDigest()};
++    return {m_store->Count(n), m_store->DigestAt(n, depth)};
++}
++
++std::optional<std::vector<const Leaf *>> Snapshot::Leaves(const Hash &prefix,
++                                                          unsigned depth,
++                                                          size_t max_leaves) const {
++    std::vector<const Leaf *> out;
++    const NodeId n = Find(prefix, depth);
++    if (n == kNull) return out;
++    if (m_store->Count(n) > max_leaves) return std::nullopt;
++    out.reserve(m_store->Count(n));
++    auto collect = [&](const Leaf &leaf) { out.push_back(&leaf); };
++    detail::ForEachLeaf(*m_store, n, collect);
++    return out;
++}
++
++std::optional<Hash> Snapshot::FindHash(const Hash &tx_id) const {
++    NodeId n = m_root;
++    while (n != kNull && !Store::IsLeaf(n)) {
++        const Branch &b = m_store->B(n);
++        n = b.child[KeyBit(tx_id, b.split)];
++    }
++    if (n == kNull) return std::nullopt;
++    const Leaf &leaf = m_store->L(n);
++    if (leaf.key != tx_id) return std::nullopt;
++    return leaf.tx_hash;
++}
++
++} // namespace lotus::v2::txmerklix
+diff --git a/src/lotus_v2/tx_merklix.h b/src/lotus_v2/tx_merklix.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..00ad913c36b6efa767e954c8dba33d8f6093a416
+--- /dev/null
++++ b/src/lotus_v2/tx_merklix.h
+@@ -0,0 +1,319 @@
++// Copyright (c) 2026 The Lotus developers
++// Distributed under the MIT software license, see the accompanying
++// file COPYING or http://www.opensource.org/licenses/mit-license.php.
++
++#ifndef LOTUS_V2_TX_MERKLIX_H
++#define LOTUS_V2_TX_MERKLIX_H
++
++#include "commitment.h"
++#include "minhash.h"
++
++#include <array>
++#include <atomic>
++#include <cstddef>
++#include <cstdint>
++#include <memory>
++#include <mutex>
++#include <optional>
++#include <vector>
++
++/**
++ * Slab-backed, path-compressed, persistent transaction Merklix tree.
++ *
++ * Specification: daemon/docs/slab-merklix-snapshots-spec.md (monorepo).
++ *
++ * The tree commits exactly to consensus Transaction Subtree A: keys are
++ * 256-bit TxIds routed LSB-first (bit d = (id[d/8] >> (d%8)) & 1), leaves are
++ * TaggedHash(TxRoot, 0x00 || TxId || TxHash), a branch at depth d is
++ * TaggedHash(TxRoot, 0x01 || u16le(d) || left || right), empty is
++ * TaggedHash(TxRoot, 0x02) and a single-member subtree collapses to its leaf.
++ * Only real branch points are stored; a unary run between a parent's split and
++ * a child's split is hashed on demand with empty siblings.
++ *
++ * Ownership model:
++ *  - Nodes live in per-family Store slabs addressed by 32-bit handles and are
++ *    reference counted. A parent owns one reference per child; a Tree or a
++ *    Snapshot owns one reference to its root.
++ *  - Trees are single-writer views. All Trees sharing one Store must be
++ *    mutated under one external writer lock (the mempool lock in production).
++ *    A node is mutated in place only when every node on the path from the
++ *    writer's root to it has refcount 1 ("path-unique"). Otherwise the path is
++ *    copied. No other thread can raise a refcount without that lock.
++ *  - Snapshots are immutable, thread-safe, and may be read, hashed and released
++ *    on any thread. Pinning a Tree is O(1) (one reference on the root) plus a
++ *    K-value MinHash copy and must happen under the writer lock. A pending
++ *    sketch refill is computed lazily from the immutable snapshot.
++ *  - Digests are derived caches with an atomic Dirty/Busy/Clean state. Readers
++ *    never need digests; hashing fills caches without changing logical contents.
++ *    Concurrent hashers race through compare-and-swap; a loser uses its own
++ *    computed value and never writes. Nothing here is claimed lock-free:
++ *    slab allocation and batched slot return take a short mutex.
++ */
++namespace lotus::v2::txmerklix {
++
++using NodeId = uint32_t;
++inline constexpr NodeId kNull = 0;
++inline constexpr NodeId kLeafBit = 0x80000000u;
++inline constexpr uint32_t kMaxSlots = uint32_t{1} << 26;
++
++inline bool KeyBit(const Hash &key, unsigned bit) noexcept {
++    return (key[bit >> 3] >> (bit & 7)) & 1;
++}
++Hash EmptyDigest();
++Hash LeafDigest(const Hash &tx_id, const Hash &tx_hash);
++Hash BranchDigest(unsigned depth, const Hash &left, const Hash &right);
++
++enum HashState : uint8_t { kDirty = 0, kBusy = 1, kClean = 2 };
++
++struct Branch {
++    std::atomic<uint32_t> refs{0};
++    std::atomic<uint64_t> generation{0};
++    std::array<NodeId, 2> child{kNull, kNull};
++    uint32_t count{0};
++    uint16_t split{0};
++    mutable std::atomic<uint8_t> hash_state{kDirty};
++    Hash key{};            // any member key; bits below split are the prefix
++    mutable Hash digest{}; // digest at split; valid only when Clean
++};
++
++struct Leaf {
++    std::atomic<uint32_t> refs{0};
++    std::atomic<uint64_t> generation{0};
++    mutable std::atomic<uint8_t> hash_state{kDirty};
++    uint32_t payload_bytes{0};
++    uint64_t minhash{0};
++    Hash key{};
++    Hash tx_hash{};
++    mutable Hash digest{};
++    std::shared_ptr<const void> payload;
++};
++
++/** Process-wide counters (relaxed). Exported to Prometheus by the node. */
++struct GlobalStats {
++    std::atomic<uint64_t> leaf_allocs{0}, branch_allocs{0}, slot_reuses{0};
++    std::atomic<uint64_t> path_copies{0}, inplace_updates{0}, frees{0};
++    std::atomic<uint64_t> node_hashes{0}, hash_cas_losses{0};
++    std::atomic<uint64_t> pins{0}, sketch_rebuilds{0}, sketch_rebuild_members{0};
++    std::atomic<uint64_t> parallel_completions{0};
++    std::atomic<int64_t> live_leaves{0}, live_branches{0};
++    std::atomic<int64_t> retained_leaf_slots{0}, retained_branch_slots{0};
++    std::atomic<int64_t> stores{0};
++};
++GlobalStats &Stats() noexcept;
++
++/** Fixed-size slot storage with stable addresses and generation counters. */
++template <typename T> class Slab {
++public:
++    Slab();
++    ~Slab();
++    Slab(const Slab &) = delete;
++    Slab &operator=(const Slab &) = delete;
++    T &At(uint32_t slot) const noexcept;
++    //! Caller holds the store allocation mutex.
++    uint32_t Allocate(bool &reused);
++    void Free(uint32_t slot);
++    size_t Constructed() const noexcept { return m_constructed; }
++    size_t FreeSlots() const noexcept { return m_free.size(); }
++    void ReleaseChunksIfUnused();
++
++private:
++    struct Location { uint32_t chunk, offset; };
++    static Location Locate(uint32_t slot) noexcept;
++    static uint32_t ChunkSize(uint32_t chunk) noexcept;
++    static constexpr uint32_t kChunks = 11 + ((kMaxSlots - 131008) >> 16) + 1;
++    std::unique_ptr<std::atomic<T *>[]> m_chunks;
++    uint32_t m_constructed{0};
++    std::vector<uint32_t> m_free;
++};
++
++class Snapshot;
++
++/** Node storage for a family of trees and their snapshots. */
++class Store : public std::enable_shared_from_this<Store> {
++public:
++    static std::shared_ptr<Store> Create();
++    ~Store();
++    Store(const Store &) = delete;
++    Store &operator=(const Store &) = delete;
++
++    static bool IsLeaf(NodeId n) noexcept { return n & kLeafBit; }
++    const Branch &B(NodeId n) const noexcept { return m_branches.At(n); }
++    const Leaf &L(NodeId n) const noexcept { return m_leaves.At(n & ~kLeafBit); }
++    Branch &MutB(NodeId n) noexcept { return m_branches.At(n); }
++
++    NodeId NewLeaf(const Hash &id, const Hash &hash, uint64_t minhash,
++                   std::shared_ptr<const void> payload, uint32_t payload_bytes);
++    NodeId NewBranch(const Branch &shape); // copies shape, refs = 1, Dirty
++    void Retain(NodeId n) const noexcept;
++    void Release(NodeId n) const noexcept;
++    uint32_t Refs(NodeId n) const noexcept;
++    uint32_t Count(NodeId n) const noexcept {
++        return n == kNull ? 0 : IsLeaf(n) ? 1 : B(n).count;
++    }
++    const Hash &AnyKey(NodeId n) const noexcept {
++        return IsLeaf(n) ? L(n).key : B(n).key;
++    }
++
++    /** Digest of n as the subtree rooted at depth (folds unary runs). */
++    Hash DigestAt(NodeId n, unsigned depth) const;
++    /** Digest at n's own split (leaf digest for leaves), cached. */
++    Hash NodeDigest(NodeId n) const;
++    /** Complete caches below n, in parallel for large dirty trees. */
++    void Complete(NodeId n) const;
++
++    /** Weak reference with ABA protection through slot generations. */
++    struct WeakRef { NodeId node{kNull}; uint64_t generation{0}; };
++    WeakRef Weak(NodeId n) const noexcept;
++    //! Caller holds the family writer lock, including against mutation/trim.
++    //! Returns a retained node (caller releases) or kNull if stale.
++    NodeId TryRetain(const WeakRef &weak) const noexcept;
++
++    size_t LiveLeaves() const noexcept;
++    size_t LiveBranches() const noexcept;
++    size_t RetainedBytes() const noexcept;
++    /** Return all slab chunks when no node is live (no tree/snapshot holds one). */
++    bool TrimIfUnused() noexcept;
++
++private:
++    Store();
++    void FreeBatch(const NodeId *dead, size_t count) const noexcept;
++    Hash NodeDigestCounted(NodeId n, uint64_t &hashes) const;
++    Hash DigestAtCounted(NodeId n, unsigned depth, uint64_t &hashes) const;
++    uint64_t m_next_generation{1}; // never reset when empty slabs are trimmed
++    mutable std::mutex m_alloc_mutex;
++    mutable Slab<Branch> m_branches;
++    mutable Slab<Leaf> m_leaves;
++};
++
++/** Copyable pinned summary of a membership version. */
++struct Sketch {
++    std::vector<uint64_t> values; // bottom-k, ascending
++};
++
++/**
++ * Writable working view. Not thread-safe; see the writer-lock contract above.
++ * Copying a Tree shares all nodes (O(1)); both copies then copy-on-write.
++ */
++class Tree {
++public:
++    enum class Change { Unchanged, Inserted, Replaced };
++
++    explicit Tree(std::shared_ptr<Store> store = Store::Create());
++    Tree(const Tree &other);
++    Tree &operator=(const Tree &other);
++    Tree(Tree &&other) noexcept;
++    Tree &operator=(Tree &&other) noexcept;
++    ~Tree();
++
++    Change Insert(const Hash &tx_id, const Hash &tx_hash,
++                  std::shared_ptr<const void> payload = {},
++                  uint32_t payload_bytes = 0);
++    bool Erase(const Hash &tx_id);
++    void Clear();
++
++    std::optional<Hash> FindHash(const Hash &tx_id) const;
++    bool Contains(const Hash &tx_id) const { return FindHash(tx_id).has_value(); }
++    size_t Count() const noexcept { return m_store->Count(m_root); }
++    uint64_t Version() const noexcept { return m_version; }
++    uint64_t PayloadBytes() const noexcept { return m_payload_bytes; }
++    const std::shared_ptr<Store> &GetStore() const noexcept { return m_store; }
++    NodeId Root() const noexcept { return m_root; }
++
++    /** Lazily completes dirty digests in place; caller holds the writer lock. */
++    Hash RootDigest() const;
++    /** Current bottom-k sketch (rebuilds if a deletion exhausted candidates). */
++    Sketch CurrentSketch() const;
++    /** O(1) structural pin + sketch; caller holds the writer lock. */
++    std::shared_ptr<const Snapshot> Pin() const;
++
++    /** Visit leaves in canonical (LSB-first trie) order. */
++    template <typename F> void ForEachLeaf(F &&f) const;
++
++private:
++    struct Outgoing {
++        bool found{false};
++        uint64_t minhash{0};
++        uint32_t payload_bytes{0};
++    };
++    NodeId InsertAt(NodeId n, unsigned depth, bool unique, const Hash &id,
++                    const Hash &hash, uint64_t minhash,
++                    std::shared_ptr<const void> &payload,
++                    uint32_t payload_bytes, Change &change, Outgoing &old);
++    NodeId EraseAt(NodeId n, unsigned depth, bool unique, const Hash &id,
++                   Outgoing &old);
++    NodeId ReplaceChild(NodeId b, bool unique, unsigned bit, NodeId new_child);
++    NodeId Touch(NodeId b);
++    bool ChildUnique(bool unique, NodeId c) const noexcept {
++        return unique && c != kNull && m_store->Refs(c) == 1;
++    }
++    void EnsureSketch() const;
++
++    std::shared_ptr<Store> m_store;
++    NodeId m_root{kNull};
++    uint64_t m_version{0};
++    uint64_t m_payload_bytes{0};
++    mutable minhash::Maintainer m_sketch;
++};
++
++/** Immutable pinned version. Safe for concurrent readers and hashers. */
++class Snapshot {
++public:
++    struct Descriptor { uint64_t count{0}; Hash digest{}; };
++    Snapshot(std::shared_ptr<Store> store, NodeId root, uint64_t version,
++             uint64_t payload_bytes, Sketch sketch, bool rebuild_sketch = false);
++    ~Snapshot();
++    Snapshot(const Snapshot &) = delete;
++    Snapshot &operator=(const Snapshot &) = delete;
++
++    size_t Count() const noexcept { return m_store->Count(m_root); }
++    uint64_t Version() const noexcept { return m_version; }
++    uint64_t PayloadBytes() const noexcept { return m_payload_bytes; }
++    const Sketch &GetSketch() const;
++    const Store &GetStore() const noexcept { return *m_store; }
++    NodeId Root() const noexcept { return m_root; }
++
++    Hash RootDigest() const;
++    /** Count and digest of the members whose first `depth` bits equal prefix. */
++    Descriptor At(const Hash &prefix, unsigned depth) const;
++    /** Leaves under the prefix in canonical order; nullopt if > max_leaves. */
++    std::optional<std::vector<const Leaf *>> Leaves(const Hash &prefix,
++                                                     unsigned depth,
++                                                     size_t max_leaves) const;
++    std::optional<Hash> FindHash(const Hash &tx_id) const;
++    template <typename F> void ForEachLeaf(F &&f) const;
++
++private:
++    NodeId Find(const Hash &prefix, unsigned depth) const;
++    std::shared_ptr<Store> m_store;
++    NodeId m_root;
++    uint64_t m_version;
++    uint64_t m_payload_bytes;
++    mutable Sketch m_sketch;
++    bool m_rebuild_sketch;
++    mutable std::once_flag m_sketch_once;
++};
++
++namespace detail {
++template <typename F>
++void ForEachLeaf(const Store &store, NodeId n, F &f) {
++    if (n == kNull) return;
++    if (Store::IsLeaf(n)) {
++        f(store.L(n));
++        return;
++    }
++    const Branch &b = store.B(n);
++    ForEachLeaf(store, b.child[0], f);
++    ForEachLeaf(store, b.child[1], f);
++}
++} // namespace detail
++
++template <typename F> void Tree::ForEachLeaf(F &&f) const {
++    detail::ForEachLeaf(*m_store, m_root, f);
++}
++template <typename F> void Snapshot::ForEachLeaf(F &&f) const {
++    detail::ForEachLeaf(*m_store, m_root, f);
++}
++
++} // namespace lotus::v2::txmerklix
++
++#endif // LOTUS_V2_TX_MERKLIX_H
+diff --git a/src/primitives/block.cpp b/src/primitives/block.cpp
+index da27f725a9117e477cd5c91aa2e6d716a28365e0..b74d79d0f08cd3c764de3699581c6bcd21317aee 100644
+--- a/src/primitives/block.cpp
++++ b/src/primitives/block.cpp
+@@ -11,6 +11,7 @@
+ #include <cstring>
+ #include <filesystem>
+ #include <fstream>
++#include <core_memusage.h>
+ #include <hash.h>
+ #include <lotus_v2/candidate_state_key.h>
+ #include <stdexcept>
+@@ -19,6 +20,7 @@
+ #include <lotus_v2/monetary.h>
+ #include <lotus_v2/sparse_state.h>
+ #include <lotus_v2/tagged_hash.h>
++#include <limits>
+ #include <list>
+ #include <map>
+ #include <memory>
+@@ -1139,6 +1141,17 @@ uint256 ComputeV2StateRootFromOverlay(
+     return out;
+ }
+ 
++namespace {
++//! Retained-body charge for pinned reconciliation views; matches the former
++//! full-mempool snapshot capture charge max(serialized, recursive usage).
++uint32_t OverlayPayloadBytes(const CTransactionRef &ptx) {
++    const size_t bytes = std::max<size_t>(GetSerializeSize(*ptx),
++                                          RecursiveDynamicUsage(ptx));
++    return static_cast<uint32_t>(
++        std::min<size_t>(bytes, std::numeric_limits<uint32_t>::max()));
++}
++} // namespace
++
+ bool AddTransactionToOverlay(lotus::v2::MempoolOverlayLayer &overlay,
+                              const CTransactionRef &ptx,
+                              int64_t fee_sats,
+@@ -1154,7 +1167,8 @@ bool AddTransactionToOverlay(lotus::v2::MempoolOverlayLayer &overlay,
+     ExtractOverlayTxData(*ptx, overlay.GetHeight(), overlay.GetParentMtp(),
+                          fee_sats, tx_id, tx_hash, linear_cost, spent, created);
+     return overlay.AddTransaction(tx_id, tx_hash, linear_cost, spent, created,
+-                                  fee_sats, sigchecks, ptx);
++                                  fee_sats, sigchecks, ptx,
++                                  OverlayPayloadBytes(ptx));
+ }
+ 
+ bool AddTransactionToOverlay(lotus::v2::MerklixOverlayManager &manager,
+@@ -1192,6 +1206,7 @@ size_t AddTransactionsToOverlayBatch(
+                                  e.created_coins);
+             e.fee_sats = fee_sats;
+             e.sigchecks = sigchecks;
++            e.payload_bytes = OverlayPayloadBytes(ptx);
+             e.tx_ref = ptx;
+         }
+     };
+diff --git a/src/txmempool.cpp b/src/txmempool.cpp
+index 6aca34ab28b084c8fe306e06bfd2b13a824efab0..986d805ab9f3c24dda431733023a03f47ecfb240 100644
+--- a/src/txmempool.cpp
++++ b/src/txmempool.cpp
+@@ -556,6 +556,18 @@ const lotus::v2::MempoolOverlayLayer &CTxMemPool::FreezeEpochBatch() {
+     return frozen;
+ }
+ 
++std::shared_ptr<const lotus::v2::txmerklix::Snapshot>
++CTxMemPool::PinTxMerklixSnapshot() const {
++    AssertLockHeld(cs);
++    FlushPendingOverlayAdds();
++    const auto &spec = m_merklix_overlay.GetSpeculativeOverlay();
++    if (spec.GetTxCount() != mapTx.size() ||
++        spec.GetTxTree().Count() != mapTx.size()) {
++        return nullptr;
++    }
++    return spec.PinTxTree();
++}
++
+ void CTxMemPool::SyncMerklixOverlayToTip(const BlockHash &tip_hash,
+                                          uint64_t next_height,
+                                          uint64_t next_mtp) const {
+diff --git a/src/txmempool.h b/src/txmempool.h
+index a1adc3d5f37f7da8f4745251c47b646f1a92dbfc..9f515902353d73e37eed0b01bfe86ee86b52f9ab 100644
+--- a/src/txmempool.h
++++ b/src/txmempool.h
+@@ -669,6 +669,16 @@ public:
+ 
+     const lotus::v2::MempoolOverlayLayer &FreezeEpochBatch()
+         EXCLUSIVE_LOCKS_REQUIRED(cs);
++
++    /**
++     * O(1) immutable Subtree A view of the complete current mempool: the
++     * speculative overlay's slab Merklix tree after deferred overlay updates
++     * are applied, pinned together with its membership version and bottom-k
++     * MinHash. Digests are completed lazily by the holder, outside cs. Returns
++     * nullptr (caller falls back) if overlay membership does not equal mapTx.
++     */
++    std::shared_ptr<const lotus::v2::txmerklix::Snapshot>
++    PinTxMerklixSnapshot() const EXCLUSIVE_LOCKS_REQUIRED(cs);
+     void SyncMerklixOverlayToTip(const BlockHash &tip_hash,
+                                 uint64_t next_height, uint64_t parent_mtp) const
+         EXCLUSIVE_LOCKS_REQUIRED(cs);
