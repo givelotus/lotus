@@ -20,14 +20,11 @@ v1=json.loads((HERE/'maintained-lotusv1-history.json').read_text())
 store=pathlib.Path.cwd()/'daemon/.local-artifact-archive/github-source-transfer.git'
 subprocess.run(['git','--git-dir='+str(store),'push',URL,'refs/publish/lotusd/lotusv1:refs/heads/lotusv1'],check=True)
 assert api('GET','repos/givelotus/lotusd/git/ref/heads/lotusv1')['object']['sha']==v1['head']
-# This migration created the archive at old master. Advance that archive to
-# the exact latest published V1 source; original master stays preserved.
-assert refs['refs/heads/archive/lotusv1'] in (OLD,desired['v11.6.1'])
-if refs['refs/heads/archive/lotusv1']!=desired['v11.6.1']:
-    api('PATCH','repos/givelotus/lotusd/git/refs/heads/archive/lotusv1','-f','sha='+desired['v11.6.1'],'-F','force=true')
-assert api('GET','repos/givelotus/lotusd/git/ref/heads/archive/lotusv1')['object']['sha']==desired['v11.6.1']
+# Preserve the repository exactly as it stood before migration.
+assert refs['refs/heads/archive/lotusv1']==OLD
+assert api('GET','repos/givelotus/lotusd/git/ref/heads/archive/lotusv1')['object']['sha']==OLD
 meta=api('PATCH','repos/givelotus/lotusd','-f','default_branch=main')
 assert meta['default_branch']=='main' and not meta['private']
-receipt={'verified_at':datetime.datetime.now(datetime.timezone.utc).isoformat(),'repository':URL,'default_branch':'main','private':False,'main':MAIN,'main_tree':'591fb5e702dda0c70a94a7123dc1012ad6e2eace','archive/lotusv1':desired['v11.6.1'],'master':OLD,'lotusv1':v1['head'],'lotusv1_tree':v1['tree'],'lotusv1_commit_count':v1['patch_count'],'release_tags':desired,'release_assets_modified':False,'submodules_added':False}
+receipt={'verified_at':datetime.datetime.now(datetime.timezone.utc).isoformat(),'repository':URL,'default_branch':'main','private':False,'main':MAIN,'main_tree':'591fb5e702dda0c70a94a7123dc1012ad6e2eace','archive/lotusv1':OLD,'master':OLD,'lotusv1':v1['head'],'lotusv1_tree':v1['tree'],'lotusv1_commit_count':v1['patch_count'],'release_tags':desired,'release_assets_modified':False,'submodules_added':False}
 (HERE/'lotusd-verified.json').write_text(json.dumps(receipt,indent=2)+'\n')
 print('VERIFIED lotusd: main, archive, master and all '+str(len(desired))+' release tags',flush=True)
