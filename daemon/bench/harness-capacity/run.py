@@ -30,7 +30,14 @@ def main():
     parser.add_argument('--transport-calibration', action='store_true')
     parser.add_argument('--fixture-hash-site', type=Path)
     parser.add_argument('--global-warmup', action='store_true')
+    parser.add_argument('--network-completion', action='store_true')
+    parser.add_argument('--network-timeout', type=int, default=180)
+    parser.add_argument('--owned-rss-limit-gib', type=int, choices=(12,18), default=12)
     args = parser.parse_args()
+    if args.network_completion and (args.series != 'v2' or args.smoke):
+        parser.error('Peer completion requires a full native V2 workload')
+    if not 10 <= args.network_timeout <= 600:
+        parser.error('Peer completion timeout must be10..600seconds')
     data = args.data.resolve()
     data.mkdir(parents=True, exist_ok=False)
     lock = (ROOT / 'daemon/.local-artifact-archive/benchmark-host.lock').open('a')
@@ -41,8 +48,8 @@ def main():
     receipt = json.loads(receipt_path.read_text())
     assert audit.sha(receipt['binary']) == receipt['binary_sha256']
     audit.checkout(receipt['commit'])
-    tools = {str(p.relative_to(ROOT)): audit.sha(p) for p in Path(__file__).parent.glob('*.py')}
-    audit.write(data / 'INPUTS.json', {'source': receipt, 'tools': tools, 'argv': sys.argv,
+    tools = {str(p.relative_to(ROOT)): audit.sha(p) for p in [*Path(__file__).parent.glob('*.py'), ROOT / 'daemon/bench/commit-regressions/run.py']}
+    audit.write(data / 'INPUTS.json', {'source': receipt, 'tools': tools, 'argv': sys.argv, 'owned_rss_limit_gib':args.owned_rss_limit_gib,
                 'policy': 'One fixed node binary; same8writers/12readers when comparing process count; >=5s each; processes warmed before common GO; no timing during builds/profiling'})
     cells = [cell.split(':') for cell in args.cells.split(',')]
     rows = []
@@ -56,7 +63,8 @@ def main():
             config = dict(processes=processes, writers=writers, readers=readers,
                           directory=str(directory), read_matrix=args.reads and not rows,
                           transport_calibration=args.transport_calibration and not rows,
-                          global_warmup=args.global_warmup)
+                          global_warmup=args.global_warmup, network_completion=args.network_completion,
+                          network_timeout=args.network_timeout)
             path = directory / 'CONFIG.json'
             audit.write(path, config)
             output = directory / 'result.json'
@@ -73,7 +81,8 @@ def main():
             print('RUN', round_number, label, flush=True)
             env = dict(os.environ, CAPACITY_CONFIG=str(path),
                        TMPDIR=str(ROOT / 'daemon/.local-artifact-archive/commit-regressions/runtime'))
-            resources = audit.guarded(command, directory / 'stdout.log', env)
+            resources = audit.guarded(command, directory / 'stdout.log', env,
+                                      owned_rss_limit_gib=args.owned_rss_limit_gib)
             audit.write(directory / 'RESOURCES.json', resources)
             payload = json.loads(output.read_text())
             assert payload['status'] == 'ok'

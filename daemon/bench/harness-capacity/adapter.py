@@ -51,8 +51,23 @@ def measured(fixture, client_factory, mode, batch_size, **kwargs):
         settings['warmup_batches'] = 0
     elif settings['writers'] not in (8, 16):
         raise ValueError('Keep total warmup at16transactions/batches')
+    before_started = None
+    warmup = 16 * batch_size
+    if config.get('network_completion'):
+        from network_completion import wait_for_counts, verify_inventories
+        def before_started():
+            directory = Path(config['directory'])
+            wait_for_counts(context['clients'], warmup, directory / 'NETWORK-WARMUP.json',
+                            timeout=config['network_timeout'])
+            rows = verify_inventories(context['clients'], warmup)
+            (directory / 'NETWORK-WARMUP-VERIFIED.json').write_text(json.dumps(rows, indent=2)+'\n')
     result = run_processes(settings, context['pids'], Path(config['directory']) / 'ingestion', fixture,
-                           on_started=kwargs.get('on_started'))
+                           on_started=kwargs.get('on_started'), before_started=before_started)
+    if config.get('network_completion'):
+        from network_completion import finish
+        result['network_completion'] = finish(context['clients'], result, warmup,
+            config['directory'], timeout=config['network_timeout'])
+        print('NETWORK-COMPLETION', json.dumps(result['network_completion']), flush=True)
     result['request_count'] = sum(row['request_count'] for row in result['children'])
     result['fixture_count'] = len(fixture.offsets)
     result['fixture_sha256'] = fixture.digest.hexdigest()
@@ -80,7 +95,8 @@ def read_matrix(client_factory, **kwargs):
 
 
 def run(context_arg, *args, **kwargs):
-    context.update(pids=[process.pid for process in context_arg['procs']])
+    context.update(pids=[process.pid for process in context_arg['procs']],
+                   clients=context_arg['clients'])
     config.update(port=context_arg['NODES_CFG'][0]['rpc_port'], auth=context_arg['AUTH_HEADER'])
     if 'rpc_workers' in config:
         for process in context_arg['procs']:

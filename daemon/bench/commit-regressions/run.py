@@ -31,24 +31,36 @@ def host():
         text=subprocess.check_output(['memory_pressure','-Q'],text=True)
         percent=int(re.search(r'free percentage: (\d+)%',text)[1])
         ram=int(subprocess.check_output(['sysctl','-n','hw.memsize'],text=True))
+        out['physical_memory_bytes']=ram
         out['available_indicator_bytes']=ram*percent//100
         out['pressure']=int(subprocess.check_output(['sysctl','-n','kern.memorystatus_vm_pressure_level'],text=True))
         swap=subprocess.check_output(['sysctl','-n','vm.swapusage'],text=True)
         out['swap_bytes']=float(re.search(r'used = ([\d.]+)M',swap)[1])*1048576
     return out
-def guarded(argv,log,env):
+def guarded(argv,log,env,*,owned_rss_limit_gib=12):
     before=host();samples=[];start=time.monotonic()
+    assert 1 <= owned_rss_limit_gib <= 24
+    assert owned_rss_limit_gib*1024**3 <= before.get('physical_memory_bytes',2**64)//2
+    limits={'owned_rss_limit_gib':owned_rss_limit_gib,'host_free_min_gib':6,'host_swap_growth_max_gib':4,'seconds_max':1800}
     if before.get('available_indicator_bytes',2**63)<6*1024**3:raise RuntimeError('Host free-memory indicator below 6 GiB before workload')
     with log.open('w') as f:
         p=subprocess.Popen([str(x) for x in argv],stdout=f,stderr=subprocess.STDOUT,env=env,start_new_session=True)
         try:
             while p.poll() is None:
                 lines=subprocess.check_output(['ps','-axo','pid=,pgid=,rss='],text=True).splitlines()
-                rss=sum(int(row.split()[2])*1024 for row in lines if len(row.split())==3 and int(row.split()[1])==p.pid)
-                memory=host();samples.append({'elapsed':time.monotonic()-start,'owned_group_rss':rss,**memory})
-                if (rss>12*1024**3 or memory.get('available_indicator_bytes',2**63)<6*1024**3
-                    or memory.get('pressure',0)>=4 or memory.get('swap_bytes',0)-before.get('swap_bytes',0)>4*1024**3
-                    or time.monotonic()-start>1800):raise RuntimeError('Owned workload exceeded recorded memory/time envelope')
+                owned=[{'pid':int(row.split()[0]),'rss_bytes':int(row.split()[2])*1024} for row in lines if len(row.split())==3 and int(row.split()[1])==p.pid]
+                rss=sum(row['rss_bytes'] for row in owned)
+                memory=host();samples.append({'elapsed':time.monotonic()-start,'owned_group_rss':rss,'owned_processes':owned,**memory})
+                exceeded=[]
+                if rss>owned_rss_limit_gib*1024**3:exceeded.append(f'owned group RSS above{owned_rss_limit_gib}GiB')
+                if memory.get('available_indicator_bytes',2**63)<6*1024**3:exceeded.append('host free indicator below6GiB')
+                if memory.get('pressure',0)>=4:exceeded.append('host memory pressure critical')
+                if memory.get('swap_bytes',0)-before.get('swap_bytes',0)>4*1024**3:exceeded.append('host swap growth above4GiB')
+                if time.monotonic()-start>1800:exceeded.append('owned workload above1800seconds')
+                if exceeded:
+                    write(log.with_suffix('.guard.json'),{'status':'aborted','reasons':exceeded,
+                        'before':before,'samples':samples,'owned_group':p.pid,'limits':limits})
+                    raise RuntimeError('Owned workload aborted: '+', '.join(exceeded))
                 time.sleep(1)
             if p.returncode:raise RuntimeError(f'Workload exited {p.returncode}; see {log}')
         finally:
@@ -56,7 +68,7 @@ def guarded(argv,log,env):
                 os.killpg(p.pid,signal.SIGTERM)
                 try:p.wait(timeout=15)
                 except subprocess.TimeoutExpired:os.killpg(p.pid,signal.SIGKILL);p.wait()
-    return {'before':before,'after':host(),'samples':samples,'owned_group':p.pid,'seconds_including_untimed_setup':time.monotonic()-start}
+    return {'limits':limits,'before':before,'after':host(),'samples':samples,'owned_group':p.pid,'seconds_including_untimed_setup':time.monotonic()-start}
 def main():
     ap=argparse.ArgumentParser(description=__doc__)
     ap.add_argument('--points',default='376,377');ap.add_argument('--rounds',type=int,default=3)

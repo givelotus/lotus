@@ -138,7 +138,7 @@ def child(path):
     print(json.dumps({'result': result, 'pid': os.getpid()}), flush=True)
 
 
-def run_processes(config, pids, directory, fixture=None, on_started=None):
+def run_processes(config, pids, directory, fixture=None, on_started=None, before_started=None):
     """Warm all workers before a common start; return only proven responses."""
     directory.mkdir(parents=True, exist_ok=False)
     count = config['processes']
@@ -169,6 +169,8 @@ def run_processes(config, pids, directory, fixture=None, on_started=None):
             message = json.loads(proc.stdout.readline())
             assert message['ready'] and message['pid'] == proc.pid
         # All connection/thread setup and warmup have finished.
+        if before_started is not None:
+            before_started()
         before = process_cpu(pids)
         start = time.perf_counter() + .1
         for proc in children:
