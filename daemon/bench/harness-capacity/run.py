@@ -31,9 +31,12 @@ def main():
     parser.add_argument('--fixture-hash-site', type=Path)
     parser.add_argument('--global-warmup', action='store_true')
     parser.add_argument('--network-completion', action='store_true')
+    parser.add_argument('--profile-peer-completion', action='store_true')
     parser.add_argument('--network-timeout', type=int, default=180)
     parser.add_argument('--owned-rss-limit-gib', type=int, choices=(12,18), default=12)
     args = parser.parse_args()
+    if args.profile_peer_completion and not args.network_completion:
+        parser.error('Peer profiling requires peer completion observation')
     if args.network_completion and (args.series != 'v2' or args.smoke):
         parser.error('Peer completion requires a full native V2 workload')
     if not 10 <= args.network_timeout <= 600:
@@ -64,7 +67,7 @@ def main():
                           directory=str(directory), read_matrix=args.reads and not rows,
                           transport_calibration=args.transport_calibration and not rows,
                           global_warmup=args.global_warmup, network_completion=args.network_completion,
-                          network_timeout=args.network_timeout)
+                          network_timeout=args.network_timeout, profile_peer_completion=args.profile_peer_completion)
             path = directory / 'CONFIG.json'
             audit.write(path, config)
             output = directory / 'result.json'
@@ -90,7 +93,10 @@ def main():
             assert result['seconds'] >= 5 and result['tx_count'] > 0
             rows.append(dict(round=round_number, label=label, result=result, evidence=str(output)))
             audit.write(data / 'RESULTS.json', dict(status='partial', runs=rows))
-            print('RESULT', round_number, label, result['tps'], result['client_cpu_seconds'], result['node_cpu_seconds'], flush=True)
+            if result.get('throughput_publishable', True):
+                print('RESULT', round_number, label, result['tps'], result['client_cpu_seconds'], result['node_cpu_seconds'], flush=True)
+            else:
+                print('PROFILE-DIAGNOSTIC', round_number, label, 'rates excluded', flush=True)
     audit.write(data / 'RESULTS.json', dict(status='complete', runs=rows))
 
 

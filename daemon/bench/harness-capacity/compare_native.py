@@ -21,6 +21,7 @@ def main():
     parser.add_argument('--data', type=Path, required=True)
     parser.add_argument('--before', type=Path, required=True)
     parser.add_argument('--after', type=Path, required=True)
+    parser.add_argument('--network-completion', action='store_true')
     parser.add_argument('--fixture-transactions', type=int, default=1000000)
     parser.add_argument('--owned-rss-limit-gib', type=int, choices=(12,18), default=12)
     args = parser.parse_args()
@@ -41,7 +42,7 @@ def main():
             tools={str(p.relative_to(ROOT)): audit.sha(p) for p in [*Path(__file__).parent.glob('*.py'), ROOT / 'daemon/bench/commit-regressions/run.py']},
             policy='Three alternating pairs; 4 generator processes, 8 writers, 0 readers, batch200, fixed distinct signed native fixtures, fixed3200 warmup; >=5s; no profiler/build during timing; exact source inventory required',
             fixture_transactions=args.fixture_transactions, owned_rss_limit_gib=args.owned_rss_limit_gib,
-            scope='Validated native V2 acceptance, not peer convergence, block confirmation or Avalanche finality'))
+            scope=('Validated native admission and exact all-peer inventory completion; no block confirmation or Avalanche finality' if args.network_completion else 'Validated native V2 acceptance, not peer convergence, block confirmation or Avalanche finality')))
         rows = []
         try:
             for round_number in range(1, 4):
@@ -52,7 +53,8 @@ def main():
                     directory.mkdir(parents=True)
                     config = directory / 'CONFIG.json'
                     audit.write(config, dict(processes=4, writers=8, readers=0,
-                        directory=str(directory), read_matrix=False, transport_calibration=False))
+                        directory=str(directory), read_matrix=False, transport_calibration=False,
+                        network_completion=args.network_completion, network_timeout=180))
                     command = [sys.executable, Path(__file__).with_name('adapter.py'), '--series', 'v2',
                         '--daemon', receipt['binary'], '--source', audit.SOURCE,
                         '--output', directory / 'result.json', '--steady', '--case', 'signed_batch200_steady',
@@ -75,8 +77,15 @@ def main():
                     print('RESULT', round_number, side, metric['tps'], flush=True)
             medians = {side: statistics.median(row['result']['tps'] for row in rows if row['side'] == side)
                        for side in receipts}
-            audit.write(data / 'RESULTS.json', dict(status='complete', runs=rows, medians=medians,
-                ratio=medians['after']/medians['before']))
+            summary = dict(status='complete', runs=rows, medians=medians,
+                ratio=medians['after']/medians['before'])
+            if args.network_completion:
+                peer_medians = {side: statistics.median(
+                    row['result']['network_completion']['all_peer_verified_tps']
+                    for row in rows if row['side'] == side) for side in receipts}
+                summary['all_peer_verified_medians'] = peer_medians
+                summary['all_peer_verified_ratio'] = peer_medians['after'] / peer_medians['before']
+            audit.write(data / 'RESULTS.json', summary)
         finally:
             audit.checkout(previous)
 

@@ -65,8 +65,31 @@ def measured(fixture, client_factory, mode, batch_size, **kwargs):
                            on_started=kwargs.get('on_started'), before_started=before_started)
     if config.get('network_completion'):
         from network_completion import finish
-        result['network_completion'] = finish(context['clients'], result, warmup,
-            config['directory'], timeout=config['network_timeout'])
+        import subprocess
+        sampler = None
+        if config.get('profile_peer_completion'):
+            sample_path = Path(config['directory']) / 'peer1.sample.txt'
+            assert not sample_path.exists()
+            sampler = subprocess.Popen(['/usr/bin/sample', str(context['pids'][1]), '4', '1',
+                                        '-file', str(sample_path)],
+                                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        try:
+            result['network_completion'] = finish(context['clients'], result, warmup,
+                config['directory'], timeout=config['network_timeout'])
+        finally:
+            if sampler is not None:
+                code = sampler.wait(timeout=15)
+                record = dict(pid=context['pids'][1], returncode=code,
+                    phase='After timed RPC admission, during peer catch-up', duration_seconds=4,
+                    interval_ms=1, throughput_publishable=False, path=str(sample_path))
+                (Path(config['directory']) / 'PEER-PROFILE.json').write_text(json.dumps(record, indent=2)+'\n')
+                assert code == 0 and sample_path.exists()
+        if sampler is not None:
+            result['throughput_publishable'] = False
+            result['network_completion']['throughput_publishable'] = False
+            result['network_completion']['profiled'] = True
+            Path(config['directory'], 'NETWORK-COMPLETION.json').write_text(
+                json.dumps(result['network_completion'], indent=2)+'\n')
         print('NETWORK-COMPLETION', json.dumps(result['network_completion']), flush=True)
     result['request_count'] = sum(row['request_count'] for row in result['children'])
     result['fixture_count'] = len(fixture.offsets)
