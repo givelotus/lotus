@@ -27,7 +27,7 @@ Independent primary research also finds nontrivial safety/liveness tradeoffs in 
 
 ## Actual Lotus/eCash source constraints
 
-Inspected immutable lifecycle source `b81455fa120dcbdd86938a6ed62a5a9dbac5a95a` in the repair checkout. Generic node-storage/publication has advanced separately; none of those changes supplies the clock described here. Source provenance must remain separate: historical `daemon/v2-version` beginning `09f` is not the current runtime selector; the original failing 500k cohort was `2b61dded451755e175681f41a57281a5c0554e32` / tree `2b4fef46071b44cc8789a49553b3d112b4fd084e`, and the ordered 522 progression uses tree `143e6ae94885cf9e1ebf2772fb918904af7ac846`. The b814 lifecycle audit is an immutable repair-source checkpoint, not a claim that a later unbuilt candidate is a tested daemon.
+Inspected immutable lifecycle source `b81455fa120dcbdd86938a6ed62a5a9dbac5a95a`. Generic node-storage/publication has advanced separately; none of those changes supplies the clock described here. Source provenance must remain separate: historical `daemon/v2-version` beginning `09f` is not the current runtime selector; the original failing 500k cohort was `2b61dded451755e175681f41a57281a5c0554e32` / tree `2b4fef46071b44cc8789a49553b3d112b4fd084e`, and the ordered 522 progression uses tree `143e6ae94885cf9e1ebf2772fb918904af7ac846`. The b814 lifecycle audit is an immutable repair-source checkpoint, not a claim that a later unbuilt candidate is a tested daemon.
 
 * `avalanche/protocol.h`: Poll is `(round, invs)` and Response is `(round, cooldown, votes)`. Signed responses attest that sender's response under its authorized key. They do not prove that a weighted global set accepted an epoch boundary.
 * `processor.cpp` session setup and `net_processing.cpp` AVAHELLO: sessions are generated/delegated and handshake authentication binds connection nonces/entropy. This provides authenticated communication, not a persistent globally exclusive authored sequence.
@@ -122,7 +122,7 @@ The current implementation defects should be repaired against the selected lifec
 
 ## Independent review disposition
 
-Two independent source-grounded reviews of the actual publisher alternative are preserved in the canonical optimization repository under `daemon/patch-intake/20261021/triage/astra-reconciliation-overlay-spec/`: `EPOCH-PUBLISHER-OVERLAY-REVIEW.md` (source 91dbda5308) and `EPOCH-PUBLISHER-ALTERNATIVE-REVIEW.md` (source b81455fa12). Their concrete findings have been incorporated above. Both assess options only; neither selects or approves a clock protocol, transfers the earlier lifecycle review to a different epoch definition, or authorizes implementation. Normative clock/cut vectors remain pending the actual protocol choice.
+Two independent source-grounded reviews of the actual publisher alternative were performed: an overlay review (source 91dbda5308) and an alternative-protocol review (source b81455fa12). Their concrete findings have been incorporated above. Both assess options only; neither selects or approves a clock protocol, transfers the earlier lifecycle review to a different epoch definition, or authorizes implementation. Normative clock/cut vectors remain pending the actual protocol choice.
 
 
 ---
@@ -218,7 +218,7 @@ Required new small vectors include the X/Y/Z overlap above, cross-publisher depe
 
 # Committed contributions: current §§9.4/10 review and proposed behavior vectors
 
-Status: proposal review, not production protocol approval. Reviewed snapshot `leaderless-epochs-reviewed-39c1ccead262.md`, SHA256 `39c1ccead26255409820b312d87fff0ae924a91cd62afcaf72cb453133d0f114`. This current revision removes per-transaction finality, uses a stake-first total score, acknowledges hash tie grinding, and adds committed contributions plus explicit ACS limitations. The newest §9.3 requires each contribution to contain every unconfirmed ancestor; this supersedes the earlier deferred-child proposal. Earlier reviews of finalized-only or pairwise/per-input rules are historical; do not repeat their resolved objections as current findings.
+Status: proposal review, not production protocol approval. Reviewed proposal snapshot SHA256 `39c1ccead26255409820b312d87fff0ae924a91cd62afcaf72cb453133d0f114`. This current revision removes per-transaction finality, uses a stake-first total score, acknowledges hash tie grinding, and adds committed contributions plus explicit ACS limitations. The newest §9.3 requires each contribution to contain every unconfirmed ancestor; this supersedes the earlier deferred-child proposal. Earlier reviews of finalized-only or pairwise/per-input rules are historical; do not repeat their resolved objections as current findings.
 
 ## Scope and recommendation
 
@@ -336,7 +336,7 @@ The authored cutoff-vector mechanism and these agreement contracts remain a prop
 
 ## Review and verification record
 
-Canonical independent notes are `SECTION9-OVERLAY-REVIEW-UPDATED.md`, `SECTION9-PROTOCOL-REVIEW-UPDATED.md` and `SECTION9-PROTOCOL-EXPERIMENT-PLAN.md` under `daemon/patch-intake/20261021/triage/astra-reconciliation-overlay-spec/`. The protocol reviewer reread proposal39c1ccead262 and the current study/fixtures, confirmed all four requested areas and no remaining contradiction in their stated scope; this approves the accuracy of the proposal review, not any architecture. The overlay reviewer confirmed the G/M/R/Z outputs and persisted a current H1/H2/H3, prior-loser and per-contribution closure addendum. Both independent reviews cover the latest ancestor-closed variant as a proposal, not a selected architecture. Five symbolic support/generation vectors pass arithmetic checks in `PROPOSED-VECTOR-ARITHMETIC-CHECK.json`; no production, cryptographic, ACS or security experiment was run.
+Two independent reviews (overlay and protocol) and an experiment plan were recorded. The protocol reviewer reread proposal39c1ccead262 and the current study/fixtures, confirmed all four requested areas and no remaining contradiction in their stated scope; this approves the accuracy of the proposal review, not any architecture. The overlay reviewer confirmed the G/M/R/Z outputs and persisted a current H1/H2/H3, prior-loser and per-contribution closure addendum. Both independent reviews cover the latest ancestor-closed variant as a proposal, not a selected architecture. Five symbolic support/generation vectors pass arithmetic checks; no production, cryptographic, ACS or security experiment was run.
 
 
 ## Section 11 follow-up

@@ -978,7 +978,7 @@ def make_vectors() -> dict:
         assert compact_encode(compact_decode(bits)) == bits
         assert 0 < compact_decode(bits) <= raw
 
-    packets = sorted((ROOT / 'decisions').glob('*.md'))
+    packets = sorted(p for p in (ROOT / 'decisions').glob('*.md') if p.name != 'history.md')
     return {
         'schema': 'lotus/spec-candidate-smoke/v1',
         'status': 'single-model structural fixtures; not independently verified conformance',

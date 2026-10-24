@@ -2,7 +2,7 @@
 
 Status: preparation only. Start with V1-00/V1-01; do not start by applying all v2 patches.
 
-The [implementation entry contracts](implementation-entry.md) bound the first workspace-tooling and independent reference-tool units. The [review handoff](../lotus-v2/review-notes.md) summarizes the candidate choices and outstanding production decisions.
+The [implementation entry contracts](implementation-entry.md) bound the first workspace-tooling and independent reference-tool units. The [review handoff](../lotus-v2/research/review-notes.md) summarizes the candidate choices and outstanding production decisions.
 
 ## Transfer and preserve
 

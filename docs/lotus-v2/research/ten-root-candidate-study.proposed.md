@@ -1,6 +1,6 @@
 # Ten roots, candidate selection, and similarity hints
 
-Status: an unselected design experiment, not a new consensus implementation. Permissionless dissemination remains independent of this study. The executable fixture is `ten-actor-study/model.py` and its generated `traces.json` in the canonical Astra review directory. It models ten equal-authority honest actors, available bodies, all initial descriptors known, one shared validation context, a cap of ten frozen candidates, asynchronous seeded scheduling, five distinct other actors per sample, threshold three, and a three-success observation. These are illustrative constants, not Lotus parameters or a security claim. Fixture roots are SHA256 content fingerprints over symbolic TxId/TxHash pairs, not production Merklix roots.
+Status: an unselected design experiment, not a new consensus implementation. Permissionless dissemination remains independent of this study. An executable fixture (a Python model and generated traces, not published in this repository) accompanies this study. It models ten equal-authority honest actors, available bodies, all initial descriptors known, one shared validation context, a cap of ten frozen candidates, asynchronous seeded scheduling, five distinct other actors per sample, threshold three, and a three-success observation. These are illustrative constants, not Lotus parameters or a security claim. Fixture roots are SHA256 content fingerprints over symbolic TxId/TxHash pairs, not production Merklix roots.
 
 ## Three separate choices at one node
 

@@ -123,7 +123,25 @@ NAV_SECTIONS: List[Tuple[str, List[Tuple[str, str]]]] = [
             ("mempool-reconciliation.md", "Mempool Set Reconciliation"),
             ("validation.md", "Validation & Conformance"),
             ("decisions.md", "Decision Register (D01–D15)"),
-            ("review-notes.md", "Review Handoff Notes"),
+            ("decisions/history.md", "Decision History"),
+        ],
+    ),
+    (
+        "5. Research (Non-Normative)",
+        [
+            ("research/README.md", "Research Index"),
+            ("research/mining-envelope-alternative.md", "SHA256D Mining Envelope"),
+            ("research/burn-data-open-questions.md", "Prunable Burn Data"),
+            ("research/burn-demand-economics.md", "Burn Demand Economics"),
+            ("research/pairwise-reconciliation-scheduler.proposed.md", "Pairwise Reconciliation Scheduler"),
+            ("research/epoch-root-gossip-loop.proposed.md", "Epoch Root Gossip Loop"),
+            ("research/epoch-snapshot-routing.proposed.md", "Epoch Snapshot Routing"),
+            ("research/shared-reconciliation-steering.proposed.md", "Shared Reconciliation Steering"),
+            ("research/ten-root-candidate-study.proposed.md", "Ten-Root Candidate Study"),
+            ("research/epoch-clock-open-questions.md", "Epoch Clock Study"),
+            ("research/epoch-contribution-proposal.md", "Committed Contributions Review"),
+            ("research/epoch-availability-open-decisions.md", "Epoch Availability Decisions"),
+            ("research/review-notes.md", "Review Handoff (Oct 2026)"),
         ],
     ),
 ]
@@ -348,6 +366,12 @@ def markdown_to_html(md_text: str, current_rel: Path) -> str:
 
 
 def build_summary_banner(rel_str: str) -> str:
+    if rel_str.startswith("research/"):
+        return """
+    <div class="exec-banner research-banner">
+      <div class="exec-why"><strong>Research — non-normative.</strong> This page records an investigation. It defines no rule; a research result enters the specification only through a decision recorded in <a href="{ROOT_PREFIX}decisions/history.html">decision history</a>.</div>
+    </div>
+    """
     if rel_str not in PAGE_SUMMARIES:
         return ""
     why, everyday, engineer = PAGE_SUMMARIES[rel_str]
@@ -504,6 +528,11 @@ def html_template(title: str, sidebar_html: str, banner_html: str, body_html: st
       padding: 1.1rem 1.25rem;
       margin-bottom: 2rem;
     }}
+    .research-banner {{
+      border-color: #b45309;
+      background: rgba(180, 83, 9, 0.12);
+    }}
+    .research-banner .exec-why {{ margin-bottom: 0; }}
     .exec-why {{
       color: #fff;
       font-size: 1rem;

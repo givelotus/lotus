@@ -1,6 +1,6 @@
 # Review handoff — October 9, 2026 (updated October 14, 2026)
 
-The design is ready to begin isolated candidate implementation. It is not ready to freeze genesis. Start with [I01 workspace routing and I02 independent reference semantics](../plans/implementation-entry.md); investigate the historical v1 sync obstruction in parallel once its evidence is available. The V2 daemon uses its dedicated ABC-based series with selective verified V1 ports; see the restored [implementation and launch plan](../../daemon/docs/lotus-v2-implementation-plan.md) for source routing, miner requirements and genesis gates.
+The design is ready to begin isolated candidate implementation. It is not ready to freeze genesis. Start with [I01 workspace routing and I02 independent reference semantics](../../plans/implementation-entry.md); investigate the historical v1 sync obstruction in parallel once its evidence is available. The V2 daemon uses its dedicated ABC-based series with selective verified V1 ports; see the restored [implementation and launch plan](../../../daemon/docs/lotus-v2-implementation-plan.md) for source routing, miner requirements and genesis gates.
 
 ## October 14 specification corrections
 
@@ -18,12 +18,12 @@ Coinbase now has zero or one opaque vanity/extranonce payload, retained in both 
 
 ## Production blockers that remain real
 
-The [decision register](decisions.md) owns the complete list. With structural formulas specified for `D08`, `D10`, `D12`, and `MonetaryState`, the remaining launch blockers are confirming the candidate shift/initial constants ($k_{\text{boot}} = 20, B_0 = T_0 = 250{,}000\text{ XPI}, R_0 = 2^{20} B_0, S_{\text{tx\_knee}} = 17, w = 10, E_{\min}, S_{\text{linear}}, S_{\text{quad}}$) via simulation and hardware benchmarks, freezing future-time eligibility and primitive `cu` weights, and generating independent parser, signature, VM and state conformance vectors.
+The [decision register](../decisions.md) owns the complete list. With structural formulas specified for `D08`, `D10`, `D12`, and `MonetaryState`, the remaining launch blockers are confirming the candidate shift/initial constants ($k_{\text{boot}} = 20, B_0 = T_0 = 250{,}000\text{ XPI}, R_0 = 2^{20} B_0, S_{\text{tx\_knee}} = 17, w = 10, E_{\min}, S_{\text{linear}}, S_{\text{quad}}$) via simulation and hardware benchmarks, freezing future-time eligibility and primitive `cu` weights, and generating independent parser, signature, VM and state conformance vectors.
 
 Timestamp truthfulness is still an economic research question. P06 defines the objective and feasible-history analysis needed to compare mobile and persistent miners; square-root issuance plus decay is not presently established as a truthful-timestamp mechanism. The paper has not been changed by this planning pass.
 
 ## Evidence and limits
 
-The [small structural model](tools/README.md) checks framing, hashing, tree proofs, header sizes, 56-byte `MonetaryState` / `StateRoot` commitments, telescoping bootstrap reserve conservation, parabolic transaction/block cost curves and selected integer algorithms. It records its own source and six packet digests. Those results are construction checks from one model, not independent consensus review or signed-payment validation. The [validation ledger](../../daemon/docs/lotus-validation-results.md) separates these from unrun daemon, live-sync, monetary and performance gates.
+The [small structural model](../tools/README.md) checks framing, hashing, tree proofs, header sizes, 56-byte `MonetaryState` / `StateRoot` commitments, telescoping bootstrap reserve conservation, parabolic transaction/block cost curves and selected integer algorithms. It records its own source and six packet digests. Those results are construction checks from one model, not independent consensus review or signed-payment validation. The [validation ledger](../../../daemon/docs/lotus-validation-results.md) separates these from unrun daemon, live-sync, monetary and performance gates.
 
-No daemon build, patch replay, live-network operation or benchmark was attempted. The [faster-machine handoff](../plans/faster-machine-handoff.md) and bounded implementation contracts describe the next execution steps. No external tickets or changes have been published.
+No daemon build, patch replay, live-network operation or benchmark was attempted. The [faster-machine handoff](../../plans/faster-machine-handoff.md) and bounded implementation contracts describe the next execution steps. No external tickets or changes have been published.

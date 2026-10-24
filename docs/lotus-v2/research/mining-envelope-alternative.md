@@ -2,7 +2,7 @@
 
 Status: **unselected design alternative, 2026-10-20; provisional through testnet**.
 The maintainer requested discussion of existing Bitcoin ASIC reuse, not a PoW
-selection or implementation. [P04](decisions/header-and-mining.md)'s current
+selection or implementation. [P04](../decisions/header-and-mining.md)'s current
 134-byte recursive BLAKE3 header, work hash and BlockID remain unchanged.
 This document does not enable a second accepted header or an optional per-block
 algorithm. Selection would require an explicit consensus/profile decision and

@@ -201,4 +201,18 @@ Legacy UTXO protocols inherited 2009 serialization bugs, unindexed linear Merkle
 | **[Peering & Pre-Consensus (`peering.md`)](peering.md)** | High-throughput P2P relay, `submitminedheader`, Avalanche batch voting, and bulk template pre-consensus. |
 | **[Mempool Reconciliation (`mempool-reconciliation.md`)](mempool-reconciliation.md)** | Pinned epoch snapshots and authenticated prefix-page set reconciliation. |
 | **[Validation & Conformance (`validation.md`)](validation.md)** | Reference evaluator boundary, differential test obligations, and Genesis launch gates. |
-| **[Decision Register (`decisions.md`)](decisions.md) & [Review Notes (`review-notes.md`)](review-notes.md)** | Status of all decision packets (`D01`–`D15`) and pre-genesis calibration items. |
+| **[Decision Register (`decisions.md`)](decisions.md)** | Status of all decision packets (`D01`–`D15`) and pre-genesis calibration items. |
+| **[Decision History (`decisions/history.md`)](decisions/history.md)** | Dated record of decisions: date, decision ID, change and link. |
+
+### Research (non-normative)
+
+| Document | Scope & Key Contents |
+| :--- | :--- |
+| **[Research Index (`research/README.md`)](research/README.md)** | Investigations, reviews and unselected alternatives (mining envelope, burn-data pruning, burn-demand economics, epoch reconciliation and clock studies). None defines a rule. |
+
+### How these documents are organized
+
+- **Specifications and `decisions/`** state rules, rationale and status (candidate, open, rejected). They do not carry decision provenance.
+- **`research/`** holds investigations: analysis, reviews and explorations of designs that are not selected.
+- **[`decisions/history.md`](decisions/history.md)** holds the dated decision history.
+- A research document graduates into the specification only by a decision, recorded in `decisions/history.md`.

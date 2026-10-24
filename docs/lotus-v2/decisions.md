@@ -87,35 +87,13 @@ provisional through testnet; it does not assert these operational properties
 are already implemented or tested.
 
 
-## SHA256D mining envelope — discussion requested, 2026-10-20
+## SHA256D mining envelope — unselected alternative
 
-The maintainer requested an [optional 80-byte Bitcoin-shaped mining-envelope
-alternative](mining-envelope-alternative.md), with BLAKE3-committed canonical
-extension fields and SHA256D over exactly the 80-byte envelope. This is an
-unselected alternative to D12/P04, not an additional accepted block format;
-the current 134-byte recursive BLAKE3 header/work/BlockID scheme is unchanged.
-The proposed 80-bit search space combines 32 nonce, 32 former-time-position
-and 16 rolling-version bits; it is not a claim about S9 hardware counters.
-Actual time remains committed in the extension. BlockID, rolling allocation,
-controller/Stratum adaptation and any transition require separate selection.
-Height-driven upgrade preference is recorded for discussion without adopting
-new activation rules or assigning miner signaling control. The document records
-ASIC reuse/security/economic tradeoffs and independent-vector, real-device,
-controller, pool and full-validation gates. No compatibility, performance,
-exchange-listing or production-readiness result is claimed.
-
-
-Mining-envelope clarification (2026-10-20): the discussed direct-commitment
-architecture has the node supply completed work headers and the fixed extension
-commitment. A controller/host adapter partitions permitted header fields and
-returns solutions; miners need not generate coinbase/Merklix/extension data.
-Stratum session/target/share mechanisms may be reused with adapted job
-construction. A Bitcoin coinbase/Merkle wrapper is optional, not a prerequisite
-for the direct design. Expanded search space reduces node-template turnover
-only when the actual controller can use it; chip nonce exhaustion still requires
-appropriate chip assignments. A shared pool manager with native browser and
-Stratum adapters is a proposal, not existing ASIC support. P04 and the open
-selection/measurement gates remain unchanged.
+An optional 80-byte Bitcoin-shaped mining envelope (SHA256D over the envelope,
+BLAKE3-committed extension fields) is studied in
+[research/mining-envelope-alternative.md](research/mining-envelope-alternative.md).
+It is not an accepted block format; D12/P04's 134-byte recursive BLAKE3
+header, work hash and BlockID are unchanged.
 
 
 ## Historical root verification — provisional maintainer direction, 2026-10-20
@@ -141,25 +119,10 @@ completeness, status reporting, invalid-history handling and independent tests
 remain open; no new trust or activation mechanism is adopted here.
 
 
-## Prunable burn data and script receipts — open questions, 2026-10-20
+## Prunable burn data and script receipts — open questions
 
-The maintainer requested the [burn-data appendix](burn-data-open-questions.md)
-to explore commitment-preserving pruning and large paid publication data.
-Existing native Merkleized output identities can retain an opaque leaf hash,
-but that hash alone does not authenticate disclosed burn classification or
-accounting fields. A separately committed small burn descriptor plus payload
-commitment is a hypothesis requiring its own canonical format, streaming
-validation, charged resource model and retention/retrieval evidence. It is
-not a selected rule or a request to rewrite block files.
-
-Descriptor-only pruning, script-readable historical receipts and consumable
-receipts/nullifiers are separate choices. Burned value remains unspendable;
-references must not resurrect it or bypass conservation. Read-only inputs are
-still forbidden. Any receipt capability requires explicit chain anchoring,
-reorg/replay/duplicate-claim handling and cost/availability analysis, with
-existing branch/HAS_STATE contract commitments considered first. The appendix
-flags the older P01 state-field description versus implementation discrepancy
-without modifying either rule. Backwards transition verification still needs
-its authenticated coin/provenance and full-state evidence. No payload
-availability guarantee, new wire format, consensus activation, fee parameter
-or burn distribution is selected.
+Commitment-preserving pruning of burn payloads and script-readable historical
+receipts are explored in
+[research/burn-data-open-questions.md](research/burn-data-open-questions.md).
+No burn descriptor format, receipt capability, wire format, activation, fee
+parameter or burn distribution is selected; read-only inputs remain forbidden.

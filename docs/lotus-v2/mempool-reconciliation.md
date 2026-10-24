@@ -1,12 +1,12 @@
 # Reconciliation and voting over mempool epoch candidates
 
-**Current implementation scope:** [permissionless adaptive pairwise reconciliation](pairwise-reconciliation-scheduler.proposed.md) proceeds independently of staking, Avalanche, epoch finality and a causal clock. The lifecycle below constrains a future integrated epoch implementation; it must not be installed as an eligibility gate on ordinary reconciliation. The isolated scheduler experiment does not itself repair existing full-set representation limits or implement authoritative epoch sealing.
+**Current implementation scope:** [permissionless adaptive pairwise reconciliation](research/pairwise-reconciliation-scheduler.proposed.md) proceeds independently of staking, Avalanche, epoch finality and a causal clock. The lifecycle below constrains a future integrated epoch implementation; it must not be installed as an eligibility gate on ordinary reconciliation. The isolated scheduler experiment does not itself repair existing full-set representation limits or implement authoritative epoch sealing.
 
 Status: core lifecycle architecture approved after two independent review rounds, 2026-10-21. The real Avalanche-based clock mechanism and authoritative trace vectors remain unresolved and unapproved; production protocol/lifecycle promotion stays paused for that contract. The earlier full-mempool design omitted the user's epoch ownership requirement and its reviews do not cover this lifecycle. Generic immutable canonical-node storage remains reusable.
 
-## Current root-gossip proposal
+## Related research
 
-The newer [root-gossip loop proposal](epoch-root-gossip-loop.proposed.md) evaluates the requested shared epoch name, forwarded signed preferences, reconciliation, repeated voting and locked-root catchup. It explicitly separates a preagreement SlotId from a possible vector-cut content ID. Its cohort aggregation and vector-cut extension remain proposals; the older lifecycle review did not approve these protocol changes. Candidate-context validation can require bounded bodies not admitted in the conflicting live mempool; see that proposal before interpreting the resident-body-only fast path below as universal.
+Alternative epoch-formation designs are investigated outside this specification: the [root-gossip loop proposal](research/epoch-root-gossip-loop.proposed.md) (shared slot names, forwarded preferences, repeated voting, locked-root catch-up) and its companion studies in [research/](research/README.md). None of them amends the lifecycle below. Candidate-context validation can require bounded bodies not admitted in the conflicting live mempool; see the root-gossip study before treating the resident-body-only fast path in §4 as universal.
 
 ## 1. The required behavior
 
@@ -139,16 +139,8 @@ Use fair admission and bounded per-peer work. Never evict useful older work mere
 
 This protocol cannot prove that every peer has revealed every possible eligible transaction before finality. A proof of membership in an immutable advertised proposal proves set association, not an objective wall-clock creation/admission time; clocks cannot authenticate an unstated transaction origin. The user's explicit requirement to admit recovered missing C into an epoch already under voting supersedes the older plan's blanket local pre-voting-admission cutoff. Do not silently retain that cutoff and strand C. Revisions are bounded/rate-limited and can be deferred on resource exhaustion, but no unconditional anti-drip convergence claim is made. Progress requires honest service, sufficient resources and existing Avalanche/network assumptions. Discovered valid missing epoch membership is routed into the revisable candidate, followed by a fresh proposal/vote cycle, without dragging unrelated top arrivals into it or rewriting finalized history.
 
-## 10. Real clock contract still required
+## 10. Real clock contract still required (open)
 
-Current research is captured separately in the [committed-contribution proposal](epoch-contribution-proposal.md) and [proposed conflict fixtures](epoch-conflict-vectors.proposed.json). These are a different, unselected epoch protocol; the earlier parent-slot lifecycle above is not silently amended into publisher-cut semantics. The current proposal includes the latest ancestor-closure requirement and four requested review areas.
+Audited source has no distributed vector clock. Local epoch counters, parent BatchIds, poll round numbers and vote confidence do not constitute one, and the older plan's finalized-epoch causal header and separate bucket-progress vector are not an implemented per-origin transaction clock. Remote progress claims cannot replace local finality; a clock alone cannot authenticate C's membership in a proposal.
 
-The [clock option study and recommendation](epoch-clock-open-questions.md)
-compares an authored heartbeat consensus DAG, a bounded peer-progress vector,
-and the accepted parent-BatchId chain against primary sources and actual Lotus
-code. No option has been selected; a new heartbeat consensus layer must not be
-inferred from the user's research proposal.
-
-Audited source has no distributed vector clock. Local epoch counters, parent BatchIds, poll round numbers and vote confidence do not constitute one. The older plan's proposed finalized-epoch causal header and separate bucket-progress vector likewise are not an implemented per-origin transaction clock.
-
-The pending alternatives now include the exact accepted parent-BatchId chain (a scalar causal order), bounded peer-progress observations, a new authenticated heartbeat DAG, and publisher microbatch chains with consensus-selected exit cuts. The supplied publisher proposal also raises a prior semantic choice: whether epoch batches perform transaction pre-consensus or package transactions already finalized by another mechanism. None is silently selected by the lifecycle above; see the option study for concrete counterexamples and required contracts. Remote progress claims cannot replace local finality; a clock alone cannot authenticate C's membership in a proposal. A complete selected mechanism must specify origin identity, updates/receive/merge, cut creation, trust, wire commitments and bounds before the requested machine-readable clock/lifecycle vectors or implementation harness can be accepted. Observer-only timestamps will not be substituted for this missing production mechanism.
+A selected mechanism must specify origin identity, update/receive/merge rules, cut creation, trust, wire commitments and bounds before machine-readable clock/lifecycle vectors or an implementation harness can be accepted. Observer-only timestamps are not a substitute. Candidate mechanisms (the exact parent-BatchId chain as a scalar causal order, bounded peer-progress observations, an authenticated heartbeat DAG, and publisher microbatch chains with committed contributions) are compared in the [clock option study](research/epoch-clock-open-questions.md) and the [committed-contribution review](research/epoch-contribution-proposal.md); none is selected, and the lifecycle above is not amended into publisher-cut semantics.

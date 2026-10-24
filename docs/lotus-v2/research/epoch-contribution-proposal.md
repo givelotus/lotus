@@ -1,6 +1,6 @@
 # Committed contributions: current §§9.4/10 review and proposed behavior vectors
 
-Status: proposal review, not production protocol approval. Reviewed snapshot `leaderless-epochs-reviewed-39c1ccead262.md`, SHA256 `39c1ccead26255409820b312d87fff0ae924a91cd62afcaf72cb453133d0f114`. This current revision removes per-transaction finality, uses a stake-first total score, acknowledges hash tie grinding, and adds committed contributions plus explicit ACS limitations. The newest §9.3 requires each contribution to contain every unconfirmed ancestor; this supersedes the earlier deferred-child proposal. Earlier reviews of finalized-only or pairwise/per-input rules are historical; do not repeat their resolved objections as current findings.
+Status: proposal review, not production protocol approval. Reviewed proposal snapshot SHA256 `39c1ccead26255409820b312d87fff0ae924a91cd62afcaf72cb453133d0f114`. This current revision removes per-transaction finality, uses a stake-first total score, acknowledges hash tie grinding, and adds committed contributions plus explicit ACS limitations. The newest §9.3 requires each contribution to contain every unconfirmed ancestor; this supersedes the earlier deferred-child proposal. Earlier reviews of finalized-only or pairwise/per-input rules are historical; do not repeat their resolved objections as current findings.
 
 ## Scope and recommendation
 
@@ -118,7 +118,7 @@ The authored cutoff-vector mechanism and these agreement contracts remain a prop
 
 ## Review and verification record
 
-Canonical independent notes are `SECTION9-OVERLAY-REVIEW-UPDATED.md`, `SECTION9-PROTOCOL-REVIEW-UPDATED.md` and `SECTION9-PROTOCOL-EXPERIMENT-PLAN.md` under `daemon/patch-intake/20261021/triage/astra-reconciliation-overlay-spec/`. The protocol reviewer reread proposal39c1ccead262 and the current study/fixtures, confirmed all four requested areas and no remaining contradiction in their stated scope; this approves the accuracy of the proposal review, not any architecture. The overlay reviewer confirmed the G/M/R/Z outputs and persisted a current H1/H2/H3, prior-loser and per-contribution closure addendum. Both independent reviews cover the latest ancestor-closed variant as a proposal, not a selected architecture. Five symbolic support/generation vectors pass arithmetic checks in `PROPOSED-VECTOR-ARITHMETIC-CHECK.json`; no production, cryptographic, ACS or security experiment was run.
+Two independent reviews (overlay and protocol) and an experiment plan were recorded. The protocol reviewer reread proposal39c1ccead262 and the current study/fixtures, confirmed all four requested areas and no remaining contradiction in their stated scope; this approves the accuracy of the proposal review, not any architecture. The overlay reviewer confirmed the G/M/R/Z outputs and persisted a current H1/H2/H3, prior-loser and per-contribution closure addendum. Both independent reviews cover the latest ancestor-closed variant as a proposal, not a selected architecture. Five symbolic support/generation vectors pass arithmetic checks; no production, cryptographic, ACS or security experiment was run.
 
 
 ## Section 11 follow-up
