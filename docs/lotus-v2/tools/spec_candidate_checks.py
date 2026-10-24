@@ -1,0 +1,1063 @@
+#!/usr/bin/env python3
+"""Small P01/P02/P03/P04 models, not a transaction validator or consensus oracle."""
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+from math import isqrt
+from pathlib import Path
+
+from blake3 import blake3
+
+ROOT = Path(__file__).resolve().parents[1]
+CHAIN = bytes(range(32))  # fixture-only; no production identity is selected
+
+
+def u(value: int, width: int) -> bytes:
+    return value.to_bytes(width, 'little')
+
+
+def cs(n: int) -> bytes:
+    if n < 253:
+        return u(n, 1)
+    if n <= 65535:
+        return b'\xfd' + u(n, 2)
+    if n <= 2**32 - 1:
+        return b'\xfe' + u(n, 4)
+    return b'\xff' + u(n, 8)
+
+
+def blob(data: bytes) -> bytes:
+    return cs(len(data)) + data
+
+
+def coinbase_data(data: bytes | None) -> bytes:
+    """Construct P01's one optional opaque item, not a script witness."""
+    if data is None:
+        return b'\0'
+    if not 1 <= len(data) <= 8192:
+        raise ValueError('coinbase data length')
+    return b'\1' + blob(data)
+
+
+def parse_coinbase_data(encoded: bytes) -> bytes | None:
+    """Check this field's framing only; no transaction or VM parsing."""
+    def length(offset: int) -> tuple[int, int]:
+        if offset >= len(encoded):
+            raise ValueError('truncated CompactSize')
+        marker = encoded[offset]
+        offset += 1
+        width = {253: 2, 254: 4, 255: 8}.get(marker, 0)
+        if not width:
+            return marker, offset
+        if len(encoded) - offset < width:
+            raise ValueError('truncated CompactSize')
+        value = int.from_bytes(encoded[offset:offset + width], 'little')
+        if value < (253 if width == 2 else 65536 if width == 4 else 2**32):
+            raise ValueError('non-shortest CompactSize')
+        return value, offset + width
+
+    count, offset = length(0)
+    if count == 0:
+        if offset != len(encoded):
+            raise ValueError('trailing coinbase data')
+        return None
+    if count != 1:
+        raise ValueError('coinbase data count')
+    size, offset = length(offset)
+    if not 1 <= size <= 8192:
+        raise ValueError('coinbase data length')
+    if len(encoded) - offset != size:
+        raise ValueError('truncated or trailing coinbase data')
+    return encoded[offset:]
+
+
+def coinbase_input(parent_id: bytes, height: int, data: bytes | None) -> bytes:
+    if len(parent_id) != 32 or not 0 <= height <= 2**32 - 1:
+        raise ValueError('coinbase parent or height')
+    return parent_id + u(height, 4) + b'\xff' * 4 + b'\2' + coinbase_data(data)
+
+
+def check_coinbase_context(inp: bytes, parent_id: bytes, derived_height: int) -> None:
+    """Model the parent/height comparison after a block supplies context."""
+    if len(parent_id) != 32 or not 0 <= derived_height <= 2**32 - 1:
+        raise ValueError('coinbase context overflow')
+    if derived_height == 0 and parent_id != ZERO32:
+        raise ValueError('genesis parent')
+    if inp[:32] != parent_id or inp[32:36] != u(derived_height, 4):
+        raise ValueError('coinbase parent or height mismatch')
+
+
+def h(name: str, data: bytes) -> bytes:
+    return blake3(('Lotus/v2/' + name).encode('ascii') + b'\0' + data).digest()
+
+
+def leaf(script: bytes) -> bytes:
+    return h('branch', b'\0' + blob(script))
+
+
+def branch(a: bytes, b: bytes) -> bytes:
+    lo, hi = sorted((a, b), key=lambda x: x[::-1])  # unsigned little-endian order
+    return h('branch', b'\1' + lo + hi)
+
+
+EMPTY_TX_ROOT = h('txroot', b'\2')
+EMPTY_ROOT = h('utxo', b'\2')
+EMPTY_INDEXED_ROOT = h('merkleidx', b'\2')
+ZERO32 = b'\0' * 32
+
+
+def bit(key: bytes, depth: int) -> int:
+    return (key[depth // 8] >> (depth % 8)) & 1  # little-endian bit order
+
+
+def tx_leaf(tx_id: bytes, tx_hash: bytes) -> bytes:
+    assert len(tx_id) == 32 and len(tx_hash) == 32
+    return h('txroot', b'\0' + tx_id + tx_hash)
+
+
+def tx_node(depth: int, left: bytes, right: bytes) -> bytes:
+    return h('txroot', b'\1' + u(depth, 2) + left + right)
+
+
+def tx_smt(entries: dict[bytes, bytes], depth: int = 0) -> bytes:
+    if not entries:
+        return EMPTY_TX_ROOT
+    if len(entries) == 1:
+        tx_id, tx_hash = next(iter(entries.items()))
+        return tx_leaf(tx_id, tx_hash)
+    assert depth < 256
+    left = {k: v for k, v in entries.items() if bit(k, depth) == 0}
+    right = {k: v for k, v in entries.items() if bit(k, depth) == 1}
+    return tx_node(depth, tx_smt(left, depth + 1), tx_smt(right, depth + 1))
+
+
+def txroot(items: list[bytes]) -> bytes:
+    if not items:
+        return EMPTY_TX_ROOT
+    seen_ids: set[bytes] = set()
+    for item in items:
+        assert len(item) == 64
+        tx_id = item[32:64]
+        assert tx_id not in seen_ids, 'duplicate transaction id'
+        seen_ids.add(tx_id)
+    cb_hash, cb_id = items[0][:32], items[0][32:64]
+    cb_leaf = tx_leaf(cb_id, cb_hash)
+    entries = {item[32:64]: item[:32] for item in items[1:]}
+    return h('txroot', b'\3' + cb_leaf + tx_smt(entries))
+
+
+def tx_path(entries: dict[bytes, bytes], key: bytes, depth: int = 0) -> tuple[dict[bytes, bytes], list[tuple[int, bytes]]]:
+    if len(entries) <= 1:
+        return entries, []
+    assert depth < 256
+    selected = {k: v for k, v in entries.items() if bit(k, depth) == bit(key, depth)}
+    other = {k: v for k, v in entries.items() if bit(k, depth) != bit(key, depth)}
+    terminal, path = tx_path(selected, key, depth + 1)
+    return terminal, path + [(depth, tx_smt(other, depth + 1))]
+
+
+def tx_proof(items: list[bytes], query_txid: bytes, is_coinbase: bool = False) -> bytes:
+    assert len(items) >= 1 and len(query_txid) == 32
+    cb_hash, cb_id = items[0][:32], items[0][32:64]
+    cb_leaf = tx_leaf(cb_id, cb_hash)
+    entries = {item[32:64]: item[:32] for item in items[1:]}
+    if is_coinbase:
+        assert query_txid == cb_id
+        return b'\1' + cb_id + cb_hash + tx_smt(entries)
+    terminal, path = tx_path(entries, query_txid)
+    if not terminal:
+        start = b'\0'
+    else:
+        term_id, term_hash = next(iter(terminal.items()))
+        start = (b'\1' if term_id == query_txid else b'\2') + term_id + term_hash
+    bitmap = bytearray(32)
+    nondefault = []
+    for depth, sibling in path:
+        if sibling != EMPTY_TX_ROOT:
+            bitmap[depth // 8] |= 1 << (depth % 8)
+            nondefault.append(sibling)
+    return b'\0' + cb_leaf + start + bytes(bitmap) + b''.join(nondefault)
+
+
+def recover_txroot(query_txid: bytes, proof: bytes) -> bytes:
+    is_cb = proof[0]
+    assert is_cb in (0, 1)
+    if is_cb == 1:
+        assert len(proof) == 97 and proof[1:33] == query_txid
+        cb_leaf = tx_leaf(proof[1:33], proof[33:65])
+        return h('txroot', b'\3' + cb_leaf + proof[65:97])
+    cb_leaf = proof[1:33]
+    presence = proof[33]
+    assert presence in (0, 1, 2)
+    offset = 34
+    term_id, term_hash = None, None
+    if presence in (1, 2):
+        term_id = proof[offset:offset + 32]
+        term_hash = proof[offset + 32:offset + 64]
+        assert len(term_id) == 32 and len(term_hash) == 32
+        offset += 64
+    bitmap = proof[offset:offset + 32]
+    assert len(bitmap) == 32
+    offset += 32
+    set_bits = [d for d in range(256) if bitmap[d // 8] & (1 << (d % 8))]
+    k = 0 if not set_bits else max(set_bits) + 1
+    if presence == 0:
+        acc = EMPTY_TX_ROOT
+    elif presence == 1:
+        assert term_id == query_txid and term_hash is not None
+        acc = tx_leaf(term_id, term_hash)
+    else:
+        assert term_id is not None and term_id != query_txid and term_hash is not None
+        assert all(bit(term_id, d) == bit(query_txid, d) for d in range(k))
+        acc = tx_leaf(term_id, term_hash)
+    for depth in range(k - 1, -1, -1):
+        sibling = EMPTY_TX_ROOT
+        if bitmap[depth // 8] & (1 << (depth % 8)):
+            sibling = proof[offset:offset + 32]
+            assert len(sibling) == 32 and sibling != EMPTY_TX_ROOT
+            offset += 32
+        left, right = (sibling, acc) if bit(query_txid, depth) else (acc, sibling)
+        acc = tx_node(depth, left, right)
+    assert offset == len(proof)
+    return h('txroot', b'\3' + cb_leaf + acc)
+
+
+def node(depth: int, left: bytes, right: bytes) -> bytes:
+    return h('utxo', b'\1' + u(depth, 2) + left + right)
+
+
+def indexed_tree_root(leaves: list[bytes]) -> bytes:
+    if not leaves:
+        return EMPTY_INDEXED_ROOT
+    if len(leaves) == 1:
+        assert len(leaves[0]) == 32
+        return leaves[0]
+    cur = list(leaves)
+    s = 0
+    while len(cur) > 1:
+        if len(cur) % 2 == 1:
+            cur.append(ZERO32)
+        cur = [h('merkleidx', b'\1' + u(s, 2) + cur[2 * j] + cur[2 * j + 1]) for j in range(len(cur) // 2)]
+        s += 1
+    return cur[0]
+
+
+def indexed_tree_proof(leaves: list[bytes], index: int) -> bytes:
+    assert 0 <= index < len(leaves)
+    if len(leaves) == 1:
+        return b''
+    cur = list(leaves)
+    idx = index
+    s = 0
+    siblings = []
+    while len(cur) > 1:
+        if len(cur) % 2 == 1:
+            cur.append(ZERO32)
+        siblings.append(cur[idx ^ 1])
+        cur = [h('merkleidx', b'\1' + u(s, 2) + cur[2 * j] + cur[2 * j + 1]) for j in range(len(cur) // 2)]
+        idx >>= 1
+        s += 1
+    return b''.join(siblings)
+
+
+def merkle_sorted(leaf_hash: bytes, proof_bytes: bytes, hash_alg: int = 0) -> bytes:
+    assert len(leaf_hash) == 32 and len(proof_bytes) % 32 == 0 and hash_alg in (0, 1, 2, 3)
+    k = len(proof_bytes) // 32
+    assert 0 <= k <= 64
+    acc = leaf_hash
+    for s in range(k):
+        sib = proof_bytes[32 * s:32 * (s + 1)]
+        lo, hi = sorted((acc, sib), key=lambda x: x[::-1])
+        if hash_alg == 0:
+            acc = h('branch', b'\1' + lo + hi)
+        elif hash_alg == 1:
+            acc = blake3(lo + hi).digest()
+        elif hash_alg == 2:
+            acc = hashlib.sha256(lo + hi).digest()
+        else:
+            acc = hashlib.sha256(hashlib.sha256(lo + hi).digest()).digest()
+    return acc
+
+
+def merkle_indexed(leaf_hash: bytes, key_bytes: bytes, proof_bytes: bytes, hash_alg: int = 0) -> bytes:
+    assert len(leaf_hash) == 32 and 1 <= len(key_bytes) <= 32 and len(proof_bytes) % 32 == 0 and hash_alg in (0, 1, 2, 3)
+    k = len(proof_bytes) // 32
+    assert 0 <= k <= 8 * len(key_bytes)
+    acc = leaf_hash
+    for s in range(k):
+        sib = proof_bytes[32 * s:32 * (s + 1)]
+        left, right = (sib, acc) if bit(key_bytes, s) else (acc, sib)
+        if hash_alg == 0:
+            acc = h('merkleidx', b'\1' + u(s, 2) + left + right)
+        elif hash_alg == 1:
+            acc = blake3(left + right).digest()
+        elif hash_alg == 2:
+            acc = hashlib.sha256(left + right).digest()
+        else:
+            acc = hashlib.sha256(hashlib.sha256(left + right).digest()).digest()
+    return acc
+
+
+def smt(entries: dict[bytes, bytes], depth: int = 0) -> bytes:
+    if not entries:
+        return EMPTY_ROOT
+    if len(entries) == 1:
+        key, coin = next(iter(entries.items()))
+        return h('utxo', b'\0' + key + blob(coin))
+    assert depth < 256
+    left = {k: v for k, v in entries.items() if bit(k, depth) == 0}
+    right = {k: v for k, v in entries.items() if bit(k, depth) == 1}
+    return node(depth, smt(left, depth + 1), smt(right, depth + 1))
+
+
+def state_path(entries: dict[bytes, bytes], key: bytes, depth: int = 0) -> tuple[dict[bytes, bytes], list[tuple[int, bytes]]]:
+    if len(entries) <= 1:
+        return entries, []
+    assert depth < 256
+    selected = {k: v for k, v in entries.items() if bit(k, depth) == bit(key, depth)}
+    other = {k: v for k, v in entries.items() if bit(k, depth) != bit(key, depth)}
+    terminal, path = state_path(selected, key, depth + 1)
+    return terminal, path + [(depth, smt(other, depth + 1))]
+
+
+def state_proof(entries: dict[bytes, bytes], key: bytes) -> bytes:
+    terminal, path = state_path(entries, key)
+    if not terminal:
+        start = b'\0'
+    else:
+        term_key, term_coin = next(iter(terminal.items()))
+        start = (b'\1' if term_key == key else b'\2') + blob(term_coin)
+    bitmap = bytearray(32)
+    nondefault = []
+    for depth, sibling in path:
+        if sibling != EMPTY_ROOT:
+            bitmap[depth // 8] |= 1 << (depth % 8)
+            nondefault.append(sibling)
+    return start + bytes(bitmap) + b''.join(nondefault)
+
+
+def outpoint_key(outpoint: bytes) -> bytes:
+    assert len(outpoint) == 36
+    tail = int.from_bytes(outpoint[28:32], 'little') ^ int.from_bytes(outpoint[32:36], 'little')
+    return outpoint[:28] + u(tail, 4)
+
+
+def recover_compact(outpoint: bytes, proof: bytes) -> bytes:
+    """Decode the generated P02 fixtures; this is not a hardened input parser."""
+    key = outpoint_key(outpoint)
+    presence = proof[0]
+    assert presence in (0, 1, 2)
+    offset, coin = 1, None
+    if presence in (1, 2):
+        first = proof[offset]
+        offset += 1
+        if first < 253:
+            size = first
+        else:
+            width = {253: 2, 254: 4, 255: 8}[first]
+            size = int.from_bytes(proof[offset:offset + width], 'little')
+            offset += width
+        coin = proof[offset:offset + size]
+        assert len(coin) == size
+        assert proof[1:offset + size] == blob(coin)
+        offset += size
+    bitmap = proof[offset:offset + 32]
+    assert len(bitmap) == 32
+    offset += 32
+    set_bits = [d for d in range(256) if bitmap[d // 8] & (1 << (d % 8))]
+    k = 0 if not set_bits else max(set_bits) + 1
+    if presence == 0:
+        root = EMPTY_ROOT
+    elif presence == 1:
+        assert coin is not None and coin[:36] == outpoint
+        root = h('utxo', b'\0' + key + blob(coin))
+    else:
+        assert coin is not None and coin[:36] != outpoint
+        other_key = outpoint_key(coin[:36])
+        assert all(bit(other_key, d) == bit(key, d) for d in range(k))
+        root = h('utxo', b'\0' + other_key + blob(coin))
+    for depth in range(k - 1, -1, -1):
+        sibling = EMPTY_ROOT
+        if bitmap[depth // 8] & (1 << (depth % 8)):
+            sibling = proof[offset:offset + 32]
+            assert len(sibling) == 32 and sibling != EMPTY_ROOT
+            offset += 32
+        left, right = (sibling, root) if bit(key, depth) else (root, sibling)
+        root = node(depth, left, right)
+    assert offset == len(proof)
+    return root
+
+
+def log_q64(x: int) -> int:
+    assert 0 < x < 2**127
+    e = x.bit_length() - 1
+    z, frac = x << (127 - e), 0
+    for _ in range(64):
+        t = z * z >> 127
+        high = int(t >= 2**128)
+        z = t >> high
+        frac = frac * 2 + high
+    return (e << 64) + frac
+
+
+def compact_encode(target: int) -> int:
+    exponent = (target.bit_length() + 7) // 8
+    mantissa = target << (8 * (3 - exponent)) if exponent <= 3 else target >> (8 * (exponent - 3))
+    if mantissa & 0x800000:
+        mantissa >>= 8
+        exponent += 1
+    return exponent << 24 | mantissa
+
+
+def compact_decode(bits: int) -> int:
+    exponent, mantissa = bits >> 24, bits & 0x7fffff
+    return mantissa >> (8 * (3 - exponent)) if exponent <= 3 else mantissa << (8 * (exponent - 3))
+
+
+def asert(target: int, drift: int, half_life: int, limit: int) -> int:
+    exponent = (abs(drift) * 65536 // half_life) * (-1 if drift < 0 else 1)
+    q, f = divmod(exponent, 65536)
+    factor = 65536 + ((195766423245049*f + 971821376*f*f + 5127*f*f*f + 2**47) >> 48)
+    value, shift = target * factor, q - 16
+    if shift >= 0:
+        raw = limit if shift >= 256 or value > (limit >> shift) else value << shift
+    else:
+        raw = 0 if -shift >= value.bit_length() else value >> -shift
+    return min(limit, max(1, raw))
+
+
+def monetary_state_record(bootstrap_reserve: int, tail_subsidy: int, prev_work: int, ema_block_cost: int) -> bytes:
+    record = u(bootstrap_reserve, 8) + u(tail_subsidy, 8) + u(prev_work, 32) + u(ema_block_cost, 8)
+    assert len(record) == 56
+    return record
+
+
+def state_root_envelope(height: int, utxo_root: bytes, monetary_state: bytes) -> bytes:
+    assert len(utxo_root) == 32 and len(monetary_state) == 56
+    preimage = b'\0' + CHAIN + u(height, 8) + utxo_root + blob(monetary_state)
+    assert len(preimage) == 130 and blob(monetary_state)[:1] == b'\x38'
+    return h('state', preimage)
+
+
+def bootstrap_step(reserve: int, k_boot: int = 20) -> tuple[int, int]:
+    assert reserve >= 0 and k_boot >= 0
+    if reserve == 0:
+        return 0, 0
+    b_n = max(1, reserve >> k_boot)
+    assert 1 <= b_n <= reserve
+    return b_n, reserve - b_n
+
+
+def parabolic_tx_cost(linear_cu: int, knee_shift: int = 17) -> int:
+    assert linear_cu >= 0 and knee_shift >= 0
+    return linear_cu + ((linear_cu * linear_cu) >> knee_shift)
+
+
+def update_ema_block_cost(ema_cu: int, block_cu: int, w: int = 10) -> int:
+    assert ema_cu >= 0 and block_cu >= 0 and w >= 0
+    return ema_cu - (ema_cu >> w) + (block_cu >> w)
+
+
+def required_block_burn_floor(block_cu: int, ema_cu: int, ema_min: int, s_linear: int, s_quad: int) -> int:
+    assert block_cu >= 0 and ema_cu >= 0 and ema_min >= 0
+    return ((block_cu * max(ema_cu, ema_min)) >> s_linear) + ((block_cu * block_cu) >> s_quad)
+
+
+def minimum_byte_fee(size: int) -> int:
+    assert size >= 0
+    return (1000 * size + 999) // 1000
+
+
+def coinbase_claim_limit(subsidy: int, fees: int, token_burn: int,
+                         coinbase_bytes: int, envelope_bytes: int,
+                         required_burn: int) -> tuple[int, int]:
+    assert min(subsidy, fees, token_burn, coinbase_bytes, envelope_bytes, required_burn) >= 0
+    assert fees >= token_burn
+    net_fees = fees - token_burn
+    fee_burn = net_fees - net_fees // 2
+    deduction = max(minimum_byte_fee(coinbase_bytes + envelope_bytes),
+                    max(0, required_burn - fee_burn))
+    entitlement = subsidy + net_fees // 2
+    if deduction > entitlement:
+        raise ValueError('insufficient reward for resource charge')
+    return entitlement - deduction, deduction
+
+
+def review_regression_vectors() -> dict:
+    # Literal boundary expectations independently exercise rounding and units.
+    assert [minimum_byte_fee(n) for n in (0, 1, 999, 1000, 1001)] == [0, 1, 999, 1000, 1001]
+    fee_rows = []
+    for label, args, expected in (
+        ('coinbase_only', (10000, 0, 0, 100, 139, 0), (9761, 239)),
+        ('extra_coinbase_output', (10000, 0, 0, 623, 139, 0), (9238, 762)),
+        ('parabolic_dominates', (10000, 0, 0, 100, 139, 1000), (9000, 1000)),
+        ('token_and_odd_fee', (10000, 1001, 100, 100, 139, 1000), (9901, 549)),
+        ('fee_burn_covers_curve', (10000, 2000, 0, 100, 139, 1000), (10761, 239)),
+    ):
+        claim, deduction = coinbase_claim_limit(*args)
+        assert (claim, deduction) == expected
+        subsidy, fees, token_burn, cb_bytes, envelope, floor = args
+        net_fees = fees - token_burn
+        for candidate, valid in ((claim, True), (claim + 1, False)):
+            underclaim = subsidy + net_fees // 2 - candidate
+            assert ((underclaim >= minimum_byte_fee(cb_bytes + envelope)) and
+                    (net_fees - net_fees // 2 + underclaim >= floor)) == valid
+        fee_rows.append(dict(case=label, inputs=list(args), max_claim=claim, required_underclaim=deduction))
+    try:
+        coinbase_claim_limit(238, 0, 0, 100, 139, 0)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError('negative claim was allowed')
+    # An output with zero value still adds full serialized output bytes.
+    assert len(cs(252)) == 1 and len(cs(253)) == 3
+    assert minimum_byte_fee(134 + 4 + len(cs(253)) + 253) == 394
+
+    # Mock extension: old and new enforce different floors but commit the SAME
+    # accounting EMA. Actual assigned-opcode execution requires the future VM.
+    account = parabolic_tx_cost(1024)
+    enforce = parabolic_tx_cost(2048)
+    ema = update_ema_block_cost(1024, account)
+    assert (account, enforce, ema) == (1032, 2080, 1024)
+    incorrect_ema = update_ema_block_cost(1024, enforce)
+    assert incorrect_ema == 1025
+    state = monetary_state_record(100000, 100, 1, ema)
+    old_root = state_root_envelope(1, EMPTY_ROOT, state)
+    new_root = state_root_envelope(1, EMPTY_ROOT, state)
+    wrong_root = state_root_envelope(1, EMPTY_ROOT, monetary_state_record(100000, 100, 1, incorrect_ema))
+    assert old_root == new_root and old_root != wrong_root
+    old_floor = required_block_burn_floor(account, 1024, 1, 10, 10)
+    new_floor = required_block_burn_floor(enforce, 1024, 1, 10, 10)
+    old_claim, _ = coinbase_claim_limit(10000, 0, 0, 100, 139, old_floor)
+    new_claim, _ = coinbase_claim_limit(10000, 0, 0, 100, 139, new_floor)
+    assert new_claim < old_claim
+    # Every new valid claim is also old-valid; old maximum is new-invalid.
+    assert all((claim <= old_claim) for claim in range(new_claim + 1))
+
+    # Genesis initialization is not step 0. Keep a small, hand-checkable profile.
+    genesis = monetary_state_record(64, 10, 1, 1024)
+    b0, r1 = bootstrap_step(64, 6)
+    b1, r2 = bootstrap_step(r1, 6)
+    assert (b0, r1, b1, r2) == (1, 63, 1, 62)
+    height1 = monetary_state_record(r1, 10, 1, update_ema_block_cost(1024, account))
+    height2 = monetary_state_record(r2, 10, 1, update_ema_block_cost(1024, account))
+    assert [int.from_bytes(record[:8], 'little') for record in (genesis, height1, height2)] == [64, 63, 62]
+    # Domain bytes count toward BLAKE3 compression blocks.
+    assert len(b'Lotus/v2/sighash\0') == 17
+    assert [(n + 17 + 63) // 64 for n in (138, 150, 178)] == [3, 3, 4]
+    return {'fee_and_reward_cases': fee_rows,
+            'extension': {'account_cost': account, 'enforce_cost': enforce,
+                          'account_ema': ema, 'old_floor': old_floor, 'new_floor': new_floor,
+                          'shared_root': old_root.hex(), 'incorrect_root': wrong_root.hex()},
+            'genesis_indexing': {'genesis': genesis.hex(), 'height_1': height1.hex(), 'height_2': height2.hex(),
+                                 'height_1_gross_subsidy': b0 + 10, 'height_2_gross_subsidy': b1 + 10},
+            'scope': 'Arithmetic and commitments only; not a block validator, assigned-opcode VM, or Avalanche test.'}
+
+
+# Byte allocation has one machine-readable source; semantics stay in P03.
+OPCODE_PATH = ROOT / 'tools' / 'opcodes.json'
+OPCODE_ROWS = json.loads(OPCODE_PATH.read_text())['opcodes']
+OPCODES = {row['name']: int(row['byte'], 16) for row in OPCODE_ROWS}
+assert len(OPCODES) == len(OPCODE_ROWS) == len(set(OPCODES.values())) == 215
+ASSIGNED_OPCODES = set(OPCODES.values())
+SUCCESS_OPCODES = set(range(256)) - ASSIGNED_OPCODES
+
+
+def op(name: str) -> bytes:
+    return bytes([OPCODES[name]])
+
+
+def success_scan(script: bytes, max_element_bytes: int = 8192) -> bool:
+    """P03 structural scan only; False still requires ordinary decode/evaluation.
+
+    The caller must validate framing, outer limits and membership first.
+    This helper is not a VM, transaction validator or relay implementation.
+    """
+    offset = 0
+    while offset < len(script):
+        op = script[offset]
+        offset += 1
+        if op in SUCCESS_OPCODES:
+            return True
+        if 1 <= op <= 75:
+            size = op
+        elif op == 0x4c:
+            if offset == len(script):
+                raise ValueError('missing push length')
+            first = script[offset]
+            offset += 1
+            if first < 253:
+                size = first
+            else:
+                width = {253: 2, 254: 4, 255: 8}[first]
+                if width > len(script) - offset:
+                    raise ValueError('truncated push length')
+                size = int.from_bytes(script[offset:offset + width], 'little')
+                offset += width
+                if size < {253: 253, 254: 65536, 255: 2**32}[first]:
+                    raise ValueError('nonminimal push length')
+            if 1 <= size <= 75:
+                raise ValueError('noncanonical PUSHDATA form')
+        else:
+            continue
+        if size > max_element_bytes or size > len(script) - offset:
+            raise ValueError('oversized or truncated push')
+        offset += size
+    return False
+
+
+def success_scan_vectors() -> dict:
+    assert len(ASSIGNED_OPCODES) == 215 and len(SUCCESS_OPCODES) == 41
+    # Cross-check every documented name, not just the set of occupied bytes.
+    import re
+    documented = {}
+    packet = (ROOT / 'decisions' / 'vm-semantics.md').read_text()
+    for byte, name in re.findall(r'^\| ([0-9a-f]{2}) \| ([A-Z0-9_]+) \|', packet, re.M):
+        assert name not in documented
+        documented[name] = int(byte, 16)
+    documented.update({f'PUSH_{i}': i for i in range(1, 76)})
+    assert documented == OPCODES
+    assert [OPCODES[n] for n in ('ZERO', 'PUSHDATA', 'ONE', 'RETURN', 'BLAKE3', 'TXID', 'CHECKSEQUENCEVERIFY')] == [0, 0x4c, 0x4e, 0x66, 0xba, 0xce, 0xf4]
+    assert all(OPCODES[n] == 0x4e + i for i, n in enumerate(('ONE TWO THREE FOUR FIVE SIX SEVEN EIGHT NINE TEN ELEVEN TWELVE THIRTEEN FOURTEEN FIFTEEN SIXTEEN').split()))
+
+    success_listing = packet.split('## Extension points', 1)[1].split('```text', 1)[1].split('```', 1)[0]
+    assert set(bytes.fromhex(success_listing)) == SUCCESS_OPCODES
+    for path in ROOT.rglob('*.md'):
+        for name, byte in re.findall(r'\b([A-Z][A-Z0-9_]+)`?\s*\(\s*`?0x([0-9a-f]{2})', path.read_text()):
+            if name in OPCODES:
+                assert OPCODES[name] == int(byte, 16), (path, name, byte)
+
+    rows = []
+    cases = [(f'success_{op}', bytes([op]), True) for op in sorted(SUCCESS_OPCODES)]
+    cases += [
+        ('after_return', op('RETURN') + b'\xff', True),
+        ('skipped_arm', op('ZERO') + op('IF') + b'\xff' + op('ENDIF'), True),
+        ('unmatched_conditional', op('IF') + b'\xff', True),
+        ('ignored_truncated_suffix', b'\xff\x01', True),
+        ('fixed_push_payload', b'\x01\xff', False),
+        ('long_push_payload', b'\x4c\x4c' + b'\xff' * 76, False),
+        ('after_long_push', b'\x4c\x4c' + b'\xff' * 76 + b'\xff', True),
+        ('empty_push', b'\x4c\x00', False),
+        ('ordinary_one', op('ONE'), False),
+        ('ordinary_return_needs_vm', op('RETURN'), False),
+        ('truncated_push_before_success', b'\x02\xff', 'error'),
+        ('noncanonical_push_before_success', b'\x4c\x01\xff', 'error'),
+        ('nonminimal_length_before_success', b'\x4c\xfd\x01\x00\xff', 'error'),
+        ('truncated_length_before_success', b'\x4c\xfe\xff', 'error'),
+        ('oversized_push_before_success', b'\x4c\xfd\x01\x20\xff', 'error'),
+    ]
+    for name, script, expected in cases:
+        try:
+            result = success_scan(script)
+        except ValueError:
+            result = 'error'
+        assert result == expected, (name, result, expected)
+        rows.append({'id': name, 'script': script.hex(), 'scan_result': result})
+    return {'note': 'Instruction-boundary scanning only; outer validation and ordinary VM execution are not modeled.',
+            'success_bytes': bytes(sorted(SUCCESS_OPCODES)).hex(), 'cases': rows}
+
+
+def coinbase_identity_vectors(output: bytes) -> dict:
+    """Construct P01 coinbase identities and check field/context boundaries."""
+    parent = b'\x55' * 32
+    height = 7
+    header = u(7, 4) + u(0, 8) + u(1, 2) + u(1, 2)
+    outputs_root = indexed_tree_root([h('output', blob(output))])
+
+    def identities(inp: bytes) -> tuple[bytes, bytes]:
+        # Coinbase has no BranchWitness, so InputCore is byte-for-byte InputFull.
+        core = inp
+        full = inp
+        assert core == full
+        txid = h('txid', CHAIN + header + indexed_tree_root([h('inputcore', core)]) + outputs_root)
+        txhash = h('txhash', CHAIN + header + indexed_tree_root([h('inputfull', full)]) + outputs_root)
+        return txid, txhash
+
+    absent = coinbase_input(parent, height, None)
+    original = coinbase_input(parent, height, b'pool-1')
+    changed_data = coinbase_input(parent, height, b'pool-2')
+    changed_parent = coinbase_input(b'\x56' * 32, height, b'pool-1')
+    changed_height = coinbase_input(parent, height + 1, b'pool-1')
+    assert len(absent) == 42 and len(original) == 49
+    assert absent[41:] == b'\0' and original[41:] == b'\1\x06pool-1'
+    assert parse_coinbase_data(absent[41:]) is None
+    assert parse_coinbase_data(original[41:]) == b'pool-1'
+    assert parse_coinbase_data(coinbase_data(b'\xff\x66')) == b'\xff\x66'
+    assert parse_coinbase_data(coinbase_data(b'\xaa' * 8192)) == b'\xaa' * 8192
+    check_coinbase_context(original, parent, height)
+    check_coinbase_context(coinbase_input(ZERO32, 0, None), ZERO32, 0)
+    original_ids = identities(original)
+    assert identities(coinbase_input(parent, height, b'pool-1')) == original_ids  # sibling template
+    for inp in (absent, changed_data, changed_parent, changed_height):
+        assert all(a != b for a, b in zip(identities(inp), original_ids))
+    assert txroot([original_ids[1] + original_ids[0]]) != txroot([identities(changed_data)[1] + identities(changed_data)[0]])
+
+    for malformed in (b'', b'\x02', b'\x01\0', b'\x01' + blob(b'\xaa' * 8193),
+                      b'\xfd\x01\0', b'\x01\xfd\x01\0x', b'\x01\xfd',
+                      b'\x01\x02x', b'\0x'):
+        try:
+            parse_coinbase_data(malformed)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f'accepted malformed coinbase data: {malformed[:8].hex()}')
+    for bad in (b'', b'\xaa' * 8193):
+        try:
+            coinbase_data(bad)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError('accepted invalid constructed coinbase data')
+    for inp, expected_parent, expected_height in (
+        (original, b'\x56' * 32, height), (original, parent, height + 1),
+        (original, parent, 2**32)):
+        try:
+            check_coinbase_context(inp, expected_parent, expected_height)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError('accepted wrong coinbase context')
+    try:
+        coinbase_input(parent, 2**32, None)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError('encoded overflowing coinbase height')
+    return {'absent_input': absent.hex(), 'present_input': original.hex(),
+            'txid': original_ids[0].hex(), 'txhash': original_ids[1].hex(),
+            'scope': 'Constructed field and context model only; not a transaction parser or block validator.'}
+
+
+def make_vectors() -> dict:
+    # Maximum output uses distinct paths: one of length16 and fifteen of length15.
+    max_paths = sorted([list(range(16))] + [[i for i in range(16) if i != skip] for skip in range(15)])
+    assert len({tuple(path) for path in max_paths}) == 16
+    max_output = (b'\1' + u(1, 8) + b'\1' * 32 + cs(16)
+                  + b''.join(u(i, 32) for i in range(16)) + cs(16)
+                  + b''.join(cs(len(path)) + bytes(path) for path in max_paths))
+    max_coin = bytes(36) + blob(max_output) + bytes(8 + 8 + 1)
+    assert len(max_output) == 812 and len(cs(len(max_output))) == 3
+    assert len(max_coin) == 868
+    # Ordinary fixture uses OP_ONE, not a signature placeholder or payment claim.
+    script = op('ONE')
+    root = leaf(script)
+    output = b'\0' + u(1000, 8) + b'\1' + root + b'\1\1\0'
+    prev_output = b'\0' + u(2000, 8) + b'\1' + root + b'\1\1\0'
+    outpoint = b'\x11' * 32 + u(0, 4)
+    prefix = u(7, 4) + u(0, 8) + u(1, 2) + u(1, 2)
+    core_witness = blob(script) + b'\0'  # Bytes(script) || Vec(h32 sibling)
+    inp_core = outpoint + b'\xff' * 4 + b'\1\0\1' + core_witness  # flags 01 spend, path_index 0, 1 CoreWitness
+    inp_wire = inp_core + b'\0'  # empty Vec(Bytes(arg))
+    core = prefix + inp_core + output
+    wire = prefix + inp_wire + output
+    assert (len(prefix), len(output), len(core), len(wire)) == (16, 45, 107, 108)
+    input_core_leaf = h('inputcore', inp_core)
+    input_full_leaf = h('inputfull', inp_wire)
+    output_leaf = h('output', blob(output))
+    inputs_root = indexed_tree_root([input_core_leaf])
+    full_inputs_root = indexed_tree_root([input_full_leaf])
+    outputs_root = indexed_tree_root([output_leaf])
+    assert (inputs_root, full_inputs_root, outputs_root) == (input_core_leaf, input_full_leaf, output_leaf)
+    txid_preimage = CHAIN + prefix + inputs_root + outputs_root
+    txhash_preimage = CHAIN + prefix + full_inputs_root + outputs_root
+    assert len(txid_preimage) == 112 and len(txhash_preimage) == 112
+    txid, wid = h('txid', txid_preimage), h('txhash', txhash_preimage)
+    # C08 domain-tagged hashes are unkeyed BLAKE3 over ASCII(tag) || 0x00 || data, computable directly in script.
+    assert blake3(b'Lotus/v2/txid\0' + txid_preimage).digest() == txid
+    assert blake3(b'Lotus/v2/inputcore\0' + inp_core).digest() == input_core_leaf
+    assert blake3(b'Lotus/v2/output\0' + blob(output)).digest() == output_leaf
+    # Changing witness arguments changes TxHash only; changing script or proof changes InputCoreLeaf and TxID.
+    inp_wire_with_arg = inp_core + b'\1' + blob(b'\xaa' * 64)
+    assert h('txhash', CHAIN + prefix + indexed_tree_root([h('inputfull', inp_wire_with_arg)]) + outputs_root) != wid
+    alt_inp_core = outpoint + b'\xff' * 4 + b'\1\0\1' + blob(b'\x52') + b'\0'
+    sibling_inp_core = outpoint + b'\xff' * 4 + b'\1\0\1' + blob(script) + b'\1' + b'\x99' * 32
+    assert h('txid', CHAIN + prefix + indexed_tree_root([h('inputcore', alt_inp_core)]) + outputs_root) != txid
+    assert h('txid', CHAIN + prefix + indexed_tree_root([h('inputcore', sibling_inp_core)]) + outputs_root) != txid
+    coin_leaf = h('coinentry', blob(prev_output))
+    coins_root = indexed_tree_root([coin_leaf])
+    assert coins_root == coin_leaf
+    selector = b'\1' + u(0, 4) + u(0, 4) + root  # 01 || input_index:u32 || branch_index:u32 || Leaf(script)
+    assert len(selector) == 41
+    preimage = CHAIN + b'\0' + txid + coins_root + selector
+    assert len(preimage) == 138
+    # Partial signing modes use O(1) 32-byte digests: OwnInputHash(i) and OutputsRoot (01) or OutputLeaf(i) (02).
+    own_input = inp_core + blob(prev_output)
+    assert len(own_input) == 46 + 46
+    own_input_hash = h('owninput', own_input)
+    partial_head = u(7, 4) + u(0, 8) + own_input_hash
+    preimage_mode_01 = CHAIN + b'\1' + partial_head + outputs_root + selector
+    preimage_mode_02 = CHAIN + b'\2' + partial_head + output_leaf + selector
+    assert len(preimage_mode_01) == 150 and len(preimage_mode_02) == 150
+    msg_all_outputs = h('sighash', preimage_mode_01)
+    msg_one_output = h('sighash', preimage_mode_02)
+    # Mint input: token ID is the one-leaf mint root itself; Core retains CoreWitness and omits Vec(Bytes(arg)).
+    token_id = root
+    mint_core = token_id + u(0, 4) + b'\xff' * 4 + b'\3' + core_witness
+    mint_wire = mint_core + b'\0'
+    assert (len(mint_core), len(mint_wire)) == (44, 45)
+    # Pruneable burn/commitment output (flags=0x02 IS_BURN): 1..16 branch roots and path_count == 0 (never enters UtxoRoot).
+    burn_output = b'\2' + u(500, 8) + b'\1' + root + b'\0'
+    assert len(burn_output) == 43
+
+    # MERKLEROOT_SORTED (0xee) and MERKLEROOT_INDEXED (0xef) fixtures across hash_alg in 0..3 and IndexedTreeRoot.
+    assert indexed_tree_root([]) == EMPTY_INDEXED_ROOT
+    for n in range(1, 10):
+        leaves = [h('output', u(j, 4)) for j in range(n)]
+        expected_root = indexed_tree_root(leaves)
+        for j in range(n):
+            proof = indexed_tree_proof(leaves, j)
+            assert merkle_indexed(leaves[j], u(j, 2), proof, 0) == expected_root
+    # Parent transaction O(log N) input/output proof verification (3 inputs, 3 outputs).
+    parent_in_leaves = [input_core_leaf, h('inputcore', alt_inp_core), h('inputcore', sibling_inp_core)]
+    parent_out_leaves = [output_leaf, h('output', blob(prev_output)), h('output', blob(burn_output))]
+    parent_header = u(7, 4) + u(0, 8) + u(3, 2) + u(3, 2)
+    parent_in_root = indexed_tree_root(parent_in_leaves)
+    parent_out_root = indexed_tree_root(parent_out_leaves)
+    parent_txid = h('txid', CHAIN + parent_header + parent_in_root + parent_out_root)
+    reconstructed_in_root = merkle_indexed(parent_in_leaves[2], u(2, 2), indexed_tree_proof(parent_in_leaves, 2), 0)
+    reconstructed_out_root = merkle_indexed(parent_out_leaves[1], u(1, 2), indexed_tree_proof(parent_out_leaves, 1), 0)
+    assert blake3(b'Lotus/v2/txid\0' + CHAIN + parent_header + reconstructed_in_root + reconstructed_out_root).digest() == parent_txid
+
+    sib0, sib1 = leaf(b'\x52'), leaf(b'\x53')
+    sorted_roots = {str(alg): merkle_sorted(root, sib0 + sib1, alg).hex() for alg in range(4)}
+    assert bytes.fromhex(sorted_roots['0']) == branch(branch(root, sib0), sib1)
+    idx_key = b'\x05'  # bits: s=0 -> 1, s=1 -> 0
+    indexed_old_roots = {str(alg): merkle_indexed(root, idx_key, sib0 + sib1, alg).hex() for alg in range(4)}
+    indexed_new_roots = {str(alg): merkle_indexed(leaf(b'\x54'), idx_key, sib0 + sib1, alg).hex() for alg in range(4)}
+    for alg in range(4):
+        assert merkle_sorted(root, b'', alg) == root and merkle_indexed(root, idx_key, b'', alg) == root
+        assert indexed_old_roots[str(alg)] != indexed_new_roots[str(alg)]
+
+    transaction_trees = []
+    for count in range(18):
+        items = [h('txhash', u(i, 4)) + h('txid', u(i, 4)) for i in range(count)]  # item = TxHash || TxID
+        expected = txroot(items)
+        if count >= 2:
+            assert txroot([items[0]] + list(reversed(items[1:]))) == expected
+        for i in range(count):
+            query_txid = items[i][32:64]
+            assert recover_txroot(query_txid, tx_proof(items, query_txid, is_coinbase=(i == 0))) == expected
+        if count >= 1:
+            absent_txid = h('txid', u(999, 4))
+            assert recover_txroot(absent_txid, tx_proof(items, absent_txid, is_coinbase=False)) == expected
+        transaction_trees.append({'count': count, 'root': expected.hex()})
+
+    coin = outpoint + blob(prev_output) + u(100, 8) + u(1700000000, 8) + b'\0'
+    key = outpoint_key(outpoint)
+    assert key == outpoint[:32]  # vout = 0 preserves txid exactly
+    same_tx_outpoint_1 = outpoint[:32] + u(1, 4)
+    same_tx_key_1 = outpoint_key(same_tx_outpoint_1)
+    assert same_tx_key_1[:28] == key[:28] and same_tx_key_1[28:32] != key[28:32]
+    same_tx_coin_1 = same_tx_outpoint_1 + blob(output) + u(100, 8) + u(1700000000, 8) + b'\0'
+    _, same_tx_path = state_path({key: coin, same_tx_key_1: same_tx_coin_1}, key)
+    assert len(same_tx_path) == 225 and same_tx_path[0][0] == 224
+    other_outpoint = b'\x22' * 32 + u(1, 4)
+    other_coin = other_outpoint + blob(output) + u(101, 8) + u(1700000001, 8) + b'\0'
+    other_key = outpoint_key(other_outpoint)
+    absent_outpoint = b'\x33' * 32 + u(2, 4)
+    absent_key = outpoint_key(absent_outpoint)
+    entries = {key: coin, other_key: other_coin}
+    state_root = smt(entries)
+    assert state_root == smt(dict(reversed(list(entries.items()))))
+    for query_outpoint in (outpoint, other_outpoint, absent_outpoint):
+        query = outpoint_key(query_outpoint)
+        assert recover_compact(query_outpoint, state_proof(entries, query)) == state_root
+    # Single-leaf map: root is UtxoLeaf directly (0 interior node hashes), and absence uses presence=2 at k=0.
+    single_map = {key: coin}
+    single_root = smt(single_map)
+    assert single_root == h('utxo', b'\0' + key + blob(coin))
+    assert recover_compact(outpoint, state_proof(single_map, key)) == single_root
+    single_absence = state_proof(single_map, absent_key)
+    assert single_absence[0] == 2 and recover_compact(absent_outpoint, single_absence) == single_root
+    # Empty map: root is EMPTY_ROOT, and absence uses presence=0 at k=0.
+    assert smt({}) == EMPTY_ROOT
+    empty_absence = state_proof({}, absent_key)
+    assert empty_absence == b'\0' + b'\0' * 32 and recover_compact(absent_outpoint, empty_absence) == EMPTY_ROOT
+    assert single_root != state_root
+
+    # Arbitrary root bytes below are header-hashing fixtures, not a valid mined block.
+    body = u(2, 4) + u(1000, 8) + u(101, 8) + txroot([wid + txid]) + b'\x44' * 32
+    body_hash = h('header/body', CHAIN + body)
+    work_fields = u(0x1d00ffff, 4) + u(2**32, 6) + u(123, 8)
+    work_hash = h('header/work', work_fields + body_hash)
+    prev_id = b'\x55' * 32
+    header = prev_id + work_fields + body
+    block_id = h('blockid', prev_id + work_hash)
+    assert (len(body), len(header), len(prev_id + work_fields + body_hash)) == (84, 134, 82)
+    assert len(prev_id + work_hash) == 64
+    assert branch(root, leaf(b'\x52')) == branch(leaf(b'\x52'), root)
+    for e in range(127):
+        assert log_q64(1 << e) == e << 64
+    logs = [log_q64(x) for x in range(1, 1000)]
+    assert logs == sorted(logs)
+    # These scalar inputs are explicit immutable genesis tail/work anchors.
+    tails = []
+    for subsidy, work, prior in ((100, 4, 1), (100, 1, 4), (101, 2, 3), (2**64-1, 2**255, 1)):
+        q = subsidy * subsidy * work // prior
+        r = isqrt(q)
+        assert r*r*prior <= subsidy*subsidy*work < (r+1)*(r+1)*prior
+        tails.append({'tail': str(subsidy), 'work': str(work), 'prior_work': str(prior), 'unclipped_next': str(r)})
+
+    absolute = lambda tail, anchor_work, work, lo, hi: min(hi, max(lo, isqrt(tail*tail*work//anchor_work)))
+    assert [absolute(100,10,w,1,1000) for w in (11,10)] == [104,100]
+    assert [absolute(100,10,w,1,150) for w in (40,10)] == [150,100]
+    assert [absolute(100,4,w,80,1000) for w in (1,4)] == [80,100]
+    assert absolute(2**64-1,1,2**256-1,1,2**64-1) == 2**64-1
+
+    # P02/P06 56-byte MonetaryState, StateRoot commitment, telescoping bootstrap reserve (k_boot = 20), and additive S_n = B_n + T_n.
+    atoms_per_xpi = 10**6
+    b0_atoms = 250_000 * atoms_per_xpi  # 250,000 XPI = 2.5e11 atoms
+    r0_atoms = (1 << 20) * b0_atoms     # 262,144,000,000 XPI = 2.62144e17 atoms (< 2^64 - 1)
+    t0_atoms = 250_000 * atoms_per_xpi  # 250,000 XPI = 2.5e11 atoms
+    assert r0_atoms < 2**64
+    b0_check, r1_atoms = bootstrap_step(r0_atoms, 20)
+    assert b0_check == b0_atoms and r1_atoms == r0_atoms - b0_atoms
+    s0_atoms = b0_check + t0_atoms
+    assert s0_atoms == 500_000 * atoms_per_xpi
+    # Exact telescoping conservation check: sum_{n>=0} B_n == R_0 to the exact atom, then permanently 0.
+    b_above, rem_after_above = bootstrap_step((2 << 20) + 37, 20)
+    assert b_above == 2 and rem_after_above == (2 << 20) + 35
+    rem, total_emitted, steps = 37, 0, 0
+    while rem > 0:
+        b_step, rem = bootstrap_step(rem, 20)
+        total_emitted += b_step
+        steps += 1
+    assert total_emitted == 37 and steps == 37 and bootstrap_step(rem, 20) == (0, 0)
+    # Also verify full multi-epoch telescoping conservation with k_boot = 6 on an arbitrary reserve.
+    rem6, emitted6 = 50_000, 0
+    while rem6 > 0:
+        b6, rem6 = bootstrap_step(rem6, 6)
+        emitted6 += b6
+    assert emitted6 == 50_000 and rem6 == 0
+    # Homomorphic scale invariance in the interior regime (R_n >= 2^20): scaling by lambda scales B_n and T_{n+1} by lambda.
+    for scale in (1, 10, 10**6):
+        b_scaled, _ = bootstrap_step(scale * (1 << 20) * 250_000, 20)
+        assert b_scaled == scale * 250_000
+        assert isqrt((scale * 250_000)**2 * (9 * 7) // (4 * 7)) == scale * 375_000
+
+    # P05 parabolic transaction cost C_tx, rolling integer ema_block_cost E_n, and required block fee-burn floor.
+    tx_cost_cases = []
+    for l_cu in (500, 32_000, 131_072, 262_144, 1_048_576):
+        c_tx = parabolic_tx_cost(l_cu, 17)
+        tx_cost_cases.append({'linear_cu': l_cu, 'effective_cu': c_tx})
+    assert [row['effective_cu'] for row in tx_cost_cases] == [501, 39_812, 262_144, 786_432, 9_437_184]
+    # Super-additivity above the quadratic threshold: splitting a mega-batch lowers total C_tx.
+    assert parabolic_tx_cost(262_144, 17) > 2 * parabolic_tx_cost(131_072, 17)
+    ema0 = 1_048_576
+    block_cu_sample = 2_097_152
+    ema1 = update_ema_block_cost(ema0, block_cu_sample, 10)
+    assert ema1 == 1_048_576 - 1024 + 2048 == 1_049_600
+    burn_floor_sample = required_block_burn_floor(block_cu_sample, ema0, 524_288, 30, 32)
+    assert burn_floor_sample == ((block_cu_sample * ema0) >> 30) + ((block_cu_sample * block_cu_sample) >> 32) == 2048 + 1024 == 3072
+
+    prev_work_0 = (1 << 256) // (compact_decode(0x1d00ffff) + 1)
+    ms0 = monetary_state_record(r0_atoms, t0_atoms, prev_work_0, ema0)
+    ms1 = monetary_state_record(r1_atoms, t0_atoms, prev_work_0, ema1)
+    sr0 = state_root_envelope(0, EMPTY_ROOT, ms0)
+    sr1 = state_root_envelope(1, state_root, ms1)
+    assert sr0 != sr1
+
+    target, half_life, limit = 2**200, 172800, 2**224 - 1
+    assert asert(target, 0, half_life, limit) == target
+    assert asert(target, half_life, half_life, limit) == 2*target
+    assert asert(target, -half_life, half_life, limit) == target//2
+    assert asert(target, 2**80, half_life, limit) == limit
+    assert asert(target, -2**80, half_life, limit) == 1
+    asert_rows = []
+    for drift in (-345600, -172801, -172800, -1, 0, 1, 172799, 172800, 345600):
+        raw = asert(target, drift, half_life, limit)
+        bits = compact_encode(raw)
+        encoded_target = compact_decode(bits)
+        assert 0 < encoded_target <= raw and compact_encode(encoded_target) == bits
+        asert_rows.append({'drift': drift, 'raw_target': str(raw), 'bits': f'{bits:08x}',
+                           'decoded_target': str(encoded_target)})
+    for raw in (1, 127, 128, 255, 256, 65535, 65536, 2**255, 2**256-1):
+        bits = compact_encode(raw)
+        assert compact_encode(compact_decode(bits)) == bits
+        assert 0 < compact_decode(bits) <= raw
+
+    packets = sorted((ROOT / 'decisions').glob('*.md'))
+    return {
+        'schema': 'lotus/spec-candidate-smoke/v1',
+        'status': 'single-model structural fixtures; not independently verified conformance',
+        'opcode_registry_sha256': hashlib.sha256(OPCODE_PATH.read_bytes()).hexdigest(),
+        'generator_sha256': hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+        'packet_sha256': {p.name: hashlib.sha256(p.read_bytes()).hexdigest() for p in packets},
+        'success_scan': success_scan_vectors(),
+        'review_regressions': review_regression_vectors(),
+        'chain_id_fixture_only': CHAIN.hex(),
+        'ordinary_op_one_fixture': {
+            'output': output.hex(), 'burn_output': burn_output.hex(),
+            'core': core.hex(), 'wire': wire.hex(),
+            'inputs_root': inputs_root.hex(), 'full_inputs_root': full_inputs_root.hex(),
+            'outputs_root': outputs_root.hex(), 'coins_root': coins_root.hex(),
+            'txid': txid.hex(), 'txhash': wid.hex(), 'branch_leaf': root.hex(),
+            'selector': selector.hex(),
+            'own_input_hash': own_input_hash.hex(), 'output_leaf': output_leaf.hex(),
+            'signing_preimage': preimage.hex(), 'signing_message': h('sighash', preimage).hex(),
+            'signing_message_mode_01': msg_all_outputs.hex(), 'signing_message_mode_02': msg_one_output.hex(),
+            'note': 'No signature or full VM/block validation is asserted.'},
+        'coinbase_identity_fixture': coinbase_identity_vectors(output),
+        'mint_input_fixture': {
+            'mint_root': token_id.hex(), 'token_id': token_id.hex(),
+            'input_core': mint_core.hex(), 'input_wire': mint_wire.hex(),
+            'note': 'One-leaf OP_ONE mint policy; framing and token ID only.'},
+        'merkle_opcode_fixtures': {
+            'empty_indexed_root': EMPTY_INDEXED_ROOT.hex(),
+            'parent_txid_3x3': parent_txid.hex(),
+            'sorted_roots': sorted_roots,
+            'indexed_key': idx_key.hex(),
+            'indexed_old_roots': indexed_old_roots,
+            'indexed_new_roots': indexed_new_roots},
+        'ordered_transaction_roots': transaction_trees,
+        'state': {'empty_root': EMPTY_ROOT.hex(), 'single_coin_root': single_root.hex(),
+                  'two_coin_root': state_root.hex(),
+                  'present_outpoint': outpoint.hex(), 'membership_proof': state_proof(entries, key).hex(),
+                  'absent_outpoint': absent_outpoint.hex(), 'absence_proof': state_proof(entries, absent_key).hex(),
+                  'empty_absence_proof': empty_absence.hex()},
+        'monetary_state_and_cost_fixtures': {
+            'atoms_per_xpi': atoms_per_xpi,
+            'k_boot': 20,
+            'b0_atoms': str(b0_atoms),
+            'r0_atoms': str(r0_atoms),
+            'r1_atoms': str(r1_atoms),
+            't0_atoms': str(t0_atoms),
+            's0_atoms': str(s0_atoms),
+            'monetary_state_0': ms0.hex(),
+            'monetary_state_1': ms1.hex(),
+            'state_root_0': sr0.hex(),
+            'state_root_1': sr1.hex(),
+            'parabolic_tx_cost_examples': tx_cost_cases,
+            'ema_block_cost_0': ema0,
+            'block_cu_sample': block_cu_sample,
+            'ema_block_cost_1': ema1,
+            'burn_floor_sample': burn_floor_sample},
+        'header_hash_fixture': {'wire': header.hex(), 'body_hash': body_hash.hex(),
+                                'work_hash': work_hash.hex(), 'block_id': block_id.hex(),
+                                'note': 'Size/state/transaction fields are hash inputs only; not a valid block.'},
+        'tail_rounding_examples': tails,
+        'asert_examples': {'note': 'Fixture parameters only, not production constants.',
+                           'anchor_target': str(target), 'half_life': half_life,
+                           'pow_limit': str(limit), 'rows': asert_rows},
+    }
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--write', action='store_true', help='explicitly regenerate candidate fixtures')
+    args = parser.parse_args()
+    if not __debug__:
+        raise SystemExit('Run without -O: this smoke checker uses assertions.')
+    actual = make_vectors()
+    path = ROOT / 'examples' / 'candidate-smoke-vectors.json'
+    if args.write:
+        path.write_text(json.dumps(actual, indent=2) + '\n')
+    else:
+        assert json.loads(path.read_text()) == actual, 'Fixtures or packet digests changed; review before regenerating.'
+    print('PASS: framing/signing inputs and coinbase identity/context; 41 success opcodes and push-boundary scan cases; Merkle opcodes; 153 ordered-tree paths; compact sparse-map membership/absence/order; 56B MonetaryState/StateRoot, telescoping bootstrap & parabolic cost curves; 134/82/64-byte header views; LOG power/monotonic checks; exact tail rounding; ASERT boundaries and compact targets; byte fees, coinbase deductions, extension accounting and genesis indexing.')
+
+
+if __name__ == '__main__':
+    main()
