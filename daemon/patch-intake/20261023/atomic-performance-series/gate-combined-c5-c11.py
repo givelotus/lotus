@@ -36,7 +36,9 @@ with (SRC/'.git/progression.lock').open('a') as sl,(ROOT/'daemon/.local-artifact
  for name,source in [('test_bitcoin',BUILD/'src/test/test_bitcoin'),('lotusd',BUILD/'src/lotusd'),('lotus-cli',BUILD/'src/lotus-cli'),('CMakeCache.txt',BUILD/'CMakeCache.txt')]:
   if source.exists():
    target=pre/name;shutil.copy2(source,target);assert sha(source)==sha(target);preserved[name]={'source':str(source),'copy':str(target),'sha256':sha(target)}
- save(DATA/'INPUTS.json',{'head':EXPECTED['head'],'tree':EXPECTED['tree'],'flags':FLAGS,'source_sha256':EXPECTED['source_sha256'],'prior_artifacts':preserved,'note':'prior common test binary is failing diagnostic prefix32; not a passing baseline','launcher':{'path':'/opt/homebrew/bin/sccache','sha256':sha(Path('/opt/homebrew/bin/sccache'))},'pid':os.getpid()})
+ for source in sorted((BUILD/'src').glob('libbitcoinconsensus*.dylib')):
+  target=pre/source.name;shutil.copy2(source,target);assert sha(source)==sha(target);preserved[source.name]={'source':str(source),'copy':str(target),'sha256':sha(target)}
+ save(DATA/'INPUTS.json',{'head':EXPECTED['head'],'tree':EXPECTED['tree'],'flags':FLAGS,'source_sha256':EXPECTED['source_sha256'],'prior_artifacts':preserved,'prior_binary_replay_env':{'DYLD_LIBRARY_PATH':str(pre)},'note':'prior common test binary is failing diagnostic prefix32; not a passing baseline','launcher':{'path':'/opt/homebrew/bin/sccache','sha256':sha(Path('/opt/homebrew/bin/sccache'))},'pid':os.getpid()})
  success=False
  try:
   run('configure',['cmake','-GNinja','-S',SRC,'-B',BUILD,*FLAGS,'-DCMAKE_C_COMPILER_LAUNCHER=/opt/homebrew/bin/sccache','-DCMAKE_CXX_COMPILER_LAUNCHER=/opt/homebrew/bin/sccache'])
