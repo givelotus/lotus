@@ -1,6 +1,6 @@
 # VM semantics and opcode allocation candidate
 
-Decision packet P03, October 9, 2026. **Recommended candidate**, not frozen. Resolves concrete stack/control/arithmetic questions for D07; the cost schedule and independent crypto/opcode vectors remain blockers. This is a v2 machine, not Bitcoin Script with implicit inherited edge cases.
+Decision packet P03. **Recommended candidate**, not frozen. Resolves concrete stack/control/arithmetic questions for D07; the cost schedule and independent crypto/opcode vectors remain blockers. This is a v2 machine, not Bitcoin Script with implicit inherited edge cases.
 
 ## Values and parsing
 
@@ -293,7 +293,7 @@ LESSSWAP is a general ordering operation on byte strings. It reads each operand 
 
 ## Extension points
 
-Maintainer direction, October 11, 2026: every otherwise unassigned opcode byte is a generic OP_SUCCESS_N extension point. This replaces the eight no-op EXTENSION instructions and the reserved CHECKDATASIG algorithm selectors. The current tables assign 215 bytes and leave 41 success bytes:
+Every otherwise unassigned opcode byte is a generic OP_SUCCESS_N extension point. This replaces the eight no-op EXTENSION instructions and the reserved CHECKDATASIG algorithm selectors. The current tables assign 215 bytes and leave 41 success bytes:
 
 ```text
 5e 5f 6c 6d 6e 6f 82 83 84 85 86 87 95 96 97 b5

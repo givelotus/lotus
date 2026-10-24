@@ -1,7 +1,7 @@
 # Lotus V2 and multi-chain browser connect protocol (`lotus-connect/1`)
 
 Status: candidate browser and multi-chain wallet connection specification,
-provisional through pre-launch testnet (2026-10-20). This is an application and
+provisional through pre-launch testnet. This is an application and
 wallet-bridge protocol, not a consensus change. It defines how web applications
 discover and communicate with a user's browser extension or companion wallet
 over a dedicated W3C `MessageChannel` (`MessagePort`), how intent-first native
@@ -286,7 +286,7 @@ before rendering the user approval prompt:
    - Replace every `$WALLET_FRESH_RECEIVE_POLICY` placeholder with a freshly
      derived, unlinked single-key Type-1 policy (`DUP BLAKE3 PUSH32(keyhash) EQUALVERIFY CHECKSIG`,
      `flags = 0 | 1`, `branches = [BranchLeaf(program)]`, `paths = [[0]]`; see
-     [`addresses.md`](addresses.md#type-1-x-only-keyhash-template-candidate-2026-10-20)).
+     [`addresses.md`](addresses.md#type-1-x-only-keyhash-template-candidate)).
    - Replace `$WALLET_PERSONA_POLICY` (and any `$WALLET_PUBKEY` / `$WALLET_SIG`
      witness placeholders) with the x-only public key and policy bound to the
      origin's isolated `account = 1'` Persona (`Persona(origin, xpi)`).

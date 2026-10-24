@@ -2,7 +2,7 @@
 
 ## Scope and status
 
-Candidate selected by the maintainer on 2026-10-20; provisional through
+Selected candidate; provisional through
 pre-launch testnet. This is an application proof of control of a recognized
 single-key address, not a transaction signature, authorization to transfer
 funds, or proof of control of arbitrary MAST policies. It changes no consensus

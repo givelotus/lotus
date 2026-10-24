@@ -1,6 +1,6 @@
 # Lotus V2 addresses ("xpi1...")
 
-## Status and provisional design decision (2026-10-19)
+## Status and provisional design decision
 
 This format is pre-release and remains open to revision during testnet,
 before a production format is frozen. The accepted direction is a typed
@@ -40,7 +40,7 @@ Each allocated template defines exact program bytes, parameter encoding and
 lengths, and deterministic branch-root derivation. A change to an allocated
 template's interpretation requires a new ID.
 
-### Type 1: x-only keyhash template (candidate, 2026-10-20)
+### Type 1: x-only keyhash template (candidate)
 
 The payload is **32 bytes: unkeyed BLAKE3 of the 32-byte big-endian x
 coordinate of a valid secp256k1 public key**. This is the same x-only public

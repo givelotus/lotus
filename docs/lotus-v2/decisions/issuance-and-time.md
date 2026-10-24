@@ -1,6 +1,6 @@
 # Issuance, clocks and Avalanche-controlled payouts
 
-Decision packet P06, October 9, 2026 (updated October 14, 2026). **Candidate structural formulas specified for D10** (additive continuous bootstrap $B_n$ + adaptive work-responsive tail $T_n$ from Block 1, backed by the canonical 56-byte `MonetaryState` record in [P02](commitments-and-state.md)); **initial monetary constants ($R_0, T_0, T_{\min}, T_{\max}, k_{\text{boot}}$) and economic simulation calibration remain open before genesis freeze**. D05's identity model, a token ID equal to the root of its mint scripts, was chosen by the maintainer on 2026-10-09; the lifecycle requirements below still need acceptance. D11 now selects Avalanche-controlled payouts using Bitcoin ABC machinery (maintainer direction 2026-10-14); treasury contracts and protocol faucet state are excluded. This packet does not amend the monetary paper; it defines the exact integer candidate mechanics and the simulation evidence needed to freeze their constants.
+Decision packet P06. **Candidate structural formulas specified for D10** (additive continuous bootstrap $B_n$ + adaptive work-responsive tail $T_n$ from Block 1, backed by the canonical 56-byte `MonetaryState` record in [P02](commitments-and-state.md)); **initial monetary constants ($R_0, T_0, T_{\min}, T_{\max}, k_{\text{boot}}$) and economic simulation calibration remain open before genesis freeze**. D05's identity model is selected: a token ID equals the root of its mint scripts; the lifecycle requirements below still need acceptance. D11 selects Avalanche-controlled payouts using Bitcoin ABC machinery; treasury contracts and protocol faucet state are excluded. This packet does not amend the monetary paper; it defines the exact integer candidate mechanics and the simulation evidence needed to freeze their constants.
 
 Monetary index convention: issuance step `n >= 0` means block height `n + 1`; genesis commits the initial state without advancing any recurrence. See P02's genesis/indexing rule.
 
@@ -41,9 +41,9 @@ This integer recurrence satisfies four foundational properties:
 3. **Homomorphic scale invariance:** In the interior regime ($R_n \ge 2^{k_{\text{boot}}}$, $T_{\min} \le T_n \le T_{\max}$), both the bootstrap recurrence $B_n = R_n \gg k_{\text{boot}}$ and the absolute tail $T_{n+1} = \text{isqrt}(\lfloor T_g^2 W_n / W_g \rfloor)$ are **homogeneous of degree 1 in currency units** (scaling initial parameters $R_0, T_0, T_{\min}, T_{\max} \mapsto \lambda R_0, \lambda T_0, \lambda T_{\min}, \lambda T_{\max}$ scales all block rewards by $\lambda$ up to integer floor rounding) and **homogeneous of degree 0 in work units** (rescaling $W_n \mapsto c W_n$ cancels identically in $W_n / W_g$).
 4. **Long-run supply equilibrium:** Because $\sum_{n=0}^{\infty} B_n = R_0$ is strictly finite, long-run net issuance per block is governed by $\Delta M_n = T_n - \text{Burn}_n$ (where $\text{Burn}_n$ is the sum of mandatory native fee burns `B`, any coinbase underclaim `U`, and explicit `IS_BURN` outputs under `C16`), so total circulating supply stabilizes smoothly where per-block burns match the adaptive tail $T_n$.
 
-### Absolute adaptive tail (adopted October 15, 2026)
+### Absolute adaptive tail
 
-The maintainer authorized the genesis-anchored formula after the [absolute reward review](../../plans/lotus-v2-absolute-reward-research.md). This supersedes the recurrent tail formula; bootstrap scheduling, genesis native issuance (zero), fee/burn accounting and the one-block lag retain their defined rules. This selects a formula, not numerical mainnet constants or economic acceptance.
+The genesis-anchored formula is the candidate tail rule; its derivation is in the [absolute reward review](../../plans/lotus-v2-absolute-reward-research.md). It supersedes the recurrent tail formula; bootstrap scheduling, genesis native issuance (zero), fee/burn accounting and the one-block lag retain their defined rules. This selects a formula, not numerical mainnet constants or economic acceptance.
 
 Immutable profile parameters are `genesis_tail` ($T_g$, an in-range `u64` amount) and `genesis_work` ($W_g$, positive `u256` per-block work from the genesis target). Define version 1:
 
@@ -86,7 +86,7 @@ The analysis deliverable is: model/assumptions, feasible controls, honest baseli
 
 ## Avalanche-controlled payouts (D11)
 
-Maintainer direction, October 14–16, 2026: select Avalanche-controlled coinbase payouts using Bitcoin ABC's existing soft block-parking machinery (`ConnectTip` `ParkingPolicy`), extended to a **three-way coinbase split** (`~50% Miner / ~25% Staker Winner / ~25% Staker-Voted Treasury Winner`, exact ratios configurable in the network profile). Hard consensus treasury covenants, genesis vesting contracts, controller singleton coins and on-chain treasury state roots remain excluded; there is no protocol faucet balance or treasury field in `MonetaryState`.
+Coinbase payouts are Avalanche-controlled, using Bitcoin ABC's existing soft block-parking machinery (`ConnectTip` `ParkingPolicy`), extended to a **three-way coinbase split** (`~50% Miner / ~25% Staker Winner / ~25% Staker-Voted Treasury Winner`, exact ratios configurable in the network profile). Hard consensus treasury covenants, genesis vesting contracts, controller singleton coins and on-chain treasury state roots remain excluded; there is no protocol faucet balance or treasury field in `MonetaryState`.
 
 The reviewed and planned integration points ([bulk pre-consensus & overlay plan](../../plans/lotus-v2-bulk-preconsensus-and-mempool-overlays.md)) are:
 

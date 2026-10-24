@@ -1,6 +1,6 @@
 # Lotus V2: Programmable Digital Cash Built for Planetary Scale
 
-Status: **specification & reference implementation suite** (updated October 23, 2026).
+Status: **specification & reference implementation suite**.
 
 ---
 

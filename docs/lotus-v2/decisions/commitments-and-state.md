@@ -1,6 +1,6 @@
 # Hash commitments and authenticated state
 
-Decision packet P02, October 9, 2026. **Recommended candidate**, not frozen or implemented. Refines D02/D13 and the commitment part of D14. Defines separate branch, ordered-vector and keyed-map commitments rather than one ambiguous “Merklix” API.
+Decision packet P02. **Recommended candidate**, not frozen or implemented. Refines D02/D13 and the commitment part of D14. Defines separate branch, ordered-vector and keyed-map commitments rather than one ambiguous “Merklix” API.
 
 ## Hash registry
 
@@ -83,7 +83,7 @@ Because layer index $s$ runs bottom-up from $0$ (leaves) to $k - 1$ (root), for 
 
 ## Block transaction commitment: prefix-sharded Merklix `Subtree A` and top-level `CoinbaseLeaf`
 
-Per the maintainer's sharding architecture ([*Sharding Bitcoin Cash*](https://www.bitcoinabc.org/2018-09-06-sharding-bitcoin-cash/), September 6, 2018), scaling block construction, mempool acceptance, and transaction commitment across horizontal CPU cores and processes requires **consistent key-prefix range partitioning** rather than positional array-index splitting.
+Following the sharding architecture of [*Sharding Bitcoin Cash*](https://www.bitcoinabc.org/2018-09-06-sharding-bitcoin-cash/) (September 6, 2018), scaling block construction, mempool acceptance, and transaction commitment across horizontal CPU cores and processes requires **consistent key-prefix range partitioning** rather than positional array-index splitting.
 
 Let transaction $i$ ($0 \le i < n$) have identity pair `(TxID_i, TxHash_i)`, with `vtx[0]` as the block's coinbase transaction and `vtx[1 .. n - 1]` as the block's non-coinbase transactions. All `TxID_i` in a block (or commitment vector) MUST be pairwise distinct. Define:
 
@@ -297,4 +297,4 @@ For non-genesis blocks: choose the transaction set and coinbase output policies/
 
 Pin test vectors for empty/one/two/odd transaction trees, every proof direction, empty/single-leaf/multi-leaf/deleted compact state maps, all three proof presence modes (`0`, `1`, `2`), same map built in different orders, coin metadata changes, 56-byte `MonetaryState` transitions and `StateRoot` envelope restoration. Check both scalar and incremental implementations against the same vectors. Initial genesis parameter values ($R_0, T_0, W_{-1}, E_0$) remain to be confirmed by simulation before genesis freeze.
 
-Absolute-tail adoption (2026-10-15) preserves these 56 serialized bytes and the 134-byte header. Immutable genesis tail/work anchors and formula version 1 belong to the consensus profile identity; a snapshot cannot supply or reset them. Validate both cached fields against authenticated header work and the profile formula before accepting continuation state. See P06 for exact rounding and migration.
+The absolute tail preserves these 56 serialized bytes and the 134-byte header. Immutable genesis tail/work anchors and formula version 1 belong to the consensus profile identity; a snapshot cannot supply or reset them. Validate both cached fields against authenticated header work and the profile formula before accepting continuation state. See P06 for exact rounding and migration.

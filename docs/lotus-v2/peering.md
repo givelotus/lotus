@@ -1,12 +1,12 @@
 # Lotus V2 peering candidate
 
-Status: **proposed protocol, 2026-10-15; review required before networking implementation**. This document adds a peering design to the V2 candidate. It does not claim that `lotusd` currently speaks this protocol or that the development genesis is a usable network. Requirements below are normative within this proposal only. [Consensus](consensus.md), [P01–P06](decisions.md), and their unresolved parameters still determine validity. The implementation sequence and review gates are in [peering milestones](../plans/lotus-v2-peering-milestones.md).
+Status: **proposed protocol; review required before networking implementation**. This document adds a peering design to the V2 candidate. It does not claim that `lotusd` currently speaks this protocol or that the development genesis is a usable network. Requirements below are normative within this proposal only. [Consensus](consensus.md), [P01–P06](decisions.md), and their unresolved parameters still determine validity. The implementation sequence and review gates are in [peering milestones](../plans/lotus-v2-peering-milestones.md).
 
-The maintainer selected **ABC TCP peering first, QUIC second, new development network magic, P2P port 10605 and RPC port 10604**. All wire allocations, limits, handshake extensions, hash choices and QUIC details below are design proposals. These port defaults are the only network values selected by the maintainer here; they do not freeze D10–D14 or select a production launch profile.
+Selected: **ABC TCP peering first, QUIC second, new development network magic, P2P port 10605 and RPC port 10604**. All wire allocations, limits, handshake extensions, hash choices and QUIC details below are design proposals. These port defaults are the only network values selected here; they do not freeze D10–D14 or select a production launch profile.
 
 ## 1. Source baseline and compatibility findings
 
-The inspected monorepo revision is `8914db5177d7b97fa7aa7d04172f71ead633775c`. Native source is the clean replay of 57 V2 patches, `000`–`056`, on Bitcoin ABC `1fb7db17c176cdea8a2c60d887891589382ee4e3`: commit `6a7849b1887bfe814c4e1679d7e01ffedb9a52d8`, tree `9a3e3e57aa6ee0c0430144ee1200ab9cbe48f6e7`, inspected at `/private/tmp/lotus-v2-audit-replay-20261015`. Paths in the following inventory refer to that exact native tree.
+The inspected monorepo revision is `8914db5177d7b97fa7aa7d04172f71ead633775c`. Native source is the clean replay of 57 V2 patches, `000`–`056`, on Bitcoin ABC `1fb7db17c176cdea8a2c60d887891589382ee4e3`: commit `6a7849b1887bfe814c4e1679d7e01ffedb9a52d8`, tree `9a3e3e57aa6ee0c0430144ee1200ab9cbe48f6e7`. Paths in the following inventory refer to that exact native tree.
 
 | Area | Reusable implementation | Required V2 work |
 | --- | --- | --- |
@@ -173,8 +173,8 @@ Use greatest accumulated valid work under P04 and the explicitly chosen eligibil
 
 ### Snapshot catch-up and optional history (N06a)
 
-Maintainer direction, 2026-10-20: **“possibly never reaching genesis is
-reasonable, but never being able to catch up is not.”** This is a required
+Design goal: **a node may never reach genesis, but it must always be able to
+catch up.** This is a required
 operational property of the proposed synchronization design, subject to the
 supported conditions below. It is not a claim that the current implementation
 has demonstrated that property. It remains provisional through testnet.
@@ -242,8 +242,8 @@ and its restart semantics before concurrent use is claimed safe.
 
 #### Historical verification policy: root checks by default, full replay opt-in
 
-Maintainer direction, 2026-10-20, **provisional before and through testnet**:
-backwards synchronization should default to authenticated root-transition
+Status: **provisional before and through testnet**.
+Backwards synchronization should default to authenticated root-transition
 verification; executing historical transactions and signatures should be a
 separate opt-in verification track. Full historical replay and reaching genesis
 are not prerequisites for forward catch-up. This is a proposed local
@@ -382,6 +382,6 @@ The QUIC library selection is open. Review maintained platform support, TLS inte
 
 The current `src/lotus_v2/dev_genesis.cpp` is an isolated construction fixture: header bits `0x1d00ffff`, time `0x010203040506`, nonce zero, size 134, empty transaction root, and monetary state reserve 9/tail 200/previous work 9/EMA 4. `dev_genesis.h` uses an all-zero fixture ChainID. Its comments explicitly say the function does not connect a block. These values do not demonstrate a mineable, accepted genesis or a chain that can fund the real coinbase/envelope resource charge. A header-only empty-transaction fixture is not P04's complete block with P01's first-and-only coinbase. The target encoded by `0x1d00ffff` yields work 4,295,032,833, not the fixture previous work 9. The current monetary profile's first subsidy is 202 atoms, while a minimal 101-byte legal coinbase plus the 134-byte header, four-byte count and one-byte transaction frame already requires 240 atoms of byte charge with no ordinary fees (242 for the minimal spendable-output form). The existing first-block entitlement therefore cannot fund that bare envelope. These are development-profile blockers, not permission to raise issuance silently. This proposal must not promote those constants to a network manifest.
 
-Before a two-node testnet can be called usable, review a complete **development-only** parameter artifact and demonstrate genesis validation, exact initial state, target/work consistency, attainable test mining, realistic time eligibility, funded first-block coinbase/resource accounting, ordinary signed transactions, synchronization, restart and reorg. That artifact may select explicit test parameters after review; it must not silently choose mainnet issuance, ASERT anchor/half-life, initial work, ChainID, coinbase entitlement, maturity or seeds. D10–D14 stay open except for the maintainer's development port defaults.
+Before a two-node testnet can be called usable, review a complete **development-only** parameter artifact and demonstrate genesis validation, exact initial state, target/work consistency, attainable test mining, realistic time eligibility, funded first-block coinbase/resource accounting, ordinary signed transactions, synchronization, restart and reorg. That artifact may select explicit test parameters after review; it must not silently choose mainnet issuance, ASERT anchor/half-life, initial work, ChainID, coinbase entitlement, maturity or seeds. D10–D14 stay open except for the selected development port defaults.
 
-The next review should accept or amend these concrete proposed choices: candidate magic; mandatory identity/profile handshake and its allocations; full-TxHash inventory; compact profile 2 with inherited SHA256/SipHash compression; receive-limit negotiation and the larger-object availability limitation; initial unsupported-service list; and the QUIC stream/authentication approach. Separately approve a usable development consensus/genesis profile. Until those reviews, networking implementation is a dependent task, not part of this document change.
+The next review should accept or amend these concrete proposed choices: candidate magic; mandatory identity/profile handshake and its allocations; full-TxHash inventory; compact profile 2 with inherited SHA256/SipHash compression; receive-limit negotiation and the larger-object availability limitation; initial unsupported-service list; and the QUIC stream/authentication approach. Separately approve a usable development consensus/genesis profile. Networking implementation depends on those reviews.

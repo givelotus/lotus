@@ -1,6 +1,6 @@
 # Encoding, transaction identity and signatures
 
-Decision packet P01, October 9, 2026. **Recommended candidate**, not frozen or implemented. Refines D01/D03/D04 and the serialization portions of D12–D14. This packet owns the detailed candidate grammar; the consensus overview links here. Production parameter values and independent vectors remain prerequisites for acceptance.
+Decision packet P01. **Recommended candidate**, not frozen or implemented. Refines D01/D03/D04 and the serialization portions of D12–D14. This packet owns the detailed candidate grammar; the consensus overview links here. Production parameter values and independent vectors remain prerequisites for acceptance.
 
 ## Choice and tradeoffs
 

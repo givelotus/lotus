@@ -1,6 +1,6 @@
 # Header design from Lotus v1's useful properties
 
-Decision packet P04, October 9, 2026 (updated October 13, 2026). **Recommended candidate**, not frozen. Refines D12/D14. The maintainer clarified that v2 need not preserve a deployed ASIC interface, that the lucky-block pointer is not useful to the intended design, that v1's recursive hashes were chosen to reveal useful header portions without Merkle-path overhead, and that **pure tagged BLAKE3** (`H_headerbody`, `H_headerwork`, `H_blockid`) is the candidate consensus hash for both the 134-byte recursive header and Proof-of-Work (`BlockID`), keeping BLAKE3 as the single hash primitive across the entire Lotus v2 protocol.
+Decision packet P04. **Recommended candidate**, not frozen. Refines D12/D14. Design requirements: v2 need not preserve a deployed ASIC interface; the lucky-block pointer is not useful to the intended design; v1's recursive hashes exist to reveal useful header portions without Merkle-path overhead; and **pure tagged BLAKE3** (`H_headerbody`, `H_headerwork`, `H_blockid`) is the candidate consensus hash for both the 134-byte recursive header and Proof-of-Work (`BlockID`), keeping BLAKE3 as the single hash primitive across the entire Lotus v2 protocol.
 
 ## Verified v1 source evidence
 
@@ -91,7 +91,7 @@ Per-block chainwork is `floor(2^256/(T+1))`, with mathematical or sufficiently w
 
 ## Selected Avalanche/PoW integration direction
 
-Maintainer decision, October 15, 2026: follow Bitcoin ABC's existing Avalanche/PoW
+Follow Bitcoin ABC's existing Avalanche/PoW
 chain-selection rules and default settings at the pinned V2 base
 `1fb7db17c176cdea8a2c60d887891589382ee4e3`. Do not design a separate Lotus work
 override threshold or assume a ten-block override. This selects the upstream
