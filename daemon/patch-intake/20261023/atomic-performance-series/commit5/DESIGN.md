@@ -1,6 +1,6 @@
 # C5 plan: consolidate native overlay and signing workers
 
-Status: READ-ONLY PLAN. No source edits, checkout switches, new worktrees, builds, tests or benchmarks. Host belongs to root's native C4 gate. This is authorized Wave1 only; no Wave2 implementation is included.
+Status: PASS committed candidate 935d1fb369374bad972bd38133cf9a6cfab887dd. Native build,131targeted unit cases,30metrics repetitions,zero-new-warning gate and5functional runs pass. Separate fixture-fixup 87737aaa1e3f846a53ab7c8a5a371734d5f4e8b3 preserves historical atom amounts and all assertions. No Wave2 work or throughput claim; root owns integration.
 
 Exact reviewed native C4 input: `8b55e7c8de373d2097da1ebacfcf14fd1098d046`, tree `2ac7093521dcf926c15eb9b77babb881ddff771a`. Root must finish its C4 gate and assign the implementation checkout/base before mutation. Current executor lane stays on its existing committed shared C4 checkout.
 
