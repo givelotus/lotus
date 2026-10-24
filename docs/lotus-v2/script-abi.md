@@ -39,7 +39,7 @@ The [TypeScript compiler](../../tools/lotus-v2-compiler/README.md) implements a 
 
 Each generated artifact records compiler/evaluator revisions, consensus/parameter digests, argument order, selected policy, leaf/proof bytes, core/complete transaction bytes, TxID/TxHash, signature digest, final stack, resulting state and static charges. A pretty source listing is not a conformance vector.
 
-The [compiler and ABI implementation plan](../plans/lotus-v2-compiler-abi.md) defines staged assembler, typed language, artifact schema, binding generation and independent execution/stress-test gates. Development targets a versioned draft profile; final consensus freeze is required for launch, not for beginning tooling.
+The [compiler and ABI implementation plan](../plans/lotus-v2-compiler-abi.md) defines staged assembler, typed language, artifact schema, binding generation and independent execution/stress-test gates. The [browser connect protocol (`lotus-connect/1`)](browser-connect.md) specifies how web applications and browser extensions transport `lotus-v2/contract-artifact/2`, `lotus-v2/policy-artifact/1`, and partial `TransactionIntent`s over W3C `MessagePort` channels for connectless intent fulfillment. Development targets a versioned draft profile; final consensus freeze is required for launch, not for beginning tooling.
 
 The requested first client targets are **Python and TypeScript**, generated from the same versioned interface model with matching runtime libraries and exact-byte cross-language tests. The maintainer selected a TypeScript compiler and a small Finch-spec-inspired typed stack pipeline; Python remains an independent reference and generated-client target. Finch implementation code is not treated as conformance evidence.
 

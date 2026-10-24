@@ -4,7 +4,9 @@ Status: provisional wallet interchange profile 1, subject to testnet revision.
 This is an application format, not a consensus change or a threshold-signature
 protocol. FROST and other multiparty signing protocols are outside its scope.
 The authoritative specification lives with the Lotus V2 specifications in this
-monorepo. Daemon copies under `doc/standards` are implementation mirrors.
+monorepo. Daemon copies under `doc/standards` are implementation mirrors. Browser
+and web-application transport of binary `0x4c560001` PSBT documents over W3C
+`MessagePort` channels is specified in [browser-connect.md](browser-connect.md).
 
 ## Relationship to Bitcoin PSBT
 

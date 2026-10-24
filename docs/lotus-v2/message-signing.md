@@ -104,6 +104,9 @@ must not change the separate global receive/send address capabilities until
 native wallet destination and spending support is actually integrated.
 The PWA's strict ChainConfig validator must adopt this scheme at the same
 integration point, so it never mislabels a Lotus proof as eCash-compatible.
+Origin-bound web session challenges (`wallet_signMessage`) and per-origin
+persona isolation over W3C `MessagePort` channels are specified in
+[browser-connect.md](browser-connect.md).
 
 ## Independent digest vector and validation gates
 

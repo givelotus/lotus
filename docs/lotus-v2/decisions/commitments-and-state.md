@@ -20,6 +20,7 @@ Decision packet P02, October 9, 2026. **Recommended candidate**, not frozen or i
 | txroot | `Lotus/v2/txroot` |
 | utxo | `Lotus/v2/utxo` |
 | state | `Lotus/v2/state` |
+| HEADER_HISTORY | `Lotus/v2/HEADER_HISTORY` |
 | blockid | `Lotus/v2/blockid` |
 | merkleidx | `Lotus/v2/merkleidx` |
 
@@ -219,7 +220,68 @@ StateRoot     = H_state(00 || ChainID || height:u64
 
 The header's former `hashUtxoMerklixRoot` is therefore renamed **state_root**. RPCs must expose both the 56-byte `MonetaryState` envelope and UTXO proofs so clients can connect a coin proof to the header's `state_root`. `height` must match the validated block context.
 
-Header ancestry supplies validated time/target context; a standalone UTXO snapshot does not. Snapshot admission must check the envelope, unique entries, canonical `Coin` encodings, root reconstruction, the 56-byte `MonetaryState` record and selected chain context, and clearly state which historical transitions were actually verified. Retained undo data must restore every field of the prior 56-byte `MonetaryState` envelope on disconnect.
+Header ancestry supplies validated time/target context; a standalone UTXO snapshot does not. Snapshot admission must check the envelope, unique entries, canonical `Coin` encodings, root reconstruction, the `MonetaryState` record and selected chain context, and clearly state which historical transitions were actually verified. Retained undo data must restore every field of the prior `MonetaryState` envelope on disconnect.
+
+## Header History Merkle Tree (`HeaderHistoryFrontier` and `history_root`)
+
+So that light clients, bridges, and FastSync / Snapshot verifiers can authenticate any historical block header at height $h < H$ against the current block header at height $H$ in $O(\log H)$ space and time, every post-genesis block ($H \ge 1$) commits to `history_root` inside `MonetaryState`: the root of an append-only binary Merkle mountain / carry-chain frontier over all prior canonical block hashes $(0, \text{BlockID}_0), (1, \text{BlockID}_1), \dots, (H-1, \text{BlockID}_{H-1})$.
+
+### 1. Leaf and internal node hashes
+
+With domain tag `HEADER_HISTORY` (`TaggedHashWriter("HEADER_HISTORY", ChainID)`):
+
+```text
+HeaderLeafHash(ChainID, height, block_hash)
+  = TaggedHash("HEADER_HISTORY", ChainID, 0x00 || u64_le(height) || block_hash:h32)
+
+HeaderInternalHash(ChainID, level, left, right)
+  = TaggedHash("HEADER_HISTORY", ChainID, 0x01 || u8(level) || left:h32 || right:h32)
+
+NULL_HASH = 0x00^32
+```
+
+- `0x00` vs. `0x01` separates leaves from internal nodes (second-preimage resistance).
+- `u64_le(height)` binds each block hash to its exact block height.
+- `u8(level)` ($0 \le \text{level} < 64$) binds each internal node to its exact height in the binary tree ($2^{\text{level}}$ leaves per complete subtree).
+
+### 2. Incremental frontier (`HeaderHistoryFrontier`) and $O(\text{ctz}(\text{count}+1))$ append
+
+`HeaderHistoryFrontier` maintains:
+- `count: u64` — the number of committed prior headers (at block height $H$, `count == H`).
+- `peaks: [Hash256; 64]` — for each bit $k \in [0, 63]$, if `((count >> k) & 1) == 1`, `peaks[k]` holds the root of the complete binary subtree of $2^k$ headers at level $k$; otherwise `peaks[k] = NULL_HASH`.
+
+Appending `(height = prev.count, block_hash)` to `prev` (`AppendHeaderToFrontier`):
+1. Compute `carry = HeaderLeafHash(ChainID, prev.count, block_hash)`.
+2. For $k = 0, 1, \dots, 63$:
+   - If `((prev.count >> k) & 1) == 1`: merge `carry = HeaderInternalHash(ChainID, k, prev.peaks[k], carry)` and clear `next.peaks[k] = NULL_HASH`.
+   - Else: store `next.peaks[k] = carry`, set `next.count = prev.count + 1`, and stop.
+
+### 3. Root fold (`HeaderHistoryRoot`) and `MonetaryState` binding
+
+Given `frontier` with `count` committed headers:
+- **`count == 0` (Genesis, height $0$):** `HeaderHistoryRoot` is `NULL_HASH` (`0x00^32`), and `MonetaryStateHash` omits `history_root` when `history_root == NULL_HASH` so the Genesis block's `hashStateRoot` and PoW nonce remain unchanged.
+- **`count > 0` (Every block at height $H \ge 1$):**
+  Let $k_0 = \text{ctz}(\text{count})$ be the lowest set bit of `count` and $L = \lfloor \log_2(\text{count}) \rfloor = 63 - \text{clz}(\text{count})$ be the highest set bit of `count`:
+  - If $k_0 == L$ (`count` is an exact power of two): return `frontier.peaks[L]` directly.
+  - Otherwise ($k_0 < L$):
+    1. Initialize `acc = HeaderInternalHash(ChainID, k_0, frontier.peaks[k_0], NULL_HASH)`.
+    2. For $k = k_0 + 1 \dots L$:
+       - If `((count >> k) & 1) == 1`: `acc = HeaderInternalHash(ChainID, k, frontier.peaks[k], acc)`.
+       - Else: `acc = HeaderInternalHash(ChainID, k, acc, NULL_HASH)`.
+    3. Return `acc` (which is cryptographically non-zero and appended to `MonetaryStateHash`).
+
+### 4. $O(\log H)$ inclusion proofs (`HeaderInclusionProof`) and RPC verification
+
+Full nodes maintain `HeaderHistoryTree` (persisted atomically at `<datadir>/blocks/header_history_v2.dat` with magic `"LV2HHT01"`), storing complete subtree roots `m_levels[k][i]` at every level $k \ge 0$ alongside the frontier so historical inclusion proofs at any `target_count` are constructed in $O(\log(\text{target\_count}))$ time and verified via `VerifyHeaderInclusionProof`:
+
+- Reject if `total_count == 0` or `leaf_height >= total_count`.
+- Let tree depth $D = \text{ctz}(\text{total\_count})$ when `total_count` is a power of two, and $D = 64 - \text{clz}(\text{total\_count})$ otherwise. Reject if `siblings.size() != D`.
+- Start with `cur = HeaderLeafHash(ChainID, leaf_height, block_hash)`.
+- For $k = 0 \dots D - 1$:
+  - If `((leaf_height >> k) & 1) == 0` (left child): if the right child subtree does not exist (`(((leaf_height >> k) + 1) << k) >= total_count`) and `siblings[k] != NULL_HASH`, reject (canonical null-sibling check); then set `cur = HeaderInternalHash(ChainID, k, cur, siblings[k])`.
+  - Else (right child): set `cur = HeaderInternalHash(ChainID, k, siblings[k], cur)`.
+- Accept iff `cur == expected_root`.
+- Exposed via RPCs `getheaderhistoryproof(height, [anchor_height_or_hash])` and `verifyheaderhistoryproof(proof_hex, [expected_root_or_anchor])`.
 
 ## Genesis and monetary indexing
 

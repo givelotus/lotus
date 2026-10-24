@@ -2,6 +2,17 @@
 
 Status: **Architecture and Protocol Specification Proposal, 2026-10-16 (Review Required Before Implementation)**.
 
+**2026-10-21 lifecycle correction:** the maintainer explicitly requires a valid
+transaction recovered for an epoch already under voting to complete that working
+candidate, followed by a fresh immutable proposal and fresh votes (for example,
+`AB|D` plus recovered C and ordinary E becomes `ABC|DE`). The blanket local
+pre-voting-admission cutoff below is superseded for this recovery path. See the
+[integrated epoch reconciliation draft](../lotus-v2/mempool-reconciliation.md)
+for exact context/validation/ownership and vote-reset rules. Its core lifecycle
+has been reviewed; the real Avalanche-based clock and trace vectors remain open.
+This historical plan's causal-header and bucket-vector prose must not be read as
+evidence that a distributed vector clock exists in current source.
+
 Refines and connects:
 - [P02: Hash commitments and authenticated state](../lotus-v2/decisions/commitments-and-state.md) — specifically the Maintainer Architecture Direction (2026-10-16) on horizontal sharding via prefix-keyed Merklix trees (`Subtree A`), `OutpointKey = txid || vout` prefix preservation, and delayed/pipelined coinbase UTXO insertion.
 - [P04: Header design and mining](../lotus-v2/decisions/header-and-mining.md) — 134-byte recursive BLAKE3 header (`BodyHash`, `WorkHash`, `BlockID`), 120-second target block spacing, and Avalanche/PoW integration.

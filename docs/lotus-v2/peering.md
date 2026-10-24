@@ -159,6 +159,14 @@ Retain bounded per-peer/global download queues, progress timeouts and alternate-
 
 ## 7. Validation boundary, generalized Merklix set reconciliation, and Avalanche coordination (N06)
 
+The [epoch reconciliation and voting draft](mempool-reconciliation.md) specifies
+recovery into the working epoch (`AB|D -> ABC|DE`), pinned proposal-pair zoom,
+fresh root-bound votes after revision and repeated reconciliation. Two independent
+review rounds approved the core lifecycle. Actual clock-based epoch formation
+and authoritative trace vectors remain unresolved; production promotion is
+pending that contract. The earlier full-pool recovery review did not cover
+these voting-epoch semantics.
+
 TCP/QUIC, `tmplblock`, full/compact transfer and disk import must enter one V2 validation interface. Transport may reject malformed messages or refuse local resources, but cannot invent block entitlement, use upstream transaction hashes, relax a missing opcode implementation, choose an ASERT anchor, skip signatures, or reinterpret a state-root mismatch. Unknown VM operations must follow the reviewed V2 implementation and C02/P03 contract; no OP_DEFINE/OP_INVOKE is introduced.
 
 Use greatest accumulated valid work under P04 and the explicitly chosen eligibility profile. Header work is not permission to mark an unvalidated state root trusted. Preserve bounded header presynchronization, reorg handling, download-stall recovery and distinct invalid/missing/context-ineligible results. Crash consistency and atomic undo must be established before peer-supplied blocks can change persistent state.
