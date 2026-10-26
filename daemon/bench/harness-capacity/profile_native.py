@@ -16,10 +16,12 @@ spec.loader.exec_module(audit)
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--source', type=Path, required=True, help='Independent benchmark clone outside Lotus')
     parser.add_argument('--data', type=Path, required=True)
     parser.add_argument('--build-receipt', type=Path, required=True)
     parser.add_argument('--fixture-transactions', type=int, default=800000)
     args = parser.parse_args()
+    audit.set_source(args.source)
     if not 500000 <= args.fixture_transactions <= 1200000:
         parser.error('Use 500K..1.2M distinct signed transactions')
     data = args.data.resolve()

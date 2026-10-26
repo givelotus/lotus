@@ -5,8 +5,8 @@ view over the node's ordinary wallet and node RPCs (`getbalances`,
 `sendmany`, `listtransactions`, `getpeerinfo`, …), so the keys stay in the
 node's wallet. It is not the Frank app and has no server of its own.
 
-Design: `docs/addendum-designs/P1-pwa-wallet-and-Q1-qt-removal.md` in the
-`lotus-v2-addendum` repository (§2 is the app, §2.9 the parity checklist).
+Design: [PWA and Qt-removal research](../../docs/lotus-v2/research/addendum-designs/P1-pwa-wallet-and-Q1-qt-removal.md)
+(§2 is the app, §2.9 the parity checklist).
 This directory implements phase 1: overview, send, receive, transactions,
 wallets, peers, message signing/verification, mining, console and node information.
 

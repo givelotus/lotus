@@ -28,6 +28,7 @@ def main():
     data.mkdir(parents=True, exist_ok=False)
     archive = Path.home()/'repos/archive/builds/lotus-bench/commit-regressions/template-test-order'
     probe = audit.ROOT/'daemon/bench/workloads/scripts/size_probe.py'
+    archive.parent.mkdir(parents=True, exist_ok=True)
     lock = (archive.parent/'benchmark-host.lock').open('a')
     fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
     points = tuple(int(n) if n.isdigit() else n for n in args.points.split(','))

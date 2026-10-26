@@ -18,6 +18,13 @@ def write(path,value):
     path.parent.mkdir(parents=True,exist_ok=True)
     tmp=path.with_suffix('.tmp');tmp.write_text(json.dumps(value,indent=2)+'\n');tmp.replace(path)
 def git(*args):return subprocess.check_output(['git','-C',str(SOURCE),*args],text=True).strip()
+def set_source(path):
+    global SOURCE
+    source = Path(path).resolve()
+    if source == ROOT or ROOT in source.parents or not (source / '.git').is_dir():
+        raise RuntimeError('Use an independent Git clone outside Lotus, not the canonical checkout, a submodule or linked worktree')
+    SOURCE = source
+    (Path.home() / 'repos/archive/builds/lotus-bench').mkdir(parents=True, exist_ok=True)
 def checkout(commit):
     if git('status','--porcelain'):raise RuntimeError('Benchmark checkout has source changes; preserve them before proceeding')
     subprocess.run(['git','-C',str(SOURCE),'checkout','--no-overwrite-ignore','--detach',commit],check=True,capture_output=True)
@@ -84,10 +91,8 @@ def main():
     ap.add_argument('--override-ref',action='append',default=[],metavar='POINT=REF')
     ap.add_argument('--diagnostic-net',action='store_true',help='Enable network logs; results are diagnostics, not progression timing samples')
     ap.add_argument('--fixed-transactions',type=int,help='Fixed-count latency diagnostic, not a sustained TPS claim');args=ap.parse_args()
-    SOURCE, BUILD = args.source.resolve(), args.build.resolve()
-    registered = json.loads((ROOT/'daemon/sources.json').read_text())['sources']
-    if SOURCE in [(ROOT/s['path']).resolve() for s in registered.values()] or not (SOURCE/'.git').is_dir():
-        raise RuntimeError('Use an independent temporary Git clone, not a registered source submodule or linked worktree')
+    set_source(args.source)
+    BUILD = args.build.resolve()
     if args.data.resolve() == ROOT or ROOT in args.data.resolve().parents:
         raise RuntimeError('Benchmark results belong outside the Lotus working tree')
     BUILD.mkdir(parents=True, exist_ok=True)

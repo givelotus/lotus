@@ -18,6 +18,7 @@ spec.loader.exec_module(audit)
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--source', type=Path, required=True, help='Independent benchmark clone outside Lotus')
     parser.add_argument('--data', type=Path, required=True)
     parser.add_argument('--before', type=Path, required=True)
     parser.add_argument('--after', type=Path, required=True)
@@ -25,6 +26,7 @@ def main():
     parser.add_argument('--fixture-transactions', type=int, default=1000000)
     parser.add_argument('--owned-rss-limit-gib', type=int, choices=(12,18), default=12)
     args = parser.parse_args()
+    audit.set_source(args.source)
     if not 800000 <= args.fixture_transactions <= 1200000:
         parser.error('Use800K..1.2M distinct transactions within the recorded memory envelope')
     data = args.data.resolve()

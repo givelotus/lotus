@@ -19,6 +19,7 @@ spec.loader.exec_module(audit)
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--source', type=Path, required=True, help='Independent benchmark clone outside Lotus')
     parser.add_argument('--data', type=Path, required=True)
     parser.add_argument('--rounds', type=int, default=3)
     parser.add_argument('--cells', default='single_tx_steady:1:8:0,single_tx_steady:4:8:0,single_tx_loaded_steady:1:8:12,single_tx_loaded_steady:4:8:12')
@@ -35,6 +36,7 @@ def main():
     parser.add_argument('--network-timeout', type=int, default=180)
     parser.add_argument('--owned-rss-limit-gib', type=int, choices=(12,18), default=12)
     args = parser.parse_args()
+    audit.set_source(args.source)
     if args.profile_peer_completion and not args.network_completion:
         parser.error('Peer profiling requires peer completion observation')
     if args.network_completion and (args.series != 'v2' or args.smoke):

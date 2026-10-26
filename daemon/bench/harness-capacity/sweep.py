@@ -17,6 +17,7 @@ spec.loader.exec_module(audit)
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--source', type=Path, required=True, help='Independent benchmark clone outside Lotus')
     parser.add_argument('--data', type=Path, required=True)
     parser.add_argument('--counts', default='1,2,4,8,16,32')
     parser.add_argument('--rounds', type=int, default=3)
@@ -25,6 +26,7 @@ def main():
     parser.add_argument('--client-counts', help='Balanced submitter/reader totals; hold RPC workers at16')
     parser.add_argument('--profile', action='store_true', help='Diagnostic samples; exclude throughput')
     args = parser.parse_args()
+    audit.set_source(args.source)
     data = args.data.resolve()
     data.mkdir(parents=True, exist_ok=False)
     lock = (Path.home() / 'repos/archive/builds/lotus-bench/benchmark-host.lock').open('a')
