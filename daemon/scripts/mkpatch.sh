@@ -28,6 +28,10 @@ if [[ "$SERIES" == "v1" ]]; then
     WORKSPACE="$DAEMON_DIR/workspace-v1"
     PATCHES_DIR="$DAEMON_DIR/patches/v1"
     mkdir -p "$PATCHES_DIR"
+elif [[ "$SERIES" == "v2" ]]; then
+    WORKSPACE="$DAEMON_DIR/workspace-v2"
+    PATCHES_DIR="$DAEMON_DIR/patches/v2"
+    mkdir -p "$PATCHES_DIR"
 elif [[ "$SERIES" == "doged" ]]; then
     WORKSPACE="$DAEMON_DIR/workspace-doged-abc"
     PATCHES_DIR="$DAEMON_DIR/patches/doged"
@@ -45,7 +49,7 @@ elif [[ "$SERIES" == "bchn" ]]; then
     PATCHES_DIR="$DAEMON_DIR/patches/bchn"
     mkdir -p "$PATCHES_DIR"
 else
-    echo "Unsupported series: $SERIES (choose v1, ecash, doged, doged-reference, or bchn)" >&2
+    echo "Unsupported series: $SERIES (choose v1, v2, ecash, doged, doged-reference, or bchn)" >&2
     exit 1
 fi
 

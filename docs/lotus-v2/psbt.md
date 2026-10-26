@@ -60,7 +60,7 @@ key, 8,388,608 bytes per value, and 4,096 records per map. Check remaining bytes
 and all size arithmetic before allocation. Base64 wrappers must enforce the
 corresponding decoded limit. Native consensus/profile limits additionally
 apply, including 1..256 inputs, 0..256 outputs, at most 16 witnesses per spend,
-10,000 script bytes, 64 branch siblings, 65,535 arguments per witness, and
+8,192 script bytes (`C09`, `P05`; legacy bridge `CoinOutput` `scriptPubKey` up to 10,000 bytes), 64 branch siblings, 64 arguments per witness, and
 8,192 bytes per argument. An implementation may advertise stricter resource
 limits; it MUST report rejection rather than silently discard data.
 
@@ -91,12 +91,12 @@ zero-based argument position. `slot = w:u16 || a:u16`.
 | Global | proprietary `02` | TX_TEMPLATE, required | Canonical full v7 transaction wire, with every witness argument vector empty |
 | Global | proprietary `03` | UTXO_ROOT, optional | 32-byte proposed authentication root; never self-authenticating |
 | Input | proprietary `01` | COIN, optional while incomplete; required to sign/finalize | Full canonical Coin-v2 bytes, including outpoint and all metadata |
-| Input | proprietary `02`, keydata `w:u16` | ARGUMENTS | `CS(count) || Bytes(arg[0]) || ...`; signature slots contain empty bytes |
-| Input | proprietary `03`, keydata `slot` | SIGN_REQUEST | `scheme:u8 || mode:u8 || public_key` |
+| Input | proprietary `02`, keydata `w:u16` | ARGUMENTS | `CS(count) \|\| Bytes(arg[0]) \|\| ...`; signature slots contain empty bytes |
+| Input | proprietary `03`, keydata `slot` | SIGN_REQUEST | `scheme:u8 \|\| mode:u8 \|\| public_key` |
 | Input | proprietary `04`, keydata `slot` | PARTIAL_SIG | Signature bytes to insert at the requested slot |
 | Input | proprietary `05`, keydata `w:u16` | FINAL_ARGUMENTS | Complete argument vector, same encoding as ARGUMENTS |
-| Input | proprietary `06` | COIN_PROOF | `bitmap:32 || CS(sibling_count) || sibling:32*` |
-| Input | proprietary `07`, keydata `public_key:33` | KEY_ORIGIN | `fingerprint:4 || child_index:u32*`, at most 255 child indices |
+| Input | proprietary `06` | COIN_PROOF | `bitmap:32 \|\| CS(sibling_count) \|\| sibling:32*` |
+| Input | proprietary `07`, keydata `public_key:33` | KEY_ORIGIN | `fingerprint:4 \|\| child_index:u32*`, at most 255 child indices |
 | Output | proprietary `01`, keydata `public_key:33` | KEY_ORIGIN | Same origin encoding; a change hint, not a proof of change |
 
 `KEY_ORIGIN` public keys use valid compressed secp256k1 SEC encoding. For native
@@ -272,3 +272,13 @@ modes, per-slot signature conflicts, unknown metadata preservation, final
 argument tampering, and full extraction/validation. Coinbase/mint rejection
 is required; legacy wrapped unsatisfiable mining outputs are not valid
 native signing fixtures.
+
+---
+
+## References
+
+1. **[Chow 2017]** Andrew Chow, *"BIP 174: Partially Signed Bitcoin Transaction Format"*, Bitcoin Improvement Proposals, July 2017.
+2. **[Chow 2021]** Andrew Chow, *"BIP 370: PSBT Version 2"*, Bitcoin Improvement Proposals, January 2021.
+3. **[Wuille, Nick, & Ruffing 2020]** Pieter Wuille, Jonas Nick, and Tim Ruffing, *"BIP 340: Schnorr Signatures for secp256k1"*, Bitcoin Improvement Proposals, January 2020.
+4. **[Wuille, Nick, & Towns 2020a]** Pieter Wuille, Jonas Nick, and Anthony Towns, *"BIP 341: Taproot: SegWit version 1 spending rules"*, Bitcoin Improvement Proposals, January 2020.
+5. **[O'Connor, Aumasson, Neves, & Wilcox-O'Hearn 2020]** Jack O'Connor, Jean-Philippe Aumasson, Samuel Neves, and Zooko Wilcox-O'Hearn, *"BLAKE3: One Function, Fast Everywhere"*, January 2020 (`https://github.com/BLAKE3-team/BLAKE3-specs`).

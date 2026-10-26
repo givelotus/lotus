@@ -120,8 +120,14 @@ outcomes. Existing implementation tests live in `test_deferred_checks.cpp`,
 `test_vm.cpp` and the deferred-block functional tests. Documentation validation
 does not substitute for running those native tests on the final stack.
 
-The older P03 opcode table and machine-readable opcode registry still predate
-ENFORCEOUTPUT (the reviewed implementation assigns byte eb). This document
-records its deferred validation semantics; it does not silently resolve the
-remaining opcode-allocation and resource-charge synchronization. Reconcile that
-registry, template encoding and cost vectors before freezing the specification.
+The [P03 opcode table (`decisions/vm-semantics.md`)](decisions/vm-semantics.md) and machine-readable opcode registry ([`tools/opcodes.json`](tools/opcodes.json)) are synchronized with `ENFORCEOUTPUT` (`0xeb`), `STATEVERIFY` (`0xed`), `STATEHASH` (`0xc3`), `EMITLOG` (`0x6c`), `ENUMERATE` (`0x69`), conditional `BREAK` (`0x6b`), and `EXT2` (`0xff`) (`225` assigned instructions and `31` `OP_SUCCESS_N` bytes), verified by [`tools/spec_candidate_checks.py`](tools/spec_candidate_checks.py).
+
+---
+
+## References
+
+1. **[Nakamoto 2008]** Satoshi Nakamoto, *"Bitcoin: A Peer-to-Peer Electronic Cash System"*, October 2008 (`https://bitcoin.org/bitcoin.pdf`).
+2. **[Lau & Wuille 2016a]** Johnson Lau and Pieter Wuille, *"BIP 114: Merkelized Abstract Syntax Tree"*, Bitcoin Improvement Proposals, April 2016.
+3. **[Wuille, Nick, & Towns 2020a]** Pieter Wuille, Jonas Nick, and Anthony Towns, *"BIP 341: Taproot: SegWit version 1 spending rules"*, Bitcoin Improvement Proposals, January 2020.
+4. **[Wuille, Nick, & Towns 2020b]** Pieter Wuille, Jonas Nick, and Anthony Towns, *"BIP 342: Validation of Taproot Scripts"*, Bitcoin Improvement Proposals, January 2020.
+5. **[O'Connor & Piekarska 2017]** Russell O'Connor and Marta Piekarska, *"Enhancing Bitcoin Transactions with Covenants"*, in *Financial Cryptography and Data Security (FC 2017)*, LNCS vol. 10323, pp. 191–198, 2017.

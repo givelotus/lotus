@@ -1,6 +1,6 @@
 # Hash commitments and authenticated state
 
-Decision packet P02, October 9, 2026. **Recommended candidate**, not frozen or implemented. Refines D02/D13 and the commitment part of D14. Defines separate branch, ordered-vector and keyed-map commitments rather than one ambiguous “Merklix” API.
+Decision packet P02. **Recommended candidate**, not frozen or implemented. Refines D02/D13 and the commitment part of D14. Defines separate branch, ordered-vector and keyed-map commitments rather than one ambiguous “Merklix” API.
 
 ## Hash registry
 
@@ -20,7 +20,7 @@ Decision packet P02, October 9, 2026. **Recommended candidate**, not frozen or i
 | txroot | `Lotus/v2/txroot` |
 | utxo | `Lotus/v2/utxo` |
 | state | `Lotus/v2/state` |
-| HEADER_HISTORY | `Lotus/v2/HEADER_HISTORY` |
+| header/history | `Lotus/v2/header/history` |
 | blockid | `Lotus/v2/blockid` |
 | merkleidx | `Lotus/v2/merkleidx` |
 
@@ -83,7 +83,7 @@ Because layer index $s$ runs bottom-up from $0$ (leaves) to $k - 1$ (root), for 
 
 ## Block transaction commitment: prefix-sharded Merklix `Subtree A` and top-level `CoinbaseLeaf`
 
-Per the maintainer's sharding architecture ([*Sharding Bitcoin Cash*](https://www.bitcoinabc.org/2018-09-06-sharding-bitcoin-cash/), September 6, 2018), scaling block construction, mempool acceptance, and transaction commitment across horizontal CPU cores and processes requires **consistent key-prefix range partitioning** rather than positional array-index splitting.
+Following the sharding architecture of [*Sharding Bitcoin Cash*](https://www.bitcoinabc.org/2018-09-06-sharding-bitcoin-cash/) (September 6, 2018), scaling block construction, mempool acceptance, and transaction commitment across horizontal CPU cores and processes requires **consistent key-prefix range partitioning** rather than positional array-index splitting.
 
 Let transaction $i$ ($0 \le i < n$) have identity pair `(TxID_i, TxHash_i)`, with `vtx[0]` as the block's coinbase transaction and `vtx[1 .. n - 1]` as the block's non-coinbase transactions. All `TxID_i` in a block (or commitment vector) MUST be pairwise distinct. Define:
 
@@ -115,7 +115,7 @@ The top-level block transaction commitment `TxRoot(xs)` is:
                          (prefix 0...)   (prefix 1...)
   ```
 
-Each leaf commits to both identities of its transaction (`TxID` first, then `TxHash`). `TxHash` fixes the complete witness bytes as the leaf value at key `TxID`, while `TxID` alone defines the 256-bit prefix path through `Subtree A`. Because `Subtree A` partitions strictly by the bits of `TxID`, any $2^k$ mempool/validation shards (where Shard $s \in [0, 2^k - 1]$ owns the $k$-bit `TxID` prefix $s$) can maintain their mempool subtrees and pre-compute `(TxSubtreeRoot[s], fee_sum[s], cost_sum[s])` **100% independently with zero cross-shard count synchronization**, and `Subtree A` is invariant to the slice ordering of `vtx[1 .. n - 1]` (allowing topological parent-before-child ordering in block wire format while committing a canonical prefix-keyed tree). On `getblocktemplate`, the coordinator aggregates the $2^k$ shard roots into `Subtree A` (32 bytes), constructs `vtx[0]`, and combines `CoinbaseLeaf` with `Subtree A` in **one single top-level hash ($O(1)$)** without re-entering any shard.
+Each leaf commits to both identities of its transaction (`TxID` first, then `TxHash`). `TxHash` fixes the complete witness bytes as the leaf value at key `TxID`, while `TxID` alone defines the 256-bit prefix path through `Subtree A`. Because `Subtree A` partitions strictly by the bits of `TxID`, any $2^k$ mempool/validation shards (where Shard $s \in [0, 2^k - 1]$ owns the $k$-bit `TxID` prefix $s$) can maintain their mempool subtrees and pre-compute `(TxSubtreeRoot[s], fee_sum[s], cost_sum[s])` **100% independently with zero cross-shard count synchronization**, and `Subtree A` is naturally ordered by ascending `TxID` (matching Canonical Transaction Ordering, CTOR, in block wire format `vtx[1 .. n - 1]` with two-phase outputs-then-inputs intra-block UTXO resolution per `C12`). On `getblocktemplate`, the coordinator aggregates the $2^k$ shard roots into `Subtree A` (32 bytes), constructs `vtx[0]`, and combines `CoinbaseLeaf` with `Subtree A` in **one single top-level hash ($O(1)$)** without re-entering any shard.
 
 ### Canonical transaction membership and absence proof
 
@@ -197,21 +197,24 @@ A TxID-based proof is not a substitute: a TxID with its transaction-tree path an
 
 Limits of this candidate. Proof size is about one sibling per doubling of the coin set (about 27 siblings, near 1 KB per input, at 10^8 coins). A proof expires when its anchor leaves the window; any state-holding node can reissue it and need not be trusted. Checking a block's new state_root without state additionally needs the paths of every key the block inserts; because all outputs of a transaction share a 224-bit `txid` prefix, outputs created by the same transaction share a single Merklix path down to depth 224 and are co-located on the shard owning `txid`'s prefix. Block producers need the coin set or a complete set of proofs.
 
-## Full state root and canonical 56-byte `MonetaryState`
+## Full state root and canonical `MonetaryState` (`56B` at Genesis, `88B` at $h \ge 1$)
 
-A UTXO root alone omits the protocol's stateful issuance and dynamic fee-burn recurrences ([P05](resources-and-parameters.md), [P06](issuance-and-time.md)). Commit a versioned state envelope:
+A UTXO root alone omits the protocol's stateful issuance, dynamic fee-burn recurrences, and historical header accumulator ([P05](resources-and-parameters.md), [P06](issuance-and-time.md), [Header History Tree](../header-history-tree.md)). Commit a versioned state envelope:
 
 ```text
-MonetaryState = bootstrap_reserve:u64     # R_n (remaining unissued bootstrap atoms, P06)
-                || tail_subsidy:u64       # T_n (current adaptive tail subsidy atoms, P06)
-                || prev_work:u256         # W_{n-1} (32-byte little-endian unsigned per-block work, P04/P06)
-                || ema_block_cost:u64     # E_n (rolling integer EMA of block cost units, P05)
+CoreMonetaryState = bootstrap_reserve:u64     # R_n (remaining unissued bootstrap atoms, P06)
+                    || tail_subsidy:u64       # T_n (current adaptive tail subsidy atoms, P06)
+                    || prev_work:u256         # W_{n-1} (32-byte little-endian unsigned per-block work, P04/P06)
+                    || ema_block_cost:u64     # E_n (rolling integer EMA of block cost units, P05)
 
-StateRoot     = H_state(00 || ChainID || height:u64
-                        || UtxoRoot:h32 || Bytes(MonetaryState))
+MonetaryState(h)  = CoreMonetaryState                         (56 bytes at Genesis h = 0, where history_root == 0x00^32)
+                  | CoreMonetaryState || history_root:h32     (88 bytes at every post-genesis height h >= 1)
+
+StateRoot         = H_state(00 || ChainID || height:u64
+                            || UtxoRoot:h32 || Bytes(MonetaryState(h)))
 ```
 
-`MonetaryState` is a canonical fixed-width **56-byte** record (`8 + 8 + 32 + 8 = 56` bytes, serialized in `StateRoot` and `ProvenTx` via `Bytes(MonetaryState) = 0x38 || MonetaryState`, making the `StateRoot` preimage after the domain tag exactly `1 + 32 + 8 + 32 + 57 = 130` bytes). It retains bootstrap/EMA continuation state plus checked tail/work redundancy (D11 uses Avalanche coordination policy, so no faucet or treasury state exists):
+`CoreMonetaryState` is a canonical fixed-width **56-byte** record (`8 + 8 + 32 + 8 = 56` bytes). At Genesis ($h = 0$, `count == 0`, `history_root == 0x00^32`), `MonetaryState` is 56 bytes (`Bytes(MonetaryState) = 0x38 || CoreMonetaryState`, making the `StateRoot` preimage `130` bytes after the domain tag). At every post-genesis block ($h \ge 1$, `count = h >= 1`), the non-zero 32-byte `history_root` (`HeaderHistoryRoot` over blocks $0 \dots h - 1$) is appended, making `MonetaryState` **88 bytes** (`Bytes(MonetaryState) = 0x58 || CoreMonetaryState || history_root`, and the `StateRoot` preimage `162` bytes after the domain tag). It retains bootstrap/EMA continuation state, checked tail/work redundancy, and the authenticated header history root (D11 uses Avalanche coordination policy, so no faucet or treasury state exists):
 
 1. `bootstrap_reserve:u64` ($R_n$): remaining unissued bootstrap reserve in native atoms; issuance step $n$ emits $B_n = \max(1, R_n \gg k_{\text{boot}})$ when $R_n > 0$ (or $0$ when $R_n = 0$) and updates $R_{n+1} = R_n - B_n$ ([P06](issuance-and-time.md)).
 2. `tail_subsidy:u64` ($T_n$), checked cache of `F(authenticated_parent_work)`: issuance step $n$'s adaptive tail subsidy in native atoms (total issuance step $n$ subsidy entitlement is $S_n = B_n + T_n$); after accepting issuance step $n$ with per-block work $W_n$, updates to $T_{n+1} = \min(T_{\max}, \max(T_{\min}, \text{isqrt}(\lfloor T_g^2 W_n / W_g \rfloor)))$ ([P06](issuance-and-time.md)).
@@ -228,14 +231,14 @@ So that light clients, bridges, and FastSync / Snapshot verifiers can authentica
 
 ### 1. Leaf and internal node hashes
 
-With domain tag `HEADER_HISTORY` (`TaggedHashWriter("HEADER_HISTORY", ChainID)`):
+With BLAKE3 domain tag `"Lotus/v2/header/history"` (`H_header_history(x) = BLAKE3("Lotus/v2/header/history" || 0x00 || x)`):
 
 ```text
 HeaderLeafHash(ChainID, height, block_hash)
-  = TaggedHash("HEADER_HISTORY", ChainID, 0x00 || u64_le(height) || block_hash:h32)
+  = H_header_history(ChainID || 0x00 || u64_le(height) || block_hash:h32)
 
 HeaderInternalHash(ChainID, level, left, right)
-  = TaggedHash("HEADER_HISTORY", ChainID, 0x01 || u8(level) || left:h32 || right:h32)
+  = H_header_history(ChainID || 0x01 || u8(level) || left:h32 || right:h32)
 
 NULL_HASH = 0x00^32
 ```
@@ -291,10 +294,23 @@ Height 1 executes step 0 using the genesis state: `B_0 = max(1, R_0 >> k_boot)` 
 
 ## Coinbase and root dependency order
 
-For non-genesis blocks: choose the transaction set and coinbase output policies/count → calculate resource charges and reduce the coinbase claim under P05 (amount fields have fixed width) → construct coinbase using parent ID/height and the parent's `MonetaryState` ($S_n = B_n + T_n$) → derive TxID/TxHash → evaluate transitions, block cost $C_{\text{block}}$, mandatory fee-burn floor against $E_n$, and the post-block 56-byte `MonetaryState` ($R_{n+1}, T_{n+1}, W_n, E_{n+1}$) → compute transaction/state roots → construct header → compute BlockID/PoW. The containing header hash is never embedded in its own coin records. In a non-genesis block, the parent's hash and `MonetaryState` are already available. Genesis (`height = 0`) uses zero parent (`parent_id = 00^32`), an explicitly initialized 56-byte `MonetaryState` ($R_0, T_0, W_{-1}, E_0$), and applies the **exact same UTXO insertion rule (`C17`) as every other block**: every spendable output (`(flags & 0x02) == 0`) of Block 0's coinbase is inserted into the Genesis `UtxoRoot` (with `creation_height = 0`, `creation_parent_mtp = 0`, `coinbase = 1`) and is normally spendable after coinbase maturity (`C18`), while any unspendable Genesis timestamp/headline message uses an `IS_BURN` (`flags = 0x02`, `paths = []`) output that is excluded from `UtxoRoot`. There is no Bitcoin-0.1.0 special case skipping Genesis UTXO insertion.
+For non-genesis blocks ($h \ge 1$): insert parent block $h - 1$'s spendable coinbase outputs into the UTXO tree and apply block $h$'s non-coinbase transactions `vtx[1 .. n - 1]` in two-phase outputs-then-inputs CTOR order (`C12`, `C17`) → calculate resource charges and reduce the coinbase claim under P05 (`C16`, `C25`) → construct coinbase `vtx[0]` using parent ID/height and the parent's `MonetaryState` ($S_n = B_n + T_n$) → derive TxID/TxHash → evaluate transitions, total block cost $C_{\text{block}} = C_{\text{envelope}} + C(vtx[1..n-1]) + C(vtx[0])$, mandatory fee-burn floor against $E_n$, and the post-block 88-byte `MonetaryState` ($R_{n+1}, T_{n+1}, W_n, E_{n+1}, \text{HistoryRoot}_h$) → compute transaction/state roots → construct header → compute BlockID/PoW. Because block $h$'s own spendable coinbase outputs are inserted into `UtxoRoot` at height $h + 1$ (`C17`, delayed 1-block pipelining), `UtxoRoot` at height $h \ge 1$ is 100% invariant to block $h$'s coinbase transaction (enabling Snowstorm's $O(1)$ `SnapBlock` fast path), while the containing header hash is never embedded in its own coin records. Genesis (`height = 0`) has no prior block ($h - 1$) to pipeline from, so it uses zero parent (`parent_id = 00^32`), an explicitly initialized 56-byte `MonetaryState` ($R_0, T_0, W_{-1}, E_0$ with `history_root == 00^32` omitted), and inserts every spendable output (`(flags & 0x02) == 0`) of Block 0's coinbase directly into the Genesis `UtxoRoot` (with `creation_height = 0`, `creation_parent_mtp = 0`, `coinbase = 1`, spendable after coinbase maturity `C18`), while any unspendable Genesis timestamp/headline message uses an `IS_BURN` (`flags = 0x02`, `paths = []`) output that is excluded from `UtxoRoot`.
 
 ## Acceptance obligations
 
 Pin test vectors for empty/one/two/odd transaction trees, every proof direction, empty/single-leaf/multi-leaf/deleted compact state maps, all three proof presence modes (`0`, `1`, `2`), same map built in different orders, coin metadata changes, 56-byte `MonetaryState` transitions and `StateRoot` envelope restoration. Check both scalar and incremental implementations against the same vectors. Initial genesis parameter values ($R_0, T_0, W_{-1}, E_0$) remain to be confirmed by simulation before genesis freeze.
 
-Absolute-tail adoption (2026-10-15) preserves these 56 serialized bytes and the 134-byte header. Immutable genesis tail/work anchors and formula version 1 belong to the consensus profile identity; a snapshot cannot supply or reset them. Validate both cached fields against authenticated header work and the profile formula before accepting continuation state. See P06 for exact rounding and migration.
+The absolute tail preserves these 56 serialized bytes and the 134-byte header. Immutable genesis tail/work anchors and formula version 1 belong to the consensus profile identity; a snapshot cannot supply or reset them. Validate both cached fields against authenticated header work and the profile formula before accepting continuation state. See P06 for exact rounding and migration.
+
+---
+
+## References
+
+1. **[Merkle 1987]** Ralph C. Merkle, *"A Digital Signature Based on a Conventional Encryption Function"*, in *Advances in Cryptology — CRYPTO '87*, Lecture Notes in Computer Science, vol. 293, pp. 369–378, Springer, 1988.
+2. **[Vermorel, Séchet, Chancellor, & van der Wansem 2018]** Joannes Vermorel, Amaury Séchet, Shammah Chancellor, and Tomas van der Wansem, *"Canonical Transaction Ordering for Bitcoin"*, June 12, 2018.
+3. **[Vermorel, Séchet, Chancellor, & Cox 2018]** Joannes Vermorel, Amaury Séchet, Shammah Chancellor, and Jason Cox, *"Merklix Tree for Bitcoin"*, July 2018.
+4. **[Dahlberg, Pulls, & Peeters 2016]** Rasmus Dahlberg, Tobias Pulls, and Roel Peeters, *"Efficient Sparse Merkle Trees: Caching Strategies and Secure (Non-)Membership Proofs"*, in *Proceedings of the 21st Nordic Conference on Secure IT Systems (NordSec 2016)*, LNCS vol. 10014, pp. 199–215, 2016 (`IACR ePrint 2016/683`).
+5. **[Crosby & Wallach 2009]** Scott A. Crosby and Dan S. Wallach, *"Efficient Data Structures for Tamper-Evident Logging"*, in *Proceedings of the 18th USENIX Security Symposium*, pp. 317–334, August 2009.
+6. **[Todd 2012/2016]** Peter Todd, *"Merkle Mountain Ranges"*, OpenTimestamps / Bitcoin Core developer notes, 2012–2016.
+7. **[O'Connor, Aumasson, Neves, & Wilcox-O'Hearn 2020]** Jack O'Connor, Jean-Philippe Aumasson, Samuel Neves, and Zooko Wilcox-O'Hearn, *"BLAKE3: One Function, Fast Everywhere"*, January 2020 (`https://github.com/BLAKE3-team/BLAKE3-specs`).
+8. **[Nakamoto 2008]** Satoshi Nakamoto, *"Bitcoin: A Peer-to-Peer Electronic Cash System"*, October 2008 (`https://bitcoin.org/bitcoin.pdf`).

@@ -19,17 +19,40 @@ def output(repo, *args):
     return git(repo, *args, stdout=subprocess.PIPE).stdout.decode().strip()
 
 
-def patches(manifest, allow_empty=False):
+def patches(manifest, allow_empty=False, _visited=None, _patches_root=None):
+    manifest = manifest.resolve()
     root = manifest.parent.resolve()
+    patches_root = _patches_root or root.parent.resolve()
+    visited = set(_visited or ())
+    if manifest in visited:
+        raise ValueError(f'Cyclic manifest include: {manifest}')
+    visited.add(manifest)
     result = []
     seen = set()
-    for name in manifest.read_text().splitlines():
+    for raw_line in manifest.read_text().splitlines():
+        name = raw_line.strip()
         if not name or name.startswith('#'):
             continue
+        if name.startswith('@include '):
+            inc_rel = name[len('@include '):].strip()
+            if not inc_rel:
+                raise ValueError('Empty @include directive')
+            inc_manifest = (root / inc_rel).resolve()
+            if inc_manifest.name != 'series' or inc_manifest.parent.parent.resolve() != patches_root or not inc_manifest.is_file():
+                raise ValueError(f'Invalid or out-of-bounds @include manifest: {inc_rel}')
+            for inc_path, inc_mail in patches(inc_manifest, allow_empty=allow_empty, _visited=visited, _patches_root=patches_root):
+                key = str(inc_path.resolve())
+                if key in seen:
+                    raise ValueError(f'Duplicate patch across included manifest: {inc_path.name}')
+                seen.add(key)
+                result.append((inc_path, inc_mail))
+            continue
         path = root / name
-        if name in seen:
+        key = str(path.resolve())
+        if name in seen or key in seen:
             raise ValueError(f'Duplicate manifest entry: {name}')
         seen.add(name)
+        seen.add(key)
         if path.parent.resolve() != root or not path.is_file():
             raise ValueError(f'Invalid or missing patch: {name}')
         data = path.read_bytes()
@@ -48,8 +71,8 @@ def patches(manifest, allow_empty=False):
                 raise ValueError(f'{name}: malformed metadata')
             if not re.sub(r'^\[PATCH[^\]]*\]\s*', '', str(message['Subject'])).strip():
                 raise ValueError(f'{name}: empty patch subject')
-        elif root.name == 'v1':
-            raise ValueError(f'{name}: V1 patches require git format-patch metadata')
+        elif root.name in ('v1', 'v2'):
+            raise ValueError(f'{name}: {root.name.upper()} patches require git format-patch metadata')
         if b'\ndiff --git ' not in b'\n' + data:
             raise ValueError(f'{name}: missing patch diff')
         result.append((path, mail))

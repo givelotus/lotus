@@ -1,7 +1,8 @@
 # daemon/Makefile — Lotus mainnet daemon build management
 #
 # SERIES=v1 (default) — Lotus mainnet, bitcoin-abc-v1-version, workspace-v1/
-# SERIES=ecash        — upstream candidates, shared bitcoin-abc-version, workspace-ecash/
+# SERIES=v2           — Lotus V2 new chain (self-describing @include ../ecash/series + patches/v2/series), workspace-v2/
+# SERIES=ecash        — Bitcoin ABC / eCash high-throughput engine & P2P layer, shared bitcoin-abc-version, workspace-ecash/
 # SERIES=doged        — Dogecoin on shared Bitcoin ABC pin, workspace-doged-abc/
 # SERIES=doged-reference — pinned doged-io/doged reference, doged-reference-version/
 # SERIES=bchn         — BCHN candidates, bchn-version, workspace-bchn/
@@ -12,51 +13,15 @@ SERIES  ?= v1
 .PHONY: setup build run mkpatch refresh refresh-abc refresh-chronik prepare-release prepare-component features clean help
 
 help:
-	@echo "Lotus daemon build targets:"
-	@echo "  make setup [SERIES=v1|ecash|doged|doged-reference|bchn|bitcoin] Clone workspace and apply patches"
-	@echo "  Existing workspaces are preserved; move an old workspace aside before setup."
-	@echo "  make build [SERIES=v1|ecash|doged|doged-reference|bchn|bitcoin] Build selected daemon and CLI"
-	@echo "  make run   [SERIES=v1|ecash|doged|doged-reference|bchn|bitcoin] ARGS=\"...\"  Run selected daemon"
-	@echo "  make mkpatch NAME=<n>          Export committed HEAD with authorship and rationale"
-	@echo "  make refresh COMMIT=<sha|tag|latest> [SERIES=...]  Rebase patches, then advance the pin"
-	@echo "    COMMIT=latest resolves origin's advertised default branch; review every rebase/build result."
-	@echo "  make refresh-abc [REF=latest] CANDIDATE=<new-dir>  Replay eCash/Doged and Chronik on one ABC commit"
-	@echo "    Candidate-only; Lotus V1 is excluded. Clean replay does not mean build/behavior passed."
-	@echo "  make refresh-chronik [UPSTREAM=<ABC clone>] [REF=latest] CANDIDATE=<new-dir>"
-	@echo "    Prepare an isolated shared-Chronik source/export candidate and test adapter patch application."
-	@echo "    Does not change active provider pins, host profiles, workspaces, or releases."
-	@echo "  Human patch workflow: daemon/docs/adding-patches.md"
-	@echo "  make build FEATURES=chronik,nng-off       Select independent build options"
-	@echo "  make features FEATURES=chronik,zeromq-off Show resolved flags and dependencies"
-	@echo "  make prepare-component COMPONENT=bitcoin-core UPSTREAM=<repo> VERSION=<distributor-x.y.z> CANDIDATE=<new-dir>"
-	@echo "  Use PROFILE=custom FEATURES=chronik for explicit independent feature selection."
-	@echo "  After reviewing/committing the candidate, validate artifacts for that exact commit:"
-	@echo "    gh workflow run release-components.yml --ref REVIEW_BRANCH -f component=bitcoin-abc"
-	@echo "  Publish only after exact component CI passes and the reviewed commit reaches main:"
-	@echo "    python3 daemon/scripts/component-release.py --component NAME --upstream REPO --publish --reviewed-commit FULL_SHA --validation-run RUN_ID"
-	@echo "  Component names/tags/patch profiles: daemon/docs/component-releases.md"
-	@echo "  Legacy v11: make prepare-release UPSTREAM=<repo> VERSION=<x.y.z> CANDIDATE=<new-dir>"
-	@echo "                                Prepare an atomic review candidate; never publish"
-	@echo "  Release preparation updates daemon/Arch/Docker versions and records patch hashes/source tree."
-	@echo "  UPSTREAM is a read-only local ABC repository; CANDIDATE must be a new directory."
-	@echo "  Seeds/checkpoints are preserved unless verified network inputs are supplied to the script."
-	@echo "  Example from the monorepo root:"
-	@echo "    make -C daemon prepare-release UPSTREAM=/tmp/rebase-latest-abc VERSION=11.6.1 CANDIDATE=/tmp/lotus-release-11.6.1"
-	@echo "  Review and commit the candidate, then run artifact-only CI for that exact commit:"
-	@echo "    gh workflow run release-daemon.yml --repo givelotus/lotus --ref REVIEW_BRANCH"
-	@echo "  After the reviewed commit reaches origin/main and CI passes, publish from the candidate:"
-	@echo "    python3 daemon/scripts/prepare-release.py --upstream /path/to/abc --publish --reviewed-commit FULL_SHA --validation-run RUN_ID"
-	@echo "  Publication creates a new immutable tag; existing releases are refused. Deployment is separate."
-	@echo "  Full instructions and validation limits: daemon/docs/release-preparation.md"
-	@echo "  Network input schema: daemon/NETWORK-RELEASE.md"
-	@echo ""
-	@echo "  SERIES=v1 (default): mainnet    — workspace-v1/     (bitcoin-abc 8c67fe1e85 + Chronik)"
-	@echo "  SERIES=ecash:        upstream   — workspace-ecash/  (bitcoin-abc 1fb7db17)"
-	@echo "  SERIES=doged:        Dogecoin   — workspace-doged-abc/ (Bitcoin ABC + 174 maintained patches)"
-	@echo "  SERIES=doged-reference: doged   — workspace-doged-reference/ (pinned doged-io/doged reference)"
-	@echo "  SERIES=bchn:         BCHN       — workspace-bchn/   (exact current-tip pin in bchn-version)"
-	@echo "  eCash/BCHN defaults apply no candidates; experimental/placeholder patches are not validated features."
-	@echo "  Exact application/build/test evidence: daemon/docs/support-matrix.md"
+	@echo "Pinned daemon source submodules under daemon/ (no mailbox replay):"
+	@echo "  make setup SERIES=all|ecash|v2|v1|doged|bchn|bitcoin   Initialize exact gitlinks"
+	@echo "  make status                                         Verify repos, pins and trees"
+	@echo "  make source-plan SERIES=v2                           Show shared then native order"
+	@echo "  make source-plan SERIES=v2 PLAN_ARGS=--commits       Show individual commit order"
+	@echo "  make source-verify                                  Check every source submodule"
+	@echo "  make build/run SERIES=...                           Require promoted stack first"
+	@echo "  make sync/autosquash/bridge-ours SERIES=...          Maintain source histories"
+	@echo "Unfinished historical candidates remain separate from the selected source pins."
 
 setup:
 ifdef RESET
@@ -64,6 +29,46 @@ ifdef RESET
 else
 	SERIES=$(SERIES) $(SCRIPTS)/setup.sh
 endif
+	python3 $(SCRIPTS)/lotus-git.py init $(SERIES)
+
+source-plan:
+	python3 $(SCRIPTS)/daemon_sources.py plan $(SERIES) $(PLAN_ARGS)
+
+source-verify:
+	python3 $(SCRIPTS)/daemon_sources.py verify all
+
+source-path:
+	python3 $(SCRIPTS)/daemon_sources.py path $(SERIES)
+
+status:
+	python3 $(SCRIPTS)/daemon_sources.py status $(SERIES)
+
+init:
+	python3 $(SCRIPTS)/daemon_sources.py init $(SERIES)
+
+autosquash:
+	python3 $(SCRIPTS)/daemon_sources.py autosquash $(SERIES) $(if $(filter 1,$(PATCHES)),--export-patches)
+
+sync:
+	python3 $(SCRIPTS)/daemon_sources.py sync $(SERIES) $(if $(filter 1,$(BRIDGE_OURS)),--bridge-ours) $(if $(filter 1,$(PATCHES)),--export-patches) $(if $(filter 1,$(VERIFY)),--verify-replay) $(if $(filter 1,$(PUSH)),--push)
+
+bridge-ours:
+	python3 $(SCRIPTS)/daemon_sources.py bridge-ours $(SERIES) $(if $(REF),--ref "$(REF)")
+
+sink-to-ecash:
+	python3 $(SCRIPTS)/daemon_sources.py sink-to-ecash $(or $(COMMIT),HEAD) $(if $(filter 1,$(PATCHES)),--export-patches)
+
+rebase-upstream:
+ifndef COMMIT
+	$(error COMMIT is required: make rebase-upstream SERIES=v2 COMMIT=<sha|latest>)
+endif
+	python3 $(SCRIPTS)/daemon_sources.py rebase-upstream $(SERIES) --onto "$(COMMIT)" $(if $(filter 1,$(BRIDGE_OURS)),--bridge-ours) $(if $(filter 1,$(PATCHES)),--export-patches)
+
+extract-pr:
+ifndef BRANCH
+	$(error BRANCH is required: make extract-pr SERIES=ecash BRANCH=pr/my-feature COMMITS="<sha>")
+endif
+	python3 $(SCRIPTS)/daemon_sources.py extract-pr $(SERIES) --branch "$(BRANCH)" $(or $(COMMITS),HEAD)
 
 build:
 	SERIES=$(SERIES) FEATURES="$(FEATURES)" $(SCRIPTS)/build.sh
@@ -84,7 +89,7 @@ endif
 ifndef CANDIDATE
 	$(error CANDIDATE must identify a new directory for the review candidate)
 endif
-	python3 $(SCRIPTS)/prepare-release.py --upstream "$(UPSTREAM)" --version "$(VERSION)" --candidate "$(CANDIDATE)"
+	python3 $(SCRIPTS)/prepare-release.py --upstream "$(UPSTREAM)" --version "$(VERSION)" --patch-revision "$(or $(PATCH_REVISION),1)" --candidate "$(CANDIDATE)"
 
 prepare-component:
 ifndef COMPONENT
@@ -133,4 +138,14 @@ endif
 	python3 $(SCRIPTS)/prepare-abc-refresh.py --ref "$(or $(REF),latest)" --candidate "$(CANDIDATE)"
 
 clean:
-	rm -rf workspace-ecash/build workspace-v1/build workspace-doged-abc/build workspace-doged-reference/build workspace-bchn/build workspace-bitcoin/build
+	@series="$$(python3 $(SCRIPTS)/daemon_sources.py canonical "$(SERIES)")" || exit 1; \
+	if [ -f "$(SCRIPTS)/../.build/$$series/CMakeCache.txt" ]; then \
+	  cmake --build "$(SCRIPTS)/../.build/$$series" --target clean; \
+	else echo "No submodule build to clean for $$series; legacy workspaces preserved."; fi
+
+# Historical replay/export entrypoints cannot run against the base-only scaffold.
+.PHONY: source-plan source-verify source-path reviewed-source
+reviewed-source:
+	python3 $(SCRIPTS)/daemon_sources.py release-check all
+
+refresh refresh-abc mkpatch prepare-release prepare-component: reviewed-source

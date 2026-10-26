@@ -119,11 +119,12 @@ NAV_SECTIONS: List[Tuple[str, List[Tuple[str, str]]]] = [
     (
         "4. Networking & Governance",
         [
+            ("snowstorm.md", "Snowstorm Pseudo-Consensus"),
             ("peering.md", "Peering & Avalanche Pre-Consensus"),
             ("mempool-reconciliation.md", "Mempool Set Reconciliation"),
             ("validation.md", "Validation & Conformance"),
             ("decisions.md", "Decision Register (D01–D15)"),
-            ("review-notes.md", "Review Handoff Notes"),
+            ("decisions/history.md", "Decision History"),
         ],
     ),
 ]
@@ -178,9 +179,11 @@ def render_inline(text: str, current_rel: Path) -> str:
     )
     # Links [label](url)
     def replace_link(m: re.Match) -> str:
-        label = m.group(1)
+        label = html.escape(m.group(1), quote=False)
+        label = re.sub(r"\*\*([^*]+)\*\*", r"<strong>\1</strong>", label)
+        label = re.sub(r"(?<!\*)\*([^*\n]+)\*(?!\*)", r"<em>\1</em>", label)
         url = convert_href(m.group(2).strip(), current_rel)
-        return save_token(f'<a href="{html.escape(url, quote=True)}">{render_inline(label, current_rel)}</a>')
+        return save_token(f'<a href="{html.escape(url, quote=True)}">{label}</a>')
 
     text = re.sub(r"\[([^\]]+)\]\(([^)]+)\)", replace_link, text)
 
@@ -190,8 +193,8 @@ def render_inline(text: str, current_rel: Path) -> str:
     text = re.sub(r"\*\*([^*]+)\*\*", r"<strong>\1</strong>", text)
     text = re.sub(r"(?<!\*)\*([^*\n]+)\*(?!\*)", r"<em>\1</em>", text)
 
-    for i, tok in enumerate(tokens):
-        text = text.replace(f"\x00TOK{i}\x00", tok)
+    for i in range(len(tokens) - 1, -1, -1):
+        text = text.replace(f"\x00TOK{i}\x00", tokens[i])
     return text
 
 
@@ -199,6 +202,12 @@ def slugify(heading: str) -> str:
     s = re.sub(r"<[^>]+>", "", heading).lower()
     s = re.sub(r"[^a-z0-9]+", "-", s).strip("-")
     return s or "section"
+
+
+def split_table_row(line: str) -> List[str]:
+    """Split a GFM table row on unescaped pipes; `\\|` is a literal pipe, as on GitHub."""
+    cells = re.split(r"(?<!\\)\|", line.strip().strip("|"))
+    return [c.strip().replace("\\|", "|") for c in cells]
 
 
 def markdown_to_html(md_text: str, current_rel: Path) -> str:
@@ -234,7 +243,7 @@ def markdown_to_html(md_text: str, current_rel: Path) -> str:
             continue
 
         # Fenced code block
-        m_fence = re.match(r"^(\s*)```(\w*)\s*$", line)
+        m_fence = re.match(r"^(\s*)```\s*([^`\s]*)[^`]*$", line)
         if m_fence:
             lang = m_fence.group(2).strip()
             i += 1
@@ -277,11 +286,11 @@ def markdown_to_html(md_text: str, current_rel: Path) -> str:
 
         # Markdown Table
         if "|" in line and i + 1 < n and re.match(r"^\s*\|?[\s:-]+\|[\s|:-]*$", lines[i + 1]):
-            headers = [c.strip() for c in line.strip().strip("|").split("|")]
+            headers = split_table_row(line)
             i += 2
             rows: List[List[str]] = []
             while i < n and "|" in lines[i] and lines[i].strip():
-                rows.append([c.strip() for c in lines[i].strip().strip("|").split("|")])
+                rows.append(split_table_row(lines[i]))
                 i += 1
             out.append('<div class="table-wrap"><table><thead><tr>')
             for hcell in headers:
@@ -341,13 +350,22 @@ def markdown_to_html(md_text: str, current_rel: Path) -> str:
         ):
             para_lines.append(lines[i].strip())
             i += 1
-        if para_lines:
-            out.append(f"<p>{render_inline(' '.join(para_lines), current_rel)}</p>")
+        if not para_lines:
+            # A line no block rule consumed (e.g. an unrecognized <div>); keep it as text.
+            para_lines.append(lines[i].strip())
+            i += 1
+        out.append(f"<p>{render_inline(' '.join(para_lines), current_rel)}</p>")
 
     return "\n".join(out)
 
 
 def build_summary_banner(rel_str: str) -> str:
+    if rel_str.startswith("research/"):
+        return """
+    <div class="exec-banner research-banner">
+      <div class="exec-why"><strong>Research — non-normative.</strong> This page records an investigation. It defines no rule; a research result enters the specification only through a decision recorded in <a href="{ROOT_PREFIX}decisions/history.html">decision history</a>.</div>
+    </div>
+    """
     if rel_str not in PAGE_SUMMARIES:
         return ""
     why, everyday, engineer = PAGE_SUMMARIES[rel_str]
@@ -455,9 +473,43 @@ def html_template(title: str, sidebar_html: str, banner_html: str, body_html: st
     }}
     main {{
       flex: 1;
+      min-width: 0;
       max-width: 1080px;
       padding: 0 2.5rem 4rem 2.5rem;
       margin: 0 auto;
+      overflow-wrap: break-word;
+    }}
+    article img {{ max-width: 100%; height: auto; }}
+    .math-block, .katex-display, .mermaid {{ overflow-x: auto; max-width: 100%; }}
+    th, td {{ min-width: 6.5rem; }}
+    .nav-toggle {{ display: none; }}
+    @media (max-width: 900px) {{
+      body {{ flex-direction: column; }}
+      aside {{
+        width: 100%;
+        height: auto;
+        max-height: none;
+        position: static;
+        border-right: none;
+        border-bottom: 1px solid var(--border);
+        padding: 0.75rem 1rem;
+      }}
+      .brand {{ margin-bottom: 0; padding-bottom: 0; border-bottom: none; justify-content: space-between; }}
+      .nav-toggle {{
+        display: inline-block;
+        background: var(--bg-card);
+        color: var(--text);
+        border: 1px solid var(--border);
+        border-radius: 6px;
+        padding: 0.3rem 0.7rem;
+        font-size: 0.85rem;
+        cursor: pointer;
+      }}
+      aside .nav-body {{ display: none; margin-top: 0.75rem; }}
+      aside.open .nav-body {{ display: block; }}
+      main {{ padding: 0 1rem 3rem 1rem; width: 100%; }}
+      header.topbar {{ position: static; }}
+      h1 {{ font-size: 1.6rem; }}
     }}
     header.topbar {{
       position: sticky;
@@ -504,6 +556,11 @@ def html_template(title: str, sidebar_html: str, banner_html: str, body_html: st
       padding: 1.1rem 1.25rem;
       margin-bottom: 2rem;
     }}
+    .research-banner {{
+      border-color: #b45309;
+      background: rgba(180, 83, 9, 0.12);
+    }}
+    .research-banner .exec-why {{ margin-bottom: 0; }}
     .exec-why {{
       color: #fff;
       font-size: 1rem;
@@ -511,7 +568,7 @@ def html_template(title: str, sidebar_html: str, banner_html: str, body_html: st
     }}
     .lens-grid {{
       display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(310px, 1fr));
+      grid-template-columns: repeat(auto-fit, minmax(min(310px, 100%), 1fr));
       gap: 1rem;
       margin: 1rem 0;
     }}
@@ -575,8 +632,11 @@ def html_template(title: str, sidebar_html: str, banner_html: str, body_html: st
 </head>
 <body data-lens="both">
   <aside>
-    <a class="brand" href="{{ROOT_PREFIX}}index.html">🪷 <span>Lotus V2</span> Docs</a>
+    <div class="brand"><a href="{{ROOT_PREFIX}}index.html" style="color:inherit;text-decoration:none;">🪷 <span>Lotus V2</span> Docs</a>
+      <button class="nav-toggle" onclick="this.closest('aside').classList.toggle('open')">☰ Contents</button></div>
+    <nav class="nav-body">
     {sidebar_html}
+    </nav>
   </aside>
   <main>
     <header class="topbar">
@@ -649,6 +709,7 @@ def render_site(out_dir: Path) -> int:
         banner = build_summary_banner(rel.as_posix())
         body = markdown_to_html(raw_md, rel)
         page = html_template(title, sidebar, banner, body, rel.as_posix()).replace("{ROOT_PREFIX}", root_prefix)
+        page = "\n".join(line.rstrip() for line in page.splitlines()) + "\n"
         dest.write_text(page, encoding="utf-8")
         count += 1
     print(f"Rendered {count} HTML pages to {out_dir}")

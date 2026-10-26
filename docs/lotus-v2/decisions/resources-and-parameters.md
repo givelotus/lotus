@@ -1,6 +1,6 @@
 # Resource soundness and parameter selection
 
-Decision packet P05, October 9, 2026 (updated October 14, 2026). **Candidate cost algebra and parabolic fee-burn curves specified for D08** (unified Cost Units `cu`, parabolic transaction cost $C_{\text{tx}}$, rolling integer `ema_block_cost` $E_n$, and parabolic block burn floor, eliminating hard step-function walls `MAX_TX_BYTES` and `MAX_BLOCK_BYTES`); **primitive `cu` coefficients and shift constants ($S_{\text{tx\_knee}}, w, E_{\min}, S_{\text{linear}}, S_{\text{quad}}$) remain to be confirmed by hardware benchmark and economic simulation before genesis freeze**. A resource rule is consensus, even when its motivation is protection of a daemon. No post-genesis vote or hardware benchmark may change it implicitly.
+Decision packet P05. **Candidate cost algebra and parabolic fee-burn curves specified for D08** (unified Cost Units `cu`, parabolic transaction cost $C_{\text{tx}}$, rolling integer `ema_block_cost` $E_n$, and parabolic block burn floor, eliminating hard step-function walls `MAX_TX_BYTES` and `MAX_BLOCK_BYTES`); **primitive `cu` coefficients and shift constants ($S_{\text{tx\_knee}}, w, E_{\min}, S_{\text{linear}}, S_{\text{quad}}$) remain to be confirmed by hardware benchmark and economic simulation before genesis freeze**. A resource rule is consensus, even when its motivation is protection of a daemon. No post-genesis vote or hardware benchmark may change it implicitly.
 
 Monetary index convention: issuance step `n >= 0` means block height `n + 1`; genesis commits the initial state without advancing any recurrence. See P02's genesis/indexing rule.
 
@@ -163,3 +163,13 @@ A separate named development profile may choose smaller values for fixtures. Its
 Implementation can begin on the parameterized parser/evaluator, unified `cu` cost algebra, and parabolic fee-burn checks before final constant calibration. Mainnet readiness cannot. This separates a real implementation dependency from a launch dependency without pretending either is complete.
 
 A minimally populated block, including its coinbase byte charge and envelope work, must remain affordable at the selected tail minimum and reachable EMA values. Test that liveness condition during calibration; underclaim may consume subsidy but cannot make a negative payout valid. Coinbase output amounts use fixed-width encoding, so reducing the claim does not change its serialized length; constructors finalize output count/policies before computing the deduction.
+
+---
+
+## References
+
+1. **[Chancellor 2026]** Shammah Chancellor, *"Adaptive PoW Monetary Policy Without Oracles: A Constructive Mechanism for Pseudo-Stability via Work-Coupled Tail Emission and Burn"*, Lotus Network Technical Paper, 2026.
+2. **[Buterin et al. 2019]** Vitalik Buterin, Eric Conner, Rick Dudley, Matthew Slipper, Ian Norden, and Abdelhamid Bakhta, *"EIP-1559: Fee market change for ETH 1.0 chain"*, Ethereum Improvement Proposals, April 2019.
+3. **[Roughgarden 2020]** Tim Roughgarden, *"Transaction Fee Mechanism Design for the Ethereum Blockchain: An Economic Analysis of EIP-1559"*, `arXiv:2012.00854`, December 2020.
+4. **[Nakamoto 2008]** Satoshi Nakamoto, *"Bitcoin: A Peer-to-Peer Electronic Cash System"*, October 2008 (`https://bitcoin.org/bitcoin.pdf`).
+5. **[Lombrozo, Lau, & Wuille 2015]** Eric Lombrozo, Johnson Lau, and Pieter Wuille, *"BIP 141: Segregated Witness (Consensus layer)"*, Bitcoin Improvement Proposals, December 2015.

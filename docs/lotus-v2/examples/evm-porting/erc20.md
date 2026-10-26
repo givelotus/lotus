@@ -94,3 +94,12 @@ This is **not ERC-2612 wire compatibility**. EIP-712 uses Keccak and Ethereum ad
 Tests must reject repeated seed issuance, forged/zero-valued controllers, altered cap/state, duplicated successors, missing rules on any OR path, reused nonce, wrong chain/instance/spender, oversized proof, stale map update, signature mutation, native-fee omission, and overflow. Demonstrate successful burn followed by remint under the outstanding cap, rejection under a lifetime cap, and a simultaneous positive mint plus explicit burn. Test the approval replacement race; UTXO conflicts prevent both spends of one state, but do not guarantee which wins.
 
 **Frontend:** state effects, input/output roles, `<=` emission, hash/codec and data-signature bindings. **Library:** singleton bootstrap, exact-policy preservation, authenticated maps, checked aggregate deltas. **SDK:** funding, permit encoding, nonce selection and signing display. **Indexer:** historical issuance/burn supply, balances, metadata/events and reorg rollback. **VM:** no new instruction demonstrated necessary for the Lotus design. **Transaction:** current consume/recreate model expresses it but serializes controller access. **Consensus:** exact expiring ERC-2612 semantics conflict with C22a; this design requests no consensus change.
+
+---
+
+## References
+
+1. **[Vogelsteller & Buterin 2015]** Fabian Vogelsteller and Vitalik Buterin, *"EIP-20: Token Standard"*, Ethereum Improvement Proposals, November 2015.
+2. **[Lundfall 2020]** Martin Lundfall, *"EIP-2612: Permit Extension for EIP-20 Signed Approvals"*, Ethereum Improvement Proposals, April 2020.
+3. **[O'Connor & Piekarska 2017]** Russell O'Connor and Marta Piekarska, *"Enhancing Bitcoin Transactions with Covenants"*, in *Financial Cryptography and Data Security (FC 2017)*, LNCS vol. 10323, pp. 191–198, 2017.
+4. **[Wuille, Nick, & Ruffing 2020]** Pieter Wuille, Jonas Nick, and Tim Ruffing, *"BIP 340: Schnorr Signatures for secp256k1"*, Bitcoin Improvement Proposals, January 2020.

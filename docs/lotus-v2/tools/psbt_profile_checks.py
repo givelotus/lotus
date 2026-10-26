@@ -91,7 +91,7 @@ def encode(maps):
 
 def vector(raw):
     r = Reader(raw)
-    args = [r.bytes(8192) for _ in range(r.compact(65535))]
+    args = [r.bytes(8192) for _ in range(r.compact(64))]
     r.done()
     return args
 
@@ -141,9 +141,9 @@ def template(raw):
         if not nw:
             raise ValueError('witness count')
         for _ in range(nw):
-            r.bytes(10000)
+            r.bytes(8192)
             r.take(32 * r.compact(64))
-            if r.compact(65535):
+            if r.compact(64):
                 raise ValueError('template arguments')
         inputs.append((outpoint, nw))
     for _ in range(no):

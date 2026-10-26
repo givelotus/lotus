@@ -15,7 +15,7 @@ The [script ABI](../script-abi.md) distinguishes today's schema-2 compiler gramm
 - **`state { ... }`** declares fields a contract keeps between spends. They are stored by P02's data-leaf convention; example 5 shows the compiled form. In a contract with state, a method not marked **`ends`** must leave a successor. A contract without state never requires one, so its methods carry no marker.
 - **`paired output`** refers to the output at the same position as the input the script is running for. Pairing by position stops two inputs from both claiming one output.
 
-For new language work use [LC-1's explicit entry and policy proposal](../script-abi.md#composition-proposal-lc-1-not-implemented): methods select leaves within a program, while named paths select the AND of required branch slots. Imports have no deployment effect. Mint identity is independent of holder policy branch order. A bound program root does not identify a complete output policy. The [work plan](../../plans/lotus-v2-language-composition.md) gives versioning, implementation owners and acceptance gates.
+For new language work use [LC-1's explicit entry and policy proposal](../script-abi.md#composition-proposal-lc-1-not-implemented): methods select leaves within a program, while named paths select the AND of required branch slots. Imports have no deployment effect. Mint identity is independent of holder policy branch order. A bound program root does not identify a complete output policy. The [work plan](../research/plans/lotus-v2-language-composition.md) gives versioning, implementation owners and acceptance gates.
 
 ## 1. Ordinary payment
 
@@ -387,3 +387,15 @@ There are no read-only inputs. A transaction that needs data held in a shared co
 ## Completion contract
 
 Deliver these examples in order. Each becomes executable only when it includes source, assembly, bytecode, canonical arguments, initial coin records, complete transaction bytes, commitments, signing data, final stack, static cost and post-state/undo result, produced by pinned tools. Pair each with focused local conformance cases for its requirements. The schema for those records and the outstanding evidence are in [validation](../validation.md).
+
+---
+
+## References
+
+1. **[Wuille, Nick, & Towns 2020a]** Pieter Wuille, Jonas Nick, and Anthony Towns, *"BIP 341: Taproot: SegWit version 1 spending rules"*, Bitcoin Improvement Proposals, January 2020.
+2. **[Wuille, Nick, & Towns 2020b]** Pieter Wuille, Jonas Nick, and Anthony Towns, *"BIP 342: Validation of Taproot Scripts"*, Bitcoin Improvement Proposals, January 2020.
+3. **[Möser, Eyal, & Sirer 2016]** Malte Möser, Ittay Eyal, and Emin Gün Sirer, *"Bitcoin Covenants"*, in *Financial Cryptography and Data Security (FC 2016)*, LNCS vol. 9604, pp. 126–141, 2016.
+4. **[O'Connor & Piekarska 2017]** Russell O'Connor and Marta Piekarska, *"Enhancing Bitcoin Transactions with Covenants"*, in *Financial Cryptography and Data Security (FC 2017)*, LNCS vol. 10323, pp. 191–198, 2017.
+5. **[Vogelsteller & Buterin 2015]** Fabian Vogelsteller and Vitalik Buterin, *"EIP-20: Token Standard"*, Ethereum Improvement Proposals, November 2015.
+6. **[Entriken, Shirley, Evans, & Sachs 2018]** William Entriken, Dieter Shirley, Jacob Evans, and Nastassia Sachs, *"EIP-721: Non-Fungible Token Standard"*, Ethereum Improvement Proposals, January 2018.
+7. **[Adams, Zinsmeister, & Robinson 2020]** Hayden Adams, Noah Zinsmeister, and Dan Robinson, *"Uniswap v2 Core"*, March 2020.

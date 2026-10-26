@@ -35,3 +35,11 @@ There is no EVM call stack, `msg.sender`, shared mutable storage between branche
 Compose protocols by assembling one transaction whose consuming inputs and outputs satisfy every independent covenant. Use typed role indices and complete policy/state checks. A participant can require another coin's mandatory policy and exact output effects, but that proves neither a particular leaf ran nor an arbitrary call returned a value. If method identity matters, encode the required effect/authorization in both participants or use an authenticated controller state that makes alternatives safe. Do not introduce an `invoked(other.method)` assertion with no enforceable lowering.
 
 **Frontend/library:** explicit effects, migration codecs and full-policy comparison. **SDK:** artifact version pinning, approvals, role composition, honest signer displays. **Indexer:** stable application identity and lineage. **VM/transaction:** the migration/atomic-composition model uses existing operations; complete proofs and runtime measurements remain work. **Consensus:** exact delegatecall, callbacks or arbitrary dynamic code execution would require a new execution model, not a source-language convenience. This proposal rejects automatic addition of DEFINE/INVOKE or any claimed EVM compatibility shortcut.
+
+---
+
+## References
+
+1. **[Lau & Wuille 2016a]** Johnson Lau and Pieter Wuille, *"BIP 114: Merkelized Abstract Syntax Tree"*, Bitcoin Improvement Proposals, April 2016.
+2. **[Wuille, Nick, & Towns 2020a]** Pieter Wuille, Jonas Nick, and Anthony Towns, *"BIP 341: Taproot: SegWit version 1 spending rules"*, Bitcoin Improvement Proposals, January 2020.
+3. **[O'Connor & Piekarska 2017]** Russell O'Connor and Marta Piekarska, *"Enhancing Bitcoin Transactions with Covenants"*, in *Financial Cryptography and Data Security (FC 2017)*, LNCS vol. 10323, pp. 191–198, 2017.

@@ -1,0 +1,398 @@
+From 67cb95ce6acdd3d766ae6113c143e50c0e838331 Mon Sep 17 00:00:00 2001
+From: Shammah Chancellor <shammah.chancellor@notvalid.com>
+Date: Wed, 14 Oct 2026 17:28:27 -0700
+Subject: [PATCH] Reuse prepared signing per VM invocation and complete stack
+ core
+
+Review integration note (2026-10-14; newly recorded explanation):
+Prepare signing commitments once per invocation, reuse them for repeated SIGHASH/CHECKSIG, cache mint count, enforce the 8192-byte element ceiling, and complete the compiler-used stack operations. Transaction-wide cache sharing and full block validation remain separate work.
+
+---
+ src/lotus_v2/test_vm.cpp             |  63 ++++++++++++-
+ src/lotus_v2/vm.cpp                  | 131 ++++++++++++++++++++++-----
+ src/lotus_v2/vm.h                    |   5 +-
+ src/lotus_v2/vm_test/differential.py |  23 +++++
+ 4 files changed, 194 insertions(+), 28 deletions(-)
+
+diff --git a/src/lotus_v2/test_vm.cpp b/src/lotus_v2/test_vm.cpp
+index 3f7caf1f1..0f4a677aa 100644
+--- a/src/lotus_v2/test_vm.cpp
++++ b/src/lotus_v2/test_vm.cpp
+@@ -77,6 +77,39 @@ void ControlAndArithmetic() {
+     Expect("4e", VmStatus::Success, {}, one_step);
+     Expect("4e4e91", VmStatus::Invalid, {}, one_step);
+ }
++void StackOpcodes() {
++    auto check = [](std::initializer_list<uint8_t> initial, uint8_t op,
++                    std::initializer_list<uint8_t> expected) {
++        VmBytes script;
++        for (uint8_t n : initial) script.push_back(0x4d + n);
++        script.push_back(op);
++        for (auto it = expected.end(); it != expected.begin();) {
++            script.push_back(0x4d + *--it);
++            script.push_back(0x92); // EQUALVERIFY consumes one result
++        }
++        script.push_back(0x4e);
++        CHECK(EvaluateVm(script, {}, PROFILE).status == VmStatus::Success);
++    };
++    check({1, 2}, 0x72, {});
++    check({1, 2}, 0x73, {1, 2, 1, 2});
++    check({1, 2, 3}, 0x74, {1, 2, 3, 1, 2, 3});
++    check({1, 2, 3, 4}, 0x75, {1, 2, 3, 4, 1, 2});
++    check({1, 2, 3, 4, 5, 6}, 0x76, {3, 4, 5, 6, 1, 2});
++    check({1, 2, 3, 4}, 0x77, {3, 4, 1, 2});
++    check({1, 2}, 0x78, {1, 2, 2});
++    check({1, 2}, 0x79, {1});
++    check({1, 2}, 0x7a, {1, 2, 2});
++    check({1, 2}, 0x7b, {2});
++    check({1, 2}, 0x7c, {1, 2, 1});
++    check({1, 2, 1}, 0x7d, {1, 2, 1});
++    check({1, 2, 3, 2}, 0x7e, {2, 3, 1});
++    check({1, 2, 3}, 0x7f, {2, 3, 1});
++    check({1, 2}, 0x80, {2, 1});
++    check({1, 2}, 0x81, {2, 1, 2});
++    Expect("4e4d7d", VmStatus::Invalid); // negative PICK index
++    Expect("4e4f7d", VmStatus::Invalid); // out-of-range PICK index
++    Expect("4e4f7e", VmStatus::Invalid); // out-of-range ROLL index
++}
+ void HashAndBounds() {
+     Expect("03616263b820ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff6"
+            "1f20015ad91",
+@@ -96,6 +129,17 @@ void HashAndBounds() {
+     tiny_bytes.max_vm_bytes = 16;
+     Expect("4e4e91", VmStatus::Invalid, {}, tiny_bytes);
+     Expect("5e", VmStatus::AutomaticSuccess, {}, tiny_bytes);
++    VmProfile hard = PROFILE;
++    hard.max_element_bytes = VM_HARD_ELEMENT_BYTES + 1;
++    hard.max_vm_bytes = VM_HARD_ELEMENT_BYTES + 32;
++    Expect("5e", VmStatus::Invalid, {}, hard);
++    hard.max_element_bytes = VM_HARD_ELEMENT_BYTES;
++    hard.max_script_bytes = VM_HARD_ELEMENT_BYTES + 32;
++    hard.max_stack_items = 2;
++    Expect("794e", VmStatus::Success,
++           {VmBytes(VM_HARD_ELEMENT_BYTES, 0x41)}, hard);
++    Expect("794e", VmStatus::Invalid,
++           {VmBytes(VM_HARD_ELEMENT_BYTES + 1, 0x41)}, hard);
+ }
+ VmCostProfile IllustrativeCost() {
+     VmCostProfile schedule;
+@@ -156,11 +200,9 @@ void ChargedAccounting() {
+     schedule.opcode[0xb8].per_operand_byte = UINT64_MAX;
+     VmProfile huge = PROFILE;
+     huge.max_element_bytes = SIZE_MAX;
+-    auto overflow = EvaluateVmCharged(Hex("b8"), {}, huge, schedule);
+-    CHECK(!overflow.charged && overflow.invocation.status == VmStatus::Invalid);
+-    overflow = EvaluateVmCharged(Hex("6779b86a4e"), {}, huge, schedule);
+-    CHECK(!overflow.charged && overflow.invocation.status == VmStatus::Invalid &&
+-          overflow.invocation.error == "static cost u128 overflow");
++    auto rejected_profile = EvaluateVmCharged(Hex("b8"), {}, huge, schedule);
++    CHECK(!rejected_profile.charged &&
++          rejected_profile.invocation.error == "invalid explicit VM profile");
+ }
+ void AuthenticatedPayment() {
+     const auto wire =
+@@ -254,6 +296,16 @@ void AuthenticatedPayment() {
+     sighash_script.insert(sighash_script.end(), finish.begin(), finish.end());
+     witness.script = sighash_script;
+     resolved[0]->branches[0] = BranchLeaf(witness.script);
++    CHECK(EvaluateVmWithContext(witness.script, witness.arguments, PROFILE,
++                                context)
++              .status == VmStatus::Success);
++    witness.script = Hex("00c200c291"); // two prepared messages, one snapshot
++    resolved[0]->branches[0] = BranchLeaf(witness.script);
++    CHECK(EvaluateVmWithContext(witness.script, witness.arguments, PROFILE,
++                                context)
++              .status == VmStatus::Success);
++    witness.script = Hex("cb0091"); // cached mint count for this invocation
++    resolved[0]->branches[0] = BranchLeaf(witness.script);
+     CHECK(EvaluateVmWithContext(witness.script, witness.arguments, PROFILE,
+                                 context)
+               .status == VmStatus::Success);
+@@ -299,6 +351,7 @@ void AuthenticatedPayment() {
+ int main() {
+     FramingAndSuccess();
+     ControlAndArithmetic();
++    StackOpcodes();
+     HashAndBounds();
+     ChargedAccounting();
+     AuthenticatedPayment();
+diff --git a/src/lotus_v2/vm.cpp b/src/lotus_v2/vm.cpp
+index e7b945611..5ad8991a5 100644
+--- a/src/lotus_v2/vm.cpp
++++ b/src/lotus_v2/vm.cpp
+@@ -184,6 +184,8 @@ namespace {
+         uint16_t input_count;
+         uint16_t output_count;
+         const VmExecutionContext *context;
++        const PreparedSigningContext *prepared_signing;
++        size_t mint_count;
+         std::vector<VmBytes> stack;
+         std::vector<VmBytes> alternate;
+         size_t bytes = 0;
+@@ -325,6 +327,47 @@ namespace {
+                         Push(std::move(value));
+                         break;
+                     }
++                    case 0x72:
++                        Require(2);
++                        Pop();
++                        Pop();
++                        break;
++                    case 0x73: {
++                        Require(2);
++                        auto a = stack[stack.size() - 2];
++                        auto b = stack.back();
++                        Push(std::move(a));
++                        Push(std::move(b));
++                        break;
++                    }
++                    case 0x74: {
++                        Require(3);
++                        auto a = stack[stack.size() - 3];
++                        auto b = stack[stack.size() - 2];
++                        auto c = stack.back();
++                        Push(std::move(a));
++                        Push(std::move(b));
++                        Push(std::move(c));
++                        break;
++                    }
++                    case 0x75: {
++                        Require(4);
++                        auto a = stack[stack.size() - 4];
++                        auto b = stack[stack.size() - 3];
++                        Push(std::move(a));
++                        Push(std::move(b));
++                        break;
++                    }
++                    case 0x76:
++                        Require(6);
++                        std::rotate(stack.end() - 6, stack.end() - 4,
++                                    stack.end());
++                        break;
++                    case 0x77:
++                        Require(4);
++                        std::rotate(stack.end() - 4, stack.end() - 2,
++                                    stack.end());
++                        break;
+                     case 0x78:
+                         Push(Number(stack.size()));
+                         break;
+@@ -335,15 +378,50 @@ namespace {
+                         Require(1);
+                         Push(stack.back());
+                         break;
++                    case 0x7b: {
++                        Require(2);
++                        auto top = Pop();
++                        Pop();
++                        Push(std::move(top));
++                        break;
++                    }
+                     case 0x7c:
+                         Require(2);
+                         Push(stack[stack.size() - 2]);
+                         break;
++                    case 0x7d: {
++                        const Int index = Numeric(Pop());
++                        if (index < 0 || index >= Int(stack.size()))
++                            throw VmFailure("PICK index");
++                        Push(stack[stack.size() - 1 - size_t(index)]);
++                        break;
++                    }
++                    case 0x7e: {
++                        const Int index = Numeric(Pop());
++                        if (index < 0 || index >= Int(stack.size()))
++                            throw VmFailure("ROLL index");
++                        auto item = stack.end() - 1 - size_t(index);
++                        std::rotate(item, item + 1, stack.end());
++                        break;
++                    }
++                    case 0x7f:
++                        Require(3);
++                        std::rotate(stack.end() - 3, stack.end() - 2,
++                                    stack.end());
++                        break;
+                     case 0x80:
+                         Require(2);
+                         std::swap(stack[stack.size() - 1],
+                                   stack[stack.size() - 2]);
+                         break;
++                    case 0x81: {
++                        Require(2);
++                        auto top = stack.back();
++                        std::swap(stack[stack.size() - 1],
++                                  stack[stack.size() - 2]);
++                        Push(std::move(top));
++                        break;
++                    }
+                     case 0x88: {
+                         auto b = Pop(), a = Pop();
+                         if (a.size() > profile.max_element_bytes - b.size())
+@@ -455,10 +533,8 @@ namespace {
+                         const auto &ctx = Context();
+                         Hash message;
+                         std::string error;
+-                        if (!SigningMessage(ctx.tx, ctx.tx_profile,
+-                                            ctx.chain_id, ctx.resolved,
+-                                            ctx.input_index, ctx.witness_index,
+-                                            uint8_t(selected),
++                        if (!SigningMessage(*prepared_signing, ctx.input_index,
++                                            ctx.witness_index, uint8_t(selected),
+                                             ctx.positive_delta, message, error))
+                             throw VmFailure("SIGHASH message unavailable");
+                         Push(VmBytes(message.begin(), message.end()));
+@@ -474,11 +550,11 @@ namespace {
+                             signature.size() == 65 ? signature.back() : 0;
+                         Hash message;
+                         std::string error;
+-                        if (!SigningMessage(
+-                                context->tx, context->tx_profile,
+-                                context->chain_id, context->resolved,
+-                                context->input_index, context->witness_index,
+-                                mode, context->positive_delta, message, error))
++                        if (!SigningMessage(*prepared_signing,
++                                            context->input_index,
++                                            context->witness_index, mode,
++                                            context->positive_delta, message,
++                                            error))
+                             throw VmFailure("CHECKSIG message unavailable");
+                         const bool mint =
+                             context->tx.inputs[context->input_index].flags == 3;
+@@ -500,12 +576,8 @@ namespace {
+                         Push(Number(output_count));
+                         break;
+                     case 0xcb: {
+-                        const auto &tx = Context().tx;
+-                        Push(Number(std::count_if(tx.inputs.begin(),
+-                                                  tx.inputs.end(),
+-                                                  [](const Input &input) {
+-                                                      return input.flags == 3;
+-                                                  })));
++                        Context();
++                        Push(Number(mint_count));
+                         break;
+                     }
+                     case 0xd0:
+@@ -583,9 +655,18 @@ namespace {
+         Machine(const std::vector<Instruction> &code, const VmProfile &profile,
+                 uint16_t input_count, uint16_t output_count,
+                 const std::vector<VmBytes> &arguments,
+-                const VmExecutionContext *context)
++                const VmExecutionContext *context,
++                const PreparedSigningContext *prepared_signing)
+             : code(code), profile(profile), input_count(input_count),
+-              output_count(output_count), context(context) {
++              output_count(output_count), context(context),
++              prepared_signing(prepared_signing),
++              mint_count(context ? std::count_if(
++                                       context->tx.inputs.begin(),
++                                       context->tx.inputs.end(),
++                                       [](const Input &input) {
++                                           return input.flags == 3;
++                                       })
++                                 : 0) {
+             for (const auto &arg : arguments)
+                 Push(arg);
+             if (context &&
+@@ -619,6 +700,7 @@ VmResult EvaluateVmImpl(std::span<const uint8_t> script,
+                         VmCostUnits *charged_cost) {
+     try {
+         if (!profile.max_script_bytes || !profile.max_element_bytes ||
++            profile.max_element_bytes > VM_HARD_ELEMENT_BYTES ||
+             !profile.max_stack_items || !profile.max_altstack_items ||
+             !profile.max_vm_bytes || !profile.max_ast_depth ||
+             !profile.max_steps)
+@@ -636,6 +718,7 @@ VmResult EvaluateVmImpl(std::span<const uint8_t> script,
+         if (arguments.size() > profile.max_stack_items)
+             throw VmFailure("argument count exceeds stack cap");
+         if (cost_profile) CheckCostProfile(*cost_profile, profile);
++        std::optional<PreparedSigningContext> prepared_signing;
+         if (context) {
+             if (context->input_index >= context->tx.inputs.size())
+                 throw VmFailure("invocation input index");
+@@ -659,11 +742,15 @@ VmResult EvaluateVmImpl(std::span<const uint8_t> script,
+                             witness.script.begin(), witness.script.end()) ||
+                 arguments != witness.arguments)
+                 throw VmFailure("invocation bytes disagree with witness");
+-            Hash message;
+             std::string error;
+-            if (!SigningMessage(context->tx, context->tx_profile,
+-                                context->chain_id, context->resolved,
+-                                context->input_index, context->witness_index, 0,
++            prepared_signing.emplace();
++            if (!PrepareSigningContext(context->tx, context->tx_profile,
++                                       context->chain_id, context->resolved,
++                                       *prepared_signing, error))
++                throw VmFailure("invocation membership/context invalid");
++            Hash message;
++            if (!SigningMessage(*prepared_signing, context->input_index,
++                                context->witness_index, 0,
+                                 context->positive_delta, message, error))
+                 throw VmFailure("invocation membership/context invalid");
+         }
+@@ -709,7 +796,7 @@ VmResult EvaluateVmImpl(std::span<const uint8_t> script,
+             *charged_cost = cost;
+         }
+         Machine machine(code, profile, input_count, output_count, arguments,
+-                        context);
++                        context, prepared_signing ? &*prepared_signing : nullptr);
+         return {VmStatus::Success, {}, machine.Run()};
+     } catch (const VmFailure &failure) {
+         return {failure.unsupported ? VmStatus::Unsupported : VmStatus::Invalid,
+diff --git a/src/lotus_v2/vm.h b/src/lotus_v2/vm.h
+index 26f10029a..707de252c 100644
+--- a/src/lotus_v2/vm.h
++++ b/src/lotus_v2/vm.h
+@@ -16,6 +16,8 @@
+ 
+ namespace lotus::v2 {
+ using VmBytes = std::vector<uint8_t>;
++// P05's immutable per-item bound; caller profiles may only tighten it.
++constexpr size_t VM_HARD_ELEMENT_BYTES = 8192;
+ 
+ struct VmProfile {
+     size_t max_script_bytes;
+@@ -78,7 +80,8 @@ VmResult EvaluateVm(std::span<const uint8_t> script,
+ 
+ // This overload authenticates the active script/arguments and selected-branch
+ // membership before OP_SUCCESS scanning. It still requires P05 cost gating and
+-// transaction-wide validation by the caller.
++// transaction-wide validation by the caller. It prepares a signing snapshot
++// once per invocation, then reuses it for every SIGHASH/CHECKSIG opcode.
+ VmResult EvaluateVmWithContext(std::span<const uint8_t> script,
+                                const std::vector<VmBytes> &arguments,
+                                const VmProfile &profile,
+diff --git a/src/lotus_v2/vm_test/differential.py b/src/lotus_v2/vm_test/differential.py
+index 680e37c65..0efab8fba 100644
+--- a/src/lotus_v2/vm_test/differential.py
++++ b/src/lotus_v2/vm_test/differential.py
+@@ -35,6 +35,29 @@ fixed = [
+     ("61", (number(2),), 0, 0), ("98", (number(2**127-1),), 0, 0),
+     ("4e4e", (), 0, 0), ("4e6b", (), 0, 0),
+ ]
++stack_cases = (
++    ((1, 2), 0x72, ()),
++    ((1, 2), 0x73, (1, 2, 1, 2)),
++    ((1, 2, 3), 0x74, (1, 2, 3, 1, 2, 3)),
++    ((1, 2, 3, 4), 0x75, (1, 2, 3, 4, 1, 2)),
++    ((1, 2, 3, 4, 5, 6), 0x76, (3, 4, 5, 6, 1, 2)),
++    ((1, 2, 3, 4), 0x77, (3, 4, 1, 2)),
++    ((1, 2), 0x78, (1, 2, 2)),
++    ((1, 2), 0x79, (1,)),
++    ((1, 2), 0x7a, (1, 2, 2)),
++    ((1, 2), 0x7b, (2,)),
++    ((1, 2), 0x7c, (1, 2, 1)),
++    ((1, 2, 1), 0x7d, (1, 2, 1)),
++    ((1, 2, 3, 2), 0x7e, (2, 3, 1)),
++    ((1, 2, 3), 0x7f, (2, 3, 1)),
++    ((1, 2), 0x80, (2, 1)),
++    ((1, 2), 0x81, (2, 1, 2)),
++)
++for initial, op, expected in stack_cases:
++    script = (bytes(0x4d + n for n in initial) + bytes((op,)) +
++              b"".join(bytes((0x4d + n, 0x92)) for n in reversed(expected)) +
++              b"\x4e")
++    fixed.append((script.hex(), (), 0, 0))
+ rng = random.Random(0x1032026)
+ # Generated scripts produce a Boolean from arithmetic or byte equality,
+ # sometimes under one or two conditional frames.

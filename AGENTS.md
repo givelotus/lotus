@@ -1,6 +1,37 @@
-# Lotus Monorepo — Agent & Developer Guide (`AGENTS.md`)
+# Lotus — canonical repository and daemon submodules
 
-> `CLAUDE.md` is a symlink to `AGENTS.md` so Claude Code, Cursor, Codex, Antigravity, and other agent harnesses share a single source of truth.
+The permanent working checkout is `/Users/shammah/repos/lotus`. Daemon source
+belongs in the registered `daemon/` submodules, with exact pins in
+`daemon/sources.json`. `daemon/stack-review.json` records their source ancestry.
+
+- Use `make -C daemon setup SERIES=all`, `source-verify`, and `source-plan`.
+  Setup initializes exact submodule commits; it never replays mailboxes or
+  overwrites a changed checkout. Builds use `daemon/.build/<series>`.
+- Shared engine changes belong in `daemon/ecashd` (`givelotus/bitcoin-abc`).
+  Lotus-specific changes belong in `daemon/lotusd` (`givelotus/lotusd`). V1 uses
+  the separate `daemon/lotusv1` checkout of that repository. Doged, Core and BCHN
+  use `daemon/doged`, `daemon/bitcoind` and `daemon/bitcoincashd`.
+- The selected Doged source is the original Doged implementation. Current-ABC
+  port candidates remain explicitly separate; do not describe them as selected.
+- Existing setup, sync, autosquash and history-bridge tooling is in
+  `daemon/scripts/daemon_sources.py`; use it before inventing a new workflow.
+  Publish required source commits before parent gitlinks. Verify exact source
+  trees and tests before promoting behavior changes.
+- Temporary PR branches/worktrees have a bounded purpose. Finish by merging or
+  explicitly closing the work, accounting for every retained change, and removing
+  the temporary checkout. Do not use temporary worktrees as permanent project homes.
+- Do not recreate `lotus-v2-optimizations` or `lotus-v2-specifications`. Their
+  histories and working changes are preserved outside this repository in
+  `/Users/shammah/repos/archive/`.
+  Recovery artifacts are outside the tracked source tree. Historical logs may
+  retain original paths; those paths are provenance, not operational entrypoints.
+- Preserve source history, dirty work, production nodes/data, existing release
+  tags and published assets. Source migration does not authorize deployment.
+- After a Serena source edit, run `get_diagnostics_for_file` and fix all errors.
+
+The technical notes below retain historical validation evidence. Their old
+workspace/replay paths describe those historical runs; current operational
+commands and pins are defined above and in `daemon/README.md`.
 
 ## What is Lotus?
 
@@ -49,26 +80,86 @@ Workspaces (`daemon/workspace-*`) are **gitignored** local clones created by `ma
 
 | SERIES | Base | Version file | Workspace | Purpose |
 |--------|------|-------------|-----------|---------|
+| `v2` | `daemon/ecash` (on `1fb7db17`) | `bitcoin-abc-version` | `workspace-v2/` | **Lotus V2 new chain** — stacked directly on `daemon/ecash` (`@include ../ecash/series` + `patches/v2/series`) |
+| `ecash` | `bitcoin-abc` `1fb7db17` | `bitcoin-abc-version` | `workspace-v2/` (shared `daemon/ecash` ref) or `workspace-ecash/` | Shared high-throughput ABC engine & P2P layer (`patches/ecash/series`) |
 | `v1` | `bitcoin-abc` `8c67fe1e85` | `bitcoin-abc-v1-version` | `workspace-v1/` | **Lotus V1 mainnet (`v11.6.1`)** — 153 maintained patches (`000`–`247`) plus generated release metadata + in-process Chronik (`-DBUILD_CHRONIK=ON`) |
-| `ecash` | `bitcoin-abc` `1fb7db17` | `bitcoin-abc-version` | `workspace-ecash/` | Upstream reference patches |
 | `doged` | `bitcoin-abc` | `bitcoin-abc-version` | `workspace-doged-abc/` | Dogecoin implementation, 174-patch maintained series |
 | `doged-reference` | `doged-io/doged` | `doged-reference-version` | `workspace-doged-reference/` | Historical Doged reference build |
 | `bchn` | BCHN `abd433abe0` (29.2.1) | `bchn-version` | `workspace-bchn/` | Current-tip Bitcoin Cash Node upstream candidates |
+| `bitcoin` | Bitcoin Core `f13ae519de` | `bitcoin-core-version` | `workspace-bitcoin/` | Bitcoin Core (`BTC`) source pin and patches |
+
+### Mechanistic Branch-First Workflow (`daemon/scripts/lotus-git.py`)
+
+**CRITICAL RULE FOR AGENTS & DEVELOPERS:**
+Do **NOT** create or hand-edit `.patch` files in `daemon/patches/<series>/`. Subdaemons are maintained as real Git branches (`refs/heads/daemon/ecash`, `refs/heads/daemon/v2`, etc.) with their commit SHAs pinned in `daemon/*-version`. Work with normal Git commits inside `daemon/workspace-<series>` and use [`daemon/scripts/lotus-git.py`](daemon/scripts/lotus-git.py) (or its `make -C daemon` targets):
+
+1. **Check Status Across All Subdaemons:**
+   ```bash
+   make -C daemon status
+   ```
+2. **Two-Tier `daemon/ecash` $\rightarrow$ `daemon/v2` Architecture Inside `daemon/workspace-v2`:**
+   - `daemon/workspace-v2` holds **both** `refs/heads/daemon/ecash` (Tier 1: chain-agnostic engine, C++ Chronik, PWA Wallet) and `refs/heads/daemon/v2` (Tier 2: Lotus V2 consensus/wire), with `rebase.updateRefs=true` and `rebase.autoSquash=true` enabled automatically by `make -C daemon init SERIES=v2`.
+   - **When to Use `git commit --fixup <sha>` vs. a New Commit vs. `--amend` (Mandatory Agent Rules):**
+     - **Use `git commit --fixup <sha>` (or `git commit --fixup :/<subject-substring>`) whenever you are:**
+       1. Fixing a bug, compiler error/warning, lint issue, or test failure introduced by an earlier commit in `base/abc..daemon/ecash` or `daemon/ecash..daemon/v2`.
+       2. Addressing code review feedback or refining an existing feature/optimization commit that is buried below `HEAD` (especially a commit in `daemon/ecash` while `HEAD` is at `daemon/v2`).
+       3. *Never* leave noisy "fix build", "fix typo", or "address review" commits at the top of the branch when the change logically belongs inside an earlier commit.
+     - **Use `git commit --amend` ONLY when:**
+       - Your fix belongs to the very last commit at `HEAD` (`daemon/v2` tip) and does not cross the `daemon/ecash` boundary.
+     - **Create a new standalone `git commit` ONLY when:**
+       - Introducing a genuinely distinct, self-contained logical feature or optimization that stands on its own in upstream review.
+   - **How to Squash Fixups Non-Interactively (`make -C daemon autosquash`):**
+     - **Agents must NEVER run bare `git rebase -i` without `GIT_SEQUENCE_EDITOR=true`**, because interactive terminal editors (`vim`/`nano`) will hang non-interactive agent sessions.
+     - Instead, after creating one or more `git commit --fixup <sha>` commits, run:
+       ```bash
+       make -C daemon autosquash SERIES=v2
+       ```
+       This saves a backup ref (`refs/backups/pre-autosquash-...`), runs `GIT_SEQUENCE_EDITOR=true git rebase -i --autosquash --update-refs base/abc` to fold every `fixup!` commit into its target commit across both tiers, updates **both** `daemon/ecash` and `daemon/v2` branch pointers, and re-pins `daemon/ecash-version` and `daemon/v2-version` (`make -C daemon sync` will refuse if any unsquashed `fixup!` commit remains).
+   - **Adding or moving a new shared engine commit into `daemon/ecash`:** Commit your new feature on `HEAD` in `daemon/workspace-v2`, then sink it down onto `daemon/ecash` in one command:
+     ```bash
+     make -C daemon sink-to-ecash COMMIT=HEAD
+     ```
+   - **Pinning & Pushing Subdaemon Branches:**
+     ```bash
+     make -C daemon sync SERIES=v2 PUSH=1
+     ```
+     Updates `daemon/ecash-version` and `daemon/v2-version` with the branch tip SHAs and pushes `refs/heads/daemon/ecash` and `refs/heads/daemon/v2` to `origin` with `--force-with-lease` (while hard-blocking `main` from ever being force-pushed).
+3. **Extracting a Clean Branch for Submitting Upstream PRs (Bitcoin ABC / BCHN / Core):**
+   ```bash
+   make -C daemon extract-pr SERIES=ecash BRANCH=pr/my-upstream-feature COMMITS="<sha1> <sha2>"
+   ```
+   Cherry-picks the selected commit(s) onto a fresh branch (`pr/my-upstream-feature`) directly on top of `base/abc` (`1fb7db17`), ready to push to an upstream PR.
+4. **Rebasing Both Tiers Onto a New Upstream Commit:**
+   ```bash
+   make -C daemon rebase-upstream SERIES=v2 COMMIT=<new-abc-sha-or-latest>
+   ```
 
 ### Commands
 
 ```bash
-# 1. Clone the pinned V1 bitcoin-abc base and apply all 153 patches in order:
-make -C daemon setup SERIES=v1
+# 1. Clone the pinned base and initialize lotus-git refs (updateRefs + autoSquash):
+make -C daemon setup SERIES=v2
 
-# 2. Compile lotusd and lotus-cli (with -DBUILD_CHRONIK=ON enabled by default for SERIES=v1):
-make -C daemon build SERIES=v1
+# 2. Compile lotusd and lotus-cli:
+make -C daemon build SERIES=v2
 
-# 3. Run lotusd on mainnet with in-process Chronik enabled:
-./daemon/workspace-v1/build/src/lotusd -chronik=1 -daemon
+# 3. Check branch & pin-sync status across all subdaemons:
+make -C daemon status
 
-# Rebase a selected patch stack against its upstream's current default branch:
-make -C daemon refresh SERIES=v1 COMMIT=latest
+# 4. Non-interactively fold all `fixup!` commits into their targets across both tiers:
+make -C daemon autosquash SERIES=v2
+
+# 5. Pin workspace Git branch SHAs in daemon/*-version (and optionally push branches to origin):
+make -C daemon sync SERIES=v2 PUSH=1
+
+# 6. Move a general engine commit from the top of daemon/v2 down into daemon/ecash:
+make -C daemon sink-to-ecash COMMIT=HEAD
+
+# 7. Spin selected commits from daemon/ecash onto a clean base/abc branch for an upstream PR:
+make -C daemon extract-pr SERIES=ecash BRANCH=pr/my-feature COMMITS="<sha>"
+
+# 8. Rebase a selected stack against upstream with --update-refs:
+make -C daemon rebase-upstream SERIES=v2 COMMIT=latest
 
 # Prepare a review-only shared Chronik provider refresh candidate:
 make -C daemon refresh-chronik CANDIDATE=/tmp/chronik-provider-candidate
@@ -77,11 +168,6 @@ make -C daemon refresh-chronik CANDIDATE=/tmp/chronik-provider-candidate
 make -C daemon refresh-abc CANDIDATE=/tmp/abc-update-candidate
 ```
 
-`COMMIT=latest` resolves the workspace remote's advertised default branch and
-updates its selector only after the complete patch replay succeeds. It does not
-upgrade the independent Chronik provider pin or validate behavior; see
-`daemon/docs/adding-patches.md`.
-
 `refresh-chronik` fetches the canonical ABC default branch into temporary
 storage, exports the requested immutable Chronik revision into a new candidate,
 and checks current ABC/BCHN/Bitcoin Core adapter patches for clean application.
@@ -89,9 +175,7 @@ It never advances the active Chronik source pin, host profile hashes, release
 manifests, or workspaces. Supply `UPSTREAM=<ABC clone> REF=<ref>` only for an
 explicit ref. Clean patch application is not build or behavioral validation. See
 `daemon/docs/shared-chronik-source-and-hosts.md` for review and promotion steps.
-There is no tracked Bitcoin ABC Git submodule in this repository; daemon
-workspaces are gitignored clones, while Chronik's canonical ABC URL and exact
-source commit are recorded in `daemon/chronik/source.json`.
+Bitcoin ABC is the `daemon/ecashd` submodule. Chronik provider provenance is recorded separately in `daemon/chronik/source.json`.
 
 `make -C daemon refresh-abc CANDIDATE=<new-dir>` coordinates the non-V1 ABC
 update tracks on one exact commit: it replays eCash and maintained Dogecoin
@@ -154,9 +238,9 @@ Upstream Bitcoin ABC's in-process Chronik (`chronik/`) assumes standard 80-byte 
 - Public-facing cleanup preserves imported component licenses and Git history. Generated Vase server/iOS artifacts and the localhost development `.env` are removed from the current Git index while local files remain available; use `.env.example` for development setup. No live credential or recognizable access token/private key was identified in the tracked-text audit. Historical build files remain in the subtree import; do not rewrite that history as an incidental cleanup.
 - The first tag release build was cancelled after a packaging audit found missing upstream `COPYING`. Packaging now includes that file. Public README/build documentation must distinguish tested mainnet daemon behavior from inherited wallet/SDK/miner components.
 
-- Main contains the mainnet implementation and its operational documentation only. Exploratory protocol work is kept on separate branches. Preserve those branch contents when removing unrelated plans from this checkout; do not rewrite history.
+- Preserve original source histories and attribution when integrating protocol work; do not rewrite historical evidence as part of consolidation.
 
-- `main` contains the V1 mainnet implementation and its supporting tools only. Exploratory protocol specifications and implementation belong on separate development branches; do not add their files, roadmap, or links to this branch.
+- Main contains maintained implementation, specifications and explicitly identified candidates. Candidate retention does not establish runtime validation.
 - Release CI pins Rust 1.93.0 (`dtolnay/rust-toolchain@1.93.0`, CMake `Rust_TOOLCHAIN=1.93.0`), matching passing local checks. Floating stable selected 1.99.0 and Clippy reported `clone_on_copy` in CXX-generated bridge derives. Pinning the validated toolchain avoids changing bridge ABI/source to satisfy generated-code lint diagnostics.
 
 ## Release engineering and component review (2026-10-14)

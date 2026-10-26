@@ -82,3 +82,11 @@ These are reasoning counterexamples and required future cases, not executed test
 | Initial deposit assumes new reserve policies executed on creation | A weak output policy could be created without its covenant running | Controller and LP mint validate initial reserve output bytes/effects themselves |
 
 The state library and application tests must also cover mismatched enrollment, repeat enrollment, simultaneous mint/state updates, unauthorized migration, duplicate authority successors, explicit burns, wrong policy paths and all mint conservation/fee rules. No compiler source or consensus change is made by this correction.
+
+---
+
+## References
+
+1. **[Möser, Eyal, & Sirer 2016]** Malte Möser, Ittay Eyal, and Emin Gün Sirer, *"Bitcoin Covenants"*, in *Financial Cryptography and Data Security (FC 2016)*, LNCS vol. 9604, pp. 126–141, 2016.
+2. **[O'Connor & Piekarska 2017]** Russell O'Connor and Marta Piekarska, *"Enhancing Bitcoin Transactions with Covenants"*, in *Financial Cryptography and Data Security (FC 2017)*, LNCS vol. 10323, pp. 191–198, 2017.
+3. **[Wuille, Nick, & Towns 2020a]** Pieter Wuille, Jonas Nick, and Anthony Towns, *"BIP 341: Taproot: SegWit version 1 spending rules"*, Bitcoin Improvement Proposals, January 2020.

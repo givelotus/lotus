@@ -35,4 +35,14 @@ Threshold, escrow and mint cases derive signing/invocation contexts from complet
 
 The [frontend failure record](evidence/frontend-gaps.json) preserves original sources and diagnostics. `entry`, `policy`, state syntax, division and a data-signature binding are unavailable. A genuine emitter defect is recorded separately: `Amount <= Amount` parses/types but fails emission (`E0403`). The working mint slice uses the equivalent `limit >= delta`; [less-equal.lotus](proposed/less-equal.lotus) preserves the failing input. Rejected frontend cases have `bytecode: null` and were not sent to a VM. Expected VM rejections retain their bytecode and engine output; no consensus or golden fixture was changed to make them pass.
 
-Python 3.14 setup failed while building coincurve 21.0.0 because its cffi distribution license metadata was not found. Python 3.13's pinned wheel succeeded. This is environment evidence, not a contract failure. Existing CABI-08/transaction-runtime checks and exact command outcomes are recorded in the [work plan](../../../plans/lotus-v2-language-composition.md).
+Python 3.14 setup failed while building coincurve 21.0.0 because its cffi distribution license metadata was not found. Python 3.13's pinned wheel succeeded. This is environment evidence, not a contract failure. Existing CABI-08/transaction-runtime checks and exact command outcomes are recorded in the [work plan](../../research/plans/lotus-v2-language-composition.md).
+
+---
+
+## References
+
+1. **[Vogelsteller & Buterin 2015]** Fabian Vogelsteller and Vitalik Buterin, *"EIP-20: Token Standard"*, Ethereum Improvement Proposals, November 2015.
+2. **[Entriken, Shirley, Evans, & Sachs 2018]** William Entriken, Dieter Shirley, Jacob Evans, and Nastassia Sachs, *"EIP-721: Non-Fungible Token Standard"*, Ethereum Improvement Proposals, January 2018.
+3. **[Adams, Zinsmeister, & Robinson 2020]** Hayden Adams, Noah Zinsmeister, and Dan Robinson, *"Uniswap v2 Core"*, March 2020.
+4. **[O'Connor & Piekarska 2017]** Russell O'Connor and Marta Piekarska, *"Enhancing Bitcoin Transactions with Covenants"*, in *Financial Cryptography and Data Security (FC 2017)*, LNCS vol. 10323, pp. 191–198, 2017.
+5. **[Wuille, Nick, & Towns 2020a]** Pieter Wuille, Jonas Nick, and Anthony Towns, *"BIP 341: Taproot: SegWit version 1 spending rules"*, Bitcoin Improvement Proposals, January 2020.

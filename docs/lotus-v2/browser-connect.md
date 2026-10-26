@@ -1,7 +1,7 @@
 # Lotus V2 and multi-chain browser connect protocol (`lotus-connect/1`)
 
 Status: candidate browser and multi-chain wallet connection specification,
-provisional through pre-launch testnet (2026-10-20). This is an application and
+provisional through pre-launch testnet. This is an application and
 wallet-bridge protocol, not a consensus change. It defines how web applications
 discover and communicate with a user's browser extension or companion wallet
 over a dedicated W3C `MessageChannel` (`MessagePort`), how intent-first native
@@ -132,7 +132,7 @@ chains).
 | --- | --- | --- | --- |
 | Lotus (`xpi`) | Mainnet | `bip122:000000000abc0cde58ee7e919d3d4de1` | `960da6d7e4c6f4fe0b639f08e7c344a2c654610aed4b3377149666406a0d1597` (`hrp = xpi`) |
 | Lotus (`xpi`) | Testnet | `bip122:00000000080a6c9633aae9d24b9acda1` | `5f5e904cc5dfab62a8b62ee22551bca02e47a6d92d0de1f73c150e906bc3851b` (`hrp = txpi`) |
-| Lotus (`xpi`) | Regtest | `bip122:xpi-regtest` | `0000000000000000000000000000000000000000000000000000000000000000` (`hrp = rxpi`) |
+| Lotus (`xpi`) | Regtest / Devnet | `bip122:7b76718e1f49d8bbad83cc6db172d99c` *(alias `bip122:xpi-regtest`)* | `0000000000000000000000000000000000000000000000000000000000000000` (`hrp = rxpi`) |
 | EVM (`evm`) | Monad / ETH / L2s | `eip155:<decimal_chain_id>` (e.g. `eip155:143`, `eip155:1`, `eip155:8453`) | EIP-155 `chainId` uint256 |
 | Solana (`solana`) | Mainnet / Devnet / Testnet | `solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp` / `solana:EtWTRABZaYq6iMfeYKouRu166VU2xqa1` | 32-byte genesis hash |
 | Bitcoin (`btc`) | Mainnet / Testnet3 / Testnet4 / Regtest | `bip122:000000000019d6689c085ae165831e93` / `bip122:000000000933ea01ad0ee984209779ba` / `bip122:00000000da84f2bafbbc53dee25a72ae` / `bip122:btc-regtest` | Genesis hash prefix |
@@ -172,7 +172,7 @@ export type WalletFulfillIntentRequest = {
 ### Lotus V2 native integration with `@lotus/v2-payment-compiler/transaction-runtime` and `psbt.md`
 
 On Lotus V2 (`bip122:000000000abc0cde58ee7e919d3d4de1`,
-`bip122:00000000080a6c9633aae9d24b9acda1`, `bip122:xpi-regtest`), a dApp
+`bip122:00000000080a6c9633aae9d24b9acda1`, `bip122:7b76718e1f49d8bbad83cc6db172d99c`), a dApp
 submits either a structured **Partial `TransactionIntent`** compatible with
 `@lotus/v2-payment-compiler/transaction-runtime` (`prepareTransactionCall` /
 `finalizeTransactionCall`) or a binary **[Lotus V2 PSBT Profile 1 (`0x4c560001`)](psbt.md)**
@@ -286,7 +286,7 @@ before rendering the user approval prompt:
    - Replace every `$WALLET_FRESH_RECEIVE_POLICY` placeholder with a freshly
      derived, unlinked single-key Type-1 policy (`DUP BLAKE3 PUSH32(keyhash) EQUALVERIFY CHECKSIG`,
      `flags = 0 | 1`, `branches = [BranchLeaf(program)]`, `paths = [[0]]`; see
-     [`addresses.md`](addresses.md#type-1-x-only-keyhash-template-candidate-2026-10-20)).
+     [`addresses.md`](addresses.md#type-1-x-only-keyhash-template-candidate)).
    - Replace `$WALLET_PERSONA_POLICY` (and any `$WALLET_PUBKEY` / `$WALLET_SIG`
      witness placeholders) with the x-only public key and policy bound to the
      origin's isolated `account = 1'` Persona (`Persona(origin, xpi)`).
@@ -354,7 +354,7 @@ To prevent cross-site address correlation across all 7 chain families:
 1. **Dedicated HD account branch (`account = 1'`)**:
    Primary holdings and privacy/stamp pools reside at `account = 0'` and are
    **never** exposed to any browser origin. All dApp personas are derived under
-   `account = 1'` (`m/44'/899'/1'/0/k` or `m/44'/10605'/1'/0/k` for Lotus/eCash,
+   `account = 1'` (using SLIP-0044 coin type `10605'` `m/44'/10605'/1'/0/k` for native Lotus `xpi`, and `899'` `m/44'/899'/1'/0/k` for eCash `xec` / legacy compatibility,
    `m/44'/60'/1'/0/k` for EVM, `m/44'/501'/1'/k'` for Solana, `m/84'/0'/1'/0/k`
    and `m/86'/0'/1'/0/k` for Bitcoin SegWit/Taproot, `m/44'/145'/1'/0/k` for
    BCH, `m/44'/3'/1'/0/k` for Dogecoin, and `m/84'/2'/1'/0/k` for Litecoin).
@@ -447,3 +447,12 @@ the exact same internal router and per-origin persona engine:
 | **Bitcoin (`WBIP004` / `sats-connect` + `window.unisat`)** | Exposes `BitcoinProvider` and `window.unisat` shims for `getAccounts`, `signMessage` (ECDSA & BIP-322), and `signPsbt` / `signPsbts`. | Maps each origin to isolated `m/84'/0'/1'/0/k` (`p2wpkh`) and `m/86'/0'/1'/0/k` (`p2tr`) personas, using `planUtxoPersonaJitInputSelection` and `@frank/nakamoto` BIP-174 PSBT signing. |
 | **eCash (`Cashtab` `FROM_PAGE` / `FROM_CASHTAB`)** | Listens for `window.postMessage` `{ type: 'FROM_PAGE', text: 'Cashtab' }` requests. | Maps `addressRequest` and `txInfo` to `account = 1'` `ecash:q...` per-origin personas (`m/44'/899'/1'/0/k`) and uncorrelated UTXO selection. |
 | **BCH / Doge / Litecoin (`bch_*`, `doge_*`, `ltc_*`)** | Exposes per-family RPC methods over the in-page bridge. | Maps to `m/44'/145'/1'/0/k`, `m/44'/3'/1'/0/k`, and `m/84'/2'/1'/0/k` per-origin personas with anti-cluster UTXO selection. |
+
+---
+
+## References
+
+1. **[WHATWG / W3C Channel Messaging]** WHATWG, *"HTML Living Standard — §9.4 Channel messaging (`MessageChannel` / `MessagePort`)"*, `https://html.spec.whatwg.org/multipage/web-messaging.html#channel-messaging`.
+2. **[agnusdei et al. 2018]** Ryan Ghods, Fabian Vogelsteller, et al., *"EIP-1193: Ethereum Provider JavaScript API"*, Ethereum Improvement Proposals, June 2018.
+3. **[Chow 2017]** Andrew Chow, *"BIP 174: Partially Signed Bitcoin Transaction Format"*, Bitcoin Improvement Proposals, July 2017.
+4. **[Wuille, Nick, & Ruffing 2020]** Pieter Wuille, Jonas Nick, and Tim Ruffing, *"BIP 340: Schnorr Signatures for secp256k1"*, Bitcoin Improvement Proposals, January 2020.

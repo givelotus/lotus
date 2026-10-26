@@ -53,42 +53,17 @@ curl -s http://127.0.0.1:8331/blockchain-info | xxd
 
 ---
 
-## Building `lotusd` from Source (Lotus V1 Mainnet)
+## Building from the pinned daemon submodules
 
-Rather than maintaining a diverging fork of the entire C++/Rust tree, `daemon/` pins an upstream [`Bitcoin-ABC/bitcoin-abc`](https://github.com/Bitcoin-ABC/bitcoin-abc) commit ([`daemon/bitcoin-abc-v1-version`](daemon/bitcoin-abc-v1-version), currently `8c67fe1e85a602204a2ce65aa3b643469c2c3a1d`) and automatically applies the ordered patch series in [`daemon/patches/v1/series`](daemon/patches/v1/series).
-
-### 1. Install Dependencies
-
-Follow the [daemon dependency instructions](daemon/README.md#step-2-install-build-dependencies), including Python selection for Chronik. The release workflow builds on Ubuntu 24.04 and macOS arm64. Other components and platforms have separate validation requirements.
-
-### 2. Clone `bitcoin-abc` and Apply the Lotus V1 Patch Series
-
-From the repository root:
-
-```bash
-make -C daemon setup SERIES=v1
+```sh
+make -C daemon setup SERIES=all
+make -C daemon source-verify
+make -C daemon build SERIES=v1
 ```
 
-What this does automatically (`daemon/scripts/setup.sh`):
-1. Clones `https://github.com/Bitcoin-ABC/bitcoin-abc.git` into `daemon/workspace-v1/`.
-2. Checks out the pinned base commit from [`daemon/bitcoin-abc-v1-version`](daemon/bitcoin-abc-v1-version) (`8c67fe1e85a602204a2ce65aa3b643469c2c3a1d`) on branch `lotus-v1-work`.
-3. Iterates through every patch in [`daemon/patches/v1/series`](daemon/patches/v1/series) (`000` through `247`) in order, applying and committing each patch onto `daemon/workspace-v1/`.
-
-*(To wipe `daemon/workspace-v1/` and re-apply all patches from scratch at any time, run `make -C daemon setup SERIES=v1 RESET=1`.)*
-
-### 3. Compile `lotusd` and `lotus-cli` (with In-Process Chronik)
-
-```bash
-# Use the Python interpreter selected in the dependency instructions:
-PYO3_PYTHON="$LOTUS_BUILD_PYTHON" SERIES=v1 daemon/scripts/build.sh \
-  -DPython_EXECUTABLE="$LOTUS_BUILD_PYTHON"
-```
-
-This runs CMake + Ninja inside `daemon/workspace-v1/build/` with `-DBUILD_CHRONIK=ON` enabled by default, producing:
-- `daemon/workspace-v1/build/src/lotusd`
-- `daemon/workspace-v1/build/src/lotus-cli`
-
----
+Select `v2`, `ecash`, `doged`, `bitcoin`, or `bchn` for other daemon sources.
+Private submodules require authenticated Git access. See the
+[daemon guide](daemon/README.md) for paths, configuration and source maintenance.
 
 ## Research
 
