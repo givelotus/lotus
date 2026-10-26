@@ -11,8 +11,8 @@ import sys
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--agent', required=True)
-    parser.add_argument('--log', type=Path, default=Path(__file__).resolve().parents[2]
-                        / 'daemon/patch-audit/progression/RECOVERY-APPEND.md')
+    parser.add_argument('--log', type=Path, default=Path.home()
+                        / 'repos/archive/wip/RECOVERY-APPEND.md')
     args = parser.parse_args()
     message = sys.stdin.read()
     if not message.strip():
