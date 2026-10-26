@@ -560,7 +560,7 @@ def review_regression_vectors() -> dict:
 OPCODE_PATH = ROOT / 'tools' / 'opcodes.json'
 OPCODE_ROWS = json.loads(OPCODE_PATH.read_text())['opcodes']
 OPCODES = {row['name']: int(row['byte'], 16) for row in OPCODE_ROWS}
-assert len(OPCODES) == len(OPCODE_ROWS) == len(set(OPCODES.values())) == 215
+assert len(OPCODES) == len(OPCODE_ROWS) == len(set(OPCODES.values())) == 225
 ASSIGNED_OPCODES = set(OPCODES.values())
 SUCCESS_OPCODES = set(range(256)) - ASSIGNED_OPCODES
 
@@ -609,7 +609,7 @@ def success_scan(script: bytes, max_element_bytes: int = 8192) -> bool:
 
 
 def success_scan_vectors() -> dict:
-    assert len(ASSIGNED_OPCODES) == 215 and len(SUCCESS_OPCODES) == 41
+    assert len(ASSIGNED_OPCODES) == 225 and len(SUCCESS_OPCODES) == 31
     # Cross-check every documented name, not just the set of occupied bytes.
     import re
     documented = {}
@@ -632,21 +632,21 @@ def success_scan_vectors() -> dict:
     rows = []
     cases = [(f'success_{op}', bytes([op]), True) for op in sorted(SUCCESS_OPCODES)]
     cases += [
-        ('after_return', op('RETURN') + b'\xff', True),
-        ('skipped_arm', op('ZERO') + op('IF') + b'\xff' + op('ENDIF'), True),
-        ('unmatched_conditional', op('IF') + b'\xff', True),
-        ('ignored_truncated_suffix', b'\xff\x01', True),
-        ('fixed_push_payload', b'\x01\xff', False),
-        ('long_push_payload', b'\x4c\x4c' + b'\xff' * 76, False),
-        ('after_long_push', b'\x4c\x4c' + b'\xff' * 76 + b'\xff', True),
+        ('after_return', op('RETURN') + b'\xfe', True),
+        ('skipped_arm', op('ZERO') + op('IF') + b'\xfe' + op('ENDIF'), True),
+        ('unmatched_conditional', op('IF') + b'\xfe', True),
+        ('ignored_truncated_suffix', b'\xfe\x01', True),
+        ('fixed_push_payload', b'\x01\xfe', False),
+        ('long_push_payload', b'\x4c\x4c' + b'\xfe' * 76, False),
+        ('after_long_push', b'\x4c\x4c' + b'\xfe' * 76 + b'\xfe', True),
         ('empty_push', b'\x4c\x00', False),
         ('ordinary_one', op('ONE'), False),
         ('ordinary_return_needs_vm', op('RETURN'), False),
-        ('truncated_push_before_success', b'\x02\xff', 'error'),
-        ('noncanonical_push_before_success', b'\x4c\x01\xff', 'error'),
-        ('nonminimal_length_before_success', b'\x4c\xfd\x01\x00\xff', 'error'),
-        ('truncated_length_before_success', b'\x4c\xfe\xff', 'error'),
-        ('oversized_push_before_success', b'\x4c\xfd\x01\x20\xff', 'error'),
+        ('truncated_push_before_success', b'\x02\xfe', 'error'),
+        ('noncanonical_push_before_success', b'\x4c\x01\xfe', 'error'),
+        ('nonminimal_length_before_success', b'\x4c\xfd\x01\x00\xfe', 'error'),
+        ('truncated_length_before_success', b'\x4c\xfe\xfe', 'error'),
+        ('oversized_push_before_success', b'\x4c\xfd\x01\x20\xfe', 'error'),
     ]
     for name, script, expected in cases:
         try:
@@ -978,7 +978,7 @@ def make_vectors() -> dict:
         assert compact_encode(compact_decode(bits)) == bits
         assert 0 < compact_decode(bits) <= raw
 
-    packets = sorted((ROOT / 'decisions').glob('*.md'))
+    packets = sorted(p for p in (ROOT / 'decisions').glob('*.md') if p.name != 'history.md')
     return {
         'schema': 'lotus/spec-candidate-smoke/v1',
         'status': 'single-model structural fixtures; not independently verified conformance',

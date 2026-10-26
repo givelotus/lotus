@@ -1,0 +1,9 @@
+import { readFileSync } from 'node:fs';
+import { corpus,signedCases,linkedCases,runCorpus,saveReport,reportFailed } from './harness.mjs';
+const [directory,seed='79225',file]=process.argv.slice(2);
+if(!directory)throw Error('usage: node test/differential/run.mjs OUTPUT_DIRECTORY [SEED] [CORPUS_JSON]');
+const input=file?JSON.parse(readFileSync(file,'utf8')):corpus(Number(seed));
+if(!file)input.cases.push(...signedCases(),...await linkedCases());
+const report=runCorpus(input,{native:process.env.LOTUS_V2_NATIVE_VM});saveReport(report,directory);
+console.log(JSON.stringify({cases:report.cases.length,discrepancies:report.cases.filter(c=>c.discrepancies.length).length,unsupported:report.cases.filter(c=>c.native.status==='unsupported').length,inconclusive:report.cases.filter(c=>c.comparison.status==='inconclusive').length,operational_errors:report.cases.filter(c=>[c.python.status,c.native.status].includes('operational-error')).length,tool_errors:report.cases.filter(c=>[c.python.status,c.native.status].includes('tool-error')).length}));
+process.exitCode=reportFailed(report)?1:0;

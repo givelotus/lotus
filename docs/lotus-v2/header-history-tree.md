@@ -26,7 +26,7 @@ Linear hash chains ($H_{n} \to H_{n-1} \to \dots \to H_0$) require $O(N)$ bandwi
 
 Lotus V2 embeds a canonical **Binary Carry-Chain Mountain Frontier (`HeaderHistoryFrontier`)** directly into `MonetaryState::history_root` (committed inside the 134-byte header's `hashStateRoot`):
 - **Consensus state footprint:** Fixed $64 \times 32\text{ B} + 8\text{ B} = 2{,}056\text{ bytes}$ in memory (`popcount(H) * 32` bytes on disk).
-- **Per-block update cost:** Amortized $O(1)$—specifically $\text{ctz}(H)$ SHA-256 tagged hashes when appending block $H-1$ (1 leaf hash on odd heights, and $1 + \text{ctz}(H)$ hashes on even heights).
+- **Per-block update cost:** Amortized $O(1)$—specifically $\text{ctz}(H)$ domain-separated BLAKE3 tagged hashes (`"Lotus/v2/header/history"`) when appending block $H-1$ (1 leaf hash on odd heights, and $1 + \text{ctz}(H)$ hashes on even heights).
 - **Proof size & verification:** Strictly $\lceil \log_2 H \rceil$ 32-byte siblings ($\le 20$ hashes for $10^6$ blocks, $\le 640\text{ B}$), verified in one bottom-up pass with canonical null-right-sibling enforcement.
 
 </div>
@@ -73,18 +73,16 @@ Because half of all integers have bit $0 = 0$, **50% of blocks require zero inte
 
 ### 3.1 Domain-Separated Leaf and Internal Hashes
 
-All hashes use `TaggedHashWriter("HEADER_HISTORY", ChainID)` (`SHA256(SHA256("LotusV2/HEADER_HISTORY") || SHA256("LotusV2/HEADER_HISTORY") || ChainID || payload)`):
+All hashes use unkeyed 32-byte **BLAKE3** (`C08`, `C26`) with domain tag `"Lotus/v2/header/history"` (`H_header_history(x) = BLAKE3("Lotus/v2/header/history" || 0x00 || x)` in `src/lotus_v2/tagged_hash.cpp`):
 
 ```text
 NULL_HASH = 0x00^32
 
 HeaderLeafHash(ChainID, height: u64, block_hash: h32) -> h32:
-  TaggedHash("HEADER_HISTORY", ChainID,
-             0x00 || u64_le(height) || block_hash)
+  H_header_history(ChainID || 0x00 || u64_le(height) || block_hash)
 
 HeaderInternalHash(ChainID, level: u8, left: h32, right: h32) -> h32:
-  TaggedHash("HEADER_HISTORY", ChainID,
-             0x01 || u8(level) || left || right)
+  H_header_history(ChainID || 0x01 || u8(level) || left || right)
 ```
 
 - **Leaf vs. internal separation:** Prefix byte `0x00` vs. `0x01` prevents any internal node from colliding with a leaf preimage.
@@ -144,3 +142,14 @@ HeaderInclusionProof =
 - **RPC commands:**
   - `getheaderhistoryproof(height, [anchor_height_or_hash])`: Returns `{leaf_height, total_count, block_hash, anchor_height, anchor_block_hash, history_root, siblings, proof_hex}`.
   - `verifyheaderhistoryproof(proof_hex, [expected_root_or_anchor])`: Decodes `proof_hex`, resolves the anchor's `history_root`, and returns `{valid, leaf_height, total_count, block_hash, expected_root}`.
+
+---
+
+## References
+
+1. **[Merkle 1987]** Ralph C. Merkle, *"A Digital Signature Based on a Conventional Encryption Function"*, in *Advances in Cryptology — CRYPTO '87*, Lecture Notes in Computer Science, vol. 293, pp. 369–378, Springer, 1988.
+2. **[Crosby & Wallach 2009]** Scott A. Crosby and Dan S. Wallach, *"Efficient Data Structures for Tamper-Evident Logging"*, in *Proceedings of the 18th USENIX Security Symposium*, pp. 317–334, August 2009.
+3. **[Todd 2012/2016]** Peter Todd, *"Merkle Mountain Ranges"*, OpenTimestamps / Bitcoin Core developer notes, 2012–2016.
+4. **[Bünz, Kiffer, Luu, & Zamani 2020]** Benedikt Bünz, Lucianna Kiffer, Loi Luu, and Mahdi Zamani, *"FlyClient: Super-Light Clients for Cryptocurrencies"*, in *2020 IEEE Symposium on Security and Privacy (SP)*, pp. 928–946, May 2020.
+5. **[O'Connor, Aumasson, Neves, & Wilcox-O'Hearn 2020]** Jack O'Connor, Jean-Philippe Aumasson, Samuel Neves, and Zooko Wilcox-O'Hearn, *"BLAKE3: One Function, Fast Everywhere"*, January 2020 (`https://github.com/BLAKE3-team/BLAKE3-specs`).
+6. **[Nakamoto 2008]** Satoshi Nakamoto, *"Bitcoin: A Peer-to-Peer Electronic Cash System"*, October 2008 (`https://bitcoin.org/bitcoin.pdf`).

@@ -1,6 +1,6 @@
 # Lotus V2 addresses ("xpi1...")
 
-## Status and provisional design decision (2026-10-19)
+## Status and provisional design decision
 
 This format is pre-release and remains open to revision during testnet,
 before a production format is frozen. The accepted direction is a typed
@@ -40,7 +40,7 @@ Each allocated template defines exact program bytes, parameter encoding and
 lengths, and deterministic branch-root derivation. A change to an allocated
 template's interpretation requires a new ID.
 
-### Type 1: x-only keyhash template (candidate, 2026-10-20)
+### Type 1: x-only keyhash template (candidate)
 
 The payload is **32 bytes: unkeyed BLAKE3 of the 32-byte big-endian x
 coordinate of a valid secp256k1 public key**. This is the same x-only public
@@ -301,3 +301,13 @@ Future types retain the first symbol as selector and use checksum-covered,
 strictly specified parameters. Extended IDs must be canonical and bounded,
 not arbitrary variable-length fields. Any decision to retain the current
 checksum/constants for new body lengths requires the checks described above.
+
+---
+
+## References
+
+1. **[Wuille & Maxwell 2017]** Pieter Wuille and Gregory Maxwell, *"BIP 173: Base32 address format for native v0-16 witness outputs (Bech32)"*, Bitcoin Improvement Proposals, March 2017.
+2. **[Wuille 2020]** Pieter Wuille, *"BIP 350: Bech32m format for v1+ witness addresses"*, Bitcoin Improvement Proposals, December 2020.
+3. **[Séchet 2017]** Amaury Séchet, *"CashAddr: A Base32 Address Format for Bitcoin Cash"*, Bitcoin ABC Specification, November 2017.
+4. **[Wuille, Nick, & Towns 2020a]** Pieter Wuille, Jonas Nick, and Anthony Towns, *"BIP 341: Taproot: SegWit version 1 spending rules"*, Bitcoin Improvement Proposals, January 2020.
+5. **[O'Connor, Aumasson, Neves, & Wilcox-O'Hearn 2020]** Jack O'Connor, Jean-Philippe Aumasson, Samuel Neves, and Zooko Wilcox-O'Hearn, *"BLAKE3: One Function, Fast Everywhere"*, January 2020 (`https://github.com/BLAKE3-team/BLAKE3-specs`).

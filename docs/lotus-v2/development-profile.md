@@ -1,15 +1,15 @@
 # Separate Lotus V2 development profile proposal
 
-Status: **exact proposed test profile, 2026-10-15; not selected for deployment**. The maintainer authorized proposing a separate development-only profile. This document supplies its values, canonical parameter bytes, complete genesis and a funded first-block example. It does not change the existing zero-ChainID fixtures or adopt mainnet parameters. The candidate name is `lotus-v2-devnet-20261015-absolute1`; balances are disposable test coins. Implementation and launch follow the review gates in [peering milestones](../plans/lotus-v2-peering-milestones.md).
+Status: **exact proposed test profile; not selected for deployment**. This document proposes a separate development-only profile and supplies its values, canonical parameter bytes, complete genesis and a funded first-block example. It does not change the existing zero-ChainID fixtures or adopt mainnet parameters. The candidate name is `lotus-v2-devnet-20261015-absolute1`; balances are disposable test coins. Implementation and launch follow the review gates in [peering milestones](../plans/lotus-v2-peering-milestones.md).
 
-“Separate” means a distinct ChainID, genesis, profile digest, network magic and datadir namespace. Nodes using this profile can agree on exactly which development chain to validate. Existing fixture values remain available for their original tests. After review and implementation, changing any consensus parameter requires a new development network name/ChainID and reset; it is not an in-place monetary upgrade. Mainnet D10–D14 stay open. The previously selected development P2P/RPC defaults are **10605/10604**.
+“Separate” means a distinct ChainID, genesis, profile digest, network magic and datadir namespace. Nodes using this profile can agree on exactly which development chain to validate. Existing fixture values remain available for their original tests. After review and implementation, changing any consensus parameter requires a new development network name/ChainID and reset; it is not an in-place monetary upgrade. Mainnet D10–D14 stay open. The selected development P2P/RPC defaults are **10605/10604**.
 
 ## 1. Exact identity, time and target
 
 | Parameter | Proposed value and reason |
 | --- | --- |
 | Name | `lotus-v2-devnet-20261015-absolute1`, a versioned disposable network |
-| ChainID | `BLAKE3(ASCII("Lotus/v2/development-chain") || 00 || ASCII(name))`; chosen from the name alone, before genesis or profile hashing |
+| ChainID | `BLAKE3(ASCII("Lotus/v2/development-chain") \|\| 00 \|\| ASCII(name))`; chosen from the name alone, before genesis or profile hashing |
 | Header / transaction version | 2 / 7, exact P04/P01 layouts |
 | Genesis time | **1792022400**, `2026-10-15T00:00:00Z`, an ordinary UTC timestamp |
 | Genesis bits / maximum target | `0x207fffff`; `pow_limit = 0x7fffff << 232`, exactly the decoded canonical target |
@@ -81,7 +81,7 @@ These are exact development profile bounds. They are enforced before allocation 
 | Total invocation charge | Checked u128 sum; no additional development block-invocation ceiling |
 | Complete transaction / block bytes | No new consensus MAX_TX_BYTES/MAX_BLOCK_BYTES; P05 effective costs and exact framing apply |
 
-Unimplemented assigned instructions are unsupported implementation errors, never accepted as success. The fixed 215 assigned/41 success allocation is the registry with SHA256 `fb790b230e76befc90a1f183ea727cb3232d1f03e9b5838b10d025d96b9832da`. Success-scan consensus behavior and relay refusal follow P03. There are no activated opcode extensions in this profile. Monetary accounting and enforcement use the same genesis schedule. A native host `max_steps` guard is operational: reaching it must return an implementation/resource failure, not a new consensus-invalid result. Set it high enough for tested permitted invocations and retain the static-cost gate.
+Unimplemented assigned instructions are unsupported implementation errors, never accepted as success. Note: the `2026-10-15` snapshot below pins the historical `215 assigned / 41 success` registry (`fb790b230e76befc90a1f183ea727cb3232d1f03e9b5838b10d025d96b9832da`) and pre-pipelined reference package `6ed3c828`; the current specification ([`P03`](decisions/vm-semantics.md), [`tools/opcodes.json`](tools/opcodes.json), [`consensus.md` C03/C17](consensus.md)) updates the opcode allocation to **225 assigned / 31 success** (adding `EMITLOG`, `ENFORCEOUTPUT`, `STATEVERIFY`, `STATEHASH`, `ENUMERATE`, conditional `BREAK`, and `EXT2`), appends the 32-byte `history_root` to post-genesis `MonetaryState` (`88B` at $h \ge 1$), and pipelines post-genesis coinbase UTXO insertion by one block (`h -> h+1`, whereas line 257 of the historical `2026-10-15` script below inserted Block 1's coinbase directly at height 1). Success-scan consensus behavior and relay refusal follow P03. There are no activated opcode extensions in this profile. Monetary accounting and enforcement use the same genesis schedule. A native host `max_steps` guard is operational: reaching it must return an implementation/resource failure, not a new consensus-invalid result. Set it high enough for tested permitted invocations and retain the static-cost gate.
 
 For each assigned opcode, charge `base + sum(operand_size_bounds) + sum(result_size_bounds)`, with P05's size analysis, control/loop algebra and separate structural charge **1 cu per script byte**. The complete base table is specified by these disjoint overrides; every other assigned byte has base 1:
 
@@ -123,7 +123,7 @@ The executable construction below is also the exact canonical parameter-file rec
 
 The ChainID is computed from the independent name before creating this stream. `profile_digest=BLAKE3(ASCII("Lotus/v2/p2p/profile") || 00 || parameter_bytes)`. Neither digest nor genesis hash occurs inside parameter bytes. Outer manifest JSON is human/machine reporting only: its JSON formatting is not a hashed consensus preimage.
 
-Proposed TCP magic is `d7 6c 32 a9`, matching the [peering proposal](peering.md); TCP 10605 and authenticated loopback RPC 10604 use the maintainer's defaults. Proposed future QUIC uses UDP 10605. Transport revision 1 and features `0x07` follow N02. Initially receive cap is 2 MiB, negotiable within 1..16 MiB as specified there. Transport values are outside the consensus parameter stream. No seeds, checkpoints, assumevalid, assumeutxo, production addresses or wallet prefix are selected. Use explicit loopback peers, separate namespace `lotus-v2-devnet-20261015-absolute1`, and automatically allocated test ports rather than occupied defaults.
+Proposed TCP magic is `d7 6c 32 a9`, matching the [peering proposal](peering.md); TCP 10605 and authenticated loopback RPC 10604 use the selected development defaults. Proposed future QUIC uses UDP 10605. Transport revision 1 and features `0x07` follow N02. Initially receive cap is 2 MiB, negotiable within 1..16 MiB as specified there. Transport values are outside the consensus parameter stream. No seeds, checkpoints, assumevalid, assumeutxo, production addresses or wallet prefix are selected. Use explicit loopback peers, separate namespace `lotus-v2-devnet-20261015-absolute1`, and automatically allocated test ports rather than occupied defaults.
 
 The receive cap is local transport capacity, not a new consensus byte ceiling. Valid larger blocks can exceed the initial peering implementation; N05's availability follow-up remains required before general-network claims. Proposed operational defaults are a 10-second handshake timeout, 16 in-flight blocks per peer, 64 globally, 256 MiB mempool, 1 GiB received-body staging quota and disabled automatic public discovery. These limits are cancel/retry/refusal policy, never permanent-invalid cache keys. Peer scheduling/resource measurements and separate disk-magic/schema allocation remain implementation gates.
 
@@ -324,4 +324,13 @@ Exact first block bytes (242 bytes; this is an illustrative mined child, not a c
 7b76718e1f49d8bbad83cc6db172d99c7ea1a377802b646975b2a7865eaaed4affff7f20f817d06a0000000000000000000002000000f2000000000000000100000000000000fc65566329c5f2498b97ddedfdf06969a159c3543e606aca5b7b8c166c1629fc7285b111fc96547a46d0b41170692ba2fb375fe6ae737a0398bc21f46f751daf0100000067070000000000000000000000010001007b76718e1f49d8bbad83cc6db172d99c7ea1a377802b646975b2a7865eaaed4a01000000ffffffff0200008e831e00000000000159128a347a29ca0178ac8ab3dd868a6a30ab185e9f51dad77c5737e4cbad0526010100
 ```
 
-Absolute-tail migration (2026-10-15): this renamed proposal replaces prior `lotus-v2-devnet-20261015-a`. Historical ChainID `63b5ddca6f75cbc64df5ff128cadd35e8658905595afc290b7698b2419b9745c`, profile digest `384bb3c6cd4f47eb84860ebb56f4ceafebaa6414ebf7f230e85682a2afe8fdd1` and genesis `9dc4d2fa9803bad48ae38ec24027bf55abff952f7e549a738986112848fab629` describe that earlier recurrence proposal. The actual tested controller fixture has separate migration evidence.
+Absolute-tail migration: this renamed proposal replaces prior `lotus-v2-devnet-20261015-a`. Historical ChainID `63b5ddca6f75cbc64df5ff128cadd35e8658905595afc290b7698b2419b9745c`, profile digest `384bb3c6cd4f47eb84860ebb56f4ceafebaa6414ebf7f230e85682a2afe8fdd1` and genesis `9dc4d2fa9803bad48ae38ec24027bf55abff952f7e549a738986112848fab629` describe that earlier recurrence proposal. The actual tested controller fixture has separate migration evidence.
+
+---
+
+## References
+
+1. **[Nakamoto 2008]** Satoshi Nakamoto, *"Bitcoin: A Peer-to-Peer Electronic Cash System"*, October 2008 (`https://bitcoin.org/bitcoin.pdf`).
+2. **[Chancellor 2026]** Shammah Chancellor, *"Adaptive PoW Monetary Policy Without Oracles: A Constructive Mechanism for Pseudo-Stability via Work-Coupled Tail Emission and Burn"*, Lotus Network Technical Paper, 2026.
+3. **[O'Connor, Aumasson, Neves, & Wilcox-O'Hearn 2020]** Jack O'Connor, Jean-Philippe Aumasson, Samuel Neves, and Zooko Wilcox-O'Hearn, *"BLAKE3: One Function, Fast Everywhere"*, January 2020 (`https://github.com/BLAKE3-team/BLAKE3-specs`).
+4. **[Lundeberg 2020]** Mark B. Lundeberg, *"ASERT (`aserti3-2d`): Absolutely Scheduled Exponentially Rising Targets"*, Bitcoin Cash Specification, July 2020.

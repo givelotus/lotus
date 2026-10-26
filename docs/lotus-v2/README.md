@@ -1,6 +1,6 @@
 # Lotus V2: Programmable Digital Cash Built for Planetary Scale
 
-Status: **specification & reference implementation suite** (updated October 23, 2026).
+Status: **specification & reference implementation suite**.
 
 ---
 
@@ -143,21 +143,22 @@ Legacy UTXO protocols inherited 2009 serialization bugs, unindexed linear Merkle
 
 ---
 
-### 2.6 134-Byte Pure BLAKE3 Headers, Avalanche Finality & Set Reconciliation
+### 2.6 134-Byte Pure BLAKE3 Headers, Avalanche Finality & Snowstorm Pseudo-Consensus
 
 <div class="lens-grid">
 <div class="lens-card lens-consumer">
 
 #### In Practice
-- **Sub-Second Finality:** Avalanche pre-consensus locks in transactions and blocks in **under 1 second**, while Proof-of-Work anchors long-term history.
-- **Aligned Incentives:** Block rewards follow a **50% Miner / 25% Staker / 25% Treasury** coordination policy enforced by Avalanche quorum.
+- **Sub-Second Finality & Instant `SnapBlock` Propagation:** **Snowstorm** rateless fountain pre-consensus crystallizes mempool epochs before a block is even mined, so newly found blocks propagate as a **compact sealed header + coinbase (`290 B` with the 134-byte V2 header, or `240 B` on legacy 84B-header benchmark frames)** in **under 0.1 milliseconds** (`>2,500×` faster than post-block recovery) while Avalanche locks in finality in under 1 second.
+- **Pseudo-Consensus (Optional, Incentive-Compatible):** Nodes and miners don't *have* to run Snowstorm to follow or mine valid blocks—Proof-of-Work and Lotus V2's deterministic rules remain the sole hard consensus requirement. However, participating is strongly advantageous because Snowstorm resolves double-spends deterministically before mining and eliminates post-block propagation stalls.
+- **Aligned Incentives (Soft Avalanche Coordination Policy):** While hard consensus (`C16`) places zero mandatory destination splits on the coinbase, staking nodes coordinate a soft **~50% Miner / ~25% Staker / ~25% Staker-Voted Treasury** block-parking policy (`P06`, `D11`) once Avalanche quorum is established.
 
 </div>
 <div class="lens-card lens-engineer">
 
 #### Under the Hood
 - **Single Hash Primitive Across the Stack ([`P04`](decisions/header-and-mining.md)):** The 134-byte header uses 48-bit timestamps (`time:u48`) and three domain-tagged BLAKE3 stages (`H_headerbody` $\to$ `H_headerwork` $\to$ `H_blockid`), allowing miners to grind an 18-byte work suffix (`nonce1:u64 || nonce2:u64 || extra_work:u16`) within a single 64-byte BLAKE3 compression block.
-- **Pinned Merklix Set Reconciliation ([`peering.md`](peering.md), [`mempool-reconciliation.md`](mempool-reconciliation.md)):** Nodes synchronize mempool epochs via $O(1)$ pinned CoW radix/Merklix snapshots and GF($2^{64}$) / prefix-page reconciliation without holding `cs_main`.
+- **Snowstorm Multi-Peer Rateless $\text{GF}(2^{64})$ BCH Fountain Codes ([`snowstorm.md`](snowstorm.md), [`peering.md`](peering.md), [`mempool-reconciliation.md`](mempool-reconciliation.md)):** Nodes synchronize mempool epochs across multiple divergent peers simultaneously using 913-byte `RatelessMiniblock` streams (`32` cells $\times$ `(count, s1, s3, s5)` in $\text{GF}(2^{64})$ with geometric decimation $1/2^L$), coupled multi-peer Berlekamp-Massey/Chien peeling (~30% cell overhead), symmetric `BatchId(E)` conflict quarantine, and Type 1/2/3 algebraic fraud proofs.
 
 </div>
 </div>
@@ -174,7 +175,7 @@ Legacy UTXO protocols inherited 2009 serialization bugs, unindexed linear Merkle
 | :--- | :--- |
 | **[Consensus Specification (`consensus.md`)](consensus.md)** | Normative validity rules **C01–C28**: encoding, MAST branches, `IndexedTreeRoot`, UTXO resolution, fee burn, VM bounds, and block transitions. |
 | **[Header History Merkle Tree (`header-history-tree.md`)](header-history-tree.md)** | `HeaderHistoryFrontier`, `HeaderHistoryRoot` in `MonetaryState`, $O(\log H)$ `HeaderInclusionProof`, and RPC verification. |
-| **[P01: Encoding & Signatures (`decisions/encoding-and-signatures.md`)](decisions/encoding-and-signatures.md)** | 16-byte transaction prefix, packed 64-bit lock word, input kinds (`01` spend, `02` coinbase, `03` mint), output flags (`HAS_TOKEN`, `IS_BURN`), and $O(1)$ Merkleized BIP340 sighash modes. |
+| **[P01: Encoding & Signatures (`decisions/encoding-and-signatures.md`)](decisions/encoding-and-signatures.md)** | 16-byte transaction prefix, packed 64-bit lock word, input kinds (`01` spend, `02` coinbase, `03` mint), output flags (`HAS_TOKEN`, `IS_BURN`, `HAS_STATE`), and $O(1)$ Merkleized BIP340 sighash modes. |
 | **[P02: Commitments & State (`decisions/commitments-and-state.md`)](decisions/commitments-and-state.md)** | BLAKE3 domain registry, Branch MAST, `IndexedTreeRoot`, prefix-sharded `TxRoot` (`Subtree A`), single-leaf-collapsed `UtxoRoot`, `MonetaryState`, `StateRoot`, and `HEADER_HISTORY`. |
 | **[P03: VM Semantics (`decisions/vm-semantics.md`)](decisions/vm-semantics.md)** | Structured control flow, enumeration loops, `OP_SUCCESS_N` scan, 16..1024-byte (`128..8192`-bit) signed two's-complement arithmetic, and introspection opcodes. |
 | **[P04: Header & Mining (`decisions/header-and-mining.md`)](decisions/header-and-mining.md)** | 134-byte header layout, 48-bit timestamp, two-stage BLAKE3 PoW (`H_headerbody` / `H_headerwork` / `H_blockid`), and integer ASERT difficulty adjustment. |
@@ -198,7 +199,29 @@ Legacy UTXO protocols inherited 2009 serialization bugs, unindexed linear Merkle
 
 | Document | Scope & Key Contents |
 | :--- | :--- |
+| **[Snowstorm Pseudo-Consensus (`snowstorm.md`)](snowstorm.md)** | Multi-peer rateless $\text{GF}(2^{64})$ BCH fountain miniblocks (`RatelessMiniblock`), coupled peeling decoder (~30% cell overhead), symmetric `BatchId(E)` conflict quarantine, Type 1/2/3 algebraic fraud proofs, and 0-RTT `SnapBlock` propagation. |
 | **[Peering & Pre-Consensus (`peering.md`)](peering.md)** | High-throughput P2P relay, `submitminedheader`, Avalanche batch voting, and bulk template pre-consensus. |
 | **[Mempool Reconciliation (`mempool-reconciliation.md`)](mempool-reconciliation.md)** | Pinned epoch snapshots and authenticated prefix-page set reconciliation. |
 | **[Validation & Conformance (`validation.md`)](validation.md)** | Reference evaluator boundary, differential test obligations, and Genesis launch gates. |
-| **[Decision Register (`decisions.md`)](decisions.md) & [Review Notes (`review-notes.md`)](review-notes.md)** | Status of all decision packets (`D01`–`D15`) and pre-genesis calibration items. |
+| **[Decision Register (`decisions.md`)](decisions.md)** | Status of all decision packets (`D01`–`D15`) and pre-genesis calibration items. |
+| **[Decision History (`decisions/history.md`)](decisions/history.md)** | Dated record of decisions: date, decision ID, change and link. |
+
+### How these documents are organized
+
+- **Specifications and `decisions/`** state rules, rationale and status (candidate, open, rejected).
+- **[`decisions/history.md`](decisions/history.md)** holds the dated decision history.
+
+---
+
+## References
+
+1. **[Nakamoto 2008]** Satoshi Nakamoto, *"Bitcoin: A Peer-to-Peer Electronic Cash System"*, October 2008 (`https://bitcoin.org/bitcoin.pdf`).
+2. **[Chancellor 2026]** Shammah Chancellor, *"Adaptive PoW Monetary Policy Without Oracles: A Constructive Mechanism for Pseudo-Stability via Work-Coupled Tail Emission and Burn"*, Lotus Network Technical Paper, 2026.
+3. **[Oak 2026]** Professor Oak, *"Snowball to Snowstorm: Rateless Set Reconciliation and Probabilistic Mempool Preconsensus for Proof-of-Work Blockchains"*, October 2026.
+4. **[O'Connor, Aumasson, Neves, & Wilcox-O'Hearn 2020]** Jack O'Connor, Jean-Philippe Aumasson, Samuel Neves, and Zooko Wilcox-O'Hearn, *"BLAKE3: One Function, Fast Everywhere"*, January 2020 (`https://github.com/BLAKE3-team/BLAKE3-specs`).
+5. **[Vermorel, Séchet, Chancellor, & van der Wansem 2018]** Joannes Vermorel, Amaury Séchet, Shammah Chancellor, and Tomas van der Wansem, *"Canonical Transaction Ordering for Bitcoin"*, June 12, 2018.
+6. **[Vermorel, Séchet, Chancellor, & Cox 2018]** Joannes Vermorel, Amaury Séchet, Shammah Chancellor, and Jason Cox, *"Merklix Tree for Bitcoin"*, July 2018.
+7. **[Wuille, Nick, & Ruffing 2020]** Pieter Wuille, Jonas Nick, and Tim Ruffing, *"BIP 340: Schnorr Signatures for secp256k1"*, Bitcoin Improvement Proposals, January 2020.
+8. **[Wuille, Nick, & Towns 2020a]** Pieter Wuille, Jonas Nick, and Anthony Towns, *"BIP 341: Taproot: SegWit version 1 spending rules"*, Bitcoin Improvement Proposals, January 2020.
+9. **[Dahlberg, Pulls, & Peeters 2016]** Rasmus Dahlberg, Tobias Pulls, and Roel Peeters, *"Efficient Sparse Merkle Trees: Caching Strategies and Secure (Non-)Membership Proofs"*, in *Proceedings of the 21st Nordic Conference on Secure IT Systems (NordSec 2016)*, LNCS vol. 10014, pp. 199–215, 2016 (`IACR ePrint 2016/683`).
+10. **[Rocket et al. 2019]** Team Rocket, Maofan Yin, Kevin Sekniqi, Robbert van Renesse, and Emin Gün Sirer, *"Scalable and Probabilistic Leaderless BFT Consensus through Metastability"*, `arXiv:1906.08936`, 2019.

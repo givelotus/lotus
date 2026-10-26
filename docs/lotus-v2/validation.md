@@ -67,3 +67,15 @@ Require vectors for every currently unassigned byte at an instruction boundary; 
 7. **Independent review and launch reproduction:** review the exact source/parameter/genesis candidate; reproduce builds and genesis; all blockers closed. A later candidate change reruns affected gates.
 
 Record results in [daemon validation results](../../daemon/docs/lotus-validation-results.md). The v1 gate is independent: a passing v2 regtest cannot establish live-network compatibility. Snapshot authentication is also independent of historical execution; record the trust and validation mode used.
+
+---
+
+## References
+
+1. **[Nakamoto 2008]** Satoshi Nakamoto, *"Bitcoin: A Peer-to-Peer Electronic Cash System"*, October 2008 (`https://bitcoin.org/bitcoin.pdf`).
+2. **[Chancellor 2026]** Shammah Chancellor, *"Adaptive PoW Monetary Policy Without Oracles: A Constructive Mechanism for Pseudo-Stability via Work-Coupled Tail Emission and Burn"*, Lotus Network Technical Paper, 2026.
+3. **[O'Connor, Aumasson, Neves, & Wilcox-O'Hearn 2020]** Jack O'Connor, Jean-Philippe Aumasson, Samuel Neves, and Zooko Wilcox-O'Hearn, *"BLAKE3: One Function, Fast Everywhere"*, January 2020 (`https://github.com/BLAKE3-team/BLAKE3-specs`).
+4. **[Wuille, Nick, & Ruffing 2020]** Pieter Wuille, Jonas Nick, and Tim Ruffing, *"BIP 340: Schnorr Signatures for secp256k1"*, Bitcoin Improvement Proposals, January 2020.
+5. **[Wuille, Nick, & Towns 2020a]** Pieter Wuille, Jonas Nick, and Anthony Towns, *"BIP 341: Taproot: SegWit version 1 spending rules"*, Bitcoin Improvement Proposals, January 2020.
+6. **[Dahlberg, Pulls, & Peeters 2016]** Rasmus Dahlberg, Tobias Pulls, and Roel Peeters, *"Efficient Sparse Merkle Trees: Caching Strategies and Secure (Non-)Membership Proofs"*, in *Proceedings of the 21st Nordic Conference on Secure IT Systems (NordSec 2016)*, LNCS vol. 10014, pp. 199–215, 2016 (`IACR ePrint 2016/683`).
+7. **[Lundeberg 2020]** Mark B. Lundeberg, *"ASERT (`aserti3-2d`): Absolutely Scheduled Exponentially Rising Targets"*, Bitcoin Cash Specification, July 2020.

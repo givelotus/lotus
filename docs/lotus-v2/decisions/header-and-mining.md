@@ -1,6 +1,6 @@
 # Header design from Lotus v1's useful properties
 
-Decision packet P04, October 9, 2026 (updated October 13, 2026). **Recommended candidate**, not frozen. Refines D12/D14. The maintainer clarified that v2 need not preserve a deployed ASIC interface, that the lucky-block pointer is not useful to the intended design, that v1's recursive hashes were chosen to reveal useful header portions without Merkle-path overhead, and that **pure tagged BLAKE3** (`H_headerbody`, `H_headerwork`, `H_blockid`) is the candidate consensus hash for both the 134-byte recursive header and Proof-of-Work (`BlockID`), keeping BLAKE3 as the single hash primitive across the entire Lotus v2 protocol.
+Decision packet P04. **Recommended candidate**, not frozen. Refines D12/D14. Design requirements: v2 need not preserve a deployed ASIC interface; the lucky-block pointer is not useful to the intended design; v1's recursive hashes exist to reveal useful header portions without Merkle-path overhead; and **pure tagged BLAKE3** (`H_headerbody`, `H_headerwork`, `H_blockid`) is the candidate consensus hash for both the 134-byte recursive header and Proof-of-Work (`BlockID`), keeping BLAKE3 as the single hash primitive across the entire Lotus v2 protocol.
 
 ## Verified v1 source evidence
 
@@ -75,7 +75,7 @@ The first two cases preserve the reason for v1's recursion. The layout does not 
 
 | Design | Header bytes | Per-field disclosure | Tradeoff |
 | --- | ---: | --- | --- |
-| Flat `H_blockid(ChainID || Header)` | 134 | Supply header (134 bytes) and parse fixed offsets | Least hash-structure complexity; fixed prefixes can be precomputed when nonce is last |
+| Flat `H_blockid(ChainID \|\| Header)` | 134 | Supply header (134 bytes) and parse fixed offsets | Least hash-structure complexity; fixed prefixes can be precomputed when nonce is last |
 | Recommended recursive groups | 134 | 64-byte linkage or 82-byte work disclosure | Preserves useful script/light-client boundary; more hash layers |
 | Fully field-Merkleized template plus nonce | 134 | Three siblings for the eight template fields | General field proofs often exceed the complete header; useful only with demonstrated composability/reuse benefits |
 
@@ -91,7 +91,7 @@ Per-block chainwork is `floor(2^256/(T+1))`, with mathematical or sufficiently w
 
 ## Selected Avalanche/PoW integration direction
 
-Maintainer decision, October 15, 2026: follow Bitcoin ABC's existing Avalanche/PoW
+Follow Bitcoin ABC's existing Avalanche/PoW
 chain-selection rules and default settings at the pinned V2 base
 `1fb7db17c176cdea8a2c60d887891589382ee4e3`. Do not design a separate Lotus work
 override threshold or assume a ten-block override. This selects the upstream
@@ -148,3 +148,13 @@ A selected future-time rule must be shared by the economic/network model and nod
 ## Acceptance
 
 Before closure: recompute v1 source layout/hashes and carry forward its timestamp fixtures; generate independent v2 full/partial hash vectors; measure hashing/pool/script costs; independently check the specified target/ASERT candidate; freeze time eligibility and genesis values. The 134-byte candidate is an explicit proposal for review, not a new silently assumed constant in daemon code.
+
+---
+
+## References
+
+1. **[Nakamoto 2008]** Satoshi Nakamoto, *"Bitcoin: A Peer-to-Peer Electronic Cash System"*, October 2008 (`https://bitcoin.org/bitcoin.pdf`).
+2. **[O'Connor, Aumasson, Neves, & Wilcox-O'Hearn 2020]** Jack O'Connor, Jean-Philippe Aumasson, Samuel Neves, and Zooko Wilcox-O'Hearn, *"BLAKE3: One Function, Fast Everywhere"*, January 2020 (`https://github.com/BLAKE3-team/BLAKE3-specs`).
+3. **[Lundeberg 2020]** Mark B. Lundeberg, *"ASERT (`aserti3-2d`): Absolutely Scheduled Exponentially Rising Targets"*, Bitcoin Cash Specification, July 2020.
+4. **[Merkle 1987]** Ralph C. Merkle, *"A Digital Signature Based on a Conventional Encryption Function"*, in *Advances in Cryptology — CRYPTO '87*, Lecture Notes in Computer Science, vol. 293, pp. 369–378, Springer, 1988.
+5. **[Crosby & Wallach 2009]** Scott A. Crosby and Dan S. Wallach, *"Efficient Data Structures for Tamper-Evident Logging"*, in *Proceedings of the 18th USENIX Security Symposium*, pp. 317–334, August 2009.

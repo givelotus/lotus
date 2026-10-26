@@ -1,6 +1,6 @@
 # Encoding, transaction identity and signatures
 
-Decision packet P01, October 9, 2026. **Recommended candidate**, not frozen or implemented. Refines D01/D03/D04 and the serialization portions of D12–D14. This packet owns the detailed candidate grammar; the consensus overview links here. Production parameter values and independent vectors remain prerequisites for acceptance.
+Decision packet P01. **Recommended candidate**, not frozen or implemented. Refines D01/D03/D04 and the serialization portions of D12–D14. This packet owns the detailed candidate grammar; the consensus overview links here. Production parameter values and independent vectors remain prerequisites for acceptance.
 
 ## Choice and tradeoffs
 
@@ -36,11 +36,15 @@ CoinbaseData = Vec(Bytes(data))  // count 0 or 1; present data length 1..8192
 BranchWitness = CoreWitness || Vec(Bytes(arg))
 CoreWitness   = Bytes(script) || Vec(h32 sibling)
 
-Output = flags:u8 || value:u64 || token_id?
+Output = flags:u8 || value:u64 || token_id? || state_root?
          || Vec(h32 branch_root) || Vec(Vec(CS(branch_index)))
 ```
 
-An output has no separate state field. `Output.flags` defines two bits—bit 0 (`0x01`) `HAS_TOKEN` (`token_id:h32` present and nonzero) and bit 1 (`0x02`) `IS_BURN` (provably unspendable burn / commitment output, analogous to `OP_RETURN`)—while bits 2..7 (`0xfc`) are unassigned and MUST be zero (valid `flags` values are `0x00`, `0x01`, `0x02`, `0x03`). A contract or protocol stores data or Merkle roots in `branches` in three ways (P02): on an `IS_BURN` (`0x02`/`0x03`) output with `paths = []`, as a dedicated unexecuted data branch on a spendable coin (`branches = [CodeRoot, StateMerkleRoot]`, `paths = [[0]]`), or inside the executing branch tree itself (`BranchNode(DataLeaf, M)`).
+`Output.flags` defines two baseline bits plus one tentative LC-2 bit:
+- Bit 0 (`0x01`) `HAS_TOKEN`: `token_id:h32` present and nonzero.
+- Bit 1 (`0x02`) `IS_BURN`: provably unspendable burn / commitment output, analogous to `OP_RETURN`.
+- Bit 2 (`0x04`) `HAS_STATE` (**Tentative LC-2 update**): `state_root:h32` present after `token_id?`, holding the single 32-byte state commitment (`STATEHASH` `0xc3`) of the UTXO's enforcement contract (`branches[1]`). Verified in $O(1)$ on inputs via `STATEVERIFY` (`0xed`) and on outputs via `ENFORCEOUTPUT` (`0xeb` with `state_mode != 0`) in [P03](vm-semantics.md), which requires every `HAS_STATE` output in a transaction to be explicitly authorized by at least one input or mint script.
+- Bits 3..7 (`0xf8`) are unassigned and MUST be zero.
 
 The fixed transaction prefix is **16 bytes** (4+8+2+2); nothing follows the outputs. On the wire the first lock byte is lock_kind and the next seven bytes are lock_value, little-endian. Lock_kind values 3..255 are unassigned and reject; they are not an extension mechanism. There is no transaction-kind field: a coinbase is recognized by its input. Version is 7, chosen so that no parser for Bitcoin-family or Lotus v1 transactions (versions 1 and 2) mistakes a v2 transaction for one of its own; any other version rejects. Input and output counts are at most 65,535 by construction; a larger payment set is expressed as chained transactions. Lower production limits remain D08 parameters. Output grammar/flags are C05. Unknown version/flags reject. No token-operation byte, scriptSig, annex, hidden per-input signature-mode byte, separate mint section, or optional trailing section exists.
 
@@ -56,7 +60,7 @@ Branch order stays committed as supplied; every output has `1 <= branch_count <=
 
 Bounding outputs to at most 16 branches and 16 paths (and pruning `IS_BURN` outputs from `UtxoRoot`) eliminates Bitcoin's parent-transaction and oversized-UTXO out-of-memory hazards by construction:
 - **Zero parent-transaction loading:** Input resolution fetches only the compact UTXO `Coin` record (`Outpoint || Bytes(Output) || creation_height || creation_parent_mtp || coinbase`), never the creating transaction.
-- **Bounded `Output` and `Coin` size:** Because scripts live in witnesses and contract state lives in branches or branch-tree data leaves (P02), an `Output` contains only 32-byte `branch_root`s and path indices. With `MAX_OUTPUT_BRANCHES = 16` and `MAX_OUTPUT_PATHS = 16` (each path containing at most 16 one-byte branch indices in `0..15`), every serialized `Output` is at most **812 bytes** (`1 + 8 + 32 + 1 + 16×32 + 1 + (1 + 16) + 15×(1 + 15)` = 812 bytes: distinct paths allow at most one length-16 path, with the next 15 longest paths of length 15; standard 1-branch, 1-path outputs are 45B native / 77B token), and every `Coin` record in `UtxoRoot` is at most **868 bytes** (865 bytes without the three-byte `CS(len(Output))` prefix, so `36 + 3 + 812 + 8 + 8 + 1 = 868`; `IS_BURN` outputs are never inserted into `UtxoRoot`). Spending 256 or 1,000 inputs from the largest transactions in history requires $< 225\text{ KB}$ or $< 870\text{ KB}$ of `Coin` memory.
+- **Bounded `Output` and `Coin` size:** Because scripts live in witnesses and contract state lives in `state_root` (`HAS_STATE` `0x04`, 32 bytes) or branches (P02), an `Output` contains only 32-byte `branch_root`s, an optional 32-byte `state_root`, and path indices. With `MAX_OUTPUT_BRANCHES = 16` and `MAX_OUTPUT_PATHS = 16` (each path containing at most 16 one-byte branch indices in `0..15`), every serialized `Output` is at most **812 bytes** (**844 bytes** when `HAS_STATE` is set; standard 1-branch, 1-path outputs are 45B native / 77B token), and every `Coin` record in `UtxoRoot` is at most **868 bytes** (**900 bytes** with `HAS_STATE`; `IS_BURN` outputs are never inserted into `UtxoRoot`). Spending 256 or 1,000 inputs from the largest transactions in history requires $< 230\text{ KB}$ or $< 900\text{ KB}$ of `Coin` memory.
 - **$O(1)$ bitmask path checks in RAM:** Because every branch index is in `0..15`, a node represents each path in memory as a single `uint16_t` bitmask (`uint16_t paths[16]`, 32 bytes total per coin), making `UTXOREQUIRESBRANCH`, `OUTPUTREQUIRESBRANCH`, `OUTPUTEXCLUSIVEBRANCH`, and `OUTPUTCONTINUESBRANCH` pure $O(1)$ bitwise operations.
 
 ## Absolute and relative locks
@@ -158,3 +162,16 @@ CHECKSIG stack order is `[..., signature, public_key]`; it consumes both and pus
 ## Acceptance evidence still required
 
 Generate exact primitive, ordinary/coinbase, core/full, CoinsRoot/selector and signing vectors in the independent reference tool; compare a second implementation. Test confirmation-metadata and witness-argument changes separately from output/method/proof changes. Account for the per-transaction construction cost of `InputsRoot`, `OutputsRoot`, `CoinsRoot`, and `OwnInputHash(i)`, and per-invocation signature charges. Freeze ChainID, versions and limits in the parameter manifest. This packet resolves proposed byte meaning; it does not supply mainnet constants, signed fixtures, or acceptance of this three-mode set without review.
+
+---
+
+## References
+
+1. **[Nakamoto 2008]** Satoshi Nakamoto, *"Bitcoin: A Peer-to-Peer Electronic Cash System"*, October 2008 (`https://bitcoin.org/bitcoin.pdf`).
+2. **[Wuille, Nick, & Ruffing 2020]** Pieter Wuille, Jonas Nick, and Tim Ruffing, *"BIP 340: Schnorr Signatures for secp256k1"*, Bitcoin Improvement Proposals, January 2020.
+3. **[Wuille, Nick, & Towns 2020a]** Pieter Wuille, Jonas Nick, and Anthony Towns, *"BIP 341: Taproot: SegWit version 1 spending rules"*, Bitcoin Improvement Proposals, January 2020.
+4. **[Lombrozo, Lau, & Wuille 2015]** Eric Lombrozo, Johnson Lau, and Pieter Wuille, *"BIP 141: Segregated Witness (Consensus layer)"*, Bitcoin Improvement Proposals, December 2015.
+5. **[Lau & Wuille 2016b]** Johnson Lau and Pieter Wuille, *"BIP 143: Transaction Signature Verification for Version 0 Witness Program"*, Bitcoin Improvement Proposals, January 2016.
+6. **[Todd 2014]** Peter Todd, *"BIP 65: OP_CHECKLOCKTIMEVERIFY"*, Bitcoin Improvement Proposals, October 2014.
+7. **[Friedenbach, BtcDrak, Dorier, & Kinoshita 2015]** Mark Friedenbach, BtcDrak, Nicolas Dorier, and kinoshita, *"BIP 68: Relative lock-time using consensus-enforced sequence numbers"*, Bitcoin Improvement Proposals, May 2015.
+8. **[O'Connor, Aumasson, Neves, & Wilcox-O'Hearn 2020]** Jack O'Connor, Jean-Philippe Aumasson, Samuel Neves, and Zooko Wilcox-O'Hearn, *"BLAKE3: One Function, Fast Everywhere"*, January 2020 (`https://github.com/BLAKE3-team/BLAKE3-specs`).

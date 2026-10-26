@@ -2,7 +2,7 @@
 
 ## Scope and status
 
-Candidate selected by the maintainer on 2026-10-20; provisional through
+Selected candidate; provisional through
 pre-launch testnet. This is an application proof of control of a recognized
 single-key address, not a transaction signature, authorization to transfer
 funds, or proof of control of arbitrary MAST policies. It changes no consensus
@@ -127,3 +127,12 @@ high-S malleation and whitespace preservation. Existing eCash vectors are a
 byte-for-byte compatibility control, not evidence of native wallet spend
 support. Record actual build/runtime results separately; documentation or a
 round-trip alone is insufficient validation.
+
+---
+
+## References
+
+1. **[Wuille, Nick, & Ruffing 2020]** Pieter Wuille, Jonas Nick, and Tim Ruffing, *"BIP 340: Schnorr Signatures for secp256k1"*, Bitcoin Improvement Proposals, January 2020.
+2. **[Alm 2018]** Karl-Johan Alm, *"BIP 322: Generic Signed Message Format"*, Bitcoin Improvement Proposals, September 2018.
+3. **[O'Connor, Aumasson, Neves, & Wilcox-O'Hearn 2020]** Jack O'Connor, Jean-Philippe Aumasson, Samuel Neves, and Zooko Wilcox-O'Hearn, *"BLAKE3: One Function, Fast Everywhere"*, January 2020 (`https://github.com/BLAKE3-team/BLAKE3-specs`).
+4. **[Séchet 2017]** Amaury Séchet, *"CashAddr: A Base32 Address Format for Bitcoin Cash"*, Bitcoin ABC Specification, November 2017.

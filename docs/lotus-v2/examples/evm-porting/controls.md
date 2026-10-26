@@ -77,3 +77,11 @@ entry release(t: Int, payout: Amount) transition {
 This is proposed syntax; typed absolute-time locks, division, state effects and full-policy output checking need implementation. Selecting an older `t` can release less, not more; selecting a future `t` delays contextual eligibility. It does not expose block time. Use checked wide multiplication/division or a proven bound; int128 multiplication of unrestricted u64 quantities can overflow. `duration=0` needs an explicit cliff rule, not division by zero.
 
 For exact later-deposit behavior, additional funding must be enrolled by consuming the genuine controller and updating `total = prior deposited + new deposit`, preserving `released`; the newly enrolled amount follows the original schedule. Stray coins sent to a similar root do not silently alter authenticated allocation. Multi-asset vesting requires one vault per asset or an explicit controller and asset-specific reserve outputs. Test first/last unit rounding, late deposits, wrong asset, duplicate payout counting across two vault inputs, forged state, beneficiary changes, and remainder bypass paths. **Gaps:** frontend arithmetic/state/output effects, library codec/wide math, SDK slot allocation, indexer history. No new VM or consensus operation is requested.
+
+---
+
+## References
+
+1. **[O'Connor & Piekarska 2017]** Russell O'Connor and Marta Piekarska, *"Enhancing Bitcoin Transactions with Covenants"*, in *Financial Cryptography and Data Security (FC 2017)*, LNCS vol. 10323, pp. 191–198, 2017.
+2. **[Wuille, Nick, & Ruffing 2020]** Pieter Wuille, Jonas Nick, and Tim Ruffing, *"BIP 340: Schnorr Signatures for secp256k1"*, Bitcoin Improvement Proposals, January 2020.
+3. **[Wuille, Nick, & Towns 2020a]** Pieter Wuille, Jonas Nick, and Anthony Towns, *"BIP 341: Taproot: SegWit version 1 spending rules"*, Bitcoin Improvement Proposals, January 2020.

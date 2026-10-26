@@ -27,7 +27,7 @@ P03 defines field and complete-output/path reads, active invocation kind, branch
 
 The signing API returns the exact digest and a decoded display of the committed intent: chain, inputs and resolved assets (`InputsRoot` and `CoinsRoot`), paths, outputs (`OutputsRoot`), native fee, positive mint deltas and invocation (`input_index`, `branch_index`, and `Leaf(script)` in a spend). In partial modes `01` and `02`, the preimage commits to the 32-byte per-input digest `OwnInputHash(i)` and either `OutputsRoot` or `OutputLeaf(i)` so every signature check hashes at most 4 BLAKE3 blocks in $O(1)$ time. Hardware wallets must refuse unsupported context, not silently sign a hash they display as an ordinary native payment. [P01](decisions/encoding-and-signatures.md) now defines the preimage bytes; signing fixtures become executable only when generated and independently checked against that proposal.
 
-An address identifies a network and a construction template or a complete output policy. A branch root alone does not identify a multi-branch path policy. Address encoding/checksum, script template, parameter widths and policy reconstruction must be specified together. Roots change when policies change. The `xpi` prefix is a historical proposal, not a complete address standard. Direction from the maintainer (2026-10-09): a cashaddr-style encoding whose checksum covers the prefix, with no `:` separator because it breaks copy and paste; wallets accept an address with the prefix omitted and recover it by trying the known prefixes against the checksum. The payload must distinguish a single-branch, single-path policy (one 32-byte root) from a full serialized branch-and-path policy.
+An address ([`addresses.md`](addresses.md)) encodes a network prefix (`xpi` mainnet, `txpi` testnet, `rxpi` regtest), the separator `"1"`, a 5-bit type selector (`0` = `q` for an explicit 32-byte MAST branch root with `flags=0, branches=[root], paths=[[0]]`; `1` = `p` for the standard 37-byte x-only keyhash template `DUP BLAKE3 PUSH32(keyhash) EQUALVERIFY CHECKSIG`), a 52-symbol payload, and an 8-symbol BCH `PolyMod` checksum XORed against a network-specific constant `K[hrp]`, with no `:` separator so one double-click selects the entire address. A single-root Type-0 or Type-1 address represents a single-branch, single-path output policy (`paths=[[0]]`); multi-branch or multi-path covenant policies are exchanged via `lotus-v2/policy-artifact/1` or complete `Output` descriptors rather than a bare 32-byte root.
 
 Native XPI uses a 6-decimal-place base unit (**`1 XPI = 10^6 atoms`**; [P06](decisions/issuance-and-time.md)). Standard wallet UIs and signing displays format native amounts to **2 decimal places (`1.00 XPI`, like dollars and cents)** and hide the lower 4 sub-cent decimal places (`0.00_0000`) by default (exposing full 6-decimal atom precision on hover/detail inspection or hardware-wallet exact-atom screens). Ordinary transaction fees ($\sim 200\text{--}2{,}000\text{ atoms} = 0.0002\text{--}0.0020\text{ XPI}$) therefore sit entirely inside the hidden sub-cent precision as invisible rounding dust to everyday users while preserving $10{,}000$ integer ticks per `0.01 XPI` for [P05](decisions/resources-and-parameters.md)'s parabolic fee-burn accounting and micro-stamps.
 
@@ -41,7 +41,7 @@ Each generated artifact records compiler/evaluator revisions, consensus/paramete
 
 The [compiler and ABI implementation plan](../plans/lotus-v2-compiler-abi.md) defines staged assembler, typed language, artifact schema, binding generation and independent execution/stress-test gates. The [browser connect protocol (`lotus-connect/1`)](browser-connect.md) specifies how web applications and browser extensions transport `lotus-v2/contract-artifact/2`, `lotus-v2/policy-artifact/1`, and partial `TransactionIntent`s over W3C `MessagePort` channels for connectless intent fulfillment. Development targets a versioned draft profile; final consensus freeze is required for launch, not for beginning tooling.
 
-The requested first client targets are **Python and TypeScript**, generated from the same versioned interface model with matching runtime libraries and exact-byte cross-language tests. The maintainer selected a TypeScript compiler and a small Finch-spec-inspired typed stack pipeline; Python remains an independent reference and generated-client target. Finch implementation code is not treated as conformance evidence.
+The first client targets are **Python and TypeScript**, generated from the same versioned interface model with matching runtime libraries and exact-byte cross-language tests. The compiler is written in TypeScript as a small Finch-spec-inspired typed stack pipeline; Python remains an independent reference and generated-client target. Finch implementation code is not treated as conformance evidence.
 
 ## Composition proposal LC-1 (not implemented)
 
@@ -188,3 +188,120 @@ A one-time authorized enrollment stores the future target TokenId in controller 
 Choose supply semantics explicitly: a lifetime-issued cap decrements issuance budget and never refunds burns; circulating supply is indexed from consensus accounting. An ERC20Capped-style outstanding-supply cap with reusable burned capacity must authenticate burn updates too. One conservative construction requires the controller on every token transfer/burn/mint via mandatory transfer rules, tracks transaction net supply including explicit burn outputs, and updates once per transaction. This serializes activity and is not claimed performant. It must also reject hidden supply-changing paths, zero-value counterfeit controllers, arbitrary token destruction of the singleton, and simultaneous untracked mint/burn tricks. The [ERC20 conversion](examples/evm-porting/erc20.md) spells out the accounting limits.
 
 Initial library priorities are checked amounts and wide arithmetic, canonical state codecs/maps, threshold signatures, full-policy comparisons and output-role allocation, unique issuance/controllers, permit intents with consumed nonces, and event commitments. Library contracts link through CABI-08; helpers inline. A library name or interface digest does not attest security. Artifacts retain source/tree digests and target capabilities. Targets reject unavailable features rather than substitute a different integer width, signature algorithm, or transaction model.
+
+---
+
+## Tentative LC-2 Spec Update: Templated Output Enforcement (`ENFORCEOUTPUT`), Shared Off-Chain/On-Chain Generation, `SIMLOG`, and 2-Byte Opcode Encoding
+
+1. **Unified Loop & Conditional `BREAK` (`Boolean(cond) N(depth) BREAK`):**
+   - Input and output iteration use `TXINPUTCOUNT ENUMERATE ... ENDENUMERATE` and `TXOUTPUTCOUNT ENUMERATE ... ENDENUMERATE` (retiring the fused `ENUMERATE_INPUTS`/`ENUMERATE_OUTPUTS` opcodes).
+   - `BREAK` (`0x6b`) takes `Boolean(cond) N(depth)`: it pops `depth` (`1 <= depth <= active_loop_depth`) and `cond` (`N(0)` or `N(1)`). When `cond == N(1)`, it unwinds `depth` enclosing `ENUMERATE` loops; when `cond == N(0)`, execution continues. This gives bounded `ENUMERATE` loops native `DO/WHILE` and `LOOP/UNTIL` ergonomics (`<until_cond> ONE BREAK`) without wrapping every early exit in `IF ... ENDIF`. Unconditional break is `ONE <depth> BREAK`.
+2. **Symmetric Incoming-Vout, Cross-Input Witness & Asset Introspection:**
+   - Adds `UTXOFLAGS` (`0xde`, symmetric with `OUTPUTFLAGS` `0xe0`), `INPUTWITNESSARG` (`0xdf`, reading argument `a` of witness `w` of input `i` so N-to-1 stateful merges can inspect sibling inputs' state preimages without $O(N^2)$ witness duplication), `STATEHASH` (`0xc3`, canonical tuple state commitment `item_1 ... item_k N(k) → Hash32` matching `UTXOBRANCH`/`OUTPUTBRANCH` alongside `CAT`/`SPLIT`/`NUM2BIN`/`BIN2NUM`), `TXTOKENBALANCE` (`0xec`, returning `N(total_in) N(total_out)` in $O(1)$ for any `AssetId`), `ACTIVEBRANCHINDEX` (`0xf5`, returning `0..15` in a spend or `-1` in a mint), and `ACTIVEWITNESSINDEX` (`0xf6`).
+3. **Templated Output Enforcement (`ENFORCEOUTPUT` `0xeb`) & Value-Budget Claiming:**
+   - Rather than duplicating output-construction rules in an external JSON template and positional index checks in script, contracts express output requirements through a single shared transition function that calls `enforce_output(template, claim_amount)` (`ENFORCEOUTPUT` `0xeb`):
+     - `OutputTemplate` supports omitting, pinning, or popping from the stack at runtime `value` (`OMIT`, `EXACT`, `MIN`, `FROM_STACK`), `token_id` (`OMIT`, `NATIVE_XPI`, `EXACT`, `SELF_BRANCH_ROOT`), `paths` (`OMIT`, `EXPLICIT`, `INHERIT_INPUT_PATHS`), and individual `branches[0..15]` via `branch_mask` (static 32-byte roots) and `branch_stack_mask` (runtime-computed 32-byte roots popped from the stack, e.g., from `STATEHASH`), where `0` bits in `branch_mask | branch_stack_mask` represent omitted/wildcard branch slots filled by the wallet.
+     - **On-chain:** `ENFORCEOUTPUT` finds the first output `j` matching the template with `unclaimed_value[j] >= claim_amount`, deducts `unclaimed_value[j] -= claim_amount` (preventing double-claim attacks across inputs while natively supporting N-to-1 UTXO consolidations where multiple inputs claim their share of a single consolidated output `j`), and pushes the matched index `N(j)` onto the stack so the script can read any omitted fields (`j OUTPUTVALUE`, `j 1 OUTPUTBRANCH`, etc.).
+     - **Off-chain (Implicit `EMITLOG` & Constructive Simulation Mode):** Because `.simulate()` runs *before* the transaction's outputs exist in order to discover them, running strict `ENFORCEOUTPUT` during initial simulation would fail immediately. Instead, during `.simulate()`, `enforce_output(role, template, claim_amount)` **implicitly emits a `"lotus.output.draft"` `EMITLOG` (`0x6c`)** with the role metadata, and the simulator constructively appends (or coalesces) a matching draft output `j` in the simulated transaction and pushes `N(j)` onto the stack so subsequent instructions (`j OUTPUTVALUE`, etc.) succeed in a single pass. When `.sign()` is called after the wallet materializes the outputs, it compiles the original contract source in production mode (eliding all `emit` / `wallet::*` statements) through the **pinned versioned optimizer (`edition`, `optimizer_version`)**—the exact same pipeline that generated the Merkle roots originally—and runs strict `ENFORCEOUTPUT` verification before signing.
+4. **Structured Simulation Logs (`EMITLOG` `0x6c` — Consensus `OP_INVALID` On-Chain, Entire Statement Elided in Production Builds):**
+   - Contracts may declare structured events (`emit("required_output_template", x, y, z)`).
+   - In simulation mode, the compiler lowers the `emit` statement to standard stack instructions—e.g. `PICK(x) PICK(y) PICK(z) PUSH("required_output_template") 4 EMITLOG`—where arguments can be stack element references (`PICK`), constants (`PUSH`), or expressions pushed in the exact canonical order expected by standard wallet event handlers, and `EMITLOG` (`0x6c`) pops `N(k)` (`4`) and those `k` items (`+(k+1) - (k+1) = 0` net stack effect for the statement).
+   - In production mode (used to generate the on-chain `BranchRoot` / `token_id` Merkle roots and witness scripts during `.sign()`), the compiler omits the entire `emit` AST statement before running the versioned optimizer, so `PICK`/`PUSH` operands for `EMITLOG` never block peephole/stack optimizations and add zero wire overhead.
+   - In the node validator, `0x6c` (`EMITLOG`) is permanently defined as **`OP_INVALID`** (never `OP_SUCCESS_N`), so any accidental attempt to broadcast simulation bytecode is deterministically rejected.
+5. **Two-Byte Opcode Architecture (Compiler 16-Bit IR & On-Chain MSB Extension):**
+   - The compiler IR, assembler, disassembler, and cost tables represent all opcodes as 16-bit unsigned integers (`uint16_t`).
+   - For on-chain two-byte opcode expansion, two designs are recorded for genesis freeze selection:
+     - **MSB Variable-Length Encoding (Candidate A):** Reserve bit 7 (`0x80` MSB) of the first opcode byte as the two-byte indicator (`0x00`–`0x7f` = 128 single-byte hot instructions for literals, pushes, control flow, and stack ops; `0x80`–`0xff` followed by `b1` = `32,768` two-byte instructions `((b0 & 0x7f) << 8) | b1`).
+     - **Escape Prefix Byte `EXT2` `0xff` (Candidate B):** Keep the existing single-byte table (`0x00`–`0xfe`) and reserve `0xff <ext_op>` for 256 two-byte instructions (`0xff00`–`0xffff`).
+   - In both encodings, unassigned two-byte opcodes follow the same `OP_SUCCESS` scan and soft-fork upgrade contract as single-byte unassigned opcodes (while `EMITLOG` remains permanently `OP_INVALID` on-chain).
+6. **Standardized Ephemeral Wallet Functions (`lotus_std::wallet`) & Wallet-Centric Fluent Pipeline:**
+   - Rather than making each contract call construct its own transaction in isolation, the SDK centers on a configured **`Wallet`** instance (`new Wallet({ contracts, utxos, indexerUrls, kdf, signer })`) that already knows the contract registry, tracked/available UTXOs, Chronik/indexer endpoints, and the user's KDF / recipient derivation function:
+     ```ts
+     const wallet = new Wallet({
+       contracts: [DexPoolContract], // optional local overrides
+       registryUrls: ["https://registry.lotus.org"], // off-chain contract registry keyed by token_id / branch_root
+       utxos: cachedUtxos,
+       indexerUrls: ["https://chronik.lotus.org"],
+       kdf: userHdKdf,
+     });
+
+     const txid = await wallet
+       .send(dexPool.swap({ deltaX: 100_000n }), toAddrOrKdf)
+       .simulate()
+       .maxSlippageBps(50)
+       .withFeeRate(1000)
+       .sign()
+       .send();
+     ```
+   - When `.send(contractCall, toAddr | kdfFunc).simulate()` runs, `wallet` compiles and executes the contract in simulation mode and intercepts standardized `lotus_std::wallet` `EMITLOG` events:
+     - `wallet::output_draft(role, template, claim_amount, branch_roles)` (`"lotus.output.draft"`, auto-emitted by `enforce_output`): registers each required output draft and **automatically fills omitted `0`-bit user spend branch slots** (`branches[0]`) in `OutputTemplate` using `toAddr` or a fresh unlinked branch root derived from `kdfFunc` (while still allowing explicit `.fillBranch(role, branch)` overrides in the fluent chain).
+     - `wallet::require_funding(token_id, amount)` (`"lotus.input.funding"`): automatically selects funding UTXOs from `wallet.utxos` / `indexerUrls` and attaches native XPI or token change outputs derived via `kdfFunc`.
+     - `wallet::require_mint_authority(token_id, delta, mint_entry)` (`"lotus.input.authority"`): looks up the mint contract for `token_id` in `wallet.contracts` (or fetches and verifies it from `registryUrls` by `token_id`), attaches the `nFlags = 3` Mint Authority input (`prev_txid = token_id`), and binds `mint_entry`.
+     - `wallet::require_companion(role, token_id, branch_root)` (`"lotus.input.companion"`): queries `wallet.utxos` / `indexerUrls` to discover and attach coupled multi-UTXO contract inputs (e.g., vault or singleton controller UTXOs) and resolves their contracts by `(token_id, branch_root)` via `registryUrls`.
+     - `wallet::require_lock(scope, kind, min_bound)` (`"lotus.tx.lock"`, auto-emitted by `check_locktime` / `check_sequence`): populates `tx.lock` or `input.sequence` on the unsigned transaction plan.
+     - `wallet::quote(token_in, amount_in, token_out, amount_out, fee)` (`"lotus.ui.quote"`): powers post-`.simulate()` fluent assertions like `.maxSlippageBps(bps)`, `.minAmountOut(amount)`, and `.inspectQuote()` before `.sign().send()`.
+7. **Content-Addressed Off-Chain Contract Registry (Keyed by `token_id` and `branch_root`, Strictly Non-Consensus):**
+   - Because every `token_id` in Lotus V2 is the 32-byte `BranchRoot` of its mint authority program (`in.prevout.GetTxId()` when `nFlags == 3`) and every covenant branch in `coin.branches[0..15]` is a 32-byte `BranchRoot` (Merkle root over `Leaf(script_bytes)`), an off-chain npm-style package registry keyed by **`token_id` / `branch_root`** is **cryptographically self-verifying** and **100% outside consensus**:
+     - **Lookup by `token_id` or `branch_root`:** When a wallet encounters an unfamiliar token UTXO or covenant branch on-chain (or via `wallet::require_mint_authority` / `wallet::require_companion` during `.simulate()`), it queries `registryUrls` by the 32-byte root (`GET /v1/by-root/<32-byte-hex>`) to fetch the contract source and pinned `(edition, optimizer_version)`.
+     - **Zero-Trust Client Verification via the Versioned Optimizer:** The wallet passes the downloaded contract source through the pinned `(edition, optimizer_version)` production compiler/optimizer pipeline—the exact same deterministic process that generated the Merkle roots originally—and verifies that the resulting `BranchRoot` equals the 32-byte `token_id` or `branch_root` on the UTXO before running `.simulate()` or `.sign()`.
+
+8. **Canonical Branch Slot Convention (`branches[0]` = Owner/`CHECKSIG`, `branches[1]` = Enforcement ABI), `HAS_STATE` (`0x04`), and Direct $O(1)$ State Verification (`STATEVERIFY` `0xed`):**
+   - Single-value-slot `Output` framing (Option 2A) and P02's separation between **Mint trees** (`nFlags == 3`, defining *what token it is* via `token_id`) and **Spend/Enforcement trees** (`nFlags == 0`, defining *what ABI the UTXO conforms to*) are strictly preserved using a canonical branch slot layout across all contracts, wallets, and indexers:
+     - **`branches[0]` (Owner / Authorization Branch by Convention):** Holds the owner's `CHECKSIG` / wallet KDF branch root (or `0x00..00` / unspendable stub for ownerless shared pools). This guarantees that wallets and Chronik indexers can always index and query user ownership uniformly at slot `0` (`branches[0]`), and in `OutputTemplate` bit `0` of `branch_mask` is always the user/KDF slot!
+     - **`branches[1]` (Universal Enforcement / ABI Contract by Convention, `branches[1] == STANDARD_VAULT_ABI_ROOT`):** Holds the covenant/enforcement contract root (with `paths = [[0, 1]]` when both owner signature and enforcement ABI are required, or `paths = [[1]]` when the enforcement contract alone governs spending). Because wrapping an asset locks the underlying token inside a dedicated Vault UTXO and mints a fresh receipt token UTXO, layers live in separate UTXOs and each stateful UTXO only ever has a single enforcement contract (`branches[1]`) and a single 32-byte `state_root`!
+     - **`Output.flags` Bit 2 (`0x04` `HAS_STATE` — Single 32-Byte `state_root`) & $O(1)$ `STATEVERIFY` (`0xed`):**
+       - When `HAS_STATE` (`0x04`) is set on an `Output`, a single 32-byte `state_root` is stored in the `Output` header (`STATEHASH` `0xc3` of `branches[1]`'s state tuple), leaving all `16` branch slots (`branches[0..15]`) 100% for executable contracts.
+       - **Input State (`STATEVERIFY` `0xed`):** `<state_hash> STATEVERIFY` immediately checks `(coin[INPUTINDEX].flags & 0x04) != 0` and `state_hash == coin[INPUTINDEX].state_root` in $O(1)$.
+       - **Output State (`ENFORCEOUTPUT` `0xeb` with `state_mode`):** When a contract enforces output `j` via `ENFORCEOUTPUT` with `state_mode != 0` (`EXACT_STATE` or `FROM_STACK`), it checks `output[j].state_root == expected_state` and marks `state_authorized[j] = true` (and the validator rejects any `HAS_STATE` output `j` that was not authorized by an executing script in the transaction, preventing forged initial state).
+     - **Token-Specific Mint Contract (`token_id = BranchRoot(StakingMint<UNDERLYING, STANDARD_VAULT_ABI_ROOT>)`):** Because `STANDARD_VAULT_ABI_ROOT` is fixed independently of any token, each wrapper token's Mint contract embeds `STANDARD_VAULT_ABI_ROOT` and `UNDERLYING` (`AssetId::XPI` or `TokenId`) with zero circular dependency.
+   - Depositing/wrapping executes as a canonical 3-input transaction:
+     1. **Deposit Input:** Spends the user's `UNDERLYING` asset (`XPI` or `Token`) into a Vault output (`flags = HAS_STATE | ...`, `token_id = UNDERLYING`, `branches = [OwnerOrPoolAuthRoot, STANDARD_VAULT_ABI_ROOT]`, `state_root = STATEHASH(receipt_token_id, ...)`).
+     2. **Minting Input (`nFlags == 3`):** Executes `StakingMint<UNDERLYING, STANDARD_VAULT_ABI_ROOT>::mint`, whose `BRANCHROOT` (`0xf2`) is the minted wrapper's `token_id`, calling `ENFORCEOUTPUT` (`0xeb`) with `state_mode = FROM_STACK` to verify `output[vault_out].state_root == STATEHASH(this.branch_root, ...)`.
+     3. **Fee Input:** Pays native XPI transaction fees (coalesced with the Deposit Input when `UNDERLYING == AssetId::XPI`).
+
+9. **Zero-Callback Flash Loans, Off-Chain Signed Oracles (`CHECKDATASIG`), and Multi-Hop DeFi Pipelines:**
+   - **Off-Chain Oracles via `CHECKDATASIG` (`0xbd`, Zero UTXO Contention):** Oracles never need on-chain UTXOs (which would serialize transactions and require singleton token authentication). Instead, an oracle signs `(price, timestamp)` off-chain, and the spending contract verifies the signature in $O(1)$ via `CHECKDATASIG` (`0xbd`) and bounds staleness via `CHECKLOCKTIMEVERIFY` (`0xf3`).
+   - **Zero-Callback Flash Loans (5 Lines, Zero Reentrancy):** In EVM, flash loans require a reentrant callback dance (`flashLoan()` $\rightarrow$ `onFlashLoan()` $\rightarrow$ `repay()`). In Lotus V2, because all inputs and outputs in a transaction are validated atomically against `TXTOKENBALANCE` conservation, a Vault or Pool supports flash loans with a single stateless entry that simply requires its own UTXO to be recreated in the outputs with `old_value + fee`:
+     ```rust
+     contract FlashVault<const FEE_BPS: Int> {
+         entry flash_loan(state_preimage: Bytes32) {
+             // 1. Verify current vault state in O(1)
+             state_verify(state_preimage);
+
+             // 2. Compute required repayment = old_value + fee
+             let old_val = utxo_value(this.input_index);
+             let fee = (old_val * FEE_BPS) / 10_000;
+             let new_val = old_val + fee;
+
+             // 3. Require successor vault output with the same branches, paths, token_id, and state_root,
+             //    holding at least new_val. Inside this transaction, the borrowed funds can be used across
+             //    any other contract inputs (arbitrage, liquidations, collateral swaps) with zero callbacks!
+             let out_idx = enforce_output(
+                 "flash_repay",
+                 OutputTemplate {
+                     value_mode: ValueMode::FromStack(new_val),
+                     token_mode: TokenMode::Exact(utxo_token_id(this.input_index)),
+                     paths_mode: PathsMode::InheritInputPaths,
+                     state_mode: StateMode::FromStack(state_preimage),
+                 },
+                 claim_amount: new_val,
+             );
+         }
+     }
+     ```
+   - **Atomic Multi-Hop Pipelines (e.g., Swap `XPI` $\rightarrow$ `USDC` $\rightarrow$ Stake into `sUSDC`):** Because tokens are native UTXO values rather than isolated inside ERC-20 storage maps, the wallet chains multiple contract calls in one transaction without cross-contract `CALL` opcodes:
+     - **Input 0:** User's `XPI` input.
+     - **Input 1:** `AmmPool` UTXO swapping `XPI` $\rightarrow$ `500 USDC`.
+     - **Input 2 (`nFlags == 3`):** `StakingMint<USDC, STANDARD_VAULT_ABI_ROOT>` minting `500 sUSDC` and enforcing via `ENFORCEOUTPUT` that the `500 USDC` from the AMM swap is locked directly into a new `USDC` Vault UTXO (`branches[1] == STANDARD_VAULT_ABI_ROOT`, `state_root = STATEHASH(sUSDC_TOKEN_ID, ...)`).
+     - **Outputs:** Updated `AmmPool` UTXO + new `USDC` Vault UTXO + user's `500 sUSDC` receipt token UTXO.
+
+---
+
+## References
+
+1. **[Lau & Wuille 2016a]** Johnson Lau and Pieter Wuille, *"BIP 114: Merkelized Abstract Syntax Tree"*, Bitcoin Improvement Proposals, April 2016.
+2. **[Wuille, Nick, & Ruffing 2020]** Pieter Wuille, Jonas Nick, and Tim Ruffing, *"BIP 340: Schnorr Signatures for secp256k1"*, Bitcoin Improvement Proposals, January 2020.
+3. **[Wuille, Nick, & Towns 2020a]** Pieter Wuille, Jonas Nick, and Anthony Towns, *"BIP 341: Taproot: SegWit version 1 spending rules"*, Bitcoin Improvement Proposals, January 2020.
+4. **[Wuille, Nick, & Towns 2020b]** Pieter Wuille, Jonas Nick, and Anthony Towns, *"BIP 342: Validation of Taproot Scripts"*, Bitcoin Improvement Proposals, January 2020.
+5. **[O'Connor & Piekarska 2017]** Russell O'Connor and Marta Piekarska, *"Enhancing Bitcoin Transactions with Covenants"*, in *Financial Cryptography and Data Security (FC 2017)*, LNCS vol. 10323, pp. 191–198, 2017.
+6. **[O'Connor, Aumasson, Neves, & Wilcox-O'Hearn 2020]** Jack O'Connor, Jean-Philippe Aumasson, Samuel Neves, and Zooko Wilcox-O'Hearn, *"BLAKE3: One Function, Fast Everywhere"*, January 2020 (`https://github.com/BLAKE3-team/BLAKE3-specs`).

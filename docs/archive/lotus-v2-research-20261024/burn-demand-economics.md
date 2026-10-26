@@ -1,0 +1,22 @@
+# Burn demand, price and the work-responsive tail
+
+Status: **open economic analysis; non-consensus**. Formerly the economic-interpretation appendix of [P06](../decisions/issuance-and-time.md). It informs D10 constant calibration and selects no rule, constant, price peg or supply bound.
+
+Let $A_n$ be the **actual** external-currency budget spent on verifiable native burns during an interval and $P_n>0$ the market price in that currency per XPI. The corresponding purchased-and-burned amount is $A_n/P_n$ XPI, subject to atom rounding and transaction costs. A falling $P_n$ raises the coin-denominated burn **only if** the budget and access to XPI persist. Adoption, attention value, and budgets may fall with price; a demand collapse can reduce $A_n$ faster than $P_n$, eliminating the proposed negative feedback. Neither $A_n$ nor $P_n$ is a consensus input or an observed control target.
+
+For the candidate tail held at $250{,}000$ XPI per 120-second block, 365 days contain 262,800 target-spaced blocks and tail issuance is $65.7$ billion XPI/year. After bootstrap emission becomes negligible, balancing **that tail alone** with voluntary burns at a reference price of $1/XPI would require about $65.7$ billion/year of external burn spending if fees, other burns, underclaims, and tail variation are ignored. This is a steady-supply scenario, not a launch assumption, price peg, guaranteed burn budget, or aggregate supply bound. Actual blocks are stochastic and the tail responds to work.
+
+Count native supply destruction once under [C16](../consensus.md): $\Delta M_n=S_n-B-U-\text{Burn\_explicit}$, where $B$ includes C14a's token-output burn and the mandatory share of remaining native fees, $U$ is coinbase underclaim (including required resource deductions), and $\text{Burn\_explicit}$ is native `IS_BURN` output value. Fees paid to miners, including optional tips, are transfers and are excluded from burn demand; do not add the fee amount to issuance or count an explicit burn output again as a fee. A CashWeb-style proof of payment can verify a message-linked native `IS_BURN` output and reuse its on-chain burn as an application receipt. The application decides access and receipt reuse; it adds no consensus burn rule or second monetary sink.
+
+The adaptive PoW paper's local stability result concerns a linearized equilibrium under persistent fiat budgets, immediate hashrate adjustment, an assumed price-response coefficient and inactive clipping. It does not establish those assumptions for V2 or prove convergence to a chosen fiat price. Before fixing genesis constants, simulate adoption and budget persistence, price elasticity, mining adjustment lag, energy and hardware cost changes, clipping and atom rounding, correlated demand/price/work shocks, and miner security payout after burns and resource underclaim. Report supply paths and security expenditure as conditional outcomes, including a cold start with little or no application burn.
+
+Paper provenance for this interpretation (read-only local sources, SHA-256 of `main.tex` on 2026-10-14): *Adaptive PoW Monetary Policy Without Oracles: A Constructive Mechanism for Pseudo-Stability via Work-Coupled Tail Emission and Burn*, `60f845adc6b3645722e97cad3b7f8e315cc557d4ab4b27f851eba0770ef4dacd`; *CashWeb: A Cryptocurrency-Integrated Protocol for Federated Anti-Spam Messaging and Publish-Subscribe Systems*, `29b71351f2a6558d721b90cc44fafb59bca4c19a7d3db5b928112d4cb08a79e4`. The monetary paper writes an aggregate expectation with a fee term; C16 above is V2's normative transfer/burn accounting. Its CashWeb citation describes an application proof-of-payment construction using an unspendable output; V2 uses `IS_BURN` for the corresponding native receipt.
+
+---
+
+## References
+
+1. **[Chancellor 2026]** Shammah Chancellor, *"Adaptive PoW Monetary Policy Without Oracles: A Constructive Mechanism for Pseudo-Stability via Work-Coupled Tail Emission and Burn"*, Lotus Network Technical Paper, 2026.
+2. **[Buterin et al. 2019]** Vitalik Buterin, Eric Conner, Rick Dudley, Matthew Slipper, Ian Norden, and Abdelhamid Bakhta, *"EIP-1559: Fee market change for ETH 1.0 chain"*, Ethereum Improvement Proposals, April 2019.
+3. **[Roughgarden 2020]** Tim Roughgarden, *"Transaction Fee Mechanism Design for the Ethereum Blockchain: An Economic Analysis of EIP-1559"*, `arXiv:2012.00854`, December 2020.
+4. **[Nakamoto 2008]** Satoshi Nakamoto, *"Bitcoin: A Peer-to-Peer Electronic Cash System"*, October 2008 (`https://bitcoin.org/bitcoin.pdf`).
