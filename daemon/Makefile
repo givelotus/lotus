@@ -13,14 +13,15 @@ SERIES  ?= v1
 .PHONY: setup build run mkpatch refresh refresh-abc refresh-chronik prepare-release prepare-component features clean help
 
 help:
-	@echo "Pinned daemon source submodules (no automatic stack application):"
+	@echo "Pinned daemon source submodules under daemon/ (no mailbox replay):"
 	@echo "  make setup SERIES=all|ecash|v2|v1|doged|bchn|bitcoin   Initialize exact gitlinks"
 	@echo "  make status                                         Verify repos, pins and trees"
 	@echo "  make source-plan SERIES=v2                           Show shared then native order"
 	@echo "  make source-plan SERIES=v2 PLAN_ARGS=--commits       Show individual commit order"
 	@echo "  make source-verify                                  Check every source submodule"
 	@echo "  make build/run SERIES=...                           Require promoted stack first"
-	@echo "Stack mutation/replay and releases remain deferred during source-order review."
+	@echo "  make sync/autosquash/bridge-ours SERIES=...          Maintain source histories"
+	@echo "Unfinished historical candidates remain separate from the selected source pins."
 
 setup:
 ifdef RESET
@@ -40,31 +41,34 @@ source-path:
 	python3 $(SCRIPTS)/daemon_sources.py path $(SERIES)
 
 status:
-	python3 $(SCRIPTS)/lotus-git.py status
+	python3 $(SCRIPTS)/daemon_sources.py status $(SERIES)
 
 init:
-	python3 $(SCRIPTS)/lotus-git.py init $(SERIES)
+	python3 $(SCRIPTS)/daemon_sources.py init $(SERIES)
 
 autosquash:
-	python3 $(SCRIPTS)/lotus-git.py autosquash $(SERIES) $(if $(filter 1,$(PATCHES)),--export-patches)
+	python3 $(SCRIPTS)/daemon_sources.py autosquash $(SERIES) $(if $(filter 1,$(PATCHES)),--export-patches)
 
 sync:
-	python3 $(SCRIPTS)/lotus-git.py sync $(SERIES) $(if $(filter 1,$(PATCHES)),--export-patches) $(if $(filter 1,$(VERIFY)),--verify-replay) $(if $(filter 1,$(PUSH)),--push)
+	python3 $(SCRIPTS)/daemon_sources.py sync $(SERIES) $(if $(filter 1,$(BRIDGE_OURS)),--bridge-ours) $(if $(filter 1,$(PATCHES)),--export-patches) $(if $(filter 1,$(VERIFY)),--verify-replay) $(if $(filter 1,$(PUSH)),--push)
+
+bridge-ours:
+	python3 $(SCRIPTS)/daemon_sources.py bridge-ours $(SERIES) $(if $(REF),--ref "$(REF)")
 
 sink-to-ecash:
-	python3 $(SCRIPTS)/lotus-git.py sink-to-ecash $(or $(COMMIT),HEAD) $(if $(filter 1,$(PATCHES)),--export-patches)
+	python3 $(SCRIPTS)/daemon_sources.py sink-to-ecash $(or $(COMMIT),HEAD) $(if $(filter 1,$(PATCHES)),--export-patches)
 
 rebase-upstream:
 ifndef COMMIT
 	$(error COMMIT is required: make rebase-upstream SERIES=v2 COMMIT=<sha|latest>)
 endif
-	python3 $(SCRIPTS)/lotus-git.py rebase-upstream $(SERIES) --onto "$(COMMIT)" $(if $(filter 1,$(PATCHES)),--export-patches)
+	python3 $(SCRIPTS)/daemon_sources.py rebase-upstream $(SERIES) --onto "$(COMMIT)" $(if $(filter 1,$(BRIDGE_OURS)),--bridge-ours) $(if $(filter 1,$(PATCHES)),--export-patches)
 
 extract-pr:
 ifndef BRANCH
 	$(error BRANCH is required: make extract-pr SERIES=ecash BRANCH=pr/my-feature COMMITS="<sha>")
 endif
-	python3 $(SCRIPTS)/lotus-git.py extract-pr $(SERIES) --branch "$(BRANCH)" $(or $(COMMITS),base/abc..daemon/$(SERIES))
+	python3 $(SCRIPTS)/daemon_sources.py extract-pr $(SERIES) --branch "$(BRANCH)" $(or $(COMMITS),HEAD)
 
 build:
 	SERIES=$(SERIES) FEATURES="$(FEATURES)" $(SCRIPTS)/build.sh

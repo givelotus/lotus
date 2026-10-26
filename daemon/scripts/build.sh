@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# build.sh — Build lotusd from a workspace.
+# Build an exact registered source submodule into daemon/.build/<series>.
 #
-# SERIES=v1 (default):           build from workspace-v1/
+# SERIES=v1 (default): Lotus mainnet from daemon/lotusv1.
 #
 # Usage: ./scripts/build.sh [cmake-args...]
 #   e.g. ./scripts/build.sh -DBUILD_BITCOIN_QT=OFF
@@ -21,7 +21,7 @@ WORKSPACE="$(python3 "$SCRIPT_DIR/daemon_sources.py" path "$SERIES")"
 case "$SERIES" in
     v1|v2) LABEL="Lotus $SERIES"; TARGETS=(lotusd lotus-cli) ;;
     ecash|bchn|bitcoin) LABEL="$SERIES"; TARGETS=(bitcoind bitcoin-cli) ;;
-    doged) LABEL="Dogecoin on ABC"; TARGETS=(doged doge-cli) ;;
+    doged) LABEL="Pinned Doged reference"; TARGETS=(doged doge-cli) ;;
 esac
 
 BUILD_DIR="$DAEMON_DIR/.build/$SERIES"
@@ -47,7 +47,7 @@ fi
 
 if [[ "$SERIES" == "v1" || "$SERIES" == "v2" || "$SERIES" == "doged" || "$SERIES" == "doged-reference" ]]; then
     CMAKE_ARGS+=(-DBUILD_CHRONIK=ON)
-    if [[ "$SERIES" == v2 || "$SERIES" == doged ]]; then
+    if [[ "$SERIES" == v2 ]]; then
         CMAKE_ARGS+=(-DCHRONIK_IMPLEMENTATION=native)
     fi
 fi

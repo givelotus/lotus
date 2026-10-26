@@ -43,7 +43,7 @@ This integer recurrence satisfies four foundational properties:
 
 ### Absolute adaptive tail
 
-The genesis-anchored formula is the candidate tail rule; its derivation is in the [absolute reward review](../../plans/lotus-v2-absolute-reward-research.md). It supersedes the recurrent tail formula; bootstrap scheduling, genesis native issuance (zero), fee/burn accounting and the one-block lag retain their defined rules. This selects a formula, not numerical mainnet constants or economic acceptance.
+The genesis-anchored formula is the candidate tail rule; its derivation is in the [absolute reward review](../research/plans/lotus-v2-absolute-reward-research.md). It supersedes the recurrent tail formula; bootstrap scheduling, genesis native issuance (zero), fee/burn accounting and the one-block lag retain their defined rules. This selects a formula, not numerical mainnet constants or economic acceptance.
 
 Immutable profile parameters are `genesis_tail` ($T_g$, an in-range `u64` amount) and `genesis_work` ($W_g$, positive `u256` per-block work from the genesis target). Define version 1:
 
@@ -88,7 +88,7 @@ The analysis deliverable is: model/assumptions, feasible controls, honest baseli
 
 Coinbase payouts are Avalanche-controlled, using Bitcoin ABC's existing soft block-parking machinery (`ConnectTip` `ParkingPolicy`), extended to a **three-way coinbase split** (`~50% Miner / ~25% Staker Winner / ~25% Staker-Voted Treasury Winner`, exact ratios configurable in the network profile). Hard consensus treasury covenants, genesis vesting contracts, controller singleton coins and on-chain treasury state roots remain excluded; there is no protocol faucet balance or treasury field in `MonetaryState`.
 
-The reviewed and planned integration points ([bulk pre-consensus & overlay plan](../../plans/lotus-v2-bulk-preconsensus-and-mempool-overlays.md)) are:
+The reviewed and planned integration points ([bulk pre-consensus & overlay plan](../research/plans/lotus-v2-bulk-preconsensus-and-mempool-overlays.md)) are:
 
 - **Staker reward winner (`MSG_AVA_STAKE_CONTENDER`, target `~25%` share):** `src/avalanche/processor.*` and `StakeContenderCache` select staking-reward winners relative to the parent block (`StakeContenderId = H(prevblockhash, proofid)`). `StakingRewardsPolicy` (`src/policy/block/stakingrewards.cpp`) verifies that `vtx[0]` pays at least `STAKER_REWARD_RATIO` (default `25%`, configurable) of the net claimable block reward to a finalized winner.
 - **Staker-voted treasury payout script (`MSG_AVA_TREASURY_CONTENDER`, target `~25%` share):** Instead of the legacy hardcoded `MinerFundPolicy` whitelist (`src/minerfund.cpp`), `TreasuryContenderCache` (`src/avalanche/treasurycontendercache.*`) and `TreasuryPolicy` (`src/policy/block/treasurypolicy.*`) poll staker-endorsed treasury payout scripts via `MSG_AVA_TREASURY_CONTENDER` (`TreasuryContenderId = H(prevblockhash, payout_script_hash)`, resolved via `getdata(MSG_AVA_TREASURY_CONTENDER)` $\to$ `avatreasury` when unknown). `TreasuryPolicy` verifies that `vtx[0]` pays at least `TREASURY_REWARD_RATIO` (default `25%`, configurable) of the net claimable block reward to the finalized treasury script.

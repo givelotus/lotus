@@ -15,7 +15,7 @@ The [script ABI](../script-abi.md) distinguishes today's schema-2 compiler gramm
 - **`state { ... }`** declares fields a contract keeps between spends. They are stored by P02's data-leaf convention; example 5 shows the compiled form. In a contract with state, a method not marked **`ends`** must leave a successor. A contract without state never requires one, so its methods carry no marker.
 - **`paired output`** refers to the output at the same position as the input the script is running for. Pairing by position stops two inputs from both claiming one output.
 
-For new language work use [LC-1's explicit entry and policy proposal](../script-abi.md#composition-proposal-lc-1-not-implemented): methods select leaves within a program, while named paths select the AND of required branch slots. Imports have no deployment effect. Mint identity is independent of holder policy branch order. A bound program root does not identify a complete output policy. The [work plan](../../plans/lotus-v2-language-composition.md) gives versioning, implementation owners and acceptance gates.
+For new language work use [LC-1's explicit entry and policy proposal](../script-abi.md#composition-proposal-lc-1-not-implemented): methods select leaves within a program, while named paths select the AND of required branch slots. Imports have no deployment effect. Mint identity is independent of holder policy branch order. A bound program root does not identify a complete output policy. The [work plan](../research/plans/lotus-v2-language-composition.md) gives versioning, implementation owners and acceptance gates.
 
 ## 1. Ordinary payment
 

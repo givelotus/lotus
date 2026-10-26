@@ -625,6 +625,9 @@ def success_scan_vectors() -> dict:
     success_listing = packet.split('## Extension points', 1)[1].split('```text', 1)[1].split('```', 1)[0]
     assert set(bytes.fromhex(success_listing)) == SUCCESS_OPCODES
     for path in ROOT.rglob('*.md'):
+        # Retained research preserves superseded opcode assignments verbatim.
+        if 'research' in path.relative_to(ROOT).parts:
+            continue
         for name, byte in re.findall(r'\b([A-Z][A-Z0-9_]+)`?\s*\(\s*`?0x([0-9a-f]{2})', path.read_text()):
             if name in OPCODES:
                 assert OPCODES[name] == int(byte, 16), (path, name, byte)
@@ -1056,7 +1059,7 @@ def main() -> None:
         path.write_text(json.dumps(actual, indent=2) + '\n')
     else:
         assert json.loads(path.read_text()) == actual, 'Fixtures or packet digests changed; review before regenerating.'
-    print('PASS: framing/signing inputs and coinbase identity/context; 41 success opcodes and push-boundary scan cases; Merkle opcodes; 153 ordered-tree paths; compact sparse-map membership/absence/order; 56B MonetaryState/StateRoot, telescoping bootstrap & parabolic cost curves; 134/82/64-byte header views; LOG power/monotonic checks; exact tail rounding; ASERT boundaries and compact targets; byte fees, coinbase deductions, extension accounting and genesis indexing.')
+    print('PASS: framing/signing inputs and coinbase identity/context; 31 success opcodes and push-boundary scan cases; Merkle opcodes; 153 ordered-tree paths; compact sparse-map membership/absence/order; 56B MonetaryState/StateRoot, telescoping bootstrap & parabolic cost curves; 134/82/64-byte header views; LOG power/monotonic checks; exact tail rounding; ASERT boundaries and compact targets; byte fees, coinbase deductions, extension accounting and genesis indexing.')
 
 
 if __name__ == '__main__':

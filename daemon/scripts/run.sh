@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # run.sh — Launch lotusd with adequate file descriptor limits.
 #
-# SERIES=v1 (default):           run from workspace-v1/
+# SERIES=v1 (default): run the daemon/.build/v1 binary from the pinned submodule.
 #
 # Usage: ./scripts/run.sh [lotusd-args...]
 #   e.g. ./scripts/run.sh -regtest -datadir=/tmp/lotus-regtest -daemon

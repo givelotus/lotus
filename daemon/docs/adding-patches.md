@@ -1,40 +1,22 @@
-# Submodule migration: base-only scaffold
+# Maintaining daemon source submodules
 
-The active migration uses `daemon/sources.json` and exact gitlinks in `.gitmodules`.
-`make -C daemon setup SERIES=all` initializes sources only. It never applies a
-mailbox, rebases a stack, changes a published source branch, or resets local work.
-Use `make -C daemon status` and `make -C daemon source-verify` to check repository
-URLs, gitlinks, HEADs and exact trees.
+Use `daemon/sources.json` and the parent gitlinks as the exact source lock.
+`make -C daemon setup SERIES=all` initializes the selected commits and refuses
+changed checkouts. `make -C daemon source-verify` checks URLs, pins and trees.
+Builds use `daemon/.build/<series>`.
 
-Review the proposed order with `make -C daemon source-plan SERIES=v2`;
-`PLAN_ARGS=--commits` lists the individual inputs and `PLAN_ARGS=--json` exports
-the full plan. Shared eCash changes target `daemon/ecashd` in
-`givelotus/bitcoin-abc`. After review, that exact shared tip is fetched into
-`daemon/lotusd` as the parent of the Lotus-only commits. The native stage must
-not replay the shared list again. Cross-repository branch updates require
-explicit coordination; `rebase.updateRefs` cannot update another repository.
+Make ordinary authored commits in the appropriate submodule. Shared changes
+belong in `daemon/ecashd`; Lotus-specific changes belong in `daemon/lotusd` on
+its exact shared parent. The existing `sync`, `autosquash`, `sink-to-ecash`,
+`rebase-upstream` and `bridge-ours` commands are exposed by the daemon Makefile.
+A history bridge preserves the selected tree while recording earlier ancestry;
+it does not apply the other history's source changes. Review tree equality and
+source tests before publishing. Push source commits before parent gitlinks.
 
-The six source paths are `daemon/ecashd`, `daemon/lotusd`, `daemon/lotusv1`,
-`daemon/doged`, `daemon/bitcoincashd` and `daemon/bitcoind`. Builds resolve these
-paths and use `daemon/.build/<series>` instead of writing inside the submodules.
-Build/run and historical replay/release entrypoints are gated until the relevant
-stack is reviewed and promoted. No new stack application command is enabled in
-this phase.
-
-Dogecoin has three distinct identities: the original Doged export source,
-the historical ABC replay base, and the pinned current ABC master used as the
-new replay target. Its 174 exported changes plus retained fixes are pending
-review and replay on that new target; the original Doged history stays preserved.
-
-The reviewed source reference has all 378 shared eCash commits; the historical
-mailbox export has 377. This is informational archival lag. Normal source
-initialization and builds do not read or require patch-series files. V1's generated local release-metadata variant is
-also explicitly distinguished from the published source reference. All old
-source histories, patch inputs and benchmark identities remain preserved.
-
-Private source clones require credentials with read access to the private
-`givelotus` repositories. The optional authenticated source-layout CI job uses
-`DAEMON_REPOS_TOKEN`; the ordinary layout tests do not fetch private sources.
+Archived mailboxes and candidate histories retain provenance. They are not read
+by normal setup/build and must not silently replace the selected source tree.
+Private repository checkout requires Git credentials. Never reset a dirty source
+checkout or move the source/build directory of a running daemon.
 
 ## Historical workspace workflow (retained for provenance)
 

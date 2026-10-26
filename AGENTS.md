@@ -1,28 +1,37 @@
-## Active source migration — base-only submodules (2026-10-23)
+# Lotus — canonical repository and daemon submodules
 
-The user requested submodules/tooling BEFORE stack application. On this migration
-branch, `daemon/sources.json` and the parent gitlinks select the active base-only
-source checkouts. `daemon/stack-review.json` records ordered reference inputs;
-these references are preserved evidence, not already-applied module contents.
+The permanent working checkout is `/Users/shammah/repos/lotus`. Daemon source
+belongs in the registered `daemon/` submodules, with exact pins in
+`daemon/sources.json`. `daemon/stack-review.json` records their source ancestry.
 
-- Use `make -C daemon setup SERIES=all`, `status`, `source-verify`, and
-  `source-plan SERIES=v2 PLAN_ARGS=--commits`. Setup must never replay patches.
-- Shared changes belong in `daemon/ecashd` (`givelotus/bitcoin-abc`). Only after
-  review/application there does its exact resulting tip become the parent in
-  `daemon/lotusd`; the Lotus stage must not replay the shared inputs again.
-- Dogecoin's export source, historical replay base, and pinned current ABC-master
-  target are distinct. Its exported changes plus retained fixes remain unapplied.
-- Preserve existing stack branches, source trees and archived mailbox inputs.
-  Git commit histories are authoritative. The old 377-entry shared mailbox export
-  lags the complete 378-commit Git history; regenerating it is not required.
-  Normal setup/build must not read patch-series files. Stack review gates remain.
-- The workspace-based mutation instructions below are historical during this
-  scaffold phase. Do not use them to bypass the source model or its review gates.
-  See `daemon/docs/adding-patches.md` for the active procedure.
+- Use `make -C daemon setup SERIES=all`, `source-verify`, and `source-plan`.
+  Setup initializes exact submodule commits; it never replays mailboxes or
+  overwrites a changed checkout. Builds use `daemon/.build/<series>`.
+- Shared engine changes belong in `daemon/ecashd` (`givelotus/bitcoin-abc`).
+  Lotus-specific changes belong in `daemon/lotusd` (`givelotus/lotusd`). V1 uses
+  the separate `daemon/lotusv1` checkout of that repository. Doged, Core and BCHN
+  use `daemon/doged`, `daemon/bitcoind` and `daemon/bitcoincashd`.
+- The selected Doged source is the original Doged implementation. Current-ABC
+  port candidates remain explicitly separate; do not describe them as selected.
+- Existing setup, sync, autosquash and history-bridge tooling is in
+  `daemon/scripts/daemon_sources.py`; use it before inventing a new workflow.
+  Publish required source commits before parent gitlinks. Verify exact source
+  trees and tests before promoting behavior changes.
+- Temporary PR branches/worktrees have a bounded purpose. Finish by merging or
+  explicitly closing the work, accounting for every retained change, and removing
+  the temporary checkout. Do not use temporary worktrees as permanent project homes.
+- Do not recreate `lotus-v2-optimizations` or `lotus-v2-specifications`. Their
+  histories and working changes are preserved outside this repository in
+  `/Users/shammah/repos/archive/`.
+  Recovery artifacts are outside the tracked source tree. Historical logs may
+  retain original paths; those paths are provenance, not operational entrypoints.
+- Preserve source history, dirty work, production nodes/data, existing release
+  tags and published assets. Source migration does not authorize deployment.
+- After a Serena source edit, run `get_diagnostics_for_file` and fix all errors.
 
-# Lotus Monorepo — Agent & Developer Guide (`AGENTS.md`)
-
-> `CLAUDE.md` is a symlink to `AGENTS.md` so Claude Code, Cursor, Codex, Antigravity, and other agent harnesses share a single source of truth.
+The technical notes below retain historical validation evidence. Their old
+workspace/replay paths describe those historical runs; current operational
+commands and pins are defined above and in `daemon/README.md`.
 
 ## What is Lotus?
 
@@ -166,9 +175,7 @@ It never advances the active Chronik source pin, host profile hashes, release
 manifests, or workspaces. Supply `UPSTREAM=<ABC clone> REF=<ref>` only for an
 explicit ref. Clean patch application is not build or behavioral validation. See
 `daemon/docs/shared-chronik-source-and-hosts.md` for review and promotion steps.
-There is no tracked Bitcoin ABC Git submodule in this repository; daemon
-workspaces are gitignored clones, while Chronik's canonical ABC URL and exact
-source commit are recorded in `daemon/chronik/source.json`.
+Bitcoin ABC is the `daemon/ecashd` submodule. Chronik provider provenance is recorded separately in `daemon/chronik/source.json`.
 
 `make -C daemon refresh-abc CANDIDATE=<new-dir>` coordinates the non-V1 ABC
 update tracks on one exact commit: it replays eCash and maintained Dogecoin
@@ -231,9 +238,9 @@ Upstream Bitcoin ABC's in-process Chronik (`chronik/`) assumes standard 80-byte 
 - Public-facing cleanup preserves imported component licenses and Git history. Generated Vase server/iOS artifacts and the localhost development `.env` are removed from the current Git index while local files remain available; use `.env.example` for development setup. No live credential or recognizable access token/private key was identified in the tracked-text audit. Historical build files remain in the subtree import; do not rewrite that history as an incidental cleanup.
 - The first tag release build was cancelled after a packaging audit found missing upstream `COPYING`. Packaging now includes that file. Public README/build documentation must distinguish tested mainnet daemon behavior from inherited wallet/SDK/miner components.
 
-- Main contains the mainnet implementation and its operational documentation only. Exploratory protocol work is kept on separate branches. Preserve those branch contents when removing unrelated plans from this checkout; do not rewrite history.
+- Preserve original source histories and attribution when integrating protocol work; do not rewrite historical evidence as part of consolidation.
 
-- `main` contains the V1 mainnet implementation and its supporting tools only. Exploratory protocol specifications and implementation belong on separate development branches; do not add their files, roadmap, or links to this branch.
+- Main contains maintained implementation, specifications and explicitly identified candidates. Candidate retention does not establish runtime validation.
 - Release CI pins Rust 1.93.0 (`dtolnay/rust-toolchain@1.93.0`, CMake `Rust_TOOLCHAIN=1.93.0`), matching passing local checks. Floating stable selected 1.99.0 and Clippy reported `clone_on_copy` in CXX-generated bridge derives. Pinning the validated toolchain avoids changing bridge ABI/source to satisfy generated-code lint diagnostics.
 
 ## Release engineering and component review (2026-10-14)

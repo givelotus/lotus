@@ -709,6 +709,7 @@ def render_site(out_dir: Path) -> int:
         banner = build_summary_banner(rel.as_posix())
         body = markdown_to_html(raw_md, rel)
         page = html_template(title, sidebar, banner, body, rel.as_posix()).replace("{ROOT_PREFIX}", root_prefix)
+        page = "\n".join(line.rstrip() for line in page.splitlines()) + "\n"
         dest.write_text(page, encoding="utf-8")
         count += 1
     print(f"Rendered {count} HTML pages to {out_dir}")

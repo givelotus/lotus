@@ -39,13 +39,13 @@ The [TypeScript compiler](../../tools/lotus-v2-compiler/README.md) implements a 
 
 Each generated artifact records compiler/evaluator revisions, consensus/parameter digests, argument order, selected policy, leaf/proof bytes, core/complete transaction bytes, TxID/TxHash, signature digest, final stack, resulting state and static charges. A pretty source listing is not a conformance vector.
 
-The [compiler and ABI implementation plan](../plans/lotus-v2-compiler-abi.md) defines staged assembler, typed language, artifact schema, binding generation and independent execution/stress-test gates. The [browser connect protocol (`lotus-connect/1`)](browser-connect.md) specifies how web applications and browser extensions transport `lotus-v2/contract-artifact/2`, `lotus-v2/policy-artifact/1`, and partial `TransactionIntent`s over W3C `MessagePort` channels for connectless intent fulfillment. Development targets a versioned draft profile; final consensus freeze is required for launch, not for beginning tooling.
+The [compiler and ABI implementation plan](research/plans/lotus-v2-compiler-abi.md) defines staged assembler, typed language, artifact schema, binding generation and independent execution/stress-test gates. The [browser connect protocol (`lotus-connect/1`)](browser-connect.md) specifies how web applications and browser extensions transport `lotus-v2/contract-artifact/2`, `lotus-v2/policy-artifact/1`, and partial `TransactionIntent`s over W3C `MessagePort` channels for connectless intent fulfillment. Development targets a versioned draft profile; final consensus freeze is required for launch, not for beginning tooling.
 
 The first client targets are **Python and TypeScript**, generated from the same versioned interface model with matching runtime libraries and exact-byte cross-language tests. The compiler is written in TypeScript as a small Finch-spec-inspired typed stack pipeline; Python remains an independent reference and generated-client target. Finch implementation code is not treated as conformance evidence.
 
 ## Composition proposal LC-1 (not implemented)
 
-This section specifies the next language surface and its lowering contract. It does not change C01–C25, P01–P06, CABI-07/08, the current schema-2 compiler, or the explicit eCash target. Implement it behind a new language version; legacy source continues to have precisely its existing meaning. [Implementation work and acceptance gates](../plans/lotus-v2-language-composition.md) are separate from this specification. No `OP_DEFINE` or `OP_INVOKE` is introduced: bytes `89` and `8a` already mean SPLIT and NUM2BIN.
+This section specifies the next language surface and its lowering contract. It does not change C01–C25, P01–P06, CABI-07/08, the current schema-2 compiler, or the explicit eCash target. Implement it behind a new language version; legacy source continues to have precisely its existing meaning. [Implementation work and acceptance gates](research/plans/lotus-v2-language-composition.md) are separate from this specification. No `OP_DEFINE` or `OP_INVOKE` is introduced: bytes `89` and `8a` already mean SPLIT and NUM2BIN.
 
 ### Four different objects
 
